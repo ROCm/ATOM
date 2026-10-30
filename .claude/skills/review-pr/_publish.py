@@ -353,10 +353,37 @@ def do_post(pr):
     """Post the card as a review. Only ever reached from main() under --post."""
     payload = review_payload(pr)
     assert payload["event"] == "COMMENT", "this bot never approves or requests changes"
-    r = _api(f"pulls/{pr}/reviews", method="POST", body=payload)
-    if isinstance(r, dict) and r.get("html_url"):
-        n = len(payload["comments"])
-        return True, f'{r["html_url"]}  ({n} inline, {len(payload["body"])} chars in summary)'
+    # A review is all-or-nothing: GitHub rejects the whole call -- summary included -- if
+    # any one comments[] entry names a line it will not accept. The anchor set is computed
+    # from the diff's own hunks, but an off-by-one there would lose the entire review,
+    # which is strictly worse than the plain comment this replaced. So: try anchored, and
+    # if that is refused, send the same review with the anchors dropped. Same endpoint and
+    # the same single call site either way, so the drift check in check_prompts still holds.
+    for attempt in ("anchored", "summary-only"):
+        if attempt == "summary-only":
+            # Fold the anchors back into the body before dropping them. A review that
+            # silently sheds half its findings reads exactly like a review that only had
+            # the other half -- the failure this project keeps finding in its own parts.
+            payload = dict(payload)
+            payload["body"] = (
+                payload["body"]
+                + "\n\n_The findings below could not be attached to their lines — GitHub "
+                "refused the anchored review, so they are inlined here instead._\n\n"
+                + "\n\n".join(
+                    f'`{c["path"]}:{c["line"]}` — {c["body"]}' for c in payload["comments"]
+                )
+            )
+            payload["comments"] = []
+        r = _api(f"pulls/{pr}/reviews", method="POST", body=payload)
+        if isinstance(r, dict) and r.get("html_url"):
+            n = len(payload["comments"])
+            how = "" if attempt == "anchored" else "  [ANCHORS REFUSED -- folded into summary]"
+            return True, (
+                f'{r["html_url"]}  ({n} inline, '
+                f'{len(payload["body"])} chars in summary){how}'
+            )
+        if not payload["comments"]:
+            break  # the summary-only attempt failed too; nothing left to degrade to
     return False, str(r)[:200]
 
 
