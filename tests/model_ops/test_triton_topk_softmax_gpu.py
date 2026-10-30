@@ -261,7 +261,7 @@ def test_mismatched_triton_launches_fail(shared, monkeypatch):
     assert not torch.allclose(w_ref[:, :TOPK].sum(1), torch.ones(rows, device="cuda"))
     with pytest.raises(AssertionError, match="always renormalizes"):
         route(False, EXPERTS, cutoff)
-    for routed in (0, EXPERTS + shared, EXPERTS // 2):
+    for routed in (0, EXPERTS + 1, EXPERTS // 2):
         with pytest.raises(AssertionError, match="routed experts"):
             route(True, routed, cutoff)
     route(True, EXPERTS, cutoff)
