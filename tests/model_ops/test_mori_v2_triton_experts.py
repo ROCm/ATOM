@@ -131,25 +131,33 @@ class Manager:
 def fresh_state(monkeypatch):
     log = Log()
     own = []
+    gathered = []
 
-    def init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm):
+    # mori's Communicator; _init_cco_comm itself is the production one.
+    def init(ep_size, ep_rank, uid, per_rank_vmm):
         own.append(Comm(f"own_comm{len(own)}", log))
         return own[-1]
 
-    init_cco_comm.cache_clear = log.call("cache_clear")
+    def gather(value):
+        gathered.append(value)
+        return [value] * WORLD
+
+    monkeypatch.setattr(
+        mv2, "Communicator", SimpleNamespace(get_unique_id=lambda: "uid", init=init)
+    )
+    monkeypatch.setattr(mv2, "_broadcast_from_ep_group", lambda value, src: value)
     monkeypatch.setattr(mv2, "_import_mega_recipe", lambda: API)
     monkeypatch.setattr(mv2, "_import_mega", lambda: Mega)
-    monkeypatch.setattr(mv2, "_init_cco_comm", init_cco_comm)
-    monkeypatch.setattr(mv2, "_gather_from_ep_group", lambda value: [value] * WORLD)
+    monkeypatch.setattr(mv2, "_gather_from_ep_group", gather)
     monkeypatch.setattr(mv2, "_MEGA_TRANSPORTS", {})
     monkeypatch.setattr(mv2, "_OWN_COMMUNICATORS", [])
     monkeypatch.setattr(mv2, "_BORROWED_COMMUNICATOR", None)
     monkeypatch.setattr(mv2, "_SETTINGS_AGREED", False)
     monkeypatch.setattr(Mega, "built", [])
-    return SimpleNamespace(log=log, own=own, manager=Manager(log))
+    return SimpleNamespace(log=log, own=own, gathered=gathered, manager=Manager(log))
 
 
-def _build(state, max_tokens=MAX_TOKENS, situ_beta=None):
+def _build(state, max_tokens=MAX_TOKENS, situ_beta=None, activation="silu", lends=True):
     return mv2.init_mega_transport(
         ep_rank=0,
         ep_size=WORLD,
@@ -160,7 +168,7 @@ def _build(state, max_tokens=MAX_TOKENS, situ_beta=None):
         num_experts_per_token=TOPK,
         data_type_itemsize=2,
         inter_dim=32,
-        activation="silu",
+        activation=activation,
         gate_mode="interleave",
         quant_type="per_1x32",
         hidden_pad=0,
@@ -168,7 +176,8 @@ def _build(state, max_tokens=MAX_TOKENS, situ_beta=None):
         swiglu_limit=0.0,
         situ_beta=situ_beta,
         combine_wire="fp4",
-        all2all_manager=state.manager,
+        # An aiter whose manager lends no communicator: every MegaMoE owns one.
+        all2all_manager=state.manager if lends else SimpleNamespace(),
     )
 
 
@@ -202,6 +211,22 @@ def test_a_second_shape_gets_its_own_communicator(fresh_state):
     assert len(fresh_state.manager.sizes) == 1
 
 
+def test_megamoes_of_equal_size_never_share_a_communicator(fresh_state):
+    # Different recipes, the same arena size: each is sized for one arena.
+    first = _build(fresh_state, lends=False)
+    second = _build(fresh_state, activation="gelu", lends=False)
+    assert first is not second
+    assert first.communicator is not second.communicator
+    assert (
+        mv2._OWN_COMMUNICATORS
+        == fresh_state.own
+        == [
+            first.communicator,
+            second.communicator,
+        ]
+    )
+
+
 def test_ranks_with_different_settings_are_refused(fresh_state, monkeypatch):
     monkeypatch.setattr(
         mv2, "_gather_from_ep_group", lambda value: [value, ("other",) + value[1:]]
@@ -209,6 +234,20 @@ def test_ranks_with_different_settings_are_refused(fresh_state, monkeypatch):
     with pytest.raises(RuntimeError, match="same on every EP rank"):
         _build(fresh_state)
     assert not Mega.built and not fresh_state.manager.sizes
+
+
+def test_settings_are_agreed_before_aiter_checks_the_recipe(fresh_state, monkeypatch):
+    # A rank whose gate mode aiter refuses must not leave the others waiting.
+    def refuse(**fields):
+        raise ValueError("gate_mode")
+
+    monkeypatch.setattr(
+        mv2, "_import_mega_recipe", lambda: SimpleNamespace(Compute=refuse)
+    )
+    with pytest.raises(ValueError, match="gate_mode"):
+        _build(fresh_state)
+    assert len(fresh_state.gathered) == 1
+    assert fresh_state.gathered[0][-1] == "interleave"
 
 
 def test_teardown_order_survives_a_failing_close(fresh_state):
@@ -226,7 +265,6 @@ def test_teardown_order_survives_a_failing_close(fresh_state):
         "own_comm0.dev_comm.close",
         "mega0.close",
         "manager_comm.dev_comm.close",
-        "cache_clear",
         "own_comm0.destroy",
     ]
     assert not mv2._MEGA_TRANSPORTS and not mv2._OWN_COMMUNICATORS

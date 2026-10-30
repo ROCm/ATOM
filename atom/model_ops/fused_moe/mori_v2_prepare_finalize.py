@@ -91,26 +91,22 @@ def _import_mega_recipe() -> SimpleNamespace | None:
     )
 
 
-@lru_cache(maxsize=1)
 def _init_cco_comm(
     ep_size: int,
     ep_rank: int,
     ep_src_global_rank: int,
     per_rank_vmm: int,
 ) -> Any:
-    """Collective: create a persistent cco Communicator over the EP group.
+    """Collective: create a cco Communicator over the EP group, sized for one
+    MegaMoE. Never shared: _MEGA_TRANSPORTS already dedups equal MegaMoEs, and
+    two different ones would overrun a communicator sized for either.
 
     The mori cco unique-id is generated on the EP leader and broadcast over the
     EP gloo cpu_group (mirrors mori.shmem.shmem_torch_process_group_init but for
     the cco fabric). All EP ranks must call this together.
     """
-    from aiter.dist.parallel_state import get_ep_group
-
-    ep = get_ep_group()
     uid = Communicator.get_unique_id() if ep_rank == 0 else None
-    objs = [uid]
-    dist.broadcast_object_list(objs, src=ep_src_global_rank, group=ep.cpu_group)
-    uid = objs[0]
+    uid = _broadcast_from_ep_group(uid, src=ep_src_global_rank)
     comm = Communicator.init(ep_size, ep_rank, uid, per_rank_vmm=per_rank_vmm)
     comm.barrier()
     logger.info(
@@ -258,8 +254,7 @@ def _mega_communicator(
             "first MegaMoE; this differently shaped one gets its own"
         )
     comm = _init_cco_comm(ep_size, ep_rank, ep_src_global_rank, per_rank_vmm)
-    if not any(own is comm for own in _OWN_COMMUNICATORS):
-        _OWN_COMMUNICATORS.append(comm)
+    _OWN_COMMUNICATORS.append(comm)
     return comm
 
 
@@ -285,24 +280,11 @@ def close_mega_transports() -> None:
     with contextlib.ExitStack() as stack:
         for comm in communicators:
             stack.callback(comm.destroy)
-        stack.callback(_init_cco_comm.cache_clear)
         for mega in transports:
             dev_comm = getattr(mega, "_atom_dev_comm", None)
             if dev_comm is not None:
                 stack.callback(dev_comm.close)
             stack.callback(mega.close)
-
-
-def _launch_settings() -> tuple:
-    """The environment settings that fix MegaMoE's dispatch and combine formats,
-    and each step's combine wire."""
-    return (
-        _MEGA_DISPATCH_WIRE,
-        _MEGA_STAGE1_FUSED,
-        _MEGA_STAGE2_FUSED,
-        _MEGA_COMBINE_WIRE,
-        _MEGA_DECODE_COMBINE_QUANT,
-    )
 
 
 def _gather_from_ep_group(value: Any) -> list:
@@ -314,23 +296,45 @@ def _gather_from_ep_group(value: Any) -> list:
     return gathered
 
 
-def _check_settings_agree() -> None:
+def _broadcast_from_ep_group(value: Any, src: int) -> Any:
+    from aiter.dist.parallel_state import get_ep_group
+
+    objs = [value]
+    dist.broadcast_object_list(objs, src=src, group=get_ep_group().cpu_group)
+    return objs[0]
+
+
+def _launch_settings(gate_mode: Any) -> tuple:
+    """What each rank reads from its own environment: the dispatch and combine
+    formats, each step's combine wire, and the gate mode ($ATOM_MOE_GU_ITLV)."""
+    return (
+        _MEGA_DISPATCH_WIRE,
+        _MEGA_STAGE1_FUSED,
+        _MEGA_STAGE2_FUSED,
+        _MEGA_COMBINE_WIRE,
+        _MEGA_DECODE_COMBINE_QUANT,
+        gate_mode,
+    )
+
+
+def _check_settings_agree(gate_mode: Any) -> None:
     """Refuse ranks whose MegaMoE settings differ.
 
-    They are read from each rank's environment and never negotiated: the
-    formats are fixed at construction, and combine_wire_for_step trusts
-    $ATOM_MEGA_DECODE_COMBINE_QUANT on every rank alike. Collective, once per
-    process, when the first MegaMoE is built.
+    They are read from each rank's environment and never negotiated; the rest
+    of what MegaMoE fixes comes from the model config, the same on every rank.
+    Collective, once per process, at the first init_mega_transport and before
+    anything there can fail on one rank alone (aiter's recipe checks).
     """
     global _SETTINGS_AGREED
     if _SETTINGS_AGREED:
         return
-    gathered = _gather_from_ep_group(_launch_settings())
+    gathered = _gather_from_ep_group(_launch_settings(gate_mode))
     if any(settings != gathered[0] for settings in gathered):
         raise RuntimeError(
             "MEGA_DISPATCH_WIRE, ATOM_MEGA_STAGE1_FUSED, ATOM_MEGA_STAGE2_FUSED, "
-            "ATOM_MEGA_COMBINE_WIRE and ATOM_MEGA_DECODE_COMBINE_QUANT must be "
-            f"the same on every EP rank; per rank: {gathered}"
+            "ATOM_MEGA_COMBINE_WIRE, ATOM_MEGA_DECODE_COMBINE_QUANT and "
+            "ATOM_MOE_GU_ITLV must be the same on every EP rank; per rank: "
+            f"{gathered}"
         )
     _SETTINGS_AGREED = True
 
@@ -450,6 +454,7 @@ def init_mega_transport(
     ``all2all_manager`` is the EP group's; its cco communicator carries the
     arena where it lends one (see _mega_communicator).
     """
+    _check_settings_agree(gate_mode)
     api = _import_mega_recipe()
     if api is not None:
         recipe = _mega_recipe(
@@ -509,7 +514,6 @@ def init_mega_transport(
         _check_same_situ(cached, situ_beta, situ_linear_beta)
         return cached
 
-    _check_settings_agree()
     MegaMoEGfx1250 = _import_mega()
     if hasattr(MegaMoEGfx1250, "required_vmm_bytes"):
         per_rank_vmm = MegaMoEGfx1250.required_vmm_bytes(
@@ -621,7 +625,6 @@ def _init_mega_from_recipe(
         _check_same_situ(cached, situ_beta, situ_linear_beta)
         return cached
 
-    _check_settings_agree()
     MegaMoEGfx1250 = _import_mega()
     # MegaMoE's arena -- exactly what the constructor allocates -- plus the
     # DevComm created below, asked for in full before the communicator exists.
