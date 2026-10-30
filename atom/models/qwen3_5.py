@@ -537,6 +537,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         if self.fuse_gemm_ar:
             gluon_gemm_ar_init()
             attn.skip_out_proj = True
+            # Not a submodule: the projection belongs to the attention, and a second
+            # registration would give the loader a second copy.
+            object.__setattr__(self, "gemm_ar_proj", proj)
 
 
 @token_graph
