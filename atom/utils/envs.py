@@ -383,6 +383,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
+    # Largest new-row count of a prefix-cache-hit prefill whose FP8 attention runs
+    # on aiter's Gluon unified_attention (KV walk split across the device) instead
+    # of FMHA v3. Both read the same gathered, dequantized K/V. 0 (default) always
+    # uses FMHA v3; 4096 is the value measured on Qwen3.5-397B TP4.
+    "ATOM_PREFILL_UNIFIED_ATTN_MAX_Q": lambda: int(
+        os.getenv("ATOM_PREFILL_UNIFIED_ATTN_MAX_Q", "0")
+    ),
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
