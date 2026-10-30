@@ -897,6 +897,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
+    # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
+    # (eager prefill) keep the hyper-connection residual streams token-sharded
+    # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
+    # so the replicated HC norm/GEMM work is split TP ways. 0 disables.
+    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", "1024")
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
