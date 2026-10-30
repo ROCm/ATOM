@@ -1689,12 +1689,20 @@ models:
 
         - <<: *m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-tp4-index-freq1-mcstore-agentx-c32
+          env: &m31_flash_index_mcstore_env
+            common:
+              <<: *m31_flash_mcstore_common_env
+              # Release host page/slab caches before pinning two 512 GiB owners.
+              ATOMESH_DROP_HOST_CACHES: "1"
+            prefill: *m31_flash_mcstore_prefill_env
+            decode: *m31_flash_mcstore_decode_env
           server:
             common_args:
               spec_decode_acceptance_length: 4.04
               hf_overrides: '{"use_index_cache": false, "index_topk_freq": 1}'
         - <<: *m31_flash_mcstore_dspark7
           name: minimax-m31-flash-mxfp4-tp4-index-freq4-mcstore-agentx-c32
+          env: *m31_flash_index_mcstore_env
           server:
             common_args:
               spec_decode_acceptance_length: 4.04

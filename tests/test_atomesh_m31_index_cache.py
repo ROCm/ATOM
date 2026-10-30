@@ -61,6 +61,9 @@ class IndexCacheRecipeTest(unittest.TestCase):
             c.pop("id")
             c.pop("name")
             c["server_args"].pop("hf_overrides", None)
+            for env in c["env"].values():
+                cleanup = env.pop("ATOMESH_DROP_HOST_CACHES", None)
+                self.assertEqual(cleanup, None if cell is baseline else "1")
             normalized.append(c)
         self.assertEqual(normalized[0], normalized[1])
         self.assertEqual(normalized[0], normalized[2])
@@ -75,6 +78,8 @@ class IndexCacheRecipeTest(unittest.TestCase):
         self.assertEqual(len(pair), 4)
         for c in pair:
             self.assertTrue(c["eval_only"])
+            for env in c["env"].values():
+                self.assertNotIn("ATOMESH_DROP_HOST_CACHES", env)
             self.assertIsNone(c["accuracy"]["limit"])
             task = c["accuracy"]["task"]
             self.assertEqual(c["accuracy"]["fewshot"], 5 if task == "gsm8k" else 0)

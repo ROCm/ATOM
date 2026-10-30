@@ -63,6 +63,17 @@ P→D, `semianalysis_cc_traces_weka_062126`, and no torch profiler. Report
 throughput/GPU against all eight physical GPUs. Synthetic acceptance cannot
 establish accuracy or real acceptance performance.
 
+Both performance cases enable `env.common.ATOMESH_DROP_HOST_CACHES=1`.
+After image/mesh preparation and before launching the service container, each
+node runs a bounded root Docker helper to `sync` and write `3` to the host's
+`/proc/sys/vm/drop_caches` (clean page cache and reclaimable slab). Host and NUMA
+memory snapshots are saved in `rank-*/host-memory-<phase>.log`. Cleanup failure
+or timeout stops startup; the helper is removed on exit. This is host-wide cache
+eviction, so enable it only for benchmark allocations where that is intended.
+The existing model-file cache eviction and per-NUMA huge-page compaction still
+run before Store owners. The 1 TiB Store allocation is unchanged. Accuracy
+cases do not opt into this additional cleanup.
+
 Dispatch `.github/workflows/atomesh-benchmark.yaml` on the new branch with
 `atom_source=mounted`, `atomesh_slurm_submit_runner=atomesh-cicd`,
 `atomesh_image=rocm/atom-dev:nightly_202610261558`, the appropriate `suite` and

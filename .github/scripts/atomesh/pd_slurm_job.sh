@@ -348,6 +348,10 @@ EOF
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
   fi
 
+  bash "${REPO_ROOT}/.github/scripts/atomesh/prepare_host_memory.sh" \
+    "${DOCKER_IMAGE}" "${container}" \
+    2>&1 | tee "${rank_dir}/host-memory-${execution_phase}.log" || return $?
+
   docker_args=(
     run --name "${container}"
     --user "$(id -u):$(id -g)"
@@ -877,6 +881,9 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         mesh_binary="$(bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/setup_mesh.sh" \
           "'"${REPO_ROOT}"'" "'"${RUN_DIR}"'" "'"${DOCKER_IMAGE}"'" "'"${ENV_FILE}"'" "'"${SLURM_JOB_ID}"'")"
       fi
+      bash "'"${REPO_ROOT}"'/.github/scripts/atomesh/prepare_host_memory.sh" \
+        "'"${DOCKER_IMAGE}"'" "${container}" \
+        2>&1 | tee "${rank_dir}/host-memory-${execution_phase}.log"
       nested_docker_args=()
       if [[ -d /shared_nfs ]]; then
         nested_docker_args+=(-v /shared_nfs:/shared_nfs:ro)
