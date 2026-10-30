@@ -25,7 +25,16 @@ def _probe():
     # storage merges all rank/phase instruments through its collector.
     registries = [CollectorRegistry() for _ in range(4)]
     schedulers = [
-        SchedulerMetrics(rank, phase, registry=None if directory else registries[i])
+        SchedulerMetrics(
+            rank,
+            phase,
+            registry=None if directory else registries[i],
+            **(
+                {"request_context_enabled": False}
+                if "--explicit-disabled" in sys.argv
+                else {}
+            ),
+        )
         for i, (rank, phase) in enumerate(
             (rank, phase) for rank in range(2) for phase in ("prefill", "decode")
         )
@@ -113,20 +122,20 @@ def _probe():
 
 
 @pytest.mark.parametrize("native_storage", [False, True])
-@pytest.mark.parametrize("setting", [None, "0"])
-def test_completed_request_cardinality_is_bounded(tmp_path, native_storage, setting):
+@pytest.mark.parametrize("explicit_disabled", [False, True])
+def test_completed_request_cardinality_is_bounded(
+    tmp_path, native_storage, explicit_disabled
+):
     env = dict(os.environ)
     env.pop("PROMETHEUS_MULTIPROC_DIR", None)
     env.pop("prometheus_multiproc_dir", None)
-    env.pop("ATOM_ENABLE_METRICS_REQUEST_CONTEXT", None)
     if native_storage:
         env["PROMETHEUS_MULTIPROC_DIR"] = str(tmp_path)
-    if setting is not None:
-        env["ATOM_ENABLE_METRICS_REQUEST_CONTEXT"] = setting
     root = Path(__file__).resolve().parents[1]
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
     result = subprocess.run(
-        [sys.executable, __file__],
+        [sys.executable, __file__]
+        + (["--explicit-disabled"] if explicit_disabled else []),
         env=env,
         capture_output=True,
         text=True,

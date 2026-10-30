@@ -117,9 +117,12 @@ KV block partition counts are maintained as blocks change state; snapshot
 collection does not scan the free block pool.
 
 Both request context gauges are **disabled by default**. For a short diagnostic
-capture, set `ATOM_ENABLE_METRICS_REQUEST_CONTEXT=1` before starting every
-scheduler process. When disabled, these gauges are not registered and no
-per-request samples are written. Aggregate context histograms, queue and batch
+capture, pass `--enable-request-context-metrics` when starting the server.
+For PD deployments, pass it separately to each P/D service to be diagnosed.
+The option is disabled by default for both roles and standalone serving.
+Python callers can set `enable_request_context_metrics=True` on `LLM(...)`.
+When disabled, these gauges are not registered and no per-request samples are
+written. Aggregate context histograms, queue and batch
 metrics, cache counters and the independent GPU timing option are unaffected.
 
 These gauges replace the former histograms of the same names;

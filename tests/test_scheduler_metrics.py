@@ -16,7 +16,7 @@ from atom.entrypoints.openai.metrics_setup import create_metrics_exporter
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.engine_utility import EngineUtilityHandler
-from atom.model_engine.scheduler import DecodeScheduler, Scheduler
+from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus
 
 
@@ -39,6 +39,19 @@ def samples(exporter):
         for family in text_string_to_metric_families(exporter.render().decode())
         for sample in family.samples
     }
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls", [Scheduler, PrefillScheduler, DecodeScheduler]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_context_option_reaches_each_scheduler(scheduler_cls, enabled):
+    scheduler = scheduler_cls(MockConfig(enable_request_context_metrics=enabled))
+    assert (scheduler.metrics.prefill_request_context_tokens is not None) == enabled
+    assert (scheduler.metrics.decode_request_context_tokens is not None) == enabled
+    # Aggregate observations remain available under either setting.
+    scheduler.metrics.queue_time.observe(0.25)
+    assert histogram_values_by_name(scheduler.metrics)["queue_time"]["sum"] == 0.25
 
 
 @pytest.mark.parametrize("kind", ["ordinary", "dp", "pp_head", "pp_downstream"])
@@ -470,7 +483,6 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
 
 
 def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeypatch):
-    monkeypatch.setenv("ATOM_ENABLE_METRICS_REQUEST_CONTEXT", "1")
     import numpy as np
     from prometheus_client import CollectorRegistry, generate_latest
 
@@ -479,7 +491,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
 
     monkeypatch.delenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", raising=False)
     registry = CollectorRegistry()
-    metrics = SchedulerMetrics(registry=registry)
+    metrics = SchedulerMetrics(registry=registry, request_context_enabled=True)
     decode = Sequence([1, 2], block_size=4)
     decode.type = SequenceType.DECODE
     first = Sequence(list(range(12)), block_size=4, request_id="first")
@@ -585,11 +597,10 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
 
 
 def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
-    monkeypatch.setenv("ATOM_ENABLE_METRICS_REQUEST_CONTEXT", "1")
     from prometheus_client import CollectorRegistry, generate_latest
 
     registry = CollectorRegistry()
-    metrics = SchedulerMetrics(registry=registry)
+    metrics = SchedulerMetrics(registry=registry, request_context_enabled=True)
     # Live sequence lengths deliberately differ from the dispatched context snapshot.
     seqs = {
         i: Sequence([1, 2], block_size=4, id=i, request_id=f"request-{i}")

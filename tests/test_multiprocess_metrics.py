@@ -19,13 +19,15 @@ def _observe(rank):
     from atom.metrics.gpu import GPUForwardMetrics
     from atom.metrics.scheduler import SchedulerMetrics
 
-    scheduler = SchedulerMetrics(rank, "prefill")
+    scheduler = SchedulerMetrics(rank, "prefill", request_context_enabled=True)
     for _ in range(5):
         scheduler.queue_time.observe(0.05 * (rank + 1))
     with patch("atom.metrics.scheduler.time.perf_counter", return_value=0.0):
         for phase in ("prefill", "decode"):
             context_metrics = (
-                scheduler if phase == "prefill" else SchedulerMetrics(rank, phase)
+                scheduler
+                if phase == "prefill"
+                else SchedulerMetrics(rank, phase, request_context_enabled=True)
             )
             seq = SimpleNamespace(
                 external_request_id=f"request-{rank}", num_prompt_tokens=1000 + rank
@@ -166,7 +168,6 @@ def _run_node():
 def test_spawned_metrics_are_exported_without_snapshots_and_restart_cleanly():
     root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
-    env["ATOM_ENABLE_METRICS_REQUEST_CONTEXT"] = "1"
     env.pop("PROMETHEUS_MULTIPROC_DIR", None)
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
     results = []

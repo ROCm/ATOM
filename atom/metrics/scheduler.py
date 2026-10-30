@@ -14,7 +14,6 @@ import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
-from atom.utils import envs
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -52,12 +51,18 @@ class RequestQueueTiming:
 
 
 class SchedulerMetrics:
-    def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
+    def __init__(
+        self,
+        dp_rank=0,
+        engine_role="default",
+        *,
+        request_context_enabled=False,
+        registry=None,
+    ):
         labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
         self._labels = labels
-        # Read once at scheduler startup. Do not allocate request-label children
+        # Do not allocate request-label children
         # by default: native multiprocess storage retains them after completion.
-        request_context_enabled = envs.ATOM_ENABLE_METRICS_REQUEST_CONTEXT
         self.queue_time = Histogram(
             "atom:request_queue_time_seconds",
             "Time from engine receipt to first real forward dispatch, including KV loading waits.",
