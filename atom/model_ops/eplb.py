@@ -2802,3 +2802,12 @@ def _eplb_route(
         NUM_BINS=1 << num_physical.bit_length() if record else 1,
     )
     return out_w, out_ids
+
+
+# Temporary diagnostics on the isolated performance investigation branch.
+import os as _diag_os
+
+if _diag_os.environ.get("ATOM_EPLB_DIAGNOSTICS_DIR"):
+    from atom.model_ops.eplb_perf_diag import install as _install_perf_diag
+
+    _install_perf_diag(globals())
