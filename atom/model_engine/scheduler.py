@@ -392,6 +392,22 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        # A windowed draft's held run per row of `block_tables`, as `(first
+        # blocks, run lengths, the runs' ids end to end)`: a window's worth per
+        # row, not the context's, and flat so the worker scatters it in one
+        # assign. None without a windowed draft.
+        self.draft_windows = None
+        if any(seq.draft_block_table for seq in seqs.values()):
+            starts, ids = [], []
+            for seq in seqs.values():
+                if seq.block_table:
+                    starts.append(seq.draft_window_start)
+                    ids.append(seq.draft_block_table[seq.draft_window_start :])
+            self.draft_windows = (
+                np.asarray(starts, dtype=np.int32),
+                np.asarray([len(run) for run in ids], dtype=np.int32),
+                np.fromiter(itertools.chain.from_iterable(ids), dtype=np.int32),
+            )
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -3062,24 +3078,34 @@ class Scheduler:
         )
         if loaded is not None and loaded > seq.num_cached_tokens:
             promoted = 0
-            if load_start is not None and load_start < loaded:
+            # A windowed draft's window rows are not in the tier: resume where
+            # its forward writes them, publishing only what is not recomputed.
+            resume = self.block_manager.draft_window_resume(seq, loaded)
+            if resume < loaded:
+                logger.debug(
+                    "[OFFLOAD-WAKE] seq %s: recomputing %d loaded tokens for the "
+                    "draft window",
+                    seq.id,
+                    loaded - resume,
+                )
+            if load_start is not None and load_start < resume:
                 promoted = self.block_manager.publish_loaded_prefix(
                     seq,
                     start_token=load_start,
-                    end_token=loaded,
+                    end_token=resume,
                 )
                 logger.info(
                     "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d gpu_indexed_tokens=%d",
                     seq.id,
                     load_start,
-                    loaded,
+                    resume,
                     promoted,
                 )
             seq.offload_promoted_tokens = promoted
-            seq.num_cached_tokens = loaded
+            seq.num_cached_tokens = resume
             # Report the extended CPU-offload hit without reducing any
             # prefix-cache hit inherited from an upstream prefill node.
-            seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, loaded)
+            seq.prefix_cache_hit_tokens = max(seq.prefix_cache_hit_tokens, resume)
         seq.offload_load_start_tokens = None
         seq.offload_loaded = True
         # A state load moves no KV, so the block above does nothing for it --

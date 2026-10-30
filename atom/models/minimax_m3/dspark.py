@@ -145,6 +145,7 @@ def _window_rows(
     start16: torch.Tensor,  # [rb * T] int64 scratch
     out_tables: torch.Tensor,  # [rb * T, P]
     out_lens: torch.Tensor,  # [rb * T]
+    table_first16: torch.Tensor | None = None,  # [rb] page-16 each table starts at
 ) -> None:
     """Each block row's page-16 table and length under the sliding window.
 
@@ -155,6 +156,11 @@ def _window_rows(
     the P-wide window of its request's table from that page on, taken from
     the flat buffer; its length ends it within its own request's columns,
     so what that window runs into past them is never read.
+
+    A windowed draft pool's table holds a request's run of blocks from its
+    first held one, not from block 0: `table_first16` is where each table
+    starts, and a row's first column is its page less that. The pool holds
+    every page a row reads, so the difference is never negative.
     """
     P = out_tables.shape[1]
     if window:
@@ -166,6 +172,8 @@ def _window_rows(
         start16.zero_()
     torch.index_select(ctx_eff, 0, row_req, out=out_lens)
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
+    if table_first16 is not None:
+        start16.sub_(torch.index_select(table_first16, 0, row_req))
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
 
@@ -404,10 +412,13 @@ class M3DSparkDecoderLayer(nn.Module):
 
     def write_context_kv(self, ctx_hidden, positions) -> None:
         """Populate this layer's context rows at the TARGET forward's slots,
-        which are still the installed metadata when the proposer calls this."""
-        slot_mapping = get_forward_context().attn_metadata.slot_mapping[
-            : ctx_hidden.shape[0]
-        ]
+        which are still the installed metadata when the proposer calls this --
+        or, in a windowed draft pool, at the slots of the rows it kept
+        (`draft_slot_mapping`, published by `DraftKvBuilder.kept_context`)."""
+        md = get_forward_context().attn_metadata
+        slot_mapping = getattr(md, "draft_slot_mapping", None)
+        if slot_mapping is None:
+            slot_mapping = md.slot_mapping[: ctx_hidden.shape[0]]
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
 
     def forward(self, positions, hidden_states, residual=None):
@@ -502,6 +513,12 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     def first_attention_layer_num(self) -> int:
         return self.layers[0].self_attn.kv.layer_num
 
+    @property
+    def kv_read_window(self) -> "tuple[int, int] | None":
+        """Each block row reads its window from the page-16 holding its first
+        key (`_window_rows`); no window, the whole context."""
+        return (self.sliding_window, ASM_PAGE_SIZE) if self.sliding_window else None
+
     # ---- weight-loading hooks ---------------------------------------------
 
     def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
@@ -556,6 +573,8 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
         self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        # A windowed pool's per-request table start, in page-16s.
+        self._first16 = torch.zeros(max_bs, dtype=torch.int32, device=device)
 
     def prepare_paged_block(
         self,
@@ -566,6 +585,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
         allocated_pages,  # [>= scheduled_bs] host, pages each request holds
         scheduled_bs: int,
+        window=None,  # a windowed draft pool's (tables, first, extent)
     ) -> None:
         """Per-row paged decode tables for the block.
 
@@ -583,7 +603,17 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         prefix caching, a prefix every request shares. Such positions are
         neither written (slot -1) nor read (the row's context is capped at what
         is allocated): their draft rows simply miss a few of their own keys.
+
+        In a windowed draft pool (`window`), a request's table is its run of
+        draft blocks from its `first` held block, the block's slots are taken
+        from that run, and the block its table reaches stands in for the pages
+        it holds. Nothing else changes: positions stay absolute, so RoPE and the
+        window's start are the same numbers, and only the column a page is
+        found at moves.
         """
+        table_first = None
+        if window is not None:
+            block_tables, table_first, allocated_pages = window
         running_bs, T = block_positions.shape
         P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
         if self._bt16 is None or self._bt16.shape[1] != P:
@@ -604,6 +634,13 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self._alloc_copied.record()
         alloc.mul_(self.block_size)
 
+        first16 = None
+        if table_first is not None:
+            self._window_slots(
+                block_tables, table_first, block_positions, slots, scheduled_bs
+            )
+            first16 = self._first16[:running_bs]
+            torch.mul(table_first, PAGES_PER_SPARSE_BLOCK, out=first16)
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         # The rows' own lengths; `ctx_lens` is left as the proposer built it.
         ctx_eff = self._ctx_eff[:running_bs]
@@ -625,9 +662,35 @@ class MiniMaxM3DSpark(DSparkDraftModel):
             self._start16[:rows],
             self._bt16_rows[:rows],
             self._ctx_rows[:rows],
+            first16,
         )
         attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
+
+    def _window_slots(
+        self,
+        tables: torch.Tensor,  # [running_bs, W] each request's run of draft blocks
+        first: torch.Tensor,  # [running_bs] the block each run starts at
+        block_positions: torch.Tensor,  # [running_bs, T]
+        slots: torch.Tensor,  # [running_bs, T] out
+        scheduled_bs: int,
+    ) -> None:
+        """The block's KV write slots in a windowed draft pool.
+
+        A position's block, less its request's first, is its column of the
+        run; a column off the run is not the request's to write. Pad rows stay
+        aimed at nowhere, as `_build_paged_block_metadata` left them.
+        """
+        width = tables.shape[1]
+        col = torch.div(block_positions, self.block_size, rounding_mode="floor")
+        col.sub_(first.view(-1, 1))
+        in_run = (col >= 0) & (col < width)
+        slots.copy_(torch.gather(tables, 1, col.clamp_(0, width - 1)))
+        slots.mul_(self.block_size).add_(
+            torch.remainder(block_positions, self.block_size)
+        )
+        slots.masked_fill_(~in_run, -1)
+        slots[scheduled_bs:].fill_(-1)
 
     def forward_spec(self, input_ids, positions, num_draft):
         return self.head_and_sample(

@@ -450,6 +450,25 @@ How ATOM runs it:
   the graph in pre-allocated buffers. The block pass therefore has fixed shapes and is
   CUDA-graph captured for every batch size up to `--max-num-seqs`. The per-row decode takes one
   KV head per rank, so DSpark needs TP ≥ 4 (the draft has 4 KV heads) and refuses smaller TP.
+- Windowed draft KV (`ATOM_DSPARK_DRAFT_KV_WINDOW=1`, off by default). The block reads only
+  its 4096-key sliding window, so the draft's KV can be kept to that window instead of one draft
+  block per target block. The draft then gets a pool of its own block ids, sized to
+  `--max-num-seqs` windows (34 blocks of 128 tokens each, at 7 drafts) plus
+  `ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE` windows per sequence slot of finished requests' windows
+  for prefix reuse. A prefill computes and stores only the context rows its first block pass
+  reads, and a decode step hands back the blocks the window has passed. At TP4 with FP8, the
+  draft costs 1,320 B per token per rank, so a 128K-token request holds about 5.5 MiB of draft
+  KV per rank instead of 165 MiB. The startup log prints the windowed pool's size and what one
+  block per target block would have taken.
+  - Prefix cache: a hit is kept only as far as the draft's window rows below it are still
+    cached, and is otherwise cut at the first missing block. That costs at most one window of
+    recompute.
+  - Offload tiers (LMCache, Mooncake Store) hold no draft rows. A request resuming from one
+    recomputes from its window's first block, and the PAGE namespace names the layout, so a
+    windowed and a riding instance never read each other's objects.
+  - P/D (Mooncake): only the consumer's window crosses, and both sides must set the variable
+    the same way; a mismatched pair fails the request. Chunked transfer, MoRI-IO, PP, and
+    RapidServe refuse the windowed pool at startup.
 
 ## PD Disaggregation
 
