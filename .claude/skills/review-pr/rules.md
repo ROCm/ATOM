@@ -643,6 +643,25 @@ not "clean"), and T4 was checked and came back with zero hits for those three na
 directories sampled for this assessment — "not found in sampled directories", not "absent
 from ATOM". Neither claim should be read as more than it is.
 
+**N6 — a self-described workaround with no root cause named** ⚠️
+The reviewer's standing objection to a special case is not that special cases are wrong, but
+that the PR stops at the symptom. A comment that calls its own code a workaround, a hack, or
+temporary is the author telling you where the real defect is — and the review's job is to ask
+why it is not fixed there instead.
+Trigger: an added **code comment** matching `workaround` / `work around` / `temporar*` /
+`for now` / `hack` / `WAR`. Comments only, not code and not the PR body: an author writing
+`# workaround for X` has stated the claim explicitly, while prose in a description is loose
+("works for now") and would roughly double the rate for no extra signal. Measured over 40
+merged PRs: 5% carry it in a comment, 7% in the title or body.
+Real example (ATOM#741, "[feat][breaking] Enable prefix caching by default", **CLOSED**).
+valarLip, verbatim: "i would like to fix it instead of workaround for special cases..". The PR
+was closed over exactly this, which is the strongest form the objection takes — not a change
+request, a refusal of the approach.
+This rule does not say the workaround is wrong. It says the card must carry the root cause and
+the reason it is not being fixed here, so the reviewer decides that rather than inheriting it.
+→ `⚠️ N6: [FILE]:[LINE] describes itself as [WORD] — name the underlying defect and say why it
+is handled here rather than at its source, or drop the wording if it is not actually temporary`
+
 **T5 ("accumulator precision loses tail-of-sum bits") was landed here, then removed.** It
 had no ATOM citation from the start — carried from aiter and labeled uncited, same as T6
 below — and P1's 26-PR distribution measurement (`p1-distribution.md`) found it fired 0/14

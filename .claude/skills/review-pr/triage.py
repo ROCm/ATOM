@@ -1458,6 +1458,15 @@ def derive(files, title="", raw_diff=""):
            for p, f in files.items()):
         hit("plugin-symbol-outside-plugin-dir", "N5")
 
+    # N6 -- the author's own comment calls the code a workaround. Anchored on ATOM#741,
+    # closed by valarLip with "i would like to fix it instead of workaround for special
+    # cases..". Comments only: measured over 40 merged PRs, 5% carry the wording in an
+    # added comment and 7% in the title/body, and the body text is the looser signal --
+    # a description saying "works for now" is not the author marking a known shortcut.
+    if re.search(r"(?mi)^\+\s*(?:#|//)[^\n]*\b(?:work\s?around|temporar\w*|for now|hack|WAR)\b",
+                 raw_diff or ""):
+        hit("self-described-workaround", "N6")
+
     # Triton family (T1 T3 T6 T8), ported from aiter's own review-pr skill. Gated so it
     # only looks at Triton PRs: either the diff adds a `@triton.jit`-decorated kernel, or it
     # touches one of the directories that hold ATOM's Triton kernels today. v4_kernels and
@@ -1496,7 +1505,7 @@ UNREACHABLE_BY_DESIGN = {rid: _P1_FAMILY_AXIS for rid in (
 )}
 
 ALL_RULES = ("A1 A2 A3 A4 A5 B1 B2 B5 B6 B7 C1 C2 D1 D4 D10 D11 E1 E2 E3 E4 F2 G1 G1b G2 H1 H2 "
-             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8 P1 P2 P3 P4 P5")
+             "I1 HK1 HK2 HK4 HK5 STEP4 T1 T3 T6 T8 N1 N2 N3 N4 N5 N6")
 
 GUARD_NOISE = frozenset("""not is None True False and or in if else self len int float
 str bool tuple list dict set all any isinstance type return raise sizeof static_assert

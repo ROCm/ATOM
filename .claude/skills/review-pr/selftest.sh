@@ -311,5 +311,29 @@ t "connection failure then 404: still aborts (class glm) -- not both-404" \
 t "both shapes 500: still aborts (class glm) -- a real backend fault, not a 404" \
   "$(probe 500 500 | grep -c '^FAIL:glm:')" "1"
 
+# Every rule id derive() can emit must be in ALL_RULES. Nothing checked this, and a rename
+# proved why it matters: the P->N section rename updated rules.md, MAPPING.md and every
+# hit() call, but ALL_RULES is one space-separated string and kept the old ids. Selftest
+# stayed 93 green. ALL_RULES is the fallback list handed to the worker when derivation
+# fails, so the stale version would have shipped five ids with no body in rules.md --
+# a broken fallback that only fires on the path nobody exercises.
+_rule_ids_consistent() {
+  python3 - "$S" <<'PYEOF'
+import inspect, re, sys
+sys.path.insert(0, sys.argv[1])
+import triage
+src = inspect.getsource(triage.derive)
+emitted = set()
+# hit("family-name", "A1 B2 ...") -- the rule list is the second argument, and rule ids
+# are an uppercase letter run followed by digits, so the fragments a looser pattern
+# picked up (IE, ule) cannot match.
+for m in re.finditer(r"hit\([^)]*?,\s*.((?:[A-Z]+[0-9]+[a-z]?(?: |(?=.)))+).\)", src):
+    emitted |= set(m.group(1).split())
+missing = sorted(emitted - set(triage.ALL_RULES.split()))
+print("ok" if emitted and not missing else ("empty" if not emitted else "missing:" + ",".join(missing)))
+PYEOF
+}
+t "every id derive() emits is in ALL_RULES" "$(_rule_ids_consistent)" "ok"
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]
