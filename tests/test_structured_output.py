@@ -1,12 +1,14 @@
 import json
 from types import SimpleNamespace as NS
+from typing import ClassVar
 
 import numpy as np
 import pytest
 import torch
 
-xgr = pytest.importorskip("xgrammar")
+llg = pytest.importorskip("llguidance")
 
+from atom.model_engine import structured_grammar as xgr
 from atom.model_engine.structured_output import (
     StructuredOutput,
     structured_stop_token_ids,
@@ -28,8 +30,18 @@ def controller():
     obj.xgr = xgr
     obj.stop_ids = [127]
     obj.vocab_size = 128
-    info = xgr.TokenizerInfo([chr(i) for i in range(128)], stop_token_ids=[127])
-    obj.compiler = xgr.GrammarCompiler(info, max_threads=1)
+
+    class AsciiTokenizer:
+        eos_token_id = 127
+        bos_token_id = None
+        tokens: ClassVar[list[bytes]] = [bytes([i]) for i in range(128)]
+        special_token_ids: ClassVar[list[int]] = [127]
+
+        def __call__(self, value):
+            return list(value if isinstance(value, bytes) else value.encode())
+
+    info = llg.LLTokenizer(llg.TokenizerWrapper(AsciiTokenizer()))
+    obj.compiler = xgr.GrammarCompiler(info)
     obj.compile = obj.compiler.compile_json_schema
     obj.pending = {}
     return obj
@@ -122,3 +134,52 @@ def test_valid_output_and_stop(controller):
         controller.commit(torch.tensor([[token]]), b, prefixes)
         history.append(token)
     assert json.loads(expected) == {"x": 1}
+
+
+@pytest.mark.parametrize(
+    "value_schema,good,bad",
+    [
+        ({"allOf": [{"type": "integer", "minimum": 2}, {"maximum": 5}]}, "3", "6"),
+        (
+            {"type": "integer", "multipleOf": 7, "minimum": 10, "maximum": 30},
+            "14",
+            "15",
+        ),
+        ({"type": "integer", "not": {"const": 0}}, "2", "0"),
+        (
+            {
+                "type": "array",
+                "items": {"enum": [1, 2, 3]},
+                "uniqueItems": True,
+                "minItems": 3,
+            },
+            "[1,2,3]",
+            "[1,1,3]",
+        ),
+    ],
+)
+def test_supported_predicates_reject_invalid_tokens(
+    controller, value_schema, good, bad
+):
+    schema = {
+        "type": "object",
+        "properties": {"v": value_schema},
+        "required": ["v"],
+        "additionalProperties": False,
+    }
+    compiled = controller.compile(json.dumps(schema))
+    for value, expected in [(good, True), (bad, False)]:
+        matcher = xgr.GrammarMatcher(compiled)
+        tokens = list(map(ord, '{"v":' + value + "}")) + [127]
+        assert all(matcher.accept_token(t) for t in tokens) == expected
+
+
+def test_unsupported_unique_cannot_enable_lenient_compilation(controller):
+    schema = {
+        "type": "array",
+        "items": {"type": "integer"},
+        "uniqueItems": True,
+        "x-guidance": {"lenient": True},
+    }
+    with pytest.raises(ValueError, match="finite items domain"):
+        controller.compile(json.dumps(schema))
