@@ -1841,17 +1841,20 @@ def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch):
 
     monkeypatch.delenv("ATOM_PP_MAX_INFLIGHT", raising=False)
     assert pp_max_inflight(8) == 8
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "")
+    assert pp_max_inflight(8) == 8
     monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "0")
     assert pp_max_inflight(8) == 8
     monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "16")
     assert pp_max_inflight(8) == 16
 
 
-def test_pp_max_inflight_rejects_negative(monkeypatch):
+@pytest.mark.parametrize("value", ["-1", "eight"])
+def test_pp_max_inflight_rejects_a_value_that_is_not_a_count(monkeypatch, value):
     _pp_engine_core_cls()
     from atom.model_engine.pp_engine_core import pp_max_inflight
 
-    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "-1")
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", value)
     with pytest.raises(ValueError, match="ATOM_PP_MAX_INFLIGHT"):
         pp_max_inflight(8)
 
