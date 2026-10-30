@@ -35,7 +35,10 @@ must-fire bound forces release regardless, the group's work stops changing
 (stall), or the opt-in cost gate measures that waiting longer no longer pays
 off. Pending-token probes are capped per rank, so a flat pending sum alone is
 not "no more work": the stall count also restarts when a rank becomes (or stops
-being) prefillable or a request arrives anywhere in the group.
+being) prefillable or a request arrives anywhere in the group. Nor does stall
+release an unaligned group while every rank without prefill will finish a
+decode, and so free a slot for its next request, within the TTFT bound: under a
+closed loop that rank aligns then, however quiet the group is meanwhile.
 
 Decision (evaluated every tick, on every rank, in lockstep)
 -----------------------------------------------------------
@@ -45,6 +48,9 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   n_prefillable   = #ranks with admittable prefill (SUM of a 0/1 flag)
   n_blocked       = #ranks with waiting work whose head cannot be admitted
                     (no KV, max_num_seqs full, remote KV pending)
+  n_unreachable   = #ranks with neither, whose next decode completion (the
+                    slot a new request would fill) lies past the hold's TTFT
+                    bound, or that run no decode
   G_pending       = total pending prefill tokens across ranks (fresh + partial
                     remaining, each rank capped at the token budget)
   G_running_dec   = total decode seqs across ranks
@@ -71,7 +77,7 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   # -- alignment gate: hold while some rank lacks prefill and could take
   #    some (anti-skew); a blocked rank waits on its own decode, not on us --
   if n_prefillable + n_blocked < dp_size:
-      if stall >= stall_ticks:                    FIRE
+      if n_unreachable > 0 and stall >= stall_ticks: FIRE
       stall_us = G_running_dec * max(rank cost) * t_prefill  # unaligned release
       if cost_gate and (arrival rate on ranks without prefill * stall_us
                         < G_waiting or hold_cost >= stall_us):
@@ -93,7 +99,7 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over a 10-int64 cpu buffer (gloo-safe). Booleans are
+Single ``all_reduce(SUM)`` over an 11-int64 cpu buffer (gloo-safe). Booleans are
 encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
 tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
 wall-clock, so ranks never diverge on a timeout boundary. The cost gate's step
@@ -120,7 +126,7 @@ _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "tru
 _STEP_EMA_WEIGHT = 0.2
 # The reduce buffer: these fixed slots, each rank's prefill cost, then the cost
 # gate's `_Gate` (`PrefillDelayer.__init__`).
-_FIXED_SLOTS = 10
+_FIXED_SLOTS = 11
 
 
 class _Gate(NamedTuple):
@@ -277,6 +283,8 @@ class PrefillDelayer:
         #                                count, see _decide)
         #   slot 9 = blocked flag       (SUM → n_blocked; waiting work but the
         #                                head cannot be admitted)
+        #   slot 10 = unreachable flag  (SUM → n_unreachable; no prefill and no
+        #                                decode completion within the hold)
         # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
         #   slot `_FIXED_SLOTS` + r = rank r's prefill chunk cost (one-hot, SUM
         #                → every rank's cost), read back as rank_prefill_costs
@@ -403,6 +411,7 @@ class PrefillDelayer:
         prefill_cost: float = 0.0,
         waiting_requests: int = 0,
         arrived_requests: int = 0,
+        next_completion_steps: int | None = None,
     ) -> PrefillDecision:
         """Whether this rank may admit new prefills this tick (FIRE), and how
         many ranks have prefill to admit.
@@ -441,6 +450,10 @@ class PrefillDelayer:
                 (fresh prefills and resumable partials); read by the cost gate.
             arrived_requests: requests added to this rank since the previous
                 call; the cost gate's arrival rate.
+            next_completion_steps: an upper bound on the decode steps until
+                one of this rank's running decodes completes (its fewest
+                remaining max_tokens); None when it runs no decode. Read only
+                when this rank has no prefill and no waiting work.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -450,6 +463,19 @@ class PrefillDelayer:
         # is full, or remote KV is pending): only its own decode completions
         # change that, so holding its peers cannot align it.
         blocked = not prefillable and (waiting_requests > 0 or has_partial)
+        # A rank with neither aligns once a decode completes and its slot takes
+        # the next request. If that cannot happen before the TTFT bound
+        # releases this hold anyway, waiting for it only delays its peers.
+        # hold_ticks evolves in lockstep, so every rank compares to the same
+        # remaining budget.
+        unreachable = (
+            not prefillable
+            and not blocked
+            and (
+                next_completion_steps is None
+                or next_completion_steps > self.ttft_max_ticks - self._hold_ticks
+            )
+        )
         kv_low = prefillable and low is not None and kv_usage < low
         queue_hot = (
             prefillable
@@ -467,6 +493,7 @@ class PrefillDelayer:
         self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
         self._reduce_buf[8] = int(arrived_requests)
         self._reduce_buf[9] = 1 if blocked else 0
+        self._reduce_buf[10] = 1 if unreachable else 0
         if self._cost_slots:
             self._reduce_buf[_FIXED_SLOTS : self._gate_at] = 0
             self._reduce_buf[_FIXED_SLOTS + self._rank] = int(prefill_cost)
@@ -529,6 +556,7 @@ class PrefillDelayer:
             prefill_ran_n,
             g_arrived,
             n_blocked,
+            n_unreachable,
         ) = reduced[:_FIXED_SLOTS]
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
@@ -605,14 +633,17 @@ class PrefillDelayer:
         stalled = self._stall_count >= self.stall_ticks
 
         # ---- alignment gate: hold while a rank lacks prefill (anti-skew) for
-        # stragglers to catch up, until the group's work stops changing
-        # (stall: e.g. ranks with no traffic at concurrency below dp_size) or
-        # (cost gate) the wait has cost more than the unaligned prefill it
-        # avoids. A blocked rank is no straggler: waiting cannot make its head
-        # admittable, so it keeps its peers company with a dummy prefill, as
-        # an idle rank does once released.
+        # stragglers to catch up, until the group's work stops changing while
+        # some straggler cannot align within the TTFT bound (stall: e.g. idle
+        # ranks at concurrency below dp_size) or (cost gate) the wait has cost
+        # more than the unaligned prefill it avoids. A straggler that will
+        # complete a decode in time is waited for even through quiet ticks: at
+        # high concurrency its next request arrives with that completion. A
+        # blocked rank is no straggler: waiting cannot make its head
+        # admittable, so it keeps its peers company with a dummy prefill, as an
+        # idle rank does once released.
         if n_prefillable + n_blocked < self.dp_size:
-            if stalled:
+            if stalled and n_unreachable > 0:
                 return self._fire("stall", g_pending)
             if self._cost_gate and self._alignment_wait_paid(
                 _Gate(*reduced[self._gate_at :]), g_running_dec

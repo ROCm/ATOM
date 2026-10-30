@@ -1448,6 +1448,19 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    def _next_decode_completion_steps(self) -> int | None:
+        """An upper bound on the decode steps until a running decode completes:
+        the fewest tokens any of them has left to max_tokens (EOS, or several
+        accepted tokens a step, only bring it sooner). None without decode."""
+        fewest = None
+        for seq in self.running:
+            if seq.is_partial_prefill:
+                continue
+            left = seq.max_tokens - seq.num_completion_tokens
+            if fewest is None or left < fewest:
+                fewest = left
+        return fewest
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -2035,6 +2048,7 @@ class Scheduler:
                 if self.cost_balance and prefillable
                 else 0.0
             )
+            waiting_requests = len(self.waiting) + self._partial_prefill_count
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -2051,8 +2065,14 @@ class Scheduler:
                     else 0.0
                 ),
                 prefill_cost=prefill_cost,
-                waiting_requests=len(self.waiting) + self._partial_prefill_count,
+                waiting_requests=waiting_requests,
                 arrived_requests=self._arrived_requests,
+                # read only by a rank with no prefill and nothing waiting
+                next_completion_steps=(
+                    self._next_decode_completion_steps()
+                    if not prefillable and not waiting_requests
+                    else None
+                ),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
