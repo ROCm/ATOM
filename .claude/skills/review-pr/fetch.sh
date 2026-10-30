@@ -1022,6 +1022,6 @@ echo "WORK=$WORK"
 # produced only when a guard or a signature actually changed, so it is listed as such.
 echo "artifacts: pr.diff pr_meta.json base_head.txt rules.txt rules_expanded.txt \
 test_quality.txt twins.txt ci_coverage.txt perf_claims.txt comment_only.txt \
-guards.txt siblings.txt flydsl_bounds.txt kernel_tests.txt applies.txt symbols.txt \
+guards.txt siblings.txt flydsl_bounds.txt agents.txt kernel_tests.txt applies.txt symbols.txt \
 merge_target.txt validation_requirement.json \
 auto_validation_outcome.txt${HAVE_EVIDENCE:+ evidence.txt}"

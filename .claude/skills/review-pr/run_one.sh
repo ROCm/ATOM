@@ -76,6 +76,20 @@ AGENT="${ATOM_REVIEW_AGENT:-claude-glm}"
 WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
 # Cross-family (restores the refuter's value): set ATOM_REVIEW_REFUTER_AGENT to an Opus entrypoint.
 REFUTER_CMD=("${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
+
+# Whether the refuter is a different model family from the worker, decided here in the
+# shell so no agent can report it. aiter's own note at the top of this file says the
+# refuter's value comes from being a different family catching the worker's mistakes,
+# and that pure GLM is weaker adversarially -- but a same-family refutation and a
+# cross-family one produce identical artifacts, so a reader cannot tell which they got.
+# Recorded as evidence, and said on the card, for the same reason the card admits when
+# no independent reader was available at all.
+REFUTER_BIN="${ATOM_REVIEW_REFUTER_AGENT:-$AGENT}"
+if [ "$REFUTER_BIN" = "$AGENT" ]; then
+  SAME_FAMILY=1
+else
+  SAME_FAMILY=0
+fi
 say() { echo "[run_one #$PR] $*"; }
 # Classify a failed review and expose it so the notify step @-mentions the RIGHT owner:
 #   atom -> GLM/backend | flow -> this review pipeline | env -> runner box.
@@ -268,6 +282,25 @@ python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
 # the job log shows it, and a human deciding whether to trust a card can see it. Making a
 # 50%-precision heuristic withhold reviews would cost more than the defect it catches.
 python3 "$SKILL/check_citations.py" "$W" 2>&1 | tee "$W/citations.txt" || true
+
+# Record which entrypoint ran each side, and whether the adversarial pass was
+# cross-family. Written by the shell, after both agents have run.
+{ printf 'worker:  %s\n' "$AGENT"
+  printf 'refuter: %s\n' "$REFUTER_BIN"
+  if [ "$SAME_FAMILY" = 1 ]; then
+    printf 'cross-family: NO -- the refuter is the same entrypoint as the worker, so the\n'
+    printf '  refutation pass is same-family and weaker adversarially. Point\n'
+    printf '  ATOM_REVIEW_REFUTER_AGENT at a different model to restore it.\n'
+  else
+    printf 'cross-family: YES\n'
+  fi
+} > "$W/agents.txt"
+# Say it on the card too: the artifact is only read by someone who already went looking.
+if [ "$SAME_FAMILY" = 1 ] && [ -f "$W/card.md" ] \
+   && ! grep -q 'same-family refutation' "$W/card.md"; then
+  printf '\n_Refutation was same-family (worker and refuter are both `%s`); findings here\nwere attacked by the same model family that produced them._\n' \
+    "$(basename "$AGENT")" >> "$W/card.md"
+fi
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)
 say "gates..."
