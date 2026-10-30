@@ -58,6 +58,39 @@ Notes:
 - `--disable-radix-cache` is required for the current SGLang-ATOM DeepSeek V4 bridge.
 - The recipe is validated on 8-GPU MI355 runners with TP=8.
 
+### DeepSeek-V4-Pro MTP (TP=8)
+
+MTP uses the same server settings as above, plus the EAGLE draft flags. `AITER_DISABLE_COMM_FUSED_MOE=1` is only for this path: with `ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1`, gfx950's comm-fused mega gemm2 faults during target-verify CUDA graph capture. The base server above does not set it. Drop the variable once that kernel survives capture.
+
+```bash
+export AITER_DISABLE_COMM_FUSED_MOE=1
+export ATOM_USE_TRITON_MOE=0
+export ATOM_SGLANG_V4_DISABLE_PRO_DRAFT_TRITON_MOE=1
+export ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG=1
+
+# MTP1: one speculative step, two draft tokens.
+# MTP3: change to --speculative-num-steps 3 --speculative-num-draft-tokens 4.
+python3 -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-V4-Pro \
+    --host localhost \
+    --port 8000 \
+    --trust-remote-code \
+    --tensor-parallel-size 8 \
+    --kv-cache-dtype fp8_e4m3 \
+    --mem-fraction-static 0.9 \
+    --swa-full-tokens-ratio 0.1 \
+    --max-running-requests 256 \
+    --page-size 256 \
+    --disable-radix-cache \
+    --disable-shared-experts-fusion \
+    --tool-call-parser deepseekv4 \
+    --reasoning-parser deepseek-v4 \
+    --speculative-algorithm EAGLE \
+    --speculative-num-steps 1 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 2
+```
+
 ## Step 3: Performance Benchmark
 
 This recipe uses the `bench_serving` client for performance benchmarking.
