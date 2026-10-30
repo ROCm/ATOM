@@ -47,8 +47,9 @@ This applies to the standard scheduler, including connector-based P/D roles.
 RapidServe's dedicated `PrefillScheduler`/`DecodeScheduler` do not use the delayer.
 
 After each executed prefill, the decode interval runs before all coalescing
-bounds. Once it expires, fill, queue age, KV pressure, partial-prefill and stall
-bounds decide when to release. `MAX_QUEUE_MS` stops extra coalescing after that
+bounds. Once it expires, fill, queue age, KV pressure, partial-prefill, no-decode
+and stall bounds decide when to release; with DP, a group where some rank has no
+prefill also waits for alignment until one of the non-fill bounds fires. `MAX_QUEUE_MS` stops extra coalescing after that
 interval; it does not guarantee end-to-end TTFT. DP decisions reduce local
 signals across ranks to keep their phases aligned.
 
@@ -82,9 +83,9 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_TARGET_FILL** | float | 0.9 | Release once accumulated pending tokens reach `target_fill × max_num_batched_tokens` (averaged across prefillable ranks). In (0, 1]; higher = fewer, larger prefills at some TTFT cost. Clamped to (0, 1]. |
 | **ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS** | int | 200 | Max consecutive scheduler ticks a held prefill waits before force-release. Values `< 1` clamped to 1. |
 | **ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS** | int | 100 | Tighter bound for a held mid-chunked-prefill (it holds allocated KV). Values `< 1` clamped to 1. |
-| **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 10 | After this many consecutive non-growing ticks, release an aligned, underfilled prefill. Never releases while some DP rank has no prefill: pending-token probes are capped, and decoding peers may receive replacement requests after a completion; unaligned groups wait for peers, the cost gate, or a TTFT, partial, queue-age, or KV bound. Values `< 1` clamped to 1. |
-| **ATOM_PREFILL_DELAYER_COST_GATE** | bool | false | Opt-in. With DP prefill cost balancing (DP attention, DP > 1): while some DP rank has no prefill, release when a held decode step is not expected to pay off (request arrival rate on the ranks without prefill × the decode stall of one unaligned prefill step < waiting requests), or once the held requests have waited (in measured decode steps) as long as that stall. Step times and arrival rates are combined over the DP group; until every rank has timed both steps, only the must-fire bounds release. |
-| **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a prefillable rank force-releases (can't accumulate a bigger batch anyway). |
+| **ATOM_PREFILL_DELAYER_STALL_TICKS** | int | 10 | After this many consecutive ticks in which the group's work does not change, release an underfilled or unaligned prefill. A tick counts only if pending tokens did not grow, no rank turned prefillable or non-prefillable, and no request arrived on any rank: pending-token probes are capped per rank, so a flat sum alone does not mean decoding peers stopped receiving work. By default an unaligned group waits for its peers until this stall bound or a TTFT, partial, KV or no-decode bound fires (the cost gate and `MAX_QUEUE_MS` are off by default). Values `< 1` clamped to 1. |
+| **ATOM_PREFILL_DELAYER_COST_GATE** | bool | false | Opt-in. With DP prefill cost balancing (DP attention, DP > 1): while some DP rank has no prefill, release when a held decode step is not expected to pay off (request arrival rate on the ranks without prefill × the decode stall of one unaligned prefill step < waiting requests), or once the held requests have waited (in measured decode steps) as long as that stall. Step times and arrival rates are combined over the DP group; until every rank has timed both steps, only the stall and must-fire bounds release. Off by default: at 8k/1k c128 DPA its releases still fragmented prefills. |
+| **ATOM_PREFILL_DELAYER_KV_HIGH_WATERMARK** | float | 0.9 | At/above this KV usage a rank with waiting prefill work force-releases the group (it can't accumulate a bigger batch, and a head that cannot allocate KV would otherwise keep the group unaligned). |
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
 | **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
