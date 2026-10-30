@@ -178,13 +178,19 @@ class LaunchTest(unittest.TestCase):
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX",
                                          "BF16-GX")),
                                      *((c, "N3966-BF16-GX") for c in (16, 32, 48, 56)),
-                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (56, 72, 88))):
+                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (56, 72, 88)),
+                                     *((c, "N3966-BF16-GX-H96OPUS-P12K") for c in (72, 88))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant.startswith("N3966"):
                 # 3966924d fuses MLA g_proj into fused_qkv_a_proj: 24 fewer PTPC modules, same weights.
                 env = candidate["roles"]["prefill"]["env"]
+                if variant.endswith("-P12K"):
+                    args = candidate["roles"]["prefill"]["args"]
+                    self.assertEqual(args["max-num-batched-tokens"], 12288)
+                    args["max-num-batched-tokens"] = 8192
+                    variant = variant.removesuffix("-P12K")
                 if variant.endswith("-H96OPUS"):
                     for key in ("C48_D_MLA_NATIVE96", "AITER_MLA_USE_OPUS"):
                         self.assertEqual(candidate["roles"]["decode"]["env"].pop(key), "1")
