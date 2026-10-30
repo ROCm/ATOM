@@ -515,9 +515,9 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     walks = []
 
-    def can_allocate(seq, *, record, block_hashes):
+    def can_allocate(seq, *, record, probe):
         walks.append(record)
-        block_hashes.extend([11, 12])
+        probe.block_hashes.extend([11, 12])
         return 2
 
     s = Scheduler.__new__(Scheduler)
@@ -525,7 +525,8 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
     probe = s._probe_hbm_prefix(SimpleNamespace())
-    assert probe == (2, [11, 12]) and walks == [False]
+    assert (probe.num_cached_blocks, probe.block_hashes) == (2, [11, 12])
+    assert walks == [False]
     assert s._can_detach_tier_lookup(SimpleNamespace(), probe)
     assert walks == [False]  # the decision itself does not walk again
 
