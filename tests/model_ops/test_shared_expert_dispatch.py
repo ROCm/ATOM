@@ -153,11 +153,15 @@ def test_select_experts_passes_the_layer_kernel_choice(
     Mxfp4MoEMethod.select_experts(object(), layer, torch.empty(1, 4), torch.empty(1, 9))
     assert captured["triton_max_rows"] == expected
     assert captured["num_fused_shared_experts"] == (0 if use_all2all else 1)
+    assert captured["num_routing_experts"] == 8
     captured.clear()
     moe_module.FusedMoEMethodBase.select_experts(
         object(), layer, torch.empty(1, 4), torch.empty(1, 9)
     )
     assert captured["triton_max_rows"] == 5120
+    # The routed width the Triton launch checks its logits against, not the
+    # dispatch space (`global_num_experts`, 10 here).
+    assert captured["num_routing_experts"] == 8
 
 
 def test_eplb_appends_unscaled_shared_weight(monkeypatch):
