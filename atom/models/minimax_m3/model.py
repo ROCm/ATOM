@@ -850,6 +850,23 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 
+    def configure_kv_transfer_tensors(self, transfer_tensors, builder) -> None:
+        """Map every target plane before the runner appends the draft pool."""
+        from atom.model_ops.minimax_m3.kv_transfer import (
+            configure_m3_kv_transfer_tensors,
+        )
+        from atom.utils import envs
+
+        configure_m3_kv_transfer_tensors(
+            transfer_tensors,
+            builder,
+            num_layers=self.config.num_hidden_layers,
+            sparse_layers=_sparse_attention_layer_ids(self.config),
+            index_fp4=builder.model_runner.config.index_cache_dtype == "fp4",
+            sparse_nvfp4=envs.ATOM_M3_SPARSE_KV_NVFP4,
+            sparse_mxfp4=envs.ATOM_M3_SPARSE_KV_MXFP4,
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings(input_ids)
 
@@ -936,6 +953,9 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_input_embeddings(input_ids)
+
+    def configure_kv_transfer_tensors(self, transfer_tensors, builder) -> None:
+        self.language_model.configure_kv_transfer_tensors(transfer_tensors, builder)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)

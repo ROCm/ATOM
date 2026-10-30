@@ -579,12 +579,11 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             # No spec path supports pipeline parallel yet; it wants the deferred
-            # branch's per-request staging. Gate on PP itself rather than on
-            # `use_spec`: a P/D producer also reaches this branch, and the flag
-            # is still set there (the runner keeps the drafter loaded to write
-            # the draft's context KV at prefill) even though the scheduler
-            # turned speculation off for it.
-            if self.use_spec and self.is_pipeline_parallel:
+            # branch's per-request staging. A P/D producer is exempt, under PP
+            # too: `use_spec` is still set there (the runner keeps the drafter
+            # loaded to write the draft's context KV at prefill), but the
+            # scheduler turned speculation off for it, so its decodes are q=1.
+            if self.use_spec and self.is_pipeline_parallel and not self.is_pd_producer:
                 raise NotImplementedError("pipeline parallel + speculative decode")
             # PP verifies nothing locally and a P/D producer never speculates
             # (its DP dummy included), so no row here carries drafts. One that
@@ -739,6 +738,9 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # Carries a DSpark drafter's taps across PP stages (`PPAuxRelay`).
+    _pp_aux_relay = None
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
@@ -938,6 +940,13 @@ class ModelRunner:
             bind_mono_drafter = getattr(self.model, "bind_mono_drafter", None)
             if bind_mono_drafter is not None:
                 bind_mono_drafter(self.drafter)
+        spec_config = self.config.speculative_config
+        if spec_config and spec_config.use_dspark() and get_pp_group().world_size > 1:
+            from atom.spec_decode.pp_aux_relay import PPAuxRelay
+
+            self._pp_aux_relay = PPAuxRelay(
+                self.config, self.model, getattr(self, "drafter", None), self.device
+            )
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
@@ -1375,9 +1384,11 @@ class ModelRunner:
         # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
         # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
         # (EAGLE gets that free -- its first draft step is a many-row prefill).
-        # Other cases only need the usual >= 1 floor.
-        drafter = getattr(self, "drafter", None)
-        min_seqs = 2 if getattr(drafter, "is_block_drafter", False) else 1
+        # Other cases only need the usual >= 1 floor. Read off the config, not
+        # the drafter: under PP only the last stage builds one, and every stage
+        # must warm up on the same rows.
+        spec_config = self.config.speculative_config
+        min_seqs = 2 if spec_config and spec_config.use_dspark() else 1
         num_seqs = max(num_seqs, min_seqs)
 
         # Split the token budget across the seqs so >1 sequences never exceed it
@@ -2180,6 +2191,36 @@ class ModelRunner:
             )
         return pool
 
+    def _get_kv_transfer_tensors(self, num_blocks):
+        """The backend's PAGE regions as the model names them, then the draft's.
+
+        A model may annotate the regions (`configure_kv_transfer_tensors`)
+        before the draft pool is merged, so an explicit consumer map can
+        declare its full consumer count first.
+        """
+        builder = self.attn_metadata_builder
+        transfer_tensors = builder.get_kv_transfer_tensors()
+        if transfer_tensors is None:
+            return None
+        configure = getattr(self.model, "configure_kv_transfer_tensors", None)
+        if configure is not None:
+            configure(transfer_tensors, builder)
+        # The tier is built inside `register_kv_caches` and needs
+        # `state_entry_views` to name the bytes it packs. The caller is the
+        # only place the builder and the connector are both in scope.
+        transfer_tensors.state_backend = builder
+        if hasattr(self, "draft_kv_builder"):
+            transfer_tensors.merge_pages(
+                self.draft_kv_builder.get_kv_transfer_tensors()
+            )
+        # After the draft's regions are in, and here because this is the
+        # only place holding both the complete region list and the
+        # scheduler's block count. The builders cannot answer this: each
+        # counts in its own page, and the transfer protocol addresses
+        # ``req.block_ids``, which are the scheduler's.
+        transfer_tensors.set_block_count(num_blocks)
+        return transfer_tensors
+
     def allocate_kv_cache(self, num_kvcache_blocks):
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
@@ -2262,23 +2303,7 @@ class ModelRunner:
                 if kv_cache_tensor is not None:
                     kv_cache_data[f"layer_{module.layer_num}"] = kv_cache_tensor
 
-        transfer_tensors = self.attn_metadata_builder.get_kv_transfer_tensors()
-        if transfer_tensors is not None:
-            # The tier is built inside `register_kv_caches` and needs
-            # `state_entry_views` to name the bytes it packs. This is the only
-            # place the builder and the connector are both in scope.
-            transfer_tensors.state_backend = self.attn_metadata_builder
-        if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            transfer_tensors.merge_pages(
-                self.draft_kv_builder.get_kv_transfer_tensors()
-            )
-        if transfer_tensors is not None:
-            # After the draft's regions are in, and here because this is the
-            # only place holding both the complete region list and the
-            # scheduler's block count. The builders cannot answer this: each
-            # counts in its own page, and the transfer protocol addresses
-            # ``req.block_ids``, which are the scheduler's.
-            transfer_tensors.set_block_count(num_kvcache_blocks)
+        transfer_tensors = self._get_kv_transfer_tensors(num_kvcache_blocks)
         # The same count reaches the codecs, which likewise index by scheduler
         # block: MLA's cache is allocated in page-size-1 rows, so its own count
         # is block_ratio times larger and would make a codec treat one token as
@@ -3173,6 +3198,8 @@ class ModelRunner:
                     if recv_sparse is not None and self._pp_recv_needs_sparse:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
+                    if self._pp_aux_relay is not None:
+                        self._pp_aux_relay.take_received(intermediate_tensors)
 
                 # Time only the chunk computation between PP receive and send.
                 chunk_sample = self._dynamic_chunking.start_sample(batch)
@@ -3190,6 +3217,10 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 self._dynamic_chunking.finish_sample(chunk_sample)
+                if self._pp_aux_relay is not None and pp_group.is_last_rank:
+                    self._pp_aux_relay.deliver(self.drafter)
+                elif self._pp_aux_relay is not None:
+                    self._pp_aux_relay.attach(model_output)
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
@@ -3419,8 +3450,15 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages and P/D producers still run the drafter.
-            if hasattr(self, "drafter"):
+            # PP stages and P/D producers still run the drafter -- but not a PP
+            # producer's DSpark: its drafts are dropped (`mtp_k` 0), its context
+            # K/V is already written, and a TP1 stage cannot draft. EAGLE leaves
+            # a final chunk's context K/V to propose's first step, so it runs.
+            if hasattr(self, "drafter") and (
+                self.drafter.draft_kv_duplicates_propose
+                or not self.tokenID_processor.is_pd_producer
+                or not self.tokenID_processor.is_pipeline_parallel
+            ):
                 # Mid-prompt sequences get their anchor corrected inside
                 # propose_draft_token_ids, from `batch.next_token_ids`.
                 next_token_ids = torch.gather(

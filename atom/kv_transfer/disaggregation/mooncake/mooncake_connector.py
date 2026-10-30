@@ -43,6 +43,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     PrefillHandoff,
     chunked_topology_supported,
 )
+from atom.kv_transfer.disaggregation.mha_head_transfer import consumer_head_slices
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -868,6 +869,8 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # Set by `register_kv_caches`; until then no units are cut by head.
+    _block_head_major_runs: tuple = ()
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -1327,6 +1330,7 @@ class MooncakeConnector(KVConnectorBase):
         self.kv_caches_base_addr = [r.base_addr for r in tt.block_regions]
         self._per_block_bytes_list = [r.unit_bytes for r in tt.block_regions]
         self._block_region_roles = [r.semantic_role for r in tt.block_regions]
+        self._block_head_major_runs = tuple(page.head_major_runs for page in tt.pages)
         self._fp4_index_layout = any(
             role is not None and role.startswith(INDEX_CACHE_FP4_PREFIX)
             for role in self._block_region_roles
@@ -1840,6 +1844,8 @@ class MooncakeConnector(KVConnectorBase):
                 # check its per-region plan lands on the same kind of region.
                 "consumer_region_roles": self._block_region_roles,
                 "consumer_block_bpb": [bpb for _, bpb in self._block_regions],
+                # For a producer at another TP size to cut its units by head.
+                "consumer_head_major_runs": self._block_head_major_runs,
                 "dst_block_ids": dst_block_ids,
                 # Source block_ids so downstream stages (no scheduler, no
                 # _completed_prefills) can transfer without a local lookup.
@@ -2852,6 +2858,10 @@ class MooncakeConnector(KVConnectorBase):
                     "Explicit consumer region map length does not match local "
                     f"regions: {len(explicit_indices)} != {num_local_regions}"
                 )
+            if any(not 0 <= i < num_consumer_regions for i in explicit_indices):
+                raise ValueError(
+                    "Explicit consumer region map exceeds consumer regions"
+                )
             return explicit_indices
         if (
             consumer_num_layers is not None
@@ -2886,6 +2896,27 @@ class MooncakeConnector(KVConnectorBase):
                 "agree on speculative decode (a draft KV layer widens every group)."
             )
         return cmap
+
+    def _consumer_head_cut(self, request_data: dict, consumer_dcp_size: int):
+        """``(consumer head runs, consumer rank, consumer TP)`` when a consumer
+        at another TP size needs per-head units cut, else None. Only a TP1
+        producer holds every head (and is the rank every consumer is sent to)."""
+        if not any(self._block_head_major_runs):
+            return None
+        consumer_tp = int(request_data.get("consumer_tp_size", self.tp_size))
+        if consumer_tp == self.tp_size:
+            return None
+        if self.tp_size != 1 or self.dcp_size != 1 or consumer_dcp_size != 1:
+            raise RuntimeError(
+                "Cutting KV heads between TP sizes needs a TP1 producer and no "
+                f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
+                f"consumer TP {consumer_tp} DCP {consumer_dcp_size}"
+            )
+        return (
+            request_data["consumer_head_major_runs"],
+            int(request_data["consumer_tp_rank"]),
+            consumer_tp,
+        )
 
     def _execute_block_transfer(
         self,
@@ -2926,6 +2957,31 @@ class MooncakeConnector(KVConnectorBase):
             src_addrs.clear()
             dst_addrs.clear()
             sizes.clear()
+            return True
+
+        def queue_descriptors(srcs, dsts, lens) -> bool:
+            """Queue address arrays, flushing each batch as it fills."""
+            nonlocal block_descriptor_count, total_block_bytes
+            if len(srcs) != len(dsts) or len(srcs) != len(lens):
+                raise ValueError("RDMA source, destination and size counts disagree")
+            start = 0
+            while start < len(srcs):
+                stop = min(
+                    len(srcs),
+                    start + self._MAX_RDMA_ENTRIES_PER_BATCH - len(src_addrs),
+                )
+                src_addrs.extend(srcs[start:stop].tolist())
+                dst_addrs.extend(dsts[start:stop].tolist())
+                sizes.extend(lens[start:stop].tolist())
+                block_descriptor_count += stop - start
+                if debug_block_transfer:
+                    total_block_bytes += int(lens[start:stop].sum())
+                start = stop
+                if (
+                    len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH
+                    and not flush_block_descriptors()
+                ):
+                    return False
             return True
 
         num_regions = len(self.kv_caches_base_addr)
@@ -2993,6 +3049,9 @@ class MooncakeConnector(KVConnectorBase):
         # producer/consumer layouts fail instead of silently corrupting KV.
         consumer_roles = request_data.get("consumer_region_roles")
         consumer_bpb = request_data.get("consumer_block_bpb")
+        head_cut = self._consumer_head_cut(request_data, dcp_size)
+        source_blocks = np.asarray(src_block_ids, dtype=np.int64)
+        destination_blocks = np.asarray(dst_block_ids, dtype=np.int64)
         for region_idx in range(num_regions):
             src_base = self.kv_caches_base_addr[region_idx]
             dst_base = consumer_base_addrs[cmap[region_idx]]
@@ -3004,6 +3063,35 @@ class MooncakeConnector(KVConnectorBase):
                     f"{region_idx} is {role!r}, but consumer region "
                     f"{cmap[region_idx]} is {consumer_roles[cmap[region_idx]]!r}"
                 )
+            if head_cut is not None:
+                # The consumer rank holds its share of the heads: write it that
+                # share of every head-major run of each unit.
+                all_runs, rank, tp = head_cut
+                dst_runs, dst_bpb = (
+                    all_runs[cmap[region_idx]],
+                    consumer_bpb[cmap[region_idx]],
+                )
+                cuts = np.array(
+                    consumer_head_slices(
+                        bpb,
+                        dst_bpb,
+                        self._block_head_major_runs[region_idx],
+                        dst_runs and tuple(dst_runs),
+                        rank,
+                        tp,
+                    ),
+                    dtype=np.int64,
+                )
+                src = source_blocks[:, None] * bpb + cuts[:, 0]
+                dst = destination_blocks[:, None] * dst_bpb + cuts[:, 1]
+                if not queue_descriptors(
+                    (src_base + src).ravel(),
+                    (dst_base + dst).ravel(),
+                    np.broadcast_to(cuts[:, 2], src.shape).ravel(),
+                ):
+                    logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+                    return False
+                continue
             if consumer_bpb is not None and consumer_bpb[cmap[region_idx]] != bpb:
                 raise RuntimeError(
                     f"Region byte-size mismatch for req {req_id}: producer "
@@ -3014,21 +3102,13 @@ class MooncakeConnector(KVConnectorBase):
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
             if sharded_runs is None:
-                for sb, db in zip(src_block_ids, dst_block_ids):
-                    src_addrs.append(src_base + sb * bpb)
-                    dst_addrs.append(dst_base + db * bpb)
-                    sizes.append(bpb)
-                    block_descriptor_count += 1
-                    if debug_block_transfer:
-                        total_block_bytes += bpb
-                    if (
-                        len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH
-                        and not flush_block_descriptors()
-                    ):
-                        logger.error(
-                            "[PRODUCER] block transfer failed for req %s", req_id
-                        )
-                        return False
+                if not queue_descriptors(
+                    src_base + source_blocks * bpb,
+                    dst_base + destination_blocks * bpb,
+                    np.full(source_blocks.size, bpb, dtype=np.int64),
+                ):
+                    logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+                    return False
                 continue
             if role != MLA_KV_ROLE:
                 raise RuntimeError(
@@ -3052,25 +3132,11 @@ class MooncakeConnector(KVConnectorBase):
                 continue
             unit = bpb // self.block_size
             run_src, run_dst, run_len = sharded_runs
-            run_start = 0
-            while run_start < len(run_src):
-                remaining = self._MAX_RDMA_ENTRIES_PER_BATCH - len(src_addrs)
-                run_stop = min(run_start + remaining, len(run_src))
-                run_slice = slice(run_start, run_stop)
-                src_addrs.extend((src_base + run_src[run_slice] * unit).tolist())
-                dst_addrs.extend((dst_base + run_dst[run_slice] * unit).tolist())
-                sizes.extend((run_len[run_slice] * unit).tolist())
-                added = run_stop - run_start
-                block_descriptor_count += added
-                if debug_block_transfer:
-                    total_block_bytes += int(run_len[run_slice].sum()) * unit
-                run_start = run_stop
-                if (
-                    len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH
-                    and not flush_block_descriptors()
-                ):
-                    logger.error("[PRODUCER] block transfer failed for req %s", req_id)
-                    return False
+            if not queue_descriptors(
+                src_base + run_src * unit, dst_base + run_dst * unit, run_len * unit
+            ):
+                logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+                return False
 
         if not flush_block_descriptors():
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)

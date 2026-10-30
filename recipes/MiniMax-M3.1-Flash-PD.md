@@ -170,3 +170,73 @@ accuracy, benchmark and trace results must be verified from their CI jobs.
   P/D TP4, NVFP4/FP4 index, DSpark K7/AL4.04, 1 TiB Store, no torch trace, and
   3600-second formal profiling. C88 uses max-num-seqs 176 on both roles.
 - Ruff, Black, Python AST and diff whitespace checks passed for the reverted files.
+
+## PP4 prefill integration
+
+The PP4 path combines this recipe's NVFP4/FP4 caches with the PP producer and
+DSpark aux-state relay from PR #2721. Prefill uses TP1 × PP4 on GPUs 0–3;
+decode uses TP4 on GPUs 4–7. Both roles must run this integrated revision.
+The original CI cells above select TP4 prefill. The additional `pp4-tp4`
+cells below select this integrated PP4 path.
+
+Start with the PP4 launch commands in
+[the M3 mesh recipe](mesh/MiniMax-M3.md#1p1d--pp4-prefill--tp4-decode-minimax-m31-flash-dspark),
+with these changes on **both** roles:
+
+```bash
+export ATOM_M3_SPARSE_KV_NVFP4=1
+export ATOM_M3_FUSED_VERIFY_TOPK=1
+export ATOM_M3_DSPARK_DRAFT_PTPC=0
+export ATOM_MONO_ENABLE=0
+export ATOM_M3_INDEXER_CP=0
+```
+
+Use `--index-cache-dtype fp4` in their shared arguments and retain
+`--kv_cache_dtype fp8` for dense target layers and the DSpark draft. Keep
+prefill at `-tp 1 -pp 4 --enforce-eager --max-num-batched-tokens 8192`;
+decode remains `-tp 4`, with its CUDA graphs. Use real acceptance for GSM8K;
+only performance runs may add the synthetic acceptance length. The draft
+requantization switch is disabled in this configuration following #2743's
+closure; results from the earlier PTPC draft recipe are separate baselines.
+
+For an FP8 control, set `ATOM_M3_SPARSE_KV_NVFP4=0` and change the shared
+index dtype to `fp8`. Keep the PP topology, token budget and draft settings
+fixed. Validate direct P/D first, then add the existing P-side Store settings
+and the producer's `enable_chunked_transfer` switch separately.
+
+The target's PAGE regions are published in field/global-layer order across
+all pools. NVFP4 K/V and scales use one head-major run per page-128; sparse
+FP8 and draft KV use eight page-16 runs. Index and index-scale planes are
+replicated over TP consumers. The draft is appended after the full target
+region count, including when it lives only on the last PP stage.
+
+M3 offload namespaces now use `m3-page-regions-v2`, separating this ordering
+from previously stored pool-major chunks. P-side Store remains at DCP=1.
+This integration does not enable M3 or DSpark DCP; those paths retain their
+existing guards.
+
+CPU tests cover the model's registration hook, mixed-pool exports, physical
+KV/scale copies, draft planes, cached-prefix skipping and final chunk handoff.
+GPU GSM8K, actual acceptance, Store/RDMA and performance measurements are
+still required for this combined PP4/NVFP4 configuration.
+
+### PP4 CI validation
+
+The branch was rebased onto `up/main@c8f7f0583` on 2026-10-28. Select the
+following cases with the same pinned image and mounted source as above:
+
+- `suite=accuracy`:
+  `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-c32`
+  and `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-gsm8k-5shot-chunked-c32`.
+  Both run all 1319 GSM8K questions with real DSpark acceptance, without Store.
+  Flexible exact match must be at least 0.94; the FP8 PP4 reference in #2721
+  scores 0.9515. Retain strict-match and sample logs as well.
+- After accuracy passes, `suite=mooncake_store`:
+  `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-c32`
+  and `minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx-chunked-c32`.
+  Each runs AgentX for 3600 seconds with the recipe's synthetic AL 4.04 and
+  1 TiB Store. Run sequentially on the same node for the off/on comparison.
+
+These four cells disable draft PTPC, Mono and indexer CP on both roles.
+Prefill is TP1 × PP4, eager, with an 8192-token budget; decode is TP4 with
+CUDA graphs. The off/on pair changes only `enable_chunked_transfer`.

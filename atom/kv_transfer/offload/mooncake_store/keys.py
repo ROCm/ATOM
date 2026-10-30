@@ -88,6 +88,7 @@ def kv_layout_selectors() -> dict[str, Any]:
         "unified_attn": bool(envs.ATOM_USE_UNIFIED_ATTN),
         "force_attn_triton": bool(envs.ATOM_FORCE_ATTN_TRITON),
         "m3_sparse_kv_nvfp4": bool(envs.ATOM_M3_SPARSE_KV_NVFP4),
+        "m3_sparse_kv_mxfp4": bool(envs.ATOM_M3_SPARSE_KV_MXFP4),
         "m3_dspark_draft_ptpc": bool(envs.ATOM_M3_DSPARK_DRAFT_PTPC),
     }
 

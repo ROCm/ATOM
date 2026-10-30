@@ -2536,8 +2536,13 @@ def test_window_rows_start_each_row_at_its_own_window(window):
         assert tables[row].tolist() == list(range(first, first + P))
 
 
+@pytest.mark.parametrize(
+    "atom_config",
+    # A producer outside PP still proposes, so it is refused too.
+    [None, types.SimpleNamespace(kv_transfer_config={"kv_role": "kv_producer"})],
+)
 @pytest.mark.parametrize("tp", [1, 2])
-def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
+def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp, atom_config):
     """The MiniMax-M3.1 draft decodes its block per row with one KV head per
     rank; with 4 KV heads it refuses TP < 4 at construction rather than
     failing on the first drafted block."""
@@ -2546,4 +2551,4 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)
     with pytest.raises(ValueError, match="needs TP >= 4"):
-        m3_dspark.M3DSparkAttention(None, config, None, layer_num=0)
+        m3_dspark.M3DSparkAttention(atom_config, config, None, layer_num=0)

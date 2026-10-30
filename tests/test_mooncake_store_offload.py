@@ -3783,3 +3783,11 @@ def test_m3_store_namespace_separates_complete_pages_from_dense_codec(monkeypatc
     m3_namespace = keys.store_namespace(config, CHUNK)
     monkeypatch.setattr(offcfg, "select_offload_layout", lambda _: "dense")
     assert keys.store_namespace(config, CHUNK) != m3_namespace
+
+
+def test_m3_store_namespace_separates_legacy_pool_order(monkeypatch):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3_vl"
+    current = keys.store_namespace(config, CHUNK)
+    monkeypatch.setattr(offcfg, "M3_PAGE_MODE", "m3-page-regions")
+    assert keys.store_namespace(config, CHUNK) != current

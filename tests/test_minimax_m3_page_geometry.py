@@ -3,7 +3,8 @@
 
 """`PAGES_PER_SPARSE_BLOCK` is defined twice and nothing enforced it.
 
-`sparse_attn.py` derives it (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`);
+`cache_layout.py` derives it (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`) and
+`sparse_attn.py` imports it;
 `index_topk.py` repeats it as a literal `8`, because `sparse_attn` imports
 `index_topk` and importing back would close a cycle. The duplication was held
 together by a comment saying "must match", which is not a check: the two are the
@@ -32,6 +33,7 @@ import pathlib
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SPARSE_ATTN = _ROOT / "atom" / "model_ops" / "minimax_m3" / "sparse_attn.py"
+_CACHE_LAYOUT = _ROOT / "atom" / "model_ops" / "minimax_m3" / "cache_layout.py"
 _INDEX_TOPK = _ROOT / "atom" / "model_ops" / "minimax_m3" / "index_topk.py"
 _PLUGIN = _ROOT / "atom" / "plugin" / "vllm" / "attention" / "minimax_m3_attnetion.py"
 
@@ -95,7 +97,7 @@ def _stride_defaults(path: pathlib.Path) -> dict[str, str]:
 
 
 def test_pages_per_sparse_block_agrees_across_its_two_definitions():
-    sparse = _module_constants(_SPARSE_ATTN)
+    sparse = _module_constants(_CACHE_LAYOUT)
     topk = _module_constants(_INDEX_TOPK)
     assert topk["PAGES_PER_SPARSE_BLOCK"] == sparse["PAGES_PER_SPARSE_BLOCK"], (
         "index_topk repeats sparse_attn.PAGES_PER_SPARSE_BLOCK as a literal to "
@@ -105,7 +107,7 @@ def test_pages_per_sparse_block_agrees_across_its_two_definitions():
 
 def test_pages_per_sparse_block_is_the_derived_value():
     """Pin the derivation too, so the literal cannot win by both being wrong."""
-    sparse = _module_constants(_SPARSE_ATTN)
+    sparse = _module_constants(_CACHE_LAYOUT)
     assert sparse["PAGES_PER_SPARSE_BLOCK"] == (
         sparse["SPARSE_BLOCK_SIZE"] // sparse["ASM_PAGE_SIZE"]
     )
@@ -124,10 +126,27 @@ def test_kernel_stride_defaults_are_the_back_to_back_value():
 
 def test_packed_plane_stride_lives_with_the_cache_it_describes():
     """`BLOCK_PAGE_STRIDE` belongs to the vLLM page view, not to the kernels."""
-    sparse = _module_constants(_SPARSE_ATTN)
+    sparse = _module_constants(_CACHE_LAYOUT)
     plugin = _module_constants(_PLUGIN, seed=sparse)
     assert "BLOCK_PAGE_STRIDE" not in _SPARSE_ATTN.read_text(encoding="utf-8"), (
         "the packed-plane stride is a property of the vLLM plugin's cache; "
         "shared kernel code should not name it"
     )
     assert plugin["BLOCK_PAGE_STRIDE"] == 2 * sparse["PAGES_PER_SPARSE_BLOCK"]
+
+
+def test_sparse_kernels_import_the_shared_cache_geometry():
+    tree = ast.parse(_SPARSE_ATTN.read_text(encoding="utf-8"))
+    imports = {
+        name.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "atom.model_ops.minimax_m3.cache_layout"
+        for name in node.names
+    }
+    assert {
+        "ASM_PAGE_SIZE",
+        "SPARSE_BLOCK_SIZE",
+        "PAGES_PER_SPARSE_BLOCK",
+        "to_page16_shuffle",
+    } <= imports
