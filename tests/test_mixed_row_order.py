@@ -7,6 +7,8 @@ same bounds describe both."""
 
 from types import SimpleNamespace
 
+import pytest
+
 from atom.metrics.scheduler import RequestQueueTiming, SchedulerMetrics
 from atom.observability import tracing
 
@@ -82,10 +84,12 @@ def test_trace_marks_only_a_mixed_batchs_decode_rows_as_decode(monkeypatch):
     assert calls == [("p", False), ("d1", True), ("d2", True)]
 
 
-def test_a_real_mixed_step_records_each_rows_own_metric():
+@pytest.mark.parametrize("request_context_enabled", [False, True])
+def test_a_real_mixed_step_records_each_rows_own_metric(request_context_enabled):
     """A mixed batch the scheduler really builds, recorded by a real
     `SchedulerMetrics`: the single-chunk prefill lands in the prefill metrics
-    and the decode row's context in the decode ones."""
+    and the decode row's context in the decode ones. Aggregate metrics remain
+    available with per-request context gauges either disabled or enabled."""
     from conftest import MockConfig
     from prometheus_client import CollectorRegistry
 
@@ -112,7 +116,9 @@ def test_a_real_mixed_step_records_each_rows_own_metric():
     assert batch.is_mixed and batch.req_ids == [prefill.id, decode.id]
 
     registry = CollectorRegistry()
-    metrics = SchedulerMetrics(registry=registry)
+    metrics = SchedulerMetrics(
+        registry=registry, request_context_enabled=request_context_enabled
+    )
     for seq in (prefill, decode):
         seq.queue_timing = None
         metrics.enqueue(seq)
@@ -138,10 +144,13 @@ def test_a_real_mixed_step_records_each_rows_own_metric():
         for s in metric.samples
         if s.name.endswith("request_context_tokens")
     }
-    assert gauges == {
-        ("atom:decode_request_context_tokens", str(decode.id)): 7,
-        ("atom:prefill_request_context_tokens", str(prefill.id)): 13,
-    }
+    if request_context_enabled:
+        assert gauges == {
+            ("atom:decode_request_context_tokens", str(decode.id)): 7,
+            ("atom:prefill_request_context_tokens", str(prefill.id)): 13,
+        }
+    else:
+        assert gauges == {}
 
 
 def test_eplb_commits_a_mixed_passs_load_and_counts_its_step(monkeypatch):
