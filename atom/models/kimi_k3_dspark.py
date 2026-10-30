@@ -534,11 +534,12 @@ class KimiK3DSpark(DSparkDraftModel):
     #     memory and risk drifting from the target's.
     #
     # Under PP, __init__ drops embed_tokens from this list on non-first stages.
-    skip_weight_prefixes: ClassVar[list[str]] = [
+    # A tuple, not a ClassVar: the per-stage override rebinds, never mutates.
+    skip_weight_prefixes: tuple[str, ...] = (
         "confidence_head.",
         "embed_tokens.",
         "lm_head.",
-    ]
+    )
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
@@ -587,9 +588,9 @@ class KimiK3DSpark(DSparkDraftModel):
         if self.own_embed_tokens:
             from atom.model_ops.embed_head import VocabParallelEmbedding
 
-            self.skip_weight_prefixes = [
+            self.skip_weight_prefixes = tuple(
                 p for p in self.skip_weight_prefixes if p != "embed_tokens."
-            ]
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size, config.hidden_size, prefix="embed_tokens"
             )
