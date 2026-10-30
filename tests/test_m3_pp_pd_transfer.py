@@ -70,6 +70,7 @@ _configure_model = _cache_methods(
     (
         "_sparse_attention_layer_ids",
         "_sparse_attention_layer_ordinals",
+        "_should_skip_minimax_m3_index_topk",
         "configure_kv_transfer_tensors",
     ),
 )["configure_kv_transfer_tensors"]
@@ -131,9 +132,13 @@ def _m3_builder(layer_nums, sparse, heads, config=None, kv_dtype=torch.float8_e4
 
 def _export(builder, draft=None):
     if draft is not None:
-        builder.model_runner.draft_kv_builder = SimpleNamespace(
-            get_kv_transfer_tensors=lambda: draft
+        draft_builder = SimpleNamespace(
+            window=None, get_kv_transfer_tensors=lambda: draft
         )
+        draft_builder.attach_transfer_tensors = MethodType(
+            DraftKvBuilder.attach_transfer_tensors, draft_builder
+        )
+        builder.model_runner.draft_kv_builder = draft_builder
     return _runner_transfer(builder.model_runner, 4)
 
 
