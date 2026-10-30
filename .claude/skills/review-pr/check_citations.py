@@ -108,7 +108,24 @@ def check(card_text: str, tree: pathlib.Path, changed=()):
                 continue
             if any(e in window for e in excerpts):
                 continue
-            elsewhere = [q for q in quoted if q in "\n".join(lines)]
+            whole = "\n".join(lines)
+            elsewhere = [q for q in quoted if q in whole]
+            if not elsewhere and quoted:
+                # Nothing the finding quotes appears in the cited file at all. This fell
+                # through silently before, which inverted the severity: a symbol present
+                # but far from the cited line got flagged, while one that is not in the
+                # file is the stronger sign the citation points somewhere else. Found on
+                # PR#2707, whose finding cited model_runner.py:4465 for `uses_router_gemm`
+                # -- a symbol that lives in linear.py and appears nowhere in model_runner.
+                # Restricted to identifier-shaped tokens: a finding may legitimately quote
+                # a value (`per_token`) that is not source text in that file.
+                ident = [q for q in quoted if "_" in q or "." in q or len(q) > 12]
+                if ident:
+                    yield "note", (
+                        f"{path}:{lineno} -- none of {sorted(ident)} appears anywhere in "
+                        f"this file; check the citation points where the finding means"
+                    )
+                continue
             if elsewhere:
                 where = []
                 for q in elsewhere[:1]:
