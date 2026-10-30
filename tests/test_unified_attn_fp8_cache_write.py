@@ -7,7 +7,9 @@ so `rope_cache` takes its last branch. That branch wrote every fp8 cache with
 per-token scales, which `unified_attention` refuses (one descale for the whole
 tensor), so ATOM_USE_UNIFIED_ATTN=1 with --kv_cache_dtype fp8 raised on the
 first prefill. Under unified it now writes per tensor with the layer's
-kv_scale and casts Q to the cache dtype, as the Triton RoPE branch does.
+kv_scale and casts Q to the cache dtype, as the Triton RoPE branch does,
+clamping K, V and Q into the fp8 range first: neither the write nor the cast
+saturates, and a value of 480 or more would be stored as NaN.
 
 Dispatch only, no device: both aiter writers are stubbed. Like the other
 attention tests, this file skips where triton or aiter does not import.
@@ -56,14 +58,17 @@ def _impl(kv_cache_dtype):
     impl.use_flash_layout = False
     impl.per_token_quant = True
     impl.kv_scale = torch.tensor(1.0)
+    impl.kv_scale_float = 1.0
     return impl
 
 
-def _rope_cache(impl, q, cache_dtype):
+def _rope_cache(impl, q, cache_dtype, k=None, v=None):
     """`rope_cache` on one decode batch, over a 5-D SHUFFLE cache holding
     per-token scale planes, as the native fp8 pool binds it."""
-    k = torch.randn(TOKENS, NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16)
-    v = torch.randn(TOKENS, NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16)
+    if k is None:
+        k = torch.randn(TOKENS, NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16)
+    if v is None:
+        v = torch.randn(TOKENS, NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16)
     layer = SimpleNamespace(
         k_cache=torch.empty(1, 1, 1, 1, 1, dtype=cache_dtype),
         v_cache=torch.empty(1, 1, 1, 1, 1, dtype=cache_dtype),
@@ -122,6 +127,22 @@ def test_unified_fp8_query_is_clamped_into_the_cache_dtype(writers, monkeypatch)
     assert q_out[0, 0, 0].float() == fp8_max
     assert q_out[0, 0, 1].float() == -fp8_max
     assert torch.isfinite(q_out.float()).all()
+
+
+def test_unified_fp8_cache_write_is_clamped_into_the_fp8_range(writers, monkeypatch):
+    """The cache write does not saturate: 480 and up would be stored as NaN."""
+    monkeypatch.setenv("ATOM_USE_UNIFIED_ATTN", "1")
+    k = torch.randn(TOKENS, NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16)
+    v = torch.randn(TOKENS, NUM_KV_HEADS * HEAD_DIM, dtype=torch.bfloat16)
+    k[0, 0], v[1, 2] = 1000.0, -1000.0
+    _rope_cache(_impl("fp8"), _query(), FP8, k, v)
+
+    args, _kwargs = writers.plain.call_args
+    fp8_max = torch.finfo(FP8).max
+    assert args[0][0, 0, 0] == fp8_max and args[1][1, 0, 2] == -fp8_max
+    assert args[0].abs().max() <= fp8_max and args[1].abs().max() <= fp8_max
+    # In range, the written rows are the inputs themselves.
+    assert torch.equal(args[0][1:], k.view(-1, NUM_KV_HEADS, HEAD_DIM)[1:])
 
 
 def test_fp8_cache_off_unified_keeps_the_per_token_scales(writers, monkeypatch):
