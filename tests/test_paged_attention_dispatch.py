@@ -1205,6 +1205,18 @@ class TestExplicitPlan:
                     "max_context_partition_num"
                 ), f"{relpath}: plan cap is not the static split count"
 
+    def test_callers_leave_gluon_scratch_to_aiter(self):
+        """No caller keeps its own copy of the kernel's scratch shapes."""
+        scratch = {"exp_sums", "max_logits", "temporary_output"}
+        for relpath in (
+            "model_ops/attention_mha.py",
+            "model_ops/minimax_m3/sparse_attn.py",
+            "plugin/vllm/attention/layer_mha.py",
+            "plugin/sglang/attention_backend/full_attention/full_attention_backend.py",
+        ):
+            for kw in self._call_kwargs(relpath, "run_pa_decode"):
+                assert not scratch & kw.keys(), relpath
+
     def test_both_sparse_decode_sites_scope_refresh_to_the_step(self):
         """Native and vLLM must hand their per-step decode metadata down.
 
@@ -1303,6 +1315,45 @@ class TestExplicitPlan:
         ba, _ = self._setup(monkeypatch)
         plans = [self._call(ba) for _ in range(3)]
         assert plans[0].refreshed == 2
+
+
+class TestGluonScratch:
+    """Leaving scratch to aiter covers every gluon caller, FlyDSL or not."""
+
+    def test_omitted_scratch_is_left_to_gluon(self, monkeypatch):
+        """pa_decode_gluon sizes its own scratch from the query it is given."""
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", False)
+        seen = {}
+
+        def record(*args, **kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_gluon", record)
+        meta = lambda *shape, dtype=torch.bfloat16: torch.empty(
+            shape, dtype=dtype, device="meta"
+        )
+        ba.run_pa_decode(
+            output=meta(8, 16, 128),
+            q=meta(8, 16, 128),
+            k_cache=meta(8, 2, 8, 16, 16),
+            v_cache=meta(8, 2, 1, 128, 16),
+            context_lens=meta(8, dtype=torch.int32),
+            block_tables=meta(8, 8, dtype=torch.int32),
+            softmax_scale=1.0,
+            max_seqlen_q=2,
+            max_context_partition_num=4,
+            context_partition_size=256,
+            compute_type=torch.bfloat16,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+        )
+        scratch = ("exp_sums", "max_logits", "temporary_output")
+        assert all(seen[name] is None for name in scratch), seen
 
 
 @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
