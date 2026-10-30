@@ -41,6 +41,7 @@ on:
           - agentic_multi_decode
           - mooncake_store
           - accuracy
+          - k3_infx
           - profile
       rdma_smoke_nodes:
         description: 'Comma-separated Slurm candidate nodes for the Mooncake RDMA smoke test; Slurm selects two when multiple nodes are listed'

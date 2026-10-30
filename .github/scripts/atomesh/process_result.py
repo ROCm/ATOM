@@ -691,6 +691,8 @@ def perf_point(
     }
     if accuracy and accuracy.get("task") == "gsm8k":
         point["gsm8k"] = round_or_none(accuracy.get("value"), digits=4)
+    if accuracy and accuracy.get("kimi_tool_call") is not None:
+        point["kimi_tool_call"] = round_or_none(accuracy["kimi_tool_call"], digits=4)
     return {key: value for key, value in point.items() if value is not None}
 
 
@@ -751,6 +753,8 @@ def collect_dashboard_entries(
             if accuracy.get("task") == "gsm8k":
                 payload["gsm8k"] = accuracy.get("value")
                 payload["gsm8k_raw"] = accuracy.get("raw")
+            if accuracy.get("kimi_tool_call") is not None:
+                payload["kimi_tool_call"] = accuracy.get("kimi_tool_call")
         extra = extra_text(payload, run_url, payload.get("slurm_job_id"))
         point = perf_point(path, payload, fields, run_url, accuracy)
         point_entry = dashboard_point_entry(point, extra)
@@ -778,6 +782,9 @@ def eval_topology(path: Path) -> str:
 
 def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
     scores = {}
+    # Kimi-Vendor-Verifier tool-call scores ride beside the primary accuracy
+    # (gsm8k) of the same point, or stand in for it when it did not run.
+    tool_call = {}
     for path in sorted(root.rglob("results*.json")):
         payload = read_json(path)
         if not payload:
@@ -786,6 +793,15 @@ def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
         if conc is None:
             continue
         results = payload.get("results", {})
+        if "kimi_tool_call_schema_full" in results:
+            result = results["kimi_tool_call_schema_full"]
+            env = slurm_job_env(path)
+            tool_call[(model_key(env.get("MODEL_NAME")), eval_topology(path), conc)] = {
+                "value": number(result.get("em_strict")),
+                "passed": int_value(result.get("passed")),
+                "total": int_value(result.get("total")),
+            }
+            continue
         task = ""
         metric = ""
         score_raw = None
@@ -839,6 +855,22 @@ def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
                 "total": int_value(total),
                 "threshold": number(env.get("EVAL_THRESHOLD")),
                 "fewshot": int_value(fewshot),
+            }
+    for key, tool in tool_call.items():
+        if tool["value"] is None:
+            continue
+        value = round(tool["value"], 4)
+        if key in scores:
+            scores[key]["kimi_tool_call"] = value
+        else:
+            scores[key] = {
+                "task": "kimi_tool_call_schema_full",
+                "metric": "em_strict",
+                "value": value,
+                "raw": f"{value:.4f}",
+                "resolved": tool["passed"],
+                "total": tool["total"],
+                "kimi_tool_call": value,
             }
     return scores
 

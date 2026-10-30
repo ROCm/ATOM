@@ -406,6 +406,8 @@ def build_cell(
     if eval_only and accuracy_cfg.get("task", "gsm8k") not in {
         "gsm8k",
         "swebench_lite",
+        "kimi_tool_call",
+        "gsm8k,kimi_tool_call",
     }:
         raise ValueError("eval_only requires a supported accuracy task")
     return {

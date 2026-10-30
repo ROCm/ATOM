@@ -244,6 +244,8 @@ REQUEST_RATE="${REQUEST_RATE:-inf}"
 
 RUN_EVAL="${RUN_EVAL:-false}"
 EVAL_TASK="${EVAL_TASK:-gsm8k}"
+# EVAL_TASK may name several tasks, comma-separated (e.g. gsm8k,kimi_tool_call).
+eval_task_has() { [[ ",${EVAL_TASK// /}," == *",$1,"* ]]; }
 EVAL_FEWSHOT="${EVAL_FEWSHOT:-3}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 EVAL_MODEL_TYPE="${EVAL_MODEL_TYPE:-local-completions}"
@@ -774,9 +776,9 @@ if [[ -n "${NUM_SPEC_TOKENS}" ]]; then
   server_common+=(--num-speculative-tokens "${NUM_SPEC_TOKENS}")
 fi
 spec_decode_acceptance_for_server="${SPEC_DECODE_ACCEPTANCE_LENGTH}"
-if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" && "${EVAL_TASK}" == "gsm8k" ]]; then
+if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]] && { eval_task_has gsm8k || eval_task_has kimi_tool_call; }; then
   spec_decode_acceptance_for_server=""
-  echo "[runtime] omitting spec-decode-acceptance-length for gsm8k eval phase"
+  echo "[runtime] omitting spec-decode-acceptance-length for ${EVAL_TASK} eval phase"
 fi
 if [[ -n "${spec_decode_acceptance_for_server}" ]]; then
   server_common+=(
@@ -2611,10 +2613,82 @@ run_eval() {
     run_swebench_lite_eval
     return
   fi
-  if [[ "${EVAL_TASK}" != "gsm8k" ]]; then
-    echo "[eval] unsupported task ${EVAL_TASK}; skipping"
-    return 0
+  local rc=0
+  if eval_task_has gsm8k; then
+    run_gsm8k_eval || rc=1
   fi
+  if eval_task_has kimi_tool_call; then
+    run_kimi_tool_call_eval || rc=1
+  fi
+  if ! eval_task_has gsm8k && ! eval_task_has kimi_tool_call; then
+    echo "[eval] unsupported task ${EVAL_TASK}; skipping"
+  fi
+  return "${rc}"
+}
+
+# The Kimi-Vendor-Verifier tool-call suite exactly as InferenceX runs it:
+# kimi_tool_call_schema_full (204 schemas x stream/non-stream = 408 cases,
+# tool_choice=required, strict, T=1) through InferenceX's adapter, at the
+# verifier commit and dependency pins InferenceX uses.
+KIMI_VERIFIER_REF=3dad65a760a8867cda72f6dd8848d876a4e851b4
+KIMI_VERIFIER_SHA256=ede9ea300c72ccfde9d8975ea4b1b54e423c7625690f6631ab1e65a715821e01
+INFERENCEX_ADAPTER_REF=f8eceffc1f69f832c41fe7f8ec9cecac4f7217d1
+run_kimi_tool_call_eval() {
+  local tag
+  tag="$(date +%Y%m%d%H%M%S)_kimi_tool_call_${TOPOLOGY}_c${CONC_LIST%%,*}"
+  local result_dir="${RUN_DIR}/eval_results/${tag}"
+  local work="${RUN_DIR}/eval_results/kimi_tool_call_work"
+  mkdir -p "${result_dir}" "${work}"
+  echo ""
+  echo "========================================="
+  echo "[eval] kimi_tool_call_schema_full (408 cases, 8 workers)"
+  echo "========================================="
+  python3 -m pip install -q --no-cache-dir --target "${work}/pydeps" \
+    "httpx[http2]==0.28.1" "openai==2.14.0" "jsonschema==4.25.1" \
+    "pytest==8.4.2" "pytest-xdist==3.8.0" || return 1
+  local archive="${work}/verifier.tar.gz"
+  curl -fsSL --retry 5 -o "${archive}" \
+    "https://codeload.github.com/MoonshotAI/Kimi-Vendor-Verifier/tar.gz/${KIMI_VERIFIER_REF}" || return 1
+  if ! echo "${KIMI_VERIFIER_SHA256}  ${archive}" | sha256sum -c - >/dev/null 2>&1; then
+    echo "[eval] FAIL: verifier archive sha256 differs from the InferenceX pin" >&2; return 1
+  fi
+  rm -rf "${work}/verifier" && mkdir -p "${work}/verifier"
+  tar -xzf "${archive}" -C "${work}/verifier" --strip-components=1 || return 1
+  curl -fsSL --retry 5 -o "${work}/kimi_vendor_eval.py" \
+    "https://raw.githubusercontent.com/SemiAnalysisAI/InferenceX/${INFERENCEX_ADAPTER_REF}/inferencex-e2e/infx/evals/kimi_vendor_eval.py" || return 1
+  PYTHONPATH="${work}/pydeps${PYTHONPATH:+:${PYTHONPATH}}" python3 "${work}/kimi_vendor_eval.py" \
+    --verifier-dir "${work}/verifier" --model-prefix kimik3 \
+    --base-url "http://127.0.0.1:${ROUTER_PORT}/v1" --model "${MODEL_PATH}" \
+    --output-dir "${result_dir}" --task-name kimi_tool_call_schema_full \
+    > "${result_dir}/eval.log" 2>&1
+  local rc=$?
+  tail -3 "${result_dir}/eval.log"
+  # One lm_eval-shaped record so process_result.py attaches the score to the
+  # perf point like gsm8k's.
+  python3 - "${result_dir}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+reports = sorted(out.rglob("kimi_vendor_report.json"))
+if not reports:
+    print("[eval] kimi_tool_call: no kimi_vendor_report.json")
+    sys.exit(0)
+results = json.loads(reports[-1].read_text()).get("results", [])
+passed = sum(r.get("status") == "passed" for r in results)
+total = len(results)
+score = passed / total if total else 0.0
+(out / "results_kimi_tool_call.json").write_text(json.dumps({
+    "results": {"kimi_tool_call_schema_full": {
+        "em_strict": score, "passed": passed, "total": total}},
+}, indent=2))
+print(f"[eval] kimi_tool_call_schema_full em_strict={score:.4f} ({passed}/{total})")
+PY
+  return "${rc}"
+}
+
+run_gsm8k_eval() {
   if ! command -v lm_eval >/dev/null 2>&1; then
     python3 -m pip install 'lm-eval[api]'
   fi
@@ -2650,7 +2724,9 @@ run_eval() {
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
-    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${eval_conc}"
+    # Named by the perf point's concurrency so the dashboard attaches the score
+    # to that point whatever concurrency the eval itself ran at.
+    tag="$(date +%Y%m%d%H%M%S)_gsm8k_${TOPOLOGY}_c${CONC_LIST%%,*}"
     result_dir="${RUN_DIR}/eval_results/${tag}"
 
     echo ""
@@ -2724,7 +2800,8 @@ run_benchmark_and_eval() {
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
-    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
+    && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" \
+      || "${EVAL_TASK}" == "kimi_tool_call" || "${EVAL_TASK}" == "gsm8k,kimi_tool_call" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
     # Agentic performance cases require a fresh prefix/state-cache state. Run
     # their trace benchmark before any independent accuracy workload.

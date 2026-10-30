@@ -33,7 +33,9 @@ if [[ "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
   EXECUTION_PHASES=(eval)
 elif [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
-    || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
+    || "${EVAL_TASK:-gsm8k}" == "gsm8k" \
+    || "${EVAL_TASK:-gsm8k}" == "kimi_tool_call" \
+    || "${EVAL_TASK:-gsm8k}" == "gsm8k,kimi_tool_call" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi

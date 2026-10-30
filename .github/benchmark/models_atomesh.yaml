@@ -1334,6 +1334,105 @@ models:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
+      # InferenceX #4311 (kimik3-fp4-mi355x-atom-disagg-agentic), point for
+      # point: the six overrides of its disagg-variants.yaml. The benchmark
+      # phase serves at the golden AL; the eval phase restarts without it and
+      # runs gsm8k (5-shot, thinking on) and the Kimi-Vendor-Verifier
+      # tool-call suite, both attached to the perf point. Differs from #4311
+      # only in the LMCache pool's backing: 4 KiB pages, not 2 MiB HugeTLB.
+      k3_infx:
+        - <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-infx-1p1d-tp8-dspark7-agentic-1m-c1
+          concurrency: [1]
+          run_eval: true
+          eval_concurrency: [32]
+          accuracy: &k3_infx_accuracy
+            task: gsm8k,kimi_tool_call
+            fewshot: 5
+            model_type: local-chat-completions
+            endpoint: chat/completions
+            max_gen_toks: 16384
+            apply_chat_template: true
+            # Reported, not gated: a low score must not read as a job to retry.
+            threshold: 0.50
+
+        - <<: *kimi_k3_agentic_dcp8_lmcache
+          name: kimi-k3-infx-1p2d-tp8-dcp8-dspark7-agentic-lmcache-1m-c16
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DCP8-DSPARK7
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [16]
+          server:
+            common_args: *kimi_k3_agentic_dspark7_args
+          decode:
+            workers: 2
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "0"
+            prefill: *kimi_k3_agentic_lmcache128_env
+          run_eval: true
+          eval_concurrency: [32]
+          accuracy: *k3_infx_accuracy
+
+        - &k3_infx_hc
+          <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-infx-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          concurrency: [48]
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "0"
+            prefill: &k3_infx_lmcache224_env
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+          run_eval: true
+          eval_concurrency: [48]
+          accuracy: *k3_infx_accuracy
+
+        - <<: *k3_infx_hc
+          name: kimi-k3-infx-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark4_args
+              max_num_seqs: 144
+          env: &k3_infx_hc_reuse_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill: *k3_infx_lmcache224_env
+          eval_concurrency: [72]
+
+        - <<: *k3_infx_hc
+          name: kimi-k3-infx-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark4_args
+              max_num_seqs: 176
+          env: *k3_infx_hc_reuse_env
+          eval_concurrency: [88]
+
+        - <<: *k3_infx_hc
+          name: kimi-k3-infx-1p2d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DCP8-DSPARK4
+          nodes: "${ATOMESH_2P1D_NODES}"
+          decode:
+            workers: 2
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+
       # gsm8k-only PD cell over MoRI IO, prefill and decode on a node each. No
       # DSpark, so it needs no draft model and has no ReplaySSM record buffers,
       # which the MoRIIO connector refuses: it moves the MLA KV by block and the
