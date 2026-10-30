@@ -666,6 +666,9 @@ class Scheduler:
             * getattr(config, "pipeline_parallel_size", 1)
             + getattr(pc, "pipeline_parallel_rank", 0),
             self._METRICS_ROLE or "default",
+            request_context_enabled=getattr(
+                config, "enable_request_context_metrics", False
+            ),
         )
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
@@ -5044,6 +5047,9 @@ class PrefillScheduler:
             * getattr(config, "pipeline_parallel_size", 1)
             + getattr(pc, "pipeline_parallel_rank", 0),
             self._METRICS_ROLE or "default",
+            request_context_enabled=getattr(
+                config, "enable_request_context_metrics", False
+            ),
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()

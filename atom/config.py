@@ -2079,6 +2079,7 @@ class Config:
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
     # Requests in the sliding window behind the status line's prefix-cache hit

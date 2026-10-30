@@ -144,6 +144,7 @@ class EngineArgs:
     enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     throughput_log_interval: float = 10.0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
@@ -570,6 +571,14 @@ class EngineArgs:
             default=True,
             help="Enable chunked prefill (default: enabled). "
             "Use --no-enable_chunked_prefill to disable.",
+        )
+        parser.add_argument(
+            "--enable-request-context-metrics",
+            action="store_true",
+            default=False,
+            help="Enable per-request prefill/decode context metrics (default: disabled). "
+            "Retains request-labelled series after completion; use only for short "
+            "diagnostic captures. Aggregate metrics are unaffected.",
         )
         parser.add_argument(
             "--enable-log-stats",
