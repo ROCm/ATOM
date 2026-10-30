@@ -50,7 +50,7 @@ def _layer(index_q):
     )
 
 
-def _decode(layer, q, num_reqs, max_query_len, monkeypatch):
+def _decode(layer, q, num_reqs, max_query_len, monkeypatch, cache_format="shuffle"):
     seen = {}
 
     def topk(idx_q, *args, **kwargs):
@@ -67,6 +67,33 @@ def _decode(layer, q, num_reqs, max_query_len, monkeypatch):
         assert output.shape[0] == q.shape[0] == kw["sparse_bt"].shape[0]
         assert kw["sparse_ctx"].shape[0] == q.shape[0]
         output.fill_(1.0)
+
+    if cache_format == "mxfp4":
+        layer.kv_mxfp4 = True
+
+        def mxfp4(q, k, v, bt, ctx, owner):
+            seen["attended_rows"] = q.shape[0]
+            assert q.shape[0] == bt.shape[0] == ctx.shape[0]
+            return torch.ones(q.shape, dtype=torch.bfloat16)
+
+        layer._sparse_pa_mxfp4 = mxfp4
+    elif cache_format == "nvfp4":
+        from atom.model_ops.minimax_m3 import sparse_attn_nvfp4
+
+        layer.kv_nvfp4 = True
+
+        def nvfp4(q, k, ks, v, vs, topk, bt, req, seq, scale, output):
+            seen["attended_rows"] = q.shape[0]
+            assert q.shape[0] == output.shape[0] == req.shape[0]
+            # Production returns a fresh result; its output argument is shape-only.
+            return torch.ones(q.shape, dtype=torch.bfloat16)
+
+        monkeypatch.setattr(sparse_attn_nvfp4, "nvfp4_sparse_attention_gfx950", nvfp4)
+        monkeypatch.setattr(
+            sparse_attn_nvfp4,
+            "decode_rows",
+            lambda seq, rows: (torch.zeros(rows), torch.ones(rows)),
+        )
 
     monkeypatch.setattr(index_topk, "minimax_m3_index_topk_decode", topk)
     monkeypatch.setattr(sparse_attn, "minimax_m3_sparse_attn_decode_asm", attend)
@@ -104,3 +131,19 @@ def test_a_decode_whose_tables_describe_every_row_attends_them_all(
     out, seen = _decode(layer, q, num_reqs, max_query_len, monkeypatch)
     assert seen == {"topk_rows": 16, "attended_rows": 16}
     assert torch.equal(out, torch.ones(16, 4, 128))
+
+
+@pytest.mark.parametrize("cache_format", ["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("num_reqs", [9, 16])
+def test_quantized_decode_preserves_returned_output_and_padding(
+    monkeypatch, cache_format, num_reqs
+):
+    q = torch.randn(16, 4, 128)
+    out, seen = _decode(
+        _layer(torch.randn(16, 1, 128)), q, num_reqs, 1, monkeypatch, cache_format
+    )
+    assert seen == {"topk_rows": num_reqs, "attended_rows": num_reqs}
+    assert out.shape == q.shape and out.dtype == torch.bfloat16
+    assert torch.equal(
+        out[:num_reqs], torch.ones(num_reqs, 4, 128, dtype=torch.bfloat16)
+    )

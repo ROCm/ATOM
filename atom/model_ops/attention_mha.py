@@ -1921,12 +1921,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             output = self._sparse_pa_mxfp4(
                 q[:rows], k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
             )
-            if rows != q.shape[0]:
-                padded_output = torch.empty(
-                    q.shape, dtype=output.dtype, device=q.device
-                )
-                padded_output[:rows].copy_(output)
-                output = padded_output
         elif self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
                 decode_rows,
@@ -1934,7 +1928,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
 
             row_req, row_seq = decode_rows(decode_md.seq_lens, rows)
-            nvfp4_sparse_attention_gfx950(
+            output = nvfp4_sparse_attention_gfx950(
                 q[:rows],
                 k_cache,
                 k_scale,
@@ -1965,6 +1959,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 # Once per step only when the tail block is forced (see sparse_attn).
                 plan_step_owner=decode_md if self.local_blocks >= 1 else None,
             )
+        if output.shape[0] != q.shape[0]:
+            padded_output = torch.empty(q.shape, dtype=output.dtype, device=q.device)
+            padded_output[:rows].copy_(output)
+            output = padded_output
         self._index_q = None
         self._index_q_cache_key_info = None
         output = output.view(*q.shape)

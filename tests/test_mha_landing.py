@@ -400,6 +400,9 @@ def test_mha_budget_is_visible_through_connector_factory(monkeypatch):
         decode_context_parallel_size=1,
         kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
     )
-    assert KVConnectorFactory.kv_budget_reserve_bytes(cfg) == mha_landing_reserve_bytes(
-        cfg
-    )
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        assert KVConnectorFactory.kv_budget_reserve_bytes(
+            cfg
+        ) == mha_landing_reserve_bytes(cfg)
