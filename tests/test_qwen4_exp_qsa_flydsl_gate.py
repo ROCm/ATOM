@@ -108,3 +108,56 @@ def test_flag_off_falls_back(flydsl, monkeypatch):
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
     assert _call(_layer()) is None
     assert flydsl == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_mixed_prefix_batch_gathers_full_contexts(monkeypatch):
+    """Prefixed and fresh requests with unequal lengths on non-consecutive
+    pages, crossing page boundaries: the bridge's context rows must be every
+    request's full context in request-major order, and the kernel must receive
+    exactly those K/V rows plus the per-request query / prefix lengths."""
+    from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
+
+    device, block, pages = "cuda", 4, 12
+    prefixes, extends = (5, 0, 2), (3, 6, 1)
+    seqs = tuple(p + e for p, e in zip(prefixes, extends))
+    tables = torch.tensor(
+        [[7, 2, 11], [5, 9, 11], [0, 11, 11]], dtype=torch.int32, device=device
+    )
+    batch = SimpleNamespace(extend_seq_lens_cpu=list(extends), seq_lens_cpu=list(seqs))
+    host_lens, context_slots = _flydsl_prefill_layout(
+        batch, len(seqs), sum(extends), tables, block
+    )
+    assert host_lens == (extends, seqs)
+    expected_slots = [
+        int(tables[r, t // block]) * block + t % block
+        for r, seq in enumerate(seqs)
+        for t in range(seq)
+    ]
+    assert context_slots.tolist() == expected_slots
+
+    # Each cache row holds its own flat index, so gathered rows name themselves.
+    rows = torch.arange(pages * block, device=device, dtype=torch.bfloat16)
+    k_cache = rows.view(pages, block, 1, 1).expand(-1, -1, 1, 256).contiguous()
+    calls = []
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+    monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
+    monkeypatch.setattr(
+        qsa_attention,
+        "_flydsl_attention_op",
+        lambda: lambda q, k, v, indices, **kw: calls.append((k, v, kw)) or q,
+    )
+    layer = _layer(k_cache=k_cache, v_cache=-k_cache)
+    tokens = sum(extends)
+    query = torch.zeros(tokens, 12, 256, dtype=torch.bfloat16, device=device)
+    qsa = SimpleNamespace(host_lens=host_lens, context_slots=context_slots)
+    selected = _selection(tokens, 2051).to(device)
+    assert (
+        Qwen4ExpAttention._flydsl_attention(layer, query, query, query, selected, qsa)
+        is not None
+    )
+    ((k, v, kwargs),) = calls
+    assert k[:, 0, 0].tolist() == expected_slots
+    assert torch.equal(v, -k)
+    assert kwargs["query_lens"] == extends
+    assert kwargs["prefix_lens"] == prefixes
