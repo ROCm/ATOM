@@ -99,13 +99,40 @@ def _config(
         ({"pp": 2}, "does not support PP"),
         ({"dcp": 2}, "does not support DCP"),
         ({"pcp": 2}, "does not support PCP"),
-        ({"dp": 2, "dp_local": 1}, "only within one host"),
+        (
+            {"dp": 2, "dp_local": 1, "extra": {"lmcache.mp.host": "tcp://10.0.0.5"}},
+            "one LMCache server per host",
+        ),
         ({"tp": 1.5}, "tensor_parallel_size must be an integer"),
     ],
 )
 def test_mp_config_rejects_unsupported_topologies(kwargs, message):
     with pytest.raises((NotImplementedError, ValueError), match=message):
         deployment._validate_mp_config(_config(**kwargs))
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": 5555},
+        {"lmcache.mp.host": "tcp://localhost"},
+        {"lmcache.mp.server_urls": "tcp://[::1]:5555"},
+    ],
+)
+def test_mp_config_accepts_multi_node_dp_with_host_local_server(extra):
+    # Kimi-K3 dp8ep8 on two hosts: DP 8, 4 replicas per host, each host's
+    # replicas served by that host's own loopback LMCache server.
+    config = _config(
+        tp=1,
+        dp=8,
+        dp_local=4,
+        dp_rank=4,
+        enable_dp_attention=True,
+        enable_expert_parallel=True,
+        extra=extra,
+    )
+    assert deployment._validate_mp_config(config) == (1, 1)
 
 
 def test_mp_config_accepts_arbitrary_model_type():
