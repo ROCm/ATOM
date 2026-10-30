@@ -308,7 +308,7 @@ def _producer(tt, heads):
     c._block_head_major_runs = [p.head_major_runs for p in tt.pages]
     c._per_block_bytes_list = [p.region.unit_bytes for p in tt.pages]
     c.kv_caches_base_addr = [p.region.base_addr for p in tt.pages]
-    c._mla_staging = None
+    c._kv_staging = None
     c._MAX_RDMA_ENTRIES_PER_BATCH = 7
     return c, req
 

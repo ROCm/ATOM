@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from atom.kv_transfer.disaggregation.mooncake.mla_landing import LandingCredits
+from atom.kv_transfer.disaggregation.mooncake.landing import LandingCredits
 from atom.kv_transfer.disaggregation.sharded_transfer import (
     build_dcp_shard_plan,
     pack_slots,
@@ -229,13 +229,13 @@ def _producer(mc, regions, *, pool_size=0, slot_pages=0):
     conn._nic = _Nic()
     conn._rdma_write = conn._nic.write
     if pool_size:
-        conn._mla_staging = torch.empty(
+        conn._kv_staging = torch.empty(
             (pool_size, slot_pages * PAGE_BYTES), dtype=torch.uint8
         )
-        conn._mla_staging_slots = mc.SlotPool(pool_size)
+        conn._kv_staging_slots = mc.SlotPool(pool_size)
         conn._stream = _Stream()
         conn._send_worker_stream = lambda: conn._stream
-        conn._mla_token_views = {
+        conn._kv_source_views = {
             i: t.view(-1, TOKEN_BYTES) for i, t in enumerate(regions)
         }
     return conn
@@ -350,9 +350,9 @@ def test_staged_mla_matches_per_token_bytes(
     # Every staged descriptor carries at least one page's worth of tokens
     # except a trailing partial page, so descriptors never exceed pages.
     assert new._nic.descriptors <= 3 * len(dst_ids)
-    assert set(new._nic.labels) == {"staged-mla"}
+    assert set(new._nic.labels) == {"staged-kv"}
     assert new._stream.waited  # ordered after the ready event
-    assert sorted(new._mla_staging_slots.free) == [0, 1]  # every slot returned
+    assert sorted(new._kv_staging_slots.free) == [0, 1]  # every slot returned
     # The per-token path sends one descriptor per owned token per region.
     plan = build_dcp_shard_plan(
         src_ids, block_size=BLOCK_SIZE, dcp_size=dcp_size, dcp_rank=dcp_rank
@@ -425,7 +425,7 @@ def test_staged_mla_workers_wait_for_a_shared_slot():
     """Fewer slots than workers: a worker blocks until a slot is released."""
     mc = _mooncake()
     conn = _producer(mc, _source_regions(1, 1), pool_size=1, slot_pages=1)
-    pool = conn._mla_staging_slots
+    pool = conn._kv_staging_slots
     assert pool.acquire() == 0
     got = []
     waiter = threading.Thread(target=lambda: got.append(pool.acquire()))
@@ -450,20 +450,20 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
     dst = [torch.zeros(8, PAGE_BYTES, dtype=torch.uint8) for _ in range(2)]
     request = _request(2, 2, 0, 1, dst)
     if landing:
-        monkeypatch.setattr(mc, "MLA_LANDING_MIN_SLOTS", 1)
+        monkeypatch.setattr(mc, "LANDING_MIN_SLOTS", 1)
         offer = {"epoch": 1, "base": 0, "slot_bytes": 4 * PAGE_BYTES, "slots": [0]}
         conn._landing_credits = LandingCredits()
         conn._landing_credits.sync("consumer:1", offer)
         request.update(mla_landing=offer, notify_host="decode", notify_port=1)
     events = []
     conn._stream.synchronize = lambda: events.append("sync")
-    release = conn._mla_staging_slots.release
+    release = conn._kv_staging_slots.release
 
     def release_slot(idx):
         events.append("release")
         release(idx)
 
-    conn._mla_staging_slots.release = release_slot
+    conn._kv_staging_slots.release = release_slot
     index_select = torch.index_select
     calls = []
 
@@ -477,8 +477,9 @@ def test_a_failed_gather_ends_before_its_slot_is_released(monkeypatch, landing):
     monkeypatch.setattr(mc.torch, "index_select", second_gather_fails)
     with pytest.raises(RuntimeError, match="gather failed"):
         _run(mc, conn, request, range(4), [3, 5], object())
-    assert events == ["sync", "release"]
-    assert conn._mla_staging_slots.free == [0]
+    assert events[:2] == ["sync", "release"]
+    assert events[-1] == "sync"  # the shared index upload lifetime also ends
+    assert conn._kv_staging_slots.free == [0]
     if landing:
         # Never announced, so the credit went back too.
         assert conn._landing_credits.acquire("consumer:1", 1, 0) == 0
@@ -549,7 +550,7 @@ def test_staged_mla_leaves_index_regions_to_index_staging(monkeypatch):
     }
     event = object()
     assert _run(mc, conn, request, range(4), [3, 5], event)
-    assert conn._nic.labels == ["staged-mla"]
+    assert conn._nic.labels == ["staged-kv"]
     assert staged_index == [1]
     # Both staged paths order this worker's stream after the ready event.
     assert conn._stream.waited == [event, event]
@@ -586,19 +587,20 @@ def test_staging_gathers_bytes_whatever_the_kv_dtype(monkeypatch):
     tt = SimpleNamespace(
         block_regions=[published.region], block_tensor_views=[_Bf16View()]
     )
-    assert conn._build_mla_staging(tt) is None
-    assert conn._mla_staging is None
+    conn._kv_staging_reserve = 16 * (8 << 20)
+    assert conn._build_kv_staging(tt) is None
+    assert conn._kv_staging is None
 
 
-def test_mla_staging_is_disabled_by_env(monkeypatch):
+def test_kv_staging_is_disabled_by_env(monkeypatch):
     mc = _mooncake()
     monkeypatch.setenv("ATOM_PD_MLA_STAGING", "0")
     conn = object.__new__(mc.MooncakeConnector)
     conn.is_producer = True
     conn.dcp_size = 1
     conn._has_slot_regions = False
-    assert conn._build_mla_staging(object()) is None
-    assert conn._mla_staging is None
+    assert conn._build_kv_staging(object()) is None
+    assert conn._kv_staging is None
 
 
 class _DeviceNic:
@@ -641,12 +643,12 @@ def test_staged_mla_gathers_on_the_gpu(dcp_rank):
     dst_new = [torch.zeros_like(t) for t in dst_old]
     old = _producer(mc, regions)
     new = _producer(mc, regions, pool_size=1, slot_pages=2)
-    new._mla_staging = new._mla_staging.to(device)
+    new._kv_staging = new._kv_staging.to(device)
     new._cuda_device = device.index
     new._send_worker_streams = threading.local()
     del new._send_worker_stream  # the real per-worker stream
     old._rdma_write = _DeviceNic(regions + dst_old).write
-    nic = _DeviceNic(regions + dst_new + [new._mla_staging])
+    nic = _DeviceNic(regions + dst_new + [new._kv_staging])
     new._rdma_write = nic.write
     event = torch.cuda.Event()
     event.record()
@@ -660,7 +662,7 @@ def test_staged_mla_gathers_on_the_gpu(dcp_rank):
             event,
         )
     torch.cuda.synchronize()
-    assert set(nic.labels) == {"staged-mla"}
+    assert set(nic.labels) == {"staged-kv"}
     for a, b in zip(dst_old, dst_new):
         assert torch.equal(a, b)
         assert a.any()

@@ -11,18 +11,19 @@ import test_m3_kv_transfer_layout as layout
 import test_pd_chunked_transfer as protocol
 import torch
 
-from atom.kv_transfer.disaggregation.mha_landing import (
-    MHA_LANDING_LAYOUT,
-    MHA_POOL_SLOTS,
-    MHA_SCATTER_SEGMENTS,
-    MHA_SLOT_BYTES,
-    mha_landing_reserve_bytes,
-    mha_staging_reserve_bytes,
-)
-from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
+from atom.kv_transfer.disaggregation.mooncake.landing import (
+    LANDING_POOL_SLOTS,
+    LANDING_SLOT_BYTES,
     LandingCredits,
     LandingReceiver,
 )
+from atom.kv_transfer.disaggregation.staging_config import (
+    MHA_SCATTER_SEGMENTS,
+    LandingSpec,
+    mha_landing_reserve_bytes,
+    mha_staging_reserve_bytes,
+)
+from atom.kv_transfer.disaggregation.transfer_plan import PAGE_UNITS
 
 mc = protocol.mc
 
@@ -49,9 +50,9 @@ class Harness:
         self.device = torch.device(device)
         self.src_views = [p.view.to(device) for p in self.tt.pages]
         self.dst_views = [p.view.to(device) for p in self.consumer.pages]
-        c._mha_staging = torch.empty((1, 32768), dtype=torch.uint8, device=device)
-        c._mha_staging_slots = mc.SlotPool(1)
-        c._mha_page_views = dict(enumerate(self.src_views))
+        c._kv_staging = torch.empty((1, 32768), dtype=torch.uint8, device=device)
+        c._kv_staging_slots = mc.SlotPool(1)
+        c._kv_source_views = dict(enumerate(self.src_views))
         c._landing_credits = LandingCredits()
         c.kv_caches_base_addr = [v.data_ptr() for v in self.src_views]
         self.req["consumer_base_addrs"] = [v.data_ptr() for v in self.dst_views]
@@ -71,11 +72,11 @@ class Harness:
             device=0 if self.device.type == "cuda" else None,
             pool_slots=2,
             slot_bytes=32768,
-            block_size=1,
+            units_per_page=1,
             consumer_key="cpu:1",
             region_bases=self.req["consumer_base_addrs"],
             region_block_bytes=self.req["consumer_block_bpb"],
-            mla_regions=list(range(len(self.consumer.pages))),
+            region_indices=list(range(len(self.consumer.pages))),
             send=lambda addr, parts: c._landing_credits.release(
                 "cpu:1", self.recv.epoch, msgpack.loads(parts[-1])["slots"]
             ),
@@ -95,7 +96,7 @@ class Harness:
             self.recv._copy_segments = copy
         advertised = self.recv.advertise("s0", 1)
         if offer:
-            self.req["mla_landing"] = {**advertised, "layout": MHA_LANDING_LAYOUT}
+            self.req["mla_landing"] = {**advertised, "layout": PAGE_UNITS}
         self.recv.begin(21, 3, self.req["dst_block_ids"], {0: "s0"})
 
         def notify(addr, parts):
@@ -114,10 +115,10 @@ class Harness:
                 if self.device.type == "cpu":
                     ctypes.memmove(dst, src, n)
                 else:
-                    source = c._mha_staging.view(-1)[
+                    source = c._kv_staging.view(-1)[
                         src
-                        - c._mha_staging.data_ptr() : src
-                        - c._mha_staging.data_ptr()
+                        - c._kv_staging.data_ptr() : src
+                        - c._kv_staging.data_ptr()
                         + n
                     ]
                     owner = next(
@@ -141,7 +142,7 @@ class Harness:
         self.recv._process(tasks)
 
     def send(self, src, dst, offset=0):
-        self.req["_mha_dst_offset"] = offset
+        self.req["_transfer_dst_offset"] = offset
         return self.c._execute_block_transfer(
             self.req, "cpu:1", src, dst, 21, self.event
         )
@@ -166,7 +167,7 @@ def test_full_transfer_matches_physical_nvfp4_fp4_and_draft(held, rank, offer):
         assert h.ready
         assert all(len(src) == 1 for src, _, _ in h.writes)
         assert [x["seq"] for x in h.ready] == list(range(len(h.ready)))
-        h.recv.stage_done(21, 0, 3, True, h.req["_mla_landed"])
+        h.recv.stage_done(21, 0, 3, True, h.req["_landed_slots"])
         assert h.finished == [(21, False)]
 
 
@@ -183,7 +184,7 @@ def test_chunks_use_receive_global_page_offsets_and_sequences(rank, cached):
         assert h.finished == []
     assert [x["seq"] for x in h.ready] == list(range(len(h.ready)))
     assert {row[1] for x in h.ready for row in x["items"]} == set(range(len(ids)))
-    h.recv.stage_done(21, 0, 3, True, h.req["_mla_landed"])
+    h.recv.stage_done(21, 0, 3, True, h.req["_landed_slots"])
     assert h.finished == [(21, False)]
 
 
@@ -192,7 +193,7 @@ def test_credit_exhaustion_gathers_remaining_pages_to_direct_destinations():
     assert h.send([3, 1, 2], [2, 0, 3])
     assert len(h.ready) == 2
     assert any(len(src) > 1 for src, _, _ in h.writes)
-    h.recv.stage_done(21, 0, 3, True, h.req["_mla_landed"])
+    h.recv.stage_done(21, 0, 3, True, h.req["_landed_slots"])
     assert h.finished == []
     h.pump()
     h.check([3, 1, 2], [2, 0, 3])
@@ -214,10 +215,10 @@ def test_failed_nic_quarantines_landing_and_retains_source_staging(monkeypatch):
     monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     h.c.transfer_engine.batch_transfer_sync_write = lambda *args: -1
     assert not h.send([3, 1, 2], [2, 0, 3])
-    assert h.c._mha_staging_failed
-    assert h.c._mha_staging_slots.free == []
+    assert h.c._kv_staging_failed
+    assert h.c._kv_staging_slots.free == []
     with pytest.raises(RuntimeError, match="staging row unavailable"):
-        h.c._mha_staging_slots.acquire()
+        h.c._kv_staging_slots.acquire()
     assert len(h.c._landing_credits._targets["cpu:1"].quarantined) == 1
     assert h.ready == []
 
@@ -228,14 +229,14 @@ def test_gather_failure_synchronizes_before_releasing_slot(monkeypatch):
     h.stream.synchronize = sync
 
     def fail(*args):
-        assert h.c._mha_staging_slots.free == []
+        assert h.c._kv_staging_slots.free == []
         raise RuntimeError("gather failed")
 
-    monkeypatch.setattr(mc, "gather_head_pages", fail)
+    monkeypatch.setattr(mc, "gather_units", fail)
     with pytest.raises(RuntimeError, match="gather failed"):
         h.send([3, 1, 2], [2, 0, 3])
     assert sync.call_count >= 1
-    assert h.c._mha_staging_slots.free == [0]
+    assert h.c._kv_staging_slots.free == [0]
     assert not h.c._landing_credits._targets["cpu:1"].in_flight
     assert h.writes == []
 
@@ -244,8 +245,8 @@ def test_gather_failure_synchronizes_before_releasing_slot(monkeypatch):
 def test_chunk_handoff_is_checked_before_landing_completion(bad):
     h = Harness([6, 7], 0)
     c = h.c
-    c._mla_landing = h.recv
-    c._mha_landing_enabled = True
+    c._landing = h.recv
+    c._landing_spec = LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, True)
     c._pending_handoffs = {
         21: {
             "failed": False,
@@ -277,14 +278,14 @@ def test_reserves_are_gated_and_bounded(monkeypatch, workers):
         decode_context_parallel_size=1,
         kv_transfer_config={"kv_role": "kv_producer", "num_worker_threads": workers},
     )
-    assert mha_staging_reserve_bytes(cfg) == min(workers, 32) * MHA_SLOT_BYTES
+    assert mha_staging_reserve_bytes(cfg) == min(workers, 32) * LANDING_SLOT_BYTES
     assert mha_landing_reserve_bytes(cfg) == 0
     cfg.tensor_parallel_size = 4
     cfg.kv_transfer_config["kv_role"] = "kv_consumer"
     assert mha_staging_reserve_bytes(cfg) == 0
     assert (
         mha_landing_reserve_bytes(cfg)
-        == MHA_POOL_SLOTS * MHA_SLOT_BYTES + 3 * 8 * MHA_SCATTER_SEGMENTS
+        == LANDING_POOL_SLOTS * LANDING_SLOT_BYTES + 3 * 8 * MHA_SCATTER_SEGMENTS
     )
     for key, val in [
         ("decode_context_parallel_size", 4),
@@ -304,13 +305,13 @@ def test_gpu_gather_rdma_landing_scatter_real_nvfp4_index_draft(rank):
     h = Harness([6, 7], rank, device="cuda")
     for offset in range(3):
         assert h.send([[3, 1, 2][offset]], [[2, 0, 3][offset]], offset)
-    h.recv.stage_done(21, 0, 3, True, h.req["_mla_landed"])
+    h.recv.stage_done(21, 0, 3, True, h.req["_landed_slots"])
     assert h.finished == [(21, False)]
     h.check([3, 1, 2], [2, 0, 3])
     assert len(h.ready) > h.recv._pool_slots  # NIC rewrites the same slots.
 
 
-def test_off_path_records_ready_event_with_only_mha_staging(monkeypatch):
+def test_off_path_records_ready_event_with_only_kv_staging(monkeypatch):
     h = Harness([6, 7], 0)
     h.c._index_staging_pool_size = 0
     event = MagicMock()
@@ -336,8 +337,8 @@ def test_real_consumer_offers_page_landing_and_waits_for_scatter(monkeypatch, ch
         zip(h.req["consumer_base_addrs"], h.req["consumer_block_bpb"])
     )
     d.kv_caches_base_addr = h.req["consumer_base_addrs"]
-    d._mha_landing_enabled = True
-    d._mla_landing = h.recv
+    d._landing_spec = LandingSpec(1, MHA_SCATTER_SEGMENTS, PAGE_UNITS, True)
+    d._landing = h.recv
     h.recv._finish = d._complete_recv
     h.recv._partitions.clear()
     h.recv._unassigned = list(range(h.recv._pool_slots))
@@ -366,7 +367,7 @@ def test_real_consumer_offers_page_landing_and_waits_for_scatter(monkeypatch, ch
     ]
     assert len(requests) == 1
     request = requests[0]
-    assert request["mla_landing"]["layout"] == MHA_LANDING_LAYOUT
+    assert request["mla_landing"]["layout"] == PAGE_UNITS
     h.req.update(request)
     # The fixture's copy engine and credit callbacks name this local target.
     h.req["consumer_host"] = "cpu"
@@ -378,7 +379,7 @@ def test_real_consumer_offers_page_landing_and_waits_for_scatter(monkeypatch, ch
         0,
         write_nonce=request["write_nonce"],
         handoff=handoff,
-        landed_slots=h.req["_mla_landed"],
+        landed_slots=h.req["_landed_slots"],
     )
     assert 21 not in d.done_recving
     h.pump()

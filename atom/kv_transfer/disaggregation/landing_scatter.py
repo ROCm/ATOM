@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Decode-side scatter of landed MLA rows into the paged KV cache.
+"""Scatter landed KV units into destination PAGEs using byte segments.
 
-A DCP producer packs the rows a decode rank owns into a landing slot in rank
-order (see ``MooncakeConnector._execute_mla_regions``). Row ``j`` of
-consumer region ``c`` belongs at token ``j % block_size`` of destination block
-``dst_block_ids[j // block_size]``, so consecutive rows fill whole destination
-pages. The scatter copies one segment -- a run of rows that is contiguous at
-the destination, at most one page -- per 1-warp program. That page-granular
-copy is about 2x faster than ``index_copy_`` and, because each program is short
-and light on registers, slows concurrent decode kernels about 3x less.
+The transfer plan chooses each rank's data and packs it into contiguous units.
+Unit j belongs at j % units_per_page of dst_block_ids[j // units_per_page].
+A unit can be a token row or a whole physical PAGE. Each GPU program copies
+one contiguous segment within a destination PAGE; the kernel is independent
+of attention family and the topology that produced that mapping.
 """
 
 from __future__ import annotations
@@ -82,7 +79,7 @@ def landing_segments(
     region_base: np.ndarray,
     block_bytes: np.ndarray,
     dst_block_ids: np.ndarray,
-    block_size: int,
+    units_per_page: int,
     dst_origin: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Byte segments for the landed items of one request, vectorized.
@@ -90,8 +87,8 @@ def landing_segments(
     Item ``i`` holds rows ``[row_start[i], row_start[i] + row_count[i])`` of a
     region whose blocks are ``block_bytes[i]`` wide at ``region_base[i]``; the
     rows sit contiguously at byte ``src_offset[i]`` of the landing pool. Row
-    ``j`` belongs at token ``j % block_size`` of block
-    ``dst_block_ids[j // block_size]``. Returns ``(src, dst, nbytes)``, with
+    ``j`` belongs at unit ``j % units_per_page`` of block
+    ``dst_block_ids[j // units_per_page]``. Returns ``(src, dst, nbytes)``, with
     ``dst`` relative to ``dst_origin``; a segment never crosses a destination
     page, because consecutive pages are not adjacent in general.
     """
@@ -107,27 +104,27 @@ def landing_segments(
     if row_start.size == 0:
         empty = np.empty(0, dtype=np.int64)
         return empty, empty, empty
-    first_page = row_start // block_size
+    first_page = row_start // units_per_page
     row_stop = row_start + row_count
-    pages_per_item = (row_stop - 1) // block_size - first_page + 1
+    pages_per_item = (row_stop - 1) // units_per_page - first_page + 1
     item = np.repeat(np.arange(row_start.size), pages_per_item)
     item_start = np.cumsum(pages_per_item) - pages_per_item
     page = first_page[item] + np.arange(item.size) - item_start[item]
-    seg_row0 = np.maximum(page * block_size, row_start[item])
-    seg_row1 = np.minimum((page + 1) * block_size, row_stop[item])
-    token_bytes = np.asarray(block_bytes, dtype=np.int64)[item] // block_size
+    seg_row0 = np.maximum(page * units_per_page, row_start[item])
+    seg_row1 = np.minimum((page + 1) * units_per_page, row_stop[item])
+    unit_bytes = np.asarray(block_bytes, dtype=np.int64)[item] // units_per_page
     src = (
         np.asarray(src_offset, dtype=np.int64)[item]
-        + (seg_row0 - row_start[item]) * token_bytes
+        + (seg_row0 - row_start[item]) * unit_bytes
     )
     dst = (
         np.asarray(region_base, dtype=np.int64)[item]
         - dst_origin
         + np.asarray(dst_block_ids, dtype=np.int64)[page]
         * np.asarray(block_bytes, dtype=np.int64)[item]
-        + (seg_row0 - page * block_size) * token_bytes
+        + (seg_row0 - page * units_per_page) * unit_bytes
     )
-    return src, dst, (seg_row1 - seg_row0) * token_bytes
+    return src, dst, (seg_row1 - seg_row0) * unit_bytes
 
 
 def segment_table_capacity(num_segments: int) -> int:

@@ -18,7 +18,7 @@ its own KV allocations. A slot packs complete destination PAGEs, potentially
 from several layers/planes, and uses one RDMA descriptor. No new cross-GPU
 scatter or decode-side collective is introduced. A wire row is one whole
 physical PAGE (`mha_pages_v1`), so page-16 SHUFFLE and page-128 NVFP4 do not need
-a token-contiguous layout. The consumer's scatter uses the existing segment
+a token-contiguous layout. The consumer's scatter uses the shared segment
 copy kernel and waits for the compute-stream event recorded at admission.
 
 All source/destination head geometry and semantic roles are checked for the
@@ -44,8 +44,8 @@ waiting for more credits. A consumer without a landing offer can use this
 staged path too; a producer without MHA staging keeps the original direct path.
 
 A gather must finish before its source slot is reused, including exceptions.
-A failed RDMA quarantines the remote credit and permanently retains the local
-staging pool until connector teardown, because the NIC may still read it;
+An uncertain RDMA failure quarantines the remote credit and retains its local
+staging slot until connector teardown, because the NIC may still read it;
 waiters are awakened with an error and later requests use the original direct
 path. Successful RDMA is recorded in the write-done manifest before READY can
 fail to send. Decode still observes the existing failed-write page hold.
@@ -58,7 +58,9 @@ D allocates 32 x 8 MiB landing slots plus a 4096-column int64 scatter table
 cache sizing. Gathering uploads one int64 source block index per chunk; the
 copy is synchronized before that metadata is released. The first version is
 limited to MiniMax M3, TP1 P and TP-sharded D, without DCP or slot-state pools.
-The existing MLA/DCP path and Store's persistent KV layout are unchanged.
+The existing MLA/DCP configuration gates and Store's persistent KV layout are
+unchanged. MLA/DCP now uses the same buffer and sender lifecycle as this path;
+uncertain writes retain their source slots on both paths.
 
 ## Validation and CI recipes
 
@@ -88,10 +90,50 @@ RDMA descriptor counts, gather/scatter cost, KV-ready wait, TTFT and ITL alongsi
 both p90 interactivity metrics and throughput. Reduced descriptor counts alone
 do not establish improved model performance or explain the earlier PP OFF ITL.
 
-Local validation on 2026-10-30: 608 tests passed across the MHA landing,
+Initial validation on 2026-10-30: 608 tests passed across the MHA landing,
 M3 physical layouts, chunk protocol, MLA landing/staging, model-runner fence,
 connector topology, and PP suites. GPU tests ran on MI308X with ROCm 7.2.4;
 the NIC was simulated. Black, Ruff and whitespace checks passed. The actual
 CI matrix parser expanded all four cases for `atomesh-cicd`, with automatic
 placement and identical inherited workload settings. Full-model MI355X
 accuracy and C32 measurements for this optimization have not run yet.
+
+## Shared transport structure
+
+The implementation now follows peer topology rather than dispatching an entire
+transport by attention family:
+
+- `transfer_plan.py`: `TransferTopology` selects DCP token ownership and TP
+  partition/replication. `RegionLayout` supplies source/target PAGE widths,
+  head runs and the declared token-contiguous capability. Explicit region
+  indices describe the PP layer mapping. `TransferPlan` supplies gathered
+  units, packing, READY offsets and MR-bounded direct-write descriptors.
+- `gather.py`: contiguous rows use `index_select`; strided byte slices use
+  the gather kernel. Both receive physical layouts and indices, without a
+  model-family input.
+- `mooncake_connector.py`: one source pool, one staged sender, and one slot
+  write lifecycle handle both unit mappings, including deadlines, credit
+  fallback and chunk-global manifests.
+- `mooncake/landing.py`: one receiver and credit protocol with explicit
+  `units_per_page` and eligible region indices.
+- `staging_config.py`: legacy switches gate validated configurations and
+  reserve memory. These model gates do not select transport algorithms.
+
+The legacy wire key `mla_landing` and PAGE layout ID `mha_pages_v1` are retained
+for compatibility. An offer without a layout ID retains the legacy token-row
+interpretation. Existing MLA chunk restrictions remain in place. Combining
+DCP token repartition with a TP head repartition needs an additional physical
+adapter and is explicitly rejected; the planner already handles DCP with
+TP-replicated planes. This refactor does not add model-compute support for
+new parallel configurations or merge the separate MiniMax DCP branch.
+
+The topology tests use the same multihead byte layout with different D TP/DCP
+settings and compare independent expected bytes, including head replication,
+partial token pages and PP region mapping. Failure tests distinguish writes
+that never started from operations whose completion is uncertain; only the
+latter retain source slots and quarantine destination credits.
+
+After the shared-transport refactor, 703 tests passed locally, including the
+additional topology and GPU buffer-allocation tests and M3 PP transfer suite.
+Real RDMA and full-model MI355X accuracy/performance remain pending; the GPU
+transfer tests still use a simulated NIC.

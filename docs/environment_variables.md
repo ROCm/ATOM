@@ -642,7 +642,15 @@ Default: `0`. It is independent of `enable_chunked_transfer`; both whole-prompt
 and incremental transfers are supported. P reserves one 8 MiB staging slot per
 send worker, capped at 256 MiB per GPU. Each D GPU reserves 256 MiB for landing
 plus 96 KiB for the scatter table, before KV cache sizing. Other models, DCP,
-and slot-state layouts retain their existing transfer paths.
+and slot-state layouts retain their existing support gates.
 
 See [MiniMax PP-to-TP landing](minimax_m3_pp_tp_landing.md) for the protocol,
 fallback and validation recipes.
+
+MLA and MiniMax use the same staging pool lifecycle, landing receiver and
+transport implementation. The peer topology determines ownership; physical
+region metadata determines gather/scatter addressing. The switches above keep
+their existing defaults and supported configurations. An uncertain staged RDMA
+failure retains its source slot until connector teardown and disables further
+staging on that connector; later requests use the existing direct path. A write
+that finishes or stops before submission releases its slot normally.

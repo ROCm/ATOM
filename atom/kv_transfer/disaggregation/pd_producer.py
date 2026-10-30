@@ -17,10 +17,10 @@ from atom.utils import envs
 _PD_TRANSFER_CONNECTORS = frozenset({"mooncake", "moriio"})
 # Only Mooncake consumes staging callbacks / pool slots (DSA index and MLA).
 _MOONCAKE_CONNECTORS = frozenset({"mooncake"})
-# MLA staging: one slot of this size per send worker, the pool capped in bytes
+# KV staging: one slot of this size per send worker, the pool capped in bytes
 # so a large ``num_worker_threads`` makes workers share slots.
-MLA_STAGING_SLOT_BYTES = 8 << 20
-MLA_STAGING_POOL_BYTES = 256 << 20
+STAGING_SLOT_BYTES = 8 << 20
+STAGING_POOL_BYTES = 256 << 20
 
 
 def _canonical(connector: dict, *, path: str) -> str | None:
@@ -111,27 +111,27 @@ def send_worker_count(connector: dict) -> int:
     return count
 
 
-def mla_staging_pool_bytes(num_send_workers: int) -> int:
-    """HBM one Mooncake producer holds back for its MLA staging pool.
+def staging_pool_bytes(num_send_workers: int) -> int:
+    """HBM one Mooncake producer holds back for its KV staging pool.
 
-    One ``MLA_STAGING_SLOT_BYTES`` slot per send worker, capped at
-    ``MLA_STAGING_POOL_BYTES``, so a large ``num_worker_threads`` makes
+    One ``STAGING_SLOT_BYTES`` slot per send worker, capped at
+    ``STAGING_POOL_BYTES``, so a large ``num_worker_threads`` makes
     workers share slots instead of growing HBM.
     """
 
-    return min(num_send_workers * MLA_STAGING_SLOT_BYTES, MLA_STAGING_POOL_BYTES)
+    return min(num_send_workers * STAGING_SLOT_BYTES, STAGING_POOL_BYTES)
 
 
-def mla_staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
-    """MLA staging slots for one producer: one per send worker, within its reserve.
+def staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
+    """KV staging slots for one producer: one per send worker, within its reserve.
 
-    ``slot_bytes`` follows the MLA layout and exceeds ``MLA_STAGING_SLOT_BYTES``
+    ``slot_bytes`` follows the physical layout and exceeds ``STAGING_SLOT_BYTES``
     when one block is wider. The pool then gets fewer slots, or none (the
     producer keeps per-token sends), rather than outgrow what
     ``mla_staging_reserve_bytes`` held back from the KV cache.
     """
 
-    return min(num_send_workers, mla_staging_pool_bytes(num_send_workers) // slot_bytes)
+    return min(num_send_workers, staging_pool_bytes(num_send_workers) // slot_bytes)
 
 
 def plain_mla_model(config) -> bool:
@@ -159,7 +159,7 @@ def mla_staging_reserve_bytes(config) -> int:
 
     An upper bound of what ``MooncakeConnector`` allocates after the KV cache
     is sized: every Mooncake producer entry on a plain MLA model without
-    producer DCP gets ``mla_staging_pool_bytes``, which its slots fit into.
+    producer DCP gets ``staging_pool_bytes``, which its slots fit into.
     """
 
     if (
@@ -169,6 +169,6 @@ def mla_staging_reserve_bytes(config) -> int:
     ):
         return 0
     return sum(
-        mla_staging_pool_bytes(send_worker_count(connector))
+        staging_pool_bytes(send_worker_count(connector))
         for connector in _producer_connectors(config, _MOONCAKE_CONNECTORS)
     )

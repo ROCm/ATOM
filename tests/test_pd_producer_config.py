@@ -8,10 +8,10 @@ import pytest
 from atom.kv_transfer.disaggregation.pd_producer import (
     index_staging_pool_size,
     mla_staging_reserve_bytes,
-    mla_staging_slot_count,
     mooncake_pd_producer_configured,
     pd_producer_configured,
     send_worker_count,
+    staging_slot_count,
 )
 
 
@@ -129,15 +129,15 @@ def test_send_worker_count_defaults_to_sixteen():
     assert send_worker_count({"kv_connector": "mooncake"}) == 16
 
 
-def test_mla_staging_slots_are_capped_by_pool_bytes():
+def test_kv_staging_slots_are_capped_by_pool_bytes():
     slot = 8 << 20
-    assert mla_staging_slot_count(16, slot) == 16
-    assert mla_staging_slot_count(128, slot) == 32  # 256 MiB cap
+    assert staging_slot_count(16, slot) == 16
+    assert staging_slot_count(128, slot) == 32  # 256 MiB cap
     # A slot wider than 8 MiB (one wide MLA block) gets fewer slots, or none,
     # rather than outgrow the reserve: 4 x 12 MiB used to take 48 of 32 MiB.
-    assert mla_staging_slot_count(4, 12 << 20) == 2
-    assert mla_staging_slot_count(1, 12 << 20) == 0
-    assert mla_staging_slot_count(128, (256 << 20) + 64) == 0
+    assert staging_slot_count(4, 12 << 20) == 2
+    assert staging_slot_count(1, 12 << 20) == 0
+    assert staging_slot_count(128, (256 << 20) + 64) == 0
 
 
 def _mla_producer_config(workers, **overrides):
@@ -154,7 +154,7 @@ def _mla_producer_config(workers, **overrides):
     return SimpleNamespace(**config)
 
 
-def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
+def test_kv_staging_reserve_covers_the_connector_pool(monkeypatch):
     monkeypatch.delenv("ATOM_PD_MLA_STAGING", raising=False)
     assert mla_staging_reserve_bytes(_mla_producer_config(16)) == 128 << 20
     assert mla_staging_reserve_bytes(_mla_producer_config(128)) == 256 << 20
@@ -163,7 +163,7 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
     for page in (16 * 576, 12 << 20):
         slot = max(page, (8 << 20) // page * page)
         for workers in (1, 4, 16, 31, 32, 33, 128):
-            allocated = mla_staging_slot_count(workers, slot) * slot
+            allocated = staging_slot_count(workers, slot) * slot
             reserved = mla_staging_reserve_bytes(_mla_producer_config(workers))
             assert allocated <= reserved
 
@@ -201,7 +201,7 @@ def test_mla_staging_reserve_covers_the_connector_pool(monkeypatch):
         ({}, {"ATOM_PD_MLA_STAGING": "0"}),
     ],
 )
-def test_mla_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env):
+def test_kv_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env):
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert mla_staging_reserve_bytes(_mla_producer_config(16, **overrides)) == 0
