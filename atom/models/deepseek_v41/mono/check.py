@@ -19,10 +19,10 @@ from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.v4_kernels.indexer_weights import scale_indexer_weights
 from atom.model_ops.v4_kernels.paged_decode import _sparse_attn_v4_paged_decode_triton
 from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels import attention as attention_kernel
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.kernels import attention as attention_kernel
+from atom.models.deepseek_v41.mono.gfx950.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import HEAD_TILE
 from atom.mono.runtime.compare import compare
 

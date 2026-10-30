@@ -31,15 +31,17 @@ ATTENTION_KEYS_MAX = 64 * 16
 INDEXER_SHAPE = (ip.TOPK, ip.TOPK_BLOCKS, ip.BLOCK_ROWS, ip.HEADS, ip.DIM)
 
 
-def config_refusal(atom_config) -> str | None:
+def config_refusal(atom_config, *, arch="gfx950", enabled=None) -> str | None:
     """Why this deployment cannot use V4.1 mono, or None."""
     spec = atom_config.speculative_config
     method = None if spec is None else spec.method
     dspark = method == "dspark"
     hf = atom_config.hf_config
     keys = hf.sliding_window + hf.index_topk
-    checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA) + [
+    checks = [(envs.ATOM_MONO_ENABLE if enabled is None else enabled, "switched off")]
+    checks += common_refusals(
+        atom_config, Dims, SUPPORTED_TP, SUPPORTED_DPA, arch=arch
+    ) + [
         (
             atom_config.kv_cache_dtype in ("bf16", "fp8"),
             f"kv cache {atom_config.kv_cache_dtype}",

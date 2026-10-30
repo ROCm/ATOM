@@ -109,7 +109,8 @@ def _lift_kernel(
 
 
 def candidate_block_table(
-    candidates, block_tables, batch_ids, units_per_page, visible, *, rows_per_block
+    candidates, block_tables, batch_ids, units_per_page, visible, *, rows_per_block,
+    out=None,
 ):
     """`(table, context)` for scoring only the blocks `candidates` kept.
 
@@ -121,8 +122,15 @@ def candidate_block_table(
     a caller inside a graph capture gets the address the replay will read.
     """
     tokens, topk_blocks = candidates.shape
-    table = torch.empty_like(candidates)
-    context = torch.empty(tokens, dtype=torch.int32, device=candidates.device)
+    if out is None:
+        table = torch.empty_like(candidates)
+        context = torch.empty(tokens, dtype=torch.int32, device=candidates.device)
+    else:
+        table, context = out
+        if (table.shape != candidates.shape or context.shape != (tokens,)
+            or any(t.dtype != torch.int32 or t.device != candidates.device
+                   or not t.is_contiguous() for t in out)):
+            raise ValueError("candidate table output must be contiguous int32 on the input device")
     if tokens:
         _candidate_table_kernel[(tokens,)](
             candidates,

@@ -19,9 +19,9 @@ Usage: python -m atom.models.deepseek_v41.mono.contract [S ...]
 import sys
 
 from atom.models.deepseek_v41.mono import index_plan as ip
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.kernels import layer_post as k2
 from atom.models.deepseek_v41.mono.kernels.moe_shape import MoeBuild
 from atom.mono.plan.check import RegionDecl
 from atom.mono.plan.trace import Space
