@@ -116,7 +116,13 @@ percentiles. Prefill and decode request contexts are exact gauges.
 KV block partition counts are maintained as blocks change state; snapshot
 collection does not scan the free block pool.
 
-Both request context gauges replace the former histograms of the same names;
+Both request context gauges are **disabled by default**. For a short diagnostic
+capture, set `ATOM_ENABLE_METRICS_REQUEST_CONTEXT=1` before starting every
+scheduler process. When disabled, these gauges are not registered and no
+per-request samples are written. Aggregate context histograms, queue and batch
+metrics, cache counters and the independent GPU timing option are unaffected.
+
+These gauges replace the former histograms of the same names;
 their `_bucket`, `_count`, and `_sum` series are no longer emitted. Reports show
 exact request points, a table, and CSV rows instead of P50/P99 curves. The
 `started_at` label records the first dispatch time for that phase, not scrape time.
@@ -128,11 +134,13 @@ regardless of prefix cache hits. The per-batch context histogram continues to
 measure context through each chunk end.
 For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
-These are intentionally per-request metrics: series count grows with requests.
+When enabled, these are per-request metrics: series count grows with requests.
 Samples remain after request completion so even short requests can be scraped.
 Native multiprocess files retain them until the service's metrics directory is
-cleaned; there is no automatic per-request expiry. Use a fresh service/metrics
-directory between long benchmark runs when this accumulated cardinality matters.
+cleaned; there is no automatic per-request expiry. Keep this option disabled
+for sustained serving and throughput benchmarks. Disabling it does not remove
+old samples from an existing metrics directory: restart the service with a fresh
+metrics directory, without deleting storage used by live workers.
 
 ### GPU forward timing
 

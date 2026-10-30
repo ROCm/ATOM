@@ -719,6 +719,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_SHUTDOWN_TIMEOUT_S", "5"
     ),
     # --- Profiling & Logging ---
+    "ATOM_ENABLE_METRICS_REQUEST_CONTEXT": lambda: os.getenv(
+        "ATOM_ENABLE_METRICS_REQUEST_CONTEXT", "0"
+    )
+    == "1",
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
     ),

@@ -470,6 +470,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
 
 
 def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeypatch):
+    monkeypatch.setenv("ATOM_ENABLE_METRICS_REQUEST_CONTEXT", "1")
     import numpy as np
     from prometheus_client import CollectorRegistry, generate_latest
 
@@ -584,6 +585,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
 
 
 def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
+    monkeypatch.setenv("ATOM_ENABLE_METRICS_REQUEST_CONTEXT", "1")
     from prometheus_client import CollectorRegistry, generate_latest
 
     registry = CollectorRegistry()
