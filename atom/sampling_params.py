@@ -20,6 +20,9 @@ class SamplingParams:
     n: int = 1
     logprobs: bool | int | None = None
     top_logprobs: int = 0
+    json_schema: str | None = None
+    # Generated reasoning tokens are unconstrained until this marker closes.
+    structured_reasoning_end: tuple[int, ...] = ()
 
     def __post_init__(self):
         if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20:

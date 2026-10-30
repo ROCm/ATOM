@@ -553,6 +553,13 @@ def _build_sampling_params(
     top_p: float = 1.0,
     n: int = 1,
 ) -> SamplingParams:
+    from .model_capabilities import deployment_metadata
+
+    output_limit = deployment_metadata(
+        _get_engine_config(), custom_message_encoder
+    ).get("max_output_tokens")
+    if output_limit is not None and max_tokens > output_limit:
+        raise ValueError(f"max_tokens must be <= {output_limit} for this deployment")
     return SamplingParams(
         temperature=temperature,
         top_k=top_k,
@@ -1716,6 +1723,63 @@ def _effective_thinking_enabled(kwargs):
     return effective.get(name, on_value) != off_value
 
 
+async def _configure_structured_output(
+    sampling_params, schema, kwargs, *, tools=None, kv_transfer=None, multimodal=False
+):
+    if schema is None:
+        return
+    if tools or kv_transfer or multimodal or sampling_params.logprobs:
+        raise ValueError(
+            "Structured output currently requires text without tools, P/D or logprobs"
+        )
+    config = _get_engine_config()
+    spec = getattr(config, "speculative_config", None)
+    if synthetic_token_text is not None or getattr(
+        spec, "synthetic_acceptance_rates", None
+    ):
+        raise ValueError("Structured output cannot use synthetic forced acceptance")
+    if sampling_params.ignore_eos or sampling_params.stop_strings:
+        raise ValueError(
+            "Structured output does not support ignore_eos or custom stop strings"
+        )
+    from atom.model_engine.structured_output import (
+        StructuredOutput,
+        structured_stop_token_ids,
+    )
+
+    # Compile before enqueue so invalid/unsupported schemas cannot crash workers.
+    compiler = getattr(_configure_structured_output, "compiler", None)
+    if (
+        compiler is None
+        or getattr(_configure_structured_output, "tokenizer", None) is not tokenizer
+    ):
+        hf = config.hf_config
+        vocab = getattr(hf, "text_config", hf).vocab_size
+        stops = structured_stop_token_ids(config, tokenizer)
+        compiler = await asyncio.to_thread(
+            StructuredOutput,
+            tokenizer,
+            vocab,
+            stops,
+        )
+        _configure_structured_output.compiler = compiler
+        _configure_structured_output.tokenizer = tokenizer
+    try:
+        await asyncio.to_thread(compiler.compile, schema)
+    except Exception as exc:
+        raise ValueError(f"Cannot compile JSON Schema: {exc}") from exc
+    sampling_params.json_schema = schema
+    if _effective_thinking_enabled(kwargs):
+        marker = getattr(reasoning_dialect, "think_end_marker", None)
+        if not marker:
+            raise ValueError(
+                "Structured thinking requires an explicit reasoning end marker"
+            )
+        sampling_params.structured_reasoning_end = tuple(
+            tokenizer.encode(marker, add_special_tokens=False)
+        )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1787,6 +1851,17 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         sampling_params.logprobs = bool(request.logprobs)
         sampling_params.top_logprobs = request.top_logprobs or 0
+        from .structured_output import schema_from_format
+
+        schema = schema_from_format(request.response_format)
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            merged_kwargs,
+            tools=request.tools,
+            kv_transfer=request.kv_transfer_params,
+            multimodal=_has_multimodal_content(messages),
+        )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1912,6 +1987,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 from .chat_logprobs import stream_logprobs
 
                 gen = stream_logprobs(gen, stream_collector.trackers)
+            if schema is not None:
+                from .structured_output import validate_chat_stream
+
+                gen = validate_chat_stream(gen, schema)
             if compatibility.chat_usage_on_finish:
                 gen = chat_stream_usage_on_finish(
                     gen,
@@ -2024,6 +2103,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
+        if schema is not None:
+            from .structured_output import validate_output
+
+            for choice in resp.choices:
+                validate_output(
+                    schema,
+                    choice["message"].get("content") or "",
+                    choice.get("finish_reason"),
+                )
         if logprob_codec is not None:
             from .chat_logprobs import response_logprobs
 
@@ -2707,6 +2795,19 @@ async def responses_create(raw_request: Request):
             top_p=(request.top_p if request.top_p is not None else model_top_p),
         )
 
+        from .structured_output import schema_from_format, validate_output
+
+        text_config = getattr(request, "text", None)
+        if text_config is not None and not isinstance(text_config, dict):
+            raise ValueError("text must be an object")
+        schema = schema_from_format((text_config or {}).get("format"), responses=True)
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            merged_kwargs,
+            tools=openai_tools,
+            kv_transfer=kv_transfer_params,
+        )
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
@@ -2764,6 +2865,7 @@ async def responses_create(raw_request: Request):
                 output_tokens = 0
                 opened = False
                 aborted = True
+                structured_text = []
                 try:
                     while True:
                         chunk_data = await stream_collector.get()
@@ -2788,6 +2890,8 @@ async def responses_create(raw_request: Request):
                                 ):
                                     yield _frame
                             else:
+                                if schema is not None:
+                                    structured_text.append(text)
                                 events = tool_parser.process(text)
                                 has_tool_calls = has_tool_calls or (
                                     completes_a_tool_call(events)
@@ -2802,6 +2906,11 @@ async def responses_create(raw_request: Request):
                             )
                             for _frame in emitter.frames_for_events(events):
                                 yield _frame
+                            validate_output(
+                                schema,
+                                "".join(structured_text),
+                                chunk_data.get("finish_reason"),
+                            )
                             aborted = False
                             cache_read = chunk_data.get("num_cached_tokens", 0)
                             usage = {
@@ -2871,6 +2980,15 @@ async def responses_create(raw_request: Request):
             created_at=created_at,
             finish_reason=final_output.get("finish_reason"),
         )
+        if schema is not None:
+            visible = "".join(
+                part.get("text", "")
+                for item in response.get("output", [])
+                if item.get("type") == "message"
+                for part in item.get("content", [])
+                if part.get("type") == "output_text"
+            )
+            validate_output(schema, visible, final_output.get("finish_reason"))
         return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:
@@ -2894,7 +3012,16 @@ async def responses_create(raw_request: Request):
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    return ModelList(data=[ModelCard(id=model_name)])
+    from .model_capabilities import deployment_metadata
+
+    return ModelList(
+        data=[
+            ModelCard(
+                id=model_name,
+                **deployment_metadata(_get_engine_config(), custom_message_encoder),
+            )
+        ]
+    ).model_dump(exclude_none=True)
 
 
 @app.get("/health")

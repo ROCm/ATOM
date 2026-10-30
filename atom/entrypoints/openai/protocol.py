@@ -397,6 +397,12 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
+    name: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    input_modalities: list[str] | None = None
+    output_modalities: list[str] | None = None
+    effort: dict[str, Any] | None = None
 
 
 class ModelList(BaseModel):

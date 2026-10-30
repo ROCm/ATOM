@@ -3236,6 +3236,27 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        structured = getattr(self, "structured_output", None)
+        if getattr(batch, "structured_requests", None) and structured is None:
+            from transformers import AutoTokenizer
+
+            from atom.model_engine.structured_output import (
+                StructuredOutput,
+                structured_stop_token_ids,
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model, trust_remote_code=self.config.trust_remote_code
+            )
+            stop_ids = structured_stop_token_ids(self.config, tokenizer)
+            structured = self.structured_output = StructuredOutput(
+                tokenizer, logits.shape[-1], stop_ids
+            )
+        structured_prefixes = (
+            structured.apply(logits, batch, spec_decode_metadata)
+            if structured is not None
+            else {}
+        )
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3318,6 +3339,9 @@ class ModelRunner:
             self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
+
+        if structured_prefixes:
+            structured.commit(sampled_tokens, batch, structured_prefixes)
 
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)
