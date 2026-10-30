@@ -390,6 +390,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
+    # V4.1 fused rope/window seam (`deepseek_v41/rope_window.py`): one program
+    # rotates every query head's RoPE tail of a token instead of one program a
+    # head. In-place BF16 query only (BF16 KV cache; the FP8 pool's MXFP8 query
+    # keeps a program a head); bit-exact. Read once at import.
+    "ATOM_DSV41_ROPE_HEAD_BLOCK": lambda: _flag_env("ATOM_DSV41_ROPE_HEAD_BLOCK"),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
