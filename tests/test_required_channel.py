@@ -8,6 +8,8 @@ The GPU half -- masking target rows and carrying the state across a deferred
 step -- is `tests/test_required_channel_mask.py`, which needs Triton.
 """
 
+import types
+
 import pytest
 from conftest import MockConfig
 
@@ -137,6 +139,93 @@ def test_k3_required_call_needs_tools_to_call():
         required_call_channel(KimiK3Parser, K3Tokenizer(), "required", TOOLS_ARG)
         == K3_CHANNEL
     )
+
+
+# ── the endpoints that build a chat request's sampling params ────────────
+#
+# Each chat entrypoint resolves the channel itself; a site that stops passing
+# it samples a required request unconstrained, and nothing else would notice.
+
+
+class _Submitted(Exception):
+    """Raised by a stub engine once it holds the request's sampling params."""
+
+
+def _k3_chat(tool_choice):
+    return {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": TOOLS_ARG,
+        "tool_choice": tool_choice,
+    }
+
+
+@pytest.mark.parametrize("tool_choice", ["required", "auto"])
+def test_openai_chat_endpoint_hands_the_channel_to_sampling(monkeypatch, tool_choice):
+    import asyncio
+
+    from atom.entrypoints.openai import api_server
+    from atom.entrypoints.openai.protocol import ChatCompletionRequest
+
+    seen = []
+
+    async def generate(_prompt, sampling_params, _request_id, **_kw):
+        seen.append(sampling_params)
+        yield {
+            "text": "hello",
+            "finish_reason": "eos",
+            "num_tokens_input": 1,
+            "num_tokens_output": 1,
+        }
+
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(api_server, "_request_logger", None)
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", {})
+    monkeypatch.setattr(api_server, "reasoning_toggle", None)
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", KimiK3Parser)
+    monkeypatch.setattr(api_server, "tokenizer", K3Tokenizer())
+    monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **k: "prompt")
+    monkeypatch.setattr(api_server, "generate_async", generate)
+
+    request = ChatCompletionRequest(**_k3_chat(tool_choice))
+    asyncio.run(api_server.chat_completions(request, None))
+    (sampling_params,) = seen
+    expected = K3_CHANNEL if tool_choice == "required" else None
+    assert sampling_params.required_channel == expected
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("tool_choice", ["required", "auto"])
+def test_atomesh_chat_endpoints_hand_the_channel_to_sampling(
+    monkeypatch, stream, tool_choice
+):
+    standalone = pytest.importorskip(
+        "atom.entrypoints.atomesh.atom_standalone_service", exc_type=ImportError
+    )
+    seen = []
+
+    def submit(_prompt, sampling_params, *_args, **_kw):
+        seen.append(sampling_params)
+        raise _Submitted
+
+    service = standalone.AtomStandaloneService.__new__(standalone.AtomStandaloneService)
+    service.model_name = "m"
+    service.default_chat_template_kwargs = {}
+    service.custom_message_encoder = None
+    service.tool_parser_cls = KimiK3Parser
+    service.tokenizer = K3Tokenizer()
+    service.engine_service = types.SimpleNamespace(generate=submit, start_stream=submit)
+    monkeypatch.setattr(standalone, "apply_chat_template", lambda *a, **k: "prompt")
+
+    entry = (
+        service.start_chat_completions_stream if stream else service.chat_completions
+    )
+    with pytest.raises(_Submitted):
+        entry(_k3_chat(tool_choice))
+    (sampling_params,) = seen
+    expected = K3_CHANNEL if tool_choice == "required" else None
+    assert sampling_params.required_channel == expected
 
 
 # ── the state machine ────────────────────────────────────────────────────
