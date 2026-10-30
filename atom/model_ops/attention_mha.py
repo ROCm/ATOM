@@ -19,7 +19,6 @@ from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     dense_decode_splits,
     flydsl_decode_seqs,
-    flydsl_decode_static_ok,
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
@@ -610,14 +609,28 @@ class PagedAttentionImpl(nn.Module):
         return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
     def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
-        """Without gluon decode (gfx1250): whether FlyDSL accepts this call.
+        """Whether a decode routed to unified runs on FlyDSL instead.
+
+        Two cases reach unified with a call FlyDSL may take: a GPU without
+        gluon decode (gfx1250), and a gluon GPU whose query length x group is
+        past the gluon envelope (Qwen3.5 MTP-5: qlen 6, group 8). Inside that
+        envelope a gluon GPU keeps its route. The decision is made per call,
+        on the same tensors and metadata ``run_pa_decode`` then receives, and
+        passed down as ``require_flydsl`` so the two cannot disagree.
 
         ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
+
+        gfx1250 with per-token FP8 KV past qlen 4 is decided by the same check;
+        it is not exercised by this path's tests or runs (out of scope here).
         """
         if (
             envs.ATOM_USE_UNIFIED_ATTN
-            or pa_decode_gluon_supports_arch()
+            or self.use_flash_layout
             or self.sliding_window > 0
+        ):
+            return False
+        if pa_decode_gluon_supports_arch() and not gluon_decode_over_limit(
+            attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
         ):
             return False
         num_seqs = attn_metadata.context_lens.shape[0]
@@ -660,7 +673,15 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
         if self._flydsl_takes_decode(q, k_cache, v_cache, attn_metadata):
             return self.paged_attention_triton(
-                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                require_flydsl=True,
             )
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
@@ -697,15 +718,22 @@ class PagedAttentionImpl(nn.Module):
 
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        require_flydsl: bool = False,
     ):
         """Decode through ``run_pa_decode``: gluon, or opted-in FlyDSL.
 
         Callers must have cleared ``gluon_decode_over_limit`` in
-        ``_dispatch_decode``, or established there through
-        ``flydsl_decode_static_ok`` that FlyDSL serves this layer past that
-        limit, or, on a GPU without gluon, established through
-        ``_flydsl_takes_decode`` that FlyDSL accepts the call.
+        ``_dispatch_decode`` or established through ``_flydsl_takes_decode``
+        that FlyDSL accepts the call; the latter pass ``require_flydsl=True``.
         """
 
         attn_metadata = fwd_ctx.attn_metadata
@@ -758,10 +786,7 @@ class PagedAttentionImpl(nn.Module):
             # max_context_length: the block-table bound is the same in graph
             # and eager, so both pick the same kernel specialization.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
-            # Past the gluon envelope only FlyDSL may run it; see _dispatch_decode.
-            require_flydsl=gluon_decode_over_limit(
-                attn_metadata.max_seqlen_q, num_q_heads_total, num_kv_heads
-            ),
+            require_flydsl=require_flydsl,
         )
 
         return o
@@ -1093,9 +1118,10 @@ class PagedAttentionImpl(nn.Module):
     def _dispatch_decode(self, max_qlen: int = 1):
         """Select the coarse decode runner from model shape and configuration.
 
-        Cache-dependent dispatch happens later: on a GPU without gluon,
-        ``paged_attention_unified`` hands FlyDSL calls inside its supported
-        domain and keeps the rest on unified attention. The vLLM bridge shares
+        Cache-dependent dispatch happens later: on a GPU without gluon, or
+        past the gluon envelope on one with it, ``paged_attention_unified``
+        hands FlyDSL calls inside its supported domain and keeps the rest on
+        unified attention. The vLLM bridge shares
         the constants and predicate, not this order -- its arms differ (no
         unified fallback, no sliding-window arm). Both
         paged kernels stop short of unified, at different points, and drafting
@@ -1114,23 +1140,6 @@ class PagedAttentionImpl(nn.Module):
         over_gluon = not pa_decode_gluon_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
-        # FlyDSL takes any query length, so a layer it will serve stays on the
-        # paged path past the gluon envelope (Qwen3.5 MTP-5: qlen 6, group 8).
-        # Only evaluated when the limit is actually hit, so every within-limit
-        # route -- including MTP-3 -- is decided exactly as before. A GPU
-        # without gluon already reaches FlyDSL through paged_attention_unified.
-        flydsl_past_gluon = False
-        if over_gluon and pa_decode_gluon_supports_arch() and not self.use_flash_layout:
-            flydsl_past_gluon = flydsl_decode_static_ok(
-                head_dim=self.head_dim,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                kv_cache_dtype=self.kv_cache_dtype,
-                block_size=get_current_atom_config().kv_cache_block_size,
-                sliding_window=self.sliding_window,
-                has_sinks=self.sinks is not None,
-            )
-            over_gluon = not flydsl_past_gluon
         over_asm = (
             max_qlen * (self.num_heads // self.num_kv_heads)
             > PA_ASM_MAX_QUERY_GROUP_SIZE
@@ -1162,10 +1171,7 @@ class PagedAttentionImpl(nn.Module):
 
         if wants_unified:
             return self.paged_attention_unified
-        # Straight to the FlyDSL-capable runner, not through the ASM arm: the
-        # ASM envelope is a group bound only and this query length is past
-        # anything ASM was ever routed here with.
-        if self.use_triton_attn or flydsl_past_gluon:
+        if self.use_triton_attn:
             return self.paged_attention_triton
 
         # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the

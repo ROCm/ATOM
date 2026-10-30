@@ -21,7 +21,6 @@ import importlib
 import importlib.util
 import sys
 from types import SimpleNamespace
-from typing import ClassVar
 
 import pytest
 
@@ -296,23 +295,10 @@ class _Layer:
     through once already.
     """
 
-    def __init__(
-        self,
-        sliding_window=-1,
-        num_heads=16,
-        num_kv_heads=1,
-        head_dim=128,
-        kv_cache_dtype="fp8",
-        sinks=None,
-        **flags,
-    ):
+    def __init__(self, sliding_window=-1, num_heads=16, num_kv_heads=1, **flags):
         self.sliding_window = sliding_window
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        # Read only past the gluon envelope, by the FlyDSL static gate.
-        self.head_dim = head_dim
-        self.kv_cache_dtype = kv_cache_dtype
-        self.sinks = sinks
         self.use_triton_attn = flags.get("use_triton_attn", False)
         self.use_flash_layout = flags.get("use_flash_layout", False)
         for name in (
@@ -324,26 +310,11 @@ class _Layer:
             setattr(self, name, name)
 
 
-def _route(
-    monkeypatch,
-    max_qlen,
-    block_size=128,
-    unified=False,
-    force=False,
-    flydsl=False,
-    flydsl_arch=True,
-    **kw,
-):
+def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
     from atom.model_ops import attention_mha as mha
-    from atom.model_ops import base_attention as ba
 
     monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
     monkeypatch.setattr(mha.envs, "ATOM_FORCE_ATTN_TRITON", force)
-    # Pinned, not inherited: the container sets ATOM_PA_FLYDSL=1, and the two
-    # capability probes below need a GPU / the aiter API, not this test.
-    monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", flydsl)
-    monkeypatch.setattr(ba, "_flydsl_arch_supported", lambda: flydsl_arch)
-    monkeypatch.setattr(ba, "_flydsl_explicit_plan_api", lambda: True)
     monkeypatch.setattr(
         mha,
         "get_current_atom_config",
@@ -430,118 +401,227 @@ class TestDecodeRouting:
         )
 
 
-class TestFlyDSLPastGluonRouting:
-    """Past the gluon envelope a FlyDSL-served layer stays on the paged path.
+class TestFlyDSLPastGluon:
+    """Past the gluon envelope on a gluon GPU, FlyDSL takes the call per call.
 
-    Qwen3.5 TP4 MTP-5: 8 q heads / 1 kv head per rank, head_dim 256, fp8 KV,
-    qlen 6 -> 48 rows. FlyDSL takes any query length; unified cannot carry the
-    per-token KV scales and raises at capture.
+    Qwen3.5 TP4 MTP-5: 8 q heads / 1 kv head per rank, head_dim 256, page-16
+    fp8 KV with per-token scales, qlen 6 -> 48 rows. _dispatch_decode still
+    sends it to paged_attention_unified; the FlyDSL decision is made there on
+    the call's own tensors (the same check run_pa_decode applies) and passed
+    down as require_flydsl.
     """
 
-    QWEN35: ClassVar[dict] = {
-        "num_heads": 8,
-        "num_kv_heads": 1,
-        "head_dim": 256,
-        "use_triton_attn": True,
-    }
+    HEADS, KV_HEADS, HEAD_DIM, BLOCK = 8, 1, 256, 16
 
-    @pytest.mark.parametrize("max_qlen", [5, 6, 8])
-    def test_qwen35_mtp5_takes_paged_with_flydsl(self, monkeypatch, max_qlen):
-        assert (
-            _route(monkeypatch, max_qlen, block_size=16, flydsl=True, **self.QWEN35)
-            == "paged_attention_triton"
-        )
+    @staticmethod
+    def _meta(*shape, dtype=None):
+        import torch
 
-    @pytest.mark.parametrize("max_qlen", [1, 2, 4])
-    def test_within_gluon_unchanged_by_flydsl(self, monkeypatch, max_qlen):
-        """MTP-3 (qlen 4) and the draft steps (qlen 1) route identically."""
-        for kw in (self.QWEN35, {}):
-            assert _route(
-                monkeypatch, max_qlen, block_size=16, flydsl=True, **kw
-            ) == _route(monkeypatch, max_qlen, block_size=16, flydsl=False, **kw)
+        return torch.empty(shape, device="meta", dtype=dtype)
 
-    def test_flydsl_off_still_unified(self, monkeypatch):
-        assert (
-            _route(monkeypatch, 6, block_size=16, flydsl=False, **self.QWEN35)
-            == "paged_attention_unified"
-        )
-
-    @pytest.mark.parametrize(
-        "override",
-        [
-            {"block_size": 256},
-            {"block_size": 1024},
-            {"kv_cache_dtype": "bf16"},
-            {"sinks": object()},
-            {"sliding_window": 128},
-            {"head_dim": 192},
-            {"use_flash_layout": True},
-            {"flydsl_arch": False},
-        ],
-    )
-    def test_non_flydsl_configs_still_unified(self, monkeypatch, override):
-        kw = {**self.QWEN35, "block_size": 16, "flydsl": True, **override}
-        assert _route(monkeypatch, 6, **kw) == "paged_attention_unified"
-
-    def test_unified_env_still_wins(self, monkeypatch):
-        assert (
-            _route(
-                monkeypatch, 6, block_size=16, flydsl=True, unified=True, **self.QWEN35
-            )
-            == "paged_attention_unified"
-        )
-
-    def test_no_gluon_gpu_keeps_unified_first(self, monkeypatch):
-        """Without gluon (gfx1250) paged_attention_unified already hands FlyDSL
-        its calls per call; the static shortcut must not bypass that."""
+    def _layer(self, **over):
         from atom.model_ops import attention_mha as mha
 
-        monkeypatch.setattr(mha, "pa_decode_gluon_supports_arch", lambda: False)
+        layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
+        layer.num_heads, layer.num_kv_heads = self.HEADS, self.KV_HEADS
+        layer.sliding_window, layer.kv_cache_dtype, layer.sinks = -1, "fp8", None
+        layer.use_flash_layout = False
+        layer.layer_num = 0
+        for k, v in over.items():
+            setattr(layer, k, v)
+        return layer
+
+    def _call(self, qlen, seqs=4, block=None, kv_dtype=None):
+        import torch
+
+        block = block or self.BLOCK
+        kv_dtype = kv_dtype or _FP8
+        x = 8 if kv_dtype is torch.bfloat16 else 16
+        m = self._meta
+        q = m(seqs * qlen, self.HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
+        k_cache = m(64, self.KV_HEADS, self.HEAD_DIM // x, block, x, dtype=kv_dtype)
+        v_cache = m(64, self.KV_HEADS, self.HEAD_DIM, block, dtype=kv_dtype)
+        md = SimpleNamespace(
+            context_lens=m(seqs, dtype=torch.int32),
+            block_tables=m(seqs, 64, dtype=torch.int32),
+            max_seqlen_q=qlen,
+        )
+        return q, k_cache, v_cache, md
+
+    @staticmethod
+    def _flydsl_on(monkeypatch, on=True):
+        from atom.model_ops import attention_mha as mha
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", on)
+        monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", False)
+        # The arch probe needs a GPU; the rest of the gate is the real one.
+        monkeypatch.setattr(ba, "_flydsl_arch_supported", lambda: True)
+        monkeypatch.setattr(mha, "dense_decode_splits", lambda n, h: 8)
+
+    def test_dispatch_still_sends_past_gluon_to_unified(self, monkeypatch):
+        """No static gate in _dispatch_decode: qlen 6 routes as on main, and
+        never through the ASM arm (qlen 5 x group 3 is inside ASM's bound)."""
+        assert _route(monkeypatch, 6, num_heads=8) == "paged_attention_unified"
         assert (
-            _route(monkeypatch, 6, block_size=16, flydsl=True, **self.QWEN35)
+            _route(monkeypatch, 5, num_heads=3, use_triton_attn=False)
             == "paged_attention_unified"
         )
 
-    def test_past_gluon_with_flydsl_skips_asm(self, monkeypatch):
-        """qlen 5 x group 3 = 15 is inside ASM's group bound; it must still
-        go to the FlyDSL-capable runner, never run_pa_fwd_asm at qlen 5."""
-        assert (
-            _route(
-                monkeypatch, 5, block_size=16, flydsl=True, num_heads=3, num_kv_heads=1
-            )
-            == "paged_attention_triton"
-        )
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    @pytest.mark.parametrize("qlen", [5, 6, 8])
+    def test_qwen35_mtp5_takes_flydsl(self, monkeypatch, qlen):
+        self._flydsl_on(monkeypatch)
+        q, kc, vc, md = self._call(qlen)
+        assert self._layer()._flydsl_takes_decode(q, kc, vc, md)
 
-    def test_run_pa_decode_refuses_gluon_past_envelope(self, monkeypatch):
-        """require_flydsl: a call FlyDSL rejects raises, never reaches gluon."""
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    @pytest.mark.parametrize("qlen", [1, 2, 4])
+    def test_within_gluon_keeps_its_route(self, monkeypatch, qlen):
+        """MTP-3 (qlen 4) and draft steps (qlen 1) never divert to FlyDSL here."""
+        self._flydsl_on(monkeypatch)
+        q, kc, vc, md = self._call(qlen)
+        assert not self._layer()._flydsl_takes_decode(q, kc, vc, md)
+
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    @pytest.mark.parametrize(
+        "case",
+        ["flydsl_off", "unified_env", "flash", "window", "block256", "bf16_kv"],
+    )
+    def test_declined_calls_stay_on_unified(self, monkeypatch, case):
+        import torch
+
+        from atom.model_ops import attention_mha as mha
+
+        self._flydsl_on(monkeypatch, on=case != "flydsl_off")
+        if case == "unified_env":
+            monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", True)
+        layer = self._layer(
+            use_flash_layout=case == "flash",
+            sliding_window=128 if case == "window" else -1,
+            kv_cache_dtype="bf16" if case == "bf16_kv" else "fp8",
+        )
+        q, kc, vc, md = self._call(
+            6,
+            block=256 if case == "block256" else None,
+            kv_dtype=torch.bfloat16 if case == "bf16_kv" else None,
+        )
+        assert not layer._flydsl_takes_decode(q, kc, vc, md)
+
+    def test_unified_passes_the_decision_down(self, monkeypatch):
+        from atom.model_ops import attention_mha as mha
+
+        monkeypatch.setattr(
+            mha.PagedAttentionImpl, "_flydsl_takes_decode", lambda *a: True
+        )
+        layer = self._layer()
+        layer.paged_attention_triton = lambda *a, **k: k
+        q, kc, vc, md = self._call(6)
+        out = mha.PagedAttentionImpl.paged_attention_unified(
+            layer, q, None, None, kc, vc, None, None, SimpleNamespace(attn_metadata=md)
+        )
+        assert out == {"require_flydsl": True}
+
+    @pytest.mark.parametrize("gluon", [True, False])
+    def test_a_required_flydsl_call_never_reaches_gluon_or_a_plan(
+        self, monkeypatch, gluon
+    ):
+        """Feasibility first: no plan or scratch is built on the refusal, and a
+        GPU without gluon keeps its own error."""
         import torch
 
         from atom.model_ops import base_attention as ba
 
+        monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: gluon)
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **k: None)
-        q = torch.empty(12, 8, 256)
-        with pytest.raises(NotImplementedError, match="gluon envelope"):
+        monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: None)
+
+        def boom(*a, **k):
+            raise AssertionError("built a plan or scratch before refusing")
+
+        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", boom)
+        monkeypatch.setattr(ba, "_flydsl_plan_scratch", boom)
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_gluon", boom, raising=False)
+        q, kc, vc, md = self._call(6)
+        err = NotImplementedError if gluon else RuntimeError
+        with pytest.raises(err, match="declined" if gluon else "no gluon fallback"):
             ba.run_pa_decode(
-                output=q,
-                q=q,
-                k_cache=None,
-                v_cache=None,
-                context_lens=torch.empty(2, dtype=torch.int32),
-                block_tables=None,
-                softmax_scale=1.0,
-                max_seqlen_q=6,
-                max_context_partition_num=1,
-                context_partition_size=256,
-                compute_type=None,
-                q_scale=None,
-                k_scale=None,
-                v_scale=None,
-                exp_sums=None,
-                max_logits=None,
-                temporary_output=None,
+                *(q, q, kc, vc, md.context_lens, md.block_tables, 1.0, 6, 8, 256),
+                *(_FP8, None, None, None),
                 require_flydsl=True,
             )
+
+
+def _gpu_flydsl_arch():
+    if not (_HAS_CUDA and _HAS_FLYDSL_PA):
+        return False
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() in ("gfx942", "gfx950")
+
+
+@pytest.mark.skipif(
+    not _gpu_flydsl_arch(), reason="runs aiter FlyDSL pa_decode on gfx942/gfx950"
+)
+@pytest.mark.parametrize("qlen", [4, 6])
+def test_qwen35_mtp5_shape_is_accepted_by_real_aiter(monkeypatch, qlen):
+    """No monkeypatched probe: ATOM's gate accepts the Qwen3.5 MTP-5 call and
+    aiter's own pa_decode validation and kernel then take it, with per-token
+    fp8 KV scales and require_flydsl=True (a decline would raise)."""
+    import torch
+
+    from atom.model_ops import base_attention as ba
+
+    monkeypatch.undo()  # drop the autouse gfx950 / gluon pins
+    monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+    dev = torch.device("cuda", 0)
+    heads, kv_heads, head_dim, block, seqs, blocks_per_seq = 8, 1, 256, 16, 4, 32
+    nblk = seqs * blocks_per_seq
+    q = torch.randn(seqs * qlen, heads, head_dim, device=dev, dtype=torch.bfloat16)
+    k_cache = (
+        torch.randn(nblk, kv_heads, head_dim // 16, block, 16, device=dev) * 0.1
+    ).to(_FP8)
+    v_cache = (torch.randn(nblk, kv_heads, head_dim, block, device=dev) * 0.1).to(_FP8)
+    k_scale = torch.rand(nblk, kv_heads, block, 1, device=dev) + 0.5
+    v_scale = torch.rand(nblk, kv_heads, block, 1, device=dev) + 0.5
+    block_tables = torch.arange(nblk, device=dev, dtype=torch.int32).view(seqs, -1)
+    context_lens = torch.tensor([7, 100, 300, 511], device=dev, dtype=torch.int32)
+    splits = ba.dense_decode_splits(seqs, kv_heads)
+    out = torch.empty_like(q)
+    common = {
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "context_lens": context_lens,
+        "block_tables": block_tables,
+        "max_seqlen_q": qlen,
+        "max_context_partition_num": splits,
+        "context_partition_size": 256,
+        "compute_type": _FP8,
+        "q_scale": None,
+    }
+    assert (
+        ba.flydsl_decode_seqs(
+            output=out,
+            q=q,
+            alibi_slopes=None,
+            sinks=None,
+            sliding_window=-1,
+            ps=True,
+            **common,
+        )
+        == seqs
+    )
+    ba.run_pa_decode(
+        output=out,
+        q=q,
+        softmax_scale=head_dim**-0.5,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        require_flydsl=True,
+        **common,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
 
 
 class _FakePlan:
@@ -2066,8 +2146,9 @@ class TestNoGluonFlyDSLRouting:
         monkeypatch.setattr(mha, "dense_decode_splits", lambda n, h: 8)
         layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
         layer.sliding_window, layer.kv_cache_dtype, layer.sinks = -1, "fp8", None
+        layer.use_flash_layout = False
         layer.layer_num = 0
-        layer.paged_attention_triton = lambda *a: "flydsl"
+        layer.paged_attention_triton = lambda *a, **k: "flydsl"
         m = self._meta
         md = SimpleNamespace(context_lens=m(4), block_tables=m(4, 8), max_seqlen_q=1)
         call = lambda: mha.PagedAttentionImpl.paged_attention_unified(

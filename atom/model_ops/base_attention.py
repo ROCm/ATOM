@@ -360,49 +360,6 @@ def _flydsl_pa_decode_num_seqs(
     return num_seqs
 
 
-def flydsl_decode_static_ok(
-    *,
-    head_dim: int,
-    num_heads: int,
-    num_kv_heads: int,
-    kv_cache_dtype: str,
-    block_size: int,
-    sliding_window: int,
-    has_sinks: bool,
-) -> bool:
-    """Whether FlyDSL will take a layer's dense paged decode, from what is known
-    before the call.
-
-    The layer-static half of ``_flydsl_pa_decode_num_seqs`` as
-    ``paged_attention_triton`` calls it (fp8 KV, page-16 cache with dim -2 the
-    block size, no alibi, no q_scale, ps=True, a 256 tile and at most
-    PA_DENSE_SPLIT_MAX partitions). It is what lets ``_dispatch_decode`` keep a
-    query length past the gluon envelope on the paged path: FlyDSL takes any
-    positive query length. The per-call clauses (q dtype, contiguity, the
-    row/sequence rectangle, batch cap) cannot be known here, so
-    ``run_pa_decode(require_flydsl=True)`` refuses rather than handing such a
-    call to gluon out of its envelope.
-    """
-    if not envs.ATOM_PA_FLYDSL:
-        return False
-    if has_sinks or sliding_window > 0:
-        return False
-    if kv_cache_dtype != "fp8":
-        return False
-    if block_size not in _FLYDSL_PA_BLOCK_SIZES:
-        return False
-    if not (head_dim == 64 or (head_dim % 128 == 0 and head_dim <= 1024)):
-        return False
-    if num_kv_heads < 1 or num_heads % num_kv_heads != 0:
-        return False
-    # paged_attention_triton's dense tile and split ceiling; both are fixed.
-    if _FLYDSL_PA_TILE != 256 or PA_DENSE_SPLIT_MAX > _FLYDSL_PA_MAX_PARTITIONS:
-        return False
-    if not _flydsl_arch_supported():
-        return False
-    return _flydsl_explicit_plan_api()
-
-
 _FLYDSL_PLAN_MAX_BATCH = 4096
 # aiter's planner keeps one LDS int32 per sequence plus this much scan storage.
 _FLYDSL_PLAN_SCAN_LDS_BYTES = 512
@@ -704,10 +661,11 @@ def run_pa_decode(
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
 
-    ``require_flydsl``: the caller dispatched here only because FlyDSL takes a
-    query length gluon does not (``flydsl_decode_static_ok``); on a GPU with
-    gluon, a call FlyDSL then rejects raises instead of falling back to gluon
-    outside its envelope.
+    ``require_flydsl``: the caller already decided this call runs on FlyDSL
+    (``PagedAttentionImpl._flydsl_takes_decode``); if FlyDSL declines it on a
+    gluon GPU, raise before any plan or scratch is built rather than fall back
+    to gluon, which may be outside its query-length envelope. A GPU without
+    gluon raises below as it always has.
     """
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
@@ -727,6 +685,12 @@ def run_pa_decode(
         ps=ps,
         max_context_length=max_context_length,
     )
+    if require_flydsl and not flydsl_seqs and pa_decode_gluon_supports_arch():
+        raise NotImplementedError(
+            "pa_decode: the caller routed this call to FlyDSL, which declined it "
+            f"(rows={q.shape[0]}, max_seqlen_q={max_seqlen_q}, "
+            f"padded_seqs={context_lens.shape[0]}, q dtype {q.dtype})"
+        )
     # Inside the guard, not before it: this runs 63 times per decode step and
     # attention is an eager region of the token graphs, so replay does not
     # elide it. A deployment that never enables FlyDSL should pay nothing here.
@@ -850,12 +814,6 @@ def run_pa_decode(
             if not envs.ATOM_PA_FLYDSL
             else "FlyDSL paged decode does not take this call and this GPU "
             f"has no gluon fallback (q {tuple(q.shape)}, {compute_type})"
-        )
-    if require_flydsl:
-        raise NotImplementedError(
-            f"pa_decode: max_seqlen_q={max_seqlen_q} is past the gluon envelope "
-            f"and FlyDSL rejected this call (rows={q.shape[0]}, "
-            f"padded_seqs={context_lens.shape[0]}, q dtype {q.dtype})"
         )
     return torch.ops.aiter.pa_decode_gluon(
         output,
