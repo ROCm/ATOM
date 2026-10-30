@@ -45,6 +45,7 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP MoE"),
         ({"tensor_parallel_size": 2}, "requires --tensor-parallel-size 1"),
         ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
+        ({"enable_expert_parallel": True}, "expert parallelism"),
         ({"prefill_context_parallel_size": 2}, "same rank dimension"),
         ({"enable_tbo": True}, "TBO token slicing"),
         ({"speculative_config": object()}, "speculative decoding"),

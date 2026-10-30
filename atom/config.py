@@ -2308,6 +2308,8 @@ class Config:
             )
         if self.pipeline_parallel_size != 1:
             raise ValueError("Ulysses SP is not validated with pipeline parallelism.")
+        if self.enable_expert_parallel:
+            raise ValueError("Ulysses SP is not validated with expert parallelism.")
         if self.prefill_context_parallel_size not in (1, sp):
             raise ValueError(
                 "--sequence-parallel-size and --prefill-context-parallel-size "

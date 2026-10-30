@@ -112,20 +112,16 @@ def test_sp_routes_owned_rows_then_gathers_them_once(
     scatter.assert_called_once_with(layer._run_experts.return_value)
 
 
-@pytest.mark.parametrize("sp_enabled,all2all", [(False, False), (True, True)])
-def test_non_sp_and_routed_all2all_skip_sp_gather(
-    monkeypatch, sp_modules, sp_enabled, all2all
-):
+def test_non_sp_skips_sp_gather(monkeypatch, sp_modules):
     moe = sp_modules.moe
     layer = _layer(moe)
-    layer.moe_parallel_config.use_all2all_kernels = all2all
     hidden, logits = torch.empty(4, 2), torch.empty(4, 4)
     weights, ids = object(), object()
     layer.quant_method.select_experts = Mock(return_value=(weights, ids))
     layer._run_experts = Mock(return_value=hidden)
     gather, scatter = Mock(), Mock()
     monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=1))
-    monkeypatch.setattr(moe, "sp_is_enabled", lambda: sp_enabled)
+    monkeypatch.setattr(moe, "sp_is_enabled", lambda: False)
     monkeypatch.setattr(moe, "all_gatherv", gather)
     monkeypatch.setattr(moe, "sp_moe_reduce_scatter", scatter)
 

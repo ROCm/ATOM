@@ -34,7 +34,6 @@ from atom.distributed.pcp_utils import (
 )
 from atom.distributed.ulysses_sp import (
     get_sp_group,
-    get_sp_world_size,
     sp_is_enabled,
     sp_moe_reduce_scatter,
 )
@@ -241,15 +240,9 @@ class FusedMoEParallelConfig:
     # every PCP rank must run the experts over the same rows.
     pcp_merge: bool = False
 
-    # SP supplies distinct token shards to EP dispatchers at TP=1.
-    sp_shards_tokens: bool = False
-
     @property
     def selected_all2all_backend(self) -> str | None:
-        # Routed dispatch requires distinct token shards and real EP peers.
-        if not self.use_ep or self.dp_logical_ratio != 1:
-            return None
-        if self.dp_size <= 1 and not self.sp_shards_tokens:
+        if self.dp_size <= 1 or not self.use_ep or self.dp_logical_ratio != 1:
             return None
         if self.requested_all2all_backend == "none":
             return None
@@ -304,13 +297,10 @@ class FusedMoEParallelConfig:
             enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
-        # Include simulated DP and SP ranks when deciding whether experts can
-        # shard. SP folds into MoE TP below unless EP is explicitly enabled.
-        sp_size = get_sp_world_size()
-        use_ep = (
-            dp_logical * tp_size_ * sp_size > 1
-            and parallel_config.enable_expert_parallel
-        )
+        # dp_logical, not dp_size_: with DP-attention simulated down to a single
+        # rank the real product is 1, but the deployment being reproduced still
+        # shards experts, so EP must stay on.
+        use_ep = dp_logical * tp_size_ > 1 and parallel_config.enable_expert_parallel
 
         dp_size = dp_size_
         dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
@@ -380,12 +370,10 @@ class FusedMoEParallelConfig:
                 dp_logical // dp_size if flatten_tp_across_dp_for_moe else 1
             ),
             local_ep_size=atom_config.parallel_config.data_parallel_size_local
-            * tp_size_
-            * sp_size,
+            * tp_size_,
             requested_all2all_backend=requested_all2all_backend,
             low_latency=low_latency,
             pcp_merge=pcp_merge,
-            sp_shards_tokens=sp_size > 1 and tp_size_ == 1,
         )
 
 
@@ -5664,8 +5652,7 @@ class FusedMoE(torch.nn.Module):
 
         # Route the SP token shards on their owners, gather the routed rows for
         # local expert computation, then sum partials back to each owner.
-        # Routed all2all handles token movement itself.
-        sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
+        sp_moe = sp_is_enabled()
         topk_weights, topk_ids = self.quant_method.select_experts(
             self, hidden_states, router_logits
         )
