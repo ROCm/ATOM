@@ -10,7 +10,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from atom.model_engine.model_runner import tokenIDProcessor
+# On the module, not on "aiter" -- see tests/test_dspark.py for why a name-only
+# guard passes on the non-GPU runner and then aborts collection.
+runner_module = pytest.importorskip(
+    "atom.model_engine.model_runner",
+    reason="requires AITER to import model_runner",
+    exc_type=ImportError,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.sequence import SequenceType
 from atom.model_ops.attentions.token_layout.decode import decode_positions
@@ -23,7 +29,7 @@ def _verify_ctx_lens(context_lens, num_rejected, is_deferred_out):
     processor = SimpleNamespace(
         num_rejected=num_rejected, is_deferred_out=is_deferred_out
     )
-    return tokenIDProcessor.verify_ctx_lens(processor, context_lens)
+    return runner_module.tokenIDProcessor.verify_ctx_lens(processor, context_lens)
 
 
 def _decode_batch(seq_factory, length, num_rejected, is_deferred_out):
