@@ -238,6 +238,35 @@ models:
           run_eval: true
           eval_concurrency: [128, 512]
 
+      accuracy:
+        # 0.95: the per-request state pool does not fit at 0.85.
+        - &dsv4_moriio_gsm8k
+          name: ds-v4-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          server:
+            common_args:
+              gpu_memory_utilization: 0.95
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_only: true
+          accuracy:
+            threshold: 0.90
+        - <<: *dsv4_moriio_gsm8k
+          name: ds-v4-2p1d-tp8-moriio-gsm8k
+          topology: 2p1d_tp8_moriio
+          nodes: "${ATOMESH_2P1D_NODES}"
+          prefill:
+            workers: 2
+
     accuracy:
       task: gsm8k
       fewshot: 3
