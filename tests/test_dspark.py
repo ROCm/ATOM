@@ -2579,6 +2579,43 @@ def test_window_rows_read_a_windowed_table_from_its_first_page():
         assert torch.equal(run_tables[row, :pages], full_tables[row, :pages])
 
 
+def test_window_rows_keep_a_row_anchored_below_its_run_inside_it():
+    """A prefill chunk that does not end its prompt still gets block rows,
+    anchored at the chunk's end; their drafts are thrown away. Its request
+    holds only the window the prompt's end reads, so the row's own window
+    starts before the run: it must start at the run's first page and read at
+    least one key -- never a negative column, which is another request's
+    table or no memory at all."""
+    import torch
+
+    from atom.models.minimax_m3.dspark import _window_rows
+
+    window, T, rb, P = 35, 3, 2, 24
+    # Request 0's chunk ends at 99 (rows 100-102) but it holds blocks 2-4 of a
+    # 300-token prompt; request 1 is padding.
+    ctx_eff = torch.tensor([103, 16], dtype=torch.int32)
+    positions = torch.tensor([100, 101, 102, 102, 102, 102])
+    row_req = torch.arange(rb).repeat_interleave(T)
+    flat = torch.arange((rb + 1) * P, dtype=torch.int32) + 1000
+    tables = torch.empty(rb * T, P, dtype=torch.int32)
+    lens = torch.empty(rb * T, dtype=torch.int32)
+    _window_rows(
+        flat,
+        ctx_eff,
+        positions,
+        row_req,
+        window,
+        T,
+        torch.empty(rb * T, dtype=torch.int64),
+        tables,
+        lens,
+        torch.tensor([16, 0], dtype=torch.int32),
+    )
+    for row in range(T):
+        assert tables[row].tolist() == list(range(1000, 1000 + P))
+    assert lens.tolist() == [1, 1, 1, 16, 16, 16]
+
+
 def test_window_slots_address_each_request_run():
     """A block position's draft slot is in its request's run: its block less
     the run's first, as a column. Below the run, and on a pad row, nothing."""

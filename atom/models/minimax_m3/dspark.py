@@ -159,8 +159,12 @@ def _window_rows(
 
     A windowed draft pool's table holds a request's run of blocks from its
     first held one, not from block 0: `table_first16` is where each table
-    starts, and a row's first column is its page less that. The pool holds
-    every page a row reads, so the difference is never negative.
+    starts, and a row's first column is its page less that. The run holds
+    every page a row anchored at its request's last finalized token reads. A
+    row anchored further back -- a prefill chunk that does not end its
+    prompt, whose drafts are thrown away -- would start before the run, so it
+    starts at the run's first page and reads at least one key: its own blocks,
+    and never another request's.
     """
     P = out_tables.shape[1]
     if window:
@@ -171,9 +175,13 @@ def _window_rows(
     else:
         start16.zero_()
     torch.index_select(ctx_eff, 0, row_req, out=out_lens)
+    if table_first16 is not None:
+        first16 = torch.index_select(table_first16, 0, row_req)
+        torch.maximum(start16, first16, out=start16)
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     if table_first16 is not None:
-        start16.sub_(torch.index_select(table_first16, 0, row_req))
+        out_lens.clamp_(min=1)
+        start16.sub_(first16)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
 
