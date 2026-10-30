@@ -141,7 +141,9 @@ class LaunchTest(unittest.TestCase):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
         for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS"),
                                      (72, "JUNCTION"), (72, "P16K"), (88, "MR256"),
-                                     (32, "NATIVE96"), (72, "N3966"), (72, "N3966-PP8")):
+                                     (32, "NATIVE96"), (72, "N3966"), (72, "N3966-PP8"),
+                                     *((c, f"N3966-{tag}") for c in (16, 32, 48, 56, 72, 88)
+                                       for tag in ("BF16", "R4391"))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
@@ -153,7 +155,19 @@ class LaunchTest(unittest.TestCase):
                 env["C48_EXPECT_QUANT"] = base["roles"]["prefill"]["env"]["C48_EXPECT_QUANT"]
                 if variant.endswith("-PP8"):
                     self.assertEqual(env.pop("VLLM_MLA_CONTEXT_WORKSPACE_TOKENS"), "16384")
-                variant = variant.removeprefix("N3966").removeprefix("-") or "N3966"
+                if variant.endswith(("-BF16", "-R4391")):
+                    for role in ("prefill", "decode"):
+                        args = candidate["roles"][role]["args"]
+                        self.assertEqual(args["mamba-ssm-cache-dtype"], "bfloat16")
+                        args["mamba-ssm-cache-dtype"] = "float32"
+                if variant.endswith("-R4391"):
+                    bench_env, store = candidate["benchmark"]["env"], candidate["mooncake"]["store"]
+                    self.assertEqual(bench_env["TOTAL_CPU_DRAM_GB"], "2399")
+                    self.assertEqual(store["global_segment_size"], 2399000000000 // 8 >> 21 << 21)
+                    bench_env["TOTAL_CPU_DRAM_GB"] = base["benchmark"]["env"]["TOTAL_CPU_DRAM_GB"]
+                    store["global_segment_size"] = base["mooncake"]["store"]["global_segment_size"]
+                variant = variant.removeprefix("N3966").removeprefix("-")
+                variant = "N3966" if variant in ("", "BF16", "R4391") else variant
             if variant == "PP8":
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("HIP_VISIBLE_DEVICES"),
                                  "0,1,2,3,4,5,6,7")
