@@ -33,6 +33,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -1625,6 +1626,33 @@ app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
 
 # ---- Error handlers ----
+
+
+@app.exception_handler(HTTPException)
+async def openai_http_error_handler(request: Request, exc: HTTPException):
+    # HTTPException bypasses the ValueError/Exception handlers. Keep its status
+    # and headers, but use the same OpenAI error envelope on generation routes.
+    if request.url.path not in {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+    }:
+        return await http_exception_handler(request, exc)
+    return JSONResponse(
+        status_code=exc.status_code,
+        headers=exc.headers,
+        content={
+            "error": {
+                "message": str(exc.detail),
+                "type": (
+                    "invalid_request_error"
+                    if exc.status_code < 500
+                    else "internal_server_error"
+                ),
+                "code": exc.status_code,
+            }
+        },
+    )
 
 
 @app.exception_handler(ValueError)

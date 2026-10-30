@@ -692,3 +692,62 @@ def test_explicit_enable_overrides_inherited_none_effort(
     assert response.status_code == 200, response.text
     assert server.templates[-1][1]["thinking_mode"] == "thinking"
     assert server.templates[-1][1].get("reasoning_effort") != "none"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"stream_options": {"include_usage": True}},
+        {"reasoning_effort": "ultra"},
+        {"reasoning_effort": "low", "tools": [TOOL], "tool_choice": "required"},
+        {
+            "reasoning_effort": "low",
+            "tools": [TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        },
+    ],
+)
+def test_chat_validation_errors_have_openai_envelope(server, body):
+    response = post(
+        "/v1/chat/completions",
+        {"messages": [{"role": "user", "content": "hi"}], **body},
+    )
+    assert response.status_code == 400
+    assert "detail" not in response.json()
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert response.json()["error"]["message"]
+    assert server.generations == 0
+
+
+def test_chat_model_validation_uses_same_error_envelope(server):
+    response = post(
+        "/v1/chat/completions",
+        {
+            "model": "different-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 400
+    assert "does not match" in response.json()["error"]["message"]
+    assert server.generations == 0
+
+
+def test_http_error_handler_preserves_status_headers_and_other_routes():
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    async def run(path):
+        request = Request(
+            {"type": "http", "method": "POST", "path": path, "headers": []}
+        )
+        return await api_server.openai_http_error_handler(
+            request,
+            HTTPException(
+                status_code=429, detail="slow down", headers={"Retry-After": "5"}
+            ),
+        )
+
+    response = asyncio.run(run("/v1/chat/completions"))
+    assert response.status_code == 429 and response.headers["Retry-After"] == "5"
+    assert json.loads(response.body)["error"]["message"] == "slow down"
+    assert json.loads(asyncio.run(run("/server_info")).body) == {"detail": "slow down"}
