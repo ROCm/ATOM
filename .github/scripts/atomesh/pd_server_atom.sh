@@ -33,6 +33,35 @@ if [[ -z "${atom_origin}" ]] \
   exit 1
 fi
 
+# An ATOM ignores a setting it does not define, so a cell measured with one
+# names it in requires_atom_env and fails here on an ATOM without it, rather
+# than publishing numbers that lack the setting. envs.py imports only the
+# standard library, so it loads without the package.
+ATOMESH_REQUIRED_ATOM_ENV="${ATOMESH_REQUIRED_ATOM_ENV:-}"
+check_required_atom_env() {
+  [[ -n "${ATOMESH_REQUIRED_ATOM_ENV}" ]] || return 0
+  local envs_py="${atom_origin%/__init__.py}/utils/envs.py" missing
+  if ! missing="$(python3 - "${envs_py}" "${ATOMESH_REQUIRED_ATOM_ENV}" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("atom_envs", sys.argv[1])
+envs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(envs)
+names = [name for name in sys.argv[2].split(",") if name]
+print(" ".join(name for name in names if name not in envs.environment_variables))
+PY
+  )"; then
+    echo "ERROR: cannot read the settings ATOM defines from ${envs_py}" >&2
+    exit 1
+  fi
+  if [[ -n "${missing}" ]]; then
+    echo "ERROR: ${ATOMESH_CELL_ID:-this cell} needs ATOM settings that ${atom_origin%/__init__.py} does not define: ${missing}" >&2
+    exit 1
+  fi
+}
+check_required_atom_env
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"

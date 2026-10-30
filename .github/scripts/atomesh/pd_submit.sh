@@ -151,6 +151,7 @@ elif not spur_controller_addr:
 
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
+    "ATOMESH_REQUIRED_ATOM_ENV": ",".join(cell.get("requires_atom_env", [])),
     "MODEL_NAME": cell["model"],
     "BACKEND": cell["backend"],
     "DOCKER_IMAGE": cell["image"],

@@ -448,6 +448,11 @@ def build_cell(
             )
             for role in ("common", "prefill", "decode", "router")
         },
+        # ATOM settings (atom.utils.envs names) the cell is measured with; the
+        # launcher fails the cell on an ATOM that does not define one.
+        "requires_atom_env": [
+            str(name) for name in normalize_list(suite_cfg.get("requires_atom_env"))
+        ],
         "run_eval": bool(suite_cfg.get("run_eval", False)),
         "eval_only": eval_only,
         "accuracy": {
