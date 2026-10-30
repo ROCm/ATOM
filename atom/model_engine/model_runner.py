@@ -1117,26 +1117,38 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
-        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
-        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
-        destroy_dist_env()
-        # 2. Release CUDA graphs
-        self.req_graph = None
-        # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
-        # scales and any indexer cache are regions of it, not attributes.
-        for attr in (
-            "kv_cache",
-            "mamba_k_cache",
-            "mamba_v_cache",
-            "kpool_tail_cache",
-        ):
-            if hasattr(self, attr):
-                delattr(self, attr)
-        if hasattr(self, "model"):
-            del self.model
-        if hasattr(self, "drafter"):
-            del self.drafter
-        torch.cuda.empty_cache()
+        # MegaMoE's arenas live on the EP all2all manager's cco communicator,
+        # which destroy_dist_env() destroys. A close error propagates once the
+        # rest of the teardown has run.
+        try:
+            if envs.ATOM_MORI_V2:
+                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                    close_mega_transports,
+                )
+
+                close_mega_transports()
+        finally:
+            # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
+            #    Must happen while ops module is still alive for CustomAllreduce
+            #    cleanup.
+            destroy_dist_env()
+            # 2. Release CUDA graphs
+            self.req_graph = None
+            # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
+            # scales and any indexer cache are regions of it, not attributes.
+            for attr in (
+                "kv_cache",
+                "mamba_k_cache",
+                "mamba_v_cache",
+                "kpool_tail_cache",
+            ):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            if hasattr(self, "model"):
+                del self.model
+            if hasattr(self, "drafter"):
+                del self.drafter
+            torch.cuda.empty_cache()
         return True
 
     def start_profiler(self, trace_name: str | None = None):
