@@ -38,7 +38,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -1234,7 +1234,9 @@ def _flydsl_layout_needed(
     KV, compression ratio 4 with a supported budget). The per-call and
     per-layer ones (selection byte span, graph capture, head shape) stay with
     the layer. An FP8 SGLang KV pool binds no scale planes, so the layer
-    cannot detect it; without host lengths it keeps the native kernel."""
+    cannot detect it: the KV dtype is checked here, on the same pool the QSA
+    caches are bound from, and a pool whose dtype cannot be read keeps the
+    native kernel."""
     if not envs.ATOM_QSA_FLYDSL_ATTN:
         return False
     # Imported here: the flag-off path keeps the bridge free of the layer module.
@@ -1242,10 +1244,20 @@ def _flydsl_layout_needed(
 
     if compress_ratio != 4 or indexer_budget + 3 not in qsa_attention._FLYDSL_WIDTHS:
         return False
-    kv_dtype = getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None)
-    if kv_dtype is not None and kv_dtype != torch.bfloat16:
+    if getattr(_token_to_kv_pool(forward_batch), "dtype", None) != torch.bfloat16:
         return False
     return qsa_attention._flydsl_arch_supported()
+
+
+def _token_to_kv_pool(forward_batch: Any) -> Any:
+    """The SGLang KV pool the QSA K/V caches are bound from."""
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None:
+        backend = resolve_attn_backend(forward_batch)
+        pool = getattr(backend, "token_to_kv_pool", None) or getattr(
+            getattr(backend, "full_attn_backend", None), "token_to_kv_pool", None
+        )
+    return pool
 
 
 def _flydsl_prefill_layout(
@@ -1275,13 +1287,17 @@ def _flydsl_prefill_layout(
         return None, None
     if all(s == e for e, s in zip(extends, seqs)):
         return (extends, seqs), None
-    lengths = np.asarray(seqs, dtype=np.int64)
-    requests = np.repeat(np.arange(live_bs, dtype=np.int64), lengths)
-    tokens = np.arange(len(requests), dtype=np.int64) - np.repeat(
-        np.cumsum(lengths) - lengths, lengths
+    # Built on the device from the per-request lengths (a few bytes up):
+    # host-side index arrays would be MBs per prefixed forward.
+    device = block_tables.device
+    lengths = upload_numpy(np.asarray(seqs, dtype=np.int64), device)
+    total = sum(seqs)
+    requests = torch.repeat_interleave(
+        torch.arange(live_bs, device=device), lengths, output_size=total
     )
-    host = torch.from_numpy(np.stack((requests, tokens))).pin_memory()
-    requests, tokens = host.to(block_tables.device, non_blocking=True)
+    tokens = torch.arange(total, device=device) - torch.repeat_interleave(
+        torch.cumsum(lengths, 0) - lengths, lengths, output_size=total
+    )
     pages = block_tables[requests, tokens // block_size].to(torch.int64)
     return (extends, seqs), pages * block_size + tokens % block_size
 
@@ -1608,12 +1624,7 @@ def bind_qsa_caches(model: Any, forward_batch: Any, atom_config: Any) -> None:
     if not qsa_layers:
         return
 
-    pool = getattr(forward_batch, "token_to_kv_pool", None)
-    if pool is None:
-        backend = resolve_attn_backend(forward_batch)
-        pool = getattr(backend, "token_to_kv_pool", None) or getattr(
-            getattr(backend, "full_attn_backend", None), "token_to_kv_pool", None
-        )
+    pool = _token_to_kv_pool(forward_batch)
     block_size = _block_size(forward_batch, atom_config)
     compress_ratio = _compress_ratio(atom_config)
     hf = _hf_text_config(atom_config)

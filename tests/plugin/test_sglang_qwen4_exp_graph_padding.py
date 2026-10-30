@@ -1395,7 +1395,7 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
     "flag,arch,kv_dtype,ratio,budget,needed",
     [
         ("1", True, torch.bfloat16, 4, 2048, True),
-        ("1", True, None, 4, 4096, True),  # pool without a dtype: let the layer decide
+        ("1", True, None, 4, 4096, False),  # dtype unreadable: keep the native kernel
         ("0", True, torch.bfloat16, 4, 2048, False),  # flag off
         ("1", False, torch.bfloat16, 4, 2048, False),  # not gfx942
         ("1", True, torch.float8_e4m3fn, 4, 2048, False),  # FP8 KV pool
@@ -1418,3 +1418,51 @@ def test_flydsl_layout_built_only_when_the_kernel_can_run(
     pool = SimpleNamespace() if kv_dtype is None else SimpleNamespace(dtype=kv_dtype)
     batch = SimpleNamespace(token_to_kv_pool=pool)
     assert _flydsl_layout_needed(batch, ratio, budget) is needed
+
+
+@pytest.mark.parametrize(
+    "backend,needed",
+    [
+        # No pool on the forward batch: the attention backend's, as the QSA
+        # cache binding resolves it.
+        (SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16)), True),
+        (
+            SimpleNamespace(
+                token_to_kv_pool=None,
+                full_attn_backend=SimpleNamespace(
+                    token_to_kv_pool=SimpleNamespace(dtype=torch.float8_e4m3fn)
+                ),
+            ),
+            False,
+        ),
+        (SimpleNamespace(), False),
+    ],
+    ids=["backend-bf16", "full-attn-backend-fp8", "unresolved"],
+)
+def test_flydsl_layout_reads_kv_dtype_from_the_bound_pool(monkeypatch, backend, needed):
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    qsa_attention = pytest.importorskip(
+        "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
+    )
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+    monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
+    monkeypatch.setattr(bridge, "resolve_attn_backend", lambda fb: backend)
+    assert _flydsl_layout_needed(SimpleNamespace(), 4, 2048) is needed
+
+
+def test_flydsl_prefill_layout_context_rows_on_device_tensors():
+    """Prefixed / fresh / prefixed requests with unequal lengths on
+    non-consecutive pages: every request's full context, request-major."""
+    prefixes, extends, block = (5, 0, 2), (3, 6, 1), 4
+    seqs = [p + e for p, e in zip(prefixes, extends)]
+    tables = torch.tensor([[7, 2, 11], [5, 9, 11], [0, 11, 11]], dtype=torch.int32)
+    batch = SimpleNamespace(extend_seq_lens_cpu=list(extends), seq_lens_cpu=seqs)
+    host_lens, slots = _flydsl_prefill_layout(batch, 3, sum(extends), tables, block)
+    assert host_lens == (extends, tuple(seqs))
+    assert slots.tolist() == [
+        int(tables[r, t // block]) * block + t % block
+        for r, seq in enumerate(seqs)
+        for t in range(seq)
+    ]
+    assert slots.device == tables.device
