@@ -23,7 +23,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode,
     run_pa_fwd_asm,
 )
-from atom.utils import envs
+from atom.utils import blasst, envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
@@ -671,6 +671,10 @@ class PagedAttentionImpl(nn.Module):
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
+        # No block_skip_threshold here on purpose: BLASST is prefill-only. A
+        # decode step has one query row per sequence and no running max to
+        # threshold against, so there is nothing to skip; the kernel would
+        # force-disable it anyway. See prefill_attention_triton.
         unified_attention(
             q,
             k_cache,
@@ -1057,6 +1061,23 @@ class PagedAttentionImpl(nn.Module):
         # at 0 -- hence is_prefill False, which is the branch this method is
         # reached from. Every is_prefill batch sets the two counts equal.
         n_seqs = fwd_ctx.context.scheduled_bs
+
+        # BLASST block skipping, keyed off the KV length being attended over,
+        # which is what the calibrated fit is defined against. 0.0 unless
+        # configured, and the kernel treats 0.0 as "run dense".
+        #
+        # Forward the keyword ONLY when skipping is enabled. block_skip_threshold
+        # is a new argument from ROCm/aiter#5868, which is unmerged, so the stock
+        # upstream AITER signature -- including the default Docker dependency --
+        # does not accept it. Passing it unconditionally would raise TypeError on
+        # the first prefill of every ATOM_USE_UNIFIED_ATTN=1 deployment, even one
+        # that never enabled BLASST. The opt-in dependency stays scoped to the
+        # opt-in users.
+        block_skip_threshold = blasst.resolve_threshold(attn_metadata.max_seqlen_k)
+        blasst_kwargs = {}
+        if block_skip_threshold > 0.0:
+            blasst_kwargs["block_skip_threshold"] = block_skip_threshold
+
         unified_attention(
             q,
             k_for_attn,
@@ -1079,6 +1100,7 @@ class PagedAttentionImpl(nn.Module):
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
+            **blasst_kwargs,
         )
 
         return o
