@@ -305,7 +305,7 @@ class UnitZeroer:
         # Pageable uploads synchronize; acceptable once, at construction.
         self._base = torch.as_tensor(np.asarray(base, dtype=np.int64)).to(self.device)
         self._size = torch.as_tensor(np.asarray(size, dtype=np.int64)).to(self.device)
-        self._num_regions = int(len(size))
+        self._num_regions = len(size)
         self._tiles = max(1, -(-int(np.max(size)) // _TILE_BYTES))
         self._host = torch.zeros(self.num_blocks, dtype=torch.int64, pin_memory=cuda)
         self._dev = torch.zeros(self.num_blocks, dtype=torch.int64, device=self.device)

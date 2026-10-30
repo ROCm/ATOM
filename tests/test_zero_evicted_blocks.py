@@ -15,6 +15,7 @@ import array
 
 import numpy as np
 import pytest
+from conftest import MockConfig
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
@@ -22,8 +23,6 @@ from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointSpec,
     PageUnitCheckpointStore,
 )
-
-from conftest import MockConfig
 
 
 def toks(*ids):
