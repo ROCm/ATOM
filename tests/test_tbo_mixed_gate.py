@@ -11,6 +11,8 @@ cannot handle -- a cut that would leave a pure-decode ubatch -- must surface
 here as can_split=False.
 """
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -124,3 +126,31 @@ def test_tbo_off_reports_no_split(is_prefill):
         np.asarray(_PREFILL_TOKENS + [1, 1], dtype=np.int64),
     )
     assert can_split is False
+
+
+@pytest.mark.parametrize("pcp_size,is_mixed", [(1, True), (2, False), (2, True)])
+def test_runner_rejects_mixed_pcp_before_collective_sizing(pcp_size, is_mixed):
+    """The runtime backstop also protects callers that bypass Config validation."""
+    from atom.model_engine.model_runner import ModelRunner
+
+    config = _Config()
+    config.prefill_context_parallel_size = pcp_size
+    runner = SimpleNamespace(config=config)
+    tokens = _PREFILL_TOKENS + ([1, 1] if is_mixed else [])
+    batch = _Batch(
+        is_mixed=is_mixed,
+        total_seqs_num_prefill=2,
+        total_seqs_num_decode=2 if is_mixed else 0,
+        total_tokens_num=sum(tokens),
+        total_tokens_num_prefill=sum(_PREFILL_TOKENS),
+    )
+    batch.num_scheduled_tokens = np.asarray(tokens, dtype=np.int64)
+    if pcp_size > 1 and is_mixed:
+        with pytest.raises(NotImplementedError, match="mixed prefill.*PCP"):
+            ModelRunner._local_tbo_eligibility(runner, batch)
+    else:
+        meets_min, can_split, ub0, ub1 = ModelRunner._local_tbo_eligibility(
+            runner, batch
+        )
+        assert meets_min and can_split
+        assert ub0 + ub1 == sum(tokens) // pcp_size

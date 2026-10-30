@@ -2570,43 +2570,26 @@ class ModelRunner:
         # verbatim as `tbo_collective_active`, and each micro-batch's token
         # count is its own slice's (`UBatchWrapper._ub_tokens_across_dp`).
         pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1 and not batch.is_dummy_run:
-            eligible = (
-                batch.total_seqs_num_prefill >= 2
-                and batch.total_tokens_num_prefill // pcp_size >= 2
-            )
-            return (eligible, eligible, 0, 0)
-        return prefill_tbo_vote(batch.total_tokens_num_prefill)
-
-    def _cut_ubatches(
-        self, forward_mode: ForwardMode, batch: ScheduledBatch
-    ) -> ForwardMode:
-        """``forward_mode`` with the step's TBO micro-batches, cut once on the
-        shape it settled: a decode by request, as its graphs are recorded; a
-        PCP prefill at a request boundary; any other prefill by token."""
-        if not forward_mode.tbo_collective_active:
-            return forward_mode
-        pcp_groups = None
-        if not forward_mode.is_prefill:
-            scheduled_bs = forward_mode.scheduled_bs
-            ubatch_slices = cut_decode_ubatches(
-                forward_mode.running_bs,
-                forward_mode.running_tokens,
-                np.asarray(batch.num_scheduled_tokens[:scheduled_bs]),
-            )
-        elif self.config.prefill_context_parallel_size > 1 and not batch.is_dummy_run:
-            ubatch_slices, pcp_groups = cut_pcp_prefill_ubatches(
-                batch.num_scheduled_tokens,
-                batch.total_seqs_num_prefill,
-                self.config.prefill_context_parallel_size,
-            )
-        else:
-            ubatch_slices = cut_prefill_ubatches(
-                batch.total_seqs_num_prefill,
-                batch.num_scheduled_tokens,
-                forward_mode.running_tokens,
-            )
-        return replace(forward_mode, ubatch_slices=ubatch_slices, pcp_groups=pcp_groups)
+        # Read by build_ubatch / run_model / prepare_prefill to route the
+        # per-group path; reset every step so a stale value cannot route one.
+        self._pcp_tbo_balanced_active = False
+        self._pcp_bal_groups = None
+        if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            # Config._validate_mixed_prefill_decode rejects this at launch.
+            # Keep a backstop for callers that construct a runner directly:
+            # the PCP split below only sizes the prefill rows.
+            if getattr(batch, "is_mixed", False):
+                raise NotImplementedError(
+                    "mixed prefill+decode is not supported with PCP"
+                )
+            # PCP is always dp=1, so the single-rank path returns this verbatim
+            # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
+            local_tokens = batch.total_tokens_num_prefill // pcp_size
+            eligible = batch.total_seqs_num_prefill >= 2 and local_tokens >= 2
+            ub0 = local_tokens // 2
+            local_tbo = (eligible, eligible, ub0, local_tokens - ub0)
+            self._pcp_tbo_balanced_active = eligible
+        return local_tbo
 
     def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> int | None:
         """Shrink this decode step's verify length to one CUDA-graph bucket q,
