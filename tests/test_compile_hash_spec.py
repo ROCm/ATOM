@@ -17,6 +17,7 @@ def _hash(spec=None):
         prefill_context_parallel_size=1,
         dcp_config=None,
         enable_dp_attention=True,
+        enable_mixed_prefill_decode=False,
         index_cache_dtype="fp4",
         enable_decoder_swa_bounded_replay=True,
         hf_config=SimpleNamespace(),

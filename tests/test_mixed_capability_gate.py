@@ -135,6 +135,7 @@ class _FakeConfig:
         cudagraph_mode=None,
         chunked_prefill=True,
         pcp=1,
+        dcp=1,
     ):
         self.enable_mixed_prefill_decode = enabled
         self.hf_config = hf if hf is not None else _v4_hf()
@@ -145,6 +146,7 @@ class _FakeConfig:
         self.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
         self.enable_chunked_prefill = chunked_prefill
         self.prefill_context_parallel_size = pcp
+        self.decode_context_parallel_size = dcp
 
 
 def _v4_hf():
@@ -239,6 +241,18 @@ def test_validator_refuses_pcp():
     _bind()
     with pytest.raises(ValueError, match="prefill context parallel"):
         _FakeConfig(pcp=2)._validate_mixed_prefill_decode()
+
+
+def test_validator_refuses_dcp():
+    """Mixed batching and context parallelism are mutually exclusive."""
+    _bind()
+    with pytest.raises(ValueError, match="decode context parallel"):
+        _FakeConfig(dcp=2)._validate_mixed_prefill_decode()
+
+
+def test_context_parallel_is_allowed_when_mixed_is_disabled():
+    _bind()
+    _FakeConfig(enabled=False, pcp=2, dcp=2)._validate_mixed_prefill_decode()
 
 
 # Every member of the taxonomy, named. The first version of this table tested
