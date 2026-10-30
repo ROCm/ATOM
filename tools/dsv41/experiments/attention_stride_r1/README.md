@@ -7,6 +7,10 @@ repository. The 14 files in [source/](source/) are byte-for-byte copies;
 The original experiment remains in place. Nothing here installs a runtime
 adapter or changes the dashboard default.
 
+The adjacent `ruff.toml` keeps the original external-package classification
+of `atom` for import sorting while inheriting the repository's checks. This
+allows linting without rewriting the archived source bytes.
+
 The candidate retains four native FP8 H16 calls, native split selection and
 projection arithmetic. It passes strided Q/scale views and slices of a single
 caller-owned BF16 output, removing four input copies and the final concat.

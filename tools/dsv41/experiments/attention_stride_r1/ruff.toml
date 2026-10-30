@@ -1,0 +1,9 @@
+extend = "../../../../pyproject.toml"
+
+# This byte-exact snapshot was prepared outside ATOM and imported atom as an
+# external dependency. Keep that import classification when checking its copy.
+src = []
+
+[lint.isort]
+known-first-party = []
+known-third-party = ["atom"]
