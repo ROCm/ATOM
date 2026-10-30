@@ -18,6 +18,7 @@ from atom.models.qwen3_5 import (
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+from atom.utils import envs
 
 from .utils import maybe_prefix
 
@@ -118,6 +119,26 @@ class Qwen3_5MTP(nn.Module):
         "shared_expert_gate": ("gate", 1),
     }
     weights_mapping = {"mtp.": "model."}
+
+    @property
+    def reuse_draft_graph_step_buffers(self) -> bool:
+        """Let the draft mid-step graph write its outputs into its own inputs.
+
+        Read once by ``EagleProposer._declare_draft_graphs``. With it, the
+        captured epilogue copies the step's hidden states into the staged
+        ``hidden_states`` buffer and writes the argmax ids into the staged
+        ``input_ids`` buffer, so the replay needs no clones and the next stage
+        no copies; step 0's ``index_select`` lands in the staged buffer too.
+
+        Safe here because the draft is one ``full_attention`` decoder layer: it
+        reads ``input_ids`` (embedding) and ``hidden_states``
+        (``pre_fc_norm_hidden``, out of place) only at the top of its forward,
+        before the epilogue overwrites them in stream order, and it touches no
+        GDN conv/SSM state or checkpoint slot -- the only cache it writes is
+        its own paged KV, through ``slot_mapping``, which this does not change.
+        ``ATOM_QWEN35_MTP_REUSE_STEP_BUFFERS=0`` turns it off.
+        """
+        return envs.ATOM_QWEN35_MTP_REUSE_STEP_BUFFERS
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         """Filter MTP weights; remap (mtp.* → model.*) is via weights_mapping."""

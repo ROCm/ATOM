@@ -414,3 +414,109 @@ def test_unsupported_capture_still_warms_both_halves(monkeypatch):
     assert g.warmup(2) is None
     assert calls == ["backbone", "head"]
     assert not g.is_captured(2)
+
+
+# ---- batch-last staging (MRoPE positions, [3, N]) -------------------------
+
+
+def _mrope_graph():
+    return _graph(
+        inputs={
+            "positions": StagedInput(shape=(3,), dtype=torch.int64, batch_last=True),
+            "row": StagedInput(dtype=torch.int32),
+        }
+    )
+
+
+def test_batch_last_view_is_contiguous_at_every_size():
+    """Each size's view is `[3, bs]` with stride `(bs, 1)`: the layout the
+    runner's `_mrope_positions_view` hands the target, and the one the fused
+    MRoPE kernel checks (`stride(1) == 1`). A column slice of a
+    `[3, max_num_seqs]` matrix would carry stride `(max_num_seqs, 1)` instead.
+    One storage under every size, so a capture's baked address stays valid."""
+    g = _mrope_graph()
+    base = g._buffers["positions"].data_ptr()
+    for bs in (1, 4, 7, 256):
+        view = g.buffer("positions", bs)
+        assert view.shape == (3, bs)
+        assert view.stride() == (bs, 1)
+        assert view.data_ptr() == base
+    with pytest.raises(AssertionError, match="capacity"):
+        g.buffer("positions", 257)
+
+
+def test_batch_last_identical_rows_stage_to_the_eager_columns_plus_pad():
+    """Text-only decode: three equal rows. The staged `[3, running_bs]` holds
+    exactly the eager `[3, scheduled_bs]` in its real columns, and every pad
+    column repeats the last real one -- on all three rows."""
+    g = _mrope_graph()
+    row = torch.tensor([10, 21, 35], dtype=torch.int64)
+    eager = row.unsqueeze(0).expand(3, -1).contiguous()
+    staged = g.stage(
+        8, {"positions": eager, "row": torch.tensor([1, 2, 3], dtype=torch.int32)}
+    )
+    assert staged["positions"].shape == (3, 8)
+    torch.testing.assert_close(staged["positions"][:, :3], eager)
+    assert staged["positions"][:, 3:].tolist() == [[35] * 5] * 3
+    assert staged["row"].tolist() == [1, 2, 3, 3, 3, 3, 3, 3]
+
+
+def test_batch_last_unequal_rows_are_staged_as_they_are():
+    """A vision-token anchor carries three DIFFERENT rows (t/h/w). Staging
+    must not collapse them -- that is what lets one recording serve a
+    multimodal step too, so no per-step eager fallback (and no per-rank split
+    between replay and eager under DP) is needed."""
+    g = _mrope_graph()
+    eager = torch.tensor([[5, 9], [6, 11], [7, 13]], dtype=torch.int64)
+    staged = g.stage(4, {"positions": eager})["positions"]
+    assert staged.tolist() == [[5, 9, 9, 9], [6, 11, 11, 11], [7, 13, 13, 13]]
+
+
+def test_batch_last_positions_read_back_after_an_in_place_bump():
+    """`_advance_decode_metadata` bumps the staged positions in place (`+= 1`)
+    between replays; the graph reads the same storage, so the bump must land
+    there and not in a copy."""
+    g = _mrope_graph()
+    staged = g.stage(2, {"positions": torch.full((3, 2), 4, dtype=torch.int64)})
+    staged["positions"] += 1
+    assert g.buffer("positions", 2).tolist() == [[5, 5]] * 3
+
+
+def test_batch_last_counts_rows_on_the_last_axis():
+    """Sources are matched on their own batch axis: a `[3, 2]` positions and a
+    `[2]` row describe the same two sequences; `[3, 3]` and `[2]` do not."""
+    g = _mrope_graph()
+    g.stage(
+        4,
+        {
+            "positions": torch.zeros(3, 2, dtype=torch.int64),
+            "row": torch.zeros(2, dtype=torch.int32),
+        },
+    )
+    with pytest.raises(AssertionError, match="batches of"):
+        g.stage(
+            4,
+            {
+                "positions": torch.zeros(3, 3, dtype=torch.int64),
+                "row": torch.zeros(2, dtype=torch.int32),
+            },
+        )
+
+
+def test_batch_last_refuses_one_dimensional_positions():
+    """1-D positions into a `[3, N]` pass are a layout bug, not a batch."""
+    g = _mrope_graph()
+    with pytest.raises(AssertionError, match="trailing axis is not the batch"):
+        g._stage_one("positions", 4, torch.zeros(4, dtype=torch.int64))
+    with pytest.raises(AssertionError, match="fixed storage expects"):
+        g._stage_one("positions", 4, torch.zeros(2, 4, dtype=torch.int64))
+
+
+def test_batch_last_producer_view_is_not_self_copied():
+    g = _mrope_graph()
+    produced = g.buffer("positions", 2)
+    produced.copy_(torch.tensor([[1, 2]] * 3, dtype=torch.int64))
+    version = g._buffers["positions"]._version
+    staged = g.stage(2, {"positions": produced})["positions"]
+    assert staged.data_ptr() == produced.data_ptr()
+    assert g._buffers["positions"]._version == version
