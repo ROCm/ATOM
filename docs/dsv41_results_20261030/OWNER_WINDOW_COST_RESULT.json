@@ -1,0 +1,373 @@
+{
+  "status": "new_complete_window_diagnosis_conditional_budget_no_candidate_admission",
+  "bindings": {
+    "/home/yifehuan/dsv41_commfusedmoe/validation/dashboard_whole_20261029/owner_window_cost_r3/REVIEW.json.gz": "11096f457c58c0d04911e24c5f6e2ca9ab48528244cf12e9b0b05799da788065",
+    "/home/yifehuan/dsv41_commfusedmoe/validation/dashboard_whole_20261029/owner_window_cost_r4/REVIEW.json.gz": "192684b7df140409cf9ec8c58dc8bd701827aefc2382a711b9d59032e9c81814",
+    "/home/yifehuan/dsv41_commfusedmoe/validation/dashboard_whole_20261029/fp8_owner_service_r3/REVIEW.json.gz": "143704a0d5d17680f229e38765cd4d4ac3833f75403cf3b05732c704b30c64b7",
+    "/home/yifehuan/dsv41_commfusedmoe/validation/dashboard_whole_20261029/FP8_OWNER_WINDOW_BUDGET.json": "6a9e4bf3ca55217505f81af98f651877b23f693679b3f905b39cd879b5ee9b89"
+  },
+  "calls": {
+    "1536": 3724,
+    "7550": 1199,
+    "16291": 647
+  },
+  "wall_seconds": 374.8370730020106,
+  "table": {
+    "1536": {
+      "native_full_window_ms": [
+        0.7634643614292145,
+        0.7634262442588806,
+        0.7635768055915833,
+        0.7635026574134827
+      ],
+      "scopes": {
+        "complete_ffn": {
+          "mean_ms_per_rank": [
+            0.70696,
+            0.70796,
+            0.70794,
+            0.70828
+          ],
+          "all4_observer_admissible": true
+        },
+        "feed_through_g1_ready": {
+          "mean_ms_per_rank": [
+            0.18076,
+            0.17972,
+            0.18074,
+            0.18026
+          ],
+          "all4_observer_admissible": true
+        },
+        "g1": {
+          "mean_ms_per_rank": [
+            0.25812,
+            0.24296,
+            0.24128,
+            0.2572
+          ],
+          "all4_observer_admissible": true
+        },
+        "g2_and_local_reduce": {
+          "mean_ms_per_rank": [
+            0.15516,
+            0.15517999999999998,
+            0.15836,
+            0.1539
+          ],
+          "all4_observer_admissible": true
+        },
+        "next_consumer": {
+          "mean_ms_per_rank": [
+            0.03512,
+            0.035699999999999996,
+            0.035640000000000005,
+            0.03558
+          ],
+          "all4_observer_admissible": true
+        },
+        "producer_mhc_norm": {
+          "mean_ms_per_rank": [
+            0.02198,
+            0.02234,
+            0.022359999999999998,
+            0.02218
+          ],
+          "all4_observer_admissible": false
+        },
+        "reduce_scatter": {
+          "mean_ms_per_rank": [
+            0.10222,
+            0.11584,
+            0.11406,
+            0.10084
+          ],
+          "all4_observer_admissible": true
+        }
+      },
+      "gate_changed_rows": 193,
+      "gate_compared_rows": 4608
+    },
+    "7550": {
+      "native_full_window_ms": [
+        2.037346601486206,
+        2.037267804145813,
+        2.0373910665512085,
+        2.0371861457824707
+      ],
+      "scopes": {
+        "complete_ffn": {
+          "mean_ms_per_rank": [
+            1.92158,
+            1.91718,
+            1.9217,
+            1.92142
+          ],
+          "all4_observer_admissible": true
+        },
+        "feed_through_g1_ready": {
+          "mean_ms_per_rank": [
+            0.42858,
+            0.43414,
+            0.43344,
+            0.43344000000000005
+          ],
+          "all4_observer_admissible": true
+        },
+        "g1": {
+          "mean_ms_per_rank": [
+            0.5715600000000001,
+            0.57474,
+            0.56898,
+            0.5713999999999999
+          ],
+          "all4_observer_admissible": true
+        },
+        "g2_and_local_reduce": {
+          "mean_ms_per_rank": [
+            0.40562,
+            0.39872,
+            0.41500000000000004,
+            0.39927999999999997
+          ],
+          "all4_observer_admissible": true
+        },
+        "next_consumer": {
+          "mean_ms_per_rank": [
+            0.08266,
+            0.08116,
+            0.08318,
+            0.0833
+          ],
+          "all4_observer_admissible": true
+        },
+        "producer_mhc_norm": {
+          "mean_ms_per_rank": [
+            0.05632,
+            0.05402,
+            0.05384,
+            0.056040000000000006
+          ],
+          "all4_observer_admissible": true
+        },
+        "reduce_scatter": {
+          "mean_ms_per_rank": [
+            0.43012,
+            0.44052,
+            0.43245999999999996,
+            0.432
+          ],
+          "all4_observer_admissible": true
+        }
+      },
+      "gate_changed_rows": 862,
+      "gate_compared_rows": 22650
+    },
+    "16291": {
+      "native_full_window_ms": [
+        3.899388313293457,
+        3.899521827697754,
+        3.899457812309265,
+        3.8991466760635376
+      ],
+      "scopes": {
+        "complete_ffn": {
+          "mean_ms_per_rank": [
+            3.62552,
+            3.6304999999999996,
+            3.6303799999999997,
+            3.6375200000000003
+          ],
+          "all4_observer_admissible": true
+        },
+        "feed_through_g1_ready": {
+          "mean_ms_per_rank": [
+            0.79726,
+            0.7985800000000001,
+            0.80202,
+            0.8396399999999999
+          ],
+          "all4_observer_admissible": true
+        },
+        "g1": {
+          "mean_ms_per_rank": [
+            1.03186,
+            1.0433,
+            1.0345,
+            1.04026
+          ],
+          "all4_observer_admissible": true
+        },
+        "g2_and_local_reduce": {
+          "mean_ms_per_rank": [
+            0.77278,
+            0.77362,
+            0.77018,
+            0.77044
+          ],
+          "all4_observer_admissible": true
+        },
+        "next_consumer": {
+          "mean_ms_per_rank": [
+            0.1446,
+            0.14844000000000002,
+            0.14384000000000002,
+            0.14307999999999998
+          ],
+          "all4_observer_admissible": true
+        },
+        "producer_mhc_norm": {
+          "mean_ms_per_rank": [
+            0.10354,
+            0.10203999999999999,
+            0.09904,
+            0.09736
+          ],
+          "all4_observer_admissible": true
+        },
+        "reduce_scatter": {
+          "mean_ms_per_rank": [
+            0.9172,
+            0.91222,
+            0.90218,
+            0.90706
+          ],
+          "all4_observer_admissible": true
+        }
+      },
+      "gate_changed_rows": 1539,
+      "gate_compared_rows": 48873
+    }
+  },
+  "scenarios": [
+    {
+      "decode_layers": 18,
+      "prefill_layers": 18,
+      "ffn_proxy_seconds_per_rank": [
+        131.0832882,
+        131.11335648,
+        131.20816896,
+        131.30806932000002
+      ],
+      "ffn_proxy_wall_share_per_rank": [
+        0.34970737326000007,
+        0.3497875901920105,
+        0.35004053336873703,
+        0.35030705012280283
+      ],
+      "whole_time_reduction_if_FFN_2x": [
+        0.17485368663000003,
+        0.17489379509600525,
+        0.17502026668436851,
+        0.17515352506140142
+      ],
+      "ideal_G2_RS_overlap_seconds_per_rank": [
+        24.605897759999998,
+        25.37974044,
+        25.5717162,
+        24.349312079999997
+      ],
+      "ideal_G2_RS_overlap_wall_share": [
+        0.06564424794734222,
+        0.06770872538497243,
+        0.06822088326322737,
+        0.06495972206001456
+      ],
+      "ten_equal_columns_pipeline_saving_seconds": [
+        22.145307984,
+        22.841766396,
+        23.014544580000003,
+        21.914380872
+      ],
+      "ten_equal_columns_pipeline_wall_share": [
+        0.059079823152608,
+        0.060937852846475196,
+        0.061398794936904644,
+        0.05846374985401311
+      ],
+      "extra_cost_allowance_for_5pct_wall_seconds": [
+        3.403454333899468,
+        4.09991274589947,
+        4.272690929899472,
+        3.1725272218994682
+      ],
+      "extra_cost_allowance_per_layer_call_us": [
+        33.946283003186394,
+        40.89280616297098,
+        42.61610741970349,
+        31.643000417908123
+      ],
+      "layer_calls": 100260
+    },
+    {
+      "decode_layers": 38,
+      "prefill_layers": 18,
+      "ffn_proxy_seconds_per_rank": [
+        183.737669,
+        183.84221728,
+        183.93554016,
+        184.06076372
+      ],
+      "ffn_proxy_wall_share_per_rank": [
+        0.4901800868534006,
+        0.49045900344818316,
+        0.4907079726316542,
+        0.49104204727106254
+      ],
+      "whole_time_reduction_if_FFN_2x": [
+        0.2450900434267003,
+        0.24522950172409158,
+        0.2453539863158271,
+        0.24552102363553127
+      ],
+      "ideal_G2_RS_overlap_seconds_per_rank": [
+        32.21924335999999,
+        34.007503639999996,
+        34.066905,
+        31.859875279999997
+      ],
+      "ideal_G2_RS_overlap_wall_share": [
+        0.08595532747591157,
+        0.09072609432049851,
+        0.09088456679901902,
+        0.08499659605395837
+      ],
+      "ten_equal_columns_pipeline_saving_seconds": [
+        28.997319023999996,
+        30.606753275999996,
+        30.6602145,
+        28.673887752
+      ],
+      "ten_equal_columns_pipeline_wall_share": [
+        0.07735979472832043,
+        0.08165348488844865,
+        0.08179611011911711,
+        0.07649693644856254
+      ],
+      "extra_cost_allowance_for_5pct_wall_seconds": [
+        10.255465373899465,
+        11.864899625899465,
+        11.918360849899468,
+        9.932034101899468
+      ],
+      "extra_cost_allowance_per_layer_call_us": [
+        58.68985563637098,
+        67.90030688966159,
+        68.20625414844608,
+        56.838926988093554
+      ],
+      "layer_calls": 174740
+    }
+  ],
+  "decision": "Do not implement/promote Window-RS on this evidence alone: 5% net whole-time saving not established after GEMM degradation, extra collectives, route/partial conversion, fill/drain. Stop ordinary owner-M gate substitution. Keep a single bounded candidate preparation as next work, with no blind guard expansion.",
+  "next_candidate_contract": "Native full-M gate schedule explicitly bound on owner rows; native full M/K experts; G2 output-column ordering plus owner RS (no final AG). First establish complete input supply cost, preserve native gate routing, then pay measured Window producer/communication/consumer costs before implementation admission.",
+  "limits": [
+    "These are layer8 proxies, not measured full-model fractions, theoretical bounds, or performance promises.",
+    "1536 calls are exact owner FFN counters. Prefill calls come from retained sparse bins; one shape per bin cannot represent its entire row/routing distribution.",
+    "18 layers means2..19;38 decode means nonhash2..39 and is an extrapolation, not route/auxiliary-consumer admission. Next-consumer9 has noEngram; not all next layers do.",
+    "Ten equal N512 windows use ideal (P-1)/P*min(G2,RS), with no resource contention, unequal readiness, precision cost, or changed GEMM efficiency. This is an optimistic model, not an achieved overlap.",
+    "Feed-to-G1 contains native shared computation, gate/topk/sort and communication. Its whole duration is not deletable BF16 preparation.",
+    "Producer1536 observer exceeded1% and has no stage-budget credit. Different scopes use separate graphs and inputs; do not sum them into an exact trace.",
+    "No new end-to-end performance ratio, full-model L2, KV/state, or GSM acceptance. Prior6281.294tok/s/1.191939x remains the last sample with its original caveats."
+  ]
+}

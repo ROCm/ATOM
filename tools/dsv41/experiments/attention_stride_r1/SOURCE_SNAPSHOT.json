@@ -1,0 +1,90 @@
+{
+  "status": "GPU_UNRUN_SOURCE_SNAPSHOT",
+  "original_runtime_head": "96405d8609abdb0e9be594b47dcd4a492e81c6d4",
+  "files": [
+    {
+      "snapshot": "LOCAL_PREPARATION.json",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/LOCAL_PREPARATION.json",
+      "bytes": 2521,
+      "sha256": "80a12444aa7fcd4c77f9130e9b0ca437e00449675b4d902dff3cc07badc43849"
+    },
+    {
+      "snapshot": "README.md",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/README.md",
+      "bytes": 5016,
+      "sha256": "775fccfad79fe65fc7305d051aea3fb81823ee06977b9574b3b4e74675d2b2a7"
+    },
+    {
+      "snapshot": "RESOURCE.md",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/RESOURCE.md",
+      "bytes": 1467,
+      "sha256": "e803913ffe1602d07c4ea55e51aacc7a067bb075cbc58f0cfdbe24557ecf574d"
+    },
+    {
+      "snapshot": "binding.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/binding.py",
+      "bytes": 3310,
+      "sha256": "e26efc2be8847a6c04fdbbdfbe0a54a7183174bd1bebc5249190e44a666ad704"
+    },
+    {
+      "snapshot": "candidate.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/candidate.py",
+      "bytes": 1476,
+      "sha256": "11e38e14e81caa3d2c31652d45d8a3283cb4481e94c27eda0daf99c7b7321961"
+    },
+    {
+      "snapshot": "driver.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/driver.py",
+      "bytes": 2516,
+      "sha256": "4489b08725556076ff120d701e86e8c097f6072383c9fc329a714360ede63003"
+    },
+    {
+      "snapshot": "fixture.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/fixture.py",
+      "bytes": 9344,
+      "sha256": "4c0db66b7714e06f9c507c2d1b384eeb864cd4e149389051ccf71a38dda5a4f2"
+    },
+    {
+      "snapshot": "hold.sh",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/hold.sh",
+      "bytes": 32,
+      "sha256": "4556ae4ffc2116831b1d66115b942cff0a44c973407387a05b0465ac0a066d05"
+    },
+    {
+      "snapshot": "launch.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/launch.py",
+      "bytes": 8355,
+      "sha256": "6ceb7be137f64879a503c9be21498bc5f4d68e74dc6ed9a070c01b570b2dfde1"
+    },
+    {
+      "snapshot": "preweight.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/preweight.py",
+      "bytes": 5040,
+      "sha256": "992e5376afe777952a74cce6f565e699db4b85288c5e655979ca2a5086f1651e"
+    },
+    {
+      "snapshot": "probe.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/probe.py",
+      "bytes": 12803,
+      "sha256": "da6501b33877cb8bb9e973b10c1260cfa3bfbc776be80a4c9e705d63f53da815"
+    },
+    {
+      "snapshot": "review.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/review.py",
+      "bytes": 3910,
+      "sha256": "028d95d73b75c68d91bdfb4b6ca84019acb59d268fedcf4a62db1a08ed28a0a3"
+    },
+    {
+      "snapshot": "static_check.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/static_check.py",
+      "bytes": 3102,
+      "sha256": "e893b796bd5c81da3f4f3202bbd39ab603b232573f9a88aa84cb5b059f68ccf4"
+    },
+    {
+      "snapshot": "weights.py",
+      "original": "validation/dashboard_whole_20261029/attention_stride_r1/weights.py",
+      "bytes": 8145,
+      "sha256": "c5bfed5b9e23d6780ec031b321274334622af72d67435712e9a187197fabdb16"
+    }
+  ]
+}

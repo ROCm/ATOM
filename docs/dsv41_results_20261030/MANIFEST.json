@@ -1,0 +1,71 @@
+{
+  "status": "COPIED_EXISTING_RESULTS_NO_REVIEW_RERUN",
+  "files": [
+    {
+      "snapshot": "FP8_DEPENDENCY.json",
+      "original": "validation/dashboard_whole_20261029/FP8_DEPENDENCY.json",
+      "bytes": 37155,
+      "sha256": "aad83cee8b0668f3686cbf716f64d2effe429a48085e56546ef68c03d085dcce"
+    },
+    {
+      "snapshot": "FP8_MIGRATION_COST_RESULT.json",
+      "original": "validation/dashboard_whole_20261029/FP8_MIGRATION_COST_RESULT.json",
+      "bytes": 7046,
+      "sha256": "452d181404a246605194975f24dcbac20c9897bab6c1611c0b85104cd2cab4a3"
+    },
+    {
+      "snapshot": "OWNER_WINDOW_COST_RESULT.json",
+      "original": "validation/dashboard_whole_20261029/OWNER_WINDOW_COST_RESULT.json",
+      "bytes": 11322,
+      "sha256": "45a64fcbd3d354d26c2aad136806087446eeb7f0e8792af3cc280834c682472c"
+    },
+    {
+      "snapshot": "OWNER_BF16_WINDOW_RESULT.json",
+      "original": "validation/dashboard_whole_20261029/OWNER_BF16_WINDOW_RESULT.json",
+      "bytes": 15750,
+      "sha256": "eeffa1988cbfb43c26ca701e4cad445699c33832f12703488fcbbe8fd7999932"
+    },
+    {
+      "snapshot": "r9/ABBA_REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/r9/ABBA_REVIEW.json.gz",
+      "bytes": 79918,
+      "sha256": "2f7f266e987fd75adbfefcb0c3bc5215d8d55f27bf59f7467a1546b1e761a388"
+    },
+    {
+      "snapshot": "fp8_owner_service_r3/REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/fp8_owner_service_r3/REVIEW.json.gz",
+      "bytes": 13301,
+      "sha256": "143704a0d5d17680f229e38765cd4d4ac3833f75403cf3b05732c704b30c64b7"
+    },
+    {
+      "snapshot": "owner_supply_r1/REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/owner_supply_r1/REVIEW.json.gz",
+      "bytes": 7182,
+      "sha256": "91af763d107a91dc8c62f02e91058c5a99906df60bfa7fd821012afd9792ebaa"
+    },
+    {
+      "snapshot": "owner_column_rs_r1/REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/owner_column_rs_r1/REVIEW.json.gz",
+      "bytes": 14593,
+      "sha256": "4c0e9d22ea951d9910c2f65bb6628dc3164fa3386e6e9064c606c3bb53f9f608"
+    },
+    {
+      "snapshot": "owner_device_window_r4/REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/owner_device_window_r4/REVIEW.json.gz",
+      "bytes": 11717,
+      "sha256": "2d63c95d6efa5c316dda7288c3b7dbe43072f919990d89c7ceee0411eee02cf2"
+    },
+    {
+      "snapshot": "owner_bf16_ready_r4/REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/owner_bf16_ready_r4/REVIEW.json.gz",
+      "bytes": 15168,
+      "sha256": "2afd111aa334e85caa5b6a89d8307ca0253c0d885459e32d632857d02610ed18"
+    },
+    {
+      "snapshot": "owner_bf16_ready_r5/REVIEW.json.gz",
+      "original": "validation/dashboard_whole_20261029/owner_bf16_ready_r5/REVIEW.json.gz",
+      "bytes": 6394,
+      "sha256": "f58ac8457c46e7f5e1b6587b17535decb2476ae8a6968f8e1ad76c1ddba2e152"
+    }
+  ]
+}

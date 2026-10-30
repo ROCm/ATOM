@@ -1,8 +1,18 @@
 # FP8 C256 下一项结构优化：owner FFN 输入、Window-RS 与下层消费者
 
+**2026-10-29 15:21 UTC 当前计划入口：** 用户要求面向整网2×重新检索与诊断，已写入[新的C256完整优化方案](dsv41_c256_2x_replan.md)。三轮列Window停止；下文各“下一项”保留为历史过程，不再作为实施队列。新主线为完整attention的数据布局/KV复用、保留大GEMM的转换删除及主要prefill接续。首个有限候选是保持四H16原生算术的Q/scale/out直接stride完整attention A/B，尚未实现。当前FFN约49%的条件覆盖不足以单独支撑目标；2×仍缺40.403%当前时间。最新AITER四份相关源码与本地依赖逐字节相同。此次仅检索和写方案，无GPU、新服务成绩或生产代码变更。
+
+**2026-10-29 15:03 UTC 最新：** [紧凑 BF16＋分块 ready 完整链](dsv41_bf16_chunk_window_result.md)已完成。修复多形状布局特化和 decode BF16x8 零写回后，M1536/M7550/M16291 分别仍退化 27.19%/30.42%/43.33%。同算术分块等待回收约 36/89/180µs，全部有效净配对为负；无 spill、无 FP8 中间编解码，数值也未获模型验收。本版停止、不扫描参数、不接服务。最终 decode 来自 R5，prefill 保留 R4；R4 原 decode 输出错误，计时无效。原供料收益保留，生产代码未改、248783 保留且八卡空闲。下一候选须回到原生 G2 大矩阵效率，针对可删除的 partial 物化及按 CTA 聚合的通信通知另立完整成本/可见性合同；尚未实现，无排队 GPU 任务。
+
+**2026-10-29 14:14 UTC 历史：** [设备内 G2/归约/IPC RS Window](dsv41_fp8_device_window_result.md)已实现并完成三形状真实权重完整链。TP shared 已在各 rank 的 partial 中参与归约，独立 RCCL/compact/stitch 已删除；M1536/M7550/M16291仍分别退化4.99%/10.47%/8.89%，全部72配对为负。新增FP8 partial压缩独立相对L2约2.67%，完整owner约3.37%，本版停止、不接服务。无spill证据；尚未分离G2效率、双重量化、服务竞争与十次epoch barrier的成本。下一个新候选须同时解决BF16紧凑数值合同和阶段同步/转换成本，不能继续扫当前FP8 Window参数。生产代码未改，248783保留、八卡空闲，原供料收益保留。下文旧待办以本条及结果文档为准。
+
+**2026-10-29 13:35 UTC 历史：** [BF16十列窗口＋RS候选](dsv41_fp8_column_rs_result.md)已实现并完成三形状完整链。M1536/M7550分别退化33.92%/7.90%，M16291仅快0.30%；侧流相对相同分列串行版收回35/97/234µs，但前两档分列成本更大。另有新增数值差异，本版停止、不晋级。下一Window必须减少独立RCCL/compact/stitch边界，并解决TP shared在RS前归约的合同；设备内融合版本尚未实现。下面13:11记录为历史进度，已验证的输入供料候选继续保留。
+
+**2026-10-29 13:11 UTC 更新：** [固定gate调度的owner供料候选](dsv41_fp8_owner_supply_result.md)已完成，M1536同次原生→候选完整链0.75551→0.72667ms，1.03969×，四rank全部配对为正。gate/logits/top-6逐字节兼容，原生G1/G2及实际G1 FP8输入保持相同。条件整网节省仅约1.09%，尚无新服务成绩。下一项为供料＋G2/RS窗口的有限完整链候选；5%是结构集成筛选目标，不要求未测成本在实现前自行证明。三形状原生成本见[完整链成本](dsv41_fp8_owner_window_cost_result.md)；下文原始预算/待办以这些新结果为准。
+
 2026-10-29。实现基线为`f723af820`，部署保持TP4/EP1/DP1、FP8 KV、FP4 index、真实DSpark5、owner full；C256主容量为全局M1536、每owner384行。该提交包含已跑完整服务的迁移实现。性能基线仍是冻结R3的6281.294tok/s、374.837秒，并保留单臂时间间隔、正式4个冷特化和未做新GSM的限制。
 
-**下一项大结构方向选定为：保持owner行所有权的完整FFN窗口，统一输入供料，按N列安排G2及归约，输出直接交给下一层owner消费者。** 首个实例是layer8 attention出口→完整shared/routed FFN→layer9的mHC、norm和真实QKV消费。先做新配置的完整链成本诊断，再决定实现预算；当前没有新GPU任务、kernel、winner或排队。
+**下一项大结构方向选定为：保持owner行所有权的完整FFN窗口，统一输入供料，按N列安排G2及归约，输出直接交给下一层owner消费者。** 首个实例是layer8 attention出口→完整shared/routed FFN→layer9的mHC、norm和真实QKV消费。原生成本、M1536供料、BF16列流水/RS和设备FP8 Window均已完成；供料有局部收益，两种Window均已停止。当前无排队GPU任务。
 
 ## 1. 迁移后的实际缺口
 
@@ -19,7 +29,7 @@
 还有三道明确接口约束：
 
 - `supports_prequantized_input()`支持TP4/EP1，但`_validate_preselected_routes()`只允许TP1/EP4。首版沿用**logits AG＋原生top-k**，不假装EP1已有route packet接口。
-- owner384 gate与原生M1536 gate的计算顺序、kernel选择和效率尚未核对。现有prefill local-router只准入2–19层、M4096–16384。其full-M零填充fallback提供另一种保持原生M的方式，但需支付清零、复制和完整gate计算，并验证实际kernel及top-k；不能只扩guard。
+- owner384普通lookup与原生M1536调度不同；新的供料候选显式固定full-M调度后已验证兼容和局部收益。现有prefill local-router仍只准入2–19层、M4096–16384，不能只扩guard；其他decode行数和层权重尚未纳入本次验收。
 - 当前loaded模块的comm-fused backend均为None，H5120/I640/E384的原表无winner。owner需要显式的RS输出合同，不能通过打开DPA/DEP来绕过普通backend的AR选择。
 
 ## 2. 目标执行链与保持的计算
@@ -92,7 +102,9 @@ M1536每rank的完整接收tensor：BF16输入15,728,640B；Q＋E8M0 scale＋BF1
 
 完整链采用实际端点计算`Δt = native_window - candidate_window`，不相加跨rank最大值或重叠事件。服务估算为`Σ(实际层型/shape调用次数 × Δt) / T`，使用相同owner行数及prefill replay合同；不同变更的收益不连乘。作为研究准入标准，完整方案保守估计至少应有**5%整网收益**（约17.85秒），优先争取10%（约34.08秒）；这是继续投入大结构实现的门槛，不是已测预测。
 
-## 4. 下一个实际任务
+## 4. 已完成的原生诊断与接续任务
+
+下面1–4的三形状原生诊断已经完成，不重跑；随后固定gate供料A/B也已完成。当前接续第5项：以供料版本为独立对照，实现一个有明确列完成/RS依赖的有限Window候选，测量新增成本。没有测量不等于失败，也不等于允许服务晋级。
 
 写一个新的、一次真实权重加载的完整链fixture，而不是重启旧服务：
 
@@ -113,4 +125,4 @@ M1536每rank的完整接收tensor：BF16输入15,728,640B；Q＋E8M0 scale＋BF1
 - 服务阶段两侧都用同一TP4/EP1/FP8/DSpark5/full、相同请求指纹；记录formal AL、target/draft行数和每层路由。新的准备版本补齐R3四个已观察Triton签名，再检查完整key；不通过减少请求或裁剪验证行来获得zero-cold。
 - input路径没净收益就停止该子项；Window完整链退化、状态/数值不合格、GEMM退化吃掉重叠、窗口仅在layer8有效却达不到整网门槛，均停止晋级。若完整FFN覆盖不足，下一调查转向实测最大的attention/投影/状态阶段；不再回头累积router、旧ready或旧prefetch。
 
-本轮只提交已有迁移实现、读取源码并核算新RS容量及时间门槛。历史冻结源码、运行及review保持原样；没有新的GPU性能或精度成绩。
+原计划编写时仅提交迁移实现和读取源码。后续GPU进展以文首两个结果文档为准：已取得供料候选完整链性能，仍无新增整网性能或模型精度验收。历史冻结源码、运行及review保持原样。

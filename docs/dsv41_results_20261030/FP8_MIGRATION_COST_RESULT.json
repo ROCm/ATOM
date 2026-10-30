@@ -1,0 +1,184 @@
+{
+  "status": "NEW_COMPLETE_MIGRATION_COST_ANALYSIS_NOT_REPEAT_REVIEW",
+  "bindings": {
+    "validation/dashboard_whole_20261029/fp8_owner_service_r3/REVIEW.json.gz": "143704a0d5d17680f229e38765cd4d4ac3833f75403cf3b05732c704b30c64b7",
+    "validation/dashboard_whole_20261029/r9/ABBA_REVIEW.json.gz": "2f7f266e987fd75adbfefcb0c3bc5215d8d55f27bf59f7467a1546b1e761a388"
+  },
+  "whole_wall": {
+    "main_mean_seconds": 446.783019244991,
+    "migrated_seconds": 374.8370730020106,
+    "saved_seconds": 71.94594624298043,
+    "time_reduction_percent": 16.103106685782354,
+    "throughput_ratio": 1.1919392488762566,
+    "TPOT_reduction_percent": 16.452140550780225
+  },
+  "acceptance": {
+    "main_AL": 2.4888258360024,
+    "migrated_AL": 2.471299296472713,
+    "change_percent": -0.7042091606473511
+  },
+  "work": {
+    "formal:decode:calls": {
+      "main_mean_per_arm": 4131.0,
+      "native_branch_mean_per_arm": 4149.0,
+      "migrated": 4157,
+      "versus_main_percent": 0.6293875574921337,
+      "versus_native_branch_percent": 0.19281754639672855
+    },
+    "formal:decode:executed_rows": {
+      "main_mean_per_arm": 5804691.0,
+      "native_branch_mean_per_arm": 5834769.0,
+      "migrated": 5835366,
+      "versus_main_percent": 0.5284519020909206,
+      "versus_native_branch_percent": 0.010231767530122227
+    },
+    "formal:decode:scheduled_requests": {
+      "main_mean_per_arm": 948469.0,
+      "native_branch_mean_per_arm": 954510.5,
+      "migrated": 955206,
+      "versus_main_percent": 0.7103026034588344,
+      "versus_native_branch_percent": 0.07286457299318094
+    },
+    "formal:decode:scheduled_rows": {
+      "main_mean_per_arm": 5690814.0,
+      "native_branch_mean_per_arm": 5727063.0,
+      "migrated": 5731236,
+      "versus_main_percent": 0.7103026034588344,
+      "versus_native_branch_percent": 0.07286457299318094
+    },
+    "formal:draft:executed_requests": {
+      "main_mean_per_arm": 970273.5,
+      "native_branch_mean_per_arm": 975259.0,
+      "migrated": 975394,
+      "versus_main_percent": 0.527737797641592,
+      "versus_native_branch_percent": 0.013842476716452445
+    },
+    "formal:draft:executed_rows": {
+      "main_mean_per_arm": 4851367.5,
+      "native_branch_mean_per_arm": 4876295.0,
+      "migrated": 4876970,
+      "versus_main_percent": 0.527737797641592,
+      "versus_native_branch_percent": 0.013842476716452445
+    },
+    "formal:draft:graph_calls": {
+      "main_mean_per_arm": 5972.5,
+      "native_branch_mean_per_arm": 5990.5,
+      "migrated": 6028,
+      "versus_main_percent": 0.9292591042277198,
+      "versus_native_branch_percent": 0.6259911526583783
+    },
+    "formal:draft_kv:input_rows": {
+      "main_mean_per_arm": 24463042.5,
+      "native_branch_mean_per_arm": 24492541.5,
+      "migrated": 24493442,
+      "versus_main_percent": 0.1242670448698302,
+      "versus_native_branch_percent": 0.0036766294751355844
+    },
+    "formal:prefill:calls": {
+      "main_mean_per_arm": 1841.5,
+      "native_branch_mean_per_arm": 1841.5,
+      "migrated": 1871,
+      "versus_main_percent": 1.6019549280477774,
+      "versus_native_branch_percent": 1.6019549280477774
+    },
+    "formal:prefill:executed_rows": {
+      "main_mean_per_arm": 18658351.5,
+      "native_branch_mean_per_arm": 18657772.5,
+      "migrated": 18658076,
+      "versus_main_percent": -0.0014765505945146806,
+      "versus_native_branch_percent": 0.0016266679208287727
+    },
+    "formal:prefill:scheduled_requests": {
+      "main_mean_per_arm": 2825.0,
+      "native_branch_mean_per_arm": 2797.5,
+      "migrated": 2833,
+      "versus_main_percent": 0.2831858407079668,
+      "versus_native_branch_percent": 1.2689901697944483
+    },
+    "formal:prefill:scheduled_rows": {
+      "main_mean_per_arm": 18653958.0,
+      "native_branch_mean_per_arm": 18654214.0,
+      "migrated": 18654022,
+      "versus_main_percent": 0.00034309072638460947,
+      "versus_native_branch_percent": -0.001029258053975024
+    }
+  },
+  "sparse_phase_estimates": {
+    "prefill_target": {
+      "main_estimated_seconds_per_arm": 221.09522813732454,
+      "migrated_estimated_seconds": 185.68213177704698
+    },
+    "decode_target": {
+      "main_estimated_seconds_per_arm": 198.66327164575148,
+      "migrated_estimated_seconds": 186.74668331313134
+    },
+    "after_target": {
+      "main_estimated_seconds_per_arm": 15.75876983675127,
+      "migrated_estimated_seconds": 15.84674507445582
+    },
+    "M1536_target": {
+      "main_estimated_seconds_per_arm": 190.85317170521307,
+      "migrated_estimated_seconds": 176.57838647460937
+    }
+  },
+  "M1536_target_mean_ms": {
+    "main": 51.70071020051824,
+    "migrated": 47.56960842527192
+  },
+  "sparse_estimated_enclosing_over_wall": [
+    1.0358515346649184,
+    1.0353583177476846,
+    1.036373409811112,
+    1.0353805031325451
+  ],
+  "formal_cold": [
+    {
+      "rank": 0,
+      "count": 4,
+      "detail_sha256": [
+        "ef307627e6ca22f78d249d3223600c96e666af0fc08fcdc4e52da3d17c0f8bf1",
+        "561c7192e35ccd797820427429232c05ce235d2c5cc9bf41aafff85a21a61058",
+        "50a42551468f41eeaa3df8d6953d9465442e89460abe0e2905696eb6a6ac2df0",
+        "b105dfa0b157b4196efac848cdec631d8335f2db4f8d865bf2c9efb437f178aa"
+      ]
+    },
+    {
+      "rank": 1,
+      "count": 4,
+      "detail_sha256": [
+        "ef307627e6ca22f78d249d3223600c96e666af0fc08fcdc4e52da3d17c0f8bf1",
+        "561c7192e35ccd797820427429232c05ce235d2c5cc9bf41aafff85a21a61058",
+        "50a42551468f41eeaa3df8d6953d9465442e89460abe0e2905696eb6a6ac2df0",
+        "b105dfa0b157b4196efac848cdec631d8335f2db4f8d865bf2c9efb437f178aa"
+      ]
+    },
+    {
+      "rank": 2,
+      "count": 4,
+      "detail_sha256": [
+        "ef307627e6ca22f78d249d3223600c96e666af0fc08fcdc4e52da3d17c0f8bf1",
+        "561c7192e35ccd797820427429232c05ce235d2c5cc9bf41aafff85a21a61058",
+        "50a42551468f41eeaa3df8d6953d9465442e89460abe0e2905696eb6a6ac2df0",
+        "b105dfa0b157b4196efac848cdec631d8335f2db4f8d865bf2c9efb437f178aa"
+      ]
+    },
+    {
+      "rank": 3,
+      "count": 4,
+      "detail_sha256": [
+        "ef307627e6ca22f78d249d3223600c96e666af0fc08fcdc4e52da3d17c0f8bf1",
+        "561c7192e35ccd797820427429232c05ce235d2c5cc9bf41aafff85a21a61058",
+        "50a42551468f41eeaa3df8d6953d9465442e89460abe0e2905696eb6a6ac2df0",
+        "b105dfa0b157b4196efac848cdec631d8335f2db4f8d865bf2c9efb437f178aa"
+      ]
+    }
+  ],
+  "remaining": [
+    "Single new arm versus retained main/native-branch arms; same node but time gap",
+    "Four formal new Triton specializations per rank; exact keys retained, no compile-duration subtraction",
+    "Sparse sums exceed wall by3.54\u20133.64%, so cannot attribute whole saved seconds exactly",
+    "No full-model numeric/GSM acceptance; no default production promotion",
+    "EP4 deployment and packed prefix policy are separate followups"
+  ],
+  "next_priority": "Close four observed cold signatures in a new preparation; use actual full-window timing before choosing wider FFN/consumer changes. FP8 stride removal is an explicit smaller candidate, not 2x coverage."
+}
