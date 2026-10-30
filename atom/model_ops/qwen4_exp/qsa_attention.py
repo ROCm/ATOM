@@ -552,8 +552,9 @@ class Qwen4ExpAttention(nn.Module):
             or width is None
             # aiter rejects a padded selection spanning 2**31 bytes or more.
             or query.shape[0] * width * selected.element_size() >= 2**31
-            # Padding a selection laid out for another budget or ratio moves the
-            # causal tail: the kernel would read it at the wrong column.
+            # The kernel expects min(v // 4, T) blocks for a row with v visible
+            # tokens (width 4T + 3); another budget or ratio selects a different
+            # number, so padding its selection would give wrong output.
             or self.indexer.compress_ratio != 4
             or self.indexer.token_topk + 3 not in _FLYDSL_WIDTHS
             # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
@@ -574,8 +575,10 @@ class Qwen4ExpAttention(nn.Module):
         else:
             k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
             v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
-        # The expansion drops columns no row can reach; the kernel reads them as -1.
-        # It does not validate the layout: a malformed selection gives wrong output.
+        # The expansion drops columns no row can reach (short contexts select
+        # every complete block, then the tail, left-aligned), so padding with -1
+        # keeps each row's layout. The kernel does not validate it: a malformed
+        # selection gives wrong output.
         indices = torch.nn.functional.pad(
             selected, (0, width - selected.shape[1]), value=-1
         )

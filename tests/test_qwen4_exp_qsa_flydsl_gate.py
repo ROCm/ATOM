@@ -161,3 +161,113 @@ def test_mixed_prefix_batch_gathers_full_contexts(monkeypatch):
     assert torch.equal(v, -k)
     assert kwargs["query_lens"] == extends
     assert kwargs["prefix_lens"] == prefixes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "prefixes, extends",
+    [
+        ((0,), (7,)),
+        ((0,), (300,)),
+        ((0,), (512,)),
+        ((200,), (300,)),
+        ((0, 0, 100), (100, 37, 250)),
+        ((0,), (1000,)),
+    ],
+    ids=["7", "300", "512", "prefix-200+300", "mixed-3-requests", "1000-unpadded"],
+)
+def test_short_context_matches_native_kernel(monkeypatch, prefixes, extends):
+    """Short contexts shrink the selection (its width follows max_seq_len, not
+    the budget), so it is padded with -1 to the next FlyDSL width, past the
+    budget's own layout. Every row still lists all its complete blocks, then
+    its tail, left-aligned, so the real kernel must match the native
+    `qsa_sparse_paged_gqa` on the same selection."""
+    from atom.model_ops.qwen4_exp.ops.qsa import (
+        qsa_select_paged_tokens,
+        qsa_sparse_paged_gqa,
+    )
+    from atom.plugin.sglang.qwen4_exp_bridge import _flydsl_prefill_layout
+
+    if not qsa_attention._flydsl_arch_supported():
+        pytest.skip("FlyDSL QSA attention needs gfx942")
+    try:
+        qsa_attention._flydsl_attention_op()
+    except ImportError:
+        pytest.skip("aiter without FlyDSL QSA attention (ROCm/aiter#6576)")
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+
+    device, block, ratio, budget, heads, dim = "cuda", 64, 4, 2048, 6, 256
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, dtype=torch.bfloat16, device=device, generator=gen)
+
+    seqs = [p + e for p, e in zip(prefixes, extends)]
+    width = max(-(-s // block) for s in seqs)
+    pages = len(seqs) * width
+    tables = (
+        torch.randperm(pages, device=device, generator=gen)
+        .view(len(seqs), width)
+        .to(torch.int32)
+    )
+    positions = torch.cat(
+        [torch.arange(p, p + e, device=device) for p, e in zip(prefixes, extends)]
+    )
+    token_to_req = torch.cat(
+        [
+            torch.full((e,), r, dtype=torch.int32, device=device)
+            for r, e in enumerate(extends)
+        ]
+    )
+    selected = qsa_select_paged_tokens(
+        randn(positions.numel(), 4, 128),
+        randn(pages, block // ratio, 1, 128),
+        tables,
+        token_to_req,
+        positions,
+        torch.tensor(seqs, dtype=torch.int32, device=device),
+        budget,
+        ratio,
+        max_seq_len=max(seqs),
+        allow_flydsl=True,
+    )
+    if max(seqs) <= 512:
+        assert selected.shape[1] < 1027  # the padded case under review
+
+    k_cache, v_cache = randn(pages, block, 1, dim), randn(pages, block, 1, dim)
+    query = randn(positions.numel(), heads, dim)
+    slots = (
+        tables[token_to_req.long(), positions // block].long() * block
+        + positions % block
+    )
+    batch = SimpleNamespace(extend_seq_lens_cpu=list(extends), seq_lens_cpu=seqs)
+    host_lens, context_slots = _flydsl_prefill_layout(
+        batch, len(seqs), positions.numel(), tables, block
+    )
+    layer = _layer(
+        indexer=SimpleNamespace(compress_ratio=ratio, token_topk=budget),
+        num_heads=heads,
+        k_cache=k_cache,
+        v_cache=v_cache,
+    )
+    qsa = SimpleNamespace(host_lens=host_lens, context_slots=context_slots)
+    flydsl = Qwen4ExpAttention._flydsl_attention(
+        layer,
+        query,
+        k_cache.flatten(0, 1)[slots],
+        v_cache.flatten(0, 1)[slots],
+        selected,
+        qsa,
+    )
+    assert flydsl is not None
+    native = qsa_sparse_paged_gqa(
+        query,
+        k_cache,
+        v_cache,
+        selected,
+        tables,
+        token_to_req,
+        softmax_scale=layer.scaling,
+        num_decode_requests=None,
+    )
+    torch.testing.assert_close(flydsl, native, atol=1.6e-2, rtol=1.6e-2)
