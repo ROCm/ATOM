@@ -1117,7 +1117,7 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=global_num_experts,
+            num_routing_experts=layer.expert_layout.num_routed,
             num_fused_shared_experts=layer.num_fused_shared_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,

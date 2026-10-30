@@ -97,7 +97,8 @@ def triton_topk_softmax(
     logit in its row is NaN. AITER agrees unless a NaN is the first element
     of one of its per-thread vector loads (16 bf16 below 512 experts, 32 at
     512; expert 0 always is): there it may pick it, making every weight NaN,
-    or misorder the row, so rows with NaNs are not bit-identical.
+    or misorder the row, so rows with NaNs are not bit-identical. Probed
+    against ROCm/aiter@836b336ed.
 
     `num_valid_rows`, as in AITER (ROCm/aiter#6916): an optional int32 device
     tensor whose first element is the count of real rows. Rows at or past it

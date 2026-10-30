@@ -42,6 +42,7 @@ def _cu_num() -> int:
 
 
 def _masked_cu_fraction() -> float:
+    # To move to atom/config.py: https://github.com/ROCm/ATOM/issues/2863
     from atom.model_engine.model_runner import RapidServeModelRunner
 
     # A prefill stream gets fraction f of the CUs, its decode stream the rest.
