@@ -422,7 +422,28 @@ class PagedAttentionImpl(nn.Module):
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
-            if self.kv_cache_dtype == "fp8":
+            if self.kv_cache_dtype == "fp8" and envs.ATOM_USE_UNIFIED_ATTN:
+                # unified_attention carries one descale for the whole cache, so
+                # write it per tensor with the layer's kv_scale, as the Triton
+                # RoPE branch above does, and hand it Q in the cache dtype.
+                # Clamped first: the cast to fp8 does not saturate.
+                self.per_token_quant = False
+                k_scale = v_scale = self.kv_scale
+                aiter.reshape_and_cache(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    attn_metadata.slot_mapping,
+                    kv_cache_dtype="fp8",
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    asm_layout=asm_layout,
+                )
+                if not self._can_attempt_prefill_sink_asm(fwd_ctx):
+                    fp8_max = torch.finfo(k_cache.dtype).max
+                    q = q.clamp(-fp8_max, fp8_max).to(k_cache.dtype)
+            elif self.kv_cache_dtype == "fp8":
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
                     v,
