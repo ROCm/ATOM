@@ -159,6 +159,20 @@ class PleHostTable:
         with self._lock:
             self._rows[shard] = (row_start, None)
 
+    def check_resumed(self) -> None:
+        """Raise if the table is released: a weight sync has to wait for the
+        resume."""
+        with self._lock:
+            self._check_resumed()
+
+    def _check_resumed(self) -> None:
+        # In HBM, `weight` itself is released, with the other parameters.
+        if self._released or (self._in_hbm and not self.weight.numel()):
+            raise ValueError(
+                f"{self.prefix}: the n-gram table is released; sync its "
+                "rows after the weights are resumed"
+            )
+
     def sync_rows(self, first: int, rows: torch.Tensor) -> None:
         """A weight sync's global rows `[first, first + len(rows))`: this
         rank's part is written in place, over the page-locked rows or into
@@ -180,12 +194,7 @@ class PleHostTable:
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
         with self._lock:
-            # In HBM, `weight` itself is released, with the other parameters.
-            if self._released or (self._in_hbm and not self.weight.numel()):
-                raise ValueError(
-                    f"{self.prefix}: the n-gram table is released; sync its "
-                    "rows after the weights are resumed"
-                )
+            self._check_resumed()
             if self._in_hbm:
                 if lo < hi:
                     self.weight.data.narrow(0, lo - self.vocab_start, hi - lo).copy_(

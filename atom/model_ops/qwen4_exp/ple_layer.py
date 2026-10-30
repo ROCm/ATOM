@@ -209,7 +209,8 @@ class _Qwen4ExpHostEmbedding(nn.Module):
 
     Each data-parallel rank is its own model and page-locks its own copy of
     the table (split across its TP ranks): N ranks on a node hold N copies,
-    ~95 GiB each for the BF16 table.
+    ~95 GiB each for the BF16 table. Sharing one copy across them:
+    https://github.com/ROCm/ATOM/issues/2861
     """
 
     def __init__(
@@ -264,12 +265,17 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         """`WeightUpdaterMixin`: `weight` -- the whole table, or checkpoint
         shard `shard_id` of it -- written in place (`PleHostTable.sync_rows`).
         False for other parameters, and for the whole table in HBM: that is
-        `weight` itself, which the updater syncs as any other parameter.
+        `weight` itself, which the updater syncs as any other parameter --
+        unless it is released, which raises as a shard would rather than
+        reach the updater as a shape mismatch.
 
         The last lookups of the step that just ended may still be reading the
         rows over the bus; the updater has waited for them, once per update.
         """
-        if param_name != "weight" or (shard_id is None and not self.table.on_host):
+        if param_name != "weight":
+            return False
+        if shard_id is None and not self.table.on_host:
+            self.table.check_resumed()
             return False
         num_rows = (self.vocab_end_idx - self.vocab_start_idx) * self.tp_size
         first = 0 if shard_id is None else shard_id * self.shard_rows

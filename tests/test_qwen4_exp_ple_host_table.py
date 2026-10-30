@@ -255,7 +255,10 @@ class _Embedding(torch.nn.Module):
 
     def sync_weight(self, param_name, tensor, shard_id=None):
         """`_Qwen4ExpHostEmbedding.sync_weight` at TP1, less its shape check."""
-        if param_name != "weight" or (shard_id is None and not self.table.on_host):
+        if param_name != "weight":
+            return False
+        if shard_id is None and not self.table.on_host:
+            self.table.check_resumed()
             return False
         self.table.sync_rows(0 if shard_id is None else shard_id * SHARD_ROWS, tensor)
         return True
@@ -319,12 +322,14 @@ def test_releasing_the_weights_releases_the_table(fake_pin, monkeypatch, fail_at
     assert _bitwise_equal(got, new[ids])
 
 
+@pytest.mark.parametrize("shards", [False, True])
 @pytest.mark.parametrize("fail_at", [None, 1])
 def test_a_sync_between_release_and_resume_is_out_of_order(
-    fake_pin, monkeypatch, fail_at
+    fake_pin, monkeypatch, fail_at, shards
 ):
     """The rows are not missing from the checkpoint, they are released: the
-    error says to sync after resuming, which then works."""
+    error says to sync after resuming, which then works. By the table's own
+    name too, which on the HBM fallback is the updater's to sync."""
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     fake_pin.fail_at = fail_at
@@ -335,11 +340,12 @@ def test_a_sync_between_release_and_resume_is_out_of_order(
     emb.bind()
     runner = _runner(model)
     runner.release_memory(tags=["weights"])
-    shards = _sync_tensors(table.neg(), torch.ones(4, 4), True)[:NUM_SHARDS]
+    tensors = _sync_tensors(table.neg(), torch.ones(4, 4), shards)
+    tensors = tensors[:NUM_SHARDS] if shards else tensors[:1]
     with pytest.raises(ValueError, match="released; sync its rows after the weights"):
-        _updater(model).update_weights(shards)
+        _updater(model).update_weights(tensors)
     runner.resume_memory(tags=["weights"])
-    assert _updater(model).update_weights(shards) == NUM_SHARDS
+    assert _updater(model).update_weights(tensors) == len(tensors)
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
     assert _bitwise_equal(got, table.neg()[ids])
@@ -944,6 +950,11 @@ def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
     runner.release_memory(tags=["weights"])
     assert allocated - torch.cuda.memory_allocated() >= table_bytes
     squatter = torch.empty(table_bytes, dtype=torch.uint8, device="cuda")
+    # The whole table is `weight`, which the updater would otherwise find
+    # empty and skip as a shape mismatch.
+    updater = _updater(host_layer, "cuda")
+    with pytest.raises(ValueError, match="released; sync its rows after the weights"):
+        updater.update_weights([("ngram_embedding.weight", table)])
 
     runner.resume_memory(tags=["weights"])
     assert embedding.weight.is_cuda and embedding.weight.shape == table.shape
