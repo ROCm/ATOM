@@ -288,6 +288,9 @@ def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
     eager/custom-op regions. Without these directories they can land under
     /tmp/torchinductor_<user> and be recompiled in each fresh container.
     Use the same rank-owned directory for the regular and standalone adaptors.
+    Preserve the regular adaptor's redirection policy, rather than setdefault:
+    PyTorch can already have populated these variables with temporary paths.
+    This affects future compiler work only; earlier artifacts are not moved.
     """
     inductor_cache = os.path.join(base_cache_dir, "inductor_cache")
     os.makedirs(inductor_cache, exist_ok=True)
@@ -295,6 +298,24 @@ def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
     triton_cache = os.path.join(base_cache_dir, "triton_cache")
     os.makedirs(triton_cache, exist_ok=True)
     os.environ["TRITON_CACHE_DIR"] = triton_cache
+    logger.info(
+        "Compiler cache directories: Inductor=%s, Triton=%s",
+        inductor_cache,
+        triton_cache,
+    )
+
+
+class _InductorCacheAdaptor(CompilerInterface):
+    """Shared cache lifecycle for regular and standalone Inductor."""
+
+    def initialize_cache(
+        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
+    ):
+        self.cache_dir = cache_dir
+        self.prefix = prefix
+        self.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
+        if not disable_cache:
+            _initialize_inductor_cache_dirs(self.base_cache_dir)
 
 
 def get_inductor_factors() -> list[Any]:
@@ -330,7 +351,7 @@ def set_inductor_config(config, runtime_shape):
         pass
 
 
-class InductorAdaptor(CompilerInterface):
+class InductorAdaptor(_InductorCacheAdaptor):
     """
     The adaptor for the Inductor compiler, version 2.5, 2.6, 2.7.
     """
@@ -343,16 +364,6 @@ class InductorAdaptor(CompilerInterface):
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
-
-    def initialize_cache(
-        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
-    ):
-        self.cache_dir = cache_dir
-        self.prefix = prefix
-        self.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
-        if disable_cache:
-            return
-        _initialize_inductor_cache_dirs(self.base_cache_dir)
 
     def compile(
         self,
@@ -660,7 +671,7 @@ class InductorAdaptor(CompilerInterface):
             return contextlib.nullcontext()
 
 
-class InductorStandaloneAdaptor(CompilerInterface):
+class InductorStandaloneAdaptor(_InductorCacheAdaptor):
     """
     The adaptor for the Inductor compiler.
     Requires PyTorch 2.8+.
@@ -678,14 +689,6 @@ class InductorStandaloneAdaptor(CompilerInterface):
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
-
-    def initialize_cache(
-        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
-    ):
-        self.cache_dir = cache_dir
-        if not disable_cache:
-            base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
-            _initialize_inductor_cache_dirs(base_cache_dir)
 
     def compile(
         self,
