@@ -243,9 +243,8 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
             worker,
             lambda got: operation in got["saved"] and source_safe <= got["completions"],
         )
-        assert (
-            ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True)
-            in (saved["completions"])
+        assert ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True) in (
+            saved["completions"]
         )
         assert (
             ConnectorCompletion(DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL, operation, True)
@@ -280,9 +279,9 @@ def test_kv_round_trip_through_the_store(monkeypatch, layout):
         for name, cache in kv_caches.items():
             for field, tensor in vars(cache).items():
                 blocks = tensor.reshape(NUM_BLOCKS, -1)
-                assert torch.equal(blocks[DESTINATION], blocks[SOURCE]), (
-                    f"{name}.{field} differs after the Store round trip"
-                )
+                assert torch.equal(
+                    blocks[DESTINATION], blocks[SOURCE]
+                ), f"{name}.{field} differs after the Store round trip"
         assert worker._pool.quarantined("save") == 0
         assert worker._pool.quarantined("load") == 0
     finally:

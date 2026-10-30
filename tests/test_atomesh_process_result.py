@@ -138,5 +138,26 @@ class AggregatedResourcesTest(unittest.TestCase):
                 self.assertEqual(process_result.topology_key(topology), topology)
 
 
+class AimeResultTest(unittest.TestCase):
+    def test_aime24_results_are_included_in_accuracy_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "20261030_aime24_1p1d_c32" / "model"
+            output.mkdir(parents=True)
+            (output / "results.json").write_text(
+                json.dumps(
+                    {
+                        "results": {"aime24": {"exact_match,none": 0.8}},
+                        "configs": {"aime24": {"num_fewshot": 0}},
+                    }
+                )
+            )
+            scores = process_result.find_eval_scores(root)
+            self.assertEqual(len(scores), 1)
+            score = next(iter(scores.values()))
+            self.assertEqual(score["task"], "aime24")
+            self.assertEqual(score["value"], 0.8)
+
+
 if __name__ == "__main__":
     unittest.main()

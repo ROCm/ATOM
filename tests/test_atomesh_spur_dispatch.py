@@ -26,11 +26,13 @@ class SpurDispatchTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / JOB_SCRIPT.name
         shutil.copyfile(JOB_SCRIPT, self.script)
-        for helper in ("pd_job_result.py", "cap_log.py"):
+        for helper in ("pd_job_result.py", "cap_log.py", "prepare_host_memory.sh"):
             shutil.copyfile(JOB_SCRIPT.with_name(helper), scripts / helper)
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
+        # Do not let real GPU occupancy on the test host affect launcher tests.
+        self.write_tool("amd-smi", "print('GPU VRAM_USED VRAM_TOTAL')")
         self.write_tool(
             "ip",
             """
@@ -106,6 +108,10 @@ class SpurDispatchTest(unittest.TestCase):
                 stream.write(json.dumps(sys.argv[1:]) + "\\n")
             if sys.argv[1:3] == ["image", "inspect"] and os.environ.get("FAKE_IMAGE_ID"):
                 print(os.environ["FAKE_IMAGE_ID"])
+            if sys.argv[1] == "run" and "--privileged" in sys.argv:
+                import time
+                time.sleep(float(os.environ.get("HOST_CLEANUP_DELAY", "0")))
+                sys.exit(int(os.environ.get("HOST_CLEANUP_RC", "0")))
             if sys.argv[1] == "run" and "--entrypoint" in sys.argv and "test-image" in sys.argv:
                 import io
                 import tarfile
@@ -186,6 +192,59 @@ class SpurDispatchTest(unittest.TestCase):
             self.assertEqual(len(runs), 1)
             self.assertIn("ATOMESH_EXECUTION_PHASE=eval", runs[0])
             self.assertIn("ATOMESH_SERVICE_PORT_OFFSET=1000", runs[0])
+
+    def test_host_cache_cleanup_precedes_service_on_each_worker(self):
+        self.run_job(ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES="1")
+        for rank in range(2):
+            calls = self.docker_calls(rank)
+            runs = [call for call in calls if call[0] == "run"]
+            self.assertEqual(len(runs), 2)
+            cleanup, service = runs
+            self.assertLess(calls.index(["pull", "test-image"]), calls.index(cleanup))
+            self.assertEqual(cleanup[cleanup.index("--user") + 1], "0")
+            self.assertEqual(cleanup[cleanup.index("--network") + 1], "none")
+            self.assertIn("--privileged", cleanup)
+            self.assertIn("--rm", cleanup)
+            self.assertEqual(cleanup[cleanup.index("--entrypoint") + 1], "/bin/bash")
+            self.assertIn("-ec", cleanup)
+            payload = cleanup[-1]
+            self.assertLess(payload.index("sync"), payload.index("echo 3 >"))
+            self.assertIn("/proc/sys/vm/drop_caches", payload)
+            self.assertLess(payload.index("echo 3 >"), payload.index("snapshot after"))
+            self.assertNotIn("--privileged", service)
+            self.assertIn(f"NODE_RANK={rank}", service)
+            log = self.run_dir / f"rank-{rank}/host-memory-combined.log"
+            self.assertIn("cache cleanup completed", log.read_text())
+
+    def test_host_cache_cleanup_failure_blocks_service(self):
+        self.run_job(
+            "--spur-worker",
+            ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES="1",
+            HOST_CLEANUP_RC="9",
+            expected_rc=9,
+        )
+        calls = self.docker_calls(0)
+        runs = [call for call in calls if call[0] == "run"]
+        self.assertEqual(len(runs), 1)
+        self.assertIn("--privileged", runs[0])
+        helper = runs[0][runs[0].index("--name") + 1]
+        self.assertIn(["rm", "-f", helper], calls)
+        self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "9\n")
+
+    def test_host_cache_cleanup_timeout_blocks_service_and_removes_helper(self):
+        self.run_job(
+            "--spur-worker",
+            ATOMESH_ENV_ATOMESH_DROP_HOST_CACHES="1",
+            ATOMESH_HOST_CACHE_DROP_TIMEOUT="1",
+            HOST_CLEANUP_DELAY="60",
+            expected_rc=124,
+        )
+        calls = self.docker_calls(0)
+        runs = [call for call in calls if call[0] == "run"]
+        self.assertEqual(len(runs), 1)
+        helper = runs[0][runs[0].index("--name") + 1]
+        self.assertIn(["rm", "-f", helper], calls)
+        self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "124\n")
 
     def test_eval_only_rejects_disabled_eval(self):
         self.run_job(EVAL_ONLY="true", RUN_EVAL="false", expected_rc=2)

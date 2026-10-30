@@ -357,6 +357,12 @@ class Gsm8kThresholdTest(unittest.TestCase):
         start = source.index(marker) + len(marker)
         cls.checker = source[start : source.index("\nPY\n", start)]
 
+    def test_aime24_score_is_validated(self):
+        result = self.score({"aime24": {"exact_match,none": 0.8}}, "0.7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("aime24", result.stdout)
+        self.assertNotEqual(self.score({"aime24": {}}, "").returncode, 0)
+
     def score(self, results, threshold):
         with tempfile.TemporaryDirectory() as temp:
             result_dir = Path(temp) / "20260101_gsm8k_1p1d_c64"

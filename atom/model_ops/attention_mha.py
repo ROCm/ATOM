@@ -1361,11 +1361,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_index_cache = self.index_cache
             fused_index_slot_mapping = slot_mapping
 
-        if self.skip_index_topk:
-            if self.kv_nvfp4:
-                raise NotImplementedError(
-                    "ATOM_M3_SPARSE_KV_NVFP4 does not cover top-k-reusing layers"
-                )
+        # Preserve the existing FP8/BF16 reuse path. Only NVFP4 needs the
+        # AITER skip-index path below and its separate quantized KV store.
+        if self.skip_index_topk and not self.kv_nvfp4:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
                 triton_fused_norm_rope_cache,
             )
@@ -1411,8 +1409,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             dtype=qkv.dtype,
             device=qkv.device,
         )
-        index_q = torch.empty(
-            (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+        index_q = (
+            None
+            if self.skip_index_topk
+            else torch.empty(
+                (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+            )
         )
         aiter.fused_qknorm_idxrqknorm(
             qkv,
@@ -1440,6 +1442,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_scale=fused_k_scale,
             v_scale=fused_v_scale,
             asm_layout=not self.kv_nvfp4,
+            skip_index_branch=self.skip_index_topk,
         )
         if self.kv_nvfp4:
             from atom.model_ops.minimax_m3.index_fp4 import kv_nvfp4_store
@@ -1460,11 +1463,15 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         q = q_out.view(-1, self.num_heads, self.head_dim)
         # Stash the rotated indexer query for dispatch_backend (same-forward,
         # single-threaded; cleared after the sparse backend consumes it).
-        self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+        self._index_q = (
+            None
+            if index_q is None
+            else index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+        )
         self._index_q_cache_key_info = (
-            tuple(self._index_q.shape),
-            self._index_q.dtype,
-            self._index_q.device,
+            (num_tokens, self.num_idx_heads, self.index_head_dim),
+            qkv.dtype,
+            qkv.device,
         )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale

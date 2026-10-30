@@ -818,6 +818,10 @@ def find_eval_scores(root: Path) -> dict[tuple[str, str, int], dict[str, Any]]:
                 None,
             )
             strict = number(result.get("exact_match,strict-match"))
+        elif "aime24" in results:
+            task = "aime24"
+            metric = "exact_match"
+            score_raw = results[task].get("exact_match,none")
         else:
             continue
 
