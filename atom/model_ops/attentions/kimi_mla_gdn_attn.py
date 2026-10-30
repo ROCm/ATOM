@@ -224,8 +224,10 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         conv_cache = runner.mamba_k_cache
         n_kda = conv_cache.shape[0]
         width, channels = conv_cache.shape[2:]
+        # As `_state_shape_for_runner` sized it: from the runner's count, which
+        # a drafter's `mtp_k` (`self.num_spec`) can differ from.
         expected_width = (
-            runner.config.hf_config.linear_conv_kernel_dim - 1 + self.num_spec
+            runner.config.hf_config.linear_conv_kernel_dim - 1 + runner.num_spec_tokens
         )
         if width == expected_width and channels % 3 == 0:
             run = channels // 3 * conv_cache.element_size()

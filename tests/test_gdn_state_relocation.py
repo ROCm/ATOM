@@ -384,6 +384,7 @@ def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
     # No checkpoint spec, so the answer is the P/D join alone rather than the
     # `lmcache_mp` checkpoint contract layered on it.
     builder.model_runner.state_runtime = SimpleNamespace(checkpoint_spec=None)
+    builder.model_runner.num_spec_tokens = 0
     return builder
 
 
@@ -568,6 +569,22 @@ def test_a_slot_unit_without_a_tp_split_is_refused_at_startup():
         RuntimeError, match=r"slot regions \[0, 1, 2\] have no TP split"
     ):
         builder.get_kv_transfer_tensors()
+
+
+def test_the_conv_width_is_read_from_the_count_the_cache_was_sized_by():
+    """The conv cache is sized by the runner's speculative count. A drafter's
+    `mtp_k` can differ from it (DSpark), and must not make a correctly sized
+    unit look like one of an unexpected width."""
+    builder = kimi_builder({"kv_connector": "mooncake"})
+    builder.num_spec = 3
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    rows, channels = SHAPE_K
+    assert (
+        tensors.slot_region_tp_segments[:LAYERS]
+        == [(channels // 3 * 4,) * (3 * rows)] * LAYERS
+    )
 
 
 def test_without_replayssm_no_slot_region_is_tp_replicated():
