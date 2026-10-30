@@ -101,3 +101,37 @@ def test_relay_tap_split_partitions_the_layer_ids(pp_size):
         expected = () if rank == pp_size - 1 else relay.incoming_ids + relay.own_ids
         assert relay.outgoing_ids == expected
     assert tuple(seen) == layer_ids, "every tap is owned by exactly one stage"
+
+
+@pytest.mark.parametrize("pp_size", [2, 4, 8])
+@pytest.mark.parametrize(
+    "layer_ids", [(-1, 2, 23, 47, 71, 89), (47, -1, 89, 2), (-1, 2, 89)]
+)
+def test_relay_round_trip_lands_each_tap_in_its_drafter_buffer(pp_size, layer_ids):
+    # Unsorted taps, and stages that own none, must still hand the last stage
+    # each tap's rows in the drafter's `layer_ids` slot.
+    n_layers, hidden, n = 93, 8, 3
+    payload = None
+    for rank in range(pp_size):
+        lo, hi = get_pp_indices(n_layers, rank, pp_size)
+        last = rank == pp_size - 1
+        relay, _ = _relay(
+            layer_ids, n_layers, (lo, hi), first=rank == 0, last=last, hidden=hidden
+        )
+        if last:
+            aux = [torch.zeros(4, hidden) for _ in layer_ids]
+            relay.absorb(payload, aux)
+            break
+        for lid in relay.own_ids:
+            relay.buffers[lid].fill_(lid)
+        payload = relay.pack(payload, n)
+    for lid, buf in zip(layer_ids, aux):
+        if lid in relay.incoming_ids:
+            torch.testing.assert_close(buf[:n], torch.full((n, hidden), float(lid)))
+    assert set(relay.incoming_ids) == {lid for lid in layer_ids if lid < lo}
+
+
+def test_relay_rejects_a_payload_of_the_wrong_width():
+    relay, _ = _relay([-1, 2, 6], 8, (4, 8), first=False, last=True)
+    with pytest.raises(RuntimeError, match="expected 16 aux columns"):
+        relay.absorb(torch.zeros(3, 8), [torch.zeros(4, 8) for _ in range(3)])

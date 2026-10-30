@@ -6,8 +6,10 @@
 The drafter lives only on the last PP stage, so hooks on taps owned by earlier
 stages land on ``PPMissingLayer`` and never fire, leaving zero aux buffers and
 garbage drafts. Earlier stages capture their own taps and forward them in the
-intermediate-tensor payload, concatenated along the hidden axis in
-``layer_ids`` order; both sides derive the layout from that tuple.
+intermediate-tensor payload, concatenated along the hidden axis in ascending
+tap order (-1, the embedding, first). Stages own contiguous ascending layer
+ranges, so every stage derives the same order from ``layer_ids`` alone,
+whatever order the drafter lists them in.
 """
 
 import logging
@@ -29,7 +31,7 @@ logger = logging.getLogger("atom")
 class PPAuxRelay:
     """Per-stage aux relay, built on every stage when speculating with pp > 1.
 
-    Sends ``incoming_ids + own_ids`` columns, in ``layer_ids`` order.
+    Sends ``incoming_ids + own_ids`` columns, in ascending tap order.
     """
 
     def __init__(
@@ -42,26 +44,27 @@ class PPAuxRelay:
     ) -> None:
         pp = get_pp_group()
         layers = _resolve_decoder_layers(target_model)
-        resident = [
-            lid
-            for lid in spec.layer_ids
-            if 0 <= lid < len(layers) and not isinstance(layers[lid], PPMissingLayer)
-        ]
-        # The embedding tap (-1) is resident on the first stage.
-        if -1 in spec.layer_ids and pp.is_first_rank:
-            resident.insert(0, -1)
+        stage_start = next(
+            i for i, layer in enumerate(layers) if not isinstance(layer, PPMissingLayer)
+        )
+        taps = sorted(spec.layer_ids)
+
+        def resident(lid):
+            # The embedding tap (-1) is resident on the first stage.
+            if lid == -1:
+                return pp.is_first_rank
+            return 0 <= lid < len(layers) and not isinstance(
+                layers[lid], PPMissingLayer
+            )
 
         self.spec = spec
         self.layer_ids = spec.layer_ids
         self.hidden_size = spec.hidden_size
-        self.own_ids = tuple(resident)
-        # Taps below the first resident one come from upstream; a stage with no
-        # resident tap still passes on everything it was handed.
-        first_own = self.own_ids[0] if self.own_ids else None
+        self.own_ids = tuple(lid for lid in taps if resident(lid))
+        # Every tap below this stage's first layer was captured upstream, which
+        # is exactly what the previous stage sent, even if it owned none itself.
         self.incoming_ids = tuple(
-            lid
-            for lid in self.layer_ids
-            if lid not in self.own_ids and (first_own is None or lid < first_own)
+            lid for lid in taps if not resident(lid) and lid < stage_start
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
@@ -130,9 +133,18 @@ class PPAuxRelay:
                     f"PPAuxRelay expected aux rows for target layers "
                     f"{list(self.incoming_ids)} from the previous stage, got none."
                 )
+            self._check_width(received)
             parts.append(received[:num_tokens])
         parts.extend(self.buffers[lid][:num_tokens] for lid in self.own_ids)
         return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+
+    def _check_width(self, received: torch.Tensor) -> None:
+        expected = len(self.incoming_ids) * self.hidden_size
+        if received.shape[-1] != expected:
+            raise RuntimeError(
+                f"PPAuxRelay expected {expected} aux columns for target layers "
+                f"{list(self.incoming_ids)}, got {received.shape[-1]}."
+            )
 
     def absorb(self, received: torch.Tensor | None, aux_buffers: list) -> None:
         """Copy relayed rows into ``Drafter._aux_buffers`` (indexed by
@@ -144,6 +156,7 @@ class PPAuxRelay:
                 f"PPAuxRelay expected aux rows for target layers "
                 f"{list(self.incoming_ids)} from the previous stage, got none."
             )
+        self._check_width(received)
         n = received.shape[0]
         for col, lid in enumerate(self.incoming_ids):
             start = col * self.hidden_size
