@@ -233,32 +233,17 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             )
 
     def _make_codec(self, kv_caches, transfer_tensors, num_blocks):
-        """Include M3 index and draft regions that are absent from kv_caches."""
+        """Include M3's NSA index cache, which is absent from kv_caches.
+
+        Target and draft K/V/scales are in kv_caches; the complete PAGE region
+        list also carries the NSA index cache needed to restore an M3 prefix.
+        """
         from atom.kv_transfer.offload import config as offcfg
 
         if offcfg.select_offload_layout(self._config) == "m3":
-            from atom.kv_transfer.offload.hybrid.dsv4.codec import DSV4PageSlotCodec
+            from atom.kv_transfer.offload.hybrid.m3.codec import build_m3_page_codec
 
-            pages = getattr(transfer_tensors, "block_regions", ())
-            if not pages or getattr(transfer_tensors, "slot_regions", ()):
-                raise ValueError(
-                    "M3 Store requires complete PAGE regions and no SLOT state"
-                )
-            blocks = (
-                num_blocks if num_blocks is not None else transfer_tensors.num_blocks
-            )
-            views = transfer_tensors.block_tensor_views
-            if len(views) != len(pages):
-                raise ValueError(
-                    "M3 Store requires a tensor view for every PAGE region"
-                )
-            return DSV4PageSlotCodec(
-                page_regions=pages,
-                slot_regions=(),
-                num_blocks=blocks,
-                num_slots=0,
-                device=views[0].device,
-            )
+            return build_m3_page_codec(transfer_tensors, num_blocks)
         return DenseKVByteCodec(
             kv_caches,
             num_blocks=num_blocks,
