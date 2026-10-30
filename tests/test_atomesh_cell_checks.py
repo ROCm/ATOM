@@ -3,9 +3,13 @@
 
 """Launcher checks that fail a cell instead of publishing what it did not run."""
 
+import copy
 import importlib.util
+import json
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,7 +152,9 @@ class ExpectedLogTest(unittest.TestCase):
                 "bash",
                 "-eu",
                 "-c",
-                shell_function("check_expected_logs") + "check_expected_logs\necho OK",
+                shell_function("collect_role_logs")
+                + shell_function("check_expected_logs")
+                + "check_expected_logs\necho OK",
             ],
             env=dict(
                 os.environ,
@@ -195,9 +201,228 @@ class ExpectedLogTest(unittest.TestCase):
 
     def test_aggregated_reads_the_server_as_the_decode(self):
         self.write("server-rank-0.log", f"{self.ARMED} (TP8)")
-        result = self.check(aggregated="1", prefill="never logged", decode=self.ARMED)
+        result = self.check(aggregated="1", decode=self.ARMED)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("all 1 decode server log(s)", result.stdout)
+
+    def test_an_aggregated_prefill_line_fails_the_cell(self):
+        self.write("server-rank-0.log", f"{self.ARMED} (TP8)")
+        result = self.check(aggregated="1", prefill=self.ARMED)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("OK", result.stdout)
+        self.assertIn("aggregated cell has no prefill server", result.stderr)
+
+
+MONO_GONE = [
+    "Kimi-K3 mono decode off",
+    "Kimi-K3 mono decode declined the 8-row build",
+]
+
+
+class RejectedLogTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.logs = Path(temp.name)
+
+    def write(self, name, *lines):
+        (self.logs / name).write_text("".join(f"INFO {line}\n" for line in lines))
+
+    def check(self, aggregated="0", prefill=None, decode=None):
+        return subprocess.run(
+            [
+                "bash",
+                "-eu",
+                "-c",
+                shell_function("collect_role_logs")
+                + shell_function("check_rejected_logs")
+                + "check_rejected_logs\necho OK",
+            ],
+            env=dict(
+                os.environ,
+                RUNTIME_LOG_DIR=str(self.logs),
+                AGGREGATED=aggregated,
+                PREFILL_REJECT_LOG=json.dumps(prefill) if prefill else "",
+                DECODE_REJECT_LOG=json.dumps(decode) if decode else "",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_nothing_rejected_reads_no_log(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OK\n")
+
+    def test_servers_that_kept_the_feature_pass(self):
+        # A prefill turning mono down is its own role's business.
+        self.write("prefill-rank-0.log", "Kimi-K3 mono decode off: expert parallel")
+        self.write(
+            "decode-rank-1.log",
+            "Kimi-K3 mono decode armed (TP8)",
+            "Kimi-K3 mono decode declined a step: prefill",
+            "Kimi-K3 mono decode on",
+        )
+        result = self.check(decode=MONO_GONE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no decode server log shows any of 2", result.stdout)
+        self.assertTrue(result.stdout.endswith("OK\n"))
+
+    def test_a_server_that_logged_one_fails_the_cell(self):
+        self.write("decode-rank-1.log", "Kimi-K3 mono decode armed (TP8)")
+        self.write(
+            "decode-rank-1-worker-1.log",
+            "Kimi-K3 mono decode armed (TP8)",
+            "Kimi-K3 mono decode declined the 8-row build; other widths unaffected",
+        )
+        result = self.check(decode=MONO_GONE)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("OK", result.stdout)
+        self.assertIn(
+            "decode-rank-1-worker-1.log logged "
+            "'Kimi-K3 mono decode declined the 8-row build'",
+            result.stderr,
+        )
+
+    def test_no_server_log_fails_the_cell(self):
+        result = self.check(decode=MONO_GONE)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no decode server log", result.stderr)
+
+    def test_an_aggregated_prefill_list_fails_the_cell(self):
+        self.write("server-rank-0.log", "Kimi-K3 mono decode armed (TP8)")
+        result = self.check(aggregated="1", prefill=MONO_GONE)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("aggregated cell has no prefill server", result.stderr)
+
+    def test_the_lines_are_checked_before_and_after_the_run(self):
+        stubs = "\n".join(
+            f"{name}() {{ echo {name}; }}"
+            for name in (
+                "check_expected_logs",
+                "check_rejected_logs",
+                "run_benchmark",
+                "run_eval",
+            )
+        )
+        for phase in ("benchmark", "eval", "combined"):
+            with self.subTest(phase=phase):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-eu",
+                        "-c",
+                        stubs
+                        + "\n"
+                        + shell_function("run_benchmark_and_eval")
+                        + "run_benchmark_and_eval",
+                    ],
+                    env=dict(
+                        os.environ,
+                        ATOMESH_EXECUTION_PHASE=phase,
+                        BENCHMARK_KIND="aiperf",
+                        EVAL_TASK="gsm8k",
+                        RUN_EVAL="false",
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=True,
+                )
+                steps = result.stdout.split()
+                self.assertEqual(
+                    steps[:2], ["check_expected_logs", "check_rejected_logs"]
+                )
+                self.assertEqual(steps[-1], "check_rejected_logs")
+                self.assertEqual(len(steps), 4 if phase != "combined" else 5)
+
+
+class SubmitRejectLogTest(unittest.TestCase):
+    """pd_submit.sh's export of a role's reject_log, from the real C1 cell."""
+
+    @classmethod
+    def setUpClass(cls):
+        env = dict(
+            os.environ,
+            ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd",
+            ATOMESH_SLURM_ACCOUNT="",
+            ATOMESH_SLURM_PARTITION="",
+            ATOMESH_MODEL_ROOT="/models",
+            ATOMESH_LOG_ROOT="/logs",
+            ATOMESH_1P1D_NODES="",
+            ATOMESH_2P1D_NODES="",
+            ATOMESH_PD_RANK_MAPPING_POLICY="none",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "matrix.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "pd_matrix.py"),
+                    "--suite",
+                    "nightly",
+                    "--model",
+                    "Kimi-K3-MXFP4",
+                    "--output",
+                    str(output),
+                ],
+                cwd=ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            cells = json.loads(output.read_text())["include"]
+        cls.cell = next(cell for cell in cells if cell["name"].endswith("-c1-mono"))
+        source = (SCRIPTS / "pd_submit.sh").read_text()
+        start = source.index("python3 - <<'PY'\nimport json\nimport os\nimport shlex")
+        start = source.index("\n", start) + 1
+        cls.mapping = source[start : source.index("\nPY\n", start)]
+
+    def submit(self, decode_reject_log):
+        cell = copy.deepcopy(self.cell)
+        cell["service"]["decode"]["reject_log"] = decode_reject_log
+        return subprocess.run(
+            [sys.executable, "-c", self.mapping],
+            env=dict(os.environ, CELL_JSON=json.dumps(cell)),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def exported(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exports = {}
+        for line in result.stdout.splitlines():
+            words = shlex.split(line)
+            if words[:1] == ["export"]:
+                key, _, value = words[1].partition("=")
+                exports[key] = value
+        return exports["PREFILL_REJECT_LOG"], exports["DECODE_REJECT_LOG"]
+
+    def test_c1_rejects_mono_turning_itself_off_on_its_decode_only(self):
+        prefill, decode = self.exported(
+            self.submit(self.cell["service"]["decode"]["reject_log"])
+        )
+        self.assertEqual(prefill, "")
+        self.assertEqual(json.loads(decode), MONO_GONE)
+        self.assertNotIn("\n", decode)
+
+    def test_a_single_line_is_a_list_of_one(self):
+        _, decode = self.exported(self.submit("Kimi-K3 mono decode off"))
+        self.assertEqual(json.loads(decode), ["Kimi-K3 mono decode off"])
+
+    def test_an_entry_that_is_not_a_line_fails_the_cell(self):
+        for entry in ("", 8):
+            with self.subTest(entry=entry):
+                result = self.submit(["Kimi-K3 mono decode off", entry])
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not a non-empty string", result.stdout)
+                self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
 
 
 if __name__ == "__main__":

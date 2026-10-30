@@ -1074,6 +1074,11 @@ models:
               - "*shared_experts.gate_up_proj*"
               - "*shared_experts.down_proj*"
             expect_log: "Kimi-K3 mono decode armed"
+            # Armed, then gone: the runner failed to build, or C1's 8-row
+            # steps (one request plus seven drafts) have no build.
+            reject_log:
+              - "Kimi-K3 mono decode off"
+              - "Kimi-K3 mono decode declined the 8-row build"
           server:
             common_args: &kimi_k3_pd_dspark7_args
               <<: *kimi_k3_agentic_dspark7_args

@@ -2780,38 +2780,47 @@ PY
 PREFILL_EXPECT_LOG="${PREFILL_EXPECT_LOG:-}"
 DECODE_EXPECT_LOG="${DECODE_EXPECT_LOG:-}"
 ATOMESH_EXPECT_LOG_TIMEOUT="${ATOMESH_EXPECT_LOG_TIMEOUT:-60}"
+# Sets role_logs to a role's server logs, failing the cell when there are none
+# to check `what` against. The aggregated server is configured as the decode,
+# so an aggregated cell has no prefill server to check anything in.
+collect_role_logs() {
+  local role="$1" what="$2" glob log
+  if [[ "${AGGREGATED}" != "1" ]]; then
+    glob="${role}-rank-*.log"
+  elif [[ "${role}" == "decode" ]]; then
+    glob="server-rank-*.log"
+  else
+    echo "[check][FAIL] an aggregated cell has no prefill server to check ${what} in" >&2
+    exit 1
+  fi
+  role_logs=()
+  for log in "${RUNTIME_LOG_DIR}"/${glob}; do
+    if [[ -f "${log}" ]]; then
+      role_logs+=("${log}")
+    fi
+  done
+  if (( ${#role_logs[@]} == 0 )); then
+    echo "[check][FAIL] no ${role} server log in ${RUNTIME_LOG_DIR} to check ${what} in" >&2
+    exit 1
+  fi
+}
+
 check_expected_logs() {
-  local role expected glob log deadline
-  local -a logs pending
+  local role expected log deadline
+  local -a role_logs pending
   for role in prefill decode; do
     if [[ "${role}" == "prefill" ]]; then
       expected="${PREFILL_EXPECT_LOG}"
-      glob="prefill-rank-*.log"
-      [[ "${AGGREGATED}" != "1" ]] || continue
     else
       expected="${DECODE_EXPECT_LOG}"
-      glob="decode-rank-*.log"
-      # The aggregated server is configured as the decode.
-      if [[ "${AGGREGATED}" == "1" ]]; then
-        glob="server-rank-*.log"
-      fi
     fi
     [[ -n "${expected}" ]] || continue
-    logs=()
-    for log in "${RUNTIME_LOG_DIR}"/${glob}; do
-      if [[ -f "${log}" ]]; then
-        logs+=("${log}")
-      fi
-    done
-    if (( ${#logs[@]} == 0 )); then
-      echo "[check][FAIL] no ${role} server log in ${RUNTIME_LOG_DIR} to find '${expected}' in" >&2
-      exit 1
-    fi
+    collect_role_logs "${role}" "'${expected}'"
     # Another node's writes can take a few seconds to show up over NFS.
     deadline=$((SECONDS + ATOMESH_EXPECT_LOG_TIMEOUT))
     while :; do
       pending=()
-      for log in "${logs[@]}"; do
+      for log in "${role_logs[@]}"; do
         grep -qF -- "${expected}" "${log}" || pending+=("${log}")
       done
       if (( ${#pending[@]} == 0 )); then
@@ -2823,21 +2832,52 @@ check_expected_logs() {
       fi
       sleep 5
     done
-    echo "[check] all ${#logs[@]} ${role} server log(s) show '${expected}'"
+    echo "[check] all ${#role_logs[@]} ${role} server log(s) show '${expected}'"
+  done
+}
+
+# A role's reject_log is a JSON list of lines none of its servers may log: how
+# a feature its expect_log saw armed says it then turned itself off, which can
+# happen on the first request as well as at startup. Checked before the first
+# request and again after the last.
+PREFILL_REJECT_LOG="${PREFILL_REJECT_LOG:-}"
+DECODE_REJECT_LOG="${DECODE_REJECT_LOG:-}"
+check_rejected_logs() {
+  local role rejected listed line log hit
+  local -a role_logs lines
+  for role in prefill decode; do
+    if [[ "${role}" == "prefill" ]]; then
+      rejected="${PREFILL_REJECT_LOG}"
+    else
+      rejected="${DECODE_REJECT_LOG}"
+    fi
+    [[ -n "${rejected}" ]] || continue
+    if ! listed="$(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "${rejected}")"; then
+      echo "[check][FAIL] ${role} reject_log is not a JSON list: ${rejected}" >&2
+      exit 1
+    fi
+    mapfile -t lines <<< "${listed}"
+    collect_role_logs "${role}" "its reject_log"
+    for log in "${role_logs[@]}"; do
+      for line in "${lines[@]}"; do
+        if hit="$(grep -m1 -F -- "${line}" "${log}")"; then
+          echo "[check][FAIL] ${log} logged '${line}': ${hit}" >&2
+          exit 1
+        fi
+      done
+    done
+    echo "[check] no ${role} server log shows any of ${#lines[@]} rejected line(s)"
   done
 }
 
 run_benchmark_and_eval() {
   check_expected_logs
+  check_rejected_logs
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
-    return
-  fi
-  if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+  elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
     run_eval
-    return
-  fi
-  if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
+  elif [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
     && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
     # Agentic performance cases require a fresh prefix/state-cache state. Run
@@ -2848,6 +2888,7 @@ run_benchmark_and_eval() {
     run_eval
     run_benchmark
   fi
+  check_rejected_logs
 }
 
 validate_mooncake_store_settings
