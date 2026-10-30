@@ -204,9 +204,8 @@ class ForwardMode:
 
         is_prefill = batch.total_tokens_num_prefill > 0
         scheduled_tokens = batch.total_tokens_num
-        # The whole batch, never a per-kind count: `schedule` returns its
-        # prefill batch before it can add a decode row, so the two are equal
-        # today, and this is the one that survives a mixed batch.
+        # The whole batch, including both regions when prefill and decode
+        # share a step. A per-kind count would under-size mixed metadata.
         scheduled_bs = batch.total_seqs_num
         meets_min, can_split, ub0, ub1 = local_tbo
         # Every rank's row of the step, a group of one's included (its own

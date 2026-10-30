@@ -241,15 +241,28 @@ def test_a_non_deferred_decode_stages_the_scheduled_ids_as_they_are():
     processor.input_ids.copy_to_gpu.assert_called_once_with(3)
 
 
-def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts():
+@pytest.mark.parametrize("is_mixed", [False, True])
+def test_the_non_deferred_branch_refuses_a_batch_carrying_drafts(is_mixed):
     """Nothing reaches it with drafts: PP verifies none locally and a producer
     never speculates. Staging them here would size rows by `max_seqlen_q`,
     which under DP is the group's maximum for a block drafter, not this
     batch's row width."""
     processor = _recurrent_producer_processor()
+    batch = _decode_batch(num_spec_step=3)
+    if is_mixed:
+        batch.is_mixed = True
+        batch.scheduled_tokens = np.arange(5, dtype=np.int32)
+        batch.total_tokens_num = 5
+        batch.total_tokens_num_prefill = 1
+        batch.total_tokens_num_decode = 4
+        batch.total_seqs_num = 2
+        batch.total_seqs_num_prefill = 1
+        batch.total_seqs_num_decode = 1
+        batch.num_rejected = None
+        batch.num_bonus = None
 
-    with pytest.raises(AssertionError, match="num_spec_step=3"):
-        tokenIDProcessor.prepare_input_ids(processor, _decode_batch(num_spec_step=3), 4)
+    with pytest.raises(NotImplementedError, match="num_spec_step=3"):
+        tokenIDProcessor.prepare_input_ids(processor, batch, 4)
 
 
 @pytest.mark.parametrize(("is_pd_producer", "expected_q"), [(False, 4), (True, 1)])

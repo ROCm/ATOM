@@ -13,7 +13,7 @@
 | 模型族 | V4（`Family.V4`，DeepSeek-V4-Pro-DSpark） | 非 V4 的所有模型族（mixed 只支持 V4） |
 | spec 方法 | `dspark` | `mtp` / `eagle`（数据流相同，Phase 2 顺带放开） |
 | TBO | `--enable-tbo`（开 mixed 时自动走 mixed 切分，见 §4.8） | DCP + decode TBO + spec（main 已拒绝，不动） |
-| DSpark ragged / q-bucket | 纯 decode step 照常生效 | mixed step 上自动退化为全宽 K+1（现有代码已如此，见 §4.6） |
+| DSpark ragged / q-bucket | 纯 decode 和 mixed 的 decode 区域均可缩短 | prefill 前缀不变；ragged 仅在连续两步 decode 请求及顺序相同时生效，mixed eager 不受 FULL graph 的矩形宽度限制 |
 | PP | — | PP>1（reserve 口径不一致，见 §4.1） |
 
 mixed 只实现了 V4（dense MLA 的 mixed 支持已删除）。V4 的 decode 段是直接调用未修改的 `prepare_decode`（经 `_MixedDecodeView`），本身已是宽度无关的，所以 spec 形状不用另写。
@@ -132,7 +132,7 @@ merged.state_slot_out = _pad_to(running_bs, torch.cat([prefill_meta.state_slot_o
 
 - **`num_rejected` 回滚**：`prepare_decode` 直接读 `tokenID_processor.num_rejected`（全批数组）做 `ctx -= num_rejected`。经 view 调用时必须切到 decode 行：view 增加 `row_offset = n_p`，`prepare_decode` 用 `num_rejected[row_offset : row_offset + scheduled_bs]`。**不能**靠 `__getattr__` 兜底——这个数组不在 batch 上，guard 抓不到。
 - `_MixedDecodeView` 补切 `scheduled_spec_decode_tokens`、`num_rejected`、`num_bonus`（虽然当前 V4 decode 路径未必读，但 view 的原则是"每行字段要么切要么 raise"）；`scheduled_tokens`（长度 = 总 token 数）目前会**静默**穿透，guard 只查长度 = 总 seq 数的字段——改成显式切 `[n_p_tokens:]` 或显式 raise。
-- `prepare_mixed` 里 `cu[n_d] == n_d * decode_max_q` 的检查：mixed step 上 ragged/q-bucket 都不生效，decode 宽度恒为 K+1，检查仍成立。依据是 `dspark_scheduler.apply_q_bucket`（原 `_dspark_apply_q_bucket` 内联逻辑，main #2332 后移出）开头的 `if batch.total_tokens_num_prefill > 0: return None`——ragged 分支在它**之后**分派，所以一个守卫同时关掉两者。（"ragged 要求 prev/cur req_ids 相同、mixed 组成必变"**不成立**：一个跨多步的 chunked prefill 配同一组 decode 行，连续两个 mixed step 的 req_ids 完全相同。）检查旁注明依赖的是这个守卫，并加单测锁住"组成不变的连续 mixed step 也不 shrink"。
+- `prepare_mixed` 按实际 decode 行长度逐项校验 decode-local `cu_seqlens_q`，传入实际 token 总数及最大行长。q-bucket / ragged 通过共用的 `resize_decode_tokens` 仅重排 decode 区域，prefill token、行长度、KV 预留和 `num_spec_step` 保持不变。prefill 的 bonus 不参与 decode 长度选择；ragged 的边界保护只比较前后两步的 decode 请求及顺序。
 - 注释/docstring 里 "1 token per decode seq, no MTP in mixed" 同步更新（name-matches-function）。
 
 ### 4.7 不需要改的部分
@@ -221,7 +221,7 @@ V4-Flash-DSpark tp4 + dp-attention，K=5，`--max-num-batched-tokens 2048`（强
 1. mixed 采样行索引：给定 `n_p, prefill 段长, decode lens`，断言 `bonus/target/cu_num_draft` 与手算一致，`input_ids[shift:]` gather 出的 draft id 正确（含 0-draft 的 prefill 行、新入 decode 行）。
 2. verdict 换算：prefill 行（含中间 chunk）anchor 落在段尾、reject 为 0；decode 行 anchor 等于 `cu[i] + num_accepted`；无 verify 时每段最后一行。
 3. **（必须）** `postprocess` prefill 行 `num_reject == 0`、`next_token_locs == 0`；并端到端断言：一个在 mixed step 走完 prefill 的请求，下一步 decode 时 V4 `prepare_decode` 算出的 positions 与"纯 prefill → decode"路径完全一致（§4.4 的错位就在这里显形）。
-3b. 组成不变的连续两个 mixed step：`dspark_scheduler.apply_q_bucket`（runner 的 `_dspark_apply_q_bucket` 委托给它）返回 None，`num_scheduled_tokens` 未被改写（§4.6）。
+3b. decode 请求及顺序不变的连续 mixed step：验证 ragged 缩短 decode、保持 prefill 前缀；改变 prefill 请求不应禁止缩短。dummy 前序 batch 不复用 GPU token/draft，所有 decode 行从 scheduler 输入开始。
 3c. 刚走完 prefill 的请求的首个 decode step：`decode_src` 指向它上一步的 prefill 行，draft 取自该行（§4.5 全批 propose）。
 4. deferred remap：chunked prefill 中间 chunk 在 prev_batch 里时不被当成 deferred 行。
 5. view：`num_rejected` 按 `row_offset` 切；`scheduled_tokens` 不再静默穿透。
@@ -240,7 +240,7 @@ V4-Flash-DSpark tp4 + dp-attention，K=5，`--max-num-batched-tokens 2048`（强
 ## 7. 开放问题
 
 1. **Reserve 饱和**：是否给 prefill 保底预算（如 `prefill_budget >= max(chunk_min, mnbt * α)`）？会改变 decode-first 语义，需要单独的吞吐/尾延迟 A/B。
-2. **mixed step 放弃 ragged**：mixed step 每个 decode 行都 verify 满 K+1，浪费一部分算力；mixed 本来就算力受限（见 CUDAGraph/mixed 测量结论）。值不值得在 mixed 上支持 ragged，取决于 mixed step 占比，先测再说。
+2. **mixed ragged 的边界步**：decode 请求新增、结束或重排时保持全宽；连续 decode 集合稳定后可按请求缩短。性能收益仍应由相同配置下的 GPU 测量确定。
 3. **单次运行的噪声**：B' 比 A 接受率低 2.6 个点，只跑了一次。mixed 组的接受率要和 B' 比，需要各组重复 2-3 次才能区分实现问题和噪声。
 4. **decode 占多数时的 mixed TBO 切分**（§4.8-2）：是否支持切点落在 decode 区，取决于 arm2 测得的 `gate:split` 比例。
 5. **Phase 2**：`mtp`/`eagle` 放开。

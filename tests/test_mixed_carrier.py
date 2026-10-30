@@ -108,6 +108,7 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch)
     n_p, n_d, p_tokens = 2, 3, 16
     batch = _batch(n_p=n_p, n_d=n_d)
     batch.total_seqs_num_prefill = n_p
+    batch.num_scheduled_tokens = np.array([8, 8, 1, 1, 1], dtype=np.int32)
     calls = {}
 
     def _stub(name, positions):
@@ -195,3 +196,70 @@ def test_runner_builds_the_banks_before_warmup():
     built = body.index("build_mixed_prefill_banks()")
     assert body.index("_init_h2d_publication()") < built
     assert built < body.index("_maybe_warmup()")
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+def test_prefill_bank_clones_only_its_writers_and_preserves_live_bindings(
+    monkeypatch, slots
+):
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.utils import CpuGpuBuffer
+
+    groups = {
+        "positions": "positions",
+        "cu_seqlens_q": "early",
+        "block_tables": "prefill",
+        "v4_state": "v4_state",
+        "plans": "v4_plans",
+        "indexer": "v4_indexer",
+        "ub_inputs": "ub0_v4_inputs",
+        "ub_plans": "ub1_v4_plans",
+        "batch_id_per_q_token": None,
+        "input_ids": "input_ids",
+        "sampling": "sampling",
+        "spec": "spec_decode",
+        "decode_only": "v4_qo",
+        "decode_scratch": None,
+    }
+    ring = [
+        {
+            name: CpuGpuBuffer(
+                4,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=False,
+                publication_group=group,
+            )
+            for name, group in groups.items()
+        }
+        for _ in range(slots)
+    ]
+    bound = []
+
+    def bind(variables, event, *, partial):
+        assert partial
+        bound.append(set(variables))
+        return object(), {}
+
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(
+        _fv_ring=ring, _fv_idx=0, h2d_groups={}, build_h2d_slot=bind
+    )
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    builder.build_mixed_prefill_banks()
+    shared = {"input_ids", "sampling", "spec", "decode_only", "decode_scratch"}
+    for i, original in enumerate(ring):
+        bank = builder._mixed_prefill_banks[i][0]
+        assert bound[i] == set(groups) - shared
+        for name, buffer in original.items():
+            assert (bank[name] is buffer) == (name in shared)
+            if name not in shared:
+                assert bank[name].cpu.data_ptr() != buffer.cpu.data_ptr()
+                assert bank[name].gpu.data_ptr() != buffer.gpu.data_ptr()
+        bank["positions"].cpu.fill_(i + 1)
+    if slots == 2:
+        assert builder._mixed_prefill_banks[0][0]["positions"].cpu.tolist() == [1] * 4

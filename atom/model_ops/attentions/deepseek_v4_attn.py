@@ -530,8 +530,8 @@ class _MixedDecodeView:
         self._batch = batch
         self._np = n_prefill_seqs
         self.context_lens = batch.context_lens[n_prefill_seqs:]
-        # `ScheduledBatch` builds both block-table lists from non-empty tables
-        # only, so one entry per row is a precondition, not a given: a row with
+        # `ScheduledBatch` builds block_tables from non-empty tables only,
+        # so one entry per row is a precondition, not a given: a row with
         # an empty table (a preempted prefill, say) would hand every decode row
         # its neighbour's pages. Checked before the positional slice.
         self.block_tables = _decode_rows(batch, "block_tables", n_prefill_seqs)
@@ -585,8 +585,8 @@ class _MixedDecodeView:
         _srcs = getattr(batch, "state_fork_srcs", None)
         self.state_fork_srcs = _srcs[n_prefill_seqs:] if _srcs is not None else _srcs
         # Per-row arrays the decode consumers index by the DECODE row count.
-        # `decode_spans` (backends.py) does `num_scheduled_tokens[:bs]` with
-        # `bs = total_seqs_num_decode`, so an unsliced array hands it the
+        # `decode_spans` (backends.py) reads the view's decode-only lengths,
+        # so an unsliced array hands it the
         # PREFILL rows' token counts -- and pairs them with a cu_seqlens built
         # from the real batch, which is how a length vector and its cumsum come
         # to disagree. Found by the __getattr__ guard, not by the static scan:
@@ -693,6 +693,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     kv_block_size (= the CSA row count) to be 64 for N_PHYS=1. Must equal
     `config.kv_cache_block_size` (config.py forces the same value for V4).
     """
+
+    # The prefill builder also publishes compressor/indexer metadata. TBO
+    # rebuilds need their own input, state, indexer and plan groups, but never
+    # the decode-only destination/attention buffers or sampling/input-id groups.
+    mixed_prefill_groups = (
+        CommonAttentionBuilder.mixed_prefill_groups
+        | frozenset(
+            f"{prefix}{group}"
+            for prefix in ("", "ub0_", "ub1_")
+            for group in ("v4_state", "v4_indexer", "v4_plans")
+        )
+        | frozenset(("ub0_v4_inputs", "ub1_v4_inputs"))
+    )
 
     capture_owns_cu_seqlens_q = True
     block_size = 256
@@ -2665,27 +2678,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # instead of running off the end (GPU OOB in swa_write). The host check
         # is what stands between a full-batch cumsum and that OOB.
         #
-        # Every decode row is exactly `num_spec_step + 1` wide here, so the
-        # check can be a product: DSpark's ragged / q-bucket shrink never runs
-        # on a mixed step (`dspark_scheduler.apply_q_bucket` returns before
-        # either on any batch with prefill tokens). If that guard moves, this
-        # check must become a comparison against the real per-row lengths.
-        decode_max_q = batch.num_spec_step + 1
-        if var["cu_seqlens_q"].np[n_d_seqs] != n_d_seqs * decode_max_q:
-            raise RuntimeError(
-                f"cu_seqlens_q[{n_d_seqs}] = {var['cu_seqlens_q'].np[n_d_seqs]}, "
-                f"not the decode segment's {n_d_seqs * decode_max_q} tokens: "
-                "publish_cu_seqlens_q did not publish decode-local spans"
-            )
-        # `prepare_decode` used to take a single `bs` and derive the rest; it now
-        # takes the three quantities separately. A mixed batch is never padded to
-        # a captured graph width (it runs eager), so the decode segment's running
-        # sizes ARE its scheduled sizes: `n_d_seqs` rows of `decode_max_q` tokens,
-        # matching the cu_seqlens_q checked just above.
+        # Query shrinking keeps the prefill prefix and repacks only decode
+        # tokens. Validate every decode-local boundary, not just a rectangular
+        # product, so equal totals cannot hide shifted request spans.
+        lens = np.asarray(batch.num_scheduled_tokens[n_p_seqs:])
+        cu = var["cu_seqlens_q"].np[: n_d_seqs + 1]
+        if cu[0] != 0 or not np.array_equal(cu[1:], np.cumsum(lens)):
+            raise RuntimeError("cu_seqlens_q does not contain decode-local spans")
+        decode_max_q = int(lens.max())
         decode_meta, decode_positions = self.prepare_decode(
             decode_view,
             running_bs=n_d_seqs,
-            running_tokens=n_d_seqs * decode_max_q,
+            running_tokens=n_d_tokens,
             max_seqlen_q=decode_max_q,
         )
 
@@ -2768,7 +2772,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # full_q`, below), and every compress count is now `visible_*(pos)`, so
         # a rejected slot's KV falls out of range on its own — `block_tables`
         # needs no truncation here.
-        if not batch.is_dummy_run and max_seqlen_q > 1:
+        if not batch.is_dummy_run and batch.num_spec_step > 0:
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 # One entry per row of the WHOLE batch, and it lives on the
@@ -3404,8 +3408,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Reading the live bank would rebuild this ubatch's prefill rows out of
         the decode half's staging.
 
-        Swapping is safe -- the bank mirrors every CpuGpuBuffer in
-        `forward_vars`, `ub{idx}_` sets included: `build_mixed_prefill_banks`
+        The bank mirrors the groups this prefill rebuild writes, including
+        its `ub{idx}_` groups: `build_mixed_prefill_banks`
         clones them once, in `ModelRunner.__init__` before warmup, and
         `_alloc_v4_metadata_buffers` has already run its
         `forward_vars.update(bufs)` in this builder's `__init__`. That order is

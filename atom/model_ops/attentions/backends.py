@@ -497,6 +497,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
     capture_owns_cu_seqlens_q = False
+    mixed_prefill_groups = frozenset(("early", "prefill", "positions"))
 
     def __init__(self, model_runner):
         self.model_runner = model_runner
@@ -599,11 +600,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         have decode's staging overwrite the prefill segment's GPU tensors and
         race its in-flight pinned sources (the large-ISL OOB of `ab55dfb6`).
 
-        Instead the prefill half runs against this bank: a clone of every
-        `CpuGpuBuffer` in `forward_vars`, so the two halves never share a pinned
-        CPU source or a GPU destination. Non-buffer entries (e.g. the scalar
-        `mtp_k`) are shared by reference; the prefill path never stages into
-        them.
+        Instead the prefill half runs against clones of the publication groups
+        it writes, plus the ungrouped token-to-request map. Decode-only and
+        token-input buffers stay shared and keep their original bindings: the
+        prefill half must not stage into them. Backends declare any extra
+        prefill groups in `mixed_prefill_groups`, including TBO rebuild groups.
 
         The clones are BOUND to a publication owner and groups of their own,
         built exactly as the runner builds a ring slot's. Swapping
@@ -647,17 +648,30 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         before warmup, so the memory profile and the KV budget see them."""
         runner = self.model_runner
         ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
+        private_groups = getattr(
+            self, "mixed_prefill_groups", CommonAttentionBuilder.mixed_prefill_groups
+        )
         banks = {}
         for slot, forward_vars in enumerate(ring):
             # `clone()` carries `pin_memory`: an unpinned source would make
             # `copy_(non_blocking=True)` synchronous.
-            variables = {
-                name: (val.clone() if isinstance(val, CpuGpuBuffer) else val)
+            private = {
+                name: val.clone()
                 for name, val in forward_vars.items()
+                if isinstance(val, CpuGpuBuffer)
+                and (
+                    val.publication_group in private_groups
+                    or name == "batch_id_per_q_token"
+                )
             }
+            variables = {**forward_vars, **private}
             owner = groups = None
             if getattr(runner, "h2d_groups", None) is not None:
-                owner, groups = runner.build_h2d_slot(variables, torch.cuda.Event())
+                # Binding a shared buffer again would steal it from the live
+                # slot's owner. Only the clones belong to this publication slot.
+                owner, groups = runner.build_h2d_slot(
+                    private, torch.cuda.Event(), partial=True
+                )
             banks[slot] = (variables, owner, groups)
         self._mixed_prefill_banks = banks
 
@@ -860,7 +874,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         return forward_mode.running_bs + 1
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
-        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+        """The decode region's `(bs, per-request lengths, exclusive prefix sum)`.
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
@@ -870,7 +884,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         bs = batch.total_seqs_num_decode
         return (
             bs,
-            batch.num_scheduled_tokens[:bs],
+            batch.num_scheduled_tokens[batch.total_seqs_num_prefill :],
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
