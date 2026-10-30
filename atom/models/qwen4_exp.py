@@ -23,7 +23,10 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpHyperConnection
+from atom.model_ops.qwen4_exp.hyperconnection import (
+    HC_QUANT_ROWS_MAX,
+    Qwen4ExpHyperConnection,
+)
 from atom.model_ops.qwen4_exp.ops.gated import (
     is_per_token_fp8_linear,
     sigmoid_mul,
@@ -700,11 +703,19 @@ class _SequenceParallel:
     @classmethod
     def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
         """Sharding for a forward of `num_tokens`, or None to stay replicated:
-        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, or under graph capture."""
+        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, at most
+        `HC_QUANT_ROWS_MAX` tokens, or under graph capture.
+
+        Up to `HC_QUANT_ROWS_MAX` tokens the unsharded attention HC emits the
+        FP8 projection input itself (`mix_fused_quant`); a sharded layer leaves
+        that quantization to the projection, which the unsharded path only
+        does above `HC_QUANT_ROWS_MAX`. Sharding only above it keeps the two
+        paths on the same quantization, whatever the env threshold."""
         min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
         if (
             min_tokens <= 0
             or num_tokens < min_tokens
+            or num_tokens <= HC_QUANT_ROWS_MAX
             or torch.cuda.is_current_stream_capturing()
         ):
             return None
@@ -820,8 +831,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 pending = None
             hidden_states = self._apply_ple(hidden_states, input_ids)
-        # Under `sp` the consumer quantizes the gathered rows itself, as the
-        # unsharded path does above HC_QUANT_ROWS_MAX rows.
+        # Under `sp` (only above HC_QUANT_ROWS_MAX tokens, see
+        # `_SequenceParallel.maybe`) the consumer quantizes the gathered rows
+        # itself, as the unsharded path does at that size.
         quant_dtype = None if sp is not None else self._attn_input_quant_dtype()
         if quant_dtype is None:
             mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(

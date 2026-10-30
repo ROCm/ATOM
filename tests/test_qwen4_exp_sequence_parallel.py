@@ -163,11 +163,12 @@ def _model(num_layers, ple_layer, return_hc_state, embed, hc=4):
 @pytest.mark.parametrize("return_hc_state", [False, True])
 @pytest.mark.parametrize(
     "world,tokens,ple_layer",
+    # Above HC_QUANT_ROWS_MAX (1024), the smallest forwards that shard.
     [
-        (2, 8, 1),
-        (4, 10, 1),
+        (2, 1026, 1),
+        (4, 1027, 1),
         # PLE in the last layer: nothing is left to shard, SP must stay off.
-        (4, 8, 3),
+        (4, 1032, 3),
     ],
 )
 def test_model_forward_matches_unsharded(
@@ -194,3 +195,26 @@ def test_model_forward_matches_unsharded(
         for idx, rows, sharded in calls:
             assert sharded == (idx > ple_layer)
             assert rows == (chunk if sharded else tokens)
+
+
+@pytest.mark.parametrize(
+    "env,tokens,shards",
+    [
+        ("1024", 1024, False),  # the fused-HC-quant boundary itself
+        ("1024", 1025, True),
+        ("512", 1024, False),  # a lower threshold cannot go below the boundary
+        ("512", 700, False),
+        ("2048", 1025, False),  # a higher one still applies
+        ("2048", 2048, True),
+        ("0", 4096, False),  # disabled
+    ],
+)
+def test_sp_gate_stays_above_the_fused_quant_rows(
+    ranks, monkeypatch, env, tokens, shards
+):
+    monkeypatch.setenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", env)
+    assert qwen4_exp.HC_QUANT_ROWS_MAX == 1024
+    results = ranks(2, lambda rank: qwen4_exp._SequenceParallel.maybe(tokens))
+    assert [sp is not None for sp in results] == [shards, shards]
+    # TP=1 never shards.
+    assert qwen4_exp._SequenceParallel.maybe(tokens) is None
