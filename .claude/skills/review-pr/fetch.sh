@@ -833,6 +833,32 @@ for c in comments:
 " 2>/dev/null
 fi
 
+# How a finding can be confirmed on this repo, so an action clause can name a check
+# instead of ending at "worth checking". Every finding this reviewer produces is read
+# out of the diff -- REVIEW_AUTO_VALIDATE is off by default, so nothing is built or run
+# -- which makes "how would I check this?" the reviewer's first question and one the
+# card cannot currently answer. ATOM ships four skills that answer it; this names them
+# with the traps each one documents, because those traps are what makes the difference
+# between a check that measures and a check that silently reports nothing.
+cat <<'CONFIRM'
+[HOW TO CONFIRM A FINDING] ATOM's own debugging skills, with the trap each documents:
+  wrong numbers (NaN, bad logits)  -> .claude/skills/dump-bisect-debug
+      Phase 0 establishes a reference FIRST, and Phase 1 rules out weight loading
+      before any forward bisect. ATOM_FWD_DUMP_LAYERS / ATOM_FWD_DUMP_DIR dump a
+      layer (atom/utils/debug_helper/dump.py).
+  a fault or hang inside a kernel  -> .claude/skills/debug-agent-locate-kernel
+      Retry with --enforce-eager to tell a graph-mode artefact from a real kernel bug.
+  a performance claim              -> .claude/skills/capture-trace
+      ATOM_PROFILER_MORE belongs on the SERVER env, not the benchmark client; the
+      trace dir must be empty first because start_atom_server.sh does not clear it,
+      so a stale dir yields a trace of the PREVIOUS run that looks perfectly valid.
+  anything needing a live server   -> .claude/skills/run-atom-workload
+      Verifying the server is ready is mandatory, not optional: driving a server that
+      has not finished warmup measures the warmup.
+Name the relevant one in the action clause of any finding whose impact was reasoned
+about rather than observed. Do not run them here -- this review does not execute code.
+CONFIRM
+
 # Which rule families this diff actually triggers. Step 3 used to be a prose
 # checklist the model ticked itself; measured over 597 open aiter PRs that meant
 # reading all 44 rules every time. Derived structurally it is 12 at the median.

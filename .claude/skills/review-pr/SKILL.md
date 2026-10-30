@@ -463,7 +463,7 @@ run, this box, unverified`, never upgraded because it felt thorough.
 Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
 2. **Impact** — what goes wrong at runtime if this is not fixed (wrong output / crash / OOM / perf regression)
-3. **Action** — end with a verb phrase: "**Author must** [do X]" or "**Reviewer should ask** [Y]" — no verb = incomplete finding, do not include
+3. **Action** — end with a verb phrase: "**Author must** [do X]" or "**Reviewer should ask** [Y]" — no verb = incomplete finding, do not include If the impact was reasoned about rather than observed, name the check from [HOW TO CONFIRM A FINDING] in your context.
 
 **Tag every finding [verified] or [inferred], and never ship a root cause you only inferred.**
 - `[verified]` — traced to the actual code/evidence chain.
