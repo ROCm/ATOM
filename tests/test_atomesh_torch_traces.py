@@ -102,6 +102,24 @@ class WaitForTorchTracesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 4 rank traces on disk", result.stdout)
 
+    def test_a_reported_dir_counts_whatever_its_name(self):
+        worker = self.root / "decode-rank-1"
+        reported = worker / "custom_trace_dir"
+        stop_file = self.write_stop_file("decode", [reported])
+        self.write_trace(reported)
+        (worker / "tmp").mkdir()
+        result = self.run_wait(stop_file)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 1 rank traces on disk", result.stdout)
+
+    def test_a_reported_dir_without_a_trace_is_pending(self):
+        worker = self.root / "decode-rank-1"
+        stop_file = self.write_stop_file("decode", [worker / "rank_0"])
+        worker.mkdir()
+        result = self.run_wait(stop_file)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("1/1 rank traces still missing", result.stdout)
+
     def test_dp_rank_dirs_count_as_ranks(self):
         worker = self.root / "decode-rank-1"
         rank_dirs = [worker / f"dp{d}_tp0" for d in range(2)]

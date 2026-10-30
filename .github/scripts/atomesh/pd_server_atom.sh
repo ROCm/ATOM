@@ -238,6 +238,17 @@ fi
 if [[ -n "${DECODE_EXTRA_SERVER_ARGS}" ]]; then
   DECODE_SERVER_ARGS="${DECODE_SERVER_ARGS:+${DECODE_SERVER_ARGS} }${DECODE_EXTRA_SERVER_ARGS}"
 fi
+# PP size is not a top-level env var on this launcher; parse it from extra_args.
+_pp_from_args() {
+  local args="$1"
+  if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo 1
+  fi
+}
+PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
+DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
 
 has_cli_flag() {
   local args="$1"
@@ -348,18 +359,19 @@ if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
 fi
 mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
-role_tp="${PREFILL_TP_SIZE}"
+# A role's server spans TP * PP GPUs: every pipeline stage holds a full TP group.
+role_gpus=$(( PREFILL_TP_SIZE * PREFILL_PP_SIZE ))
 if [[ "${AGGREGATED}" == "1" ]]; then
   # The aggregated server launches with decode_parallel, so its GPU count is the
-  # decode TP. Rank 0 would otherwise fall through to the prefill TP below.
-  role_tp="${DECODE_TP_SIZE}"
+  # decode's. Rank 0 would otherwise fall through to the prefill's below.
+  role_gpus=$(( DECODE_TP_SIZE * DECODE_PP_SIZE ))
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
-  role_tp="${DECODE_TP_SIZE}"
+  role_gpus=$(( DECODE_TP_SIZE * DECODE_PP_SIZE ))
 elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
-  role_tp="${DECODE_TP_SIZE}"
+  role_gpus=$(( DECODE_TP_SIZE * DECODE_PP_SIZE ))
 fi
 if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
-  export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_tp - 1))")"
+  export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_gpus - 1))")"
 fi
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 echo "[runtime] phase=${ATOMESH_EXECUTION_PHASE} service_port_offset=${ATOMESH_SERVICE_PORT_OFFSET}"
@@ -517,17 +529,6 @@ elif [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
 elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
-  # PP size is not a top-level env var on this launcher; parse it from extra_args.
-  _pp_from_args() {
-    local args="$1"
-    if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
-      echo "${BASH_REMATCH[1]}"
-    else
-      echo 1
-    fi
-  }
-  PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
-  DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
   prefill_nodes=()
   prefill_gpus=()
   decode_nodes=()
@@ -2367,26 +2368,28 @@ run_torch_profile_window() {
 # stop_profile returns once TP rank 0 has exported, while the other ranks may
 # still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
 # removes the raw file, so a rank is done once it holds a .gz newer than the
-# window start and no raw .json. A rank's dir under its worker dir is named by
-# ModelRunner, rank_<tp> or dp<d>_tp<tp>, prefixed pp<k>_ under PP; any other
-# subdir there is not a rank and must not hold the wait open.
+# window start and no raw .json. The ranks are the dirs stop_profile reported
+# and their siblings that ModelRunner named for a rank: rank_<tp> or
+# dp<d>_tp<tp>, prefixed pp<k>_ under PP. Any other subdir is not a rank.
 wait_for_torch_traces() {
   local marker="$1"
   shift
-  local stop_file trace_dir worker_dir rank_dir worker_ranks
+  local stop_file trace_dir worker_dir rank_dir
   local rank_dir_re='^(pp[0-9]+_)?(rank_[0-9]+|dp[0-9]+_tp[0-9]+)$'
-  local -A worker_dirs=()
+  local -A worker_dirs=() rank_dirs=()
   for stop_file in "$@"; do
     if ! grep -qE '"status" *: *"success"' "${stop_file}" 2>/dev/null; then
       echo "[profile] stop_profile failed: $(cat "${stop_file}" 2>/dev/null)"
       return 1
     fi
     while IFS= read -r trace_dir; do
-      [[ -n "${trace_dir}" ]] && worker_dirs["$(dirname "${trace_dir}")"]=1
+      [[ -n "${trace_dir}" ]] || continue
+      worker_dirs["$(dirname "${trace_dir}")"]=1
+      rank_dirs["${trace_dir%/}/"]=1
     done < <(grep -oE '"trace_dir" *: *"[^"]+"' "${stop_file}" \
       | sed -E 's/.*"([^"]+)"$/\1/')
   done
-  if [[ "${#worker_dirs[@]}" -eq 0 ]]; then
+  if [[ "${#rank_dirs[@]}" -eq 0 ]]; then
     echo "[profile] stop_profile reported no trace_dir"
     return 1
   fi
@@ -2394,25 +2397,20 @@ wait_for_torch_traces() {
   local deadline=$(( $(date +%s) + ${ATOM_PROFILER_TIMEOUT:-300} ))
   local pending ranks
   while :; do
-    pending=0
-    ranks=0
     for worker_dir in "${!worker_dirs[@]}"; do
-      worker_ranks=0
       for rank_dir in "${worker_dir}"/*/; do
-        [[ "$(basename "${rank_dir}")" =~ ${rank_dir_re} ]] || continue
-        worker_ranks=$(( worker_ranks + 1 ))
-        if [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
-          || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
-            -newer "${marker}" -print -quit)" ]]; then
-          pending=$(( pending + 1 ))
-        fi
+        [[ "$(basename "${rank_dir}")" =~ ${rank_dir_re} ]] && rank_dirs["${rank_dir}"]=1
       done
-      # A worker with no rank dir yet still owes its traces.
-      if (( worker_ranks == 0 )); then
-        worker_ranks=1
+    done
+    pending=0
+    ranks="${#rank_dirs[@]}"
+    for rank_dir in "${!rank_dirs[@]}"; do
+      if [[ ! -d "${rank_dir}" ]] \
+        || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
+        || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
+          -newer "${marker}" -print -quit)" ]]; then
         pending=$(( pending + 1 ))
       fi
-      ranks=$(( ranks + worker_ranks ))
     done
     if (( pending == 0 )); then
       echo "[profile] all ${ranks} rank traces on disk at $(date -Is): ${!worker_dirs[*]}"

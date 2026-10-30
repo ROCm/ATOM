@@ -106,8 +106,8 @@ def q(value):
     return shlex.quote(str(shell_value(value)))
 
 def fail(reason):
-    # `eval "$(...)"` ignores this script's status, so the printed `exit 1` is
-    # what stops pd_submit.sh; the status fails any caller that checks it.
+    # pd_submit.sh runs this through `eval "$(...)"`, which ignores the status,
+    # so the printed `exit 1` is what stops it.
     print(f"echo {shlex.quote(reason)} >&2")
     print("exit 1")
     raise SystemExit(1)

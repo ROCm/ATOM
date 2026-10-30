@@ -1108,6 +1108,8 @@ models:
                 # tier. The CONC 1-4 prefills park nothing, and the PP8
                 # prefills ignore the setting.
                 ATOM_KV_POLL_FRESH_WAIT_MS: "5"
+              # Overrides the merged "0" on purpose: this is the only cell that
+              # runs mono.
               ATOM_MONO_ENABLE: "1"
               ATOM_GDN_SSM_DTYPE: fp32
             prefill: &kimi_k3_pd_prefill_env
@@ -1221,8 +1223,6 @@ models:
             common: *kimi_k3_pd_replay_env
             prefill: &kimi_k3_pp8_lmcache128_prefill_env
               <<: *kimi_k3_pd_lmcache128_prefill_env
-              # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
-              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
               VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
               ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
             decode: *kimi_k3_pd_decode_env
