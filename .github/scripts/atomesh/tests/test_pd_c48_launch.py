@@ -144,7 +144,8 @@ class LaunchTest(unittest.TestCase):
                                      (32, "NATIVE96"), (72, "N3966"), (72, "N3966-PP8"),
                                      *((c, f"N3966-{tag}") for c in (16, 32, 48, 56, 72, 88)
                                        for tag in ("BF16", "R4391")),
-                                     (72, "N3966-BF16-KVB"), (72, "N3966-BF16-KVB-TH")):
+                                     *((c, f"N3966-BF16-{tag}") for c in (56, 72, 88)
+                                       for tag in ("KVB", "KVB-TH"))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
@@ -164,6 +165,11 @@ class LaunchTest(unittest.TestCase):
                     [key] = [k for k in targets if "|g_proj)$" in k]
                     self.assertNotIn("kv_b_proj", key)
                     targets[key.replace("|g_proj)$", "|kv_b_proj|g_proj)$")] = targets.pop(key)
+                    # 3966924d host-MR registration fails past ~266 GB per rank; capped at the C72 1.8 TB.
+                    store = candidate["mooncake"]["store"]
+                    self.assertEqual(store["global_segment_size"],
+                                     min(base["mooncake"]["store"]["global_segment_size"], 224873414656))
+                    store["global_segment_size"] = base["mooncake"]["store"]["global_segment_size"]
                     variant = variant.removesuffix("-KVB")
                 self.assertEqual(json.loads(env["C48_EXPECT_QUANT"]),
                                  {"Fp8PtpcOnlineLinearMethod": 489, "Mxfp4OnlineLinearMethod": 92})
