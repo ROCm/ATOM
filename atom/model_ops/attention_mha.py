@@ -241,6 +241,95 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    def forward_after_prologue(
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        index_q=None,
+    ):
+        """``forward_impl`` after ``rope_cache``: the caller already wrote the
+        KV (and index) caches and produced the normed+roped ``q``.
+
+        Identical tail to ``forward_impl`` (dispatch_backend -> backend -> view)
+        so the fused GEMM prologue path cannot diverge from the native path.
+        ``index_q`` is only meaningful for the sparse impl.
+        """
+        q = q.view(-1, self.num_heads, self.head_dim)
+        if k is not None:
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+        if v is not None:
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+        attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        return o.view(-1, self.num_heads * self.head_dim)
+
+    def _native_use_triton_attn(self) -> bool:
+        """The decode-backend choice ``rope_cache`` records (read later by
+        ``_dispatch_decode``). Single definition, shared with the fused-prologue path so
+        the two cannot disagree."""
+        return bool(
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
+
+    def gemm_fusion_prologue_supported(self) -> bool:
+        """Static (config only, no forward context) eligibility of a fused prologue: this
+        layer's native prologue is the GemmaRMSNorm norm-rope-cache one
+        (``triton_fused_norm_rope_cache``), the branch ``rope_cache`` takes whenever rotary,
+        q_norm and k_norm exist and q_norm is a GemmaRMSNorm. Agreed across ranks at resolve.
+
+        Deliberately NOT a function of ``ATOM_FORCE_ATTN_TRITON`` / sliding window /
+        head_dim: those only choose the DECODE kernel that later reads the cache
+        (``use_triton_attn``). The Gemma branch writes the same SHUFFLE cache with the same
+        per-token scales either way (the NHD ``fused_qk_rope_reshape_and_cache`` branch is
+        reached only when norms are absent), so the fused prologue's job (write q and the cache
+        exactly as native would) does not depend on which decode kernel follows."""
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
+        return bool(
+            self.rotary_emb is not None
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and self.k_norm is not None
+        )
+
+    def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext):
+        """Caches + metadata a fused GEMM prologue needs, mirroring what
+        ``rope_cache`` resolves on the Gemma/Triton norm-rope-cache path.
+
+        Returns ``None`` when this layer's native prologue is not the Triton
+        GemmaRMSNorm one (a fused prologue then has no equivalent semantics).
+        Also pins the same impl state ``rope_cache`` pins on that path: ``use_triton_attn``
+        EXACTLY as native computes it (so the decode kernel, Triton under
+        ATOM_FORCE_ATTN_TRITON, reads the fused-written cache) and the SHUFFLE format.
+        """
+        if not self.gemm_fusion_prologue_supported():
+            return None
+        self.use_triton_attn = self._native_use_triton_attn()
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache = layer.k_cache, layer.v_cache
+        x = 16 // k_cache.element_size()
+        if k_cache.dim() == 5 and v_cache.dim() == 4:
+            n, nh, hd, bs = v_cache.shape
+            v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+        else:
+            v_cache_shuffle = v_cache
+        self._cache_format = "SHUFFLE"
+        return {
+            "k_cache": k_cache,
+            "v_cache": v_cache,  # what the backend receives (rope_cache returns it)
+            "v_cache_shuffle": v_cache_shuffle,  # what the prologue writes
+            "k_scale": layer.k_scale,
+            "v_scale": layer.v_scale,
+            "slot_mapping": fwd_ctx.attn_metadata.slot_mapping,
+        }
+
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
@@ -252,11 +341,7 @@ class PagedAttentionImpl(nn.Module):
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
         # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
+        use_triton_attn = self._native_use_triton_attn()
         self.use_triton_attn = use_triton_attn
 
         if (
@@ -1343,6 +1428,105 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Rotated indexer query produced by rope_cache, consumed (and cleared) by
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: torch.Tensor | None = None
+
+    @staticmethod
+    def _to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
+        """Reinterpret the standard page-128 SHUFFLE KV/scale views as page-16
+        SHUFFLE for the MiniMax-M3 ASM/gluon kernels. Zero-copy (128 == 8*16):
+
+            K:     [N, nkv, hd//x, 128, x] -> [N*8, nkv, hd//x, 16, x]
+            V:     [N, nkv, 128//x, hd, x] -> [N*8, nkv, 16//x, hd, x]
+            scale: [N, nkv, 128]           -> [N*8, nkv, 16]   (fp8 only)
+
+        Scales are re-viewed only when present (fp8); bf16 passes them through
+        (None).
+        """
+        from atom.model_ops.minimax_m3.sparse_attn import (
+            ASM_PAGE_SIZE,
+            PAGES_PER_SPARSE_BLOCK,
+        )
+
+        n_blocks, nkv = k_cache.shape[0], k_cache.shape[1]
+        x = k_cache.shape[-1]
+        head_dim = k_cache.shape[2] * x
+        num_phys16 = n_blocks * PAGES_PER_SPARSE_BLOCK
+
+        k16 = k_cache.view(num_phys16, nkv, head_dim // x, ASM_PAGE_SIZE, x)
+        v16 = v_cache.view(num_phys16, nkv, ASM_PAGE_SIZE // x, head_dim, x)
+        if k_scale is not None and v_scale is not None:
+            k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
+            v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
+        return k16, v16, k_scale, v_scale
+
+    def forward_after_prologue(
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        index_q=None,
+    ):
+        """Continue from ``rope_cache``'s result (caller wrote KV/index caches).
+
+        Restores the per-forward state ``rope_cache`` leaves for
+        ``dispatch_backend``: ``_index_q`` (``None`` on skip-index layers) and
+        ``_index_q_cache_key_info`` exactly as the corresponding rope_cache
+        branch sets them. ``k``/``v`` are unused by the sparse backends.
+        """
+        num_tokens = q.shape[0]
+        if self.skip_index_topk or index_q is None:
+            # Skip-index branch of rope_cache (qkv.dtype == q.dtype here).
+            self._index_q = None
+            self._index_q_cache_key_info = (
+                (num_tokens, self.num_idx_heads, self.index_head_dim),
+                q.dtype,
+                q.device,
+            )
+        else:
+            self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+            self._index_q_cache_key_info = (
+                tuple(self._index_q.shape),
+                self._index_q.dtype,
+                self._index_q.device,
+            )
+        return super().forward_after_prologue(
+            q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+        )
+
+    def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext):
+        """Caches + metadata for a fused prologue, as ``rope_cache`` resolves
+        them (page-16 SHUFFLE re-view, sparse slot mapping, M3 cos/sin)."""
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache, k_scale, v_scale = self._to_page16_shuffle(
+            layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
+        )
+        self.use_triton_attn = False
+        self._cache_format = "SHUFFLE"
+        attn_metadata = fwd_ctx.attn_metadata
+        sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
+        if sparse_metadata is None:
+            sparse_metadata = attn_metadata
+        is_fp8 = self.kv_cache_dtype == "fp8"
+        return {
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "k_scale": k_scale if is_fp8 else None,
+            "v_scale": v_scale if is_fp8 else None,
+            "k_scale_view": k_scale,
+            "v_scale_view": v_scale,
+            "slot_mapping": sparse_metadata.slot_mapping,
+        }
+
+    def gemm_fusion_prologue_supported(self) -> bool:
+        """The M3 sparse prologue (aiter fused qk/index norm+rope, or the Triton
+        norm-rope-cache on skip-index layers) has no GemmaRMSNorm/env gate of the
+        dense Triton path it inherits; always eligible. Explicit because the
+        site treats a missing method as NOT eligible."""
+        return True
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):

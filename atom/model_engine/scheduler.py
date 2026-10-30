@@ -541,6 +541,11 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+        aborted_req_ids: None normally. A list (possibly empty) when the runner's
+            device error check found an error word set on some rank: every
+            request in it ran a step that may have written corrupt KV, and the
+            scheduler must abort it and drop the prefix cache (see
+            ``Scheduler.postprocess``).
 
     NumPy views are copied before the result enters the output queue. Views
     returned by asynchronous D2H copies otherwise keep pinned tensor storage
@@ -559,6 +564,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        aborted_req_ids: list[int] | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -573,6 +579,7 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        self.aborted_req_ids = aborted_req_ids
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -4013,6 +4020,88 @@ class Scheduler:
             )
 
     def postprocess(
+        self,
+        seqs: list[Sequence],
+        fwd_output: ScheduledBatchOutput,
+        stream_output_queue=None,
+        batch: ScheduledBatch = None,
+    ) -> list[Sequence]:
+        """Process model outputs, applying a device-error verdict first when there is one.
+
+        ``fwd_output.aborted_req_ids`` is set by the runner when its device error check found an
+        error word set on some rank (GEMM fusion) and ran the collective reset. The requests in it
+        ran steps that may have written corrupt KV: they are marked ABORTED BEFORE the body runs, so
+        it finishes them as ``"aborted"`` without consuming their sampled tokens. The prefix cache is
+        dropped AFTER the body, so no block of this step is hashed behind the clear: corrupt KV that
+        was already hashed (and freed) would otherwise be served to a later request as a prefix hit.
+        Requests that finished inside the window are gone (their tokens were already streamed) and
+        cannot be aborted, but the blocks they freed are scrubbed with every other free block that was
+        ever used. See ``_postprocess_impl`` for the normal processing.
+        """
+        aborted = getattr(fwd_output, "aborted_req_ids", None)
+        if aborted is None:
+            return self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
+        held = self._abort_for_device_error(aborted)
+        finished = self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
+        self.block_manager.clear_cache()
+        # AFTER the body, which frees the aborted requests' blocks: only blocks that really went
+        # back to the free list may be zeroed (a block a surviving request still shares must not).
+        # Every block that can hold NaN is now either free or held by a request the verdict did NOT
+        # abort, and the latter never ran in the unchecked window. So wipe every free block that was
+        # ever used, not only the aborted requests' own: the blocks of a request that finished inside
+        # the window, or earlier, are free and may hold NaN too (the next request takes the LOWEST free
+        # ids, which are the oldest blocks).
+        self._kv_scrub_blocks = self._scrub_set(held)
+        return finished
+
+    def _scrub_set(self, held) -> list[int]:
+        """The blocks every rank zeroes after a device error verdict: the ones the aborted requests
+        held that really were freed, plus every free block that was ever used (see postprocess).
+        """
+        freed_held = self._freed_blocks(held)
+        free_used = self.block_manager.kv.used_free_blocks()
+        blocks = sorted({*freed_held, *free_used})
+        logger.warning(
+            "Scheduler: KV scrub after a device error verdict: %d block(s) held by aborted "
+            "requests (%d actually freed), %d free block(s) ever used; %d to zero%s",
+            len(held),
+            len(freed_held),
+            len(free_used),
+            len(blocks),
+            f" (ids {blocks[0]}..{blocks[-1]})" if blocks else "",
+        )
+        return blocks
+
+    def _freed_blocks(self, block_ids) -> list[int]:
+        kv = self.block_manager.kv
+        return [b for b in block_ids if kv.block(b).ref_count == 0]
+
+    def take_kv_scrub(self) -> list[int]:
+        """The blocks the engine core must have every rank zero before the next step: after a device
+        error verdict, those the aborted requests held plus every free block that was ever used (see
+        ``postprocess``). Returned once, then cleared.
+        """
+        blocks, self._kv_scrub_blocks = getattr(self, "_kv_scrub_blocks", []), []
+        return blocks
+
+    def _abort_for_device_error(self, req_ids) -> list[int]:
+        """Mark the requests aborted; returns the blocks they hold NOW, which the body is about to
+        free (the caller zeroes the ones that really are freed: see ``take_kv_scrub``).
+        """
+        wanted = set(req_ids)
+        held = sorted(
+            {b for seq in self.running if seq.id in wanted for b in seq.block_table}
+        )
+        aborted = [rid for rid in req_ids if self.abort_request(rid)]
+        logger.error(
+            "Scheduler: device error verdict from the runner: aborted %d of %d request(s) "
+            "(the rest already finished) and dropped the prefix cache",
+            len(aborted),
+            len(req_ids),
+        )
+        return held
+
+    def _postprocess_impl(
         self,
         seqs: list[Sequence],
         fwd_output: ScheduledBatchOutput,

@@ -156,6 +156,78 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
     assert captured["scale"] == 2.0
 
 
+@pytest.mark.parametrize("shared_fused", [False, True])
+def test_sigmoid_dispatch_scales_routed_weights_once(monkeypatch, shared_fused):
+    """Routing scales the routed weights exactly when the model expects it.
+
+    Port of this branch's ``select_experts_with_record`` pin onto main's #2725
+    API: routing and placement are separate now, so the scale-once property
+    lives in ``FusedMoE.select_experts``' ``shared_experts_fused`` argument
+    (the union this merge kept), and the shared column is pre-filled by the
+    ``topK`` meta buffer as before.
+    """
+    captured = {}
+
+    def fake_topk_meta_rows(num_rows):
+        # `init_aiter_topK_meta_data`'s buffer: routed columns first, the
+        # prefilled shared ones after (weight = the layer's shared score).
+        total_topk_weights = torch.empty(num_rows, 3)
+        total_topk_ids = torch.empty(num_rows, 3, dtype=torch.int32)
+        total_topk_weights[:, 2] = 1.0
+        total_topk_ids[:, 2] = 8  # logical id of the fused shared expert
+        return total_topk_weights, total_topk_ids
+
+    def cpu_topk(
+        weights,
+        ids,
+        logits,
+        bias,
+        renormalize,
+        scale,
+        *,
+        score_func,
+        num_valid_rows=None,
+    ):
+        captured["scale"] = scale
+        assert score_func == "sigmoid"
+        scores, indices = logits.float().sigmoid().topk(ids.shape[1], dim=-1)
+        if renormalize:
+            scores = scores / scores.sum(dim=-1, keepdim=True)
+        weights.copy_(scores * scale)
+        ids.copy_(indices)
+
+    monkeypatch.setattr(moe_module, "topk_meta_rows", fake_topk_meta_rows)
+    monkeypatch.setattr(moe_module, "topk_gating", cpu_topk)
+    monkeypatch.setattr(
+        moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
+    )
+    logits = torch.tensor([[2.0, -2.0, -2.0, -2.0, 1.0, -2.0, -2.0, -2.0]])
+
+    weights, ids = FusedMoE.select_experts(
+        hidden_states=torch.empty(1, 4),
+        router_logits=logits,
+        top_k=2,
+        use_grouped_topk=False,
+        renormalize=True,
+        scoring_func="sigmoid",
+        num_routing_experts=8,
+        num_fused_shared_experts=1,
+        routed_scaling_factor=2.0,
+        mask_pad_rows=False,
+        shared_experts_fused=shared_fused,
+    )
+
+    # A separate shared MLP leaves scaling to the model. Fused shared experts
+    # require scaled routed weights even though routing receives no shared cols.
+    expected_scale = 2.0 if shared_fused else 1.0
+    assert captured["scale"] == expected_scale
+    torch.testing.assert_close(
+        weights[:, :2].sum(dim=-1), torch.tensor([expected_scale])
+    )
+    assert weights[:, 2].tolist() == [1.0]
+    assert ids.tolist() == [[0, 4, 8]]
+
+
 def _parallel_config(
     *, dp_size: int, use_ep: bool, backend: str = "auto"
 ) -> FusedMoEParallelConfig:
@@ -266,3 +338,37 @@ def test_rccl_backend_does_not_take_mori_shared_expert_gate(monkeypatch):
     )
 
     assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None)
+
+
+@pytest.mark.parametrize("backend", ["none", "rccl", "mori"])
+@pytest.mark.parametrize("sp_size", [1, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float4_e2m1fn_x2])
+def test_sp_shared_mlp_fallback_matches_loader_decision(
+    monkeypatch, backend, sp_size, dtype
+):
+    spec = SimpleNamespace(quant_dtype=dtype, quant_type=None, is_dynamic=False)
+    quant = SimpleNamespace(
+        quant_dtype=dtype,
+        exclude_layers=[],
+        global_quant_config=spec,
+        get_layer_quant_config=lambda *args, **kwargs: spec,
+    )
+    config = atom_config_double(
+        quant_config=quant,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        sequence_parallel_size=sp_size,
+        enable_expert_parallel=True,
+        moe_all2all_backend=backend,
+    )
+    monkeypatch.setattr(topK_module, "get_current_atom_config", lambda: config)
+    monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
+    monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
+    expected = not (sp_size > 1 and backend != "none" and dtype == torch.bfloat16)
+    # Module construction and checkpoint loading must choose the same layout.
+    assert is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(None) == expected
+    assert (
+        is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
+            quant, shared_expert_prefix="shared", routed_expert_prefix="experts"
+        )
+        == expected
+    )

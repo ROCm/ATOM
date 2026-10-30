@@ -62,6 +62,7 @@ def test_supported_deployment_has_no_refusal(native):
     [
         ({"tensor_parallel_size": 8}, "kv heads 4 is not divisible by TP 8"),
         ({"tensor_parallel_size": 2}, "2 kv heads a rank at TP 2"),
+        ({"m3_tp_replicated_o_proj": True}, "replicated o_proj"),
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP"),
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"enable_expert_parallel": True}, "expert parallel"),

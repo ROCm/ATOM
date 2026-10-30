@@ -12,11 +12,11 @@ if TYPE_CHECKING:
 
 import numpy as np
 import torch
-from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.config import DCPConfig
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
+from atom.distributed.ulysses_sp import attn_head_shard_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
@@ -469,6 +469,13 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         backing back. A builder that holds no pool has nothing to drop.
         """
 
+    def zero_kv_entries(self, entry_ids) -> bool:
+        """Return the given scheduler blocks of every paged pool this builder holds to the zeros a
+        fresh pool has (KV, scales and indexer keys, every layer). True when it did. The default is
+        False: a builder without per-block zeroing says so instead of pretending, and the caller
+        reports it."""
+        return False
+
     def build_kv_cache_tensor(self, module):
         """Build the vLLM-style `KVCacheTensor` registration entry for one
         attention module, OR return None if this builder does not recognize
@@ -541,7 +548,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         # need a kernel-minimum-padded count set `self.padded_num_attention_heads`
         # separately (it does NOT replace this attribute).
         self.num_attention_heads = (
-            hf_config.num_attention_heads // get_tp_group().world_size
+            hf_config.num_attention_heads // attn_head_shard_size()
         )
 
         i64_kwargs = {"dtype": torch.int64, "device": self.device}

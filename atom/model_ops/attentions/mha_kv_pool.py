@@ -238,6 +238,30 @@ class MhaKvPool:
         self.cache = self.scale = self.extra = None
         self._views = {}
 
+    def zero_entries(self, entries: Sequence[int]) -> int:
+        """Return the given entries, in EVERY layer and field (K, V, scales, indexer keys), to what a
+        fresh pool holds: zeros. Returns how many were zeroed (0 once released).
+
+        ``entries`` are the scheduler's block ids: an entry is ``blocks_per_entry`` of this pool's
+        blocks laid end to end, and the pool is built with one entry per scheduler block. Each field's
+        view is ``[layers, entries, *shape]``, so one indexed write per field covers every layer.
+        Used to wipe blocks that a failed step may have filled with NaN before they are reused: finite
+        stale bytes are harmless to a masked read, NaN is not (NaN * 0 = NaN)."""
+        if not self._views or self.cache is None:
+            return 0
+        ids = sorted({int(e) for e in entries})
+        if not ids:
+            return 0
+        if ids[0] < 0 or ids[-1] >= self.cache.entries:
+            raise ValueError(
+                f"entries {ids[0]}..{ids[-1]} are outside the pool's {self.cache.entries} entries"
+            )
+        device = next(iter(self._views.values())).device
+        index = torch.tensor(ids, dtype=torch.long, device=device)
+        for view in self._views.values():
+            view[:, index] = 0
+        return len(ids)
+
     def field_view(self, name: str, layer: int, dtype, shape) -> torch.Tensor:
         """One layer's field, retyped and shaped by its owner.
 

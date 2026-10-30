@@ -17,6 +17,7 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.distributed.ulysses_sp import sp_is_enabled, ulysses_attention
 from atom.utils import envs, mark_spliting_op
 from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
@@ -1064,6 +1065,10 @@ def unified_attention_with_output_base(
             positions=positions,
             q_scale=q_scale,
         )
+    elif sp_is_enabled():
+        # Ulysses: trade this rank's token chunk for its head slice around the
+        # unchanged impl. Inside the custom op, so the collectives stay opaque.
+        return ulysses_attention(self, q, k, v, positions, q_scale, qkv)
     else:
         return self.impl.forward(
             query=q,

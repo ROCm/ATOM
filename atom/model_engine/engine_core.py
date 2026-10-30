@@ -540,6 +540,7 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=batch,
         )
+        self._scrub_kv_after_verdict()
 
         # Send stream outputs to main process via output_queue
         try:
@@ -553,6 +554,18 @@ class EngineCore:
         if finished_seqs:
             self._release_multimodal_requests(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
+
+        return True
+
+    def _scrub_kv_after_verdict(self) -> None:
+        """After a gemm_fusion device error verdict, have every rank zero the KV blocks the aborted
+        requests held (``ModelRunner.scrub_kv_blocks``), BEFORE the next ``schedule()`` can hand them
+        to another request. A plain RPC, queued ahead of the next forward on every worker.
+        """
+        take = getattr(self.scheduler, "take_kv_scrub", None)
+        blocks = take() if take is not None else None
+        if blocks:
+            self.runner_mgr.call_func("scrub_kv_blocks", blocks, wait_out=True)
 
     def has_pending_kv_work(self) -> bool:
         """True while KV transfer work outlives the scheduler queues.

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from atom.config import Config, KVCacheTensor, ParallelConfig
+from atom.distributed.ulysses_sp import sp_is_enabled, sp_tokens_across_ranks
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
@@ -1040,8 +1041,15 @@ def set_forward_context(
     )
 
     # Mirrored here rather than at each caller: the two going out of step is how
-    # an all2all comes to bound its receive buffer by one rank's count.
-    context.running_tokens_across_dp = tuple(running_tokens_per_dp_rank.tolist())
+    # an all2all comes to bound its receive buffer by one rank's count. Ulysses
+    # SP: every SP rank runs the same padded local width, so the table is that
+    # width per SP rank (the array holds the step's rows on the DP axis).
+    if sp_is_enabled():
+        context.running_tokens_across_dp = sp_tokens_across_ranks(
+            int(running_tokens_per_dp_rank[0])
+        )
+    else:
+        context.running_tokens_across_dp = tuple(running_tokens_per_dp_rank.tolist())
 
     forward_mode = context.forward_mode
     _forward_context = ForwardContext(
