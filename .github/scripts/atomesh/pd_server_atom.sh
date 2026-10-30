@@ -2078,12 +2078,15 @@ start_router() {
   if [[ "${router_policy}" == "cache_aware" ]]; then
     # Keep the InferenceX defaults, with a case-level absolute-load override.
     router_policy_args+=(
-      --prefill-policy cache_aware --decode-policy cache_aware
       --cache-threshold 0.8
       --balance-abs-threshold "${ROUTER_BALANCE_ABS_THRESHOLD:-20}"
       --balance-rel-threshold 2.0
       --eviction-interval 300
     )
+    if [[ "${#router_prefill_policy_args[@]}" -eq 0 ]]; then
+      router_policy_args+=(--prefill-policy cache_aware)
+    fi
+    router_policy_args+=(--decode-policy cache_aware)
     router_rank_mapping_args=(--atom-pd-rank-mapping-policy "${ATOM_PD_RANK_MAPPING_POLICY}")
   fi
   local -a router_cmd=(
