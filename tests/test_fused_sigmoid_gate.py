@@ -173,8 +173,10 @@ def _attention(qwen3_next, qkv, attn_out, q_size, kv_size):
     layer.qkv_proj = lambda h, x_scale=None: qkv
     layer.qk_norm = lambda q, k: (q, k)
     layer.rotary_emb = None
+    layer.fuse_qk_norm_rope_cache = False
     layer.attn = lambda q, k, v: attn_out
     layer.use_fused_sigmoid_mul_quant = False
+    layer.skip_out_proj = False
     layer.o_proj = lambda x: x
     return layer
 
@@ -187,11 +189,9 @@ def test_attention_output_gate_call_site(monkeypatch, enabled):
     qkv = torch.randn(rows, 2 * q_size + 2 * kv_size, generator=gen).to(torch.bfloat16)
     attn_out = torch.randn(rows, q_size, generator=gen).to(torch.bfloat16)
     calls = []
-    monkeypatch.setattr(
-        qwen3_next, "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", False
-    )
     monkeypatch.setattr(qwen3_next, "ATOM_FUSED_SIGMOID_GATE", enabled)
     monkeypatch.setattr(sigmoid_gate, "fused_sigmoid_gate", _recording_fused(calls))
+    monkeypatch.setattr(qwen3_next, "try_fused_qk_norm_mrope", lambda *a: None)
     monkeypatch.setattr(qwen3_next, "try_mrope_qk_fused", lambda *a: (a[2], a[3]))
     layer = _attention(qwen3_next, qkv, attn_out, q_size, kv_size)
     out = layer.forward(torch.zeros(rows), torch.zeros(rows, 8))
