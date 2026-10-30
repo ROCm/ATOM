@@ -454,6 +454,9 @@ host_name="$(hostname)"
 
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 
+# Install the pinned MXFP4 runtime before any server or JIT cache is prepared.
+source "${ATOMESH_SCRIPT_DIR}/setup_m31_aiter.sh"
+
 # Resolve nested drafts after the shared HF cache environment is exported.
 if [[ -n "${DRAFT_MODEL_PATH}" ]]; then
   DRAFT_MODEL_PATH="$(python3 "${ATOMESH_SCRIPT_DIR}/resolve_draft_model.py" \

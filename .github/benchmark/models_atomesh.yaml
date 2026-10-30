@@ -2516,6 +2516,7 @@ models:
     image: rocm/atom-dev:nightly_202610291449
     env:
       common: &m31_stack_env
+        ATOMESH_M31_AITER_REF: "1053d8d18e297543efda93f99375b2d51e9740f3"
         AITER_LOG_LEVEL: WARNING
         ATOM_M3_SPARSE_KV_MXFP4: "1"
         ATOM_M3_SPARSE_KV_NVFP4: "0"
