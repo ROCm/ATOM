@@ -171,7 +171,7 @@ Compare `-tp 4 -pcp 2` against the `-tp 8` baseline and watch **Mean TTFT** and
 output throughput; the gap widens as `--random-input-len` grows.
 
 > PCP was introduced in [ROCm/ATOM#1220](https://github.com/ROCm/ATOM/pull/1220),
-> which reported, on 8×MI308 for `-tp 4 -pcp 2` vs `-tp 8`, a **35–43%** Mean-TTFT
+> which reported, on 8×MI300X/MI300A/MI325X (gfx942) for `-tp 4 -pcp 2` vs `-tp 8`, a **35–43%** Mean-TTFT
 > reduction and up to **~49%** higher throughput on long prefill. Actual gains
 > depend on model, sequence length, and hardware.
 
@@ -179,10 +179,10 @@ output throughput; the gap widens as `--random-input-len` grows.
 
 TBO's benefit is **hardware-dependent**:
 
-- **MI308**: current testing shows PCP + TBO gives **almost no gain** over PCP
+- **MI300X/MI300A/MI325X** (gfx942): current testing shows PCP + TBO gives **almost no gain** over PCP
   alone — the overlap does not meaningfully hide the MoE communication on this
   hardware. Prefer plain PCP (`-tp 4 -pcp 2`) here.
-- **MI355**: PCP + TBO **does** deliver a speedup. Enable it with
+- **MI355X/MI350X** (gfx950): PCP + TBO **does** deliver a speedup. Enable it with
   `ATOM_PCP_MOE_MERGE=1 -tp 1 -pcp 8 --enable-tbo`.
 
 Because TBO requires `-tp 1`, compare TBO configs against the matching `-tp 1`
