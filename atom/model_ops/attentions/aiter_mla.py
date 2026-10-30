@@ -65,9 +65,9 @@ from atom.model_ops.glm5_next.geometry import (
 )
 from atom.model_ops.indexer import (
     ConcatKeys,
-    DcpSplit,
     Fp4LaunchStorages,
     IndexRows,
+    RowSplit,
     concat_rows,
     fp4_rows,
     fp8_rows,
@@ -2750,7 +2750,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows = len(row_ends)
         var["index_row_ends"].np[:rows] = row_ends
         ends = var["index_row_ends"].copy_to_gpu(rows)
-        split = DcpSplit.of(rows, self.dcp_rank, self.dcp_world_size)
+        split = RowSplit.of(rows, self.dcp_rank, self.dcp_world_size)
         if not self._indexer_fp4:
             keys = ConcatKeys(
                 block_tables=attn_metadata.block_tables,
@@ -3648,12 +3648,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """A TBO prefill ubatch's share of the step's index `rows`: its rows,
         against the step's keys as the step reads them -- a request a token
         split cuts in two keeps every key its rows see -- and under DCP this
-        rank's share of them (`DcpSplit`)."""
+        rank's share of them (`RowSplit`)."""
         if rows is None:
             return None
         ts = ub_slice.token_slice
         ends = rows.row_ends[ts]
-        split = DcpSplit.of(ends.shape[0], self.dcp_rank, self.dcp_world_size)
+        split = RowSplit.of(ends.shape[0], self.dcp_rank, self.dcp_world_size)
         if rows.concat is not None:
             row_starts = rows.concat.row_starts[ts]
             return concat_rows(ends, rows.concat._replace(row_starts=row_starts), split)

@@ -12,6 +12,7 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
@@ -20,7 +21,12 @@ from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
-from atom.model_ops.base_attention import Attention
+from atom.model_ops.base_attention import (
+    Attention,
+    _flydsl_arch_supported,
+    _flydsl_explicit_plan_api,
+    _flydsl_plan_max_batch,
+)
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
@@ -48,6 +54,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
@@ -71,6 +78,42 @@ def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]
         layer_id: ordinal
         for ordinal, layer_id in enumerate(sorted(_sparse_attention_layer_ids(config)))
     }
+
+
+def _validate_sparse_flydsl_config(
+    atom_config: Config, config: PretrainedConfig
+) -> None:
+    """Reject gfx1250 M3 sparse PA configurations that cannot be served."""
+    if not _sparse_attention_layer_ids(config) or pa_decode_gluon_supports_arch():
+        return
+    if not envs.ATOM_PA_FLYDSL:
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention on this GPU requires "
+            "ATOM_PA_FLYDSL=1 because there is no gluon fallback"
+        )
+    if not _flydsl_arch_supported():
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention requires a GPU supported by "
+            "aiter's FlyDSL paged decode because there is no gluon fallback"
+        )
+    if not _flydsl_explicit_plan_api():
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
+            "explicit-plan API (#5809) because there is no gluon fallback"
+        )
+    tp_size = get_tensor_model_parallel_world_size()
+    local_kv_heads = max(1, int(config.num_key_value_heads) // tp_size)
+    max_tokens = int(atom_config.max_num_batched_tokens)
+    max_rows = max_tokens * local_kv_heads
+    plan_limit = _flydsl_plan_max_batch()
+    if max_rows > plan_limit:
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention can schedule at most "
+            f"{plan_limit} FlyDSL rows, but max_num_batched_tokens "
+            f"({max_tokens}) * local num_kv_heads ({local_kv_heads}) "
+            f"= {max_rows}; lower --max-num-batched-tokens to at most "
+            f"{plan_limit // local_kv_heads}"
+        )
 
 
 def _should_skip_minimax_m3_index_topk(
@@ -705,6 +748,7 @@ class MiniMaxM3Model(nn.Module):
     ) -> None:
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
+        _validate_sparse_flydsl_config(atom_config, config)
         self.config = config
         cache_config = atom_config.kv_cache_dtype
         index_cache_config = atom_config.index_cache_dtype

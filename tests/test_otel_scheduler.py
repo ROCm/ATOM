@@ -363,9 +363,13 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
             else True
         )
 
-    monkeypatch.setattr(
-        engine_core, "AsyncIOProcManager", lambda *a: SimpleNamespace(call_func=call)
-    )
+    failure_callbacks = []
+
+    def runner_manager(*args, on_worker_failure):
+        failure_callbacks.append(on_worker_failure)
+        return SimpleNamespace(call_func=call)
+
+    monkeypatch.setattr(engine_core, "AsyncIOProcManager", runner_manager)
     monkeypatch.setattr(engine_core, "Scheduler", lambda *a, **k: None)
     monkeypatch.setattr(engine_core, "EngineUtilityHandler", lambda *a, **k: None)
     monkeypatch.setattr(tracing, "initialize", lambda: events.append("initialize"))
@@ -383,7 +387,8 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         pipeline_parallel_size=1,
         kv_transfer_config=None,
     )
-    cls(config, "unused", "unused")
+    core = cls(config, "unused", "unused")
+    assert failure_callbacks == [core._send_engine_dead]
     # Only the order around `initialize` is the contract; other startup RPCs
     # may come and go between these points.
     order = [
