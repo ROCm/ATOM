@@ -216,6 +216,14 @@ class _Embedding(torch.nn.Module):
     def rebind_weight_addresses(self):
         self.shard_bases.copy_(self.table.shard_bases(NUM_SHARDS))
 
+    def sync_weight(self, param_name, tensor, shard_id=None):
+        """`_Qwen4ExpHostEmbedding.sync_weight` at TP1, less its shape check
+        and device fence."""
+        if param_name != "weight" or (shard_id is None and not self.table.on_host):
+            return False
+        self.table.sync_rows(0 if shard_id is None else shard_id * SHARD_ROWS, tensor)
+        return True
+
 
 def _runner(model, device="cpu"):
     from atom.rollout.memory_manager import MemoryManagerMixin
@@ -262,6 +270,124 @@ def test_releasing_the_weights_releases_an_hbm_fallback(fake_pin, monkeypatch, f
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
     assert _bitwise_equal(got, table[ids])
+
+
+class _Model(torch.nn.Module):
+    """The PLE table and one ordinary parameter, named as the trainer sends
+    them: the table whole, or as the checkpoint's shards."""
+
+    def __init__(self):
+        super().__init__()
+        self.packed_modules_mapping = {
+            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+            for shard in range(NUM_SHARDS)
+        }
+        self.ple = torch.nn.Module()
+        self.ple.ngram_embedding = _Embedding()
+        self.proj = torch.nn.Linear(4, 4, bias=False)
+
+
+def _updater(model, device="cpu"):
+    from atom.rollout.weight_updater import WeightUpdaterMixin
+
+    class _Updater(WeightUpdaterMixin):
+        label, rank, world_size = "ple", 0, 1
+
+        def clear_kv_cache(self):
+            pass
+
+    updater = _Updater()
+    updater.model, updater.device = model, torch.device(device)
+    return updater
+
+
+def _sync_tensors(table, proj, shards):
+    if not shards:
+        return [("ple.ngram_embedding.weight", table), ("proj.weight", proj)]
+    return [
+        (f"ple.ngram_embedding.shard_{index}.weight", shard)
+        for index, shard in enumerate(_shards(table))
+    ] + [("proj.weight", proj)]
+
+
+@pytest.mark.parametrize("shards", [False, True])
+@pytest.mark.parametrize("fail_at", [None, 1])
+def test_a_weight_sync_reaches_the_rows_the_lookup_reads(fake_pin, fail_at, shards):
+    """`update_weights` with the table and an ordinary parameter updates
+    both. The rows are written in place: nothing is page-locked again and
+    the kernel's addresses do not move, so a captured graph reads the new
+    rows. A whole HBM fallback table is `weight` and is synced as any other
+    parameter; its checkpoint shards, which have no parameter of their own,
+    are written into it."""
+    fake_pin.fail_at = fail_at
+    old, new = _table(), _table().neg()
+    model = _Model()
+    emb = model.ple.ngram_embedding
+    _load(old, emb.table)
+    emb.rebind_weight_addresses()
+    before = emb.shard_bases.clone()
+    pinned = [p.data_ptr() for _, p in emb.table._rows.values() if p is not None]
+    pins = fake_pin.calls
+    proj = torch.randn(4, 4)
+
+    hbm = emb.weight.data_ptr()
+
+    updated = _updater(model).update_weights(_sync_tensors(new, proj, shards))
+
+    assert updated == (NUM_SHARDS + 1 if shards else 2)
+    assert torch.equal(model.proj.weight, proj)
+    assert emb.weight.data_ptr() == hbm
+    assert torch.equal(emb.shard_bases, before)
+    assert fake_pin.calls == pins
+    assert [p.data_ptr() for _, p in emb.table._rows.values() if p is not None] == (
+        pinned
+    )
+    ids = _probe_ids(TABLE_ROWS)
+    got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, new.dtype)
+    assert _bitwise_equal(got, new[ids])
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_synced_table_writes_only_the_ranks_rows(fake_pin, rank):
+    table = _table(rows=SHARD_ROWS * NUM_SHARDS)
+    rows = table.shape[0] // 2
+    start, end = rank * rows, (rank + 1) * rows
+    host = _host(start, end)
+    _load(table, host, start, end)
+    bases = host.shard_bases(NUM_SHARDS)
+    new = table.neg()
+    host.sync_rows(0, new)
+    # One checkpoint shard straddling the ranks' boundary.
+    straddling = rows // SHARD_ROWS
+    first = straddling * SHARD_ROWS
+    new[first : first + SHARD_ROWS] = 2.0
+    host.sync_rows(first, new[first : first + SHARD_ROWS])
+    ids = _probe_ids(table.shape[0])
+    expected = torch.where(
+        ((ids >= start) & (ids < end))[:, None], new[ids], torch.zeros(())
+    ).to(table.dtype)
+    assert _bitwise_equal(_follow(bases, ids, start, end, table.dtype), expected)
+
+
+def test_a_sync_the_table_cannot_take_is_an_error(fake_pin):
+    table = _table()
+    host = _host()
+    _load(table, host)
+    with pytest.raises(ValueError, match="expected \\[rows, 160\\]"):
+        host.sync_rows(0, table[:, :8])
+    fp8 = _host(dtype=torch.float8_e4m3fn)
+    _load(table.to(torch.float8_e4m3fn), fp8)
+    with pytest.raises(ValueError, match="expected torch.float8_e4m3fn"):
+        fp8.sync_rows(0, table)
+    partial = _host()
+    _load(table, partial, shards=_shards(table)[:2])
+    with pytest.raises(ValueError, match="never loaded"):
+        partial.sync_rows(0, table)
+    # Through the updater too: raised, not counted as skipped.
+    model = _Model()
+    _load(table, model.ple.ngram_embedding.table)
+    with pytest.raises(ValueError, match="expected \\[rows, 160\\]"):
+        _updater(model).update_weights([("ple.ngram_embedding.weight", table[:, :8])])
 
 
 def test_shards_are_copied_even_with_uva_copy_off(fake_pin, monkeypatch):
@@ -514,6 +640,64 @@ def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
     assert int(embedding.shard_bases[0]) == embedding.weight.data_ptr() != old_base
     assert _bitwise_equal(host_layer(*inputs), expected)
     del squatter
+
+
+@_gpu
+@pytest.mark.parametrize("shards", [False, True])
+def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shards):
+    """`update_weights` on the host table, whole or as the checkpoint's
+    shards: the rows are written in place, the shard addresses do not move,
+    and a lookup captured in a CUDA graph before the sync replays onto the
+    new rows -- the bytes the HBM embedding returns after the same sync."""
+    host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
+    old = _layer_table(host_layer)
+    new = torch.randn(old.shape, generator=torch.Generator().manual_seed(4))
+    new = new.bfloat16()
+    for layer in (host_layer, hbm_layer):
+        _load_layer(layer, old)
+    embedding = host_layer.ngram_embedding
+    assert embedding.table.on_host
+    bases = embedding.shard_bases.clone()
+    pinned = [p.data_ptr() for _, p in embedding.table._rows.values()]
+    ids = torch.zeros(256, dtype=torch.int64, device="cuda")
+    embedding(ids)  # compile outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = embedding(ids)
+
+    def sync(layer, by_shard):
+        model = torch.nn.Module()
+        model.ple = layer
+        model.packed_modules_mapping = {
+            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+            for shard in range(_NGRAM_CONFIG.split_ngram_parts)
+        }
+        if by_shard:
+            parts = new.split(layer.checkpoint_shard_rows)
+            tensors = [
+                (f"ple.ngram_embedding.shard_{index}.weight", part)
+                for index, part in enumerate(parts)
+            ]
+        else:
+            tensors = [("ple.ngram_embedding.weight", new)]
+        assert _updater(model, "cuda").update_weights(tensors) == len(tensors)
+
+    sync(host_layer, shards)
+    sync(hbm_layer, False)
+    assert torch.equal(embedding.shard_bases, bases)
+    assert [p.data_ptr() for _, p in embedding.table._rows.values()] == pinned
+    reference = hbm_layer.ngram_embedding
+    for seed in range(3):
+        gen = torch.Generator().manual_seed(seed)
+        ids.copy_(torch.randint(0, host_layer.table_rows, (256,), generator=gen))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert _bitwise_equal(out, reference(ids))
+        assert not _bitwise_equal(out, torch.nn.functional.embedding(ids, old.cuda()))
+    inputs = _layer_inputs()
+    assert _bitwise_equal(host_layer(*inputs), hbm_layer(*inputs))
+    del graph
 
 
 @_gpu

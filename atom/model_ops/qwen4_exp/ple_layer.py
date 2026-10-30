@@ -181,7 +181,8 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     does not earn its HBM. `PleHostTable` page-locks each checkpoint shard as
     it loads, and `sharded_table_lookup` reads the rows a step names across the
     bus through `shard_bases`. Those addresses are fixed from load to exit, so
-    the lookup can be captured in a CUDA graph. If page-locking fails the
+    the lookup can be captured in a CUDA graph; a weight sync writes the rows
+    in place (`sync_weight`). If page-locking fails the
     table moves to HBM and the same kernel reads it there; either way the rows
     returned are the checkpoint's, bit for bit. In HBM the table is `weight`,
     released and resumed with the other weights, and the addresses follow it
@@ -233,6 +234,35 @@ class _Qwen4ExpHostEmbedding(nn.Module):
             self.shard_bases.device,
             prefix,
         )
+
+    def sync_weight(
+        self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
+    ) -> bool:
+        """`WeightUpdaterMixin`: `weight` -- the whole table, or checkpoint
+        shard `shard_id` of it -- written in place (`PleHostTable.sync_rows`).
+        False for other parameters, and for the whole table in HBM: that is
+        `weight` itself, which the updater syncs as any other parameter.
+        """
+        if param_name != "weight" or (shard_id is None and not self.table.on_host):
+            return False
+        num_rows = (self.vocab_end_idx - self.vocab_start_idx) * self.tp_size
+        first = 0 if shard_id is None else shard_id * self.shard_rows
+        expected = (
+            num_rows if shard_id is None else min(self.shard_rows, num_rows - first),
+            self.embedding_dim,
+        )
+        if not 0 <= first < num_rows or tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"{self.prefix}: expected {expected} for n-gram "
+                f"{'table' if shard_id is None else f'shard {shard_id}'}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if self.shard_bases.is_cuda:
+            # The last lookups of the step that just ended may still be
+            # reading the rows over the bus.
+            torch.cuda.synchronize(self.shard_bases.device)
+        self.table.sync_rows(first, tensor)
+        return True
 
     def rebind_weight_addresses(self) -> None:
         """`MemoryManagerMixin` resumed the weights: a table that fell back

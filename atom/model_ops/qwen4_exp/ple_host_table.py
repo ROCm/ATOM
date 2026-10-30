@@ -134,6 +134,47 @@ class PleHostTable:
         with self._lock:
             self._rows[shard] = (row_start, None)
 
+    def sync_rows(self, first: int, rows: torch.Tensor) -> None:
+        """A weight sync's global rows `[first, first + len(rows))`: this
+        rank's part is written in place, over the page-locked rows or into
+        `weight` in HBM. Nothing is allocated or page-locked again, so
+        `shard_bases`, and the graphs that captured it, stay valid.
+
+        The caller makes sure no lookup is still reading the rows.
+        """
+        if rows.dim() != 2 or rows.shape[1] != self.dim:
+            raise ValueError(
+                f"{self.prefix}: expected [rows, {self.dim}] n-gram rows, "
+                f"got {tuple(rows.shape)}"
+            )
+        if rows.dtype != self.dtype and self.dtype.itemsize < 2:
+            # The FP8 table's rows go with its scale: no conversion is right.
+            raise ValueError(
+                f"{self.prefix}: expected {self.dtype} n-gram rows, got {rows.dtype}"
+            )
+        lo = max(first, self.vocab_start)
+        hi = min(first + rows.shape[0], self.vocab_end)
+        if self._in_hbm:
+            if lo < hi:
+                self.weight.data.narrow(0, lo - self.vocab_start, hi - lo).copy_(
+                    rows.narrow(0, lo - first, hi - lo)
+                )
+            return
+        written = 0
+        for row_start, pinned in self._rows.values():
+            start = max(lo, row_start)
+            end = min(hi, row_start + pinned.shape[0])
+            if start < end:
+                pinned.narrow(0, start - row_start, end - start).copy_(
+                    rows.narrow(0, start - first, end - start)
+                )
+                written += end - start
+        if written != max(hi - lo, 0):
+            raise ValueError(
+                f"{self.prefix}: n-gram rows [{lo}, {hi}) were never loaded, "
+                "so they cannot be synced"
+            )
+
     def _to_hbm(self) -> None:
         """Make `weight` the table on `device`, holding every row pinned so
         far; under `_lock`."""

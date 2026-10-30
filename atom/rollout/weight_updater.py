@@ -242,6 +242,8 @@ class WeightUpdaterMixin:
 
         atom_name, shard_id, tgt_suffix = resolved
         module, param_name, param = param_to_module[atom_name]
+        if self._synced_by_module(module, param_name, tensor, shard_id):
+            return "updated"
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
             return "skipped"
@@ -287,6 +289,23 @@ class WeightUpdaterMixin:
         tensor_gpu = tensor.to(device=self.device)
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
         return "updated"
+
+    @staticmethod
+    def _synced_by_module(
+        module: torch.nn.Module,
+        param_name: str,
+        tensor: torch.Tensor,
+        shard_id=None,
+    ) -> bool:
+        """Whether the module wrote this weight itself.
+
+        For a module whose parameter is not where the values live -- the
+        Qwen3.8 PLE table's rows are in page-locked host memory and `weight`
+        is an empty placeholder -- so no path below could write them. It
+        raises rather than skip a weight it cannot take.
+        """
+        sync = getattr(module, "sync_weight", None)
+        return callable(sync) and sync(param_name, tensor, shard_id)
 
     def _apply_unmatched_weight(
         self,
@@ -1015,7 +1034,9 @@ class WeightUpdaterMixin:
             module, param_name, param = param_to_module[name]
             weight_loader = getattr(module, "weight_loader", None)
 
-            if param_name in _EXPERT_BUFFER_SHARDS:
+            if self._synced_by_module(module, param_name, tensor):
+                updated += 1
+            elif param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
@@ -1141,7 +1162,9 @@ class WeightUpdaterMixin:
                 module, param_name, param = param_to_module[name]
                 weight_loader = getattr(module, "weight_loader", None)
 
-                if param_name in _EXPERT_BUFFER_SHARDS:
+                if self._synced_by_module(module, param_name, tensor):
+                    updated += 1
+                elif param_name in _EXPERT_BUFFER_SHARDS:
                     self._apply_named_expert_buffer(
                         name, param_name, module, param, tensor
                     )
@@ -1306,7 +1329,9 @@ class WeightUpdaterMixin:
             module, param_name, param = param_to_module[name]
             weight_loader = getattr(module, "weight_loader", None)
 
-            if param_name in _EXPERT_BUFFER_SHARDS:
+            if self._synced_by_module(module, param_name, tensor):
+                updated += 1
+            elif param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
