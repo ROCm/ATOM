@@ -157,6 +157,7 @@ def build_dsv4_kernel(
     compressor_projection_bf16: bool = False,
     attention_fp8_bf16: bool = False,
     indexer_hadamard: bool = True,
+    indexer_mfma_scales: bool = False,
     index_topk_refresh: bool = True,
     phase: str = "one",
     qkv_batch_limit: int | None = None,
@@ -331,6 +332,7 @@ def build_dsv4_kernel(
     BOUNDED_POLL = poll_timeout_us is not None
     POLL_TIMEOUT_TICKS = (poll_timeout_us or 0) * 100  # s_memrealtime runs at 100 MHz
     INDEXER_HADAMARD = indexer_hadamard
+    INDEXER_MFMA_SCALES = indexer_mfma_scales
     if CR:
         assert (
             BLOCK_TOKENS % CR == 0
@@ -346,7 +348,8 @@ def build_dsv4_kernel(
     # Compressed entries are paged as ATOM's: entry e of sequence s is KV row
     # dest_rows[1, s] + block_tables[s][e // K_PB] * env_rows + e % K_PB. The indexer's
     # FP4 key pool: per block, codes [IHD / 32][K_PB][16 B] and E8M0 scales [IHD / 32][K_PB]
-    # with the entry axis interleaved (byte (e % 16) * 4 + (e % K_PB) // 16).
+    # with the entry axis interleaved for FlyDSL, or [2, 32, 4] MFMA scales
+    # for OPUS. index_scale_address maps each row/group to its byte.
     K_PB = BLOCK_TOKENS // CR if CR else 1
     IC_GRP_WORDS = K_PB * 16 // 4  # one 32-element group of one block, in dwords
     IC_BLK_WORDS = (IHD // 32) * IC_GRP_WORDS if IHD else 0

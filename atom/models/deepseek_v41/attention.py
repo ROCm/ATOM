@@ -116,7 +116,11 @@ class Indexer(nn.Module):
         )
         weights = self.weights_proj(hidden)[0]
         if cache.geometry.index_fp4:
-            return quantize_query_fp4(query[0], rope, positions), weights
+            units = cache.index_units[self.spec.kv_owner]
+            return (
+                quantize_query_fp4(query[0], rope, positions, layout=units.layout),
+                weights,
+            )
         return rope(query, positions)[0], weights
 
     def score(self, query, weights, cache, step):
