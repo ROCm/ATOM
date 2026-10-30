@@ -430,9 +430,19 @@ def test_initialization_redirects_only_future_cache_work(
 
 @pytest.fixture(autouse=True)
 def _isolate_compiler_cache_ownership(monkeypatch):
+    import os
+
     from atom.utils import compiler_inferface as ci
 
     monkeypatch.setattr(ci, "_managed_compiler_cache_dirs", {})
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        # Register even an absent key for restoration. delenv(raising=False)
+        # alone would not record anything if the variable was initially absent,
+        # so direct assignments by the adaptor would otherwise leak.
+        previous = os.environ.get(name)
+        monkeypatch.setenv(name, previous if previous is not None else "")
+        if previous is None:
+            monkeypatch.delenv(name)
 
 
 @pytest.mark.parametrize(
@@ -520,3 +530,26 @@ def test_standalone_does_not_match_similarly_named_temp_path(tmp_path, monkeypat
     monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
     ci.InductorStandaloneAdaptor().initialize_cache(str(tmp_path / "atom"))
     assert os.environ["TRITON_CACHE_DIR"] == custom
+
+
+@pytest.mark.parametrize("initial", [None, "", "/caller-cache"])
+@pytest.mark.parametrize("mutation", ["assign", "delete"])
+def test_cache_fixture_restores_environment(monkeypatch, initial, mutation):
+    import os
+
+    names = ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR")
+    for name in names:
+        if initial is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, initial)
+    before = {name: os.environ.get(name) for name in names}
+    with pytest.MonkeyPatch.context() as isolated:
+        _isolate_compiler_cache_ownership.__wrapped__(isolated)
+        assert {name: os.environ.get(name) for name in names} == before
+        for name in names:
+            if mutation == "assign":
+                os.environ[name] = "/set-directly-by-adaptor"
+            else:
+                os.environ.pop(name, None)
+    assert {name: os.environ.get(name) for name in names} == before
