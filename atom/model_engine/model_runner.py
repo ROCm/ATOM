@@ -7,7 +7,6 @@ import inspect
 import logging
 import math
 import os
-import sys
 import time
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
@@ -1119,12 +1118,14 @@ class ModelRunner:
         if builder is not None:
             builder.close()
         # MegaMoE's arenas live on the EP all2all manager's cco communicator,
-        # which destroy_dist_env() destroys. Looked up rather than imported: a
-        # run without MegaMoE never loaded the module.
-        mega = sys.modules.get("atom.model_ops.fused_moe.mori_v2_prepare_finalize")
+        # which destroy_dist_env() destroys.
         try:
-            if mega is not None:
-                mega.close_mega_transports()
+            if envs.ATOM_MORI_V2:
+                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                    close_mega_transports,
+                )
+
+                close_mega_transports()
         finally:
             # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
             #    Must happen while ops module is still alive for CustomAllreduce

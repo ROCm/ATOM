@@ -67,6 +67,7 @@ def _import_mega():
     return MegaMoEGfx1250
 
 
+@lru_cache(maxsize=1)
 def _import_mega_recipe() -> SimpleNamespace | None:
     """aiter's MegaMoERecipe, its ExpertComputeConfig and MegaMoEGeometry, with
     the kinds a recipe picks; None on an aiter from before them, which takes
@@ -141,10 +142,11 @@ def _cco_per_rank_vmm(
     return 2 * win_bytes + (1 << 28)
 
 
-# Keyed by everything MegaMoE fixes at construction, so the MoE layers of one
-# model share a single instance -- and a single cco symmetric arena. Not an
-# lru_cache because the Situv2 betas are tensors and cannot be cache keys; they
-# are config-wide, so the first layer's are the model's.
+# Keyed by everything MegaMoE fixes at construction -- the recipe and geometry,
+# plain values -- so the MoE layers of one model share a single instance and a
+# single cco symmetric arena. The Situv2 betas are model-wide and stay out of the
+# key; a layer whose betas differ from the shared instance's is refused
+# (_check_same_situ).
 _MEGA_TRANSPORTS: dict = {}
 
 # $ATOM_MEGA_COMBINE_WIRE, the return trip's counterpart to $MEGA_DISPATCH_WIRE
@@ -166,13 +168,8 @@ if _MEGA_COMBINE_WIRE not in _COMBINE_WIRES:
 _MEGA_DECODE_COMBINE_QUANT = envs.ATOM_MEGA_DECODE_COMBINE_QUANT
 
 # aiter's stage2_fused: the gemm2-fused combine, or mori's combine over
-# fused_moe's rows.
+# fused_moe's rows. Which combine wires each offers is aiter's to check.
 _MEGA_STAGE2_FUSED = envs.ATOM_MEGA_STAGE2_FUSED
-if not _MEGA_STAGE2_FUSED and _MEGA_COMBINE_WIRE == "fp8":
-    raise RuntimeError(
-        "ATOM_MEGA_COMBINE_WIRE=fp8 needs ATOM_MEGA_STAGE2_FUSED=1: with stage 2 "
-        "unfused, combine runs through mori, which has no fp8 wire (bf16 or fp4)"
-    )
 
 
 # bf16 | fp8 | fp4, and it must MATCH the expert GEMM's A operand -- on gfx1250
@@ -203,6 +200,11 @@ _CCO_DEVCOMM_BYTES = 2 << 20
 # The communicators ATOM created for MegaMoE itself (see _mega_communicator);
 # close_mega_transports() destroys them.
 _OWN_COMMUNICATORS: list = []
+# The all2all manager's communicator, once a MegaMoE has borrowed it. It is sized
+# for that MegaMoE alone, and the manager destroys it.
+_BORROWED_COMMUNICATOR: Any = None
+# Set once every rank has been checked to run the same MegaMoE settings.
+_SETTINGS_AGREED = False
 
 
 def mori_v2_all2all_manager(device_communicator: Any) -> Any:
@@ -245,9 +247,11 @@ def _mega_communicator(
     shaped one gets a communicator of its own, as does any MegaMoE on an aiter
     whose manager lends none.
     """
+    global _BORROWED_COMMUNICATOR
     borrow = getattr(all2all_manager, "get_or_create_cco_communicator", None)
-    if borrow is not None and not _MEGA_TRANSPORTS:
-        return borrow(per_rank_vmm)
+    if borrow is not None and _BORROWED_COMMUNICATOR is None:
+        _BORROWED_COMMUNICATOR = borrow(per_rank_vmm)
+        return _BORROWED_COMMUNICATOR
     if borrow is not None:
         logger.warning(
             "[MegaMoEGfx1250] the EP group's cco communicator is sized for the "
@@ -268,18 +272,88 @@ def close_mega_transports() -> None:
     Collective, as building them was. Every close is attempted; an error is
     raised once all have run.
     """
+    global _BORROWED_COMMUNICATOR
     transports = list(_MEGA_TRANSPORTS.values())
     communicators = list(_OWN_COMMUNICATORS)
     _MEGA_TRANSPORTS.clear()
     _OWN_COMMUNICATORS.clear()
-    # An ExitStack runs its callbacks last-in first-out: the transports, newest
-    # first, then the communicators they lived on.
+    _BORROWED_COMMUNICATOR = None
+    # Required order: each MegaMoE, newest first, then its DevComm, while their
+    # communicator is alive; then the communicators ATOM created. The borrowed
+    # one goes later, in destroy_dist_env(). ExitStack runs callbacks last-in
+    # first-out, and runs the rest when one raises.
     with contextlib.ExitStack() as stack:
         for comm in communicators:
             stack.callback(comm.destroy)
         stack.callback(_init_cco_comm.cache_clear)
         for mega in transports:
+            dev_comm = getattr(mega, "_atom_dev_comm", None)
+            if dev_comm is not None:
+                stack.callback(dev_comm.close)
             stack.callback(mega.close)
+
+
+def _launch_settings() -> tuple:
+    """The environment settings that fix MegaMoE's dispatch and combine formats,
+    and each step's combine wire."""
+    return (
+        _MEGA_DISPATCH_WIRE,
+        _MEGA_STAGE1_FUSED,
+        _MEGA_STAGE2_FUSED,
+        _MEGA_COMBINE_WIRE,
+        _MEGA_DECODE_COMBINE_QUANT,
+    )
+
+
+def _gather_from_ep_group(value: Any) -> list:
+    from aiter.dist.parallel_state import get_ep_group
+
+    ep = get_ep_group()
+    gathered = [None] * ep.world_size
+    dist.all_gather_object(gathered, value, group=ep.cpu_group)
+    return gathered
+
+
+def _check_settings_agree() -> None:
+    """Refuse ranks whose MegaMoE settings differ.
+
+    They are read from each rank's environment and never negotiated: the
+    formats are fixed at construction, and combine_wire_for_step trusts
+    $ATOM_MEGA_DECODE_COMBINE_QUANT on every rank alike. Collective, once per
+    process, when the first MegaMoE is built.
+    """
+    global _SETTINGS_AGREED
+    if _SETTINGS_AGREED:
+        return
+    gathered = _gather_from_ep_group(_launch_settings())
+    if any(settings != gathered[0] for settings in gathered):
+        raise RuntimeError(
+            "MEGA_DISPATCH_WIRE, ATOM_MEGA_STAGE1_FUSED, ATOM_MEGA_STAGE2_FUSED, "
+            "ATOM_MEGA_COMBINE_WIRE and ATOM_MEGA_DECODE_COMBINE_QUANT must be "
+            f"the same on every EP rank; per rank: {gathered}"
+        )
+    _SETTINGS_AGREED = True
+
+
+def _check_same_situ(mega: Any, situ_beta: Any, situ_linear_beta: Any) -> None:
+    """A layer reusing the shared MegaMoE must bring the Situv2 betas it was
+    built with: they are fixed at construction and not part of the cache key."""
+    for name, value in (
+        ("situ_beta", situ_beta),
+        ("situ_linear_beta", situ_linear_beta),
+    ):
+        built = getattr(mega, name, None)
+        if value is None or built is None:
+            same = value is None and built is None
+        else:
+            same = torch.equal(
+                torch.as_tensor(value).cpu(), torch.as_tensor(built).cpu()
+            )
+        if not same:
+            raise ValueError(
+                f"this layer's {name} differs from the one the shared MegaMoE "
+                "was built with"
+            )
 
 
 def _mega_recipe(
@@ -432,8 +506,10 @@ def init_mega_transport(
     )
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
+        _check_same_situ(cached, situ_beta, situ_linear_beta)
         return cached
 
+    _check_settings_agree()
     MegaMoEGfx1250 = _import_mega()
     if hasattr(MegaMoEGfx1250, "required_vmm_bytes"):
         per_rank_vmm = MegaMoEGfx1250.required_vmm_bytes(
@@ -493,8 +569,10 @@ def init_mega_transport(
     # below follows -- because create_dev_comm() may be COLLECTIVE while the
     # forward that consumes this is NOT rank-aligned: the Triton experts are
     # picked per step, so a lazy first-use read could have only some ranks
-    # enter the collective, and hang.
-    mega._atom_per_rank_size = int(comm.create_dev_comm().per_rank_size)
+    # enter the collective, and hang. Kept so close_mega_transports() can close
+    # it before the communicator goes.
+    mega._atom_dev_comm = comm.create_dev_comm()
+    mega._atom_per_rank_size = int(mega._atom_dev_comm.per_rank_size)
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
@@ -540,8 +618,10 @@ def _init_mega_from_recipe(
     key = (recipe, geometry)
     cached = _MEGA_TRANSPORTS.get(key)
     if cached is not None:
+        _check_same_situ(cached, situ_beta, situ_linear_beta)
         return cached
 
+    _check_settings_agree()
     MegaMoEGfx1250 = _import_mega()
     # MegaMoE's arena -- exactly what the constructor allocates -- plus the
     # DevComm created below, asked for in full before the communicator exists.
@@ -564,7 +644,9 @@ def _init_mega_from_recipe(
     )
     # Peer-region stride in the flat symmetric VA, for triton_mega_moe; read
     # here, while every rank constructs, for the reason the flag path gives.
-    mega._atom_per_rank_size = int(comm.create_dev_comm().per_rank_size)
+    # Kept so close_mega_transports() can close it before the communicator goes.
+    mega._atom_dev_comm = comm.create_dev_comm()
+    mega._atom_per_rank_size = int(mega._atom_dev_comm.per_rank_size)
     comm.barrier()
     _MEGA_TRANSPORTS[key] = mega
     logger.info(
@@ -797,7 +879,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         topk_ids: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # Bound in init_prepare_finalize; there is no path without it.
         mega = self.prepare_finalize.mega
+        assert mega is not None, "MegaMoE was not bound"
         triton_experts = (kwargs.get("moe_extra_args") or {}).get("triton_experts")
 
         # MegaMoE as transport, with OUR experts, driven from one place.
@@ -878,12 +962,6 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 m_eff=m_eff,
             )
 
-        if mega is None:
-            raise RuntimeError(
-                "MegaMoE was not bound: init_prepare_finalize builds it before "
-                "the first forward"
-            )
-
         assert not kwargs.get(
             "apply_router_weight_on_input", False
         ), "mori does not support apply_router_weight_on_input=True now."
@@ -951,9 +1029,10 @@ def _mega_kinds(mega: Any) -> tuple[bool, bool]:
     recipe = getattr(mega, "recipe", None)
     if recipe is None:
         return mega._config.stage1_fused, mega._config.stage2_fused
+    api = _import_mega_recipe()
     return (
-        recipe.dispatch.value == "compact",
-        recipe.combine.value == "fused_scatter",
+        recipe.dispatch is api.DispatchKind.COMPACT,
+        recipe.combine is api.CombineKind.FUSED_SCATTER,
     )
 
 

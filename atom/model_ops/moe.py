@@ -796,9 +796,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # told the expert-GEMM recipe that only the layer + this quant method
             # know. Here is also the last point before any cudagraph capture, and
             # it allocates a cco arena and JIT-compiles its kernels.
-            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
-            if bind_mega is not None:
-                bind_mega(layer, self)
+            if mori_v2:
+                prepare_finalize.bind_mega_transport(layer, self)
+                assert (
+                    prepare_finalize.mega is not None
+                ), "MoriV2ModularKernel has no MegaMoE to run"
 
         comm_fused = getattr(layer, "_comm_fused_moe", None)
         if comm_fused is not None:

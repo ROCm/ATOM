@@ -118,9 +118,9 @@ python -m atom.entrypoints.openai_server \
 ```
 
 Notes:
-- The log line `[MegaMoEGfx1250] Created: ... dispatch=flydsl wire=fp4 ...
-  stage1_fused=True stage2_fused=True` confirms the compact stage-1 path is
-  active.
+- The log line `[MegaMoEGfx1250] Created: ... dispatch=compact wire=fp4
+  combine=fused_scatter combine_wires=bf16,fp4 ...` confirms the compact
+  dispatch and the gemm2-fused combine are active.
 - Compact stage 1 cannot run with the Triton experts (`ATOM_USE_TRITON_MOE*`),
   and neither can mori's combine: set `ATOM_MEGA_STAGE1_FUSED=0` to fall back
   to mori dispatch and keep `ATOM_MEGA_STAGE2_FUSED=1`.
