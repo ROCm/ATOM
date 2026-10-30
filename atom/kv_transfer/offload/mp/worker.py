@@ -97,7 +97,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self._lock = threading.Lock()
         parallel = getattr(config, "parallel_config", None)
         self._event_reclaimer = (
-            IPCEventReclaimer()
+            IPCEventReclaimer(background=True)
             if torch.version.hip and getattr(parallel, "data_parallel_size", 1) > 1
             else None
         )

@@ -156,3 +156,30 @@ def test_unfinished_events_wait_for_a_later_safe_point():
     del pending
     reclaimer.release()
     assert destroyed == ["plain", "pending"]
+
+
+def test_background_reaper_destroys_off_the_releasing_thread():
+    """A destroy that blocks (an imported IPC event whose work waits on this
+    rank's next collective) must not block the runner's forward."""
+    import threading
+
+    threads = []
+
+    class Blocking:
+        def __init__(self, gate):
+            self.gate = gate
+
+        def query(self):
+            return True  # HIP can report complete and still block on destroy
+
+        def __del__(self):
+            threads.append(threading.current_thread().name)
+            self.gate.wait(5)
+
+    gate = threading.Event()
+    reclaimer = IPCEventReclaimer(background=True)
+    reclaimer.defer(Blocking(gate))
+    reclaimer.release()  # returns although the destroy blocks
+    gate.set()
+    assert reclaimer._reaper.flush(5)
+    assert threads == ["atom-ipc-event-reaper"]
