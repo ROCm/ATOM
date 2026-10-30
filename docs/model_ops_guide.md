@@ -277,6 +277,8 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
+**CU count for the Triton cutoff:** the cutoff counts AITER's `get_cu_num()`, which does not see an `HSA_CU_MASK` set outside ATOM. Under such a mask, set AITER's `CU_NUM` to the number of CUs the mask leaves.
+
 **Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`.
 
 ### `FusedMoEParallelConfig`
