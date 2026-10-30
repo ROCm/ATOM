@@ -50,8 +50,10 @@ Both request context metrics are collected through Prometheus `/metrics` as
 Gauges with request ID and phase dispatch-time labels. Scatter plots show each
 request; hover for identity or use Data table / CSV for all values. Repeated
 scrapes do not create additional report rows. Samples persist until the service's
-metrics directory is cleaned, so series count grows with requests. These CPU
-scheduler metrics are available even when GPU event timing is disabled.
+metrics directory is cleaned, so series count grows with requests. ATOM records
+them only with `ATOM_METRICS_PER_REQUEST_CONTEXT=1`, which agentic CI sets on the
+prefill and decode services. These CPU scheduler metrics are available even when
+GPU event timing is disabled.
 
 Mean, P50, P90, P95, and P99 can be toggled globally or per chart. The report also
 supports hiding charts, time-range selection, a data table, and CSV export.

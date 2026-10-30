@@ -725,6 +725,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: (
         os.getenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "0") == "1"
     ),
+    # atom:{prefill,decode}_request_context_tokens add one series per request
+    # that is never removed, and every /metrics render re-reads all of them.
+    "ATOM_METRICS_PER_REQUEST_CONTEXT": lambda: (
+        os.getenv("ATOM_METRICS_PER_REQUEST_CONTEXT", "0") == "1"
+    ),
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections

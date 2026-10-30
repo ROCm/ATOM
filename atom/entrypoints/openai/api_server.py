@@ -741,6 +741,23 @@ def flush_stream_batch() -> None:
         _stream_batch_dispatcher.flush()
 
 
+def _deliver_through_stream_callbacks(core_mgr: Any) -> None:
+    """Point the core manager's output thread at this server's delivery path.
+
+    Per-seq stream callbacks only buffer their chunks into a thread-local; the
+    output thread calls this flush after each step's callbacks to drain the
+    buffer into the per-request stream collectors (one call_soon_threadsafe
+    per event loop). Wired here rather than imported by the core manager to
+    avoid the api_server <-> engine_core_mgr import cycle.
+
+    Every result reaches its client through those callbacks, and nothing in
+    this process reads ``outputs_queue``, so the output thread stops filling
+    it.
+    """
+    core_mgr._flush_stream_batch_fn = flush_stream_batch
+    core_mgr.consumes_outputs_queue = False
+
+
 def _send_stream_chunk_tagged(
     request_output: RequestOutput,
     request_id: str,
@@ -3107,13 +3124,7 @@ def main():
         envs.ATOM_DETOKENIZER_AUDIT_EVERY,
     )
 
-    # Wire the batched stream-flush hook: per-seq stream callbacks only buffer
-    # their chunks into a thread-local; the engine core manager's output thread
-    # calls this flush after each step's callbacks to drain the buffer into the
-    # per-request stream collectors (one call_soon_threadsafe per event loop).
-    # Registered lazily here to avoid the api_server <-> engine_core_mgr import
-    # cycle; the core manager leaves the hook as None until this resolves it.
-    engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
+    _deliver_through_stream_callbacks(engine.core_mgr)
 
     import signal
 

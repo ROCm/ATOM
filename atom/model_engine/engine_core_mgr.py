@@ -252,6 +252,19 @@ class CoreManager:
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
         # path that never streams, which the output thread checks for.
         self._flush_stream_batch_fn = None
+        # Whether anything reads outputs_queue. LLMEngine.step()/generate() and
+        # asyncio mode do, so it starts True. An entrypoint that delivers only
+        # through the per-seq stream callbacks (the OpenAI server, the atomesh
+        # standalone service) clears it as it wires up: queued for no reader,
+        # every finished Sequence stays reachable for the life of the process
+        # and slows each gen-2 GC pass. Declared, not inferred from the flush
+        # hook -- atomesh never sets the hook. get_output() refuses to wait on
+        # a queue that is not being filled. The output thread reads this, and
+        # starts before the end of __init__.
+        self.consumes_outputs_queue = True
+        # Whether _async_output_handler drains outputs_queue into
+        # async_output_queue, which each manager derives from this.
+        self._asyncio_mode = getattr(config, "asyncio_mode", False)
         # Longest prompt the KV pool can hold, reported by each rank's READY.
         # None until the first one arrives, and thereafter the smallest across
         # ranks: a DP rank sizes its pool from its own free memory, so a prompt
@@ -559,7 +572,6 @@ class CoreManager:
                     self._finalizer = weakref.finalize(self, self.close)
                     self.async_output_queue = None
                     self._output_handler_task = None
-                    self._asyncio_mode = False
                     for proc in self.engine_core_processes:
                         proc.join()
                     return
@@ -641,9 +653,8 @@ class CoreManager:
             f"{self.label}: All {len(self.output_sockets)} EngineCores initialized and ready"
         )
         self._finalizer = weakref.finalize(self, self.close)
-        self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
+        self.async_output_queue = asyncio.Queue() if self._asyncio_mode else None
         self._output_handler_task = None
-        self._asyncio_mode = config.asyncio_mode
 
     def _record_ready_payload(self, data) -> None:
         """Fold one rank's READY facts into the manager's view of capacity."""
@@ -831,7 +842,11 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        # Only for a reader: LLMEngine.step()/generate() or
+                        # asyncio mode. Callback-only entrypoints clear the
+                        # flag; see consumes_outputs_queue.
+                        if self.consumes_outputs_queue:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when
@@ -878,9 +893,20 @@ class CoreManager:
                 break
             await self.async_output_queue.put(seqs)
 
+    def _require_outputs_queue_reader(self) -> None:
+        # The output thread fills outputs_queue only while this is set, so a
+        # read with it cleared would block forever.
+        if not self.consumes_outputs_queue:
+            raise RuntimeError(
+                f"{self.label}: finished sequences are delivered only through "
+                f"stream callbacks here (consumes_outputs_queue is False), so "
+                f"nothing will arrive on outputs_queue"
+            )
+
     async def get_output_async(self) -> list[Sequence]:
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
+        self._require_outputs_queue_reader()
 
         # Ensure output handler task is started
         self._ensure_output_handler_task()
@@ -2077,6 +2103,7 @@ class CoreManager:
                 )
 
     def get_output(self) -> list[Sequence]:
+        self._require_outputs_queue_reader()
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
@@ -2340,9 +2367,8 @@ class DisaggCoreManager(CoreManager):
             raise
 
         self._finalizer = weakref.finalize(self, self.close)
-        self.async_output_queue = None
+        self.async_output_queue = asyncio.Queue() if self._asyncio_mode else None
         self._output_handler_task = None
-        self._asyncio_mode = config.asyncio_mode
 
     def _wait_for_single_ready(self, idx: int):
         """Block until output_sockets[idx] sends a READY signal."""

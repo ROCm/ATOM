@@ -30,6 +30,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_MODEL_SENSITIVE_RMSNORM",
     "ATOM_TORCH_PROFILER_DIR",
     "ATOM_ENABLE_METRICS_DEVICE_TIMER",
+    "ATOM_METRICS_PER_REQUEST_CONTEXT",
     "ATOM_METRICS_UPDATE_INTERVAL_S",
     "ATOM_SHUTDOWN_TIMEOUT_S",
     "ATOM_PROFILER_MORE",
@@ -112,6 +113,9 @@ class TestEnvsDefaults:
 
     def test_metrics_device_timer_default_disabled(self):
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
+
+    def test_metrics_per_request_context_default_disabled(self):
+        assert _get_envs().ATOM_METRICS_PER_REQUEST_CONTEXT is False
 
     def test_metrics_update_interval_default(self, caplog):
         assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
@@ -216,6 +220,10 @@ class TestEnvsOverrides:
     def test_metrics_device_timer_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "1")
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is True
+
+    def test_metrics_per_request_context_enabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_METRICS_PER_REQUEST_CONTEXT", "1")
+        assert _get_envs().ATOM_METRICS_PER_REQUEST_CONTEXT is True
 
     @pytest.mark.parametrize("value", ["0.25", "5"])
     def test_metrics_update_interval_override(self, monkeypatch, caplog, value):

@@ -452,10 +452,13 @@ host_name="$(hostname)"
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 prepare_kv_connector || exit 2
 
-# GPU timing is opt-in; agentic reports need it on both service roles.
+# GPU timing and the per-request context gauges are opt-in; agentic reports need
+# them on both service roles.
 if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
   export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
   export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
+  export ATOMESH_PREFILL_ENV_ATOM_METRICS_PER_REQUEST_CONTEXT="${ATOMESH_PREFILL_ENV_ATOM_METRICS_PER_REQUEST_CONTEXT:-${ATOM_METRICS_PER_REQUEST_CONTEXT:-1}}"
+  export ATOMESH_DECODE_ENV_ATOM_METRICS_PER_REQUEST_CONTEXT="${ATOMESH_DECODE_ENV_ATOM_METRICS_PER_REQUEST_CONTEXT:-${ATOM_METRICS_PER_REQUEST_CONTEXT:-1}}"
 fi
 
 IFS=',' read -r -a IP_ARRAY <<< "${IPADDRS}"

@@ -477,6 +477,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     from atom.model_engine.sequence import SequenceType
 
     monkeypatch.delenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", raising=False)
+    monkeypatch.setenv("ATOM_METRICS_PER_REQUEST_CONTEXT", "1")
     registry = CollectorRegistry()
     metrics = SchedulerMetrics(registry=registry)
     decode = Sequence([1, 2], block_size=4)
@@ -586,6 +587,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
 def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     from prometheus_client import CollectorRegistry, generate_latest
 
+    monkeypatch.setenv("ATOM_METRICS_PER_REQUEST_CONTEXT", "1")
     registry = CollectorRegistry()
     metrics = SchedulerMetrics(registry=registry)
     # Live sequence lengths deliberately differ from the dispatched context snapshot.
@@ -649,6 +651,38 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     final = metrics.decode_request_context_tokens.collect()[0].samples
     assert len(final) == 3
     assert final[-1].labels["request_id"] == "request-3" and final[-1].value == 300
+
+
+def test_request_context_gauges_are_opt_in(monkeypatch):
+    """Each request adds a series that is never removed, and every /metrics
+    render re-reads all of them, so they are off unless asked for. The batch
+    histograms do not depend on them."""
+    from prometheus_client import CollectorRegistry
+
+    monkeypatch.delenv("ATOM_METRICS_PER_REQUEST_CONTEXT", raising=False)
+    metrics = SchedulerMetrics(registry=CollectorRegistry())
+    seqs = {
+        i: Sequence([1, 2], block_size=4, id=i, request_id=f"request-{i}")
+        for i in (1, 2)
+    }
+    for seq in seqs.values():
+        metrics.enqueue(seq)
+    batch = SimpleNamespace(
+        req_ids=[1, 2],
+        is_dummy_run=False,
+        total_seqs_num_decode=1,
+        total_seqs_num_prefill=1,
+        total_tokens_num_prefill=2,
+        num_cached_tokens=[0, 0],
+        context_lens=[1000, 2],
+    )
+    metrics.record_forward(batch, seqs)
+    assert metrics.prefill_request_context_tokens.collect()[0].samples == []
+    assert metrics.decode_request_context_tokens.collect()[0].samples == []
+    snapshot = histogram_values_by_name(metrics)
+    assert snapshot["decode_context_tokens"]["sum"] == 1000
+    assert snapshot["prefill_context_tokens"]["sum"] == 2
+    assert snapshot["prefill_request_tokens"]["sum"] == 2
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])

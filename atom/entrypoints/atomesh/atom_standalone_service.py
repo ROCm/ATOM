@@ -93,6 +93,10 @@ class AtomEngineService:
     def __init__(self, engine: Any, tokenizer: Any) -> None:
         self.engine = engine
         self.tokenizer = tokenizer
+        # Every result is delivered through the per-seq stream callbacks and
+        # nothing here reads `outputs_queue`; filled anyway, it would keep
+        # every finished sequence reachable for the life of the process.
+        engine.core_mgr.consumes_outputs_queue = False
         self._queue: queue.Queue[EngineRequest | EngineStreamRequest | None] = (
             queue.Queue()
         )

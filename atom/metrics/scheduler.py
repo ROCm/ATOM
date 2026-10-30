@@ -1,8 +1,8 @@
 """Scheduler-owned Prometheus observations.
 
 Only the scheduler owner updates these metrics. Request context gauges carry
-per-request labels. No GPU synchronization is needed, and scrapes never consume
-observations.
+per-request labels and are recorded only with ATOM_METRICS_PER_REQUEST_CONTEXT=1.
+No GPU synchronization is needed, and scrapes never consume observations.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.utils import envs
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -54,6 +55,10 @@ class SchedulerMetrics:
     def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
         labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
         self._labels = labels
+        # Off by default: each request adds a series that is never removed, and
+        # every /metrics render re-reads all of them, so render time and the
+        # API process's gen-2 GC passes grow with every request served.
+        self._record_request_contexts = envs.ATOM_METRICS_PER_REQUEST_CONTEXT
         self.queue_time = Histogram(
             "atom:request_queue_time_seconds",
             "Time from engine receipt to first real forward dispatch, including KV loading waits.",
@@ -156,6 +161,8 @@ class SchedulerMetrics:
             self.pd_transfer.observe(now - started)
 
     def _record_request_context(self, metric, req_id, seq, tokens):
+        if not self._record_request_contexts:
+            return
         # Retain completed requests so a scrape can still see short requests.
         metric.labels(
             **self._labels,

@@ -103,9 +103,9 @@ Observed in each scheduler; exported per DP rank. All carry
 | `atom:prefill_request_tokens` | Histogram, tokens | `num_prompt_tokens - batch.num_cached_tokens` at first local prefill dispatch, floored at 0. Once per request. |
 | `atom:prefill_batch_tokens` | Histogram, tokens | `total_tokens_num_prefill` per real forward. One sample per chunk; excludes cached prefix, decode tokens and padding. |
 | `atom:prefill_context_tokens` | Histogram, tokens | Sum of the prefill rows' logical context lengths through the current chunk, including cached prefixes. One sample per real forward. |
-| `atom:prefill_request_context_tokens` | Gauge, tokens | Full input length (`num_prompt_tokens`), including cached prefixes, recorded at first real local prefill dispatch. Once per request sequence across chunks and preemption. Additional labels: `request_id`, `sequence_id`, `started_at` (Unix seconds). |
+| `atom:prefill_request_context_tokens` | Gauge, tokens | Opt-in: requires `ATOM_METRICS_PER_REQUEST_CONTEXT=1`, no samples by default. Full input length (`num_prompt_tokens`), including cached prefixes, recorded at first real local prefill dispatch. Once per request sequence across chunks and preemption. Additional labels: `request_id`, `sequence_id`, `started_at` (Unix seconds). |
 | `atom:decode_context_tokens` | Histogram, tokens | Sum of the decode rows' logical sequence lengths per real forward. |
-| `atom:decode_request_context_tokens` | Gauge, tokens | Exact logical context length at the first real decode dispatch. One sample per request sequence, preserved across preemption. Additional labels: `request_id`, `sequence_id`, `started_at` (Unix seconds). |
+| `atom:decode_request_context_tokens` | Gauge, tokens | Opt-in: requires `ATOM_METRICS_PER_REQUEST_CONTEXT=1`, no samples by default. Exact logical context length at the first real decode dispatch. One sample per request sequence, preserved across preemption. Additional labels: `request_id`, `sequence_id`, `started_at` (Unix seconds). |
 | `atom:scheduler_requests` | Gauge, requests | Requests by scheduler state. Label `state`: `running`, `waiting` (excludes KV waits), `waiting_kv` (external KV load or shared-cache prefill wait). |
 | `atom:scheduler_kv_cache_blocks` | Gauge, blocks | KV block pool by state. Label `state`: `used`, `evictable`, `vacant`, `total`, where `used + evictable + vacant = total`. |
 
@@ -128,11 +128,14 @@ regardless of prefix cache hits. The per-batch context histogram continues to
 measure context through each chunk end.
 For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
-These are intentionally per-request metrics: series count grows with requests.
+**Opt-in.** Set `ATOM_METRICS_PER_REQUEST_CONTEXT=1` before starting the service
+to record the two request context gauges; default `0` emits no samples. These are
+intentionally per-request metrics: series count grows with requests.
 Samples remain after request completion so even short requests can be scraped.
 Native multiprocess files retain them until the service's metrics directory is
-cleaned; there is no automatic per-request expiry. Use a fresh service/metrics
-directory between long benchmark runs when this accumulated cardinality matters.
+cleaned; there is no automatic per-request expiry, and every `/metrics` render
+re-reads all of them. Use a fresh service/metrics directory between long
+benchmark runs when this accumulated cardinality matters.
 
 ### GPU forward timing
 
