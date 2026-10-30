@@ -89,6 +89,7 @@ from atom.utils import (
     envs,
     get_hf_text_config,
     init_exit_handler,
+    register_crash_release,
     resolve_obj_by_qualname,
     worker_process_name,
 )
@@ -115,6 +116,10 @@ from atom.utils.tbo import (
 )
 
 logger = logging.getLogger("atom")
+
+# Device fraction held back from the KV cache under mixed prefill+decode
+# (`ModelRunner._kv_budget_extra_reserve`): 14.4 GiB on a 288 GiB MI355X.
+MIXED_KV_RESERVE_FRACTION = 0.05
 
 
 def max_schedulable_decode_bs(
@@ -404,9 +409,12 @@ class tokenIDProcessor:
         token_id_dict[-1] = 1
         return token_id_dict, logprobs_map
 
-    def get_token_locations(self, batch: ScheduledBatch) -> TokenLocations:
+    def get_token_locations(
+        self, batch: ScheduledBatch, row_offset: int = 0
+    ) -> TokenLocations:
+        """Map decode-local rows to the previous output-producing batch."""
         prev_req_ids = self.prev_batch.req_ids
-        cur_req_ids = batch.req_ids
+        cur_req_ids = batch.req_ids[row_offset:]
         num_prev = len(prev_req_ids)
         num_cur = len(cur_req_ids)
 
@@ -519,61 +527,38 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
+        is_mixed = getattr(batch, "is_mixed", False)
 
-        # TODO: remove this when we support mixed prefill and decode in one batch
-        if total_reqs_prefill > 0:
-            # Decode does not publish an empty prefill prefix: an explicit
-            # zero copy is still a publication in this forward's ledger.
-            self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
-                :total_tokens_prefill
-            ]
-            return (
-                self._publish_input_ids(total_tokens_prefill, publication_group),
-                None,
-            )
+        # Both paths stage the whole batch once. Only decode rows may gather
+        # last step's GPU outputs; prefill tokens always keep the scheduler's
+        # exact ids, including a partial prompt also present in prev_batch.
+        total_tokens = batch.total_tokens_num
+        self.input_ids.np[:total_tokens] = scheduled_tokens[:total_tokens]
+        if is_mixed and self.use_spec:
+            self.num_rejected = batch.num_rejected
+            self.num_bonus = batch.num_bonus
+            if self.num_rejected is not None:
+                self.num_rejected[:total_reqs_prefill] = 0
+                self.num_bonus[:total_reqs_prefill] = 0
+        if not total_tokens_decode:
+            return self._publish_input_ids(total_tokens, publication_group), None
 
         if not self.is_deferred_out:
-            token_ids = scheduled_tokens[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-            ]
-            # No spec path supports pipeline parallel yet; it wants the deferred
-            # branch's per-request staging. Gate on PP itself rather than on
-            # `use_spec`: a P/D producer also reaches this branch, and the flag
-            # is still set there (the runner keeps the drafter loaded to write
-            # the draft's context KV at prefill) even though the scheduler
-            # turned speculation off for it.
             if self.use_spec and self.is_pipeline_parallel:
                 raise NotImplementedError("pipeline parallel + speculative decode")
-            # PP verifies nothing locally and a P/D producer never speculates
-            # (its DP dummy included), so no row here carries drafts. One that
-            # did would need the deferred branch's per-request staging: under
-            # DP a block drafter's `max_seqlen_q` is the group's maximum, not
-            # this batch's row width.
-            assert batch.num_spec_step == 0, (
-                "non-deferred decode got a speculative batch "
-                f"(num_spec_step={batch.num_spec_step})"
-            )
+            # P/D producers keep a drafter but schedule no speculative tokens.
+            if batch.num_spec_step != 0:
+                raise NotImplementedError(
+                    "speculative decode requires deferred output "
+                    f"(num_spec_step={batch.num_spec_step})"
+                )
+            return self._publish_input_ids(total_tokens, publication_group), None
 
-            self.input_ids.np[:total_tokens_decode] = token_ids
-            return (
-                self._publish_input_ids(total_tokens_decode, publication_group),
-                None,
-            )
-
-        # PD consumer first decode: no prior prefill step initialized
-        # prev_batch, so use scheduled_tokens directly for this step.
+        # A P/D consumer's first decode has no previous GPU output to gather.
         if self.prev_batch is None:
-            token_ids = scheduled_tokens[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-            ]
-            self.input_ids.np[:total_tokens_decode] = token_ids
-            return (
-                self._publish_input_ids(total_tokens_decode, publication_group),
-                None,
-            )
+            return self._publish_input_ids(total_tokens, publication_group), None
 
-        """for decode: input ids are from prev_sampled_token_ids"""
-        locs = self.get_token_locations(batch)
+        locs = self.get_token_locations(batch, row_offset=total_reqs_prefill)
         deferred_curr_indices = locs.deferred_curr
         deferred_prev_indices = locs.deferred_prev
         new_curr_indices = locs.new_curr
@@ -590,12 +575,6 @@ class tokenIDProcessor:
         # already published; a second copy is what let the two disagree under DP.
         bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
 
-        # Stage the scheduler's ids over the whole region. For a request the
-        # scheduler just admitted this is already its real anchor (and drafts);
-        # for a carried-over one it is a placeholder the kernel overwrites.
-        self.input_ids.np[:total_tokens_decode] = scheduled_tokens[
-            total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-        ]
         # A newly admitted request has no row in `prev_token_ids`, so
         # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
         # must be staged here -- `scheduled_tokens` gave it committed history,
@@ -611,8 +590,9 @@ class tokenIDProcessor:
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
                 if n_draft > 0:
-                    s = int(cu_np[i]) + 1
-                    self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+                    s = total_tokens_prefill + int(cu_np[i]) + 1
+                    row = total_reqs_prefill + i
+                    self.input_ids.np[s : s + n_draft] = spec[row, :n_draft]
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
@@ -622,7 +602,7 @@ class tokenIDProcessor:
             else publication_group
         )
         counts = group.counts
-        counts[group.indices["input_ids"]] = total_tokens_decode
+        counts[group.indices["input_ids"]] = total_tokens
         counts[group.indices["decode_src"]] = bs
         counts[group.indices["batch_info"]] = 3
         group.publish(counts)
@@ -631,14 +611,14 @@ class tokenIDProcessor:
         # sits between two captured buckets on most steps -- a 65-request batch
         # replays the 128 graph. The kernel zeroes the difference.
         fill_to = total_tokens_decode
-        if not self.runner.enforce_eager:
+        if not is_mixed and not self.runner.enforce_eager:
             gbs = next(
                 (g for g in reversed(self.runner.capture_sizes) if g >= bs), None
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
         fill_deferred_decode_ids(
-            self.input_ids.gpu,
+            self.input_ids.gpu[total_tokens_prefill:],
             self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
             self.decode_src.gpu[:bs],
             self.prev_token_ids,
@@ -647,11 +627,15 @@ class tokenIDProcessor:
             width=fill_to,
         )
 
-        # Slice by the width this path actually staged. Prefill returned above,
-        # so the decode total is the whole batch; a worker-side speculative q
-        # shrink rewrites it, and reading any other total here would leave the
-        # attention metadata wider than input_ids.
-        return self.input_ids.gpu[:total_tokens_decode], locs
+        # Status remapping addresses the whole batch, while the shared gather
+        # above addresses only its decode region.
+        if total_reqs_prefill:
+            locs = TokenLocations(
+                locs.deferred_curr + total_reqs_prefill,
+                locs.deferred_prev,
+                locs.new_curr + total_reqs_prefill,
+            )
+        return self.input_ids.gpu[:total_tokens], locs
 
     def prepare_draft_ids(
         self, batch: ScheduledBatch, draft_token_ids: torch.Tensor
@@ -696,9 +680,26 @@ def _profile_runner_stage(method):
     return wrapped
 
 
+def close_kv_connector() -> None:
+    """Close this process's KV connector, if it has one that closes.
+
+    Only offload workers define `close()` (moriio etc. do not). It joins their
+    copy threads and, for the LMCache MP connector, unregisters this rank from
+    the MP server, which otherwise keeps its GPU IPC mapping of the KV pool --
+    and the memory -- until its reaper times out. Idempotent: the connectors
+    drop what they released."""
+    connector = get_kvconnector()
+    close = getattr(connector, "close", None) if connector is not None else None
+    if callable(close):
+        close()
+
+
 class ModelRunner:
     def __init__(self, rank: int, config: Config):
         self.config = config
+        # A crash exits without `exit()`; the connector's close is the part of
+        # it a server outside this process waits on (`run_exiting_on_crash`).
+        register_crash_release(close_kv_connector)
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -905,6 +906,9 @@ class ModelRunner:
             )
         self._init_forward_vars_ring()
         self._init_h2d_publication()
+        if config.enable_mixed_prefill_decode:
+            # Before warmup's memory profile, so the KV budget counts them.
+            self.attn_metadata_builder.build_mixed_prefill_banks()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
@@ -977,9 +981,22 @@ class ModelRunner:
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
         """Extra GPU bytes to hold back from the KV cache budget beyond the
-        base overhead. Base runner reserves nothing; override point for
-        setups that share the GPU with another process."""
-        return 0
+        base overhead. Override point for setups that share the GPU with
+        another process; overrides add to this, not replace it.
+
+        Mixed prefill+decode holds back `MIXED_KV_RESERVE_FRACTION` of the
+        device (5%). The budget is sized from one profiled pure-prefill step
+        that runs before the KV cache exists, so it cannot exercise a mixed
+        step's decode rows; on DeepSeek-V4-Pro tp8 with DSpark, the real steps
+        needed ~16 GiB more than it planned (activation peaks 1.5x the
+        profile, ~8 GiB of allocator fragmentation, ~4 GiB of growth outside
+        the allocator). Without it c=1024 OOMed and c=512 stalled with the
+        device at ~0 GiB free; at 5% both ran clean, at no-mixed throughput,
+        with the KV cache at 7% used.
+        """
+        if not getattr(self.config, "enable_mixed_prefill_decode", False):
+            return 0
+        return int(total_bytes * MIXED_KV_RESERVE_FRACTION)
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -1109,11 +1126,7 @@ class ModelRunner:
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
         #    pool it copies out of is dropped and before the dist env goes away.
-        #    Guarded: only offload workers define close() (moriio etc. do not).
-        connector = get_kvconnector()
-        close = getattr(connector, "close", None) if connector is not None else None
-        if callable(close):
-            close()
+        close_kv_connector()
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
@@ -1497,9 +1510,10 @@ class ModelRunner:
         logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
 
     def _init_h2d_publication(self):
-        from atom.utils.h2d import PublicationOwner, PublicationRegistry
+        from atom.utils.h2d import PublicationRegistry
 
-        registry = PublicationRegistry()
+        # Shared by every slot `build_h2d_slot` binds, a mixed prefill bank's too.
+        self.publication_registry = PublicationRegistry()
         transport = envs.ATOM_H2D_BACKEND
         if transport not in ("direct", "packed"):
             raise ValueError("ATOM_H2D_BACKEND must be direct or packed")
@@ -1511,52 +1525,66 @@ class ModelRunner:
                 if self._fv_slot_events is None
                 else self._fv_slot_events[index]
             )
-            owner = PublicationOwner(self.device, event, registry=registry)
-            members = {}
-            for name, buffer in variables.items():
-                if isinstance(buffer, CpuGpuBuffer) and buffer.publication_group:
-                    binding = owner.bind(buffer, name, unit=buffer.publication_unit)
-                    members.setdefault(buffer.publication_group, []).append(binding)
-            groups = {name: owner.group(name, items) for name, items in members.items()}
-            if transport == "packed":
-                # One upload immediately before token assembly's first GPU
-                # consumer. Sampling has no earlier device consumer.
-                if all(name in groups for name in ("sampling", "early", "input_ids")):
-                    token_members = ("sampling", "early", "input_ids")
-                    if "spec_decode" in groups:
-                        token_members += ("spec_decode",)
-                    groups["token_inputs"] = owner.group(
-                        "token_inputs",
-                        [b for name in token_members for b in groups[name].members],
-                    )
-                if "prefill" in groups and "positions" in groups:
-                    groups["prefill_inputs"] = owner.group(
-                        "prefill_inputs",
-                        groups["prefill"].members + groups["positions"].members,
-                    )
-            # Some buffers also publish together at a later consumer boundary
-            # (e.g. MHA decode shares block tables with the prefill group).
-            for name, names in getattr(
-                getattr(self, "attn_metadata_builder", None), "h2d_group_members", {}
-            ).items():
-                groups[name] = owner.group(
-                    name, [variables[item]._publication for item in names]
-                )
-            if transport == "packed":
-                for group in owner.use_packed_transport():
-                    logger.info(
-                        "H2D group %s: %s%s",
-                        group.name,
-                        group.transport,
-                        f" ({group.fallback_reason})" if group.fallback_reason else "",
-                    )
-            # Cover constructor uploads, ring clones and transport pointer
-            # tables before the first preparation, even on another stream.
-            event.record()
+            owner, groups = self.build_h2d_slot(variables, event)
             self._h2d_owners.append(owner)
             self._h2d_groups.append(groups)
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
+
+    def build_h2d_slot(self, variables, event, *, partial=False):
+        """Bind one `forward_vars` slot to a publication owner and its groups.
+
+        What every ring slot gets, and what a builder's private bank needs to
+        publish under the same rules (see `mixed_prefill_bank_active`).
+        """
+        from atom.utils.h2d import PublicationOwner
+
+        transport = envs.ATOM_H2D_BACKEND
+        owner = PublicationOwner(self.device, event, registry=self.publication_registry)
+        members = {}
+        for name, buffer in variables.items():
+            if isinstance(buffer, CpuGpuBuffer) and buffer.publication_group:
+                binding = owner.bind(buffer, name, unit=buffer.publication_unit)
+                members.setdefault(buffer.publication_group, []).append(binding)
+        groups = {name: owner.group(name, items) for name, items in members.items()}
+        if transport == "packed":
+            # One upload immediately before token assembly's first GPU
+            # consumer. Sampling has no earlier device consumer.
+            if all(name in groups for name in ("sampling", "early", "input_ids")):
+                token_members = ("sampling", "early", "input_ids")
+                if "spec_decode" in groups:
+                    token_members += ("spec_decode",)
+                groups["token_inputs"] = owner.group(
+                    "token_inputs",
+                    [b for name in token_members for b in groups[name].members],
+                )
+            if "prefill" in groups and "positions" in groups:
+                groups["prefill_inputs"] = owner.group(
+                    "prefill_inputs",
+                    groups["prefill"].members + groups["positions"].members,
+                )
+        # Some buffers also publish together at a later consumer boundary
+        # (e.g. MHA decode shares block tables with the prefill group).
+        for name, names in getattr(
+            getattr(self, "attn_metadata_builder", None), "h2d_group_members", {}
+        ).items():
+            if partial and not all(item in variables for item in names):
+                continue
+            groups[name] = owner.group(
+                name, [variables[item]._publication for item in names]
+            )
+        if transport == "packed":
+            for group in owner.use_packed_transport():
+                logger.info(
+                    "H2D group %s: %s%s",
+                    group.name,
+                    group.transport,
+                    f" ({group.fallback_reason})" if group.fallback_reason else "",
+                )
+        # Cover constructor uploads, ring clones and transport pointer
+        # tables before the first preparation, even on another stream.
+        event.record()
+        return owner, groups
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
@@ -2000,6 +2028,7 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"extra_reserve={extra_reserve / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
@@ -2300,11 +2329,29 @@ class ModelRunner:
 
         With the packed-reduce path the eligibility (local + cross-DP AND)
         is decided in ``ForwardMode.decide``; here we just realise the split.
+
+        Deliberately has NO local veto of its own -- not even a defensive one.
+        `tbo_collective_active` is the cross-DP decision, and a rank that
+        second-guesses it here runs 1 ubatch while its peers run 2, which
+        deadlocks the per-ubatch collectives. Every reason to decline belongs in
+        `local_tbo_precompute`, where it reaches the AND-reduce and turns TBO
+        off for the whole group. A mixed batch used to be vetoed here; that
+        veto is now expressed as can_split=False, and re-adding one would
+        reintroduce the hang (observed: one rank scheduled a mixed batch, and
+        no rank scheduled another forward after it).
         """
         if not tbo_collective_active:
             return None
 
-        tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        # A mixed batch spans BOTH segments, so the split has to see every row.
+        # `total_seqs_num_prefill` would hide the decode rows from the cut and
+        # from `num_scheduled_tokens`, leaving slices that do not cover the
+        # tokens actually forwarded.
+        is_mixed = getattr(batch, "is_mixed", False)
+        if is_mixed:
+            tbo_num_reqs = batch.total_seqs_num
+        else:
+            tbo_num_reqs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
         # tbo_collective_active is the OR-reduced cross-DP decision: this rank
         # is committed to splitting even if it's below ATOM_TBO_PREFILL_MIN_TOKENS
         # (a peer cleared the bar). force=True bypasses the local min-token gate
@@ -2315,6 +2362,8 @@ class ModelRunner:
             is_prefill=is_prefill,
             num_scheduled_tokens=num_scheduled_tokens if is_prefill else None,
             force=True,
+            num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else None,
+            num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else None,
         )
         if ubatch_slices is not None:
             logger.debug(
@@ -2354,6 +2403,13 @@ class ModelRunner:
         self._pcp_tbo_balanced_active = False
         self._pcp_bal_groups = None
         if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            # Config._validate_mixed_prefill_decode rejects this at launch.
+            # Keep a backstop for callers that construct a runner directly:
+            # the PCP split below only sizes the prefill rows.
+            if getattr(batch, "is_mixed", False):
+                raise NotImplementedError(
+                    "mixed prefill+decode is not supported with PCP"
+                )
             # PCP is always dp=1, so the single-rank path returns this verbatim
             # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
             local_tokens = batch.total_tokens_num_prefill // pcp_size
@@ -2375,7 +2431,7 @@ class ModelRunner:
 
         Mutates only the worker's batch copy (counts + scheduled_spec_decode_
         tokens truncated to q-1); KV stays reserved at mtp_k+1. No-op unless
-        DSpark confidence scheduling is on and this is a pure-decode batch.
+        DSpark confidence scheduling is on and the batch has decode rows.
         The bucket math lives in `apply_q_bucket` so CPU CI can run it without
         importing this module (which loads AITER).
         """
@@ -2406,10 +2462,16 @@ class ModelRunner:
 
         tp = getattr(self, "tokenID_processor", None)
         prev_b = getattr(tp, "prev_batch", None) if tp is not None else None
-        cur_req = list(batch.req_ids[:scheduled_bs])
-        prev_req = list(prev_b.req_ids) if prev_b is not None else None
-        # Shrinking needs the previous batch to be exactly this decode set in
-        # the same order (no new/prefill seqs, no reorder), because the per-
+        row0 = batch.total_seqs_num_prefill
+        cur_req = list(batch.req_ids[row0 : row0 + scheduled_bs])
+        prev_req = (
+            list(prev_b.req_ids[getattr(prev_b, "total_seqs_num_prefill", 0) :])
+            if prev_b is not None and not prev_b.is_dummy_run
+            else None
+        )
+        # Keep the decode set and order stable across steps. Prefill rows may
+        # change independently; their bonus counts never bound decode spans.
+        # This excludes a first decode after prefill, because the per-
         # request lengths below are read off that batch's `num_bonus`. Any
         # deviation → boundary step.
         if prev_req is None or prev_req != cur_req:
@@ -2418,11 +2480,12 @@ class ModelRunner:
         # Positional, which is what the `prev_req == cur_req` guard buys: entry
         # i is request i's own count from the step that produced it, before
         # `prepare_input_ids` remaps the deferred rows.
-        nb = batch.num_bonus[:scheduled_bs]
+        nb = batch.num_bonus[row0 : row0 + scheduled_bs]
 
         from atom.spec_decode.dspark_scheduler import (
             quantize_to_bucket,
             ragged_verify_lens,
+            resize_decode_tokens,
             resolve_q_buckets,
         )
 
@@ -2430,15 +2493,15 @@ class ModelRunner:
         # segment) and old_nst[i] (a stale ell must not grow a seq past what the
         # scheduler scheduled). None -> some request's bounds cross.
         new_len = ragged_verify_lens(
-            (by_req.get(rid) for rid in batch.req_ids[:scheduled_bs]),
+            (by_req.get(rid) for rid in cur_req),
             full_q,
             nb,
-            old_nst[:scheduled_bs],
+            old_nst[row0 : row0 + scheduled_bs],
         )
         if new_len is None:
             return  # stay rectangular
 
-        if not (new_len < old_nst[:scheduled_bs]).any():
+        if not (new_len < old_nst[row0 : row0 + scheduled_bs]).any():
             return  # nothing to shrink this step -> Phase-1 layout
 
         # q_eff, and the replay-shape feasibility check, BEFORE anything on the
@@ -2452,7 +2515,7 @@ class ModelRunner:
         #     running_tokens, bucketed from the scheduled tokens' real sum, so a
         #     long-tail seq no longer inflates the batch row count.
         buckets = resolve_q_buckets(self.config.dspark.ragged_graph_sizes, full_q)
-        if self.enforce_eager:
+        if self.enforce_eager or batch.is_mixed:
             # Eager: no graph → capacity == exact Σ (no bucket). Scalar = batch max
             # real len (positions/attn bound); layout is pure flat Σ.
             q_eff = int(new_len.max()) if scheduled_bs > 0 else full_q
@@ -2478,28 +2541,7 @@ class ModelRunner:
             if not self._tr_hybrid_active():
                 return  # stay rectangular
 
-        # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
-        # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
-        # placeholders already populated by the scheduler from seq.token_ids).
-        sched = np.asarray(batch.scheduled_tokens)
-        old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
-        np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
-        new_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
-        np.cumsum(new_len, out=new_cu[1:])
-        total_new = int(new_cu[-1])
-        new_sched = np.empty(total_new, dtype=sched.dtype)
-        for i in range(scheduled_bs):
-            s_old = int(old_cu[i])
-            s_new = int(new_cu[i])
-            new_sched[s_new : s_new + new_len[i]] = sched[s_old : s_old + new_len[i]]
-        batch.scheduled_tokens = new_sched
-
-        nst = old_nst.copy()
-        nst[:scheduled_bs] = new_len
-        batch.num_scheduled_tokens = nst
-        prefill_tok = int(batch.total_tokens_num_prefill)
-        batch.total_tokens_num_decode = total_new
-        batch.total_tokens_num = prefill_tok + total_new
+        resize_decode_tokens(batch, new_len)
         # No marker is published for "this step shrank": a shrunk step is
         # `num_scheduled_tokens` with smaller entries, and every reader reads
         # those. `scheduled_spec_decode_tokens` keeps its full width --
@@ -2520,6 +2562,46 @@ class ModelRunner:
             and not batch.is_dummy_run
         )
 
+    def _verify_spans(
+        self, batch: ScheduledBatch
+    ) -> tuple[np.ndarray, np.ndarray, int] | None:
+        """This step's verify layout in LOGIT-row space, or None if it verifies nothing.
+
+        Returns `(sampled_lens, cu_end, shift)`: rows each request samples, their
+        inclusive prefix sum (`cu_num_sampled_tokens`), and the offset from a
+        logit row to its token row. The spec indices are built over logit rows
+        and the draft ids gathered out of `input_ids[shift:]`.
+
+        Pure decode: every token row reaches the LM head, so the two row spaces
+        coincide and `shift` is 0. Mixed: the LM head keeps one row per prefill
+        seq (its last token) then every decode token, so a prefill row is a
+        0-draft request sampling one row, and decode token j sits at logit row
+        `n_p + j` but token row `n_p_tokens + j` -- a constant `n_p_tokens -
+        n_p`. The prefill rows' `(1, 0 drafts)` spans are exactly what
+        `prepare_spec_decode_indices` and the rejection sampler already accept.
+        """
+        n_p = batch.total_seqs_num_prefill
+        is_mixed = n_p > 0 and getattr(batch, "is_mixed", False)
+        # A mixed step verifies its decode rows as a pure decode would, so it
+        # asks `_verifies_drafts` the decode question; pure prefill samples
+        # without verification.
+        if not self._verifies_drafts(batch, is_prefill=n_p > 0 and not is_mixed):
+            return None
+        if n_p == 0:
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            return lens, cu[1:], 0
+        lens = np.concatenate(
+            [
+                np.ones(n_p, dtype=np.int32),
+                np.asarray(batch.num_scheduled_tokens[n_p:], dtype=np.int32),
+            ]
+        )
+        return (
+            lens,
+            np.cumsum(lens, dtype=np.int32),
+            batch.total_tokens_num_prefill - n_p,
+        )
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
@@ -2532,6 +2614,7 @@ class ModelRunner:
         # lives). The q-bucket shrink ran there too, so `batch` is already
         # reduced here.
         is_prefill = batch.total_tokens_num_prefill > 0
+        is_mixed = getattr(batch, "is_mixed", False)
         scheduled_bs = batch.total_seqs_num
         scheduled_tokens = batch.total_tokens_num
         num_scheduled_tokens = batch.num_scheduled_tokens
@@ -2547,12 +2630,13 @@ class ModelRunner:
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
         spec_decode_metadata = None
-        if self._verifies_drafts(batch, is_prefill):
-            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+        spans = self._verify_spans(batch)
+        if spans is not None:
+            lens, cu_end, shift = spans
             # Inside the staging window: without the token group it publishes
             # the indices itself. Packed indices already share the token upload.
             spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                lens, cu[1:], input_ids, prepared_indices=spec_decode_indices
+                lens, cu_end, input_ids[shift:], prepared_indices=spec_decode_indices
             )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
@@ -2573,6 +2657,9 @@ class ModelRunner:
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
+            is_mixed=is_mixed,
+            num_prefill_tokens=batch.total_tokens_num_prefill if is_mixed else 0,
+            num_prefill_seqs=batch.total_seqs_num_prefill if is_mixed else 0,
         )
 
         pcp_size = self.config.prefill_context_parallel_size
@@ -2720,10 +2807,11 @@ class ModelRunner:
             token_group.counts[token_group.indices["cu_seqlens_q"]] = cu_count
             spec_group = self.h2d_groups.get("spec_decode")
             if spec_group is not None:
-                if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
-                    _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+                spans = self._verify_spans(batch)
+                if spans is not None:
+                    lens, cu_end, _ = spans
                     spec_decode_indices = self.drafter.prepare_spec_decode_indices(
-                        lens, cu[1:], token_group
+                        lens, cu_end, token_group
                     )
                 else:
                     # A preceding decode may have filled these counts. Forwards
@@ -3211,6 +3299,38 @@ class ModelRunner:
         return True
 
     @_profile_runner_stage
+    def _settle_mixed_verdict(
+        self,
+        batch: ScheduledBatch,
+        num_reject_tokens: torch.Tensor,
+        anchors: torch.Tensor,
+    ) -> None:
+        """Re-express a mixed step's verdict in the batch's TOKEN rows, in place.
+
+        The rejection verdict is computed over LOGIT rows: `anchors` is each
+        request's bonus logit row minus its drafts plus its accepts, and
+        `num_reject` is `mtp_k - accepted`. On a pure-decode step logit rows are
+        token rows. On a mixed step the LM head keeps one row per prefill seq
+        (its last token) and then every decode token, so:
+
+        * a prefill row (they lead the batch) verified a 0-draft span. It
+          rejects nothing, as a pure-prefill step reports it -- left at
+          `mtp_k`, the next step rolls that request's ctx back K positions the
+          moment it decodes, shifting its positions and KV slots, and the
+          acceptance stats count K rejected drafts it never had. Its anchor is
+          its chunk's last TOKEN row, not its logit row.
+        * a decode row's logit row `n_p + j` is token row `n_p_tokens + j`.
+        """
+        if not getattr(batch, "is_mixed", False):
+            return
+        n_p = batch.total_seqs_num_prefill
+        num_reject_tokens[:n_p] = 0
+        # The carrier's whole-batch spans: its first `n_p + 1` entries are the
+        # prefill segment's.
+        cu = get_forward_context().attn_metadata.cu_seqlens_q
+        anchors[:n_p] = cu[1 : n_p + 1] - 1
+        anchors[n_p:] += batch.total_tokens_num_prefill - n_p
+
     def postprocess(
         self,
         batch: ScheduledBatch,
@@ -3289,6 +3409,10 @@ class ModelRunner:
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
                 verdict = get_pcp_group().broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
+            # Only a mixed step's verdict needs re-expressing in token rows; a
+            # pure step keeps postprocess free of the mixed path entirely.
+            if getattr(batch, "is_mixed", False):
+                self._settle_mixed_verdict(batch, num_reject_tokens, anchors)
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
@@ -4487,7 +4611,7 @@ class RapidServeModelRunner(ModelRunner):
         # Two processes share the GPU in disagg mode; reserve extra headroom so
         # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
         safety_margin = int(total_bytes * 0.02)
-        return 4 * safety_margin
+        return super()._kv_budget_extra_reserve(total_bytes) + 4 * safety_margin
 
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from

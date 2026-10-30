@@ -30,7 +30,8 @@ def _add_rank(slots):
     """all_reduce mock that adds one more rank's contribution to the buffer.
 
     `slots` maps buffer index → that sibling rank's value (indices per
-    PrefillDelayer._reduce_buf: 0=prefillable, 1=pending, 2=running_decode).
+    PrefillDelayer._reduce_buf: 0=prefillable, 1=pending, 2=running_decode,
+    9=prefill_budget -- a prefillable rank reports the one it can admit).
     """
 
     def f(tensor, op=None, group=None):
@@ -263,7 +264,7 @@ class TestAlignmentGate:
         # dp_size=2, sibling prefillable + full → aligned, aggregate fill high.
         d = make_delayer(dp_size=2, ttft_max_ticks=1000)
         skip_first(d)
-        aligned = _add_rank({0: 1, 1: MAX_BATCHED, 2: 64})
+        aligned = _add_rank({0: 1, 1: MAX_BATCHED, 2: 64, 9: MAX_BATCHED})
         assert call(d, pending_tokens=MAX_BATCHED, reduce=aligned) is True
         assert d._stat_fire_fill == 1
 
@@ -396,7 +397,7 @@ class TestCostGate:
         clock = _Clock()
         d = make_gated(clock=clock)
         skip_first(d)
-        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1})
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, 9: MAX_BATCHED})
         for _ in range(3):
             clock.now += 0.010
             call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
@@ -409,7 +410,7 @@ class TestCostGate:
         clock = _Clock()
         d = make_gated(clock=clock)
         skip_first(d)
-        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1})
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, 9: MAX_BATCHED})
         # decode steps of 10 ms (no prefill ran)
         for _ in range(3):
             clock.now += 0.010
@@ -432,6 +433,48 @@ class TestCostGate:
         call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
         assert d._prefill_ps_per_cost == pytest.approx(0.020e12 / 2e8)
         assert d._decode_tick_us == pytest.approx(10_000)
+
+    def test_times_a_mixed_step_as_a_prefill_step(self):
+        """A mixed step arms no decode protection but is still the prefill step
+        the fired cost bought: timed per cost unit, not as a decode tick."""
+        clock = _Clock()
+        d = make_gated(clock=clock)
+        skip_first(d)
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, 9: MAX_BATCHED})
+        for _ in range(3):
+            clock.now += 0.010
+            call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
+        clock.now += 0.010
+        call(
+            d,
+            pending_tokens=MAX_BATCHED,
+            running_decode_batch=1,
+            prefill_cost=2e8,
+            reduce=sibling,
+        )
+        d.notify_prefill_executed(decoded=True)
+        clock.now += 0.020
+        call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
+        assert d._prefill_ps_per_cost == pytest.approx(0.020e12 / 2e8)
+        assert d._decode_tick_us == pytest.approx(10_000)
+
+
+class TestFillAgainstThePrefillBudget:
+    def test_fill_is_measured_against_what_a_step_can_admit(self):
+        """Under mixed batching a step admits at most `prefill_budget` (the
+        batch budget less the decode reserve). Pending that reaches it is a
+        full step; measuring it against the whole batch budget would hold for
+        tokens no step could take, until the stall or TTFT bound."""
+        d = make_delayer(target_fill=0.9, stall_ticks=1000, ttft_max_ticks=1000)
+        skip_first(d)
+        budget = int(MAX_BATCHED * 0.8)
+        assert call(d, pending_tokens=budget, prefill_budget=budget) is True
+        assert d._stat_fire_fill == 1
+
+    def test_without_a_budget_the_batch_budget_is_the_target(self):
+        d = make_delayer(target_fill=0.9, stall_ticks=1000, ttft_max_ticks=1000)
+        skip_first(d)
+        assert call(d, pending_tokens=int(MAX_BATCHED * 0.8)) is False
 
 
 class TestParamClamps:
@@ -474,6 +517,23 @@ class TestPrefillDecodeInterval:
         # The next pass reaches the normal decision and fires on KV pressure.
         assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
 
+    def test_a_mixed_step_does_not_arm_the_interval(self):
+        """A mixed step decoded beside its prefill: it starves no decode, so
+        holding the next prefills would only turn mixed back into alternation."""
+        d = make_delayer(prefill_decode_interval=3, kv_high_watermark=0.1)
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+        d.notify_prefill_executed(decoded=True)
+        assert not d.protects_decode(running_decode_batch=1)
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+        assert d._stat_hold_decode_interval == 0
+
+    def test_a_prefill_only_step_still_arms_it(self):
+        d = make_delayer(prefill_decode_interval=3, kv_high_watermark=0.1)
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is True
+        d.notify_prefill_executed(decoded=False)
+        assert d.protects_decode(running_decode_batch=1)
+        assert call(d, pending_tokens=MAX_BATCHED, kv_usage=1.0) is False
+
     def test_countdown_advances_when_no_prefill_is_waiting(self):
         d = make_delayer(prefill_decode_interval=2)
         assert call(d, pending_tokens=MAX_BATCHED) is True
@@ -506,9 +566,17 @@ class TestPrefillDecodeInterval:
     def test_execution_on_peer_arms_all_ranks(self):
         d = make_delayer(dp_size=2, prefill_decode_interval=1)
         skip_first(d)
-        peer_prefill_ran = _add_rank({7: 1})
-        assert call(d, pending_tokens=1000, reduce=peer_prefill_ran) is False
+        # slot 7: a prefill ran; slot 8: it decoded nothing.
+        peer_prefill_only = _add_rank({7: 1, 8: 1})
+        assert call(d, pending_tokens=1000, reduce=peer_prefill_only) is False
         assert d._stat_hold_decode_interval == 1
+
+    def test_a_mixed_step_on_peer_arms_nothing(self):
+        d = make_delayer(dp_size=2, prefill_decode_interval=1)
+        skip_first(d)
+        peer_mixed = _add_rank({7: 1})
+        call(d, pending_tokens=1000, reduce=peer_mixed)
+        assert d._stat_hold_decode_interval == 0
 
 
 class TestStatsDistinct:

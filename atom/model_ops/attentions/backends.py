@@ -4,7 +4,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 if TYPE_CHECKING:
@@ -497,6 +497,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic[T]):
     capture_owns_cu_seqlens_q = False
+    mixed_prefill_groups = frozenset(("early", "prefill", "positions"))
 
     def __init__(self, model_runner):
         self.model_runner = model_runner
@@ -589,6 +590,152 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         backend a draft can run against has to answer. Only the MLA one
         overrides.
         """
+
+    def _get_mixed_prefill_bank(self):
+        """Private publication slot for the prefill half of a mixed batch.
+
+        A mixed batch is built as ``[prefill | decode]`` by running the
+        unmodified `prepare_prefill` then the decode builder, both of which
+        stage through the SAME named `forward_vars` buffers. Sharing them would
+        have decode's staging overwrite the prefill segment's GPU tensors and
+        race its in-flight pinned sources (the large-ISL OOB of `ab55dfb6`).
+
+        Instead the prefill half runs against clones of the publication groups
+        it writes, plus the ungrouped token-to-request map. Decode-only and
+        token-input buffers stay shared and keep their original bindings: the
+        prefill half must not stage into them. Backends declare any extra
+        prefill groups in `mixed_prefill_groups`, including TBO rebuild groups.
+
+        The clones are BOUND to a publication owner and groups of their own,
+        built exactly as the runner builds a ring slot's. Swapping
+        `forward_vars` alone is not enough: the prefill producers publish
+        through `h2d_groups` and `acquire_write` on each buffer's binding, and
+        the runner's groups bind the real buffers -- they would upload the real
+        (stale) sources while the metadata viewed the bank's never-uploaded
+        GPU side.
+
+        Built for every `forward_vars` ring slot by `build_mixed_prefill_banks`,
+        which the runner calls before warmup's memory profile, so the KV budget
+        counts them; a run without mixed batching builds none. A slot's bank is
+        reused only when the slot is, which the runner's own owner already
+        gates on the slot's previous forward.
+
+        So the bank's own completion event covers only its uploads, and needs
+        no more. Its GPU side is ordered by stream: uploads publish on the
+        owner's compute stream, the forward that reads them runs there too
+        (TBO rejoins its comm stream before returning), so the next step's
+        upload queues behind the previous step's reads. With a PP ring, the
+        slot owner's `begin()` -- which runs before `prepare_mixed` touches the
+        bank -- has already waited for the slot's previous forward to finish.
+
+        Returns ``(forward_vars, owner, groups)``; the last two are None for a
+        runner without a publication registry.
+        """
+        banks = getattr(self, "_mixed_prefill_banks", None)
+        if banks is None:
+            # Building here would allocate mid-serve, after the KV cache took
+            # the memory the profile left.
+            raise RuntimeError(
+                "mixed prefill banks were not built: the runner calls "
+                "build_mixed_prefill_banks() before warmup when "
+                "--enable-mixed-prefill-decode is set"
+            )
+        return banks[getattr(self.model_runner, "_fv_idx", 0)]
+
+    def build_mixed_prefill_banks(self) -> None:
+        """Build `_get_mixed_prefill_bank`'s bank for every `forward_vars` ring
+        slot. Called once, after the ring and its publication owners exist and
+        before warmup, so the memory profile and the KV budget see them."""
+        runner = self.model_runner
+        ring = getattr(runner, "_fv_ring", None) or [runner.forward_vars]
+        private_groups = getattr(
+            self, "mixed_prefill_groups", CommonAttentionBuilder.mixed_prefill_groups
+        )
+        banks = {}
+        for slot, forward_vars in enumerate(ring):
+            # `clone()` carries `pin_memory`: an unpinned source would make
+            # `copy_(non_blocking=True)` synchronous.
+            private = {
+                name: val.clone()
+                for name, val in forward_vars.items()
+                if isinstance(val, CpuGpuBuffer)
+                and (
+                    val.publication_group in private_groups
+                    or name == "batch_id_per_q_token"
+                )
+            }
+            variables = {**forward_vars, **private}
+            owner = groups = None
+            if getattr(runner, "h2d_groups", None) is not None:
+                # Binding a shared buffer again would steal it from the live
+                # slot's owner. Only the clones belong to this publication slot.
+                owner, groups = runner.build_h2d_slot(
+                    private, torch.cuda.Event(), partial=True
+                )
+            banks[slot] = (variables, owner, groups)
+        self._mixed_prefill_banks = banks
+
+    @contextmanager
+    def mixed_prefill_bank_selected(self):
+        """Point the runner's `forward_vars`, owner and groups at the bank.
+
+        Only the swap; it opens no publication epoch. For a caller that
+        publishes through an epoch of its own, e.g. a TBO ubatch rebuild, which
+        reopens whichever owner the runner holds (`_ubatch_prefill_sources`).
+        """
+        runner = self.model_runner
+        variables, owner, groups = self._get_mixed_prefill_bank()
+        saved = (
+            runner.forward_vars,
+            getattr(runner, "h2d_owner", None),
+            getattr(runner, "h2d_groups", None),
+        )
+        runner.forward_vars = variables
+        if owner is not None:
+            runner.h2d_owner, runner.h2d_groups = owner, groups
+        try:
+            yield variables
+        finally:
+            # Restore even on error so a failed mixed build can't leave the
+            # runner pointed at the bank.
+            runner.forward_vars = saved[0]
+            if owner is not None:
+                runner.h2d_owner, runner.h2d_groups = saved[1], saved[2]
+
+    @contextmanager
+    def mixed_prefill_bank_active(self, batch: ScheduledBatch):
+        """Build the prefill half of a mixed batch inside the bank.
+
+        Selects the bank, and opens one publication epoch on its owner, sealed
+        on exit, so the prefill producers publish into it under the same ledger
+        rules as an ordinary step. A failure fails the bank's owner, as it would
+        the runner's.
+
+        Also publishes the bank's `cu_seqlens_q`. It is the one buffer the
+        prefill path READS rather than fills (`prepare_prefill` cross-checks
+        against it), and `publish_cu_seqlens_q` gives the runner's own copy the
+        decode segment's spans on a mixed step -- so the prefill segment's spans
+        are written here, from the same `num_scheduled_tokens`.
+        """
+        _, owner, _ = self._get_mixed_prefill_bank()
+        if owner is not None:
+            owner.begin()
+        try:
+            with self.mixed_prefill_bank_selected() as variables:
+                n_p_seqs = batch.total_seqs_num_prefill
+                cu = variables["cu_seqlens_q"]
+                cu.np[1 : n_p_seqs + 1] = np.cumsum(
+                    batch.num_scheduled_tokens[:n_p_seqs]
+                )
+                cu.copy_to_gpu(n_p_seqs + 1)
+                yield variables
+        except BaseException:
+            if owner is not None:
+                owner.fail()
+            raise
+        else:
+            if owner is not None:
+                owner.finish()
 
     def prepare_block_tables(self, batch: ScheduledBatch, running_bs=None):
         """Prepare the shared CPU snapshot, reusing unchanged page mappings."""
@@ -695,6 +842,12 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     ) -> int:
         """Publish this step's `cu_seqlens_q`. The only writer.
 
+        A mixed batch's attention runs as two segments, and this buffer carries
+        the DECODE segment's spans (anchor + drafts per row, from 0): that is what the
+        decode builder reads, and publishing it here, once, keeps the ledger to
+        one upload per epoch. The prefill segment's spans go to its private
+        bank in `mixed_prefill_bank_active`.
+
         Lives here because this class declares the buffer and defines its
         layout, but is CALLED from `prepare_model` before `prepare_input_ids`,
         which addresses each request's span through it and so cannot wait for
@@ -711,13 +864,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             "ForwardMode.decide invariant violated"
         )
         cu = self.model_runner.forward_vars["cu_seqlens_q"]
-        cu.np[1 : scheduled_bs + 1] = np.cumsum(batch.num_scheduled_tokens)
-        cu.np[scheduled_bs + 1 : forward_mode.running_bs + 1] = batch.total_tokens_num
+        lens = batch.num_scheduled_tokens
+        if getattr(batch, "is_mixed", False):
+            lens = lens[batch.total_seqs_num_prefill :]
+        n = len(lens)
+        cu.np[1 : n + 1] = np.cumsum(lens)
+        cu.np[n + 1 : forward_mode.running_bs + 1] = cu.np[n]
         # Caller publishes alone or with sampling/IDs before token assembly.
         return forward_mode.running_bs + 1
 
     def decode_spans(self, batch: ScheduledBatch) -> tuple[int, np.ndarray, np.ndarray]:
-        """A pure-decode step's `(bs, per-request lengths, exclusive prefix sum)`.
+        """The decode region's `(bs, per-request lengths, exclusive prefix sum)`.
 
         One place, so no caller can pair a length vector with someone else's
         cumsum: both come off `num_scheduled_tokens` and the buffer
@@ -727,7 +884,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         bs = batch.total_seqs_num_decode
         return (
             bs,
-            batch.num_scheduled_tokens[:bs],
+            batch.num_scheduled_tokens[batch.total_seqs_num_prefill :],
             self.model_runner.forward_vars["cu_seqlens_q"].np[: bs + 1],
         )
 
@@ -1038,6 +1195,11 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.execute_paged_state_copies(
                 state_ops.checkpoint_stores, state_ops.checkpoint_restores
             )
+
+        # Mixed dispatch comes AFTER state maintenance: it returns early, and a
+        # mixed batch needs the same relocations / checkpoint copies as any other.
+        if getattr(batch, "is_mixed", False):
+            return self.prepare_mixed(batch, running_bs)
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:
             if (
@@ -1065,6 +1227,13 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     # `ReqGraph`s, each on `build_for_req_graph_capture`'s step
     # (`ModelRunner._record_prefill_req_graphs`). Empty: none.
     prefill_req_graph_sizes: tuple[int, ...] = ()
+
+    def prepare_mixed(self, batch: ScheduledBatch, bs: int):
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support mixed prefill+decode "
+            "batches: this metadata builder has no prepare_mixed. Disable "
+            "--enable-mixed-prefill-decode."
+        )
 
 
 class AttentionImpl(nn.Module):

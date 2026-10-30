@@ -34,6 +34,7 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
     runner.model = SimpleNamespace()
     runner.use_mrope = True
     runner.enforce_eager = True
+    runner.tbo_decode_graphs = {}
     runner.running_tokens_per_dp_rank = np.zeros(1, dtype=np.int32)
     runner.tokenID_processor = tokenIDProcessor(runner, 64)
     if speculative:
@@ -63,6 +64,57 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
     return runner
+
+
+@pytest.mark.parametrize("transport", ["direct", "packed"])
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_mixed_query_spans_reach_independent_device_banks(
+    monkeypatch, transport, pp_size
+):
+    """Check the device consumers, including ring reuse and ragged decode rows."""
+    runner = runner_with_buffers(monkeypatch, transport, pp_size)
+    builder = runner.attn_metadata_builder
+    builder.build_mixed_prefill_banks()
+    observed = []
+    # Non-spec, rectangular spec, shrunk spec, then equal-total ragged layouts.
+    cases = (
+        ([5, 3], [1, 1, 1], [0, 5, 8], [0, 1, 2, 3]),
+        ([9], [8, 8], [0, 9], [0, 8, 16]),
+        ([2, 6], [4, 4], [0, 2, 8], [0, 4, 8]),
+        ([1, 7], [1, 3], [0, 1, 8], [0, 1, 4]),
+        ([3], [3, 1], [0, 3], [0, 3, 4]),
+    )
+    for prefill, decode, expected_prefill, expected_decode in cases * 2:
+        runner._advance_forward_vars()
+        runner._gate_staging_reuse()
+        live = runner.forward_vars["cu_seqlens_q"]
+        bank, _, _ = builder._get_mixed_prefill_bank()
+        private = bank["cu_seqlens_q"]
+        assert private.cpu.is_pinned() and live.cpu.is_pinned()
+        assert private.gpu.data_ptr() != live.gpu.data_ptr()
+        live.gpu.fill_(-99)
+        private.gpu.fill_(-99)
+        batch = SimpleNamespace(
+            is_mixed=True,
+            total_seqs_num=len(prefill) + len(decode),
+            total_seqs_num_prefill=len(prefill),
+            num_scheduled_tokens=np.array(prefill + decode, dtype=np.int32),
+        )
+        torch.cuda._sleep(2_000_000)
+        builder.publish_cu_seqlens_q(
+            batch, SimpleNamespace(running_bs=batch.total_seqs_num)
+        )
+        with builder.mixed_prefill_bank_active(batch) as variables:
+            prefill_gpu = variables["cu_seqlens_q"].gpu[: len(prefill) + 1].clone()
+        decode_gpu = live.gpu[: len(decode) + 1].clone()
+        observed.extend(
+            ((prefill_gpu, expected_prefill), (decode_gpu, expected_decode))
+        )
+        runner._mark_staging_h2d_enqueued()
+        runner._record_forward_vars_event()
+    torch.cuda.synchronize()
+    for actual, expected in observed:
+        assert actual.cpu().tolist() == expected
 
 
 @pytest.mark.parametrize("transport", ["direct", "packed"])

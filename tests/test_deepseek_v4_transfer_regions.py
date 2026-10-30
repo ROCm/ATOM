@@ -153,6 +153,9 @@ def _stub_v4_runtime_imports():
         "CommonAttentionBuilder",
     ):
         setattr(backends, name, type(name, (), {}))
+    # The V4 class extends this set at import time. Transfer tests do not
+    # publish H2D metadata, so the stub needs no publication groups of its own.
+    backends.CommonAttentionBuilder.mixed_prefill_groups = frozenset()
 
     kernels = types.ModuleType("atom.model_ops.v4_kernels")
     for name in (

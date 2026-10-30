@@ -12,6 +12,8 @@ from atom.config import get_current_atom_config
 from atom.utils.tbo.ubatch_splitting import (
     decode_bucket_splits,
     decode_ubatch_request_ranges,
+    mixed_cut_inside_prefill,
+    token_midpoint_cuts,
 )
 
 
@@ -54,9 +56,8 @@ def _precompute_prefill_token_split(
     # meets_min_tokens: this rank's prefill reached the min-token bar
     # (ATOM_TBO_PREFILL_MIN_TOKENS, e.g. 8k) — big enough to be worth TBO.
     meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
-    ub0 = num_pref_tokens // 2
-    ub1 = num_pref_tokens - ub0
-    return meets_min_tokens, True, ub0, ub1
+    _, cut, end = token_midpoint_cuts(num_pref_tokens, 2)
+    return meets_min_tokens, True, cut, end - cut
 
 
 def _precompute_prefill_req_split(
@@ -99,6 +100,61 @@ def _precompute_prefill_req_split(
     ub0 = int(toks[:split_idx].sum())
     ub1 = num_pref_tokens - ub0
     return meets_min_tokens, True, ub0, ub1
+
+
+def _precompute_mixed_token_split(
+    num_scheduled_tokens: np.ndarray,
+    num_reqs: int,
+    num_pref_tokens: int,
+    min_pref: int,
+) -> tuple[bool, bool, int, int]:
+    """Mixed ``[prefill | decode]``, token-midpoint split over the WHOLE batch.
+
+    Differs from `_precompute_prefill_token_split` in what it counts: that one
+    sums only ``num_scheduled_tokens[:num_pref_reqs]``, which for a mixed batch
+    silently drops every decode row and produces ub0/ub1 that do not add up to
+    the tokens actually forwarded.
+
+    ``meets_min_tokens`` still keys off the PREFILL tokens alone: the bar exists
+    to skip TBO when there is not enough prefill compute to hide communication
+    behind, and a few hundred decode rows do not change that.
+
+    MUST mirror `split_mixed_token_midpoint` in ubatch_splitting.py -- the
+    cross-DP MAX-reduce of ub0/ub1 sizes the per-ubatch buffers, so the two
+    disagreeing is an all_gather size mismatch, i.e. a hang.
+    """
+    total_tokens = int(
+        np.asarray(num_scheduled_tokens[:num_reqs], dtype=np.int64).sum()
+    )
+    # can_split: two non-empty halves, cut where the split itself cuts.
+    cuts = token_midpoint_cuts(total_tokens, 2)
+    if cuts is None:
+        return False, False, 0, 0
+
+    # One contiguous cut of a `[prefill | decode]` layout can never leave BOTH
+    # halves mixed: whichever side the cut falls on, the other side is pure.
+    # Require it to land strictly inside the prefill region, which gives
+    #     ubatch 0 = pure prefill      (the ordinary prefill path, unchanged)
+    #     ubatch 1 = [prefill tail | every decode row]   (mixed)
+    # so both ubatches keep is_prefill=True and only ubatch 1 needs mixed
+    # metadata.
+    #
+    # The other landing -- cut at or past the prefill tokens -- would make
+    # ubatch 1 pure DECODE while its parent context says is_prefill=True, and
+    # TBO builds per-ubatch contexts off the parent's mode
+    # (`_make_ubatch_context` branches on `ctx.context.is_prefill`, one branch
+    # for all ubatches). Supporting that needs per-ubatch mode switching, which
+    # is a separate piece of work; refuse the split instead.
+    #
+    # Real mixed batches are overwhelmingly prefill (measured: 15831 prefill vs
+    # 379 decode tokens), so the midpoint lands inside the prefill region and
+    # this rejects almost nothing.
+    if not mixed_cut_inside_prefill(cuts, num_pref_tokens):
+        return False, False, 0, 0
+
+    meets_min_tokens = not (min_pref > 0 and num_pref_tokens < min_pref)
+    _, cut, end = cuts
+    return meets_min_tokens, True, cut, end - cut
 
 
 def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
@@ -154,6 +210,21 @@ def local_tbo_precompute(
     """
     if not config.enable_tbo:
         return False, False, 0, 0
+
+    if getattr(batch, "is_mixed", False):
+        from atom.utils import envs
+
+        # With TBO on, a mixed batch takes the mixed split. Whatever it cannot
+        # split it refuses HERE, as can_split=False, not later in
+        # `_maybe_create_tbo_slices`: `can_split` is AND-reduced across DP so
+        # that one rank's refusal turns TBO off for everyone, and a rank that
+        # bailed out later would run 1 ubatch while its peers ran 2.
+        return _precompute_mixed_token_split(
+            num_scheduled_tokens,
+            batch.total_seqs_num,
+            batch.total_tokens_num_prefill,
+            envs.ATOM_TBO_PREFILL_MIN_TOKENS,
+        )
 
     if is_prefill:
         from atom.utils import envs

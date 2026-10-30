@@ -1470,6 +1470,82 @@ class TestLongPrefillTokenThreshold:
         assert list(batch2.num_scheduled_tokens) == [8]
 
 
+# ── mixed prefill+decode (decode-first budget reservation) ──────────────────
+
+
+class TestMixedDecodeFirst:
+    """Decode-first budget reservation: when --enable-mixed-prefill-decode is
+    on, a running decode reserves its token budget BEFORE new prefills spend
+    it, so a long prefill chunk cannot starve decode out of the step and a
+    mixed batch forms. Mirrors vLLM V1's running-before-waiting ordering."""
+
+    def _mixed_sched(self, **kw):
+        cfg = {
+            "enable_mixed_prefill_decode": True,
+            "enable_chunked_prefill": True,
+            "max_num_batched_tokens": 8,
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": 4,
+            "max_num_seqs": 8,
+        }
+        cfg.update(kw)
+        return Scheduler(MockConfig(**cfg))
+
+    def test_mixed_batch_forms_when_decode_inflight(self, seq_factory):
+        sched = self._mixed_sched()
+        # One seq reaches decode first.
+        d = seq_factory([1, 2, 3, 4])
+        sched.add(d)
+        sched.schedule()  # prefill d
+        d.num_cached_tokens = d.num_prompt_tokens
+        d.append_token(5)
+        # A long new prompt arrives; its full chunk (8) would, under the old
+        # prefill-first order, consume the entire budget and push decode out.
+        p = seq_factory([10, 11, 12, 13, 14, 15, 16, 17])
+        sched.add(p)
+        batch, _ = sched.schedule()
+        # Decode-first reservation (1 decode * 1 tok) leaves prefill_budget=7,
+        # so the prefill chunk shrinks and the decode row rides along: MIXED.
+        assert batch.is_mixed
+        assert batch.total_seqs_num_decode == 1
+        assert batch.total_seqs_num_prefill == 1
+
+    def test_mixed_batch_layout_prefill_first(self, seq_factory):
+        sched = self._mixed_sched()
+        d = seq_factory([1, 2, 3, 4])
+        sched.add(d)
+        sched.schedule()
+        d.num_cached_tokens = d.num_prompt_tokens
+        d.append_token(5)
+        p = seq_factory([10, 11, 12, 13, 14, 15, 16, 17])
+        sched.add(p)
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        # Runner/attention require [prefill rows | decode rows]: prefill row(s)
+        # lead, decode row(s) trail.
+        assert batch.req_ids[0] == p.id
+        assert batch.req_ids[-1] == d.id
+        # One decode seq -> exactly one trailing decode token.
+        assert batch.total_seqs_num_decode == 1
+        assert batch.total_tokens_num_decode == 1
+
+    def test_flag_off_is_prefill_first(self, seq_factory):
+        # With mixed OFF, scheduling a prefill yields a prefill-only batch even
+        # when a decode is in flight (byte-identical to legacy behavior).
+        sched = self._mixed_sched(enable_mixed_prefill_decode=False)
+        d = seq_factory([1, 2, 3, 4])
+        sched.add(d)
+        sched.schedule()
+        d.num_cached_tokens = d.num_prompt_tokens
+        d.append_token(5)
+        p = seq_factory([10, 11, 12, 13, 14, 15, 16, 17])
+        sched.add(p)
+        batch, _ = sched.schedule()
+        assert not batch.is_mixed
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 0
+
+
 # ── prefix caching ────────────────────────────────────────────────────────
 
 
@@ -2582,16 +2658,15 @@ class TestOffloadResumeAdmission:
     GENERATED = tuple(range(100, 112))  # owes 20 positions in total
 
     def _sched(self, **overrides):
-        sched = Scheduler(
-            MockConfig(
-                max_num_seqs=4,
-                max_num_batched_tokens=64,
-                num_kvcache_blocks=100,
-                kv_cache_block_size=4,
-                max_model_len=256,
-                **overrides,
-            )
-        )
+        cfg = {
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 64,
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": 4,
+            "max_model_len": 256,
+        }
+        cfg.update(overrides)
+        sched = Scheduler(MockConfig(**cfg))
         sched.kv_connector = SimpleNamespace(
             is_offload=True,
             build_connector_meta=lambda: None,
@@ -2688,6 +2763,29 @@ class TestOffloadResumeAdmission:
         _, scheduled = sched.schedule()
 
         assert behind.id in scheduled, "starved behind the offload resume"
+
+    def test_a_resume_leaves_the_decode_reserve(self, seq_factory):
+        """With mixed batching on, a resume spends only `prefill_budget`, like
+        a first admission: sized against the whole batch budget it took every
+        token and pushed the running decode out of the step."""
+        sched = self._sched(
+            enable_mixed_prefill_decode=True,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=16,
+        )
+        d = seq_factory([1, 2, 3, 4])
+        sched.add(d)
+        sched.schedule()
+        d.num_cached_tokens = d.num_prompt_tokens
+        d.append_token(5)
+        # Owes 16 positions: exactly the batch budget.
+        seq = self._parked(sched, seq_factory, cached=4)
+
+        batch, scheduled = sched.schedule()
+
+        assert seq.id in scheduled and d.id in scheduled
+        assert batch.is_mixed
+        assert int(batch.num_scheduled_tokens[0]) == 15
 
 
 # ── get_next_batch_info ────────────────────────────────────────────────────
@@ -3313,3 +3411,279 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     assert scheduler.total_finished_requests == 1
     scheduler.kv_connector.request_finished.assert_called_once_with(seq)
     scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)
+
+
+# ── mixed prefill+decode batch (Phase 2) ───────────────────────────────────
+
+
+class TestMixedBatch:
+    """Verify that --enable-mixed-prefill-decode merges prefill chunks and
+    decode seqs into one ScheduledBatch (Phase 2 of chunked prefill)."""
+
+    def _mixed_scheduler(self, **overrides):
+        cfg = {
+            "enable_mixed_prefill_decode": True,
+            "num_kvcache_blocks": 20,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 256,
+        }
+        cfg.update(overrides)
+        return Scheduler(MockConfig(**cfg))
+
+    def _prefill_only_scheduler(self, **overrides):
+        cfg = MockConfig(
+            enable_mixed_prefill_decode=False,
+            num_kvcache_blocks=20,
+            max_num_seqs=4,
+            max_num_batched_tokens=256,
+            **overrides,
+        )
+        return Scheduler(cfg)
+
+    def _ready_decode_seq(self, sched, seq_factory, token_ids):
+        seq = seq_factory(token_ids)
+        sched.add(seq)
+        sched.schedule()  # prefill
+        seq.num_cached_tokens = seq.num_prompt_tokens
+        seq.append_token(99)
+        return seq
+
+    def test_a_decode_never_preempts_a_prefill_scheduled_this_step(self, seq_factory):
+        """A mixed step admits its prefills first, at the tail of `running`. A
+        decode that then runs out of blocks must not preempt one of them: the
+        prefill would lose its blocks while staying in the batch, shifting
+        every decode row's block table onto its neighbour's pages."""
+        sched = self._mixed_scheduler(
+            num_kvcache_blocks=3,
+            kv_cache_block_size=4,
+            max_num_batched_tokens=16,
+            enable_chunked_prefill=True,
+        )
+        d = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        assert len(d.block_table) == 1  # its 5th token needs a second block
+        p = seq_factory([10, 11, 12, 13, 14, 15, 16, 17])
+        sched.add(p)
+
+        batch, scheduled = sched.schedule()
+
+        assert p.id in scheduled
+        assert p.status == SequenceStatus.RUNNING and p.block_table
+        # The decode gave way instead: preempted, not scheduled.
+        assert d.id not in scheduled and d.status == SequenceStatus.WAITING
+        assert len(batch.block_tables) == batch.total_seqs_num
+
+    def test_prefill_hash_registration_skips_a_mixed_batchs_decode_rows(
+        self, seq_factory
+    ):
+        """PP hashes a middle chunk's blocks outside postprocess
+        (`register_prefill_hashes`). A decode row is not a prompt chunk, so its
+        tokens never go into the prefix cache, whatever batch reaches here."""
+        sched = self._mixed_scheduler(enable_prefix_caching=True)
+        decode_seq = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        prefill_seq = seq_factory([5, 6, 7, 8])
+        sched.add(prefill_seq)
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        assert batch.req_ids == [prefill_seq.id, decode_seq.id]
+
+        with mock.patch.object(sched.block_manager, "hash_blocks") as hash_blocks:
+            sched.register_prefill_hashes(batch, list(sched.running))
+        assert [c.args[0] for c in hash_blocks.call_args_list] == [prefill_seq]
+
+    def test_reserve_skips_rows_whose_pp_token_is_in_flight(self):
+        """The decode loop skips a row whose PP token is in flight, so the
+        reserve does not hold its width back from prefill."""
+        sched = self._mixed_scheduler(max_num_batched_tokens=64, max_num_seqs=16)
+        sched.running.extend(
+            SimpleNamespace(id=i, is_partial_prefill=False) for i in range(6)
+        )
+        assert sched._prefill_budget() == 64 - 6
+        sched._pp_inflight_token_block.update({0, 1, 2})
+        assert sched._prefill_budget() == 64 - 3
+
+    def test_an_in_progress_prompt_keeps_a_chunk_under_a_full_reserve(
+        self, seq_factory
+    ):
+        """With more decodes than the batch budget the reserve would take all
+        of it, and a chunked prompt that already holds its blocks would get no
+        chunk until the decodes drain. It keeps `max_num_batched_tokens // 8`;
+        the decodes that do not fit wait a step, as on any full step."""
+        sched = self._mixed_scheduler(
+            max_num_batched_tokens=16, max_num_seqs=32, num_kvcache_blocks=200
+        )
+        for i in range(20):
+            self._ready_decode_seq(sched, seq_factory, [100 + i, 1, 2, 3])
+        prompt = seq_factory(list(range(200, 240)))  # 40 tokens: chunked
+        sched.add(prompt)
+        batch, _ = sched.schedule()
+        assert prompt.id in batch.req_ids
+        assert batch.num_scheduled_tokens[batch.req_ids.index(prompt.id)] >= 16 // 8
+
+    def test_mixed_final_prefill_chunk_completes_its_trace(self, seq_factory):
+        """With progress advanced at schedule time, a mixed step's final
+        prefill chunk closes its prefill span even though a decode row shares
+        the step: the loop covers prefill rows only, so the batch's decode
+        count says nothing about which rows are prefills."""
+        sched = self._mixed_scheduler()
+        decode_seq = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        sched.advance_on_schedule = True
+        prefill_seq = seq_factory([5, 6, 7, 8])
+        sched.add(prefill_seq)
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        assert batch.req_ids == [prefill_seq.id, decode_seq.id]
+
+        with mock.patch(
+            "atom.model_engine.scheduler.tracing.prefill_complete"
+        ) as prefill_complete:
+            sched.postprocess(
+                list(sched.running),
+                ScheduledBatchOutput(
+                    req_ids=[prefill_seq.id, decode_seq.id],
+                    token_ids=[(10,), (11,)],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                batch=batch,
+            )
+        prefill_complete.assert_called_once_with(prefill_seq)
+
+    def test_flag_off_full_budget_leaves_the_queue_order_alone(self, seq_factory):
+        """As on main: once the budget is full, the loop stops before popping
+        the next row, so a partial / PP-inflight row is not rotated to the
+        tail on the way out."""
+        sched = self._prefill_only_scheduler()
+        d1 = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        d2 = self._ready_decode_seq(sched, seq_factory, [5, 6, 7, 8])
+        x = self._ready_decode_seq(sched, seq_factory, [9, 10, 11, 12])
+        d3 = self._ready_decode_seq(sched, seq_factory, [13, 14, 15, 16])
+        sched.running = deque([d1, d2, x, d3])
+        x.is_partial_prefill = True  # skipped by the decode loop if reached
+        sched.max_num_batched_tokens = 2  # room for exactly d1 and d2
+
+        _, scheduled = sched.schedule()
+
+        assert set(scheduled) == {d1.id, d2.id}
+        assert [s.id for s in sched.running] == [d1.id, d2.id, x.id, d3.id]
+
+    def test_flag_off_keeps_batch_pure_prefill(self, seq_factory):
+        """Back-compat: without the flag, a step with both pending prefill and
+        running decode emits prefill-only (decode waits)."""
+        sched = self._prefill_only_scheduler()
+        self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        sched.add(seq_factory([5, 6, 7, 8]))  # new prefill
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 0
+        assert batch.is_mixed is False
+
+    def test_flag_on_produces_mixed_batch(self, seq_factory):
+        sched = self._mixed_scheduler()
+        self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        sched.add(seq_factory([5, 6, 7, 8]))  # new prefill
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 1
+        assert batch.is_mixed is True
+        # prefill rows come first, then decode rows
+        assert batch.num_scheduled_tokens[0] == 4  # prefill chunk
+        assert batch.num_scheduled_tokens[1] == 1  # decode token
+
+    def test_decode_loop_skips_seq_already_scheduled_as_prefill(self, seq_factory):
+        """A newly-added prefill seq must not also be picked by the decode
+        loop in the same step (it isn't in running, but guard the contract)."""
+        sched = self._mixed_scheduler()
+        decode_seq = self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        prefill_seq = seq_factory([5, 6, 7, 8])
+        sched.add(prefill_seq)
+        batch, _ = sched.schedule()
+        # Both seqs scheduled exactly once
+        assert len(batch.num_scheduled_tokens) == 2
+        ids = list(batch.req_ids) if hasattr(batch, "req_ids") else None
+        if ids is not None:
+            assert ids.count(decode_seq.id) == 1
+            assert ids.count(prefill_seq.id) == 1
+
+    def test_mixed_batch_decode_only_when_no_prefill(self, seq_factory):
+        """If no prefill is pending, mixed flag still produces a decode-only
+        batch (is_mixed False)."""
+        sched = self._mixed_scheduler()
+        self._ready_decode_seq(sched, seq_factory, [1, 2, 3, 4])
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 0
+        assert batch.total_seqs_num_decode == 1
+        assert batch.is_mixed is False
+
+    def test_mixed_batch_prefill_only_when_no_decode(self, seq_factory):
+        """If no decode is ready, flag still produces a prefill-only batch."""
+        sched = self._mixed_scheduler()
+        sched.add(seq_factory([5, 6, 7, 8]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+        assert batch.total_seqs_num_decode == 0
+        assert batch.is_mixed is False
+
+
+class TestMixedSpecDecodeReserve:
+    """Decode-first reserves what the decode loop spends, `decode_spec_width+1`.
+
+    The reserve used to be written against `mtp_k + 1` while the loop spent
+    `spec_width + 1`; they only agree when this engine verifies locally.
+    """
+
+    def _sched(self, mtp_k, **overrides):
+        return Scheduler(
+            MockConfig(
+                enable_mixed_prefill_decode=True,
+                num_kvcache_blocks=64,
+                max_num_seqs=4,
+                max_num_batched_tokens=16,
+                max_model_len=128,
+                speculative_config=_spec_config(mtp_k),
+                **overrides,
+            )
+        )
+
+    def test_spend_and_reserve_share_one_width(self):
+        assert self._sched(3).decode_spec_width == 3
+        # Drafting-only under PP: no draft rows are forwarded, none reserved.
+        assert self._sched(3, pipeline_parallel_size=2).decode_spec_width == 0
+
+    def test_a_pure_prefill_step_verifies_nothing(self, seq_factory):
+        """With the flag on a pure-prefill batch leaves through the decode
+        loop's fall-through, not the prefill-only return. It still verifies
+        nothing: under DP a block drafter MAX-reduces `num_spec_step + 1`, and
+        a prefill rank reporting the decode width widens its decoding peers."""
+        sched = self._sched(3)
+        sched.add(seq_factory([1, 2, 3, 4]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_decode == 0 and batch.total_seqs_num_prefill == 1
+        assert batch.num_spec_step == 0
+
+    def test_a_mixed_step_keeps_the_decode_width(self, seq_factory):
+        sched = self._sched(3)
+        decode = seq_factory([1, 2, 3, 4])
+        sched.add(decode)
+        sched.schedule()
+        decode.num_cached_tokens = decode.num_prompt_tokens
+        decode.append_token(99)
+        sched.add(seq_factory(list(range(10, 20))))
+        batch, _ = sched.schedule()
+        assert batch.is_mixed and batch.num_spec_step == 3
+
+    def test_mixed_step_fills_the_budget_exactly(self, seq_factory):
+        sched = self._sched(3)
+        decode = seq_factory([1, 2, 3, 4])
+        sched.add(decode)
+        sched.schedule()  # prefill
+        decode.num_cached_tokens = decode.num_prompt_tokens
+        decode.append_token(99)
+        sched.add(seq_factory(list(range(10, 40))))  # 30-token prompt: chunked
+        batch, _ = sched.schedule()
+        assert batch.is_mixed
+        # [prefill chunk | decode row]; the decode row forwards anchor + 3.
+        assert batch.num_scheduled_tokens[1] == 4
+        # 16 - one reserved row of 4 = 12 for prefill, and nothing left over.
+        assert batch.num_scheduled_tokens[0] == 12
+        assert batch.total_tokens_num == 16

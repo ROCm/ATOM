@@ -367,6 +367,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--data-parallel-size` | `-dp` | `int` | `1` | Data parallel size |
 | `--enforce-eager` | | flag | `False` | Enforce eager mode execution |
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
+| `--enable-mixed-prefill-decode` | | flag | `False` | Let one step carry prefill and decode rows together (DeepSeek-V4 only), so long prefills no longer stall running decodes. Works with DSpark and, with `--enable-tbo`, splits mixed steps into TBO micro-batches. Holds 5% of device memory back from the KV cache (`MIXED_KV_RESERVE_FRACTION`) for the activation and fragmentation a mixed step adds. Refused at launch for other attention families, TR_HYBRID cudagraph modes, speculative methods other than DSpark, spec + pipeline parallel, chunked prefill off, M-RoPE and prefill context parallel |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
 | `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
 | `--port` | | `int` | `8006` | Engine internal port |

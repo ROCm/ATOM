@@ -375,6 +375,19 @@
     "_baseline_note": "TBO + dp-attention at conc=1000. Local 1319-sample GSM8K 3-shot, 4 runs = 0.9439/0.9484/0.9538/0.9530 (mean ~0.950, 2026-06-14, after TBO ids-gather + pad_for_all_gather fixes). Baseline 0.95; threshold 0.93 (~1.4pp below lowest 0.9439, conc=1000 variance)."
   },
   {
+    "model_name": "DeepSeek-V4-Pro TBO+DPA+mixed conc1000",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --max-num-batched-tokens 2048 --trust-remote-code --gpu-memory-utilization 0.85 --no-enable_prefix_caching --max-model-len 9472",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=1000,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "The non-spec mixed path's gate: the 'DeepSeek-V4-Pro TBO+DPA conc1000' case plus --enable-mixed-prefill-decode and --max-num-batched-tokens 2048, nothing else. The small budget is what makes mixed steps happen at all: gsm8k's ~1k-token prompts, admitted at conc 1000 under the default 16384 budget, mostly prefill in steps of their own, while at 2048 a prompt is chunked and its chunks share steps with running decodes, so the mixed deferred input fill (`_stage_input_ids`), the per-segment attention and the non-spec LM-head gather all run. ATOM_TBO_PREFILL_MIN_TOKENS stays at its 8192 default, so no step this small takes the TBO prefill split; the mixed TBO split is the DSpark mixed case's to cover. (A 2048 budget together with a lowered TBO minimum drops GSM8K ~5 points on main itself, mixed or not: not a mixed effect, and not this configuration.) Threshold/baseline are the sibling's (0.93/0.95). Local validation (2026-10-30, commit 800a1148, g10 with 8x MI355X): this exact catalog case completed all 1319 GSM8K test questions, 3-shot, concurrency 1000, with no limit. Flexible-extract accuracy was 0.951478 (1255/1319); strict-match was 0.952237 (1256/1319). Trace recorded 393 mixed worker steps across the 8 DP workers. None used TBO splitting, as expected for mnbt 2048 below the default 8192 prefill threshold. The configured threshold/baseline remain 0.93/0.95."
+  },
+  {
     "model_name": "GLM-5.3-Flash-kpool-16shot",
     "model_path": "zai-org/GLM-5.3-Flash",
     "extraArgs": "--kv_cache_dtype bf16 -tp 8 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.85 --no-enable_prefix_caching",
@@ -412,5 +425,18 @@
     "accuracy_baseline": 0.9765,
     "accuracy_baseline_model": "zai-org/GLM-5.3",
     "_baseline_note": "Server args are the GLM-5.2-MXFP4 entry verbatim: the two checkpoints have byte-identical quantization_config, the same 1319-entry exclude list and the same 408 GB footprint, differing only in weights and a new moe_router_dtype key. Measured 2026-09-02, all 1319, chat 5-shot, temperature 0: flexible-extract=0.9765, strict-match=0.9773 -- level with the FP8 source (0.9719/0.9727), so MXFP4 costs nothing detectable here. Chat runs of this model have spanned 0.9719-0.9773 across five measurements, so 0.96 keeps ~1.6pp of headroom below the worst. The HF card ships this checkpoint with no evaluation at all. MUST run chat, not the default raw-completions client: GLM-5.3's template ends '<|assistant|><think>' and the server reports 'This chat template has no switch for reasoning', so few-shot completions suppress the reasoning the model is trained to do and score ~0.91 -- measured 0.9136 (MXFP4) and 0.9234 (FP8) over all 1319, which would fail this threshold on a healthy checkpoint. Chat 5-shot is also far steadier: two runs of identical code disagree on 13 of 1319 questions in chat versus 108 in 3-shot completions."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro DSpark TBO+DPA+mixed conc1000",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro-DSpark",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --method dspark --num-speculative-tokens 7 --enable-dp-attention --enable-tbo --enable-mixed-prefill-decode --dspark-config '{\"confidence_schedule\": true, \"ragged\": true, \"ragged_graph_sizes\": \"8\"}' --max-num-batched-tokens 16384 --trust-remote-code --gpu-memory-utilization 0.85 --no-enable_prefix_caching --max-model-len 9472",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "client_command": "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=1000,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot 3 --output_path ${OUTPUT_PATH}",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "nightly",
+    "accuracy_threshold": 0.93,
+    "accuracy_baseline": 0.95,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "_baseline_note": "DSpark speculative decode (7 tokens) inside mixed prefill+decode batches with TBO splitting them: the 'DeepSeek-V4-Pro DSpark' recipe plus --enable-tbo --enable-mixed-prefill-decode, on this case's conc-1000 client. No --cudagraph-mode, so it runs the CLI default FULL (EngineArgs.cudagraph_mode), unlike the DSpark sibling's TR_HYBRID: V4 refuses mixed under TR_HYBRID (Config._validate_mixed_prefill_decode), whose narrow split order has no mixed form. Config only falls back to TR_HYBRID at level 3 when no mode is given at all, which the CLI never does. Threshold/baseline are the non-mixed 'DeepSeek-V4-Pro TBO+DPA conc1000' case's (0.93/0.95): spec decode is lossless w.r.t. the target, and mixed is not meant to move the score. The non-spec mixed path has its own gate, 'DeepSeek-V4-Pro TBO+DPA+mixed conc1000'. Local validation (2026-10-30, commit 800a1148, g10 with 8x MI355X): this exact catalog case completed all 1319 GSM8K test questions, 3-shot, concurrency 1000, with no limit. Both flexible-extract and strict-match accuracy were 0.955269 (1260/1319). Trace recorded 38 mixed worker steps across the 8 DP workers, including 35 with TBO splitting and 3 with decode-query shrinking. Fresh-server metrics over the complete evaluation recorded 97535 accepted / 207312 drafted tokens (47.0474%) and average tokens per forward 4.293321. These acceptance metrics include all decode steps, not only mixed steps. mtp_accept_threshold remains omitted until repeated CI runs establish a robust V4-Pro-DSpark threshold. Mixed exposure at the 16384 budget varies with request timing; check the mixed-batch trace in each run."
   }
 ]

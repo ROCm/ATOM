@@ -17,6 +17,7 @@ def _hash(**overrides):
         "prefill_context_parallel_size": 1,
         "dcp_config": None,
         "enable_dp_attention": False,
+        "enable_mixed_prefill_decode": False,
         "index_cache_dtype": None,
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
@@ -38,3 +39,7 @@ def test_hash_changes_with_max_model_len():
 
 def test_hash_changes_with_max_num_seqs():
     assert _hash(max_num_seqs=512) != _hash()
+
+
+def test_hash_changes_with_mixed_prefill_decode():
+    assert _hash(enable_mixed_prefill_decode=True) != _hash()
