@@ -630,3 +630,24 @@ Set on the decode side; the prefill side follows what each write request offers 
 | **ATOM_MORIIO_VERIFY** | bool | 0 | Debugging. Digest each layer's destination blocks before and after every receive and log, per request, the layers the transfer left unchanged. Costs a device sync per request, and allocates an int64 weight per destination byte (about 150 MB for a 32k-token MLA fp8 prompt) on the worker loop, so it is not meant for runs under load. |
 
 A failed receive, in either mode, holds its blocks `ATOM_PD_FAILED_WRITE_HOLD_S` before the failure is reported: MoRI marks a batch failed on its first failed work request while the rest of it may still be in flight.
+
+### MiniMax PP-to-TP KV landing
+
+`ATOM_PD_MHA_LANDING=1` enables byte-preserving PAGE gather on MiniMax M3
+TP1 producers and GPU landing/scatter on TP-sharded consumers without DCP.
+Default: `0`. It is independent of `enable_chunked_transfer`; both whole-prompt
+and incremental transfers are supported. P reserves one 8 MiB staging slot per
+send worker, capped at 256 MiB per GPU. Each D GPU reserves 256 MiB for landing
+plus 96 KiB for the scatter table, before KV cache sizing. Other models, DCP,
+and slot-state layouts retain their existing support gates.
+
+Transfers needing fewer than two landing slots, or with no available credit
+after 10 ms, use gathered data for direct PAGE writes.
+
+MLA and MiniMax use the same staging pool lifecycle, landing receiver and
+transport implementation. The peer topology determines ownership; physical
+region metadata determines gather/scatter addressing. The switches above keep
+their existing defaults and supported configurations. An uncertain staged RDMA
+failure retains its source slot until connector teardown and disables further
+staging on that connector; later requests use the existing direct path. A write
+that finishes or stops before submission releases its slot normally.
