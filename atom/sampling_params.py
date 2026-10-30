@@ -1,7 +1,76 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+
+UNCONSTRAINED = -1
+"""The channel state of a sequence whose request requires no channel."""
+
+
+@dataclass(frozen=True)
+class RequiredChannel:
+    """A channel the output must open before it may end.
+
+    A tool-call format builds one for ``tool_choice="required"``. Kimi-K3
+    closes its response channel with ``after`` and then either opens the tools
+    channel or closes the message; a required call must do the former. The
+    sampler holds the output to it on the GPU, on the target logits:
+
+    - until ``opening`` is complete, no id in ``end_ids`` can be sampled;
+    - once the output ends with ``after``, the next ``len(opening)`` tokens
+      are ``opening``.
+
+    A sequence's state is how far its output has got. ``0 .. len(after) - 1``
+    is how much of ``after`` it currently ends with; ``len(after) + i`` means
+    the next token is ``opening[i]``; ``open_state`` means the channel is open
+    and nothing is constrained any more. The state counts generated tokens
+    only, so a sequence starts at 0 whatever its prompt ends with.
+    """
+
+    after: tuple[int, ...]
+    opening: tuple[int, ...]
+    end_ids: tuple[int, ...]
+
+    def __post_init__(self):
+        if not self.after or not self.opening:
+            raise ValueError("a required channel needs both `after` and `opening`")
+        # On a mismatch `step` restarts the match at 1 or 0. That is the whole
+        # KMP failure function only while the first token of `after` does not
+        # recur in it.
+        if self.after[0] in self.after[1:]:
+            raise ValueError(
+                f"`after` may not repeat its first token, got {self.after}"
+            )
+
+    @property
+    def open_state(self) -> int:
+        return len(self.after) + len(self.opening)
+
+    @property
+    def table(self) -> tuple[int, ...]:
+        """``after + opening + end_ids``, the layout the GPU reads.
+
+        Below ``open_state`` a state indexes the token it waits for (while
+        matching ``after``) or forces (while opening)."""
+        return self.after + self.opening + self.end_ids
+
+    def step(self, state: int, token_id: int) -> int:
+        """The state after ``token_id``. The GPU kernels make the same moves."""
+        if state < 0:
+            return state
+        if state < len(self.after):
+            if token_id == self.after[state]:
+                return state + 1
+            return 1 if token_id == self.after[0] else 0
+        # Forced tokens advance the state whatever they are: a row that saw a
+        # different one is a rejected draft, whose state nobody reads.
+        return min(state + 1, self.open_state)
+
+    def advance(self, state: int, token_ids: Iterable[int]) -> int:
+        for token_id in token_ids:
+            state = self.step(state, int(token_id))
+        return state
 
 
 @dataclass
@@ -19,6 +88,9 @@ class SamplingParams:
     # outputs diverge when temperature > 0.
     n: int = 1
     logprobs: bool | int | None = None
+    # Set by the server for `tool_choice="required"` when the tool-call format
+    # defines one (Kimi-K3 only); None leaves the output unconstrained.
+    required_channel: RequiredChannel | None = None
 
     def __post_init__(self):
         # 0 also means disabled, as in vLLM/SGLang; MLPerf Endpoints workloads send it
