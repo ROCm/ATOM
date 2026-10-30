@@ -1497,7 +1497,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             self._index_q = None
             self._index_q_cache_key_info = (
                 (num_tokens, self.num_idx_heads, self.index_head_dim),
-                qkv.dtype,
+                (
+                    torch.float8_e4m3fn
+                    if self.index_mxfp4 and envs.ATOM_M3_INDEX_Q_FP8
+                    else qkv.dtype
+                ),
                 qkv.device,
             )
             return q, k, v, k_cache, v_cache, k_scale, v_scale

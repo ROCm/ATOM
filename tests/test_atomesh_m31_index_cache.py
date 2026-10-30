@@ -96,7 +96,11 @@ class IndexCacheRecipeTest(unittest.TestCase):
 
     def test_twenty_shot_pair_changes_only_prompt_shots_from_five_shot(self):
         expanded = cells("accuracy")
-        pair = [c for c in expanded if "-gsm8k-20shot-" in c["name"]]
+        pair = [
+            c
+            for c in expanded
+            if "-gsm8k-20shot-" in c["name"] and "index-freq" in c["name"]
+        ]
         self.assertEqual(len(pair), 2)
         normalized = []
         for cell in pair:

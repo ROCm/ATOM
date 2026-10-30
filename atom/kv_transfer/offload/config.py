@@ -420,6 +420,14 @@ def build_page_namespace(
     draft_window = _draft_kv_window(config)
     if draft_window:
         document["draft_kv_window"] = draft_window
+    if _is_minimax_m3(hf):
+        from atom.utils import envs
+
+        document["m3_sparse_kv_format"] = (
+            "mxfp4"
+            if envs.ATOM_M3_SPARSE_KV_MXFP4
+            else "nvfp4" if envs.ATOM_M3_SPARSE_KV_NVFP4 else "shuffle"
+        )
     canonical = json.dumps(
         document,
         sort_keys=True,
