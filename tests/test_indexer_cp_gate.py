@@ -112,6 +112,7 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         sequence_parallel_size=1,
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,
+        enable_mixed_prefill_decode=False,
         index_cache_dtype="fp8",
         index_cache_layout=None,
         hf_config=SimpleNamespace(),
