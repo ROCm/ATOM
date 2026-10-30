@@ -3456,8 +3456,8 @@ class ModelRunner:
             # Undeferred: report THIS step's counts; the next batch carries them
             # back for linear-attention state rollback. Zeros if no drafts scored.
             if spec_decode_metadata is not None:
-                prev_rejected_num = num_reject_tokens.cpu().numpy().astype(np.int32)
-                prev_bonus_num = num_bonus_tokens.cpu().numpy().astype(np.int32)
+                # One D2H for both rows of the int32 [bonus, rejected] verdict.
+                prev_bonus_num, prev_rejected_num = spec_counts.cpu().numpy()
             else:
                 prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
                 prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
