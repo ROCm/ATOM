@@ -1080,14 +1080,14 @@ class MooncakeConnector(KVConnectorBase):
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
         # Shared transport buffers; the plan owns topology and byte addressing.
-        self._kv_staging = None
+        self._kv_staging: torch.Tensor | None = None
         self._kv_staging_slots = SlotPool()
         self._kv_source_views = {}
         self._kv_staging_failed = False
         self._kv_staging_reserve = staging_reserve_bytes(config)
         self._page_staging_enabled = bool(mha_staging_reserve_bytes(config))
         self._send_worker_streams = threading.local()
-        self._landing = None
+        self._landing: LandingReceiver | None = None
         self._landing_spec = landing_spec(config)
         self._landing_credits = LandingCredits() if self.is_producer else None
 

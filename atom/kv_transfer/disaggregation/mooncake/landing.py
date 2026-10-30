@@ -280,6 +280,7 @@ class LandingReceiver:
             torch.device("cpu") if device is None else torch.device("cuda", device)
         )
         self.slot_bytes = slot_bytes
+        # Transfer units per KV page: block_size for token rows, 1 for whole PAGEs.
         self.units_per_page = units_per_page
         self.consumer_key = consumer_key
         self.epoch = int.from_bytes(os.urandom(7), "big")
