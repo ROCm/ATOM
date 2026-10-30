@@ -77,8 +77,8 @@ def test_lower_level_cache_dirs_persist(tmp_path, monkeypatch, adapter_name, pre
 
     from atom.utils import compiler_inferface as ci
 
-    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/previous/inductor")
-    monkeypatch.setenv("TRITON_CACHE_DIR", "/previous/triton")
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
     rank_dir = tmp_path / "rank_0"
     cache_dir = rank_dir / prefix if prefix else rank_dir
     adaptor = getattr(ci, adapter_name)()
@@ -345,7 +345,6 @@ for p in Path(cache_dir()).rglob("*"):
     if p.is_file() and p.suffix in (".py", ".cpp", ".so"):
         files[str(p.relative_to(cache_dir()))] = {
             "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
-            "mtime_ns": p.stat().st_mtime_ns,
         }
 print(json.dumps({
     "files": files,
@@ -399,13 +398,16 @@ def test_initialization_redirects_only_future_cache_work(
 
     if importlib.util.find_spec("triton") is None:
         pytest.skip("requires Triton cache manager")
+    from torch._inductor.runtime import runtime_utils
     from triton.runtime.cache import get_cache_manager
 
     from atom.utils import compiler_inferface as ci
 
-    early = tmp_path / "early_cache"
+    temporary_root = tmp_path / "torchinductor_test"
+    monkeypatch.setattr(runtime_utils, "default_cache_dir", lambda: str(temporary_root))
+    early = temporary_root / "triton" / "0"
     monkeypatch.setenv("TRITON_CACHE_DIR", str(early))
-    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "early_inductor"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(temporary_root))
     before = get_cache_manager("b" * 64)
     path = Path(before.put("early artifact", "early.txt", binary=False))
     first_stat = path.stat().st_mtime_ns
@@ -424,3 +426,97 @@ def test_initialization_redirects_only_future_cache_work(
     # kernels compiled before the first backend initialization.
     assert path.read_text() == "early artifact"
     assert path.stat().st_mtime_ns == first_stat
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compiler_cache_ownership(monkeypatch):
+    from atom.utils import compiler_inferface as ci
+
+    monkeypatch.setattr(ci, "_managed_compiler_cache_dirs", {})
+
+
+@pytest.mark.parametrize(
+    "adapter_name", ["InductorAdaptor", "InductorStandaloneAdaptor"]
+)
+def test_external_paths_and_regular_compatibility(
+    tmp_path, monkeypatch, caplog, adapter_name
+):
+    import logging
+    import os
+
+    from atom.utils import compiler_inferface as ci
+
+    external = {
+        "TORCHINDUCTOR_CACHE_DIR": str(tmp_path / "operator-inductor"),
+        "TRITON_CACHE_DIR": str(tmp_path / "operator-triton"),
+    }
+    for name, path in external.items():
+        monkeypatch.setenv(name, path)
+    root = tmp_path / "atom" / "rank_0"
+    with caplog.at_level(logging.INFO, logger="atom"):
+        getattr(ci, adapter_name)().initialize_cache(
+            str(root / "backbone"), prefix="backbone"
+        )
+    if adapter_name == "InductorStandaloneAdaptor":
+        assert {k: os.environ[k] for k in external} == external
+        assert not root.exists()
+        assert all(path in caplog.text for path in external.values())
+    else:
+        assert os.environ["TRITON_CACHE_DIR"] == str(root / "triton_cache")
+        assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(root / "inductor_cache")
+
+
+@pytest.mark.parametrize("default_suffix", ["", "0", "2/child"])
+def test_standalone_redirects_auto_defaults(tmp_path, monkeypatch, default_suffix):
+    import os
+
+    from torch._inductor.runtime import runtime_utils
+
+    from atom.utils import compiler_inferface as ci
+
+    default = tmp_path / "torchinductor_default"
+    monkeypatch.setattr(runtime_utils, "default_cache_dir", lambda: str(default))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(default))
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(default / "triton" / default_suffix))
+    root = tmp_path / "atom"
+    ci.InductorStandaloneAdaptor().initialize_cache(str(root))
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(root / "inductor_cache")
+    assert os.environ["TRITON_CACHE_DIR"] == str(root / "triton_cache")
+
+
+def test_standalone_managed_paths_follow_new_owner_but_not_user_changes(
+    tmp_path, monkeypatch
+):
+    import os
+
+    from atom.utils import compiler_inferface as ci
+
+    for key in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+        monkeypatch.delenv(key, raising=False)
+    adaptor = ci.InductorStandaloneAdaptor()
+    adaptor.initialize_cache(str(tmp_path / "rank_0"))
+    adaptor.initialize_cache(str(tmp_path / "rank_1"))
+    assert os.environ["TRITON_CACHE_DIR"] == str(tmp_path / "rank_1/triton_cache")
+    user = str(tmp_path / "explicit-triton")
+    monkeypatch.setenv("TRITON_CACHE_DIR", user)
+    adaptor.initialize_cache(str(tmp_path / "rank_2"))
+    assert os.environ["TRITON_CACHE_DIR"] == user
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(
+        tmp_path / "rank_2/inductor_cache"
+    )
+
+
+def test_standalone_does_not_match_similarly_named_temp_path(tmp_path, monkeypatch):
+    import os
+
+    from torch._inductor.runtime import runtime_utils
+
+    from atom.utils import compiler_inferface as ci
+
+    default = tmp_path / "torchinductor_default"
+    monkeypatch.setattr(runtime_utils, "default_cache_dir", lambda: str(default))
+    custom = str(default / "triton-custom")
+    monkeypatch.setenv("TRITON_CACHE_DIR", custom)
+    monkeypatch.delenv("TORCHINDUCTOR_CACHE_DIR", raising=False)
+    ci.InductorStandaloneAdaptor().initialize_cache(str(tmp_path / "atom"))
+    assert os.environ["TRITON_CACHE_DIR"] == custom

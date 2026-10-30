@@ -281,39 +281,78 @@ class AlwaysHitShapeEnv:
         return ""
 
 
-def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
-    """Keep lower-level compiler artifacts beside ATOM's graph cache.
+_managed_compiler_cache_dirs: dict[str, str] = {}
 
-    Saving a standalone graph does not persist Triton kernels compiled inside
-    eager/custom-op regions. Without these directories they can land under
-    /tmp/torchinductor_<user> and be recompiled in each fresh container.
-    Use the same rank-owned directory for the regular and standalone adaptors.
-    Preserve the regular adaptor's redirection policy, rather than setdefault:
-    PyTorch can already have populated these variables with temporary paths.
-    This affects future compiler work only; earlier artifacts are not moved.
+
+def _is_default_compiler_cache(name: str, path: str) -> bool:
+    """Recognize PyTorch's temporary defaults, not arbitrary user temp paths."""
+    from torch._inductor.runtime.runtime_utils import default_cache_dir
+
+    root = os.path.abspath(default_cache_dir())
+    path = os.path.abspath(path)
+    if name == "TORCHINDUCTOR_CACHE_DIR":
+        return path == root
+    triton_root = os.path.join(root, "triton")
+    try:
+        return os.path.commonpath((path, triton_root)) == triton_root
+    except ValueError:
+        return False
+
+
+def _initialize_inductor_cache_dirs(
+    base_cache_dir: str, *, preserve_user_paths: bool = False
+) -> None:
+    """Redirect future compiler work; preserve standalone caller-owned caches.
+
+    Standalone may inherit defaults installed by PyTorch before the backend
+    runs. Redirect those defaults, unset values, and paths we set ourselves.
+    Respect other existing values (e.g. atomesh deployment configuration).
+    The regular adaptor retains its historical unconditional redirection.
+    Earlier artifacts are not migrated. Level-0 execution bypasses this
+    backend and should configure its cache environment at process startup.
     """
-    inductor_cache = os.path.join(base_cache_dir, "inductor_cache")
-    os.makedirs(inductor_cache, exist_ok=True)
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
-    triton_cache = os.path.join(base_cache_dir, "triton_cache")
-    os.makedirs(triton_cache, exist_ok=True)
-    os.environ["TRITON_CACHE_DIR"] = triton_cache
+    for name, subdir in (
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor_cache"),
+        ("TRITON_CACHE_DIR", "triton_cache"),
+    ):
+        previous = os.environ.get(name)
+        managed = previous is not None and previous == _managed_compiler_cache_dirs.get(
+            name
+        )
+        if (
+            preserve_user_paths
+            and previous is not None
+            and not managed
+            and not _is_default_compiler_cache(name, previous)
+        ):
+            continue
+        selected = os.path.join(base_cache_dir, subdir)
+        os.makedirs(selected, exist_ok=True)
+        os.environ[name] = selected
+        _managed_compiler_cache_dirs[name] = selected
     logger.info(
         "Compiler cache directories: Inductor=%s, Triton=%s",
-        inductor_cache,
-        triton_cache,
+        os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+        os.environ.get("TRITON_CACHE_DIR"),
     )
 
 
 def _initialize_inductor_cache(
-    adaptor, cache_dir: str, disable_cache: bool, prefix: str
+    adaptor,
+    cache_dir: str,
+    disable_cache: bool,
+    prefix: str,
+    *,
+    preserve_user_paths: bool = False,
 ) -> None:
-    """Initialize shared cache ownership metadata before redirecting compilers."""
+    """Initialize shared ownership metadata before redirecting compilers."""
     adaptor.cache_dir = cache_dir
     adaptor.prefix = prefix
     adaptor.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
     if not disable_cache:
-        _initialize_inductor_cache_dirs(adaptor.base_cache_dir)
+        _initialize_inductor_cache_dirs(
+            adaptor.base_cache_dir, preserve_user_paths=preserve_user_paths
+        )
 
 
 def get_inductor_factors() -> list[Any]:
@@ -696,7 +735,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ):
-        _initialize_inductor_cache(self, cache_dir, disable_cache, prefix)
+        _initialize_inductor_cache(
+            self, cache_dir, disable_cache, prefix, preserve_user_paths=True
+        )
 
     def compile(
         self,
