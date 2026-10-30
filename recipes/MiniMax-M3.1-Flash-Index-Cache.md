@@ -65,10 +65,15 @@ only these HF overrides and its case identity.
 | Suite | Case suffix after `minimax-m31-flash-mxfp4-tp4-` | Workload |
 | --- | --- | --- |
 | accuracy | `index-freq1-gsm8k-c32`, `index-freq4-gsm8k-c32` | Full GSM8K, 5-shot, max 16,384 generated tokens |
+| accuracy | `index-freq1-gsm8k-20shot-c32`, `index-freq4-gsm8k-20shot-c32` | Full GSM8K, 20-shot, max 16,384 generated tokens |
 | accuracy | `index-freq1-aime24-c32`, `index-freq4-aime24-c32` | Full AIME24, 0-shot, max 32,768 generated tokens |
 | mooncake_store | `index-freq1-mcstore-agentx-c32`, `index-freq4-mcstore-agentx-c32` | C32, AgentX 1.0.12, 3600 seconds after warmup |
 
 Accuracy uses real DSpark acceptance, chat templates and concurrency 32.
+The 20-shot pair inherits the 5-shot launch and evaluation settings, changing
+only `accuracy.fewshot` and the case identity. It adds longer prompts to exercise
+selection beyond the 16 x 128-token index budget. Retain the exported prompts
+and check their actual token lengths when reviewing the scores.
 Performance retains synthetic AL 4.04, 1 TiB Store (two 512 GiB owners), RDMA
 P→D, `semianalysis_cc_traces_weka_062126`, and no torch profiler. Report
 throughput/GPU against all eight physical GPUs. Synthetic acceptance cannot

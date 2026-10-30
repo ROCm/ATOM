@@ -75,14 +75,17 @@ class IndexCacheRecipeTest(unittest.TestCase):
 
     def test_both_accuracy_tasks_have_matched_full_dataset_pairs(self):
         pair = [c for c in cells("accuracy") if "index-freq" in c["name"]]
-        self.assertEqual(len(pair), 4)
+        self.assertEqual(len(pair), 6)
         for c in pair:
             self.assertTrue(c["eval_only"])
             for env in c["env"].values():
                 self.assertNotIn("ATOMESH_DROP_HOST_CACHES", env)
             self.assertIsNone(c["accuracy"]["limit"])
             task = c["accuracy"]["task"]
-            self.assertEqual(c["accuracy"]["fewshot"], 5 if task == "gsm8k" else 0)
+            fewshot = 20 if "-20shot-" in c["name"] else 5
+            self.assertEqual(
+                c["accuracy"]["fewshot"], fewshot if task == "gsm8k" else 0
+            )
             for role in ("prefill", "decode"):
                 self.assertNotIn("spec_decode_acceptance_length", c["server_args"])
                 overrides = json.loads(c["server_args"]["hf_overrides"])
@@ -90,6 +93,30 @@ class IndexCacheRecipeTest(unittest.TestCase):
                 self.assertEqual(
                     overrides, {"use_index_cache": freq == 4, "index_topk_freq": freq}
                 )
+
+    def test_twenty_shot_pair_changes_only_prompt_shots_from_five_shot(self):
+        expanded = cells("accuracy")
+        pair = [c for c in expanded if "-gsm8k-20shot-" in c["name"]]
+        self.assertEqual(len(pair), 2)
+        normalized = []
+        for cell in pair:
+            c = copy.deepcopy(cell)
+            old = copy.deepcopy(
+                next(
+                    x for x in expanded if x["name"] == c["name"].replace("-20shot", "")
+                )
+            )
+            for item in (c, old):
+                item.pop("id")
+                item.pop("name")
+            self.assertEqual(c["accuracy"]["fewshot"], 20)
+            self.assertEqual(c["accuracy"]["max_gen_toks"], 16384)
+            self.assertTrue(c["accuracy"]["fewshot_as_multiturn"])
+            c["accuracy"]["fewshot"] = 5
+            self.assertEqual(c, old)
+            c["server_args"].pop("hf_overrides")
+            normalized.append(c)
+        self.assertEqual(normalized[0], normalized[1])
 
 
 if __name__ == "__main__":
