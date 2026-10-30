@@ -1383,7 +1383,7 @@ models:
           topology: 1p1d_pp8_dcp8
           display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK4
           concurrency: [32]
-          prefill:
+          prefill: &kimi_k3_pp8_prefill
             workers: 1
             tp: 1
             extra_args: >-
@@ -1632,6 +1632,24 @@ models:
               ATOM_WARMUP_GEMM_M_BUCKETS: "0"
               OFFLOAD_STATE_CPU_SIZE: "64"
             decode: *kimi_k3_pd_opus_decode_env_test
+
+        # Test only: c128-opus with a second PP8 prefill node (three nodes).
+        # The router pins each session to one prefill, so a session's prefix
+        # stays on the node that cached it.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-2p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c128-opus
+          topology: 2p1d_pp8_dcp8
+          display_topology: 2P1D-PP8-DCP8-TP1-TP8-DSPARK4
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [128]
+          prefill:
+            <<: *kimi_k3_pp8_prefill
+            workers: 2
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 256
+          env: *kimi_k3_pp8_opus_hiconc_env_test
 
         # Test only: c88-opus with the decode's MLA heads folded into 3x32
         # pseudo-requests on the default kernel instead of OPUS.
