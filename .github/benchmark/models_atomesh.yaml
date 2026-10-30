@@ -1108,18 +1108,19 @@ models:
                 # tier. The CONC 1-4 prefills park nothing, and the PP8
                 # prefills ignore the setting.
                 ATOM_KV_POLL_FRESH_WAIT_MS: "5"
-              # Overrides the merged "0" on purpose: this is the only cell that
-              # runs mono.
-              ATOM_MONO_ENABLE: "1"
               ATOM_GDN_SSM_DTYPE: fp32
             prefill: &kimi_k3_pd_prefill_env
               # Hand decode the prompt ids as base64 int32, not a JSON list
               # that every hop re-parses (~670K ints at 1M context).
               ATOM_PD_PROMPT_IDS_B64: "1"
-            decode: &kimi_k3_pd_decode_env
-              # Stream the prefill's first token when the request's KV lands,
-              # not with the first local decode's deferred output.
-              ATOM_PD_EARLY_T0: "1"
+            decode:
+              <<: &kimi_k3_pd_decode_env
+                # Stream the prefill's first token when the request's KV
+                # lands, not with the first local decode's deferred output.
+                ATOM_PD_EARLY_T0: "1"
+              # Overrides the common "0" on purpose: this is the only cell that
+              # runs mono, and only its decode does.
+              ATOM_MONO_ENABLE: "1"
 
         - <<: *kimi_k3_agentic_tp8
           name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c2

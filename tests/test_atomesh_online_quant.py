@@ -120,10 +120,14 @@ class SubmitOnlineQuantTest(unittest.TestCase):
         )
         self.assertNotIn("_shell", exports)
 
-    def test_extras_without_a_config_fail_the_cell(self):
-        cell = copy.deepcopy(self.cell)
-        cell["server_args"].pop("online_quant_config", None)
-        cell["service"]["decode"]["online_quant_extra_exclude_layer"] = ["x"]
+    def test_a_single_pattern_is_one_pattern(self):
+        exports = self.exports(decode_extra="*self_attn.o_proj*")
+        self.assertEqual(
+            self.excludes(exports, "DECODE"), ["lm_head", "*self_attn.o_proj*"]
+        )
+        self.assertEqual(self.excludes(exports, "PREFILL"), ["lm_head"])
+
+    def assert_cell_fails(self, cell, reason):
         result = subprocess.run(
             [sys.executable, "-c", self.mapping],
             env=dict(os.environ, CELL_JSON=json.dumps(cell)),
@@ -133,8 +137,20 @@ class SubmitOnlineQuantTest(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("without an online_quant_config", result.stdout)
+        self.assertIn(reason, result.stdout)
         self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
+
+    def test_extras_without_a_config_fail_the_cell(self):
+        cell = copy.deepcopy(self.cell)
+        cell["server_args"].pop("online_quant_config", None)
+        cell["service"]["decode"]["online_quant_extra_exclude_layer"] = ["x"]
+        self.assert_cell_fails(cell, "without an online_quant_config")
+
+    def test_a_config_that_is_not_an_object_fails_the_cell(self):
+        cell = copy.deepcopy(self.cell)
+        cell["server_args"]["online_quant_config"] = json.dumps(["lm_head"])
+        cell["service"]["decode"]["online_quant_extra_exclude_layer"] = ["x"]
+        self.assert_cell_fails(cell, "is a JSON list, not an object")
 
 
 class LaunchOnlineQuantTest(unittest.TestCase):

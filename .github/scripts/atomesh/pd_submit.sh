@@ -112,14 +112,21 @@ def fail(reason):
     print("exit 1")
     raise SystemExit(1)
 
+def as_list(value):
+    """As pd_matrix.normalize_list: a single pattern is a list of one, not of
+    its characters."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
 def role_online_quant_config(role, role_cfg):
     """The role's --online_quant_config: the shared one, with the shared and
     the role's `online_quant_extra_exclude_layer` appended to its exclude_layer.
     A role's own key keeps its exclusions off the other role's command line."""
     config = server_args.get("online_quant_config", "")
     extra = [
-        *(server_args.get("online_quant_extra_exclude_layer") or []),
-        *(role_cfg.get("online_quant_extra_exclude_layer") or []),
+        *as_list(server_args.get("online_quant_extra_exclude_layer")),
+        *as_list(role_cfg.get("online_quant_extra_exclude_layer")),
     ]
     if not extra:
         return config
@@ -129,11 +136,16 @@ def role_online_quant_config(role, role_cfg):
             "without an online_quant_config to extend"
         )
     try:
-        parsed = json.loads(config) if isinstance(config, str) else dict(config)
+        parsed = json.loads(config) if isinstance(config, str) else config
     except ValueError as exc:
         fail(f"ERROR: {cell['id']} online_quant_config is not JSON: {exc}")
-    parsed["exclude_layer"] = [*parsed.get("exclude_layer", []), *extra]
-    return json.dumps(parsed, separators=(",", ":"))
+    if not isinstance(parsed, dict):
+        fail(
+            f"ERROR: {cell['id']} online_quant_config is a JSON "
+            f"{type(parsed).__name__}, not an object"
+        )
+    exclude = [*as_list(parsed.get("exclude_layer")), *extra]
+    return json.dumps({**parsed, "exclude_layer": exclude}, separators=(",", ":"))
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
 is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"
