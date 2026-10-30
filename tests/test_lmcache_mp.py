@@ -1193,11 +1193,8 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
     save_future = worker._pending_saves["save:11:2"].future
     load_future.query_error = RuntimeError("load query failed")
     save_future.query_error = RuntimeError("save query failed")
-    output = worker.get_finished()
-
-    assert output.finished_loading == set()
-    assert output.failed_loading == set()
-    assert output.finished_saving == set()
+    with pytest.raises(transfer.LMCacheTransferUnprovable, match="save query failed"):
+        worker.get_finished()
     assert set(worker._pending_loads) == {"load:10:1"}
     assert set(worker._pending_saves) == {"save:11:2"}
 
@@ -1369,21 +1366,26 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
     assert len(pending) == 1
 
 
-def test_worker_future_that_keeps_raising_is_bounded_by_the_deadline(
+@pytest.mark.parametrize("kind", ["load", "save"])
+def test_worker_failed_future_stops_immediately_without_releasing_lease(
     fake_lmcache_modules,
     monkeypatch,
+    kind,
 ):
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
-    worker._submit_save(_unprovable_request("save"), object())
-    [pending] = worker._pending_saves.values()
+    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), object())
+    operations = getattr(worker, f"_pending_{kind}s")
+    [pending] = operations.values()
     pending.future.query_error = ConnectionError("IPC context torn down")
 
-    assert not worker.get_finished().finished_saving
-    now[0] += worker._transfer_deadline_s
-    with pytest.raises(transfer.LMCacheTransferUnprovable):
+    with pytest.raises(
+        transfer.LMCacheTransferUnprovable, match="IPC context torn down"
+    ):
         worker.get_finished()
+    assert list(operations.values()) == [pending]
+    assert now[0] == 1000.0
 
 
 def test_worker_invalid_descriptor_fails_before_transport(

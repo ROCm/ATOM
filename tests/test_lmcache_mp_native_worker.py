@@ -422,12 +422,15 @@ def test_load_completion_waits_for_native_restore(worker, monkeypatch):
 
 
 def test_query_exception_never_releases_dma_source(worker):
+    from atom.kv_transfer.offload.mp.transfer import LMCacheTransferUnprovable
+
     def broken():
         raise RuntimeError("IPC event unavailable")
 
     worker.future.query = broken
     worker._submit_save(request(), object())
-    assert not worker.get_finished().connector_completions
+    with pytest.raises(LMCacheTransferUnprovable, match="IPC event unavailable"):
+        worker.get_finished()
     assert worker._native_saves
 
 

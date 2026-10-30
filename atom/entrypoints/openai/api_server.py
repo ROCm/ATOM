@@ -2750,7 +2750,9 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Report readiness of all engine workers, not just the HTTP process."""
+    if engine is None or not engine.core_mgr.is_healthy():
+        raise HTTPException(status_code=503, detail="Engine workers unavailable")
     return {"status": "ok"}
 
 

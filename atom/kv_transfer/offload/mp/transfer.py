@@ -56,7 +56,7 @@ _SCHEDULER_DEADLINE_MARGIN_S = 60.0
 
 
 class LMCacheTransferUnprovable(RuntimeError):
-    """An MP transfer never reached a terminal state within the deadline."""
+    """An MP transfer failed or exceeded its deadline without proving DMA safety."""
 
 
 def _transfer_deadline_s(config: Any) -> float:
@@ -121,15 +121,14 @@ def _terminal_future_result(future: Any | None) -> tuple[bool, Any]:
         if not future.query():
             return False, None
         return True, future.result(timeout=0)
-    except Exception:
+    except Exception as exc:
         # A query/result exception is not proof that the remote GPU stream has
-        # quiesced. Keep the operation pending; the transfer deadline bounds a
-        # future that keeps raising.
-        logger.warning(
-            "LMCache MP transfer future could not prove terminal state",
-            exc_info=True,
-        )
-        return False, None
+        # quiesced. Fail the engine immediately, retaining the pending lease:
+        # a known failure must not masquerade as a slow transfer for 20 minutes.
+        raise LMCacheTransferUnprovable(
+            "LMCache MP transfer failed without proof that remote GPU work "
+            f"stopped; retaining its memory and stopping the engine: {exc}"
+        ) from exc
 
 
 def _transfer_operation_id(kind: str, completion: Any) -> str:
