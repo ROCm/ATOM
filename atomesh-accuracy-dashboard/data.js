@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793297212143,
+  "lastUpdate": 1793379242011,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4558,6 +4558,40 @@ window.BENCHMARK_DATA = {
             "value": 0.906,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40909647683 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610291449 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1615 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jhchouuu",
+            "username": "jhchouuu",
+            "email": "jiahzhou@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "0e71a52733c6645b4ca4bb4097ae2c9401e43b34",
+          "message": "feat(moe): build MegaMoE from an aiter MegaMoERecipe (with the stage1/stage2 switches) (#2765)\n\n* feat(moe): map mega stage1/stage2_fused to aiter, add decode combine quant\n\n* feat(moe): build MegaMoE from an aiter MegaMoERecipe\n\nOn an aiter that has MegaMoERecipe (ROCm/aiter#6430), init_mega_transport\nhands aiter a recipe instead of the stage flags: ATOM still picks the dispatch,\nthe combine and the wires from ATOM_MEGA_STAGE1_FUSED / ATOM_MEGA_STAGE2_FUSED /\nMEGA_DISPATCH_WIRE / ATOM_MEGA_COMBINE_WIRE, the layer supplies the expert\nGEMM, and whether the pairing can run is aiter's to say.\n\n- The shared instance is keyed by (recipe, geometry).\n- The communicator is sized by MegaMoEGfx1250.required_vmm_bytes(recipe,\n  geometry) -- the arena exactly -- plus the granule the DevComm created right\n  after takes.\n- It is built with MegaMoEGfx1250.from_recipe, and the log and the per-layer\n  recipe check read mega.recipe.\n- Each step names its combine as a wire (combine_wire=bf16|fp8|fp4);\n  combine_quant_for_step is now combine_wire_for_step.\n\nAn aiter without MegaMoERecipe keeps the flag path as it was. The Triton\nexperts path still drives MegaMoE's _dispatch/_combine, which aiter keeps.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* refactor(moe): MegaMoE borrows the EP all2all manager's cco communicator\n\naiter's MoriV2All2AllManager (ROCm/aiter#6618) owns the EP group's cco\ncommunicator and lends it through get_or_create_cco_communicator(). MegaMoE\nnow takes it from there instead of creating and caching one of its own:\n\n- make_mori_v2_prepare_finalize hands the all2all manager to\n  MoriV2PrepareAndFinalize, which passes it to init_mega_transport.\n- The capacity is asked for in full before the communicator exists: the\n  arena's required_vmm_bytes() plus the DevComm's granule.\n- The communicator cannot grow, so it serves the first MegaMoE; a second,\n  differently shaped one, or one on an aiter whose manager lends none, gets\n  its own as before (with a warning in the first case).\n- close_mega_transports() closes every MegaMoE; ModelRunner.exit calls it\n  before destroy_dist_env(), so the arenas go before the manager destroys\n  the communicator.\n\nThe recipe is built with aiter's nested ExpertComputeConfig, and the per-layer\nrecipe check and the creation log read it from recipe.compute.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(moe): MegaMoE takes the MoRI v2 manager, closes cleanly; drop the v2 gather path\n\n- ATOM_MORI_V2 asks for the \"mori_v2\" all2all manager before anything reads\n  .all2all_manager, so MegaMoE borrows its cco communicator; an aiter without\n  that manager keeps the default one.\n- Communicators ATOM creates for MegaMoE itself are destroyed after the\n  MegaMoE instances close; every close is attempted, and destroy_dist_env()\n  runs even if one fails.\n- Remove the unreachable v2 gather transport (init_mori_v2_op and its\n  prepare/finalize); fix the stale weight-check message.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(moe): Triton experts branch passes _recv_bound only the arena rows\n\n- MoriV2ModularKernel's triton_experts branch called _recv_bound with\n  (topk_ids, arena_rows) and raised TypeError on its first forward.\n- tests/model_ops/test_mori_v2_triton_experts.py drives that branch with\n  MegaMoE and triton_mega_moe stand-ins, no GPU.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(moe): MegaMoE review follow-ups\n\n- Layers share one MegaMoE by recipe and geometry; a layer with other Situv2 betas is refused\n- The borrowed communicator is tracked explicitly; each DevComm closes before its communicator, in a documented order\n- Ranks with different MegaMoE settings are refused at the first build\n- Combine-wire support is left to aiter; recipe kinds compare as enum members\n- The MegaMoE tests cover the recipe path and teardown, and run without aiter; the DeepSeek-V4 log example matches the new format\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* fix(moe): MegaMoE communicators, settings check order, exit teardown\n\n- Each MegaMoE that cannot borrow the manager's communicator gets its own\n- The EP-rank settings check now includes the gate mode and runs before the recipe is built\n- ModelRunner.exit releases the dist env, CUDA graphs, KV cache and model even when a MegaMoE close fails\n- Tests cover the production communicator path, the check order and the exit teardown\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* refactor(moe): call the MoRI v2 all2all manager directly\n\n- moe.py asks the EP device communicator for the \"mori_v2\" manager directly; mori_v2_all2all_manager is gone\n- MegaMoE borrows the manager's cco communicator without probing for the method\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n* refactor(moe): drop the pre-recipe aiter path\n\n- MegaMoE is built from a recipe only; the stage-flag path and the per-token VMM fallback are gone\n- The default bf16 combine wire is passed once\n- The Situv2 betas check compares what ATOM built with\n\nCo-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: yanboshao <yashao@amd.com>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\nCo-authored-by: JiaoliangYu <Jiaoliang.Yu@amd.com>",
+          "timestamp": "2026-10-30T15:41:25Z",
+          "url": "https://github.com/ROCm/ATOM/commit/0e71a52733c6645b4ca4bb4097ae2c9401e43b34"
+        },
+        "date": 1793379241111,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41087969083 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610301458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9439 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8908,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41087969083 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610301458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1357 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
