@@ -511,6 +511,39 @@ class TestPrefillDecodeInterval:
         assert d._stat_hold_decode_interval == 1
 
 
+class TestSyncPrefill:
+    @pytest.fixture
+    def sync_on(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_PREFILL_SYNC", "1")
+
+    def test_full_align_sets_the_one_seq_cap(self, sync_on):
+        d = make_delayer(dp_size=4, ttft_max_ticks=1000, stall_ticks=1000)
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({0: 3, 2: 64}))
+        assert fired is True
+        assert d._stat_fire_align == 1
+        assert d.last_fire_aligned is True
+
+    def test_three_of_four_releases_as_quorum(self, sync_on):
+        d = make_delayer(dp_size=4, ttft_max_ticks=1000, stall_ticks=1000)
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({0: 2, 2: 64}))
+        assert fired is True
+        assert d._stat_fire_quorum == 1
+        assert d.last_fire_aligned is False
+
+    def test_one_of_four_holds_then_ttft_is_not_a_cap(self, sync_on):
+        d = make_delayer(dp_size=4, ttft_max_ticks=1, stall_ticks=1000)
+        assert call(d, pending_tokens=1000, reduce=_add_rank({2: 64})) is False
+        fired = call(d, pending_tokens=1000, reduce=_add_rank({2: 64}))
+        assert fired is True
+        assert d._stat_fire_ttft == 1
+        assert d.last_fire_aligned is False
+
+    def test_dp1_keeps_the_warmup_fire(self, sync_on):
+        d = make_delayer(dp_size=1)
+        assert call(d, pending_tokens=0) is True
+        assert d.last_fire_aligned is False
+
+
 class TestStatsDistinct:
     def test_fill_and_stall_counted_separately(self):
         d = make_delayer(stall_ticks=2, ttft_max_ticks=1000)

@@ -1088,6 +1088,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
         os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1").lower() in ("1", "true")
     ),
+    # DP prefill-sync alignment (default off). Hold a prefill wave until every
+    # DP rank has admittable prefill work, then release together, so the group
+    # goes all-prefill -> all unified graph-decode instead of a ragged 1-of-N
+    # release that drops the shared MoE/gather CUDA graph for the whole group.
+    # Escapes (no decode anywhere, KV high, queue age, TTFT/partial bounds)
+    # still force release so one idle rank cannot stall TTFT.
+    "ATOM_DP_PREFILL_SYNC": lambda: _flag_env("ATOM_DP_PREFILL_SYNC", "0"),
+    # DP phase lockstep (default off). Under DP attention, when any rank has
+    # prefillable work, a rank with no prefill work runs a 1-token idle prefill
+    # instead of decoding, including on an unaligned escape. Decoding beside
+    # that prefill knocks the group off its decode CUDA graph. Paired with the
+    # prefill delayer; off by default because it is a net loss at low
+    # concurrency / rare prefills.
+    "ATOM_DP_PHASE_LOCKSTEP": lambda: _flag_env("ATOM_DP_PHASE_LOCKSTEP", "0"),
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
     # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT
