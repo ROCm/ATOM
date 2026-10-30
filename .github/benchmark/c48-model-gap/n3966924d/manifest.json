@@ -1,0 +1,86 @@
+{
+  "name": "c48_overlays_on_vllm_3966924d",
+  "vllm_base_sha": "3966924d566340e971a6da313e790d05492aa505",
+  "ported_from_vllm_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "method": "git merge-file of each overlay (81198e97 base) onto the 3966924d file",
+  "dropped": {
+    "mooncake-multi-connector/multi_connector.py": "3966924d MultiConnector skips connectors without a Prometheus exporter"
+  },
+  "unsupported": {
+    "mooncake-shared-prefix/worker.py": "3966924d replaced boundary offloads with req_meta.boundary_puts; not ported"
+  },
+  "files": [
+    {
+      "mount_source": "moriio_common.py",
+      "relative_path": "distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py",
+      "ported_from_sha256": "23cd517ed12a0102bbedd0aeb755fae7a865f8d5f56bb2bb1f59e02d0d804268",
+      "base_sha256": "b14418194b379d89d24ceebf167942e4a4e51c2c5f7f3727f08ad95d8643f600",
+      "patched_sha256": "73165df8f5a7f1b1bff21118aea045447538343ce6c4e65db40add424a246b22"
+    },
+    {
+      "mount_source": "inproj-pad128/kda.py",
+      "relative_path": "models/kimi_k3/amd/kda.py",
+      "ported_from_sha256": "26b42764a2f4a248cccaa360435659d5f6bfa9e784dc91c28a3d6a1ea48273da",
+      "base_sha256": "7c9a5fcbd817b56359a4c1ab183230d6509ce7d80b3396da98d56004b4681fec",
+      "patched_sha256": "fce40d671e29e9c442f1733d495b049ddc563f7a0cd2a2c9b3ccddcedcc5ce7d"
+    },
+    {
+      "mount_source": "online-quant-fix/meta.py",
+      "relative_path": "model_executor/model_loader/reload/meta.py",
+      "ported_from_sha256": "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d",
+      "base_sha256": "749d03cc94639c6e0133c1f0e326eaec2b43ee7d8fe3288963982bf50a1aeed4",
+      "patched_sha256": "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d"
+    },
+    {
+      "mount_source": "cpu-lru-refresh-v3/manager.py",
+      "relative_path": "v1/simple_kv_offload/manager.py",
+      "ported_from_sha256": "18da014b1eed073f6b227b92fc0163baa1e7a6a5fbcbcb31364a4696fa1cbd3f",
+      "base_sha256": "4b77bba1a7afb7e7596b7a55436353e0b9efcde7870afe6d7bbfa3297e82890e",
+      "patched_sha256": "3ba82315913ab67415b52d6172fb4bd6fbb374c5723d6fb6e0de23a529e65933"
+    },
+    {
+      "mount_source": "mla-prefill-fp8-fusedq/aiter_flash_attn.py",
+      "relative_path": "v1/attention/backends/mla/prefill/aiter_flash_attn.py",
+      "ported_from_sha256": "d0b8caee05f50a132c7f6915fe0dd3d594f7eef8c5e8f95af6fe39ea24e230c3",
+      "base_sha256": "55541d7ee1585de73683f06e02e3681aa63fda29cc8f2a1090dcfc14f91334ad",
+      "patched_sha256": "9a3b6912d98755c1f17ba974585c8d0683aa038185d137405a01238a7c4243c3",
+      "note": "Both import additions kept."
+    },
+    {
+      "mount_source": "latent-down-mxfp4/linear.py",
+      "relative_path": "models/kimi_k3/amd/linear.py",
+      "ported_from_sha256": "aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa",
+      "base_sha256": "2bea4d8bdbd9cf74a356a11cc4cf337632067464a7ee05017a4bebe766c6182e",
+      "patched_sha256": "792cdf31b4a6ec9ddcaae5db562145d6cc839f9d3b764d86451f0438303f2e0a"
+    },
+    {
+      "mount_source": "pp-aux-hidden/linear.py",
+      "relative_path": "models/kimi_k3/amd/linear.py",
+      "ported_from_sha256": "5620f0ecf2c82a522f65f348238e08d28125382b82416ae5afc68ffb7be15bd4",
+      "base_sha256": "2bea4d8bdbd9cf74a356a11cc4cf337632067464a7ee05017a4bebe766c6182e",
+      "patched_sha256": "51e559c07875021fa668c01d09b21823de76eb0455a0f1a48455014e61203d44"
+    },
+    {
+      "mount_source": "pp-mooncake/mooncake_connector.py",
+      "relative_path": "distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
+      "ported_from_sha256": "5b702ae788d982993a93fa6b9fbde30d3403fdd72630850814f9c214a8227fe2",
+      "base_sha256": "0c32467e42ff05749b992c25e56a6ccf3d9659a263c2272d31427cf4c768015f",
+      "patched_sha256": "f22bc178085c69c5bb8e6c49bbd57c57a06bd4ddf8d17eae24bbc3d8a00aa349",
+      "note": "Upstream omits the layout after a peer acks layout_id; the DCP fields are D-static and small, so _build_pull_metadata sends them on every pull. Asymmetric DCP keeps its own block order; _normalize_paired_block_order applies to the symmetric path. KpoolTailSpec no longer exists."
+    },
+    {
+      "mount_source": "pp-mooncake/dcp_transfer.py",
+      "relative_path": "distributed/kv_transfer/kv_connector/v1/mooncake/dcp_transfer.py",
+      "ported_from_sha256": "706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e",
+      "base_sha256": null,
+      "patched_sha256": "706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e"
+    },
+    {
+      "mount_source": "pp-mooncake/dcp_staging.py",
+      "relative_path": "distributed/kv_transfer/kv_connector/v1/mooncake/dcp_staging.py",
+      "ported_from_sha256": "253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5",
+      "base_sha256": null,
+      "patched_sha256": "253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5"
+    }
+  ]
+}

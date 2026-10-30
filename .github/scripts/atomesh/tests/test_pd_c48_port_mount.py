@@ -1,5 +1,6 @@
 """Check which pinned C48 overlays each case mounts."""
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -153,7 +154,7 @@ class PortMountTest(unittest.TestCase):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-"
         for path in sorted((REPO / ".github/benchmark/c48-model-gap").glob(prefix + "*-MC.json")):
             case = path.stem
-            if "-PP8-" in case or "-JUNCTION-" in case:
+            if "-PP8-" in case or "-JUNCTION-" in case or "-N3966-" in case:
                 continue  # Additional overlays have dedicated scope/pinning tests.
             rc, mc = mounts(case)
             self.assertEqual(rc, 0)
@@ -167,6 +168,28 @@ class PortMountTest(unittest.TestCase):
                 f.write("\n")
             self.assertEqual(mounts(prefix + "SW-C1", temp)[0], 0)
             self.assertEqual(mounts(prefix + "SW-C1-MC", temp)[0], 2)
+
+    def test_n3966_mounts_only_ported_overlays(self):
+        base = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C72-N3966"
+        port = REPO / ".github/benchmark/c48-model-gap/n3966924d"
+        files = json.loads((port / "manifest.json").read_text())["files"]
+        site = "target=/usr/local/lib/python3.12/dist-packages/vllm/"
+        for case, skip in ((base + "-MC", ("pp-aux-hidden/", "pp-mooncake/")),
+                           (base + "-PP8-MC", ("latent-down-mxfp4/",))):
+            rc, got = mounts(case)
+            self.assertEqual(rc, 0)
+            want = [f for f in files if not f["mount_source"].startswith(skip)]
+            self.assertEqual(got, [f"type=bind,source={port}/{f['mount_source']},{site}{f['relative_path']},readonly"
+                                   for f in want])
+        self.assertEqual(mounts(base + "-JUNCTION-MC")[0], 2)
+        for record in files:
+            with tempfile.TemporaryDirectory() as temp:
+                gap = Path(temp) / ".github/benchmark/c48-model-gap"
+                shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+                with open(gap / "n3966924d" / record["mount_source"], "a") as f:
+                    f.write("\n")
+                pp = record["mount_source"].startswith(("pp-aux-hidden/", "pp-mooncake/"))
+                self.assertEqual(mounts(base + ("-PP8-MC" if pp else "-MC"), temp)[0], 2, record)
 
     def test_cpuref_rejects_changed_manager(self):
         for case, fix_dir in CPUREF.items():

@@ -141,10 +141,17 @@ class LaunchTest(unittest.TestCase):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
         for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS"),
                                      (72, "JUNCTION"), (72, "P16K"), (88, "MR256"),
-                                     (32, "NATIVE96")):
+                                     (32, "NATIVE96"), (72, "N3966"), (72, "N3966-PP8")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
+            if variant.startswith("N3966"):
+                # 3966924d fuses MLA g_proj into fused_qkv_a_proj: 24 fewer PTPC modules, same weights.
+                env = candidate["roles"]["prefill"]["env"]
+                self.assertEqual(json.loads(env["C48_EXPECT_QUANT"]),
+                                 {"Fp8PtpcOnlineLinearMethod": 489, "Mxfp4OnlineLinearMethod": 92})
+                env["C48_EXPECT_QUANT"] = base["roles"]["prefill"]["env"]["C48_EXPECT_QUANT"]
+                variant = variant.removeprefix("N3966").removeprefix("-") or "N3966"
             if variant == "PP8":
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("HIP_VISIBLE_DEVICES"),
                                  "0,1,2,3,4,5,6,7")
@@ -172,6 +179,8 @@ class LaunchTest(unittest.TestCase):
                 argv, _ = render(candidate, "decode", *ADDR, phase="eval")
                 spec = json.loads(argv[argv.index("--speculative-config") + 1])
                 self.assertEqual(spec["rejection_sample_method"], "standard")
+            elif variant == "N3966":
+                pass
             elif variant == "NATIVE96":
                 self.assertEqual(candidate["roles"]["decode"]["env"].pop("C48_D_MLA_NATIVE96"), "1")
             elif variant == "MR256":

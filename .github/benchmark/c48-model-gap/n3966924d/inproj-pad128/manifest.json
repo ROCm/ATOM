@@ -1,0 +1,20 @@
+{
+  "name": "kimi_kda_online_quant_padding_coverage_inproj_pad128_n3966924d",
+  "vllm_base_sha": "3966924d566340e971a6da313e790d05492aa505",
+  "files": [
+    {
+      "mount_source": "kda.py",
+      "relative_path": "models/kimi_k3/amd/kda.py",
+      "ported_from_sha256": "26b42764a2f4a248cccaa360435659d5f6bfa9e784dc91c28a3d6a1ea48273da",
+      "base_sha256": "7c9a5fcbd817b56359a4c1ab183230d6509ce7d80b3396da98d56004b4681fec",
+      "patched_sha256": "fce40d671e29e9c442f1733d495b049ddc563f7a0cd2a2c9b3ccddcedcc5ce7d"
+    },
+    {
+      "mount_source": "../online-quant-fix/meta.py",
+      "relative_path": "model_executor/model_loader/reload/meta.py",
+      "ported_from_sha256": "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d",
+      "base_sha256": "749d03cc94639c6e0133c1f0e326eaec2b43ee7d8fe3288963982bf50a1aeed4",
+      "patched_sha256": "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d"
+    }
+  ]
+}

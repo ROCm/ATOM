@@ -1,6 +1,42 @@
 #!/usr/bin/env bash
 # Called by the C48 Spur workload before Docker starts the ordinary-user service.
+
+# -N3966- cases run vLLM nightly-3966924d with the same overlays ported onto it (n3966924d/manifest.json).
+c48_append_n3966_mounts() {
+  local c48_case="${ATOMESH_ENV_ATOMESH_C48_CASE}" c48_gap="$1/.github/benchmark/c48-model-gap/n3966924d"
+  local c48_site=/usr/local/lib/python3.12/dist-packages/vllm c48_linear=latent-down-mxfp4
+  local c48_name c48_rel c48_sha c48_digest
+  # 3966924d replaced the Store boundary offloads that the shared-prefix worker patches.
+  [[ "${c48_case}" != *-JUNCTION-* ]] || return 2
+  [[ "${c48_case}" != *-PP8-MC ]] || c48_linear=pp-aux-hidden
+  while read -r c48_name c48_rel c48_sha; do
+    case "${c48_name}" in
+      pp-mooncake/*) [[ "${c48_case}" == *-PP8-MC ]] || continue ;;
+      */linear.py) [[ "${c48_name}" == "${c48_linear}/linear.py" ]] || continue ;;
+    esac
+    [[ -f "${c48_gap}/${c48_name}" && -r "${c48_gap}/${c48_name}" ]] || return 2
+    c48_digest="$(sha256sum "${c48_gap}/${c48_name}")" || return $?
+    [[ "${c48_digest%% *}" == "${c48_sha}" ]] || return 2
+    docker_args+=(--mount "type=bind,source=${c48_gap}/${c48_name},target=${c48_site}/${c48_rel},readonly")
+  done <<'C48_N3966_FILES'
+moriio_common.py distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py 73165df8f5a7f1b1bff21118aea045447538343ce6c4e65db40add424a246b22
+inproj-pad128/kda.py models/kimi_k3/amd/kda.py fce40d671e29e9c442f1733d495b049ddc563f7a0cd2a2c9b3ccddcedcc5ce7d
+online-quant-fix/meta.py model_executor/model_loader/reload/meta.py 3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d
+cpu-lru-refresh-v3/manager.py v1/simple_kv_offload/manager.py 3ba82315913ab67415b52d6172fb4bd6fbb374c5723d6fb6e0de23a529e65933
+mla-prefill-fp8-fusedq/aiter_flash_attn.py v1/attention/backends/mla/prefill/aiter_flash_attn.py 9a3b6912d98755c1f17ba974585c8d0683aa038185d137405a01238a7c4243c3
+latent-down-mxfp4/linear.py models/kimi_k3/amd/linear.py 792cdf31b4a6ec9ddcaae5db562145d6cc839f9d3b764d86451f0438303f2e0a
+pp-aux-hidden/linear.py models/kimi_k3/amd/linear.py 51e559c07875021fa668c01d09b21823de76eb0455a0f1a48455014e61203d44
+pp-mooncake/mooncake_connector.py distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py f22bc178085c69c5bb8e6c49bbd57c57a06bd4ddf8d17eae24bbc3d8a00aa349
+pp-mooncake/dcp_transfer.py distributed/kv_transfer/kv_connector/v1/mooncake/dcp_transfer.py 706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e
+pp-mooncake/dcp_staging.py distributed/kv_transfer/kv_connector/v1/mooncake/dcp_staging.py 253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5
+C48_N3966_FILES
+}
+
 c48_append_port_mount() {
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-N3966-* ]]; then
+    c48_append_n3966_mounts "$1"
+    return
+  fi
   local c48_source="$1/.github/benchmark/c48-model-gap/moriio_common.py"
   local c48_target="/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py"
   local c48_digest

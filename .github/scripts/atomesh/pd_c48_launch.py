@@ -105,7 +105,8 @@ def main() -> None:
                 record["versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError:
                 record["versions"][name] = None
-        assert "81198e97b" in record["versions"]["vllm"], record["versions"]
+        engine = "3966924d5" if "-n3966-" in config["name"] else "81198e97b"
+        assert engine in record["versions"]["vllm"], record["versions"]
         record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
         from pd_c48_quant_patch import verify_quant_patch
         record["online_quant_loading_patch"] = verify_quant_patch(Path(vllm.__file__).parent)
