@@ -287,6 +287,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
+    # gfx950: also store native 1x32 E8M0 FP8 weights (e.g. the MiniMax-M3.1
+    # DSpark draft's MXFP8 linears) (16, 16)-preshuffled, so AITER's preshuffled
+    # group32 GEMM reads them instead of the Triton group32 GEMM. Layout only: the
+    # weight bytes and scales are the checkpoint's.
+    "ATOM_MXFP8_1X32_PRESHUFFLE": lambda: (
+        os.getenv("ATOM_MXFP8_1X32_PRESHUFFLE", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
