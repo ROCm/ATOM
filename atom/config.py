@@ -2306,6 +2306,8 @@ class Config:
                 f"--sequence-parallel-size {sp} requires --tensor-parallel-size 1: "
                 "Ulysses SP requires unsharded attention projections."
             )
+        if self.pipeline_parallel_size != 1:
+            raise ValueError("Ulysses SP is not validated with pipeline parallelism.")
         if self.prefill_context_parallel_size not in (1, sp):
             raise ValueError(
                 "--sequence-parallel-size and --prefill-context-parallel-size "
