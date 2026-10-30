@@ -1,0 +1,53 @@
+# The bot's own CI lane. Pure logic checks only -- no GPU, no self-hosted box --
+# so it can gate every change to the skill without competing with ATOM's main CI
+# for runners. The main CI gates merges on absolute accuracy across PRs; this one
+# only asserts that the bot's own machinery still holds together.
+name: atom-review-bot selftest
+
+on:
+  pull_request:
+    paths:
+      - '.claude/skills/review-pr/**'
+      - '.claude/skills/validate-atom-pr/**'
+      - '.github/workflows/atom-review-bot*.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.claude/skills/review-pr/**'
+      - '.claude/skills/validate-atom-pr/**'
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0          # check_prompts.py resolves the repo root via git
+          persist-credentials: false
+
+      - name: Install test deps
+        run: python3 -m pip install --quiet pytest jsonschema
+
+      - name: Prompts have not drifted from SKILL.md
+        run: python3 .claude/skills/review-pr/check_prompts.py
+
+      - name: MAPPING.md matches the deriver
+        run: |
+          python3 .claude/skills/review-pr/triage.py mapping > /tmp/mapping.md
+          diff /tmp/mapping.md .claude/skills/review-pr/MAPPING.md
+
+      - name: SKILL.md stays inside its 500-line budget
+        run: |
+          n=$(wc -l < .claude/skills/review-pr/SKILL.md)
+          echo "SKILL.md is $n lines"
+          [ "$n" -le 500 ] || { echo "::error::SKILL.md is $n lines, budget is 500"; exit 1; }
+
+      - name: run_one.sh guards hold
+        run: bash .claude/skills/review-pr/selftest.sh
+
+      - name: Unit tests
+        run: python3 -m pytest .claude/skills/review-pr/*_test.py .claude/skills/validate-atom-pr/tests/ -v
