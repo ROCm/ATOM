@@ -956,7 +956,8 @@ class Qwen4ExpModel(nn.Module):
             ["hidden_states"], config.hidden_size * config.hc_count
         )
         # Sequence parallelism starts after the last PLE layer, whose causal
-        # short convolution needs every token of the request.
+        # short convolution needs every token of the request; with no layer
+        # after it there is nothing to shard.
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_start_layer = 1 + max(
             (
@@ -971,6 +972,7 @@ class Qwen4ExpModel(nn.Module):
         min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
         if (
             self.tp_size == 1
+            or self.sp_start_layer >= self.end_layer
             or min_tokens <= 0
             or num_tokens < min_tokens
             or torch.cuda.is_current_stream_capturing()
