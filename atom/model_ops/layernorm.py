@@ -26,6 +26,7 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
+from atom.model_ops.prefill_ar_route import prefill_ar_takes_split
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -792,6 +793,126 @@ def fused_ar_gemma_per_token_supported() -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Large-input split of the fused all-reduce + Gemma RMSNorm
+# (ATOM_PREFILL_AR_QR_MIN_TOKENS)
+#
+# aiter's fused AR + RMSNorm runs a bf16 reduce-scatter capped at 80 workgroups
+# for every input under 64 MiB and switches to quick-reduce (all-reduce, then a
+# separate norm) only above that -- at hidden 4096, from 8192 tokens. With INT4
+# quick-reduce the split costs ~3.3 us/token at TP4 against ~9.5 us/token for
+# the fused path, so a prefill step of 2k-8k tokens pays ~3x for its 121
+# all-reduces. These ops let the norm take the split from a lower token count.
+#
+# The token test runs inside a custom op, at run time: the compiled model is
+# dispatched without guards, so a Python branch on the token count in traced
+# code would be frozen at whatever size was traced.
+# ---------------------------------------------------------------------------
+
+
+def _tp_quick_reduce():
+    """The TP group's quick-reduce communicator, or None when it is off."""
+    from aiter.dist.parallel_state import get_tp_group
+
+    comm = get_tp_group().device_communicator
+    qr = getattr(comm, "qr_comm", None)
+    if qr is None or qr.disabled:
+        return None
+    return qr
+
+
+def _quick_reduce_split_norm(
+    qr, x: Tensor, residual: Tensor, weight: Tensor, eps: float
+) -> tuple[Tensor, Tensor]:
+    """What aiter's own fused AR + RMSNorm does for inputs of 64 MiB and up:
+    quick-reduce all-reduce, then the add + Gemma RMSNorm kernel."""
+    reduced = qr.quick_all_reduce(x)
+    out = torch.empty_like(reduced)
+    residual_out = torch.empty_like(residual)
+    rmsnorm2d_fwd_with_add(out, reduced, residual, residual_out, weight, eps, True)
+    return out, residual_out
+
+
+def _gemma_ar_norm_routed_fake(
+    x: Tensor, residual: Tensor, weight: Tensor, eps: float, min_tokens: int
+) -> tuple[Tensor, Tensor]:
+    return torch.empty_like(x), torch.empty_like(residual)
+
+
+@torch_compile_guard(gen_fake=_gemma_ar_norm_routed_fake, mutates_args=[])
+def _atom_gemma_ar_norm_routed(
+    x: Tensor, residual: Tensor, weight: Tensor, eps: float, min_tokens: int
+) -> tuple[Tensor, Tensor]:
+    qr = None
+
+    def qr_takes():
+        nonlocal qr
+        qr = _tp_quick_reduce()
+        return qr is not None and qr.should_quick_allreduce(x)
+
+    if prefill_ar_takes_split(x.numel() // x.shape[-1], min_tokens, qr_takes):
+        return _quick_reduce_split_norm(qr, x, residual, weight, eps)
+    return tensor_model_parallel_fused_allreduce_rmsnorm(
+        x, residual, weight, eps, gemma_norm=True
+    )
+
+
+def _gemma_ar_norm_per_token_routed_fake(
+    x: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+    min_tokens: int,
+    emit_bf16: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    from aiter.utility.dtypes import fp8
+
+    return (
+        torch.empty_like(x, dtype=fp8),
+        torch.empty_like(residual),
+        torch.empty(x.shape[:-1] + (1,), dtype=torch.float32, device=x.device),
+        torch.empty_like(residual) if emit_bf16 else x.new_empty(0),
+    )
+
+
+@torch_compile_guard(gen_fake=_gemma_ar_norm_per_token_routed_fake, mutates_args=[])
+def _atom_gemma_ar_norm_per_token_routed(
+    x: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    eps: float,
+    min_tokens: int,
+    emit_bf16: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """(fp8, residual_out, per-token scale, bf16 normed or an empty tensor)."""
+    qr = None
+
+    def qr_takes():
+        nonlocal qr
+        qr = _tp_quick_reduce()
+        return qr is not None and qr.should_quick_allreduce(x)
+
+    if prefill_ar_takes_split(x.numel() // x.shape[-1], min_tokens, qr_takes):
+        from aiter import get_hip_quant
+        from aiter.utility.dtypes import fp8
+
+        normed, residual_out = _quick_reduce_split_norm(qr, x, residual, weight, eps)
+        out_fp8, scale = get_hip_quant(QuantType.per_Token)(normed, quant_dtype=fp8)
+        bf16 = normed if emit_bf16 else x.new_empty(0)
+        return out_fp8, residual_out, scale, bf16
+    outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        x,
+        residual,
+        weight,
+        eps,
+        emit_bf16=emit_bf16,
+        gemma_norm=True,
+        quant_type="per_token",
+    )
+    bf16 = outs[3] if emit_bf16 else x.new_empty(0)
+    return outs[0], outs[1], outs[2], bf16
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -844,6 +965,16 @@ class GemmaRMSNorm(nn.Module):
                     f"{granularity} quant takes gemma_norm; this one would "
                     "silently normalize with x * w"
                 )
+        # From this many tokens, the fused all-reduce + norm splits into
+        # quick-reduce + a separate norm (ATOM_PREFILL_AR_QR_MIN_TOKENS). The
+        # per-group quant output is not routed: its scale layout
+        # (transpose_scale) has no split-path counterpart here.
+        self.ar_split_min_tokens = (
+            envs.ATOM_PREFILL_AR_QR_MIN_TOKENS
+            if self.fused_allreduce
+            and not (self.use_fused_quant and not self.per_token_quant)
+            else 0
+        )
 
     @staticmethod
     def forward_static(
@@ -985,6 +1116,8 @@ class GemmaRMSNorm(nn.Module):
         # Same return contracts as _forward_fused_fp8 / forward_cuda. The kernel
         # reads the raw weight and applies (1 + w) itself (gemma_norm), so an
         # in-place weight update (rollout sync) is seen on the next call.
+        if self.ar_split_min_tokens > 0:
+            return self._forward_fused_allreduce_routed(x, residual)
         if self.use_fused_quant:
             # group_size stays at aiter's default 128 for per-token: its fast
             # one-kernel branch is keyed on `quant_type == "per_token" and
@@ -1017,6 +1150,31 @@ class GemmaRMSNorm(nn.Module):
             self.weight,
             self.variance_epsilon,
             gemma_norm=True,
+        )
+
+    def _forward_fused_allreduce_routed(self, x, residual):
+        # Same return contracts as _forward_fused_allreduce; the token-count
+        # choice between the fused kernel and quick-reduce + norm is made at
+        # run time inside the op (see `prefill_ar_takes_split`).
+        if self.use_fused_quant:  # per-token only; per-group is never routed
+            out_fp8, res_out, out_scale, out_bf16 = (
+                _atom_gemma_ar_norm_per_token_routed(
+                    x.contiguous(),
+                    residual,
+                    self.weight,
+                    self.variance_epsilon,
+                    self.ar_split_min_tokens,
+                    self.write_bf16,
+                )
+            )
+            out_bf16 = out_bf16 if self.write_bf16 else None
+            return out_fp8, out_scale, out_bf16, res_out
+        return _atom_gemma_ar_norm_routed(
+            x.contiguous(),
+            residual,
+            self.weight,
+            self.variance_epsilon,
+            self.ar_split_min_tokens,
         )
 
     def forward(
