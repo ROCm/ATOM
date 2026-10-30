@@ -81,6 +81,14 @@
       "ported_from_sha256": "253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5",
       "base_sha256": null,
       "patched_sha256": "253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5"
+    },
+    {
+      "mount_source": "pp-mla-context/mla_attention.py",
+      "relative_path": "model_executor/layers/attention/mla_attention.py",
+      "ported_from_sha256": null,
+      "base_sha256": "52e7569308e82a08a11f09de18f81780e30e303d3e347547404c773b4639afd8",
+      "patched_sha256": "215bd083e002266955e7a8e54e31323dd34a2d226fd5f45534f583d14c47b25a",
+      "note": "Unchanged upstream file except VLLM_MLA_CONTEXT_WORKSPACE_TOKENS, which replaces the 64K cap on the chunked-context workspace; unset keeps upstream behaviour. Mounted for -PP8- cases only."
     }
   ]
 }

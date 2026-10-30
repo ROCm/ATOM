@@ -11,7 +11,7 @@ c48_append_n3966_mounts() {
   [[ "${c48_case}" != *-PP8-MC ]] || c48_linear=pp-aux-hidden
   while read -r c48_name c48_rel c48_sha; do
     case "${c48_name}" in
-      pp-mooncake/*) [[ "${c48_case}" == *-PP8-MC ]] || continue ;;
+      pp-mooncake/* | pp-mla-context/*) [[ "${c48_case}" == *-PP8-MC ]] || continue ;;
       */linear.py) [[ "${c48_name}" == "${c48_linear}/linear.py" ]] || continue ;;
     esac
     [[ -f "${c48_gap}/${c48_name}" && -r "${c48_gap}/${c48_name}" ]] || return 2
@@ -29,6 +29,7 @@ pp-aux-hidden/linear.py models/kimi_k3/amd/linear.py 51e559c07875021fa668c01d09b
 pp-mooncake/mooncake_connector.py distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py f22bc178085c69c5bb8e6c49bbd57c57a06bd4ddf8d17eae24bbc3d8a00aa349
 pp-mooncake/dcp_transfer.py distributed/kv_transfer/kv_connector/v1/mooncake/dcp_transfer.py 706b4ebc441a2a0f3ae2eaf9de432af0738b129033bc8278da55886dc300992e
 pp-mooncake/dcp_staging.py distributed/kv_transfer/kv_connector/v1/mooncake/dcp_staging.py 253741ba6c6b8537a0678152d7dfd57e6da8139392f73148c8fcbe84727a49a5
+pp-mla-context/mla_attention.py model_executor/layers/attention/mla_attention.py 215bd083e002266955e7a8e54e31323dd34a2d226fd5f45534f583d14c47b25a
 C48_N3966_FILES
 }
 

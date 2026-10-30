@@ -174,7 +174,8 @@ class PortMountTest(unittest.TestCase):
         port = REPO / ".github/benchmark/c48-model-gap/n3966924d"
         files = json.loads((port / "manifest.json").read_text())["files"]
         site = "target=/usr/local/lib/python3.12/dist-packages/vllm/"
-        for case, skip in ((base + "-MC", ("pp-aux-hidden/", "pp-mooncake/")),
+        pp_only = ("pp-aux-hidden/", "pp-mooncake/", "pp-mla-context/")
+        for case, skip in ((base + "-MC", pp_only),
                            (base + "-PP8-MC", ("latent-down-mxfp4/",))):
             rc, got = mounts(case)
             self.assertEqual(rc, 0)
@@ -188,7 +189,7 @@ class PortMountTest(unittest.TestCase):
                 shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
                 with open(gap / "n3966924d" / record["mount_source"], "a") as f:
                     f.write("\n")
-                pp = record["mount_source"].startswith(("pp-aux-hidden/", "pp-mooncake/"))
+                pp = record["mount_source"].startswith(pp_only)
                 self.assertEqual(mounts(base + ("-PP8-MC" if pp else "-MC"), temp)[0], 2, record)
 
     def test_cpuref_rejects_changed_manager(self):

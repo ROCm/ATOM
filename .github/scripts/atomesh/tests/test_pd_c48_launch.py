@@ -151,6 +151,8 @@ class LaunchTest(unittest.TestCase):
                 self.assertEqual(json.loads(env["C48_EXPECT_QUANT"]),
                                  {"Fp8PtpcOnlineLinearMethod": 489, "Mxfp4OnlineLinearMethod": 92})
                 env["C48_EXPECT_QUANT"] = base["roles"]["prefill"]["env"]["C48_EXPECT_QUANT"]
+                if variant.endswith("-PP8"):
+                    self.assertEqual(env.pop("VLLM_MLA_CONTEXT_WORKSPACE_TOKENS"), "16384")
                 variant = variant.removeprefix("N3966").removeprefix("-") or "N3966"
             if variant == "PP8":
                 self.assertEqual(candidate["roles"]["prefill"]["env"].pop("HIP_VISIBLE_DEVICES"),

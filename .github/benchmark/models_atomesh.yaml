@@ -7301,6 +7301,7 @@ models:
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:
             VLLM_PP_LAYER_PARTITION: '12,12,12,12,12,12,12,9'
+            VLLM_MLA_CONTEXT_WORKSPACE_TOKENS: '16384'
             HIP_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             CUDA_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             VLLM_ROCM_USE_AITER: '1'
@@ -7972,6 +7973,7 @@ models:
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:
             VLLM_PP_LAYER_PARTITION: '12,12,12,12,12,12,12,9'
+            VLLM_MLA_CONTEXT_WORKSPACE_TOKENS: '16384'
             HIP_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             CUDA_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             VLLM_ROCM_USE_AITER: '1'
@@ -8211,6 +8213,7 @@ models:
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:
             VLLM_PP_LAYER_PARTITION: '12,12,12,12,12,12,12,9'
+            VLLM_MLA_CONTEXT_WORKSPACE_TOKENS: '16384'
             HIP_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             CUDA_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             VLLM_ROCM_USE_AITER: '1'
@@ -8431,6 +8434,7 @@ models:
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:
             VLLM_PP_LAYER_PARTITION: '12,12,12,12,12,12,12,9'
+            VLLM_MLA_CONTEXT_WORKSPACE_TOKENS: '16384'
             HIP_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             CUDA_VISIBLE_DEVICES: '0,1,2,3,4,5,6,7'
             VLLM_ROCM_USE_AITER: '1'

@@ -196,7 +196,8 @@
         "MC_IB_TC": "104",
         "GLIBC_TUNABLES": "glibc.malloc.hugetlb=1",
         "C48_MOONCAKE_STORE_COMPACT": "1",
-        "C48_MOONCAKE_DCP_TRANSFER": "1"
+        "C48_MOONCAKE_DCP_TRANSFER": "1",
+        "VLLM_MLA_CONTEXT_WORKSPACE_TOKENS": "16384"
       }
     },
     "decode": {
