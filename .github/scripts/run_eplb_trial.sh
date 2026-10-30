@@ -9,6 +9,7 @@ test "$image_id" = "$EXPECTED_IMAGE_ID"
 docker image inspect "$PINNED_IMAGE" --format '{{json .RepoDigests}}' > "$out/repo-digests.json"
 docker exec -i -e EXPECTED_AITER_SHA -e EXPECTED_ATOM_SHA="$(git rev-parse HEAD)" \
   -e TRIAL atom-eplb python3 - <<'PY'
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
@@ -31,6 +32,12 @@ data = dict(atom_sha=sha, aiter=aiter, model_revision=marker, torch=torch.__vers
             cpu_affinity=sorted(os.sched_getaffinity(0)),
             devices=[dict(name=torch.cuda.get_device_name(i), pci=str(torch.cuda.get_device_properties(i)))
                      for i in range(torch.cuda.device_count())])
+runtime_marker = Path('/opt/rocm/.info/atom-rocm-runtime-commit')
+data['rocm_runtime_overlay_commit'] = runtime_marker.read_text().strip() if runtime_marker.is_file() else None
+libs = {line.split()[-1] for line in Path('/proc/self/maps').read_text().splitlines()
+        if any(lib in line for lib in ('librccl.so', 'libhsa-runtime64.so', 'libamdhip64.so'))}
+data['loaded_gpu_libraries'] = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
+                                for name in sorted(libs) if Path(name).is_file()}
 Path('eplb-diagnostics', os.environ['TRIAL'], 'runtime.json').write_text(json.dumps(data, indent=2))
 print('Verified ATOM', sha, 'AITER', aiter['sha'], 'model', marker)
 print('torch', data['torch'], 'HIP', data['hip'], 'NCCL/RCCL', data['nccl'])

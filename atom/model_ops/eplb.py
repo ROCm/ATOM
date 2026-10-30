@@ -986,6 +986,9 @@ def _plan_single_layer_migration(
     # vllm does the same with .cpu().numpy().
     old_list = old_p2l_layer.tolist()
     new_list = new_p2l_layer.tolist()
+    capture_perf_layout = globals().get("_capture_perf_layout")
+    if capture_perf_layout is not None:
+        capture_perf_layout(old_list, new_list)
     base = rank * num_local_physical_experts
     old_local = old_list[base : base + num_local_physical_experts]
     new_local = new_list[base : base + num_local_physical_experts]

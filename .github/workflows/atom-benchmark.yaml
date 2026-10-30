@@ -1,5 +1,5 @@
 name: ATOM Benchmark
-run-name: MegaMoE c512 EPLB pinned-image comparison
+run-name: MegaMoE c512 EPLB GPU-wait diagnosis
 on:
   workflow_dispatch:
 permissions:
@@ -10,9 +10,9 @@ concurrency:
 jobs:
   paired:
     if: github.ref == 'refs/heads/codex/mega-eplb-regression'
-    name: Same-GPU c512 current then previous image
+    name: c512 migration host and GPU timing
     runs-on: linux-atom-pitt-mi350x-8
-    timeout-minutes: 150
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v6
       - name: Require an idle allocation
@@ -76,60 +76,6 @@ jobs:
           compression-level: 1
       - name: Stop current container
         if: ${{ always() && steps.setup-current.outcome != 'skipped' }}
-        run: |
-          docker stop --time 15 atom-eplb || true
-          docker rm atom-eplb || true
-      - name: Start previous pinned container
-        id: setup-previous
-        if: ${{ !cancelled() && steps.idle.outcome == 'success' }}
-        uses: ./.github/actions/atom-bench-container
-        with:
-          image: rocm/atom-dev@sha256:9333a39842ab4364b75418832471b8f5cbcbf1fc6449928a5200b02503ae71d6
-          container-name: atom-eplb
-          model-path: deepseek-ai/DeepSeek-V4-Pro
-          runner: linux-atom-pitt-mi350x-8
-          hf-token: ${{ secrets.AMD_HF_TOKEN }}
-          env-vars: |
-            AITER_BF16_FP8_MOE_BOUND=0
-            ATOM_MOE_GU_ITLV=1
-            AITER_LOG_LEVEL=WARNING
-            MORI_SHMEM_HEAP_SIZE=16G
-            ATOM_BENCHMARK_STUCK_POLLS=60
-            ATOM_EPLB_DIAGNOSTICS_DIR=/workspace/eplb-diagnostics/previous
-          container-env: >-
-            -e ISL=8192 -e OSL=1024 -e CONC=512 -e RANDOM_RANGE_RATIO=0.8
-            -e ATOM_BENCHMARK_CAPTURE=1 -e BENCH_KIND=random
-            -e ENABLE_TORCH_PROFILER=0 -e ENABLE_RTL_PROFILER=0
-      - name: Benchmark previous image with migration diagnostics
-        if: ${{ !cancelled() && steps.setup-previous.outcome == 'success' }}
-        timeout-minutes: 65
-        env:
-          TRIAL: previous
-          EXPECTED_AITER_SHA: c90842add033fb3f9dbe0c6c53187a023faff1ee
-          EXPECTED_IMAGE_ID: sha256:01e76c6c20e3db4ed867bae44879e9ad61e523d4ebd855c51b4ba0aac1ebc397
-          PINNED_IMAGE: rocm/atom-dev@sha256:9333a39842ab4364b75418832471b8f5cbcbf1fc6449928a5200b02503ae71d6
-        run: bash .github/scripts/run_eplb_trial.sh
-      - name: Upload previous evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: eplb-previous-evidence
-          path: |
-            eplb-diagnostics/previous/
-            eplb-previous.json
-          if-no-files-found: warn
-          retention-days: 15
-      - name: Upload previous bundle
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: eplb-previous-bundle
-          path: benchmark-bundles/eplb-previous/
-          if-no-files-found: warn
-          retention-days: 7
-          compression-level: 1
-      - name: Stop previous container
-        if: ${{ always() && steps.setup-previous.outcome != 'skipped' }}
         run: |
           docker stop --time 15 atom-eplb || true
           docker rm atom-eplb || true
