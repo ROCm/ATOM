@@ -5,7 +5,8 @@
 Bit-identical to AITER's `topk_softmax` with `need_renorm` (ids, tie order,
 weights, the sigmoid-scored shared-expert slots it appends, and the pad rows
 of its optional `num_valid_rows` count), also on rows with fewer than k finite
-logits. On MI355X at 512 experts it takes about 4 us per call where the HIP
+logits. Rows with NaN logits are the exception; see `triton_topk_softmax`.
+On MI355X at 512 experts it takes about 4 us per call where the HIP
 kernel takes 9-11 us; past a few thousand rows the HIP kernel is faster, and
 `topk_softmax_dispatch.py` picks it there. Each selection is a single int64
 max over (value, -index).

@@ -24,6 +24,8 @@ from atom.utils import envs
 # (half of MI355X's CUs) the two are about even at 22-24 rows per CU, Triton
 # is slower at 26 (512 / top-10 + a shared expert: at 30) and up to 36%
 # slower at 40; at 20 it is 10-24% faster for all of the shapes above.
+# `get_cu_num()` does not count an `HSA_CU_MASK` set outside ATOM; in that
+# case set AITER's `CU_NUM` to the CUs the mask leaves.
 TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
 
 
