@@ -608,18 +608,42 @@ class PagedAttentionImpl(nn.Module):
             return v_cache
         return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
-    def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
-        """Without gluon decode (gfx1250): whether FlyDSL accepts this call.
+    def _pa_decode_kv_scales(self, k_scale, v_scale):
+        """The K/V scales ``paged_attention_triton`` hands ``run_pa_decode``."""
+        if self.kv_cache_dtype == "bf16":
+            return None, None
+        if k_scale is not None and k_scale.numel() > 1:
+            return k_scale.unsqueeze(-1), v_scale.unsqueeze(-1)
+        return k_scale, v_scale
+
+    def _flydsl_takes_decode(
+        self, q, k_cache, v_cache, k_scale, v_scale, attn_metadata
+    ) -> bool:
+        """Whether a decode routed to unified runs on FlyDSL instead.
+
+        Two cases reach unified with a call FlyDSL may take: a GPU without
+        gluon decode (gfx1250), and a gluon GPU whose query length x group is
+        past the gluon envelope (Qwen3.5 MTP-5: qlen 6, group 8). Inside that
+        envelope a gluon GPU keeps its route. The decision is made per call,
+        on the same tensors and metadata ``run_pa_decode`` then receives, and
+        passed down as ``require_flydsl`` so the two cannot disagree.
 
         ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
+
+        gfx1250 with per-token FP8 KV past qlen 4 is decided by the same check;
+        it is not exercised by this path's tests or runs (out of scope here).
         """
         if (
             envs.ATOM_USE_UNIFIED_ATTN
-            or pa_decode_gluon_supports_arch()
+            or self.use_flash_layout
             or self.sliding_window > 0
         ):
             return False
-        num_seqs = attn_metadata.context_lens.shape[0]
+        if pa_decode_gluon_supports_arch() and not gluon_decode_over_limit(
+            attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
+        ):
+            return False
+        k_scale, v_scale = self._pa_decode_kv_scales(k_scale, v_scale)
         return bool(
             flydsl_decode_seqs(
                 output=q,
@@ -629,9 +653,6 @@ class PagedAttentionImpl(nn.Module):
                 block_tables=attn_metadata.block_tables,
                 context_lens=attn_metadata.context_lens,
                 max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_context_partition_num=dense_decode_splits(
-                    num_seqs, k_cache.shape[1]
-                ),
                 context_partition_size=256,
                 compute_type=(
                     torch.bfloat16
@@ -639,6 +660,8 @@ class PagedAttentionImpl(nn.Module):
                     else aiter.dtypes.fp8
                 ),
                 q_scale=None,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 alibi_slopes=None,
                 sinks=self.sinks,
                 sliding_window=self.sliding_window,
@@ -657,9 +680,19 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
-        if self._flydsl_takes_decode(q, k_cache, v_cache, attn_metadata):
+        if self._flydsl_takes_decode(
+            q, k_cache, v_cache, k_scale, v_scale, attn_metadata
+        ):
             return self.paged_attention_triton(
-                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                require_flydsl=True,
             )
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
@@ -696,13 +729,22 @@ class PagedAttentionImpl(nn.Module):
 
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        require_flydsl: bool = False,
     ):
         """Decode through ``run_pa_decode``: gluon, or opted-in FlyDSL.
 
         Callers must have cleared ``gluon_decode_over_limit`` in
-        ``_dispatch_decode`` or, on a GPU without gluon, established through
-        ``_flydsl_takes_decode`` that FlyDSL accepts the call.
+        ``_dispatch_decode`` or established through ``_flydsl_takes_decode``
+        that FlyDSL accepts the call; the latter pass ``require_flydsl=True``.
         """
 
         attn_metadata = fwd_ctx.attn_metadata
@@ -723,9 +765,7 @@ class PagedAttentionImpl(nn.Module):
             max_context_partition_num = 1
             context_partition_size = 128
 
-        if k_scale is not None and k_scale.numel() > 1:
-            k_scale = k_scale.unsqueeze(-1)
-            v_scale = v_scale.unsqueeze(-1)
+        k_scale, v_scale = self._pa_decode_kv_scales(k_scale, v_scale)
 
         compute_type = (
             torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
@@ -743,8 +783,8 @@ class PagedAttentionImpl(nn.Module):
             context_partition_size=context_partition_size,
             compute_type=compute_type,
             q_scale=None,
-            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
-            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
@@ -755,6 +795,7 @@ class PagedAttentionImpl(nn.Module):
             # max_context_length: the block-table bound is the same in graph
             # and eager, so both pick the same kernel specialization.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
+            require_flydsl=require_flydsl,
         )
 
         return o
@@ -1086,9 +1127,10 @@ class PagedAttentionImpl(nn.Module):
     def _dispatch_decode(self, max_qlen: int = 1):
         """Select the coarse decode runner from model shape and configuration.
 
-        Cache-dependent dispatch happens later: on a GPU without gluon,
-        ``paged_attention_unified`` hands FlyDSL calls inside its supported
-        domain and keeps the rest on unified attention. The vLLM bridge shares
+        Cache-dependent dispatch happens later: on a GPU without gluon, or
+        past the gluon envelope on one with it, ``paged_attention_unified``
+        hands FlyDSL calls inside its supported domain and keeps the rest on
+        unified attention. The vLLM bridge shares
         the constants and predicate, not this order -- its arms differ (no
         unified fallback, no sliding-window arm). Both
         paged kernels stop short of unified, at different points, and drafting

@@ -401,6 +401,251 @@ class TestDecodeRouting:
         )
 
 
+class TestFlyDSLPastGluon:
+    """Past the gluon envelope on a gluon GPU, FlyDSL takes the call per call.
+
+    Qwen3.5 TP4 MTP-5: 8 q heads / 1 kv head per rank, head_dim 256, page-16
+    fp8 KV with per-token scales, qlen 6 -> 48 rows. _dispatch_decode still
+    sends it to paged_attention_unified; the FlyDSL decision is made there on
+    the call's own tensors (the same check run_pa_decode applies) and passed
+    down as require_flydsl.
+    """
+
+    HEADS, KV_HEADS, HEAD_DIM, BLOCK = 8, 1, 256, 16
+
+    @staticmethod
+    def _meta(*shape, dtype=None):
+        import torch
+
+        return torch.empty(shape, device="meta", dtype=dtype)
+
+    def _layer(self, **over):
+        from atom.model_ops import attention_mha as mha
+
+        layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
+        layer.num_heads, layer.num_kv_heads = self.HEADS, self.KV_HEADS
+        layer.sliding_window, layer.kv_cache_dtype, layer.sinks = -1, "fp8", None
+        layer.use_flash_layout = False
+        layer.layer_num = 0
+        for k, v in over.items():
+            setattr(layer, k, v)
+        return layer
+
+    def _call(self, qlen, seqs=4, block=None, kv_dtype=None):
+        import torch
+
+        block = block or self.BLOCK
+        kv_dtype = kv_dtype or _FP8
+        x = 8 if kv_dtype is torch.bfloat16 else 16
+        m = self._meta
+        q = m(seqs * qlen, self.HEADS, self.HEAD_DIM, dtype=torch.bfloat16)
+        k_cache = m(64, self.KV_HEADS, self.HEAD_DIM // x, block, x, dtype=kv_dtype)
+        v_cache = m(64, self.KV_HEADS, self.HEAD_DIM, block, dtype=kv_dtype)
+        md = SimpleNamespace(
+            context_lens=m(seqs, dtype=torch.int32),
+            block_tables=m(seqs, 64, dtype=torch.int32),
+            max_seqlen_q=qlen,
+        )
+        return q, k_cache, v_cache, md
+
+    @staticmethod
+    def _flydsl_on(monkeypatch, on=True, aiter_accepts=True):
+        """FlyDSL opted in; aiter's predicate is faked (meta tensors), the rest
+        of ATOM's decision is the real one. Returns the predicate's calls."""
+        from atom.model_ops import attention_mha as mha
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", on)
+        monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", False)
+        calls = []
+
+        def can_use(*args, **kwargs):
+            calls.append((args, kwargs))
+            return aiter_accepts
+
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_can_use", lambda: can_use)
+        return calls
+
+    def test_dispatch_still_sends_past_gluon_to_unified(self, monkeypatch):
+        """No static gate in _dispatch_decode: qlen 6 routes as on main, and
+        never through the ASM arm (qlen 5 x group 3 is inside ASM's bound)."""
+        assert _route(monkeypatch, 6, num_heads=8) == "paged_attention_unified"
+        assert (
+            _route(monkeypatch, 5, num_heads=3, use_triton_attn=False)
+            == "paged_attention_unified"
+        )
+
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    @pytest.mark.parametrize("qlen", [5, 6, 8])
+    def test_qwen35_mtp5_takes_flydsl(self, monkeypatch, qlen):
+        import torch
+
+        calls = self._flydsl_on(monkeypatch)
+        q, kc, vc, md = self._call(qlen)
+        ks = vs = torch.empty(64, self.KV_HEADS, self.BLOCK, device="meta")
+        assert self._layer()._flydsl_takes_decode(q, kc, vc, ks, vs, md)
+        # aiter is asked with what run_pa_decode will pass: per-token scales
+        # with their trailing singleton, the query length, no window.
+        ((args, kwargs),) = calls
+        assert args[1] is q and args[6] == qlen
+        assert kwargs["key_scale"].shape == (64, self.KV_HEADS, self.BLOCK, 1)
+        assert kwargs["value_scale"].shape == (64, self.KV_HEADS, self.BLOCK, 1)
+        assert kwargs["sliding_window"] == 0
+
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    @pytest.mark.parametrize("qlen", [1, 2, 4])
+    def test_within_gluon_keeps_its_route(self, monkeypatch, qlen):
+        """MTP-3 (qlen 4) and draft steps (qlen 1) never divert to FlyDSL here."""
+        calls = self._flydsl_on(monkeypatch)
+        q, kc, vc, md = self._call(qlen)
+        assert not self._layer()._flydsl_takes_decode(q, kc, vc, None, None, md)
+        assert not calls
+
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    @pytest.mark.parametrize(
+        "case",
+        ["flydsl_off", "unified_env", "flash", "window", "aiter_declines", "bf16_kv"],
+    )
+    def test_declined_calls_stay_on_unified(self, monkeypatch, case):
+        import torch
+
+        from atom.model_ops import attention_mha as mha
+
+        self._flydsl_on(
+            monkeypatch,
+            on=case != "flydsl_off",
+            aiter_accepts=case != "aiter_declines",
+        )
+        if case == "unified_env":
+            monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", True)
+        layer = self._layer(
+            use_flash_layout=case == "flash",
+            sliding_window=128 if case == "window" else -1,
+            kv_cache_dtype="bf16" if case == "bf16_kv" else "fp8",
+        )
+        q, kc, vc, md = self._call(
+            6, kv_dtype=torch.bfloat16 if case == "bf16_kv" else None
+        )
+        assert not layer._flydsl_takes_decode(q, kc, vc, None, None, md)
+
+    def test_unified_passes_the_decision_down(self, monkeypatch):
+        from atom.model_ops import attention_mha as mha
+
+        monkeypatch.setattr(
+            mha.PagedAttentionImpl, "_flydsl_takes_decode", lambda *a: True
+        )
+        layer = self._layer()
+        layer.paged_attention_triton = lambda *a, **k: k
+        q, kc, vc, md = self._call(6)
+        out = mha.PagedAttentionImpl.paged_attention_unified(
+            layer, q, None, None, kc, vc, None, None, SimpleNamespace(attn_metadata=md)
+        )
+        assert out == {"require_flydsl": True}
+
+    @pytest.mark.parametrize("gluon", [True, False])
+    def test_a_required_flydsl_call_never_reaches_gluon_or_a_plan(
+        self, monkeypatch, gluon
+    ):
+        """Feasibility first: no plan or scratch is built on the refusal, and a
+        GPU without gluon keeps its own error."""
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: gluon)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: None)
+
+        def boom(*a, **k):
+            raise AssertionError("built a plan or scratch before refusing")
+
+        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", boom)
+        monkeypatch.setattr(ba, "_flydsl_plan_scratch", boom)
+        monkeypatch.setattr(torch.ops.aiter, "pa_decode_gluon", boom, raising=False)
+        q, kc, vc, md = self._call(6)
+        err = NotImplementedError if gluon else RuntimeError
+        with pytest.raises(err, match="declined" if gluon else "no gluon fallback"):
+            ba.run_pa_decode(
+                *(q, q, kc, vc, md.context_lens, md.block_tables, 1.0, 6, 8, 256),
+                *(_FP8, None, None, None),
+                require_flydsl=True,
+            )
+
+
+def _gpu_flydsl_arch():
+    if not (_HAS_CUDA and _HAS_FLYDSL_PA):
+        return False
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() in ("gfx942", "gfx950")
+
+
+@pytest.mark.skipif(
+    not _gpu_flydsl_arch(), reason="runs aiter FlyDSL pa_decode on gfx942/gfx950"
+)
+@pytest.mark.parametrize("qlen", [4, 6])
+def test_qwen35_mtp5_shape_is_accepted_by_real_aiter(monkeypatch, qlen):
+    """No monkeypatched probe: ATOM's gate accepts the Qwen3.5 MTP-5 call and
+    aiter's own pa_decode validation and kernel then take it, with per-token
+    fp8 KV scales and require_flydsl=True (a decline would raise)."""
+    import torch
+
+    from atom.model_ops import base_attention as ba
+
+    monkeypatch.undo()  # drop the autouse gfx950 / gluon pins
+    monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+    dev = torch.device("cuda", 0)
+    heads, kv_heads, head_dim, block, seqs, blocks_per_seq = 8, 1, 256, 16, 4, 32
+    nblk = seqs * blocks_per_seq
+    q = torch.randn(seqs * qlen, heads, head_dim, device=dev, dtype=torch.bfloat16)
+    k_cache = (
+        torch.randn(nblk, kv_heads, head_dim // 16, block, 16, device=dev) * 0.1
+    ).to(_FP8)
+    v_cache = (torch.randn(nblk, kv_heads, head_dim, block, device=dev) * 0.1).to(_FP8)
+    k_scale = torch.rand(nblk, kv_heads, block, 1, device=dev) + 0.5
+    v_scale = torch.rand(nblk, kv_heads, block, 1, device=dev) + 0.5
+    block_tables = torch.arange(nblk, device=dev, dtype=torch.int32).view(seqs, -1)
+    context_lens = torch.tensor([7, 100, 300, 511], device=dev, dtype=torch.int32)
+    splits = ba.dense_decode_splits(seqs, kv_heads)
+    out = torch.empty_like(q)
+    common = {
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "context_lens": context_lens,
+        "block_tables": block_tables,
+        "max_seqlen_q": qlen,
+        "context_partition_size": 256,
+        "compute_type": _FP8,
+        "q_scale": None,
+    }
+    assert (
+        ba.flydsl_decode_seqs(
+            output=out,
+            q=q,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            alibi_slopes=None,
+            sinks=None,
+            sliding_window=-1,
+            ps=True,
+            **common,
+        )
+        == seqs
+    )
+    ba.run_pa_decode(
+        output=out,
+        q=q,
+        softmax_scale=head_dim**-0.5,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        max_context_partition_num=splits,
+        require_flydsl=True,
+        **common,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+
+
 class _FakePlan:
     """Just the fields the op and the scratch helper read off a real plan."""
 
@@ -1488,298 +1733,162 @@ class TestPlanBatchLimit:
 
 
 class TestFlyDSLCapabilityGate:
-    """`_flydsl_pa_decode_num_seqs` promises a fallback, not an exception.
+    """`_flydsl_pa_decode_num_seqs` asks aiter, and only aiter, whether the
+    kernel takes a call; ATOM adds its routing choices and the sequence count.
 
-    Every clause it checks is a hard reject inside aiter, so a clause that goes
-    missing does not degrade to gluon -- it raises from inside the kernel call
-    and kills the worker, while the server keeps answering /metrics and the
-    client warms up until it times out. This gate had no coverage at all, and
-    two of aiter's rejects were in fact missing from it.
+    A wrong answer is not a slow path: a call FlyDSL rejects raises from
+    inside the kernel call and kills the worker. So the arguments aiter is
+    asked about must be exactly the ones run_pa_decode then passes.
     """
 
     @staticmethod
-    def _call(**over):
-        """A call that passes every clause, with one field overridable."""
+    def _call(monkeypatch, accepts=True, gluon=True, **over):
+        """Run the gate on meta tensors with a recording fake of aiter's
+        predicate. Returns (result, the predicate's calls)."""
         import torch
 
-        from atom.model_ops.base_attention import _flydsl_pa_decode_num_seqs
+        from atom.model_ops import base_attention as ba
 
+        calls = []
+
+        def can_use(*args, **kwargs):
+            calls.append((args, kwargs))
+            return accepts
+
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_can_use", lambda: can_use)
+        monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: gluon)
         q = over.pop("q", None)
         if q is None:
             q = torch.empty(16, 16, 128, device="meta", dtype=torch.bfloat16)
         kw = {
-            "output": (
-                over.pop("output", None) if "output" in over else torch.empty_like(q)
-            ),
+            "output": torch.empty_like(q),
             "q": q,
             "k_cache": torch.empty(4, 1, 8, 128, 16, device="meta", dtype=_FP8),
             "v_cache": torch.empty(4, 1, 8, 128, 16, device="meta", dtype=_FP8),
-            "block_tables": torch.empty(4, 64, device="meta", dtype=torch.int32),
-            "context_lens": torch.empty(4, device="meta", dtype=torch.int32),
+            "block_tables": torch.empty(5, 64, device="meta", dtype=torch.int32),
+            "context_lens": torch.empty(5, device="meta", dtype=torch.int32),
             "max_seqlen_q": 4,
-            "max_context_partition_num": 32,
             "context_partition_size": 256,
             "compute_type": _FP8,
             "q_scale": None,
+            "k_scale": torch.empty(4, 1, 128, 1, device="meta"),
+            "v_scale": torch.empty(4, 1, 128, 1, device="meta"),
             "alibi_slopes": None,
             "sinks": None,
             "sliding_window": -1,
             "ps": True,
         }
         kw.update(over)
-        return _flydsl_pa_decode_num_seqs(**kw)
+        return ba._flydsl_pa_decode_num_seqs(**kw), calls, kw
 
-    def test_the_baseline_call_is_accepted(self, monkeypatch):
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+    def test_aiter_is_asked_with_the_arguments_pa_decode_gets(self, monkeypatch):
+        """16 rows at query length 4 over 5 padded sequences: 4 sequences, and
+        aiter sees the sliced rectangle run_pa_decode passes to pa_decode."""
+        seqs, calls, kw = self._call(monkeypatch, max_context_length=1000)
+        assert seqs == 4
+        ((args, kwargs),) = calls
+        assert args[0] is kw["output"] and args[1] is kw["q"]
+        assert args[2] is kw["k_cache"] and args[3] is kw["v_cache"]
+        assert args[4].shape == (4,) and args[5].shape == (4, 64)
+        assert args[6] == 4
+        assert kwargs == {
+            "context_partition_size": 256,
+            "compute_type": _FP8,
+            "query_scale": None,
+            "key_scale": kw["k_scale"],
+            "value_scale": kw["v_scale"],
+            "alibi_slopes": None,
+            "sinks": None,
+            "sliding_window": 0,
+            # The bound run_pa_decode hands pa_decode, clamped to the table.
+            "max_context_length": 1000,
+        }
+
+    def test_the_context_bound_matches_run_pa_decode(self, monkeypatch):
+        from atom.model_ops import base_attention as ba
+
+        _, calls, kw = self._call(monkeypatch)
+        assert calls[0][1]["max_context_length"] == ba._flydsl_context_bound(
+            None, kw["block_tables"], kw["k_cache"]
         )
-        assert self._call() == 4
+
+    def test_an_aiter_decline_falls_back(self, monkeypatch):
+        seqs, calls, _ = self._call(monkeypatch, accepts=False)
+        assert seqs is None and len(calls) == 1
 
     @pytest.mark.parametrize(
         "field,value",
-        [
-            ("sliding_window", 128),
-            ("ps", False),
-            ("compute_type", "bf16"),
-            ("context_partition_size", 128),
-            ("max_context_partition_num", 512),
-            ("q_scale", "present"),
-            ("alibi_slopes", "present"),
-            ("sinks", "present"),
-        ],
+        [("sliding_window", 128), ("ps", False), ("sinks", "present")],
     )
-    def test_each_aiter_reject_falls_back(self, monkeypatch, field, value):
+    def test_atom_routing_keeps_these_on_gluon(self, monkeypatch, field, value):
         import torch
 
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        if value == "bf16":
-            value = torch.bfloat16
-        elif value == "present":
+        if value == "present":
             value = torch.empty(1, device="meta")
-        assert self._call(**{field: value}) is None, f"{field}={value} must fall back"
+        seqs, calls, _ = self._call(monkeypatch, **{field: value})
+        assert seqs is None and not calls
 
-    @pytest.mark.parametrize("block_size,ok", [(16, True), (128, True), (256, False)])
-    def test_block_size_outside_aiters_whitelist_falls_back(
-        self, monkeypatch, block_size, ok
-    ):
-        """--block-size 256 reaches this site whenever use_triton_attn is set.
-
-        aiter takes block_size from dim -2 and rejects anything but 16/64/128;
-        the guard used to check only dim -1, so a 256-block deployment routed
-        into FlyDSL and died there.
-        """
+    @pytest.mark.parametrize("gluon", [True, False])
+    def test_bf16_kv_stays_on_gluon_where_gluon_exists(self, monkeypatch, gluon):
         import torch
 
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
+        kv = torch.empty(4, 1, 16, 128, 8, device="meta", dtype=torch.bfloat16)
+        seqs, calls, _ = self._call(
+            monkeypatch,
+            gluon=gluon,
+            k_cache=kv,
+            v_cache=kv,
+            compute_type=torch.bfloat16,
+            k_scale=None,
+            v_scale=None,
         )
-        k = torch.empty(4, 1, 8, block_size, 16, device="meta", dtype=_FP8)
-        assert (self._call(k_cache=k) == 4) is ok
-
-    def test_unsupported_arch_falls_back(self, monkeypatch):
-        """aiter builds FlyDSL for gfx942/gfx950 only and raises on the rest."""
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: False
-        )
-        assert self._call() is None
-
-    def test_row_count_must_divide_evenly(self, monkeypatch):
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        odd = torch.empty(15, 16, 128, device="meta", dtype=torch.bfloat16)
-        assert self._call(q=odd) is None
-
-    @pytest.mark.parametrize("head_dim", [192, 96, 256])
-    def test_head_dim_the_cache_does_not_encode_falls_back(self, monkeypatch, head_dim):
-        """Two clauses, and the second is the one that was missing.
-
-        192 and 96 fail ATOM's own whitelist. 256 passes it -- and used to be
-        asserted as accepted -- but the baseline cache is (.., 8, 128, 16),
-        whose num_hgroups encodes head_dim 128, and aiter rejects a q that
-        disagrees with its cache. Pinning that acceptance as the contract is
-        what would have kept the clause from ever being added.
-        """
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        q = torch.empty(16, 16, head_dim, device="meta", dtype=torch.bfloat16)
-        assert self._call(q=q) is None
-
-    def test_head_dim_matching_the_cache_is_accepted(self, monkeypatch):
-        """The positive half: 256 is fine once the cache encodes 256."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        q = torch.empty(16, 16, 256, device="meta", dtype=torch.bfloat16)
-        k = torch.empty(4, 1, 16, 128, 16, device="meta", dtype=_FP8)
-        v = torch.empty(4, 1, 16, 128, 16, device="meta", dtype=_FP8)
-        assert self._call(q=q, k_cache=k, v_cache=v) == 4
-
-    def test_zero_query_length_falls_back_instead_of_dividing(self, monkeypatch):
-        """`divmod(rows, 0)` is a ZeroDivisionError, not a fallback."""
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        assert self._call(max_seqlen_q=0) is None
-
-    def test_more_rows_than_sequences_falls_back(self, monkeypatch):
-        """The upper bound is what stops the per-sequence slices going short.
-
-        `context_lens[:n]` with n past the buffer does not raise -- torch hands
-        back whatever is there -- so without this clause FlyDSL would be given
-        a rectangle that silently disagrees with the batch.
-        """
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        q = torch.empty(32, 16, 128, device="meta", dtype=torch.bfloat16)
-        assert self._call(q=q) is None
-
-    @pytest.mark.parametrize("shape", [(4, 1, 8, 128), (4, 1, 8, 128, 8)])
-    def test_cache_layout_outside_page16_falls_back(self, monkeypatch, shape):
-        """A bf16 cache gives x == 8 on the last axis; aiter needs 16."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        k = torch.empty(*shape, device="meta", dtype=_FP8)
-        assert self._call(k_cache=k) is None
-
-    @pytest.mark.parametrize("head_dim,hgroups", [(96, 6), (1152, 72)])
-    def test_head_dim_outside_atoms_own_whitelist_falls_back(
-        self, monkeypatch, head_dim, hgroups
-    ):
-        """The whitelist clause alone, with the cache made to agree.
-
-        The cases above fail the cache clause too, so deleting the whitelist
-        left them green. 96 is neither 64 nor a multiple of 128; 1152 is a
-        multiple but past aiter's 1024 ceiling.
-        """
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        q = torch.empty(16, 16, head_dim, device="meta", dtype=torch.bfloat16)
-        k = torch.empty(4, 1, hgroups, 128, 16, device="meta", dtype=_FP8)
-        assert self._call(q=q, k_cache=k, v_cache=k) is None
-
-    def test_a_q_dtype_the_kernel_has_no_arm_for_falls_back(self, monkeypatch):
-        """aiter picks its scale from q.dtype and raises on anything else."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        q = torch.empty(16, 16, 128, device="meta", dtype=torch.float32)
-        assert self._call(q=q) is None
-
-    def test_an_output_that_disagrees_with_q_falls_back(self, monkeypatch):
-        """aiter writes through the output pointer as if it were q's twin."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        other_dtype = torch.empty(16, 16, 128, device="meta", dtype=torch.float16)
-        assert self._call(output=other_dtype) is None
-        other_shape = torch.empty(32, 16, 128, device="meta", dtype=torch.bfloat16)
-        assert self._call(output=other_shape) is None
-
-    def test_a_non_contiguous_head_dim_axis_falls_back(self, monkeypatch):
-        """Both axes: aiter checks q and output separately (pa_decode:443,448)."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        skewed = torch.empty(
-            16, 128, 16, device="meta", dtype=torch.bfloat16
-        ).transpose(1, 2)
-        assert skewed.shape == (16, 16, 128) and skewed.stride(2) != 1
-        contiguous = torch.empty(16, 16, 128, device="meta", dtype=torch.bfloat16)
-        assert self._call(q=skewed, output=contiguous) is None
-        assert self._call(output=skewed) is None
-
-    def test_q_heads_that_do_not_divide_over_kv_heads_fall_back(self, monkeypatch):
-        """The kernel gives each kv head a whole group; 16 over 3 has no split."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        k = torch.empty(4, 3, 8, 128, 16, device="meta", dtype=_FP8)
-        assert self._call(k_cache=k, v_cache=k) is None
-
-    def test_a_v_cache_of_another_dtype_falls_back(self, monkeypatch):
-        """One compute_type covers both caches; a split pair raises inside aiter."""
-        import torch
-
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        v = torch.empty(4, 1, 8, 128, 16, device="meta", dtype=torch.bfloat16)
-        assert self._call(v_cache=v) is None
+        assert (seqs is None) == gluon
+        assert bool(calls) != gluon
 
     @pytest.mark.parametrize(
-        "field", ["k_cache", "v_cache", "block_tables", "context_lens"]
+        "rows,qlen,seqs",
+        [(15, 4, None), (16, 0, None), (24, 4, None), (16, 4, 4), (5, 1, 5)],
     )
-    def test_a_non_contiguous_argument_falls_back(self, monkeypatch, field):
-        """aiter demands all four contiguous (pa_decode.py:464-470).
-
-        Nothing in this tree hands one over -- every cache view is a `.view()`,
-        which raises rather than returning a skewed tensor -- but the SGLang
-        bridge takes its pool from someone else and ATOM_PA_FLYDSL routes it
-        too, so the gate promises a fallback it could not keep.
-        """
+    def test_the_rectangle_is_recovered_or_declined(
+        self, monkeypatch, rows, qlen, seqs
+    ):
+        """Rows must split evenly over the query length, into no more
+        sequences than the padded lengths and block table hold."""
         import torch
 
-        monkeypatch.setattr(
-            "atom.model_ops.base_attention._flydsl_arch_supported", lambda: True
-        )
-        skewed = {
-            "k_cache": lambda: torch.empty(
-                4, 1, 8, 16, 128, device="meta", dtype=_FP8
-            ).transpose(3, 4),
-            "v_cache": lambda: torch.empty(
-                4, 1, 8, 16, 128, device="meta", dtype=_FP8
-            ).transpose(3, 4),
-            "block_tables": lambda: torch.empty(
-                64, 4, device="meta", dtype=torch.int32
-            ).t(),
-            "context_lens": lambda: torch.empty(8, device="meta", dtype=torch.int32)[
-                ::2
-            ],
-        }[field]()
-        assert not skewed.is_contiguous()
-        assert self._call(**{field: skewed}) is None
+        q = torch.empty(rows, 16, 128, device="meta", dtype=torch.bfloat16)
+        got, calls, _ = self._call(monkeypatch, q=q, output=q, max_seqlen_q=qlen)
+        assert got == seqs
+        assert bool(calls) == (seqs is not None)
 
-    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #4332")
-    def test_the_arch_probe_binding_exists(self):
-        """The binding, not the module name.
+    def test_fewer_table_rows_than_sequences_falls_back(self, monkeypatch):
+        import torch
 
-        Every other test here monkeypatches `_flydsl_arch_supported`, so the
-        one thing none of them touches is whether it can be computed at all.
-        aiter moving `get_gfx_runtime` leaves the module importable, leaves all
-        of these green, and makes a guard that exists to prevent an exception
-        inside aiter raise one itself on the first decode.
-        """
-        import importlib
+        table = torch.empty(3, 64, device="meta", dtype=torch.int32)
+        seqs, calls, _ = self._call(monkeypatch, block_tables=table)
+        assert seqs is None and not calls
 
-        mod = importlib.import_module("aiter.jit.utils.chip_info")
-        assert callable(getattr(mod, "get_gfx_runtime", None))
+    def test_an_aiter_without_the_predicate_is_refused(self, monkeypatch):
+        """No fallback copy of aiter's rules: opting in on an old aiter is an
+        error that names the missing function."""
+        import types
+
+        from atom.model_ops import base_attention as ba
+
+        old = types.ModuleType("aiter.ops.flydsl.pa_decode")
+        monkeypatch.setattr(ba.importlib, "import_module", lambda name: old)
+        with pytest.raises(RuntimeError, match="can_use_flydsl_pa_decode"):
+            ba._flydsl_pa_decode_can_use()
+
+    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter FlyDSL pa_decode")
+    def test_the_predicate_is_aiters(self):
+        """With an aiter that has it, the gate calls aiter's own function."""
+        from atom.model_ops import base_attention as ba
+
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+        if not hasattr(mod, "can_use_flydsl_pa_decode"):
+            pytest.skip("this aiter predates can_use_flydsl_pa_decode")
+        assert ba._flydsl_pa_decode_can_use() is mod.can_use_flydsl_pa_decode
 
 
 class TestFlyDSLConstantsMatchAiter:
@@ -1798,17 +1907,6 @@ class TestFlyDSLConstantsMatchAiter:
         return (pathlib.Path(aiter.__file__).parent / rel).read_text()
 
     @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #4332")
-    def test_block_size_whitelist(self):
-        from atom.model_ops.base_attention import _FLYDSL_PA_BLOCK_SIZES
-
-        src = self._aiter_src("ops/flydsl/pa_decode.py")
-        assert "block_size not in (16, 64, 128)" in src, (
-            "aiter's block_size whitelist moved; _FLYDSL_PA_BLOCK_SIZES is now "
-            "either over-rejecting or no longer protecting the call"
-        )
-        assert _FLYDSL_PA_BLOCK_SIZES == (16, 64, 128)
-
-    @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #4332")
     def test_supported_archs(self):
         from atom.model_ops.base_attention import _FLYDSL_PA_ARCHS
 
@@ -1817,24 +1915,16 @@ class TestFlyDSLConstantsMatchAiter:
             assert f'"{arch}"' in src, f"aiter no longer names {arch}"
 
     @pytest.mark.skipif(not _HAS_FLYDSL_PA, reason="needs aiter #4332")
-    def test_tile_size_and_batch_cap(self):
-        """The two limits the comment claimed were pinned and were not.
-
-        _FLYDSL_PA_TILE is the only context_partition_size aiter accepts, and
-        _FLYDSL_PLAN_MAX_BATCH is where its planner stops. Drift either way is
+    def test_batch_cap(self):
+        """_FLYDSL_PLAN_MAX_BATCH is where aiter's planner stops. Drift is
         silent: too strict falls back more than it must, too loose hands aiter
-        a call it raises on.
+        a plan it raises on.
         """
         from atom.model_ops.base_attention import (
-            _FLYDSL_PA_TILE,
             _FLYDSL_PLAN_MAX_BATCH,
             _FLYDSL_PLAN_SCAN_LDS_BYTES,
         )
 
-        src = self._aiter_src("ops/flydsl/pa_decode.py")
-        assert (
-            f"context_partition_size={_FLYDSL_PA_TILE}" in src
-        ), "aiter's accepted partition size moved"
         plan_src = self._aiter_src("ops/flydsl/kernels/pa_decode_plan.py")
         assert (
             str(_FLYDSL_PLAN_MAX_BATCH) in plan_src
@@ -1923,8 +2013,9 @@ class TestNoGluonFlyDSLRouting:
         monkeypatch.setattr(mha, "dense_decode_splits", lambda n, h: 8)
         layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
         layer.sliding_window, layer.kv_cache_dtype, layer.sinks = -1, "fp8", None
+        layer.use_flash_layout = False
         layer.layer_num = 0
-        layer.paged_attention_triton = lambda *a: "flydsl"
+        layer.paged_attention_triton = lambda *a, **k: "flydsl"
         m = self._meta
         md = SimpleNamespace(context_lens=m(4), block_tables=m(4, 8), max_seqlen_q=1)
         call = lambda: mha.PagedAttentionImpl.paged_attention_unified(
@@ -1951,7 +2042,7 @@ class TestNoGluonFlyDSLRouting:
         monkeypatch.setattr(mha, "flydsl_decode_seqs", lambda **kw: 4)
         layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
         layer.sliding_window = -1
-        assert not layer._flydsl_takes_decode(None, None, None, None)
+        assert not layer._flydsl_takes_decode(None, None, None, None, None, None)
 
     @pytest.mark.parametrize(
         "arch, takes_max_batch", [("gfx950", True), ("gfx1250", False)]
