@@ -145,13 +145,26 @@ class LaunchTest(unittest.TestCase):
                                      *((c, f"N3966-{tag}") for c in (16, 32, 48, 56, 72, 88)
                                        for tag in ("BF16", "R4391")),
                                      *((c, f"N3966-BF16-{tag}") for c in (56, 72, 88)
-                                       for tag in ("KVB", "KVB-TH"))):
+                                       for tag in ("KVB", "KVB-TH")),
+                                     *((72, f"N3966-{tag}") for tag in (
+                                         "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX"))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant.startswith("N3966"):
                 # 3966924d fuses MLA g_proj into fused_qkv_a_proj: 24 fewer PTPC modules, same weights.
                 env = candidate["roles"]["prefill"]["env"]
+                if variant.endswith("-GX"):
+                    # D FULL decode graphs up to 102 requests x 5 tokens, the 512-token step budget.
+                    cc = candidate["roles"]["decode"]["args"]["compilation-config"]
+                    self.assertEqual(cc["cudagraph_capture_sizes"][-30:], list(range(365, 511, 5)))
+                    self.assertEqual(cc["max_cudagraph_capture_size"], 510)
+                    cc["cudagraph_capture_sizes"] = cc["cudagraph_capture_sizes"][:-30]
+                    cc["max_cudagraph_capture_size"] = 360
+                    variant = variant.removesuffix("-GX")
+                if variant.endswith("-SDROP"):
+                    self.assertEqual(env.pop("C48_STORE_DROP_SUPERSEDED"), "1")
+                    variant = variant.removesuffix("-SDROP")
                 if variant.endswith("-TH"):
                     self.assertEqual(env.pop("C48_P_TAIL_CKPT_HASH"), "1")
                     variant = variant.removesuffix("-TH")

@@ -192,6 +192,62 @@ def prepare_store_memory(worker):
         done.touch()
 
 
+DROP_DELAY_S = 12
+
+
+def drop_superseded_states():
+    """Remove the Mamba states pd_c48_scheduler.track_superseded_states marks, DROP_DELAY_S after their successor saves.
+
+    With partial hash hits every lookup leases every state of the conversation it probes, so LRU never ages
+    the superseded ones out. The remove is not forced: the master refuses a key leased in the last 10 s
+    (default_kv_lease_ttl) by a lookup or load, so a state another request is reading stays for LRU.
+    """
+    import collections
+    import threading
+    import time
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import KVCacheStoreSendingThread
+    offload = KVCacheStoreSendingThread._maybe_offload_boundary_states
+    if getattr(offload, "c48_drop_superseded", False):
+        return
+
+    def drain(thread, queue):
+        drains = removed = not_removed = 0
+        while True:
+            time.sleep(1)
+            while queue and queue[0][0] <= time.monotonic():
+                keys = queue.popleft()[1]
+                try:
+                    codes = thread.store.batch_remove(keys, False)
+                except Exception as exc:
+                    codes = [exc] * len(keys)
+                drains += 1
+                removed += sum(code == 0 for code in codes)
+                not_removed += sum(code != 0 for code in codes)
+                if thread.tp_rank == 0 and drains & (drains - 1) == 0:
+                    print(f"[C48] Store superseded states drains={drains} removed={removed}"
+                          f" not_removed={not_removed} last_codes={sorted(set(map(str, codes)))}", flush=True)
+
+    def patched(self, req_meta):
+        ok = offload(self, req_meta)
+        superseded = getattr(req_meta, "c48_superseded", None)
+        if ok and superseded:
+            puts, req_meta.boundary_puts = req_meta.boundary_puts, superseded
+            try:
+                keys = [key for key, _, _, _ in self._boundary_puts(req_meta)]
+            finally:
+                req_meta.boundary_puts = puts
+            if keys:
+                if "_c48_drop" not in self.__dict__:
+                    self._c48_drop = collections.deque()
+                    threading.Thread(target=drain, args=(self, self._c48_drop), name="c48-store-drop",
+                                     daemon=True).start()
+                self._c48_drop.append((time.monotonic() + DROP_DELAY_S, keys))
+        return ok
+
+    patched.c48_drop_superseded = True
+    KVCacheStoreSendingThread._maybe_offload_boundary_states = patched
+
+
 def enable_native_mla_96(config):
     """Opt-in native 96-head CPRR control for the pinned K3 decode recipe."""
     if os.environ.get("C48_D_MLA_NATIVE96") != "1":
@@ -272,6 +328,8 @@ class ManifestWorker(Worker):
         store = os.environ.get("C48_MOONCAKE_STORE_COMPACT") == "1"
         if store:
             prepare_store_memory(self)
+        if os.environ.get("C48_STORE_DROP_SUPERSEDED") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
+            drop_superseded_states()
         with startup_stage(self, "initialize_from_config"):
             try:
                 result = super().initialize_from_config(kv_cache_config)

@@ -72,6 +72,54 @@ def align_tail_checkpoint_to_hash(scheduler):
     scheduler._mamba_block_aligned_split = hash_aligned_split
 
 
+def track_superseded_states(store):
+    """Mark each Mamba state a Prefill resumed from, or checkpointed past, as superseded by its next boundary state.
+
+    Every turn writes a ~616 MB fp32 boundary state that only the conversation's next turn reads. The old
+    ones filled mc19's Store, and LRU then evicted idle conversations' prefixes first. The worker removes
+    marked keys (pd_c48_worker.drop_superseded_states).
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import BoundaryPut
+    match, build = store.get_num_new_matched_tokens, store.build_connector_meta
+    last = {}
+
+    def get_num_new_matched_tokens(request, num_computed_tokens):
+        result = match(request, num_computed_tokens)
+        if result[0] is not None:
+            last[request.request_id] = num_computed_tokens + result[0]
+        return result
+
+    def build_connector_meta(scheduler_output):
+        meta = build(scheduler_output)
+        for req_meta in meta.requests:
+            mamba = [p for p in req_meta.boundary_puts or [] if p.group_id in store._boundary_state_group_ids]
+            ends = sorted({p.num_tokens for p in mamba})
+            start = last.get(req_meta.req_id, 0)
+            if not ends or ends[0] <= start:
+                continue
+            # The worker keys a state by the hash ending at its position, so only hash-grid positions have one.
+            groups = {p.group_id: p.block_id for p in mamba}
+            req_meta.c48_superseded = [BoundaryPut(g, b, n) for n in [start, *ends[:-1]]
+                                       if n and n % store._hash_block_size == 0 for g, b in groups.items()]
+            last[req_meta.req_id] = ends[-1]
+        # Finish-time tails ride the step that reports the request finished, so they were handled above.
+        for req_id in scheduler_output.finished_req_ids:
+            last.pop(req_id, None)
+        return meta
+
+    store.get_num_new_matched_tokens = get_num_new_matched_tokens
+    store.build_connector_meta = build_connector_meta
+
+
+def mooncake_store_scheduler(scheduler):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import MooncakeStoreConnector
+    stores = [c.connector_scheduler for c in getattr(scheduler.connector, "_connectors", [scheduler.connector])
+              if isinstance(c, MooncakeStoreConnector)]
+    if len(stores) != 1:
+        raise RuntimeError(f"C48_STORE_DROP_SUPERSEDED needs one Prefill MooncakeStoreConnector, got {len(stores)}")
+    return stores[0]
+
+
 def create_scheduler(*args, **kwargs):
     config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
     defaults = copy.copy(config.scheduler_config)
@@ -98,6 +146,10 @@ def create_scheduler(*args, **kwargs):
         align_tail_checkpoint_to_hash(scheduler)
     if os.environ.get("C48_DSPARK_JUNCTION") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
         enable_dspark_shared_prefix_checkpoint(scheduler, config)
+    if os.environ.get("C48_STORE_DROP_SUPERSEDED") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
+        if scheduler.mamba_shared_prefix_checkpoint:
+            raise RuntimeError("C48_STORE_DROP_SUPERSEDED would remove shared-prefix checkpoints")
+        track_superseded_states(mooncake_store_scheduler(scheduler))
     if (os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1"
             and os.environ["C48_DIAG_ROLE"] == "prefill"
             and not (requested and scheduler.mamba_shared_prefix_checkpoint
