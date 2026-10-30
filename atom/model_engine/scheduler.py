@@ -2704,9 +2704,9 @@ class Scheduler:
         if self._tick_cost_limit < math.inf:
             self._log_prefill_balance(total_tokens_num_prefill)
 
-        # Prefill-only fast path: behavior identical to pre-mixed-batch days.
-        # The flag controls decode admission only. Prefill-only and mixed
-        # batches share the settlement, snapshot and advance below.
+        # This decides whether decode rows may join the scheduled prefills;
+        # the final batch shape is known only after the decode loop. Prefill-only
+        # and mixed batches share the settlement, snapshot and advance below.
         admit_decode = num_seqs_prefill == 0 or self.enable_mixed_prefill_decode
 
         if self.dummy_prefill and not scheduled_seqs:

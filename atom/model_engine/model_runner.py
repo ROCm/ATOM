@@ -2403,6 +2403,13 @@ class ModelRunner:
         self._pcp_tbo_balanced_active = False
         self._pcp_bal_groups = None
         if is_prefill and pcp_size > 1 and not batch.is_dummy_run:
+            # Config._validate_mixed_prefill_decode rejects this at launch.
+            # Keep a backstop for callers that construct a runner directly:
+            # the PCP split below only sizes the prefill rows.
+            if getattr(batch, "is_mixed", False):
+                raise NotImplementedError(
+                    "mixed prefill+decode is not supported with PCP"
+                )
             # PCP is always dp=1, so the single-rank path returns this verbatim
             # as `tbo_collective_active`; ub0/ub1 are only read under dp > 1.
             local_tokens = batch.total_tokens_num_prefill // pcp_size

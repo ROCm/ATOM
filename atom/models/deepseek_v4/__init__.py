@@ -1672,9 +1672,11 @@ class Indexer(nn.Module):
 _NULL_SPAN = nullcontext()
 
 # `torch.autograd._profiler_enabled` is private but is the only cheap way to ask.
-# If a future torch drops it, fall back to always building the span: slower, but
-# profiling keeps working, which is the failure direction that does not lie.
-_profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None) or (lambda: True)
+# If a future torch drops it, omit these optional spans rather than adding
+# profiling overhead to every mixed step.
+_profiler_enabled = getattr(torch.autograd, "_profiler_enabled", None) or (
+    lambda: False
+)
 
 
 @contextmanager
