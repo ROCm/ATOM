@@ -259,6 +259,8 @@ exports = {
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
+    "PREFILL_EXPECT_LOG": prefill.get("expect_log", ""),
+    "DECODE_EXPECT_LOG": decode.get("expect_log", ""),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
     "EVAL_ONLY": str(cell.get("eval_only", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),

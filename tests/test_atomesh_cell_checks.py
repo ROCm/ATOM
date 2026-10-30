@@ -131,5 +131,74 @@ class RequiredAtomEnvTest(unittest.TestCase):
         )
 
 
+class ExpectedLogTest(unittest.TestCase):
+    ARMED = "Kimi-K3 mono decode armed"
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.logs = Path(temp.name)
+
+    def write(self, name, text):
+        (self.logs / name).write_text(f"INFO model loaded\nINFO {text}\n")
+
+    def check(self, aggregated="0", prefill="", decode=""):
+        return subprocess.run(
+            [
+                "bash",
+                "-eu",
+                "-c",
+                shell_function("check_expected_logs") + "check_expected_logs\necho OK",
+            ],
+            env=dict(
+                os.environ,
+                RUNTIME_LOG_DIR=str(self.logs),
+                AGGREGATED=aggregated,
+                ATOMESH_EXPECT_LOG_TIMEOUT="0",
+                PREFILL_EXPECT_LOG=prefill,
+                DECODE_EXPECT_LOG=decode,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    def test_nothing_expected_reads_no_log(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OK\n")
+
+    def test_every_server_of_the_role_logged_the_line(self):
+        self.write("prefill-rank-0.log", "prefill up")
+        self.write("decode-rank-1.log", f"{self.ARMED} (TP8)")
+        self.write("decode-rank-1-worker-1.log", f"{self.ARMED} (TP8)")
+        result = self.check(decode=self.ARMED)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("all 2 decode server log(s)", result.stdout)
+        self.assertTrue(result.stdout.endswith("OK\n"))
+
+    def test_a_server_that_did_not_log_it_fails_the_cell(self):
+        self.write("decode-rank-1.log", f"{self.ARMED} (TP8)")
+        self.write("decode-rank-1-worker-1.log", "Kimi-K3 mono decode off: why")
+        result = self.check(decode=self.ARMED)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("OK", result.stdout)
+        self.assertIn("decode-rank-1-worker-1.log never logged", result.stderr)
+        self.assertNotIn("decode-rank-1.log ", result.stderr)
+
+    def test_no_server_log_fails_the_cell(self):
+        self.write("prefill-rank-0.log", f"{self.ARMED} (TP8)")
+        result = self.check(decode=self.ARMED)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no decode server log", result.stderr)
+
+    def test_aggregated_reads_the_server_as_the_decode(self):
+        self.write("server-rank-0.log", f"{self.ARMED} (TP8)")
+        result = self.check(aggregated="1", prefill="never logged", decode=self.ARMED)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("all 1 decode server log(s)", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

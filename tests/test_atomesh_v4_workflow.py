@@ -152,6 +152,7 @@ class V4AccuracyPhaseTest(unittest.TestCase):
             )
         ]
         script = acceptance + dispatch + """
+check_expected_logs() { :; }
 run_benchmark() { echo UNEXPECTED_BENCHMARK; }
 run_eval() { echo EVAL; }
 run_benchmark_and_eval

@@ -2762,7 +2762,63 @@ PY
   fi
 }
 
+# A role's expect_log is a line every one of its servers must have logged by
+# the time they are healthy. It is for a feature that, when a deployment rules
+# it out, logs why at INFO and serves without it: the cell would otherwise
+# publish numbers under a name that says the feature ran. RUN_DIR is shared, so
+# node 0 reads the logs of servers on the other nodes too.
+PREFILL_EXPECT_LOG="${PREFILL_EXPECT_LOG:-}"
+DECODE_EXPECT_LOG="${DECODE_EXPECT_LOG:-}"
+ATOMESH_EXPECT_LOG_TIMEOUT="${ATOMESH_EXPECT_LOG_TIMEOUT:-60}"
+check_expected_logs() {
+  local role expected glob log deadline
+  local -a logs pending
+  for role in prefill decode; do
+    if [[ "${role}" == "prefill" ]]; then
+      expected="${PREFILL_EXPECT_LOG}"
+      glob="prefill-rank-*.log"
+      [[ "${AGGREGATED}" != "1" ]] || continue
+    else
+      expected="${DECODE_EXPECT_LOG}"
+      glob="decode-rank-*.log"
+      # The aggregated server is configured as the decode.
+      if [[ "${AGGREGATED}" == "1" ]]; then
+        glob="server-rank-*.log"
+      fi
+    fi
+    [[ -n "${expected}" ]] || continue
+    logs=()
+    for log in "${RUNTIME_LOG_DIR}"/${glob}; do
+      if [[ -f "${log}" ]]; then
+        logs+=("${log}")
+      fi
+    done
+    if (( ${#logs[@]} == 0 )); then
+      echo "[check][FAIL] no ${role} server log in ${RUNTIME_LOG_DIR} to find '${expected}' in" >&2
+      exit 1
+    fi
+    # Another node's writes can take a few seconds to show up over NFS.
+    deadline=$((SECONDS + ATOMESH_EXPECT_LOG_TIMEOUT))
+    while :; do
+      pending=()
+      for log in "${logs[@]}"; do
+        grep -qF -- "${expected}" "${log}" || pending+=("${log}")
+      done
+      if (( ${#pending[@]} == 0 )); then
+        break
+      fi
+      if (( SECONDS >= deadline )); then
+        echo "[check][FAIL] ${pending[*]} never logged '${expected}'" >&2
+        exit 1
+      fi
+      sleep 5
+    done
+    echo "[check] all ${#logs[@]} ${role} server log(s) show '${expected}'"
+  done
+}
+
 run_benchmark_and_eval() {
+  check_expected_logs
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
     return
