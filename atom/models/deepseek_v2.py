@@ -2713,7 +2713,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         # forward is identical to the original path.
         pcp = _pcp_active()
         # FusedMoE gathers its routed rows across the PCP group on this flag.
-        get_forward_context().context.pcp_split = pcp
+        # The vLLM plugin installs no ATOM context (and runs no PCP).
+        context = get_forward_context().context
+        if context is not None:
+            context.pcp_split = pcp
         n_global = positions.shape[0]
         if pcp:
             pcp_ws = get_pcp_world_size()
