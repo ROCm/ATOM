@@ -5667,12 +5667,14 @@ class FusedMoE(torch.nn.Module):
             self, hidden_states, router_logits
         )
         x_scale = None
+        dp_repeat = self.moe_parallel_config.dp_logical_ratio
         gathered = sp_moe or token_group is not None
         if gathered:
             group = get_sp_group() if token_group is None else token_group
             heights = [hidden_states.shape[0]] * group.world_size
+            # Chosen for the rows fused_moe sees, after the stand-in repeat below.
             rows = pack_routed_rows(
-                self.quant_method.gathered_rows_wire(self, sum(heights)),
+                self.quant_method.gathered_rows_wire(self, sum(heights) * dp_repeat),
                 hidden_states,
                 topk_weights,
                 topk_ids,
@@ -5686,7 +5688,6 @@ class FusedMoE(torch.nn.Module):
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
-        dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:
             hidden_states, topk_weights, topk_ids = (

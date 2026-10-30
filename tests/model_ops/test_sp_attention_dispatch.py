@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("aiter")
+aiter = pytest.importorskip("aiter")
 
 from aiter.jit.utils import chip_info
 
@@ -96,3 +96,34 @@ def test_head_exchange_requires_usable_collective(supported):
     ca.should_custom_ag = lambda x: True
     group.world_size = 2
     assert communicator() is None
+
+
+class _Norm:
+    weight = torch.ones(8, dtype=torch.bfloat16)
+    variance_epsilon = 1e-6
+
+    def __call__(self, hidden_states, residual):
+        return hidden_states, residual
+
+
+def test_norm_quant_fuses_only_when_asked(monkeypatch):
+    """Plain TP keeps the BF16-rounded quantization that mono matches."""
+    from atom.model_ops import layernorm  # its Triton import needs a GPU
+
+    calls = []
+    monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(layernorm, "gemma_rms_norm_fp8_supported", lambda width: True)
+    monkeypatch.setattr(
+        layernorm, "gemma_rms_norm_fp8", lambda *args: calls.append("fused")
+    )
+
+    def quant(x, **kwargs):
+        calls.append("bf16")
+        return x, x
+
+    monkeypatch.setattr(aiter, "get_hip_quant", lambda quant_type: quant)
+    x = torch.ones(2, 8, dtype=torch.bfloat16)
+    for fused in (False, True):
+        layernorm.gemma_rms_norm_quant(x, x, _Norm(), fused=fused)
+        layernorm.fused_allreduce_gemma_rms_norm_quant(x, x, _Norm(), fused=fused)
+    assert calls == ["bf16", "bf16", "fused", "fused"]

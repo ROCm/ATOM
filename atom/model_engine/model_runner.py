@@ -146,14 +146,17 @@ def max_schedulable_decode_bs(
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
 
 
-def sp_token_graph_ladder(sizes, sp: int, max_bs: int) -> list[int]:
-    """Capture ladder for SP token graphs, one batch size per local bucket.
+def split_rows_graph_ladder(sizes, step: int, max_bs: int) -> list[int]:
+    """Capture ladder for layouts that split a batch's rows over ranks (SP, the
+    TP replicated o_proj), one batch size per local bucket.
 
-    A token graph's bucket is its local rows (`sp_local_len`), so each rung is
-    rounded up to a multiple of `sp`. Rounding past `max_bs` would overrun the
-    per-request buffers, so the top rung is clamped to it instead of dropped.
+    Each rung is rounded up to a multiple of `step` batch sizes, chosen so its
+    rows split evenly: no layer pads them, and an SP token graph's bucket (its
+    local rows) keeps the largest batch it serves. Rounding past `max_bs` would
+    overrun the per-request buffers, so the top rung is clamped to it instead
+    of dropped.
     """
-    return sorted({min(-(-bs // sp) * sp, max_bs) for bs in sizes}, reverse=True)
+    return sorted({min(-(-bs // step) * step, max_bs) for bs in sizes}, reverse=True)
 
 
 # Re-exported under the old private name: this module is where the predicate
@@ -731,10 +734,13 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
-        # KV caches follow the attention head shards. SP needs a hidden-state
-        # gather before the LM head, so this also disables logits_in_graph.
-        # tp_world_size counts actual TP worker processes.
-        self.world_size = config.tensor_parallel_size * config.sequence_parallel_size
+        # world_size: the logical TP width, i.e. how many shards each weight is
+        # cut into. tp_world_size: how many of those shards have a process;
+        # they differ only under simulated TP. kv_head_shards: how many the
+        # attention heads are cut into, which SP splits too -- what the
+        # KV-head math below divides by.
+        self.world_size = config.tensor_parallel_size
+        self.kv_head_shards = self.world_size * config.sequence_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -1346,8 +1352,8 @@ class ModelRunner:
         max_tokens = self.config.max_num_batched_tokens
         if not self.config.enable_dp_attention:
             max_tokens //= get_dp_group().world_size
-        pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1 and not sp_is_enabled():
+        pcp_size = self.config.pcp_striping_size
+        if pcp_size > 1:
             max_tokens = max(1, max_tokens // pcp_size)
         return max_tokens
 
@@ -1685,11 +1691,11 @@ class ModelRunner:
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            return hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.kv_head_shards:
+            assert hf_config.num_key_value_heads % self.kv_head_shards == 0
+            return hf_config.num_key_value_heads // self.kv_head_shards
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.kv_head_shards % hf_config.num_key_value_heads == 0
             return 1
 
     def _mrope_positions_view(self, running_tokens: int) -> torch.Tensor:
@@ -2193,11 +2199,11 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.kv_head_shards:
+            assert hf_config.num_key_value_heads % self.kv_head_shards == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.kv_head_shards
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.kv_head_shards % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
@@ -2398,7 +2404,7 @@ class ModelRunner:
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
         # request subset". Requires num_reqs >= 2 (request-boundary split needs
         # two non-empty groups); bs=1 falls back to non-TBO.
-        pcp_size = self.config.prefill_context_parallel_size
+        pcp_size = self.config.pcp_striping_size
         # Read by build_ubatch / run_model / prepare_prefill to route the
         # per-group path; reset every step so a stale value cannot route one.
         self._pcp_tbo_balanced_active = False
@@ -2625,7 +2631,7 @@ class ModelRunner:
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
-        pcp_size = self.config.prefill_context_parallel_size
+        pcp_size = self.config.pcp_striping_size
         _pcp_tbo_balanced = (
             is_prefill
             and pcp_size > 1
@@ -3077,7 +3083,7 @@ class ModelRunner:
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
-        _pcp_size = self.config.prefill_context_parallel_size
+        _pcp_size = self.config.pcp_striping_size
         _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
         _pcp_tbo_balanced = (
             _pcp_size > 1
@@ -3883,8 +3889,8 @@ class ModelRunner:
            fit in free GPU memory (adapts to GPU size / config, no hardcoded
            cap). DP amplifies the retained per-token footprint (MoE all_gather
            ~dp_size x tokens); scale the slope by dp**0.6 to match
-           _estimate_cudagraph_overhead. Free is min-reduced across DP so all
-           ranks skip the same set.
+           _estimate_cudagraph_overhead. Free is min-reduced across the DP, TP
+           and PCP groups so all ranks skip the same set.
         """
         dp_size = self.config.parallel_config.data_parallel_size
         if dp_size > 1 and hasattr(self, "drafter"):
@@ -3906,16 +3912,13 @@ class ModelRunner:
         slope = _GUARD_BYTES_PER_TOKEN_PER_DIM * self.config.hf_config.hidden_size
         if dp_size > 1:
             slope *= float(dp_size) ** 0.6
-        free = torch.cuda.mem_get_info()[0]
-        if dp_size > 1:
-            import torch.distributed as dist
-            from aiter.dist.parallel_state import get_dp_group
-
-            free_t = torch.tensor([free], device="cpu", dtype=torch.int64)
-            dist.all_reduce(
-                free_t, op=dist.ReduceOp.MIN, group=get_dp_group().cpu_group
-            )
-            free = int(free_t.item())
+        free_t = torch.tensor([torch.cuda.mem_get_info()[0]], dtype=torch.int64)
+        for group in (get_dp_group(), get_tp_group(), get_pcp_group()):
+            if group.world_size > 1:
+                torch.distributed.all_reduce(
+                    free_t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+                )
+        free = int(free_t.item())
         need = slope * running_tokens * 1.25 + (4 << 30)
         if (free >> 30) < (int(need) >> 30):
             if self.rank == 0:
@@ -3977,9 +3980,16 @@ class ModelRunner:
         max_bs = max_schedulable_decode_bs(
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
+        split = 1
         if tr_hybrid and sp_is_enabled():
-            self.capture_sizes = sp_token_graph_ladder(
-                self.capture_sizes, get_sp_world_size(), max_bs
+            split = get_sp_world_size()
+        elif self.config.tp_replicated_o_proj:
+            split = get_tp_group().world_size
+        if split > 1:
+            q_lens = self._dspark_capture_q_buckets(full_q_len)
+            step = math.lcm(*(split // math.gcd(split, q) for q in q_lens))
+            self.capture_sizes = split_rows_graph_ladder(
+                self.capture_sizes, step, max_bs
             )
         oversized = [s for s in self.capture_sizes if s > max_bs]
         if oversized:
@@ -4025,7 +4035,8 @@ class ModelRunner:
                 "TBO decode has no token graph: under TR_HYBRID a decode step "
                 "split into microbatches runs eagerly."
             )
-        logits_in_graph = self.world_size == 1
+        # SP gathers hidden states before the LM head.
+        logits_in_graph = self.world_size == 1 and not sp_is_enabled()
 
         # start capture profiler
         self.start_capture_profiler()

@@ -25,8 +25,9 @@ limitations](observability/README.md).
 with `--tensor-parallel-size 1 --sequence-parallel-size N` on gfx950. Models opt in per
 decoder layer; layers or deployments it cannot serve keep the native MoE and log why. It
 needs AITER with the big-M path ([ROCm/aiter#6514](https://github.com/ROCm/aiter/pull/6514))
-and MORI built with `BUILD_CCO_SDMA=ON`. Each launch covers
-`min(ceil(max_num_batched_tokens / N), 8192)` local rows; small batches keep the native MoE.
+and MORI built with `BUILD_CCO_SDMA=ON`. Each launch covers at most
+`min(ceil(max_num_batched_tokens / N), 8192)` local rows, and a larger local shard runs as
+several launches; small batches keep the native MoE.
 
 ## Experimental TP replicated o-projection
 

@@ -15,6 +15,7 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.config import get_current_atom_config
 from atom.distributed.fp8_head_exchange import gather_heads_fp8
+from atom.distributed.pcp_utils import pcp_pad_dense
 from atom.distributed.token_transport import gather_heads, gather_tokens
 from atom.utils import mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
@@ -26,10 +27,7 @@ def enabled() -> bool:
 
 
 def _pad_tokens(x: torch.Tensor, world: int) -> torch.Tensor:
-    pad = (-x.shape[0]) % world
-    if pad:
-        return torch.cat((x, x.new_zeros((pad, *x.shape[1:]))), dim=0)
-    return x
+    return pcp_pad_dense(x, (-x.shape[0]) % world)
 
 
 def _attention_fake(
@@ -83,9 +81,7 @@ def replicated_o_proj_attention(
     output = gather_heads(output, group)
     # A fixed tuple schema keeps graph tracing independent of batch size. The
     # BF16 consumer ignores this scale; the FP8 consumer always receives it.
-    return output, torch.ones(
-        (output.shape[0], 1), device=q.device, dtype=torch.float32
-    )
+    return output, output.new_empty((output.shape[0], 1), dtype=torch.float32)
 
 
 def _local_residual_fake(x: torch.Tensor, world: int) -> torch.Tensor:
@@ -98,8 +94,9 @@ def replicated_o_proj_local_residual(x: torch.Tensor, world: int) -> torch.Tenso
     padded = _pad_tokens(x, world)
     local = padded.shape[0] // world
     start = group.rank_in_group * local
-    # Custom op outputs must not alias inputs, including the no-padding case.
-    return padded[start : start + local].clone()
+    rows = padded[start : start + local]
+    # Custom op outputs must not alias inputs.
+    return rows if padded is not x else rows.clone()
 
 
 def _gather_fake(x: torch.Tensor, world: int) -> torch.Tensor:

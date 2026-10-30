@@ -2214,6 +2214,17 @@ class Config:
         return visible if 0 < visible < tp else tp
 
     @property
+    def pcp_striping_size(self) -> int:
+        """Ranks the runner stripes a prefill's tokens over, round-robin, for PCP.
+
+        SP reuses the PCP group (`prefill_context_parallel_size` is its size) but
+        shards tokens contiguously inside the model, so nothing is striped.
+        """
+        if self.sequence_parallel_size > 1:
+            return 1
+        return self.prefill_context_parallel_size
+
+    @property
     def capture_sizes(self) -> list[int]:
         """The declared CUDAGraph capture ladder, in batch sizes.
 

@@ -394,9 +394,16 @@ class MiniMaxM3MoE(nn.Module):
             raise ValueError("MiniMaxM3MoE does not accept prequantized input")
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        # The replicated o_proj's FFN takes every token. An unfused shared
+        # expert needs them too, so gather once for both.
+        gather_first = self._tp_replicated_o_proj and self.shared_experts is not None
+        if gather_first:
+            hidden_states = torch.ops.aiter.replicated_o_proj_gather(
+                hidden_states, self._tp_world
+            )
         router_logits = self.gate(hidden_states)
 
-        if self._tp_replicated_o_proj:
+        if self._tp_replicated_o_proj and not gather_first:
             routed_output = torch.ops.aiter.replicated_o_proj_moe(
                 hidden_states, router_logits, self.experts.layer_name, self._tp_world
             )
@@ -409,10 +416,6 @@ class MiniMaxM3MoE(nn.Module):
             routed_output = routed_output * self.routed_scaling_factor
 
         if self.shared_experts is not None:
-            if self._tp_replicated_o_proj:
-                hidden_states = torch.ops.aiter.replicated_o_proj_gather(
-                    hidden_states, self._tp_world
-                )
             routed_output = routed_output + self.shared_experts(hidden_states)
 
         if self._tp_replicated_o_proj:
@@ -672,15 +675,16 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
 
-def _minimax_m3_norm(norm, hidden_states, residual, *, quant, reduce):
+def _minimax_m3_norm(norm, hidden_states, residual, *, quant, reduce, fused):
     """Gemma RMSNorm of `hidden_states + residual`, all-reducing the increment
-    first when `reduce` and quantizing per token when `quant`.
+    first when `reduce` and quantizing per token when `quant` (in one kernel
+    when `fused`).
 
     Returns ``(hidden_states, scale, residual)``; scale is None without `quant`.
     """
     if quant:
         fn = fused_allreduce_gemma_rms_norm_quant if reduce else gemma_rms_norm_quant
-        return fn(hidden_states, residual, norm)
+        return fn(hidden_states, residual, norm, fused=fused)
     if residual is None:
         return norm(hidden_states), None, hidden_states
     if reduce:
@@ -701,6 +705,7 @@ def _minimax_m3_input_norm(layer, hidden_states, residual):
         residual,
         quant=_linear_consumes_per_token_fp8(layer.self_attn.qkv_proj),
         reduce=residual is not None and not layer._tp_replicated_o_proj,
+        fused=layer._fused_norm_quant,
     )
 
 
@@ -754,6 +759,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         )
         self._tp_replicated_o_proj = _tp_o_proj.enabled()
         self._tp_world = get_tensor_model_parallel_world_size()
+        # Whole-token rows; plain TP keeps main's BF16-rounded quantization,
+        # which mono matches.
+        self._fused_norm_quant = sp_is_enabled() or self._tp_replicated_o_proj
 
     @property
     def uses_sp_mega_moe(self) -> bool:
@@ -827,6 +835,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             quant=not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj),
             reduce=not self._tp_replicated_o_proj,
+            fused=self._fused_norm_quant,
         )
 
         if self._tp_replicated_o_proj and not self.is_moe_layer:

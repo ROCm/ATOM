@@ -10,13 +10,17 @@ forward buffers (sized `max_num_batched_tokens`) and surfaced as a bare
 `could not broadcast input array from shape (1024,) into shape (512,)`.
 """
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
+from atom.model_engine import model_runner
 from atom.model_engine.model_runner import (
     max_schedulable_decode_bs,
-    sp_token_graph_ladder,
+    split_rows_graph_ladder,
 )
 
 
@@ -69,11 +73,37 @@ class TestMaxSchedulableDecodeBs:
 
 @pytest.mark.parametrize("sp", [2, 4, 8])
 @pytest.mark.parametrize("max_bs", [1, 2, 6, 12, 250, 512])
-def test_sp_token_graph_ladder_covers_every_schedulable_batch(sp, max_bs):
+def test_split_rows_graph_ladder_covers_every_schedulable_batch(sp, max_bs):
     # Rounding to SP multiples used to run past `max_bs` and get filtered out,
     # leaving the top batch sizes eager (or no ladder at all).
-    ladder = sp_token_graph_ladder(
+    ladder = split_rows_graph_ladder(
         list(range(1, 9)) + list(range(16, 513, 16)), sp, max_bs
     )
     assert max(ladder) == max_bs
     assert len({-(-r // sp) for r in ladder}) == len(ladder)
+
+
+def test_memory_guard_skips_a_bucket_any_tp_or_pcp_rank_cannot_fit(monkeypatch):
+    # A rank with ample free memory must still skip the bucket a peer skips,
+    # or the peers' captured collectives pair mismatched buckets.
+    groups = {"get_dp_group": 1, "get_tp_group": 1, "get_pcp_group": 4}
+    for name, size in groups.items():
+        group = SimpleNamespace(world_size=size, cpu_group=name)
+        monkeypatch.setattr(model_runner, name, lambda group=group: group)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (40 << 30, 80 << 30))
+    reduced = []
+
+    def all_reduce(free, op, group):
+        reduced.append(group)
+        free.fill_(5 << 30)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    runner = SimpleNamespace(
+        rank=0,
+        config=SimpleNamespace(
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            hf_config=SimpleNamespace(hidden_size=6144),
+        ),
+    )
+    assert model_runner.ModelRunner._skip_token_bucket(runner, 1024)
+    assert reduced == ["get_pcp_group"]

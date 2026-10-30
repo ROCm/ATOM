@@ -515,8 +515,9 @@ class Context:
     # stood for "dp-attention is off", and readers needing the strong claim --
     # `_can_use_dp_sharded_head` above all -- silently got the weak one.
     running_tokens_are_unified: bool = True
-    # `running_tokens` for every rank, unreduced, as Python ints
+    # `running_tokens` for every DP rank, unreduced, as Python ints
     # (`set_forward_context`'s table); this rank's entry IS `running_tokens`.
+    # Without DP, Ulysses SP holds its ranks' shards of it here instead.
     # Consumers reduce it, because they want different reductions: padding
     # each rank up to the group is a MAX, an all2all's receive width holds what
     # every rank sent and is a SUM. None on a TBO ubatch whose counts were not

@@ -70,14 +70,10 @@ def gather_tokens(x: torch.Tensor, group) -> torch.Tensor:
 def reduce_scatter_tokens(x: torch.Tensor, group) -> torch.Tensor:
     """Sum over ranks and keep this rank's rank-major row block."""
     x = x.contiguous()
-    # The communicator's PyNccl path reduces into a temporary and copies it
-    # out; for rows the final shard can be written directly.
-    if not custom_reduce_scatter_ok(x, group):
-        pynccl = _pynccl(group)
-        if pynccl is not None:
-            out = x.new_empty((x.shape[0] // group.world_size, *x.shape[1:]))
-            pynccl.reduce_scatter(out, x)
-            return out
+    # The communicator's PyNccl `reduce_scatter` reduces into a temporary and
+    # copies it out; for rows, `reduce_scatterv` writes the shard directly.
+    if not custom_reduce_scatter_ok(x, group) and _pynccl(group) is not None:
+        return group.device_communicator.reduce_scatterv(x, dim=0)
     return group.reduce_scatter(x, dim=0)
 
 

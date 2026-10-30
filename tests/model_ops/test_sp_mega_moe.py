@@ -231,26 +231,19 @@ def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
     assert getattr(layer, "sp_mega_moe", None) is None
 
 
-@pytest.mark.parametrize(
-    "error,falls_back",
-    [
-        (RuntimeError("SdmaComm: MORI SDMA setup failed on ranks [0, 1, 2, 3]"), True),
-        (ImportError("no MORI"), True),
-        # One rank's compile error or OOM leaves its peers inside a collective.
-        (RuntimeError("compile failed"), False),
-        (torch.OutOfMemoryError("HIP out of memory"), False),
-    ],
-)
-def test_runtime_setup_failure_keeps_the_native_moe(
-    monkeypatch, sp_modules, error, falls_back
-):
+def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, **stubs):
     from atom.distributed import ulysses_sp
 
     layer = _servable_layer(sp_modules.moe)
     mega = ModuleType("aiter.ops.flydsl.mega_moe_tp")
     mega.MegaMoeTPConfig = dict
-    mega.MegaMoeTP = Mock(side_effect=error)
-    monkeypatch.setitem(sys.modules, mega.__name__, mega)
+    mega.MegaMoeTP = runtime
+    comm = ModuleType("aiter.ops.communication")
+    comm._mori = stubs.get("mori", Mock())
+    norm = ModuleType("atom.model_ops.gemma_norm_fp8")
+    norm.gemma_rms_norm_fp8_supported = stubs.get("norm_supported", lambda h: True)
+    for module in (mega, comm, norm):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(ulysses_sp, "get_sp_world_size", lambda: 4)
     monkeypatch.setattr(
         ulysses_sp,
@@ -259,16 +252,62 @@ def test_runtime_setup_failure_keeps_the_native_moe(
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
     monkeypatch.setattr(fusion, "_model_layers", lambda model, config: ([layer], 1e-6))
-    config = SimpleNamespace(sp_mega_moe_enabled=True, max_num_batched_tokens=1024)
+    config = SimpleNamespace(sp_mega_moe_enabled=True, max_num_batched_tokens=mnbt)
+    return config, layer, lambda: fusion.initialize_sp_mega_moe(object(), config)
+
+
+@pytest.mark.parametrize(
+    "error,falls_back",
+    [
+        (RuntimeError("SdmaComm: MORI SDMA setup failed on ranks [0, 1, 2, 3]"), True),
+        # One rank's compile error, lazy import or OOM leaves its peers inside
+        # a collective.
+        (RuntimeError("compile failed"), False),
+        (ImportError("lazy import failed"), False),
+        (torch.OutOfMemoryError("HIP out of memory"), False),
+    ],
+)
+def test_runtime_setup_failure_keeps_the_native_moe(
+    monkeypatch, sp_modules, error, falls_back
+):
+    runtime = Mock(side_effect=error)
+    config, layer, initialize = _initialize(monkeypatch, sp_modules, runtime)
     if not falls_back:
         with pytest.raises(type(error)):
-            fusion.initialize_sp_mega_moe(object(), config)
+            initialize()
         assert config.sp_mega_moe_enabled is True
         return
-    assert fusion.initialize_sp_mega_moe(object(), config) is None
+    assert initialize() is None
     assert config.sp_mega_moe_enabled is False
-    assert mega.MegaMoeTP.call_args.args[0]["max_local_tokens"] == 256
+    assert runtime.call_args.args[0]["max_local_tokens"] == 256
     assert getattr(layer, "sp_mega_moe", None) is None
+
+
+@pytest.mark.parametrize(
+    "stubs",
+    [
+        {"mori": Mock(side_effect=ImportError("no MORI"))},
+        {"norm_supported": lambda hidden: False},
+    ],
+)
+def test_missing_dependency_falls_back_before_any_collective(
+    monkeypatch, sp_modules, stubs
+):
+    runtime = Mock()
+    config, _, initialize = _initialize(monkeypatch, sp_modules, runtime, **stubs)
+    assert initialize() is None
+    assert config.sp_mega_moe_enabled is False
+    runtime.assert_not_called()
+
+
+def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modules):
+    # 65536 tokens over SP4 are 16384 local rows: eight 2048-row launches.
+    runtime = Mock(return_value=Mock(max_local_tokens=2048))
+    _, layer, initialize = _initialize(monkeypatch, sp_modules, runtime, mnbt=65536)
+    backend = initialize()
+    assert runtime.call_args.args[0]["max_local_tokens"] == 8192
+    assert backend.launches_per_step == 8
+    assert layer.sp_mega_moe is backend
 
 
 @pytest.fixture
