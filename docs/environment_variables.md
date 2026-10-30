@@ -464,6 +464,7 @@ the host, give each its own endpoints.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_SHUTDOWN_TIMEOUT_S** | float | 5 | Seconds that shutdown waits for child processes to exit on their own before terminating them (SIGTERM, then SIGKILL): the server process waits this long for its EngineCores, and each EngineCore for its ModelRunner workers. All the children of one process share the same deadline. Must be finite and positive. Raise it when workers need longer to finish on exit, for example to write a profiler's output (`rocprofv3` writing a thread trace can take minutes). Set it before starting the server; every process reads it. |
+| **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | When one TP group spans nodes (`--tensor-parallel-size-local`), how many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, and the engine waits this long for every remote rank to subscribe to its broadcast queue. Must be finite and positive. |
 
 ## Profiling & debugging
 
