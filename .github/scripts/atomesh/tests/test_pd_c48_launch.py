@@ -137,6 +137,34 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(mooncake_hca(1, {"HIP_VISIBLE_DEVICES": "4,5,6,7"}), "rdma5")
         self.assertEqual(mooncake_hca(0, {"ROCR_VISIBLE_DEVICES": "6", "HIP_VISIBLE_DEVICES": "0"}), "rdma6")
 
+    def test_expanded_suites_show_their_case_args(self):
+        import shlex
+        import yaml
+
+        def nodes(node):
+            yield node
+            for child in (node.values() if isinstance(node, dict) else node if isinstance(node, list) else ()):
+                yield from nodes(child)
+
+        suites = yaml.safe_load((GAP.parent / "models_atomesh.yaml").read_text())
+        checked = 0
+        for suite in nodes(suites):
+            if not (isinstance(suite, dict) and "-n3966" in str(suite.get("name"))):
+                continue
+            case = next(n["ATOMESH_C48_CASE"] for n in nodes(suite) if isinstance(n, dict) and "ATOMESH_C48_CASE" in n)
+            config = json.loads((GAP / f"{case}.json").read_text())
+            for role in ("prefill", "decode"):
+                shown = next(n[role]["extra_args"] for n in nodes(suite)
+                             if isinstance(n, dict) and isinstance(n.get(role), dict) and "extra_args" in n[role])
+                parsed = shlex.split(shown)
+                keys = [a[2:] for a in parsed if a.startswith("--")]
+                self.assertEqual(sorted(keys), sorted(config["roles"][role]["args"]), (case, role))
+                for key, value in config["roles"][role]["args"].items():
+                    if isinstance(value, (dict, list)):
+                        self.assertEqual(json.loads(parsed[parsed.index("--" + key) + 1]), value, (case, role, key))
+                checked += 1
+        self.assertGreater(checked, 0)
+
     def test_candidates_preserve_unrelated_recipe_settings(self):
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
         for concurrency, variant in ((32, "PP8"), (72, "OPUS"), (88, "OPUS"),
@@ -149,7 +177,7 @@ class LaunchTest(unittest.TestCase):
                                      *((c, f"N3966-{tag}") for c in (72, 88) for tag in (
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX",
                                          "BF16-GX")),
-                                     (56, "N3966-BF16-GX")):
+                                     *((c, "N3966-BF16-GX") for c in (16, 32, 48, 56))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
