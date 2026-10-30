@@ -38,9 +38,9 @@ At TP=4 GLM-5.2 registers **99 KV entries in two physical layouts**:
 LMCache's `normalize_kv_and_discover_format()` probes for one **global** format
 and aborts when the registration is not uniform. The byte codec sidesteps the
 question entirely: ATOM gathers whole paged blocks into a chunk-major uint8 blob
-and LMCache only ever stores opaque bytes, so no format probe runs. **Stock
-LMCache 0.4.5 (shipped in `rocm/atom-dev:vllm-latest`) is sufficient** — unlike
-the official-connector route, no source build of 0.5.x is needed.
+and LMCache only ever stores opaque bytes, so no format probe runs. **The
+LMCache shipped in `rocm/atom-dev:vllm-latest` is sufficient** — the byte path
+needs nothing newer than stock 0.4.5, where it was first measured.
 
 Three GLM-5.2 specifics the mapping had to handle rather than assume:
 
