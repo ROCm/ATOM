@@ -449,7 +449,10 @@ def main():
            urls['prefill']+'/metrics', urls['decode']+'/metrics', '--output-artifact-dir', str(artifact),
            '--public-dataset', plan['benchmark']['dataset']]
     dump(out/'benchmark-command.json', cmd)
-    proc = start('agentx', cmd, common, logs)
+    # The runner env file declares unset AIPERF_* knobs as empty strings, which
+    # AIPerf's settings reject (job 11156); let AgentX apply its own defaults.
+    agentx_env = {k: v for k, v in common.items() if not (k.startswith('AIPERF_') and v == '')}
+    proc = start('agentx', cmd, agentx_env, logs)
     deadline = time.monotonic() + duration + 3600
     while proc.poll() is None:
         check_services()
