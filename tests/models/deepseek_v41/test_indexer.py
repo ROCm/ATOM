@@ -246,7 +246,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
 
     full, candidates = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
     reindex, _ = scoring.score_topk_paged(*args, **kwargs, candidates=bind(candidates))
-    real_score = shared.deepgemm_fp8_paged_mqa_logits
+    real_score = shared._fp8_paged_mqa_logits
     sizes = []
 
     def observe(*args, **kwargs):
@@ -264,7 +264,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     original_plane_rows = ws.plane_rows
     monkeypatch.setattr(ws, "plane_rows", lambda width: 3)
     monkeypatch.setattr(chunk, "plane_rows", lambda width: 3)
-    monkeypatch.setattr(shared, "deepgemm_fp8_paged_mqa_logits", observe)
+    monkeypatch.setattr(shared, "_fp8_paged_mqa_logits", observe)
     actual, chosen = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
     actual_reindex, _ = scoring.score_topk_paged(
         *args, **kwargs, candidates=bind(chosen)
@@ -863,17 +863,17 @@ def test_scorer_runs_in_its_workspace_and_selects_the_same_rows():
     from atom.model_ops.indexer import score as shared
 
     observed = []
-    real_score = shared.deepgemm_fp8_paged_mqa_logits
+    real_score = shared._fp8_paged_mqa_logits
 
     def observe(*a, **k):
         observed.append(a[3].data_ptr())
         return real_score(*a, **k)
 
-    shared.deepgemm_fp8_paged_mqa_logits = observe
+    shared._fp8_paged_mqa_logits = observe
     try:
         actual = scoring.score_topk_paged(*args, **kwargs, workspace=space)
     finally:
-        shared.deepgemm_fp8_paged_mqa_logits = real_score
+        shared._fp8_paged_mqa_logits = real_score
     for got, want in zip(actual, expected):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
     assert observed == [space.logits(1, 1).data_ptr()]

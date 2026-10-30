@@ -229,6 +229,16 @@ class EngramPrefetcher:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
+def _dp_world_size() -> int:
+    """Ranks in this rank's DP group (1 without DP, or with no group)."""
+    try:
+        from aiter.dist.parallel_state import get_dp_group
+
+        return int(get_dp_group().world_size)
+    except Exception:  # noqa: BLE001 - no aiter, no DP group: not DP
+        return 1
+
+
 class EngramHost:
     """Stage every token of ragged request chunks into a flat device buffer.
 
@@ -260,6 +270,7 @@ class EngramHost:
         # no UVA -- which is also what a CPU-only test wants to say.
         self.uva = False
         self._tp_group = None
+        self._shared_tables = False
         # Every table this rank page-locked, for the fallback and the shutdown.
         self._pinned_tables = []
         if device_lookup is not None and device.type == "cuda" and envs.ATOM_ENGRAM_UVA:
@@ -383,7 +394,10 @@ class EngramHost:
         heads is a contiguous row -- and byte -- range. A rank page-locks only
         that range (`host_memory.pin_rows`: copied into page-locked memory by
         default, registered in place with ATOM_ENGRAM_UVA_COPY=0): the full
-        table on every rank is what a TP job cannot afford.
+        table on every rank is what a TP job cannot afford. Under DP attention
+        every rank does hold the full table; unless ATOM_ENGRAM_UVA_COPY is
+        set it is then registered in place, so the node pins the checkpoint's
+        page cache once instead of one copy per rank.
 
         The answer is the GROUP's. An empty shard and a refused page-lock are
         both per-rank outcomes, and the device lookup ends in an all-gather: a
@@ -406,6 +420,11 @@ class EngramHost:
         self.head_start = group.rank_in_group * per
         self.local_heads = min(per, max(0, num_hash_heads - self.head_start))
         self.total_heads = num_hash_heads
+        # DP attention: a one-GPU TP group per DP rank, each holding every
+        # head. The tables are then the same on every rank of the node, and
+        # registering the shared checkpoint mapping in place pins them once
+        # where a copy per rank would pin them once per rank.
+        self._shared_tables = shards == 1 and _dp_world_size() > 1
         pinned = self._register_shard(prefetcher)
         if shards > 1:
             # Gloo, once, at load. MIN: one refusal is the group's answer.
@@ -421,11 +440,12 @@ class EngramHost:
             return False
         logger.info(
             "engram: UVA device lookup active -- heads [%d, %d) of %d, "
-            "%.1f GiB page-locked on this rank",
+            "%.1f GiB page-locked on this rank%s",
             self.head_start,
             self.head_start + self.local_heads,
             num_hash_heads,
             pinned / 1024**3,
+            " (whole tables, shared by the DP ranks)" if self._shared_tables else "",
         )
         return True
 
@@ -447,7 +467,7 @@ class EngramHost:
             row_start = int(offsets[self.head_start])
             row_end = int(offsets[last]) + int(mapping.head_vocab_sizes[layer_id][last])
             try:
-                ok = table.enable_uva(row_start, row_end)
+                ok = table.enable_uva(row_start, row_end, shared=self._shared_tables)
             except Exception:
                 # Answered as a refusal, not raised: the TP group votes next,
                 # and a rank that left before the vote would leave its peers

@@ -610,47 +610,67 @@ def register_slot_allocator(allocator) -> None:
         _slot_allocators.append(allocator)
 
 
-def _apply_runner_patches() -> bool:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+def _note_scheduler_output(runner, scheduler_output) -> None:
+    """One step's scheduler events, taken before the runner applies them.
 
-    original_update = GPUModelRunner._update_states
-    if getattr(original_update, "_atom_state_checkpoint_patched", False):
+    Slots come back on finished / preempted / resumed ids, this step's
+    placement plans replace the last step's, and whole-block copies on a proxy
+    pool are refused.
+    """
+    finished = getattr(scheduler_output, "finished_req_ids", None) or ()
+    preempted = getattr(scheduler_output, "preempted_req_ids", None) or ()
+    cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    resumed = getattr(cached, "resumed_req_ids", None) or ()
+    gone = set(finished) | set(preempted) | set(resumed)
+    if gone:
+        for allocator in _slot_allocators:
+            allocator.release(gone)
+    _event_counts["finished"] += len(finished)
+    _event_counts["preempted"] += len(preempted)
+    _event_counts["resumed"] += len(resumed)
+    _store_plan.clear()
+    _store_plan.update(
+        getattr(scheduler_output, "atom_state_checkpoint_stores", None) or {}
+    )
+    _decode_plan.clear()
+    _decode_plan.update(
+        getattr(scheduler_output, "atom_state_checkpoint_decode_candidates", None) or {}
+    )
+    copies = getattr(scheduler_output, "kv_cache_block_copies", None)
+    if copies and _config_has_proxy(getattr(runner, "kv_cache_config", None)):
+        raise RuntimeError(
+            "vLLM scheduled whole-block copies on an ATOM proxy pool; its view "
+            "of a block is not ATOM's carve, so they would corrupt it"
+        )
+
+
+# Where each runner first receives a step's scheduler output: V1 in
+# `_update_states`; Model Runner V2 in `finish_requests`, which `execute_model`
+# calls first and which is where V2 drops finished and preempted requests.
+_STEP_ENTRY_METHODS = ("_update_states", "finish_requests")
+
+
+def _patch_runner_class(runner_cls) -> bool:
+    """Hook one runner class. Returns whether this call installed anything."""
+    entry = next((m for m in _STEP_ENTRY_METHODS if hasattr(runner_cls, m)), None)
+    if entry is None:
+        raise RuntimeError(
+            f"{runner_cls.__module__}.{runner_cls.__name__} has none of "
+            f"{_STEP_ENTRY_METHODS}; ATOM state slots would never be released"
+        )
+    original_entry = getattr(runner_cls, entry)
+    if getattr(original_entry, "_atom_state_checkpoint_patched", False):
         return False
 
-    @functools.wraps(original_update)
-    def wrapped_update_states(self, scheduler_output, *args, **kwargs):
-        finished = getattr(scheduler_output, "finished_req_ids", None) or ()
-        preempted = getattr(scheduler_output, "preempted_req_ids", None) or ()
-        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        resumed = getattr(cached, "resumed_req_ids", None) or ()
-        gone = set(finished) | set(preempted) | set(resumed)
-        if gone:
-            for allocator in _slot_allocators:
-                allocator.release(gone)
-        _event_counts["finished"] += len(finished)
-        _event_counts["preempted"] += len(preempted)
-        _event_counts["resumed"] += len(resumed)
-        _store_plan.clear()
-        _store_plan.update(
-            getattr(scheduler_output, "atom_state_checkpoint_stores", None) or {}
-        )
-        _decode_plan.clear()
-        _decode_plan.update(
-            getattr(scheduler_output, "atom_state_checkpoint_decode_candidates", None)
-            or {}
-        )
-        copies = getattr(scheduler_output, "kv_cache_block_copies", None)
-        if copies and _config_has_proxy(getattr(self, "kv_cache_config", None)):
-            raise RuntimeError(
-                "vLLM scheduled whole-block copies on an ATOM proxy pool; its view "
-                "of a block is not ATOM's carve, so they would corrupt it"
-            )
-        return original_update(self, scheduler_output, *args, **kwargs)
+    @functools.wraps(original_entry)
+    def wrapped_entry(self, scheduler_output, *args, **kwargs):
+        _note_scheduler_output(self, scheduler_output)
+        return original_entry(self, scheduler_output, *args, **kwargs)
 
-    wrapped_update_states._atom_state_checkpoint_patched = True
-    GPUModelRunner._update_states = wrapped_update_states
+    wrapped_entry._atom_state_checkpoint_patched = True
+    setattr(runner_cls, entry, wrapped_entry)
 
-    original_init_kv = GPUModelRunner.initialize_kv_cache
+    original_init_kv = runner_cls.initialize_kv_cache
 
     @functools.wraps(original_init_kv)
     def wrapped_initialize_kv_cache(self, kv_cache_config, *args, **kwargs):
@@ -664,9 +684,25 @@ def _apply_runner_patches() -> bool:
         return result
 
     wrapped_initialize_kv_cache._atom_state_checkpoint_patched = True
-    GPUModelRunner.initialize_kv_cache = wrapped_initialize_kv_cache
-    install_store_sites(GPUModelRunner)
+    runner_cls.initialize_kv_cache = wrapped_initialize_kv_cache
+    if entry == "_update_states":
+        install_store_sites(runner_cls)
     return True
+
+
+def _apply_runner_patches() -> bool:
+    """Hook every GPU model runner class this vLLM ships, V1 and V2 alike.
+
+    The two classes share no base, so hooking one leaves the other's slots
+    unreleased. The store sites are installed on V1 only; a deployment that
+    would need them under V2 is refused where its checkpoints are bound.
+    """
+    from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
+
+    installed = False
+    for runner_cls in gpu_model_runner_classes():
+        installed = _patch_runner_class(runner_cls) or installed
+    return installed
 
 
 def install_store_sites(runner_cls) -> None:
