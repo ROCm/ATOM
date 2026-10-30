@@ -146,7 +146,7 @@ class LaunchTest(unittest.TestCase):
                                        for tag in ("BF16", "R4391")),
                                      *((c, f"N3966-BF16-{tag}") for c in (56, 72, 88)
                                        for tag in ("KVB", "KVB-TH")),
-                                     *((72, f"N3966-{tag}") for tag in (
+                                     *((c, f"N3966-{tag}") for c in (72, 88) for tag in (
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX"))):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
@@ -157,10 +157,12 @@ class LaunchTest(unittest.TestCase):
                 if variant.endswith("-GX"):
                     # D FULL decode graphs up to 102 requests x 5 tokens, the 512-token step budget.
                     cc = candidate["roles"]["decode"]["args"]["compilation-config"]
-                    self.assertEqual(cc["cudagraph_capture_sizes"][-30:], list(range(365, 511, 5)))
+                    top = base["roles"]["decode"]["args"]["compilation-config"]["max_cudagraph_capture_size"]
+                    extra = list(range(top + 5, 511, 5))
+                    self.assertEqual(cc["cudagraph_capture_sizes"][-len(extra):], extra)
                     self.assertEqual(cc["max_cudagraph_capture_size"], 510)
-                    cc["cudagraph_capture_sizes"] = cc["cudagraph_capture_sizes"][:-30]
-                    cc["max_cudagraph_capture_size"] = 360
+                    cc["cudagraph_capture_sizes"] = cc["cudagraph_capture_sizes"][:-len(extra)]
+                    cc["max_cudagraph_capture_size"] = top
                     variant = variant.removesuffix("-GX")
                 if variant.endswith("-SDROP"):
                     self.assertEqual(env.pop("C48_STORE_DROP_SUPERSEDED"), "1")
