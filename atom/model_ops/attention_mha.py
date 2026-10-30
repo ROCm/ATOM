@@ -1090,11 +1090,23 @@ class PagedAttentionImpl(nn.Module):
         # at 0 -- hence is_prefill False, which is the branch this method is
         # reached from. Every is_prefill batch sets the two counts equal.
         n_seqs = fwd_ctx.context.scheduled_bs
+        # A prefill padded to the DP group's token-graph bucket (attention runs
+        # eagerly there) carries pad rows no sequence owns. Hand the kernel only
+        # the scheduled ones: its route and its 3D split buffers are sized by
+        # the row count, and a short chunk at a large bucket would otherwise
+        # take the decode split at bucket height (a 64 GiB segment buffer for
+        # a 1-token chunk at 8192). The pad rows of `o` are zeroed so what
+        # follows attention reads defined values there.
+        n_tok = fwd_ctx.context.scheduled_tokens
+        q_attn, o_attn = q, o
+        if 0 < n_tok < q.shape[0] and not torch.cuda.is_current_stream_capturing():
+            q_attn, o_attn = q[:n_tok], o[:n_tok]
+            o[n_tok:].zero_()
         unified_attention(
-            q,
+            q_attn,
             k_for_attn,
             v_for_attn,
-            o,
+            o_attn,
             # Cut to the requests actually scheduled: the prefill builder pads
             # both of these past them.
             cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_seqs + 1],
