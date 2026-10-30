@@ -2081,3 +2081,54 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+def _incremental_pair():
+    from atom.kv_transfer.offload.mp.connector import LMCacheMPConnector
+    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
+
+    return (
+        LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler),
+        LMCacheMPConnector.__new__(LMCacheMPConnector),
+    )
+
+
+def _ship_save(sched, worker, seq, end, drops=False):
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    req = sched._build_save_request(seq, 0, end, None, [0], False)
+    meta = LMCacheOffloadMetadata()
+    meta.requests = [req]
+    if drops:
+        meta.token_cache_drops = sched._shipped_drops
+        sched._shipped_drops = []
+    worker._resolve_shipped_tokens(meta)
+    return req
+
+
+def test_incremental_token_shipping_roundtrip():
+    """Saves ship only new tokens; the worker rebuilds each prefix exactly."""
+    import types
+
+    sched, worker = _incremental_pair()
+    seq = types.SimpleNamespace(id=7, token_ids=list(range(1000)), block_table=[0])
+    shipped = []
+    for end in (256, 512, 512, 1000):
+        before = sched.__dict__.get("_shipped_tokens", {}).get(7, (None, 0))[1]
+        req = _ship_save(sched, worker, seq, end)
+        shipped.append(sched._shipped_tokens[7][1] - before)
+        assert req.token_ids == list(range(end))
+    assert shipped == [256, 256, 0, 488]
+    sched._drop_shipped_tokens(7)
+    assert _ship_save(sched, worker, seq, 300, drops=True).token_ids == list(range(300))
+
+
+def test_incremental_tokens_restart_from_zero_resets_worker_cache():
+    import types
+
+    sched, worker = _incremental_pair()
+    seq = types.SimpleNamespace(id=9, token_ids=list(range(800)), block_table=[0])
+    _ship_save(sched, worker, seq, 512)
+    sched._shipped_tokens.clear()  # the drop has not reached the worker
+    assert _ship_save(sched, worker, seq, 256).token_ids == list(range(256))
+    assert _ship_save(sched, worker, seq, 800).token_ids == list(range(800))

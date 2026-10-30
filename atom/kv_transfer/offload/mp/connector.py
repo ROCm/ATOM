@@ -12,6 +12,7 @@ architecture string participates in the decision.
 
 from __future__ import annotations
 
+import array
 from typing import Any
 
 from atom.kv_transfer.disaggregation.base import (
@@ -144,7 +145,34 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._impl is not None:
             self._impl.close()
 
+    def _resolve_shipped_tokens(self, metadata: Any) -> None:
+        """Rebuild each request's token prefix from incremental shipping."""
+        cache = self.__dict__.setdefault("_token_cache", {})
+        for req_id in getattr(metadata, "token_cache_drops", None) or ():
+            cache.pop(req_id, None)
+        for req in getattr(metadata, "requests", None) or ():
+            base = getattr(req, "token_base", -1)
+            if base is None or base < 0:
+                continue
+            tokens = cache.get(req.req_id)
+            if tokens is None:
+                tokens = cache[req.req_id] = array.array("q")
+            if len(tokens) > base:
+                # The scheduler restarted this request's shipping (a late save
+                # after a drop that has not reached us yet). A request's
+                # tokens are a fixed prompt, so its prefix is unchanged.
+                del tokens[base:]
+            if len(tokens) != base:
+                raise RuntimeError(
+                    f"LMCache MP token cache for {req.req_id!r} holds "
+                    f"{len(tokens)} tokens, the scheduler shipped from {base}"
+                )
+            tokens.extend(req.token_ids)
+            req.token_ids = tokens[: req.token_end].tolist()
+            req.token_base = -1
+
     def start_load_kv(self, metadata: Any) -> None:
+        self._resolve_shipped_tokens(metadata)
         self._require_impl().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
