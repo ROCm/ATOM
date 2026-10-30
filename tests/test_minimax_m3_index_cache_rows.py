@@ -49,10 +49,13 @@ def make_builder(
     span=range(60),
     fp4=True,
     nvfp4=True,
+    kv_dtype="fp8",
     sparse=None,
 ):
     aiter = ModuleType("aiter")
-    aiter.dtypes = SimpleNamespace(d_dtypes={"fp8": torch.float8_e4m3fn})
+    aiter.dtypes = SimpleNamespace(
+        d_dtypes={"fp8": torch.float8_e4m3fn, "bf16": torch.bfloat16}
+    )
     monkeypatch.setitem(__import__("sys").modules, "aiter", aiter)
     fp4_module = ModuleType("atom.model_ops.minimax_m3.index_fp4")
     fp4_module.FP4_GROUP = 16
@@ -143,7 +146,7 @@ def make_builder(
         draft_shares_kv_pool=lambda: False,
         config=SimpleNamespace(
             hf_config=hf,
-            kv_cache_dtype="fp8",
+            kv_cache_dtype=kv_dtype,
             index_cache_dtype="fp4" if fp4 else "fp8",
             max_model_len=4096,
         ),
@@ -221,6 +224,75 @@ def test_schedule_is_taken_from_model_including_pp_and_patterns(
     assert [m.layer_num for m in builder.pool_rows.get("index", {})] == expected
     if not expected:
         assert all(not p.extra_fields for p in builder.kv_pools.values())
+
+
+@pytest.mark.parametrize("kv_dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("fp4_index", [False, True])
+def test_reusing_layer_preserves_triton_path(monkeypatch, kv_dtype, fp4_index):
+    """Compact index allocation must not switch the existing KV kernel."""
+    import sys
+    from unittest.mock import Mock
+
+    _builder, layers = make_builder(
+        monkeypatch, nvfp4=False, fp4=fp4_index, kv_dtype=kv_dtype
+    )
+    impl = layers[1].impl
+    impl.layer_num = 1
+    impl.kv_nvfp4 = False
+    impl.num_heads = impl.num_kv_heads = impl.num_idx_heads = 1
+    impl.head_dim = impl.index_head_dim = impl.index_q_size = 128
+    impl.kv_cache_dtype = kv_dtype
+    impl.index_cache_dtype = "fp4" if fp4_index else "fp8"
+    impl.q_norm = impl.k_norm = SimpleNamespace(
+        weight=torch.ones(128), variance_epsilon=1e-6
+    )
+    impl.rotary_emb = SimpleNamespace(rotary_dim=64)
+    assert impl.index_cache is impl.index_scale is impl.index_stage is None
+    layer = layers[1]
+    cache_views = (layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale)
+    sparse = ModuleType("atom.model_ops.minimax_m3.sparse_attn")
+    sparse.to_page16_shuffle = Mock(return_value=cache_views)
+    monkeypatch.setitem(sys.modules, sparse.__name__, sparse)
+    model = ModuleType("atom.models.minimax_m3.model")
+    model._minimax_m3_cos_sin_cache = lambda *_: torch.ones(16, 64)
+    monkeypatch.setitem(sys.modules, model.__name__, model)
+    qkv = torch.arange(2 * 5 * 128, dtype=torch.float32).view(2, -1).to(torch.bfloat16)
+    q_raw, k_raw, v_raw, _, _ = qkv.split(128, dim=-1)
+    q_out, k_out = q_raw + 1, k_raw + 2
+    triton = ModuleType("atom.model_ops.triton_fused_qkv_norm_rope_cache")
+    triton.triton_fused_norm_rope_cache = Mock(return_value=(q_out, k_out))
+    monkeypatch.setitem(sys.modules, triton.__name__, triton)
+    fused = Mock(side_effect=AssertionError("FP8/BF16 reuse must retain Triton"))
+    sys.modules["aiter"].fused_qknorm_idxrqknorm = fused
+    ns = {"torch": torch, "aiter": sys.modules["aiter"], "ForwardContext": object}
+    definitions(
+        "atom/model_ops/attention_mha.py",
+        {"rope_cache"},
+        ns,
+        "SparseMHAPagedAttentionImpl",
+    )
+    slots, positions = torch.tensor([1, 129]), torch.arange(2)
+    ctx = SimpleNamespace(
+        attn_metadata=SimpleNamespace(slot_mapping=slots),
+        kv_cache_data={"layer_1": layer},
+    )
+    result = ns["rope_cache"](impl, None, None, None, qkv, positions, ctx)
+    triton.triton_fused_norm_rope_cache.assert_called_once()
+    args, kwargs = triton.triton_fused_norm_rope_cache.call_args
+    for actual, expected in zip(args[:3], (q_raw, k_raw, v_raw)):
+        assert torch.equal(actual, expected)
+    assert args[3] is positions
+    assert kwargs["slot_mapping"] is slots
+    assert kwargs["kv_cache_dtype"] == kv_dtype
+    for name, view, returned in zip(
+        ("k_cache", "v_cache", "k_scale", "v_scale"), cache_views, result[3:]
+    ):
+        assert kwargs[name] is returned is view
+    for actual, expected in zip(result[:3], (q_out, k_out, v_raw)):
+        assert torch.equal(actual, expected.view(2, 1, 128))
+    fused.assert_not_called()
+    assert impl._index_q is None
+    assert impl._index_q_cache_key_info == ((2, 1, 128), qkv.dtype, qkv.device)
 
 
 def test_nvfp4_reusing_layer_writes_kv_without_index_buffers(monkeypatch):

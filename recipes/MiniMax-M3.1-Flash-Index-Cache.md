@@ -23,11 +23,13 @@ weight manifest contains index Q/K projections and norms for all 60 layers.
 Here, freq4 is an optional inference reuse schedule, with accuracy to be
 validated; compact allocation follows that schedule without changing it.
 
-The base recipe rejected top-k reuse with NVFP4 KV. Reusing layers now call
-AITER's existing `skip_index_branch` path with no index output/cache, then run
-the same NVFP4 target K/V store as computing layers. Both modes use the same
-fused Q/K normalization and RoPE implementation. No persistent dummy index
-cache or per-layer scratch cache is allocated for skipped layers.
+FP8/BF16 KV reusing layers retain the original Triton norm, RoPE and KV store
+path. The base recipe rejected top-k reuse with NVFP4 KV; those reusing layers
+now call AITER's existing `skip_index_branch` path with no index output/cache,
+then run the same NVFP4 target K/V store as computing layers. Computing and
+reusing NVFP4 layers use the same fused Q/K normalization and RoPE implementation.
+No persistent dummy index cache or per-layer index staging buffer is allocated
+for skipped layers.
 
 M3 PAGE identity now fingerprints the checkpoint's index schedule, including
 explicit patterns and offsets, and the compact layout version. Mooncake Store
