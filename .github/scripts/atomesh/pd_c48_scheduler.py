@@ -22,6 +22,56 @@ def enable_mooncake_divergent_hits(scheduler, config):
     MooncakeConnector.supports_divergent_local_hybrid_hits = property(lambda self: True)
 
 
+def enable_dspark_shared_prefix_checkpoint(scheduler, config):
+    """Turn on the shared-prefix (junction) Mamba checkpoint for a DSpark drafter.
+
+    Upstream gates the junction on an EAGLE group, but DSpark drops no EAGLE block (3966924d), so the gate
+    leaves it off. The manager's EAGLE handling is additive (it also keeps junction - block_size); without
+    EAGLE a sibling resumes at the junction itself, which is the plain path.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    manager = scheduler.kv_cache_manager
+    coordinator = manager.coordinator
+    if not (scheduler.cache_config.enable_mamba_shared_prefix_checkpoint
+            and config.speculative_config is not None and config.speculative_config.use_dspark()
+            and not config.speculative_config.use_eagle_block_drop() and not coordinator.eagle_group_ids
+            and coordinator.enable_partial_hash_hits and coordinator.num_reprefillable_tokens == 0
+            and scheduler.mamba_partial_cache_hit):
+        raise RuntimeError("C48_DSPARK_JUNCTION needs a requested junction, DSpark without EAGLE groups, "
+                           "partial hash hits, no re-prefill tail and partial Mamba hits")
+    manager.mamba_shared_prefix_checkpoint = True
+    for single in coordinator.single_type_managers:
+        if isinstance(single, MambaManager):
+            single.shared_prefix_checkpoint = True
+    scheduler.mamba_shared_prefix_checkpoint = True
+
+
+def align_tail_checkpoint_to_hash(scheduler):
+    """Under no_tail_split, predict the final chunk's internal Mamba checkpoint on the hash grid.
+
+    With partial Mamba hits off, `_mamba_block_aligned_split` places that checkpoint on the scheduler block
+    (7168), while MambaManager and the worker export it on `cache_hit_alignment_tokens` (the hash block). The
+    scheduler then misses the checkpoint the backend would write and stops at the last Mamba block boundary,
+    so the tail runs one more forward over the whole cached context.
+    """
+    coordinator = scheduler.kv_cache_manager.coordinator
+    if not (coordinator.enable_partial_hash_hits and scheduler.mamba_has_prefill_checkpoint_blocks
+            and not scheduler.mamba_partial_cache_hit):
+        raise RuntimeError("C48_P_TAIL_CKPT_HASH needs no_tail_split, partial hash hits and internal checkpoints")
+    split = scheduler._mamba_block_aligned_split
+    block_size = scheduler.block_size
+
+    # The split reads scheduler.block_size only as the checkpoint grid; the scheduler is single-threaded.
+    def hash_aligned_split(*args, **kwargs):
+        scheduler.block_size = scheduler.hash_block_size
+        try:
+            return split(*args, **kwargs)
+        finally:
+            scheduler.block_size = block_size
+
+    scheduler._mamba_block_aligned_split = hash_aligned_split
+
+
 def create_scheduler(*args, **kwargs):
     config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
     defaults = copy.copy(config.scheduler_config)
@@ -43,6 +93,11 @@ def create_scheduler(*args, **kwargs):
         # Skip the extra Prefill step that only registers the prompt's partial-tail
         # Mamba state; internal checkpoints and block-boundary states still cache.
         scheduler.mamba_partial_cache_hit = False
+    tail_ckpt_hash = no_tail_split and os.environ.get("C48_P_TAIL_CKPT_HASH") == "1"
+    if tail_ckpt_hash:
+        align_tail_checkpoint_to_hash(scheduler)
+    if os.environ.get("C48_DSPARK_JUNCTION") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
+        enable_dspark_shared_prefix_checkpoint(scheduler, config)
     if (os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1"
             and os.environ["C48_DIAG_ROLE"] == "prefill"
             and not (requested and scheduler.mamba_shared_prefix_checkpoint
@@ -51,6 +106,7 @@ def create_scheduler(*args, **kwargs):
     record = {
         "role": os.environ["C48_DIAG_ROLE"],
         "no_tail_split": no_tail_split,
+        "tail_ckpt_hash": tail_ckpt_hash,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,
         "requested_shared_prefix_checkpoint": requested,

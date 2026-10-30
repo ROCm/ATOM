@@ -143,13 +143,28 @@ class LaunchTest(unittest.TestCase):
                                      (72, "JUNCTION"), (72, "P16K"), (88, "MR256"),
                                      (32, "NATIVE96"), (72, "N3966"), (72, "N3966-PP8"),
                                      *((c, f"N3966-{tag}") for c in (16, 32, 48, 56, 72, 88)
-                                       for tag in ("BF16", "R4391"))):
+                                       for tag in ("BF16", "R4391")),
+                                     (72, "N3966-BF16-KVB"), (72, "N3966-BF16-KVB-TH")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant.startswith("N3966"):
                 # 3966924d fuses MLA g_proj into fused_qkv_a_proj: 24 fewer PTPC modules, same weights.
                 env = candidate["roles"]["prefill"]["env"]
+                if variant.endswith("-TH"):
+                    self.assertEqual(env.pop("C48_P_TAIL_CKPT_HASH"), "1")
+                    variant = variant.removesuffix("-TH")
+                if variant.endswith("-KVB"):
+                    # BF16 kv_b_proj on P: 24 MLA layers leave the PTPC target.
+                    self.assertEqual(json.loads(env["C48_EXPECT_QUANT"]),
+                                     {"Fp8PtpcOnlineLinearMethod": 465, "Mxfp4OnlineLinearMethod": 92})
+                    env["C48_EXPECT_QUANT"] = json.dumps(
+                        {"Fp8PtpcOnlineLinearMethod": 489, "Mxfp4OnlineLinearMethod": 92}, separators=(",", ":"))
+                    targets = candidate["roles"]["prefill"]["args"]["quantization-config"]["targets"]
+                    [key] = [k for k in targets if "|g_proj)$" in k]
+                    self.assertNotIn("kv_b_proj", key)
+                    targets[key.replace("|g_proj)$", "|kv_b_proj|g_proj)$")] = targets.pop(key)
+                    variant = variant.removesuffix("-KVB")
                 self.assertEqual(json.loads(env["C48_EXPECT_QUANT"]),
                                  {"Fp8PtpcOnlineLinearMethod": 489, "Mxfp4OnlineLinearMethod": 92})
                 env["C48_EXPECT_QUANT"] = base["roles"]["prefill"]["env"]["C48_EXPECT_QUANT"]
