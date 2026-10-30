@@ -1613,6 +1613,26 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
             decode: *kimi_k3_pd_opus_decode_env_test
 
+        # Test only: c128-opus with the state tier at 64 GiB instead of 128,
+        # leaving the paged KV more of the same 224 GiB LMCache pool.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c128-opus-state64
+          concurrency: [128]
+          server:
+            common_args:
+              <<: *kimi_k3_pd_dspark4_args
+              max_num_seqs: 256
+          env:
+            common: *kimi_k3_pp8_reuse_env
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              ATOM_PP_MAX_INFLIGHT: "16"
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "0"
+              OFFLOAD_STATE_CPU_SIZE: "64"
+            decode: *kimi_k3_pd_opus_decode_env_test
+
         # Test only: c88-opus with the decode's MLA heads folded into 3x32
         # pseudo-requests on the default kernel instead of OPUS.
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
