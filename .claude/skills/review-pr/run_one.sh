@@ -283,23 +283,42 @@ python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
 # 50%-precision heuristic withhold reviews would cost more than the defect it catches.
 python3 "$SKILL/check_citations.py" "$W" 2>&1 | tee "$W/citations.txt" || true
 
-# Record which entrypoint ran each side, and whether the adversarial pass was
-# cross-family. Written by the shell, after both agents have run.
-{ printf 'worker:  %s\n' "$AGENT"
-  printf 'refuter: %s\n' "$REFUTER_BIN"
+# Record who ran the independent refutation and what it did. Two separate things get
+# called "refutation" here and they are not equally strong: Step 7.6 is the worker
+# killing its own candidates -- same model, same context, useful filtering but not a
+# second opinion -- and Step 7.7 is a separate invocation reading the finished card.
+# Only the second is adversarial, and REFUTER_CMD falls back to the worker's own
+# entrypoint when ATOM_REVIEW_REFUTER_AGENT is unset, which is the default. aiter's own
+# note at the top of this file says the refuter's value comes from being a DIFFERENT
+# family; same-family and cross-family produce identical artifacts, so a reader cannot
+# tell which they got. Decided in the shell, where no agent reports on itself.
+IND_KILLED=$(grep -cE '^KILLED' "$W/independent.txt" 2>/dev/null || true)
+IND_SURVIVED=$(grep -cE '^SURVIVED' "$W/independent.txt" 2>/dev/null || true)
+IND_KILLED=${IND_KILLED:-0}; IND_SURVIVED=${IND_SURVIVED:-0}
+IND_JUDGED=$(( IND_KILLED + IND_SURVIVED ))
+{ printf 'worker:              %s\n' "$AGENT"
+  printf 'independent refuter: %s\n' "$REFUTER_BIN"
   if [ "$SAME_FAMILY" = 1 ]; then
-    printf 'cross-family: NO -- the refuter is the same entrypoint as the worker, so the\n'
-    printf '  refutation pass is same-family and weaker adversarially. Point\n'
-    printf '  ATOM_REVIEW_REFUTER_AGENT at a different model to restore it.\n'
+    printf 'cross-family: NO -- same entrypoint as the worker, so the independent pass is\n'
+    printf '  same-family and weaker adversarially. Point ATOM_REVIEW_REFUTER_AGENT at a\n'
+    printf '  different model to restore it.\n'
   else
     printf 'cross-family: YES\n'
   fi
+  printf 'independent verdicts: %s judged, %s killed, %s defended\n' \
+    "$IND_JUDGED" "$IND_KILLED" "$IND_SURVIVED"
 } > "$W/agents.txt"
-# Say it on the card too: the artifact is only read by someone who already went looking.
-if [ "$SAME_FAMILY" = 1 ] && [ -f "$W/card.md" ] \
-   && ! grep -q 'same-family refutation' "$W/card.md"; then
-  printf '\n_Refutation was same-family (worker and refuter are both `%s`); findings here\nwere attacked by the same model family that produced them._\n' \
-    "$(basename "$AGENT")" >> "$W/card.md"
+
+# Say it on the card. An artifact is only read by someone who already went looking, and
+# a stage that never kills anything looks exactly like a stage that is not there.
+if [ -f "$W/card.md" ] && ! grep -q 'Independent refutation:' "$W/card.md"; then
+  if [ "$SAME_FAMILY" = 1 ]; then
+    _fam="same-family (\`$(basename "$AGENT")\` reviewed its own output)"
+  else
+    _fam="cross-family (\`$(basename "$REFUTER_BIN")\` vs \`$(basename "$AGENT")\`)"
+  fi
+  printf '\n_Independent refutation: %s judged, %s killed, %s defended — %s. Step 7.6 above\nis the worker filtering its own candidates, which is not a second opinion._\n' \
+    "$IND_JUDGED" "$IND_KILLED" "$IND_SURVIVED" "$_fam" >> "$W/card.md"
 fi
 
 # 4) gates + collect (call the python directly; no thin shell wrappers)
