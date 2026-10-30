@@ -63,6 +63,7 @@ from atom.model_ops.fused_moe.modular_kernel import (
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
+    use_mori_low_latency,
 )
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.routed_rows import (
@@ -689,7 +690,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
             tbo_is_enabled = tbo_enabled()
-            low_latency = moe.moe_parallel_config.low_latency
+            low_latency = use_mori_low_latency(
+                moe.moe_parallel_config.low_latency, all2all_manager.internode
+            )
             if all2all_manager.internode and mori_combine_quant_type != "none":
                 # MoRI registers no blockwise combine kernel for these; without
                 # this it fails later, at kernel lookup.

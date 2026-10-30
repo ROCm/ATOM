@@ -199,6 +199,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # Rendezvous base port; set per role when prefill/decode share a node.
     "ATOM_DP_BASE_PORT": lambda: int(os.getenv("ATOM_DP_BASE_PORT", "0")),
+    # Floor for the timeout of groups a multi-node DP rank creates without one
+    # (aiter's gloo groups; torch's own default is 30 minutes), in seconds.
+    "ATOM_MULTINODE_PG_TIMEOUT_S": lambda: int(
+        os.getenv("ATOM_MULTINODE_PG_TIMEOUT_S", "7200")
+    ),
     # Token-equivalent cost of one in-flight request for the "least_tokens" DP
     # load-balance strategy. The per-rank load score is
     #   sum(prompt_tokens) + ATOM_DP_LB_REQ_EQUIV * num_in_flight_requests
@@ -351,6 +356,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
+    # --all2all-backend low-latency as vLLM runs it: mori's InterNodeV1LL, at
+    # the launch geometry its handle was built with, when the EP group spans
+    # nodes, and the IntraNode kernel within a node. Off keeps aiter's mapping,
+    # which picks AsyncLL within a node.
+    "ATOM_MORI_V1_LL": lambda: os.getenv("ATOM_MORI_V1_LL", "0") == "1",
     # MegaMoE stage 2 (gemm2-fused EP combine): the grouped gemm2 epilogue
     # P2P-writes its weighted per-(token,k) results straight into the peers'
     # combine staging, so combine only barriers + sums. Requires the mxfp4 weight

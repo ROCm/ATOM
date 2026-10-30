@@ -74,6 +74,34 @@ DECODE_DCP_SIZE="${DECODE_DCP_SIZE:-1}"
 PREFILL_ENABLE_DP="${PREFILL_ENABLE_DP:-false}"
 DECODE_ENABLE_DP="${DECODE_ENABLE_DP:-false}"
 
+# A worker may span nodes: one DP-attention instance whose ranks run on
+# nodes_per_worker consecutive nodes. A worker's first node coordinates its DP
+# group and is the only one serving HTTP; the others only host engines.
+PREFILL_NODES_PER_WORKER="${PREFILL_NODES_PER_WORKER:-1}"
+DECODE_NODES_PER_WORKER="${DECODE_NODES_PER_WORKER:-1}"
+if (( PREFILL_NODES_PER_WORKER > 1 || DECODE_NODES_PER_WORKER > 1 )) \
+  && [[ "${ATOMESH_PD_WORKER_LAYOUT}" != "multi_node" ]]; then
+  echo "ERROR: nodes_per_worker > 1 needs pd_worker_layout multi_node, got ${ATOMESH_PD_WORKER_LAYOUT}" >&2
+  exit 2
+fi
+PREFILL_NODE_COUNT=$((xP * PREFILL_NODES_PER_WORKER))
+
+# "<role> <worker> <node within worker>" for a node rank: prefill workers take
+# the first nodes, decode workers the rest, and an aggregated server node 0 on.
+node_role_of() {
+  local rank="$1"
+  if [[ "${AGGREGATED}" == "1" ]]; then
+    echo "server 0 ${rank}"
+  elif (( rank < PREFILL_NODE_COUNT )); then
+    echo "prefill $((rank / PREFILL_NODES_PER_WORKER)) $((rank % PREFILL_NODES_PER_WORKER))"
+  else
+    local d=$((rank - PREFILL_NODE_COUNT))
+    echo "decode $((d / DECODE_NODES_PER_WORKER)) $((d % DECODE_NODES_PER_WORKER))"
+  fi
+}
+read -r NODE_ROLE NODE_WORKER NODE_IN_WORKER <<< "$(node_role_of "${NODE_RANK}")"
+echo "[layout] rank=${NODE_RANK} role=${NODE_ROLE} worker=${NODE_WORKER} node=${NODE_IN_WORKER} nodes_per_worker=P${PREFILL_NODES_PER_WORKER}/D${DECODE_NODES_PER_WORKER}"
+
 PREFILL_PORT="${PREFILL_PORT:-8010}"
 DECODE_PORT="${DECODE_PORT:-8020}"
 ROUTER_PORT="${ROUTER_PORT:-8000}"
@@ -82,8 +110,17 @@ ATOM_PD_RANK_MAPPING_POLICY="${ATOM_PD_RANK_MAPPING_POLICY:-none}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-29100}"
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-6301}"
 PREFILL_DP_MASTER_PORT="${PREFILL_DP_MASTER_PORT:-29500}"
-PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29700}"
+# Across nodes ATOM moves each rank's engine sockets onto TCP, three per rank
+# from master + 100, over the single-node base ports below. A role spanning
+# nodes puts its model-runner store past them.
+if (( ${PREFILL_NODES_PER_WORKER:-1} > 1 )); then
+  PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-$((PREFILL_DP_MASTER_PORT + 400))}"
+fi
+if (( ${DECODE_NODES_PER_WORKER:-1} > 1 )); then
+  DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-$((DECODE_DP_MASTER_PORT + 400))}"
+fi
+PREFILL_DP_BASE_PORT="${PREFILL_DP_BASE_PORT:-29600}"
 DECODE_DP_BASE_PORT="${DECODE_DP_BASE_PORT:-29800}"
 # Mooncake Store (MOONCAKE_STORE=1): master RPC, its HTTP metadata and metrics
 # servers, and the owners' service ports (owner i uses the base + i). Below
@@ -153,6 +190,11 @@ unset shifted_port_name
 unset -f validate_shifted_port
 USE_EXPLICIT_DP_PORTS=0
 if [[ "${SINGLE_NODE_PD}" == "1" || "${PREFILL_SINGLE_NODE_PD}" == "1" || "${DECODE_SINGLE_NODE_PD}" == "1" || "${PACKED_NODES_PD}" == "1" || "${AGGREGATED}" == "1" ]]; then
+  USE_EXPLICIT_DP_PORTS=1
+fi
+# ATOM refuses a multi-node DP group without the same nonzero base port on
+# every node.
+if (( PREFILL_NODES_PER_WORKER > 1 || DECODE_NODES_PER_WORKER > 1 )); then
   USE_EXPLICIT_DP_PORTS=1
 fi
 
@@ -323,7 +365,7 @@ if [[ "${AGGREGATED}" == "1" ]]; then
   role_tp="${DECODE_TP_SIZE}"
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
   role_tp="${DECODE_TP_SIZE}"
-elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
+elif [[ "${NODE_ROLE}" == "decode" ]]; then
   role_tp="${DECODE_TP_SIZE}"
 fi
 if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
@@ -452,6 +494,11 @@ host_name="$(hostname)"
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 prepare_kv_connector || exit 2
 
+# Cross-node MoRI EP goes through the host proxy unless the cell says otherwise.
+if has_cli_flag "${PREFILL_SERVER_ARGS} ${DECODE_SERVER_ARGS}" "--enable-expert-parallel"; then
+  export MORI_ENABLE_HOST_PROXY="${MORI_ENABLE_HOST_PROXY:-1}"
+fi
+
 # GPU timing is opt-in; agentic reports need it on both service roles.
 if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
   export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
@@ -563,14 +610,21 @@ elif [[ "${DECODE_SINGLE_NODE_PD}" == "1" ]]; then
     decode_args+=(--decode "http://${IP_ARRAY[$decode_node_idx]}:${decode_port}")
   done
 else
+  needed_nodes=$((PREFILL_NODE_COUNT + yD * DECODE_NODES_PER_WORKER))
+  if (( ${#IP_ARRAY[@]} < needed_nodes )); then
+    echo "ERROR: ${xP}P${yD}D at ${PREFILL_NODES_PER_WORKER}/${DECODE_NODES_PER_WORKER} node(s) per worker needs ${needed_nodes} nodes, got ${#IP_ARRAY[@]}" >&2
+    exit 2
+  fi
+  # Only a worker's first node serves HTTP, so it is the one the router dials.
   for idx in $(seq 0 $((xP - 1))); do
-    prefill_ips+=("${IP_ARRAY[$idx]}")
+    node_idx=$((idx * PREFILL_NODES_PER_WORKER))
+    prefill_ips+=("${IP_ARRAY[$node_idx]}")
     prefill_ports+=("${PREFILL_PORT}")
-    prefill_args+=(--prefill "http://${IP_ARRAY[$idx]}:${PREFILL_PORT}")
+    prefill_args+=(--prefill "http://${IP_ARRAY[$node_idx]}:${PREFILL_PORT}")
   done
 
   for idx in $(seq 0 $((yD - 1))); do
-    node_idx=$((xP + idx))
+    node_idx=$((PREFILL_NODE_COUNT + idx * DECODE_NODES_PER_WORKER))
     decode_ips+=("${IP_ARRAY[$node_idx]}")
     decode_ports+=("${DECODE_PORT}")
     decode_args+=(--decode "http://${IP_ARRAY[$node_idx]}:${DECODE_PORT}")
@@ -592,6 +646,31 @@ decode_parallel=(
 if [[ "${DECODE_ENABLE_DP}" == "true" ]]; then
   decode_parallel+=("--enable-dp-attention")
 fi
+
+# This node's slice of a worker that spans nodes; nothing for a one-node worker.
+multinode_dp_args() {  # nodes_per_worker node_in_worker coordinator_ip
+  (( $1 > 1 )) || return 0
+  printf '%s\n' -dp "$1" --data-parallel-size-local 1 \
+    --data-parallel-rank "$2" --data-parallel-master-ip "$3"
+}
+node_dp_args=()
+case "${NODE_ROLE}" in
+  prefill)
+    mapfile -t node_dp_args < <(multinode_dp_args "${PREFILL_NODES_PER_WORKER}" \
+      "${NODE_IN_WORKER}" "${prefill_ips[${NODE_WORKER}]:-}")
+    prefill_parallel+=(${node_dp_args[@]+"${node_dp_args[@]}"})
+    ;;
+  decode)
+    mapfile -t node_dp_args < <(multinode_dp_args "${DECODE_NODES_PER_WORKER}" \
+      "${NODE_IN_WORKER}" "${decode_ips[${NODE_WORKER}]:-}")
+    decode_parallel+=(${node_dp_args[@]+"${node_dp_args[@]}"})
+    ;;
+  server)
+    mapfile -t node_dp_args < <(multinode_dp_args "${DECODE_NODES_PER_WORKER}" \
+      "${NODE_IN_WORKER}" "${IP_ARRAY[0]}")
+    decode_parallel+=(${node_dp_args[@]+"${node_dp_args[@]}"})
+    ;;
+esac
 
 # AgentX captures every query-token count the engine can produce, i.e. the dense
 # range [1, graph_max] with graph_max = seqs * (1 + spec_tokens), where seqs
@@ -2744,17 +2823,23 @@ write_metadata
 # before their server, so a start that fails stops what it and the starts
 # before it left running.
 if [[ "${AGGREGATED}" == "1" ]]; then
-  if [[ "${NODE_RANK}" -ne 0 ]]; then
-    echo "[server] rank=${NODE_RANK} idle: aggregated serves from a single node"
+  if (( NODE_RANK >= DECODE_NODES_PER_WORKER )); then
+    echo "[server] rank=${NODE_RANK} idle: the aggregated server spans ${DECODE_NODES_PER_WORKER} node(s)"
     exit 0
   fi
   trap 'cleanup_processes ${aggregated_pid:-}' EXIT
-  start_aggregated "server-rank-0"
+  start_aggregated "server-rank-${NODE_RANK}"
   aggregated_pid="${server_pid}"
-  # No router to wait on: the server owns ROUTER_PORT, so the benchmark and eval
-  # clients reach it at the same address they use for a P/D cell.
-  wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
-  run_benchmark_and_eval
+  if [[ "${NODE_RANK}" -eq 0 ]]; then
+    # No router to wait on: the server owns ROUTER_PORT, so the benchmark and
+    # eval clients reach it at the same address they use for a P/D cell.
+    wait_http "http://127.0.0.1:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
+    run_benchmark_and_eval
+  else
+    # Engines only; node 0's server answers for them, and its exit ends this node.
+    wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "server" "${WAIT_SERVER_TIMEOUT}" "${aggregated_pid}"
+    wait_router_closed
+  fi
   cleanup_processes "${aggregated_pid}"
 elif [[ "${NODE_RANK}" -eq 0 && "${SINGLE_NODE_PD}" == "1" ]]; then
   trap 'cleanup_processes ${router_pid:-} ${prefill_pid:-} ${decode_pid:-}' EXIT
@@ -2898,7 +2983,9 @@ elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" ]]; then
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"
   wait_router_closed
   cleanup_processes "${server_pid}"
-elif [[ "${NODE_RANK}" -lt "${xP}" ]]; then
+elif [[ "${NODE_ROLE}" == "prefill" ]]; then
+  # A further prefill worker, or a further node of a worker that spans nodes,
+  # which hosts engines and serves no HTTP: either way it waits on the router.
   trap 'cleanup_processes ${server_pid:-}' EXIT
   start_prefill "prefill-rank-${NODE_RANK}"
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"

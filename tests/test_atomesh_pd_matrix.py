@@ -24,6 +24,8 @@ def expand_cell(
     single_node="auto",
     node_pool="",
     topology="test",
+    prefill=None,
+    decode=None,
 ):
     with patch.dict(
         os.environ,
@@ -41,8 +43,8 @@ def expand_cell(
                 "topology": topology,
                 "pd_worker_layout": layout,
                 "nodes": nodes,
-                "prefill": {"workers": prefill_workers},
-                "decode": {"workers": decode_workers},
+                "prefill": {"workers": prefill_workers, **(prefill or {})},
+                "decode": {"workers": decode_workers, **(decode or {})},
                 "isl": [128],
                 "osl": 128,
                 "concurrency": [1],
@@ -120,6 +122,89 @@ class NodeSelectionTest(unittest.TestCase):
         cell = expand_cell(runner="atomesh-cicd-mi355-crusoe", nodes="n1,n2")
         self.assertEqual(cell["nodes"], [])
         self.assertEqual(cell["num_nodes"], 2)
+
+
+DPA = {"tp": 8, "extra_args": "--enable-dp-attention --enable-expert-parallel"}
+
+
+class NodesPerWorkerTest(unittest.TestCase):
+    """A worker that spans nodes is one DP-attention instance cut across them."""
+
+    def test_split_cells_count_every_node_of_every_worker(self):
+        for prefill_workers, prefill_nodes, decode_nodes, expected in (
+            (1, 2, 2, 4),
+            (1, 2, 1, 3),
+            (1, 1, 2, 3),
+            (2, 2, 1, 5),
+        ):
+            with self.subTest(
+                prefill_workers=prefill_workers,
+                prefill=prefill_nodes,
+                decode=decode_nodes,
+            ):
+                cell = expand_cell(
+                    prefill_workers=prefill_workers,
+                    prefill={**DPA, "nodes_per_worker": prefill_nodes},
+                    decode={**DPA, "nodes_per_worker": decode_nodes},
+                )
+                self.assertEqual(cell["num_nodes"], expected)
+
+    def test_aggregated_cells_count_only_the_decode_block(self):
+        cell = expand_cell(topology="agg_dpa16", decode={**DPA, "nodes_per_worker": 2})
+        self.assertEqual(cell["num_nodes"], 2)
+        # Before, the unused prefill block added a node that only idled.
+        self.assertEqual(expand_cell(topology="agg")["num_nodes"], 1)
+        self.assertEqual(
+            expand_cell(topology="agg", layout="single_node")["num_nodes"], 1
+        )
+
+    def test_spur_needs_a_candidate_for_every_node(self):
+        spanning = {**DPA, "nodes_per_worker": 2}
+        cell = expand_cell(
+            runner="atomesh-cicd-mi350",
+            nodes="n1,n2,n3,n4,n5",
+            prefill=spanning,
+            decode=spanning,
+        )
+        self.assertEqual(cell["nodes"], ["n1", "n2", "n3", "n4", "n5"])
+        self.assertEqual(cell["num_nodes"], 4)
+        with self.assertRaisesRegex(ValueError, "needs at least 4 node"):
+            expand_cell(
+                runner="atomesh-cicd-mi350",
+                nodes="n1,n2,n3",
+                prefill=spanning,
+                decode=spanning,
+            )
+
+    def test_cells_a_spanning_worker_cannot_run_are_rejected(self):
+        cases = (
+            ("single_node", "decode", DPA, "needs pd_worker_layout multi_node"),
+            ("packed_nodes", "prefill", DPA, "needs pd_worker_layout multi_node"),
+            ("multi_node", "decode", {**DPA, "tp": 4}, "needs tp 8"),
+            (
+                "multi_node",
+                "prefill",
+                {"tp": 8, "extra_args": "--enable-expert-parallel"},
+                "needs --enable-dp-attention in prefill.extra_args",
+            ),
+        )
+        for layout, role, role_cfg, message in cases:
+            spanning = {role: {**role_cfg, "nodes_per_worker": 2}}
+            with (
+                self.subTest(layout=layout, role=role, message=message),
+                self.assertRaisesRegex(ValueError, f"test-model: {role}.*{message}"),
+            ):
+                expand_cell(layout=layout, **spanning)
+
+    def test_a_worker_spans_at_least_one_node(self):
+        with self.assertRaisesRegex(
+            ValueError, "decode.nodes_per_worker must be at least 1"
+        ):
+            expand_cell(decode={"nodes_per_worker": 0})
+
+    def test_an_aggregated_cell_spans_nodes_through_decode(self):
+        with self.assertRaisesRegex(ValueError, "set decode.nodes_per_worker"):
+            expand_cell(topology="agg", prefill={**DPA, "nodes_per_worker": 2})
 
 
 class ModelPathSelectionTest(unittest.TestCase):

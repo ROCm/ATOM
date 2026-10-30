@@ -1513,7 +1513,7 @@ models:
           run_eval: true
           eval_only: true
           eval_concurrency: [64]
-          accuracy:
+          accuracy: &kimi_k25_chat_gsm8k
             # Chat completions, so the template switch above applies.
             task: gsm8k
             fewshot: 5
@@ -1522,6 +1522,138 @@ models:
             max_gen_toks: 4096
             apply_chat_template: true
             threshold: 0.90
+
+        # DP attention with MoRI EP, on one node (EP8, IntraNode kernels) and
+        # across two (EP16, InterNodeV1), aggregated first and then split over
+        # MoRI IO. All keep the TP8 MoRI IO cell's eval, so the scores compare.
+        - name: kimi-k25-agg-dpa8-ep8-gsm8k
+          topology: agg_dpa8_ep8
+          display_topology: AGG-DPA8-EP8
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          # Unused here; the aggregated server is configured by the decode block.
+          prefill: {}
+          decode: &kimi_k25_dpa_ep_decode
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+            # Every rank decodes a few of the 64 requests.
+            cudagraph: "[1,2,4,8,16,32,64]"
+          server:
+            common_args: &kimi_k25_dpa_ep_args
+              # MoRI sizes its EP buffers from this per-rank budget; at EP16 the
+              # model's 32768 would need about 19 GiB of the 16 GiB shmem heap.
+              max_num_batched_tokens: 16384
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+          env:
+            common:
+              MORI_SHMEM_HEAP_SIZE: 16G
+            decode:
+              # Empty: a lone server has no peer, so no model-level Mooncake JSON.
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            # Every DP rank reads all of the non-expert weights from NFS.
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy: *kimi_k25_chat_gsm8k
+
+        - name: kimi-k25-agg-dpa16-ep16-gsm8k
+          topology: agg_dpa16_ep16
+          display_topology: AGG-DPA16-EP16
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill: {}
+          decode:
+            <<: *kimi_k25_dpa_ep_decode
+            nodes_per_worker: 2
+          server:
+            common_args: *kimi_k25_dpa_ep_args
+          env:
+            common: &kimi_k25_cross_node_env
+              MORI_SHMEM_HEAP_SIZE: 16G
+              # Cross-node EP over MoRI's host proxy; identical on every rank.
+              MORI_ENABLE_HOST_PROXY: "1"
+              # The DP-sharded LM head all-gathers across the DP group with
+              # aiter's custom all-gather, which is intra-node only; replicate
+              # the head instead.
+              ATOM_DP_LM_HEAD_MODE: default
+            decode:
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy: *kimi_k25_chat_gsm8k
+
+        - name: kimi-k25-1p1d-dpa8-ep8-moriio-gsm8k
+          topology: 1p1d_dpa8_ep8_moriio
+          display_topology: 1P1D-DPA8-EP8-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill: &kimi_k25_dpa_ep_prefill
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          decode: *kimi_k25_dpa_ep_decode
+          server:
+            common_args: *kimi_k25_dpa_ep_args
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              MORI_SHMEM_HEAP_SIZE: 16G
+            decode:
+              # Empty drops the model-level Mooncake JSON for the built-in config.
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy: *kimi_k25_chat_gsm8k
+
+        # One prefill and one decode worker, each a DPA16 + EP16 instance on two
+        # nodes; the router pairs prefill rank r with decode rank r (idx2idx),
+        # which keeps every MoRI IO transfer on rail r % 8.
+        - name: kimi-k25-2p2d-dpa16-ep16-moriio-gsm8k
+          topology: 1p1d_dpa16_ep16_moriio
+          display_topology: 2P2D-DPA16-EP16-MORIIO
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [64]
+          prefill:
+            <<: *kimi_k25_dpa_ep_prefill
+            nodes_per_worker: 2
+          decode:
+            <<: *kimi_k25_dpa_ep_decode
+            nodes_per_worker: 2
+          server:
+            common_args: *kimi_k25_dpa_ep_args
+          env:
+            common:
+              <<: *kimi_k25_cross_node_env
+              KV_CONNECTOR: moriio
+            decode:
+              DECODE_KV_TRANSFER_CONFIG: ""
+          benchmark:
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [64]
+          accuracy: *kimi_k25_chat_gsm8k
 
     accuracy:
       task: gsm8k
@@ -2152,6 +2284,77 @@ models:
           env:
             common:
               KV_CONNECTOR: moriio
+        # DP attention with MoRI EP over MoRI IO, decode on low latency as vLLM
+        # runs it (ATOM_MORI_V1_LL): within one node that is the IntraNode
+        # kernel. MoRI EP fuses the shared expert only for MXFP4 / NVFP4 routed
+        # experts, so V3's FP8 MoE keeps it a separate MLP.
+        - <<: *dsv3_pd_gsm8k
+          name: ds-v3-1p1d-dpa8-ep8-ll-moriio-gsm8k
+          topology: 1p1d_dpa8_ep8_ll_moriio
+          display_topology: 1P1D-DPA8-EP8-LL-MORIIO
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --all2all-backend low-latency"
+            cudagraph: "[1,2,4,8,16,32,64]"
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+              # Per DP rank under DP attention; MoRI sizes its EP buffers from it.
+              max_num_batched_tokens: 16384
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+              ATOM_FUSE_SHARED_EXPERT: "0"
+            decode:
+              ATOM_MORI_V1_LL: "1"
+          benchmark:
+            wait_server_timeout: 7200
+        # 2P2D wide EP: each role one DPA16 + EP16 instance across two nodes,
+        # decode on InterNodeV1LL at vLLM's gfx950 geometry (64 / 32 / 8).
+        - <<: *dsv3_pd_gsm8k
+          name: ds-v3-2p2d-dpa16-ep16-ll-moriio-gsm8k
+          topology: 1p1d_dpa16_ep16_ll_moriio
+          display_topology: 2P2D-DPA16-EP16-LL-MORIIO
+          prefill:
+            workers: 1
+            nodes_per_worker: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel"
+          decode:
+            workers: 1
+            nodes_per_worker: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-expert-parallel --all2all-backend low-latency"
+            cudagraph: "[1,2,4,8,16,32,64]"
+          server:
+            common_args:
+              decode_max_num_seqs: 256
+              max_num_batched_tokens: 16384
+              # Across nodes the device reports more free memory than it has,
+              # so the KV budget cannot subtract MoRI's memory; this leaves it room.
+              gpu_memory_utilization: 0.70
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              MORI_SHMEM_HEAP_SIZE: 16G
+              HSA_NO_SCRATCH_RECLAIM: "1"
+              ATOM_FUSE_SHARED_EXPERT: "0"
+              MORI_ENABLE_HOST_PROXY: "1"
+              ATOM_DP_LM_HEAD_MODE: default
+            decode:
+              ATOM_MORI_V1_LL: "1"
+              MORI_EP_BLOCK_NUM: "64"
+              MORI_EP_RDMA_BLOCK_NUM: "32"
+              MORI_EP_WARP_PER_BLOCK: "8"
+          benchmark:
+            wait_server_timeout: 7200
 
     accuracy:
       task: gsm8k
