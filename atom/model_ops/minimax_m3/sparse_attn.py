@@ -1442,20 +1442,8 @@ def sparse_pa_per_row(
 
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
-    query_group_size = g
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
     context_partition_size = 256
-    intermediate_shape = (
-        num_seqs,
-        num_kv_heads_view,
-        max_context_partition_num,
-        query_group_size,
-    )
-    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-    temporary_output = torch.empty(
-        *intermediate_shape, head_size, dtype=q.dtype, device=q.device
-    )
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
     is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
@@ -1481,9 +1469,6 @@ def sparse_pa_per_row(
         q_scale=None,
         k_scale=pa_k_scale,
         v_scale=pa_v_scale,
-        exp_sums=exp_sums,
-        max_logits=max_logits,
-        temporary_output=temporary_output,
         alibi_slopes=None,
         sinks=None,
         sliding_window=-1,
@@ -1533,6 +1518,12 @@ def minimax_m3_sparse_attn_prefill_asm(
     Fallback: if the precomputed metadata is None (e.g. spec-decode prefill paths
     that don't populate it), derive it on-device, SYNC-FREE, via searchsorted /
     arange (no .item(), no GPU repeat_interleave).
+
+    ``plan_step_owner``: the step's prefill metadata, passed only while every
+    sparse layer of the step has the same per-row lengths, i.e. while
+    ``local_blocks >= 1`` keeps the tail block selected (one model-wide
+    topk/init/local config). The FlyDSL plan is then refreshed once per step;
+    otherwise pass None, or later layers run on the first layer's lengths.
     """
     total_q = q.shape[0]
     device = q.device
