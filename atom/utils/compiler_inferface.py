@@ -305,17 +305,15 @@ def _initialize_inductor_cache_dirs(base_cache_dir: str) -> None:
     )
 
 
-class _InductorCacheAdaptor(CompilerInterface):
-    """Shared cache lifecycle for regular and standalone Inductor."""
-
-    def initialize_cache(
-        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
-    ):
-        self.cache_dir = cache_dir
-        self.prefix = prefix
-        self.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
-        if not disable_cache:
-            _initialize_inductor_cache_dirs(self.base_cache_dir)
+def _initialize_inductor_cache(
+    adaptor, cache_dir: str, disable_cache: bool, prefix: str
+) -> None:
+    """Initialize shared cache ownership metadata before redirecting compilers."""
+    adaptor.cache_dir = cache_dir
+    adaptor.prefix = prefix
+    adaptor.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
+    if not disable_cache:
+        _initialize_inductor_cache_dirs(adaptor.base_cache_dir)
 
 
 def get_inductor_factors() -> list[Any]:
@@ -351,7 +349,7 @@ def set_inductor_config(config, runtime_shape):
         pass
 
 
-class InductorAdaptor(_InductorCacheAdaptor):
+class InductorAdaptor(CompilerInterface):
     """
     The adaptor for the Inductor compiler, version 2.5, 2.6, 2.7.
     """
@@ -364,6 +362,11 @@ class InductorAdaptor(_InductorCacheAdaptor):
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+    def initialize_cache(
+        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
+    ):
+        _initialize_inductor_cache(self, cache_dir, disable_cache, prefix)
 
     def compile(
         self,
@@ -671,7 +674,7 @@ class InductorAdaptor(_InductorCacheAdaptor):
             return contextlib.nullcontext()
 
 
-class InductorStandaloneAdaptor(_InductorCacheAdaptor):
+class InductorStandaloneAdaptor(CompilerInterface):
     """
     The adaptor for the Inductor compiler.
     Requires PyTorch 2.8+.
@@ -689,6 +692,11 @@ class InductorStandaloneAdaptor(_InductorCacheAdaptor):
             str(factors).encode(), usedforsecurity=False
         ).hexdigest()[:10]
         return hash_str
+
+    def initialize_cache(
+        self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
+    ):
+        _initialize_inductor_cache(self, cache_dir, disable_cache, prefix)
 
     def compile(
         self,
