@@ -18,7 +18,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
-from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils import CpuGpuBuffer, envs, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
@@ -159,6 +159,18 @@ class Drafter(abc.ABC):
     """
 
     def __init__(self, atom_config: Config, device: torch.device, runner):
+        if envs.ATOM_SPEC_LOSSLESS_SAMPLING and envs.ATOM_ENABLE_RELAXED_MTP:
+            # A contradictory request, refused before anything else and for every
+            # flavor, so the answer does not depend on which capability gate a
+            # given model or parallel layout happens to trip first. Relaxed top-N
+            # accepts tokens the target would not have drawn; the ratio rule's
+            # claim is that the emitted stream is the target's distribution.
+            raise ValueError(
+                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
+                "mutually exclusive: relaxed top-N acceptance is approximate "
+                "by construction and the probability-ratio rule is exact, so "
+                "there is no defensible way to apply both. Turn one off."
+            )
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
         self.runner = runner
@@ -358,6 +370,32 @@ class Drafter(abc.ABC):
         """Confidence-schedule verify planner (DSpark Level B), or None when the
         drafter uses fixed-length verification."""
         return None
+
+    # ---- lossless speculative sampling (DSpark-only; no-ops elsewhere) ----
+    #
+    # These no-ops are the guard. `EagleProposer` and every MTP/EAGLE3 drafter
+    # inherits them unchanged, which keeps the probability-ratio accept rule
+    # unreachable from any flavor that has not been ported: the runner calls
+    # the hooks unconditionally and gets None back.
+
+    def stage_draft_sampling_host(
+        self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
+    ) -> None:
+        """Stage the draft sampler's per-step inputs into pinned host buffers
+        and claim their counts in `prepare_sample`'s own `sampling` H2D
+        publication, which is what carries them to the device."""
+        return
+
+    def lossless_verify_inputs(self, bs: int):
+        """``(draft_probs, q_row_base, ratio_scratch)`` for the ratio accept
+        rule (``draft_probs`` a `sparse_q_store.RatioDraftQ`), or all None
+        for exact match."""
+        return None, None, None
+
+    def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
+        """Compile the ratio verify before serving; see
+        `rejection_sampler.warmup_ratio_verify`."""
+        return
 
     @property
     def draft_kv_duplicates_propose(self) -> bool:

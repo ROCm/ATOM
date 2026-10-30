@@ -540,7 +540,7 @@ def test_rapidserve_entries_gate_sources_on_the_selected_stream(prefill):
     runner.prepare_model = prepare
     runner.run_model = lambda inputs, batch: (inputs.clone(), None)
     runner.postprocess = lambda batch, logits, *args, **kwargs: logits.clone()
-    runner.sampler = lambda logits, *args: logits
+    runner.sampler = lambda logits, *args, **kwargs: logits
     runner._record_kv_cache_ready = lambda batch: None
     results = []
     for value in range(6):

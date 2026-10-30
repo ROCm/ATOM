@@ -657,8 +657,87 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3's draft takes the
+    # lossless sampled block for every row, greedy rows included, whatever
+    # this says: "0" no longer selects the reference there. Turn that flag
+    # off too to compare against the reference.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
+    ),
+    # Lossless speculative sampling: draw the DSpark draft block from
+    # softmax(logits / T) and accept with the probability-ratio rule
+    # (`u * q < p`, residual relu(p - q) on rejection) instead of proposing
+    # greedily and accepting only on exact equality with the target's own draw.
+    # Both halves or neither: a ratio rule over a greedy delta q is exact match
+    # again, and a sampled draft under exact-match acceptance matches the
+    # target's draw less often than a greedy one does.
+    #
+    # Defaults off, deliberately: it changes the emitted token draw (both rules
+    # are target-exact, but they are not the same draw), and the house
+    # convention is that a behaviour-changing flag defaults off.
+    #
+    # A request with top-k/top-p is drafted within its own filters and verified
+    # against the target's p filtered as `Sampler` filters it, row by row.
+    # With the flag set, every `Sampler` draw (the first token after a
+    # prefill, the bonus, an exact-match verify's own draw) keeps a tie group
+    # at the top-k cut whole, armed or not, as aiter's fused kernel does,
+    # instead of taking aiter's top-k-first path, which keeps exactly k ids (a
+    # uniform top-k <= 256 with a top-p, vocab >= 65536); on such a cut a
+    # filtered request's tokens can differ from the flag off. Read when
+    # `Sampler` is built, so a P/D producer and its consumer draw by one law
+    # whenever both set the flag.
+    # What stays as with the flag off is the accept rule, not the draft path:
+    # an all-greedy batch keeps the exact-match kernel; a greedy row of a mixed
+    # batch is matched exactly (lowest-id argmax) inside the ratio kernel, so a
+    # greedy request's tokens do not depend on its batch. The draft, however,
+    # always runs the de-fused sampled block once the flag is on: greedy rows
+    # draft the same argmax ids as the fused greedy kernel (and publish no q),
+    # but at the sampled block's step latency, so greedy traffic pays that
+    # latency too.
+    #
+    # Costs part of what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
+    # q has to cross the step boundary, so the draft stores each position's top
+    # K entries (ATOM_SPEC_LOSSLESS_Q_TOPK) as fp32 probability + int32 id in a
+    # persistent store of 2 x max_num_seqs per-request row blocks --
+    # 2 * max_num_seqs * T * (8 * K + 8) bytes (128 MiB at max_num_seqs=512,
+    # T=16, K=1024) -- plus a dense [max_num_seqs, V] fp32 score scratch
+    # (320 MiB at 512, V=163840; the verify reuses it to spread a rejecting
+    # request's q over the vocab), all allocated before the KV cache is sized.
+    # The two ops' per-step scratch is allocated once alongside them: about
+    # 28 MiB for the draft and 191 MiB for the verify at 512, T=16, V=163840.
+    # 160 MiB of the verify's, max_num_seqs * T * V / 8 bytes, holds the run
+    # maxima that let a top-k of at most 256 read its logits once; it is
+    # reserved whether or not traffic uses top-k. The startup log line
+    # "Lossless speculative sampling armed" itemizes all of these.
+    #
+    # Only a draft model that declares `supports_lossless_draft` honours it;
+    # any other flavor silently keeps the greedy pair. Mutually exclusive with
+    # ATOM_ENABLE_RELAXED_MTP (refused at drafter construction). Not used under
+    # PP or PCP, on a P/D producer (which drafts for handoff and verifies
+    # nothing), or on a build without aiter's top-k/top-p sampling ops
+    # (`Sampler`'s native fallback filters by another rule than the verify's
+    # p_f); those warn and keep the greedy pair (`Sampler` still keeps top-k
+    # tie groups whole there, as above). Read at drafter and `Sampler`
+    # construction, so it must be set before the server starts.
+    #
+    # Under TP every rank computes its own verdict, so the target logits must
+    # be bitwise equal across ranks, as for the exact-match path: use an aiter
+    # build with ROCm/aiter#6954. From aiter 2039d2b96c (2026-09-13) until
+    # then, the custom all-reduce summed ranks in a rank-dependent order
+    # (docs/model_ops_guide.md, `RejectionSampler`).
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
+        os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
+    ),
+    # How many entries of each draft position's q the lossless draft keeps
+    # (the K above). The draft samples from exactly the stored entries,
+    # renormalized, so any K is exact; a smaller one only gives up q's tail
+    # mass, i.e. some acceptance. Clamped to the vocab size, so a K >= V
+    # stores everything drawable: the full-q baseline for acceptance-length
+    # studies, not for throughput ones -- one program per row normalizes and
+    # draws from the stored entries, which at K = V is ~200-400 us per draft
+    # position on MI355X (vs ~5-20 us at 1024). Read at drafter construction.
+    "ATOM_SPEC_LOSSLESS_Q_TOPK": lambda: int(
+        os.getenv("ATOM_SPEC_LOSSLESS_Q_TOPK", "1024")
     ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding

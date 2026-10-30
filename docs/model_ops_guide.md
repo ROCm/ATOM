@@ -25,7 +25,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
-| `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 
 ## AITER integration overview
 
@@ -493,12 +493,21 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 
 ### `RejectionSampler` (`rejection_sampler.py`)
 
-Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
+Implements rejection sampling for speculative decoding (MTP, EAGLE, DSpark). Given the drafted token IDs, the target logits at each draft position and the bonus token sampled at each request's last row, it accepts each request's drafts until the first rejection and returns `(output_token_ids, verdict)`, where `verdict` is `[accepted, rejected, anchor row]` per request. One of four rules runs per launch:
 
-1. Computes `target_argmax = target_logits.argmax(dim=-1)`.
-2. Runs a Triton kernel `rejection_greedy_sample_kernel` that sequentially compares draft tokens against target argmax, accepting until first mismatch.
-3. On full acceptance, appends the bonus token.
-4. Returns `(output_token_ids, num_bonus_tokens)`.
+1. **Exact match** (default): a draft is accepted iff it equals the target's own token at that row — the lowest-id argmax for greedy requests (`topk_select(..., tie="low")`), the target's temperature/top-k/top-p draw (`Sampler.sample_verification_tokens`) otherwise. On mismatch the target's token is emitted. Kernel: `rejection_greedy_sample_kernel`.
+2. **Probability ratio** (`ATOM_SPEC_LOSSLESS_SAMPLING=1`, DSpark drafts sampled from `q`): accept iff `u * q(x) < p(x)` with `p = softmax(logits / T)` -- for a request with top-k/top-p, `Sampler`'s filtered `p_f` instead (aiter's kept set: every id at or above one floor logit per row, found on the device by a radix descent over the logit bits, `_ratio_filter_pass_kernel` / `_ratio_filter_floor_kernel` / `_ratio_filter_cut_kernel` in `sampling_filter.py`, or for a top-k of at most 256 alone counted by `_ratio_filter_count_kernel`; both cuts agree with aiter's to fp32 rounding, not bit for bit: the descent ranks ids by logit and aiter by `Sampler`'s fp32 `p`, which can round two distinct logits near 0 onto one value that aiter then ties, and the top-p cut compares a sum against `top_p`); on rejection draw from `relu(p - q)` by an exponential race over the vocab. `p` is never materialized: per-tile softmax statistics (`softmax_tiles.py`) give `p(x)` at the drafted id, and only a rejecting row is read across the vocab again. Greedy, unfiltered and filtered rows share a batch; greedy rows take exact match. Kernels: `_ratio_stats_kernel`, `softmax_combine_kernel`, `_ratio_accept_kernel`, `_ratio_densify_clear_kernel` / `_ratio_densify_scatter_kernel` (spread a rejecting request's stored `q` row into a zeroed dense row), `_ratio_residual_race_kernel`, `_ratio_residual_pick_kernel`. The `q` rows come from `dspark_markov_sample` (`dspark_markov_sample.py`), which keeps the top K entries (`ATOM_SPEC_LOSSLESS_Q_TOPK`, further cut to the request's own top-k/top-p) of `softmax((base + W1[x_{k-1}] W2^T) / T)`, renormalized, draws each draft position from exactly those, and stores them -- ids, probabilities, and the slot of the drawn id -- in a persistent per-request `SparseQStore` (`sparse_q_store.py`), through `_dspark_q_histogram` / `_dspark_q_cut` / `_dspark_q_compact` / `_dspark_q_finalize` over a dense score scratch. `q` is 0 off the stored set; the target's `p` is never truncated. No warmup or capture forward verifies, so `warmup_ratio_verify` compiles these kernels and their filter variants at startup.
+3. **Relaxed** (`ATOM_ENABLE_RELAXED_MTP=1`, all-greedy batches only; a sampled batch keeps exact match): accept a draft that is among the target's top `RELAXED_TOP_N` (10) ids with probability within `RELAXED_DELTA` (0.6) of the top-1's; on rejection emit the top-1. Not distribution-preserving, so it and `ATOM_SPEC_LOSSLESS_SAMPLING` refuse each other at drafter construction. Kernel: `rejection_relaxed_sample_kernel`.
+4. **Synthetic** (`--spec-decode-acceptance-length` / `-rate`): forces a configured acceptance curve for benchmarking, ignoring the real comparison. Kernel: `rejection_synthetic_sample_kernel`.
+
+Every rank must reach the same verdict. Each rule gets there its own way:
+
+- **Probability ratio**: Philox (`tl.rand`) keyed on SPMD step counters -- the accept coins and the residual race on `RejectionSampler`'s per-step counter, the draft's noise on its own -- so every TP rank draws the same coins without exchanging them.
+- **Exact match**: the target's own draw comes from `Sampler` and is broadcast from TP rank 0 before the kernel compares against it.
+- **Synthetic**: a per-device `torch.Generator` re-seeded from a step counter each step.
+- **Relaxed** and greedy rows draw nothing.
+
+Only the tokens are broadcast; every rank computes its own verdict, so all of the above also needs the target logits to be bitwise equal across TP ranks. If they differ, each rank's accepted count can differ while the emitted tokens follow rank 0, and `next_token_locs`, the KDA state commit and the KV release diverge silently. This holds for main's exact-match path (a greedy row's argmax is computed on every rank) as much as for the ratio verify. **Minimum aiter**: a build that includes ROCm/aiter#6954. From aiter `2039d2b96c` (2026-09-13) until that PR, the custom all-reduce's LL/LL128 paths summed ranks in a rank-dependent order, and ranks' logits could differ by about one bf16 ulp.
 
 ## Fused kernel chains
 
@@ -539,8 +548,19 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
+| `dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
+| `sparse_q_store.py` | `SparseQStore`, `RatioDraftQ` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
+| `sampling_filter.py` | `row_filters`, `filter_floor` — the ratio verify's top-k/top-p floor per row, found on the device (radix descent, or a count for a top-k of at most 256 alone) |
+| `softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
+| `sampling_scratch.py` | `SamplingScratch`, `take` — the draft's and the ratio verify's per-step scratch, allocated once before KV sizing and carved into views where `entry_arena.plan_regions` places them |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
+
+### `atom/spec_decode/` (lossless sampling)
+
+| File | Description |
+|---|---|
+| `draft_q_slots.py` | `DraftQSlots`, `DraftQStaging` — which `SparseQStore` rows each live request's draft `q` occupies across steps, and the host staging of each step's draft sampling inputs and row bases |
 
 ### `atom/model_ops/attentions/`
 

@@ -28,10 +28,60 @@ The heads after the backbone are the same in every flavor, so they live here
 too: ``DSparkMarkovHead``, ``DSparkConfidenceHead`` and ``linear_out``.
 """
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from atom.utils import envs
+
+if TYPE_CHECKING:
+    from atom.model_ops.sampling_scratch import SamplingScratch
+    from atom.model_ops.sparse_q_store import SparseQStore
+
+
+@dataclass(frozen=True)
+class DraftSampling:
+    """Everything the block sampler needs to draw -- and publish -- a real q.
+
+    Bound once, at drafter init, and never rebound: the block head is
+    cudagraph-captured (``DSparkProposer._declare_draft_graphs``,
+    ``capture_epilogue=True``), so every address here is baked into the
+    recording. That is also why the per-step seed and row bases are device
+    tensors rather than python ints: their values are refreshed outside it.
+
+    The per-row tensors are sized at ``max_num_seqs``; the block runs at
+    ``running_bs <= max_num_seqs`` and slices.
+    """
+
+    #: [slots * T, K] -- q, the distribution each draft token was drawn from
+    #: (its top K entries; see `SparseQStore`), one block of T rows per live
+    #: request. Read a step later by the accept kernel, so it outlives the pass
+    #: and cannot live in the graph's private pool.
+    q_store: "SparseQStore"
+    #: [max_bs, V] fp32, the scaled scores between the sampled op's launches.
+    #: Dense and per batch row, so it is reused by every block position.
+    s_scratch: torch.Tensor
+    #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
+    #: position k goes to row ``base + k``. Negative writes nothing.
+    q_row_base: torch.Tensor
+    #: [max_bs] fp32, pre-clamped away from 0 (``SAMPLER_EPS``).
+    temperatures: torch.Tensor
+    #: [max_bs] int32, nonzero where the draw is an argmax -- i.e. where the
+    #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
+    #: predicate ``Sampler`` itself tests.
+    greedy_mask: torch.Tensor
+    #: [max_bs] int32, the request's top-k the draft samples within; 0 is off.
+    top_k: torch.Tensor
+    #: [max_bs] fp32, the request's top-p, over the unfiltered q and
+    #: intersected with top-k (aiter's rule); 1.0 is off.
+    top_p: torch.Tensor
+    #: [1] int32, the Philox key. Must hold the same value on every TP rank.
+    seed: torch.Tensor
+    #: Preallocated partials for the sampled op (`dspark_markov_sample_scratch`),
+    #: so the draft step allocates nothing and the profiling run sees it.
+    scratch: "SamplingScratch"
 
 
 def linear_out(output):
@@ -122,6 +172,89 @@ class DSparkMarkovHead(nn.Module):
         out.copy_((base_logits + bias).argmax(dim=-1))
         return markov_embed
 
+    def sample_next_q(
+        self,
+        token_ids: torch.Tensor,  # [B]   x_{k-1}
+        base_logits: torch.Tensor,  # [B, V]
+        out: torch.Tensor,  # [B]   destination for x_k
+        sampling: "DraftSampling",  # the bound store, scratch and row inputs
+        bs: int,  # rows of the per-row inputs this block runs
+        position: int,  # k: this position's row is q_row_base + k
+        noise_offset: int,
+    ) -> torch.Tensor:
+        """One sampled block position: draw ``x_k`` from the top of
+        ``softmax(biased / T)`` and write exactly that q out.
+
+        A separate entry point from ``sample_next`` rather than a flag on it:
+        the two have different outputs (this one publishes a distribution the
+        other exists not to materialize), so a caller that takes the wrong one
+        fails loudly rather than silently drafting under a policy the accept
+        rule does not match.
+        """
+        # Imported here for the reason `sample_next` gives.
+        from atom.model_ops.dspark_markov_sample import dspark_markov_sample
+
+        return dspark_markov_sample(
+            base_logits,
+            token_ids,
+            self.markov_w1.weight,
+            self.markov_w2.weight,
+            out,
+            *sampling.q_store,
+            sampling.s_scratch,
+            sampling.q_row_base[:bs],
+            position,
+            sampling.temperatures[:bs],
+            sampling.greedy_mask[:bs],
+            sampling.top_k[:bs],
+            sampling.top_p[:bs],
+            sampling.seed,
+            noise_offset,
+            sampling.scratch.f32,
+            sampling.scratch.i32,
+        )
+
+    def sample_block_q(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+        sampling: "DraftSampling",
+    ) -> torch.Tensor:
+        """The sampled block, left to right, through ``sample_next_q``:
+
+            logits_k <- U_k + B(x_{k-1}, .)
+            q_k      <- top of softmax(logits_k / T) -- stored at q_store[base + k]
+            x_k      <- q_k                          -- drawn, not argmaxed
+
+        Each row writes its q straight into the persistent row block its
+        request owns, ``sampling.q_row_base`` naming the block; the accept
+        kernel reads it back from there a step later. Returns the drafts
+        ``[B, T]``. One loop for every flavor that drafts losslessly, so the
+        noise counters cannot differ between them.
+        """
+        bs, num_draft, vocab = base_logits.shape
+        assert sampling.s_scratch.shape[1] == vocab, (
+            f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
+            f"block scores {vocab} ids"
+        )
+        # The noise counter stride is the buffer's max batch, not this step's,
+        # so the uniform a (position, row, id) draws does not move with the
+        # batch, and no two positions of one block share a counter.
+        position_stride = sampling.q_row_base.shape[0] * vocab
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            self.sample_next_q(
+                out_ids[:, k],
+                base_logits[:, k],
+                out_ids[:, k + 1],
+                sampling,
+                bs,
+                k,
+                k * position_stride,
+            )
+        return out_ids[:, 1:]
+
 
 class DSparkConfidenceHead(nn.Module):
     """Per-position survival-probability estimator.
@@ -185,6 +318,34 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+
+    #: Does this flavor's block sampler branch on ``draft_sampling`` and draw
+    #: from, and publish, a real q (``DSparkMarkovHead.sample_block_q``)? An
+    #: explicit class flag rather than a probe of the head: every flavor shares
+    #: ``DSparkMarkovHead``, so it has ``sample_block_q`` whether or not the
+    #: flavor's own sampling loop calls it.
+    supports_lossless_draft = False
+
+    #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
+    #: None keeps the greedy block sampler. A class default, so a flavor that
+    #: does not support lossless drafts reads None.
+    draft_sampling: "DraftSampling | None" = None
+
+    def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
+        """Hand this model the buffers its block sampler draws into.
+
+        Called once from ``DSparkProposer.__init__``, before any warmup or
+        capture, so the sampled branch is the one that gets JITed and recorded.
+        Switching it per step would not work: the branch is python, and a
+        captured graph holds whichever side was taken at capture.
+        """
+        if sampling is not None and not self.supports_lossless_draft:
+            raise ValueError(
+                f"{type(self).__name__} does not declare supports_lossless_draft; "
+                "binding draft sampling buffers to it would publish a q the "
+                "block sampler never draws from"
+            )
+        self.draft_sampling = sampling
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""

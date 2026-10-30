@@ -907,6 +907,11 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        if getattr(self, "drafter", None) is not None:
+            # No warmup or capture forward verifies, so the ratio verify is
+            # compiled here, before the memory profile. Its logits are the LM
+            # head's, which keeps the hidden states' dtype.
+            self.drafter.warmup_lossless_verify(config.torch_dtype)
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -1460,6 +1465,7 @@ class ModelRunner:
         """
         pp_size = self.config.pipeline_parallel_size
         self._fv_idx = 0
+        self.forward_step = 0
         self._stage_h2d_done = None
         if pp_size <= 1:
             self._fv_ring = [self.forward_vars]
@@ -1562,8 +1568,14 @@ class ModelRunner:
         """Rotate to the next in-flight slot before any buffer is written.
 
         Dummy forwards use the same staging buffers as real forwards, so they
-        participate in the ring too. No-op when the ring has a single slot.
+        participate in the ring too. The rotation is a no-op when the ring has a
+        single slot.
+
+        Called once at the start of every forward, so it also numbers them:
+        ``forward_step`` lets a consumer of host staging (the lossless draft's
+        `DraftQStaging`) check that what it reads was staged by this forward.
         """
+        self.forward_step += 1
         if len(self._fv_ring) == 1:
             return
         self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
@@ -2640,7 +2652,11 @@ class ModelRunner:
         top_ks = top_ps = None
         top_k_count = top_p_count = None
         if needs_topk:
-            if bs == 1 or (batch.top_ks == batch.top_ks[0]).all():
+            uniform_k = bs == 1 or (batch.top_ks == batch.top_ks[0]).all()
+            # Except where `Sampler` keeps top-k ties with a top-p: a scalar
+            # k there would take aiter's top-k-first path, so it is handed
+            # the same k per row, from the buffer a mixed batch uses.
+            if uniform_k and not (self.sampler.keep_top_k_ties and needs_topp):
                 top_ks = int(batch.top_ks[0])
             else:
                 top_k_buffer = self.forward_vars["top_ks"]
@@ -2666,6 +2682,25 @@ class ModelRunner:
         counts[group.indices["temperatures"]] = bs
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
+        # The draft's copy of the same facts, plus where its q goes, staged into
+        # the same publication so the upload stays a single batched H2D and is
+        # covered by this forward's staging window. A no-op on every drafter but
+        # a DSpark one with lossless sampling.
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            drafter.stage_draft_sampling_host(
+                batch,
+                bs,
+                group,
+                # A dummy forward's and an align-only propose's drafts are
+                # dropped, so they must not claim q slots or write q.
+                drafts_verifiable=not batch.is_dummy_run
+                and not self._is_pure_middle_chunk(batch),
+                # Only a forward that scores drafts looks its q up.
+                verifies=self._verifies_drafts(
+                    batch, batch.total_tokens_num_prefill > 0
+                ),
+            )
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -3225,6 +3260,7 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        drafter = getattr(self, "drafter", None)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3258,8 +3294,28 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            # Lossless acceptance: compare against the q the draft actually drew
+            # from (`u * q < p`) instead of requiring the draft token to equal
+            # the target's own draw. Resolved before the verification sample
+            # below, because it decides whether that sample is needed at all.
+            # An all-greedy batch always verifies by exact match, so it never
+            # asks. A filtered batch is verified against the p_f `Sampler`
+            # draws its bonus from, given the same `top_ks`/`top_ps`.
+            #
+            # The ratio verify spreads a rejecting request's q into the draft's
+            # score scratch, which the draft head rewrites on every propose.
+            # Safe because both run here, in `postprocess`, on the one current
+            # stream -- this verify after the previous step's propose, and
+            # before this step's (`propose_draft_token_ids` below) -- and the
+            # forward that may run on another stream (the disaggregated decode
+            # runner's) touches neither. Keep the two on one stream.
+            draft_probs = draft_probs_row_base = ratio_scratch = None
+            if drafter is not None and not all_greedy:
+                draft_probs, draft_probs_row_base, ratio_scratch = (
+                    drafter.lossless_verify_inputs(bs)
+                )
             target_token_ids = None
-            if not all_greedy:
+            if RejectionSampler.needs_target_draw(all_greedy, draft_probs):
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3282,6 +3338,12 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
+                draft_probs=draft_probs,
+                draft_probs_row_base=draft_probs_row_base,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
+                ratio_scratch=ratio_scratch,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
@@ -4895,7 +4957,13 @@ class RapidServeModelRunner(ModelRunner):
             self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit
-            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+            sampled = self.sampler(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+            )
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.

@@ -514,6 +514,11 @@ class KimiK3DSpark(DSparkDraftModel):
     ``packed_modules_mapping``.
     """
 
+    # `_sample_block` below branches on the binding and draws through the
+    # head's `sample_block_q`, so `DSparkProposer` may arm lossless
+    # speculative sampling here.
+    supports_lossless_draft = True
+
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
         "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
@@ -705,6 +710,14 @@ class KimiK3DSpark(DSparkDraftModel):
         Only this loop is sequential, and it is T tiny rank-256 matmuls rather
         than T backbone passes -- which is the entire point of DSpark.
         """
+        # Lossless speculative sampling draws x_k from softmax(biased / T) and
+        # publishes that q for the accept rule. Branched here and not inside the
+        # loop: the block head is captured, so whichever side is taken at warmup
+        # is the one every replay runs.
+        if self.draft_sampling is not None:
+            return self.markov_head.sample_block_q(
+                base_logits, anchor_ids, self.draft_sampling
+            )
         bs, T, _ = base_logits.shape
         out_ids = anchor_ids.new_empty(bs, T + 1)
         out_ids[:, 0] = anchor_ids
