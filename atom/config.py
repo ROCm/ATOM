@@ -1970,12 +1970,12 @@ def m3_nvfp4_stage_unsupported_reason(stage_pages: int, index_pages: int) -> str
     pool, or None.
 
     The NVFP4 K/V is written through a token-major staging buffer of
-    ``stage_pages`` 128-token pages, sized for the largest step (the larger of
-    max_num_batched_tokens and max_num_seqs x (draft + 1) rows). AITER's
-    page-128 writer checks the index cache against the KV pages it is given,
-    and a captured graph bucket can run more rows than the pool holds, so the
-    pool must hold at least the staging buffer. An FP4 index is staged too and
-    is not coupled this way.
+    ``stage_pages`` 128-token pages, sized for the largest step a forward can
+    run (max_num_batched_tokens rows, which also bounds every captured decode
+    bucket). AITER's page-128 writer checks the index cache against the KV
+    pages it is given, and a captured bucket can run more rows than the pool
+    holds, so the pool must hold the largest step. An FP4 index is staged too
+    and is not coupled this way.
     """
     if index_pages >= stage_pages:
         return None

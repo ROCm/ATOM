@@ -104,7 +104,8 @@ def prefill_rows(cu_seqlens_q: torch.Tensor, prefix_lens: torch.Tensor, rows: in
     cu = cu_seqlens_q.to(torch.int32)
     tok = torch.arange(rows, device=cu.device, dtype=torch.int32)
     live = tok < cu[-1]
-    req = torch.where(live, torch.searchsorted(cu[1:], tok, right=True), 0)
-    req = req.to(torch.int32)
+    req = torch.where(
+        live, torch.searchsorted(cu[1:], tok, right=True, out_int32=True), 0
+    )
     seq = prefix_lens.to(torch.int32)[req] + (tok - cu[req]) + 1
     return req, torch.where(live, seq, 0)

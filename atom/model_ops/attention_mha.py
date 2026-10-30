@@ -1740,7 +1740,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 # exactly the head this rank would have projected alone, so the
                 # slice is an identity, not an approximation.
                 index_q = index_q[:, self.indexer_cp_rank : self.indexer_cp_rank + 1]
-            topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk(
+            # NVFP4 attention reads top-k ids only: no page-16 sparse table.
+            emit = not self.kv_nvfp4
+            selected = minimax_m3_index_topk(
                 index_q,
                 self.index_cache,
                 block_tables,
@@ -1754,9 +1756,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.local_blocks,
                 self.num_kv_heads,
                 self.scale,
-                emit_sparse_block_table=True,
+                emit_sparse_block_table=emit,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                 index_kv_scale=self.index_scale,
+            )
+            topk_idx, sparse_bt, sparse_ctx = (
+                selected if emit else (selected, None, None)
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
@@ -1941,7 +1946,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     max_query_len,
                 )
             else:
-                topk_idx, sparse_bt, sparse_ctx = minimax_m3_index_topk_decode(
+                emit = not self.kv_nvfp4  # NVFP4 attention reads top-k ids only
+                selected = minimax_m3_index_topk_decode(
                     index_q,
                     self.index_cache,
                     decode_md.block_table,
@@ -1952,10 +1958,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     self.local_blocks,
                     self.num_kv_heads,
                     self.scale,
-                    emit_sparse_block_table=True,
+                    emit_sparse_block_table=emit,
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
                     index_kv_scale=self.index_scale,
+                )
+                topk_idx, sparse_bt, sparse_ctx = (
+                    selected if emit else (selected, None, None)
                 )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)

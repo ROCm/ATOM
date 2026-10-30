@@ -397,6 +397,34 @@ def test_quant_stage_follows_the_model_dtype(dtype):
         )
     )
     stage, slots = builder._quant_stage("index", (PAGE, D))
-    # 64 seqs x 8 verify rows = 512 > 300 tokens: the decode graph sizes it.
-    assert stage.dtype == dtype and stage.shape == (4, PAGE, D)
-    assert torch.equal(slots, torch.arange(512, device=slots.device))
+    # 300 tokens bound every step (capture drops decode buckets past
+    # max_schedulable_decode_bs), so 64 seqs x 8 rows never reach the stage.
+    assert stage.dtype == dtype and stage.shape == (3, PAGE, D)
+    assert torch.equal(slots, torch.arange(384, device=slots.device))
+
+
+def test_nvfp4_stage_is_the_step_bound_not_the_seq_count():
+    """max_num_seqs 512 x 8 verify rows is 32 pages, but max_num_batched_tokens
+    1024 caps every step (and capture) at 8: a 16-page FP8 index pool fits."""
+    from types import SimpleNamespace
+
+    from atom.config import m3_nvfp4_stage_unsupported_reason
+    from atom.model_engine.model_runner import max_schedulable_decode_bs
+    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
+
+    builder = AiterAttentionMetadataBuilder.__new__(AiterAttentionMetadataBuilder)
+    builder.block_size = PAGE
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            max_num_batched_tokens=1024,
+            max_num_seqs=512,
+            speculative_config=SimpleNamespace(num_speculative_tokens=7),
+            torch_dtype=torch.bfloat16,
+        )
+    )
+    stage, _ = builder._quant_stage("kv", (2, PAGE, 1, D))
+    assert stage.shape[0] == 8
+    # The largest captured decode bucket fits the stage.
+    assert max_schedulable_decode_bs(512, 1024, 8) * 8 <= stage.shape[0] * PAGE
+    assert m3_nvfp4_stage_unsupported_reason(stage.shape[0], 16) is None
+    assert m3_nvfp4_stage_unsupported_reason(stage.shape[0], 7) is not None

@@ -662,22 +662,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         emits, before FP4/NVFP4 quantization. Shared by every sparse layer (each
         quantizes its rows out before the next layer writes):
         token-major page-128 ``[rows // 128, *inner]`` with the identity slot
-        mapping beside it. Sized for the largest step, a prefill chunk or a full
-        decode graph of ``max_num_seqs`` spec-verify rows. One buffer per
-        ``name`` -- the K/V stage and the index-key stage."""
+        mapping beside it. Sized for the largest step any forward can run:
+        ``max_num_batched_tokens`` rows. Prefill chunks and decode steps are
+        scheduled under it, warmup stays within it, and CUDA graph capture drops
+        decode buckets above ``max_schedulable_decode_bs`` (which charges every
+        sequence ``mtp_k + 1`` rows). One buffer per ``name`` -- the K/V stage
+        and the index-key stage."""
         stages = getattr(self, "_quant_stages", None)
         if stages is None:
             stages = self._quant_stages = {}
         if name not in stages:
             config = self.model_runner.config
-            spec = config.speculative_config
-            rows_per_seq = 1 + (
-                (spec.num_speculative_tokens or 0) if spec is not None else 0
-            )
-            tokens = max(
-                int(config.max_num_batched_tokens),
-                int(config.max_num_seqs) * rows_per_seq,
-            )
+            tokens = int(config.max_num_batched_tokens)
             rows = -(-tokens // self.block_size) * self.block_size
             device = torch.device("cuda", torch.cuda.current_device())
             stages[name] = (
