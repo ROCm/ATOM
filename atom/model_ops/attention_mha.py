@@ -1938,6 +1938,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 )
                 sparse_bt = sparse_ctx = None
             elif self.indexer_cp_group is not None:
+                # shortcut: with NVFP4 KV the CP merge still emits the page-16
+                # sparse table (merge_candidate_keys builds it in the merge
+                # kernel), which the NVFP4 attention never reads. It can go once
+                # the merge takes an emit flag like the TP selector's.
                 topk_idx, sparse_bt, sparse_ctx = self._cp_index_topk_decode(
                     index_q,
                     decode_md.block_table,
