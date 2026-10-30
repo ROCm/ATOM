@@ -59,6 +59,7 @@ from atom.entrypoints.openai.serving_completion import (
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.registry import (
+    channel_for_request,
     forbids_tool_calls,
     required_call_channel,
     resolve_tool_call_parser,
@@ -1200,6 +1201,10 @@ class AtomStandaloneService:
         self.tool_parser_cls = resolve_tool_call_parser(
             tool_call_parser, tokenizer, self.custom_message_encoder, model=model_name
         )
+        # What `tool_choice="required"` holds output to, derived once with it.
+        self.required_tool_channel = required_call_channel(
+            self.tool_parser_cls, tokenizer
+        )
 
         self.engine_service = AtomEngineService(engine, tokenizer)
 
@@ -1268,9 +1273,8 @@ class AtomStandaloneService:
             sampling_params = self._build_sampling_params(
                 request_data,
                 effective_n,
-                required_channel=required_call_channel(
-                    self.tool_parser_cls,
-                    self.tokenizer,
+                required_channel=channel_for_request(
+                    self.required_tool_channel,
                     request_data.get("tool_choice"),
                     request_data.get("tools"),
                 ),
@@ -1494,9 +1498,8 @@ class AtomStandaloneService:
             sampling_params = self._build_sampling_params(
                 request_data,
                 effective_n,
-                required_channel=required_call_channel(
-                    self.tool_parser_cls,
-                    self.tokenizer,
+                required_channel=channel_for_request(
+                    self.required_tool_channel,
                     request_data.get("tool_choice"),
                     request_data.get("tools"),
                 ),

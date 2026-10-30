@@ -26,6 +26,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
 
@@ -491,6 +492,28 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
+### Required channel (`required_channel.py`)
+
+Holds a request with a `RequiredChannel` (`atom/sampling_params.py`; today only
+Kimi-K3 under `tool_choice="required"`) to its tools channel by masking the
+target logits before any sampler reads them. Until the channel opens, the end
+ids (the format's own plus the engine's EOS and `stop_token_ids`) are `-inf`;
+once the output ends with `after` (K3: `<|close|>response<|sep|>`), each next
+row keeps only the forced id of `opening`. Once `opening` is written the state
+is `UNCONSTRAINED` and the request costs nothing more.
+
+- `constrain_logits` masks a step's rows in place: plain decode and prefill
+  rows by the request's state, verification rows as if the drafts before them
+  were accepted, and the bonus row after every draft. A mismatching draft is
+  therefore rejected by the ordinary rejection sampler.
+- `advance_states` folds the step's emitted ids into each state on the GPU, so
+  a deferred-output step reads its predecessor's states through `decode_src`
+  before the host has seen those ids.
+
+One Triton program per request; a batch with no unopened channel launches
+neither kernel. `constrain_logits_reference` / `advance_states_reference` are
+the pure-torch twins the tests hold the kernels to.
+
 ### `RejectionSampler` (`rejection_sampler.py`)
 
 Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
@@ -539,6 +562,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
+| `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 

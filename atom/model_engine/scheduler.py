@@ -292,21 +292,27 @@ class ScheduledBatch:
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
         )
-        # Per row, the committed state towards the channel the request must
-        # open (`UNCONSTRAINED` for none), and the channel itself when any row
-        # has one. One per batch: a server resolves a single tool-call format.
-        self.required_channel_states = np.asarray(
-            [seq.required_channel_state for seq in seqs.values()], dtype=np.int32
-        )
+        # The channel the batch's requests must still open, when any row has
+        # one left to open (a request whose channel is open is
+        # `UNCONSTRAINED`), and then each row's committed state towards it.
+        # One per batch: a server resolves a single tool-call format. A batch
+        # with none stages no states and runs no channel kernels.
         channels = {
             seq.required_channel
             for seq in seqs.values()
-            if seq.required_channel is not None
+            if seq.required_channel_state >= 0
         }
         if len(channels) > 1:
             raise ValueError(f"one batch holds {len(channels)} required channels")
         self.required_channel: RequiredChannel | None = (
             channels.pop() if channels else None
+        )
+        self.required_channel_states = (
+            None
+            if self.required_channel is None
+            else np.asarray(
+                [seq.required_channel_state for seq in seqs.values()], dtype=np.int32
+            )
         )
 
         self.is_first_decode_without_local_prefill = [

@@ -68,11 +68,13 @@ class DeviceChannel(NamedTuple):
 
 @triton.jit
 def _step(s, tok, table_ptr, AFTER_LEN: tl.constexpr, OPEN_STATE: tl.constexpr):
-    """`RequiredChannel.step` for a state `s >= 0`."""
-    want = tl.load(table_ptr + tl.minimum(s, AFTER_LEN - 1))
+    """`RequiredChannel.step`: an opened channel is `UNCONSTRAINED` (-1), and
+    stays so."""
+    want = tl.load(table_ptr + tl.maximum(tl.minimum(s, AFTER_LEN - 1), 0))
     first = tl.load(table_ptr)
     matched = tl.where(tok == want, s + 1, tl.where(tok == first, 1, 0))
-    return tl.where(s < AFTER_LEN, matched, tl.minimum(s + 1, OPEN_STATE))
+    forced = tl.where(s + 1 < OPEN_STATE, s + 1, -1)
+    return tl.where(s < 0, s, tl.where(s < AFTER_LEN, matched, forced))
 
 
 @triton.jit
@@ -86,21 +88,26 @@ def _constrain_row(
     END_LEN: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    """Mask one logits row for a state `s >= 0`."""
+    """Mask one logits row for state `s`; an `UNCONSTRAINED` row is left alone."""
     neg_inf = float("-inf")
-    if s < AFTER_LEN:
-        for e in tl.static_range(END_LEN):
-            end_id = tl.load(table_ptr + AFTER_LEN + OPEN_LEN + e)
-            tl.store(row_ptr + end_id, neg_inf)
-    elif s < AFTER_LEN + OPEN_LEN:
-        # Every column but the forced one, in one pass: the forced logit keeps
-        # its own value, so a logprob read from the row stays finite.
-        forced = tl.load(table_ptr + s)
-        for start in range(0, vocab_size, BLOCK_V):
-            col = start + tl.arange(0, BLOCK_V)
-            live = col < vocab_size
-            x = tl.load(row_ptr + col, mask=live)
-            tl.store(row_ptr + col, tl.where(col == forced, x, neg_inf), mask=live)
+    if s >= 0:
+        if s < AFTER_LEN:
+            for e in tl.static_range(END_LEN):
+                end_id = tl.load(table_ptr + AFTER_LEN + OPEN_LEN + e)
+                tl.store(row_ptr + end_id, neg_inf)
+        elif s < AFTER_LEN + OPEN_LEN:
+            # Every column but the forced one, in one pass. The forced logit
+            # keeps its own value unless that is -inf too, which would leave
+            # no finite logit in the row and a NaN softmax: it is then 0.
+            forced = tl.load(table_ptr + s)
+            for start in range(0, vocab_size, BLOCK_V):
+                col = start + tl.arange(0, BLOCK_V)
+                live = col < vocab_size
+                x = tl.load(row_ptr + col, mask=live)
+                kept = tl.where(x == neg_inf, 0.0, x)
+                tl.store(
+                    row_ptr + col, tl.where(col == forced, kept, neg_inf), mask=live
+                )
 
 
 @triton.jit(do_not_specialize=["vocab_size"])
@@ -275,11 +282,15 @@ def advance_states(
 
 
 def _constrain_row_reference(row: torch.Tensor, state: int, channel: RequiredChannel):
+    if state < 0:
+        return
     if state < len(channel.after):
         row[list(channel.end_ids)] = float("-inf")
     elif state < channel.open_state:
         forced = channel.table[state]
         kept = row[forced].clone()
+        if kept == float("-inf"):
+            kept.zero_()
         row.fill_(float("-inf"))
         row[forced] = kept
 

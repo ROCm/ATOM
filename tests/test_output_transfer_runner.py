@@ -2,7 +2,7 @@
 """Runner wiring only; storage and protocol tests do not require this import."""
 
 import weakref
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -73,6 +73,9 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         ),
         drafter=object(),
         forward_done_event=mock.Mock(),
+    )
+    runner._constrain_required_channel = MethodType(
+        runner_module.ModelRunner._constrain_required_channel, runner
     )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(

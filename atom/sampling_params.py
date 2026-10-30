@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 UNCONSTRAINED = -1
 """The channel state of a sequence whose request requires no channel."""
@@ -23,9 +23,12 @@ class RequiredChannel:
 
     A sequence's state is how far its output has got. ``0 .. len(after) - 1``
     is how much of ``after`` it currently ends with; ``len(after) + i`` means
-    the next token is ``opening[i]``; ``open_state`` means the channel is open
-    and nothing is constrained any more. The state counts generated tokens
-    only, so a sequence starts at 0 whatever its prompt ends with.
+    the next token is ``opening[i]``. Once ``opening`` is written the channel
+    is open, nothing is constrained any more, and the state becomes
+    ``UNCONSTRAINED``: the sequence drops out of its batch's channel, so a
+    batch whose requests have all opened theirs costs nothing. The state
+    counts generated tokens only, so a sequence starts at 0 whatever its
+    prompt ends with.
     """
 
     after: tuple[int, ...]
@@ -45,6 +48,8 @@ class RequiredChannel:
 
     @property
     def open_state(self) -> int:
+        """Where writing ``opening`` would take the state; ``step`` returns
+        ``UNCONSTRAINED`` instead, so no sequence is ever in it."""
         return len(self.after) + len(self.opening)
 
     @property
@@ -65,12 +70,25 @@ class RequiredChannel:
             return 1 if token_id == self.after[0] else 0
         # Forced tokens advance the state whatever they are: a row that saw a
         # different one is a rejected draft, whose state nobody reads.
-        return min(state + 1, self.open_state)
+        state += 1
+        return state if state < self.open_state else UNCONSTRAINED
 
     def advance(self, state: int, token_ids: Iterable[int]) -> int:
         for token_id in token_ids:
             state = self.step(state, int(token_id))
         return state
+
+    def ending_on(self, stop_ids: Iterable[int | None]) -> "RequiredChannel":
+        """This channel, also holding back ``stop_ids``.
+
+        The format names the ids that end its own message; the engine may end
+        a sequence on more (its EOS and ``stop_token_ids``), and any it does
+        not hold back would end the message before the channel opens."""
+        end_ids = set(self.end_ids)
+        end_ids.update(i for i in stop_ids if i is not None and i >= 0)
+        if len(end_ids) == len(self.end_ids):
+            return self
+        return replace(self, end_ids=tuple(sorted(end_ids)))
 
 
 @dataclass

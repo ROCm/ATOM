@@ -3295,6 +3295,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # Compute logprobs if any sequence requested them
+        need_logprobs = any(batch.return_logprobs)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3305,6 +3307,14 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
+            # `_constrain_required_channel` below masks `logits` in place, so
+            # the logprob copy is taken BEFORE it. Logprobs report the model's
+            # own distribution, as they do for a request without a channel and
+            # on the verification path, which masks copies: a forced token's
+            # is its real logprob, not the masked row's 0.0.
+            logprob_logits = logits
+            if need_logprobs and getattr(batch, "required_channel", None) is not None:
+                logprob_logits = logits.clone()
             channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
@@ -3329,6 +3339,7 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            logprob_logits = logits
             channel = self._constrain_required_channel(
                 batch, bonus_logits, spec_decode_metadata, target_logits
             )
@@ -3388,11 +3399,9 @@ class ModelRunner:
         if channel is not None and self.tokenID_processor.is_deferred_out:
             channel_states = advance_states(*channel, sampled_tokens)
 
-        # Compute logprobs if any sequence requested them
-        need_logprobs = any(batch.return_logprobs)
         sampled_logprobs = None
         if need_logprobs:
-            logits_fp32 = logits.float()
+            logits_fp32 = logprob_logits.float()
             log_probs = torch.log_softmax(logits_fp32, dim=-1)
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
@@ -4978,7 +4987,10 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
-            # Sample the first generated token from each sequence's last logit
+            # Sample the first generated token from each sequence's last logit.
+            # Masked in place with no pre-mask copy, unlike `postprocess`: this
+            # path returns token ids only and computes no logprobs, so nothing
+            # reads the unmasked row.
             self._constrain_required_channel(batch, logits)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()

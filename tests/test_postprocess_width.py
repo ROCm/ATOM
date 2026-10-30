@@ -141,7 +141,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     batch.return_logprobs = [True] * scheduled_bs
     captured = {}
     runner = _runner(seen)
-    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp: (
+    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
         captured.update(logprobs=lp) or ({}, {})
     )
 
@@ -156,6 +156,47 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     )
 
     assert captured["logprobs"].shape == (scheduled_bs,)
+
+
+def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
+    """A required channel masks the logits in place. The logprob a client asked
+    for is the model's own, as on every other request, not the forced row's
+    0.0."""
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+    batch = _batch(2)
+    batch.return_logprobs = [True, True]
+    batch.required_channel = object()
+    captured = {}
+    runner = _runner({})
+
+    def force_column_zero(_batch, logits, *_args):
+        logits[:, 1:] = float("-inf")  # the sampler's `_runner` samples id 0
+
+    runner._constrain_required_channel = force_column_zero
+    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
+        captured.update(logprobs=lp) or ({}, {})
+    )
+    logits = torch.randn(2, 8)
+    expected = torch.log_softmax(logits, dim=-1)[:, 0]
+
+    runner.postprocess(
+        batch=batch,
+        logits=logits.clone(),
+        temperatures=torch.ones(2),
+        top_ks=None,
+        top_ps=None,
+        all_greedy=False,
+        hidden_states=None,
+    )
+
+    torch.testing.assert_close(captured["logprobs"], expected)
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():

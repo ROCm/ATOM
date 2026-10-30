@@ -6,7 +6,7 @@ import itertools
 import logging
 import time
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -877,6 +877,20 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
+
+        # Hold a required channel's opening against every single id this
+        # engine ends a sequence on (`Scheduler.postprocess` stops on EOS and
+        # on `stop_token_ids`), not just the ones the tool-call format named.
+        # The third way a sequence ends, the request's own `stop` strings
+        # (`stop_token_sequences` above), is left to end it: the client asked
+        # for that stop, and a multi-token match is not one logits row's mask.
+        if sampling_params.required_channel is not None:
+            sampling_params = replace(
+                sampling_params,
+                required_channel=sampling_params.required_channel.ending_on(
+                    (self.config.eos_token_id, *self.config.stop_token_ids)
+                ),
+            )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:
             raise ValueError(
