@@ -147,13 +147,14 @@ def role_online_quant_config(role, role_cfg):
     exclude = [*as_list(parsed.get("exclude_layer")), *extra]
     return json.dumps({**parsed, "exclude_layer": exclude}, separators=(",", ":"))
 
-def role_reject_log(role, role_cfg):
-    """The role's reject_log as a JSON list, or "" when it sets none. One line,
-    because the docker env file that carries it holds one per variable."""
-    lines = as_list(role_cfg.get("reject_log"))
+def role_log_lines(role, role_cfg, key):
+    """The role's expect_log or reject_log as a JSON list, or "" when it sets
+    none. One line, because the docker env file that carries it holds one per
+    variable."""
+    lines = as_list(role_cfg.get(key))
     if not all(isinstance(line, str) and line for line in lines):
         fail(
-            f"ERROR: {cell['id']} {role} reject_log has an entry that is not "
+            f"ERROR: {cell['id']} {role} {key} has an entry that is not "
             "a non-empty string"
         )
     return json.dumps(lines) if lines else ""
@@ -283,10 +284,10 @@ exports = {
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
-    "PREFILL_EXPECT_LOG": prefill.get("expect_log", ""),
-    "DECODE_EXPECT_LOG": decode.get("expect_log", ""),
-    "PREFILL_REJECT_LOG": role_reject_log("prefill", prefill),
-    "DECODE_REJECT_LOG": role_reject_log("decode", decode),
+    "PREFILL_EXPECT_LOG": role_log_lines("prefill", prefill, "expect_log"),
+    "DECODE_EXPECT_LOG": role_log_lines("decode", decode, "expect_log"),
+    "PREFILL_REJECT_LOG": role_log_lines("prefill", prefill, "reject_log"),
+    "DECODE_REJECT_LOG": role_log_lines("decode", decode, "reject_log"),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
     "EVAL_ONLY": str(cell.get("eval_only", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),

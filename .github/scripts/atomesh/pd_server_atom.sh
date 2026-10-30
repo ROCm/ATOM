@@ -2770,13 +2770,13 @@ PY
   fi
 }
 
-# A role's expect_log is a line every one of its servers must have logged while
-# starting: it is checked once they are healthy and before any request, warmup
-# included, so a line first logged while serving fails a healthy cell. It is
-# for a feature that, when a deployment rules it out, logs why at INFO and
-# serves without it: the cell would otherwise publish numbers under a name that
-# says the feature ran. RUN_DIR is shared, so node 0 reads the logs of servers
-# on the other nodes too.
+# A role's expect_log is a JSON list of lines every one of its servers must
+# have logged while starting: it is checked once they are healthy and before
+# any request, warmup included, so a line first logged while serving fails a
+# healthy cell. It is for a feature that, when a deployment rules it out, logs
+# why at INFO and serves without it: the cell would otherwise publish numbers
+# under a name that says the feature ran. RUN_DIR is shared, so node 0 reads
+# the logs of servers on the other nodes too.
 PREFILL_EXPECT_LOG="${PREFILL_EXPECT_LOG:-}"
 DECODE_EXPECT_LOG="${DECODE_EXPECT_LOG:-}"
 ATOMESH_EXPECT_LOG_TIMEOUT="${ATOMESH_EXPECT_LOG_TIMEOUT:-60}"
@@ -2805,9 +2805,20 @@ collect_role_logs() {
   fi
 }
 
+# Sets lines to the entries of a role's expect_log or reject_log, which
+# pd_submit.sh passes as a JSON list.
+parse_log_lines() {
+  local role="$1" key="$2" listed="$3" parsed
+  if ! parsed="$(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "${listed}")"; then
+    echo "[check][FAIL] ${role} ${key} is not a JSON list: ${listed}" >&2
+    exit 1
+  fi
+  mapfile -t lines <<< "${parsed}"
+}
+
 check_expected_logs() {
-  local role expected log deadline
-  local -a role_logs pending
+  local role expected log line deadline
+  local -a role_logs lines pending
   for role in prefill decode; do
     if [[ "${role}" == "prefill" ]]; then
       expected="${PREFILL_EXPECT_LOG}"
@@ -2815,24 +2826,27 @@ check_expected_logs() {
       expected="${DECODE_EXPECT_LOG}"
     fi
     [[ -n "${expected}" ]] || continue
-    collect_role_logs "${role}" "'${expected}'"
+    parse_log_lines "${role}" expect_log "${expected}"
+    collect_role_logs "${role}" "its expect_log"
     # Another node's writes can take a few seconds to show up over NFS.
     deadline=$((SECONDS + ATOMESH_EXPECT_LOG_TIMEOUT))
     while :; do
       pending=()
       for log in "${role_logs[@]}"; do
-        grep -qF -- "${expected}" "${log}" || pending+=("${log}")
+        for line in "${lines[@]}"; do
+          grep -qF -- "${line}" "${log}" || pending+=("${log} never logged '${line}'")
+        done
       done
       if (( ${#pending[@]} == 0 )); then
         break
       fi
       if (( SECONDS >= deadline )); then
-        echo "[check][FAIL] ${pending[*]} never logged '${expected}'" >&2
+        printf '[check][FAIL] %s\n' "${pending[@]}" >&2
         exit 1
       fi
       sleep 5
     done
-    echo "[check] all ${#role_logs[@]} ${role} server log(s) show '${expected}'"
+    echo "[check] all ${#role_logs[@]} ${role} server log(s) show all ${#lines[@]} expected line(s)"
   done
 }
 
@@ -2843,7 +2857,7 @@ check_expected_logs() {
 PREFILL_REJECT_LOG="${PREFILL_REJECT_LOG:-}"
 DECODE_REJECT_LOG="${DECODE_REJECT_LOG:-}"
 check_rejected_logs() {
-  local role rejected listed line log hit
+  local role rejected line log hit
   local -a role_logs lines
   for role in prefill decode; do
     if [[ "${role}" == "prefill" ]]; then
@@ -2852,11 +2866,7 @@ check_rejected_logs() {
       rejected="${DECODE_REJECT_LOG}"
     fi
     [[ -n "${rejected}" ]] || continue
-    if ! listed="$(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "${rejected}")"; then
-      echo "[check][FAIL] ${role} reject_log is not a JSON list: ${rejected}" >&2
-      exit 1
-    fi
-    mapfile -t lines <<< "${listed}"
+    parse_log_lines "${role}" reject_log "${rejected}"
     collect_role_logs "${role}" "its reject_log"
     for log in "${role_logs[@]}"; do
       for line in "${lines[@]}"; do

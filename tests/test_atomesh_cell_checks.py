@@ -135,24 +135,36 @@ class RequiredAtomEnvTest(unittest.TestCase):
         )
 
 
-class ExpectedLogTest(unittest.TestCase):
-    ARMED = "Kimi-K3 mono decode armed"
+MONO_UP = ["Kimi-K3 mono decode armed", "Kimi-K3 mono decode on"]
+MONO_UP_LOG = ["Kimi-K3 mono decode armed (TP8)", "Kimi-K3 mono decode on"]
 
+
+class ExpectedLogTest(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.logs = Path(temp.name)
 
-    def write(self, name, text):
-        (self.logs / name).write_text(f"INFO model loaded\nINFO {text}\n")
+    def write(self, name, *lines):
+        (self.logs / name).write_text(
+            "".join(f"INFO {line}\n" for line in ("model loaded", *lines))
+        )
 
-    def check(self, aggregated="0", prefill="", decode=""):
+    def check(self, aggregated="0", prefill=None, decode=None):
+        return self.check_exported(
+            aggregated,
+            json.dumps(prefill) if prefill else "",
+            json.dumps(decode) if decode else "",
+        )
+
+    def check_exported(self, aggregated, prefill, decode):
         return subprocess.run(
             [
                 "bash",
                 "-eu",
                 "-c",
                 shell_function("collect_role_logs")
+                + shell_function("parse_log_lines")
                 + shell_function("check_expected_logs")
                 + "check_expected_logs\necho OK",
             ],
@@ -175,42 +187,62 @@ class ExpectedLogTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "OK\n")
 
-    def test_every_server_of_the_role_logged_the_line(self):
+    def test_every_server_of_the_role_logged_every_line(self):
         self.write("prefill-rank-0.log", "prefill up")
-        self.write("decode-rank-1.log", f"{self.ARMED} (TP8)")
-        self.write("decode-rank-1-worker-1.log", f"{self.ARMED} (TP8)")
-        result = self.check(decode=self.ARMED)
+        self.write("decode-rank-1.log", *MONO_UP_LOG)
+        self.write("decode-rank-1-worker-1.log", *MONO_UP_LOG)
+        result = self.check(decode=MONO_UP)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("all 2 decode server log(s)", result.stdout)
+        self.assertIn(
+            "all 2 decode server log(s) show all 2 expected line(s)", result.stdout
+        )
         self.assertTrue(result.stdout.endswith("OK\n"))
 
-    def test_a_server_that_did_not_log_it_fails_the_cell(self):
-        self.write("decode-rank-1.log", f"{self.ARMED} (TP8)")
-        self.write("decode-rank-1-worker-1.log", "Kimi-K3 mono decode off: why")
-        result = self.check(decode=self.ARMED)
+    def test_a_server_armed_but_never_on_fails_the_cell(self):
+        self.write("decode-rank-1.log", *MONO_UP_LOG)
+        self.write("decode-rank-1-worker-1.log", "Kimi-K3 mono decode armed (TP8)")
+        result = self.check(decode=MONO_UP)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("OK", result.stdout)
-        self.assertIn("decode-rank-1-worker-1.log never logged", result.stderr)
-        self.assertNotIn("decode-rank-1.log ", result.stderr)
+        self.assertEqual(
+            result.stderr,
+            "[check][FAIL] "
+            f"{self.logs}/decode-rank-1-worker-1.log never logged "
+            "'Kimi-K3 mono decode on'\n",
+        )
+
+    def test_a_server_that_logged_neither_names_both(self):
+        self.write("decode-rank-1.log", "Kimi-K3 mono decode off: why")
+        result = self.check(decode=MONO_UP)
+        self.assertEqual(result.returncode, 1)
+        for line in MONO_UP:
+            self.assertIn(f"decode-rank-1.log never logged '{line}'", result.stderr)
 
     def test_no_server_log_fails_the_cell(self):
-        self.write("prefill-rank-0.log", f"{self.ARMED} (TP8)")
-        result = self.check(decode=self.ARMED)
+        self.write("prefill-rank-0.log", *MONO_UP_LOG)
+        result = self.check(decode=MONO_UP)
         self.assertEqual(result.returncode, 1)
         self.assertIn("no decode server log", result.stderr)
 
     def test_aggregated_reads_the_server_as_the_decode(self):
-        self.write("server-rank-0.log", f"{self.ARMED} (TP8)")
-        result = self.check(aggregated="1", decode=self.ARMED)
+        self.write("server-rank-0.log", *MONO_UP_LOG)
+        result = self.check(aggregated="1", decode=MONO_UP)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("all 1 decode server log(s)", result.stdout)
 
     def test_an_aggregated_prefill_line_fails_the_cell(self):
-        self.write("server-rank-0.log", f"{self.ARMED} (TP8)")
-        result = self.check(aggregated="1", prefill=self.ARMED)
+        self.write("server-rank-0.log", *MONO_UP_LOG)
+        result = self.check(aggregated="1", prefill=MONO_UP)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("OK", result.stdout)
         self.assertIn("aggregated cell has no prefill server", result.stderr)
+
+    def test_a_value_that_is_not_a_json_list_fails_the_cell(self):
+        self.write("decode-rank-1.log", *MONO_UP_LOG)
+        result = self.check_exported("0", "", "Kimi-K3 mono decode armed")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("OK", result.stdout)
+        self.assertIn("decode expect_log is not a JSON list", result.stderr)
 
 
 MONO_GONE = [
@@ -235,6 +267,7 @@ class RejectedLogTest(unittest.TestCase):
                 "-eu",
                 "-c",
                 shell_function("collect_role_logs")
+                + shell_function("parse_log_lines")
                 + shell_function("check_rejected_logs")
                 + "check_rejected_logs\necho OK",
             ],
@@ -339,8 +372,9 @@ class RejectedLogTest(unittest.TestCase):
                 self.assertEqual(len(steps), 4 if phase != "combined" else 5)
 
 
-class SubmitRejectLogTest(unittest.TestCase):
-    """pd_submit.sh's export of a role's reject_log, from the real C1 cell."""
+class SubmitLogLinesTest(unittest.TestCase):
+    """pd_submit.sh's export of a role's expect_log and reject_log, from the
+    real C1 cell."""
 
     @classmethod
     def setUpClass(cls):
@@ -382,9 +416,10 @@ class SubmitRejectLogTest(unittest.TestCase):
         start = source.index("\n", start) + 1
         cls.mapping = source[start : source.index("\nPY\n", start)]
 
-    def submit(self, decode_reject_log):
+    def submit(self, key=None, decode_lines=None):
         cell = copy.deepcopy(self.cell)
-        cell["service"]["decode"]["reject_log"] = decode_reject_log
+        if key is not None:
+            cell["service"]["decode"][key] = decode_lines
         return subprocess.run(
             [sys.executable, "-c", self.mapping],
             env=dict(os.environ, CELL_JSON=json.dumps(cell)),
@@ -394,35 +429,45 @@ class SubmitRejectLogTest(unittest.TestCase):
             check=False,
         )
 
-    def exported(self, result):
+    def exported(self, result, key):
         self.assertEqual(result.returncode, 0, result.stderr)
         exports = {}
         for line in result.stdout.splitlines():
             words = shlex.split(line)
             if words[:1] == ["export"]:
-                key, _, value = words[1].partition("=")
-                exports[key] = value
-        return exports["PREFILL_REJECT_LOG"], exports["DECODE_REJECT_LOG"]
+                name, _, value = words[1].partition("=")
+                exports[name] = value
+        variable = key.upper()
+        return exports[f"PREFILL_{variable}"], exports[f"DECODE_{variable}"]
 
-    def test_c1_rejects_mono_turning_itself_off_on_its_decode_only(self):
-        prefill, decode = self.exported(
-            self.submit(self.cell["service"]["decode"]["reject_log"])
-        )
-        self.assertEqual(prefill, "")
-        self.assertEqual(json.loads(decode), MONO_GONE)
-        self.assertNotIn("\n", decode)
+    def test_c1_expects_mono_up_and_rejects_it_gone_on_its_decode_only(self):
+        result = self.submit()
+        for key, lines in (("expect_log", MONO_UP), ("reject_log", MONO_GONE)):
+            with self.subTest(key=key):
+                prefill, decode = self.exported(result, key)
+                self.assertEqual(prefill, "")
+                self.assertEqual(json.loads(decode), lines)
+                self.assertNotIn("\n", decode)
 
     def test_a_single_line_is_a_list_of_one(self):
-        _, decode = self.exported(self.submit("Kimi-K3 mono decode off"))
-        self.assertEqual(json.loads(decode), ["Kimi-K3 mono decode off"])
+        for key in ("expect_log", "reject_log"):
+            with self.subTest(key=key):
+                _, decode = self.exported(
+                    self.submit(key, "Kimi-K3 mono decode off"), key
+                )
+                self.assertEqual(json.loads(decode), ["Kimi-K3 mono decode off"])
 
     def test_an_entry_that_is_not_a_line_fails_the_cell(self):
-        for entry in ("", 8):
-            with self.subTest(entry=entry):
-                result = self.submit(["Kimi-K3 mono decode off", entry])
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("not a non-empty string", result.stdout)
-                self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
+        for key in ("expect_log", "reject_log"):
+            for entry in ("", 8):
+                with self.subTest(key=key, entry=entry):
+                    result = self.submit(key, ["Kimi-K3 mono decode off", entry])
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        f"decode {key} has an entry that is not a non-empty string",
+                        result.stdout,
+                    )
+                    self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
 
 
 if __name__ == "__main__":

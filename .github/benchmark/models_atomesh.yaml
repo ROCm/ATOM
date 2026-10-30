@@ -1073,7 +1073,11 @@ models:
               - "*self_attn.o_proj*"
               - "*shared_experts.gate_up_proj*"
               - "*shared_experts.down_proj*"
-            expect_log: "Kimi-K3 mono decode armed"
+            # Armed: the config admits mono. On: a decode step reached mono and
+            # its runner was built, which the engine does while starting up.
+            expect_log:
+              - "Kimi-K3 mono decode armed"
+              - "Kimi-K3 mono decode on"
             # Armed, then gone: the runner failed to build, or C1's 8-row
             # steps (one request plus seven drafts) have no build.
             reject_log:
