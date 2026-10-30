@@ -1202,7 +1202,10 @@ def build_qsa_metadata(
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
     host_lens = context_slots = None
-    if not packed_step and envs.ATOM_QSA_FLYDSL_ATTN and not _is_draft_forward():
+    # Only eager unpacked extends reach here (packed draft steps returned
+    # above), so this covers the target prefill and the drafter's prefill
+    # extend over the same tokens; both have one KV head per rank.
+    if not packed_step and envs.ATOM_QSA_FLYDSL_ATTN:
         host_lens, context_slots = _flydsl_prefill_layout(
             forward_batch, live_bs, num_tokens, block_tables, block_size
         )
