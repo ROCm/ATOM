@@ -2152,6 +2152,164 @@ def near_duplicates(diff_text, root, threshold=0.60):
     return out
 
 
+# ------------------------------------------------------------- symbol twins
+PY_TOP_HEADER = re.compile(r"^(def|class)\s+(\w+)")
+
+
+def _tree_symbol_index(root):
+    """[(kind, name, relpath, lineno, lineset)] for every top-level def/class under root.
+
+    Whole tree, not scoped to a directory or package. Measured cost (see
+    symbol_duplicates' docstring): 0.16s / ~14k symbols over ATOM's 1504 .py files
+    (613k lines) -- cheap enough that a name-similarity prefilter (the kind
+    sibling_variants uses within one file) would be optimizing a cost that is not
+    there, and it would throw away exactly the hit this check exists to find: two
+    symbols with UNRELATED names that are nonetheless near-identical bodies. A
+    renamed-and-reused helper ("new util func", "unify the args") does not keep the
+    old name, so a prefilter keyed on the name would filter out the complaint this
+    was built for and keep only the case sibling_variants already covers in-file.
+    """
+    out = []
+    for p in pathlib.Path(root).rglob("*.py"):
+        rel = str(p.relative_to(root))
+        if ".git/" in rel or not p.is_file():
+            continue
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        starts = [(i, m.group(1), m.group(2)) for i, l in enumerate(lines)
+                  for m in [PY_TOP_HEADER.match(l)] if m]
+        for k, (i, kind, name) in enumerate(starts):
+            end = starts[k + 1][0] if k + 1 < len(starts) else len(lines)
+            body = {l.strip() for l in lines[i + 1:end] if len(l.strip()) > 21}
+            if len(body) >= 15:
+                out.append((kind, name, rel, i + 1, body))
+    return out
+
+
+def _added_top_symbols(blk):
+    """[(kind, name, lineset)] for top-level def/class a (non-new-file) diff block adds.
+
+    A `+` header counts as a genuinely new symbol only when its name does not also
+    appear on a `-` header line in the same block -- that second shape is a modified
+    signature of a symbol that already existed before this PR, which is not the
+    "we already have it" complaint this check is evidence for.
+
+    A real new def/class arrives in a unified diff as a run of pure `+` lines; the
+    first context or `-` line reached after a new header ends that symbol's body,
+    same as `_py_functions` ends a span at the next top-level header -- except here
+    the span is read off the diff's added lines directly, not off a file on disk,
+    because the point is to catch the symbol at the moment it is proposed, before any
+    tree has it.
+    """
+    minus_headers = set()
+    for ln in blk.split("\n"):
+        if ln.startswith("-") and not ln.startswith("---"):
+            m = PY_TOP_HEADER.match(ln[1:])
+            if m:
+                minus_headers.add(m.group(2))
+    out = []
+    cur = None  # [kind, name, [substantial body lines]]
+    for ln in blk.split("\n"):
+        if ln.startswith("+++") or ln.startswith("---"):
+            continue
+        if ln.startswith("+"):
+            body_line = ln[1:]
+            m = PY_TOP_HEADER.match(body_line)
+            if m:
+                if cur is not None:
+                    out.append(cur)
+                kind, name = m.group(1), m.group(2)
+                cur = [kind, name, []] if name not in minus_headers else None
+                continue
+            if cur is not None and len(body_line.strip()) > 21:
+                cur[2].append(body_line.strip())
+            continue
+        # a context line or a removed line: a purely-new def/class never has one of
+        # these inside its own span, so this closes whatever symbol was open
+        if cur is not None:
+            out.append(cur)
+            cur = None
+    if cur is not None:
+        out.append(cur)
+    return [(k, n, set(ls)) for k, n, ls in out if len(set(ls)) >= 15]
+
+
+def symbol_duplicates(diff_text, root, threshold=0.60, min_lines=15):
+    """Extends near_duplicates from the file grain to the symbol grain.
+
+    Same evidence, same posture: a pair and a ratio, not a verdict -- see
+    near_duplicates' docstring, which this one does not repeat. The reason to add
+    this rather than widen that one: near_duplicates only fires on a duplicate that
+    arrives as a WHOLE new file (`new file mode` in the diff), and reading 350 of the
+    lead reviewer's comments for this task, most of "we already have it" /
+    "duplicated with the one in aiter" / "use new util func" is a function or class
+    added into a file that already exists -- a shape near_duplicates cannot see at
+    all, because it never looks inside a diff hunk for a modified file.
+
+    This deliberately does NOT widen near_duplicates' own new-file path: whole new
+    files are left to that function so the two never double-report the same evidence
+    under two headings (see the `"\\nnew file mode" in blk` guard in the caller).
+
+    min_lines=15, not near_duplicates' 40: a whole FILE keeps its imports, its
+    comments, its blank lines around the logic, so 40 substantial lines is already a
+    small file. A function body is almost nothing but logic -- no import block,
+    usually no docstring once you exclude lines under the 21-char floor both checks
+    already use -- so 40 substantial lines is a large function; demanding it would
+    miss the ordinary 15-30-line helper that is the shape of real hits below (e.g.
+    PR#2553's duplicated test body). 15 is the floor below which two symbols collide
+    on shape alone (`if cond: return x` / `else: return y` reads the same in any
+    domain) rather than on content.
+
+    threshold=0.60, same as near_duplicates, not raised: measured over 197 merged
+    ATOM PRs (#2388-#2830, the most recent 197 with a non-empty diff) at this exact
+    threshold, 2 PRs fired (1.0%) -- PR#2560 (10 pairs between `paged_state_image.py`
+    /`_scheduler.py` and the pre-existing `paged_state_checkpoint.py`/`_scheduler.py`
+    they mirror -- an "image vs checkpoint" twin pair modified in-place, which
+    near_duplicates cannot see because neither file is new) and PR#2553 (a test whose
+    body is 95% identical to an existing one, down to the mocked runner setup, with
+    one of the three asserted values changed). Both spot-checked as the real
+    "mirrored code, compare field by field" case Step 6 asks for, not two unrelated
+    functions that merely share boilerplate -- so 0.60 was kept rather than raised;
+    the ~15% ceiling and the false-alarm check in this function's caller-facing specs
+    were not a binding constraint at this operating point. See the commit message for
+    the full before/after table, since (like min_lines above) this count will drift
+    as ATOM's tree grows and a docstring is not where to chase it.
+    """
+    index = _tree_symbol_index(root)
+    by_kind = {"def": [], "class": []}
+    for kind, name, path, lineno, body in index:
+        by_kind[kind].append((name, path, lineno, body))
+    out = []
+    for path, blk in _diff_blocks(diff_text):
+        if not path.endswith(".py") or "\nnew file mode" in blk:
+            continue
+        for kind, name, lines in _added_top_symbols(blk):
+            best, best_path, best_line, best_name = 0.0, None, None, None
+            for cand_name, cand_path, cand_lineno, cand_body in by_kind[kind]:
+                if cand_path == path:
+                    continue  # same file: a rename-in-place, not "already in the tree"
+                ratio = len(lines & cand_body) / len(lines)
+                if ratio > best:
+                    best, best_path, best_line, best_name = ratio, cand_path, cand_lineno, cand_name
+            if best >= threshold:
+                out.append((path, kind, name, best_path, best_line, best_name, best))
+    return out
+
+
+def render_symbol_duplicates(rows):
+    if not rows:
+        return "no newly added function or class closely mirrors one already in the tree"
+    lines = []
+    for path, kind, name, old_path, old_line, old_name, ratio in rows:
+        lines.append(f"SYMBOL-TWIN: {kind} {name} ({path})")
+        lines.append(f"  {ratio:.0%} of its substantive lines already appear in "
+                      f"{kind} {old_name} at {old_path}:{old_line}")
+        lines.append("  diff the two: a reused helper that was copied instead of "
+                      "imported, or an argument list that drifted from the original")
+    return "\n".join(lines)
+
 
 # --------------------------------------------------------------- ci coverage
 def citest_applicability(root):
@@ -3112,7 +3270,8 @@ if __name__ == "__main__":
 
     if mode == "twins":
         root = tree_root(sys.argv[3] if len(sys.argv) > 3 else ".")
-        pairs = near_duplicates(open(sys.argv[2], errors="replace").read(), root)
+        diff_text = open(sys.argv[2], errors="replace").read()
+        pairs = near_duplicates(diff_text, root)
         if not pairs:
             print("no new file closely mirrors an existing one")
         for new, old, ratio in pairs:
@@ -3120,6 +3279,8 @@ if __name__ == "__main__":
             print(f"  {ratio:.0%} of its substantive lines already appear in {old}")
             print("  diff the two and look for the asymmetry: dtype width, a mask on one"
                   " side only, a flipped stride order, a bound the copy did not adapt")
+        print()
+        print(render_symbol_duplicates(symbol_duplicates(diff_text, root)))
         raise SystemExit(0)
 
     if mode == "testquality":
