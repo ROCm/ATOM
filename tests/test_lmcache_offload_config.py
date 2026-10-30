@@ -118,6 +118,25 @@ def test_page_namespace_changes_for_meaningful_geometry(mutate):
     assert offcfg.build_page_namespace(config, cfg, 4) != original
 
 
+def test_page_namespace_names_a_windowed_draft_and_only_that(monkeypatch):
+    """A DSpark draft that keeps only its window takes its rows out of every
+    PAGE unit, so the unit is different bytes; with the switch off, or with a
+    draft that has no window, the namespace is the one it always was."""
+    config = _config()
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        num_speculative_tokens=7,
+        draft_model_hf_config=SimpleNamespace(sliding_window=4096),
+    )
+    riding = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.setenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "1")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) != riding
+    config.speculative_config.draft_model_hf_config.sliding_window = 0
+    no_window = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    monkeypatch.delenv("ATOM_DSPARK_DRAFT_KV_WINDOW")
+    assert offcfg.build_page_namespace(config, _lmcache_config(), 4) == no_window
+
+
 def test_page_namespace_changes_when_code_layout_version_changes():
     current = offcfg.build_page_namespace(_config(), _lmcache_config(), 4)
     future = offcfg.build_page_namespace(

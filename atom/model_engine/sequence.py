@@ -418,6 +418,12 @@ class Sequence:
         # `new_block_table` is main's: an array("i") rather than a list,
         # because every forward marshals these into the int32 buffer.
         self.block_table = new_block_table()
+        # A windowed draft KV pool's blocks (`atom/model_engine/draft_window.py`),
+        # aligned with `block_table` and -1 below the draft's window; the run
+        # from `draft_window_start` on is what the seq holds. Empty when the
+        # draft rides the target's block ids, or has no pool of its own.
+        self.draft_block_table: list[int] = []
+        self.draft_window_start = 0
         # Per-request state slots (filled by BlockManager.allocate()), indexing
         # the per-req cache tensors owned by ModelRunner (e.g. mamba_k_cache for
         # GDN). Empty = unallocated.

@@ -1827,6 +1827,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         decode_md = sparse_metadata.decode
         assert decode_md is not None, "sparse decode metadata missing"
         max_query_len = getattr(decode_md, "max_query_len", 1)
+        # The rows the decode tables describe. An eager decode of a batch padded
+        # up the capture ladder (a P/D producer's q=1 step) cuts the tables to
+        # its requests while q keeps the pad rows, and the top-k writes a page
+        # table and a length for the described rows alone: a pad row would read
+        # whatever its never-written row holds. Only these rows are attended;
+        # a pad row's output stays as allocated, dropped with the row like all
+        # else computed for it. A captured decode describes every row.
+        rows = decode_md.seq_lens.shape[0] * max_query_len
 
         topk_key = self._topk_cache_key(
             "decode",
@@ -1840,6 +1848,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         if cached_topk is None:
             if index_q is None:
                 raise RuntimeError("MiniMax-M3 index cache miss on a skip-index layer")
+            index_q = index_q[:rows]
             batch = decode_md.seq_lens.shape[0]
             if (
                 self.kv_nvfp4
@@ -1906,17 +1915,23 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         output = None if self.kv_mxfp4 else torch.empty_like(q)
         if self.kv_mxfp4:
             output = self._sparse_pa_mxfp4(
-                q, k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
+                q[:rows], k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
             )
+            if rows != q.shape[0]:
+                padded_output = torch.empty(
+                    q.shape, dtype=output.dtype, device=q.device
+                )
+                padded_output[:rows].copy_(output)
+                output = padded_output
         elif self.kv_nvfp4:
             from atom.model_ops.minimax_m3.sparse_attn_nvfp4 import (
                 decode_rows,
                 nvfp4_sparse_attention_gfx950,
             )
 
-            row_req, row_seq = decode_rows(decode_md.seq_lens, q.shape[0])
-            output = nvfp4_sparse_attention_gfx950(
-                q,
+            row_req, row_seq = decode_rows(decode_md.seq_lens, rows)
+            nvfp4_sparse_attention_gfx950(
+                q[:rows],
                 k_cache,
                 k_scale,
                 v_cache,
@@ -1926,11 +1941,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 row_req,
                 row_seq,
                 self.scale,
-                output,
+                output[:rows],
             )
         else:
             minimax_m3_sparse_attn_decode_asm(
-                q,
+                q[:rows],
                 k_cache,
                 v_cache,
                 topk_idx,
@@ -1938,7 +1953,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 decode_md.seq_lens,
                 self.num_kv_heads,
                 self.scale,
-                output,
+                output[:rows],
                 k_scale=k_scale,
                 v_scale=v_scale,
                 sparse_bt=sparse_bt,

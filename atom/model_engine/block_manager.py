@@ -23,6 +23,7 @@ from atom.distributed.kv_events import (
     KVCacheEvent,
 )
 from atom.model_engine.block_pool import BlockPool
+from atom.model_engine.draft_window import DraftWindowPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import (
     PagedStateCheckpointCoordinator,
@@ -255,6 +256,23 @@ class BlockManager:
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
         )
+        # A DSpark draft's KV kept only as far back as its window reads, when
+        # the runner sized one (`draft_window.py`). Its blocks have their own
+        # ids, under the same content hashes as the target's.
+        self.draft_window = DraftWindowPool.from_config(
+            config,
+            cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
+            protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
+        )
+        if (
+            self.draft_window.enabled
+            and self.draft_window.geometry.block_size != self.hash_block_size
+        ):
+            raise ValueError(
+                f"the draft window is paged in {self.draft_window.geometry.block_size}"
+                f"-token blocks but the prefix cache hashes {self.hash_block_size}"
+                "-token ones; a windowed draft does not run under DCP"
+            )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
         # state). The backing tensor is pre-allocated by ModelRunner and
@@ -1181,6 +1199,15 @@ class BlockManager:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
+        # The draft's window, cached blocks included: a claim takes a free block
+        # as surely as a fresh one does.
+        if not self.draft_window.has_free(
+            self.draft_window.admission_blocks(
+                seq,
+                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq)),
+            )
+        ):
+            return -1
         if not self.enable_prefix_caching:
             if not self._has_page_units(
                 self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
@@ -1213,6 +1240,9 @@ class BlockManager:
         # A checkpoint far below the compressed hit loses to a bounded replay,
         # which keeps the whole hit and rebuilds the state at its end.
         num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
+        # Step 4: a windowed draft reads its window's rows from the cache, so
+        # the hit ends at the first of them that is gone (`DraftWindowPool.gate`).
+        num_cached_blocks = self.draft_window.gate(seq, num_cached_blocks, block_hashes)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -1444,6 +1474,51 @@ class BlockManager:
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
         returned by `can_allocate` (0 if caller didn't call it).
+
+        The KV blocks first (`_allocate_kv`), then a windowed draft's: from
+        where the prefill actually resumes, which the KV half can still lower.
+        The draft gate runs again before either, because another admission in
+        the same pass can have evicted a draft block `can_allocate` counted on,
+        and the KV claims have to stop where the draft's do -- a forward
+        resuming below a claimed block would write into a shared one. What it
+        cuts is fresh blocks `can_allocate` did not charge for; without room
+        for them this returns False, which requeues the seq.
+        """
+        if num_cached_blocks and self.draft_window.enabled:
+            gated = self.draft_window.gate(
+                seq, num_cached_blocks, self._hash_chain(seq, num_cached_blocks)
+            )
+            if gated < num_cached_blocks and not self._has_page_units(
+                num_cached_blocks - gated
+            ):
+                return False
+            num_cached_blocks = gated
+        if not self._allocate_kv(seq, num_cached_blocks):
+            return False
+        if self.draft_window.enabled:
+            hit = seq.num_cached_tokens // self._hash_block_size()
+            self.draft_window.allocate(
+                seq, hit, self._hash_chain(seq, hit), len(seq.block_table)
+            )
+        return True
+
+    def _hash_chain(self, seq: Sequence, blocks: int) -> list[int]:
+        """Content hashes of `seq`'s first `blocks` blocks: the prompt's from
+        its chain, and past the prompt -- a preempted seq resuming over its own
+        generated blocks -- hashed here, since only prompt blocks are final."""
+        chain = self._prompt_hashes(seq)
+        if blocks <= len(chain):
+            return chain
+        hashes = list(chain)
+        h = hashes[-1] if hashes else seq.cache_seed
+        for i in range(len(hashes), blocks):
+            h = self._block_hash(seq, chain, i, h)
+            hashes.append(h)
+        return hashes
+
+    def _allocate_kv(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
+        """Allocate `seq`'s KV blocks for a prefill resuming at
+        `num_cached_blocks`.
 
         Hash registration is deferred to hash_blocks(), called from
         scheduler.postprocess() once the forward has computed each block's
@@ -2160,6 +2235,7 @@ class BlockManager:
             token_ids = self._hash_block_tokens(seq, i)
             h = known[i] if i < len(known) else self.compute_hash(token_ids, h)
             self.kv.publish(seq.block_table[i], h, token_ids)
+            self.draft_window.publish(seq, i, h, token_ids)
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)
@@ -2924,6 +3000,22 @@ class BlockManager:
             and next_forward_tokens >= c.successor_room
         ]
 
+    def draft_window_resume(self, seq: Sequence, loaded_tokens: int) -> int:
+        """Where a prefill resumes once an offload tier loaded KV to
+        `loaded_tokens`, past the HBM hit `num_cached_tokens`.
+
+        A tier holds no draft rows, so a windowed draft's fresh window blocks
+        are still empty: the forward has to start no later than the first of
+        them, which is the window's first block or the hit, whichever is
+        further. What it loaded past that is recomputed -- under a window of
+        it, since the window starts within one window of the prompt's end --
+        and stays private until the forward republishes it.
+        """
+        if not self.draft_window.enabled:
+            return loaded_tokens
+        first = self.draft_window.first_block(seq) * self._hash_block_size()
+        return min(loaded_tokens, max(seq.num_cached_tokens, first))
+
     def publish_loaded_prefix(
         self,
         seq: Sequence,
@@ -3081,6 +3173,8 @@ class BlockManager:
                         f"seq={seq.id} block={block_id} indexed={indexed_block_id}"
                     )
                 block.update(h, token_ids)
+            # The producer sent the draft's window rows with the KV.
+            self.draft_window.publish(seq, i, h, token_ids)
 
         seq.num_hashed_tokens = max(seq.num_hashed_tokens, num_full * hbs)
         # The decode consumer has no local prefill postprocess to publish these
@@ -3230,6 +3324,7 @@ class BlockManager:
         # `can_allocate` and would otherwise re-plan on top of a live list.
         self.cancel_midstep(seq)
         del seq.block_table[:]  # main's `array("i")` has no `.clear()`
+        self.draft_window.release(seq)
         if seq.has_per_req_cache and seq.state_slots:
             # Every slot the seq held — the committed one and its speculation
             # scratch, which is this request's alone and has no meaning to the
@@ -3290,7 +3385,12 @@ class BlockManager:
         reach = seq_len + max(num_new_tokens, lookahead)
         needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
-        return self._has_page_units(new_blocks_needed)
+        # A windowed draft's table grows with the target's. Not net of what the
+        # window hands back in the same call: that is a block, at most, and
+        # being one short here only defers the step.
+        return self._has_page_units(new_blocks_needed) and self.draft_window.has_free(
+            new_blocks_needed
+        )
 
     def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
         """Allocate every block this step's KV writes land in.
@@ -3320,6 +3420,13 @@ class BlockManager:
             # sampling / speculative verification), so we cannot compute a
             # correct hash here.  Just allocate the block without hashing.
             block_table.append(self._fresh_block())
+        # A windowed draft follows the table and drops what its window has
+        # passed. `num_finalized_tokens` and not `len(seq)`: the placeholders a
+        # decode step appended may yet be rejected, and the next block pass
+        # anchors at the last token that is not.
+        self.draft_window.sync(
+            seq, len(block_table), min(seq.num_finalized_tokens, seq_len)
+        )
 
     def draft_writes_allocated(self, seq: Sequence) -> bool:
         """Whether `seq`'s blocks reach the end of this forward's draft round.
@@ -3347,6 +3454,7 @@ class BlockManager:
         future requests."""
         self.kv.clear_index()
         self._state_checkpoint_cache.clear_index()
+        self.draft_window.clear_index()
         self._index_clears += 1
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
