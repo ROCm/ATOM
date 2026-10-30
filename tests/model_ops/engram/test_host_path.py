@@ -1540,6 +1540,32 @@ def test_an_explicit_copy_does_not_fall_back(monkeypatch):
     assert allocator.live == {} and cudart.registered == []
 
 
+@pytest.mark.parametrize("shared", [False, True])
+def test_an_explicit_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
+    """`copy=True` with no page-locked allocator does not register the source
+    in place instead -- the Qwen3.8 PLE shards share their safetensors
+    mapping with other weights -- while `copy=None` still does."""
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    registered = []
+    register = host_memory._register
+
+    def spy(sources, leases):
+        registered.append(len(sources))
+        return register(sources, leases)
+
+    monkeypatch.setattr(host_memory, "_register", spy)
+    rows = torch.ones(1 << 18)
+    assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
+    assert registered == [] and cudart.registered == []
+
+    pinned = host_memory.pin_rows([rows], shared=shared)
+    assert pinned is not None and registered == [1]
+    assert pinned[0].data_ptr() == rows.data_ptr()
+
+
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
     """The shared mapping cannot be written, so it is registered read-only --
     and in place: the view is the page cache, the same pages for every rank."""
