@@ -678,6 +678,13 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             return {}
         return c.take_state_touch_verdicts()
 
+    def take_state_touches_unrefreshed(self) -> int:
+        """Presence-only touches from the tier sub; 0 if none."""
+        c = self._state_tier_sub()
+        if c is None:
+            return 0
+        return int(c.take_state_touches_unrefreshed())
+
     def take_state_reports(self):
         """`(indexed, failed)` from the tier sub, else two empty sets.
 

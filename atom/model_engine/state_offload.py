@@ -138,6 +138,9 @@ class StateOffloadIndex:
         # Touches that found the image gone: LMCache evicted it and the index
         # learned of it before any request parked on it.
         self.touch_misses = 0
+        # Touches that found the image present but outside LocalCPU's hot
+        # cache, so they confirmed it without refreshing its eviction order.
+        self.touches_unrefreshed = 0
         # Admissions held back a pass because the image they would load had
         # not been confirmed recently (`needs_verify`).
         self.loads_deferred_for_verify = 0
@@ -403,9 +406,12 @@ class StateOffloadIndex:
             "hashes_evicted": self.hashes_evicted,
             # Hit refresh. `touch_misses` are images LMCache dropped that left
             # the index before anything parked on them; `loads_failed` is what
-            # still got past.
+            # still got past. `touches_unrefreshed` is the part of the
+            # resident verdicts that only confirmed presence: 0 when every
+            # touch refreshed LMCache's LRU.
             "touches_sent": self.touches_sent,
             "touch_misses": self.touch_misses,
+            "touches_unrefreshed": self.touches_unrefreshed,
             "loads_deferred_for_verify": self.loads_deferred_for_verify,
             "verify_holds_expired": self.verify_holds_expired,
         }

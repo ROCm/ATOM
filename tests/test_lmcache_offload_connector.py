@@ -7,7 +7,7 @@ import logging
 import sys
 import threading
 import types
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -6160,10 +6160,18 @@ def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():
 
 
 class _FakeStorage:
-    """The two `storage_manager` calls the codec makes, over a plain dict."""
+    """The `storage_manager` calls the codec makes, over a plain dict, with
+    the LocalCPU LRU internals `bind_storage_manager` requires."""
 
     def __init__(self) -> None:
-        self.objects: dict = {}
+        self.objects: OrderedDict = OrderedDict()
+        self.local_cpu_backend = SimpleNamespace(
+            cpu_lock=threading.Lock(),
+            hot_cache=self.objects,
+            cache_policy=SimpleNamespace(
+                update_on_hit=lambda key, cache: cache.move_to_end(key)
+            ),
+        )
 
     def batched_put(self, keys, objs) -> None:
         for k, o in zip(keys, objs, strict=True):

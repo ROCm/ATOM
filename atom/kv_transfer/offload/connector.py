@@ -348,6 +348,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "take_state_touch_verdicts", None)
         return callback() if callback is not None else {}
 
+    def take_state_touches_unrefreshed(self) -> int:
+        """Touches that only confirmed presence; 0 when the impl carries none."""
+        callback = getattr(self._impl, "take_state_touches_unrefreshed", None)
+        return int(callback()) if callback is not None else 0
+
     def take_state_reports(self):
         # Contract is a 2-tuple (indexed, failed) -- matched by the kimi_k3 impl
         # and by the sole caller `indexed, failed = take()` in

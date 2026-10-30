@@ -3811,6 +3811,9 @@ class Scheduler:
             return
         for h, resident in take().items():
             offload.apply_touch_verdict(h, resident)
+        unrefreshed = getattr(self.kv_connector, "take_state_touches_unrefreshed", None)
+        if unrefreshed is not None:
+            offload.touches_unrefreshed += int(unrefreshed())
 
     def _publish_state_loads(self) -> None:
         """Hand this pass's state-tier loads to the connector, before it builds

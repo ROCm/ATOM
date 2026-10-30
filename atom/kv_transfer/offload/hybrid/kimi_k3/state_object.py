@@ -11,6 +11,7 @@ also sidesteps LMCache's chunk-alignment loss.
 
 from __future__ import annotations
 
+import enum
 import logging
 import threading
 from collections import OrderedDict
@@ -19,6 +20,56 @@ from typing import Any
 import torch
 
 logger = logging.getLogger("atom")
+
+
+class TouchResult(enum.IntEnum):
+    """What a touch found. Truthy when the image can still be read."""
+
+    GONE = 0
+    #: Outside LocalCPU's hot cache but held by another backend (`get` reads
+    #: it and promotes it back): present, its eviction order not refreshed.
+    PRESENT = 1
+    REFRESHED = 2
+
+
+def _local_cpu_lru(storage_manager):
+    """LMCache's LocalCPU backend, checked once for what a touch needs, or
+    None when the storage manager has none.
+
+    `cpu_lock`, `hot_cache` and `cache_policy.update_on_hit` are LMCache
+    internals (written against 0.5.6), not API. A LocalCPU backend missing one
+    is an LMCache this code does not know, so raise: degrading every touch to
+    a presence check would keep every load "succeeding" while no image is
+    refreshed.
+    """
+    if not hasattr(storage_manager, "local_cpu_backend"):
+        raise RuntimeError(
+            "state offload: LMCache's storage manager has no `local_cpu_backend`; "
+            "state images cannot be refreshed in its LRU"
+        )
+    backend = storage_manager.local_cpu_backend
+    if backend is None:
+        logger.warning(
+            "state offload: LMCache has no LocalCPU backend, so state touches "
+            "only confirm presence and refresh no eviction order (counted as "
+            "state_offload_touches_unrefreshed)"
+        )
+        return None
+    missing = [
+        name
+        for name in ("cpu_lock", "hot_cache", "cache_policy")
+        if getattr(backend, name, None) is None
+    ]
+    if not missing and not callable(
+        getattr(backend.cache_policy, "update_on_hit", None)
+    ):
+        missing.append("cache_policy.update_on_hit")
+    if missing:
+        raise RuntimeError(
+            "state offload: LMCache's LocalCPUBackend has no "
+            f"{', '.join(missing)}; state images cannot be refreshed in its LRU"
+        )
+    return backend
 
 
 class StateByteCodec:
@@ -59,6 +110,7 @@ class StateByteCodec:
         self._misfit_reads = 0
         self._unrefreshed_touches = 0
         self._storage = None
+        self._local_cpu = None
         self._max_entries = (
             None
             if max_cache_bytes is None
@@ -83,6 +135,7 @@ class StateByteCodec:
         )
 
     def bind_storage_manager(self, storage_manager) -> None:
+        self._local_cpu = _local_cpu_lru(storage_manager)
         self._storage = storage_manager
 
     def key(self, h: int):
@@ -127,10 +180,12 @@ class StateByteCodec:
         if self._storage is None:
             return False
         key = self.key(h)
-        if self._touch_key(key):
-            # Same prefix hash and layout, same bytes, still resident: storing
-            # again would only cost an image-sized D2H that LocalCPU then
-            # refuses as a duplicate key. The touch counts as the use it is.
+        if self._touch_key(key) is TouchResult.REFRESHED:
+            # Same prefix hash and layout, same bytes, still in LocalCPU's hot
+            # cache: storing again would only cost an image-sized D2H that
+            # LocalCPU then refuses as a duplicate key. The touch counts as the
+            # use it is. Only there: an image another backend holds (disk) is
+            # stored again, which puts it back into the CPU tier.
             if on_source_released is not None:
                 on_source_released()
             return True
@@ -150,8 +205,8 @@ class StateByteCodec:
                     self._cache_keys[key] = None
             return ok
 
-    def touch(self, h: int) -> bool:
-        """Refresh `h`'s image in LMCache's LRU; False when it is gone.
+    def touch(self, h: int) -> TouchResult:
+        """Refresh `h`'s image in LMCache's LRU; falsy (`GONE`) when it is gone.
 
         The state-image twin of what a KV lookup does to its chunks
         (`LocalCPUBackend.batched_async_contains(pin=True)` then
@@ -166,46 +221,45 @@ class StateByteCodec:
         is the list the KV lookup is filling at the same time.
         """
         if self._storage is None:
-            return False
-        return self._touch_key(self.key(h))
+            return TouchResult.GONE
+        result = self._touch_key(self.key(h))
+        if result is TouchResult.PRESENT:
+            # Still reported resident: `get` can read it now, and the
+            # confirmation that opens only lets later loads skip the hold,
+            # where a miss degrades to a recompute.
+            self._unrefreshed_touches += 1
+            if self._unrefreshed_touches == 1:
+                logger.warning(
+                    "state offload: a touched state image is outside "
+                    "LocalCPU's hot cache, so the touch only confirmed it is "
+                    "present and did not refresh its eviction order (counted "
+                    "as state_offload_touches_unrefreshed)"
+                )
+        return result
 
-    def _touch_key(self, key) -> bool:
-        resident = self._refresh(key)
+    def _touch_key(self, key) -> TouchResult:
+        result = self._refresh(key)
         with self._cache_lock:
-            if resident:
+            if result:
                 if key in self._cache_keys:
                     self._cache_keys.move_to_end(key)
             else:
                 # Evicted by LMCache: it no longer counts against the cap.
                 self._cache_keys.pop(key, None)
-        return resident
+        return result
 
-    def _refresh(self, key) -> bool:
-        backend = getattr(self._storage, "local_cpu_backend", None)
-        lock = getattr(backend, "cpu_lock", None)
-        hot = getattr(backend, "hot_cache", None)
-        policy = getattr(backend, "cache_policy", None)
-        if lock is not None and hot is not None and policy is not None:
-            with lock:
-                if key in hot:
-                    policy.update_on_hit(key, hot)
-                    return True
+    def _refresh(self, key) -> TouchResult:
+        backend = self._local_cpu
+        if backend is not None:
+            with backend.cpu_lock:
+                if key in backend.hot_cache:
+                    backend.cache_policy.update_on_hit(key, backend.hot_cache)
+                    return TouchResult.REFRESHED
         # Not in the hot cache (or there is none): another backend may still
-        # hold it, and `get` reads every backend. Presence only. Still reported
-        # resident: `get` can read it now, and the confirmation that opens only
-        # lets later loads skip the hold, where a miss degrades to a recompute.
-        if not self._storage.contains(key):
-            return False
-        self._unrefreshed_touches += 1
-        if self._unrefreshed_touches == 1:
-            logger.warning(
-                "state offload: a touched state image is outside LocalCPU's "
-                "hot cache (or no LocalCPU LRU is reachable), so the touch "
-                "only confirmed it is present and did not refresh its "
-                "eviction order (counted as unrefreshed_touches=%d)",
-                self._unrefreshed_touches,
-            )
-        return True
+        # hold it, and `get` reads every backend. Presence only.
+        if self._storage.contains(key):
+            return TouchResult.PRESENT
+        return TouchResult.GONE
 
     def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.
