@@ -510,6 +510,8 @@ class Qwen4ExpAttention(nn.Module):
             not envs.ATOM_QSA_FLYDSL_ATTN
             or qsa.host_lens is None
             or width is None
+            # aiter rejects a padded selection spanning 2**31 bytes or more.
+            or query.shape[0] * width * selected.element_size() >= 2**31
             # Padding a selection laid out for another budget or ratio moves the
             # causal tail: the kernel would read it at the wrong column.
             or self.indexer.compress_ratio != 4
