@@ -49,6 +49,7 @@ __all__ = [
     "replayssm_buffer_shapes",
     "replayssm_commit",
     "replayssm_gated_delta_rule",
+    "replayssm_materialize",
     "replayssm_sigmoid_gating_delta_rule",
 ]
 
@@ -460,6 +461,200 @@ def replayssm_commit(
         max_query_len,
         cache_len,
         num_warps=1,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Track-slot materialisation -- the radix cache's snapshot of a verify step    #
+# --------------------------------------------------------------------------- #
+#
+# A prefix cache that snapshots the recurrent state needs it as a value: the
+# tree stores a full state and a later hit copies it into a fresh slot.  Under
+# ReplaySSM a live slot holds a checkpoint plus uncommitted records instead, so
+# the snapshot is rebuilt from both.  Verify step `s` of a sequence leaves
+#
+#     S = replay(checkpoint, records[0 : base + s + 1])
+#
+# where `base` is the offset the forward appended this step's records at --
+# `h`, or 0 when that forward flushed (and the checkpoint already absorbed the
+# first `h`).  That is the same rebuild the forward runs, stopped at step `s`
+# and written to another slot, so the snapshot and the live state can never
+# disagree about what a record means.
+
+
+@triton.jit(do_not_specialize=["N", "T_MAX", "CAP"])
+def _replayssm_materialize_kernel(
+    ckpt,
+    buf_k,
+    buf_u,
+    buf_g,
+    write_pos,
+    slot_idx,
+    dst_idx,
+    step_idx,
+    N,
+    T_MAX,
+    CAP,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BH: tl.constexpr,
+    stride_ckpt_slot: tl.constexpr,
+    stride_bufk_slot: tl.constexpr,
+    stride_bufk_pos: tl.constexpr,
+    stride_bufk_hv: tl.constexpr,
+    stride_bufu_slot: tl.constexpr,
+    stride_bufu_pos: tl.constexpr,
+    stride_bufu_hv: tl.constexpr,
+    stride_bufg_slot: tl.constexpr,
+    stride_bufg_pos: tl.constexpr,
+    stride_bufg_hv: tl.constexpr,
+    DOT_MODE: tl.constexpr,
+):
+    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    if i_n >= N:
+        return
+    step = tl.load(step_idx + i_n).to(tl.int32)
+    if step < 0:  # no tracking boundary inside this sequence's accepted window
+        return
+    dst = tl.load(dst_idx + i_n).to(tl.int64)
+    src = tl.load(slot_idx + i_n).to(tl.int64)
+    if dst < 0:
+        return
+    if src < 0:
+        return
+
+    # Same cursor and flush decision the forward branched on: it runs before
+    # `replayssm_commit` moves the cursor, so `h` is still that forward's.
+    h = tl.maximum(tl.load(write_pos + src).to(tl.int32), 0)
+    base = tl.where(h + 2 * T_MAX > CAP, 0, h)
+    n = base + step + 1
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    p_src = ckpt + src * stride_ckpt_slot + i_hv * K * V
+    b_s0 = tl.load(p_src + o_k[:, None] * V + o_v[None, :], mask=mask_h, other=0.0).to(
+        tl.float32
+    )
+    b_kw, b_ru, b_decay = _replay_tiles_kmajor(
+        buf_k,
+        buf_u,
+        buf_g,
+        src,
+        n,
+        stride_bufk_slot,
+        stride_bufk_pos,
+        stride_bufk_hv,
+        stride_bufu_slot,
+        stride_bufu_pos,
+        stride_bufu_hv,
+        stride_bufg_slot,
+        stride_bufg_pos,
+        stride_bufg_hv,
+        i_hv,
+        o_k,
+        o_v,
+        mask_k,
+        mask_v,
+        K,
+        V,
+        BK,
+        BH,
+        False,
+    )
+    b_h = b_s0 * b_decay[:, None] + _replay_dot(b_kw, b_ru, True, DOT_MODE)
+    p_dst = ckpt + dst * stride_ckpt_slot + i_hv * K * V
+    tl.store(
+        p_dst + o_k[:, None] * V + o_v[None, :],
+        b_h.to(p_dst.dtype.element_ty),
+        mask=mask_h,
+    )
+
+
+def replayssm_materialize(
+    ckpt: torch.Tensor,
+    buf_k: torch.Tensor,
+    buf_u: torch.Tensor,
+    buf_g: torch.Tensor,
+    write_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    dst_idx: torch.Tensor,
+    step_idx: torch.Tensor,
+    max_query_len: int,
+) -> None:
+    """Write the state after verify step ``step_idx[i]`` of ``slot_idx[i]``
+    into checkpoint slot ``dst_idx[i]`` (GDN, scalar gate).
+
+    Call after the verify forward and before :func:`replayssm_commit` for that
+    step: the rebuild re-derives the forward's append offset from the cursor
+    the commit is about to move.  Rows with a negative step or slot are
+    skipped on the device, so callers pass the whole batch without a host
+    round-trip.  The source slot's checkpoint and records are only read.
+
+    Args:
+        ckpt: ``[num_slots, HV, K, V]`` contiguous checkpoint pool
+        buf_k / buf_u / buf_g: this layer's record buffers
+        write_pos: ``[num_slots]`` int32 cursor, not yet advanced for this step
+        slot_idx: ``[N]`` live slot of each sequence
+        dst_idx: ``[>= N]`` destination slot per sequence
+        step_idx: ``[>= N]`` verify step to snapshot, ``-1`` for none
+        max_query_len: the verify window, as passed to the forward
+    """
+    n = slot_idx.numel()
+    if n == 0:
+        return
+    if not ckpt.is_contiguous():
+        raise ValueError("replayssm_materialize requires a contiguous checkpoint")
+    if buf_g.ndim != 3:
+        raise ValueError("replayssm_materialize supports the scalar-gate GDN ring")
+    _, HV, K, V = ckpt.shape
+    cap = buf_k.shape[2]
+    assert flush_threshold_ok(cap, max_query_len)
+    BK = triton.next_power_of_2(K)
+    assert triton.cdiv(K, BK) == 1, "K must fit one block"
+    BV = min(triton.next_power_of_2(V), 64)
+    NV = triton.cdiv(V, BV)
+    # The forward's replay tile: `base + step + 1` never exceeds
+    # `cap - max_query_len` (see the flush policy above).
+    BH = max(16, triton.next_power_of_2(cap - max_query_len))
+    _replayssm_materialize_kernel[(NV, n * HV)](
+        ckpt=ckpt,
+        buf_k=buf_k,
+        buf_u=buf_u,
+        buf_g=buf_g,
+        write_pos=write_pos,
+        slot_idx=slot_idx,
+        dst_idx=dst_idx,
+        step_idx=step_idx,
+        N=n,
+        T_MAX=max_query_len,
+        CAP=cap,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        BH=BH,
+        stride_ckpt_slot=ckpt.stride(0),
+        stride_bufk_slot=buf_k.stride(0),
+        stride_bufk_pos=buf_k.stride(2),
+        stride_bufk_hv=buf_k.stride(1),
+        stride_bufu_slot=buf_u.stride(0),
+        stride_bufu_pos=buf_u.stride(2),
+        stride_bufu_hv=buf_u.stride(1),
+        stride_bufg_slot=buf_g.stride(0),
+        stride_bufg_pos=buf_g.stride(2),
+        stride_bufg_hv=buf_g.stride(1),
+        DOT_MODE=_replay_dot_mode(buf_u.dtype),
+        num_warps=1,
+        num_stages=3,
     )
 
 

@@ -627,6 +627,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
+    # aiter's Gluon all-reduce + residual add + RMSNorm for
+    # decode (fused calls up to 2 MiB) at TP4; aiter uses it on gfx1250 only.
+    "ATOM_ENABLE_GLUON_FUSED_AR": lambda: (
+        os.getenv("ATOM_ENABLE_GLUON_FUSED_AR", "1") == "1"
+    ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
@@ -1213,7 +1218,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pages from the process as it goes; 0 registers the checkpoint mapping in
     # place (one thread, under the HIP runtime lock). Either way the shard is
     # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. `tools/engram/bench_uva_shard.py` measures both.
+    # place regardless. Unset, DP attention (every rank holds the whole table)
+    # registers in place -- the shared checkpoint mapping, pinned once per node
+    # rather than copied once per rank -- and copies only if that is refused.
+    # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for

@@ -419,8 +419,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     def _draft_extend_graph_enabled(runner) -> bool:
         if _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG"):
             return False
-        return _env_flag("ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG") or (
-            _is_dsv4_nextn_runner(runner) and _is_dsv4_flash_runner(runner)
+        return (
+            _env_flag("ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG")
+            or (_is_dsv4_nextn_runner(runner) and _is_dsv4_flash_runner(runner))
+            or _is_qwen4_exp_nextn_runner(runner)
         )
 
     def _target_verify_graph_enabled() -> bool:
@@ -530,6 +532,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             setattr(EAGLEDraftCudaGraphRunner, draft_internal_method, _replay)
 
         def replay(self, forward_batch):
+            if _is_qwen4_exp_nextn_runner(getattr(self, "model_runner", None)):
+                from atom.plugin.sglang.qwen4_exp_bridge import (
+                    stage_draft_graph_mrope,
+                )
+
+                stage_draft_graph_mrope(self.buffers.mrope_positions, forward_batch)
+                return original_draft_replay(self, forward_batch)
             if not _is_dsv4_or_glm52_nextn_runner(getattr(self, "model_runner", None)):
                 return original_draft_replay(self, forward_batch)
             if _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG"):
@@ -613,16 +622,25 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 return False
             return _dsv4_draft_extend_graph_layout_ok(self, forward_batch)
 
-        def replay(self, forward_batch):
+        # SGLang 0.5.20's ``execute(forward_batch, select_index)`` passes an
+        # extra argument; forward whatever the runner API passes.
+        def replay(self, forward_batch, *args, **kwargs):
             model_runner = getattr(self, "model_runner", None)
             if _is_glm52_nextn_runner(model_runner):
                 if not _draft_extend_graph_enabled(model_runner):
                     raise RuntimeError(
                         "GLM-5.2 draft-extend cuda graph replay was disabled"
                     )
-                return original_extend_replay(self, forward_batch)
+                return original_extend_replay(self, forward_batch, *args, **kwargs)
+            if _is_qwen4_exp_nextn_runner(model_runner):
+                from atom.plugin.sglang.qwen4_exp_bridge import (
+                    stage_draft_graph_mrope,
+                )
+
+                stage_draft_graph_mrope(self.buffers.mrope_positions, forward_batch)
+                return original_extend_replay(self, forward_batch, *args, **kwargs)
             if not _is_dsv4_nextn_runner(model_runner):
-                return original_extend_replay(self, forward_batch)
+                return original_extend_replay(self, forward_batch, *args, **kwargs)
             if not _draft_extend_graph_enabled(getattr(self, "model_runner", None)):
                 raise RuntimeError(
                     "DSV4 draft-extend cuda graph replay was disabled after capture; "
@@ -658,7 +676,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                                 :num_tokens
                             ],
                         )
-                out = original_extend_replay(self, forward_batch)
+                out = original_extend_replay(self, forward_batch, *args, **kwargs)
                 # EAGLE V2 consumes draft-extend logits with a fixed
                 # `seq * speculative_num_draft_tokens + offset` layout.
                 # SGLang's runner trims to the actual compact token count,
@@ -701,6 +719,46 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         setattr(EAGLEDraftExtendCudaGraphRunner, extend_can_run_method, can_run)
         setattr(EAGLEDraftExtendCudaGraphRunner, extend_replay_method, replay)
         EAGLEDraftExtendCudaGraphRunner._atom_dsv4_replay_patched = True
+
+    if not getattr(EagleDraftWorker, "_atom_qwen4_draft_mrope_patched", False):
+        original_draft_forward = EagleDraftWorker.draft_forward
+
+        def draft_forward(self, forward_batch):
+            # EAGLE advances only the 1-D positions after each draft decode
+            # forward, and the eager / graph runners hand the model a copy of
+            # the batch. Advance the caller's mRoPE rows (the Flash drafter's
+            # RoPE input) alongside; inside a draft graph capture the add is
+            # recorded on the graph's mRoPE buffer.
+            runner = getattr(self, "draft_runner", None)
+            if (
+                not _is_qwen4_exp_nextn_runner(runner)
+                or forward_batch.forward_mode.is_idle()
+                or getattr(forward_batch, "mrope_positions", None) is None
+            ):
+                return original_draft_forward(self, forward_batch)
+            from atom.plugin.sglang.qwen4_exp_bridge import (
+                advance_draft_decode_mrope,
+            )
+
+            shadowed = vars(runner).get("forward")
+            runner_forward = runner.forward
+
+            def forward(step_batch, *args, **kwargs):
+                out = runner_forward(step_batch, *args, **kwargs)
+                advance_draft_decode_mrope(forward_batch)
+                return out
+
+            runner.forward = forward
+            try:
+                return original_draft_forward(self, forward_batch)
+            finally:
+                if shadowed is None:
+                    del runner.forward
+                else:
+                    runner.forward = shadowed
+
+        EagleDraftWorker.draft_forward = draft_forward
+        EagleDraftWorker._atom_qwen4_draft_mrope_patched = True
 
     if not getattr(EagleDraftWorker, "_atom_dsv4_draft_extend_accept_patched", False):
         original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
@@ -867,13 +925,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
-            # Flash draft stays eager: mRoPE positions are [3, N], same as
-            # Native EagleProposer skipping mid-step graphs.
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
-            ) or _is_qwen4_exp_nextn_runner(draft_runner)
+            )
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
                 original_capture_cuda_graphs = self._capture_cuda_graphs
@@ -905,9 +961,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
+                # The Flash drafter also takes this plugin-built draft-extend
+                # runner (its [3, N] mRoPE input is staged on replay by
+                # stage_draft_graph_mrope); SGLang's own HIP gate only admits
+                # aiter multi-step / DSV4 / DSA backends.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
                     getattr(self, "draft_runner", None)
-                )
+                ) or _is_qwen4_exp_nextn_runner(getattr(self, "draft_runner", None))
                 if (
                     getattr(self, "cuda_graph_runner_for_draft_extend", None)
                     is not None
@@ -931,16 +991,23 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             or 1
                         ),
                     )
-                    for backend in (
-                        getattr(
-                            getattr(self, "draft_runner", None), "attn_backend", None
-                        ),
-                        getattr(self, "draft_extend_attn_backend", None),
+                    # DSV4 / GLM-5.2 pad rows need a long fill; Flash QSA keeps
+                    # the backend default.
+                    if _is_dsv4_or_glm52_nextn_runner(
+                        getattr(self, "draft_runner", None)
                     ):
-                        if backend is not None and hasattr(
-                            backend, "_cuda_graph_seq_len_fill_value"
+                        for backend in (
+                            getattr(
+                                getattr(self, "draft_runner", None),
+                                "attn_backend",
+                                None,
+                            ),
+                            getattr(self, "draft_extend_attn_backend", None),
                         ):
-                            backend._cuda_graph_seq_len_fill_value = seq_len_fill
+                            if backend is not None and hasattr(
+                                backend, "_cuda_graph_seq_len_fill_value"
+                            ):
+                                backend._cuda_graph_seq_len_fill_value = seq_len_fill
                     self.cuda_graph_runner_for_draft_extend = (
                         EAGLEDraftExtendCudaGraphRunner(self)
                     )
@@ -948,7 +1015,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
                 logger.warning(
-                    "Failed to enable DSV4 draft-extend cuda graph in ATOM plugin: %s",
+                    "Failed to enable draft-extend cuda graph in ATOM plugin: %s",
                     exc,
                 )
             return ret
@@ -1130,8 +1197,10 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _keep_atom_backend_for_qwen_qsa()
     _patch_sglang_dsv4_draft_backends()
     patch_sglang_eagle3_runtime_compat()
-    _patch_sglang_dsv4_spec_cuda_graph()
+    # Legacy SGLang: the argmax patch replaces EagleDraftWorker.draft_forward,
+    # so install it before the spec-graph patch wraps draft_forward.
     _patch_sglang_eagle_v2_draft_argmax()
+    _patch_sglang_dsv4_spec_cuda_graph()
 
 
 def set_attn_cls() -> None:

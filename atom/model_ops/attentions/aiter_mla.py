@@ -51,6 +51,12 @@ from atom.model_ops.attention_mla import (
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
 )
+from atom.model_ops.attentions.sparse_mla_head_groups import (
+    HEADS as HEAD_GROUP_HEADS,
+)
+from atom.model_ops.attentions.sparse_mla_head_groups import (
+    SparsePrefillHeadGroups,
+)
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -66,6 +72,7 @@ from atom.model_ops.indexer import (
     fp4_rows,
     fp8_rows,
 )
+from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
@@ -193,15 +200,19 @@ def _global_index_cache_layer_ids(
     num_hidden_layers: int,
     num_draft_layers: int,
     layer_types=None,
+    dsa_layer_indices=None,
 ) -> tuple[int, ...]:
     """Return global layers that own an index-key cache slice.
 
     GLM-5.2 ``shared`` layers reuse a preceding full layer's temporary top-k
     positions and do not construct an indexer, so their index-key cache slices
-    are dead. Other sparse MLA models have no ``indexer_types`` schedule and
+    are dead. A model that names its DSA layers (``dsa_layer_indices``) owns
+    slices on those alone. Other sparse MLA models have no such schedule and
     retain the existing one-slice-per-layer layout.
     """
-    target_layer_ids = range(num_hidden_layers)
+    target_layer_ids = (
+        range(num_hidden_layers) if dsa_layer_indices is None else dsa_layer_indices
+    )
     if layer_types is not None:
         # Hybrid models (GLM-5.3-Flash) interleave linear-attention layers that
         # have no MLA and therefore no indexer; a slice for them would be dead
@@ -397,6 +408,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             num_hidden_layers,
             self._global_num_draft_layers(),
             getattr(hf_config, "layer_types", None),
+            getattr(hf_config, "dsa_layer_indices", None),
         )
         local_layer_ids = tuple(
             layer_id
@@ -537,15 +549,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 config.max_num_batched_tokens,
                 NONPS_MAX_Q_ROWS,
             )
+        # Decode and sparse prefill round the gathered head count with different
+        # width tables, so the two can disagree. Their work/reduce buffers are
+        # separate, so size each for its own consumer.
+        self.sparse_prefill_num_heads = self.padded_num_attention_heads
         if self.sparse_dcp_metadata_rebuild:
-            # persistent_num_heads above is decode's width; sparse prefill
-            # rounds differently and can disagree (see
-            # mla_dcp_sparse_prefill_num_heads's docstring) -- catch that here
-            # instead of a corrupted reduce write. Both sides use the default
-            # min_kernel_heads=16, so this doesn't cover a model overriding
-            # min_query_heads (Kimi-K3 DSpark: 32), a pre-existing gap
-            # unrelated to QREP.
-            expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+            self.sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
                 self.num_attention_heads,
                 self.dcp_world_size,
                 persistent=mla_dcp_sparse_prefill_is_persistent(
@@ -553,15 +562,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     dcp_persistent,
                     sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
                 ),
-            )
-            assert self.persistent_num_heads == expected_sparse_prefill_num_heads, (
-                "sparse-prefill work buffers would be sized for "
-                f"{self.persistent_num_heads} gathered heads (decode's width "
-                f"function), but the sparse-prefill kernel actually dispatches "
-                f"at {expected_sparse_prefill_num_heads} heads (its own width "
-                "function) -- decode's and sparse prefill's width tables "
-                "disagree for this num_attention_heads/dcp combination. See "
-                "mla_dcp_sparse_prefill_num_heads's docstring."
             )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
@@ -713,11 +713,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.indexes_by_token_table and max_seqlen_qo > 1
                 else None
             )
-            sparse_prefill_num_heads = (
-                self.persistent_num_heads
-                if self.sparse_dcp_metadata_rebuild
-                else self.padded_num_attention_heads
-            )
             (
                 (spp_wmd_size, spp_wmd_type),
                 (spp_wi_size, spp_wi_type),
@@ -728,7 +723,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ) = get_mla_metadata_info_v1(
                 self.max_num_batched_tokens,
                 1,  # sparse prefill treats each query token as q_len=1
-                sparse_prefill_num_heads,
+                self.sparse_prefill_num_heads,
                 self.dtype_q,
                 self.dtype_kv,
                 is_sparse=True,
@@ -878,6 +873,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                     tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
                     tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
+            # One set of head-group buffers serves every owning layer in turn.
+            # Not under top-k sharing: a grouped owner leaves the shared
+            # sparse-prefill work plan unbuilt, and a skipping layer reads it.
+            if (
+                self.sparse_dcp_metadata_rebuild
+                and self.sparse_prefill_num_heads == HEAD_GROUP_HEADS
+                and self.dtype_kv == torch.bfloat16
+                and not any_layer_skips_index_topk(hf_config)
+            ):
+                head_groups = SparsePrefillHeadGroups(self.device)
+                for module in sfc.values():
+                    impl = getattr(module, "impl", None)
+                    if getattr(impl, "owns_sparse_indexer", False):
+                        impl.sparse_prefill_head_groups = head_groups
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
@@ -1942,6 +1951,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return running_bs
         return None
 
+    def _run_sparse(self, max_seqlen_k: int) -> bool:
+        """A prefill runs sparse MLA once its keys outnumber the top-k: at or
+        below it top-k selects every key, and dense attention is the same."""
+        return self.is_sparse and max_seqlen_k > self.index_topk
+
     def prepare_prefill(
         self, batch: ScheduledBatch, running_bs: int, running_tokens: int
     ):
@@ -1965,7 +1979,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.block_tables = block_table_state(var["block_tables"]).publish(
                 bs
             )
-        if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
+        attn_metadata.run_sparse = self._run_sparse(attn_metadata.max_seqlen_k)
+        if attn_metadata.run_sparse:
             if attn_metadata.block_tables is None:
                 # Already marshalled by the base builder; only the upload is
                 # gated on `has_cached`.
@@ -2027,7 +2042,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     attn_metadata.sparse_cu_seqlens_q,
                     attn_metadata.sparse_kv_indptr,
                     attn_metadata.sparse_kv_last_page_lens,
-                    self.padded_num_attention_heads,
+                    self.sparse_prefill_num_heads,
                     1,  # nhead_kv
                     True,
                     var["sparse_prefill_work_meta_data"],
@@ -3562,6 +3577,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         from atom.utils.tbo.ubatch_splitting import split_attn_metadata
 
         ub_attn = split_attn_metadata(attn_metadata, ub_slice, running_bs)
+        # Each micro-batch decides on its own keys; the sparse metadata it reads
+        # exists only when the whole batch went sparse.
+        ub_attn.run_sparse = attn_metadata.run_sparse and self._run_sparse(
+            ub_attn.max_seqlen_k
+        )
 
         ts = ub_slice.token_slice
         rs = ub_slice.request_slice
