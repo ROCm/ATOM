@@ -27,6 +27,7 @@ import math
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
 from atom.config import get_current_atom_config
@@ -41,7 +42,7 @@ from atom.model_ops.qwen4_exp.ops.ple import (
     ple_gate,
     sharded_table_lookup,
 )
-from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable
+from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable, validated_arch
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
 
@@ -111,7 +112,19 @@ def _check_global_scale(prefix: str, weight_scale: torch.Tensor) -> None:
         )
 
 
-class _Qwen4ExpFP8Embedding(nn.Module):
+class _ShardsIntoWeight:
+    """`load_shard` for a table in HBM: it is `weight`."""
+
+    def load_shard(self, shard_index: int, row_start: int, rows: torch.Tensor) -> None:
+        local = row_start - self.vocab_start_idx
+        self.weight.data.narrow(0, local, rows.shape[0]).copy_(rows)
+
+
+class _Qwen4ExpEmbedding(_ShardsIntoWeight, VocabParallelEmbedding):
+    """The BF16 table in HBM."""
+
+
+class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
     """Vocab-sharded FP8 table with one checkpoint scale for the whole table.
 
     Only selected rows are dequantized; the table stays in checkpoint E4M3FN
@@ -163,13 +176,18 @@ def _host_table_available() -> bool:
     """Whether the n-gram table goes to page-locked host memory instead of HBM.
 
     Only where it would otherwise be allocated on a ROCm device: the kernel
-    reads it through HIP's unified addressing. `ATOM_ENGRAM_UVA=0` keeps it in
-    HBM, as it does the Engram tables.
+    reads it through HIP's unified addressing. And only on an architecture
+    the host path has been validated on (`VALIDATED_ARCHS`). `ATOM_ENGRAM_UVA=0`
+    keeps it in HBM, as it does the Engram tables.
     """
     if torch.version.hip is None or torch.empty(0).device.type != "cuda":
         return False
     if not envs.ATOM_ENGRAM_UVA:
         logger.info("PLE n-gram table: in HBM (ATOM_ENGRAM_UVA=0)")
+        return False
+    arch = get_gfx_runtime()
+    if not validated_arch(arch):
+        logger.info("PLE n-gram table: in HBM (host table not validated on %s)", arch)
         return False
     return True
 
@@ -180,13 +198,14 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     The table is ~100 GB and a token reads `ngram_heads` rows of it, so it
     does not earn its HBM. `PleHostTable` page-locks each checkpoint shard as
     it loads, and `sharded_table_lookup` reads the rows a step names across the
-    bus through `shard_bases`. Those addresses are fixed from load to exit, so
-    the lookup can be captured in a CUDA graph; a weight sync writes the rows
-    in place (`sync_weight`). If page-locking fails the
-    table moves to HBM and the same kernel reads it there; either way the rows
-    returned are the checkpoint's, bit for bit. In HBM the table is `weight`,
-    released and resumed with the other weights, and the addresses follow it
-    (`rebind_weight_addresses`; resuming recaptures the graphs).
+    bus through `shard_bases`. Those addresses only move when the weights are
+    released and resumed, so the lookup can be captured in a CUDA graph; a
+    weight sync writes the rows in place (`sync_weight`). If page-locking
+    fails the table moves to HBM and the same kernel reads it there; either
+    way the rows returned are the checkpoint's, bit for bit. In HBM the table
+    is `weight`, released and resumed with the other weights; on the host its
+    rows are freed and page-locked again alongside them. Either way the
+    addresses follow (`resume_weight_memory`; resuming recaptures the graphs).
     """
 
     def __init__(
@@ -264,9 +283,25 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         self.table.sync_rows(first, tensor)
         return True
 
-    def rebind_weight_addresses(self) -> None:
-        """`MemoryManagerMixin` resumed the weights: a table that fell back
-        to HBM is `weight`, now at a new address."""
+    def load_shard(self, shard_index: int, row_start: int, rows: torch.Tensor) -> None:
+        self.table.load_rows(shard_index, row_start, rows)
+
+    def release_weight_memory(self) -> None:
+        """`MemoryManagerMixin` released the weights: free the page-locked
+        rows too."""
+        freed = self.table.release()
+        if freed:
+            logger.info(
+                "%s: released %.1f GiB of page-locked n-gram rows",
+                self.prefix,
+                freed / 1024**3,
+            )
+
+    def resume_weight_memory(self) -> None:
+        """`MemoryManagerMixin` resumed the weights: page-lock the rows
+        again, or, for a table that fell back to HBM, take `weight`'s new
+        allocation; either way the addresses have moved."""
+        self.table.resume()
         self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
 
     def _initialize_dummy(self) -> None:
@@ -302,6 +337,7 @@ class _Qwen4ExpHostEmbedding(nn.Module):
             self.shard_rows,
             self.embedding_dim,
             self.output_dtype,
+            self.table.dtype,
         )
         if ids.numel() and self.tp_size > 1:
             output = get_tp_group().all_reduce(output, ca_fp8_quant=False)
@@ -383,7 +419,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if quant_config is not None
             else None
         )
-        embedding_cls = VocabParallelEmbedding
+        embedding_cls = _Qwen4ExpEmbedding
         # PLE storage is independent of the linear layers' quantization format.
         embedding_dtype = getattr(config, "ple_embedding_dtype", None)
         if embedding_dtype == "float8_e4m3fn":
@@ -479,11 +515,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return
         rows = overlap_end - overlap_start
         source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
-        if isinstance(embedding, _Qwen4ExpHostEmbedding):
-            embedding.table.load_rows(shard_index, overlap_start, source)
-            return
-        target = param.data.narrow(0, overlap_start - tp_start, rows)
-        target.copy_(source)
+        embedding.load_shard(shard_index, overlap_start, source)
 
     def compute_ngram_ids(
         self,

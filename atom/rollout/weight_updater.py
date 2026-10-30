@@ -242,10 +242,10 @@ class WeightUpdaterMixin:
 
         atom_name, shard_id, tgt_suffix = resolved
         module, param_name, param = param_to_module[atom_name]
-        if self._synced_by_module(module, param_name, tensor, shard_id):
-            return "updated"
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
+            if self._synced_by_module(module, param_name, tensor, shard_id):
+                return "updated"
             return "skipped"
 
         if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
@@ -297,12 +297,15 @@ class WeightUpdaterMixin:
         tensor: torch.Tensor,
         shard_id=None,
     ) -> bool:
-        """Whether the module wrote this weight itself.
+        """Whether the module wrote this weight itself (``sync_weight``).
 
-        For a module whose parameter is not where the values live -- the
-        Qwen3.8 PLE table's rows are in page-locked host memory and `weight`
-        is an empty placeholder -- so no path below could write them. It
-        raises rather than skip a weight it cannot take.
+        For a module whose parameter is not where the values live, only a
+        placeholder: the writers here would copy into that, or (the FP8
+        branches) warn and count the weight as updated with the values left
+        as they were. So it is asked before them -- after the expert buffers,
+        which it never defines -- and answers False for every parameter that
+        does hold its values. It raises rather than skip a weight it cannot
+        take.
         """
         sync = getattr(module, "sync_weight", None)
         return callable(sync) and sync(param_name, tensor, shard_id)
@@ -1034,10 +1037,10 @@ class WeightUpdaterMixin:
             module, param_name, param = param_to_module[name]
             weight_loader = getattr(module, "weight_loader", None)
 
-            if self._synced_by_module(module, param_name, tensor):
-                updated += 1
-            elif param_name in _EXPERT_BUFFER_SHARDS:
+            if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._synced_by_module(module, param_name, tensor):
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)
@@ -1162,12 +1165,12 @@ class WeightUpdaterMixin:
                 module, param_name, param = param_to_module[name]
                 weight_loader = getattr(module, "weight_loader", None)
 
-                if self._synced_by_module(module, param_name, tensor):
-                    updated += 1
-                elif param_name in _EXPERT_BUFFER_SHARDS:
+                if param_name in _EXPERT_BUFFER_SHARDS:
                     self._apply_named_expert_buffer(
                         name, param_name, module, param, tensor
                     )
+                    updated += 1
+                elif self._synced_by_module(module, param_name, tensor):
                     updated += 1
                 elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                     self._requantize_fp8_weight(module, param_name, param, tensor)
@@ -1329,10 +1332,10 @@ class WeightUpdaterMixin:
             module, param_name, param = param_to_module[name]
             weight_loader = getattr(module, "weight_loader", None)
 
-            if self._synced_by_module(module, param_name, tensor):
-                updated += 1
-            elif param_name in _EXPERT_BUFFER_SHARDS:
+            if param_name in _EXPERT_BUFFER_SHARDS:
                 self._apply_named_expert_buffer(name, param_name, module, param, tensor)
+                updated += 1
+            elif self._synced_by_module(module, param_name, tensor):
                 updated += 1
             elif self._is_fp8_param(module, param) and tensor.dtype != param.dtype:
                 self._requantize_fp8_weight(module, param_name, param, tensor)

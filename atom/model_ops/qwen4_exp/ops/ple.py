@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.qwen4_exp.ple_host_table import fp8_rows_fnuz
+
 
 @triton.jit
 def _advance_ngram_state_kernel(
@@ -302,6 +304,7 @@ def _sharded_table_lookup_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
     FP8: tl.constexpr,
+    FNUZ: tl.constexpr,
 ):
     """Gather rows of a table held as separately allocated shards.
 
@@ -309,13 +312,14 @@ def _sharded_table_lookup_kernel(
     `s` lives -- page-locked host memory read over UVA, or HBM. Rows outside
     `[START, END)` (another rank's, or a placeholder id) store zeros. The grid
     is persistent: over the bus the cost is latency, and fewer programs keep
-    more of their address translations warm.
+    more of their address translations warm. FP8 rows are E4M3, `FNUZ` or not
+    as stored.
     """
     cols = tl.arange(0, BLOCK_D)
     in_row = cols < DIM
     out_dtype = Output.dtype.element_ty
     if FP8:
-        row_dtype = tl.float8e4nv
+        row_dtype = tl.float8e4b8 if FNUZ else tl.float8e4nv
         scale = tl.load(Scale).to(out_dtype).to(tl.float32)
     else:
         row_dtype = out_dtype
@@ -357,20 +361,27 @@ def sharded_table_lookup(
     shard_rows: int,
     dim: int,
     output_dtype: torch.dtype,
+    table_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Rows `ids` of a sharded table (`_sharded_table_lookup_kernel`), `[N, dim]`.
 
-    `scale` set means FP8 E4M3FN rows dequantized like `fp8_embedding_lookup`;
-    otherwise the rows are copied in `output_dtype`, which is their dtype.
+    `scale` set means FP8 rows of `table_dtype` (E4M3FN or E4M3FNUZ),
+    dequantized like `fp8_embedding_lookup`; otherwise the rows are copied in
+    `output_dtype`, which is `table_dtype`.
     """
+    fnuz = scale is not None and fp8_rows_fnuz(table_dtype)
+    if scale is None and table_dtype != output_dtype:
+        raise ValueError(f"{table_dtype} rows need a scale to read as {output_dtype}")
     ids = ids.reshape(-1)
     output = torch.empty((ids.numel(), dim), dtype=output_dtype, device=ids.device)
     if ids.numel() == 0:
         return output
-    block_rows = 16
-    grid = min(
-        triton.cdiv(ids.numel(), block_rows), 4 * _compute_units(ids.device.index)
-    )
+    units = _compute_units(ids.device.index)
+    # Rows per program: spread a small batch over as many programs as there
+    # are rows, up to a row per compute unit (bs 1 decode, 16 rows: 3.3 us at
+    # 1, 5.1 us at 16 on MI355X), then up to 16 (from 4k rows, 2-16 are even).
+    block_rows = min(16, triton.next_power_of_2(triton.cdiv(ids.numel(), units)))
+    grid = min(triton.cdiv(ids.numel(), block_rows), 4 * units)
     _sharded_table_lookup_kernel[(grid,)](
         ids,
         bases,
@@ -384,6 +395,7 @@ def sharded_table_lookup(
         triton.next_power_of_2(dim),
         block_rows,
         scale is not None,
+        fnuz,
     )
     return output
 

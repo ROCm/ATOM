@@ -19,6 +19,24 @@ from atom.model_ops.engram import host_memory
 
 logger = logging.getLogger("atom")
 
+# Where the table is page-locked on the host by default. Elsewhere it stays in
+# HBM until the host path has been validated there (lookup cost over the bus,
+# page-locking ~100 GB): gfx942, for one, has not been.
+VALIDATED_ARCHS = ("gfx950",)
+
+
+def validated_arch(arch: str) -> bool:
+    return arch in VALIDATED_ARCHS
+
+
+def fp8_rows_fnuz(dtype: torch.dtype) -> bool:
+    """Which FP8 E4M3 encoding an FP8 table's rows are stored in, for the
+    kernel to read them as: `float8_e4m3fnuz` (True) or `float8_e4m3fn`. The
+    two encode the same byte as values a factor of two apart."""
+    if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        raise ValueError(f"not an FP8 E4M3 n-gram table: {dtype}")
+    return dtype == torch.float8_e4m3fnuz
+
 
 @functools.cache
 def _hip_device_pointer():
@@ -74,8 +92,13 @@ class PleHostTable:
     rows already pinned are copied over -- and the addresses point there
     instead. There it is the data of `weight`, the module's parameter, so
     releasing and resuming the weights frees and reallocates it as they would
-    an HBM embedding; `shard_bases` then has to be asked again. Loader threads
-    may call `load_rows` concurrently.
+    an HBM embedding; `shard_bases` then has to be asked again. Page-locked
+    rows are freed and reallocated the same way (`release` / `resume`).
+
+    Loader threads may call `load_rows` concurrently. Each page-locks its rows
+    outside `_lock` -- the copy is most of the load, and under the lock the
+    threads would take turns -- and records them under it, as everything
+    reading or changing `_rows` and `_in_hbm` does.
     """
 
     def __init__(
@@ -99,6 +122,8 @@ class PleHostTable:
         # Per shard: (first global row held, page-locked rows, or None once
         # they are in `weight`).
         self._rows: dict[int, tuple[int, torch.Tensor | None]] = {}
+        # Per shard while released: (first global row, number of rows).
+        self._released: dict[int, tuple[int, int]] = {}
         self._in_hbm = False
         self._lock = threading.Lock()
 
@@ -154,26 +179,59 @@ class PleHostTable:
             )
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
-        if self._in_hbm:
-            if lo < hi:
-                self.weight.data.narrow(0, lo - self.vocab_start, hi - lo).copy_(
-                    rows.narrow(0, lo - first, hi - lo)
-                )
-            return
-        written = 0
-        for row_start, pinned in self._rows.values():
-            start = max(lo, row_start)
-            end = min(hi, row_start + pinned.shape[0])
-            if start < end:
-                pinned.narrow(0, start - row_start, end - start).copy_(
-                    rows.narrow(0, start - first, end - start)
-                )
-                written += end - start
+        with self._lock:
+            if self._in_hbm:
+                if lo < hi:
+                    self.weight.data.narrow(0, lo - self.vocab_start, hi - lo).copy_(
+                        rows.narrow(0, lo - first, hi - lo)
+                    )
+                return
+            written = 0
+            for row_start, pinned in self._rows.values():
+                start = max(lo, row_start)
+                end = min(hi, row_start + pinned.shape[0])
+                if start < end:
+                    pinned.narrow(0, start - row_start, end - start).copy_(
+                        rows.narrow(0, start - first, end - start)
+                    )
+                    written += end - start
         if written != max(hi - lo, 0):
             raise ValueError(
                 f"{self.prefix}: n-gram rows [{lo}, {hi}) were never loaded, "
                 "so they cannot be synced"
             )
+
+    def release(self) -> int:
+        """Free the page-locked rows, as releasing the weights frees the
+        parameters; the bytes freed. In HBM the table is `weight`, released
+        with them, and there is nothing else to free.
+
+        Nothing may read the rows any more: the graphs that captured
+        `shard_bases` are released first, and `hipHostFree` waits for the
+        device.
+        """
+        with self._lock:
+            if self._in_hbm or self._released:
+                return 0
+            freed = sum(pinned.nbytes for _, pinned in self._rows.values())
+            self._released = {
+                shard: (row_start, pinned.shape[0])
+                for shard, (row_start, pinned) in self._rows.items()
+            }
+            self._rows = {}
+        return freed
+
+    def resume(self) -> None:
+        """Page-lock the rows `release` freed again, at new addresses, so
+        `shard_bases` has to be asked again. Their values are whatever the
+        memory held, as for the parameters `MemoryManagerMixin` reallocates:
+        the weight sync that follows a resume writes them. A shard that cannot
+        be page-locked moves the table to HBM, as at load."""
+        with self._lock:
+            released, self._released = self._released, {}
+        for shard, (row_start, num_rows) in released.items():
+            rows = torch.empty(num_rows, self.dim, dtype=self.dtype)
+            self.load_rows(shard, row_start, rows)
 
     def _to_hbm(self) -> None:
         """Make `weight` the table on `device`, holding every row pinned so
@@ -205,32 +263,36 @@ class PleHostTable:
         first global row (0 for another rank's shards).
 
         Call once loading is done, and again whenever `weight` has been
-        reallocated. A table that received nothing (a dummy load) is
-        allocated in `weight`, as an HBM embedding would be, and filled by
-        `initialize` -- left uninitialized without one; one missing only some
-        shards is an error.
+        reallocated or the rows resumed. A table that received nothing (a
+        dummy load) is allocated in `weight`, as an HBM embedding would be,
+        and filled by `initialize` -- left uninitialized without one; one
+        missing only some shards is an error.
         """
-        missing = [shard for shard in self.shards if shard not in self._rows]
-        if len(missing) == len(self.shards):
-            with self._lock:
+        with self._lock:
+            if self._released:
+                raise ValueError(f"{self.prefix}: the n-gram table is released")
+            missing = [shard for shard in self.shards if shard not in self._rows]
+            empty = len(missing) == len(self.shards)
+            if empty:
                 self._to_hbm()
-            if initialize is not None:
-                initialize()
-        elif missing:
-            raise ValueError(
-                f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
-                "never loaded"
-            )
+            elif missing:
+                raise ValueError(
+                    f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
+                    "never loaded"
+                )
+        if empty and initialize is not None:
+            initialize()
         row_bytes = self.dim * self.dtype.itemsize
         bases = torch.zeros(num_shards, dtype=torch.int64)
-        for shard in self.shards:
-            first = shard * self.shard_rows
-            if self._in_hbm:
-                address = self.weight.data_ptr()
-                address += (first - self.vocab_start) * row_bytes
-            else:
-                row_start, pinned = self._rows[shard]
-                address = device_address(pinned.data_ptr())
-                address -= (row_start - first) * row_bytes
-            bases[shard] = address
+        with self._lock:
+            for shard in self.shards:
+                first = shard * self.shard_rows
+                if self._in_hbm:
+                    address = self.weight.data_ptr()
+                    address += (first - self.vocab_start) * row_bytes
+                else:
+                    row_start, pinned = self._rows[shard]
+                    address = device_address(pinned.data_ptr())
+                    address -= (row_start - first) * row_bytes
+                bases[shard] = address
         return bases
