@@ -27,5 +27,9 @@ runners:
     gpu_count: 8
 
   linux-atom-pitt-mi350x-8:
+    gpu_arch: MI355
+  
+  linux-atom-general-mi350x-8:
     gpu_arch: MI350X
+    gpu_count: 8
     gpu_count: 8

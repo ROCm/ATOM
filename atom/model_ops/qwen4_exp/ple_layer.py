@@ -352,6 +352,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
 
 class Qwen4ExpPLELayer(nn.Module):
+    # RTP may install a per-instance writer for prefix-cache side state.
+    _state_checkpoint_writer = None
+
     def __init__(
         self,
         config,
@@ -530,4 +533,13 @@ class Qwen4ExpPLELayer(nn.Module):
             metadata.has_initial_state,
             metadata.num_accepted_tokens,
         )
+        checkpoint_writer = getattr(self, "_state_checkpoint_writer", None)
+        if checkpoint_writer is not None:
+            checkpoint_writer(
+                input_ids,
+                normalized,
+                metadata,
+                history_width=self.ple_embedding.ngram_size - 1,
+                conv_state_len=self.conv_state_len,
+            )
         return gated_value.flatten(-2) + conv_output

@@ -4,8 +4,19 @@
 `pin_rows` takes the row ranges a device kernel will read across the bus (a
 table's values and, when quantized, its block scales) and returns them as
 page-locked tensors -- copied into `hipHostMalloc` memory of exactly their
-size, or (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP runtime) the checkpoint mapping
-registered in place.
+size, or the checkpoint mapping registered in place (`ATOM_ENGRAM_UVA_COPY=0`,
+no HIP runtime, or -- unless `ATOM_ENGRAM_UVA_COPY` is set -- a shard that
+every DP-attention rank of the node holds whole, see `pin_rows`).
+
+In-place registrations go through a process-wide, reference-counted set of
+page runs (`_PageRuns`): ranges are widened to page boundaries, so ranges
+stored back to back (a layer's scales right before its values) share a page,
+and HIP refuses to register a range overlapping one already registered.
+
+Every refused or failed HIP call clears HIP's last error (`_clear_hip_error`):
+HIP also leaves it as the runtime's sticky last error, which torch raises at
+its next kernel-launch check -- in the host-path fallback the refusal was
+meant to allow.
 
 Ownership: each returned tensor's storage holds the lease on its memory, so
 the memory is released when the last tensor viewing it is collected -- never
@@ -22,6 +33,7 @@ during a capture is skipped, with a warning, rather than breaking it.
 """
 
 import ctypes
+import functools
 import logging
 import os
 import sys
@@ -37,6 +49,11 @@ logger = logging.getLogger("atom")
 
 _PAGE = 4096
 _MADV_DONTNEED = 4
+_MADV_POPULATE_READ = 22  # Linux 5.14+; elsewhere EINVAL, and nothing is lost
+# `hipHostRegisterReadOnly`: the GPU only reads the range. Needed for a range
+# the process cannot write (the shared read-only checkpoint mapping), which
+# the default flags would ask to map writable.
+_HOST_REGISTER_READ_ONLY = 0x08
 _PR_SET_THP_DISABLE = 41
 _PR_GET_THP_DISABLE = 42
 # Copy policy, from `tools/engram/bench_host_copy.py` on MI355X (warm source,
@@ -56,6 +73,67 @@ _MIN_COPY_THREADS = 8
 # source is still mapped before it is dropped (`_source_dropper`).
 _CHUNK_BYTES = 256 << 20
 _MAX_COPY_THREADS = 16
+
+
+@functools.cache
+def _hip_runtime():
+    """The HIP runtime this process already runs -- the `libamdhip64` torch
+    loaded (a ROCm wheel bundles its own, e.g. `torch/lib/libamdhip64.so.7`)
+    -- or None.
+
+    Not `CDLL("libamdhip64.so")`: that is the system's unversioned dev link,
+    which a wheel-only install lacks (the copy would quietly turn into an
+    in-place registration) and which can name a second, different runtime
+    than torch's, with its own allocations and last error.
+    """
+    if not torch.version.hip:
+        return None
+    candidates = []
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                path = line.split(maxsplit=5)[-1].strip()
+                name = os.path.basename(path)
+                if name.startswith("libamdhip64.so") and path not in candidates:
+                    candidates.append(path)
+    except OSError:
+        pass
+    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    try:
+        candidates += sorted(
+            os.path.join(torch_lib, n)
+            for n in os.listdir(torch_lib)
+            if n.startswith("libamdhip64.so")
+        )
+    except OSError:
+        pass
+    candidates.append("libamdhip64.so")
+    for path in candidates:
+        try:
+            hip = ctypes.CDLL(path)
+        except OSError:
+            continue
+        logger.info("engram: HIP runtime for page-locking: %s", path)
+        return hip
+    logger.warning(
+        "engram: no HIP runtime found (tried %s); a UVA shard is registered in "
+        "place instead of copied",
+        ", ".join(candidates),
+    )
+    return None
+
+
+def _clear_hip_error() -> None:
+    """Reset HIP's last error after a refused or failed call.
+
+    HIP reports the failure through the return code and also leaves it as the
+    runtime's last error, and torch raises that at its next kernel-launch
+    check: the host-path fallback would die there ("part or all of the
+    requested memory range is already mapped").
+    """
+    hip = _hip_runtime()
+    if hip is not None:
+        hip.hipGetLastError()
 
 
 class _HipHostAllocator:
@@ -96,26 +174,47 @@ class _HipHostAllocator:
             if was == 0:
                 self._prctl(_PR_SET_THP_DISABLE, 0, 0, 0, 0)
         if rc != 0 or not ptr.value:
+            _clear_hip_error()
             return None
         return ptr.value
 
     def free(self, ptr: int) -> None:
         # Synchronizes the device first (an implicit hipDeviceSynchronize).
-        self._free(ptr)
+        rc = self._free(ptr)
+        if rc != 0:
+            _clear_hip_error()
+            logger.warning("engram: hipHostFree failed (%d)", rc)
 
 
 def _host_allocator():
-    """The page-locked allocator a shard is copied into, or None to register
-    the checkpoint mapping in place (`ATOM_ENGRAM_UVA_COPY=0`, or no HIP
-    runtime to call)."""
-    if not envs.ATOM_ENGRAM_UVA_COPY or not torch.version.hip:
+    """The page-locked allocator a shard is copied into, or None when there is
+    no HIP runtime to call (the shard is then registered in place)."""
+    hip = _hip_runtime()
+    if hip is None:
         return None
     try:
-        return _HipHostAllocator(
-            ctypes.CDLL("libamdhip64.so"), ctypes.CDLL(None, use_errno=True)
-        )
-    except OSError:
+        return _HipHostAllocator(hip, ctypes.CDLL(None, use_errno=True))
+    except (OSError, AttributeError):
+        logger.warning("engram: hipHostMalloc unavailable", exc_info=True)
         return None
+
+
+_COPY_ENV = "ATOM_ENGRAM_UVA_COPY"
+
+
+def copies(shared: bool) -> bool:
+    """Whether a shard is copied into page-locked memory (else registered in
+    place).
+
+    `ATOM_ENGRAM_UVA_COPY`, when set, decides. Unset, a shard copies unless it
+    is `shared`: the same whole table every DP-attention rank of the node
+    holds. A copy there is one per rank -- ~183 GiB each for V4.1-Flash --
+    where the shared read-only checkpoint mapping registered in place pins the
+    page cache once for all of them.
+    """
+    if _COPY_ENV in os.environ:
+        return envs.ATOM_ENGRAM_UVA_COPY
+    return not shared
 
 
 def _capturing() -> bool:
@@ -365,28 +464,43 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1).view(torch.uint8)
 
 
-def pin_rows(sources: list[torch.Tensor]) -> tuple[torch.Tensor, ...] | None:
+def pin_rows(
+    sources: list[torch.Tensor], shared: bool = False
+) -> tuple[torch.Tensor, ...] | None:
     """`sources` (contiguous row ranges) as page-locked tensors of the same
     dtype and shape, owning their memory; all-or-nothing.
+
+    `shared`: these are whole tables that every DP-attention rank of the node
+    page-locks too. Unless `ATOM_ENGRAM_UVA_COPY` says otherwise they are then
+    registered in place (`copies`), and copied only if that is refused.
 
     None, with everything taken released, on any failure -- no memory, a
     refused registration, no thread to copy on -- so the TP group can fall
     back as one.
     """
-    allocator = _host_allocator()
-    leases: list[_Lease] = []
-    try:
-        if allocator is not None:
-            out = _copy(allocator, sources, leases)
-        else:
-            out = _register(sources, leases)
-    except Exception:  # any failure is a fallback
-        logger.warning("engram: page-locking the UVA shard failed", exc_info=True)
-        out = None
-    if out is None:
+    plan = ["copy"] if copies(shared) else ["register"]
+    if shared and _COPY_ENV not in os.environ:
+        plan.append("copy")
+    for how in plan:
+        allocator = _host_allocator() if how == "copy" else None
+        if how == "copy" and allocator is None:
+            if "register" in plan:
+                break  # registering was refused already
+            how = "register"
+        leases: list[_Lease] = []
+        try:
+            if how == "copy":
+                out = _copy(allocator, sources, leases)
+            else:
+                out = _register(sources, leases)
+        except Exception:  # any failure is a fallback
+            logger.warning("engram: page-locking the UVA shard failed", exc_info=True)
+            out = None
+        if out is not None:
+            return out
         for lease in leases:
             lease.release()
-    return out
+    return None
 
 
 def _copy(allocator, sources, leases):
@@ -417,27 +531,135 @@ def _copy(allocator, sources, leases):
             pool.shutdown()
 
 
-def _register(sources, leases):
-    """Register the mapping in place; the range is widened to page boundaries,
-    which registration requires (the extra bytes are neighbouring rows the
-    kernel never addresses)."""
-    rt = torch.cuda.cudart()
+def _read_only(lo: int, hi: int) -> bool:
+    """Whether some mapping of `[lo, hi)` is not writable (`/proc/self/maps`)."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=2)
+                a, b = (int(x, 16) for x in fields[0].split("-"))
+                if b > lo and a < hi and "w" not in fields[1]:
+                    return True
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
 
-    def unregister(base):
-        if torch.cuda.is_initialized():
-            torch.cuda.synchronize()
-        rt.cudaHostUnregister(base)
+
+class _PageRuns:
+    """This process's in-place page-locked runs, reference-counted.
+
+    `cudaHostRegister` needs page boundaries and refuses a range overlapping
+    one already registered. Ranges stored back to back share their boundary
+    page -- a layer's scales sit right before its values in the checkpoint
+    shard, and a rank holding every hash head (one DP-attention rank per GPU)
+    registers both whole -- so each range takes a reference on the runs that
+    cover it and registers only the gaps between them. A run is unregistered
+    with its last reference.
+    """
+
+    def __init__(self):
+        self._runs: dict[int, list[int]] = {}  # base -> [end, references]
+        self._lock = threading.RLock()
+
+    def acquire(self, rt, lo: int, hi: int, flags: int = 0) -> list[int] | None:
+        """References on the runs covering `[lo, hi)` (page-aligned), the
+        uncovered gaps registered first; None, holding nothing, if HIP
+        refuses one."""
+        with self._lock:
+            held: list[int] = []
+            cursor = lo
+            overlapping = sorted(
+                b for b, (e, _) in self._runs.items() if b < hi and e > lo
+            )
+            for base in [*overlapping, None]:
+                gap_end = hi if base is None else base
+                if cursor < gap_end:
+                    if int(rt.cudaHostRegister(cursor, gap_end - cursor, flags)):
+                        _clear_hip_error()
+                        self.release(rt, held)
+                        return None
+                    self._runs[cursor] = [gap_end, 1]
+                    held.append(cursor)
+                if base is None:
+                    break
+                self._runs[base][1] += 1
+                held.append(base)
+                cursor = max(cursor, self._runs[base][0])
+            return held
+
+    def release(self, rt, bases) -> None:
+        with self._lock:
+            for base in bases:
+                run = self._runs[base]
+                run[1] -= 1
+                if run[1] == 0:
+                    del self._runs[base]
+                    if int(rt.cudaHostUnregister(base) or 0):
+                        _clear_hip_error()
+                        logger.warning("engram: cudaHostUnregister failed")
+
+    def __len__(self) -> int:
+        return len(self._runs)
+
+
+_PAGE_RUNS = _PageRuns()
+
+
+def _populate(lo: int, hi: int) -> None:
+    """Fault `[lo, hi)` in ahead of registering it, on several threads.
+
+    Registration would otherwise fault every page itself, on one thread and
+    under the HIP runtime lock (which stalls GPU allocations elsewhere in the
+    process). Best effort: a kernel without `MADV_POPULATE_READ` declines and
+    registration faults the pages as before.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    pieces = _chunks(lo, hi - lo, _CHUNK_BYTES)
+
+    def fault(piece) -> bool:
+        o, n = piece
+        return libc.madvise(lo + o, n, _MADV_POPULATE_READ) == 0
+
+    threads = min(copy_threads(hi - lo), len(pieces))
+    if threads <= 1:
+        for piece in pieces:
+            if not fault(piece):
+                return
+        return
+    with ThreadPoolExecutor(threads) as pool:
+        list(pool.map(fault, pieces))
+
+
+def _register(sources, leases):
+    """Register the mapping in place; each range is widened to page
+    boundaries, which registration requires (the extra bytes are neighbouring
+    rows the kernel never addresses), and shares any page another range of
+    this process already holds (`_PageRuns`). A read-only mapping (the shared
+    checkpoint mapping) is faulted in on several threads first and registered
+    read-only."""
+    rt = torch.cuda.cudart()
 
     out = []
     for src in sources:
         base = src.data_ptr()
         nbytes = src.numel() * src.element_size()
         lo = base - (base % _PAGE)
-        size = -(-(base + nbytes - lo) // _PAGE) * _PAGE
-        if int(rt.cudaHostRegister(lo, size, 0)) != 0:
-            logger.info("engram: page-lock registration of %d bytes refused", size)
+        hi = -(-(base + nbytes) // _PAGE) * _PAGE
+        flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
+        if flags:
+            _populate(lo, hi)
+        runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
+        if runs is None:
+            logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
             return None
-        lease = _Lease(lo, size, unregister, keep=src)
+
+        def unregister(_ptr, runs=runs):
+            if torch.cuda.is_initialized():
+                torch.cuda.synchronize()
+            _PAGE_RUNS.release(rt, runs)
+
+        lease = _Lease(lo, hi - lo, unregister, keep=src)
         leases.append(lease)
         view = _owning_bytes(lease, base - lo, nbytes)
         out.append(view.view(src.dtype).view(src.shape))
