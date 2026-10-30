@@ -42,8 +42,8 @@ def _topk_softmax_kernel(
     b = tl.where(x == 0.0, 0, bits)
     low = (E - 1 - offs).to(tl.int64)
     # AITER picks with `>` and clears each pick to -inf: once the finite
-    # logits run out the lowest index (expert 0) is picked again, its slot
-    # already cleared. A NaN sorts below -inf, so it is never picked.
+    # logits run out the lowest index at -inf (cleared or not) is picked
+    # again. A NaN sorts below -inf, so it is picked only from a row of NaNs.
     nan = (bits & 0x7FFFFFFF) > 0x7F800000
     b = tl.where(nan, -2147483648, b ^ ((b >> 31) & 0x7FFFFFFF))
     key = b.to(tl.int64) * 4294967296 + low
@@ -89,13 +89,15 @@ def triton_topk_softmax(
     `topk_weights[:, k + s]` with sigmoid(shared logit s) for each of the
     `num_shared_experts` trailing logits.
 
-    As in AITER, a row with fewer than k finite logits, but at least one,
-    picks expert 0 for the rest, with weight 0. A row with no finite logit
-    (all -inf) gets NaN for every routed weight, as in AITER. A NaN logit is
-    never picked. AITER agrees unless the
-    NaN is the first element of one of its per-thread vector loads (16 bf16
-    below 512 experts, 32 at 512): there it may pick it, making every weight
-    NaN, or misorder the row, so rows with NaNs are not bit-identical.
+    As in AITER, once a row's finite logits run out, the rest of its k picks
+    get weight 0 and repeat the lowest expert id whose logit is -inf or
+    already picked: expert 0 when the others are -inf. A row with no finite
+    logit gets NaN for every routed weight; all -inf or all NaN, it picks
+    expert 0 throughout, as in AITER. A NaN logit is picked only when every
+    logit in its row is NaN. AITER agrees unless a NaN is the first element
+    of one of its per-thread vector loads (16 bf16 below 512 experts, 32 at
+    512; expert 0 always is): there it may pick it, making every weight NaN,
+    or misorder the row, so rows with NaNs are not bit-identical.
 
     `num_valid_rows`, as in AITER (ROCm/aiter#6916): an optional int32 device
     tensor whose first element is the count of real rows. Rows at or past it

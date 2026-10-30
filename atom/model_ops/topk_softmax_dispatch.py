@@ -28,9 +28,11 @@ TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
 
 
 def _gfx() -> str:
-    from aiter.jit.utils.chip_info import get_gfx
+    # The GPU running, not `get_gfx()`'s GPU_ARCHS build target: a gfx942
+    # built with `GPU_ARCHS=gfx942;gfx950` would take gfx950's cutoff.
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx()
+    return get_gfx_runtime()
 
 
 def _cu_num() -> int:

@@ -186,6 +186,95 @@ def test_nan_logits_are_never_picked(experts, shared):
     assert not bool(nan.gather(1, ids_new[:, :TOPK].long()).any())
 
 
+def _vector_load_first_slots(experts):
+    """AITER's per-thread vector loads start every 16 bf16 below 512 experts,
+    every 32 at 512; a NaN there is where the two kernels may differ."""
+    first = torch.zeros(experts, dtype=torch.bool, device="cuda")
+    first[:: 32 if experts == 512 else 16] = True
+    return first
+
+
+def _route_one(logits, k, shared):
+    w = torch.full((logits.shape[0], k + shared), -1.0, device="cuda")
+    ids = torch.full(w.shape, 12345, dtype=torch.int32, device="cuda")
+    triton_topk_softmax(w, ids[:, :k], logits, shared)
+    return w, ids
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+@pytest.mark.parametrize("experts", [32, 128, 512])
+def test_rows_without_finite_logits_pick_expert_0(experts, shared):
+    """All NaN, all -inf, or -inf on AITER's vector-load first slots and NaN
+    or -inf elsewhere: no finite logit, so both kernels pick expert 0 every
+    time, and every routed weight is NaN."""
+    rows = 64
+    torch.manual_seed(experts + 29 * shared)
+    logits = _logits(rows, experts + shared, 2.0, False)
+    nan = torch.rand(rows, experts, device="cuda") < 0.5
+    nan[:, _vector_load_first_slots(experts)] = False
+    nan[0] = True
+    nan[1] = False
+    routed = logits[:, :experts]
+    routed[nan] = float("nan")
+    routed[~nan] = float("-inf")
+
+    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, TOPK, shared)
+    assert torch.equal(ids_new, ids_ref)
+    assert bool((ids_new[:, :TOPK] == 0).all())
+    assert bool(w_new[:, :TOPK].isnan().all()) and bool(w_ref[:, :TOPK].isnan().all())
+    assert torch.equal(_bits(w_new[:, TOPK:]), _bits(w_ref[:, TOPK:]))
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+@pytest.mark.parametrize("experts", [32, 128, 512])
+def test_rows_short_of_finite_logits_among_nans(experts, shared):
+    """Each of AITER's vector-load first slots finite or -inf, NaN elsewhere,
+    fewer finite logits than k: once they run out both kernels repeat expert
+    0, with weight 0."""
+    rows, k = 64, 32
+    torch.manual_seed(experts + 31 * shared)
+    logits = _logits(rows, experts + shared, 2.0, False)
+    routed = logits[:, :experts]
+    first = _vector_load_first_slots(experts)
+    finite = first & (torch.rand(rows, experts, device="cuda") < 0.5)
+    finite[0] = False  # no finite logit at all
+    routed[:, ~first] = float("nan")
+    routed[first & ~finite] = float("-inf")
+    count = finite.sum(1)
+    assert bool((count < k).all())
+
+    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, k, shared)
+    assert torch.equal(ids_new, ids_ref)
+    some = count > 0
+    assert torch.equal(_bits(w_new[some]), _bits(w_ref[some]))
+    assert bool(w_new[~some, :k].isnan().all()) and bool(w_ref[~some, :k].isnan().all())
+    assert bool(some[1:].any())
+    for r in range(rows):
+        n = int(count[r])
+        assert bool((ids_new[r, n:k] == 0).all())
+        if n:
+            assert bool((_bits(w_new[r, n:k]) == 0).all())
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+@pytest.mark.parametrize("experts", [32, 128, 512])
+def test_a_nan_expert_0_is_skipped_for_the_lowest_cleared_or_neg_inf(experts, shared):
+    """Expert 0 NaN, which AITER's vector loads may pick (no bit-identity
+    there): the Triton kernel repeats the lowest expert already picked, or
+    the lowest -inf one, and picks a NaN only from a row of NaNs."""
+    k = 10
+    logits = torch.full((3, experts + shared), float("nan"), device="cuda")
+    logits[0, 7] = 1.0  # one finite logit
+    logits[1, 5] = float("-inf")  # no finite logit, one -inf
+    logits[1, 9] = float("-inf")
+    logits[:, experts:] = 0.5
+    w, ids = _route_one(logits.to(torch.bfloat16), k, shared)
+    assert bool((ids[0, :k] == 7).all())
+    assert w[0, 0].item() == 1.0 and bool((_bits(w[0, 1:k]) == 0).all())
+    assert bool((ids[1, :k] == 5).all()) and bool(w[1, :k].isnan().all())
+    assert bool((ids[2, :k] == 0).all()) and bool(w[2, :k].isnan().all())
+
+
 def test_unsupported_shapes_fall_back():
     logits = torch.zeros(4, 513, dtype=torch.bfloat16, device="cuda")
     assert not _supported(logits, TOPK, False, 1)

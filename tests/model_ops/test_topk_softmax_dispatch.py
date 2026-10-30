@@ -25,6 +25,8 @@ from atom.utils import envs
 
 # MI355X: 256 CUs, so launches of up to 20 * 256 rows take the Triton kernel.
 MI355X_CUS, MI355X_MAX_ROWS = 256, 5120
+# Before the autouse `gfx` fixture replaces it.
+_RUNTIME_GFX = topk_softmax_dispatch._gfx
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +138,23 @@ def test_unmeasured_architectures_stay_on_aiter(
     assert triton_topk_softmax_max_rows() is None
     scoring_func = "sigmoid" if shared else None
     assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) is None
+
+
+@pytest.mark.parametrize(
+    "built,running,max_rows",
+    [("gfx950", "gfx942", None), ("gfx942", "gfx950", MI355X_MAX_ROWS)],
+)
+def test_cutoff_follows_the_running_gpu_not_the_build_target(
+    built, running, max_rows, monkeypatch
+):
+    """`get_gfx()` reports `GPU_ARCHS`' target, so an MI300 running a
+    `gfx942;gfx950` build would take MI355X's cutoff; the GPU running decides.
+    Needs AITER's `chip_info`, so it skips where AITER is not installed."""
+    chip_info = pytest.importorskip("aiter.jit.utils.chip_info")
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: built)
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: running)
+    monkeypatch.setattr(topk_softmax_dispatch, "_gfx", _RUNTIME_GFX)
+    assert triton_topk_softmax_max_rows() == max_rows
 
 
 @pytest.mark.parametrize("cus,max_rows", [(MI355X_CUS, MI355X_MAX_ROWS), (128, 2560)])
