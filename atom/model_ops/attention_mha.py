@@ -608,7 +608,17 @@ class PagedAttentionImpl(nn.Module):
             return v_cache
         return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
-    def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
+    def _pa_decode_kv_scales(self, k_scale, v_scale):
+        """The K/V scales ``paged_attention_triton`` hands ``run_pa_decode``."""
+        if self.kv_cache_dtype == "bf16":
+            return None, None
+        if k_scale is not None and k_scale.numel() > 1:
+            return k_scale.unsqueeze(-1), v_scale.unsqueeze(-1)
+        return k_scale, v_scale
+
+    def _flydsl_takes_decode(
+        self, q, k_cache, v_cache, k_scale, v_scale, attn_metadata
+    ) -> bool:
         """Whether a decode routed to unified runs on FlyDSL instead.
 
         Two cases reach unified with a call FlyDSL may take: a GPU without
@@ -633,7 +643,7 @@ class PagedAttentionImpl(nn.Module):
             attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
         ):
             return False
-        num_seqs = attn_metadata.context_lens.shape[0]
+        k_scale, v_scale = self._pa_decode_kv_scales(k_scale, v_scale)
         return bool(
             flydsl_decode_seqs(
                 output=q,
@@ -643,9 +653,6 @@ class PagedAttentionImpl(nn.Module):
                 block_tables=attn_metadata.block_tables,
                 context_lens=attn_metadata.context_lens,
                 max_seqlen_q=attn_metadata.max_seqlen_q,
-                max_context_partition_num=dense_decode_splits(
-                    num_seqs, k_cache.shape[1]
-                ),
                 context_partition_size=256,
                 compute_type=(
                     torch.bfloat16
@@ -653,6 +660,8 @@ class PagedAttentionImpl(nn.Module):
                     else aiter.dtypes.fp8
                 ),
                 q_scale=None,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 alibi_slopes=None,
                 sinks=self.sinks,
                 sliding_window=self.sliding_window,
@@ -671,7 +680,9 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
-        if self._flydsl_takes_decode(q, k_cache, v_cache, attn_metadata):
+        if self._flydsl_takes_decode(
+            q, k_cache, v_cache, k_scale, v_scale, attn_metadata
+        ):
             return self.paged_attention_triton(
                 q,
                 k,
@@ -754,9 +765,7 @@ class PagedAttentionImpl(nn.Module):
             max_context_partition_num = 1
             context_partition_size = 128
 
-        if k_scale is not None and k_scale.numel() > 1:
-            k_scale = k_scale.unsqueeze(-1)
-            v_scale = v_scale.unsqueeze(-1)
+        k_scale, v_scale = self._pa_decode_kv_scales(k_scale, v_scale)
 
         compute_type = (
             torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
@@ -774,8 +783,8 @@ class PagedAttentionImpl(nn.Module):
             context_partition_size=context_partition_size,
             compute_type=compute_type,
             q_scale=None,
-            k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
-            v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
