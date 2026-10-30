@@ -63,7 +63,7 @@ def _spy_rebalance(mgr, fired):
     `live_metadata` / EP MoE layers / weight movement.
     """
 
-    def _fake():
+    def _fake(*_):
         fired.append(1)
         return
         yield  # pragma: no cover - marks this a generator (never reached)
@@ -323,7 +323,7 @@ def test_execute_rebalance_uses_default_stream_no_explicit_wait(monkeypatch):
         rebalance_balancedness_agg="min",
     )
 
-    def _fake():
+    def _fake(*_):
         return
         yield  # pragma: no cover - marks this a generator
 
@@ -356,7 +356,7 @@ def test_execute_rebalance_drains_runtime_generator():
     )
     steps = []
 
-    def _fake():
+    def _fake(*_):
         steps.append("chunk0")
         yield
         steps.append("chunk1")
@@ -369,3 +369,265 @@ def test_execute_rebalance_drains_runtime_generator():
     with pytest.raises(StopIteration):
         next(gen)
     assert steps == ["chunk0", "chunk1"]
+
+
+def _alternating_hot_manager(monkeypatch, policy, reduced_shapes=None):
+    """2 GPUs, 4 physical slots, no redundancy, live placement GPU0=[A,B],
+    GPU1=[C,D]. Step 1 loads A,B; step 2 loads C,D: balanced over the window,
+    yet every step leaves one GPU idle."""
+    group = types.SimpleNamespace(world_size=2, device_group=object())
+    shapes = reduced_shapes if reduced_shapes is not None else []
+    # Stand-in for the group reduction: record what is reduced, sum over 1 rank.
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, **kw: shapes.append(tuple(t.shape))
+    )
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    monitor.set_load_group(group)
+    monitor.track_step_load = policy == "step_peak"
+    monitor.initialize(
+        num_layers=1, num_physical=4, device=torch.device("cpu"), num_gpus=2
+    )
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=2,
+        rebalance_min_balancedness=0.9,
+        rebalance_balancedness_agg="min",
+        placement_policy=policy,
+    )
+    _spy_rebalance(manager, fired)
+    manager.live_metadata = types.SimpleNamespace(ep_size=2)
+    manager._dp_is_migration_group = True
+    for hot in ([0, 1], [2, 3]):
+        monitor.on_forward_start()
+        topk = torch.tensor([e for e in hot for _ in range(100)], dtype=torch.int32)
+        monitor.record(layer_id=0, topk_physical=topk.view(-1, 1), num_physical=4)
+        monitor.on_forward_end(is_dummy_run=False)
+        manager.on_forward_pass_end(True, True, local_step_load=True)
+    return manager, fired
+
+
+def test_step_peak_gate_judges_per_step_balance(monkeypatch):
+    # The window sum is perfectly balanced, so the window gate (naive/biased)
+    # skips; step_peak judges on per-step balance (sum of mean / sum of busiest
+    # GPU = 200 / 400) and rebalances.
+    naive, naive_fired = _alternating_hot_manager(monkeypatch, "naive")
+    assert naive_fired == []
+    assert naive.last_balancedness == pytest.approx(1.0)
+
+    step_peak, step_peak_fired = _alternating_hot_manager(monkeypatch, "step_peak")
+    assert step_peak_fired == [1]
+    assert step_peak.last_balancedness == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("policy", ["naive", "biased"])
+def test_window_policies_keep_no_step_windows(monkeypatch, policy):
+    shapes = []
+    manager, _ = _alternating_hot_manager(monkeypatch, policy, reduced_shapes=shapes)
+    monitor = manager.monitor
+    assert monitor._step_load_window is None and monitor._step_gpu_window is None
+    assert monitor.dump_global_step_load() is None
+    assert monitor.dump_global_step_gpu_load() is None
+    # Only the [L, P] window sum feeds the gate, as before step_peak existed.
+    assert shapes == [(1, 4)]
+
+
+def test_step_windows_allocated_per_policy():
+    def monitor_for(track):
+        monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=8)
+        monitor.track_step_load = track
+        monitor.initialize(
+            num_layers=3, num_physical=12, device=torch.device("cpu"), num_gpus=4
+        )
+        return monitor
+
+    window_only = monitor_for(False)
+    assert window_only._step_load_window is None
+    assert window_only._step_gpu_window is None
+
+    step_peak = monitor_for(True)
+    assert tuple(step_peak._step_load_window.shape) == (8, 3, 12)
+    assert tuple(step_peak._step_gpu_window.shape) == (8, 3, 4)
+
+
+def _planning_step_peak_manager(monkeypatch, *, reduced_shapes, max_rebalances=0):
+    """The 2-GPU alternating-hotspot setup with the real planning path: live
+    metadata, a migration group of one rank (broadcast is a no-op) and a
+    `_migrate` spy that records each plan and yields once like a real chunk."""
+    monkeypatch.setenv("ATOM_EPLB_MAX_REBALANCES", str(max_rebalances))
+    group = types.SimpleNamespace(world_size=2, device_group=object())
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda t, **kw: reduced_shapes.append(tuple(t.shape)),
+    )
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda *a, **kw: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0])
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    monitor.set_load_group(group)
+    monitor.track_step_load = True
+    monitor.initialize(
+        num_layers=1, num_physical=4, device=torch.device("cpu"), num_gpus=2
+    )
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=2,
+        rebalance_min_balancedness=0.9,
+        rebalance_balancedness_agg="min",
+        placement_policy="step_peak",
+    )
+    manager.live_metadata = eplb.ExpertLocationMetadata.from_trivial(
+        num_layers=1, num_logical_experts=4, ep_size=2, ep_rank=0
+    )
+    manager._moe_layers = {0: types.SimpleNamespace(num_expert_group=1)}
+    manager._ep_group = object()
+    manager._migration_group = object()
+    manager._dp_is_migration_group = True
+    plans = []
+
+    def _migrate(plan):
+        plans.append(plan)
+        yield
+
+    manager._migrate = _migrate
+    return manager, plans
+
+
+def _prefill_step(manager, hot, *, dp_flag=True):
+    """One group prefill step whose 100 tokens per expert hit `hot`."""
+    monitor = manager.monitor
+    monitor.on_forward_start()
+    topk = torch.tensor([e for e in hot for _ in range(100)], dtype=torch.int32)
+    monitor.record(layer_id=0, topk_physical=topk.view(-1, 1), num_physical=4)
+    monitor.on_forward_end(is_dummy_run=False)
+    manager.on_forward_pass_end(
+        True, dp_flag if dp_flag is not None else None, local_step_load=True
+    )
+
+
+def _gpu_pairs(p2l):
+    return {frozenset(p2l[0, :2].tolist()), frozenset(p2l[0, 2:].tolist())}
+
+
+def test_step_peak_rebalance_reduces_each_window_once(monkeypatch):
+    # The gate reduces the [S, L, G] window; the plan reduces the [S, L, P] one
+    # and logs the gate's reduction instead of reducing the GPU window again.
+    # No physical or logical window sum is reduced on the step_peak path.
+    shapes = []
+    manager, plans = _planning_step_peak_manager(monkeypatch, reduced_shapes=shapes)
+    _prefill_step(manager, [0, 1])
+    _prefill_step(manager, [2, 3])
+    assert len(plans) == 1
+    assert shapes == [(2, 1, 2), (2, 1, 4)]
+    # Alternating hotspots are paired so every step loads both GPUs.
+    p2l = plans[0].new_meta.physical_to_logical_map
+    assert all(len(pair & {0, 1}) == 1 for pair in _gpu_pairs(p2l))
+
+
+def test_step_peak_statistics_are_freed_before_migrating(monkeypatch):
+    import gc
+    import weakref
+
+    manager, _ = _planning_step_peak_manager(monkeypatch, reduced_shapes=[])
+    monitor = manager.monitor
+    refs = []
+    for name in ("dump_global_step_load", "dump_global_step_gpu_load"):
+        dump = getattr(monitor, name)
+
+        def _tracked(dump=dump):
+            out = dump()
+            refs.append(weakref.ref(out))
+            return out
+
+        monkeypatch.setattr(monitor, name, _tracked)
+    alive_at_first_yield = []
+
+    def _migrate(plan):
+        gc.collect()
+        alive_at_first_yield.extend(r() is not None for r in refs)
+        yield
+
+    manager._migrate = _migrate
+    _prefill_step(manager, [0, 1])
+    _prefill_step(manager, [2, 3])
+    assert len(refs) == 2 and alive_at_first_yield == [False, False]
+
+
+def test_step_window_commits_group_prefill_steps_only():
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=3)
+    monitor.track_step_load = True
+    monitor.initialize(
+        num_layers=1, num_physical=4, device=torch.device("cpu"), num_gpus=2
+    )
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=100,
+        rebalance_min_balancedness=0.0,
+        rebalance_balancedness_agg="min",
+        placement_policy="step_peak",
+    )
+    manager._dp_is_migration_group = True
+    for hot, local, group in (
+        ([0], True, True),
+        ([1], False, True),
+        ([2], True, False),
+    ):
+        monitor.on_forward_start()
+        topk = torch.tensor([hot[0]] * 10, dtype=torch.int32).view(-1, 1)
+        monitor.record(layer_id=0, topk_physical=topk, num_physical=4)
+        manager.on_forward_pass_end(local, group, local_step_load=local)
+    # Step 1 is this rank's; step 2 is the group's but not this rank's (a zero
+    # row keeps the slots aligned with the peers'); step 3 is no group prefill.
+    window = monitor._step_load_window
+    assert monitor._step_filled == 2
+    assert window[0, 0].tolist() == [10, 0, 0, 0]
+    assert window[1, 0].tolist() == [0, 0, 0, 0]
+
+
+def test_manual_rebalance_after_stop_follows_new_hotspots(monkeypatch):
+    # Reach the limit, then the hotspots move and refill the window. With the
+    # DP group as the migration group the window keeps following traffic at no
+    # collective cost, so a manual rebalance plans on the new hotspots.
+    shapes = []
+    manager, plans = _planning_step_peak_manager(
+        monkeypatch, reduced_shapes=shapes, max_rebalances=1
+    )
+    _prefill_step(manager, [0, 1])
+    _prefill_step(manager, [2, 3])
+    _prefill_step(manager, [0, 1])  # runs the migration's chunk: the stop latches
+    assert len(plans) == 1 and manager.rebalancing_stopped
+    del shapes[:]
+    _prefill_step(manager, [0, 2])  # new hotspots: A with C, then B with D
+    _prefill_step(manager, [1, 3])
+    assert shapes == []  # following the window after the stop costs nothing
+    manager.trigger_offline_rebalance(reason="test")
+    assert len(plans) == 2
+    assert all(
+        len(pair & {0, 2}) == 1
+        for pair in _gpu_pairs(plans[1].new_meta.physical_to_logical_map)
+    )
+
+
+def test_manual_rebalance_refuses_a_frozen_step_window(monkeypatch, caplog):
+    # Without the DP sync's flag, following the window after the stop would
+    # need a per-step collective: it freezes instead, and a manual rebalance
+    # says so rather than planning on the old hotspots.
+    shapes = []
+    manager, plans = _planning_step_peak_manager(
+        monkeypatch, reduced_shapes=shapes, max_rebalances=1
+    )
+    _prefill_step(manager, [0, 1])
+    _prefill_step(manager, [2, 3])
+    _prefill_step(manager, [0, 1])  # runs the migration's chunk: the stop latches
+    assert manager.rebalancing_stopped
+    manager._dp_is_migration_group = False
+    del shapes[:]
+    _prefill_step(manager, [0, 2], dp_flag=None)
+    assert shapes == []  # still no per-step collective once stopped
+    with caplog.at_level("WARNING", logger="atom"):
+        manager.trigger_offline_rebalance(reason="test")
+    assert len(plans) == 1 and shapes == []
+    assert "would plan on old hotspots" in caplog.text
