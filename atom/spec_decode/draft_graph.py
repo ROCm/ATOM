@@ -199,12 +199,13 @@ class DraftGraph:
         return self._view(role, bs)
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
-        """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
+        """Copy ``src`` into its fixed buffer, tail-repeating its last real sequence.
 
-        Every input repeats the same last index, so a pad row is a coherent copy
-        of the last real one and only redoes work that row already does. Zeros
-        instead faulted 8/8 ranks at the first padded decode step, and repeating
-        one input alone -- an incoherent mix -- faulted too.
+        That sequence is the last row, or the last column of a ``batch_last``
+        input. Every input repeats the same last sequence, so a pad sequence is a
+        coherent copy of the last real one and only redoes work it already does.
+        Zeros instead faulted 8/8 ranks at the first padded decode step, and
+        repeating one input alone -- an incoherent mix -- faulted too.
 
         ``src=None`` hands back the view unwritten: warmup wants a well-formed
         batch, not a particular one.
