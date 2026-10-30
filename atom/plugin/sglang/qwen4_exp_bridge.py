@@ -1205,7 +1205,9 @@ def build_qsa_metadata(
     # Only eager unpacked extends reach here (packed draft steps returned
     # above), so this covers the target prefill and the drafter's prefill
     # extend over the same tokens; both have one KV head per rank.
-    if not packed_step and envs.ATOM_QSA_FLYDSL_ATTN:
+    if not packed_step and _flydsl_layout_needed(
+        forward_batch, compress_ratio, indexer_budget
+    ):
         host_lens, context_slots = _flydsl_prefill_layout(
             forward_batch, live_bs, num_tokens, block_tables, block_size
         )
@@ -1221,6 +1223,29 @@ def build_qsa_metadata(
         context_slots=context_slots,
     )
     return qsa
+
+
+def _flydsl_layout_needed(
+    forward_batch: Any, compress_ratio: int, indexer_budget: int
+) -> bool:
+    """Whether this forward's QSA layers can take the FlyDSL attention, so
+    its host layout is worth building. Mirrors the forward-invariant
+    fallbacks of `Qwen4ExpAttention._flydsl_attention` (flag, GPU arch, BF16
+    KV, compression ratio 4 with a supported budget). The per-call and
+    per-layer ones (selection byte span, graph capture, head shape) stay with
+    the layer. An FP8 SGLang KV pool binds no scale planes, so the layer
+    cannot detect it; without host lengths it keeps the native kernel."""
+    if not envs.ATOM_QSA_FLYDSL_ATTN:
+        return False
+    # Imported here: the flag-off path keeps the bridge free of the layer module.
+    from atom.model_ops.qwen4_exp import qsa_attention
+
+    if compress_ratio != 4 or indexer_budget + 3 not in qsa_attention._FLYDSL_WIDTHS:
+        return False
+    kv_dtype = getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None)
+    if kv_dtype is not None and kv_dtype != torch.bfloat16:
+        return False
+    return qsa_attention._flydsl_arch_supported()
 
 
 def _flydsl_prefill_layout(

@@ -13,6 +13,7 @@ from atom.plugin.sglang.qwen4_exp_bridge import (
     _NO_WRITE,
     _eager_qsa_max_seq_len,
     _fill_block_tables_into,
+    _flydsl_layout_needed,
     _flydsl_prefill_layout,
     _lift_qsa_seq_lens,
     _ple_state_pool_slots,
@@ -1388,3 +1389,32 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
     extends, seqs, live_bs, num_tokens
 ):
     assert _flydsl_layout(extends, seqs, live_bs, num_tokens) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "flag,arch,kv_dtype,ratio,budget,needed",
+    [
+        ("1", True, torch.bfloat16, 4, 2048, True),
+        ("1", True, None, 4, 4096, True),  # pool without a dtype: let the layer decide
+        ("0", True, torch.bfloat16, 4, 2048, False),  # flag off
+        ("1", False, torch.bfloat16, 4, 2048, False),  # not gfx942
+        ("1", True, torch.float8_e4m3fn, 4, 2048, False),  # FP8 KV pool
+        ("1", True, torch.bfloat16, 8, 2048, False),  # compression ratio
+        ("1", True, torch.bfloat16, 4, 1536, False),  # budget the kernel lacks
+    ],
+)
+def test_flydsl_layout_built_only_when_the_kernel_can_run(
+    monkeypatch, flag, arch, kv_dtype, ratio, budget, needed
+):
+    """The FlyDSL host layout (host lengths, and an H2D of the context rows
+    when prefixed) is only worth building when a QSA layer can take the
+    kernel; otherwise every prefill would pay for it and fall back."""
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", flag)
+    if flag == "1":
+        qsa_attention = pytest.importorskip(
+            "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
+        )
+        monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: arch)
+    pool = SimpleNamespace() if kv_dtype is None else SimpleNamespace(dtype=kv_dtype)
+    batch = SimpleNamespace(token_to_kv_pool=pool)
+    assert _flydsl_layout_needed(batch, ratio, budget) is needed
