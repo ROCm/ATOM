@@ -32,7 +32,7 @@ It is NOT about mixing prefill+decode in one forward. It DOES preserve cross-DP
 phase alignment: it only releases when every rank is prefill-ready (so all ranks
 enter prefill together and the MoE collective stays aligned), except when a
 must-fire bound forces release regardless, the group's work stops changing
-(stall), or the opt-in cost gate measures that waiting longer no longer pays
+(stall), or the cost gate measures that waiting longer no longer pays
 off. Pending-token probes are capped per rank, so a flat pending sum alone is
 not "no more work": the stall count also restarts when a rank becomes (or stops
 being) prefillable or a request arrives anywhere in the group. Nor does stall
@@ -77,12 +77,14 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   # -- alignment gate: hold while some rank lacks prefill and could take
   #    some (anti-skew); a blocked rank waits on its own decode, not on us --
   if n_prefillable + n_blocked < dp_size:
-      if n_unreachable > 0 and stall >= stall_ticks: FIRE
-      stall_us = G_running_dec * max(rank cost) * t_prefill  # unaligned release
-      if cost_gate and (arrival rate on ranks without prefill * stall_us
-                        < G_waiting or hold_cost >= stall_us):
+      if n_unreachable > 0:  # waiting may not align the group in time
+          if stall >= stall_ticks:                FIRE
+          stall_us = G_running_dec * max(rank cost) * t_prefill  # unaligned
+          if cost_gate and (arrival rate on ranks without prefill * stall_us
+                            < G_waiting or hold_cost >= stall_us):
                                                   FIRE   # wait can't pay off
-      hold_cost += G_waiting * t_decode;          HOLD
+          hold_cost += G_waiting * t_decode
+      HOLD
   # -- goal: fire once the aggregate fills a worthwhile forward --
   fill = G_pending / (n_prefillable * budget)
   if fill >= target_fill:                         FIRE
@@ -294,10 +296,9 @@ class PrefillDelayer:
         #   of the two means), request arrivals per 1000 s on ranks without
         #   prefill
         self._cost_slots = dp_size if exchange_prefill_costs else 0
-        # The cost gate is opt-in (ATOM_PREFILL_DELAYER_COST_GATE): at 8k/1k
-        # c128 DPA its measured releases still fragmented prefills (2578 vs
-        # 2810 tok/s without it), so it stays for workloads that want TTFT
-        # traded against unaligned prefill steps.
+        # The cost gate judges only a wait for a rank that cannot align in
+        # time (n_unreachable): at 8k/1k c128 DPA its releases for stragglers
+        # about to complete a decode fragmented prefills (2578 vs 2810 tok/s).
         self._cost_gate = cost_gate and exchange_prefill_costs
         # The DP group is stateless (no default process group): ask it directly.
         self._rank = (
@@ -643,12 +644,13 @@ class PrefillDelayer:
         # admittable, so it keeps its peers company with a dummy prefill, as an
         # idle rank does once released.
         if n_prefillable + n_blocked < self.dp_size:
-            if stalled and n_unreachable > 0:
-                return self._fire("stall", g_pending)
-            if self._cost_gate and self._alignment_wait_paid(
-                _Gate(*reduced[self._gate_at :]), g_running_dec
-            ):
-                return self._fire("cost", g_pending)
+            if n_unreachable > 0:
+                if stalled:
+                    return self._fire("stall", g_pending)
+                if self._cost_gate and self._alignment_wait_paid(
+                    _Gate(*reduced[self._gate_at :]), g_running_dec
+                ):
+                    return self._fire("cost", g_pending)
             return self._hold(g_pending)
 
         # ---- goal: fire once the aggregate fills a worthwhile forward ----

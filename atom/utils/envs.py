@@ -1112,12 +1112,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
         os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
     ),
-    # Opt-in. With DP prefill cost balancing: also release while some DP rank has no
-    # prefill when the work expected to reach that rank in a held decode step
-    # can't pay for the requests it delays, or once they have waited as long
-    # as the decode stall of one unaligned prefill step.
+    # With DP prefill cost balancing: also release while some DP rank has no
+    # prefill and cannot align within the TTFT bound when the work expected
+    # to reach that rank in a held decode step can't pay for the requests it
+    # delays, or once they have waited as long as the decode stall of one
+    # unaligned prefill step.
     "ATOM_PREFILL_DELAYER_COST_GATE": lambda: (
-        os.getenv("ATOM_PREFILL_DELAYER_COST_GATE", "0").lower() in ("1", "true")
+        os.getenv("ATOM_PREFILL_DELAYER_COST_GATE", "1").lower() in ("1", "true")
     ),
     # KV high watermark: at/above this KV usage a prefillable rank force-releases
     # (can't accumulate a bigger batch anyway).

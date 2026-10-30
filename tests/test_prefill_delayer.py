@@ -447,8 +447,8 @@ WAITING, DECODE_US, PREFILL_PS, TIMED, ARRIVALS = range(
 )
 # The sibling decodes 1 seq with no prefill; it timed a 10 ms decode step and
 # 100 ps a cost unit. Firing stalls 2 decodes for 3e8 x 100 ps = 30 ms: 60 ms
-# of decode stall.
-TIMED_SIBLING = {2: 1, DECODE_US: 10_000, PREFILL_PS: 100, TIMED: 1}
+# of decode stall. Its decode does not complete within the TTFT bound.
+TIMED_SIBLING = {2: 1, DECODE_US: 10_000, PREFILL_PS: 100, TIMED: 1, UNREACHABLE: 1}
 
 
 def lone_request(d, reduce):
@@ -497,6 +497,17 @@ class TestCostGate:
             assert lone_request(d, mixed) is False
         assert lone_request(d, mixed) is True
         assert d._stat_fire_cost == 1
+
+    def test_waits_for_a_sibling_completing_in_time(self):
+        # Same sibling, but its decode completes within the TTFT bound: its
+        # next request comes with that completion, so the gate does not judge.
+        d = make_gated()
+        skip_first(d)
+        reachable = {**TIMED_SIBLING, ARRIVALS: 10}
+        del reachable[UNREACHABLE]
+        for _ in range(20):
+            assert lone_request(d, _add_rank(reachable)) is False
+        assert d._stat_fire_cost == 0
 
     def test_untimed_holds_for_the_stall_bound(self):
         d = make_gated()
