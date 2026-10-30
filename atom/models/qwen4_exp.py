@@ -679,8 +679,12 @@ class _SequenceParallel:
         return nn.functional.pad(x, (0, 0, 0, self.pad)) if self.pad else x
 
     def shard(self, x: torch.Tensor) -> torch.Tensor:
-        """Replicated `[T, ...]` -> this rank's rows (a view when unpadded)."""
-        return self._padded(x)[self.start : self.start + self.chunk]
+        """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
+
+        Only the local rows are padded, never the whole replicated tensor."""
+        rows = x[self.start : self.start + self.chunk]
+        missing = self.chunk - rows.shape[0]
+        return nn.functional.pad(rows, (0, 0, 0, missing)) if missing else rows
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
