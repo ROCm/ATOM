@@ -21,6 +21,7 @@ import importlib
 import importlib.util
 import sys
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -437,7 +438,12 @@ class TestFlyDSLPastGluonRouting:
     per-token KV scales and raises at capture.
     """
 
-    QWEN35 = dict(num_heads=8, num_kv_heads=1, head_dim=256, use_triton_attn=True)
+    QWEN35: ClassVar[dict] = {
+        "num_heads": 8,
+        "num_kv_heads": 1,
+        "head_dim": 256,
+        "use_triton_attn": True,
+    }
 
     @pytest.mark.parametrize("max_qlen", [5, 6, 8])
     def test_qwen35_mtp5_takes_paged_with_flydsl(self, monkeypatch, max_qlen):
@@ -463,14 +469,14 @@ class TestFlyDSLPastGluonRouting:
     @pytest.mark.parametrize(
         "override",
         [
-            dict(block_size=256),
-            dict(block_size=1024),
-            dict(kv_cache_dtype="bf16"),
-            dict(sinks=object()),
-            dict(sliding_window=128),
-            dict(head_dim=192),
-            dict(use_flash_layout=True),
-            dict(flydsl_arch=False),
+            {"block_size": 256},
+            {"block_size": 1024},
+            {"kv_cache_dtype": "bf16"},
+            {"sinks": object()},
+            {"sliding_window": 128},
+            {"head_dim": 192},
+            {"use_flash_layout": True},
+            {"flydsl_arch": False},
         ],
     )
     def test_non_flydsl_configs_still_unified(self, monkeypatch, override):
