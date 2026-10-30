@@ -3719,6 +3719,7 @@ class FusedMoE(torch.nn.Module):
             renormalize,
             self.num_fused_shared_experts,
             shared_expert_scoring_func,
+            cu_masked=atom_config.enable_rapidserve and atom_config.disagg_constrained,
         )
         self.e_score_correction_bias = e_score_correction_bias
         if atom_config.fake_eplb and e_score_correction_bias is not None:

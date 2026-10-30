@@ -636,6 +636,7 @@ def test_launches_only_compare_the_row_count(switch, kernel, monkeypatch):
     for module, name in (
         (topk_softmax_dispatch, "_cu_num"),
         (topk_softmax_dispatch, "_gfx"),
+        (topk_softmax_dispatch, "_masked_cu_fraction"),
         (topk_softmax_dispatch, "triton_topk_softmax_max_rows"),
         (topk_softmax_dispatch, "triton_topk_softmax_supported"),
         (topk_softmax_dispatch, "triton_topk_softmax_rows"),
@@ -673,3 +674,62 @@ def test_launches_only_compare_the_row_count(switch, kernel, monkeypatch):
     torch.cuda.synchronize()
     assert used == [kernel] * 6
     assert calls == []
+
+
+@pytest.mark.parametrize("fractions", [None, [0.75], [0.3, 0.5]])
+def test_cu_masked_cutoff_counts_the_fewest_cus_a_stream_gets(fractions, monkeypatch):
+    """RapidServe's prefill stream for fraction f gets CUs [0, f * total), its
+    decode stream the rest; the masked cutoff counts the smaller of all."""
+    from atom.model_engine.model_runner import RapidServeModelRunner as Runner
+
+    if fractions is not None:
+        monkeypatch.setattr(Runner, "_CU_POOL_FRACTIONS", fractions)
+    cus = min(
+        sum(word.bit_count() for word in Runner._cu_mask_for_fraction(f, upper))
+        for f in Runner._CU_POOL_FRACTIONS
+        for upper in (False, True)
+    )
+    total = torch.cuda.get_device_properties(0).multi_processor_count
+    assert round(total * topk_softmax_dispatch._masked_cu_fraction()) == cus
+
+
+@pytest.mark.parametrize(
+    "rapidserve,constrained",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_layers_count_masked_cus_only_on_cu_masked_streams(
+    rapidserve, constrained, monkeypatch
+):
+    """Only `--enable-rapidserve --disagg-constrained` runs layers on CU-masked
+    streams. The layer's decision is all this builds: it stops there."""
+    from conftest import atom_config_double
+
+    from atom import config
+    from atom.model_ops import moe
+
+    class Decided(Exception):
+        pass
+
+    def decided(*args, cu_masked):
+        raise Decided(cu_masked)
+
+    cfg = atom_config_double(
+        enable_rapidserve=rapidserve,
+        disagg_constrained=constrained,
+        torch_dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(config, "_current_atom_config", cfg)
+    monkeypatch.setattr(moe, "triton_topk_softmax_rows", decided)
+    with pytest.raises(Decided) as e:
+        moe.FusedMoE(
+            num_experts=128,
+            top_k=8,
+            hidden_size=256,
+            intermediate_size=256,
+            quant_config=config.QuantizationConfig(),
+            tp_size=1,
+            ep_size=1,
+            dp_size=1,
+            prefix=f"cu_masked_{rapidserve}_{constrained}.experts",
+        )
+    assert e.value.args == (rapidserve and constrained,)

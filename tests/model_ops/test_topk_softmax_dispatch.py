@@ -8,8 +8,9 @@ skips on a GPU-less runner. These pin the choice itself, which a MoE layer
 makes once when it is built (`triton_topk_softmax_rows`): the Triton kernel
 takes exactly the shapes AITER's fused `topkGatingSoftmax` handles (its
 dispatch stops at 512 experts), only in launches of up to 20 rows per CU on
-MI355X (gfx950; other architectures, not measured, stay on AITER), and only
-with the switch on when the layer is built.
+MI355X (gfx950; other architectures, not measured, stay on AITER), counting
+only a CU-masked stream's CUs when the layer may run on one, and only with
+the switch on when the layer is built.
 """
 
 import pytest
@@ -91,6 +92,20 @@ def test_row_cutoff_scales_with_the_cu_count(cu_num):
     assert triton_topk_softmax_max_rows() == 640
 
 
+@pytest.mark.parametrize(
+    "fraction,cus,max_rows", [(0.5, 256, 2560), (0.25, 256, 1280), (0.5, 80, 800)]
+)
+def test_cu_masked_cutoff_counts_the_streams_cus(
+    fraction, cus, max_rows, cu_num, monkeypatch
+):
+    """On a CU-masked stream a launch only gets the stream's CUs, and the
+    crossover is per CU it gets."""
+    monkeypatch.setattr(topk_softmax_dispatch, "_masked_cu_fraction", lambda: fraction)
+    cu_num(cus)
+    assert triton_topk_softmax_max_rows(cu_masked=True) == max_rows
+    assert triton_topk_softmax_max_rows() == 20 * cus
+
+
 # The softmax top-k shapes of the models that route through it: Qwen3.8 /
 # Qwen3.5-397B / Qwen3-Next (512 / top-10, a fused shared expert or not),
 # Qwen3.5-35B (256 / top-8 + shared), Qwen3 MoE (128 / top-8), gpt-oss-120b /
@@ -132,6 +147,22 @@ def test_model_layers_take_triton_up_to_the_cutoff(
     cu_num(cus)
     scoring_func = "sigmoid" if shared else None
     assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) == max_rows
+
+
+@pytest.mark.parametrize("arch,max_rows", [("gfx950", 2560), ("gfx942", None)])
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_cu_masked_model_layers_take_triton_up_to_half_the_cutoff(
+    experts, k, shared, arch, max_rows, gfx, monkeypatch
+):
+    """RapidServe's `--disagg-constrained` streams get half of MI355X's CUs."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    monkeypatch.setattr(topk_softmax_dispatch, "_masked_cu_fraction", lambda: 0.5)
+    gfx(arch)
+    scoring_func = "sigmoid" if shared else None
+    rows = triton_topk_softmax_rows(
+        experts, k, True, shared, scoring_func, cu_masked=True
+    )
+    assert rows == max_rows
 
 
 @pytest.mark.parametrize(
@@ -197,6 +228,15 @@ def test_decides_once_from_the_switch_and_the_gpu(monkeypatch):
     max_rows = triton_topk_softmax_rows(512, 10, True, 1, "sigmoid")
     assert max_rows == MI355X_MAX_ROWS
     assert reads == ["ATOM_TRITON_TOPK_SOFTMAX", "gfx", "cu"]
+    reads.clear()
+    monkeypatch.setattr(
+        topk_softmax_dispatch,
+        "_masked_cu_fraction",
+        lambda: reads.append("mask") or 0.5,
+    )
+    max_rows = triton_topk_softmax_rows(512, 10, True, 1, "sigmoid", cu_masked=True)
+    assert max_rows == MI355X_MAX_ROWS // 2
+    assert reads == ["ATOM_TRITON_TOPK_SOFTMAX", "gfx", "cu", "mask"]
     # The switch off: no GPU query needed.
     reads.clear()
     monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0")

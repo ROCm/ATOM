@@ -19,6 +19,11 @@ from atom.utils import envs
 # top-10 + a shared expert), and AITER past it; 20 keeps Triton only where it
 # is faster for all. An architecture without an entry has not been measured
 # and keeps every launch on AITER.
+#
+# The count is per CU the launch can use. On RapidServe's CU-masked streams
+# (half of MI355X's CUs) the two are about even at 22-24 rows per CU and
+# Triton is slower from 26 (30 for 512 / top-10 + a shared expert), by up to
+# 36% at 40; at 20 it is 10-24% faster for all of the shapes above.
 TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
 
 
@@ -34,11 +39,25 @@ def _cu_num() -> int:
     return get_cu_num()
 
 
-def triton_topk_softmax_max_rows() -> int | None:
+def _masked_cu_fraction() -> float:
+    from atom.model_engine.model_runner import RapidServeModelRunner
+
+    # A prefill stream gets fraction f of the CUs, its decode stream the rest.
+    return min(min(f, 1 - f) for f in RapidServeModelRunner._CU_POOL_FRACTIONS)
+
+
+def triton_topk_softmax_max_rows(cu_masked: bool = False) -> int | None:
     """The most rows a launch can have and still take the Triton kernel on
-    this GPU; None where the crossover has not been measured."""
+    this GPU; None where the crossover has not been measured. `cu_masked`:
+    launches may run on RapidServe's CU-masked streams, so the cutoff is
+    counted on the fewest CUs such a stream gets."""
     per_cu = TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU.get(_gfx())
-    return None if per_cu is None else per_cu * _cu_num()
+    if per_cu is None:
+        return None
+    cus = _cu_num()
+    if cu_masked:
+        cus = round(cus * _masked_cu_fraction())
+    return per_cu * cus
 
 
 def triton_topk_softmax_supported(
@@ -70,20 +89,24 @@ def triton_topk_softmax_rows(
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
+    cu_masked: bool = False,
 ) -> int | None:
     """For a layer's softmax top-k routing (`rocm_aiter_topk_softmax_impl`'s
     arguments, `num_experts` routed ones), the most rows a launch can have
     and still run `triton_topk_softmax` rather than AITER's `topk_softmax`;
     None if none can: `ATOM_TRITON_TOPK_SOFTMAX=0`, a shape the Triton
-    kernel does not take, or a GPU without a measured cutoff. Called once, when the layer is built, so changing
-    the switch later does not move the layer.
+    kernel does not take, or a GPU without a measured cutoff. `cu_masked`:
+    the layer may run on RapidServe's CU-masked streams
+    (`--disagg-constrained`). Called once, when the layer is built, so
+    changing the switch later does not move the layer.
 
     Only the row count is left to each launch, never whether the stream is
-    capturing, so a pass of a given size runs the same kernel eager or
-    replayed. On MI355X the cutoff (5120 rows) is above every default CUDA
-    graph (decode: 512 sequences x 4 tokens with MTP 3; prefill token graphs:
-    3072 tokens), so replayed passes all run Triton; a long eager prefill runs
-    AITER, which the Triton kernel matches bit for bit."""
+    capturing or CU-masked, so a pass of a given size runs the same kernel
+    eager or replayed, on any stream. On MI355X the cutoff (5120 rows; 2560
+    with `cu_masked`) is above every default decode CUDA graph (512 sequences
+    x 4 tokens with MTP 3), and without `cu_masked` above the prefill token
+    graphs (3072 tokens), so those replays all run Triton; a long eager
+    prefill runs AITER, which the Triton kernel matches bit for bit."""
     # The kernels score the shared columns only given a scoring func.
     if fused_shared_experts_scoring_func is None:
         num_shared, scoring_func = 0, ""
@@ -97,4 +120,4 @@ def triton_topk_softmax_rows(
         )
     ):
         return None
-    return triton_topk_softmax_max_rows()
+    return triton_topk_softmax_max_rows(cu_masked)
