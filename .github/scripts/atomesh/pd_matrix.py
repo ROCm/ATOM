@@ -405,6 +405,7 @@ def build_cell(
         raise ValueError("eval_only requires run_eval=true")
     if eval_only and accuracy_cfg.get("task", "gsm8k") not in {
         "gsm8k",
+        "aime24",
         "swebench_lite",
     }:
         raise ValueError("eval_only requires a supported accuracy task")

@@ -865,6 +865,11 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             index_fp4=builder.model_runner.config.index_cache_dtype == "fp4",
             sparse_nvfp4=envs.ATOM_M3_SPARSE_KV_NVFP4,
             sparse_mxfp4=envs.ATOM_M3_SPARSE_KV_MXFP4,
+            computing_index_layers={
+                layer
+                for layer in _sparse_attention_layer_ids(self.config)
+                if not _should_skip_minimax_m3_index_topk(self.config, layer)[0]
+            },
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

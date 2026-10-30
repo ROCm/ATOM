@@ -1355,7 +1355,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_index_cache_dtype = (
             self.index_cache_dtype
             if self.index_cache_dtype in ("fp8", "mxfp4")
-            and not (self.skip_index_topk and self.kv_mxfp4)  # no index branch
+            and not (
+                self.skip_index_topk and (self.kv_mxfp4 or self.kv_nvfp4)
+            )  # no index branch
             else "auto"
         )
         index_fp4 = self.index_scale is not None
@@ -1384,11 +1386,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             fused_index_cache = self.index_cache
             fused_index_slot_mapping = slot_mapping
 
-        if self.skip_index_topk and not self.kv_mxfp4:
-            if self.kv_nvfp4:
-                raise NotImplementedError(
-                    "ATOM_M3_SPARSE_KV_NVFP4 does not cover top-k-reusing layers"
-                )
+        if self.skip_index_topk and not (self.kv_mxfp4 or self.kv_nvfp4):
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
                 triton_fused_norm_rope_cache,
             )

@@ -17,6 +17,7 @@ def configure_m3_kv_transfer_tensors(
     index_fp4: bool,
     sparse_nvfp4: bool,
     sparse_mxfp4: bool = False,
+    computing_index_layers: set[int] | None = None,
 ) -> None:
     """Publish field-major/global-layer pages, retaining the backend's byte views.
 
@@ -36,14 +37,22 @@ def configure_m3_kv_transfer_tensors(
     layers = list(range(num_layers))
     if not sparse_layers <= set(layers):
         raise ValueError("MiniMax-M3 sparse layers exceed the model's layer range")
-    indexed = sorted(sparse_layers)
+    if computing_index_layers is None:
+        computing_index_layers = sparse_layers
+    if not computing_index_layers <= sparse_layers:
+        raise ValueError("MiniMax-M3 index rows must belong to sparse layers")
+    indexed = sorted(computing_index_layers)
     if sparse_nvfp4 and sparse_mxfp4:
         raise ValueError("MiniMax-M3 sparse KV formats are mutually exclusive")
     scale_layers = [
-        layer for layer in layers
+        layer
+        for layer in layers
         if (layer not in sparse_layers and dtype.itemsize == 1)
-        or (layer in sparse_layers and not sparse_mxfp4
-            and (dtype.itemsize == 1 or sparse_nvfp4))
+        or (
+            layer in sparse_layers
+            and not sparse_mxfp4
+            and (dtype.itemsize == 1 or sparse_nvfp4)
+        )
     ]
     fields = (
         ("k", layers),
@@ -77,7 +86,8 @@ def configure_m3_kv_transfer_tensors(
         for layer in held:
             expected_format = (
                 ("mxfp4" if sparse_mxfp4 else "nvfp4" if sparse_nvfp4 else "")
-                if layer in sparse_layers else ""
+                if layer in sparse_layers
+                else ""
             )
             if pool.kv_format != expected_format:
                 raise ValueError(f"MiniMax-M3 layer {layer} has unexpected KV format")
@@ -94,7 +104,8 @@ def configure_m3_kv_transfer_tensors(
                         # and the draft use smaller page-16 SHUFFLE head runs.
                         page_tokens = (
                             ASM_PAGE_SIZE
-                            if layer in sparse_layers and pool.kv_format not in ("nvfp4", "mxfp4")
+                            if layer in sparse_layers
+                            and pool.kv_format not in ("nvfp4", "mxfp4")
                             else pool.block_size
                         )
                         if page_tokens <= 0 or block_size % page_tokens:
@@ -110,8 +121,10 @@ def configure_m3_kv_transfer_tensors(
                     )
     if len(set(local_layers)) != len(local_layers):
         raise ValueError("MiniMax-M3 layers cannot occupy multiple KV pools")
-    if set(index_layers) != set(local_layers) & sparse_layers:
-        raise ValueError("MiniMax-M3 index rows do not match the local sparse layers")
+    if set(index_layers) != set(local_layers) & computing_index_layers:
+        raise ValueError(
+            "MiniMax-M3 index rows do not match the local computing layers"
+        )
 
     pages = {}
     for page, (native_role, layer, field, runs) in zip(

@@ -272,6 +272,21 @@ def _stable_hf_geometry(hf: object) -> dict[str, Any]:
                 for index, ratio in enumerate(value)
             ]
         geometry[name] = _stable_config_value(value)
+    if _is_minimax_m3(hf):
+        text = getattr(hf, "text_config", hf)
+        geometry["m3_index_rows"] = {
+            "layout": "compute-only-v1",
+            **{
+                name: _stable_config_value(getattr(text, name, None))
+                for name in (
+                    "sparse_attention_config",
+                    "use_index_cache",
+                    "index_topk_freq",
+                    "index_topk_pattern",
+                    "index_skip_topk_offset",
+                )
+            },
+        }
     return geometry
 
 

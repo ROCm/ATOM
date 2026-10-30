@@ -578,7 +578,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         head counts in one block-id space, and each needs its own pool.
         """
         kinds = []
-        if _is_indexed_sparse_attention(module):
+        if _is_indexed_sparse_attention(module) and not module.impl.skip_index_topk:
             kinds.append(INDEX_ROWS)
         if (
             hasattr(module, "base_attention")
@@ -675,7 +675,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         tensor` asks for.
         """
         spec = self._index_cache_spec()
-        if spec is None:
+        if spec is None or spec.rows == 0:
             return ()
         if spec.mxfp4:
             from atom.model_ops.minimax_m3.kv_mxfp4 import HEAD_DIM, PAGE_BYTES
@@ -781,6 +781,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         was.
         """
         self.kv_pools = self._declare_kv_pools()
+        spec = self._index_cache_spec()
+        if spec is not None:
+            sparse_layers = {
+                module
+                for rows in self.pool_rows.values()
+                for module in rows
+                if _is_indexed_sparse_attention(module)
+            }
+            logger.info(
+                "MiniMax-M3 index cache: %d/%d sparse layers own rows (%s)",
+                spec.rows,
+                len(sparse_layers),
+                "mxfp4" if spec.mxfp4 else "fp4" if spec.fp4 else str(spec.dtype),
+            )
         pools = list(self.kv_pools.values())
         regions = carve(buf, [pool.pool_bytes(blocks) for pool in pools])
         for pool, region in zip(pools, regions):
@@ -824,7 +838,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         from atom.config import KVCacheTensor
 
-        if _is_indexed_sparse_attention(module):
+        if _is_indexed_sparse_attention(module) and not module.impl.skip_index_topk:
             # MiniMax-M3 sparse attention. The KV cache uses the SAME allocation
             # and binding as standard MHA — we only additionally bind the separate
             # indexer-key cache here, then fall through to the standard branch for
@@ -833,7 +847,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # page-128 SHUFFLE; SparseMHAPagedAttentionImpl.rope_cache re-views it
             # to page-16 SHUFFLE (zero-copy) at attention time. index_cache is a
             # genuinely separate field (not derivable from the K/V ones), so
-            # each sparse layer has its own row in that second space. The pool
+            # each computing layer has its own row in that second space. The pool
             # was built at this backend's block, so its slice already is.
             runner = self.model_runner
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
@@ -863,6 +877,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 module.impl.index_cache = pool.field_view(
                     "index", row, spec.dtype, (-1, self.block_size, spec.dim)
                 )
+        if _is_indexed_sparse_attention(module):
+            # Reusing layers need the per-forward top-k memo but own no index K
+            # or scale plane. The model already resolved patterns and offsets
+            # into skip_index_topk; sizing, binding and exports share its rows.
+            runner = self.model_runner
             module.impl.max_model_len = runner.config.max_model_len
             module.impl.index_topk_cache_state = getattr(
                 runner, "_sparse_attention_topk_cache_state", None

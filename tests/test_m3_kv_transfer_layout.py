@@ -56,7 +56,12 @@ def _methods(path, cls_name, names):
 _annotate_model = _methods(
     "atom/models/minimax_m3/model.py",
     "MiniMaxM3SparseForCausalLM",
-    {"_sparse_attention_layer_ids", "configure_kv_transfer_tensors"},
+    {
+        "_sparse_attention_layer_ids",
+        "_sparse_attention_layer_ordinals",
+        "_should_skip_minimax_m3_index_topk",
+        "configure_kv_transfer_tensors",
+    },
 )["configure_kv_transfer_tensors"]
 _export_backend = _methods(
     "atom/model_ops/attentions/aiter_attention.py",
