@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import dataclasses
 import logging
 import pickle
 import queue
@@ -500,6 +501,16 @@ class EngineCore:
             self.kv_transfer_enabled
             and scheduled_batch.connector_meta_output is not None
         ):
+            # A load may target a block whose zero rides this batch
+            # (ATOM_ZERO_EVICTED_BLOCKS). Loads are ordered after the compute
+            # stream at `start_load_kv`, so zero first, then dispatch, and
+            # drop the ids so `build()` does not zero the loaded bytes again.
+            ops = scheduled_batch.state_maintenance_ops
+            if ops.zero_units:
+                self.runner_mgr.call_func("zero_page_units", ops.zero_units)
+                scheduled_batch.state_maintenance_ops = dataclasses.replace(
+                    ops, zero_units=()
+                )
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
             )

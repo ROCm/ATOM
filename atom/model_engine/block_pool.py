@@ -64,6 +64,22 @@ class BlockPool:
     queue on release. New content remains probationary until claimed, so a
     stream of one-off prefixes cannot evict the whole hot set. Vacant blocks
     still go first; referenced blocks are never candidates in either policy.
+
+    ``null_block`` keeps block 0 out of circulation for the life of the pool.
+    Paged-attention kernels send every masked or out-of-context page of a
+    tile to physical block 0 (FlyDSL ``op_lds``, gluon's masked page-id load,
+    and the zero padding of ``block_tables``), so block 0 has to stay the
+    all-zero page the pool was allocated as. Handing it out lets one write
+    reach the masked lanes of every sequence in the batch.
+
+    ``scrub_released`` queues every raw unit `release_units` returns, in
+    release order and *before* the id reaches the free list, for the runner to
+    zero (`take_released_units`). A raw unit held a state checkpoint image,
+    whose bf16 bytes read as fp8 NaN patterns in the K/V/scale slots a KV
+    block's masked tail exposes; a KV block keeps finite KV when freed, so
+    plain `free` is not scrubbed. The queue rides the next built batch and is
+    executed first on the compute stream, so every later writer of the id --
+    which can only be in that batch or a later one -- is ordered after it.
     """
 
     def __init__(
@@ -74,6 +90,8 @@ class BlockPool:
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
         on_remap: Callable[[int], None] | None = None,
+        null_block: bool = False,
+        scrub_released: bool = False,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -92,6 +110,14 @@ class BlockPool:
         if not 0 <= num_blocks <= self.max_blocks:
             raise ValueError(f"{num_blocks} blocks outside 0..{self.max_blocks}")
         self.num_blocks: int = num_blocks
+        # First id the pool may hand out: 1 when block 0 is the null page.
+        self.first_block: int = 1 if null_block and num_blocks > 0 else 0
+        self.scrub_released: bool = scrub_released
+        # Raw units released since the last `take_released_units`, in order;
+        # the set mirrors the list for `cancel_scrub`.
+        self._unscrubbed: list[int] = []
+        self._unscrubbed_set: set[int] = set()
+        self.units_scrubbed: int = 0
         self._on_evict = on_evict
         # Called with a hash whose index entry moved to another block id
         # (republished elsewhere, `_adopt`): ids resolved before then are stale.
@@ -105,9 +131,9 @@ class BlockPool:
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
         # stale entries.
-        self._vacant: list[int] = list(range(num_blocks))
+        self._vacant: list[int] = list(range(self.first_block, num_blocks))
         self._cached: OrderedDict[int, None] = OrderedDict()
-        self._free: set[int] = set(range(num_blocks))
+        self._free: set[int] = set(range(self.first_block, num_blocks))
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
@@ -324,6 +350,8 @@ class BlockPool:
 
     def allocate(self, block_id: int) -> Block:
         """Take `block_id` for fresh content, evicting whatever it held."""
+        if block_id < self.first_block:
+            raise AssertionError(f"block {block_id} is the reserved null page")
         block = self.blocks[block_id]
         assert block.ref_count == 0
         if self._unindex(block_id):
@@ -417,7 +445,39 @@ class BlockPool:
                 )
         for block_id in ids:
             del self._raw_unit_owner[block_id]
+            if self.scrub_released and block_id not in self._unscrubbed_set:
+                # Queued before `free` makes the id poppable: whoever takes it
+                # next writes in the batch that carries this scrub, or later.
+                self._unscrubbed.append(block_id)
+                self._unscrubbed_set.add(block_id)
             self.free(block_id)
+
+    def take_released_units(self) -> tuple[int, ...]:
+        """Drain the raw units awaiting a zero, for the batch being built.
+
+        The caller must hand them to the runner in that batch, which zeroes
+        them before any other work of the batch touches the pool.
+        """
+        if not self._unscrubbed:
+            return ()
+        ids = tuple(self._unscrubbed)
+        self._unscrubbed = []
+        self._unscrubbed_set.clear()
+        self.units_scrubbed += len(ids)
+        return ids
+
+    def cancel_scrub(self, unit_ids: Iterable[int]) -> None:
+        """Drop queued zeros for units an out-of-band writer now owns.
+
+        An external state transfer writes its image into freshly reserved raw
+        units outside any batch; a zero queued before that write but executed
+        after it would wipe the image. Those units are overwritten anyway and
+        are scrubbed again when they are released.
+        """
+        drop = self._unscrubbed_set.intersection(unit_ids)
+        if drop:
+            self._unscrubbed_set.difference_update(drop)
+            self._unscrubbed = [b for b in self._unscrubbed if b not in drop]
 
     def rekey_units(
         self,
@@ -476,7 +536,7 @@ class BlockPool:
         request in the first place.
         """
         top = self.num_blocks - 1
-        if top < 0:
+        if top < self.first_block:
             return None
         # Raw units cannot move without updating their owning record.
         if top in self._raw_unit_owner:

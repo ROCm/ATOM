@@ -935,6 +935,11 @@ class GDNStateMixin(PoolRowsMixin):
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        # The copy above put slot 0's bytes into units 0..n-1, and block 0 is
+        # the null page every masked lane reads. Zero them back (this also
+        # compiles the zero kernel before the first request).
+        if envs.ATOM_ZERO_EVICTED_BLOCKS:
+            self.zero_page_units(list(range(spec.units_per_checkpoint)))
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
@@ -1760,6 +1765,28 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
         self._page_unit_region_cache = (key, regions)
         return regions
+
+    def zero_page_units(self, unit_ids) -> None:
+        """Zero K, V and both scales of every layer for these PAGE ids.
+
+        The full published unit (`mha_page_unit_regions`, the same bytes a
+        checkpoint image is copied over), in one launch on the current stream.
+        """
+        if not len(unit_ids):
+            return
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            UnitZeroer,
+        )
+
+        regions = self._page_unit_regions()
+        zeroer = getattr(self, "_unit_zeroer", None)
+        if zeroer is None or zeroer.regions is not regions:
+            zeroer = self._unit_zeroer = UnitZeroer(
+                regions,
+                int(self.model_runner.config.num_kvcache_blocks),
+                self._checkpoint_descriptor_device(),
+            )
+        zeroer.launch(unit_ids)
 
     def _page_unit_bases(self, unit_ids):
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (

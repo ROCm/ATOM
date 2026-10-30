@@ -3571,6 +3571,16 @@ class ModelRunner:
         return self.req_graph
 
     @torch.inference_mode()
+    def zero_page_units(self, unit_ids):
+        """Zero released state-checkpoint PAGE units ahead of a KV load.
+
+        `build()` does this for a batch's `zero_units`; the engine calls it
+        directly only when the batch also dispatches connector loads, which
+        must be ordered after the zero (see `EngineCore`).
+        """
+        self.attn_metadata_builder.zero_page_units(unit_ids)
+
+    @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
         """Dispatch KV connector metadata to initiate async KV loading."""
         if connector_meta_output is not None:
