@@ -77,6 +77,10 @@ def test_shard_gather_round_trip_drops_padding(ranks, world, tokens):
         start = rank * local.shape[0]
         real = max(0, min(local.shape[0], tokens - start))
         assert torch.equal(local[:real], full[start : start + real])
+        if real < local.shape[0]:
+            # Only the local rows are copied, not the whole padded tensor.
+            nbytes = local.untyped_storage().nbytes()
+            assert nbytes == local.numel() * local.element_size()
         assert not local[real:].any(), "padded rows must be zero"
         return sp.gather(local)
 
