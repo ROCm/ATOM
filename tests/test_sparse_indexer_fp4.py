@@ -557,7 +557,7 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
     end-to-end accuracy run can pass with this broken; the random planes here
     remove that cover.
     """
-    dsv2 = _import_or_skip("atom.models.deepseek_v2")
+    indexer_forward = _import_or_skip("atom.model_ops.indexer.indexer_forward")
 
     torch.manual_seed(0)
     block, world, src_pages = _BLOCK, 2, 4
@@ -585,14 +585,14 @@ def test_dcp_prefill_staging_keeps_every_key_with_its_own_exponent(monkeypatch):
         "correct swizzle from a missing one"
     )
     monkeypatch.setattr(
-        dsv2,
+        indexer_forward,
         "get_dcp_group",
         lambda: SimpleNamespace(
             all_gather=lambda t, dim: t.repeat(world, *([1] * (t.dim() - 1)))
         ),
     )
 
-    staged, staged_scale = dsv2._dcp_stage_indexer_fp4_prefill(
+    staged, staged_scale = indexer_forward._dcp_stage_indexer_fp4_prefill(
         data_src,
         scale_src,
         SimpleNamespace(

@@ -133,6 +133,7 @@ class EngineCore:
                 config.tp_world_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
+                on_worker_failure=self._send_engine_dead,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
@@ -434,11 +435,25 @@ class EngineCore:
                 if shutdown:
                     break
                 if self._is_idle_rl_weights_offloaded():
+                    # An RL rollout parks the weights for minutes. No forward
+                    # can run meanwhile, so the window must not be charged.
+                    self.scheduler.engine_stats.note_idle(now)
                     continue
                 if not self.scheduler.is_finished():
-                    self._process_engine_step()
-                elif self.has_pending_kv_work():
-                    self._advance_idle_kv_transfer()
+                    # Keyed on the forward, not on having requests:
+                    # `is_finished()` stays False through a deferred offload
+                    # save and while decode spins for PrefillDone, and no
+                    # forward runs in either. `now` was read before the
+                    # forward, so the forward's own time stays in the window.
+                    if self._process_engine_step():
+                        self.scheduler.engine_stats.note_busy(now)
+                        self.scheduler.engine_stats.bump_step()
+                    else:
+                        self.scheduler.engine_stats.note_idle(now)
+                else:
+                    self.scheduler.engine_stats.note_idle(now)
+                    if self.has_pending_kv_work():
+                        self._advance_idle_kv_transfer()
         finally:
             try:
                 # Teardown runs even on exceptions so the sender thread/socket
@@ -688,7 +703,13 @@ class EngineCore:
         if not self.kv_transfer_enabled:
             return
         connector = getattr(self.scheduler, "kv_connector", None)
-        if connector is None or not getattr(connector, "is_offload", False):
+        if connector is None or not (
+            getattr(connector, "is_offload", False)
+            or (
+                getattr(connector, "is_producer", False)
+                and getattr(connector, "enable_chunked_transfer", False)
+            )
+        ):
             return
         # getattr for the same reason as `kv_connector` above: this path is
         # reached with scheduler doubles that implement only the connector
@@ -921,11 +942,19 @@ class DPEngineCoreProc(EngineCore):
                     break
 
                 if global_offloaded:
+                    # Already engine-wide, which is what `note_idle` wants.
+                    self.scheduler.engine_stats.note_idle(now)
                     time.sleep(0.01)
                     continue
 
                 if not global_has_unfinished and not self.engines_running:
                     self.engines_running = False
+                    # Pass one never lands here -- `engines_running` starts
+                    # True so the first all_reduce runs -- so window one also
+                    # carries that rendezvous. The first line is warmup.
+                    # Global, not local: a locally idle rank reaching the pair
+                    # below is running a dummy for its peers, which is work.
+                    self.scheduler.engine_stats.note_idle(now)
                     if self.scheduler.prefill_delayer is not None:
                         self.scheduler.prefill_delayer.notify_idle()
                     if self.has_pending_kv_work():
@@ -935,9 +964,13 @@ class DPEngineCoreProc(EngineCore):
                         self._advance_idle_kv_transfer()
                     continue
 
+                self.scheduler.engine_stats.note_busy(now)
                 executed = self._process_engine_step()
                 if not executed:
                     self._execute_dummy_batch()
+                # After the pair, so the idle rank's dummy counts too: that is
+                # what keeps every rank's step number equal. See `bump_step`.
+                self.scheduler.engine_stats.bump_step()
 
                 self.engines_running = global_has_unfinished
         finally:

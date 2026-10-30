@@ -9,6 +9,7 @@ import os
 from dataclasses import replace
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     GLM5_CONFIG,
@@ -544,7 +545,8 @@ class Glm5MonoKernel:
         p = lambda x: x.data_ptr()  # noqa: E731
         for chunk in range(chunks):
             row = chunk * self.S
-            self.launch(
+            _run_compiled(
+                self.launch,
                 p(h) + row * HIDDEN * h.element_size(),
                 p(x_out) + row * HIDDEN * x_out.element_size(),
                 p(block_tables) if self.with_indexer and self.kv_cache_layout is KvCacheLayout.ATOM else p(cur_pos),
@@ -584,7 +586,7 @@ class Glm5MonoKernel:
                 p(self.step),
                 self.rank,
                 layer,
-                stream=torch.cuda.current_stream(),
+                torch.cuda.current_stream(),
             )
             if chunk + 1 < chunks or advance:
                 self.advance_step()

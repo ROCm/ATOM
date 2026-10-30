@@ -149,28 +149,94 @@ models:
           benchmark:
             wait_server_timeout: 4500
 
-        # - name: ds-v4-2p1d-dpa-tp8
-        #   topology: 2p1d_dpa
-        #   pd_worker_layout: multi_node
-        #   nodes: "${ATOMESH_2P1D_NODES}"
-        #   env:
-        #     prefill:
-        #       GPU_MAX_HW_QUEUES: "5"
-        #       ATOM_NUMA_BIND: "1"
-        #   isl: [8192]
-        #   osl: 1024
-        #   concurrency: [256, 512, 1024, 2048]
-        #   prefill:
-        #     workers: 2
-        #     tp: 8
-        #     extra_args: "--enable-dp-attention --enable-tbo"
-        #   decode:
-        #     workers: 1
-        #     tp: 8
-        #     extra_args: "--enable-dp-attention"
-        #   benchmark:
-        #     wait_server_timeout: 4500
-        #   run_eval: true
+        - name: ds-v4-2p1d-tp8
+          topology: 2p1d
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [128, 256]
+          prefill:
+            workers: 2
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128]
+
+        - name: ds-v4-2p1d-dpa-tp8
+          topology: 2p1d_dpa
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512, 768, 1024]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-dp-attention"
+          server:
+            common_args:
+              decode_max_num_seqs: 1024
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 768]
+
+        - name: ds-v4-2p1d-tp8-mtp3
+          topology: 2p1d_mtp3
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [128, 256]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 3"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 3"
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128]
+
+        - name: ds-v4-2p1d-dpa-tp8-mtp1
+          topology: 2p1d_dpa_mtp1
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_2P1D_NODES}"
+          env:
+            prefill:
+              GPU_MAX_HW_QUEUES: "5"
+              ATOM_NUMA_BIND: "1"
+          isl: [8192]
+          osl: 1024
+          concurrency: [256, 512]
+          prefill:
+            workers: 2
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention --enable-tbo"
+          decode:
+            workers: 1
+            tp: 8
+            extra_args: "--method mtp --num-speculative-tokens 1 --enable-dp-attention"
+          benchmark:
+            wait_server_timeout: 4500
+          run_eval: true
+          eval_concurrency: [128, 512]
 
     accuracy:
       task: gsm8k
@@ -381,7 +447,7 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode:
+            decode: &glm52_cpp4_dcp4_lmcache_decode_env
               <<: &glm52_cpp4_dcp4_decode_env
                 HIP_VISIBLE_DEVICES: "4,5,6,7"
                 # Ranks share identical communicator groups instead of creating
@@ -510,6 +576,20 @@ models:
         - <<: *glm52_agentic_lmcache_cpp4_dpa4_1p1d
           name: glm-52-mxfp4-1p1d-cpp4-dpa4-agentic-lmcache-1m-c40
           concurrency: [40]
+
+        # Match the CPP4+DCP4 LMCache baseline, enabling chunked KV transfer
+        # only on the Mooncake producer; retain every other server/benchmark knob.
+        - &glm52_agentic_lmcache_chunked_cpp4_dcp4
+          <<: *glm52_agentic_lmcache_cpp4_dcp4
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-chunked-1m-c32
+          concurrency: [32]
+          env:
+            common: *glm52_agentic_lmcache_cpp4_dcp4_env_common
+            prefill:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_env_prefill
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+            decode: *glm52_cpp4_dcp4_lmcache_decode_env
 
         # 4-5) 1P2D: CPP4 prefill (PP4×TP1, node 0) paired with 2× DPA4 decode
         # (dp4×tp1 each, node 1 GPU 0-3 and GPU 4-7). MTP4 with fixed
@@ -1253,6 +1333,55 @@ models:
             prefill:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+
+      # gsm8k-only PD cell over MoRI IO, prefill and decode on a node each. No
+      # DSpark, so it needs no draft model and has no ReplaySSM record buffers,
+      # which the MoRIIO connector refuses: it moves the MLA KV by block and the
+      # KDA recurrent state by slot.
+      accuracy:
+        - name: kimi-k3-mxfp4-1p1d-tp8-moriio-gsm8k
+          topology: 1p1d_tp8_moriio
+          display_topology: 1P1D-MORIIO-TP8
+          pd_worker_layout: multi_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [8192]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              # As in the reference accuracy config (models_accuracy.json),
+              # which disables prefix caching for Kimi-K3.
+              enable_prefix_caching: false
+              # Kimi-K3 thinks by default. lm_eval scores message content, and
+              # a reasoning model cut off at max_gen_toks mid-thought returns
+              # none. The template's own switch is named "thinking".
+              extra_args: '--default-chat-template-kwargs {"thinking":false}'
+          prefill:
+            workers: 1
+            tp: 8
+          decode:
+            workers: 1
+            tp: 8
+            # The dense 2..64 range the TP8 DSpark cells already capture.
+            cudagraph: auto
+          env:
+            common:
+              KV_CONNECTOR: moriio
+              # MoRI IO moves the KDA state only when prefill pushes it.
+              ATOM_MORIIO_MODE: write
+              # The connector refuses ReplaySSM buffers; pinned, not inherited.
+              ATOM_ENABLE_REPLAYSSM: "0"
+          benchmark:
+            # A cold read of the weights from NFS plus online FP8 quantization
+            # takes about an hour on the Spur lane, before kernel builds and
+            # graph capture; 4500 s left prefill a few minutes short.
+            wait_server_timeout: 7200
+          run_eval: true
+          eval_only: true
+          eval_concurrency: [32]
+          accuracy:
+            threshold: 0.90
 
     accuracy:
       task: gsm8k

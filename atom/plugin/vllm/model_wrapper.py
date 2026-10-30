@@ -690,10 +690,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if self._is_deepseek_v4:
             from atom.plugin.vllm.deepseek_v4_bridge import (
                 ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+                bind_deepseek_v4_proxy_cache_views,
+                check_deepseek_v4_model_runner,
                 deepseek_v4_draft_proxy_layer_name,
                 register_deepseek_v4_proxy_layer,
             )
 
+            check_deepseek_v4_model_runner(vllm_config, is_mtp=self._is_deepseek_v4_mtp)
             self._deepseek_v4_proxy_layer_name = (
                 deepseek_v4_draft_proxy_layer_name(self.atom_config.hf_config)
                 if self._is_deepseek_v4_mtp
@@ -702,7 +705,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # The MTP draft's layers live in the target's slot, as natively:
             # its proxy only carries the drafter's metadata and reuses the
             # target proxy's KV, so vLLM gives it no pages of its own.
-            register_deepseek_v4_proxy_layer(
+            proxy = register_deepseek_v4_proxy_layer(
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
                 kv_sharing_target_layer_name=(
@@ -710,6 +713,14 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                     if self._is_deepseek_v4_mtp
                     else None
                 ),
+            )
+            # The metadata builder reaches the model only through the proxy,
+            # and has to bind before the first forward under Model Runner V2.
+            proxy._atom_v4_bind = functools.partial(
+                bind_deepseek_v4_proxy_cache_views,
+                self.model,
+                vllm_config,
+                self._deepseek_v4_proxy_layer_name,
             )
             if not self._is_deepseek_v4_mtp:
                 from atom.plugin.vllm.deepseek_v4_state_checkpoint import (

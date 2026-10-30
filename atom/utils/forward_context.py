@@ -631,6 +631,9 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # Whether this prefill runs sparse (DSA) MLA, decided once a step by the
+    # attention builder: the indexer, MLA and PCP all follow it.
+    run_sparse: bool = False
     # The step's index query rows as `score_topk` scores them, published once
     # a step by the attention builder for every indexer layer.
     index_rows: "IndexRows | None" = None

@@ -255,6 +255,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_PREFILL_COMPILE_ONLY": lambda: (
         os.getenv("ATOM_SGLANG_PREFILL_COMPILE_ONLY", "0") == "1"
     ),
+    # Stopgap for a HIP device whose arch is missing from sgl_kernel
+    # common_ops.so. The release image is built gfx950-only, so MI308X
+    # (gfx942) SIGSEGVs in every sgl_kernel GPU op, including xgrammar's
+    # vocab-mask apply. 0 keeps the native kernel. TODO: drop once the
+    # image ships a gfx942 sgl_kernel.
+    "ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK": lambda: (
+        os.getenv("ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK", "1") != "0"
+    ),
     # Broadcast EAGLE3 verification predictions and acceptance decisions from
     # TP rank 0 so every tensor-parallel rank advances with identical results.
     # SGLang lacks this broadcast path; the ATOM plugin adds it to match native
@@ -378,7 +386,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
-    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950 shapes, else Triton.
+    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, else Triton.
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
@@ -618,6 +626,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
+    ),
+    # aiter's Gluon all-reduce + residual add + RMSNorm for
+    # decode (fused calls up to 2 MiB) at TP4; aiter uses it on gfx1250 only.
+    "ATOM_ENABLE_GLUON_FUSED_AR": lambda: (
+        os.getenv("ATOM_ENABLE_GLUON_FUSED_AR", "1") == "1"
     ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
@@ -1205,7 +1218,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pages from the process as it goes; 0 registers the checkpoint mapping in
     # place (one thread, under the HIP runtime lock). Either way the shard is
     # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. `tools/engram/bench_uva_shard.py` measures both.
+    # place regardless. Unset, DP attention (every rank holds the whole table)
+    # registers in place -- the shared checkpoint mapping, pinned once per node
+    # rather than copied once per rank -- and copies only if that is refused.
+    # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
