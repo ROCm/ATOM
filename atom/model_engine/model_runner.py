@@ -1847,7 +1847,7 @@ class ModelRunner:
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
     def _agree_pipeline_checkpoint_spec(
-        self, spec: PagedStateCheckpointSpec
+        self, spec: PagedStateCheckpointSpec | None
     ) -> PagedStateCheckpointSpec:
         """Put every PP stage's checkpoint images on one set of unit ids.
 
@@ -1858,19 +1858,35 @@ class ModelRunner:
         op is checked against the joint layout id and the summed image bytes,
         which change whenever any stage's geometry does. Collective over the
         PP group, which holds one rank per stage in stage order.
+
+        A stage that holds no recurrent state passes None, and then every
+        stage refuses with the same error: one raising alone would leave the
+        others waiting here for its geometry.
         """
         pp = get_pp_group()
         stages: list = [None] * pp.world_size
         torch.distributed.all_gather_object(
             stages,
             (
-                spec.layout_id,
-                spec.image_bytes,
-                spec.page_unit_bytes,
-                spec.units_per_checkpoint,
+                None
+                if spec is None
+                else (
+                    spec.layout_id,
+                    spec.image_bytes,
+                    spec.page_unit_bytes,
+                    spec.units_per_checkpoint,
+                )
             ),
             group=pp.cpu_group,
         )
+        stateless = [i for i, entry in enumerate(stages) if entry is None]
+        if stateless:
+            raise RuntimeError(
+                f"PP stages {stateless} of {len(stages)} hold no recurrent "
+                "state, so they cannot keep PAGE-backed state checkpoints; "
+                "give every stage a linear-attention layer "
+                "(VLLM_PP_LAYER_PARTITION)"
+            )
         units = max(entry[3] for entry in stages)
         op_bytes = sum(entry[1] for entry in stages)
         digest = hashlib.sha256(repr(stages).encode()).hexdigest()[:16]
@@ -2045,6 +2061,17 @@ class ModelRunner:
                     "PAGE-backed state checkpoints require a PAGE sub-pool"
                 )
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
+            pipelined = (
+                config.pipeline_parallel_size > 1 and torch.distributed.is_initialized()
+            )
+            if not slot_bytes:
+                # A PP stage without a linear-attention layer.
+                if pipelined:
+                    self._agree_pipeline_checkpoint_spec(None)
+                raise RuntimeError(
+                    "PAGE-backed state checkpoints need recurrent state, but "
+                    "this model holds none"
+                )
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
             # The charged entry can be larger than the bytes a transfer
@@ -2071,7 +2098,7 @@ class ModelRunner:
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,
             )
-            if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+            if pipelined:
                 checkpoint_spec = self._agree_pipeline_checkpoint_spec(checkpoint_spec)
                 transfer = dataclasses.replace(
                     transfer, paged_layout_id=checkpoint_spec.layout_id

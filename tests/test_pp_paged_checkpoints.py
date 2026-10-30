@@ -40,13 +40,21 @@ def _stage_spec(unit_bytes: int, slot_bytes: int, stage: int):
 
 
 def _agree(monkeypatch, stage: int, geometry=K3_PP8):
-    specs = [_stage_spec(u, s, i) for i, (u, s) in enumerate(geometry)]
+    """A None geometry is a stage that holds no recurrent state."""
+    specs = [
+        None if entry is None else _stage_spec(*entry, i)
+        for i, entry in enumerate(geometry)
+    ]
     per_stage = [
         (
-            spec.layout_id,
-            spec.image_bytes,
-            spec.page_unit_bytes,
-            spec.units_per_checkpoint,
+            None
+            if spec is None
+            else (
+                spec.layout_id,
+                spec.image_bytes,
+                spec.page_unit_bytes,
+                spec.units_per_checkpoint,
+            )
         )
         for spec in specs
     ]
@@ -90,6 +98,17 @@ def test_the_identity_moves_with_any_stage_geometry(monkeypatch):
     _, other = _agree(monkeypatch, stage=0, geometry=moved)
 
     assert base.layout_id != other.layout_id
+
+
+@pytest.mark.parametrize("stage", [0, 3])
+def test_a_stage_without_state_is_refused_on_every_stage(monkeypatch, stage):
+    geometry = list(K3_PP8)
+    geometry[3] = None
+
+    with pytest.raises(
+        RuntimeError, match=r"PP stages \[3\] of 8 hold no recurrent state"
+    ):
+        _agree(monkeypatch, stage=stage, geometry=geometry)
 
 
 def _validating_stage(spec: PagedStateCheckpointSpec, num_blocks: int = 1000):
