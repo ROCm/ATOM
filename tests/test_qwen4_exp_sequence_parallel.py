@@ -198,26 +198,35 @@ def test_model_forward_matches_unsharded(
 
 
 @pytest.mark.parametrize(
-    "env,tokens,shards",
+    "env,tokens,target_shards,drafter_shards",
     [
-        ("1024", 1024, False),  # the fused-HC-quant boundary itself
-        ("1024", 1025, True),
-        ("512", 1024, False),  # a lower threshold cannot go below the boundary
-        ("512", 700, False),
-        ("2048", 1025, False),  # a higher one still applies
-        ("2048", 2048, True),
-        ("0", 4096, False),  # disabled
+        # The target's fused-HC-quant boundary: only the drafter shards.
+        ("1024", 1024, False, True),
+        ("1024", 1025, True, True),
+        # A lower threshold cannot take the target below the boundary.
+        ("512", 1024, False, True),
+        ("512", 700, False, True),
+        ("512", 511, False, False),
+        # A higher one applies to both.
+        ("2048", 1025, False, False),
+        ("2048", 2048, True, True),
+        ("0", 4096, False, False),  # disabled
     ],
 )
-def test_sp_gate_stays_above_the_fused_quant_rows(
-    ranks, monkeypatch, env, tokens, shards
-):
+def test_sp_gates(ranks, monkeypatch, env, tokens, target_shards, drafter_shards):
+    """The target model shards only above HC_QUANT_ROWS_MAX (its attention HC
+    fuses the FP8 quant up to there); the drafter's unfused HC never
+    quantizes, so it follows the env threshold alone."""
     monkeypatch.setenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", env)
     assert qwen4_exp.HC_QUANT_ROWS_MAX == 1024
-    results = ranks(2, lambda rank: qwen4_exp._SequenceParallel.maybe(tokens))
-    assert [sp is not None for sp in results] == [shards, shards]
+    target = SimpleNamespace(sp_start_layer=2, end_layer=48)
+    target_gate = MethodType(qwen4_exp.Qwen4ExpModel._sequence_parallel, target)
+    drafter_gate = qwen4_exp._SequenceParallel.maybe
+    results = ranks(2, lambda rank: (target_gate(tokens), drafter_gate(tokens)))
+    expected = (target_shards, drafter_shards)
+    assert [(t is not None, d is not None) for t, d in results] == [expected] * 2
     # TP=1 never shards.
-    assert qwen4_exp._SequenceParallel.maybe(tokens) is None
+    assert target_gate(tokens) is None and drafter_gate(tokens) is None
 
 
 class _DraftLayer:
@@ -288,12 +297,13 @@ def _drafter(weights, rank, world, tokens, seen):
     )
 
 
-@pytest.mark.parametrize("world,tokens", [(2, 1027), (4, 1026), (4, 1027)])
+@pytest.mark.parametrize("world,tokens", [(2, 1024), (2, 1027), (4, 1026), (4, 1027)])
 def test_drafter_forward_matches_unsharded(ranks, monkeypatch, world, tokens):
     """The drafter's prefill extend shards the embeddings and the target HC
     state, runs the pre-fc norms, fc projections and its unfused HC on the
     shard, and gathers the streams at the end: the result must equal the
-    replicated forward, for uneven splits above the SP threshold."""
+    replicated forward, from the threshold itself (1024 tokens) and for
+    uneven splits."""
     monkeypatch.setenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", "1024")
     hidden, hc = 3, 4
     gen = torch.Generator().manual_seed(5)
@@ -329,3 +339,141 @@ def test_drafter_forward_matches_unsharded(ranks, monkeypatch, world, tokens):
         torch.testing.assert_close(out, expected)
         # Both sub-layers ran on all rows and took the sharded path.
         assert seen == [("attn", tokens, True), ("mlp", tokens, True)]
+
+
+def _indexer_layer(qsa_attention, device, pages, block, ratio):
+    """A QSA layer with the real indexer norm / RoPE / caches; the packed
+    projection output is supplied directly as `hidden`."""
+    from atom.model_ops.layernorm import GemmaRMSNorm
+
+    config = SimpleNamespace(
+        head_dim=256,
+        max_position_embeddings=8192,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+        },
+    )
+    indexer = qsa_attention.Qwen4ExpIndexer.__new__(qsa_attention.Qwen4ExpIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.index_n_heads, indexer.index_kv_heads, indexer.index_head_dim = 4, 1, 128
+    indexer.token_topk, indexer.compress_ratio = 2048, ratio
+    indexer.rotary_emb = qsa_attention.build_qwen4_exp_rope(config, 128).to(device)
+    indexer.q_layernorm = GemmaRMSNorm(128).to(device=device, dtype=torch.bfloat16)
+    indexer.k_layernorm = GemmaRMSNorm(128).to(device=device, dtype=torch.bfloat16)
+    indexer.index_qk_proj = lambda hidden, otype: hidden
+    return SimpleNamespace(
+        indexer=indexer,
+        raw_key_cache=torch.zeros(
+            pages, block, 1, 128, device=device, dtype=torch.bfloat16
+        ),
+        compressed_key_cache=torch.zeros(
+            pages, block // ratio, 1, 128, device=device, dtype=torch.bfloat16
+        ),
+        compressed_key_scale=None,
+        rope_position_cache=None,
+    )
+
+
+def _clone_caches(layer):
+    return SimpleNamespace(
+        **{
+            **vars(layer),
+            "raw_key_cache": layer.raw_key_cache.clone(),
+            "compressed_key_cache": layer.compressed_key_cache.clone(),
+        }
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("is_prefill", [False, True], ids=["triton", "flydsl"])
+@pytest.mark.parametrize("world", [2, 4, 8])
+@torch.inference_mode()
+def test_select_tokens_row_sharded_matches_replicated(
+    ranks, monkeypatch, world, is_prefill
+):
+    """The real `Qwen4ExpAttention._select_tokens(rows=...)`: each rank scores
+    only its own query rows of a prefixed + fresh 1500-row prefill batch and
+    all-gathers the groups; every rank must end with the replicated
+    selection and the same index caches. `is_prefill` turns on the FlyDSL
+    scorer serving prefill uses (gfx942)."""
+    from atom.model_ops.qwen4_exp import qsa_attention
+    from atom.model_ops.qwen4_exp.ops.qsa import qsa_compressed_slots
+
+    if is_prefill:
+        pytest.importorskip("flydsl")
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        if get_gfx_runtime() != "gfx942":
+            pytest.skip("the FlyDSL index scorer is built for gfx942")
+    monkeypatch.setattr(
+        qsa_attention,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_draft=False, is_prefill=is_prefill)
+        ),
+    )
+    device, block, ratio = "cuda", 64, 4
+    gen = torch.Generator(device=device).manual_seed(17)
+    seq_lens = (4200, 300)
+    pages_per_req = [-(-s // block) for s in seq_lens]
+    width = max(pages_per_req)
+    pool = torch.randperm(sum(pages_per_req) + width, device=device, generator=gen)
+    tables = pool[: 2 * width].view(2, width).to(torch.int32)
+    base = _indexer_layer(qsa_attention, device, pool.numel(), block, ratio)
+
+    def batch(chunks):
+        """chunks: (request, first position, count) -> hidden, positions, qsa."""
+        logical = torch.cat(
+            [torch.arange(s, s + n, device=device) for _, s, n in chunks]
+        )
+        requests = torch.cat(
+            [
+                torch.full((n,), r, dtype=torch.int32, device=device)
+                for r, _, n in chunks
+            ]
+        )
+        slots = tables[requests.long(), logical // block].long() * block + (
+            logical % block
+        )
+        compressed = torch.empty_like(slots)
+        qsa_compressed_slots(slots, logical, ratio, compressed)
+        lengths = torch.zeros(2, dtype=torch.int32, device=device)
+        for r, s, n in chunks:
+            lengths[r] = s + n
+        qsa = SimpleNamespace(
+            block_tables=tables,
+            token_to_req=requests,
+            logical_positions=logical,
+            slot_mapping=slots,
+            compressed_slot_mapping=compressed,
+            seq_lens=lengths,
+            max_seq_len=int(lengths.max()),
+        )
+        hidden = torch.randn(
+            logical.numel(), 640, device=device, dtype=torch.bfloat16, generator=gen
+        )
+        return hidden, logical[None].expand(3, -1), qsa
+
+    select = qsa_attention.Qwen4ExpAttention._select_tokens
+    # Prefix of request 0, replicated, fills the caches.
+    select(base, *batch([(0, 0, 3000)]))
+    # Prefixed chunk of request 0 plus a fresh request 1: 1500 rows.
+    hidden, positions, qsa = batch([(0, 3000, 1200), (1, 0, 300)])
+    reference = _clone_caches(base)
+    expected = select(reference, hidden, positions, qsa)
+
+    def on_rank(rank):
+        layer = _clone_caches(base)
+        rows = qwen4_exp._SequenceParallel(hidden.shape[0], world, rank)
+        selected = select(layer, hidden, positions, qsa, rows=rows)
+        torch.cuda.synchronize()
+        return selected, layer
+
+    for selected, layer in ranks(world, on_rank):
+        assert torch.equal(selected, expected)
+        for name in ("raw_key_cache", "compressed_key_cache"):
+            assert torch.equal(getattr(layer, name), getattr(reference, name))

@@ -703,19 +703,14 @@ class _SequenceParallel:
     @classmethod
     def maybe(cls, num_tokens: int) -> "_SequenceParallel | None":
         """Sharding for a forward of `num_tokens`, or None to stay replicated:
-        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, at most
-        `HC_QUANT_ROWS_MAX` tokens, or under graph capture.
-
-        Up to `HC_QUANT_ROWS_MAX` tokens the unsharded attention HC emits the
-        FP8 projection input itself (`mix_fused_quant`); a sharded layer leaves
-        that quantization to the projection, which the unsharded path only
-        does above `HC_QUANT_ROWS_MAX`. Sharding only above it keeps the two
-        paths on the same quantization, whatever the env threshold."""
+        no TP, below `ATOM_QWEN4_EXP_SP_MIN_TOKENS`, or under graph capture.
+        The target model adds its own fused-quant floor
+        (`Qwen4ExpModel._sequence_parallel`); the MTP drafter, whose unfused
+        hyper-connections never quantize, uses this gate as is."""
         min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
         if (
             min_tokens <= 0
             or num_tokens < min_tokens
-            or num_tokens <= HC_QUANT_ROWS_MAX
             or torch.cuda.is_current_stream_capturing()
         ):
             return None
@@ -832,8 +827,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 pending = None
             hidden_states = self._apply_ple(hidden_states, input_ids)
         # Under `sp` (only above HC_QUANT_ROWS_MAX tokens, see
-        # `_SequenceParallel.maybe`) the consumer quantizes the gathered rows
-        # itself, as the unsharded path does at that size.
+        # `Qwen4ExpModel._sequence_parallel`) the consumer quantizes the
+        # gathered rows itself, as the unsharded path does at that size.
         quant_dtype = None if sp is not None else self._attn_input_quant_dtype()
         if quant_dtype is None:
             mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
@@ -1012,7 +1007,13 @@ class Qwen4ExpModel(nn.Module):
         )
 
     def _sequence_parallel(self, num_tokens: int) -> _SequenceParallel | None:
-        if self.sp_start_layer >= self.end_layer:
+        """Up to `HC_QUANT_ROWS_MAX` tokens the unsharded attention HC emits
+        the FP8 projection input itself (`mix_fused_quant`); a sharded layer
+        leaves that quantization to the projection, which the unsharded path
+        only does above `HC_QUANT_ROWS_MAX`. Sharding only above it keeps the
+        two paths on the same quantization, whatever the env threshold. With
+        no layer after the last PLE layer there is nothing to shard."""
+        if self.sp_start_layer >= self.end_layer or num_tokens <= HC_QUANT_ROWS_MAX:
             return None
         return _SequenceParallel.maybe(num_tokens)
 
