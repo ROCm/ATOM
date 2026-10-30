@@ -121,17 +121,9 @@ on:
             glm-52-mxfp4-1p1d-cpp8-dcp8-gsm8k-only-c64
 
           Kimi-K3:
-            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1,
-            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c2,
-            kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c4,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c8,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c16,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c32,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c48,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c56,
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c64,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72,
-            kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c88,
+            kimi-k3-mxfp4-1p2d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48,
             kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128,
