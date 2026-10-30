@@ -9,6 +9,8 @@ ATOM's common controls and attach top-level tool schemas to the system turn.
 
 from typing import Any
 
+from .reasoning_controls import ReasoningRules
+
 
 def normalize_effort(effort: Any) -> str | int | None:
     """Translate the hosted API aliases while retaining ATOM's integer budget."""
@@ -28,13 +30,11 @@ def normalize_effort(effort: Any) -> str | int | None:
     )
 
 
-def validate_thinking_tool_choice(tool_choice: Any, kwargs: dict) -> None:
-    if prepare_kwargs(kwargs).get("thinking_mode", "thinking") != "chat" and (
-        tool_choice == "required" or isinstance(tool_choice, dict)
-    ):
-        raise ValueError(
-            "DeepSeek-V4.1 thinking mode does not support required or named tool_choice"
-        )
+REASONING_RULES = ReasoningRules(
+    normalize_effort=normalize_effort,
+    string_effort_enables=True,
+    clear_effort_when_disabled=True,
+)
 
 
 def prepare_messages(messages: list[dict], tools: list[dict] | None) -> list[dict]:
@@ -48,6 +48,7 @@ def prepare_messages(messages: list[dict], tools: list[dict] | None) -> list[dic
 
 
 def prepare_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    kwargs = dict(kwargs)
     # Explicit API effort is merged last under the common thinking_effort key;
     # it must also override a native reasoning_effort in template defaults.
     if "thinking_effort" in kwargs:

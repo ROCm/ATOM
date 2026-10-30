@@ -28,6 +28,7 @@ from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any
 
 import uvicorn
@@ -62,6 +63,7 @@ from atom.utils.gc_utils import (
     tune_gc,
 )
 
+from .api_compatibility import api_compatibility_for
 from .chat_encoders import (
     apply_chat_template,
     chat_template_source,
@@ -69,7 +71,6 @@ from .chat_encoders import (
     render_probe_prompt,
     resolve_reasoning_toggle,
 )
-from .deepseek_v41_encoder import normalize_effort, validate_thinking_tool_choice
 from .metrics_setup import create_metrics_exporter
 from .protocol import (
     DEFAULT_TEMPERATURE,
@@ -87,6 +88,12 @@ from .reasoning import (
     prompt_tokens_start_in_reasoning,
     template_opens_reasoning_implicitly,
     thinking_switched_off,
+)
+from .reasoning_controls import (
+    CHAT_REASONING_RULES,
+    RESPONSES_REASONING_RULES,
+    apply_reasoning_controls,
+    resolve_reasoning_controls,
 )
 from .reasoning_dialects import resolve_dialect
 from .request_timing import (
@@ -112,7 +119,7 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
-    deepseek_chat_stream,
+    chat_stream_usage_on_finish,
     normalize_chat_tools,
     resolve_thinking,
     stream_chat_response,
@@ -1652,9 +1659,21 @@ async def general_error_handler(request: Request, exc: Exception):
 # ---- Endpoints ----
 
 
-def _is_deepseek_v41() -> bool:
-    # The adapter is selected from checkpoint model_type, not the public alias.
-    return getattr(custom_message_encoder, "name", None) == "encoding_dsv41"
+def _model_reasoning_rules(default=CHAT_REASONING_RULES):
+    return getattr(custom_message_encoder, "reasoning_rules", None) or default
+
+
+def _effective_thinking_enabled(kwargs):
+    # Validate against the same defaults and normalization used by the encoder,
+    # on a copy so a predicate cannot change the prompt configuration.
+    effective = dict(getattr(custom_message_encoder, "defaults", {}))
+    effective.update(kwargs)
+    if custom_message_encoder is not None:
+        effective = custom_message_encoder.prepare_kwargs(effective)
+    if reasoning_toggle is None:
+        return True
+    name, off_value, on_value = reasoning_toggle
+    return effective.get(name, on_value) != off_value
 
 
 @app.post("/v1/chat/completions")
@@ -1679,30 +1698,19 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["response_format"] = request.response_format
         if isinstance(request.tool_choice, str):
             merged_kwargs["tool_choice"] = request.tool_choice
-        _th_enabled, _th_effort = resolve_thinking(
-            request, deepseek_v41=_is_deepseek_v41()
+        rules = _model_reasoning_rules()
+        merged_kwargs = apply_reasoning_controls(
+            merged_kwargs,
+            reasoning_toggle,
+            resolve_thinking(request, rules=rules),
+            rules=rules,
         )
-        if request.thinking is not None or request.reasoning_effort is not None:
-            # By the name this template actually reads. `thinking` was
-            # hardcoded, which is right for Kimi-K3 and a silent no-op for the
-            # whole Qwen family, whose templates read `enable_thinking` --
-            # measured, `thinking=False` left the `<think>` prefill in place.
-            # A template ignores a kwarg it does not know, so the failure was
-            # invisible: the model reasoned anyway.
-            # Only when the request said something about it. An effort is
-            # not an opt-in for generic templates. This is merged after defaults and
-            # after the client's own `chat_template_kwargs` -- so writing it
-            # unconditionally overrode both.
-            if reasoning_toggle is not None and _th_enabled is not None:
-                name, off_value, on_value = reasoning_toggle
-                merged_kwargs[name] = on_value if _th_enabled else off_value
-            if _th_effort is not None:
-                merged_kwargs["thinking_effort"] = _th_effort
-            if _is_deepseek_v41() and _th_enabled is False:
-                merged_kwargs.pop("thinking_effort", None)
-                merged_kwargs.pop("reasoning_effort", None)
-        if _is_deepseek_v41():
-            validate_thinking_tool_choice(request.tool_choice, merged_kwargs)
+        compatibility = api_compatibility_for(custom_message_encoder)
+        if not compatibility.chat_forced_tools_with_thinking:
+            compatibility.validate_chat_tool_choice(
+                request.tool_choice,
+                thinking_enabled=_effective_thinking_enabled(merged_kwargs),
+            )
 
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
@@ -1821,8 +1829,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
                 )
-            if _is_deepseek_v41():
-                gen = deepseek_chat_stream(
+            if compatibility.chat_usage_on_finish:
+                gen = chat_stream_usage_on_finish(
                     gen,
                     include_usage=bool(
                         (request.stream_options or {}).get("include_usage")
@@ -2119,6 +2127,21 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # dealing with a chain of thought it had asked for by omission.
         merged_kwargs.update(anthropic_template_kwargs(request, reasoning_toggle))
         drop_reasoning = anthropic_drop_reasoning(request)
+        compatibility = api_compatibility_for(custom_message_encoder)
+        if compatibility.anthropic_output_effort:
+            # Messages thinking is controlled by thinking.type. Its output
+            # effort adjusts the budget without implicitly opting into thinking.
+            rules = replace(_model_reasoning_rules(), string_effort_enables=False)
+            controls = resolve_reasoning_controls(
+                thinking=request.thinking,
+                effort=(request.output_config or {}).get("effort"),
+                rules=rules,
+            )
+            merged_kwargs = apply_reasoning_controls(
+                merged_kwargs, reasoning_toggle, controls, rules=rules
+            )
+            if controls[0] is False:
+                drop_reasoning = True
         # Same answer-it-in-the-prompt rule as `thinking` above, and the chat
         # path already forwards its own spelling of this. `tool_choice` was
         # read off the Anthropic request and then used nowhere at all -- a
@@ -2498,22 +2521,9 @@ async def responses_create(raw_request: Request):
     _validate_chunked_receive(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
-    if _is_deepseek_v41():
-        # DeepSeek's Responses contract is stateless and ignores these fields.
-        body = {
-            k: v
-            for k, v in body.items()
-            if k
-            not in (
-                "background",
-                "previous_response_id",
-                "conversation",
-                "store",
-                "parallel_tool_calls",
-                "max_tool_calls",
-            )
-        }
-    unsupported = unsupported_responses_parameter(body, deepseek_v41=_is_deepseek_v41())
+    compatibility = api_compatibility_for(custom_message_encoder)
+    body = compatibility.responses_body(body)
+    unsupported = unsupported_responses_parameter(body)
     if unsupported:
         return JSONResponse(
             status_code=400,
@@ -2554,20 +2564,18 @@ async def responses_create(raw_request: Request):
             merged_kwargs["tool_choice"] = request.tool_choice
         elif forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        if isinstance(request.reasoning, dict):
-            effort = request.reasoning.get("effort")
-            if effort is not None:
-                if _is_deepseek_v41():
-                    effort = normalize_effort(effort)
-                    merged_kwargs["thinking_mode"] = (
-                        "chat" if effort == "none" else "thinking"
-                    )
-                    merged_kwargs.pop("thinking_effort", None)
-                    merged_kwargs.pop("reasoning_effort", None)
-                    if effort != "none":
-                        merged_kwargs["thinking_effort"] = effort
-                else:
-                    merged_kwargs["thinking_effort"] = effort
+        rules = _model_reasoning_rules(RESPONSES_REASONING_RULES)
+        effort = (
+            request.reasoning.get("effort")
+            if isinstance(request.reasoning, dict)
+            else None
+        )
+        merged_kwargs = apply_reasoning_controls(
+            merged_kwargs,
+            reasoning_toggle,
+            resolve_reasoning_controls(effort=effort, rules=rules),
+            rules=rules,
+        )
 
         prompt = apply_chat_template(
             tokenizer,

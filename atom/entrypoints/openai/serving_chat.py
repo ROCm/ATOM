@@ -9,7 +9,6 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from .deepseek_v41_encoder import normalize_effort
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
@@ -20,8 +19,12 @@ from .protocol import (
 )
 from .reasoning import (
     NO_REASONING,
-    VALID_TEMPLATE_EFFORTS,
     ReasoningChannel,
+)
+from .reasoning_controls import (
+    CHAT_REASONING_RULES,
+    ReasoningRules,
+    resolve_reasoning_controls,
 )
 from .sse import data_frame, iter_sse_data
 from .streaming_dispatch import StreamOutputCollector
@@ -32,8 +35,8 @@ from .tool_parser.tool_parser import qualified_tool_name
 logger = logging.getLogger("atom")
 
 
-async def deepseek_chat_stream(source, *, include_usage: bool = False):
-    """DeepSeek carries usage on the final choice, never a usage-only chunk."""
+async def chat_stream_usage_on_finish(source, *, include_usage: bool = False):
+    """Carry usage on the final choice for contracts without a usage-only chunk."""
     pending_finish = None
     try:
         async for chunk in source:
@@ -136,50 +139,12 @@ def _tool_parser_for_request(parser_cls, tools):
 
 
 def resolve_thinking(
-    request: ChatCompletionRequest,
-    *,
-    deepseek_v41: bool = False,
+    request: ChatCompletionRequest, *, rules: ReasoningRules = CHAT_REASONING_RULES
 ) -> tuple[bool | None, str | int | None]:
-    """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
-
-    ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
-    Thinking is disabled when ``thinking.type == "disabled"`` or
-    ``reasoning_effort == "none"``. Effort is only returned when it is one of
-    the values the template understands.
-
-    ``enabled`` is ``None`` when the request stated no preference -- setting
-    an effort is not asking for reasoning to be switched *on*. Collapsing
-    that to ``True`` was harmless while the caller wrote a key no template
-    read; once it wrote the template's real switch, a request carrying only
-    `reasoning_effort` re-enabled reasoning over an operator's
-    `--default-chat-template-kwargs '{"enable_thinking": false}'`, and over a
-    client's own `chat_template_kwargs`, because the toggle is merged last.
-    """
-    thinking = request.thinking or {}
-    enabled: bool | None = None
-    if isinstance(thinking, dict) and thinking.get("type") is not None:
-        enabled = thinking.get("type") != "disabled"
-    if request.reasoning_effort == "none":
-        enabled = False
-
-    effort = None
-    if isinstance(thinking, dict) and thinking.get("effort") is not None:
-        effort = thinking.get("effort")
-    elif request.reasoning_effort is not None:
-        effort = request.reasoning_effort
-    if deepseek_v41:
-        effort = normalize_effort(effort)
-        if effort == "none":
-            return False, None
-        if isinstance(effort, str) and enabled is None:
-            enabled = True
-        return enabled, effort
-    if isinstance(effort, (int, float)):
-        if type(effort) is not int or not 1 <= effort <= 100:
-            raise ValueError("reasoning effort must be an integer in [1, 100]")
-    elif not isinstance(effort, str) or effort not in VALID_TEMPLATE_EFFORTS:
-        effort = None
-    return enabled, effort
+    """Read Chat control fields and resolve them with the selected model rules."""
+    return resolve_reasoning_controls(
+        thinking=request.thinking, effort=request.reasoning_effort, rules=rules
+    )
 
 
 def _validate_one_tool(tool: Any, index: int) -> str:

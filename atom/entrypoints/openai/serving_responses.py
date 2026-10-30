@@ -115,12 +115,8 @@ class CodexToolContext:
                 item["namespace"] = namespace
 
 
-def unsupported_responses_parameter(
-    body: dict, *, deepseek_v41: bool = False
-) -> str | None:
+def unsupported_responses_parameter(body: dict) -> str | None:
     """Why this request cannot run on the Python Responses path, or None."""
-    if deepseek_v41:
-        return None
     if body.get("background") is True:
         return _BACKGROUND_MESSAGE
     if body.get("previous_response_id"):
