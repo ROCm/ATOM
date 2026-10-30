@@ -40,7 +40,6 @@ from flydsl.expr.typing import Int32, T
 from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
-from atom.models.deepseek_v41.mono.kernels.topk import key_bits, lds_topk
 from atom.models.deepseek_v41.mono.step_meta import KMETA
 from atom.mono.device.ops import (
     CM_DEV,
@@ -54,6 +53,7 @@ from atom.mono.device.ops import (
     xred,
 )
 from atom.mono.device.sync import POLL_MAX, preg, publish
+from atom.mono.device.topk import key_bits, lds_topk
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, first_task
 from atom.mono.plan.trace import enter_stage

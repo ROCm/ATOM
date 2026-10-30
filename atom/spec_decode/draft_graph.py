@@ -7,6 +7,7 @@ tail, the pad contract -- are pure torch, and CI has no aiter. A flavor's own
 passes still live with the flavor; only the machine is here.
 """
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -38,10 +39,17 @@ def _owned(value: Any, staged: tuple[torch.Tensor, ...] = ()) -> Any:
 
 @dataclass(frozen=True)
 class StagedInput:
-    """One staged input's type: everything but the leading batch axis."""
+    """One staged input's type: everything but the batch axis.
+
+    The batch axis leads unless ``batch_last``, which MRoPE positions
+    (``[3, N]``) need. A batch-last input is stored the way the runner stores
+    its own MRoPE positions: each batch views the front of one flat buffer as a
+    contiguous ``[*shape, bs]``, so the kernels see the layout eager hands them.
+    """
 
     shape: tuple[int, ...] = ()
     dtype: torch.dtype = torch.int32
+    batch_last: bool = False
 
 
 @dataclass
@@ -113,13 +121,29 @@ class DraftGraph:
         )
         self._buffers = {
             role: torch.zeros(
-                (config.max_num_seqs, *staged.shape),
+                (
+                    (config.max_num_seqs * math.prod(staged.shape),)
+                    if staged.batch_last
+                    else (config.max_num_seqs, *staged.shape)
+                ),
                 dtype=staged.dtype,
                 device=device,
             )
             for role, staged in self.inputs.items()
         }
         return self
+
+    def _view(self, role: str, bs: int) -> torch.Tensor:
+        """The first ``bs`` sequences of ``role``'s storage, batch axis in place."""
+        buf = self._buffers[role]
+        staged = self.inputs[role]
+        if not staged.batch_last:
+            return buf[:bs]
+        rows = math.prod(staged.shape)
+        return buf[: rows * bs].view(*staged.shape, bs)
+
+    def _batch_of(self, role: str, src: torch.Tensor) -> int:
+        return src.shape[-1] if self.inputs[role].batch_last else src.shape[0]
 
     @property
     def will_capture(self) -> bool:
@@ -147,7 +171,7 @@ class DraftGraph:
         How many rows are real comes from the sources, never from the caller: a
         count that cannot disagree with the tensor it describes.
         """
-        counts = {t.shape[0] for t in srcs.values()}
+        counts = {self._batch_of(role, t) for role, t in srcs.items()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
             f"describe one step, so one of them is not this step's"
@@ -167,12 +191,12 @@ class DraftGraph:
             f"{self.name} has no staged input {role!r}; "
             f"declared roles are {sorted(self._buffers)}"
         )
-        buf = self._buffers[role]
-        assert 0 <= bs <= buf.shape[0], (
+        capacity = self._buffers[role].numel() // math.prod(self.inputs[role].shape)
+        assert 0 <= bs <= capacity, (
             f"{self.name} requested {bs} rows from draft input {role!r}, "
-            f"whose capacity is {buf.shape[0]}"
+            f"whose capacity is {capacity}"
         )
-        return buf[:bs]
+        return self._view(role, bs)
 
     def _stage_one(self, role: str, running_bs: int, src: torch.Tensor | None):
         """Copy ``src`` into this input's fixed buffer, tail-repeating its last row.
@@ -185,22 +209,21 @@ class DraftGraph:
         ``src=None`` hands back the view unwritten: warmup wants a well-formed
         batch, not a particular one.
         """
-        buf = self._buffers[role]
-        out = buf[:running_bs]
+        out = self._view(role, running_bs)
         if src is None:
             return out
-        assert src.dtype == buf.dtype, (
+        assert src.dtype == out.dtype, (
             f"draft input '{role}' of {self.name} arrived as {src.dtype}, but "
-            f"its storage is {buf.dtype}; a capture has that address baked"
+            f"its storage is {out.dtype}; a capture has that address baked"
         )
-        assert src.ndim == buf.ndim, (
+        batch_last = self.inputs[role].batch_last
+        assert src.ndim == out.ndim, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"whose leading axis is not the batch; this pass stages "
-            f"{tuple(buf.shape[1:])} per sequence. MRoPE positions ([3, N]) are "
-            f"the case that reaches here"
+            f"but this pass stages {tuple(self.inputs[role].shape)} per sequence "
+            f"with the batch axis {'last' if batch_last else 'leading'}"
         )
-        scheduled_bs = src.shape[0]
-        dst = out[:scheduled_bs]
+        scheduled_bs = self._batch_of(role, src)
+        dst = out[..., :scheduled_bs] if batch_last else out[:scheduled_bs]
         assert src.shape == dst.shape, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
             f"but its fixed storage expects {tuple(dst.shape)}"
@@ -210,7 +233,10 @@ class DraftGraph:
         if src.data_ptr() != dst.data_ptr() or src.stride() != dst.stride():
             dst.copy_(src)
         if running_bs > scheduled_bs:
-            out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
+            if batch_last:
+                out[..., scheduled_bs:].copy_(src[..., -1:])
+            else:
+                out[scheduled_bs:].copy_(src[-1])  # broadcasts; no expand needed
         return out
 
     def is_captured(self, running_bs: int) -> bool:

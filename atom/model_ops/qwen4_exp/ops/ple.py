@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """PLE tensor operators: n-gram state/hash, FP8 lookup, gate and convolution."""
 
+import functools
 import math
 
 import torch
@@ -283,6 +284,106 @@ def fp8_embedding_lookup(
         vocab_end_idx,
         dim,
         triton.next_power_of_2(dim),
+    )
+    return output
+
+
+@triton.jit
+def _sharded_table_lookup_kernel(
+    Ids,
+    Bases,
+    Scale,
+    Output,
+    num_ids,
+    START,
+    END,
+    SHARD_ROWS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    FP8: tl.constexpr,
+):
+    """Gather rows of a table held as separately allocated shards.
+
+    `Bases[s]` is the address of global row `s * SHARD_ROWS`, wherever shard
+    `s` lives -- page-locked host memory read over UVA, or HBM. Rows outside
+    `[START, END)` (another rank's, or a placeholder id) store zeros. The grid
+    is persistent: over the bus the cost is latency, and fewer programs keep
+    more of their address translations warm.
+    """
+    cols = tl.arange(0, BLOCK_D)
+    in_row = cols < DIM
+    out_dtype = Output.dtype.element_ty
+    if FP8:
+        row_dtype = tl.float8e4nv
+        scale = tl.load(Scale).to(out_dtype).to(tl.float32)
+    else:
+        row_dtype = out_dtype
+    for first in tl.range(
+        tl.program_id(0) * BLOCK_R, num_ids, tl.num_programs(0) * BLOCK_R
+    ):
+        rows = first + tl.arange(0, BLOCK_R)
+        valid = rows < num_ids
+        token = tl.load(Ids + rows, mask=valid, other=-1).to(tl.int64)
+        owned = valid & (token >= START) & (token < END)
+        token = tl.where(owned, token, 0)
+        shard = token // SHARD_ROWS
+        base = tl.load(Bases + shard, mask=owned, other=0)
+        src = base.to(tl.pointer_type(row_dtype))
+        offsets = (token - shard * SHARD_ROWS)[:, None] * DIM + cols[None, :]
+        values = tl.load(
+            src[:, None] + offsets, mask=owned[:, None] & in_row[None, :], other=0.0
+        )
+        if FP8:
+            values = values.to(out_dtype).to(tl.float32) * scale
+        tl.store(
+            Output + rows.to(tl.int64)[:, None] * DIM + cols[None, :],
+            values,
+            mask=valid[:, None] & in_row[None, :],
+        )
+
+
+@functools.cache
+def _compute_units(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def sharded_table_lookup(
+    ids: torch.Tensor,
+    bases: torch.Tensor,
+    scale: torch.Tensor | None,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+    shard_rows: int,
+    dim: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Rows `ids` of a sharded table (`_sharded_table_lookup_kernel`), `[N, dim]`.
+
+    `scale` set means FP8 E4M3FN rows dequantized like `fp8_embedding_lookup`;
+    otherwise the rows are copied in `output_dtype`, which is their dtype.
+    """
+    ids = ids.reshape(-1)
+    output = torch.empty((ids.numel(), dim), dtype=output_dtype, device=ids.device)
+    if ids.numel() == 0:
+        return output
+    block_rows = 16
+    grid = min(
+        triton.cdiv(ids.numel(), block_rows), 4 * _compute_units(ids.device.index)
+    )
+    _sharded_table_lookup_kernel[(grid,)](
+        ids,
+        bases,
+        bases if scale is None else scale,
+        output,
+        ids.numel(),
+        vocab_start_idx,
+        vocab_end_idx,
+        shard_rows,
+        dim,
+        triton.next_power_of_2(dim),
+        block_rows,
+        scale is not None,
     )
     return output
 

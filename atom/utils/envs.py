@@ -956,6 +956,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
+    # Renormalized softmax top-k routing, eager and captured alike, uses the
+    # Triton kernel in `model_ops/triton_topk_softmax.py` for the shapes it
+    # supports, in launches of up to 20 rows per CU (same bits as AITER, ~2x
+    # faster at 512 experts; AITER is faster on longer launches and takes
+    # them). 0 puts every pass on AITER's `topk_softmax`.
+    "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1").lower() == "1"
+    ),
     # Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4
     # export of MiniMax-M3.1) by re-quantizing the shared expert MXFP8 -> MXFP4
     # at load, so the MoE runs as one 129-expert / top-5 fused MoE. Off by
@@ -1210,6 +1218,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
+    # Also governs the Qwen3.8 PLE n-gram table (~100 GB): page-locked on the
+    # host and read over UVA by default, in HBM with 0.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
     # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
     # into page-locked memory of exactly its size (hipHostMalloc on base pages,
