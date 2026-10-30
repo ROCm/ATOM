@@ -68,13 +68,20 @@ class PPAuxRelay:
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
-        # The last stage's hooks write into the drafter's own buffers.
+        # The send payload, preallocated: received taps are copied into its
+        # leading columns and the hooks capture straight into the rest, so
+        # packing allocates nothing. The last stage's hooks write into the
+        # drafter's own buffers instead.
         self.buffers: dict[int, torch.Tensor] = {}
-        if not pp.is_last_rank:
-            for lid in self.own_ids:
-                self.buffers[lid] = torch.zeros(
-                    max_num_tokens, spec.hidden_size, device=device, dtype=dtype
-                )
+        self._send = None
+        if self.outgoing_ids:
+            h = spec.hidden_size
+            self._send = torch.zeros(
+                max_num_tokens, len(self.outgoing_ids) * h, device=device, dtype=dtype
+            )
+            for col, lid in enumerate(self.outgoing_ids):
+                if lid in self.own_ids:
+                    self.buffers[lid] = self._send[:, col * h : (col + 1) * h]
 
         self._armed = False
 
@@ -126,7 +133,6 @@ class PPAuxRelay:
         """Payload to send on (received block, then own captures), or None."""
         if not self.outgoing_ids:
             return None
-        parts = []
         if self.incoming_ids:
             if received is None:
                 raise RuntimeError(
@@ -134,9 +140,9 @@ class PPAuxRelay:
                     f"{list(self.incoming_ids)} from the previous stage, got none."
                 )
             self._check_width(received)
-            parts.append(received[:num_tokens])
-        parts.extend(self.buffers[lid][:num_tokens] for lid in self.own_ids)
-        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+            self._send[:num_tokens, : received.shape[-1]].copy_(received[:num_tokens])
+        # A view: the send path clones it before the next step's hooks write.
+        return self._send[:num_tokens]
 
     def _check_width(self, received: torch.Tensor) -> None:
         expected = len(self.incoming_ids) * self.hidden_size

@@ -135,3 +135,13 @@ def test_relay_rejects_a_payload_of_the_wrong_width():
     relay, _ = _relay([-1, 2, 6], 8, (4, 8), first=False, last=True)
     with pytest.raises(RuntimeError, match="expected 16 aux columns"):
         relay.absorb(torch.zeros(3, 8), [torch.zeros(4, 8) for _ in range(3)])
+
+
+def test_relay_pack_reuses_one_send_buffer():
+    # A middle stage that both receives and owns taps: packing must not allocate.
+    relay, _ = _relay([-1, 2, 6], 8, (4, 8), first=False, last=False)
+    received = torch.ones(3, 16)
+    first = relay.pack(received, 3)
+    second = relay.pack(received, 2)
+    assert first.data_ptr() == second.data_ptr() == relay._send.data_ptr()
+    assert relay.buffers[6].data_ptr() == relay._send[:, 16:].data_ptr()
