@@ -574,17 +574,18 @@ class tokenIDProcessor:
                     self._publish_input_ids(total_tokens_decode, publication_group),
                     None,
                 )
-            if self.is_spec_run:
+            if self.is_spec_run and batch.num_spec_step > 0:
                 # PP: the host already holds each row's anchor, so fill only
                 # the draft columns. Gated on `is_spec_run` because the
                 # embedding runs on the first stage, not the (has_drafter) last.
-                _, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
-                spec = batch.scheduled_spec_decode_tokens
-                for i in range(len(lens)):
-                    n_draft = int(lens[i]) - 1
-                    if n_draft > 0:
-                        s = int(cu_np[i]) + 1
-                        self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
+                bs, lens, cu_np = self.runner.attn_metadata_builder.decode_spans(batch)
+                spec = batch.scheduled_spec_decode_tokens[:bs]
+                cols = np.arange(spec.shape[1])
+                # Row i's drafts land right after its anchor at cu_np[i].
+                drafted = cols < (lens[:, None] - 1)
+                self.input_ids.np[(cu_np[:bs, None] + 1 + cols)[drafted]] = spec[
+                    drafted
+                ]
             # Previous step's acceptance counts, read off the batch so every
             # stage (not just the sampling one) rolls its linear-attention
             # state back correctly; unset, GDN assumes 1 accepted token.
