@@ -118,10 +118,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
-      - name: Prefer latest main aiter wheel manifest and fallback to artifact
+      # Validation only: ROCm/aiter#7110 at eacdf93d4f09a6740b407936c1f3f6d4eb34c8f9.
+      - name: Download pinned aiter PR 7110 wheel
         timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_WHEEL_DOWNLOAD_MODE: workflow_artifact
+          AITER_WORKFLOW_ARTIFACT_REPO: ROCm/aiter
+          AITER_WORKFLOW_RUN_ID: '40974695385'
+          AITER_WORKFLOW_ARTIFACT_ID: '12947784249'
+          AITER_WORKFLOW_ARTIFACT_NAME: aiter-whl-40974695385-py3.12
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
@@ -153,6 +159,17 @@ jobs:
           allowed = {"pr": {"pr"}, "main": {"pr", "main"}, "nightly": {"pr", "main", "nightly"}}[current]
           models = json.load(open(".github/benchmark/models_accuracy.json", encoding="utf-8"))
           filtered = [m for m in models if m.get("test_level", "nightly") in allowed]
+          # Validation only: the six accuracy failures in run 40357759983.
+          regression_models = {
+              "DeepSeek-R1-0528",
+              "DeepSeek-R1-0528 MTP",
+              "Kimi-K3",
+              "GLM-5.3-Flash-kpool-16shot",
+              "Qwen3.5-397B-A17B-FP8",
+              "GLM-5.3-FP8",
+          }
+          filtered = [m for m in filtered if m["model_name"] in regression_models]
+          assert {m["model_name"] for m in filtered} == regression_models
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event} level={current}: {len(filtered)}/{len(models)} models")
@@ -519,6 +536,18 @@ jobs:
             pip show triton | grep -E '^(Name|Version):'
             pip show torch | grep -E '^(Name|Version):'
           "
+
+      - name: Check TP and EP row-count contract
+        if: matrix.model_name == 'DeepSeek-R1-0528'
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            python3 -m pip install pytest
+            python3 -m pytest -q -rs \
+              tests/test_pass_scheduled_tokens.py \
+              tests/model_ops/test_dp_gather_routed_rows.py \
+              tests/model_ops/test_shared_expert_dispatch.py
+          '
 
       - name: Download models
         timeout-minutes: 150

@@ -6,6 +6,7 @@ tensor. CPU only: the group is a stand-in for two ranks, rank 1 holding
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from import_guard import skip_if_dependency_missing
 
@@ -138,7 +139,8 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     assert runs[0] == {0, 2} and runs[1] == {1, 3}
 
 
-def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch):
+@pytest.mark.parametrize("use_ep", [False, True])
+def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch, use_ep):
     """Placement (the EPLB remap, which shifts the shared column) follows the
     gather and the shared-id re-mark, and gathered rows carry no count."""
     calls = []
@@ -156,8 +158,7 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch):
         activation=None,
         apply_router_weight_on_input=False,
         prefix="t",
-        # Only an expert-parallel layer hands its experts the row count.
-        use_ep=True,
+        use_ep=use_ep,
     )
     count = torch.tensor([2], dtype=torch.int32)
     context = SimpleNamespace(
