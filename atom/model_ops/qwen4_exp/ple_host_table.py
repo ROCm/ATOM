@@ -19,10 +19,10 @@ from atom.model_ops.engram import host_memory
 
 logger = logging.getLogger("atom")
 
-# Where the table is page-locked on the host by default. Elsewhere it stays in
-# HBM until the host path has been validated there (lookup cost over the bus,
-# page-locking ~100 GB): gfx942, for one, has not been.
-VALIDATED_ARCHS = ("gfx950",)
+# Where the table is page-locked on the host by default: the archs the host
+# path has been validated on (bitwise lookups, GSM8K, page-locking ~100 GB),
+# MI355X and MI308X. Elsewhere it stays in HBM until it has been.
+VALIDATED_ARCHS = ("gfx950", "gfx942")
 
 
 def validated_arch(arch: str) -> bool:

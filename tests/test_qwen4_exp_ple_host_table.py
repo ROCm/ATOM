@@ -514,8 +514,9 @@ def test_fp8_rows_are_read_in_the_encoding_they_are_stored_in(fake_pin, dtype):
 
 
 def test_the_host_table_is_on_by_default_only_where_validated():
-    assert ple_host_table.validated_arch("gfx950")
-    for arch in ("gfx942", "gfx90a", "gfx1250", "unknown"):
+    for arch in ("gfx950", "gfx942"):
+        assert ple_host_table.validated_arch(arch)
+    for arch in ("gfx90a", "gfx1250", "unknown"):
         assert not ple_host_table.validated_arch(arch)
 
 
@@ -747,6 +748,8 @@ def ngram_layer(monkeypatch):
     group = SimpleNamespace(world_size=1, rank_in_group=0)
     monkeypatch.setattr(embed_head, "get_tp_group", lambda: group)
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
+    # The host path whatever GPU runs the test; the arch guard has its own.
+    monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx950")
 
     def build(uva, config=_NGRAM_CONFIG):
         monkeypatch.setenv("ATOM_ENGRAM_UVA", "1" if uva else "0")
@@ -950,15 +953,16 @@ def test_dummy_load_fills_the_table_as_an_hbm_embedding(ngram_layer, monkeypatch
 
 @_gpu
 def test_the_host_table_stays_off_where_not_validated(ngram_layer, monkeypatch):
-    """gfx942, for one: the table stays the HBM embedding it was."""
+    """gfx90a, for one: the table stays the HBM embedding it was."""
     from atom.model_ops.qwen4_exp import ple_layer
 
-    monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx90a")
     layer = ngram_layer(True)
     assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpEmbedding)
-    monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx950")
-    layer = ngram_layer(True)
-    assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
+    for arch in ple_host_table.VALIDATED_ARCHS:
+        monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda arch=arch: arch)
+        layer = ngram_layer(True)
+        assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
 
 
 @_gpu
