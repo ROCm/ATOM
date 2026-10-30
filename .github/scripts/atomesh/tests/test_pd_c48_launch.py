@@ -148,7 +148,8 @@ class LaunchTest(unittest.TestCase):
                                        for tag in ("KVB", "KVB-TH")),
                                      *((c, f"N3966-{tag}") for c in (72, 88) for tag in (
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX",
-                                         "BF16-GX"))):
+                                         "BF16-GX")),
+                                     (56, "N3966-BF16-GX")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
