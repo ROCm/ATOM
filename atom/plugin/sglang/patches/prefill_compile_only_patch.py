@@ -4,10 +4,11 @@ SGLang 0.5.22 rejects ``--cuda-graph-backend-prefill tc_piecewise``. The Qwen
 accuracy case launches with the supported ``breakable`` prefill backend, which
 still carries the prefill capture sizes. When
 ``ATOM_SGLANG_PREFILL_COMPILE_ONLY=1`` is set, this patch rewrites that
-published config to the internal piecewise backend, forces the Inductor
-compiler, and executes the compiled callable against the live ForwardBatch
-instead of capturing per-bucket CUDA graphs. Capturing the 8192/16384 prefill
-graphs during server startup makes the ROCm worker exit before it is ready.
+published config to the internal piecewise backend, forces Inductor on the
+prefill config that 0.5.22 actually reads, and executes the compiled callable
+against the live ForwardBatch instead of capturing per-bucket CUDA graphs.
+Capturing the 8192/16384 prefill graphs during server startup makes the ROCm
+worker exit before it is ready.
 """
 
 from __future__ import annotations
@@ -87,6 +88,37 @@ def _published_prefill_config():
     if cfg is None:
         return None
     return getattr(cfg, "prefill", None)
+
+
+def _prefill_config_read_by_trace(server_args):
+    """Prefill config that 0.5.22 reads while compiling and tracing.
+
+    ``TcPiecewiseCudaGraphBackend.build_compilation_config`` and the later
+    ``fp8_utils`` forward both read
+    ``get_exec().graph.cuda_graph_config.prefill``. That object is not
+    ``server_args.cuda_graph_config.prefill`` once the runtime has published
+    its own copy. Older call sites still only have the server_args object.
+    """
+
+    published = _published_prefill_config()
+    if published is not None:
+        return published
+    return resolve_prefill_cuda_graph_config(server_args)
+
+
+def _pin_compile_only_inductor(server_args) -> None:
+    """Leave ``tc_compiler=inductor`` on the config the trace reads.
+
+    0.5.22's default is eager, and the CLI rejects ``tc_compiler``. The
+    piecewise compile reads the field while building the compilation config,
+    then the forward that traces activation quantization reads it again after
+    that function returns. Restoring eager in between skips the PyTorch quant
+    fusion. Compile-only mode keeps inductor for the whole trace.
+    """
+
+    prefill = _prefill_config_read_by_trace(server_args)
+    if prefill is not None:
+        prefill.tc_compiler = "inductor"
 
 
 def _promote_compile_only_prefill(server_args, backend_cls):
@@ -198,6 +230,10 @@ def apply_prefill_compile_only_patch() -> bool:
         if prefill is None or getattr(prefill, "backend", None) != Backend.TC_PIECEWISE:
             return original_runner_init(self, model_runner)
 
+        # Pin inductor before runner construction. The backend builds its
+        # compilation config and then traces; fp8 quantization reads the same
+        # published field during that later forward.
+        _pin_compile_only_inductor(model_runner.server_args)
         # TcPiecewise compiles during runner construction. Set the branch before
         # the first Dynamo trace so it sees native returning attention ops
         # immediately instead of recompiling on the first live request.
@@ -205,19 +241,19 @@ def apply_prefill_compile_only_patch() -> bool:
             original_runner_init(self, model_runner)
 
     def build_compile_only_config(server_args):
-        prefill_config = resolve_prefill_cuda_graph_config(server_args)
+        prefill_config = _prefill_config_read_by_trace(server_args)
         if prefill_config is None:
             return original_build_config(server_args)
-        original_compiler = prefill_config.tc_compiler
-        try:
-            prefill_config.tc_compiler = "inductor"
-            compile_config = original_build_config(server_args)
-        finally:
-            prefill_config.tc_compiler = original_compiler
+        # Do not restore the previous compiler. The trace that decides whether
+        # activation quantization fuses into PyTorch ops runs after this
+        # function returns, and it reads the same published field.
+        prefill_config.tc_compiler = "inductor"
+        compile_config = original_build_config(server_args)
 
         # With no capture sizes, CUDAPiecewiseBackend runs only its general
         # dynamic-shape Inductor artifact and never captures a CUDA Graph.
-        compile_config.capture_sizes = []
+        if compile_config is not None:
+            compile_config.capture_sizes = []
         return compile_config
 
     def capture_compile_only(self):
