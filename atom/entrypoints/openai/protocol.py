@@ -246,6 +246,8 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool | None = False
     stream: bool | None = False
     stream_options: dict[str, Any] | None = None
+    logprobs: Annotated[bool, Field(strict=True)] | None = False
+    top_logprobs: Annotated[int, Field(strict=True, ge=0, le=20)] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling

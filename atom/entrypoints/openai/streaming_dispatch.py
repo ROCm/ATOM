@@ -369,6 +369,8 @@ def merge_chunk(into: dict, new: dict) -> None:
     and rebuilding them walked the whole accumulation on every merge.
     """
     into["token_ids"].extend(new.get("token_ids") or ())
+    if new.get("logprobs") is not None:
+        into.setdefault("logprobs", []).extend(new["logprobs"])
     # Popped so the string has one reference and CPython grows it in place;
     # assigning `into["text"] + ...` back reallocates and copies per merge.
     text = into.pop("text", "")
@@ -415,6 +417,8 @@ class StreamOutputCollector:
             # A merge extends this list, so it has to be ours. The scheduler
             # already copies per step, but that is too far away to rely on.
             chunk["token_ids"] = list(chunk.get("token_ids") or ())
+            if chunk.get("logprobs") is not None:
+                chunk["logprobs"] = list(chunk["logprobs"])
             self._pending[tag] = chunk
         else:
             merge_chunk(waiting, chunk)

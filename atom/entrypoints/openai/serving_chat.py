@@ -181,6 +181,8 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
     engine is never handed a request the chat template cannot render.
     """
+    if request.top_logprobs is not None and not request.logprobs:
+        raise ValueError("top_logprobs requires logprobs=true")
     if request.stream_options is not None:
         if request.stream is not True:
             raise ValueError("stream_options requires stream=true")

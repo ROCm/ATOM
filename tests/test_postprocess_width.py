@@ -155,7 +155,13 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
         hidden_states=None,
     )
 
-    assert captured["logprobs"].shape == (scheduled_bs,)
+    values, candidates, ranks = captured["logprobs"]
+    assert values.shape == (scheduled_bs, 1, 1)
+    assert candidates.shape == (scheduled_bs, 1, 0)
+    assert ranks.shape == (scheduled_bs, 1)
+    torch.testing.assert_close(
+        values.flatten(), torch.full((scheduled_bs,), -__import__("math").log(8))
+    )
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():
