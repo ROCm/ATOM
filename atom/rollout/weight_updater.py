@@ -45,6 +45,21 @@ def _discard_sync_state_on_error(method):
     return guarded
 
 
+def _one_update(method):
+    """Each call is one update, with its own wait for the readers of the
+    weights modules write themselves (`_synced_by_module`)."""
+
+    @wraps(method)
+    def update(self, *args, **kwargs):
+        self._module_readers_awaited = False
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._module_readers_awaited = False
+
+    return update
+
+
 def _unwrap_once(module) -> torch.nn.Module | None:
     """The model inside one wrapper `ModelRunner` may have rebound onto itself,
     or None when *module* is not one. See `_sync_target_model`.
@@ -290,8 +305,8 @@ class WeightUpdaterMixin:
         self._load_into_param(param, weight_loader, tensor_gpu, shard_id)
         return "updated"
 
-    @staticmethod
     def _synced_by_module(
+        self,
         module: torch.nn.Module,
         param_name: str,
         tensor: torch.Tensor,
@@ -306,9 +321,22 @@ class WeightUpdaterMixin:
         which it never defines -- and answers False for every parameter that
         does hold its values. It raises rather than skip a weight it cannot
         take.
+
+        Such a module writes from the host (the PLE n-gram rows, page-locked
+        memory the device reads), so no stream orders the write after the
+        lookups of the step that just ended. The device is waited for once,
+        before the first module is asked in an update: nothing launches
+        during one, and each of these writes is done when it returns, leaving
+        nothing for a later wait to cover (unlike `_await_readers_of`'s).
         """
         sync = getattr(module, "sync_weight", None)
-        return callable(sync) and sync(param_name, tensor, shard_id)
+        if not callable(sync):
+            return False
+        if not getattr(self, "_module_readers_awaited", False):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            self._module_readers_awaited = True
+        return sync(param_name, tensor, shard_id)
 
     def _apply_unmatched_weight(
         self,
@@ -992,6 +1020,7 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+    @_one_update
     @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
@@ -1094,6 +1123,7 @@ class WeightUpdaterMixin:
         self._warn_if_nothing_matched(updated, skipped)
         return updated
 
+    @_one_update
     @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
@@ -1228,6 +1258,7 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
+    @_one_update
     @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,

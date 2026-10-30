@@ -206,6 +206,10 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     is `weight`, released and resumed with the other weights; on the host its
     rows are freed and page-locked again alongside them. Either way the
     addresses follow (`resume_weight_memory`; resuming recaptures the graphs).
+
+    Each data-parallel rank is its own model and page-locks its own copy of
+    the table (split across its TP ranks): N ranks on a node hold N copies,
+    ~95 GiB each for the BF16 table.
     """
 
     def __init__(
@@ -261,6 +265,9 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         shard `shard_id` of it -- written in place (`PleHostTable.sync_rows`).
         False for other parameters, and for the whole table in HBM: that is
         `weight` itself, which the updater syncs as any other parameter.
+
+        The last lookups of the step that just ended may still be reading the
+        rows over the bus; the updater has waited for them, once per update.
         """
         if param_name != "weight" or (shard_id is None and not self.table.on_host):
             return False
@@ -276,10 +283,6 @@ class _Qwen4ExpHostEmbedding(nn.Module):
                 f"{'table' if shard_id is None else f'shard {shard_id}'}, "
                 f"got {tuple(tensor.shape)}"
             )
-        if self.shard_bases.is_cuda:
-            # The last lookups of the step that just ended may still be
-            # reading the rows over the bus.
-            torch.cuda.synchronize(self.shard_bases.device)
         self.table.sync_rows(first, tensor)
         return True
 
@@ -320,11 +323,20 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         bases = self.table.shard_bases(self.shard_bases.numel(), self._initialize_dummy)
         self.shard_bases.copy_(bases)
         if self.table.on_host:
+            dp_ranks = (
+                get_current_atom_config().parallel_config.data_parallel_size_local
+            )
+            table_bytes = self.table.pinned_bytes * self.tp_size
             logger.info(
-                "%s: n-gram table in page-locked host memory, %.1f GiB read "
-                "over UVA, none in HBM",
+                "%s: n-gram table in page-locked host memory, %.1f GiB on this "
+                "rank read over UVA, none in HBM; every data-parallel rank "
+                "page-locks its own %.1f GiB copy, %.1f GiB for the %d on this "
+                "node",
                 self.prefix,
                 self.table.pinned_bytes / 1024**3,
+                table_bytes / 1024**3,
+                table_bytes * dp_ranks / 1024**3,
+                dp_ranks,
             )
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:

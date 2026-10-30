@@ -9,6 +9,7 @@ replaces, bit for bit.
 
 import ctypes
 import gc
+import logging
 import threading
 import weakref
 from types import SimpleNamespace
@@ -202,6 +203,27 @@ def test_only_an_empty_table_is_handed_to_initialize(fake_pin, fail_at):
     assert _bitwise_equal(_follow(bases, ids, 0, TABLE_ROWS, table.dtype), table[ids])
 
 
+def test_only_a_refused_page_lock_is_a_warning(fake_pin, caplog):
+    """A dummy load has no rows to page-lock: its table belongs in HBM, as
+    expected as any other. A refused page-lock is a fallback to flag."""
+    caplog.set_level(logging.INFO, logger="atom")
+    _host().shard_bases(NUM_SHARDS)
+    fake_pin.fail_at = 2
+    refused = _host()
+    _load(_table(), refused)
+    refused.shard_bases(NUM_SHARDS)
+    dummy = "ple: no n-gram rows loaded (dummy load); the table is allocated in HBM"
+    failed = (
+        "ple: page-locking the n-gram table on the host failed; falling back to HBM"
+    )
+    logged = [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if "n-gram" in record.getMessage()
+    ]
+    assert logged == [(logging.INFO, dummy), (logging.WARNING, failed)]
+
+
 class _Embedding(torch.nn.Module):
     """`_Qwen4ExpHostEmbedding` as the weight lifecycle sees it: the
     parameter, the table and the addresses the kernel reads."""
@@ -232,8 +254,7 @@ class _Embedding(torch.nn.Module):
         self.bind()
 
     def sync_weight(self, param_name, tensor, shard_id=None):
-        """`_Qwen4ExpHostEmbedding.sync_weight` at TP1, less its shape check
-        and device fence."""
+        """`_Qwen4ExpHostEmbedding.sync_weight` at TP1, less its shape check."""
         if param_name != "weight" or (shard_id is None and not self.table.on_host):
             return False
         self.table.sync_rows(0 if shard_id is None else shard_id * SHARD_ROWS, tensor)
@@ -296,6 +317,32 @@ def test_releasing_the_weights_releases_the_table(fake_pin, monkeypatch, fail_at
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
     assert _bitwise_equal(got, new[ids])
+
+
+@pytest.mark.parametrize("fail_at", [None, 1])
+def test_a_sync_between_release_and_resume_is_out_of_order(
+    fake_pin, monkeypatch, fail_at
+):
+    """The rows are not missing from the checkpoint, they are released: the
+    error says to sync after resuming, which then works."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    fake_pin.fail_at = fail_at
+    table = _table()
+    model = _Model()
+    emb = model.ple.ngram_embedding
+    _load(table, emb.table)
+    emb.bind()
+    runner = _runner(model)
+    runner.release_memory(tags=["weights"])
+    shards = _sync_tensors(table.neg(), torch.ones(4, 4), True)[:NUM_SHARDS]
+    with pytest.raises(ValueError, match="released; sync its rows after the weights"):
+        _updater(model).update_weights(shards)
+    runner.resume_memory(tags=["weights"])
+    assert _updater(model).update_weights(shards) == NUM_SHARDS
+    ids = _probe_ids(TABLE_ROWS)
+    got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
+    assert _bitwise_equal(got, table.neg()[ids])
 
 
 def test_the_modules_holding_weight_memory_are_found_once(fake_pin, monkeypatch):
@@ -432,6 +479,33 @@ def test_a_weight_sync_reaches_the_rows_the_lookup_reads(fake_pin, fail_at, shar
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, new.dtype)
     assert _bitwise_equal(got, new[ids])
+
+
+@pytest.mark.parametrize("fail_at", [None, 1])
+def test_an_update_waits_for_the_lookups_once_before_any_row(
+    fake_pin, monkeypatch, fail_at
+):
+    """The rows are written from the host, after one device-wide wait per
+    update for the lookups of the step that ended -- not one per shard."""
+    fake_pin.fail_at = fail_at
+    model = _Model()
+    emb = model.ple.ngram_embedding
+    _load(_table(), emb.table)
+    emb.bind()
+    events = []
+    sync_rows = emb.table.sync_rows
+    monkeypatch.setattr(
+        emb.table, "sync_rows", lambda *a: events.append("row") or sync_rows(*a)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda device=None: events.append(device)
+    )
+    updater = _updater(model, device="cuda")
+    shards = _sync_tensors(_table().neg(), torch.ones(4, 4), True)[:NUM_SHARDS]
+    for _ in range(2):
+        events.clear()
+        assert updater.update_weights(shards) == NUM_SHARDS
+        assert events == [torch.device("cuda")] + ["row"] * NUM_SHARDS
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -750,6 +824,10 @@ def ngram_layer(monkeypatch):
     monkeypatch.setattr(ple_layer, "get_tp_group", lambda: group)
     # The host path whatever GPU runs the test; the arch guard has its own.
     monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx950")
+    config = SimpleNamespace(
+        load_dummy=None, parallel_config=SimpleNamespace(data_parallel_size_local=1)
+    )
+    monkeypatch.setattr(ple_layer, "get_current_atom_config", lambda: config)
 
     def build(uva, config=_NGRAM_CONFIG):
         monkeypatch.setenv("ATOM_ENGRAM_UVA", "1" if uva else "0")
@@ -786,6 +864,33 @@ def _layer_inputs():
     starts = torch.tensor([0, 7, 120, 300], dtype=torch.int32, device="cuda")
     context = torch.randint(0, vocab, (3, 2), generator=gen).cuda()
     return tokens, starts, context
+
+
+@_gpu
+def test_the_load_log_counts_a_copy_per_data_parallel_rank(
+    ngram_layer, monkeypatch, caplog
+):
+    """Each DP rank page-locks a whole table of its own: the log says what
+    this rank holds and what the node's DP ranks hold together."""
+    from atom.model_ops.qwen4_exp import ple_layer
+
+    parallel = SimpleNamespace(data_parallel_size_local=4)
+    monkeypatch.setattr(
+        ple_layer,
+        "get_current_atom_config",
+        lambda: SimpleNamespace(load_dummy=None, parallel_config=parallel),
+    )
+    caplog.set_level(logging.INFO, logger="atom")
+    layer = ngram_layer(True)
+    table = _layer_table(layer)
+    _load_layer(layer, table)
+    gib = table.nbytes / 1024**3
+    assert (
+        f"ple.ngram_embedding: n-gram table in page-locked host memory, "
+        f"{gib:.1f} GiB on this "
+        f"rank read over UVA, none in HBM; every data-parallel rank page-locks "
+        f"its own {gib:.1f} GiB copy, {4 * gib:.1f} GiB for the 4 on this node"
+    ) in caplog.messages
 
 
 @_gpu

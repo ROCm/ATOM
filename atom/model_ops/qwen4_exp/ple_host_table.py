@@ -153,7 +153,7 @@ class PleHostTable:
                 if pinned is not None and not self._in_hbm:
                     self._rows[shard] = (row_start, pinned[0])
                     return
-                self._to_hbm()
+                self._to_hbm(pin_failed=True)
         local = row_start - self.vocab_start
         self.weight.data.narrow(0, local, rows.shape[0]).copy_(rows)
         with self._lock:
@@ -180,6 +180,12 @@ class PleHostTable:
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
         with self._lock:
+            # In HBM, `weight` itself is released, with the other parameters.
+            if self._released or (self._in_hbm and not self.weight.numel()):
+                raise ValueError(
+                    f"{self.prefix}: the n-gram table is released; sync its "
+                    "rows after the weights are resumed"
+                )
             if self._in_hbm:
                 if lo < hi:
                     self.weight.data.narrow(0, lo - self.vocab_start, hi - lo).copy_(
@@ -233,15 +239,23 @@ class PleHostTable:
             rows = torch.empty(num_rows, self.dim, dtype=self.dtype)
             self.load_rows(shard, row_start, rows)
 
-    def _to_hbm(self) -> None:
+    def _to_hbm(self, pin_failed: bool) -> None:
         """Make `weight` the table on `device`, holding every row pinned so
-        far; under `_lock`."""
+        far; under `_lock`. Either page-locking a shard failed, or nothing
+        was loaded (a dummy load), which is expected and not warned about."""
         if not self._in_hbm:
-            logger.warning(
-                "%s: page-locking the n-gram table on the host failed; "
-                "falling back to HBM",
-                self.prefix,
-            )
+            if pin_failed:
+                logger.warning(
+                    "%s: page-locking the n-gram table on the host failed; "
+                    "falling back to HBM",
+                    self.prefix,
+                )
+            else:
+                logger.info(
+                    "%s: no n-gram rows loaded (dummy load); the table is "
+                    "allocated in HBM",
+                    self.prefix,
+                )
             hbm = torch.empty(
                 self.vocab_end - self.vocab_start,
                 self.dim,
@@ -274,7 +288,7 @@ class PleHostTable:
             missing = [shard for shard in self.shards if shard not in self._rows]
             empty = len(missing) == len(self.shards)
             if empty:
-                self._to_hbm()
+                self._to_hbm(pin_failed=False)
             elif missing:
                 raise ValueError(
                     f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
