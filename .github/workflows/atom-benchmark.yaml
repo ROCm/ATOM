@@ -1,5 +1,5 @@
 name: ATOM Benchmark
-run-name: MegaMoE captured layer52 migration replay
+run-name: MegaMoE c512 selected-layer communication trace
 on:
   workflow_dispatch:
 permissions:
@@ -8,11 +8,11 @@ concurrency:
   group: mega-eplb-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  replay:
+  paired:
     if: github.ref == 'refs/heads/codex/mega-eplb-regression'
-    name: Captured EPLB traffic and GPU trace
+    name: c512 original workload with layer52 GPU traces
     runs-on: linux-atom-pitt-mi350x-8
-    timeout-minutes: 40
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v6
       - name: Require an idle allocation
@@ -20,32 +20,69 @@ jobs:
         run: |
           docker ps --format '{{.Names}}'
           test -z "$(docker ps -q)"
-      - name: Start pinned current container
-        id: setup
+      - name: Record source comparison
+        run: |
+          mkdir -p eplb-diagnostics
+          git rev-parse HEAD > eplb-diagnostics/atom-sha.txt
+          git show --stat --oneline HEAD > eplb-diagnostics/source.txt
+      - name: Start current pinned container
+        id: setup-current
         if: ${{ !cancelled() && steps.idle.outcome == 'success' }}
-        uses: ./.github/actions/setup-gpu-container
+        uses: ./.github/actions/atom-bench-container
         with:
-          container-name: atom-eplb-replay
-          base-image: rocm/atom-dev@sha256:44ca53b6eec447b937403fbf884f4dcfaab2f0b889d28430d928dff1f805ea31
+          image: rocm/atom-dev@sha256:44ca53b6eec447b937403fbf884f4dcfaab2f0b889d28430d928dff1f805ea31
+          container-name: atom-eplb
+          model-path: deepseek-ai/DeepSeek-V4-Pro
           runner: linux-atom-pitt-mi350x-8
-          pull-policy: always
-          network-host: 'true'
+          hf-token: ${{ secrets.AMD_HF_TOKEN }}
           env-vars: |
+            AITER_BF16_FP8_MOE_BOUND=0
+            ATOM_MOE_GU_ITLV=1
             AITER_LOG_LEVEL=WARNING
-      - name: Replay three captured layouts and trace the slow layout once
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 15
-        run: bash .github/scripts/run_eplb_replay.sh
-      - name: Upload first-result evidence and traces
+            MORI_SHMEM_HEAP_SIZE=16G
+            ATOM_BENCHMARK_STUCK_POLLS=60
+            ATOM_EPLB_DIAGNOSTICS_DIR=/workspace/eplb-diagnostics/current
+            ATOM_EPLB_TRACE_LAYER=52
+            ATOM_EPLB_TRACE_VISIT=2
+            NCCL_DEBUG=INFO
+            NCCL_DEBUG_SUBSYS=INIT,GRAPH,P2P,ENV
+            NCCL_DEBUG_FILE=/workspace/eplb-diagnostics/current/rccl-%h-%p.log
+            NCCL_TOPO_DUMP_FILE=/workspace/eplb-diagnostics/current/topology.xml
+            NCCL_GRAPH_DUMP_FILE=/workspace/eplb-diagnostics/current/graph.xml
+          container-env: >-
+            -e ISL=8192 -e OSL=1024 -e CONC=512 -e RANDOM_RANGE_RATIO=0.8
+            -e ATOM_BENCHMARK_CAPTURE=1 -e BENCH_KIND=random
+            -e ENABLE_TORCH_PROFILER=0 -e ENABLE_RTL_PROFILER=0
+      - name: Benchmark current image with migration diagnostics
+        if: ${{ !cancelled() && steps.setup-current.outcome == 'success' }}
+        timeout-minutes: 65
+        env:
+          TRIAL: current
+          EXPECTED_AITER_SHA: 6fe1bfc8fe1341179567268820e62827c19aee39
+          EXPECTED_IMAGE_ID: sha256:35b984a7a2fc779ba288a4bb21e3a8c41f2ef4ec8e488e382cd84d975e9b7be8
+          PINNED_IMAGE: rocm/atom-dev@sha256:44ca53b6eec447b937403fbf884f4dcfaab2f0b889d28430d928dff1f805ea31
+        run: bash .github/scripts/run_eplb_trial.sh
+      - name: Upload current evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: eplb-replay-evidence
-          path: eplb-replay-evidence/
+          name: eplb-current-evidence
+          path: |
+            eplb-diagnostics/current/
+            eplb-current.json
           if-no-files-found: warn
           retention-days: 15
-      - name: Stop replay container
-        if: ${{ always() && steps.setup.outcome != 'skipped' }}
+      - name: Upload current bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eplb-current-bundle
+          path: benchmark-bundles/eplb-current/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 1
+      - name: Stop current container
+        if: ${{ always() && steps.setup-current.outcome != 'skipped' }}
         run: |
-          docker stop --time 15 atom-eplb-replay || true
-          docker rm atom-eplb-replay || true
+          docker stop --time 15 atom-eplb || true
+          docker rm atom-eplb || true

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One complete original c512 workload, called twice on one GPU allocation.
+# One complete original c512 workload with explicitly labeled diagnostics.
 set -euo pipefail
 : "${TRIAL:?}" "${EXPECTED_AITER_SHA:?}" "${EXPECTED_IMAGE_ID:?}" "${PINNED_IMAGE:?}"
 out="eplb-diagnostics/$TRIAL"
@@ -75,6 +75,14 @@ trial = os.environ['TRIAL']
 r = json.loads(Path(f'eplb-{trial}.json').read_text())
 assert r['completed'] == r['num_prompts'] == 5120, r.get('completed')
 print('Validated 5120/5120 requests', r.get('total_token_throughput'), r.get('mean_tpot_ms'))
+if os.environ.get('ATOM_EPLB_TRACE_LAYER'):
+    root = Path('eplb-diagnostics', trial)
+    summaries = [json.loads(p.read_text()) for p in root.glob('trace-*.summary.json')]
+    expected = {(rank, 52, 2) for rank in range(8)}
+    actual = {(s['rank'], s['layer'], s['visit']) for s in summaries}
+    assert actual == expected, (actual, expected)
+    assert all(s['gpu_event_count'] > 0 for s in summaries), 'Missing GPU profiler events'
+    print('Validated all 8 selected-layer GPU traces; profiling is intrusive.')
 PY
 docker exec atom-eplb python3 -m atom.benchmarks.results summary-package \
   "benchmark-bundles/eplb-$TRIAL" --output "$out/summary"

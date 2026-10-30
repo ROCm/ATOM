@@ -1,5 +1,6 @@
-"""Temporary EPLB host-side diagnostics; no added device synchronization."""
+"""Temporary EPLB diagnostics; optional selected-layer GPU profiling is intrusive."""
 
+from contextlib import nullcontext
 import faulthandler
 import functools
 import gc
@@ -17,6 +18,8 @@ def install(namespace):
     root.mkdir(parents=True, exist_ok=True)
     state = threading.local()
     gc_start = {}
+    trace_layer = int(os.environ.get("ATOM_EPLB_TRACE_LAYER", "-1"))
+    trace_visit = int(os.environ.get("ATOM_EPLB_TRACE_VISIT", "2"))
 
     def capture_layout(old_list, new_list):
         row = getattr(state, "row", None)
@@ -75,7 +78,12 @@ def install(namespace):
                           torch.cuda.Event(enable_timing=True))
                 events[0].record()
             try:
-                return original(*args, **kwargs)
+                annotation = (
+                    torch.profiler.record_function("eplb::" + name)
+                    if getattr(state, "profiled", False) else nullcontext()
+                )
+                with annotation:
+                    return original(*args, **kwargs)
             finally:
                 if events is not None:
                     events[1].record()
@@ -97,10 +105,30 @@ def install(namespace):
 
     @functools.wraps(original)
     def measured_chunk(*args, **kwargs):
+        profile = None
+        trace_ordinal = None
+        trace_prepare_seconds = 0.0
+        if kwargs["layer_ids"] == [trace_layer]:
+            trace_ordinal = getattr(state, "trace_visits", 0) + 1
+            state.trace_visits = trace_ordinal
+            # Start profiling only at the selected occurrence. In particular,
+            # leave the warmup rebalance unprofiled to avoid perturbing later state.
+            if trace_ordinal == trace_visit:
+                trace_started = time.perf_counter()
+                profile = torch.profiler.profile(
+                    activities=[torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA],
+                    record_shapes=False, profile_memory=False, with_stack=False,
+                )
+                profile.start()
+                trace_prepare_seconds = time.perf_counter() - trace_started
+        state.profiled = profile is not None
         row = {
             "pid": os.getpid(), "rank": kwargs["rank"],
             "layers": kwargs["layer_ids"], "start_ns": time.time_ns(),
             "phase_host_seconds": {}, "gc_seconds": 0.0,
+            "profiled": profile is not None,
+            "trace_ordinal": trace_ordinal if profile is not None else None,
         }
         before = snapshot()
         started = time.perf_counter()
@@ -127,7 +155,31 @@ def install(namespace):
                     for name, (begin, end) in state.events.items()
                 }
                 state.row = None
+                state.profiled = False
                 with (root / f"migration-{os.getpid()}.jsonl").open("a") as out:
                     out.write(json.dumps(row) + "\n")
+                if profile is not None:
+                    # Profiler start/stop may synchronize and perturb rank skew.
+                    # Keep that overhead separate and preserve the original row
+                    # before exporting, so a profiler failure retains evidence.
+                    trace_finished = time.perf_counter()
+                    profile.stop()
+                    stem = f"trace-rank{kwargs['rank']}-layer{trace_layer}-visit{trace_ordinal}"
+                    profile.export_chrome_trace(str(root / (stem + ".json")))
+                    events = profile.events()
+                    summary = {
+                        "rank": kwargs["rank"], "layer": trace_layer,
+                        "visit": trace_ordinal, "gpu_event_count": sum(
+                            event.device_type == torch.autograd.DeviceType.CUDA
+                            for event in events
+                        ),
+                        "profiler_event_count": len(events),
+                        "prepare_host_seconds": trace_prepare_seconds,
+                        "finish_and_export_host_seconds": time.perf_counter() - trace_finished,
+                        "intrusive_profiling": True,
+                    }
+                    (root / (stem + ".summary.json")).write_text(
+                        json.dumps(summary, indent=2), encoding="utf-8"
+                    )
 
     namespace["migrate_and_commit_chunk"] = measured_chunk
