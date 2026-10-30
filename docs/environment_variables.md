@@ -644,8 +644,8 @@ send worker, capped at 256 MiB per GPU. Each D GPU reserves 256 MiB for landing
 plus 96 KiB for the scatter table, before KV cache sizing. Other models, DCP,
 and slot-state layouts retain their existing support gates.
 
-See [MiniMax PP-to-TP landing](minimax_m3_pp_tp_landing.md) for the protocol,
-fallback and validation recipes.
+Transfers needing fewer than two landing slots, or with no available credit
+after 10 ms, use gathered data for direct PAGE writes.
 
 MLA and MiniMax use the same staging pool lifecycle, landing receiver and
 transport implementation. The peer topology determines ownership; physical
