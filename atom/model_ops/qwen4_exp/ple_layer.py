@@ -29,6 +29,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
+from atom.config import get_current_atom_config
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpGroupedRMSNorm
@@ -238,10 +239,21 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         to HBM is `weight`, now at a new address."""
         self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
 
+    def _initialize_dummy(self) -> None:
+        """`--load_dummy` filled the parameters while `weight` was still the
+        `[0, dim]` placeholder; the table it has become gets the same fill."""
+        mode = get_current_atom_config().load_dummy
+        if mode and mode != "empty":
+            # Deferred: the loader imports the model ops.
+            from atom.model_loader.loader import initialize_dummy_weights
+
+            initialize_dummy_weights(self, mode)
+
     def process_weights_after_loading(self) -> None:
         if self.fp8:
             _check_global_scale(self.prefix, self.weight_scale)
-        self.rebind_weight_addresses()
+        bases = self.table.shard_bases(self.shard_bases.numel(), self._initialize_dummy)
+        self.shard_bases.copy_(bases)
         if self.table.on_host:
             logger.info(
                 "%s: n-gram table in page-locked host memory, %.1f GiB read "

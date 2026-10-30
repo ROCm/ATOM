@@ -169,6 +169,34 @@ def test_missing_shard_is_an_error_and_an_empty_load_is_not(fake_pin):
     assert int(bases[0]) == dummy.weight.data_ptr()
 
 
+@pytest.mark.parametrize("fail_at", [None, 2])
+def test_only_an_empty_table_is_handed_to_initialize(fake_pin, fail_at):
+    """A dummy load's table is filled (`--load_dummy`'s mode) once it exists,
+    before its addresses are taken; a loaded one, host or HBM, is the
+    checkpoint's and is not."""
+    fake_pin.fail_at = fail_at
+    filled = []
+
+    def initialize(host):
+        assert host.weight.shape == (TABLE_ROWS, DIM)
+        host.weight.data.fill_(0.5)
+        filled.append(host)
+
+    dummy = _host()
+    bases = dummy.shard_bases(NUM_SHARDS, lambda: initialize(dummy))
+    assert filled == [dummy]
+    ids = _probe_ids(TABLE_ROWS)
+    got = _follow(bases, ids, 0, TABLE_ROWS, torch.bfloat16)
+    assert torch.equal(got, torch.full_like(got, 0.5))
+
+    table = _table()
+    loaded = _host()
+    _load(table, loaded)
+    bases = loaded.shard_bases(NUM_SHARDS, lambda: initialize(loaded))
+    assert filled == [dummy]
+    assert _bitwise_equal(_follow(bases, ids, 0, TABLE_ROWS, table.dtype), table[ids])
+
+
 class _Embedding(torch.nn.Module):
     """`_Qwen4ExpHostEmbedding` as the weight lifecycle sees it: the
     parameter, the table and the addresses the kernel reads."""
@@ -486,3 +514,47 @@ def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
     assert int(embedding.shard_bases[0]) == embedding.weight.data_ptr() != old_base
     assert _bitwise_equal(host_layer(*inputs), expected)
     del squatter
+
+
+@_gpu
+@pytest.mark.parametrize("mode", ["zero", "xavier", "empty"])
+def test_dummy_load_fills_the_table_as_an_hbm_embedding(ngram_layer, monkeypatch, mode):
+    """`--load_dummy`: `load_model` runs `initialize_dummy_weights` before the
+    post-load hook, while `weight` is still the `[0, dim]` placeholder. The
+    table the hook allocates gets what the HBM `VocabParallelEmbedding.weight`
+    gets from the same RNG state; `empty` leaves it uninitialized."""
+    from atom.model_loader import loader
+    from atom.model_ops.qwen4_exp import ple_layer
+
+    monkeypatch.setattr(
+        ple_layer, "get_current_atom_config", lambda: SimpleNamespace(load_dummy=mode)
+    )
+    calls = []
+    initialize = loader.initialize_dummy_weights
+
+    def spy(model, init_mode):
+        calls.append(init_mode)
+        initialize(model, init_mode)
+
+    monkeypatch.setattr(loader, "initialize_dummy_weights", spy)
+    host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
+    embedding = host_layer.ngram_embedding
+    if mode != "empty":
+        loader.initialize_dummy_weights(host_layer, mode)
+    torch.manual_seed(7)
+    embedding.process_weights_after_loading()
+    assert not embedding.table.on_host
+    assert int(embedding.shard_bases[0]) == embedding.weight.data_ptr()
+    if mode == "empty":
+        assert calls == []
+        return
+    assert calls == [mode, mode]
+    torch.manual_seed(7)
+    loader.initialize_dummy_weights(hbm_layer, mode)
+    reference = hbm_layer.ngram_embedding.weight
+    assert reference.shape == embedding.weight.shape
+    assert _bitwise_equal(embedding.weight, reference)
+    assert torch.isfinite(embedding.weight).all()
+    assert (embedding.weight == 0).all() == (mode == "zero")
+    ids = torch.arange(0, host_layer.table_rows, 997, device="cuda")
+    assert _bitwise_equal(embedding(ids), reference[ids])

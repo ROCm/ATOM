@@ -11,6 +11,7 @@ import ctypes
 import functools
 import logging
 import threading
+from collections.abc import Callable
 
 import torch
 
@@ -156,19 +157,24 @@ class PleHostTable:
                     hbm.narrow(0, local, pinned.shape[0]).copy_(pinned)
                     self._rows[shard] = (row_start, None)
 
-    def shard_bases(self, num_shards: int) -> torch.Tensor:
+    def shard_bases(
+        self, num_shards: int, initialize: Callable[[], None] | None = None
+    ) -> torch.Tensor:
         """`[num_shards]` int64 on the CPU: the address of each local shard's
         first global row (0 for another rank's shards).
 
         Call once loading is done, and again whenever `weight` has been
         reallocated. A table that received nothing (a dummy load) is
-        allocated in `weight` uninitialized, as an HBM embedding would be;
-        one missing only some shards is an error.
+        allocated in `weight`, as an HBM embedding would be, and filled by
+        `initialize` -- left uninitialized without one; one missing only some
+        shards is an error.
         """
         missing = [shard for shard in self.shards if shard not in self._rows]
         if len(missing) == len(self.shards):
             with self._lock:
                 self._to_hbm()
+            if initialize is not None:
+                initialize()
         elif missing:
             raise ValueError(
                 f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
