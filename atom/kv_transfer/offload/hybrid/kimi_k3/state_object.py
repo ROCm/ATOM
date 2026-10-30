@@ -57,6 +57,7 @@ class StateByteCodec:
         self._worker_id = int(worker_id)
         self._layout_id = layout_id
         self._misfit_reads = 0
+        self._unrefreshed_touches = 0
         self._storage = None
         self._max_entries = (
             None
@@ -190,8 +191,21 @@ class StateByteCodec:
                     policy.update_on_hit(key, hot)
                     return True
         # Not in the hot cache (or there is none): another backend may still
-        # hold it, and `get` reads every backend. Presence only.
-        return bool(self._storage.contains(key))
+        # hold it, and `get` reads every backend. Presence only. Still reported
+        # resident: `get` can read it now, and the confirmation that opens only
+        # lets later loads skip the hold, where a miss degrades to a recompute.
+        if not self._storage.contains(key):
+            return False
+        self._unrefreshed_touches += 1
+        if self._unrefreshed_touches == 1:
+            logger.warning(
+                "state offload: a touched state image is outside LocalCPU's "
+                "hot cache (or no LocalCPU LRU is reachable), so the touch "
+                "only confirmed it is present and did not refresh its "
+                "eviction order (counted as unrefreshed_touches=%d)",
+                self._unrefreshed_touches,
+            )
+        return True
 
     def _put(self, h: int, unit_ids, on_source_released=None) -> bool:
         """Store one checkpoint image. False when nothing was stored.

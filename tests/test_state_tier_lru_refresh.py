@@ -16,6 +16,7 @@ verdict land before a request parks on an image.
 """
 
 import dataclasses
+import logging
 import sys
 import threading
 import types
@@ -280,6 +281,33 @@ class TestCodecRefresh:
         assert codec.touch(1) is True
         pool.hot.clear()
         assert codec.touch(1) is False
+
+    def test_a_presence_only_touch_is_counted_and_warned_once(
+        self, lmcache_key, caplog
+    ):
+        """It confirms the image without refreshing it, so it must not be
+        silent."""
+        pool = _LocalCPU()
+        codec, _ = _codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        pool.local_cpu_backend = None
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            assert codec.touch(1) is True
+            assert codec.touch(1) is True
+        assert codec._unrefreshed_touches == 2
+        warned = [r for r in caplog.records if "unrefreshed_touches" in r.message]
+        assert len(warned) == 1 and "unrefreshed_touches=1" in warned[0].message
+
+    def test_a_refreshed_or_gone_image_is_not_counted(self, lmcache_key, caplog):
+        pool = _LocalCPU()
+        codec, _ = _codec(pool, max_entries=None)
+        assert codec.put(1, [])
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            assert codec.touch(1) is True
+            pool.hot.clear()
+            assert codec.touch(1) is False
+        assert codec._unrefreshed_touches == 0
+        assert not [r for r in caplog.records if "unrefreshed_touches" in r.message]
 
 
 # ── the index: votes queue touches, verdicts keep it in step ───────────────
@@ -807,6 +835,15 @@ class TestVotersRegisterTouches:
         seq = _seq()
         assert bm._request_state_load(seq, 77)
         assert bm.state_offload.take_touches() == [77]
+
+    def test_an_offload_without_touches_still_counts_a_tier_hit(self, clock):
+        """`attach_offload` takes any index answering `could_serve`."""
+        bm = _paged_bm()
+        bm.paged_state_checkpoints.attach_offload(
+            SimpleNamespace(hashes={77}, could_serve=lambda h: h == 77)
+        )
+        assert bm.paged_state_checkpoints._reachable(77)
+        assert not bm.paged_state_checkpoints._reachable(78)
 
 
 class TestResumeHash:
