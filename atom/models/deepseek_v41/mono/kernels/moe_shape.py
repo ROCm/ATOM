@@ -12,7 +12,7 @@ import flydsl.expr as fx
 from atom.model_ops.deepseek_v41.router import PARTS as ROUTER_PARTS
 from atom.models.deepseek_v41.mono import moe_plan as mplan
 from atom.models.deepseek_v41.mono.config import MAX_ROWS
-from atom.models.deepseek_v41.mono.kernels.attn_pre import ROWS, TILE, token_tiles
+from atom.models.deepseek_v41.mono.gfx950.kernels.attn_pre import ROWS, TILE, token_tiles
 from atom.models.deepseek_v41.mono.kernels.dims import TOPK, UG_PART, Dims
 from atom.mono.plan.execution import BLOCKS, WAVES
 

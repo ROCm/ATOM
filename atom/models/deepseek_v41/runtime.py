@@ -66,7 +66,7 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
     if isinstance(metadata.engram_embeddings, EngramStagedRows):
         metadata.engram_embeddings.stage()
     if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1" and metadata.step.decode:
-        from .mono.gfx1250_runner import begin_k1_forward
+        from .mono.gfx1250.gfx1250_runner import begin_k1_forward
 
         begin_k1_forward(metadata)
 
@@ -80,7 +80,7 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
         hidden.zero_()
         return
     if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1" and metadata.step.decode:
-        from .mono.gfx1250_runner import finish_k1_forward
+        from .mono.gfx1250.gfx1250_runner import finish_k1_forward
 
         finish_k1_forward(metadata)
     if getattr(metadata, "staged_outside_forward", False):
@@ -147,7 +147,7 @@ class RuntimeBlock(Block):
         self, state, cache, step, rope, embeddings=None, image_mask=None, queries=None
     ):
         if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1":
-            from .mono.gfx1250_runner import try_decode_k1
+            from .mono.gfx1250.gfx1250_runner import try_decode_k1
 
             metadata = get_forward_context().attn_metadata
             result = try_decode_k1(
@@ -298,7 +298,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MHTJSTEST",
         )):
             return
-        from .mono.gfx1250_diagnostics import DeferredDiagnostics
+        from .mono.gfx1250.gfx1250_diagnostics import DeferredDiagnostics
 
         transfer = getattr(self, "_gfx1250_diagnostic_transfer", None)
         if transfer is None:
@@ -310,7 +310,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         if any(os.getenv(flag, "0") == "1" for flag in (
             "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MHTJSTEST",
         )):
-            from .mono.gfx1250_runner import check_k1_diagnostics
+            from .mono.gfx1250.gfx1250_runner import check_k1_diagnostics
 
             try:
                 transfer = getattr(self, "_gfx1250_diagnostic_transfer", None)
@@ -414,7 +414,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # there is anything to stage or join.
     def begin_forward(self, hidden, engram_embeddings):
         if os.getenv("ATOM_DSV41_GFX1250_K2_MERGED", "0") == "1":
-            from .mono.gfx1250_context import bind_gfx1250_context
+            from .mono.gfx1250.gfx1250_context import bind_gfx1250_context
 
             bind_gfx1250_context(self, get_forward_context().attn_metadata)
         v41_begin_forward(hidden)
