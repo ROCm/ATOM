@@ -69,7 +69,8 @@ export TRITON_CACHE_AUTOTUNING=${TRITON_CACHE_AUTOTUNING:-1}
 LEVEL=${LEVEL:-0}; KV=${KV:-bf16}; MAX_LEN=${MAX_LEN:-262144}
 # 262144 is the model's native context; it fits 98% of the dataset's conversations.
 # Prefix caching stays on (the default): every agentic turn resends the whole history.
-ARGS=(--model $MODEL --trust-remote-code --host 0.0.0.0 --server-port 8000 -tp 4
+# TP=1: one GPU a server (the 4xTP1 node: one server per GPU, HIP_VISIBLE_DEVICES=<gpu>)
+ARGS=(--model $MODEL --trust-remote-code --host 0.0.0.0 --server-port 8000 -tp ${TP:-4}
   --kv_cache_dtype $KV --gpu-memory-utilization 0.9 --max-model-len $MAX_LEN
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384
   --level $LEVEL --disable_uvicorn_access_log)
