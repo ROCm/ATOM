@@ -59,6 +59,8 @@ from atom.mono.plan.trace import Space
 
 KEY_TILES = SPARSE_BLOCK // 16  # WMMA row tiles of a block
 CHUNKS = HEAD_DIM // 32  # k32 chunks of a key
+CP_TILES = 1  # key tiles a context-parallel task holds at a time
+TASK_TILES = 4  # and a wave task (more than BLOCKS tasks)
 _CURRENT_STREAM = fx.Stream(None)
 
 
@@ -166,24 +168,30 @@ def emit_index_scores(
         seq_lane = pick(seq, fx.min(lane, tokens - 1))
         n_cols = TP * q_len
 
+        passes = TP * MAX_TOKENS // 16
+
         def score_cp(tk, b, page):
+            """Every pass's (head, row) columns over the block's key tiles: a pass
+            reads the keys CP_TILES tiles at a time (every tile's keys held across
+            the passes would not fit wave32's registers; the re-reads hit L2)."""
             if const_expr(wait_new_keys is not None):  # noqa: SIM102
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
-            kw = load_keys(page, tiles)
-            for p in range_constexpr(TP * MAX_TOKENS // 16):
+            for p in range_constexpr(passes):
                 if p * 16 < n_cols:
                     f = p * 16 + l16
                     head = fx.min(f // q_len, TP - 1)
                     col = tk - (q_len - 1) + f % q_len
                     qb = [q_frag_head(col, s, head) for s in range(CHUNKS)]
-                    v = tiles_max(b, qb, lane_gather(seq_lane, col), tiles, kw)
+                    col_seq = lane_gather(seq_lane, col)
+                    v = fx.Float32(float("-inf"))
+                    for t0 in range_constexpr(0, KEY_TILES, CP_TILES):
+                        group = range(t0, t0 + CP_TILES)
+                        v = fx.max(v, tiles_max(b, qb, col_seq, group, load_keys(page, group)))
                     if (lane < 16) & (f < n_cols):
                         mb_put(
                             iscore,
-                            col * MAX_INDEX_BLOCKS
-                            + head * (MAX_INDEX_BLOCKS // TP)
-                            + b // TP,
+                            col * MAX_INDEX_BLOCKS + head * (MAX_INDEX_BLOCKS // TP) + b // TP,
                             v * scale,
                         )
 
@@ -234,11 +242,16 @@ def emit_index_scores(
             if const_expr(wait_new_keys is not None):  # noqa: SIM102
                 if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
                     wait_new_keys()
-            kw = load_keys(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)
             col_seq = lane_gather(seq_lane, col)
             qb = [q_frag(col, s) for s in range(CHUNKS)]
-            put(b, col, tiles_max(b, qb, col_seq, tiles, kw))
+            # TASK_TILES tiles' keys in flight at a time: all eight are 128
+            # VGPRs on wave32
+            v = fx.Float32(float("-inf"))
+            for t0 in range_constexpr(0, KEY_TILES, TASK_TILES):
+                group = range(t0, t0 + TASK_TILES)
+                v = fx.max(v, tiles_max(b, qb, col_seq, group, load_keys(page, group)))
+            put(b, col, v)
 
         step = BLOCKS * WAVES
         for c0 in range(slot + BLOCKS * wave, total, step * WAVE):

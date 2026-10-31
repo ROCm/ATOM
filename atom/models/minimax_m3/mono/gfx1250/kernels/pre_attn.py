@@ -555,7 +555,7 @@ def emit_k1(
         slot_mapping, k_cache, v_cache, k_scale, v_scale, index_cache, q_out, iq_out,
         block_table, seq_lens, iscore, scratch,
     ) = ptrs  # fmt: skip
-    mbox = Mailbox(layer, diag, region_ids, gfx1250=True)
+    mbox = Mailbox(layer, diag, region_ids, gfx1250=True, steady=diag is not None)
     qkv_mb = sreg(scratch, SCRATCH_QKV, "k1.qkv")
     x8_mb = scratch + fx.Int64(SCRATCH_X8)
     x8s_mb = sreg(scratch, SCRATCH_X8S, "k1.x8s")
