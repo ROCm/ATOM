@@ -40,10 +40,13 @@ logprob arrays contain committed tokens only, not speculative placeholders.
 
 - ByteLevel tokenizers are supported; other decoder types return an explicit
   error rather than inventing UTF-8 bytes. The intended V4.1 tokenizer is ByteLevel.
-- Text and thinking output, streaming/non-streaming, and multiple choices are
-  included. Tools, multimodal input, and P/D KV transfer with logprobs are
-  explicitly rejected in this initial draft. Their existing behavior is retained
-  when logprobs is disabled. No image implementation is added.
+- Text and thinking output, streaming/non-streaming, multiple choices, and normal
+  function tools are included. Probability fields describe visible content and
+  reasoning; no tool-argument probability field is invented. Structured Chat
+  output can also request logprobs: requested target rows are preserved before
+  grammar masking so probabilities still describe the raw target distribution.
+  Multimodal input and P/D KV transfer with logprobs remain unsupported.
+  No image implementation is added.
 - Forced synthetic acceptance is rejected. It cannot validate target-model
   semantics or token probabilities.
 - This does not add logprob fields to Responses or Anthropic Messages.
