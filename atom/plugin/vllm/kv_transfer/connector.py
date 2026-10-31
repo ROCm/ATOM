@@ -63,6 +63,7 @@ from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
 )
 from atom.plugin.vllm.kv_transfer.offload_config import build_offload_config
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
+from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -265,31 +266,6 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
             f"state_load_failed={self.state_load_failed}, "
             f"state_refusals={self.state_refusals})"
         )
-
-
-def _v41_state_checkpoints_can_serve(vllm_config) -> bool:
-    """Whether a V4.1 state checkpoint may back a LOCAL prefix hit.
-
-    Takes the config: the scheduler calls `cap_local_hit` outside any
-    `set_current_vllm_config` scope. Where the checkpoint module cannot be
-    imported, local hits are refused.
-    """
-    try:
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-            register_v41_state_checkpoint_adapter,
-        )
-        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
-
-        return bool(
-            vllm_config is not None
-            and state_checkpoints_on(
-                register_v41_state_checkpoint_adapter(), vllm_config
-            )
-        )
-    except ImportError:
-        # Absent mechanism means no checkpoints; any other error is a real
-        # fault and must not quietly turn every V4.1 HBM hit off.
-        return False
 
 
 #: Options that sized or selected an in-process state pool beside the MP
@@ -538,8 +514,24 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
                 self._scheduler = DenseOffloadScheduler(self._config)
-            self._init_kda_planner(vllm_config, kv_cache_config)
-            self._init_v41_planner(vllm_config, kv_cache_config)
+            if self._mamba_groups:
+                self._kda_planner = KdaBoundaryPlanner.from_vllm_config(
+                    vllm_config,
+                    kv_cache_config,
+                    self._mamba_groups,
+                    chunk_size=int(self._scheduler.chunk_size),
+                    world_size=self._world_size,
+                )
+            if self._is_deepseek_v41:
+                self._v41_planner = V41BoundaryPlanner.from_vllm_config(
+                    vllm_config,
+                    kv_cache_config,
+                    scheduler=self._scheduler,
+                    page_block_size=self._attn_block_size,
+                    checkpoint_group_ids=self._v41_checkpoint_group_ids,
+                    request_of=self._v41_request_of,
+                )
+            self._install_planners()
 
     def _resolve_offload_backend(self) -> str:
         """Which ATOM offload transport this connector drives.
@@ -791,99 +783,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         return others[0]
 
-    def _init_v41_planner(self, vllm_config, kv_cache_config) -> None:
-        """Stand up the scheduler half of V4.1's STATE leg."""
-        if not self._is_deepseek_v41:
-            return
-        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-
-        from .v41_state import V41BoundaryPlanner
-
-        _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-        # The grid a STATE boundary may sit on is V4.1's PAGE block, which
-        # is the attention group's. `hash_block_size` is engine-wide and
-        # becomes the smallest group's, so with a draft group the two part
-        # company and a boundary chosen on the hash grid is not a PAGE edge.
-        grid = int(getattr(self, "_attn_block_size", 0) or 0) or int(hash_block_size)
-        # When checkpoints are registered the two mechanisms have to agree on one
-        # grid: the planner decides where a boundary may sit, and the checkpoint
-        # group decides which column vLLM hashes. A boundary the planner
-        # accepts on a different grid is a store nothing can look up, and the
-        # symptom is a silent zero hit rate rather than an error.
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-            register_v41_state_checkpoint_adapter,
-        )
-
-        adapter = register_v41_state_checkpoint_adapter()
-        checkpoint_block = int(adapter.block_size)
-        if checkpoint_block and checkpoint_block != grid:
-            raise ValueError(
-                f"ATOM LMCache offload: V4.1 boundary grid {grid} does not match the "
-                f"state checkpoint block {checkpoint_block}. A boundary claimed on one grid is "
-                "hashed on the other, so nothing stored would ever be found."
-            )
-        self._refuse_v41_ride_without_dense_checkpoints(int(grid))
-        self._v41_planner = V41BoundaryPlanner(
-            hash_block_size=int(hash_block_size),
-            boundary_grid=grid,
-            chunk_size=int(self._scheduler.chunk_size),
-            state_checkpoints_can_serve=_v41_state_checkpoints_can_serve(vllm_config),
-            checkpoint_group_ids=self._v41_checkpoint_group_ids,
-            prefill_tail=adapter.prefill_tail(vllm_config),
-        )
-        self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
-        self._scheduler.bind_planner(self._v41_planner, self._v41_request_of)
-        logger.info(
-            "ATOM LMCache offload: V4.1 state leg on (hash_block=%d, chunk=%d, "
-            "checkpoint_groups=%s)",
-            int(hash_block_size),
-            int(self._scheduler.chunk_size),
-            ",".join(str(g) for g in self._v41_checkpoint_group_ids) or "-",
-        )
-
-    def _refuse_v41_ride_without_dense_checkpoints(self, grid: int) -> None:
-        """A save needs a state checkpoint at the boundary it ends on.
-
-        One save spans many chunks and carries one checkpoint image, the one
-        at its end; its earlier chunks name the null block, and the MP server
-        stores no image for them. The server serves a hit length only if every
-        image group holds the length's last chunk (with
-        `--separate-object-groups`, which keeps the image groups apart from
-        PAGE), so a hit never ends inside a save: the hit grain is the set of
-        saved forward ends, not the chunk. `cap_hit` relies on that.
-
-        What has to hold on this side is that a save's end has a checkpoint
-        at all. A prefill forward ends on a rung of the checkpoint interval
-        (`Placement.cut`) and a save ends on a chunk boundary; with the two
-        equal they coincide. With V4.1's default interval of 8192 against a
-        chunk of 256, most saves would end where no forward did, find no
-        checkpoint, and be dropped -- correct, but a tier that fills only at
-        interval multiples and says nothing about it. Refused instead, naming
-        the setting that fixes it.
-        """
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
-            V41CheckpointPlacement,
-        )
-
-        placement = V41CheckpointPlacement.from_env()
-        interval = int(placement.interval)
-        chunk = int(self._scheduler.chunk_size)
-        if interval == chunk:
-            return
-        raise ValueError(
-            "ATOM offload connector: DeepSeek-V4.1 state cannot ride the PAGE "
-            f"object with a checkpoint interval of {interval} tokens against "
-            f"an LMCache chunk of {chunk}. A save carries the checkpoint at the "
-            "boundary it ends on and a prefill forward ends on a rung of the "
-            "interval, so with the two unequal most saves find no checkpoint "
-            "and are dropped. Bring the two together from either side -- "
-            f"ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS={chunk}, or an LMCache "
-            f"chunk of {interval} on the server and the client, which is the "
-            "cheaper one: the interval decides how often a checkpoint is "
-            "written, while the chunk only decides how coarse a tier hit is, "
-            "and a V4.1 hit is already quantised to a checkpoint."
-        )
-
     def _v41_request_of(self, seq):
         """The vLLM request a scheduler ``SeqView`` stands for, or None.
 
@@ -909,41 +808,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             if planner is not None
         )
 
-    def _init_kda_planner(self, vllm_config, kv_cache_config) -> None:
-        """Stand up the scheduler half of the recurrent leg, if there is one."""
-        if not self._mamba_groups:
-            return
-        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+    def _install_planners(self) -> None:
+        """Hand ATOM's scheduler the hit cap of this model's planner.
 
-        group_ids = tuple(group_id for group_id, _ in self._mamba_groups)
-        spec = self._mamba_groups[0][1]
-        cache_mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
-        if cache_mode != "align":
-            # Any other mode keeps the recurrent state somewhere this connector
-            # has no hand-off for, so a boundary block id would be a guess. The
-            # failure would be a wrong restored state, which nothing reports.
+        At most one planner: the scheduler holds a single hit-cap hook
+        (`install_hit_cap_hook`), so a second planner's cap would silently
+        replace the first's and leave that leg's hits unchecked -- a prefix
+        restored on somebody else's state. No supported configuration builds
+        two (V4.1 offloads only over mp, a recurrent model is refused there,
+        and V4.1's checkpoint groups are kept out of the recurrent leg); this
+        keeps a new one from doing it quietly.
+        """
+        planners = self._planners
+        if len(planners) > 1:
             raise ValueError(
-                "ATOM offload connector: a hybrid model needs "
-                f"--mamba-cache-mode align to offload KV, got {cache_mode!r}; "
-                "vLLM hands off exact boundary state blocks only in that mode"
+                "ATOM offload connector: this model would need "
+                f"{len(planners)} boundary planners ("
+                + ", ".join(planner.leg_name for planner in planners)
+                + "), but ATOM's scheduler holds one hit-cap hook; a second "
+                "would silently replace the first's cap"
             )
-        _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-        self._kda_planner = KdaBoundaryPlanner(
-            group_ids=group_ids,
-            mamba_block_size=int(spec.block_size),
-            hash_block_size=int(hash_block_size),
-            chunk_size=int(self._scheduler.chunk_size),
-            world_size=self._world_size,
-        )
-        self._scheduler.install_hit_cap_hook(self._kda_planner.cap_hit)
-        logger.info(
-            "ATOM LMCache offload: recurrent state leg on group(s) %s "
-            "(mamba_block=%d, hash_block=%d, chunk=%d)",
-            ",".join(str(group_id) for group_id in group_ids),
-            int(spec.block_size),
-            int(hash_block_size),
-            int(self._scheduler.chunk_size),
-        )
+        for planner in planners:
+            self._scheduler.install_hit_cap_hook(planner.cap_hit)
 
     # ---- worker side --------------------------------------------------
 

@@ -562,6 +562,54 @@ class KdaBoundaryPlanner(BoundaryPlanner):
                 "could ever be reported"
             )
 
+    @classmethod
+    def from_vllm_config(
+        cls,
+        vllm_config,
+        kv_cache_config,
+        mamba_groups,
+        *,
+        chunk_size: int,
+        world_size: int,
+    ) -> KdaBoundaryPlanner:
+        """Stand up the scheduler half of the recurrent leg.
+
+        *mamba_groups* is the connector's ``(group_id, spec)`` list -- the
+        recurrent groups, with any group that is not this leg's already taken
+        out -- and must not be empty.
+        """
+        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+        group_ids = tuple(group_id for group_id, _ in mamba_groups)
+        spec = mamba_groups[0][1]
+        cache_mode = getattr(vllm_config.cache_config, "mamba_cache_mode", None)
+        if cache_mode != "align":
+            # Any other mode keeps the recurrent state somewhere this connector
+            # has no hand-off for, so a boundary block id would be a guess. The
+            # failure would be a wrong restored state, which nothing reports.
+            raise ValueError(
+                "ATOM offload connector: a hybrid model needs "
+                f"--mamba-cache-mode align to offload KV, got {cache_mode!r}; "
+                "vLLM hands off exact boundary state blocks only in that mode"
+            )
+        _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+        planner = cls(
+            group_ids=group_ids,
+            mamba_block_size=int(spec.block_size),
+            hash_block_size=int(hash_block_size),
+            chunk_size=int(chunk_size),
+            world_size=world_size,
+        )
+        logger.info(
+            "ATOM LMCache offload: recurrent state leg on group(s) %s "
+            "(mamba_block=%d, hash_block=%d, chunk=%d)",
+            ",".join(str(group_id) for group_id in group_ids),
+            int(spec.block_size),
+            int(hash_block_size),
+            int(chunk_size),
+        )
+        return planner
+
     # -- lookup ----------------------------------------------------------
     def _cap_unarmed(self, seq, hit: int) -> int:
         """Pass a hit reported outside any lookup through unchanged.

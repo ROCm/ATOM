@@ -50,6 +50,36 @@ def _hooks(calls):
     return [(leg, hook) for leg, hook, *_ in calls]
 
 
+# -- one planner, one hit cap ------------------------------------------------
+
+
+def test_two_planners_are_refused_at_init():
+    """The scheduler has one hit-cap slot; the second cap would replace the first."""
+    c = _connector([])
+    c._scheduler = SimpleNamespace(install_hit_cap_hook=Mock())
+    with pytest.raises(ValueError, match="one hit-cap hook"):
+        c._install_planners()
+    c._scheduler.install_hit_cap_hook.assert_not_called()
+
+
+@pytest.mark.parametrize("leg", ["_kda_planner", "_v41_planner"])
+def test_the_one_planner_gets_the_hit_cap(leg):
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    planner = SimpleNamespace(leg_name=leg, cap_hit=Mock())
+    setattr(c, leg, planner)
+    c._scheduler = SimpleNamespace(install_hit_cap_hook=Mock())
+    c._install_planners()
+    c._scheduler.install_hit_cap_hook.assert_called_once_with(planner.cap_hit)
+
+
+def test_a_connector_without_planners_installs_no_hit_cap():
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._scheduler = SimpleNamespace(install_hit_cap_hook=Mock())
+    c._install_planners()
+    assert c._planners == ()
+    c._scheduler.install_hit_cap_hook.assert_not_called()
+
+
 # -- every hook reaches every planner ----------------------------------------
 
 

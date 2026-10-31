@@ -30,6 +30,75 @@ from .page_ride import PageRideMixin
 logger = logging.getLogger("atom")
 
 
+def _state_checkpoints_can_serve(vllm_config) -> bool:
+    """Whether a V4.1 state checkpoint may back a LOCAL prefix hit.
+
+    Takes the config: the scheduler calls `cap_local_hit` outside any
+    `set_current_vllm_config` scope. Where the checkpoint module cannot be
+    imported, local hits are refused.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+        )
+        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
+
+        return bool(
+            vllm_config is not None
+            and state_checkpoints_on(
+                register_v41_state_checkpoint_adapter(), vllm_config
+            )
+        )
+    except ImportError:
+        # Absent mechanism means no checkpoints; any other error is a real
+        # fault and must not quietly turn every V4.1 HBM hit off.
+        return False
+
+
+def _refuse_ride_without_dense_checkpoints(chunk: int) -> None:
+    """A save needs a state checkpoint at the boundary it ends on.
+
+    One save spans many chunks and carries one checkpoint image, the one
+    at its end; its earlier chunks name the null block, and the MP server
+    stores no image for them. The server serves a hit length only if every
+    image group holds the length's last chunk (with
+    `--separate-object-groups`, which keeps the image groups apart from
+    PAGE), so a hit never ends inside a save: the hit grain is the set of
+    saved forward ends, not the chunk. `cap_hit` relies on that.
+
+    What has to hold on this side is that a save's end has a checkpoint
+    at all. A prefill forward ends on a rung of the checkpoint interval
+    (`Placement.cut`) and a save ends on a chunk boundary; with the two
+    equal they coincide. With V4.1's default interval of 8192 against a
+    chunk of 256, most saves would end where no forward did, find no
+    checkpoint, and be dropped -- correct, but a tier that fills only at
+    interval multiples and says nothing about it. Refused instead, naming
+    the setting that fixes it.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        V41CheckpointPlacement,
+    )
+
+    placement = V41CheckpointPlacement.from_env()
+    interval = int(placement.interval)
+    chunk = int(chunk)
+    if interval == chunk:
+        return
+    raise ValueError(
+        "ATOM offload connector: DeepSeek-V4.1 state cannot ride the PAGE "
+        f"object with a checkpoint interval of {interval} tokens against "
+        f"an LMCache chunk of {chunk}. A save carries the checkpoint at the "
+        "boundary it ends on and a prefill forward ends on a rung of the "
+        "interval, so with the two unequal most saves find no checkpoint "
+        "and are dropped. Bring the two together from either side -- "
+        f"ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS={chunk}, or an LMCache "
+        f"chunk of {interval} on the server and the client, which is the "
+        "cheaper one: the interval decides how often a checkpoint is "
+        "written, while the chunk only decides how coarse a tier hit is, "
+        "and a V4.1 hit is already quantised to a checkpoint."
+    )
+
+
 class V41BoundaryPlanner(BoundaryPlanner, PageRideMixin):
     """Scheduler half: picks the boundary a transfer carries, and caps hits to it.
 
@@ -98,6 +167,68 @@ class V41BoundaryPlanner(BoundaryPlanner, PageRideMixin):
         # One warning per planner, not per hit: an unarmed cap fires once
         # per request on whatever path is missing its arming.
         self._warned_unarmed = False
+
+    @classmethod
+    def from_vllm_config(
+        cls,
+        vllm_config,
+        kv_cache_config,
+        *,
+        scheduler,
+        page_block_size: int,
+        checkpoint_group_ids: tuple[int, ...],
+        request_of,
+    ) -> V41BoundaryPlanner:
+        """Stand up the scheduler half of V4.1's STATE leg, bound to *scheduler*.
+
+        *page_block_size* is the proxy group's block size (0 when unknown),
+        and ``request_of(seq)`` the vLLM request a scheduler ``SeqView``
+        stands for, or None.
+        """
+        from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+        _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+        # The grid a STATE boundary may sit on is V4.1's PAGE block, which
+        # is the attention group's. `hash_block_size` is engine-wide and
+        # becomes the smallest group's, so with a draft group the two part
+        # company and a boundary chosen on the hash grid is not a PAGE edge.
+        grid = int(page_block_size or 0) or int(hash_block_size)
+        # When checkpoints are registered the two mechanisms have to agree on one
+        # grid: the planner decides where a boundary may sit, and the checkpoint
+        # group decides which column vLLM hashes. A boundary the planner
+        # accepts on a different grid is a store nothing can look up, and the
+        # symptom is a silent zero hit rate rather than an error.
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+        )
+
+        adapter = register_v41_state_checkpoint_adapter()
+        checkpoint_block = int(adapter.block_size)
+        if checkpoint_block and checkpoint_block != grid:
+            raise ValueError(
+                f"ATOM LMCache offload: V4.1 boundary grid {grid} does not match the "
+                f"state checkpoint block {checkpoint_block}. A boundary claimed on one grid is "
+                "hashed on the other, so nothing stored would ever be found."
+            )
+        chunk = int(scheduler.chunk_size)
+        _refuse_ride_without_dense_checkpoints(chunk)
+        planner = cls(
+            hash_block_size=int(hash_block_size),
+            boundary_grid=grid,
+            chunk_size=chunk,
+            state_checkpoints_can_serve=_state_checkpoints_can_serve(vllm_config),
+            checkpoint_group_ids=checkpoint_group_ids,
+            prefill_tail=adapter.prefill_tail(vllm_config),
+        )
+        scheduler.bind_planner(planner, request_of)
+        logger.info(
+            "ATOM LMCache offload: V4.1 state leg on (hash_block=%d, chunk=%d, "
+            "checkpoint_groups=%s)",
+            int(hash_block_size),
+            chunk,
+            ",".join(str(g) for g in checkpoint_group_ids) or "-",
+        )
+        return planner
 
     # -- lookup ----------------------------------------------------------
     def _cap_unarmed(self, seq, hit: int) -> int:
