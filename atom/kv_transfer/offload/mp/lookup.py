@@ -29,6 +29,10 @@ _ORPHAN_STATUS_RETRIES = 8
 # and its MP session open.
 _ORPHAN_TIMEOUT_S = 120.0
 
+
+#: Named requests the non-blocking path sends on the adapter's client.
+_ASYNC_CLIENT_METHODS = ("lookup", "query_prefetch_status")
+
 _ASYNC_LOOKUP_FAILED = (
     "LMCache MP async lookup failed for request %s in phase %s; "
     "read locks it may hold are left to the read TTL"
@@ -81,6 +85,12 @@ class _MPLookupClient:
         # internals (message-queue client and result caches). An adapter
         # without them falls back to the synchronous lookup.
         missing = [name for name in _ASYNC_ADAPTER_ATTRS if not hasattr(adapter, name)]
+        if not missing:
+            missing = [
+                f"_client.{name}"
+                for name in _ASYNC_CLIENT_METHODS
+                if not hasattr(adapter._client, name)
+            ]
         self._async_supported = not missing
         if missing:
             logger.warning(

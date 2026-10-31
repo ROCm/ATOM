@@ -435,6 +435,16 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
+    def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
+        """A frontend's chance to restore checkpoints before the contract judges.
+
+        The point between a slot being assigned and its cursor being judged,
+        so `_report_stale_state` checks whatever a restore produced. Native
+        ATOM restores nothing here; a frontend that checkpoints state
+        overrides it.
+        """
+        return cursors
+
     def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
 
@@ -503,6 +513,7 @@ class PagedAttentionCache:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
+            cursors = self._restore_stale_rows(cursors, wanted, ids, fresh, step, count)
             self._report_stale_state(cursors, wanted, ids, fresh)
         else:
             # Issued before the reset below, so a recycled slot is captured as

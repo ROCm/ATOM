@@ -1243,6 +1243,38 @@ def test_dense_worker_records_the_blocks_a_failed_load_left_unfilled():
         worker._load_executor.shutdown(wait=True)
 
 
+def test_failed_loads_are_named_by_request_only_when_asked():
+    """Nothing native drains the per-request record, so it stays off: kept,
+    it would grow for the life of the worker."""
+    worker = DenseOffloadConnector(_config("kv_consumer"))
+    request = LMCacheReqMeta(
+        req_id=61,
+        token_ids=list(range(16)),
+        block_ids=[10, 11, 12, 13],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=4,
+            lmcache_cached_tokens=12,
+            can_load=True,
+        ),
+        load_operation=LoadOperationId(req_id=61, generation=1),
+    )
+
+    try:
+        with worker._lock:
+            worker._record_load_error_blocks(request)
+        assert worker._failed_load_reqs is None
+        assert worker.take_load_error_reqs() == set()
+
+        worker.track_load_error_reqs()
+        with worker._lock:
+            worker._record_load_error_blocks(request)
+        assert worker.take_load_error_reqs() == {"61"}
+        assert worker.take_load_error_reqs() == set()
+    finally:
+        worker._save_executor.shutdown(wait=True)
+        worker._load_executor.shutdown(wait=True)
+
+
 def test_dense_worker_fences_in_flight_jobs_for_a_preempted_request():
     """Preemption hands the blocks to somebody else in the same step.
 

@@ -424,6 +424,22 @@ def test_the_pool_is_sized_from_the_speculation_that_is_admitted():
     atom_platform_module().enforce_deepseek_v41_constraints(config)
 
 
+def test_the_connector_alone_does_not_admit_prefix_caching(monkeypatch):
+    """Prefix caching needs the state checkpoints, and so does the connector:
+    naming it without them is refused here, with that one requirement."""
+    monkeypatch.delenv("ATOM_V41_STATE_CHECKPOINTS", raising=False)
+    config = _vllm_config()
+    config.model_config.architectures = list(
+        config.model_config.hf_config.architectures
+    )
+    config.cache_config.enable_prefix_caching = True
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="AtomLMCacheOffloadConnector"
+    )
+    with pytest.raises(ValueError, match="only with its state checkpoints"):
+        atom_platform_module().enforce_deepseek_v41_constraints(config)
+
+
 def atom_platform_module():
     import importlib
 

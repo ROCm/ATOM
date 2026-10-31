@@ -22,10 +22,12 @@ from atom.kv_transfer.offload._offload_common import (
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
-from atom.kv_transfer.offload.mp.native_state_worker import (
-    NATIVE_STATE_MP_STORE_CHANNEL,
+from atom.kv_transfer.offload.mp.native_state_layout import (
     require_native_state_server,
     stores_state_images,
+)
+from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_STORE_CHANNEL,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
@@ -382,6 +384,11 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
 
     def _may_emit_save(self) -> bool:
         return len(self._save_inflight) < self._max_pending_saves
+
+    def _unbuilt_save_is_final(self) -> bool:
+        # Declined while the pin budget is full or the image is still COPYING;
+        # both clear, so the tracker stays and the save is retried.
+        return False
 
     def _build_save_request(
         self, seq, saved, aligned, operation, block_ids, is_last_prefill

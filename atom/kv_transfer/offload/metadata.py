@@ -48,9 +48,18 @@ class ATOMRawBytesLMCacheMetadata:
         if self.atom_bytes_per_block <= 0:
             raise ValueError("ATOM raw-byte metadata: bytes_per_block must be > 0")
         if chunk_size % self.atom_block_size != 0:
+            # The block size is not always the configured one: on a hybrid
+            # model it can be raised until one attention page holds one
+            # recurrent-state page (Kimi-K3: 128 -> 1536), so the chunk size
+            # that does work cannot be read off the command line. Name it here
+            # rather than only the two values that do not work.
             raise ValueError(
                 "LMCache chunk size must be divisible by ATOM KV block size: "
-                f"chunk_size={chunk_size}, block_size={self.atom_block_size}"
+                f"chunk_size={chunk_size}, block_size={self.atom_block_size}. "
+                "Set LMCACHE_CHUNK_SIZE to a multiple of "
+                f"{self.atom_block_size}. On a hybrid model the block size "
+                "can be derived from the recurrent state page size, so it can "
+                "differ from the configured one."
             )
 
     def __getattr__(self, name: str) -> Any:

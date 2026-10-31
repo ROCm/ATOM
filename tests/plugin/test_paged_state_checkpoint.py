@@ -137,6 +137,8 @@ def test_generic_layer_imports_no_model_code():
             "vllm",
             "torch",
             "numpy",
+            # ATOM's own checkpoint defaults (`native_checkpoint_defaults`).
+            "atom.config",
             "atom.model_engine.page_unit_checkpoint",
             "atom.plugin.vllm.paged_state_checkpoint",
             "atom.plugin.vllm.req_id_passthrough_patch",
@@ -702,3 +704,131 @@ def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
     ) == (s.page_unit_bytes, s.slot_bytes, s.image_bytes, s.layout_id)
     assert s.k == s.spec.units_per_checkpoint == -(-s.image_bytes // s.page_unit_bytes)
     assert a.block_size == 128 and a.matches(vc) and s == v4_state_checkpoint_sizing(vc)
+
+
+def test_decode_keeps_take_the_callers_exact_starts(monkeypatch):
+    """V2's input-batch count is an optimistic upper bound; V4.1 passes the
+    step's own `seq_lens - query_lens` and the batch is not read."""
+    import atom.plugin.vllm.req_id_passthrough_patch as passthrough
+
+    monkeypatch.setattr(passthrough, "get_current_req_ids", lambda: ["a", "b"])
+
+    def batch_read(*args):
+        raise AssertionError("read the input batch")
+
+    monkeypatch.setattr(G, "_exact_starts", batch_read)
+    seen = {}
+    monkeypatch.setattr(
+        G,
+        "store_decode_keeps",
+        lambda worker, ids, starts, fresh: seen.setdefault("keep", list(starts)),
+    )
+    monkeypatch.setattr(
+        G,
+        "record_decode_candidates",
+        lambda worker, ids, slots, starts, lens, block, name: seen.setdefault(
+            "candidates", list(starts)
+        ),
+    )
+    monkeypatch.setattr(G, "current_state_checkpoint_store_plan", dict)
+    G.plan_state_checkpoint_ops(
+        NS(decode_candidates={"a": (0, {})}),
+        NS(),
+        rows=2,
+        slots=np.array([0, 1]),
+        chunk_start=np.array([9, 300]),
+        lens=np.array([1, 1]),
+        fresh_rows=(),
+        block=BLOCK,
+        is_target=True,
+        name="Fake",
+        starts=np.array([9, 300]),
+    )
+    assert seen == {"keep": [9, 300], "candidates": [9, 300]}
+
+
+def test_v2_host_rows_follow_the_runners_block_table_rules(monkeypatch):
+    """New and updated rows overwrite, cached rows append, gone rows drop.
+
+    The rules are V2's `finish_requests` / `add_requests` / `update_requests`;
+    a row that diverged from the device table would name the wrong unit.
+    """
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+
+    rows = P._HostRows()
+
+    def out(new=(), cached=(), updates=None, finished=(), preempted=()):
+        return NS(
+            finished_req_ids=set(finished),
+            preempted_req_ids=set(preempted),
+            scheduled_new_reqs=[NS(req_id=r, block_ids=b) for r, b in new],
+            block_table_updates=updates,
+            scheduled_cached_reqs=NS(
+                req_ids=[r for r, _ in cached],
+                new_block_ids=[b for _, b in cached],
+            ),
+        )
+
+    bpk = [1, 2]
+    rows.apply(out(new=[("a", ([1, 2], [5])), ("b", ([3], [6]))]), bpk)
+    assert rows.rows["a"] == [[1, 2], [10, 11]]
+    rows.apply(out(cached=[("a", ([4], [7])), ("b", None)]), bpk)
+    assert rows.rows["a"] == [[1, 2, 4], [10, 11, 14, 15]]
+    assert rows.rows["b"] == [[3], [12, 13]]
+    # An update replaces the row and suppresses the same step's append.
+    rows.apply(out(updates={"a": ([9], [8])}, cached=[("a", ([99], [99]))]), bpk)
+    assert rows.rows["a"] == [[9], [16, 17]]
+    rows.apply(out(preempted={"b"}, finished={"a"}), bpk)
+    assert rows.rows == {}
+    rows.apply(out(new=[("b", ([20], [21]))]), bpk)
+    assert rows.rows["b"] == [[20], [42, 43]]
+
+    monkeypatch.setattr(P, "_V2_HOST_ROWS", rows)
+    view = P._V2InputBatchView(NS(req_ids=["x", "b"]), tables=None)
+    table = view.block_table[1].block_table.np
+    assert (table[1, 0], table[1, 1], table[1, 2], table[0, 0]) == (42, 43, 0, 0)
+
+
+def test_v2_host_rows_replace_a_resumed_request():
+    """Its blocks were freed at preemption: the ids it comes back with are the
+    whole row, recreated if the preemption dropped it."""
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+
+    rows = P._HostRows()
+    rows.rows["a"] = [[1, 2]]
+    out = NS(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        block_table_updates=None,
+        scheduled_cached_reqs=NS(
+            req_ids=["a", "b"],
+            new_block_ids=[([7, 8],), ([9],)],
+            resumed_req_ids={"a", "b"},
+        ),
+    )
+    rows.apply(out, [1])
+    assert rows.rows == {"a": [[7, 8]], "b": [[9]]}
+
+
+def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
+    """Armed with nothing keeping it current, every unit id would read 0."""
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+    from atom.plugin.vllm import vllm_runtime
+
+    monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", list)
+    assert P.install_v2_host_block_rows() == 0
+    assert P._V2_HOST_ROWS is None
+
+    class _V2Runner:
+        def update_requests(self, scheduler_output):
+            return None
+
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_V2Runner])
+    assert P.install_v2_host_block_rows() == 1
+    assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
+    # Already patched: armed again without patching twice.
+    monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
+    assert P.install_v2_host_block_rows() == 0
+    assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT

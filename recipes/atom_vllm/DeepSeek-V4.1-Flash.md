@@ -6,9 +6,9 @@ vLLM plugin backend. For background on the plugin backend, see
 model itself and its native ATOM path, see the
 [DeepSeek-V4.1-Flash recipe](../DeepSeek-V4.1-Flash.md).
 
-The plugin path serves the **text backbone only**, without prefix caching or
-KV-transfer connectors. Do not configure a connector: startup rejection does
-not cover every connector name. DSpark speculation and CUDA graphs are
+The plugin path serves the **text backbone only**. This recipe runs it without
+prefix reuse; prefix caching and the LMCache tier are in the
+[LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). DSpark speculation and CUDA graphs are
 supported, both behind an explicit flag. The scope and restrictions are in
 [What the plugin path does not do](#what-the-plugin-path-does-not-do).
 
@@ -45,7 +45,8 @@ Notes:
   HF `tokenizer.json`; it carries the same DeepSeek-V4 encoding under
   `encoding/`, and vLLM only auto-selects that mode for the V4 architecture
   string.
-- `--no-enable-prefix-caching` is **required**; see below.
+- `--no-enable-prefix-caching` is **required** here: prefix caching needs the
+  state checkpoints the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md) turns on.
 - `--block-size` is negotiated to `256` whatever you pass. V4.1's PAGE is 256
   tokens, and the bridge relies on a vLLM block id being the same id as a V4.1
   page id.
@@ -63,8 +64,11 @@ Notes:
 Feature flags:
 
 - `--kv-cache-dtype auto` (equivalently `bfloat16`) runs the unpacked BF16
-  pool. `--kv-cache-dtype nvfp4` selects ATOM's packed FP4 pool, which roughly
-  halves the bytes a cached token costs. The fp8 spellings are rejected: V4.1
+  pool. `--kv-cache-dtype nvfp4` maps to ATOM's packed FP4 pool, which roughly
+  halves the bytes a cached token costs, but vLLM 0.31.1 refuses `nvfp4` for
+  MLA models in its own config validation (`validate_nvfp4_kv_cache_with_mla`)
+  before ATOM is consulted, so on that build only BF16 starts. The fp8
+  spellings are rejected: V4.1
   has no fp8 main pool, and silently downgrading would leave vLLM's allocation
   and the kernels' geometry describing different bytes.
 - This integration targets the **V2 model runner**. The validated deployment
@@ -154,16 +158,17 @@ from target proxy pages alone.
 | Capability | On the plugin path |
 |---|---|
 | Text generation, chat, tools, reasoning effort | Supported |
-| BF16 and packed FP4 main pool | Supported (`--kv-cache-dtype auto` / `nvfp4`) |
+| BF16 main pool | Supported (`--kv-cache-dtype auto`) |
+| Packed FP4 main pool | Mapped (`nvfp4`), but refused by vLLM 0.31.1's MLA check before ATOM runs |
 | Image requests | Refused — text only |
 | DSpark speculative decoding | Supported — 5 draft tokens, fixed by the model's own config gate; the draft is the target checkpoint's `mtp.*` stages, so there is no separate draft model to pass |
-| Prefix caching | Refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
-| KV transfer / offload connectors | Unsupported in this integration — restoring PAGE bytes without the matching per-request STATE is unsafe. Do not rely on every connector alias being rejected at startup |
+| Prefix caching | Only with the state checkpoints (`ATOM_V41_STATE_CHECKPOINTS=1` and `--mamba-cache-mode align`); see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Otherwise refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
+| KV transfer / offload connectors | `AtomLMCacheOffloadConnector` on its MP backend only, together with the state checkpoints and prefix caching; see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Every other connector, `lmcache_mp` included, is refused at startup: restoring PAGE bytes without the matching per-request STATE is unsafe |
 | CUDA graphs | Opt-in with both graph flags; FULL and PIECEWISE use different staging boundaries. See [CUDA graphs](#cuda-graphs) |
 
-Existing refusals are made by `enforce_deepseek_v41_constraints` or
-`atom.models.deepseek_v41.config.validate_runtime_config`. These checks are not
-a complete connector admission gate. For capabilities outside this recipe,
+The connector, speculation and prefix-caching refusals are made by
+`enforce_deepseek_v41_constraints`; the rest by
+`atom.models.deepseek_v41.config.validate_runtime_config`. For capabilities outside this recipe,
 consult the [native ATOM recipe](../DeepSeek-V4.1-Flash.md) for its supported
 configuration rather than bypassing a plugin refusal.
 

@@ -270,3 +270,21 @@ def test_failed_lookup_warns_its_locks_are_left_to_the_ttl(caplog):
 
     assert not client.is_pending("req")
     assert "read TTL" in caplog.text and "phase status" in caplog.text
+
+
+def test_a_client_without_named_calls_stays_synchronous():
+    """LMCache 0.5.5's MQ client has only `submit_request`.
+
+    Calling `client.lookup` there raised AttributeError inside schedule(); the
+    adapter's own synchronous lookup still works, so the client is checked once
+    when the lookup client is built rather than adapted on every request.
+    """
+    adapter = _Adapter(SimpleNamespace(submit_request=lambda *a: None))
+    client = _client(adapter)
+    assert not client.supports_async()
+    assert not client.submit(list(range(10)), "req")
+
+
+def test_a_client_that_can_send_nothing_stays_synchronous():
+    adapter = _Adapter(SimpleNamespace())
+    assert not _client(adapter).supports_async()

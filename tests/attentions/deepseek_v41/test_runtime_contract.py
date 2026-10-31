@@ -225,16 +225,12 @@ def test_plugin_mode_is_not_refused_by_the_model_validator():
     registers V4.1 at all -- so this gate guarded no reachable configuration
     while reading as though it did.
 
-    `is_vllm` survives only as a qualifier on the two capability gates whose
-    answer genuinely differs by path (non-DSpark speculation, prefix
-    caching), which is asserted elsewhere in this file.
+    The validator does not read `is_vllm` at all; the plugin's transport and
+    speculation gates are in `atom.plugin.vllm.platform` too.
     """
     validate_runtime_config(
         runtime_config(plugin_config=SimpleNamespace(is_vllm=False))
     )
-    # Through `vllm_plugin_config` for the vLLM arm: the capability gates
-    # it reaches (`enable_prefix_caching`) are fields a bare namespace does
-    # not carry, and reaching them is the point of this test.
     validate_runtime_config(vllm_plugin_config())
 
 

@@ -83,6 +83,54 @@ class _HFConfigView:
         )
 
 
+# vLLM `SpeculativeConfig` fields that describe this process rather than the
+# cached bytes, so hashing them into the PAGE namespace splits it in two.
+#
+# `target_parallel_config` / `draft_parallel_config` carry this process' own
+# `rank`, `data_parallel_rank` and `node_rank`: every TP rank would get its own
+# namespace, which under `tp_rank_collapse` is silent data loss -- the one
+# writing rank publishes under its name and every other rank misses on its own.
+# The parallelism that does shape the bytes, TP and DCP width,
+# `build_page_namespace` hashes explicitly.
+#
+# `disable_eagle_block_drop` is decided per process. Measured on
+# DeepSeek-V4.1-Flash with DSpark on the `mp` backend: the four workers hashed
+# `false` and the scheduler `true`, so the workers registered their layout
+# under `atom-page-v3-290a23f2...` while every lookup asked for
+# `atom-page-v3-dbdf5a1c...`; the tier logged `Stored 2560 tokens` for the saves
+# and `No GPU context found for model ... during lookup` for the reads, at a
+# flat zero hit rate with no error on the engine side.
+#
+# `target_model_config` / `draft_model_config` / `draft_load_config` are filled
+# in by each process (`hf_config` included). The bytes are named without them:
+# the target by the HF fields the namespace hashes, the draft by the
+# speculative config's own `model`, `method` and `num_speculative_tokens`.
+_PER_PROCESS_SPECULATIVE_FIELDS = frozenset(
+    {
+        "target_parallel_config",
+        "draft_parallel_config",
+        "disable_eagle_block_drop",
+        "target_model_config",
+        "draft_model_config",
+        "draft_load_config",
+    }
+)
+
+
+def _stable_speculative_config(value: Any) -> Any:
+    """vLLM's speculative config as the PAGE namespace hashes it."""
+    from atom.kv_transfer.offload.config import _stable_config_value
+
+    stable = _stable_config_value(value)
+    if isinstance(stable, dict):
+        return {
+            key: item
+            for key, item in stable.items()
+            if key not in _PER_PROCESS_SPECULATIVE_FIELDS
+        }
+    return stable
+
+
 class OffloadConfigShim:
     """The ATOM-offload-shaped view of a vLLM config.
 
@@ -103,14 +151,49 @@ class OffloadConfigShim:
                 "the codec addresses KV by block and cannot proceed without it"
             )
         self.kv_cache_block_size = int(block_size)
-        self.kv_cache_dtype = _atom_kv_dtype(cache_config, model_config)
+        from atom.plugin.vllm.deepseek_v41_bridge import (
+            is_deepseek_v41_vllm_config,
+            v41_kv_cache_dtype,
+        )
+
+        is_v41 = is_deepseek_v41_vllm_config(vllm_config)
+        if is_v41:
+            # V4.1's pool is bf16 or ATOM's packed fp4 (`--kv-cache-dtype
+            # nvfp4`), named the way the bridge sizes it; V4.1 offloads over MP
+            # only, so no in-process codec sizes segments from this.
+            self.kv_cache_dtype = v41_kv_cache_dtype(vllm_config)
+        else:
+            self.kv_cache_dtype = _atom_kv_dtype(cache_config, model_config)
 
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         role = getattr(kv_transfer_config, "kv_role", None) or "kv_both"
         extra = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+        extra = dict(extra) if isinstance(extra, dict) else {}
+        collapse = extra.get("lmcache.mp.tp_rank_collapse", "auto")
+        if is_v41 and isinstance(collapse, str) and collapse.strip().lower() == "auto":
+            # Resolved here rather than by the shared `auto` rule, which reads
+            # `kv_lora_rank` and the state-owning layouts: V4.1's pool geometry
+            # never asks for the TP width, so every rank holds the same PAGE and
+            # checkpoint bytes, and the connector declares that factor
+            # (`_page_tp_replication_factor`) for the worker to check.
+            extra["lmcache.mp.tp_rank_collapse"] = True
+        # Published in BOTH spellings on purpose. ATOM's offload readers
+        # disagree about where the option bag lives, and the disagreement is
+        # silent in one direction: ``offload/config.py`` reads
+        # ``kvc.get("kv_connector_extra_config", kvc)`` and so tolerates the
+        # flattened form, but ``offload/mp/deployment.py`` reads
+        # ``kvc.get("kv_connector_extra_config", {})`` with no such fallback.
+        # Publishing only the flattened form would hand the MP path an empty
+        # bag, and every option there has a default -- server host and port
+        # included -- so nothing would raise: the worker would quietly dial
+        # tcp://localhost:5555 instead of the configured server. ``kv_role``
+        # stays out of the nested copy, which is forwarded to LMCache's own
+        # storage-option parser once the ``lmcache.mp.*`` keys are stripped;
+        # it is a transfer role, not a storage option.
         self.kv_transfer_config = {
             "kv_role": role,
-            **(dict(extra) if isinstance(extra, dict) else {}),
+            **extra,
+            "kv_connector_extra_config": extra,
         }
 
         outer_hf = getattr(model_config, "hf_config", None)
@@ -131,18 +214,50 @@ class OffloadConfigShim:
         self.decode_context_parallel_size = int(
             getattr(parallel_config, "decode_context_parallel_size", 1) or 1
         )
+        # The multiprocess offload path reads its deployment geometry off the
+        # config object directly rather than off ``parallel_config``, and every
+        # read has a ``getattr(..., 1)`` default. A missing field therefore does
+        # not raise: it silently describes a TP8 deployment as TP1, which makes
+        # the LMCache side size one rank's key space for the whole world and
+        # lets eight ranks write the same keys with different bytes. Project
+        # them explicitly so the default never applies.
+        self.tensor_parallel_size = int(
+            getattr(parallel_config, "tensor_parallel_size", 1) or 1
+        )
+        self.data_parallel_size = int(
+            getattr(parallel_config, "data_parallel_size", 1) or 1
+        )
+        self.prefill_context_parallel_size = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+        )
+        # Part of the LMCache model namespace: two revisions of one model name
+        # have different weights and must not share a key space.
+        self.revision = getattr(model_config, "revision", None)
+        # Part of the page namespace (a draft changes the cached bytes), and
+        # how the MP deployment tells whether DSpark's draft owns a KV pool.
+        self.speculative_config = getattr(vllm_config, "speculative_config", None)
         # Feeds the LMCache page namespace, so two different models never share
         # a key space. vLLM's served name is the closest analogue of ATOM's
         # model_tag.
         self.model = str(getattr(model_config, "model", "") or "atom-model")
         self.model_tag = self.model
+        # No bounded state replay on the plugin: a tier hit restores its state
+        # from the checkpoint image the transfer carries, so the MP layout
+        # registers image groups (`stores_state_images`).
+        self.state_replay_tokens = 0
+
+    @property
+    def offload_speculative_config(self) -> Any:
+        """What `build_page_namespace` hashes for `speculative_config`."""
+        return _stable_speculative_config(self.speculative_config)
 
     def __repr__(self) -> str:
         return (
             f"OffloadConfigShim(block_size={self.kv_cache_block_size}, "
             f"kv_dtype={self.kv_cache_dtype!r}, role="
             f"{self.kv_transfer_config.get('kv_role')!r}, pp="
-            f"{self.pipeline_parallel_size}, dcp={self.decode_context_parallel_size})"
+            f"{self.pipeline_parallel_size}, tp={self.tensor_parallel_size}, "
+            f"dcp={self.decode_context_parallel_size})"
         )
 
 

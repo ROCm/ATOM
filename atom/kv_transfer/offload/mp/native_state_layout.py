@@ -7,7 +7,10 @@ The native codec streams PAGE units in ordinal order, with regions inside
 each unit. Every ordinal gets its own engine block-id list while aliasing the
 original PAGE allocation. No Active SLOT or extra state allocation is exposed.
 LMCache imports stay behind ``engine_group_infos`` so layout validation and
-copy-plan tests run without a GPU or LMCache's native extension.
+copy-plan tests run without a GPU or LMCache's native extension. Every worker
+that registers this layout, and the scheduler naming its namespace, asks the
+same two questions here: whether saves carry images, and whether the server's
+chunk is the configured one.
 """
 
 from __future__ import annotations
@@ -18,6 +21,8 @@ from typing import Any
 
 import torch
 
+from atom.kv_transfer.offload import config as offcfg
+from atom.kv_transfer.offload.mp.deployment import _storage_kv_transfer_config
 from atom.kv_transfer.offload.mp.page_views import validate_page_views
 
 
@@ -40,6 +45,9 @@ class NativeStateMPLayout:
     checkpoint_spec: Any
     # False: PAGE alone, no image group (`stores_state_images`).
     images: bool = True
+    # What an image group names for a chunk that holds no image: the MP
+    # server's `--null-block-id`. See `build_native_state_mp_layout`.
+    null_block_id: int = -1
 
     def engine_group_infos(self) -> list[Any]:
         """Convert the neutral plan at the actual LMCache registration boundary."""
@@ -67,11 +75,30 @@ class NativeStateMPLayout:
             )
         num_blocks = self.tensors[0].shape[0]
         for unit_id in ids:
-            if type(unit_id) is not int or not 0 <= unit_id < num_blocks:
+            # The null id would read as an absent image on the server.
+            if (
+                type(unit_id) is not int
+                or not 0 <= unit_id < num_blocks
+                or unit_id == self.null_block_id
+            ):
                 raise ValueError(f"invalid native checkpoint unit ID: {unit_id!r}")
         if len(set(ids)) != len(ids):
             raise ValueError("native checkpoint unit IDs must be distinct")
         return ids
+
+    def transfer_block_ids(
+        self, pages: Sequence[int], unit_ids: Sequence[int], count: int
+    ) -> list[list[int]]:
+        """One block-id list per engine group for a transfer of `count` chunks.
+
+        PAGE engine group 0 names `pages`. Image ordinal ``j`` names its unit
+        at the final chunk and the null block before it: earlier chunks have
+        PAGE only, and a boundary image is indivisible, so all its ordinal
+        groups are present at exactly the same final chunk.
+        """
+        return [list(pages)] + [
+            [self.null_block_id] * (count - 1) + [unit] for unit in unit_ids
+        ]
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -87,15 +114,19 @@ def build_native_state_mp_layout(
     chunk_size: int,
     num_blocks: int | None = None,
     images: bool = True,
+    null_block_id: int = -1,
 ) -> NativeStateMPLayout:
     """Validate and alias PAGE plus compact native STATE for LMCache MP.
 
     PAGE uses engine group zero. STATE ordinal ``j`` uses group ``1+j`` and one
-    logical chunk per block. The MP server's global null block ID must be
-    configured as ``-1``. The final ordinal's final region ends exactly at
-    ``image_bytes``; its dim-0 stride continues to address the original full
-    PAGE region. ``images=False`` registers PAGE alone: with no image group,
-    LMCache's hit is the PAGE KV's own extent.
+    logical chunk per block. ``null_block_id`` is what a STATE group names for
+    a chunk with no image, and the MP server's global null block ID must be
+    configured to it: ``-1`` for ATOM's own pool, where PAGE unit 0 is real
+    data; a pool that never hands out block 0 may keep LMCache's default of
+    0. The final ordinal's final region ends exactly at ``image_bytes``; its
+    dim-0 stride continues to address the original full PAGE region.
+    ``images=False`` registers PAGE alone: with no image group, LMCache's hit
+    is the PAGE KV's own extent.
     """
     block_size = _positive_int("native PAGE block size", block_size)
     chunk_size = _positive_int("native checkpoint chunk size", chunk_size)
@@ -203,11 +234,44 @@ def build_native_state_mp_layout(
         kernel_groups=groups,
         checkpoint_spec=spec,
         images=images,
+        null_block_id=int(null_block_id),
     )
+
+
+def stores_state_images(replay_tokens: int) -> bool:
+    """Whether native-state saves carry a state image: only without a bounded
+    replay (`replay_tokens`, 0 when off).
+
+    With one (DeepSeek-V4, ATOM_DSV4_STATE_REPLAY) the replay rebuilds the
+    state from the PAGE KV, so saves store that alone, the layout registers no
+    image group, and LMCache's own hit is the PAGE KV's extent. Without one a
+    save must carry its image: nothing could resume from PAGE alone, and for a
+    state with no bounded receptive field (Kimi-K3's KDA, GDN) no replay could
+    stand in for it. The scheduler and every worker ask with the one replay
+    length the engine runs, `Config.state_replay_tokens` (set once on the
+    engine's config, which a `multi` connector copies to its offload leg as
+    is), and register under the namespace their answer names
+    (`_model_namespace`).
+    """
+    return not replay_tokens
+
+
+def require_native_state_server(adapter: Any, config: Any) -> None:
+    """Validate native transfer geometry shared with the LMCache server."""
+    configured_chunk = int(
+        offcfg.build_lmcache_config(_storage_kv_transfer_config(config)).chunk_size
+    )
+    if configured_chunk != int(adapter.lmcache_tokens_per_chunk):
+        raise ValueError(
+            "Native-state LMCache configured chunk size must match the MP server: "
+            f"configured={configured_chunk}, server={adapter.lmcache_tokens_per_chunk}"
+        )
 
 
 __all__ = [
     "NativeStateMPKernelGroup",
     "NativeStateMPLayout",
     "build_native_state_mp_layout",
+    "require_native_state_server",
+    "stores_state_images",
 ]

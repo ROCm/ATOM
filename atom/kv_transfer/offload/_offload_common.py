@@ -196,6 +196,14 @@ class OffloadWorkerMixin:
         # load could not supply, and needs a fence it can hold a preemption
         # against. See `take_load_error_blocks` / `wait_for_requests`.
         self._failed_load_blocks: set[int] = set()
+        # The same failures, named by request, for a frontend whose block ids
+        # are unique only within a KV cache group, so a flat block set cannot
+        # name them. Kept alongside rather than instead of: on a single group
+        # the block set truncates to the first bad block and recomputes from
+        # there, where the request set discards the whole external prefix.
+        # None until that frontend asks (`track_load_error_reqs`): nothing
+        # else drains it.
+        self._failed_load_reqs: set[str] | None = None
         self._inflight_jobs: dict[str, set] = {}
 
     def close(self) -> None:
@@ -267,6 +275,22 @@ class OffloadWorkerMixin:
             self._failed_load_blocks.clear()
         return blocks
 
+    def track_load_error_reqs(self) -> None:
+        """Also record failed loads by request, for `take_load_error_reqs`."""
+
+        with self._lock:
+            if self._failed_load_reqs is None:
+                self._failed_load_reqs = set()
+
+    def take_load_error_reqs(self) -> set[str]:
+        """Drain the requests whose load failed, for the multi-group channel."""
+
+        with self._lock:
+            reqs = set(self._failed_load_reqs or ())
+            if self._failed_load_reqs:
+                self._failed_load_reqs.clear()
+        return reqs
+
     def _record_load_error_blocks(self, req) -> None:
         """Record the block range a failed load was supposed to fill.
 
@@ -289,6 +313,12 @@ class OffloadWorkerMixin:
             or getattr(self, "block_size", 0)
             or 0
         )
+        # Named before the block arithmetic can decline: a load that failed
+        # with no usable range is still a failed load, and dropping it here
+        # would leave the frontend treating the external prefix as valid.
+        req_id = getattr(req, "req_id", None)
+        if req_id is not None and self._failed_load_reqs is not None:
+            self._failed_load_reqs.add(str(req_id))
         if load_spec is None or not block_ids or block_size <= 0:
             return
         start = max(0, int(load_spec.hbm_cached_tokens)) // block_size
@@ -500,6 +530,11 @@ class OffloadSchedulerMixin(ABC):
         # external-tier attempt per request; see `_repeat_load_suppressed`.
         self._load_failed_seqs: dict[str, object] = {}
         self.total_suppressed_load_retries = 0
+        #: Load completions discarded because they did not match the active
+        #: operation. The only place a performed load can vanish, and it was
+        #: silent: a dropped completion and a load that was never performed
+        #: produce the same absence downstream.
+        self._dropped_load_completions = 0
         # Repeats of `get_num_new_matched_tokens` served from the remembered
         # tier hit instead of a fresh external-tier lookup.
         self.total_lookups_skipped_by_memo = 0
@@ -511,6 +546,7 @@ class OffloadSchedulerMixin(ABC):
         self.total_source_safe_released_blocks = 0  # freed once their save reported
         self.total_abnormal_lease_reclaims = 0  # freed by stall timeout, no report
         self.total_truncated_late_saves = 0  # final save lost evicted prefix blocks
+        self.total_unbacked_saves = 0  # skipped: source blocks already gone
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         """Apply offload-specific completions and expose plain request IDs."""
@@ -638,6 +674,7 @@ class OffloadSchedulerMixin(ABC):
                 blocks_waiting_for_store=self.blocks_waiting_for_store(),
                 abnormal_lease_reclaims=self.total_abnormal_lease_reclaims,
                 truncated_late_saves=self.total_truncated_late_saves,
+                unbacked_saves=self.total_unbacked_saves,
             )
         return statistics
 

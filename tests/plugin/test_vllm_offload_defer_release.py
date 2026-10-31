@@ -59,7 +59,14 @@ def _adapter(monkeypatch):
     adapter._scheduler = dense_mod.DenseOffloadScheduler(config)
     adapter._config = config
     adapter._seqs = SeqViewRegistry()
+    # Match the non-hybrid scheduler defaults from the real constructor.
+    adapter._requests = {}
+    adapter._attn_group_id = 0
+    adapter._kda_planner = None
+    adapter._v41_planner = None
+    adapter._state_load_failure_reports = {}
     adapter._promised_loads = {}
+    adapter._detach_after_alloc, adapter._finished_withdrawals = {}, []
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
     adapter._next_save_reconcile_at = 0.0
