@@ -972,9 +972,10 @@ models:
         ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: "1"
         # ReplaySSM caches the KDA inputs instead of a state per draft token, so
         # it pays only with drafts to roll back: AgentX runs it off at CONC
-        # 1/2/4 and on from CONC 8. Cases that declare their own env block must
-        # restate the key, because a YAML merge key loses to an explicit `env:`
-        # on the same node.
+        # 1/2/4 and on from CONC 8, which here means from C16, the first cell
+        # above C4. Cases that declare their own env block must restate the
+        # key, because a YAML merge key loses to an explicit `env:` on the same
+        # node.
         ATOM_ENABLE_REPLAYSSM: "0"
       prefill: {}
       decode: {}
