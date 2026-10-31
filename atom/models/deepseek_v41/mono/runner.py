@@ -56,6 +56,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -63,6 +64,7 @@ from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_u
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -495,7 +497,7 @@ class V41MonoDecodeRunner:
         if self.debug:
             self.diag_off = nbytes
             nbytes += DIAG_BYTES
-        self.scratch = torch.zeros(nbytes, device=dev, dtype=torch.uint8)
+        self.scratch = uncached_bytes(nbytes, dev)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -667,6 +669,7 @@ class V41MonoDecodeRunner:
             **self._moe_args(weights),
             **self._peer_args(),
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
+            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
         _run_compiled(self.build.layer_post, *args, torch.cuda.current_stream())
@@ -739,6 +742,7 @@ class V41MonoDecodeRunner:
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
             **self._peer_args(), "layer": MOE_TAG0 + layer_id,
+            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
             "tl": self._timeline_ptr("k2b", layer_id),
             # where the merged launch's layout puts K2b's regions
             "scratch": self.scratch.data_ptr() + k2.moe_base(key_a),
