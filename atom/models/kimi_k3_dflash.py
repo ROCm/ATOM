@@ -132,7 +132,6 @@ from torch import nn
 
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -143,6 +142,7 @@ from atom.models.dspark_draft import (
     KVCacheBinding,
     linear_out,
 )
+from atom.models.qwen3 import Qwen3MLP
 
 logger = logging.getLogger("atom")
 
@@ -410,31 +410,6 @@ class KimiK3DFlashAttention(nn.Module):
         self._write_block_kv(k, v, slot_mapping, k_cache, v_cache)
 
 
-class KimiK3DFlashMLP(nn.Module):
-    def __init__(self, config, quant_config=None, prefix: str = ""):
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
-        self.act_fn = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = linear_out(self.gate_up_proj(x))
-        gate, up = gate_up.chunk(2, dim=-1)
-        return linear_out(self.down_proj(self.act_fn(gate) * up))
-
-
 class KimiK3DFlashDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -452,19 +427,34 @@ class KimiK3DFlashDecoderLayer(nn.Module):
             quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = KimiK3DFlashMLP(config, quant_config, prefix=f"{prefix}.mlp")
+        # SpecForge builds this draft on a plain Qwen3 config; its MLP is Qwen3's.
+        self.mlp = Qwen3MLP(
+            config.hidden_size,
+            config.intermediate_size,
+            config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn(positions, hidden_states)
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        return residual + self.mlp(hidden_states)
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Residual add fused into the norm, as in Qwen3DecoderLayer.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
 
     def write_context_kv(self, ctx_hidden: torch.Tensor, positions: torch.Tensor):
         """The context rows bypass `input_layernorm`.
@@ -735,9 +725,11 @@ class KimiK3DFlash(DSparkDraftModel):
         draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
         draft_ids[:, 0] = input_ids
         hidden = self.embed_tokens(draft_ids.view(-1))
+        residual = None
         for layer in self.layers:
-            hidden = layer(positions, hidden)
-        return self.norm(hidden)
+            hidden, residual = layer(positions, hidden, residual)
+        hidden, _ = self.norm(hidden, residual)
+        return hidden
 
     def head_and_sample(self, out, anchor_ids: torch.Tensor, num_draft: int):
         base_logits = self.lm_head(out).view(anchor_ids.shape[0], num_draft, -1)
