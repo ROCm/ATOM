@@ -455,6 +455,18 @@ def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
     return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
 
 
+def gather_routed_rows(layer, rows: tuple[torch.Tensor, ...], group):
+    """`pack_routed_rows` output, one height on every rank of `group`, gathered
+    rank-major in one grouped collective: hidden states, top-k weights and
+    ids, and their scales (None when unquantized)."""
+    heights = [rows[0].shape[0]] * group.world_size
+    hidden_states, topk_weights, topk_ids, *scale = gather_rows(
+        lambda ts: all_gatherv(ts, heights, group), rows
+    )
+    reassign_gathered_shared_ids(layer, topk_ids)
+    return hidden_states, topk_weights, topk_ids, scale[0] if scale else None
+
+
 def dp_gather_routed_rows(
     rows: tuple[torch.Tensor, ...],
     dp_eager_mode: bool,
@@ -5498,14 +5510,9 @@ class FusedMoE(torch.nn.Module):
             tbo = tbo_active()
             if tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            # One grouped collective, rank-major: every PCP shard is one height.
-            pcp_group = get_pcp_group()
-            heights = [hidden_states.shape[0]] * pcp_group.world_size
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, pcp_group), rows
+            hidden_states, topk_weights, topk_ids, x_scale = gather_routed_rows(
+                self, rows, get_pcp_group()
             )
-            x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
             if tbo:
                 tbo_switch_to_compute_sync()
         gathered = gathered or split
@@ -5641,19 +5648,17 @@ class FusedMoE(torch.nn.Module):
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
         if sp_moe:
             group = get_sp_group()
-            heights = [hidden_states.shape[0]] * group.world_size
             # Chosen for the rows fused_moe sees, after the stand-in repeat below.
+            gathered_rows = hidden_states.shape[0] * group.world_size * dp_repeat
             rows = pack_routed_rows(
-                self.quant_method.gathered_rows_wire(self, sum(heights) * dp_repeat),
+                self.quant_method.gathered_rows_wire(self, gathered_rows),
                 hidden_states,
                 topk_weights,
                 topk_ids,
             )
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, group), rows
+            hidden_states, topk_weights, topk_ids, x_scale = gather_routed_rows(
+                self, rows, group
             )
-            x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
