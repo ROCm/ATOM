@@ -1264,3 +1264,21 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(is_mla):
         assert p._blk_kv_indices.numel() == 8 * (4096 + 7)
     else:
         assert p._blk_kv_indices.numel() == 0
+
+
+def test_context_write_drops_padded_target_rows(monkeypatch):
+    """Under TR_HYBRID the runner passes `running_tokens` hidden rows but only
+    the scheduled rows' positions; only those rows may reach the projection."""
+    torch = pytest.importorskip("torch")
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    from atom.models import dspark_draft
+
+    seen = {}
+    monkeypatch.setattr(
+        dspark_draft.DSparkDraftModel,
+        "write_context_kv",
+        lambda self, aux, pos: seen.update(rows=aux.shape[0], pos=pos.shape[0]),
+    )
+    draft = dflash.KimiK3DFlash.__new__(dflash.KimiK3DFlash)
+    draft.write_context_kv(torch.zeros(12, 4), torch.arange(9))
+    assert seen == {"rows": 9, "pos": 9}

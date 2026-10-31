@@ -607,8 +607,15 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         slot_mapping = getattr(attn_metadata, "draft_ctx_slot_mapping", None)
         if slot_mapping is None:
             slot_mapping = attn_metadata.slot_mapping
-        slot_mapping = slot_mapping[: ctx_hidden.shape[0]]
-        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping, fwd_ctx)
+        rows = ctx_hidden.shape[0]
+        if slot_mapping.shape[0] < rows:
+            raise RuntimeError(
+                f"DFlash context write has {rows} rows but only "
+                f"{slot_mapping.shape[0]} draft slots"
+            )
+        self.self_attn.write_context_kv(
+            ctx_hidden, positions, slot_mapping[:rows], fwd_ctx
+        )
 
 
 class KimiK3DFlash(DSparkDraftModel):
@@ -808,6 +815,12 @@ class KimiK3DFlash(DSparkDraftModel):
         return AuxCaptureSpec(layer_ids, hidden_size, extract)
 
     # -- DSparkDraftModel contract ----------------------------------------
+
+    def write_context_kv(self, aux_concat: torch.Tensor, positions: torch.Tensor):
+        # Under TR_HYBRID the runner hands over `running_tokens` rows of target
+        # hidden state but only the scheduled rows' `positions`; the padded tail
+        # has no slot to land in, so it is dropped before the projection.
+        super().write_context_kv(aux_concat[: positions.shape[0]], positions)
 
     @property
     def first_attention_layer_num(self) -> int:
