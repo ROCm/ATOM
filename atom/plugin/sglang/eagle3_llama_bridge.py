@@ -937,6 +937,8 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
 
     original_draft_extend_for_prefill = EagleDraftWorker._draft_extend_for_prefill
     original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
+    prefill_params = inspect.signature(original_draft_extend_for_prefill).parameters
+    decode_params = inspect.signature(original_draft_extend_for_decode).parameters
 
     def _draft_extend_for_prefill(
         self,
@@ -944,13 +946,17 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
         target_hidden_states,
         next_token_ids,
         mm_input_embeds=None,
+        kv_loc_plan=None,
     ):
+        prefill_kwargs = {"mm_input_embeds": mm_input_embeds}
+        if "kv_loc_plan" in prefill_params:
+            prefill_kwargs["kv_loc_plan"] = kv_loc_plan
         ret = original_draft_extend_for_prefill(
             self,
             batch,
             target_hidden_states,
             next_token_ids,
-            mm_input_embeds=mm_input_embeds,
+            **prefill_kwargs,
         )
         # A fresh request has no rejected draft suffix.  Set an explicit
         # per-request zero vector so merging it into an active decode batch
@@ -960,7 +966,7 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
         )
         return ret
 
-    def _draft_extend_for_decode(self, batch, batch_result):
+    def _draft_extend_for_decode(self, batch, batch_result, *, kv_loc_plan=None):
         is_eagle3 = bool(
             getattr(
                 getattr(self, "speculative_algorithm", None),
@@ -968,8 +974,13 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
                 lambda: False,
             )()
         )
+        decode_kwargs = {}
+        if "kv_loc_plan" in decode_params:
+            decode_kwargs["kv_loc_plan"] = kv_loc_plan
         if not is_eagle3:
-            return original_draft_extend_for_decode(self, batch, batch_result)
+            return original_draft_extend_for_decode(
+                self, batch, batch_result, **decode_kwargs
+            )
 
         patched_next_token_ids = None
         original_next_token_ids = getattr(batch_result, "next_token_ids", None)
@@ -1008,7 +1019,9 @@ def _patch_sglang_eagle3_draft_extend_compat() -> None:
             batch_result.next_token_ids = patched_next_token_ids
 
         try:
-            ret = original_draft_extend_for_decode(self, batch, batch_result)
+            ret = original_draft_extend_for_decode(
+                self, batch, batch_result, **decode_kwargs
+            )
         finally:
             if patched_next_token_ids is not None:
                 batch_result.next_token_ids = original_next_token_ids
@@ -1039,14 +1052,14 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
         return
 
     try:
-        from sglang.srt.distributed import get_tp_group
+        import sglang.srt.speculative.eagle_worker_v2 as eagle_worker_module
         from sglang.srt.distributed.parallel_state import get_attn_tp_group
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-        from sglang.srt.speculative import eagle_worker_v2 as eagle_worker_module
+        from sglang.srt.runtime_context import get_parallel
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
         if not hasattr(EagleVerifyInput, "sample"):
-            from sglang.srt.speculative import eagle_utils
+            import sglang.srt.speculative.eagle_utils as eagle_utils  # noqa: PLR0402
     except Exception as exc:
         logger.debug(
             "Skipping optional EAGLE3 TP verify broadcast patch: %s",
@@ -1064,7 +1077,11 @@ def _patch_sglang_eagle3_tp_verify_broadcast() -> None:
 
     def _broadcast_sample_result(result):
         predict, accept_lens, accept_index = result
-        tp_group = get_attn_tp_group() if is_dp_attention_enabled() else get_tp_group()
+        tp_group = (
+            get_attn_tp_group()
+            if is_dp_attention_enabled()
+            else get_parallel().tp_group
+        )
         if tp_group.world_size > 1:
             tp_group.broadcast(predict, src=0)
             tp_group.broadcast(accept_lens, src=0)
