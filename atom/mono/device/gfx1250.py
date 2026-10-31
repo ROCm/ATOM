@@ -17,6 +17,7 @@ The f32 accumulator: lane l holds column l % 16, rows 8 (l // 16) + i, i < 8.
 
 from __future__ import annotations
 
+from flydsl._mlir import ir
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
@@ -173,15 +174,17 @@ def lds_addr(ptr):
     return fx.Int32(fx.ptrtoint(ptr))
 
 
-def async_to_lds(gaddr, laddr, b128=True):
+def async_to_lds(gaddr, laddr, b128=True, cm=0):
     """16 B (``b128``) or 4 B global -> LDS a lane, counted by ASYNCcnt: the copy
-    is an op with side effects, so it stays where it is issued (``wait_async``)."""
+    is an op with side effects, so it stays where it is issued (``wait_async``).
+    ``cm``: its cache policy (CM_NT streaming, CM_DEV another XCD's writes)."""
     g = _llvm_ptr(fx.Int64(gaddr), fx.AddressSpace.Global)
     lp = _llvm_ptr(fx.Int32(laddr), fx.AddressSpace.Shared)
+    aux = ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cm) if cm else None
     if b128:
-        rocdl.global_load_async_to_lds_b128(g, lp, 0)
+        rocdl.global_load_async_to_lds_b128(g, lp, 0, aux=aux)
     else:
-        rocdl.global_load_async_to_lds_b32(g, lp, 0)
+        rocdl.global_load_async_to_lds_b32(g, lp, 0, aux=aux)
 
 
 def wait_async(n):
