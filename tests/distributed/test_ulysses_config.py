@@ -89,18 +89,6 @@ def test_dp_isolated_rlhf_workers_refuse_sp(monkeypatch):
         runner._setup_device_and_distributed(0, config)
 
 
-def test_replicated_o_proj_rejects_speculative_decoding():
-    # Its inline-recorded attention needs one (bs, q=1) request per token bucket.
-    config = atom_config_double(
-        tp_replicated_o_proj=True,
-        tensor_parallel_size=4,
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        speculative_config=object(),
-    )
-    with pytest.raises(ValueError, match="speculative decoding"):
-        Config._validate_tp_replicated_o_proj(config)
-
-
 def test_sp_attention_needs_rope_in_the_impl():
     # A model that ropes before attention sees only its token shard there.
     with pytest.raises(ValueError, match="RoPE inside the attention impl"):
@@ -123,7 +111,6 @@ def test_layouts_that_change_the_graph_do_not_share_compiled_artifacts():
     keys = [Config.compute_hash(config)]
     for name, value in (
         ("sequence_parallel_size", 4),
-        ("tp_replicated_o_proj", True),
         ("sp_mega_moe_enabled", True),
     ):
         setattr(config, name, value)

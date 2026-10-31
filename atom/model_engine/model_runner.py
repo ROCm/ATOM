@@ -147,8 +147,8 @@ def max_schedulable_decode_bs(
 
 
 def split_rows_graph_ladder(sizes, step: int, max_bs: int) -> list[int]:
-    """Capture ladder for layouts that split a batch's rows over ranks (SP, the
-    TP replicated o_proj), one batch size per local bucket.
+    """Capture ladder for SP, which splits a batch's rows over ranks: one batch
+    size per local bucket.
 
     Each rung is rounded up to a multiple of `step` batch sizes, chosen so its
     rows split evenly: no layer pads them, and an SP token graph's bucket (its
@@ -831,12 +831,6 @@ class ModelRunner:
         model_class = resolve_obj_by_qualname(
             support_model_arch_dict[hf_config.architectures[0]]
         )  # type: ignore
-        if config.tp_replicated_o_proj and not getattr(
-            model_class, "supports_tp_replicated_o_proj", False
-        ):
-            raise ValueError(
-                f"ATOM_TP_REPLICATED_O_PROJ is not supported by {model_class.__name__}"
-            )
         # The model construction depends on quant_config,
         # so we must complete the remapping for layers before constructing the model.
         config.quant_config.remap_layer_name(
@@ -3980,12 +3974,8 @@ class ModelRunner:
         max_bs = max_schedulable_decode_bs(
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
-        split = 1
         if tr_hybrid and sp_is_enabled():
             split = get_sp_world_size()
-        elif self.config.tp_replicated_o_proj:
-            split = get_tp_group().world_size
-        if split > 1:
             q_lens = self._dspark_capture_q_buckets(full_q_len)
             step = math.lcm(*(split // math.gcd(split, q) for q in q_lens))
             self.capture_sizes = split_rows_graph_ladder(
@@ -4328,10 +4318,10 @@ class ModelRunner:
         if self.attn_metadata_builder.supports_token_graph:
             # Their attention ops are recorded inline, so a prefill token graph
             # would replay the synthetic prompt's attention on real prompts.
-            if sp_is_enabled() or self.config.tp_replicated_o_proj:
+            if sp_is_enabled():
                 raise ValueError(
-                    "Ulysses SP and ATOM_TP_REPLICATED_O_PROJ do not support an "
-                    "attention backend with prefill token graphs."
+                    "Ulysses SP does not support an attention backend with "
+                    "prefill token graphs."
                 )
             self._record_tr_graphs()
         self._record_prefill_req_graphs()

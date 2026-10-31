@@ -32,18 +32,6 @@ several launches; small batches keep the native MoE. On that native path at SP4 
 `AITER_QUICK_REDUCE_QUANTIZATION=INT4` also quantizes the expert reduce-scatter of
 tensors from 24 MiB, and the first such call logs it.
 
-## Experimental TP replicated o-projection
-
-`ATOM_TP_REPLICATED_O_PROJ=1` selects TP-sharded QKV and replicated `o_proj` weights with
-`--tensor-parallel-size N --sequence-parallel-size 1`. It exchanges attention output heads
-for local token chunks, gathers FFN inputs, and adds each rank's owned attention output
-before one TP all-reduce. Default: `0`. Models opt in. Requires
-native BF16 serving, DP1/PP1/PCP1/DCP1, without EP, TBO, indexer CP or speculative
-decoding.
-
-QuickReduce quantizes the combined attention/FFN increment; the accumulated
-replicated residual stays outside the collective.
-
 ## Data parallelism
 
 | Variable | Type | Default | Description |

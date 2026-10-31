@@ -2049,8 +2049,6 @@ class Config:
     # Ulysses shards tokens and exchanges them for heads around attention.
     # Its workers use the PCP rank dimension.
     sequence_parallel_size: int = 1
-    # Snapshot the experimental layout once and propagate it to all workers.
-    tp_replicated_o_proj: bool = field(init=False, default=False)
     sp_mega_moe_enabled: bool = field(init=False, default=False)
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
@@ -2356,51 +2354,7 @@ class Config:
                 )
         self.prefill_context_parallel_size = sp
 
-    def _validate_tp_replicated_o_proj(self) -> None:
-        if not self.tp_replicated_o_proj:
-            return
-        if is_plugin_mode():
-            raise ValueError("ATOM_TP_REPLICATED_O_PROJ requires native ATOM serving.")
-        if (
-            self.tensor_parallel_size < 2
-            or self.sequence_parallel_size != 1
-            or self.prefill_context_parallel_size != 1
-            or self.decode_context_parallel_size != 1
-            or self.pipeline_parallel_size != 1
-            or self.parallel_config.data_parallel_size != 1
-            or self.enable_dp_attention
-            or self.dp_logical_size > 1
-        ):
-            raise ValueError(
-                "ATOM_TP_REPLICATED_O_PROJ requires TP>1 with SP1, PCP1, DCP1, "
-                "PP1 and DP1 without DP attention."
-            )
-        # Speculative decoding: see the SP refusal; this attention is also
-        # recorded inline.
-        if (
-            self.enable_expert_parallel
-            or self.moe_all2all_backend not in ("auto", "none")
-            or self.moe_backend != "standard"
-            or self.fake_eplb
-            or self.enable_tbo
-            or self.enable_tbo_decode
-            or self.speculative_config is not None
-            or self.dcp_config.indexer_dcp_only
-        ):
-            raise ValueError(
-                "ATOM_TP_REPLICATED_O_PROJ does not support EP, routed MoE "
-                "all2all, fake EPLB, TBO, speculative decoding or indexer CP."
-            )
-        if self.torch_dtype != torch.bfloat16:
-            raise ValueError("ATOM_TP_REPLICATED_O_PROJ requires BF16 activations.")
-        logger.info(
-            "Experimental TP replicated o_proj enabled: TP QKV, output head "
-            "exchange, local FFN input, and owner-attention addition before TP "
-            "all-reduce. The accumulated residual stays outside QuickReduce."
-        )
-
     def __post_init__(self):
-        self.tp_replicated_o_proj = envs.ATOM_TP_REPLICATED_O_PROJ
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
@@ -2920,8 +2874,6 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
-        self._validate_tp_replicated_o_proj()
-
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -3002,8 +2954,6 @@ class Config:
         if self.sequence_parallel_size > 1:
             # SP and PCP use the same rank dimension but different head shapes.
             factors.append(("sp", self.sequence_parallel_size))
-        if self.tp_replicated_o_proj:
-            factors.append("tp_replicated_o_proj")
         if self.sp_mega_moe_enabled:
             # This changes the decoder graph, including the next input norm
             # and final norm. Never load a native SP artifact for this region.

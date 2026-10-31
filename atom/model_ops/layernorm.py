@@ -1026,7 +1026,7 @@ def gemma_rms_norm_quant(
 
     By default the norm is rounded to BF16 before quantization, as on the TP
     all-reduce path. `fused` quantizes the FP32 norm in one kernel when
-    supported; SP and the replicated o_proj use it for whole-token rows.
+    supported; SP uses it for whole-token rows.
     """
     from aiter import get_hip_quant
     from aiter.utility.dtypes import fp8

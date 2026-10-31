@@ -5625,22 +5625,8 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        *,
-        token_group=None,
-    ):
+    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
-
-        # Explicit TP token gathering for the replicated o_proj layout.
-        # Its caller adds the owner's attention output and all-reduces the sum;
-        # the ordinary SP branch below still reduces back to local tokens.
-        if token_group is not None:
-            assert get_dp_group().world_size == 1 and not sp_is_enabled()
-            assert not self.moe_parallel_config.use_all2all_kernels
-            assert not self.reduce_results and not self.use_ep
 
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
@@ -5653,9 +5639,8 @@ class FusedMoE(torch.nn.Module):
         )
         x_scale = None
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
-        gathered = sp_moe or token_group is not None
-        if gathered:
-            group = get_sp_group() if token_group is None else token_group
+        if sp_moe:
+            group = get_sp_group()
             heights = [hidden_states.shape[0]] * group.world_size
             # Chosen for the rows fused_moe sees, after the stand-in repeat below.
             rows = pack_routed_rows(
@@ -5688,7 +5673,7 @@ class FusedMoE(torch.nn.Module):
             topk_weights,
             topk_ids,
             x_scale,
-            gathered=gathered or dp_repeat > 1,
+            gathered=sp_moe or dp_repeat > 1,
         )
 
         if dp_repeat > 1:
