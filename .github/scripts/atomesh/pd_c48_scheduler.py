@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 
+import pd_c48_pp
 from vllm.v1.simple_kv_offload import manager as simple_kv_offload_manager
 
 
@@ -173,6 +174,9 @@ def create_scheduler(*args, **kwargs):
     fill = os.environ.get("C48_P_SUBBLOCK_FILL") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill"
     if fill:
         subblock_fill(scheduler)
+    pp_output_cap = int(os.environ.get("C48_P_PP_EARLY_RELEASE", "0"))
+    if pp_output_cap:
+        pd_c48_pp.enable_early_release(scheduler, pp_output_cap)
     if os.environ.get("C48_DSPARK_JUNCTION") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
         enable_dspark_shared_prefix_checkpoint(scheduler, config)
     if os.environ.get("C48_STORE_DROP_SUPERSEDED") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
@@ -189,6 +193,9 @@ def create_scheduler(*args, **kwargs):
         "no_tail_split": no_tail_split,
         "tail_ckpt_hash": tail_ckpt_hash,
         "subblock_fill": fill,
+        "pp_inflight": pd_c48_pp.INFLIGHT,
+        "pp_output_cap": pp_output_cap,
+        "max_concurrent_batches": config.max_concurrent_batches,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,
         "requested_shared_prefix_checkpoint": requested,

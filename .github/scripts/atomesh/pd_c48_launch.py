@@ -60,6 +60,8 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
     env["GLOO_SOCKET_IFNAME"] = os.environ.get("MORI_SOCKET_IFNAME", "")
     env["VLLM_HOST_IP"] = host
     env["PYTHONPATH"] = str(Path(__file__).parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
+    if "C48_P_PP_MQ_CHUNKS" in env:
+        env["PYTHONPATH"] = str(Path(__file__).parent / "pp_ring") + os.pathsep + env["PYTHONPATH"]
     env["C48_DIAG_ROLE"] = role
     env["C48_DIAG_PTPC"] = str(int("quantization-config" in args))
     env["C48_DIAG_AL"] = str(args["speculative-config"].get("synthetic_acceptance_length", ""))

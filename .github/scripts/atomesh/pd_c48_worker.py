@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
+import pd_c48_pp
 from vllm.v1.worker.gpu_worker import Worker
 
 
@@ -443,6 +444,9 @@ def enable_specdec(config):
 
 
 class ManifestWorker(Worker):
+    def execute_model(self, scheduler_output):
+        return pd_c48_pp.bounded_execute(self, super().execute_model, scheduler_output)
+
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
         if os.environ.get("C48_P_GEMM_WARMUP") == "1":

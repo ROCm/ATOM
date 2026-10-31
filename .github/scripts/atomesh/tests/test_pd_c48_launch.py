@@ -26,7 +26,8 @@ class LaunchTest(unittest.TestCase):
         bootstrap = source[start:source.index('rm -rf /root/.cache/atom/', start)]
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
         for name in ("C32-MC", "C32-PP8-MC", "C32-AX109-PP8-MC",
-                     *(f"C{c}-N3966-BF16-KVB-TH-GX-H96OPUS-P12K-FILL-PP8-MC" for c in (72, 88))):
+                     *(f"C{c}-N3966-BF16-KVB-TH-GX-H96OPUS-P12K-FILL{cpp}-PP8-MC"
+                       for c in (72, 88) for cpp in ("", "-CPP"))):
             config = json.loads((GAP / (prefix + name + ".json")).read_text())
             for rank, role in enumerate(("prefill", "decode")):
                 with self.subTest(case=name, role=role):
@@ -365,6 +366,23 @@ class LaunchTest(unittest.TestCase):
                 args[key] = 8
             producer = args["kv-transfer-config"]["kv_connector_extra_config"]["connectors"][0]
             self.assertEqual(producer["kv_connector_extra_config"].pop("dcp_staging_bytes"), 64 << 20)
+            candidate["name"] = base["name"]
+            self.assertEqual(candidate, base)
+
+    def test_cpp_cases_only_add_prefill_pp_depth_and_ring_path(self):
+        ring = str(Path(__file__).resolve().parents[1] / "pp_ring")
+        for concurrency in (72, 88):
+            stem = f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C{concurrency}-N3966-BF16-KVB-TH-GX-H96OPUS-P12K"
+            base = json.loads((GAP / f"{stem}-FILL-PP8-MC.json").read_text())
+            candidate = json.loads((GAP / f"{stem}-FILL-CPP-PP8-MC.json").read_text())
+            self.assertNotIn(ring, render(base, "prefill", *ADDR)[1]["PYTHONPATH"])
+            self.assertEqual(render(candidate, "prefill", *ADDR)[1]["PYTHONPATH"].split(os.pathsep)[0], ring)
+            self.assertNotIn(ring, render(candidate, "decode", *ADDR)[1]["PYTHONPATH"])
+            pre = candidate["roles"]["prefill"]
+            for key, value in (("C48_P_PP_INFLIGHT", "16"), ("C48_P_PP_EARLY_RELEASE", "9"),
+                               ("C48_P_PP_EAGER_RECV", "1"), ("C48_P_PP_STAGE_DEPTH", "3"),
+                               ("C48_P_PP_MQ_CHUNKS", "64")):
+                self.assertEqual(pre["env"].pop(key), value, (concurrency, key))
             candidate["name"] = base["name"]
             self.assertEqual(candidate, base)
 
