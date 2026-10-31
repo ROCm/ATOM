@@ -151,6 +151,11 @@ def build_post_attn_kernel(
     # narrow: the split's PV halves, then the MoE's up / down partials, one
     # accumulator set a token plus the shared expert's
     OPART = 1 if WIDE else max(PV_HALVES * O_K, (tokens + 1) * ACC_WORDS)
+    # wide: the up / gate streams' partials, an accumulator set a round (block)
+    UGR = (U_MAX * UG_PER_SLOT // 2 + BLOCKS - 1) // BLOCKS
+    # and their LDS rings (a wave's chunks in flight), as deep as LDS allows
+    UG_RING = 7 if tokens <= 12 else 6
+    UG_SLOT_WORDS = (WAVE * 32 + WAVE * 4) // 4
 
     @fx.struct
     class Smem:
@@ -159,6 +164,8 @@ def build_post_attn_kernel(
         p8: fx.Array[fx.Int32, H * SPLIT_KEYS // 4, 16]
         q8: fx.Array[fx.Int32, O_K // 4, 16]
         opart: fx.Array[fx.Float32, OPART, 16]
+        upart: fx.Array[fx.Float32, 2 * ACC_WORDS if WIDE else 1, 16]
+        ugring: fx.Array[fx.Int32, WAVES * UG_RING * UG_SLOT_WORDS if WIDE else 1, 16]
         uexp: fx.Array[fx.Int32, U_MAX + 2, 16]
         umask: fx.Array[fx.Int32, U_MAX + 2 + WAVES, 16]
         urow: fx.Array[fx.Int32, U_MAX * 16 if WIDE else 1, 16]
@@ -230,6 +237,8 @@ def build_post_attn_kernel(
         q8 = lds.q8.ptr
         fpool = fx.recast_iter(fx.Float32, xs)
         opart = fpool if WIDE else lds.opart.ptr
+        upart = lds.upart.ptr
+        ugring = lds.ugring.ptr
         uexp = lds.uexp.ptr
         umask = lds.umask.ptr
         urow = lds.urow.ptr
