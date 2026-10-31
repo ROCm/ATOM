@@ -130,7 +130,9 @@ def emit_index_scores(
             row = (page * INDEX_BLOCK_BYTES + (16 * i + l16) * HEAD_DIM + 64 * g) // 4
             out.append(
                 [
-                    fx.Vector(bo.buffer_load(r_ic, row + 4 * c, vec_width=4, dtype=T.i32))
+                    fx.Vector(
+                        bo.buffer_load(r_ic, row + 4 * c, vec_width=4, dtype=T.i32)
+                    )
                     for c in range(CHUNKS)
                 ]
             )
@@ -164,7 +166,6 @@ def emit_index_scores(
     def emit_cp_tasks():
         if const_expr(prepare_heads is not None):
             prepare_heads()
-        tiles = range(KEY_TILES)
         seq_lane = pick(seq, fx.min(lane, tokens - 1))
         n_cols = TP * q_len
 
@@ -187,11 +188,15 @@ def emit_index_scores(
                     v = fx.Float32(float("-inf"))
                     for t0 in range_constexpr(0, KEY_TILES, CP_TILES):
                         group = range(t0, t0 + CP_TILES)
-                        v = fx.max(v, tiles_max(b, qb, col_seq, group, load_keys(page, group)))
+                        v = fx.max(
+                            v, tiles_max(b, qb, col_seq, group, load_keys(page, group))
+                        )
                     if (lane < 16) & (f < n_cols):
                         mb_put(
                             iscore,
-                            col * MAX_INDEX_BLOCKS + head * (MAX_INDEX_BLOCKS // TP) + b // TP,
+                            col * MAX_INDEX_BLOCKS
+                            + head * (MAX_INDEX_BLOCKS // TP)
+                            + b // TP,
                             v * scale,
                         )
 
@@ -235,7 +240,6 @@ def emit_index_scores(
     if total > BLOCKS:
         if const_expr(prepare is not None):
             prepare(fx.Int32(0), fx.Int32(tokens - 1))
-        tiles = range(KEY_TILES)
         seq_lane = pick(seq, fx.min(lane, tokens - 1))
 
         def score_task(tk, b, page):

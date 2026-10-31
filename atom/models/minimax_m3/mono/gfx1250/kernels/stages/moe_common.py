@@ -14,7 +14,13 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from atom.models.minimax_m3.mono.config import HIDDEN, INTER, MOE_SLOTS, SHARED_EXPERT, TOP_K
+from atom.models.minimax_m3.mono.config import (
+    HIDDEN,
+    INTER,
+    MOE_SLOTS,
+    SHARED_EXPERT,
+    TOP_K,
+)
 from atom.models.minimax_m3.mono.gfx1250.layout import (
     SH_ROWS,
     UG_PER_SLOT,
@@ -32,7 +38,6 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
 from atom.mono.device.gfx1250 import (
     CM_NT,
     WAVE,
-    WAVES,
     acc_row_sum,
     n32k4_word,
     shuffled_rows,
@@ -90,7 +95,9 @@ def moe_common_defs(k4ctx):
         shared = t >= ROUTED_TASKS
         r = fx.min(t, ROUTED_TASKS - 1)
         tk = r // (TOP_K * UG_PER_SLOT)
-        slot = shared.select(fx.Int32(TOP_K), (r % (TOP_K * UG_PER_SLOT)) // UG_PER_SLOT)
+        slot = shared.select(
+            fx.Int32(TOP_K), (r % (TOP_K * UG_PER_SLOT)) // UG_PER_SLOT
+        )
         return shared, tk, slot, t % UG_PER_SLOT
 
     def ug_load(t):
@@ -98,7 +105,9 @@ def moe_common_defs(k4ctx):
         shared, tk, slot, cg = ug_task(t)
         e_u = shared.select(
             fx.Int32(SHARED_EXPERT),
-            fx.max(fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), SHARED_EXPERT), 0),
+            fx.max(
+                fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), SHARED_EXPERT), 0
+            ),
         )
         r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES)
         r_s = rsrc(s13)
@@ -110,7 +119,9 @@ def moe_common_defs(k4ctx):
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
                 wts[h].append(shuffled_rows(r_w, rg, HIDDEN // 2, kc, lane, 64, CM_NT))
-                scs[h].append(n32k4_word(r_s, e_u * W13_ROWS + 16 * rg + l16, kc, HIDDEN))
+                scs[h].append(
+                    n32k4_word(r_s, e_u * W13_ROWS + 16 * rg + l16, kc, HIDDEN)
+                )
         return wts, scs
 
     def ug_compute(t, wts, scs):
@@ -118,7 +129,10 @@ def moe_common_defs(k4ctx):
         shared, tk, slot, cg = ug_task(t)
         col = shared.select(fx.min(l16, tokens - 1), tk)
         acc = [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(2)]
-        sbs = [lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4) for i in range(UG_CPW)]
+        sbs = [
+            lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4)
+            for i in range(UG_CPW)
+        ]
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             xb = lds_b8(col * XN8_ROW + kc * 32)
@@ -136,9 +150,15 @@ def moe_common_defs(k4ctx):
             p = m % 8
             first = m < 8
             g = first.select(acc_row_sum(red, 2 * p, c), acc_row_sum(opart, 2 * p, c))
-            u = first.select(acc_row_sum(red, 2 * p + 1, c), acc_row_sum(opart, 2 * p + 1, c))
+            u = first.select(
+                acc_row_sum(red, 2 * p + 1, c), acc_row_sum(opart, 2 * p + 1, c)
+            )
             y = swiglu_mul_batch([g], [u], fx.Float32(-swiglu_limit))[0]
-            mb_put(mr("mid"), (kk * MOE_SLOTS + slot) * INTER + cg * UG_ROWS + m, bf16_round(y))
+            mb_put(
+                mr("mid"),
+                (kk * MOE_SLOTS + slot) * INTER + cg * UG_ROWS + m,
+                bf16_round(y),
+            )
         gpu.barrier()
 
     def sh_load(j, has=None):
@@ -147,19 +167,27 @@ def moe_common_defs(k4ctx):
             r_w = rsrc(w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES)
             r_s = rsrc(s13)
         else:
-            r_w = rsrc(w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES, has.select(fx.Int32(W13_BYTES), fx.Int32(0)))
+            r_w = rsrc(
+                w13 + fx.Int64(SHARED_EXPERT) * W13_BYTES,
+                has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
+            )
             r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
         wts, scs = [], []
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             wts.append(shuffled_rows(r_w, j, HIDDEN // 2, kc, lane, 64, CM_NT))
-            scs.append(n32k4_word(r_s, SHARED_EXPERT * W13_ROWS + 16 * j + l16, kc, HIDDEN))
+            scs.append(
+                n32k4_word(r_s, SHARED_EXPERT * W13_ROWS + 16 * j + l16, kc, HIDDEN)
+            )
         return wts, scs
 
     def sh_compute(j, wts, scs):
         col = fx.min(l16, tokens - 1)
         c = fx.Vector.filled(8, 0.0, fx.Float32)
-        sbs = [lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4) for i in range(UG_CPW)]
+        sbs = [
+            lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4)
+            for i in range(UG_CPW)
+        ]
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             c = wmma_a8w4(wts[i], lds_b8(col * XN8_ROW + kc * 32), c, scs[i], sbs[i])
@@ -171,7 +199,11 @@ def moe_common_defs(k4ctx):
             g = acc_row_sum(red, 2 * r, cl)
             u = acc_row_sum(red, 2 * r + 1, cl)
             y = swiglu_mul_batch([g], [u], fx.Float32(-swiglu_limit))[0]
-            mb_put(mr("mid"), (cl * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r, bf16_round(y))
+            mb_put(
+                mr("mid"),
+                (cl * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
+                bf16_round(y),
+            )
         gpu.barrier()
 
     def down_load(k, td, has_dn):
@@ -185,10 +217,24 @@ def moe_common_defs(k4ctx):
             jj = fx.min(j, DN_UNITS - 1)
             sl = jj // DN_KC
             kc = jj % DN_KC
-            e_d = fx.max(fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT), 0)
-            wv = shuffled_rows(rsrc(w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes), rg_d, INTER // 2, kc, lane, 64, CM_NT)
-            sc = n32k4_word(rsrc(s2, dn_scale_bytes), e_d * HIDDEN + 16 * rg_d + l16, kc, INTER)
-            wgt = (j < DN_UNITS).select(fx.ptr_load(rwt + (8 * k + sl)), fx.Float32(0.0))
+            e_d = fx.max(
+                fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT), 0
+            )
+            wv = shuffled_rows(
+                rsrc(w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes),
+                rg_d,
+                INTER // 2,
+                kc,
+                lane,
+                64,
+                CM_NT,
+            )
+            sc = n32k4_word(
+                rsrc(s2, dn_scale_bytes), e_d * HIDDEN + 16 * rg_d + l16, kc, INTER
+            )
+            wgt = (j < DN_UNITS).select(
+                fx.ptr_load(rwt + (8 * k + sl)), fx.Float32(0.0)
+            )
             units.append((wv, sc, sl, kc, wgt))
         return units
 
@@ -201,9 +247,20 @@ def moe_common_defs(k4ctx):
             j = (wave % DN_GW) + DN_GW * i
             kc = fx.min(j, DN_KC - 1)
             wv = shuffled_rows(
-                rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes), rg_d, INTER // 2, kc, lane, 64, CM_NT
+                rsrc(w2 + fx.Int64(SHARED_EXPERT) * W2_BYTES, dn_bytes),
+                rg_d,
+                INTER // 2,
+                kc,
+                lane,
+                64,
+                CM_NT,
             )
-            sc = n32k4_word(rsrc(s2, dn_scale_bytes), SHARED_EXPERT * HIDDEN + 16 * rg_d + l16, kc, INTER)
+            sc = n32k4_word(
+                rsrc(s2, dn_scale_bytes),
+                SHARED_EXPERT * HIDDEN + 16 * rg_d + l16,
+                kc,
+                INTER,
+            )
             wgt = (j < DN_KC).select(fx.Float32(shared_weight), fx.Float32(0.0))
             units.append((wv, sc, kc, wgt))
         return units

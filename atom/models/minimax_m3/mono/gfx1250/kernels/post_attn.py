@@ -33,14 +33,18 @@ from atom.models.minimax_m3.mono.gfx1250.kernels.stages.attention import (
     o_defs,
     split_defs,
 )
-from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_common import DN_GW, moe_common_defs
-from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_narrow import moe_narrow_defs
+from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_common import (
+    DN_GW,
+    moe_common_defs,
+)
+from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_narrow import (
+    moe_narrow_defs,
+)
 from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_wide import moe_wide_defs
 from atom.models.minimax_m3.mono.gfx1250.kernels.stages.router import router_defs
 from atom.models.minimax_m3.mono.gfx1250.kernels.stages.select import select_defs
 from atom.models.minimax_m3.mono.gfx1250.layout import (
     ACC_WORDS,
-    AG_RS_FROM,
     MID_ROW,
     O_K,
     O_ROWS,
@@ -139,7 +143,9 @@ def build_post_attn_kernel(
     )  # fmt: skip
     SKIP = set(key.skip.split(",")) - {""}
     build_key = key_tuple(key, SOURCES)
-    REGION_IDS = region_ids(d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk))
+    REGION_IDS = region_ids(
+        d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk)
+    )
     W = npes
     G = BLOCKS
     BASE = stage_bases(tokens)
@@ -184,7 +190,9 @@ def build_post_attn_kernel(
     )
     ih_count, ih_own = heads.count, heads.own
     QS_CP = tokens * HIDDEN // 4
-    assert not (fuse_k1 and heads.count > 1) or (QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL)
+    assert not (fuse_k1 and heads.count > 1) or (
+        QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
+    )
     assert POOL >= tokens * HIDDEN // 4  # K1's x8 rows
 
     _bc = dict(locals())
@@ -267,10 +275,14 @@ def build_post_attn_kernel(
             return sreg(scratch, SCRATCH[name], name)
 
         def acquire():
-            fx.memory_fence(syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire)
+            fx.memory_fence(
+                syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
+            )
 
         def scores_copy(c, k=0):
-            return shift(mr("scores"), (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (N_ROUTED * 16))
+            return shift(
+                mr("scores"), (fx.Int64(c) * MAX_TOKENS + fx.Int64(k)) * (N_ROUTED * 16)
+            )
 
         def route_key(v, e):
             b = v.bitcast(fx.Int32)
@@ -302,7 +314,9 @@ def build_post_attn_kernel(
                 if to & (i < half * tokens):
                     mb_put_bf(
                         preg(peer_dst, SY[region], region),
-                        (rank * MAX_TOKENS + i // half) * HIDDEN + row0 + (i % half) * 2,
+                        (rank * MAX_TOKENS + i // half) * HIDDEN
+                        + row0
+                        + (i % half) * 2,
                         [fx.ptr_load(misc + i * 2), fx.ptr_load(misc + (i * 2 + 1))],
                     )
 
@@ -338,14 +352,18 @@ def build_post_attn_kernel(
                 index_topk,
             )  # fmt: skip
             gpu.barrier()
-            k1_mbox = Mailbox(layer, diag, REGION_IDS, gfx1250=True, steady=diag is not None)
+            k1_mbox = Mailbox(
+                layer, diag, REGION_IDS, gfx1250=True, steady=diag is not None
+            )
             k1_poll = k1_mbox.poll
             hdone_mb = sreg(scratch1, K1_SCRATCH_HDONE, "k1.hdone")
             rdone_mb = sreg(scratch1, K1_SCRATCH_RDONE, "k1.rdone")
         else:
             k1_poll = hdone_mb = rdone_mb = None
 
-        seq_lens_k, n_blks, long_rows = step_rows(seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own))
+        seq_lens_k, n_blks, long_rows = step_rows(
+            seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
+        )
         scored = [nb > TOPK_BLOCKS for nb in n_blks]
 
         k4ctx = dict(_bc)
