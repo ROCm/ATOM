@@ -142,7 +142,10 @@ def test_non_bytelevel_tokenizer_is_explicitly_rejected():
 
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("top_k", [0, 1, 2])
-def test_chat_route_transports_actual_records(server, monkeypatch, stream, top_k):
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_chat_route_transports_actual_records(
+    server, monkeypatch, stream, top_k, with_tools
+):
     from atom.entrypoints.openai import chat_logprobs
 
     monkeypatch.setattr(chat_logprobs, "token_bytes", lambda tokenizer: codec())
@@ -176,6 +179,22 @@ def test_chat_route_transports_actual_records(server, monkeypatch, stream, top_k
             "logprobs": True,
             "top_logprobs": top_k,
             "stream": stream,
+            **(
+                {
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "weather",
+                                "parameters": {"type": "object"},
+                            },
+                        }
+                    ],
+                    "tool_choice": "none",
+                }
+                if with_tools
+                else {}
+            ),
         },
     )
     assert response.status_code == 200, response.text
