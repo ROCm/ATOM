@@ -21,15 +21,17 @@ case "${ATOMESH_ATOM_SOURCE}" in
     exit 1
     ;;
 esac
-atom_origin="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c \
-  'import importlib.util as u; s = u.find_spec("atom"); print(s.origin if s else "")')"
+atom_dir="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c '
+import importlib.util as u
+s = u.find_spec("atom")
+print(next(iter(s.submodule_search_locations or ()), "") if s else "")')"
 atom_version="$(python3 -c \
   'import importlib.metadata as m; print(m.version("atom"))' 2>/dev/null || echo unknown)"
-echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_origin:-<missing>} image_dist=${atom_version}"
-if [[ -z "${atom_origin}" ]] \
-  || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_origin}" != "${PWD}"/* ]]; } \
-  || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_origin}" == "${PWD}"/* ]]; }; then
-  echo "ERROR: atom resolves to '${atom_origin}', which does not match ATOMESH_ATOM_SOURCE=${ATOMESH_ATOM_SOURCE} (cwd ${PWD})" >&2
+echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_dir:-<missing>} image_dist=${atom_version}"
+if [[ -z "${atom_dir}" ]] \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_dir}" != "${PWD}"/* ]]; } \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_dir}" == "${PWD}"/* ]]; }; then
+  echo "ERROR: atom resolves to '${atom_dir}', which does not match ATOMESH_ATOM_SOURCE=${ATOMESH_ATOM_SOURCE} (cwd ${PWD})" >&2
   exit 1
 fi
 
@@ -40,7 +42,7 @@ fi
 ATOMESH_REQUIRED_ATOM_ENV="${ATOMESH_REQUIRED_ATOM_ENV:-}"
 check_required_atom_env() {
   [[ -n "${ATOMESH_REQUIRED_ATOM_ENV}" ]] || return 0
-  local envs_py="${atom_origin%/__init__.py}/utils/envs.py" missing
+  local envs_py="${atom_dir}/utils/envs.py" missing
   if ! missing="$(python3 - "${envs_py}" "${ATOMESH_REQUIRED_ATOM_ENV}" <<'PY'
 import importlib.util
 import sys
@@ -56,7 +58,7 @@ PY
     exit 1
   fi
   if [[ -n "${missing}" ]]; then
-    echo "ERROR: ${ATOMESH_CELL_ID:-this cell} needs ATOM settings that ${atom_origin%/__init__.py} does not define: ${missing}" >&2
+    echo "ERROR: ${ATOMESH_CELL_ID:-this cell} needs ATOM settings that ${atom_dir} does not define: ${missing}" >&2
     exit 1
   fi
 }
@@ -2865,12 +2867,19 @@ check_expected_logs() {
 # A role's reject_log is a JSON list of lines none of its servers may log: how
 # a feature its expect_log saw armed says it then turned itself off, which can
 # happen on the first request as well as at startup. Checked before the first
-# request and again after the last.
+# request and again after the last, which is called with `last`. A line's
+# absence cannot be retried the way expect_log retries a line's presence, so
+# the last check first waits out the same NFS lag; whatever the first check
+# misses, the last one still reads.
 PREFILL_REJECT_LOG="${PREFILL_REJECT_LOG:-}"
 DECODE_REJECT_LOG="${DECODE_REJECT_LOG:-}"
 check_rejected_logs() {
-  local role rejected line log hit
+  local when="${1:-}" role rejected line log hit
   local -a role_logs lines
+  if [[ "${when}" == "last" && -n "${PREFILL_REJECT_LOG}${DECODE_REJECT_LOG}" ]]; then
+    echo "[check] waiting ${ATOMESH_EXPECT_LOG_TIMEOUT}s for the servers' last lines to reach ${RUNTIME_LOG_DIR}"
+    sleep "${ATOMESH_EXPECT_LOG_TIMEOUT}"
+  fi
   for role in prefill decode; do
     if [[ "${role}" == "prefill" ]]; then
       rejected="${PREFILL_REJECT_LOG}"
@@ -2910,7 +2919,7 @@ run_benchmark_and_eval() {
     run_eval
     run_benchmark
   fi
-  check_rejected_logs
+  check_rejected_logs last
 }
 
 validate_mooncake_store_settings

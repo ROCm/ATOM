@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -78,7 +79,7 @@ class RequiredAtomEnvTest(unittest.TestCase):
             '    "ATOM_PD_EARLY_T0": lambda: os.getenv("ATOM_PD_EARLY_T0", "0"),\n'
             "}\n"
         )
-        self.atom_origin = str(package / "__init__.py")
+        self.atom_dir = str(package)
 
     def check(self, required):
         return subprocess.run(
@@ -91,7 +92,7 @@ class RequiredAtomEnvTest(unittest.TestCase):
             ],
             env=dict(
                 os.environ,
-                atom_origin=self.atom_origin,
+                atom_dir=self.atom_dir,
                 ATOMESH_CELL_ID="cell-c1",
                 ATOMESH_REQUIRED_ATOM_ENV=required,
             ),
@@ -117,7 +118,7 @@ class RequiredAtomEnvTest(unittest.TestCase):
         self.assertNotIn("ATOM_PD_EARLY_T0", result.stderr)
 
     def test_an_unreadable_envs_py_fails_the_cell(self):
-        Path(self.atom_origin).with_name("utils").joinpath("envs.py").write_text(
+        Path(self.atom_dir, "utils", "envs.py").write_text(
             "raise ImportError('broken')\n"
         )
         result = self.check("ATOM_PD_EARLY_T0")
@@ -188,6 +189,38 @@ class RequiredAtomEnvTest(unittest.TestCase):
                 in_flight_cells += "ATOM_PP_MAX_INFLIGHT" in sets
         # C88's, which the env read above must have seen
         self.assertEqual(in_flight_cells, 1)
+
+
+def atom_dir_probe():
+    source = (SCRIPTS / "pd_server_atom.sh").read_text()
+    start = source.index("-c '", source.index('atom_dir="$(')) + len("-c '")
+    return source[start : source.index("')\"", start)]
+
+
+class AtomDirProbeTest(unittest.TestCase):
+    """The directory check_required_atom_env reads envs.py from."""
+
+    def probe(self, cwd, *flags):
+        return subprocess.run(
+            [sys.executable, *flags, "-c", atom_dir_probe()],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout.strip()
+
+    def test_this_checkout_resolves_to_the_dir_holding_envs_py(self):
+        atom_dir = Path(self.probe(ROOT))
+        self.assertEqual(atom_dir, ROOT / "atom")
+        self.assertTrue((atom_dir / "utils" / "envs.py").is_file())
+
+    def test_a_package_without_an_init_still_resolves_to_its_dir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            package = Path(temp).resolve() / "atom"
+            (package / "utils").mkdir(parents=True)
+            # -S: no site-packages, so no installed atom shadows this one.
+            self.assertEqual(self.probe(package.parent, "-S"), str(package))
 
 
 MONO_UP = ["Kimi-K3 mono decode armed", "Kimi-K3 mono decode on"]
@@ -329,7 +362,7 @@ class RejectedLogTest(unittest.TestCase):
     def write(self, name, *lines):
         (self.logs / name).write_text("".join(f"INFO {line}\n" for line in lines))
 
-    def check(self, aggregated="0", prefill=None, decode=None):
+    def check(self, aggregated="0", prefill=None, decode=None, when="", wait="60"):
         return subprocess.run(
             [
                 "bash",
@@ -338,10 +371,11 @@ class RejectedLogTest(unittest.TestCase):
                 shell_function("collect_role_logs")
                 + shell_function("parse_log_lines")
                 + shell_function("check_rejected_logs")
-                + "check_rejected_logs\necho OK",
+                + f"check_rejected_logs {when}\necho OK",
             ],
             env=dict(
                 os.environ,
+                ATOMESH_EXPECT_LOG_TIMEOUT=wait,
                 RUNTIME_LOG_DIR=str(self.logs),
                 AGGREGATED=aggregated,
                 PREFILL_REJECT_LOG=json.dumps(prefill) if prefill else "",
@@ -354,9 +388,28 @@ class RejectedLogTest(unittest.TestCase):
         )
 
     def test_nothing_rejected_reads_no_log(self):
-        result = self.check()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "OK\n")
+        # nor waits 60 s, which would outlast the 30 s timeout
+        for when in ("", "last"):
+            with self.subTest(when=when):
+                result = self.check(when=when)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "OK\n")
+
+    def test_a_line_that_reaches_the_log_while_waiting_fails_the_cell(self):
+        log = self.logs / "decode-rank-1.log"
+        self.write(log.name, "Kimi-K3 mono decode armed (TP8)")
+        late = threading.Timer(
+            0.5,
+            lambda: log.write_text(
+                log.read_text() + "INFO Kimi-K3 mono decode off: build failed\n"
+            ),
+        )
+        late.start()
+        self.addCleanup(late.cancel)
+        result = self.check(decode=MONO_GONE, when="last", wait="2")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("waiting 2s", result.stdout)
+        self.assertIn("logged 'Kimi-K3 mono decode off'", result.stderr)
 
     def test_servers_that_kept_the_feature_pass(self):
         # A prefill turning mono down is its own role's business.
@@ -404,7 +457,7 @@ class RejectedLogTest(unittest.TestCase):
 
     def test_the_lines_are_checked_before_and_after_the_run(self):
         stubs = "\n".join(
-            f"{name}() {{ echo {name}; }}"
+            f'{name}() {{ echo "{name}${{1:+:$1}}"; }}'
             for name in (
                 "check_expected_logs",
                 "check_rejected_logs",
@@ -440,7 +493,8 @@ class RejectedLogTest(unittest.TestCase):
                 self.assertEqual(
                     steps[:2], ["check_expected_logs", "check_rejected_logs"]
                 )
-                self.assertEqual(steps[-1], "check_rejected_logs")
+                # the one that first waits out the NFS lag
+                self.assertEqual(steps[-1], "check_rejected_logs:last")
                 self.assertEqual(len(steps), 4 if phase != "combined" else 5)
 
 
@@ -502,6 +556,17 @@ class SubmitLogLinesTest(unittest.TestCase):
             f"Kimi-K3 mono decode declined the {rows}-row build",
             self.cell["service"]["decode"]["reject_log"],
         )
+
+    def test_c1_gates_mono_s_accuracy(self):
+        # No other cell runs mono, so no other GSM8K covers it.
+        mono = [
+            cell["name"]
+            for suite in ("nightly", "profile")
+            for cell in kimi_k3_cells(suite)
+            if cell["env"].get("decode", {}).get("ATOM_MONO_ENABLE") == "1"
+        ]
+        self.assertEqual(mono, [self.cell["name"]])
+        self.assertTrue(self.cell["run_eval"])
 
     def test_a_single_line_is_a_list_of_one(self):
         for key in ("expect_log", "reject_log"):
