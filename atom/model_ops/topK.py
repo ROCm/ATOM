@@ -8,6 +8,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.triton_topk_softmax import triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -209,7 +210,14 @@ def rocm_aiter_topk_softmax_impl(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """`triton_max_rows`: the layer's `triton_topk_softmax_rows` for these
+    arguments; launches of up to that many rows run `triton_topk_softmax`,
+    the rest (all of them when None) AITER's `topk_softmax`. The cutoff was
+    decided for this routing, so a Triton launch that is not renormalized or
+    whose logits are not `num_routing_experts` wide plus the scored shared
+    columns is a mismatched caller, and fails."""
     from aiter import topk_softmax
 
     token = gating_output.shape[0]
@@ -222,24 +230,38 @@ def rocm_aiter_topk_softmax_impl(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    token_expert_indicies = torch.empty(
-        gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
-    )
     if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    topk_softmax(
-        topk_weights,
-        topk_ids,
-        token_expert_indicies,
-        gating_output,
-        renormalize,
-        fused_shared_experts_for_kernel,
-        fused_shared_experts_scoring_func,
-        num_valid_rows,
-    )
+    if triton_max_rows is not None and token <= triton_max_rows:
+        assert renormalize, "triton_topk_softmax always renormalizes"
+        assert (
+            num_routing_experts
+            == gating_output.shape[1] - fused_shared_experts_for_kernel
+        ), "the logits must be the routed experts' and then the scored shared ones'"
+        triton_topk_softmax(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            fused_shared_experts_for_kernel,
+            num_valid_rows,
+        )
+    else:
+        token_expert_indicies = torch.empty(
+            gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
+        )
+        topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+            fused_shared_experts_for_kernel,
+            fused_shared_experts_scoring_func,
+            num_valid_rows,
+        )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids
@@ -429,6 +451,7 @@ def rocm_aiter_topk_softmax(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
+    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -438,6 +461,7 @@ def rocm_aiter_topk_softmax(
         num_routing_experts,
         fused_shared_experts_scoring_func,
         num_valid_rows,
+        triton_max_rows,
     )
 
 

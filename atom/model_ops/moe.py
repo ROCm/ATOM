@@ -81,6 +81,7 @@ from atom.model_ops.topK import (
 )
 from atom.model_ops.topK import rocm_aiter_grouped_topk as grouped_topk
 from atom.model_ops.topK import rocm_aiter_topk_softmax as fused_topk
+from atom.model_ops.topk_softmax_dispatch import triton_topk_softmax_rows
 from atom.model_ops.utils import (
     _has_module,
     atom_parameter,
@@ -505,6 +506,7 @@ def _select_logical(
     router_logits: torch.Tensor,
     num_routing_experts: int,
     num_fused_shared_experts: int,
+    triton_max_rows: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The layer's routing over `num_routing_experts` logical experts,
     `num_fused_shared_experts` shared columns widened in."""
@@ -526,6 +528,7 @@ def _select_logical(
         # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
         # found, pure TP routes and runs its pad rows like real ones.
         mask_pad_rows=layer.use_ep,
+        triton_max_rows=triton_max_rows,
     )
 
 
@@ -593,8 +596,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             layer,
             x,
             router_logits,
-            layer.global_num_experts,
+            layer.expert_layout.num_routed,
             layer.num_fused_shared_experts,
+            layer.triton_topk_softmax_max_rows,
         )
 
     def place_experts(
@@ -1117,10 +1121,11 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
-            num_routing_experts=global_num_experts,
+            num_routing_experts=layer.expert_layout.num_routed,
             num_fused_shared_experts=layer.num_fused_shared_experts,
             fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
             routed_scaling_factor=layer.routed_scaling_factor,
+            triton_max_rows=layer.triton_topk_softmax_max_rows,
         )
         topk_ids = topk_ids.to(torch.int32).contiguous()
         topk_weights = topk_weights.to(torch.float32).contiguous()
@@ -2071,12 +2076,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """The base routing over the layer's logical experts, its prefilled
         shared column widened in where the legacy layout fuses one."""
         layout = layer.expert_layout
+        in_dispatch = layout.uses_all2all_fusion
         return _select_logical(
             layer,
             x,
             router_logits,
             layout.num_routed,
-            0 if layout.uses_all2all_fusion else layer.num_fused_shared_experts,
+            0 if in_dispatch else layer.num_fused_shared_experts,
+            # The layer chose its kernel with the shared columns routed; left
+            # to the dispatch, a scored one still has its logit in
+            # `router_logits`, a width the Triton kernel does not take.
+            (
+                None
+                if in_dispatch and layer.shared_expert_scoring_func is not None
+                else layer.triton_topk_softmax_max_rows
+            ),
         )
 
     def place_experts(
@@ -3470,6 +3484,9 @@ class FusedMoE(torch.nn.Module):
 
     # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
     shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
+    # Set in __init__: the most rows a softmax top-k launch of this layer runs
+    # the Triton kernel for (`triton_topk_softmax_rows`); None: never.
+    triton_topk_softmax_max_rows: int | None = None
 
     def __init__(
         self,
@@ -3700,6 +3717,14 @@ class FusedMoE(torch.nn.Module):
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
         self.scoring_func = scoring_func
+        self.triton_topk_softmax_max_rows = triton_topk_softmax_rows(
+            num_experts,
+            top_k,
+            renormalize,
+            self.num_fused_shared_experts,
+            shared_expert_scoring_func,
+            cu_masked=atom_config.enable_rapidserve and atom_config.disagg_constrained,
+        )
         self.e_score_correction_bias = e_score_correction_bias
         if atom_config.fake_eplb and e_score_correction_bias is not None:
             # The noaux_tc bias is added on top of the score, so a bias wider than
@@ -5203,7 +5228,10 @@ class FusedMoE(torch.nn.Module):
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
         mask_pad_rows: bool = True,
+        triton_max_rows: int | None = None,
     ):
+        """`triton_max_rows`: the layer's `triton_topk_softmax_max_rows`, for
+        softmax top-k (`rocm_aiter_topk_softmax_impl`)."""
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
         # in the first 3 layers, where topk_ids are looked up from a per-token
@@ -5251,6 +5279,7 @@ class FusedMoE(torch.nn.Module):
                     num_routing_experts=num_routing_experts,
                     fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
                     num_valid_rows=num_valid_rows,
+                    triton_max_rows=triton_max_rows,
                 )
             elif scoring_func in ("sigmoid", "sqrtsoftplus"):
                 tokens_num = router_logits.shape[0]
