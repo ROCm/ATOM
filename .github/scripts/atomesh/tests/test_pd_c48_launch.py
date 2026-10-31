@@ -182,6 +182,7 @@ class LaunchTest(unittest.TestCase):
                                      *((c, "N3966-BF16-GX-H96OPUS-P12K") for c in (72, 88)),
                                      *((c, f"N3966-BF16-KVB-TH-SDROP-GX-H96OPUS{tag}") for c in (72, 88)
                                        for tag in ("", "-P12K")),
+                                     *((c, "N3966-BF16-KVB-TH-GX-H96OPUS-P12K") for c in (72, 88)),
                                      *((c, "N3966-BF16-GX-H96OPUS-PBM") for c in (16, 32, 48, 56, 72, 88)),
                                      (72, "N3966-BF16-GX-H96OPUS-P12K-PBM")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
