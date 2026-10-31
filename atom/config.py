@@ -2296,10 +2296,11 @@ class Config:
     def _init_sequence_parallel(self) -> None:
         """Validate Ulysses SP and assign its workers to the PCP dimension."""
         sp = self.sequence_parallel_size
-        if self.parallel_config.data_parallel_size != 1:
+        if self.parallel_config.data_parallel_size != 1 or self.enable_dp_attention:
             raise ValueError(
-                "Ulysses SP currently requires data_parallel_size=1: the DP "
-                "MoE forward path does not gather/scatter SP token shards."
+                "Ulysses SP currently requires data_parallel_size=1 without "
+                "--enable-dp-attention: the DP MoE forward path does not "
+                "gather/scatter SP token shards."
             )
         if self.tensor_parallel_size != 1:
             raise ValueError(
@@ -2998,18 +2999,15 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
-        # SP and PCP use the same rank dimension but different head shapes.
-        factors.append(self.sequence_parallel_size)
+        if self.sequence_parallel_size > 1:
+            # SP and PCP use the same rank dimension but different head shapes.
+            factors.append(("sp", self.sequence_parallel_size))
         if self.tp_replicated_o_proj:
             factors.append("tp_replicated_o_proj")
         if self.sp_mega_moe_enabled:
             # This changes the decoder graph, including the next input norm
             # and final norm. Never load a native SP artifact for this region.
             factors.append("sp_mega_moe_full_fusion_v1")
-        # Expert layout and transport also change compiled shapes/subgraphs.
-        factors.append(
-            (self.enable_expert_parallel, self.moe_all2all_backend, self.moe_backend)
-        )
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the

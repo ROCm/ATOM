@@ -236,7 +236,9 @@ class EngineArgs:
             default=1,
             help="Ulysses sequence parallel size. Shards tokens across the "
             "group and trades sequence for heads around attention via "
-            "all-to-all. Requires --tensor-parallel-size 1.",
+            "all-to-all. Requires --tensor-parallel-size 1 and DP1/PP1; "
+            "refuses EP, TBO, speculative decoding, KV transfer and image "
+            "input. Attention heads must divide across the ranks.",
         )
         parser.add_argument(
             "--data-parallel-size",

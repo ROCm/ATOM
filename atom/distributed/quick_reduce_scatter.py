@@ -8,7 +8,11 @@ as for the existing QuickAllReduce implementation. There is only one payload
 communication phase and one quantization; no full all-reduce is performed.
 """
 
+import logging
+
 import torch
+
+logger = logging.getLogger("atom")
 
 try:
     import aiter.ops.quick_reduce_scatter as _qrs_ops
@@ -24,6 +28,7 @@ _qr_reduce_scatter = getattr(_qrs_ops, "qr_reduce_scatter", None)
 # 24 MiB but only 2% at 6 MiB, too little for another lossy step. Decode stays
 # below it on the exact reduce-scatter.
 QUICK_RS_MIN_BYTES = 24 << 20
+_announced = False
 
 
 def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
@@ -56,6 +61,14 @@ def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
     if get_gfx_runtime() != "gfx950":
         return None
 
+    global _announced
+    if not _announced:
+        _announced = True
+        logger.info(
+            "AITER_QUICK_REDUCE_QUANTIZATION=INT4 also quantizes the SP MoE "
+            "reduce-scatter of tensors from %d MiB",
+            QUICK_RS_MIN_BYTES >> 20,
+        )
     out = x.new_empty((x.shape[0] // comm.world_size, *x.shape[1:]))
     _qr_reduce_scatter(comm._ptr, x, out, bool(comm.use_fp16_kernels))
     return out

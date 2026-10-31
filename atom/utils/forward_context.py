@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from atom.config import Config, KVCacheTensor, ParallelConfig
-from atom.distributed.ulysses_sp import sp_local_len, sp_tokens_across_ranks
+from atom.distributed.ulysses_sp import sp_local_len
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
@@ -515,9 +515,8 @@ class Context:
     # stood for "dp-attention is off", and readers needing the strong claim --
     # `_can_use_dp_sharded_head` above all -- silently got the weak one.
     running_tokens_are_unified: bool = True
-    # `running_tokens` for every DP rank, unreduced, as Python ints
+    # `running_tokens` for every rank, unreduced, as Python ints
     # (`set_forward_context`'s table); this rank's entry IS `running_tokens`.
-    # Without DP, Ulysses SP holds its ranks' shards of it here instead.
     # Consumers reduce it, because they want different reductions: padding
     # each rank up to the group is a MAX, an all2all's receive width holds what
     # every rank sent and is a SUM. None on a TBO ubatch whose counts were not
@@ -1043,16 +1042,8 @@ def set_forward_context(
     )
 
     # Mirrored here rather than at each caller: the two going out of step is how
-    # an all2all comes to bound its receive buffer by one rank's count. Without
-    # DP, Ulysses SP ranks each run their chunk of this rank's tokens.
-    sp_across = (
-        sp_tokens_across_ranks(int(running_tokens_per_dp_rank[0]))
-        if dp_metadata is None
-        else None
-    )
-    context.running_tokens_across_dp = sp_across or tuple(
-        running_tokens_per_dp_rank.tolist()
-    )
+    # an all2all comes to bound its receive buffer by one rank's count.
+    context.running_tokens_across_dp = tuple(running_tokens_per_dp_rank.tolist())
 
     forward_mode = context.forward_mode
     _forward_context = ForwardContext(

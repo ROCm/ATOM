@@ -531,7 +531,6 @@ def _select_logical(
         # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
         # found, pure TP routes and runs its pad rows like real ones.
         mask_pad_rows=layer.use_ep,
-        shared_experts_fused=layer.num_fused_shared_experts > 0,
     )
 
 
@@ -3800,7 +3799,11 @@ class FusedMoE(torch.nn.Module):
                 top_k=self.top_k,
                 tp_rank=self.ep_rank if self.use_ep else self.tp_rank,
                 tp_size=self.ep_size if self.use_ep else self.tp_size,
-                shared_experts_score=self.shared_expert_weight,
+                shared_experts_score=(
+                    1.0
+                    if is_rocm_aiter_fuse_routed_scaling_factor()
+                    else 1 / self.routed_scaling_factor
+                ),
                 max_num_tokens=moe_token_capacity,
                 is_EP=self.use_ep,
             )
@@ -3977,12 +3980,9 @@ class FusedMoE(torch.nn.Module):
 
     @property
     def shared_expert_weight(self) -> float:
-        # Shared experts contribute once per token after the MoE reduction.
-        return (
-            1.0
-            if is_rocm_aiter_fuse_routed_scaling_factor()
-            else 1.0 / self.routed_scaling_factor
-        )
+        if is_rocm_aiter_fuse_routed_scaling_factor():
+            return 1.0
+        return 1.0 / self.routed_scaling_factor
 
     @property
     def shared_dispatch_base(self) -> int:
@@ -5322,12 +5322,7 @@ class FusedMoE(torch.nn.Module):
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
         mask_pad_rows: bool = True,
-        shared_experts_fused: bool | None = None,
     ):
-        # Dispatch layouts append shared columns after routing, so a zero-width
-        # AITER shared buffer does not imply the model applies the routed scale.
-        if shared_experts_fused is None:
-            shared_experts_fused = num_fused_shared_experts > 0
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
         # in the first 3 layers, where topk_ids are looked up from a per-token
@@ -5401,7 +5396,7 @@ class FusedMoE(torch.nn.Module):
                 # experts are not fused; DeepSeek-V4 folds it into routing.
                 route_scale = (
                     routed_scaling_factor
-                    if shared_experts_fused or scoring_func == "sqrtsoftplus"
+                    if fuse_shared or scoring_func == "sqrtsoftplus"
                     else 1.0
                 )
                 topk_gating(

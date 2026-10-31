@@ -108,13 +108,6 @@ def sp_local_len(total_tokens: int) -> int:
     return sp_pad_len(total_tokens) // _SP_WORLD_SIZE
 
 
-def sp_tokens_across_ranks(num_tokens: int | None) -> tuple[int, ...] | None:
-    """Per-rank token counts used to size routed MoE receive buffers."""
-    if _SP_WORLD_SIZE <= 1 or num_tokens is None:
-        return None
-    return (sp_local_len(num_tokens),) * _SP_WORLD_SIZE
-
-
 def sp_local_slice(total_tokens: int) -> slice:
     """This rank's contiguous token range within a padded sequence."""
     local = sp_local_len(total_tokens)
