@@ -111,6 +111,10 @@ class BlockPool:
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
+        # Units released since the last state-maintenance drain. Their bytes are
+        # a state image, not KV; the next batch zeroes them before any forward
+        # can write them as KV (`StateMaintenanceOps.zero_blocks`).
+        self.released_raw_units: list[int] = []
         # Reusable content this pool destroyed, split by what destroyed it.
         # Both are evictions in the sense that a later prefix hit is now
         # impossible, and they read the same in a hit rate, but they want
@@ -418,6 +422,7 @@ class BlockPool:
         for block_id in ids:
             del self._raw_unit_owner[block_id]
             self.free(block_id)
+        self.released_raw_units.extend(ids)
 
     def rekey_units(
         self,
