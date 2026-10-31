@@ -64,8 +64,11 @@ Notes:
 Feature flags:
 
 - `--kv-cache-dtype auto` (equivalently `bfloat16`) runs the unpacked BF16
-  pool. `--kv-cache-dtype nvfp4` selects ATOM's packed FP4 pool, which roughly
-  halves the bytes a cached token costs. The fp8 spellings are rejected: V4.1
+  pool. `--kv-cache-dtype nvfp4` maps to ATOM's packed FP4 pool, which roughly
+  halves the bytes a cached token costs, but vLLM 0.31.1 refuses `nvfp4` for
+  MLA models in its own config validation (`validate_nvfp4_kv_cache_with_mla`)
+  before ATOM is consulted, so on that build only BF16 starts. The fp8
+  spellings are rejected: V4.1
   has no fp8 main pool, and silently downgrading would leave vLLM's allocation
   and the kernels' geometry describing different bytes.
 - This integration targets the **V2 model runner**. The validated deployment
@@ -155,7 +158,8 @@ from target proxy pages alone.
 | Capability | On the plugin path |
 |---|---|
 | Text generation, chat, tools, reasoning effort | Supported |
-| BF16 and packed FP4 main pool | Supported (`--kv-cache-dtype auto` / `nvfp4`) |
+| BF16 main pool | Supported (`--kv-cache-dtype auto`) |
+| Packed FP4 main pool | Mapped (`nvfp4`), but refused by vLLM 0.31.1's MLA check before ATOM runs |
 | Image requests | Refused — text only |
 | DSpark speculative decoding | Supported — 5 draft tokens, fixed by the model's own config gate; the draft is the target checkpoint's `mtp.*` stages, so there is no separate draft model to pass |
 | Prefix caching | Only with the state checkpoints (`ATOM_V41_STATE_CHECKPOINTS=1` and `--mamba-cache-mode align`); see the [LMCache recipe](DeepSeek-V4.1-Flash-LMCache-Byte-Offload.md). Otherwise refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
