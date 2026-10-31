@@ -49,6 +49,7 @@ from atom.mono.device.gfx1250 import (
     ballot,
     lanes_below,
     lds_addr,
+    lds_reads_done,
     n32k4_word,
     publish,
     release_stores,
@@ -64,6 +65,7 @@ ROUTED_WAVES = N_ROUTED // WAVE  # waves holding one routed expert a lane
 KQ = 4  # k quarters of an up / gate row group (``wide_ug``): WAVES // KQ row groups a block
 QCH = HIDDEN // 128 // KQ  # 128-k chunks a k quarter
 SLOT_WORDS = (WAVE * 32 + WAVE * 4) // 4  # a ring slot: a chunk's FP4 rows, its scales
+TL_EXPERTS = 18  # timeline point (free on the map): the layer's distinct experts
 
 
 @traced
@@ -297,8 +299,10 @@ def moe_wide_defs(k4ctx):
             )
 
         F = UGR * QCH
-        for f in range_constexpr(min(UG_RING, F)):
-            issue(f)
+        assert UG_RING <= QCH
+        if rounds[0][0]:
+            for f in range_constexpr(UG_RING):
+                issue(f)
         return rounds, F, issue, col, n_pairs
 
     def reduce_round(r, rounds):
@@ -334,26 +338,46 @@ def moe_wide_defs(k4ctx):
                 bo.buffer_store(sc, rsrc(mb("midsp")), row * MIDSC_ROW_WORDS + blk_, cache_modifier=CM_DEV)
 
     def wide_ug_run(state):
+        """The rounds in order, a past-the-end one (and those after it) skipped:
+        a chunk's wait counts the next round's copies only if it is live."""
         rounds, F, issue, col, n_pairs = state
         v8i = fx.Vector.make_type(8, fx.Int32)
-        acc = fx.Vector.filled(8, 0.0, fx.Float32)
-        for f in range_constexpr(F):
-            r, c = divmod(f, QCH)
-            wait_async(3 * min(UG_RING - 1, F - 1 - f))
-            sw = (wave * UG_RING + f % UG_RING) * SLOT_WORDS
-            wv = fx.Vector(fx.ptr_load(ugring + (sw + lane * 8), result_type=v8i))
-            sa = fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane)))
-            kc = (wave % KQ) * QCH + c
-            acc = wmma_a8w4(
-                wv, lds_b8(col * XN8_ROW + kc * 32), acc, sa, lds_scale4(XSC_LDS + col * XSC_ROW + kc * 4)
-            )
-            if const_expr(f + UG_RING < F):
-                issue(f + UG_RING)
-            if const_expr(c == QCH - 1):
-                fx.ptr_store(acc, upart + ((r % 2) * ACC_WORDS + (wave * WAVE + lane) * 8))
-                acc = fx.Vector.filled(8, 0.0, fx.Float32)
-                gpu.barrier()
-                reduce_round(r, rounds)
+
+        def ug_round(r):
+            has_n = rounds[r + 1][0] if r + 1 < UGR else None
+            acc = fx.Vector.filled(8, 0.0, fx.Float32)
+            for c in range_constexpr(QCH):
+                f = r * QCH + c
+                n_same = min(UG_RING - 1, QCH - 1 - c)
+                n_next = min(UG_RING - 1, F - 1 - f) - n_same
+                if const_expr(n_next > 0):
+                    if has_n:
+                        wait_async(3 * (n_same + n_next))
+                    else:
+                        wait_async(3 * n_same)
+                else:
+                    wait_async(3 * n_same)
+                sw = (wave * UG_RING + f % UG_RING) * SLOT_WORDS
+                wv = fx.Vector(fx.ptr_load(ugring + (sw + lane * 8), result_type=v8i))
+                sa = fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane)))
+                kc = (wave % KQ) * QCH + c
+                acc = wmma_a8w4(
+                    wv, lds_b8(col * XN8_ROW + kc * 32), acc, sa, lds_scale4(XSC_LDS + col * XSC_ROW + kc * 4)
+                )
+                if const_expr(f + UG_RING < F):
+                    lds_reads_done()  # chunk f's slot, refilled next
+                    if const_expr((f + UG_RING) // QCH == r):
+                        issue(f + UG_RING)
+                    else:
+                        if has_n:
+                            issue(f + UG_RING)
+            fx.ptr_store(acc, upart + ((r % 2) * ACC_WORDS + (wave * WAVE + lane) * 8))
+            gpu.barrier()
+            reduce_round(r, rounds)
+
+        for r in range_constexpr(UGR):
+            if rounds[r][0]:
+                ug_round(r)
         stamp(9)
         release_stores()
         gpu.barrier()
@@ -386,6 +410,9 @@ def moe_wide_defs(k4ctx):
         gpu.barrier()
         build_experts()
         stamp(6)
+        if const_expr(k4ctx["timeline"]):  # point TL_EXPERTS: a count, not a time
+            if tid == 0:
+                fx.ptr_store(fx.Int64(uniform(fx.ptr_load(uexp + NU_AT)) + 1), k4ctx["tls"] + TL_EXPERTS)
         if (bid == BASE["down"]) & (tid < MOE_SLOTS * tokens):
             sk = tid // MOE_SLOTS
             sj = tid % MOE_SLOTS
@@ -462,14 +489,21 @@ def moe_wide_defs(k4ctx):
             ok = (j < NJ) & (i <= nu)
             return ok, ok.select(i, fx.Int32(0)), ok.select(j % DN_KC, q % DN_KC)
 
+        # lane l of eids[c]: unit 32 c + l's expert, past this wave's units too
         eids = []
-        for c in range_constexpr((NT + WAVE - 1) // WAVE):
+        for c in range_constexpr((NT + UG_RING + WAVE - 1) // WAVE):
             _, i_l, _ = unit(lane + WAVE * c)
             eids.append(fx.max(fx.min(fx.Int32(fx.ptr_load(uexp + i_l)), SHARED_EXPERT), 0))
 
         def issue(t):
             _, _, kc = unit(t)
-            de = fx.Int32(rocdl.readlane(T.i32, eids[t // WAVE], t % WAVE))
+            if const_expr(isinstance(t, int)):
+                src = eids[t // WAVE]
+            else:
+                src = eids[-1]
+                for c in range_constexpr(len(eids) - 2, -1, -1):
+                    src = (t < WAVE * (c + 1)).select(eids[c], src)
+            de = fx.Int32(rocdl.readlane(T.i32, src, t % WAVE))
             wb = fx.Int64(w2) + fx.Int64(de) * W2_BYTES
             slot = ring + ((wave * UG_RING + t % UG_RING) * SLOT_WORDS) * 4
             for piece in range_constexpr(2):
@@ -494,7 +528,7 @@ def moe_wide_defs(k4ctx):
             bsc = fx.Int32(fx.ptr_load(xs + (W_MIDSC + drow * MIDSC_ROW + kc)))
             return lds_b8(drow * MID_ROW + kc * 32), bsc, w
 
-        for t in range_constexpr(min(UG_RING, NT)):
+        for t in range_constexpr(UG_RING):
             issue(t)
         n_ug = (nu + 1) * UG_PAIRS
         mb_poll(
@@ -525,25 +559,44 @@ def moe_wide_defs(k4ctx):
         gpu.barrier()
         stamp(10)
         v8i = fx.Vector.make_type(8, fx.Int32)
-        acc = [fx.Float32(0.0) for _ in range(8)]
-        lks = [lookup(t) for t in range(min(2, NT))]
-        op = operand(lks.pop(0))
-        for t in range_constexpr(NT):
-            # LDS reads ahead are only issued here, used after the wait (the
-            # wait bounds a scheduling region: a use here would wait for them)
-            nxt = operand(lks.pop(0)) if t + 1 < NT else None
-            if const_expr(t + 2 < NT):
-                lks.append(lookup(t + 2))
-            wait_async(3 * min(UG_RING - 1, NT - 1 - t))
+        # this wave's live units, a prefix: q + 8 t < 6 (nu + 1)
+        n_w = (DN_KC * (nu + 1) - q + DN_GW - 1) // DN_GW
+
+        def ring_read(t):
             sw = (wave * UG_RING + t % UG_RING) * SLOT_WORDS
-            dwv = fx.Vector(fx.ptr_load(ugring + (sw + lane * 8), result_type=v8i))
-            dsc = fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane)))
-            b, bsc, dw = op
-            dcu = wmma_a8w4(dwv, b, fx.Vector.filled(8, 0.0, fx.Float32), dsc, bsc)
+            return (
+                fx.Vector(fx.ptr_load(ugring + (sw + lane * 8), result_type=v8i)),
+                fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane))),
+            )
+
+        # iteration t: unit t + UG_RING's copy out into unit t's slot, read by
+        # iteration t - 1 (past the live units too, a stand-in chunk, so every
+        # wait is the same); unit t + 1's B operand read, unit t + 2's lookup,
+        # unit t + 1's copy waited for and read; unit t's WMMA on what iteration
+        # t - 1 read
+        op = operand(lookup(0))
+        lk = lookup(1)
+        wait_async(3 * (UG_RING - 1))
+        a, sa = ring_read(0)
+        acc = [fx.Float32(0.0) for _ in range(8)]
+        init = acc + [a, sa, op[0], op[1], op[2], lk[0], lk[1], lk[2]]
+        fin = init
+        for t_, st in range(0, n_w, 1, init=init):
+            t = fx.Int32(t_)
+            acc = [fx.Float32(v) for v in st[0:8]]
+            a, sa = fx.Vector(st[8]), fx.Int32(st[9])
+            b, bsc, dw = fx.Vector(st[10]), fx.Int32(st[11]), fx.Float32(st[12])
+            lk = (fx.Int32(st[13]), fx.Float32(st[14]), fx.Int32(st[15]))
+            lds_reads_done()
+            issue(t + UG_RING)
+            op_n = operand(lk)
+            lk_n = lookup(t + 2)
+            wait_async(3 * (UG_RING - 1))
+            a_n, sa_n = ring_read(t + 1)
+            dcu = wmma_a8w4(a, b, fx.Vector.filled(8, 0.0, fx.Float32), sa, bsc)
             acc = [acc[e] + dcu[e] * dw for e in range(8)]
-            if const_expr(t + UG_RING < NT):
-                issue(t + UG_RING)
-            op = nxt
+            fin = yield acc + [a_n, sa_n, op_n[0], op_n[1], op_n[2], lk_n[0], lk_n[1], lk_n[2]]
+        acc = [fx.Float32(v) for v in fin[0:8]]
         fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8)
         gpu.barrier()
         if tid < DN_ROWS * tokens:
@@ -554,6 +607,7 @@ def moe_wide_defs(k4ctx):
             fx.ptr_store(bf16_round(tot), misc + tid)
         gpu.barrier()
         ffn_finish(td)
+        wait_async(0)  # the stand-in copies, before the CTA's LDS goes
 
     return {
         "slot_of": slot_of,
