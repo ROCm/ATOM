@@ -22,18 +22,31 @@ class StepMailboxes:
     never arrived reported by ``missing_ranks``."""
 
     def __init__(
-        self, peers: PeerBuffer, *scratch: torch.Tensor, debug: bool = False
+        self,
+        peers: PeerBuffer,
+        *scratch: torch.Tensor,
+        debug: bool = False,
+        gfx1250: bool = False,
     ) -> None:
         self.peers = peers
         self._scratch = scratch
         self._debug = debug
+        self._gfx1250 = gfx1250
+        if gfx1250 and not debug:
+            raise ValueError("gfx1250 step mailboxes require bounded waits")
         self._state = torch.zeros(
             STATE_WORDS, dtype=torch.int64, device=peers.bytes.device
         )
 
     def begin_step(self) -> None:
         """Before the step's first kernel, on its stream (a graph records it)."""
-        step_begin(self._scratch, self.peers, self._state, self._debug)
+        step_begin(
+            self._scratch,
+            self.peers,
+            self._state,
+            self._debug,
+            gfx1250=self._gfx1250,
+        )
 
     def missing_ranks(self) -> list[int]:
         """The ranks the fences since the last call gave up on (a debug build;

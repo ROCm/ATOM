@@ -87,6 +87,7 @@ def common_refusals(
     *,
     refuse_tr_hybrid: bool = True,
     refuse_decode_cp: bool = True,
+    arch: str = "gfx950",
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
@@ -132,7 +133,7 @@ def common_refusals(
     gfx = _gfx()
     checks = [
         # the persistent kernels are gfx950 code: wave64, MFMA, permlane32
-        (gfx == "gfx950", f"arch {gfx}"),
+        (gfx == arch, f"arch {gfx}"),
         *parallel,
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
         (
