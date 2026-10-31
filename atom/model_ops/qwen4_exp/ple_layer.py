@@ -22,12 +22,15 @@ across chunked prefill and decode. The depthwise convolution uses kernel size
 `(kernel - 1) * dilation` previous tokens per channel.
 """
 
+import logging
 import math
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from torch import nn
 
+from atom.config import get_current_atom_config
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.qwen4_exp.hyperconnection import Qwen4ExpGroupedRMSNorm
@@ -37,8 +40,13 @@ from atom.model_ops.qwen4_exp.ops.ple import (
     dilated_causal_conv1d,
     fp8_embedding_lookup,
     ple_gate,
+    sharded_table_lookup,
 )
+from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable, validated_arch
 from atom.model_ops.utils import atom_parameter
+from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -96,7 +104,27 @@ def nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-class _Qwen4ExpFP8Embedding(nn.Module):
+def _check_global_scale(prefix: str, weight_scale: torch.Tensor) -> None:
+    scale = weight_scale.item()
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(
+            f"{prefix}.weight_scale is missing or is not finite and positive"
+        )
+
+
+class _ShardsIntoWeight:
+    """`load_shard` for a table in HBM: it is `weight`."""
+
+    def load_shard(self, shard_index: int, row_start: int, rows: torch.Tensor) -> None:
+        local = row_start - self.vocab_start_idx
+        self.weight.data.narrow(0, local, rows.shape[0]).copy_(rows)
+
+
+class _Qwen4ExpEmbedding(_ShardsIntoWeight, VocabParallelEmbedding):
+    """The BF16 table in HBM."""
+
+
+class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
     """Vocab-sharded FP8 table with one checkpoint scale for the whole table.
 
     Only selected rows are dequantized; the table stays in checkpoint E4M3FN
@@ -128,11 +156,7 @@ class _Qwen4ExpFP8Embedding(nn.Module):
         param.data.copy_(loaded_weight.reshape_as(param))
 
     def process_weights_after_loading(self) -> None:
-        scale = self.weight_scale.item()
-        if not math.isfinite(scale) or scale <= 0:
-            raise ValueError(
-                f"{self.prefix}.weight_scale is missing or is not finite and positive"
-            )
+        _check_global_scale(self.prefix, self.weight_scale)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         output = fp8_embedding_lookup(
@@ -142,6 +166,196 @@ class _Qwen4ExpFP8Embedding(nn.Module):
             self.vocab_start_idx,
             self.vocab_end_idx,
             self.output_dtype,
+        )
+        if ids.numel() and self.tp_size > 1:
+            output = get_tp_group().all_reduce(output, ca_fp8_quant=False)
+        return output
+
+
+def _host_table_available() -> bool:
+    """Whether the n-gram table goes to page-locked host memory instead of HBM.
+
+    Only where it would otherwise be allocated on a ROCm device: the kernel
+    reads it through HIP's unified addressing. And only on an architecture
+    the host path has been validated on (`VALIDATED_ARCHS`). `ATOM_ENGRAM_UVA=0`
+    keeps it in HBM, as it does the Engram tables.
+    """
+    if torch.version.hip is None or torch.empty(0).device.type != "cuda":
+        return False
+    if not envs.ATOM_ENGRAM_UVA:
+        logger.info("PLE n-gram table: in HBM (ATOM_ENGRAM_UVA=0)")
+        return False
+    arch = get_gfx_runtime()
+    if not validated_arch(arch):
+        logger.info("PLE n-gram table: in HBM (host table not validated on %s)", arch)
+        return False
+    return True
+
+
+class _Qwen4ExpHostEmbedding(nn.Module):
+    """Vocab-sharded PLE table in page-locked host memory, read over UVA.
+
+    The table is ~100 GB and a token reads `ngram_heads` rows of it, so it
+    does not earn its HBM. `PleHostTable` page-locks each checkpoint shard as
+    it loads, and `sharded_table_lookup` reads the rows a step names across the
+    bus through `shard_bases`. Those addresses only move when the weights are
+    released and resumed, so the lookup can be captured in a CUDA graph; a
+    weight sync writes the rows in place (`sync_weight`). If page-locking
+    fails the table moves to HBM and the same kernel reads it there; either
+    way the rows returned are the checkpoint's, bit for bit. In HBM the table
+    is `weight`, released and resumed with the other weights; on the host its
+    rows are freed and page-locked again alongside them. Either way the
+    addresses follow (`resume_weight_memory`; resuming recaptures the graphs).
+
+    Each data-parallel rank is its own model and page-locks its own copy of
+    the table (split across its TP ranks): N ranks on a node hold N copies,
+    ~95 GiB each for the BF16 table. Sharing one copy across them:
+    https://github.com/ROCm/ATOM/issues/2861
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        shard_rows: int,
+        prefix: str,
+        fp8: bool,
+    ):
+        super().__init__()
+        self.prefix = prefix
+        self.tp_size = get_tp_group().world_size
+        if num_embeddings % self.tp_size:
+            raise ValueError("PLE vocabulary size must be divisible by TP size")
+        rows = num_embeddings // self.tp_size
+        self.vocab_start_idx = rows * get_tp_group().rank_in_group
+        self.vocab_end_idx = self.vocab_start_idx + rows
+        self.embedding_dim = embedding_dim
+        self.shard_rows = shard_rows
+        self.fp8 = fp8
+        self.output_dtype = torch.get_default_dtype()
+        dtype = torch.float8_e4m3fn if fp8 else self.output_dtype
+        # The loader's handle on the table: the dtype the shard loader checks
+        # and the `weight_loader`, holding no rows -- unless the table falls
+        # back to HBM, where it holds them all (`PleHostTable`).
+        self.weight = atom_parameter(
+            torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
+        )
+        if fp8:
+            self.weight_scale = atom_parameter(
+                torch.full((1,), float("nan"), dtype=torch.float32)
+            )
+            self.weight_scale.weight_loader = _Qwen4ExpFP8Embedding._scale_loader
+        self.register_buffer(
+            "shard_bases",
+            torch.zeros(-(-num_embeddings // shard_rows), dtype=torch.int64),
+            persistent=False,
+        )
+        self.table = PleHostTable(
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            self.weight,
+            shard_rows,
+            self.shard_bases.device,
+            prefix,
+        )
+
+    def sync_weight(
+        self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
+    ) -> bool:
+        """`WeightUpdaterMixin`: `weight` -- the whole table, or checkpoint
+        shard `shard_id` of it -- written in place (`PleHostTable.sync_rows`).
+        False for other parameters, and for the whole table in HBM: that is
+        `weight` itself, which the updater syncs as any other parameter --
+        unless it is released, which raises as a shard would rather than
+        reach the updater as a shape mismatch.
+
+        The last lookups of the step that just ended may still be reading the
+        rows over the bus; the updater has waited for them, once per update.
+        """
+        if param_name != "weight":
+            return False
+        if shard_id is None and not self.table.on_host:
+            self.table.check_resumed()
+            return False
+        num_rows = (self.vocab_end_idx - self.vocab_start_idx) * self.tp_size
+        first = 0 if shard_id is None else shard_id * self.shard_rows
+        expected = (
+            num_rows if shard_id is None else min(self.shard_rows, num_rows - first),
+            self.embedding_dim,
+        )
+        if not 0 <= first < num_rows or tuple(tensor.shape) != expected:
+            raise ValueError(
+                f"{self.prefix}: expected {expected} for n-gram "
+                f"{'table' if shard_id is None else f'shard {shard_id}'}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        self.table.sync_rows(first, tensor)
+        return True
+
+    def load_shard(self, shard_index: int, row_start: int, rows: torch.Tensor) -> None:
+        self.table.load_rows(shard_index, row_start, rows)
+
+    def release_weight_memory(self) -> None:
+        """`MemoryManagerMixin` released the weights: free the page-locked
+        rows too."""
+        freed = self.table.release()
+        if freed:
+            logger.info(
+                "%s: released %.1f GiB of page-locked n-gram rows",
+                self.prefix,
+                freed / 1024**3,
+            )
+
+    def resume_weight_memory(self) -> None:
+        """`MemoryManagerMixin` resumed the weights: page-lock the rows
+        again, or, for a table that fell back to HBM, take `weight`'s new
+        allocation; either way the addresses have moved."""
+        self.table.resume()
+        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
+
+    def _initialize_dummy(self) -> None:
+        """`--load_dummy` filled the parameters while `weight` was still the
+        `[0, dim]` placeholder; the table it has become gets the same fill."""
+        mode = get_current_atom_config().load_dummy
+        if mode and mode != "empty":
+            # Deferred: the loader imports the model ops.
+            from atom.model_loader.loader import initialize_dummy_weights
+
+            initialize_dummy_weights(self, mode)
+
+    def process_weights_after_loading(self) -> None:
+        if self.fp8:
+            _check_global_scale(self.prefix, self.weight_scale)
+        bases = self.table.shard_bases(self.shard_bases.numel(), self._initialize_dummy)
+        self.shard_bases.copy_(bases)
+        if self.table.on_host:
+            dp_ranks = (
+                get_current_atom_config().parallel_config.data_parallel_size_local
+            )
+            table_bytes = self.table.pinned_bytes * self.tp_size
+            logger.info(
+                "%s: n-gram table in page-locked host memory, %.1f GiB on this "
+                "rank read over UVA, none in HBM; every data-parallel rank "
+                "page-locks its own %.1f GiB copy, %.1f GiB for the %d on this "
+                "node",
+                self.prefix,
+                self.table.pinned_bytes / 1024**3,
+                table_bytes / 1024**3,
+                table_bytes * dp_ranks / 1024**3,
+                dp_ranks,
+            )
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        output = sharded_table_lookup(
+            ids,
+            self.shard_bases,
+            self.weight_scale if self.fp8 else None,
+            self.vocab_start_idx,
+            self.vocab_end_idx,
+            self.shard_rows,
+            self.embedding_dim,
+            self.output_dtype,
+            self.table.dtype,
         )
         if ids.numel() and self.tp_size > 1:
             output = get_tp_group().all_reduce(output, ca_fp8_quant=False)
@@ -223,7 +437,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if quant_config is not None
             else None
         )
-        embedding_cls = VocabParallelEmbedding
+        embedding_cls = _Qwen4ExpEmbedding
         # PLE storage is independent of the linear layers' quantization format.
         embedding_dtype = getattr(config, "ple_embedding_dtype", None)
         if embedding_dtype == "float8_e4m3fn":
@@ -241,14 +455,23 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # the embedding BF16; the shard loader rejects any dtype mismatch.
             # PLE uses a global scalar, independently of the linear block scales.
             embedding_cls = _Qwen4ExpFP8Embedding
-        self.ngram_embedding = embedding_cls(
-            self.table_rows, self.head_dim, prefix=embedding_prefix
-        )
         # The 128 checkpoint shards are slices of the PADDED table, so the
         # shard width divides it exactly.
         self.checkpoint_shard_rows = (
             self.table_rows + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
+        if _host_table_available():
+            self.ngram_embedding = _Qwen4ExpHostEmbedding(
+                self.table_rows,
+                self.head_dim,
+                self.checkpoint_shard_rows,
+                prefix=embedding_prefix,
+                fp8=embedding_cls is _Qwen4ExpFP8Embedding,
+            )
+        else:
+            self.ngram_embedding = embedding_cls(
+                self.table_rows, self.head_dim, prefix=embedding_prefix
+            )
         self.ngram_embedding.weight.weight_loader = self._embedding_shard_loader
 
         self.max_total_tokens = max_total_tokens
@@ -310,8 +533,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             return
         rows = overlap_end - overlap_start
         source = loaded_weight.narrow(0, overlap_start - checkpoint_start, rows)
-        target = param.data.narrow(0, overlap_start - tp_start, rows)
-        target.copy_(source)
+        embedding.load_shard(shard_index, overlap_start, source)
 
     def compute_ngram_ids(
         self,
