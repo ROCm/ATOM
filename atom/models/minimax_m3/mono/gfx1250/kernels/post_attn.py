@@ -421,8 +421,6 @@ def build_post_attn_kernel(
         UG_PAIRS = UG_PER_SLOT // 2
         UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)
         assert DN_KC <= DN_GW
-        DN_WITERS = U_MAX
-        DN_DEPTH = 6  # units in flight: gfx950's 12 x 16 B a lane, in 32 B units
         ROUTE_ITERS = (tokens + WAVES - 1) // WAVES
 
         k4ctx.update(locals())
