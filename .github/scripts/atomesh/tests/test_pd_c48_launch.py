@@ -157,7 +157,7 @@ class LaunchTest(unittest.TestCase):
                 shown = next(n[role]["extra_args"] for n in nodes(suite)
                              if isinstance(n, dict) and isinstance(n.get(role), dict) and "extra_args" in n[role])
                 parsed = shlex.split(shown)
-                keys = [a[2:] for a in parsed if a.startswith("--")]
+                keys = [a[2:].removeprefix("no-") for a in parsed if a.startswith("--")]
                 self.assertEqual(sorted(keys), sorted(config["roles"][role]["args"]), (case, role))
                 for key, value in config["roles"][role]["args"].items():
                     if isinstance(value, (dict, list)):
@@ -327,6 +327,22 @@ class LaunchTest(unittest.TestCase):
         candidate["name"] = base["name"]
         self.assertEqual(candidate, base)
 
+    def test_c1_specdec_case_only_changes_decode_backend_scope_and_prefix_cache(self):
+        stem = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C1-N3966-WR"
+        base = json.loads((GAP / f"{stem}-MC.json").read_text())
+        candidate = json.loads((GAP / f"{stem}-SPEC-MC.json").read_text())
+        dec = candidate["roles"]["decode"]
+        self.assertEqual(dec["env"].pop("C48_D_SPECDEC"), "1")
+        self.assertEqual(dec["args"].pop("additional-config"), {"decode_backend": "latency_specialized"})
+        self.assertIs(dec["args"]["enable-prefix-caching"], False)
+        dec["args"]["enable-prefix-caching"] = True
+        self.assertEqual(dec["args"]["quantization-config"]["ignore"][-4:],
+                         ["*self_attn.in_proj_qkvgfab*", "*self_attn.f_b_proj*", "*self_attn.o_proj*",
+                          "*block_sparse_moe.shared_experts*"])
+        del dec["args"]["quantization-config"]["ignore"][-4:]
+        candidate["name"] = base["name"]
+        self.assertEqual(candidate, base)
+
     def test_mla_wide_reduce_gate_refuses_unsupported_role(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
         import os
@@ -339,6 +355,51 @@ class LaunchTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": role, "C48_D_MLA_WIDE_REDUCE": "1"}), \
                     self.assertRaises(ValueError):
                 enable_mla_wide_reduce(config(dtype))
+
+    def test_specdec_hook_admits_mooncake_and_inpad_only(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        import hashlib
+        import os
+        import tempfile
+        from unittest import mock
+        import torch
+        import pd_c48_worker
+        moriio = "KV transfer connectors other than a MoRIIO consumer"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for f in pd_c48_worker.SPECDEC_FILES:
+                (root / f).parent.mkdir(parents=True, exist_ok=True)
+                (root / f).write_text(f)
+            files = {f: hashlib.sha256(f.encode()).hexdigest() for f in pd_c48_worker.SPECDEC_FILES}
+            seen = {}
+            rt = types.SimpleNamespace(__file__=str(root / "runtime/__init__.py"),
+                                       unsupported=lambda c: [moriio, "LoRA"])
+            kda = types.SimpleNamespace(NPROJ=4, HIDDEN=2, kda_pre=lambda key, *, w_in, **kw: seen.setdefault(key, w_in))
+            guards = types.SimpleNamespace(weight_reasons=lambda m: ["layer 0 in_proj: shape", "layer 1 in_proj: shape"])
+            pkg = "vllm.models.kimi_k3.amd.specialized_decode"
+            mods = {pkg + ".runtime": rt, pkg + ".runtime.guards": guards, pkg + ".mono.attention.kda": kda}
+            kv = types.SimpleNamespace(kv_connector="MooncakeConnector", kv_role="kv_consumer")
+            config = types.SimpleNamespace(kv_transfer_config=kv)
+            w = torch.zeros(6, 2, dtype=torch.bfloat16)
+            layer = lambda w, pad: types.SimpleNamespace(
+                self_attn=types.SimpleNamespace(in_proj_qkvgfab=types.SimpleNamespace(weight=w), in_proj_padding=pad))
+            model = types.SimpleNamespace(layers=[layer(w, 2), layer(w, 1)])
+            with mock.patch.dict(sys.modules, mods), mock.patch.object(pd_c48_worker, "SPECDEC_FILES", files):
+                with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": "decode"}):
+                    self.assertIsNone(pd_c48_worker.enable_specdec(config))
+                with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": "prefill", "C48_D_SPECDEC": "1"}), \
+                        self.assertRaises(RuntimeError):
+                    pd_c48_worker.enable_specdec(config)
+                with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": "decode", "C48_D_SPECDEC": "1"}):
+                    self.assertTrue(pd_c48_worker.enable_specdec(config)["mooncake_consumer"])
+                self.assertEqual(rt.unsupported(config), ["LoRA"])
+                kv.kv_connector = "NixlConnector"
+                self.assertEqual(rt.unsupported(config), [moriio, "LoRA"])
+                kda.kda_pre("k", w_in=w)
+                self.assertEqual(seen["k"].shape, (4, 2))
+                self.assertEqual(guards.weight_reasons(model), ["layer 1 in_proj: shape"])
+                w[5, 0] = 1
+                self.assertEqual(len(guards.weight_reasons(model)), 2)
 
     def test_store_memory_compacts_each_node_once(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))

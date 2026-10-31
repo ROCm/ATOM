@@ -378,6 +378,70 @@ def enable_mla_wide_reduce(config):
             "blocks": list(pd_c48_mla_wide_reduce.BLOCKS)}
 
 
+# sha256 of the 3966924d specialized-decode files the hook wraps.
+SPECDEC_FILES = {
+    "runtime/__init__.py": "74e2efd1c254d9def2f7d918d4ed33941d2e064ff6a3d78e27ca9c2cdcfdbb80",
+    "runtime/guards.py": "37875b6b3a3546074d30a0e5f2175ff2796dc49262050fecd03467cb28b9c01e",
+    "mono/attention/kda.py": "0f266306544c21a38ad9421f35cfcc4fecdcf39dbdf2ad65b82b66cca4c1e622",
+}
+
+
+def enable_specdec(config):
+    """Opt-in for vLLM's Kimi-K3 specialized decode on the C48 decode role: accept a Mooncake kv_consumer and serve
+    the INPAD (zero-padded) KDA in_proj to K1 as its leading NPROJ rows. No-op unless C48_D_SPECDEC=1."""
+    if os.environ.get("C48_D_SPECDEC") != "1":
+        return None
+    import hashlib
+    import importlib
+    import re
+
+    import torch
+
+    pkg = "vllm.models.kimi_k3.amd.specialized_decode"
+    rt = importlib.import_module(pkg + ".runtime")
+    guards = importlib.import_module(pkg + ".runtime.guards")
+    kda = importlib.import_module(pkg + ".mono.attention.kda")
+    root = Path(rt.__file__).parent.parent
+    hashes = {f: hashlib.sha256((root / f).read_bytes()).hexdigest() for f in SPECDEC_FILES}
+    if os.environ.get("C48_DIAG_ROLE") != "decode" or hashes != SPECDEC_FILES:
+        raise RuntimeError(f"specialized decode hook requires the decode role and pinned files, got {hashes}")
+    kv = config.kv_transfer_config
+    if getattr(rt, "_c48_specdec", False):
+        return {"files": hashes}
+    unsupported = rt.unsupported
+
+    def unsupported_mooncake(vllm_config):
+        reasons = unsupported(vllm_config)
+        kv = vllm_config.kv_transfer_config
+        # Mooncake's wait_for_layer_load is a no-op and its loads finish via get_finished before the request runs,
+        # which is what the MoRIIO exemption relies on.
+        if (kv is not None and kv.kv_connector == "MooncakeConnector" and kv.kv_connector_module_path is None
+                and kv.kv_role == "kv_consumer"):
+            reasons = [r for r in reasons if r != "KV transfer connectors other than a MoRIIO consumer"]
+        return reasons
+
+    rt.unsupported = unsupported_mooncake
+    kda_pre, weight_reasons = kda.kda_pre, guards.weight_reasons
+
+    def kda_pre_view(key, *, w_in, **kw):
+        return kda_pre(key, w_in=w_in[: kda.NPROJ] if w_in.size(0) > kda.NPROJ else w_in, **kw)
+
+    def weight_reasons_inpad(model):
+        def padded(i):
+            a = model.layers[i].self_attn
+            w = a.in_proj_qkvgfab.weight
+            extra = w.size(0) - kda.NPROJ
+            return (w.dtype == torch.bfloat16 and w.is_contiguous() and w.size(1) == kda.HIDDEN
+                    and 0 < extra <= getattr(a, "in_proj_padding", 0) and not w[kda.NPROJ:].any())
+
+        return [r for r in weight_reasons(model)
+                if not ((m := re.fullmatch(r"layer (\d+) in_proj: .*", r)) and padded(int(m.group(1))))]
+
+    kda.kda_pre, guards.weight_reasons = kda_pre_view, weight_reasons_inpad
+    rt._c48_specdec = True
+    return {"files": hashes, "mooncake_consumer": bool(kv and kv.kv_connector == "MooncakeConnector")}
+
+
 class ManifestWorker(Worker):
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
@@ -440,6 +504,9 @@ class ManifestWorker(Worker):
         wide_reduce = enable_mla_wide_reduce(self.vllm_config)
         if wide_reduce is not None:
             print(f"[C48-WIDE-REDUCE] rank={self.rank} {json.dumps(wide_reduce)}", flush=True)
+        specdec = enable_specdec(self.vllm_config)
+        if specdec is not None:
+            print(f"[C48-SPECDEC] rank={self.rank} {json.dumps(specdec)}", flush=True)
         with LoadingMemoryProbe(self):
             super().load_model(load_dummy_weights=load_dummy_weights)
         runner = self.model_runner
@@ -467,6 +534,8 @@ class ManifestWorker(Worker):
             data["dcp_pbm"] = pbm
         if wide_reduce is not None:
             data["mla_wide_reduce"] = wide_reduce
+        if specdec is not None:
+            data["specialized_decode"] = specdec
         if os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1":
             import hashlib
             from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker as store_worker
