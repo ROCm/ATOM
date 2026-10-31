@@ -57,7 +57,7 @@ from atom.mono.device.gfx1250 import (
     wmma_a8w4,
     xshfl,
 )
-from atom.mono.device.ops import bf16_round, row_live, rows_to_lds, rsrc, traced, uniform
+from atom.mono.device.ops import batched_rounds, bf16_round, ld_dev, row_live, rows_to_lds, rsrc, traced, uniform
 from atom.mono.plan.trace import enter_stage
 
 ROUTED_WAVES = N_ROUTED // WAVE  # waves holding one routed expert a lane
@@ -234,10 +234,13 @@ def moe_wide_defs(k4ctx):
         publish(mb_put, mr("ugdone"), pr, fx.Int32(1), tid == 0)
 
     def down_tables():
+        """Distinct expert u's (mid row, route weight) of column k at entry
+        16 u + k: the zero row, 0 where k is not routed there, past the
+        distinct experts (entry U_MAX too)."""
         nu = uniform(fx.ptr_load(uexp + NU_AT))
-        for i in range_constexpr((U_MAX * 16 + THREADS - 1) // THREADS):
+        for i in range_constexpr(((U_MAX + 1) * 16 + THREADS - 1) // THREADS):
             ix = tid + THREADS * i
-            if ix < U_MAX * 16:
+            if ix < (U_MAX + 1) * 16:
                 xu = ix // 16
                 xk = ix % 16
                 xe = fx.Int32(fx.ptr_load(uexp + fx.min(xu, nu)))
@@ -442,14 +445,16 @@ def moe_wide_defs(k4ctx):
         group's (expert, 128-k chunk) units are dealt round robin to its 8 waves
         and streamed through their up / gate rings (free by now), the first
         before the mids are in; a unit past the distinct experts re-reads unit
-        0's chunk (L2 hits) so the wait counts stay constant."""
+        0's chunk (L2 hits) so the wait counts stay constant. A unit's expert
+        comes from a lane of ``eids`` (no LDS round trip before its copy), and
+        its mid row lookup and B operand are read 2 and 1 units ahead."""
         enter_stage("down")
         nu = uniform(fx.ptr_load(uexp + NU_AT))
         rg_d = td * 2 + wave // DN_GW
         q = wave % DN_GW
         ring = lds_addr(ugring)
         NJ = DN_KC * U_MAX
-        T = (NJ + DN_GW - 1) // DN_GW
+        NT = (NJ + DN_GW - 1) // DN_GW
 
         def unit(t):
             j = q + DN_GW * t
@@ -457,9 +462,14 @@ def moe_wide_defs(k4ctx):
             ok = (j < NJ) & (i <= nu)
             return ok, ok.select(i, fx.Int32(0)), ok.select(j % DN_KC, q % DN_KC)
 
+        eids = []
+        for c in range_constexpr((NT + WAVE - 1) // WAVE):
+            _, i_l, _ = unit(lane + WAVE * c)
+            eids.append(fx.max(fx.min(fx.Int32(fx.ptr_load(uexp + i_l)), SHARED_EXPERT), 0))
+
         def issue(t):
-            _, i, kc = unit(t)
-            de = fx.max(fx.min(uniform(fx.ptr_load(uexp + i)), SHARED_EXPERT), 0)
+            _, _, kc = unit(t)
+            de = fx.Int32(rocdl.readlane(T.i32, eids[t // WAVE], t % WAVE))
             wb = fx.Int64(w2) + fx.Int64(de) * W2_BYTES
             slot = ring + ((wave * UG_RING + t % UG_RING) * SLOT_WORDS) * 4
             for piece in range_constexpr(2):
@@ -474,7 +484,17 @@ def moe_wide_defs(k4ctx):
                 b128=False,
             )
 
-        for t in range_constexpr(min(UG_RING, T)):
+        def lookup(t):
+            j = q + DN_GW * t
+            e = fx.min(j // DN_KC, U_MAX) * 16 + l16
+            return fx.Int32(fx.ptr_load(urow + e)), fx.ptr_load(uwt + e), j % DN_KC
+
+        def operand(lk):
+            drow, w, kc = lk
+            bsc = fx.Int32(fx.ptr_load(xs + (W_MIDSC + drow * MIDSC_ROW + kc)))
+            return lds_b8(drow * MID_ROW + kc * 32), bsc, w
+
+        for t in range_constexpr(min(UG_RING, NT)):
             issue(t)
         n_ug = (nu + 1) * UG_PAIRS
         mb_poll(
@@ -485,37 +505,45 @@ def moe_wide_defs(k4ctx):
         )
         gpu.barrier()
         acquire()
-        for base_w, n_row, lds_w, lds_row in (
-            (mb("mid8p"), MID_ROW_WORDS, 0, MID_ROW),
-            (mb("midsp"), MIDSC_ROW_WORDS, W_MIDSC, MIDSC_ROW),
-        ):
-            rows_to_lds(tid, base_w, MID_ROWS, n_row, xs + lds_w, lds_row)
+        rows_to_lds(tid, mb("mid8p"), MID_ROWS, MID_ROW_WORDS, xs, MID_ROW)
+        # the mid scales packed as WMMA scale words: word kc of a row, byte j
+        # the code of its 32-block 4 kc + j
+        NPK = MIDSC_ROW_WORDS // 4
+        batched_rounds(
+            tid,
+            MID_ROWS * NPK,
+            lambda v: fx.Vector(ld_dev(mb("midsp"), v * 4, 4)),
+            lambda v, c: fx.ptr_store(
+                (c[0] & 0xFF) | ((c[1] & 0xFF) << 8) | ((c[2] & 0xFF) << 16) | (c[3] << 24),
+                xs + (W_MIDSC + v // NPK * MIDSC_ROW + v % NPK),
+            ),
+        )
         if tid < MID_ROW_WORDS:
             fx.ptr_store(fx.Int32(0), xs + (MID_ROWS * MID_ROW + tid))
-        if tid < MIDSC_ROW_WORDS:
+        if tid < NPK:
             fx.ptr_store(fx.Int32(0), xs + (W_MIDSC + MID_ROWS * MIDSC_ROW + tid))
         gpu.barrier()
         stamp(10)
         v8i = fx.Vector.make_type(8, fx.Int32)
         acc = [fx.Float32(0.0) for _ in range(8)]
-        for t in range_constexpr(T):
-            wait_async(3 * min(UG_RING - 1, T - 1 - t))
+        lks = [lookup(t) for t in range(min(2, NT))]
+        op = operand(lks.pop(0))
+        for t in range_constexpr(NT):
+            # LDS reads ahead are only issued here, used after the wait (the
+            # wait bounds a scheduling region: a use here would wait for them)
+            nxt = operand(lks.pop(0)) if t + 1 < NT else None
+            if const_expr(t + 2 < NT):
+                lks.append(lookup(t + 2))
+            wait_async(3 * min(UG_RING - 1, NT - 1 - t))
             sw = (wave * UG_RING + t % UG_RING) * SLOT_WORDS
             dwv = fx.Vector(fx.ptr_load(ugring + (sw + lane * 8), result_type=v8i))
             dsc = fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane)))
-            ok, i, kc = unit(t)
-            drow = fx.Int32(fx.ptr_load(urow + (i * 16 + l16)))
-            dw = ok.select(fx.ptr_load(uwt + (i * 16 + l16)), fx.Float32(0.0))
-            dcu = wmma_a8w4(
-                dwv,
-                lds_b8(drow * MID_ROW + kc * 32),
-                fx.Vector.filled(8, 0.0, fx.Float32),
-                dsc,
-                lds_scale4(W_MIDSC + drow * MIDSC_ROW + kc * 4),
-            )
+            b, bsc, dw = op
+            dcu = wmma_a8w4(dwv, b, fx.Vector.filled(8, 0.0, fx.Float32), dsc, bsc)
             acc = [acc[e] + dcu[e] * dw for e in range(8)]
-            if const_expr(t + UG_RING < T):
+            if const_expr(t + UG_RING < NT):
                 issue(t + UG_RING)
+            op = nxt
         fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8)
         gpu.barrier()
         if tid < DN_ROWS * tokens:
