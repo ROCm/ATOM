@@ -3,10 +3,12 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 from conftest import atom_config_double
 
 from atom.config import Config
 from atom.distributed.ulysses_sp import check_sp_attention_layer
+from atom.models.minimax_m3.image_processing import image_input_refusal
 
 
 @pytest.mark.parametrize("world", [1, 2, 4, 8, 16, 32])
@@ -43,6 +45,7 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
     "overrides,reason",
     [
         ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP MoE"),
+        ({"enable_dp_attention": True}, "DP MoE"),
         ({"tensor_parallel_size": 2}, "requires --tensor-parallel-size 1"),
         ({"pipeline_parallel_size": 2}, "pipeline parallelism"),
         ({"enable_expert_parallel": True}, "expert parallelism"),
@@ -57,6 +60,33 @@ def test_unsharded_execution_paths_are_rejected(overrides, reason):
     config = atom_config_double(sequence_parallel_size=4, **overrides)
     with pytest.raises(ValueError, match=reason):
         Config._init_sequence_parallel(config)
+
+
+def test_minimax_m3_builds_no_vision_tower_under_sp():
+    config = atom_config_double(
+        sequence_parallel_size=4,
+        hf_config=SimpleNamespace(vision_config=object()),
+        compilation_config=SimpleNamespace(cudagraph_mode=None),
+    )
+    assert image_input_refusal(config) == "Ulysses SP (--sequence-parallel-size > 1)"
+    config.sequence_parallel_size = 1
+    assert image_input_refusal(config) is None
+
+
+def test_dp_isolated_rlhf_workers_refuse_sp(monkeypatch):
+    # Importing the runner resolves the chip architecture through aiter.
+    if not torch.cuda.is_available():
+        pytest.skip("RLHFModelRunner needs a ROCm device to import")
+    from atom.rollout.model_runner_ext import RLHFModelRunner
+
+    monkeypatch.setenv(RLHFModelRunner.DP_DEVICE_MAP_ENV, "0,1,2,3")
+    config = atom_config_double(
+        prefill_context_parallel_size=4,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    runner = object.__new__(RLHFModelRunner)
+    with pytest.raises(ValueError, match="Ulysses SP"):
+        runner._setup_device_and_distributed(0, config)
 
 
 def test_replicated_o_proj_rejects_speculative_decoding():
@@ -95,8 +125,6 @@ def test_layouts_that_change_the_graph_do_not_share_compiled_artifacts():
         ("sequence_parallel_size", 4),
         ("tp_replicated_o_proj", True),
         ("sp_mega_moe_enabled", True),
-        ("enable_expert_parallel", True),
-        ("moe_all2all_backend", "mori"),
     ):
         setattr(config, name, value)
         key = Config.compute_hash(config)

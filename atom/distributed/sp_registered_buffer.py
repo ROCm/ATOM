@@ -8,11 +8,12 @@ collective's end synchronization completes remote reads before pool reuse.
 
 import math
 
-import torch
-
 
 def registered_input_view(ca, shape, dtype):
-    """Return a view of ca's registered input pool, or None if it cannot hold one."""
+    """Return a view of ca's registered input pool, or None if it cannot hold one.
+
+    ``ca`` is a communicator `custom_gather_ok` already accepted for a payload
+    at least this large."""
     pool = ca._pool["input"]
     # Raw HIP allocations have no PyTorch owner/view. Keep the established
     # copy-in path for those configurations rather than manufacturing ownership.
@@ -22,7 +23,4 @@ def registered_input_view(ca, shape, dtype):
     nbytes = math.prod(shape) * dtype.itemsize
     if nbytes == 0 or nbytes > pool.max_size or nbytes % 16:
         return None
-    result = storage[:nbytes].view(dtype).view(shape)
-    if not ca.should_custom_ag(result.view(torch.bfloat16)):
-        return None
-    return result
+    return storage[:nbytes].view(dtype).view(shape)

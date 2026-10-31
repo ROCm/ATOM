@@ -13,8 +13,11 @@ import torch
 
 from atom.utils import envs
 
-# Small payloads can benefit from the registered-buffer all-gather. Large
-# prefills use all-to-all to avoid receiving unused heads.
+# Below this, sending W times the bytes through the registered-buffer
+# all-gather still beats RCCL's all-to-all; above it, the all-to-all's smaller
+# payload wins. Measured on SP4 hidden rows: the two cross at ~3.7 MB per rank,
+# and the gather only falls further behind past it. `indexer_cp`'s 512 KiB is
+# for its key gather, a different payload and a different pair of kernels.
 _ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 # Output rows per rank from which an attention output takes the prefill head
 # exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
@@ -117,7 +120,6 @@ def head_exchange_communicator(x, group):
     if (
         not x.is_cuda
         or group.world_size != 4
-        or not envs.ATOM_USE_CUSTOM_ALL_GATHER
         or x.ndim != 2
         or x.shape[0] < 4 * HEAD_EXCHANGE_MIN_LOCAL_ROWS
         or x.shape[0] % 4
@@ -129,12 +131,10 @@ def head_exchange_communicator(x, group):
         return None
     from atom.plugin.prepare import is_plugin_mode
 
-    if is_plugin_mode():
+    if is_plugin_mode() or not custom_gather_ok(x, group):
         return None
     ca = _ca_comm(group)
-    if ca is None or getattr(ca, "_pool", None) is None:
-        return None
-    if not ca.should_custom_ag(x):
+    if getattr(ca, "_pool", None) is None:
         return None
     from aiter.jit.utils.chip_info import get_gfx_runtime
 

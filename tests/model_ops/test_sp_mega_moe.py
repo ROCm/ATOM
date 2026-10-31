@@ -17,17 +17,18 @@ from atom.model_ops.sp_mega_moe import SPMegaMoE, local_token_tile
 
 
 @pytest.fixture(autouse=True)
-def mock_mega_buffer_ops(monkeypatch):
+def mock_device_ops(monkeypatch):
     from atom.model_ops import sp_mega_moe
 
-    # Replace only the GPU copy boundary for CPU orchestration tests. The real
-    # copies and launch counts are covered on GPU.
+    # Replace only the GPU copy and router GEMM boundaries for CPU orchestration
+    # tests. The real copies, routing and launch counts are covered on GPU.
     def copy(source, source_scale, out, out_scale):
         out.view(torch.uint8).copy_(source.view(torch.uint8))
         if source_scale is not None:
             out_scale.view(-1).copy_(source_scale)
 
     monkeypatch.setattr(sp_mega_moe, "copy_tail", copy)
+    monkeypatch.setattr(sp_mega_moe, "_router_logits", torch.nn.functional.linear)
 
 
 @pytest.fixture
@@ -52,7 +53,7 @@ def test_small_batches_keep_the_native_moe(monkeypatch, sp_modules, rows, use_me
     runtime = SimpleNamespace(
         cfg=SimpleNamespace(world_size=4, tail_eps=1e-6), forward=Mock()
     )
-    backend = SPMegaMoE(runtime, 1)
+    backend = SPMegaMoE(runtime, 1, None)
     assert backend.supports(layer, rows) is use_mega
     assert resolver.call_args.kwargs["M"] == rows * 4
     if use_mega:
@@ -91,7 +92,7 @@ def test_tile_covers_the_largest_local_shard(budget, world_size, tile):
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("rows", [0, 16, 65])
+@pytest.mark.parametrize("rows", [0, 8, 16, 65])
 def test_full_op_preserves_rank_rows_residual_and_output_ownership(
     monkeypatch, sp_modules, fp8, rows
 ):
@@ -143,6 +144,7 @@ def test_full_op_preserves_rank_rows_residual_and_output_ownership(
             tail_ok=lambda m: m >= 16,
         ),
         1,
+        None,
     )
     backend.supports = lambda layer, rows: True
     backend._route = route
@@ -178,6 +180,9 @@ def test_full_op_preserves_rank_rows_residual_and_output_ownership(
     if rows == 65:
         assert plain_calls == [1, 1]
         assert tail_calls == [32, 32, 32, 32]
+    elif rows == 8:
+        # One untailed launch returns the norm outputs as they are.
+        assert plain_calls == [8, 8]
 
 
 def _servable_layer(moe):
@@ -227,6 +232,9 @@ def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
 
     # Enabled by default: an ineligible model must load on the native MoE.
     monkeypatch.setattr(ulysses_sp, "get_sp_world_size", lambda: 4)
+    monkeypatch.setattr(
+        ulysses_sp, "get_sp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
     monkeypatch.setattr(fusion, "_model_layers", lambda model, config: ([layer], 1e-6))
     config = SimpleNamespace(sp_mega_moe_enabled=True)
@@ -289,18 +297,30 @@ def test_runtime_setup_failure_keeps_the_native_moe(
 
 
 @pytest.mark.parametrize(
-    "stubs",
+    "stubs,vote",
     [
-        {"mori": Mock(side_effect=ImportError("no MORI"))},
-        {"norm_supported": lambda hidden: False},
+        ({"mori": Mock(side_effect=ImportError("no MORI"))}, False),
+        ({"norm_supported": lambda hidden: False}, False),
+        # This rank could serve it; a peer cannot.
+        ({}, True),
     ],
 )
-def test_missing_dependency_falls_back_before_any_collective(
-    monkeypatch, sp_modules, stubs
+def test_any_rank_refusing_keeps_every_rank_native(
+    monkeypatch, sp_modules, stubs, vote
 ):
+    from atom.mono.runtime import consensus
+
     runtime = Mock()
     config, _, initialize = _initialize(monkeypatch, sp_modules, runtime, **stubs)
+    votes = []
+
+    def peer_refuses(ok, group):
+        votes.append(ok)
+        return False
+
+    monkeypatch.setattr(consensus, "tp_agree", peer_refuses)
     assert initialize() is None
+    assert votes == [vote]
     assert config.sp_mega_moe_enabled is False
     runtime.assert_not_called()
 
@@ -322,14 +342,17 @@ def host_copies(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "Event", lambda: SimpleNamespace(record=Mock(), query=lambda: True)
     )
+    monkeypatch.setattr(torch.distributed, "all_reduce", Mock())
 
 
 def test_epoch_reset_follows_counted_steps(monkeypatch, host_copies):
     monkeypatch.setattr(fusion, "RESET_LAUNCHES", 8)
     runtime = SimpleNamespace(
-        reset=Mock(), error_flag=lambda: torch.zeros(1, dtype=torch.int32)
+        reset=Mock(),
+        error_flag=lambda: torch.zeros(1, dtype=torch.int32),
+        poll_errors=lambda: 0,
     )
-    backend = SPMegaMoE(runtime, 3)
+    backend = SPMegaMoE(runtime, 3, None)
     for _ in range(3):
         backend.count_step()
     runtime.reset.assert_called_once_with()
@@ -338,17 +361,37 @@ def test_epoch_reset_follows_counted_steps(monkeypatch, host_copies):
     assert backend.launches == 3
 
 
-def test_timed_out_launch_fails_a_later_step(monkeypatch, host_copies):
-    # The step's output is already invalid; the epoch reset must not hide it.
-    monkeypatch.setattr(fusion, "RESET_LAUNCHES", 2)
+def test_timed_out_launch_fails_a_later_step(host_copies):
+    # The step's output is already invalid; later steps must not run on.
     flag = torch.zeros(1, dtype=torch.int32)
-    runtime = SimpleNamespace(
-        error_flag=lambda: flag, reset=Mock(side_effect=flag.zero_), cfg=Mock(rank=2)
-    )
-    backend = SPMegaMoE(runtime, 1)
+    runtime = SimpleNamespace(error_flag=lambda: flag, cfg=Mock(rank=2))
+    backend = SPMegaMoE(runtime, 1, None)
     backend.count_step()
     flag[0] = 4  # a wait in this step timed out
     backend.count_step()
-    runtime.reset.assert_called_once_with()
     with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
         backend.count_step()
+
+
+@pytest.mark.parametrize("local,peer", [(4, 0), (0, 4)])
+def test_epoch_reset_first_fails_on_any_rank_timeout(
+    monkeypatch, host_copies, local, peer
+):
+    # reset() clears the bits, which the async copy may not have read yet.
+    monkeypatch.setattr(fusion, "RESET_LAUNCHES", 1)
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda: SimpleNamespace(record=Mock(), query=lambda: False)
+    )
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda bits, op, group: bits.clamp_(min=peer)
+    )
+    runtime = SimpleNamespace(
+        error_flag=lambda: torch.zeros(1, dtype=torch.int32),
+        poll_errors=lambda: local,
+        reset=Mock(),
+        cfg=Mock(rank=2),
+    )
+    backend = SPMegaMoE(runtime, 1, None)
+    with pytest.raises(RuntimeError, match="rank 2: a MegaMoeTP wait timed out"):
+        backend.count_step()
+    runtime.reset.assert_not_called()

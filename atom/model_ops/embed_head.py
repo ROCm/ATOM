@@ -12,7 +12,13 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
-from atom.distributed.ulysses_sp import sp_gather_rows
+from atom.distributed.token_transport import gather_tokens
+from atom.distributed.ulysses_sp import (
+    get_sp_group,
+    get_sp_world_size,
+    sp_gather_rows,
+    sp_is_enabled,
+)
 from atom.model_ops.lm_head_argmax import lm_head_argmax_pack
 from atom.model_ops.utils import atom_parameter
 from atom.plugin import is_plugin_mode
@@ -265,6 +271,8 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = sp_gather_rows(x, last_indices)
             if self._can_use_dp_sharded_head(context):
                 return self._dp_sharded_logits(x, envs.ATOM_DP_LM_HEAD_MODE)
+            if sp_is_enabled() and self.num_embeddings % get_sp_world_size() == 0:
+                return self._sp_sharded_logits(x)
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
             use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
@@ -343,6 +351,21 @@ class ParallelLMHead(VocabParallelEmbedding):
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
         return out.copy_(token)
+
+    def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Every Ulysses SP rank (TP1) holds the same rows here: project them
+        onto this rank's vocab slice and gather the slices, rather than have
+        every rank read the whole LM head."""
+        group = get_sp_group()
+        world, rank = group.world_size, group.rank_in_group
+        vshard = self.num_embeddings // world
+        vocab = slice(rank * vshard, (rank + 1) * vshard)
+        bias = None if self.bias is None else self.bias[vocab]
+        shard = tgemm.mm(x, self.weight[vocab], bias)
+        rows = x.shape[0]
+        # Rank-major [world * rows, V/world] -> [rows, V].
+        gathered = gather_tokens(shard, group).view(world, rows, vshard)
+        return gathered.transpose(0, 1).reshape(rows, self.num_embeddings)
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).

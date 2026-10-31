@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """CPU dispatch tests for the optional SP4 QuickReduce collective."""
 
+import logging
 import math
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, sentinel
 
@@ -9,9 +11,6 @@ import pytest
 import torch
 
 from atom.distributed import quick_reduce_scatter as quick_rs
-
-# The arch gate imports AITER's chip_info lazily.
-chip_info = pytest.importorskip("aiter.jit.utils.chip_info")
 
 
 def tensor_metadata(shape=(8192, 1536), dtype=torch.bfloat16, **attributes):
@@ -43,7 +42,13 @@ def runtime(monkeypatch):
     group = SimpleNamespace(device_communicator=SimpleNamespace(qr_comm=comm))
     kernel = Mock()
     monkeypatch.setattr(quick_rs, "_qr_reduce_scatter", kernel)
-    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    # The arch gate imports AITER's chip_info lazily.
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.jit.utils.chip_info",
+        SimpleNamespace(get_gfx_runtime=lambda: "gfx950"),
+    )
+    monkeypatch.setattr(quick_rs, "_announced", False)
     return SimpleNamespace(comm=comm, group=group, kernel=kernel)
 
 
@@ -74,3 +79,20 @@ def test_only_supported_shards_use_the_int4_kernel(
     if selected:
         x.new_empty.assert_called_once_with((shape[0] // 4, shape[1]))
         runtime.kernel.assert_called_once_with(123, x, sentinel.shard, True)
+
+
+@pytest.mark.parametrize("level", ["FP8", "INT6", "NONE"])
+def test_other_quick_reduce_levels_keep_the_exact_reduce_scatter(runtime, level):
+    runtime.comm.qr_quant_level = SimpleNamespace(name=level)
+    x = tensor_metadata((4, _MIN_COLS))
+    assert quick_rs.try_quick_reduce_scatter(x, runtime.group) is None
+    runtime.kernel.assert_not_called()
+
+
+def test_the_int4_reduce_scatter_is_logged_once(runtime, caplog):
+    x = tensor_metadata((4, _MIN_COLS))
+    with caplog.at_level(logging.INFO, logger="atom"):
+        for _ in range(2):
+            quick_rs.try_quick_reduce_scatter(x, runtime.group)
+    assert runtime.kernel.call_count == 2
+    assert sum("INT4" in r.getMessage() for r in caplog.records) == 1

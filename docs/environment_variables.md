@@ -23,11 +23,14 @@ limitations](observability/README.md).
 
 `ATOM_SP_MOE_MEGA=1` (default) runs Ulysses SP MXFP4 prefill MoE through AITER `MegaMoeTP`
 with `--tensor-parallel-size 1 --sequence-parallel-size N` on gfx950. Models opt in per
-decoder layer; layers or deployments it cannot serve keep the native MoE and log why. It
+decoder layer. It is all or nothing: if any layer, rank or deployment setting is outside what
+it serves, every layer keeps the native MoE and a warning says why. It
 needs AITER with the big-M path ([ROCm/aiter#6514](https://github.com/ROCm/aiter/pull/6514))
 and MORI built with `BUILD_CCO_SDMA=ON`. Each launch covers at most
 `min(ceil(max_num_batched_tokens / N), 8192)` local rows, and a larger local shard runs as
-several launches; small batches keep the native MoE.
+several launches; small batches keep the native MoE. On that native path at SP4 on gfx950,
+`AITER_QUICK_REDUCE_QUANTIZATION=INT4` also quantizes the expert reduce-scatter of
+tensors from 24 MiB, and the first such call logs it.
 
 ## Experimental TP replicated o-projection
 

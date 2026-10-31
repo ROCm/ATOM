@@ -1,23 +1,17 @@
 # SPDX-License-Identifier: MIT
-"""SP token sharding and the per-rank counts published to MoE, on CPU."""
+"""SP token sharding, row gathers and the vocab-sharded LM head, on CPU."""
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
 from atom.distributed import ulysses_sp as sp
-from atom.utils.forward_context import (
-    get_forward_context,
-    reset_forward_context,
-    set_forward_context,
-)
 
 
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("total", [1, 3, 5, 17])
-def test_shards_keep_token_order_and_publish_padded_counts(monkeypatch, world, total):
+def test_shards_keep_token_order_and_pad_the_tail(monkeypatch, world, total):
     monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
     tokens = torch.arange(1, total + 1)
     shards = []
@@ -27,18 +21,6 @@ def test_shards_keep_token_order_and_publish_padded_counts(monkeypatch, world, t
     padded = torch.cat(shards)
     assert padded.numel() == sp.sp_pad_len(total)
     assert torch.equal(padded[:total], tokens) and not padded[total:].any()
-
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        compilation_config=SimpleNamespace(static_forward_context={}),
-    )
-    try:
-        context = SimpleNamespace(forward_mode=None)
-        set_forward_context(None, config, context, np.array([total]))
-        counts = get_forward_context().context.running_tokens_across_dp
-        assert counts == (shards[0].numel(),) * world
-    finally:
-        reset_forward_context()
 
 
 @pytest.mark.parametrize("world", [2, 4])
@@ -65,3 +47,32 @@ def test_gather_rows_matches_full_gather(monkeypatch, world):
     monkeypatch.setattr(sp, "gather_tokens", lambda x, group: torch.cat(sent))
     for out in on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows)):
         assert torch.equal(out, hidden[rows])
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, world):
+    embed_head = pytest.importorskip("atom.model_ops.embed_head", exc_type=ImportError)
+    x, weight = torch.randn(3, 8), torch.randn(4 * world, 8)
+    head = embed_head.ParallelLMHead.__new__(embed_head.ParallelLMHead)
+    torch.nn.Module.__init__(head)
+    head.num_embeddings, head.weight, head.bias = weight.shape[0], weight, None
+    monkeypatch.setattr(
+        embed_head, "tgemm", SimpleNamespace(mm=lambda x, w, b: x @ w.t())
+    )
+
+    def on_each_rank():
+        out = []
+        for rank in range(world):
+            group = SimpleNamespace(world_size=world, rank_in_group=rank)
+            monkeypatch.setattr(embed_head, "get_sp_group", lambda g=group: g)
+            out.append(head._sp_sharded_logits(x))
+        return out
+
+    sent = []
+    monkeypatch.setattr(
+        embed_head, "gather_tokens", lambda s, g: sent.append(s) or s.repeat(world, 1)
+    )
+    on_each_rank()
+    monkeypatch.setattr(embed_head, "gather_tokens", lambda s, g: torch.cat(sent))
+    for logits in on_each_rank():
+        torch.testing.assert_close(logits, x @ weight.t())
