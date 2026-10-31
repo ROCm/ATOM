@@ -20,7 +20,7 @@ _n=$(( $# < 7 ? $# : 7 ))
 shift "$_n" 2>/dev/null || true
 EXTRA_ARGS="$*"
 NUM_PROMPTS=$(( CONCURRENCY * PROMPT_MULTIPLIER ))
-RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-0.8}"
+RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1}"
 OUTPUT_DIR="/app/logs_claude"
 
 echo "========================================"
@@ -82,7 +82,7 @@ python -m atom.benchmarks.benchmark_serving \
     --max-concurrency="$CONCURRENCY" \
     --num-prompts="$NUM_PROMPTS" \
     --trust-remote-code \
-    --num-warmups=$((CONCURRENCY * 2)) \
+    --num-warmups=$((CONCURRENCY * 0)) \
     --request-rate=inf --ignore-eos \
     --save-result \
     --result-filename="$RESULT_FILE" \
