@@ -50,6 +50,8 @@ class TestMTPMaxTokens:
                 num_rejected=np.asarray([0]),
                 num_bonus=np.asarray([0]),
                 draft_token_ids=np.asarray([[20, 21, 22]]),
+                # pp=1 output is deferred (drafts + lagging provisional run).
+                is_deferred_out=True,
             ),
             stream_output_queue=stream_queue,
         )
@@ -157,5 +159,96 @@ class TestMTPMaxTokens:
 
         assert finished[0].leave_reason == "max_tokens"
         assert finished[0].num_completion_tokens == 2
+        emitted = stream_queue.put_nowait.call_args.args[0][0][1]
+        assert emitted.output_tokens == [10, 11]
+
+
+class TestUndeferredSpecPlaceholders:
+    """PP output is undeferred: every step leaves ONE run of `mtp_k + 1`.
+
+    `verify_ctx_lens` shifts by 1 under undeferred output only because of this:
+    the verify window starts `mtp_k + 1` placeholders back from the end, no
+    matter how many drafts the previous step rejected.
+    """
+
+    mtp_k = 3
+
+    def _scheduler(self):
+        sched = Scheduler(
+            MockConfig(
+                pipeline_parallel_size=2,
+                speculative_config=SimpleNamespace(
+                    num_speculative_tokens=self.mtp_k,
+                    use_dspark=lambda: True,
+                ),
+                num_kvcache_blocks=64,
+            )
+        )
+        assert not sched.is_deferred_out and sched.spec_decode_local
+        return sched
+
+    def _step(self, sched, seq, tokens, num_rejected, stream_queue=None):
+        batch, seqs = sched.schedule()
+        return sched.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[tuple(tokens)],
+                num_rejected=np.asarray([num_rejected]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[7] * self.mtp_k]),
+                is_deferred_out=False,
+            ),
+            stream_output_queue=stream_queue,
+            batch=batch,
+        )
+
+    def _assert_one_full_run(self, sched, seq):
+        width = self.mtp_k + 1
+        tail = seq.token_ids[-width - 1 :]
+        assert list(tail[1:]) == [sched.eos_token_id] * width
+        assert tail[0] != sched.eos_token_id
+        assert seq.num_placeholder_tokens == width
+
+    def _prefilled(self, sched, seq_factory, max_tokens=64):
+        seq = seq_factory(
+            [1, 2, 3, 4],
+            sampling_params=SamplingParams(max_tokens=max_tokens, ignore_eos=True),
+        )
+        sched.add(seq)
+        # The prefill step scores no drafts: one sampled token.
+        self._step(sched, seq, [100], num_rejected=0)
+        self._assert_one_full_run(sched, seq)
+        return seq
+
+    @pytest.mark.parametrize("num_rejected", range(mtp_k + 1))
+    def test_every_reject_count_leaves_one_full_run(self, seq_factory, num_rejected):
+        sched = self._scheduler()
+        seq = self._prefilled(sched, seq_factory)
+        accepted = self.mtp_k + 1 - num_rejected
+        real_before = seq.num_tokens - seq.num_placeholder_tokens
+        self._step(sched, seq, range(200, 200 + accepted), num_rejected)
+        self._assert_one_full_run(sched, seq)
+        assert seq.num_tokens - seq.num_placeholder_tokens == real_before + accepted
+
+    def test_mixed_steps_never_grow_or_shrink_the_run(self, seq_factory):
+        sched = self._scheduler()
+        seq = self._prefilled(sched, seq_factory)
+        for step, num_rejected in enumerate([0, self.mtp_k, 1, self.mtp_k, 2]):
+            accepted = self.mtp_k + 1 - num_rejected
+            self._step(sched, seq, range(10 * step, 10 * step + accepted), num_rejected)
+            self._assert_one_full_run(sched, seq)
+
+    def test_cap_truncates_an_all_accepted_step(self, seq_factory):
+        # 1 token from prefill + 4 accepted against max_tokens=3.
+        sched = self._scheduler()
+        seq = self._prefilled(sched, seq_factory, max_tokens=3)
+        stream_queue = mock.Mock()
+        finished = self._step(
+            sched, seq, [10, 11, 12, 13], num_rejected=0, stream_queue=stream_queue
+        )
+        assert len(finished) == 1
+        assert finished[0].leave_reason == "max_tokens"
+        assert finished[0].num_completion_tokens == 3
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]

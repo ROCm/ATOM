@@ -52,6 +52,11 @@ def step_shape(metadata, rows: int) -> tuple[int | None, str]:
     if getattr(metadata, "replayssm", False):
         # ReplaySSM keeps the slot table's shape but leaves only column 0 live
         return None, "ReplaySSM (only column 0 of the slot table is live)"
+    if getattr(metadata, "has_state_fork", False):
+        # A forked step reads one slot and writes another. `KimiKDAAttention`
+        # moves the state across before its spec kernels run; a mono step
+        # replaces that branch, so it would run on the unseeded write slot.
+        return None, "state fork (the layer's own spec branch moves the state)"
     index = metadata.spec_state_indices_tensor
     if index is None:
         return None, "no spec_state_indices_tensor"

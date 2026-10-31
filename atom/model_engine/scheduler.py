@@ -206,6 +206,7 @@ class ScheduledBatch:
         is_final_chunk: list[bool] | None = None,
         next_token_ids: list[int] | None = None,
         state_maintenance_ops: StateMaintenanceOps | None = None,
+        is_deferred_out: bool = True,
     ):
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
@@ -341,8 +342,12 @@ class ScheduledBatch:
         for i, (seq, num) in enumerate(zip(seqs.values(), num_scheduled_tokens)):
             if seq.type == SequenceType.PREFILL:
                 offset = self.num_cached_tokens[i]
-            else:
+            elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
+            else:
+                # Undeferred: the tail is one run of exactly `num` placeholders
+                # (rejects already refilled), so the anchor is just before it.
+                offset = seq.num_tokens - num - 1
             staged.extend(seq.token_ids[offset : offset + num])
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its
@@ -727,20 +732,25 @@ class Scheduler:
         self.drafter_needs_next_token = has_spec and not (
             config.speculative_config.use_dspark()
         )
-        # True when this engine both drafts and verifies; False under PP
-        # (which only drafts for handoff to the decode node).
+        # True when this engine both drafts and verifies. Under PP the last
+        # stage drafts and returns rows on `draft_token_ids` for the head.
         pp_size = getattr(config, "pipeline_parallel_size", 1)
-        self.spec_decode_local = self.use_spec and pp_size == 1
+        self.spec_decode_local = self.use_spec
         # Positions past `len(seq)` each forward's draft round writes KV to.
         # Allocated before the forward, with the step's own blocks: see
         # `draft_kv_lookahead` for the arithmetic and what an unallocated one
         # costs.
         self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
         self.block_manager.draft_lookahead = self.draft_lookahead
-        if self.use_spec and not self.spec_decode_local:
+        # Matches `tokenID_processor.is_deferred_out` under speculation, the
+        # only time it is read (a P/D producer is also undeferred, but never
+        # speculates). Scheduling needs it early because the modes leave
+        # different trailing placeholder counts.
+        self.is_deferred_out = pp_size == 1
+        if self.use_spec and pp_size > 1:
             logger.info(
-                "Speculative decoding: drafting only (pipeline_parallel_size=%d). "
-                "Drafts are produced for handoff; this engine verifies none.",
+                "Speculative decoding: verifying locally under pipeline "
+                "parallelism (pipeline_parallel_size=%d).",
                 pp_size,
             )
         # `engine_stats` (spec / cache / throughput sections) is constructed
@@ -806,6 +816,10 @@ class Scheduler:
         # them until the head releases the id after postprocess, so a seq is
         # never decoded against a token not yet appended.
         self._pp_inflight_token_block: set[int] = set()
+        # Seqs whose last chunk ended on a state-checkpoint rung not yet filed;
+        # prefill skips them. Under PP the next chunk would otherwise overwrite
+        # the state slot before it is filed under the rung's hash.
+        self._pp_checkpoint_hold: set[int] = set()
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -998,6 +1012,9 @@ class Scheduler:
         if self._partial_prefill_count:
             for seq in self.running:
                 if not seq.is_partial_prefill:
+                    continue
+                # Phase 1 skips a held seq, so its chunk is not pending work.
+                if seq.id in self._pp_checkpoint_hold:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -2087,6 +2104,8 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
+                if seq.id in self._pp_checkpoint_hold:
+                    continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
                 chunk = self._partial_prefill_chunk(
@@ -2842,6 +2861,7 @@ class Scheduler:
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
             num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
             remote_kv_seq_blocks=remote_kv_seq_blocks,
@@ -3504,6 +3524,7 @@ class Scheduler:
             # chunk's start on the block grid instead, or every snapshot
             # position in it is off the grid too.
             chunk = bm.align_midstep_chunk(seq, start, chunk)
+        on_rung = bool(target)
         # `cancel_state_fork` runs only when the first two hold, and returning
         # False is what leaves the fork in place — hence holding the chunk open.
         if (
@@ -3512,6 +3533,17 @@ class Scheduler:
             and not bm.cancel_state_fork(seq)
         ):
             chunk = bm.state.min_fork_tokens
+            on_rung = False
+        # With several forwards in flight, hold the next chunk until this
+        # checkpoint is filed. A rung at prompt end needs no hold: the first
+        # decode is already held by `_pp_inflight_token_block`.
+        if (
+            on_rung
+            and self.advance_on_schedule
+            and bm.enable_prefix_caching
+            and start + chunk < seq.num_prompt_tokens
+        ):
+            self._pp_checkpoint_hold.add(seq.id)
         return chunk
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
@@ -3883,8 +3915,8 @@ class Scheduler:
         # coherent answer that ends before it answers anything.
         #
         # `num_placeholder_tokens` is the only width that describes what is
-        # actually there: postprocess appends `mtp_k + is_deferred_out -
-        # num_rejected` slots and records exactly that count. Re-deriving it
+        # actually there: postprocess records exactly what it appended, which
+        # differs between output modes. Re-deriving it
         # here as `mtp_k + num_rejected` agrees only when deferred output is
         # off AND nothing was rejected -- on a TP-only MTP engine it leaves one
         # `eos_token_id` behind (the case above), and with `num_rejected = r`
@@ -3993,6 +4025,9 @@ class Scheduler:
         self, batch: ScheduledBatch, seqs: Iterable[Sequence] | None = None
     ) -> None:
         """Hash blocks for middle chunked-prefill chunks that skip postprocess."""
+        # Before any bail-out or hashing that can raise, so no seq of this
+        # batch (preempted, or after a failing one) is held forever.
+        self._pp_checkpoint_hold.difference_update(batch.req_ids)
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
@@ -4015,6 +4050,16 @@ class Scheduler:
                 start_tokens=start_tokens,
                 replay_until=_scheduled_replay_until(batch, i),
             )
+
+    def holds_checkpoint_hostage(self, batch: ScheduledBatch) -> bool:
+        """Whether any seq in `batch` is waiting on this batch's checkpoint.
+
+        If so, its prefix hashes must be filed now rather than deferred: a held
+        seq is out of the prefill scan until then and would stall.
+        """
+        return bool(self._pp_checkpoint_hold) and any(
+            req_id in self._pp_checkpoint_hold for req_id in batch.req_ids
+        )
 
     def postprocess(
         self,
@@ -4064,6 +4109,8 @@ class Scheduler:
             # See _batch_seq_lookup: seq may have left running.
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
+            # Before the loop; see register_prefill_hashes.
+            self._pp_checkpoint_hold.difference_update(batch.req_ids)
             for i, req_id in enumerate(batch.req_ids):
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
@@ -4130,11 +4177,14 @@ class Scheduler:
 
         need_placeholder = is_deferred_out or self.spec_decode_local
         # Drafts occupy trailing slots only on an engine that verifies them; a
-        # drafting-only engine's tokens are all real.
-        num_placeholder_width = self.mtp_k if self.spec_decode_local else 0
-        num_placeholder = self.mtp_k
-        if is_deferred_out:
-            num_placeholder += 1
+        # drafting-only engine's tokens are all real. Undeferred, `num_rejected`
+        # alone names the tail.
+        num_placeholder_width = (
+            self.mtp_k if (self.spec_decode_local and is_deferred_out) else 0
+        )
+        # Up to `mtp_k` accepted drafts plus one bonus (or, deferred without
+        # spec, the one-step lag slot).
+        num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
             # Cancellation does not require sampled output. Middle prefill
@@ -4221,7 +4271,13 @@ class Scheduler:
                 # contaminating downstream logs and arithmetic with np.int32.
                 num_rejected = int(fwd_output.num_rejected[idx])
                 num_bonus = int(fwd_output.num_bonus[idx])
-                offset = 0 if (num_new_token + num_rejected) == 1 else self.mtp_k
+                # Deferred: two runs outstanding, this step's starts `mtp_k`
+                # further back. Undeferred: only one.
+                offset = (
+                    self.mtp_k
+                    if (is_deferred_out and (num_new_token + num_rejected) != 1)
+                    else 0
+                )
                 # Align stats with vLLM: only count steps that actually ran
                 # speculation (drafts proposed and validated). Skip the
                 # prefill-only step where no draft tokens were scored against
@@ -4478,7 +4534,12 @@ class Scheduler:
                     # Clamped because `preempt()` strips exactly this many:
                     # `range()` on a negative width appends nothing, so storing
                     # one unclamped would claim placeholders that are not there.
-                    num = max(0, num_placeholder - seq.num_rejected)
+                    if is_deferred_out:
+                        num = max(0, num_placeholder - seq.num_rejected)
+                    else:
+                        # Refill the run to full width; deriving it from rejects
+                        # overgrows it by `mtp_k` on a step that scored no drafts.
+                        num = max(0, num_placeholder - seq.num_placeholder_tokens)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
                         if seq.return_logprobs:
@@ -5478,6 +5539,7 @@ class DecodeScheduler(Scheduler):
             total_seqs_num=len(scheduled_seqs),
             total_seqs_num_decode=len(scheduled_seqs),
             num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             cu_stream_fraction=self.cu_fraction,
             state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
