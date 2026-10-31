@@ -1212,6 +1212,27 @@ def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
     return None
 
 
+# Targets the Kimi-K3 DFlash draft (`K3DFlashModel`) can serve. The rename in
+# `hf_config_override` cannot check this itself: it sees only the draft, and
+# SpecForge stamps the same `DSparkDraftModel` arch on every DFlash draft.
+_K3_DFLASH_TARGET_ARCHS: frozenset[str] = frozenset({"KimiK3ForConditionalGeneration"})
+
+
+def _check_dflash_draft_target(
+    target_hf: PretrainedConfig, draft_hf: PretrainedConfig | None
+) -> None:
+    """Refuse a SpecForge DFlash draft paired with a non-Kimi-K3 target."""
+    draft_arch = (getattr(draft_hf, "architectures", None) or [""])[0]
+    if draft_arch != "K3DFlashModel":
+        return
+    target_arch = (getattr(target_hf, "architectures", None) or [""])[0]
+    if target_arch not in _K3_DFLASH_TARGET_ARCHS:
+        raise ValueError(
+            f"This SpecForge DFlash draft is only supported on a Kimi-K3 target "
+            f"({sorted(_K3_DFLASH_TARGET_ARCHS)}); the target is {target_arch!r}."
+        )
+
+
 def _normalize_draft_dspark_config(
     hf_config: PretrainedConfig, *, dflash: bool = False
 ) -> None:
@@ -2589,6 +2610,7 @@ class Config:
             num_spec = self.speculative_config.num_speculative_tokens
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
+            _check_dflash_draft_target(self.hf_config, draft_cfg)
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
                 # backbone pass, and the drafter just repeats that pass, so the

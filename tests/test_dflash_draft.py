@@ -50,11 +50,12 @@ def _gpu_stack_import(name):
         raise
 
 
-def _real_hf_config_override():
-    """Load the real SpeculativeConfig despite conftest's ``atom.config`` stub.
+def _real_config_module():
+    """Load the real `atom/config.py` despite conftest's ``atom.config`` stub.
 
     Same approach as tests/test_dspark.py: exec the real source by file path
-    under a throwaway module name, then restore the stub.
+    under a throwaway module name, then restore the stub. An import error in
+    `config.py` FAILS the tests that need it rather than skipping them.
     """
     import importlib.util
     import os
@@ -67,12 +68,14 @@ def _real_hf_config_override():
     saved = sys.modules.get("atom.config")
     try:
         spec.loader.exec_module(mod)
-    except Exception:  # noqa: BLE001 - a partial checkout has no SpeculativeConfig
-        return None
     finally:
         if saved is not None:
             sys.modules["atom.config"] = saved
-    return getattr(mod, "SpeculativeConfig", None)
+    return mod
+
+
+def _real_hf_config_override():
+    return _real_config_module().SpeculativeConfig
 
 
 def _radixark_cfg(**overrides):
@@ -119,8 +122,6 @@ def _radixark_cfg(**overrides):
 def test_dflash_config_normalize():
     """DSparkDraftModel + dflash_config -> K3DFlashModel with lifted fields."""
     SpeculativeConfig = _real_hf_config_override()
-    if SpeculativeConfig is None:
-        pytest.skip("atom.config not importable in this sandbox")
 
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
@@ -148,8 +149,6 @@ def test_dflash_rope_is_the_drafts_own():
     """The draft keeps theta 10000 / YaRN x16; it must not inherit the target's
     theta 50000 / x32. A shared rope loads clean and only moves acceptance."""
     SpeculativeConfig = _real_hf_config_override()
-    if SpeculativeConfig is None:
-        pytest.skip("atom.config not importable in this sandbox")
 
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
@@ -162,8 +161,6 @@ def test_dflash_rope_is_the_drafts_own():
 def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
     """The MLA K3-DSpark draft keeps its own route and gains no block size."""
     SpeculativeConfig = _real_hf_config_override()
-    if SpeculativeConfig is None:
-        pytest.skip("atom.config not importable in this sandbox")
 
     hf = types.SimpleNamespace(
         architectures=["K3DSparkModel"],
@@ -191,8 +188,6 @@ def test_dflash_branch_needs_dflash_config():
     is not a model identity; claiming it would silently bind the wrong class.
     """
     SpeculativeConfig = _real_hf_config_override()
-    if SpeculativeConfig is None:
-        pytest.skip("atom.config not importable in this sandbox")
 
     hf = _radixark_cfg(dflash_config=None)
     SpeculativeConfig.hf_config_override(hf, model_path=None)
@@ -208,8 +203,6 @@ def test_dflash_branch_needs_dflash_config():
 def test_dflash_plain_qwen3_target_is_untouched():
     """model_type qwen3 is a legitimate TARGET type and must not be routed."""
     SpeculativeConfig = _real_hf_config_override()
-    if SpeculativeConfig is None:
-        pytest.skip("atom.config not importable in this sandbox")
 
     hf = types.SimpleNamespace(
         architectures=["Qwen3ForCausalLM"],
@@ -346,8 +339,6 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
 
 def _normalized_radixark():
     SpeculativeConfig = _real_hf_config_override()
-    if SpeculativeConfig is None:
-        pytest.skip("atom.config not importable in this sandbox")
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
     return hf
@@ -1282,3 +1273,24 @@ def test_context_write_drops_padded_target_rows(monkeypatch):
     draft = dflash.KimiK3DFlash.__new__(dflash.KimiK3DFlash)
     draft.write_context_kv(torch.zeros(12, 4), torch.arange(9))
     assert seen == {"rows": 9, "pos": 9}
+
+
+def test_dflash_draft_is_refused_on_a_non_k3_target():
+    """SpecForge stamps one arch on every DFlash draft, so the rename to
+    `K3DFlashModel` cannot tell a Kimi-K3 draft from a Qwen3/Llama one; the
+    target is checked where both configs are known."""
+    cfg = _real_config_module()
+    draft = types.SimpleNamespace(architectures=["K3DFlashModel"])
+    cfg._check_dflash_draft_target(
+        types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]), draft
+    )
+    with pytest.raises(ValueError, match="Kimi-K3 target"):
+        cfg._check_dflash_draft_target(
+            types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]), draft
+        )
+    # Any other draft is not this check's business.
+    cfg._check_dflash_draft_target(
+        types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        types.SimpleNamespace(architectures=["Eagle3LlamaModel"]),
+    )
+    cfg._check_dflash_draft_target(types.SimpleNamespace(architectures=[]), None)
