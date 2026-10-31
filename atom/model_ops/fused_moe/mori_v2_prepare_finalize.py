@@ -244,6 +244,48 @@ def _check_mega_weights(layer: torch.nn.Module, quant_method: Any) -> None:
         )
 
 
+def _bind_mega_mori_buffers(mega) -> None:
+    """Supply the current mori dispatch ABI's buffers before any forward/capture.
+
+    MegaMoE's bare plans can select aggReserve even with a runtime TokOffExt
+    pointer. That specialization uses two int32s per peer for both the local
+    counter and recv_num; older MegaMoE only reserves one. The symmetric arena
+    has alignment padding for recv_num, but the torch counter must be enlarged.
+    """
+    if mega._config.dispatch_backend != "mori":
+        return
+    from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+
+    plans = tuple(mega._mori_plans.values())
+    infos = tuple(plan.info for plan in plans)
+    if any(info["aggReserve"] for info in infos):
+        count = 2 * mega._config.world_size
+        arena = mega._arena
+        # Use only the existing alignment gap; never move a registered region.
+        if arena.offset("recv_to_src_token") - arena.offset("recv_num") < count * 4:
+            raise RuntimeError("MegaMoE recv_num has no room for mori aggReserve")
+        counter = mega._destination_peer_counter
+        if counter.numel() < count:
+            mega._destination_peer_counter = torch.zeros(
+                count, dtype=counter.dtype, device=counter.device
+            )
+
+    # All variants run serially on the transport's stream and share one layout.
+    # Keep the owner alive: plans bind only the raw pointer. This removes mori's
+    # first-launch fallback allocation; it is independent of the counter repair.
+    nbytes = max(
+        ep_staging_bytes(
+            info["worldSize"], info["maxRecv"], info["scaleBytes"], info["maxTokPerRank"]
+        )
+        for info in infos
+    )
+    mega._atom_dispatch_staging = torch.zeros(
+        nbytes, dtype=torch.uint8, device=mega._total_recv.device
+    )
+    for plan in plans:
+        plan.bind(staging_base=mega._atom_dispatch_staging.data_ptr())
+
+
 def init_mega_transport(
     *,
     ep_rank: int,
@@ -356,6 +398,7 @@ def init_mega_transport(
         # epilogue has no such kwarg and would raise TypeError on every run.
         **({"combine_quant": combine_quant} if combine_quant != "none" else {}),
     )
+    _bind_mega_mori_buffers(mega)
     # Peer-region stride in the flat symmetric VA. triton_mega_moe needs it to
     # address the combine staging window, and MegaMoE does not keep it.
     #
@@ -755,7 +798,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             arena_rows = (
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
             )
-            bound = self._recv_bound(topk_ids, arena_rows)
+            bound = self._recv_bound(arena_rows)
             # The "Direction-3" shrink, reproduced from the base-class walk: the
             # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
             # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
