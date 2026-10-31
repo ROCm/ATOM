@@ -1339,9 +1339,8 @@ models:
               OFFLOAD_COPY_WORKERS: "2"
               OFFLOAD_LOAD_WORKERS: "2"
             decode: *kimi_k3_pd_opus_decode_env
-          # C72's GSM8K gates OPUS, which this decode runs as C72's does, at a
-          # larger batch.
-          run_eval: false
+          run_eval: true
+          eval_concurrency: [88]
 
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
