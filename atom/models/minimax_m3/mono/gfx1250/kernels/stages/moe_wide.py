@@ -70,9 +70,7 @@ SLOT_WORDS = (WAVE * 32 + WAVE * 4) // 4  # a ring slot: a chunk's FP4 rows, its
 def moe_wide_defs(k4ctx):
     """``kernels.stages.moe_wide.moe_wide_defs`` on gfx1250."""
     BASE = k4ctx["BASE"]
-    DN_DEPTH = k4ctx["DN_DEPTH"]
     DN_KC = k4ctx["DN_KC"]
-    DN_WITERS = k4ctx["DN_WITERS"]
     G = k4ctx["G"]
     MIDSC_ROW_WORDS = k4ctx["MIDSC_ROW_WORDS"]
     MID_ROWS = k4ctx["MID_ROWS"]
@@ -440,40 +438,44 @@ def moe_wide_defs(k4ctx):
     def wide_down(td):
         """Row group td * 2 + wave // 8's down GEMV over every distinct expert
         (B column l % 16 = token l % 16's mid for it, the zero row where the token
-        is not routed there), route-weighted per column -> ffn_finish."""
+        is not routed there), route-weighted per column -> ffn_finish. The row
+        group's (expert, 128-k chunk) units are dealt round robin to its 8 waves
+        and streamed through their up / gate rings (free by now), the first
+        before the mids are in; a unit past the distinct experts re-reads unit
+        0's chunk (L2 hits) so the wait counts stay constant."""
         enter_stage("down")
         nu = uniform(fx.ptr_load(uexp + NU_AT))
         rg_d = td * 2 + wave // DN_GW
         q = wave % DN_GW
+        ring = lds_addr(ugring)
+        NJ = DN_KC * U_MAX
+        T = (NJ + DN_GW - 1) // DN_GW
 
-        def unit_load(i):
-            """(weights, scale, unit, ok) of this wave's chunk q of distinct expert i."""
-            ok = (q < DN_KC) & (fx.Int32(i) <= nu)
-            du = fx.Int32(min(i, U_MAX - 1))
-            dkc = fx.min(q, DN_KC - 1)
-            de = fx.max(fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT), 0)
-            dwv = shuffled_rows(
-                rsrc(w2 + fx.Int64(de) * W2_BYTES, ok.select(fx.Int32(W2_BYTES), fx.Int32(0))),
-                rg_d,
-                INTER // 2,
-                dkc,
-                lane,
-                64,
-                CM_NT,
+        def unit(t):
+            j = q + DN_GW * t
+            i = j // DN_KC
+            ok = (j < NJ) & (i <= nu)
+            return ok, ok.select(i, fx.Int32(0)), ok.select(j % DN_KC, q % DN_KC)
+
+        def issue(t):
+            _, i, kc = unit(t)
+            de = fx.max(fx.min(uniform(fx.ptr_load(uexp + i)), SHARED_EXPERT), 0)
+            wb = fx.Int64(w2) + fx.Int64(de) * W2_BYTES
+            slot = ring + ((wave * UG_RING + t % UG_RING) * SLOT_WORDS) * 4
+            for piece in range_constexpr(2):
+                async_to_lds(
+                    wb + fx.Int64((rg_d * (INTER // 64) + 2 * kc + piece) * 512 + lane * 16),
+                    slot + lane * 32 + 16 * piece,
+                )
+            rr = de * HIDDEN + 16 * rg_d + l16
+            async_to_lds(
+                fx.Int64(s2) + fx.Int64((rr // 32) * INTER + kc * 128 + (rr % 32) * 4),
+                slot + WAVE * 32 + lane * 4,
+                b128=False,
             )
-            dsc = n32k4_word(
-                rsrc(s2, ok.select(fx.Int32(S2_BYTES), fx.Int32(0))), de * HIDDEN + 16 * rg_d + l16, dkc, INTER
-            )
-            return dwv, dsc, du, dkc, ok
 
-        def with_rows(u):
-            dwv, dsc, du, dkc, ok = u
-            drow = fx.Int32(fx.ptr_load(urow + (du * 16 + l16)))
-            dw = ok.select(fx.ptr_load(uwt + (du * 16 + l16)), fx.Float32(0.0))
-            return dwv, dsc, drow, dkc, dw, ok
-
-        acc = [fx.Float32(0.0) for _ in range(8)]
-        inflight = [unit_load(i) for i in range(min(DN_DEPTH, DN_WITERS))]
+        for t in range_constexpr(min(UG_RING, T)):
+            issue(t)
         n_ug = (nu + 1) * UG_PAIRS
         mb_poll(
             [
@@ -494,20 +496,26 @@ def moe_wide_defs(k4ctx):
             fx.ptr_store(fx.Int32(0), xs + (W_MIDSC + MID_ROWS * MIDSC_ROW + tid))
         gpu.barrier()
         stamp(10)
-        for i in range_constexpr(DN_WITERS):
-            if const_expr(i == 0):
-                inflight = [with_rows(u) for u in inflight]
-            dwv, dsc, drow, dkc, dw, ok = inflight.pop(0)
-            if const_expr(i + DN_DEPTH < DN_WITERS):
-                inflight.append(with_rows(unit_load(i + DN_DEPTH)))
+        v8i = fx.Vector.make_type(8, fx.Int32)
+        acc = [fx.Float32(0.0) for _ in range(8)]
+        for t in range_constexpr(T):
+            wait_async(3 * min(UG_RING - 1, T - 1 - t))
+            sw = (wave * UG_RING + t % UG_RING) * SLOT_WORDS
+            dwv = fx.Vector(fx.ptr_load(ugring + (sw + lane * 8), result_type=v8i))
+            dsc = fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane)))
+            ok, i, kc = unit(t)
+            drow = fx.Int32(fx.ptr_load(urow + (i * 16 + l16)))
+            dw = ok.select(fx.ptr_load(uwt + (i * 16 + l16)), fx.Float32(0.0))
             dcu = wmma_a8w4(
                 dwv,
-                lds_b8(drow * MID_ROW + dkc * 32),
+                lds_b8(drow * MID_ROW + kc * 32),
                 fx.Vector.filled(8, 0.0, fx.Float32),
                 dsc,
-                lds_scale4(W_MIDSC + drow * MIDSC_ROW + dkc * 4),
+                lds_scale4(W_MIDSC + drow * MIDSC_ROW + kc * 4),
             )
-            acc = [acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(8)]
+            acc = [acc[e] + dcu[e] * dw for e in range(8)]
+            if const_expr(t + UG_RING < T):
+                issue(t + UG_RING)
         fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8)
         gpu.barrier()
         if tid < DN_ROWS * tokens:
