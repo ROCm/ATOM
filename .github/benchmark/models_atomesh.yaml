@@ -14410,7 +14410,7 @@ models:
         osl: 1024
         concurrency:
         - 1
-        run_eval: false
+        run_eval: true
         benchmark:
           <<: *id001
           aiperf_commit: ""
