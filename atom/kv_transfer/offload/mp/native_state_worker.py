@@ -231,7 +231,14 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         # its ordinal groups are present at exactly the same final chunk.
         return [pages] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
 
-    def _submit_native(self, req: LMCacheReqMeta, event: Any, *, loading: bool) -> None:
+    def _submit_native(
+        self,
+        req: LMCacheReqMeta,
+        event: Any,
+        *,
+        loading: bool,
+        event_index: int | None = None,
+    ) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         completion = req.load_operation if loading else req.save_operation
@@ -293,6 +300,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             # transfer deadline.
             entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
+            self._hold_step_event(operation_id, event_index)
         submit = (
             self._adapter.submit_retrieve_request
             if loading
@@ -315,11 +323,15 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         with self._lock:
             entry.future = future
 
-    def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
-        self._submit_native(req, event, loading=True)
+    def _submit_load(
+        self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
+    ) -> None:
+        self._submit_native(req, event, loading=True, event_index=event_index)
 
-    def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
-        self._submit_native(req, event, loading=False)
+    def _submit_save(
+        self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
+    ) -> None:
+        self._submit_native(req, event, loading=False, event_index=event_index)
 
     def _begin_restore(self, pending: _NativePending) -> bool:
         if not self._restore_descriptor_slots:
@@ -427,6 +439,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         )
         del self._native_saves[operation_id]
+        self._release_step_event(operation_id)
         _remember_operation_tombstone(
             operation_id,
             self._completed_save_operations,
@@ -448,6 +461,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         )
         target.add(pending.request.load_operation)
         del self._native_loads[operation_id]
+        self._release_step_event(operation_id)
         _remember_operation_tombstone(
             operation_id,
             self._completed_load_operations,

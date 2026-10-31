@@ -58,10 +58,8 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
-# IPC resources the step thread may hold while its stream is busy; see
-# `LMCacheMPConnector._release_ipc_resources`. Well past LMCache's ring of
-# recently exported events (2048), which holds step events after their
-# transfers finish.
+# Finished futures the step thread may hold while its stream is busy; see
+# `LMCacheMPConnector._release_ipc_resources`.
 _OWNED_IPC_CAP = 8192
 # Past the cap with the stream still busy, the most destroyed in one step: a
 # stream that is never idle (async scheduling) pays them a batch at a time
@@ -82,6 +80,44 @@ def _sole_owner_refcount() -> int:
 
 
 _SOLE_OWNER_REFCOUNT = _sole_owner_refcount()
+
+
+class _StepEventRing:
+    """Interprocess step events, re-recorded only once nothing waits on them.
+
+    The server waits on a step's event before it moves the step's bytes, and
+    re-recording an event it still waits on raises `HIP error: invalid
+    argument`. So each event counts the transfers submitted with it, and one
+    is recorded again only once all of them have reached a terminal state;
+    until then the step takes another, or makes one. None is destroyed while
+    the connector lives: on ROCm 7.2.x every destroy synchronises every stream
+    of the device. Callers hold the connector's `_lock` around `hold` and
+    `release`; `record` runs on the step thread alone.
+    """
+
+    def __init__(self) -> None:
+        self._events: list[Any] = []
+        self._holds: list[int] = []
+
+    def __len__(self) -> int:
+        return len(self._events)
+
+    def record(self, lock: threading.Lock) -> tuple[int, Any]:
+        with lock:
+            index = next((i for i, n in enumerate(self._holds) if n == 0), None)
+            if index is None:
+                index = len(self._events)
+                self._events.append(torch.cuda.Event(interprocess=True))
+                self._holds.append(0)
+        event = self._events[index]
+        event.record(torch.cuda.current_stream())
+        return index, event
+
+    def hold(self, index: int) -> None:
+        self._holds[index] += 1
+
+    def release(self, index: int) -> None:
+        self._holds[index] -= 1
 
 
 def _take_unshared(owned: deque[Any], limit: int | None = None) -> list[Any]:
@@ -175,13 +211,15 @@ class LMCacheMPConnector(KVConnectorBase):
         # blocks of. A preemption fence has to cover these too: they reach the
         # server after the step that queued them.
         self._submitting_owner: dict[str, str] = {}
-        # IPC resources only the step thread destroys: on ROCm 7.2.x
-        # destroying an interprocess event synchronises every stream of the
-        # device and blocks event creation on every other thread meanwhile.
-        # The step events are the step thread's alone; finished futures, whose
-        # response carries the server's imported event, come from the drain
-        # thread under `_lock`. See `_release_ipc_resources`.
-        self._owned_events: deque[Any] = deque()
+        # On ROCm 7.2.x destroying an interprocess event synchronises every
+        # stream of the device and blocks event creation on every other thread
+        # meanwhile. Step events are therefore reused rather than destroyed
+        # (`_StepEventRing`, and `_step_event_of` names the one each queued or
+        # pending transfer holds). Finished futures, whose response carries the
+        # server's imported event, come from the drain thread under `_lock`
+        # and are destroyed on the step thread (`_release_ipc_resources`).
+        self._step_events = _StepEventRing()
+        self._step_event_of: dict[str, int] = {}
         self._owned_futures: deque[Any] = deque()
         # Keep in-flight IDs in the unbounded pending/submitting collections.
         # Only completed IDs enter these bounded replay tombstones.
@@ -395,6 +433,8 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._adapter is None or self.chunk_size is None:
             raise RuntimeError("lmcache_mp KV caches are not registered")
 
+        # Every step, so a backlog left when transfers stop still drains.
+        self._release_ipc_resources()
         requests = [
             req
             for req in metadata.requests
@@ -403,62 +443,66 @@ class LMCacheMPConnector(KVConnectorBase):
         ]
         if not requests:
             return
-        # Only on a step with transfers: an idle step has nothing to wake the
-        # drain thread for (`get_finished` wakes it while transfers are
-        # pending), and what is owned waits for the next one.
-        self._release_ipc_resources()
         # Raised before the submits: the drain thread's useful window is the
         # model forward that follows, where the step thread is in C with the
         # GIL released. By `get_finished` the results are settled.
         self._drain_wake.set()
-        event = self._record_step_event()
-        self._owned_events.append(event)
+        index, event = self._step_events.record(self._lock)
         for req in requests:
             if req.load_spec is not None and self._do_load:
-                self._submit_load(req, event)
+                self._submit_load(req, event, index)
             if req.save_spec is not None and self._do_save:
-                self._submit_save(req, event)
+                self._submit_save(req, event, index)
 
-    def _record_step_event(self) -> Any:
-        """A fresh event recorded on the forward's stream for this step's transfers.
+    def _hold_step_event(self, operation_id: str, event_index: int | None) -> None:
+        """Hold the step's event for a transfer the server will wait on.
 
-        Fresh every step: a handed-out interprocess event re-recorded while the
-        server still waits on it raises `HIP error: invalid argument`, measured
-        on both transfer modes.
+        Called with `_lock` held; `_release_step_event` gives it back.
         """
-        event = torch.cuda.Event(interprocess=True)
-        event.record(torch.cuda.current_stream())
-        return event
+        if event_index is not None:
+            self._step_events.hold(event_index)
+            self._step_event_of[operation_id] = event_index
+
+    def _queue_transfer(self, item: tuple, event_index: int | None) -> None:
+        """Queue one submit for the drain thread, holding the step's event."""
+        with self._lock:
+            self._hold_step_event(item[1], event_index)
+        self._transfer_queue.put(item)
+
+    def _release_step_event(self, operation_id: str) -> None:
+        """The transfer is terminal: the server no longer waits on its event.
+
+        Called with `_lock` held.
+        """
+        index = self._step_event_of.pop(operation_id, None)
+        if index is not None:
+            self._step_events.release(index)
 
     def _release_ipc_resources(self) -> None:
-        """Destroy step events and finished futures here, on the step thread.
+        """Destroy finished futures here, on the step thread.
 
         Only while this thread's stream is idle -- under synchronous
         scheduling, the start of a step -- so a destroy waits on nothing, and
         only once nothing else holds them. LMCache keeps each future until
-        its next submission and each exported event in a ring, and the drain
-        thread's locals hold some between rounds; letting go first would
-        leave the destroy to whichever of them lets go last, on the drain
-        thread. Past `_OWNED_IPC_CAP` a busy stream still releases, at most
-        `_BUSY_RELEASE_BATCH` a step, so one that is never idle can neither grow
-        the backlog without bound nor pay it in one step.
+        its next submission, and the drain thread's locals hold some between
+        rounds; letting go first would leave the destroy to whichever of them
+        lets go last, on the drain thread. Past `_OWNED_IPC_CAP` a busy stream
+        still releases, at most `_BUSY_RELEASE_BATCH` a step, so one that is
+        never idle can neither grow the backlog without bound nor pay it in
+        one step.
         """
         with self._lock:
-            owned = len(self._owned_events) + len(self._owned_futures)
+            owned = len(self._owned_futures)
         if not owned:
             return
         idle = _stream_idle()
         if owned < _OWNED_IPC_CAP and not idle:
             return
         limit = None if idle else _BUSY_RELEASE_BATCH
-        # Futures first: each retains its step event, which is unshared only
-        # once they are gone. The drain thread adds futures under `_lock`; the
-        # events are this thread's alone, so their scan holds no lock the drain
-        # thread waits on. The destroys run outside the lock.
+        # The drain thread adds futures under `_lock`; the destroys run
+        # outside it.
         with self._lock:
             unshared = _take_unshared(self._owned_futures, limit)
-        del unshared
-        unshared = _take_unshared(self._owned_events, limit)
         del unshared
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
@@ -534,7 +578,9 @@ class LMCacheMPConnector(KVConnectorBase):
             out.extend([[0] * (count - 1) + [int(block)]] * splits)
         return out
 
-    def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_load(
+        self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
+    ) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         assert req.load_spec is not None
@@ -590,7 +636,7 @@ class LMCacheMPConnector(KVConnectorBase):
         # `_submitting_loads` still holds this slot: the drain thread hands it
         # over to `_pending_loads` once the submit lands, so a duplicate
         # operation id is still refused while the submit is in flight.
-        self._transfer_queue.put(
+        self._queue_transfer(
             (
                 "load",
                 operation_id,
@@ -601,12 +647,15 @@ class LMCacheMPConnector(KVConnectorBase):
                 0,
                 0,
                 time.monotonic(),
-            )
+            ),
+            event_index,
         )
         self._ensure_drain_thread()
         self._drain_wake.set()
 
-    def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
+    def _submit_save(
+        self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
+    ) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         assert req.save_spec is not None
@@ -684,7 +733,7 @@ class LMCacheMPConnector(KVConnectorBase):
         # `_submitting_saves` still holds this slot: the drain thread hands it
         # over to `_pending_saves` once the submit lands, so a duplicate
         # operation id is still refused while the submit is in flight.
-        self._transfer_queue.put(
+        self._queue_transfer(
             (
                 "save",
                 operation_id,
@@ -695,7 +744,8 @@ class LMCacheMPConnector(KVConnectorBase):
                 start,
                 end,
                 time.monotonic(),
-            )
+            ),
+            event_index,
         )
         self._ensure_drain_thread()
         self._drain_wake.set()
@@ -846,6 +896,7 @@ class LMCacheMPConnector(KVConnectorBase):
         with self._lock:
             for operation_id, entry, result in terminal_ops:
                 self._pending_loads.pop(operation_id, None)
+                self._release_step_event(operation_id)
                 if entry.future is not None:
                     self._owned_futures.append(entry.future)
                 _remember_operation_tombstone(
@@ -935,6 +986,7 @@ class LMCacheMPConnector(KVConnectorBase):
         with self._lock:
             for operation_id, entry, result in terminal_ops:
                 self._pending_saves.pop(operation_id, None)
+                self._release_step_event(operation_id)
                 if entry.future is not None:
                     self._owned_futures.append(entry.future)
                 _remember_operation_tombstone(

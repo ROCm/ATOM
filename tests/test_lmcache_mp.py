@@ -2393,11 +2393,14 @@ def _load_step(req_id: int) -> LMCacheOffloadMetadata:
     return metadata
 
 
-def test_every_step_records_a_fresh_event(fake_lmcache_modules, monkeypatch):
-    """The server waits on the step's event, so it is never re-recorded.
+def test_a_step_event_is_reused_only_once_nothing_waits_on_it(
+    fake_lmcache_modules, monkeypatch
+):
+    """The server waits on the step's event before it moves the bytes.
 
-    Re-recording an event the server still holds raises `HIP error: invalid
-    argument` there; the worker cannot see the server's handle.
+    Re-recording an event it still waits on raises `HIP error: invalid
+    argument` there, so a step whose earlier event has a pending transfer
+    takes another; once every transfer on it is terminal it comes back.
     """
     created = []
 
@@ -2416,14 +2419,17 @@ def test_every_step_records_a_fresh_event(fake_lmcache_modules, monkeypatch):
     worker = _worker(adapter)
 
     worker.start_load_kv(_load_step(20))
+    worker._settle_transfers()
+    worker.start_load_kv(_load_step(21))
+    assert len(created) == 2, "an event with a pending transfer is not re-recorded"
+
     for _, _, _, future in adapter.loads:
         future.ready = True
     worker._settle_transfers()
     worker.get_finished()
-    worker.start_load_kv(_load_step(21))
-
-    assert len(created) == 2, "a settled event must not come back"
-    assert [event.records for event in created] == [1, 1]
+    worker.start_load_kv(_load_step(22))
+    assert len(created) == 2, "a settled event comes back"
+    assert [event.records for event in created] == [2, 1]
 
 
 def test_preemption_fence_covers_queued_transfers_and_fails_stop(monkeypatch):
@@ -2490,7 +2496,9 @@ def test_get_finished_wakes_the_drain_while_transfers_are_pending(
     worker._drain_wake.clear()
     worker.get_finished()
     assert not worker._drain_wake.is_set()
-    worker._pending_loads["load:5:1"] = object()
+    worker._pending_loads["load:5:1"] = mp_worker._PendingLoad(
+        completion=LoadOperationId(req_id=5, generation=1), future=_WorkerFuture()
+    )
     worker.get_finished()
     assert worker._drain_wake.is_set()
 
@@ -2521,14 +2529,13 @@ def test_a_recurrent_load_keeps_the_logical_transfer_end(monkeypatch):
 def test_ipc_resources_are_destroyed_on_the_step_thread(
     fake_lmcache_modules, monkeypatch
 ):
-    """No step event or finished future is destroyed on the drain thread.
+    """No step event is destroyed, and no finished future on the drain thread.
 
     On ROCm 7.2.x destroying an interprocess event synchronises the device and
-    blocks creating one on any other thread. Like LMCache, this adapter lets
-    go of a future at its next submission and of an exported event when its
-    ring overflows, both on the drain thread, so the step thread must still be
-    holding them then; it destroys them only while its stream is idle. A
-    submit that returns None or raises leaves the event to the step thread too.
+    blocks creating one on any other thread. Step events are reused instead.
+    Like LMCache, this adapter lets go of a future at its next submission, on
+    the drain thread, so the step thread must still be holding it then; it
+    destroys futures only while its stream is idle.
     """
     import itertools
     import threading
@@ -2592,12 +2599,14 @@ def test_ipc_resources_are_destroyed_on_the_step_thread(
     idle[0] = True
     for req_id in range(4, 9):
         step(_load_step(req_id))
-    step(_load_step(9))  # the release runs on a step with transfers
+    step(_load_step(9))
     assert all(destroyed.values())
-    # The adapter still holds the last future and the two newest exports.
+    # The adapter still holds the last future.
     assert {f"future{i}" for i in (1, 4, 5, 6, 7)} <= destroyed.keys()
-    assert {f"event{i}" for i in (1, 2, 4, 5, 6)} <= destroyed.keys()
-    assert not {"future8", "event7", "event8"} & destroyed.keys()
+    assert "future8" not in destroyed
+    assert not any(name.startswith("event") for name in destroyed)
+    # One more for the step whose unprovable submit still holds its event.
+    assert len(worker._step_events) == 2
     worker.close()
 
 
