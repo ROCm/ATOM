@@ -18,6 +18,7 @@ The f32 accumulator: lane l holds column l % 16, rows 8 (l // 16) + i, i < 8.
 from __future__ import annotations
 
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
@@ -202,6 +203,47 @@ def wmma_bf16_k32(a, b, c):
         rocdl.wmma_f32_16x16x32_bf16(
             fx.Vector.make_type(8, fx.Float32), as_ir_value(a), as_ir_value(b), as_ir_value(c)
         ).result
+    )
+
+
+def wmma_a8w4(a, b, c, sa, sb):
+    """Scaled 16x16x128 E2M1 x E4M3 -> f32: ``a`` 8 i32 (64 fp4, low nibble
+    first: k = 64 (n // 32) + 32 (l // 16) + n % 32), ``b`` 16 i32 of fp8, ``sa`` /
+    ``sb`` the i32 of A's row / B's column four E8M0 codes (k-blocks 0 .. 3)."""
+    return fx.Vector(
+        rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+            fx.Vector.make_type(8, fx.Float32), a, b, c, sa, sb, fmtA=4, fmtB=0
+        )
+    )
+
+
+def shuffled_rows(r_w, rg, k_bytes, kc, lane, chunk_bytes, cm=0):
+    """A lane's WMMA A operand of a ``shuffle_weight(layout=(16, 16))`` weight:
+    row group rg, k-chunk kc of ``chunk_bytes`` (64: an FP8 k64 / FP4 k128 chunk,
+    two 16 B pieces; 128: an FP8 k128 chunk, four), ``k_bytes`` a row."""
+    pieces = chunk_bytes // 32
+    parts = []
+    for c in range_constexpr(pieces):
+        w4 = fx.Vector(
+            bo.buffer_load(
+                r_w,
+                ((rg * (k_bytes // 32) + kc * pieces + c) * 512 + lane * 16) // 4,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=cm,
+            )
+        )
+        parts += [w4[e] for e in range(4)]
+    return fx.Vector.from_elements(parts, fx.Int32)
+
+
+def n32k4_word(r_s, row, step, k):
+    """The i32 of row ``row``'s four E8M0 codes of 128-k step ``step`` in a
+    ``shuffle_scale_n32k4`` scale (rows of every expert in order, ``k`` columns)."""
+    return fx.Int32(
+        bo.buffer_load(
+            r_s, ((row // 32) * k + step * 128 + (row % 32) * 4) // 4, vec_width=1, dtype=T.i32
+        )
     )
 
 
