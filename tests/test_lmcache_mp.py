@@ -2383,6 +2383,58 @@ def _load_step(req_id: int) -> LMCacheOffloadMetadata:
     return metadata
 
 
+def test_a_rank_whose_saves_settle_without_the_server_records_no_event(
+    fake_lmcache_modules, monkeypatch
+):
+    """Under TP rank collapse a non-writer's saves never reach the server.
+
+    Recording the step event anyway, step after step, and exporting it first
+    at a later load failed the server's wait with `HIP error: invalid
+    argument` on every such rank.
+    """
+    created = []
+    monkeypatch.setattr(
+        mp_worker.torch.cuda,
+        "Event",
+        lambda **_kw: created.append(1) or SimpleNamespace(record=lambda _s: None),
+    )
+    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(mp_worker, "_stream_idle", lambda: True)
+    worker = _worker(_WorkerAdapter())
+    worker._is_kv_writer = False
+    metadata = LMCacheOffloadMetadata()
+    metadata.add_request(
+        LMCacheReqMeta(
+            req_id=30,
+            token_ids=list(range(16)),
+            block_ids=[100, 101],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=SaveOperationId(req_id=30, generation=1),
+        )
+    )
+    worker.start_load_kv(metadata)
+    assert created == [] and len(worker._step_events) == 0
+    worker.start_load_kv(_load_step(31))
+    assert created == [1]
+
+
+def test_an_event_recorded_but_never_exported_is_not_reused(monkeypatch):
+    monkeypatch.setattr(
+        mp_worker.torch.cuda,
+        "Event",
+        lambda **_kw: SimpleNamespace(record=lambda _s: None),
+    )
+    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    lock = threading.Lock()
+    ring = mp_worker._StepEventRing()
+    first, _ = ring.record(lock)
+    second, _ = ring.record(lock)
+    assert second != first
+    ring.hold(second)
+    ring.release(second)
+    assert ring.record(lock)[0] == second
+
+
 def test_a_step_event_is_reused_only_once_nothing_waits_on_it(
     fake_lmcache_modules, monkeypatch
 ):

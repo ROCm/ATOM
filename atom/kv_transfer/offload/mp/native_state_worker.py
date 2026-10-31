@@ -163,7 +163,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             # transfer deadline.
             entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
-            self._hold_step_event(operation_id, event_index)
+            event = self._hold_step_event(operation_id, event, event_index)
         submit = (
             self._adapter.submit_retrieve_request
             if loading

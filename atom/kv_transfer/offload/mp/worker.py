@@ -92,37 +92,80 @@ class _StepEventRing:
 
     The server waits on a step's event before it moves the step's bytes, and
     re-recording an event it still waits on raises `HIP error: invalid
-    argument`. So each event counts the transfers submitted with it, and one
-    is recorded again only once all of them have reached a terminal state;
-    until then the step takes another, or makes one. None is destroyed while
-    the connector lives: on ROCm 7.2.x every destroy synchronises every stream
-    of the device. Callers hold the connector's `_lock` around `hold` and
-    `release`; `record` runs on the step thread alone.
+    argument`. So an event is recorded again only once every transfer
+    submitted with it has reached a terminal state, and only if one was: an
+    event recorded and never exported is not reused. With TP rank collapse a
+    rank whose saves all settle without the server recorded its event step
+    after step and exported it only at its first load, and the server's wait
+    on it then failed in every such run; a fresh event per step did not
+    (`_PendingStepEvent` keeps such steps from recording at all). None is
+    destroyed while the connector lives: on ROCm 7.2.x every destroy
+    synchronises every stream of the device. Callers hold the connector's
+    `_lock` around `record_locked`, `hold` and `release`.
     """
 
     def __init__(self) -> None:
         self._events: list[Any] = []
         self._holds: list[int] = []
+        # Whether a transfer was submitted with the event since its last record.
+        self._exported: list[bool] = []
 
     def __len__(self) -> int:
         return len(self._events)
 
-    def record(self, lock: threading.Lock) -> tuple[int, Any]:
-        with lock:
-            index = next((i for i, n in enumerate(self._holds) if n == 0), None)
-            if index is None:
-                index = len(self._events)
-                self._events.append(torch.cuda.Event(interprocess=True))
-                self._holds.append(0)
+    def record_locked(self) -> tuple[int, Any]:
+        index = next(
+            (
+                i
+                for i, (holds, exported) in enumerate(zip(self._holds, self._exported))
+                if exported and not holds
+            ),
+            None,
+        )
+        if index is None:
+            index = len(self._events)
+            self._events.append(torch.cuda.Event(interprocess=True))
+            self._holds.append(0)
+            self._exported.append(False)
+        self._exported[index] = False
         event = self._events[index]
         event.record(torch.cuda.current_stream())
         return index, event
 
+    def record(self, lock: threading.Lock) -> tuple[int, Any]:
+        with lock:
+            return self.record_locked()
+
     def hold(self, index: int) -> None:
+        """One transfer submitted with this event, which exports it."""
         self._holds[index] += 1
+        self._exported[index] = True
 
     def release(self, index: int) -> None:
         self._holds[index] -= 1
+
+
+class _PendingStepEvent:
+    """This step's event, recorded when its first transfer reaches the server.
+
+    A step whose transfers all settle without the server -- a rank that does
+    not write under TP rank collapse, a save with nothing to store -- records
+    nothing. Taken on the step thread, at the same point of its stream as an
+    event recorded at the top of `start_load_kv`: no kernel is launched in
+    between.
+    """
+
+    __slots__ = ("_ring", "_taken")
+
+    def __init__(self, ring: _StepEventRing) -> None:
+        self._ring = ring
+        self._taken: tuple[int, Any] | None = None
+
+    def take_locked(self) -> tuple[int, Any]:
+        """The event and its ring index; the caller holds the connector's `_lock`."""
+        if self._taken is None:
+            self._taken = self._ring.record_locked()
+        return self._taken
 
 
 def _take_unshared(owned: deque[Any], limit: int | None = None) -> list[Any]:
@@ -478,27 +521,34 @@ class LMCacheMPConnector(KVConnectorBase):
         # model forward that follows, where the step thread is in C with the
         # GIL released. By `get_finished` the results are settled.
         self._drain_wake.set()
-        index, event = self._step_events.record(self._lock)
+        event = _PendingStepEvent(self._step_events)
         for req in requests:
             if req.load_spec is not None and self._do_load:
-                self._submit_load(req, event, index)
+                self._submit_load(req, event)
             if req.save_spec is not None and self._do_save:
-                self._submit_save(req, event, index)
+                self._submit_save(req, event)
 
-    def _hold_step_event(self, operation_id: str, event_index: int | None) -> None:
-        """Hold the step's event for a transfer the server will wait on.
+    def _hold_step_event(
+        self, operation_id: str, event: Any, event_index: int | None = None
+    ) -> Any:
+        """The step's event for a transfer the server will wait on, held.
 
-        Called with `_lock` held; `_release_step_event` gives it back.
+        `event` is this step's `_PendingStepEvent`, recorded now if this is
+        its first transfer, or an event a caller recorded itself. Called with
+        `_lock` held; `_release_step_event` gives it back.
         """
+        if isinstance(event, _PendingStepEvent):
+            event_index, event = event.take_locked()
         if event_index is not None:
             self._step_events.hold(event_index)
             self._step_event_of[operation_id] = event_index
+        return event
 
-    def _queue_transfer(self, item: tuple, event_index: int | None) -> None:
+    def _queue_transfer(self, item: list, event: Any, event_index: int | None) -> None:
         """Queue one submit for the drain thread, holding the step's event."""
         with self._lock:
-            self._hold_step_event(item[1], event_index)
-        self._transfer_queue.put(item)
+            item[5] = self._hold_step_event(item[1], event, event_index)
+        self._transfer_queue.put(tuple(item))
 
     def _release_step_event(self, operation_id: str) -> None:
         """The transfer is terminal: the server no longer waits on its event.
@@ -677,17 +727,18 @@ class LMCacheMPConnector(KVConnectorBase):
         # over to `_pending_loads` once the submit lands, so a duplicate
         # operation id is still refused while the submit is in flight.
         self._queue_transfer(
-            (
+            [
                 "load",
                 operation_id,
                 completion,
                 request_id,
                 op,
-                event,
+                None,
                 0,
                 0,
                 time.monotonic(),
-            ),
+            ],
+            event,
             event_index,
         )
         self._ensure_drain_thread()
@@ -772,17 +823,18 @@ class LMCacheMPConnector(KVConnectorBase):
         # over to `_pending_saves` once the submit lands, so a duplicate
         # operation id is still refused while the submit is in flight.
         self._queue_transfer(
-            (
+            [
                 "save",
                 operation_id,
                 completion,
                 request_id,
                 op,
-                event,
+                None,
                 start,
                 end,
                 time.monotonic(),
-            ),
+            ],
+            event,
             event_index,
         )
         self._ensure_drain_thread()
