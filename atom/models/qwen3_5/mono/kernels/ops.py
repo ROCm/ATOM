@@ -54,3 +54,16 @@ def lds_ld(ptr, i):
 
 def lds_st(ptr, i, v):
     fx.ptr_store(v, ptr + i)
+
+
+def i64_of(w0, w1):
+    """Two i32 words, low first, as one i64 (an MFMA operand of 8 FP8 bytes)."""
+    return (fx.Int64(fx.Uint32(w1)) << 32) | fx.Int64(fx.Uint32(w0))
+
+
+def lds_i64(base, idx):
+    """The i64 at LDS word ``idx`` of ``base`` (two words, low first)."""
+    w = fx.Vector(
+        fx.ptr_load(base + idx, result_type=fx.Vector.make_type(2, fx.Float32))
+    )
+    return i64_of(w[0].bitcast(fx.Int32), w[1].bitcast(fx.Int32))

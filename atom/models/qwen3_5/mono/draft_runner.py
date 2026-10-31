@@ -27,6 +27,7 @@ from atom.models.qwen3_5.mono.runner import (
     bf16_gemm_refusal,
     check_inputs,
     check_splits,
+    flydsl_refusal,
     raise_on_given_up_waits,
 )
 from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
@@ -106,8 +107,11 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             rank=self.rank,
             weights="fp8",
             qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
+            pa_flydsl=envs.ATOM_PA_FLYDSL,
         )
-        why = bf16_gemm_refusal(self.cfg)
+        why = bf16_gemm_refusal(self.cfg) or (
+            flydsl_refusal(self.cfg) if self.cfg.pa_flydsl else None
+        )
         if why is not None:
             raise MonoUnsupported(why)
         self.full = [True]
@@ -190,7 +194,7 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         pos = (positions[0] if positions.dim() == 2 else positions)[:S].to(torch.int32)
         slots = md.slot_mapping[:S].to(torch.int32)
         # step 0 reuses the verify's metadata, whose context_lens a graph may have padded
-        check_splits(md, S // T)
+        check_splits(md, S // T, T, self.cfg.pa_flydsl)
         bt = md.block_tables[: S // T]
         ctx = md.context_lens[: S // T].to(torch.int32)
         if T > 1:

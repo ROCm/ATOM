@@ -32,6 +32,7 @@ def shape_dims(cfg) -> dict:
         "inter": cfg.local_inter,
         "weights": cfg.weights,
         "qk_fusion": cfg.qk_fusion,
+        "pa_flydsl": cfg.pa_flydsl,
     }
 
 
@@ -53,6 +54,19 @@ def dn_tile(S: int, hidden: int) -> int:
     """Hidden rows per expert-down / FFN peer-reduce task: 32 at S = 1, else about one task per CTA,
     a multiple of 16 so a tile never straddles the row groups ``reduce_rows`` emits."""
     return 32 if S == 1 else max(16, -(-(hidden // BLOCKS) // 16) * 16)
+
+
+# ATOM's FlyDSL decode plan at head_dim 256 (``base_attention.flydsl_plan_shape``; the runner refuses
+# ATOM_PA_FLYDSL when it differs): at most 64 partitions a sequence, a 256-workgroup budget
+FLYDSL_MAX_PARTS = 64
+FLYDSL_BUDGET = 256
+
+
+def flydsl_capacity(seqs: int) -> int:
+    """Plan slots of baseline ATOM's FlyDSL decode attention for ``seqs`` sequences (one KV head a rank,
+    aiter's ``plan_pa_decode`` capacity). A sequence's partition count depends on it, so the kernel plans
+    with the same."""
+    return min(FLYDSL_MAX_PARTS * seqs, max(seqs, FLYDSL_BUDGET))
 
 
 def pa_splits(seqs: int) -> int:
@@ -199,12 +213,18 @@ def layout(
     inter,
     weights,
     qk_fusion=False,
+    pa_flydsl=False,
     tokens_per_seq=1,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer. Every mailbox holds
     ``(value, tag)`` int32 pairs (8 bytes); bf16 mailboxes pack two elements per pair.
     """
-    ns = pa_splits(S // tokens_per_seq)
+    # the split partials: a split of a row (gluon), or a plan slot of a request's rows (FlyDSL)
+    parts = (
+        flydsl_capacity(S // tokens_per_seq) * tokens_per_seq
+        if pa_flydsl
+        else S * pa_splits(S // tokens_per_seq)
+    )
     dims = {
         "hk": hk,
         "hv": hv,
@@ -224,8 +244,9 @@ def layout(
                 "kvnew",
                 S * (2 * head_dim + 2) * pr,
             ),  # this token's K / V FP8 codes + their scales
-            ("sp_out", S * ns * heads * head_dim // 2 * pr),  # each split's bf16 output
-            ("sp_ml", S * ns * heads * 2 * pr),  # and its running max, exp sum
+            # a split's / plan slot's bf16 output per row, and its running max, exp sum
+            ("sp_out", parts * heads * head_dim // 2 * pr),
+            ("sp_ml", parts * heads * 2 * pr),
         ]
     else:
         g = gdn_dims(dims)
@@ -336,15 +357,25 @@ def stage_tasks(
     inter,
     weights="fp8",
     qk_fusion=False,
+    pa_flydsl=False,
     tokens_per_seq=1,
 ):
-    """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence)."""
+    """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence;
+    ``pa_flydsl``: a split task per FlyDSL plan slot, the idle ones past a step's live slots skipped).
+    """
     xin = [("xin", S)] if xin_stage(S, weights) else []
     if full:
         mixer = [
             ("proj", (heads * 2 * head_dim + 2 * head_dim) // PROJ_TILE // PROJ_GROUPS),
             ("qk", S * (heads + 1)),
-            ("split", S * pa_splits(S // tokens_per_seq)),
+            (
+                "split",
+                (
+                    flydsl_capacity(S // tokens_per_seq)
+                    if pa_flydsl
+                    else S * pa_splits(S // tokens_per_seq)
+                ),
+            ),
             ("merge", S * heads),
         ]
     else:

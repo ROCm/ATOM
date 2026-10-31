@@ -5,19 +5,53 @@
 
 from __future__ import annotations
 
+import inspect
+import logging
 from typing import ClassVar
 
 import torch
 
-from atom.models.qwen3_5.mono.kernels.layer import build_qwen35_kernel
+from atom.models.qwen3_5.mono.kernels.layer import CODEGEN_VARIANTS, build_qwen35_kernel
 from atom.models.qwen3_5.mono.layout import layout, mailbox_regions, shape_dims
 from atom.models.qwen3_5.mono.weights import LayerWeights
+from atom.mono.runtime.abi import KernelAbi
+from atom.mono.runtime.compile import compile_kernels, scratch_bytes
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, region_namer
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.step_begin import ZERO_ALIGN
 
+logger = logging.getLogger("atom")
+
 __all__ = ["Qwen35MonoKernel", "Qwen35Variant"]
+
+
+def zero_abi(launcher) -> KernelAbi:
+    """A launcher's parameters but ``stream``: what a compile-only call zeroes."""
+    fn = getattr(launcher, "func", None) or launcher._func
+    params = tuple(inspect.signature(fn).parameters)
+    assert params[-1] == "stream", params
+    return KernelAbi(params[:-1])
+
+
+def build_scratch_free(*args, **kw):
+    """``build_qwen35_kernel`` compiled (no launch) at the first ``CODEGEN_VARIANTS`` entry whose kernel needs
+    no scratch: mono refuses a build with scratch, and at some widths LLVM leaves a dead SGPR spill slot that
+    another schedule does not. The last one tried if none is free (its width is then refused as before).
+    """
+    for codegen in range(len(CODEGEN_VARIANTS)):
+        fn = build_qwen35_kernel(*args, codegen=codegen, **kw)
+        compile_kernels([(fn, zero_abi(fn))])
+        if not scratch_bytes(fn):
+            break
+    if codegen:
+        logger.info(
+            "Qwen3.5 mono: the %d-row build takes LLVM options %s (%s)",
+            args[0],
+            CODEGEN_VARIANTS[codegen],
+            "scratch-free" if not scratch_bytes(fn) else "still with scratch",
+        )
+    return fn
 
 
 class Qwen35Variant:
@@ -94,7 +128,7 @@ class Qwen35Variant:
             timeline,
         )
         if self.key not in Qwen35Variant._cache:
-            Qwen35Variant._cache[self.key] = build_qwen35_kernel(
+            Qwen35Variant._cache[self.key] = build_scratch_free(
                 samples,
                 npes,
                 full,

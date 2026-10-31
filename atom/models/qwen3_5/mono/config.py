@@ -38,8 +38,11 @@ SHARED_INTER = 1024
 
 # rows a decode step holds at most: one launch, the kernel's samples
 MAX_TOKENS = 16
-# tokens a request an MTP verify launch holds at most (the full-attention split's new-key staging)
-MAX_VERIFY_TOKENS = 4
+# tokens a request an MTP verify launch holds at most: the original decode attention's. pa_decode_gluon takes
+# up to 4 (MTP-3); past it the original path decodes only with ATOM_PA_FLYDSL's FlyDSL decode, which the
+# kernel then follows, up to 6 (MTP-5)
+GLUON_VERIFY_TOKENS = 4
+MAX_VERIFY_TOKENS = 6
 
 
 def is_full_attention(layer_id: int) -> bool:
@@ -75,6 +78,9 @@ class Q35Config:
     # ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION: the original attention's fused q / k norm + RoPE +
     # cache-quant kernel (one bf16 rounding; its KV and o_proj input quants), which the kernel follows
     qk_fusion: bool = False
+    # ATOM_PA_FLYDSL: the original decode attention is aiter's FlyDSL paged decode (its work plan and
+    # rounding), which the kernel then follows instead of pa_decode_gluon's
+    pa_flydsl: bool = False
 
     # --- Gated DeltaNet shard
     @property

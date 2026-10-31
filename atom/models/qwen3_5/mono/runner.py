@@ -19,7 +19,6 @@ and buffers (scratch, peer memory) are built on its first step (``WidthBuilds``)
 kind (GDN, full attention) share them.
 """
 
-import inspect
 import logging
 
 import torch
@@ -29,6 +28,8 @@ from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_atten
 from atom.models.qwen3_5.mono.dispatch import final_norm
 from atom.models.qwen3_5.mono.layout import (
     BF16_GEMM_RULES,
+    FLYDSL_BUDGET,
+    FLYDSL_MAX_PARTS,
     TL_POINTS,
     aiter_bf16_rule,
     bf16_gemms,
@@ -41,11 +42,11 @@ from atom.models.qwen3_5.mono.op import (
     Qwen35MonoKernel,
     Qwen35Variant,
     StepInputError,
+    zero_abi,
 )
 from atom.models.qwen3_5.mono.packing import pack_bf16
 from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
 from atom.mono.plan.execution import BLOCKS
-from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import raise_if_given_up
 from atom.mono.runtime.lifecycle import owned_peer_buffer
@@ -56,14 +57,6 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-
-
-def _zero_abi(launcher) -> KernelAbi:
-    """A launcher's parameters but ``stream``: what a compile-only call zeroes."""
-    fn = getattr(launcher, "func", None) or launcher._func
-    params = tuple(inspect.signature(fn).parameters)
-    assert params[-1] == "stream", params
-    return KernelAbi(params[:-1])
 
 
 def baseline_refusal(experts, rows: int = 16) -> str | None:
@@ -95,6 +88,34 @@ def baseline_refusal(experts, rows: int = 16) -> str | None:
         )
         if got != getattr(torch, "float4_e2m1fn_x2", None):
             return f"the original path's {m}-row decode runs the routed experts on {got}, not MXFP4"
+    return None
+
+
+def flydsl_refusal(cfg) -> str | None:
+    """Under ATOM_PA_FLYDSL, why the original decode attention is not the FlyDSL paged decode the kernel
+    follows (kernels/attn_flydsl.py), or None: ATOM runs gluon instead where aiter predates the explicit
+    work plan or the GPU has no FlyDSL decode, plans otherwise than the kernel, or aiter's head-256 decode
+    is not the one copied (its K128 pipe up to 32 rows, aiter 59fae2078)."""
+    import importlib
+
+    from atom.model_ops import base_attention as ba
+
+    try:
+        # the module before ATOM's probe of it: until then aiter.ops.flydsl.pa_decode names the function
+        importlib.import_module("aiter.ops.flydsl.pa_decode")
+        from aiter.ops.flydsl.kernels.pa_decode import traits
+    except ImportError:
+        return "ATOM_PA_FLYDSL: this aiter has no FlyDSL paged decode"
+    if not ba._flydsl_arch_supported() or not ba._flydsl_explicit_plan_api():
+        return "ATOM_PA_FLYDSL: the original path runs gluon here (no FlyDSL decode with a work plan)"
+    shape = {"max_partitions": FLYDSL_MAX_PARTS, "workgroup_budget": FLYDSL_BUDGET}
+    if ba.flydsl_plan_shape(cfg.head_dim) != shape:
+        return (
+            f"ATOM_PA_FLYDSL: the original path plans {ba.flydsl_plan_shape(cfg.head_dim)}, the kernel"
+            f" {shape}"
+        )
+    if getattr(traits, "D256_PIPE_MAX_ROWS", None) != 32:
+        return "ATOM_PA_FLYDSL: this aiter's head-256 FlyDSL decode is not the one the kernel follows"
     return None
 
 
@@ -160,12 +181,23 @@ def check_inputs(built, kvd, x, ins) -> None:
     built["pools_checked"] = kvd
 
 
-def check_splits(md, requests: int) -> None:
+def check_splits(md, requests: int, T: int = 1, flydsl: bool = False) -> None:
     """The original decode attention splits each sequence by the count of its metadata's
     ``context_lens`` (ATOM's ``dense_decode_splits``), and each split is a rounding point: a step
     whose metadata counts other than its ``requests`` rows (a graph's padded batch around an eager
-    draft) would split differently, so it raises ``StepInputError``."""
+    draft) would split differently, so it raises ``StepInputError``. Under ATOM_PA_FLYDSL the split is
+    FlyDSL's work plan on the first ``rows // max_seqlen_q`` sequences, which ATOM takes only while
+    they divide and fit its metadata (``_flydsl_pa_decode_num_seqs``; else gluon): the kernel plans
+    ``requests`` sequences of ``T`` rows, so the two must agree."""
     seqs = md.context_lens.shape[0]
+    if flydsl:
+        qlen = int(md.max_seqlen_q)
+        if qlen != T or requests > seqs or requests > md.block_tables.shape[0]:
+            raise StepInputError(
+                f"the original attention plans FlyDSL on {requests * T} rows of {qlen} tokens a"
+                f" sequence over {seqs} sequences, the kernel on {requests} of {T}"
+            )
+        return
     if pa_splits(seqs) != pa_splits(requests):
         raise StepInputError(
             f"the original attention splits {seqs} sequences {pa_splits(seqs)} ways, the kernel's"
@@ -241,6 +273,7 @@ class Qwen35MonoDecodeRunner:
             rank=self.rank,
             weights=weights,
             qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
+            pa_flydsl=envs.ATOM_PA_FLYDSL,
         )
         # the layers' f32 residual stream and their input quant follow the fused all-reduce + RMSNorm
         from atom.models.qwen3_5.model import allreduce_norm_fusion_enabled
@@ -249,7 +282,9 @@ class Qwen35MonoDecodeRunner:
             raise MonoUnsupported(
                 "the original path's all-reduce + RMSNorm fusion is off; the kernel reproduces it"
             )
-        why = bf16_gemm_refusal(self.cfg)
+        why = bf16_gemm_refusal(self.cfg) or (
+            flydsl_refusal(self.cfg) if self.cfg.pa_flydsl else None
+        )
         if why is not None:
             raise MonoUnsupported(why)
         n = len(self.lm.layers)
@@ -559,7 +594,7 @@ class Qwen35MonoDecodeRunner:
     def _width_kernels(built: dict) -> list:
         out = []
         for var in built["variants"].values():
-            out.append((var.launch, _zero_abi(var.launch)))
+            out.append((var.launch, zero_abi(var.launch)))
         return out
 
     def launch_width(self, rows: int) -> int | None:
@@ -610,7 +645,7 @@ class Qwen35MonoDecodeRunner:
             sm = sm.as_strided((S,), (1,))
         slots = sm[:S].to(torch.int32)
         T = self.T
-        check_splits(md, S // T)
+        check_splits(md, S // T, T, self.cfg.pa_flydsl)
         ctx = md.context_lens[: S // T].to(torch.int32)
         if T == 1:
             gdn = (

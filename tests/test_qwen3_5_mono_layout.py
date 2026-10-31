@@ -303,3 +303,40 @@ def test_rope_tables_hold_the_drafted_positions_past_the_last_kept_token():
     assert torch.equal(c[:10], cos.view(10, half).float())
     assert torch.equal(c[10], c[9]) and torch.equal(s_, -c)
     assert rope_tables(rot, cfg, 11) is None
+
+
+@pytest.mark.parametrize(
+    "qlen, seqs, bt_rows, refused",
+    [
+        (4, 2, 2, False),  # the kernel's 2 requests of 4 tokens
+        (
+            4,
+            4,
+            4,
+            False,
+        ),  # a graph's padded sequence axis: the original path still takes 2
+        (6, 2, 2, True),  # the metadata's query length is another verify's
+        (4, 1, 2, True),  # fewer sequences than requests: the original path runs gluon
+        (4, 2, 1, True),  # fewer block-table rows than requests: gluon too
+    ],
+)
+def test_flydsl_splits_follow_the_original_sequence_count(qlen, seqs, bt_rows, refused):
+    """Under ATOM_PA_FLYDSL the original path plans the first rows // max_seqlen_q sequences, and only while
+    they fit its metadata (``_flydsl_pa_decode_num_seqs``); else it runs gluon. A step otherwise keeps the
+    original path."""
+    pytest.importorskip("aiter")
+    from types import SimpleNamespace
+
+    from atom.models.qwen3_5.mono.op import StepInputError
+    from atom.models.qwen3_5.mono.runner import check_splits
+
+    md = SimpleNamespace(
+        context_lens=torch.zeros(seqs, dtype=torch.int32),
+        block_tables=torch.zeros(bt_rows, 4, dtype=torch.int32),
+        max_seqlen_q=qlen,
+    )
+    if refused:
+        with pytest.raises(StepInputError):
+            check_splits(md, 2, 4, flydsl=True)
+    else:
+        check_splits(md, 2, 4, flydsl=True)

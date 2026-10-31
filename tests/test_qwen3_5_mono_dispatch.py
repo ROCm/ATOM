@@ -84,12 +84,25 @@ def native(monkeypatch):
     for setting, _ in dispatch.baseline_switches():
         monkeypatch.delenv(setting.split("=")[0], raising=False)
     monkeypatch.delenv("ATOM_MONO_CHECK", raising=False)
+    monkeypatch.delenv("ATOM_PA_FLYDSL", raising=False)
 
 
 @pytest.mark.parametrize("k", [0, 1, 3])
 def test_supported_deployment_has_no_refusal(native, k):
     config = _atom_config(speculative_config=_mtp(k) if k else None)
     assert dispatch.config_refusal(config) is None
+
+
+@pytest.mark.parametrize("k", [0, 3, 4, 5])
+def test_flydsl_attention_is_followed_up_to_mtp5(native, monkeypatch, k):
+    """Under ATOM_PA_FLYDSL the original decode attention is FlyDSL's, which takes a verify of up to 6 tokens
+    a request; gluon's takes 4, so past MTP-3 the gluon mode refuses."""
+    config = _atom_config(speculative_config=_mtp(k) if k else None)
+    if k > 3:
+        assert "a verify of" in dispatch.config_refusal(config)
+    monkeypatch.setenv("ATOM_PA_FLYDSL", "1")
+    assert dispatch.config_refusal(config) is None
+    assert "> 6" in dispatch.config_refusal(_atom_config(speculative_config=_mtp(6)))
 
 
 def test_a_flat_text_config_is_read(native):
@@ -365,6 +378,16 @@ def test_verify_of_whole_requests_is_routed(monkeypatch, replay, requests):
     assert dispatch.step_supported(_ids(4 * requests), 4, replay)
 
 
+@pytest.mark.parametrize("replay", [True, False])
+@pytest.mark.parametrize("requests, routed", [(1, True), (2, True), (3, False)])
+def test_an_mtp5_verify_is_routed_while_it_fits_a_launch(
+    monkeypatch, replay, requests, routed
+):
+    """MTP-5 verifies 6 rows a request: two requests (12 rows) fit a launch, three (18) do not."""
+    _context(monkeypatch, **_verify(replay, requests, T=6))
+    assert dispatch.step_supported(_ids(6 * requests), 6, replay) == routed
+
+
 @pytest.mark.parametrize(
     "rows, gdn, replay",
     [
@@ -443,6 +466,26 @@ def test_draft_steps_follow_the_verify_width(monkeypatch, bs, rows, t):
     monkeypatch.setattr(draft_runner, "get_forward_context", lambda: fwd)
     runner = object.__new__(draft_runner.Qwen35MonoDraftRunner)
     runner.T = 4
+    assert runner.step_t(rows) == t
+
+
+@pytest.mark.parametrize(
+    "bs, rows, t",
+    [
+        (1, 6, 6),  # MTP-5 verify rows: six a request
+        (2, 12, 6),
+        (2, 2, 1),  # a later draft step
+        (3, 18, None),  # the target's verify is past a launch: ATOM's ...
+        (3, 3, None),  # ... and so is every draft step of the batch
+    ],
+)
+def test_mtp5_draft_steps_follow_the_verify_width(monkeypatch, bs, rows, t):
+    from atom.models.qwen3_5.mono import draft_runner
+
+    fwd = SimpleNamespace(context=SimpleNamespace(scheduled_bs=bs))
+    monkeypatch.setattr(draft_runner, "get_forward_context", lambda: fwd)
+    runner = object.__new__(draft_runner.Qwen35MonoDraftRunner)
+    runner.T = 6
     assert runner.step_t(rows) == t
 
 

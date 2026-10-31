@@ -32,8 +32,9 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.qwen3_5.mono.config import MAX_VERIFY_TOKENS
+from atom.models.qwen3_5.mono.config import GLUON_VERIFY_TOKENS, MAX_VERIFY_TOKENS
 from atom.models.qwen3_5.mono.kernels.attn import attn_stages
+from atom.models.qwen3_5.mono.kernels.attn_flydsl import flydsl_lds_words
 from atom.models.qwen3_5.mono.kernels.common import common_defs
 from atom.models.qwen3_5.mono.kernels.ffn import ffn_stages
 from atom.models.qwen3_5.mono.kernels.gdn import gdn_stages
@@ -68,6 +69,18 @@ from atom.mono.runtime.debug import region_ids
 _CURRENT_STREAM = fx.Stream(None)
 
 
+# Codegen-only LLVM options a width's build is retried with when the build needs scratch (``codegen``, an
+# index): at some widths LLVM's SGPR allocator leaves a dead spill slot, a frame that gives the kernel scratch,
+# which mono refuses. Each changes only the schedule / allocation, never what is computed
+CODEGEN_VARIANTS = (
+    {},
+    {"amdgpu-use-amdgpu-trackers": True},
+    {"amdgpu-sched-strategy": "max-ilp"},
+    {"amdgpu-disable-unclustered-high-rp-reschedule": True},
+    {"misched-cluster": False},
+)
+
+
 def build_qwen35_kernel(
     S: int,
     npes: int,
@@ -87,8 +100,10 @@ def build_qwen35_kernel(
     rope_dim,
     weights="fp8",
     qk_fusion=False,
+    pa_flydsl=False,
     tokens_per_seq=1,
     replay_cap=0,
+    codegen=0,
     debug=False,
     timeline=False,
 ):
@@ -164,6 +179,11 @@ def build_qwen35_kernel(
     QG = H * 2 * HD
     SCALE = HD**-0.5
     NSPLIT = pa_splits(S // T_SEQ)
+    # ATOM_PA_FLYDSL: decode attention as aiter's FlyDSL paged decode (kernels/attn_flydsl.py)
+    PA_FLYDSL = bool(pa_flydsl) and full
+    assert (
+        not full or PA_FLYDSL or T_SEQ <= GLUON_VERIFY_TOKENS
+    ), "past 4 tokens a request the original path decodes with FlyDSL only"
     CPS = 256  # keys of a decode-attention partition (aiter's CONTEXT_PARTITION_SIZE)
     if FULL:
         assert H == WAVES, "split attention runs one query head per wave"
@@ -197,6 +217,7 @@ def build_qwen35_kernel(
         "inter": inter,
         "weights": weights,
         "qk_fusion": qk_fusion,
+        "pa_flydsl": pa_flydsl,
     }
     SC, SY = layout(S, W, full, tokens_per_seq=T_SEQ, **dims)
     stages = stage_tasks(S, full, tokens_per_seq=T_SEQ, **dims)
@@ -220,7 +241,9 @@ def build_qwen35_kernel(
             if FULL
             else 0
         ),
-    )  # split: scores | P' bytes | Q bytes | per-head factors | this launch's K / V bytes, scales
+        flydsl_lds_words(T_SEQ, HD) if PA_FLYDSL else 0,
+    )  # split (gluon): scores | P' bytes | Q bytes | per-head factors | this launch's K / V bytes, scales;
+    # under ATOM_PA_FLYDSL attn_flydsl's (flydsl_lds_words)
     ON = max(
         # MXFP4: the expert down's routed tile and, after it, the shared expert's
         S * max(ROW_TILE, PROJ_TILE * PROJ_GROUPS, DN_TILE * (2 if MX else 1)),
@@ -228,7 +251,15 @@ def build_qwen35_kernel(
         HD,
         H * HD if FULL else 0,  # a split's output, every head
     )
-    MISC = max(MOE_MISC + S * XQ_BLOCKS, S * MOE_SLOTS * INTER // 128, 2 * NSPLIT) + 8
+    MISC = (
+        max(
+            MOE_MISC + S * XQ_BLOCKS,
+            S * MOE_SLOTS * INTER // 128,
+            2 * NSPLIT,
+            64 if PA_FLYDSL else 0,  # the merge's partition weights
+        )
+        + 8
+    )
 
     @fx.struct
     class Smem:
@@ -456,6 +487,6 @@ def build_qwen35_kernel(
             tl,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
-    return flyc.compile[{"llvm_options": {"disable-vector-combine": True}}](
-        launch_qwen35
-    )
+    return flyc.compile[
+        {"llvm_options": {"disable-vector-combine": True, **CODEGEN_VARIANTS[codegen]}}
+    ](launch_qwen35)

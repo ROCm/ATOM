@@ -17,8 +17,10 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.qwen3_5.mono.config import FP8_MAX
+from atom.models.qwen3_5.mono.kernels.attn_flydsl import flydsl_split_merge
 from atom.models.qwen3_5.mono.kernels.common import sigmoid, sigmoid_precise
-from atom.models.qwen3_5.mono.kernels.ops import ld_f32, lds_ld, lds_st
+from atom.models.qwen3_5.mono.kernels.ops import i64_of, ld_f32, lds_ld, lds_st
+from atom.models.qwen3_5.mono.kernels.ops import lds_i64 as lds_i64_at
 from atom.models.qwen3_5.mono.layout import BS, PROJ_TILE
 from atom.mono.device.ops import (
     bf2_f32,
@@ -37,7 +39,7 @@ from atom.mono.device.ops import (
     xshfl,
 )
 from atom.mono.device.sync import Addr
-from atom.mono.plan.execution import WAVES
+from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.plan.trace import Space
 
 
@@ -214,6 +216,11 @@ def attn_stages(ctx):
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD, ksc)
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD + 1, vsc)
 
+    if const_expr(ctx["PA_FLYDSL"]):
+        # ATOM_PA_FLYDSL: baseline's decode attention is aiter's FlyDSL paged decode
+        flydsl_split_merge(ctx)
+        return {}
+
     # ================================ 3. split attention (aiter's pa_decode_gluon, FP8 compute)
     # Baseline ATOM's decode attention, rounding point for rounding point (spec: aiter's
     # paged_attention_decode_sliding_window_head_1 + the pa_ps reduce): NSPLIT splits a sequence's
@@ -241,14 +248,8 @@ def attn_stages(ctx):
     assert NG == 2 and CPS // 16 == 2 * WAVES and H == WAVES
     g4 = lane // 16
 
-    def i64_of(w0, w1):
-        return (fx.Int64(fx.Uint32(w1)) << 32) | fx.Int64(fx.Uint32(w0))
-
     def lds_i64(idx):
-        w = fx.Vector(
-            fx.ptr_load(xs + idx, result_type=fx.Vector.make_type(2, fx.Float32))
-        )
-        return i64_of(w[0].bitcast(fx.Int32), w[1].bitcast(fx.Int32))
+        return lds_i64_at(xs, idx)
 
     def fp8_byte(word_f32, byte):
         """Byte ``byte`` (runtime) of an LDS word as an E4M3FN value."""
@@ -343,21 +344,25 @@ def attn_stages(ctx):
                 fx.Float32(0.0),
             )
         # this launch's keys, for every split with a tile (their V scales enter the tile's vmax, their
-        # P' = 0 products the split's sums): K / V codes (exact FP8 values) back to bytes
-        if (npart > 0) & (tid < T_SEQ * 2 * HD // 4):
-            i_ = tid // (2 * HD // 4)
-            kv_ = (tid // (HD // 4)) % 2
-            d4 = (tid % (HD // 4)) * 4
-            base = (s0 + i_) * (2 * HD + 2) + kv_ * HD + d4
-            got = poll([(mb("kvnew"), base, 2), (mb("kvnew"), base + 2, 2)])
-            w = fp8_pack4(
-                *[got[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
-            )
-            lds_st(
-                xs,
-                XKN + kv_ * (T_SEQ * HD // 4) + i_ * (HD // 4) + d4 // 4,
-                w.bitcast(fx.Float32),
-            )
+        # P' = 0 products the split's sums): K / V codes (exact FP8 values) back to bytes, a word a
+        # thread, in rounds of the block (past 4 tokens a request the words outnumber the threads)
+        NKW = T_SEQ * 2 * HD // 4
+        for rnd in range_constexpr(-(-NKW // THREADS)):
+            wk = tid if rnd == 0 else tid + rnd * THREADS
+            if (npart > 0) & (wk < NKW):
+                i_ = wk // (2 * HD // 4)
+                kv_ = (wk // (HD // 4)) % 2
+                d4 = (wk % (HD // 4)) * 4
+                base = (s0 + i_) * (2 * HD + 2) + kv_ * HD + d4
+                got = poll([(mb("kvnew"), base, 2), (mb("kvnew"), base + 2, 2)])
+                w = fp8_pack4(
+                    *[got[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
+                )
+                lds_st(
+                    xs,
+                    XKN + kv_ * (T_SEQ * HD // 4) + i_ * (HD // 4) + d4 // 4,
+                    w.bitcast(fx.Float32),
+                )
         if (npart > 0) & (tid < 2 * T_SEQ):
             sc2 = poll(
                 [(mb("kvnew"), (s0 + tid // 2) * (2 * HD + 2) + 2 * HD + tid % 2, 1)]

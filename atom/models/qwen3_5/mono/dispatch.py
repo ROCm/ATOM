@@ -25,7 +25,12 @@ from aiter.dist.parallel_state import get_tp_group
 from torch import nn
 
 from atom.models.qwen3_5.mono.check import forward_checked
-from atom.models.qwen3_5.mono.config import MAX_TOKENS, MAX_VERIFY_TOKENS, Q35Config
+from atom.models.qwen3_5.mono.config import (
+    GLUON_VERIFY_TOKENS,
+    MAX_TOKENS,
+    MAX_VERIFY_TOKENS,
+    Q35Config,
+)
 from atom.models.qwen3_5.mono.layout import BS
 from atom.models.qwen3_5.mono.op import StepInputError
 from atom.mono.plan.shard import Shard, ShardError
@@ -95,7 +100,6 @@ def baseline_switches() -> list[tuple[str, bool]]:
             "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0",
             not envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION,
         ),
-        ("ATOM_PA_FLYDSL=1", envs.ATOM_PA_FLYDSL),
         ("ATOM_USE_UNIFIED_ATTN=1", envs.ATOM_USE_UNIFIED_ATTN),
         ("ATOM_FORCE_ATTN_TRITON=1", envs.ATOM_FORCE_ATTN_TRITON),
         ("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST=1", envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST),
@@ -104,7 +108,7 @@ def baseline_switches() -> list[tuple[str, bool]]:
         ("ATOM_USE_TRITON_MOE_DECODE=1", envs.ATOM_USE_TRITON_MOE_DECODE),
         ("ATOM_MOE_GU_ITLV=1", envs.ATOM_MOE_GU_ITLV),
         ("ATOM_USE_MODEL_SENSITIVE_RMSNORM=1", envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM),
-        # the UT-transform replay (``auto`` takes it only past 11 verify tokens, beyond MTP-3)
+        # the UT-transform replay (``auto`` takes it only past 11 verify tokens, beyond MTP-5)
         ("ATOM_REPLAYSSM_ROUTE=ut", envs.ATOM_REPLAYSSM_ROUTE == "ut"),
         # the fused q / k norm + RoPE + cache kernel serves a step only up to this many rows; past it
         # the original path norms, rounds, rotates and quantizes K in separate kernels
@@ -169,6 +173,7 @@ def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
     spec = atom_config.speculative_config
     k = spec_steps(atom_config)
+    verify_max = MAX_VERIFY_TOKENS if envs.ATOM_PA_FLYDSL else GLUON_VERIFY_TOKENS
     hf = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
     dims = functools.partial(Dims, hf)
     checks = common_refusals(atom_config, dims, SUPPORTED_TP) + [
@@ -187,8 +192,13 @@ def config_refusal(atom_config) -> str | None:
             f"speculative method {spec.method if spec else None}",
         ),
         (
-            k + 1 <= MAX_VERIFY_TOKENS,
-            f"a verify of {k + 1} tokens a request > {MAX_VERIFY_TOKENS}",
+            k + 1 <= verify_max,
+            f"a verify of {k + 1} tokens a request > {verify_max}"
+            + (
+                ""
+                if envs.ATOM_PA_FLYDSL
+                else " (pa_decode_gluon's; past it ATOM_PA_FLYDSL's)"
+            ),
         ),
         # the draft's one decoder layer
         (

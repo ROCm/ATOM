@@ -23,11 +23,18 @@ TP = 4
 
 
 def build_layer(
-    S: int, full: bool, weights: str = "fp8", T: int = 1, npes: int = TP, cap: int = 0
+    S: int,
+    full: bool,
+    weights: str = "fp8",
+    T: int = 1,
+    npes: int = TP,
+    cap: int = 0,
+    pa_flydsl: bool = False,
 ):
     """The layer kernel for ``S`` rows (an MTP verify of ``T`` tokens a request; ``cap`` > 0 its GDN on
-    ReplaySSM records), full attention or GDN, and its launch ABI."""
-    cfg = Q35Config(tp=TP, rank=0, weights=weights)
+    ReplaySSM records; ``pa_flydsl``: decode attention as ATOM_PA_FLYDSL's), full attention or GDN, and
+    its launch ABI."""
+    cfg = Q35Config(tp=TP, rank=0, weights=weights, pa_flydsl=pa_flydsl)
     fn = build_qwen35_kernel(
         S,
         npes,
