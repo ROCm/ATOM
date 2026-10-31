@@ -637,6 +637,11 @@ class AttentionMetaData:
     # Every producer that rewrites block_tables must rewrite this too: a stale
     # one has the right length and the wrong rows.
     token_block_tables: torch.Tensor | None = None
+    # A pooled draft's own slot per token of the target forward, published by
+    # `DSparkProposer._publish_draft_ctx_slots` around the draft's context
+    # write and cleared after it. Unlike `slot_mapping` it has no DCP filter
+    # and addresses the draft's `block_size * dcp`-token entries.
+    draft_ctx_slot_mapping: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None

@@ -914,15 +914,11 @@ def test_dcp_guard_admits_an_mtp_draft():
 
 
 # --------------------------------------------------------------------------- #
-# draft pool address arithmetic (dspark_proposer)
+# draft pool addressing (dspark_proposer)
 #
-# `_draft_entry_tokens` is called on the REAL property. The slot and
-# prefix-length cases MIRROR the production expressions rather than driving
-# `_publish_draft_ctx_slots` end to end (that needs a forward_context, a
-# published block_table_state and attn_metadata). They are regression tests on
-# the ARITHMETIC -- they prove the aliasing the production comment names is
-# real and that the chosen formula avoids it. Driving the real method belongs
-# in the GPU batch alongside the rest of the proposer.
+# The property and `_publish_draft_ctx_slots` are the REAL methods, called on a
+# stub carrying real forward buffers. The proposer module imports triton, so
+# these skip on the CPU-only runner and run in the GPU batch.
 # --------------------------------------------------------------------------- #
 
 
@@ -958,57 +954,132 @@ def test_draft_entry_is_the_plain_block_for_the_mla_draft(dcp):
     assert _entry_tokens(128, dcp, dflash_pool=False) == 128
 
 
-def test_block_size_instead_of_entry_tokens_aliases_requests():
-    """The regression `_publish_draft_ctx_slots` guards against.
-
-    Mirrors the slot expression at `dspark_proposer.py:844-846`:
-        block_tables[req, page] * vblock + pos % vblock
-    Using `block_size` in place of `vblock` addresses one `dcp`-th of each
-    entry, so `dcp` distinct block ids collapse onto overlapping slot ranges.
-    """
+def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
+    """Drive the real `_publish_draft_ctx_slots`; return what it published."""
     import torch
 
-    block_size, dcp = 128, 8
-    vblock = block_size * dcp
-    # Two requests holding ADJACENT entries, each reading its own first token.
-    block_ids = torch.tensor([3, 4], dtype=torch.int64)
-    pos = torch.tensor([0, 0], dtype=torch.int64)
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttentionMetaData
 
-    correct = block_ids * vblock + torch.remainder(pos, vblock)
-    assert correct.tolist() == [3 * 1024, 4 * 1024]
-    # Distinct entries stay a full entry apart.
-    assert int(correct[1] - correct[0]) == vblock
-
-    wrong = block_ids * block_size + torch.remainder(pos, block_size)
-    # The bug: ids land `block_size` apart, so entry 3's 1024-token span runs
-    # straight through entries 4..10 -- eight requests on one range.
-    assert int(wrong[1] - wrong[0]) == block_size
-    assert int(wrong[0]) + vblock > int(wrong[1]), "must overlap to be the bug"
-
-
-def test_pages_past_the_table_are_dropped_not_clamped():
-    """Mirrors `dspark_proposer.py:838-848`.
-
-    A column the table does not have becomes -1. Clamping it into the last
-    column instead would hand the row ANOTHER request's KV, which reads as a
-    plausible answer rather than a fault.
-    """
-    import torch
-
-    vblock, width = 1024, 4
-    block_tables = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
-    pos = torch.tensor([0, 3 * vblock, 4 * vblock], dtype=torch.int64)
-    req = torch.zeros(3, dtype=torch.int64)
-
-    page = torch.div(pos, vblock, rounding_mode="floor")
-    in_table = page < width
-    page = page.clamp_(max=width - 1)
-    out = torch.where(
-        in_table,
-        block_tables[req, page] * vblock + torch.remainder(pos, vblock),
-        torch.tensor(-1, dtype=torch.int64),
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    rows = max(running_bs or 0, len(seqlens))
+    bt = CpuGpuBuffer(rows, len(tables[0]), dtype=torch.int32, device=dev)
+    bt.np[: len(tables)] = tables
+    cu = CpuGpuBuffer(rows + 1, dtype=torch.int32, device=dev)
+    # Flat over the padded tail, as `prepare_cu_seqlens_q` leaves it.
+    cu.np[1 : len(seqlens) + 1] = torch.tensor(seqlens).cumsum(0).numpy()
+    cu.np[len(seqlens) + 1 :] = cu.np[len(seqlens)]
+    cu.copy_to_gpu()
+    n_tok = 64
+    stub = types.SimpleNamespace(
+        runner=types.SimpleNamespace(
+            block_size=block_size,
+            forward_vars={"block_tables": bt, "cu_seqlens_q": cu},
+        ),
+        dcp_world_size=dcp,
+        _draft_uses_dflash_pool=True,
+        _blk_ctx_slots=torch.full((n_tok,), 7, dtype=torch.int64, device=dev),
+        _blk_tok_ramp=torch.arange(n_tok, dtype=torch.int32, device=dev),
     )
-    assert out.tolist() == [10 * vblock, 13 * vblock, -1]
+    stub._draft_entry_tokens = proposer.DSparkProposer._draft_entry_tokens.fget(stub)
+    fwd = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            running_bs=running_bs or len(seqlens), scheduled_bs=len(seqlens)
+        ),
+        attn_metadata=AttentionMetaData(),
+    )
+    pos = torch.tensor(positions, dtype=torch.int64, device=dev)
+    proposer.DSparkProposer._publish_draft_ctx_slots(stub, fwd, pos)
+    out = fwd.attn_metadata.draft_ctx_slot_mapping
+    return None if out is None else out.cpu()
+
+
+def _host_slots(tables, seqlens, positions, block_size):
+    """The host builder (`token_layout/slots.py`) for the same tokens."""
+    import numpy as np
+
+    from atom.model_ops.attentions.token_layout.slots import slot_mapping
+
+    return slot_mapping(
+        np.asarray(positions, dtype=np.int64),
+        np.asarray(seqlens),
+        np.ascontiguousarray(tables, dtype=np.int32),
+        block_size,
+    ).tolist()
+
+
+# A prefill chunk crossing an entry boundary, then two decode tokens.
+_TABLES = [[7, 9] + [0] * 14, [4] + [0] * 15]
+_SEQLENS = [3, 2]
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_draft_slots_store_every_token_at_entry_granularity(dcp):
+    """Every token gets a slot, addressed in `block_size * dcp`-token entries.
+
+    The host builder answers the same numbers when handed the entry size, and
+    at DCP>1 they differ from the target's `block_size` addressing -- which
+    would alias `dcp` requests' entries onto one range.
+    """
+    vblock = 128 * dcp
+    positions = [vblock - 2, vblock - 1, vblock, 5, 6]
+    got = _publish(128, dcp, _TABLES, _SEQLENS, positions).tolist()
+    assert got == [
+        7 * vblock + vblock - 2,
+        7 * vblock + vblock - 1,
+        9 * vblock,
+        4 * vblock + 5,
+        4 * vblock + 6,
+    ]
+    assert got == _host_slots(_TABLES, _SEQLENS, positions, vblock)
+    if dcp > 1:
+        assert got != _host_slots(_TABLES, _SEQLENS, positions, 128)
+
+
+def test_draft_slots_ignore_padded_rows():
+    """Padded graph rows past `scheduled_bs` resolve no token."""
+    got = _publish(128, 8, _TABLES, _SEQLENS, [0, 1, 2, 3, 4], running_bs=4)
+    assert got.tolist() == [
+        7 * 1024,
+        7 * 1024 + 1,
+        7 * 1024 + 2,
+        4 * 1024 + 3,
+        4 * 1024 + 4,
+    ]
+
+
+def test_draft_slots_past_the_table_are_dropped_not_clamped():
+    """A column the table does not have becomes -1.
+
+    Clamping it into the last column instead would hand the row ANOTHER
+    request's KV, which reads as a plausible answer rather than a fault.
+    """
+    got = _publish(128, 8, [[10, 11, 12, 13]], [3], [0, 3 * 1024, 4 * 1024])
+    assert got.tolist() == [10 * 1024, 13 * 1024, -1]
+
+
+def test_draft_slots_are_published_for_an_empty_forward():
+    """Zero tokens still publish (an empty map), so the layer never sees None."""
+    got = _publish(128, 8, _TABLES, [0, 0], [])
+    assert got is not None and got.numel() == 0
+
+
+def test_dflash_context_write_refuses_a_missing_draft_slot_map(monkeypatch):
+    """No silent fallback to the target's DCP-filtered `slot_mapping`."""
+    import torch
+
+    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    from atom.utils import forward_context as fc
+
+    meta = fc.AttentionMetaData(slot_mapping=torch.zeros(4, dtype=torch.int64))
+    monkeypatch.setattr(
+        fc, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=meta)
+    )
+    with pytest.raises(RuntimeError, match="draft slot mapping"):
+        m.KimiK3DFlashDecoderLayer.write_context_kv(
+            types.SimpleNamespace(), torch.zeros(4, 8), torch.arange(4)
+        )
 
 
 # --------------------------------------------------------------------------- #

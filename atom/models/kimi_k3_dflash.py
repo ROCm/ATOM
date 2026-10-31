@@ -469,18 +469,14 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         # The DRAFT's OWN slot mapping, published by
         # `DSparkProposer._publish_draft_ctx_slots` for exactly this call. NOT
         # `attn_metadata.slot_mapping`, which is the TARGET's: under DCP that
-        # one is `-1` for the 7 of every 8 tokens this rank does not own, and
-        # `block_table[p // vblock] * block_size + local_offset` for the one it
-        # does (`dcp_ops.py:1059-1072`). This draft is not in the dcp group, so
-        # it stores EVERY token, at `block_table[p // vblock] * vblock + p %
-        # vblock`. The two coincide at DCP1 and only there.
-        #
-        # Falling back to the target's is deliberate rather than an assert: the
-        # proposer publishes this only for the paged-GQA flavor, and at DCP1
-        # the two mappings are the same tensor's worth of numbers anyway.
-        slot_mapping = getattr(attn_metadata, "draft_ctx_slot_mapping", None)
+        # one is `-1` for the tokens this rank does not own and addresses
+        # `block_size`-token pages. This draft is outside the dcp group, so it
+        # stores EVERY token into `block_size * dcp`-token entries.
+        slot_mapping = attn_metadata.draft_ctx_slot_mapping
         if slot_mapping is None:
-            slot_mapping = attn_metadata.slot_mapping
+            raise RuntimeError(
+                "DFlash context write without a published draft slot mapping"
+            )
         rows = ctx_hidden.shape[0]
         if slot_mapping.shape[0] < rows:
             raise RuntimeError(

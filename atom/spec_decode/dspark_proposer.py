@@ -51,8 +51,8 @@ class DSparkProposer(Drafter):
     #: CLASS defaults because `_init_draft_block_buffers` is reached only on
     #: the standalone-draft path, while `compute_draft_kv` -- which reads these
     #: -- runs for EVERY flavor, V4's inline draft included. None is what
-    #: `_publish_draft_ctx_slots` returns on, and the layers then fall back to
-    #: the target's own mapping, which is right wherever a draft has no pool.
+    #: `_publish_draft_ctx_slots` returns on: a draft without a pool of its own
+    #: writes through the target's mapping and never reads this one.
     _blk_ctx_slots = None
     _blk_tok_ramp = None
     #: Whether the draft owns the DFlash pool (`uses_dflash_pool`): FLASH
@@ -725,16 +725,14 @@ class DSparkProposer(Drafter):
 
         with `vblock = _draft_entry_tokens`, and NO rank filter.
 
-        WHY THERE IS NO EXISTING BUILDER TO REUSE. The target's mapping is
-        `dcp_prefill_slot_mapping` (`dcp_ops.py:1037-1071`):
-        `block_table[pos // vblock] * block_size + local_offset`, and `-1` for
-        the 7 of every 8 positions this rank does not own. That is right for a
-        pool sharded by token and wrong twice over for this one -- the draft is
-        not in the dcp group, so it stores EVERY position, and its entry spans
-        `vblock` tokens rather than `block_size`. The non-DCP builder
-        (`token_layout/slots.py`) has the right shape but the wrong unit: it
-        multiplies by `block_size`, which addresses one eighth of each entry
-        and aliases eight requests' pages onto one.
+        The target's mapping (`dcp_prefill_slot_mapping`, `dcp_ops.py`) is
+        `-1` for the positions this rank does not own and addresses
+        `block_size`-token pages; this draft is outside the dcp group, so it
+        stores EVERY position into `vblock`-token entries.
+        `token_layout/slots.py` computes this same expression when handed
+        `vblock`, but on the host, from the scheduler's numpy arrays, while this
+        hook runs after the target forward with everything already on the
+        device.
 
         NO HOST SYNC, and no host-side array either. Every input is already on
         the device: `cu_seqlens_q` is uploaded for every step by
@@ -757,6 +755,8 @@ class DSparkProposer(Drafter):
             return
         ctx = forward_context.context
         n = int(positions.shape[0])
+        out = self._blk_ctx_slots[:n]
+        forward_context.attn_metadata.draft_ctx_slot_mapping = out
         if n == 0:
             return
         var = self.runner.forward_vars
@@ -783,7 +783,6 @@ class DSparkProposer(Drafter):
         # always has its own columns, so this only fires on a malformed table.
         in_table = page < block_tables.shape[1]
         page = page.clamp_(max=block_tables.shape[1] - 1)
-        out = self._blk_ctx_slots[:n]
         out.copy_(
             torch.where(
                 in_table,
@@ -792,7 +791,6 @@ class DSparkProposer(Drafter):
                 -1,
             )
         )
-        forward_context.attn_metadata.draft_ctx_slot_mapping = out
 
     def propose(
         self,
