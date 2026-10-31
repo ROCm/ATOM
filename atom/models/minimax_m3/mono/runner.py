@@ -54,6 +54,9 @@ from atom.models.minimax_m3.mono.config import (
     IndexHeads,
 )
 from atom.models.minimax_m3.mono.gfx1250.kernels.post_attn import (
+    TL_RECORD as TL_RECORD_G1250,
+)
+from atom.models.minimax_m3.mono.gfx1250.kernels.post_attn import (
     build_post_attn_kernel as build_post_attn_kernel_gfx1250,
 )
 from atom.models.minimax_m3.mono.kernels.dense_post import (
@@ -257,7 +260,13 @@ class MonoDecodeRunner:
             )
         tl_prefix = envs.ATOM_MONO_TIMELINE
         self.timeline = (
-            LayerTimeline(tl_prefix, len(self.sparse), TL_POINTS, self.rank, self.dev)
+            LayerTimeline(
+                tl_prefix,
+                len(self.sparse),
+                TL_RECORD_G1250 if self.gfx1250 else TL_POINTS,
+                self.rank,
+                self.dev,
+            )
             if tl_prefix
             else None
         )
@@ -311,8 +320,11 @@ class MonoDecodeRunner:
         )
         # every mailbox pair, zeroed at each step's start (forward)
         self.mailboxes = StepMailboxes(
-            self.peers, self.scratch1, self.scratch4,
-            debug=self.debug or self.gfx1250, gfx1250=self.gfx1250,
+            self.peers,
+            self.scratch1,
+            self.scratch4,
+            debug=self.debug or self.gfx1250,
+            gfx1250=self.gfx1250,
         )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
