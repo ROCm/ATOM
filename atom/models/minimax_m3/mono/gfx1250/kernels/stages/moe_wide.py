@@ -473,7 +473,7 @@ def moe_wide_defs(k4ctx):
             if tid == 0:
                 fx.ptr_store(
                     fx.Int64(uniform(fx.ptr_load(uexp + NU_AT)) + 1),
-                    k4ctx["tls"] + TL_EXPERTS,
+                    k4ctx["tls"] + TL_EXPERTS * WAVES,
                 )
         if (bid == BASE["down"]) & (tid < MOE_SLOTS * tokens):
             sk = tid // MOE_SLOTS
