@@ -1741,11 +1741,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 )
             if (
                 request.kv_transfer_params
-                or request.tools
                 or _has_multimodal_content(messages)
             ):
                 raise ValueError(
-                    "Chat logprobs currently supports text without tools or P/D transfer"
+                    "Chat logprobs currently supports text without P/D transfer"
                 )
             logprob_codec = token_bytes(tokenizer)
 
