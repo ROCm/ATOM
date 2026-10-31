@@ -268,7 +268,7 @@ def test_dflash_layers_share_one_bound_unit_scale_tensor():
     pool.allocate(2, "cpu")
     runner = _runner(draft_layers=2)
     runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
-    builder = DraftKvBuilder(runner, lambda **_: pool, non_causal=True)
+    builder = DraftKvBuilder(runner, lambda **_: pool, dflash_pool=True)
     builder._kv_pool = pool
 
     layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]

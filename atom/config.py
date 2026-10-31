@@ -2372,48 +2372,17 @@ class Config:
                     "decode and DCP is unverified. Use --enable-tbo (prefill "
                     "only), or drop DCP or speculative decode."
                 )
-                # A non-MLA draft owns a SIBLING KV pool with two axes, and DCP
-                # shards one of them. That is only safe where the draft stays
-                # OUT of the dcp group and runs at DCP1, so the head axis is
-                # never sharded at all -- which exactly one draft family in
-                # this tree does (the DFlash non-causal GQA block drafter,
-                # `uses_dflash_pool`; the target stays at DCP8 while the
-                # draft reads a pool whose entry is `block_size * dcp_size`
-                # tokens wide, `draft_kv_builder`). Its read returns no LSE,
-                # so it could not merge partial softmaxes even if asked. MLA is
-                # immune by construction: its cache is one latent row per token,
-                # replicated across TP, so DCP's token shard is the only shard.
-                #
-                # Every OTHER such draft (Eagle3-llama, a plain GQA speculator)
-                # double-shards and produces garbage with NO error and NO fault
-                # -- the only symptom is lost acceptance length. Refuse it.
-                #
-                # KEY ON OWNERSHIP OF A POOL, NOT ON THE FAMILY NAME. An earlier
-                # version tested `attn_family(draft_hf) is not Family.MLA` and
-                # refused every working MTP + DCP config in the tree: for
-                # `--method mtp` the draft hf config IS the target's, and
-                # `attn_family` returns the target's family -- KIMI_MLA, V4 or
-                # CSA2 -- never `Family.MLA`, which `selector.py` only reaches
-                # after every earlier family test has already failed. That
-                # rejected e.g. `recipes/Agentic-GLM-5.2.md`'s documented
-                # `--method mtp --decode-context-parallel-size 4`.
-                #
-                # `DRAFT_OWNS_KV_POOL` is the mechanism itself rather than a
-                # proxy for it: a draft that owns a SIBLING pool is the one
-                # sharded on the head axis. Latent-KV drafts share the target's
-                # cache, own no pool, and are immune. Same helper
-                # `kv_transfer/offload/mp/deployment.py:182` already uses.
-                from atom.spec_decode.draft_kv import uses_dflash_pool
-                from atom.utils.selector import attn_family, get_attn_backend
+                # A draft that owns its own GQA/MHA pool would be sharded on the
+                # head axis (TP) and the token axis (DCP) at once, which cannot
+                # be reassembled and shows only as lost acceptance. The DFlash
+                # draft avoids it by staying out of the DCP group; MLA drafts
+                # share the target's latent rows and own no pool. Keyed on pool
+                # ownership, not the attention family: `--method mtp` reuses the
+                # target's hf config, whose family is never `Family.MLA`.
+                from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
 
                 draft_hf = self.speculative_config.draft_model_hf_config
-                owns_sibling_pool = draft_hf is not None and bool(
-                    get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
-                )
-                if owns_sibling_pool and not uses_dflash_pool(draft_hf):
-                    # `raise`, not `assert`: `python -O` strips asserts, and a
-                    # stripped guard restores exactly the silent mis-shard this
-                    # exists to prevent.
+                if draft_kv_conflicts_with_dcp(draft_hf):
                     raise ValueError(
                         "Decode context parallel (--decode-context-parallel-size "
                         f"{self.decode_context_parallel_size}) with a non-MLA "

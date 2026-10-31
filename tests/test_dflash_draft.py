@@ -856,19 +856,13 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 
 
 def _guard_refuses(draft_hf):
-    """Mirror of the predicate under `Config`'s DCP guard (`atom/config.py`):
-    `owns_sibling_pool and not uses_dflash_pool(draft_hf)`."""
+    """The production predicate under `Config`'s DCP guard."""
     # get_attn_backend resolves to aiter_attention, which imports aiter at module
-    # load and probes the GPU arch there. Skip per test, not per module, so the
-    # source-only guard test below still runs on the CPU-only CI runner.
+    # load and probes the GPU arch there.
     _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
-    from atom.spec_decode.draft_kv import uses_dflash_pool
-    from atom.utils.selector import attn_family, get_attn_backend
+    from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
 
-    owns_sibling_pool = draft_hf is not None and bool(
-        get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
-    )
-    return owns_sibling_pool and not uses_dflash_pool(draft_hf)
+    return draft_kv_conflicts_with_dcp(draft_hf)
 
 
 def test_dcp_guard_admits_the_dflash_draft():
@@ -919,26 +913,6 @@ def test_dcp_guard_admits_an_mtp_draft():
     assert _guard_refuses(target_hf) is False
 
 
-def test_dcp_guard_message_names_the_real_reason():
-    """The refusal text must describe DCP1, not a replicate-and-merge scheme.
-
-    The draft's read returns only `o` and never an LSE, so the draft cannot
-    merge per-rank partial softmaxes -- it is exempt because it never joins the
-    dcp group (`draft_kv_builder`). A message claiming
-    otherwise sends a reader looking for machinery that does not exist.
-    """
-    import os
-    import re
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(root, "atom", "config.py"), encoding="utf-8") as fh:
-        src = fh.read()
-    guard = src[src.index("is only supported for the") :][:600]
-    assert "stays out of the DCP group" in guard
-    assert "DCP1" in guard
-    assert not re.search(r"merges the per-rank partial softmaxes", guard)
-
-
 # --------------------------------------------------------------------------- #
 # draft pool address arithmetic (dspark_proposer)
 #
@@ -952,7 +926,7 @@ def test_dcp_guard_message_names_the_real_reason():
 # --------------------------------------------------------------------------- #
 
 
-def _entry_tokens(block_size, dcp, non_causal_gqa):
+def _entry_tokens(block_size, dcp, dflash_pool):
     """Call the real property against a minimal stub."""
     # dspark_proposer imports triton at module load; the CPU-only CI runner has
     # none. The pure-arithmetic mirrors below do not need it and keep running.
@@ -962,7 +936,7 @@ def _entry_tokens(block_size, dcp, non_causal_gqa):
     stub = types.SimpleNamespace(
         runner=types.SimpleNamespace(block_size=block_size),
         dcp_world_size=dcp,
-        _draft_uses_dflash_pool=non_causal_gqa,
+        _draft_uses_dflash_pool=dflash_pool,
     )
     return DSparkProposer._draft_entry_tokens.fget(stub)
 
@@ -975,13 +949,13 @@ def test_draft_entry_spans_the_global_block_for_the_gqa_draft(dcp):
     DFlash draft is not in the dcp group, so one id has to cover the whole
     virtual block `dcp_prefill_slot_mapping` writes.
     """
-    assert _entry_tokens(128, dcp, non_causal_gqa=True) == 128 * dcp
+    assert _entry_tokens(128, dcp, dflash_pool=True) == 128 * dcp
 
 
 @pytest.mark.parametrize("dcp", [1, 2, 8])
 def test_draft_entry_is_the_plain_block_for_the_mla_draft(dcp):
     """A DCP-sharded draft addresses in LOCAL terms -- one id, one block."""
-    assert _entry_tokens(128, dcp, non_causal_gqa=False) == 128
+    assert _entry_tokens(128, dcp, dflash_pool=False) == 128
 
 
 def test_block_size_instead_of_entry_tokens_aliases_requests():

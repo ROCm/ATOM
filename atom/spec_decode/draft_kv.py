@@ -37,6 +37,21 @@ def uses_dflash_pool(draft_hf) -> bool:
     return arch in _DFLASH_POOL_ARCHS
 
 
+def draft_kv_conflicts_with_dcp(draft_hf) -> bool:
+    """Whether DCP > 1 would shard this draft's own KV pool on both axes.
+
+    A draft that owns a GQA/MHA pool is head-sharded by TP; DCP would shard its
+    tokens too. Only the DFlash pool (`uses_dflash_pool`) stays out of the DCP
+    group. Drafts with no pool of their own (MLA, MTP) are unaffected.
+    """
+    if draft_hf is None:
+        return False
+    from atom.utils.selector import attn_family, get_attn_backend
+
+    owns_pool = bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
+    return owns_pool and not uses_dflash_pool(draft_hf)
+
+
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 
@@ -57,10 +72,10 @@ def draft_kv_builder(model_runner, draft_hf):
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
 
-    non_causal = uses_dflash_pool(draft_hf)
+    dflash_pool = uses_dflash_pool(draft_hf)
     kv_cache_dtype = model_runner.config.kv_cache_dtype
 
-    if not non_causal:
+    if not dflash_pool:
         # Every other pool-owning draft (today: Eagle3-llama) keeps the geometry
         # and the fp8 scale planes it already had. Everything below this point
         # is specific to a non-causal block draft that sits OUTSIDE the target's
@@ -135,7 +150,7 @@ def draft_kv_builder(model_runner, draft_hf):
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`
     # still running, `runner.drafter` not yet set, nothing to walk.
-    return DraftKvBuilder(model_runner, make_pool, non_causal=non_causal)
+    return DraftKvBuilder(model_runner, make_pool, dflash_pool=True)
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -153,12 +168,13 @@ class DraftKvBuilder(PoolRowsMixin):
     re-paged at its own block size.
     """
 
-    def __init__(self, model_runner, make_pool, non_causal: bool = False):
+    def __init__(self, model_runner, make_pool, dflash_pool: bool = False):
         self.model_runner = model_runner
         self._make_pool = make_pool
-        # Decides the LAYOUT this pool is bound in, not its size. See
-        # `uses_dflash_pool` and `MhaKvPool.fa_views`.
-        self._non_causal = non_causal
+        # The DFlash pool binds FLASH views (`MhaKvPool.fa_views`) and one
+        # shared per-tensor scale; any other pool binds SHUFFLE views and its
+        # own scale planes. See `uses_dflash_pool`.
+        self._dflash_pool = dflash_pool
         # The DFlash pool's one per-tensor scale, shared by every layer: a
         # one-element fp32 tensor because both `reshape_and_cache_flash` and
         # `unified_attention` take it as a device pointer. Built at the first
@@ -292,11 +308,11 @@ class DraftKvBuilder(PoolRowsMixin):
         # way.
         k_cache, v_cache = (
             self.kv_pool.fa_views(idx)
-            if self._non_causal
+            if self._dflash_pool
             else self.kv_pool.kv_views(idx)
         )
         module.max_model_len = runner.config.max_model_len
-        if self._non_causal:
+        if self._dflash_pool:
             # One per-tensor scale of 1.0: the pool declares no scale planes
             # (`per_tensor_scales`), and the DFlash checkpoint ships no KV
             # scales (all tensors BF16, no `quantization_config`), so 1.0 is

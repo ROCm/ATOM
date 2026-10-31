@@ -55,6 +55,11 @@ class DSparkProposer(Drafter):
     #: the target's own mapping, which is right wherever a draft has no pool.
     _blk_ctx_slots = None
     _blk_tok_ramp = None
+    #: Whether the draft owns the DFlash pool (`uses_dflash_pool`): FLASH
+    #: layout, outside the DCP group, read straight off `block_tables`. A CLASS
+    #: default for proposers assembled by `__new__`; `__init__` resolves it once
+    #: from the draft config, the same function `draft_kv_builder` asks.
+    _draft_uses_dflash_pool: bool = False
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
@@ -69,12 +74,18 @@ class DSparkProposer(Drafter):
         self._verify_scheduler = (
             VerifyScheduler(runner) if self._confidence_schedule else None
         )
-        # The draft shares the target's block tables and its KV lives in the same
-        # paged pool, so it inherits the pool's DCP sharding: the block pass must
-        # address and size itself in LOCAL (per-rank) terms. 1 when -dcp is unset.
+        # The draft rides the target's block tables. An MLA draft shares the
+        # target's pool and so its DCP sharding, addressing in LOCAL (per-rank)
+        # terms; the DFlash draft owns a pool outside the DCP group
+        # (`_draft_is_dcp_sharded`). 1 when -dcp is unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
         if self._with_draft:
+            from atom.spec_decode.draft_kv import uses_dflash_pool
+
+            self._draft_uses_dflash_pool = uses_dflash_pool(
+                self.speculative_config.draft_model_hf_config
+            )
             self._init_draft_block_buffers()
 
     def _declare_draft_graphs(self):
@@ -468,26 +479,6 @@ class DSparkProposer(Drafter):
         # num_speculative_tokens may be unset when the config supplies the
         # width; default to the full block (a static verify length == block).
         return num_spec or self.dspark_block_size
-
-    @property
-    def _draft_uses_dflash_pool(self) -> bool:
-        """Whether the draft owns the DFlash pool (`uses_dflash_pool`).
-
-        The flavor is the draft CONFIG's, resolved the same way
-        `draft_kv_builder` resolves it, so the proposer and the pool cannot
-        disagree about the pool's geometry or about which read the block is
-        planned for. That read plans nothing: it takes the page table and the
-        context lengths and derives its own tiling, so the whole persistent MLA
-        work plan is skipped.
-        """
-        spec = getattr(self, "speculative_config", None)
-        if spec is None or not self._with_draft:
-            # Inline V4 DSpark, or a double that never set one up: neither owns
-            # a pool of its own, so neither takes the non-causal GQA path.
-            return False
-        from atom.spec_decode.draft_kv import uses_dflash_pool
-
-        return uses_dflash_pool(spec.draft_model_hf_config)
 
     @property
     def _draft_is_dcp_sharded(self) -> bool:
