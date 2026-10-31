@@ -116,6 +116,7 @@ def moe_wide_defs(k4ctx):
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
+    SKIP = k4ctx["SKIP"]
     NU_AT = U_MAX + 1  # uexp / umask word: the count of distinct routed experts
     CNT_AT = U_MAX + 2  # umask words: each routed-expert wave's count
 
@@ -159,7 +160,7 @@ def moe_wide_defs(k4ctx):
         rows 16 (t % 48) ..): [row group 2 cg + h][chunk]."""
         u = t // UG_PER_SLOT
         cg = t % UG_PER_SLOT
-        e_u = fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT)
+        e_u = fx.max(fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT), 0)
         r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES, has.select(fx.Int32(W13_BYTES), fx.Int32(0)))
         r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
         wts, scs = [], []
@@ -288,7 +289,7 @@ def moe_wide_defs(k4ctx):
             rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
         y_lo = fx.Float32(0.0)
-        for it in range_constexpr(UGW_ITERS):
+        for it in range_constexpr(0 if "wug" in SKIP else UGW_ITERS):
             t, has_t = task(it)
             if const_expr(it + 1 < UGW_ITERS):
                 tn, hn = task(it + 1)
@@ -297,14 +298,15 @@ def moe_wide_defs(k4ctx):
                 y = wug_y(cur[0], cur[1])
                 if const_expr(it % 2 == 0):
                     y_lo = y
-                else:
+                elif const_expr("wpub" not in SKIP):
                     wug_publish(t // 2, y_lo, y)
             if const_expr(it + 1 < UGW_ITERS):
                 cur = nxt
         stamp(8)
-        if has_dn:
-            wide_down(td)
-            stamp(11)
+        if const_expr("wdown" not in SKIP):  # noqa: SIM102
+            if has_dn:
+                wide_down(td)
+                stamp(11)
 
     def wide_down(td):
         """Row group td * 2 + wave // 8's down GEMV over every distinct expert
@@ -320,7 +322,7 @@ def moe_wide_defs(k4ctx):
             ok = (q < DN_KC) & (fx.Int32(i) <= nu)
             du = fx.Int32(min(i, U_MAX - 1))
             dkc = fx.min(q, DN_KC - 1)
-            de = fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT)
+            de = fx.max(fx.min(uniform(fx.ptr_load(uexp + du)), SHARED_EXPERT), 0)
             dwv = shuffled_rows(
                 rsrc(w2 + fx.Int64(de) * W2_BYTES, ok.select(fx.Int32(W2_BYTES), fx.Int32(0))),
                 rg_d,
