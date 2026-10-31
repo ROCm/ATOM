@@ -81,9 +81,10 @@ def _flydsl_arch_supported() -> bool:
 @functools.cache
 def _flydsl_attention_op():
     # Imported on first use so the flag-off path needs no FlyDSL QSA in aiter.
-    from aiter.ops.flydsl.kernels.qsa.attention import qsa_sparse_attention_flydsl
+    # aiter.ops.qsa is aiter's entry for consumers (ROCm/aiter#6576).
+    from aiter.ops.qsa import qsa_sparse_prefill
 
-    return qsa_sparse_attention_flydsl
+    return qsa_sparse_prefill
 
 
 def build_qwen4_exp_rope(config, head_size: int):
