@@ -150,14 +150,19 @@ def role_online_quant_config(role, role_cfg):
 def role_log_lines(role, role_cfg, key):
     """The role's expect_log or reject_log as a JSON list, or "" when it sets
     none. One line, because the docker env file that carries it holds one per
-    variable."""
-    lines = as_list(role_cfg.get(key))
+    variable. An empty list would check nothing, so it fails the cell rather
+    than read as unset."""
+    if role_cfg.get(key) is None:
+        return ""
+    lines = as_list(role_cfg[key])
+    if not lines:
+        fail(f"ERROR: {cell['id']} {role} {key} lists no line")
     if not all(isinstance(line, str) and line for line in lines):
         fail(
             f"ERROR: {cell['id']} {role} {key} has an entry that is not "
             "a non-empty string"
         )
-    return json.dumps(lines) if lines else ""
+    return json.dumps(lines)
 
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
 is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"

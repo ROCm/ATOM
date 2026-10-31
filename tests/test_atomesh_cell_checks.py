@@ -504,6 +504,20 @@ class SubmitLogLinesTest(unittest.TestCase):
                 )
                 self.assertEqual(json.loads(decode), ["Kimi-K3 mono decode off"])
 
+    def test_an_empty_list_fails_the_cell(self):
+        for key in ("expect_log", "reject_log"):
+            with self.subTest(key=key):
+                result = self.submit(key, [])
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"decode {key} lists no line", result.stdout)
+                self.assertEqual(result.stdout.splitlines()[-1], "exit 1")
+
+    def test_an_unset_role_exports_nothing(self):
+        for key in ("expect_log", "reject_log"):
+            with self.subTest(key=key):
+                _, decode = self.exported(self.submit(key, None), key)
+                self.assertEqual(decode, "")
+
     def test_an_entry_that_is_not_a_line_fails_the_cell(self):
         for key in ("expect_log", "reject_log"):
             for entry in ("", 8):
