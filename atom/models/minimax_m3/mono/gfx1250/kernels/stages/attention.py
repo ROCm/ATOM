@@ -40,6 +40,7 @@ from atom.mono.device.gfx1250 import (
     acc_row_sum,
     butterfly,
     publish,
+    rows_to_lds_async,
     shuffled_rows,
     wave_max,
     wmma_fp8_k64,
@@ -53,7 +54,6 @@ from atom.mono.device.ops import (
     fp8_pack4,
     hw_exp2,
     hw_rcp,
-    rows_to_lds,
     rsrc,
     traced,
     uniform,
@@ -127,7 +127,9 @@ def split_defs(k4ctx):
                         [
                             (
                                 hdone_mb,
-                                (lane < H).select(tok * K1_HEAD_TASKS + lane, kv_task(lane - H)),
+                                (lane < H).select(
+                                    tok * K1_HEAD_TASKS + lane, kv_task(lane - H)
+                                ),
                                 1,
                             ),
                             (hdone_mb, kv_task(lane + WAVE - H), 1),
@@ -150,7 +152,12 @@ def split_defs(k4ctx):
                             fx.Vector(
                                 bo.buffer_load(
                                     r_k,
-                                    (page * PAGE_BYTES + (4 * c + 2 * h + g4) * 256 + l16 * 16) // 4,
+                                    (
+                                        page * PAGE_BYTES
+                                        + (4 * c + 2 * h + g4) * 256
+                                        + l16 * 16
+                                    )
+                                    // 4,
                                     vec_width=4,
                                     dtype=T.i32,
                                     cache_modifier=CM_K1,
@@ -186,15 +193,29 @@ def split_defs(k4ctx):
                         m = nv - 4 * e
                         mask = (m >= 4).select(
                             fx.Int32(-1),
-                            (m <= 0).select(fx.Int32(0), (fx.Int32(1) << (fx.Int32(m) * 8)) - 1),
+                            (m <= 0).select(
+                                fx.Int32(0), (fx.Int32(1) << (fx.Int32(m) * 8)) - 1
+                            ),
                         )
                         parts.append(w4[e] & mask)
                 vw.append(fx.Vector.from_elements(parts, fx.Int32))
             ks = fx.Float32(
-                bo.buffer_load(r_ks, page * PAGE16 + l16, vec_width=1, dtype=T.f32, cache_modifier=CM_K1)
+                bo.buffer_load(
+                    r_ks,
+                    page * PAGE16 + l16,
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=CM_K1,
+                )
             )
             vs = fx.Float32(
-                bo.buffer_load(r_vs, page * PAGE16 + l16, vec_width=1, dtype=T.f32, cache_modifier=CM_K1)
+                bo.buffer_load(
+                    r_vs,
+                    page * PAGE16 + l16,
+                    vec_width=1,
+                    dtype=T.f32,
+                    cache_modifier=CM_K1,
+                )
             )
             fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
             gpu.barrier()
@@ -207,7 +228,10 @@ def split_defs(k4ctx):
                 qa = _cat(
                     [
                         fx.Vector(
-                            fx.ptr_load(q8 + (l16 * (HEAD_DIM // 4) + 16 * cc + 8 * h + 4 * g4), result_type=v4i)
+                            fx.ptr_load(
+                                q8 + (l16 * (HEAD_DIM // 4) + 16 * cc + 8 * h + 4 * g4),
+                                result_type=v4i,
+                            )
                         )
                         for h in range(2)
                     ]
@@ -243,7 +267,9 @@ def split_defs(k4ctx):
                 w8 = b8 | (xshfl(b8, 1) << 8)
                 w8 = w8 | (xshfl(w8, 2) << 16)
                 if l16 % 4 == 0:
-                    fx.ptr_store(w8, p8 + (head * (SPLIT_KEYS // 4) + (wave * PAGE16 + l16) // 4))
+                    fx.ptr_store(
+                        w8, p8 + (head * (SPLIT_KEYS // 4) + (wave * PAGE16 + l16) // 4)
+                    )
                 ls = butterfly(pj, (8, 4, 2, 1))
                 if l16 == 0:
                     fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
@@ -258,7 +284,11 @@ def split_defs(k4ctx):
                     [
                         fx.Vector(
                             fx.ptr_load(
-                                p8 + (l16 * (SPLIT_KEYS // 4) + (k0 + 32 * h + 16 * g4) // 4),
+                                p8
+                                + (
+                                    l16 * (SPLIT_KEYS // 4)
+                                    + (k0 + 32 * h + 16 * g4) // 4
+                                ),
                                 result_type=v4i,
                             )
                         )
@@ -284,7 +314,9 @@ def split_defs(k4ctx):
                 ov.append((pscale * acc) * inv_l)
             mb_put_bf(mr("sp_o"), ts * O_K + e0, ov)
             if tid < H:
-                mb_put(mr("sp_m"), ts * H + tid, fx.ptr_load(hst + (2 * WAVES * H + tid)))
+                mb_put(
+                    mr("sp_m"), ts * H + tid, fx.ptr_load(hst + (2 * WAVES * H + tid))
+                )
                 lt = fx.ptr_load(hst + (WAVES * H + tid))
                 for w in range_constexpr(1, WAVES):
                     lt = lt + fx.ptr_load(hst + (WAVES * H + w * H + tid))
@@ -316,7 +348,10 @@ def merge_defs(k4ctx):
         sp0 = k * N_SPLIT
         if wave == 0:
             mb_poll(
-                [(mr("sp_l"), sp0 * H + lane + WAVE * i, 1) for i in range(N_SPLIT * H // WAVE)]
+                [
+                    (mr("sp_l"), sp0 * H + lane + WAVE * i, 1)
+                    for i in range(N_SPLIT * H // WAVE)
+                ]
             )
         gpu.barrier()
         got = mb_poll(
@@ -351,7 +386,10 @@ def merge_defs(k4ctx):
             ]
         a0, a1, a2, a3 = (bf16_round(x) for x in av)
         amax = block_max(
-            fx.max(fx.max(fmath.absf(a0), fmath.absf(a1)), fx.max(fmath.absf(a2), fmath.absf(a3)))
+            fx.max(
+                fx.max(fmath.absf(a0), fmath.absf(a1)),
+                fx.max(fmath.absf(a2), fmath.absf(a3)),
+            )
         )
         x_scale, inv = per_token_fp8_scale(amax)
         return fp8_pack4(a0 * inv, a1 * inv, a2 * inv, a3 * inv), x_scale
@@ -361,7 +399,9 @@ def merge_defs(k4ctx):
             for k in range(start("merge"), tokens, G):
                 k = fx.Int32(k)
                 word, x_scale = merge_token(k)
-                bo.buffer_store(word, rsrc(mb("attnq")), k * (O_K // 4) + tid, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    word, rsrc(mb("attnq")), k * (O_K // 4) + tid, cache_modifier=CM_DEV
+                )
                 publish(mb_put, mr("attnq_s"), k, x_scale, tid == 0)
 
     return {"merge_token": merge_token, "stage_merge": stage_merge}
@@ -414,9 +454,14 @@ def o_defs(k4ctx):
             t = fx.Int32(t)
             rg = t * (O_ROWS // 16) + wave // GW
             kq = wave % GW
-            wts = [shuffled_rows(r_wo, rg, O_K, kq * O_CPW + cc, lane, 128, CM_NT) for cc in range(O_CPW)]
+            wts = [
+                shuffled_rows(r_wo, rg, O_K, kq * O_CPW + cc, lane, 128, CM_NT)
+                for cc in range(O_CPW)
+            ]
             ws = fx.Float32(
-                bo.buffer_load(rsrc(s_o), t * O_ROWS + tid % O_ROWS, vec_width=1, dtype=T.f32)
+                bo.buffer_load(
+                    rsrc(s_o), t * O_ROWS + tid % O_ROWS, vec_width=1, dtype=T.f32
+                )
             )
             if const_expr(tokens == 1):
                 word, x_scale = merge_token(0)
@@ -427,7 +472,7 @@ def o_defs(k4ctx):
                 stamp(3)
                 x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
-                rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
+                rows_to_lds_async(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
             gpu.barrier()
             col_tok = fx.min(l16, tokens - 1)
             row_w = 1 if tokens == 1 else O_ROW
@@ -437,7 +482,10 @@ def o_defs(k4ctx):
                 xb = _cat(
                     [
                         fx.Vector(
-                            fx.ptr_load(xs + (col_tok * row_w + 32 * kc + 8 * j + 4 * g4), result_type=v4i)
+                            fx.ptr_load(
+                                xs + (col_tok * row_w + 32 * kc + 8 * j + 4 * g4),
+                                result_type=v4i,
+                            )
                         )
                         for j in range(4)
                     ]
@@ -462,11 +510,17 @@ def o_defs(k4ctx):
                     t0, t1 = sum_partials(
                         mb_poll,
                         own,
-                        lambda src, k=ptk, r=row: (((src * MAX_TOKENS + k) * HIDDEN + r) // 2),
+                        lambda src, k=ptk, r=row: (
+                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                        ),
                         W,
                     )
                     for w in range_constexpr(W):
-                        mb_put_bf(preg(peer_addr(w), SY["a_ag"], "a_ag"), ptk * HIDDEN + row, [t0, t1])
+                        mb_put_bf(
+                            preg(peer_addr(w), SY["a_ag"], "a_ag"),
+                            ptk * HIDDEN + row,
+                            [t0, t1],
+                        )
             if const_expr(not AG_RS):  # noqa: SIM102
                 if tid < O_ROWS // 2 * tokens:
                     ptk = tid // (O_ROWS // 2)
@@ -475,13 +529,21 @@ def o_defs(k4ctx):
                         k1_poll([(rdone_mb, ptk, 1)])
                         acquire()
                     hr = fx.Int32(
-                        bo.buffer_load(rsrc(h_in), (ptk * HIDDEN + row) // 2, vec_width=1, dtype=T.i32, cache_modifier=CM_K1)
+                        bo.buffer_load(
+                            rsrc(h_in),
+                            (ptk * HIDDEN + row) // 2,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=CM_K1,
+                        )
                     )
                     own = preg(sym, SY["attn"], "attn")
                     t0, t1 = sum_partials(
                         mb_poll,
                         own,
-                        lambda src, k=ptk, r=row: (((src * MAX_TOKENS + k) * HIDDEN + r) // 2),
+                        lambda src, k=ptk, r=row: (
+                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                        ),
                         W,
                     )
                     r0, r1 = bf2_f32(hr)

@@ -14,21 +14,21 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     TP,
 )
-from atom.models.minimax_m3.mono.kernels.stages.shared import (
-    CAND_BATCH,
-    CAND_CAP,
-)
 from atom.models.minimax_m3.mono.gfx1250.layout import (
     N_SPLIT,
     PAGES_PER_BLOCK,
     SPARSE_TABLE_WORDS,
 )
+from atom.models.minimax_m3.mono.kernels.stages.shared import (
+    CAND_BATCH,
+    CAND_CAP,
+)
+from atom.mono.device.gfx1250 import THREADS, WAVES, group_floor
 from atom.mono.device.ops import (
     rsrc,
     traced,
     unlikely,
 )
-from atom.mono.device.gfx1250 import group_floor
 from atom.mono.device.select import (
     BATCH,
     KEY_LEAST,
@@ -38,7 +38,6 @@ from atom.mono.device.select import (
 )
 from atom.mono.device.sync import preg, shift
 from atom.mono.plan.arith import pick
-from atom.mono.device.gfx1250 import THREADS, WAVES
 
 
 @traced

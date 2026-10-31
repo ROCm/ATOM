@@ -107,7 +107,9 @@ def router_defs(k4ctx):
                 w = fx.ptr_load(sig + (k * N_ROUTED + pid))
                 tot = butterfly(w, (1, 2))
                 fx.ptr_store(pid, route + (8 * k + lane))
-                fx.ptr_store(w * (route_scale / fx.max(tot, 1e-20)), rwt + (8 * k + lane))
+                fx.ptr_store(
+                    w * (route_scale / fx.max(tot, 1e-20)), rwt + (8 * k + lane)
+                )
                 if const_expr(wave_mask is not None):
                     was = fx.Int32(fx.ptr_load(wave_mask + pid))
                     fx.ptr_store(was | mask_bit, wave_mask + pid)
@@ -117,7 +119,9 @@ def router_defs(k4ctx):
 
     def poll_scores(k, copy):
         """This lane's experts' (routing key, sigmoid) of token k (copy ``copy``)."""
-        got = mb_poll([(scores_copy(copy, k), (lane + WAVE * i) * 2, 2) for i in range(EPL)])
+        got = mb_poll(
+            [(scores_copy(copy, k), (lane + WAVE * i) * 2, 2) for i in range(EPL)]
+        )
         return [g[0] for g in got], [g[1].bitcast(fx.Float32) for g in got]
 
     def mx8_scale(vals, offsets):
@@ -134,8 +138,13 @@ def router_defs(k4ctx):
     def lds_b8(chunk_word):
         """This lane's WMMA B operand of the 128-k FP8 chunk at LDS word
         ``chunk_word``: k 32 j + 16 g .. + 16, j < 4 (g = lane // 16)."""
-        h = [fx.Vector(fx.ptr_load(xs + (chunk_word + 8 * j + 4 * g4), result_type=v4i)) for j in range(4)]
-        return fx.Vector.from_elements([h[j][e] for j in range(4) for e in range(4)], fx.Int32)
+        h = [
+            fx.Vector(fx.ptr_load(xs + (chunk_word + 8 * j + 4 * g4), result_type=v4i))
+            for j in range(4)
+        ]
+        return fx.Vector.from_elements(
+            [h[j][e] for j in range(4) for e in range(4)], fx.Int32
+        )
 
     def lds_i32(word):
         return fx.ptr_load(xs + word).bitcast(fx.Int32)
@@ -144,7 +153,9 @@ def router_defs(k4ctx):
         """The WMMA scale dword of the four E8M0 codes at LDS words ``word`` ..
         ``word`` + 3 (one code a word, as the stages stage them), byte j code j."""
         v = fx.Vector(fx.ptr_load(xs + word, result_type=v4i))
-        return (v[0] & 0xFF) | ((v[1] & 0xFF) << 8) | ((v[2] & 0xFF) << 16) | (v[3] << 24)
+        return (
+            (v[0] & 0xFF) | ((v[1] & 0xFF) << 8) | ((v[2] & 0xFF) << 16) | (v[3] << 24)
+        )
 
     # ============================================================ 4. router
     def stage_router():
@@ -158,11 +169,16 @@ def router_defs(k4ctx):
             t = tt % N_ROUTER
             e_r = t * (WAVES // 2) + wave // 2
             kh = wave % 2
-            bias_r = fx.Float32(bo.buffer_load(rsrc(bias), e_r, vec_width=1, dtype=T.f32))
+            bias_r = fx.Float32(
+                bo.buffer_load(rsrc(bias), e_r, vec_width=1, dtype=T.f32)
+            )
             gw = [
                 fx.Vector(
                     bo.buffer_load(
-                        r_gate, (e_r * HIDDEN + kh * GATE_HALF + (i * WAVE + lane) * 8) // 2, vec_width=4, dtype=T.i32
+                        r_gate,
+                        (e_r * HIDDEN + kh * GATE_HALF + (i * WAVE + lane) * 8) // 2,
+                        vec_width=4,
+                        dtype=T.i32,
                     )
                 )
                 for i in range(GATE_ROUNDS)
@@ -175,7 +191,12 @@ def router_defs(k4ctx):
                 acquire()
             hres = ld_bf16x12(rsrc(h_in), k * (HIDDEN // 2) + rw0, CM_K1)
             a_src = preg(sym, SY["a_ag"], "a_ag") if AG_RS else mr("a")
-            arow = mb_poll([(a_src, (k * HIDDEN + tid * RE) // 2 + 2 * h, 2) for h in range(RE // 4)])
+            arow = mb_poll(
+                [
+                    (a_src, (k * HIDDEN + tid * RE) // 2 + 2 * h, 2)
+                    for h in range(RE // 4)
+                ]
+            )
             stamp(22)
             v = [
                 f + fx.Float32(hres[4 * h + 2 * qq + i])
@@ -186,9 +207,21 @@ def router_defs(k4ctx):
             if const_expr(AG_RS):  # noqa: SIM102
                 if tid // (XN_SLICE // RE) == t:
                     hw = (k * HIDDEN + tid * RE) // 2
-                    hi = fx.Vector.from_elements(v, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-                    bo.buffer_store(fx.Vector.from_elements([hi[e] for e in range(4)], fx.Int32), rsrc(h_mid), hw)
-                    bo.buffer_store(fx.Vector.from_elements([hi[4], hi[5]], fx.Int32), rsrc(h_mid), hw + 4)
+                    hi = (
+                        fx.Vector.from_elements(v, fx.Float32)
+                        .to(fx.BFloat16)
+                        .bitcast(fx.Int32)
+                    )
+                    bo.buffer_store(
+                        fx.Vector.from_elements([hi[e] for e in range(4)], fx.Int32),
+                        rsrc(h_mid),
+                        hw,
+                    )
+                    bo.buffer_store(
+                        fx.Vector.from_elements([hi[4], hi[5]], fx.Int32),
+                        rsrc(h_mid),
+                        hw + 4,
+                    )
             ssw = fx.Float32(0.0)
             for e in range_constexpr(RE):
                 ssw = fmath.fma(v[e], v[e], ssw)
@@ -213,7 +246,11 @@ def router_defs(k4ctx):
             stamp(25)
             if tid < XN_SLICE // 4:  # 4 elements a lane, 8 lanes a 32-block
                 w0 = t * (XN_SLICE // 2) + tid * 2
-                f = [vv for j in range(2) for vv in bf2_f32(fx.ptr_load(xs + (w0 + j)).bitcast(fx.Int32))]
+                f = [
+                    vv
+                    for j in range(2)
+                    for vv in bf2_f32(fx.ptr_load(xs + (w0 + j)).bitcast(fx.Int32))
+                ]
                 e, inv = mx8_scale(f, (1, 2, 4))
                 word = fp8_pack4(*[mx8_q(vv, inv) for vv in f])
                 xw = k * XN8_WORDS + t * (XN_SLICE // 4) + tid
@@ -230,7 +267,12 @@ def router_defs(k4ctx):
             # gfx1250 has no v_dot2_f32_bf16: the pairs' halves as two FMA chains
             accs = [fx.Float32(0.0) for _ in range(4)]
             for i in range_constexpr(GATE_ROUNDS):
-                xv = fx.Vector(fx.ptr_load(xs + (kh * GATE_HALF // 2 + (i * WAVE + lane) * 4), result_type=v4i))
+                xv = fx.Vector(
+                    fx.ptr_load(
+                        xs + (kh * GATE_HALF // 2 + (i * WAVE + lane) * 4),
+                        result_type=v4i,
+                    )
+                )
                 for j in range_constexpr(4):
                     g_lo, g_hi = bf2_f32(gw[i][j])
                     x_lo, x_hi = bf2_f32(xv[j])
@@ -241,11 +283,15 @@ def router_defs(k4ctx):
             gpu.barrier()
             stamp(23)
             if kh == 0:
-                logit = fx.ptr_load(red + (WAVES + wave)) + fx.ptr_load(red + (WAVES + wave + 1))
+                logit = fx.ptr_load(red + (WAVES + wave)) + fx.ptr_load(
+                    red + (WAVES + wave + 1)
+                )
                 sc = hw_rcp(1.0 + hw_exp2(-bf16_round(logit) * LOG2E))
                 rk = route_key(sc + bias_r, e_r)
                 if lane < SCORE_COPIES:
-                    mb_put_words(scores_copy(lane, k), e_r * 2, [rk, sc.bitcast(fx.Int32)])
+                    mb_put_words(
+                        scores_copy(lane, k), e_r * 2, [rk, sc.bitcast(fx.Int32)]
+                    )
             if const_expr(WIDE):
                 publish(mb_put, mr("xndone"), tt, fx.Int32(1), tid == 0)
 

@@ -17,10 +17,10 @@ The f32 accumulator: lane l holds column l % 16, rows 8 (l // 16) + i, i < 8.
 
 from __future__ import annotations
 
-from flydsl._mlir import ir
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
+from flydsl._mlir import ir
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -192,6 +192,24 @@ def wait_async(n):
     rocdl.s_wait_asynccnt(n)
 
 
+def rows_to_lds_async(tid, src, rows, row_words, dst, dst_row):
+    """``ops.rows_to_lds`` as device-scope async copies, every one out at once and
+    waited for here (one latency, not a batched loop's several); the caller's
+    barrier shares them. A lane past the rows copies the last 16 B again."""
+    assert row_words % 4 == 0, row_words
+    p16 = row_words // 4
+    n = rows * p16
+    db = lds_addr(dst)
+    for i in range_constexpr((n + THREADS - 1) // THREADS):
+        v = fx.min(tid + THREADS * i, n - 1)
+        async_to_lds(
+            fx.Int64(src) + fx.Int64(v * 16),
+            db + (v // p16 * dst_row + v % p16 * 4) * 4,
+            cm=CM_DEV,
+        )
+    wait_async(0)
+
+
 def lds_reads_done():
     """Until this wave's LDS reads are done: an async copy into LDS a read of the
     wave may still be reading (its write lands whenever the copy returns)."""
@@ -221,7 +239,10 @@ def wmma_fp8_k64(a, b, c):
     """16x16x64 E4M3 x E4M3 -> f32: ``a`` / ``b`` 8 i32 (32 fp8) a lane, ``c`` 8 f32."""
     return fx.Vector(
         rocdl.wmma_f32_16x16x64_fp8_fp8(
-            fx.Vector.make_type(8, fx.Float32), as_ir_value(a), as_ir_value(b), as_ir_value(c)
+            fx.Vector.make_type(8, fx.Float32),
+            as_ir_value(a),
+            as_ir_value(b),
+            as_ir_value(c),
         ).result
     )
 
@@ -237,7 +258,10 @@ def wmma_bf16_k32(a, b, c):
     """16x16x32 bf16 -> f32: ``a`` / ``b`` 16 bf16 a lane."""
     return fx.Vector(
         rocdl.wmma_f32_16x16x32_bf16(
-            fx.Vector.make_type(8, fx.Float32), as_ir_value(a), as_ir_value(b), as_ir_value(c)
+            fx.Vector.make_type(8, fx.Float32),
+            as_ir_value(a),
+            as_ir_value(b),
+            as_ir_value(c),
         ).result
     )
 
@@ -278,7 +302,10 @@ def n32k4_word(r_s, row, step, k):
     ``shuffle_scale_n32k4`` scale (rows of every expert in order, ``k`` columns)."""
     return fx.Int32(
         bo.buffer_load(
-            r_s, ((row // 32) * k + step * 128 + (row % 32) * 4) // 4, vec_width=1, dtype=T.i32
+            r_s,
+            ((row // 32) * k + step * 128 + (row % 32) * 4) // 4,
+            vec_width=1,
+            dtype=T.i32,
         )
     )
 
@@ -304,7 +331,9 @@ def fp8x8_bf16(words, scale=0x7F):
     return fx.Vector(
         rocdl.cvt_scale_pk8_bf16_fp8(
             fx.Vector.make_type(8, fx.BFloat16),
-            as_ir_value(fx.Vector.from_elements([fx.Int32(w) for w in words], fx.Int32)),
+            as_ir_value(
+                fx.Vector.from_elements([fx.Int32(w) for w in words], fx.Int32)
+            ),
             as_ir_value(fx.Int32(scale)),
             0,
         )

@@ -16,7 +16,14 @@ from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.models.minimax_m3.mono.config import HIDDEN, INTER, MOE_SLOTS, N_ROUTED, SHARED_EXPERT, TOP_K
+from atom.models.minimax_m3.mono.config import (
+    HIDDEN,
+    INTER,
+    MOE_SLOTS,
+    N_ROUTED,
+    SHARED_EXPERT,
+    TOP_K,
+)
 from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_common import DN_GW
 from atom.models.minimax_m3.mono.gfx1250.layout import (
     ACC_WORDS,
@@ -32,7 +39,6 @@ from atom.models.minimax_m3.mono.gfx1250.layout import (
     XSC_ROW,
 )
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
-    S2_BYTES,
     S13_BYTES,
     W2_BYTES,
     W13_BYTES,
@@ -53,12 +59,21 @@ from atom.mono.device.gfx1250 import (
     n32k4_word,
     publish,
     release_stores,
+    rows_to_lds_async,
     shuffled_rows,
     wait_async,
     wmma_a8w4,
     xshfl,
 )
-from atom.mono.device.ops import batched_rounds, bf16_round, ld_dev, row_live, rows_to_lds, rsrc, traced, uniform
+from atom.mono.device.ops import (
+    batched_rounds,
+    bf16_round,
+    ld_dev,
+    row_live,
+    rsrc,
+    traced,
+    uniform,
+)
 from atom.mono.plan.trace import enter_stage
 
 ROUTED_WAVES = N_ROUTED // WAVE  # waves holding one routed expert a lane
@@ -173,7 +188,10 @@ def moe_wide_defs(k4ctx):
         u = t // UG_PER_SLOT
         cg = t % UG_PER_SLOT
         e_u = fx.max(fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT), 0)
-        r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES, has.select(fx.Int32(W13_BYTES), fx.Int32(0)))
+        r_w = rsrc(
+            w13 + fx.Int64(e_u) * W13_BYTES,
+            has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
+        )
         r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
         wts, scs = [], []
         for h in range_constexpr(2):
@@ -183,7 +201,9 @@ def moe_wide_defs(k4ctx):
             for i in range_constexpr(UG_CPW):
                 kc = wave * UG_CPW + i
                 wts[h].append(shuffled_rows(r_w, rg, HIDDEN // 2, kc, lane, 64, CM_NT))
-                scs[h].append(n32k4_word(r_s, e_u * W13_ROWS + 16 * rg + l16, kc, HIDDEN))
+                scs[h].append(
+                    n32k4_word(r_s, e_u * W13_ROWS + 16 * rg + l16, kc, HIDDEN)
+                )
         return wts, scs
 
     def wug_y(wts, scs):
@@ -191,7 +211,10 @@ def moe_wide_defs(k4ctx):
         token k)'s value."""
         col = fx.min(l16, tokens - 1)
         acc = [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(2)]
-        sbs = [lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4) for i in range(UG_CPW)]
+        sbs = [
+            lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4)
+            for i in range(UG_CPW)
+        ]
         for i in range_constexpr(UG_CPW):
             kc = wave * UG_CPW + i
             xb = lds_b8(col * XN8_ROW + kc * 32)
@@ -204,8 +227,12 @@ def moe_wide_defs(k4ctx):
         k = fx.min(tid // UG_ROWS, tokens - 1)
         p = r % 8
         first = r < 8
-        g = first.select(acc_row_sum(red, 2 * p, k), acc_row_sum(fpool + W_UPP, 2 * p, k))
-        u = first.select(acc_row_sum(red, 2 * p + 1, k), acc_row_sum(fpool + W_UPP, 2 * p + 1, k))
+        g = first.select(
+            acc_row_sum(red, 2 * p, k), acc_row_sum(fpool + W_UPP, 2 * p, k)
+        )
+        u = first.select(
+            acc_row_sum(red, 2 * p + 1, k), acc_row_sum(fpool + W_UPP, 2 * p + 1, k)
+        )
         gpu.barrier()
         return swiglu_mul_batch([g], [u], fx.Float32(-swiglu_limit))[0]
 
@@ -229,10 +256,18 @@ def moe_wide_defs(k4ctx):
             if r % 4 == 0:
                 for h in range_constexpr(2):
                     bo.buffer_store(
-                        words[h], rsrc(mb("mid8p")), row * MID_ROW_WORDS + blk_ * 8 + h * 4 + r // 4, cache_modifier=CM_DEV
+                        words[h],
+                        rsrc(mb("mid8p")),
+                        row * MID_ROW_WORDS + blk_ * 8 + h * 4 + r // 4,
+                        cache_modifier=CM_DEV,
                     )
             if r == 0:
-                bo.buffer_store(sc, rsrc(mb("midsp")), row * MIDSC_ROW_WORDS + blk_, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    sc,
+                    rsrc(mb("midsp")),
+                    row * MIDSC_ROW_WORDS + blk_,
+                    cache_modifier=CM_DEV,
+                )
         publish(mb_put, mr("ugdone"), pr, fx.Int32(1), tid == 0)
 
     def down_tables():
@@ -250,8 +285,13 @@ def moe_wide_defs(k4ctx):
                 xt = fx.min(xk, tokens - 1)
                 xs_ = slot_of(xt, xe)
                 xh = (((xm >> xk) & 1) != 0) & (xu <= nu)
-                fx.ptr_store(xh.select(xt * MOE_SLOTS + xs_, fx.Int32(MID_ROWS)), urow + ix)
-                fx.ptr_store(xh.select(fx.ptr_load(rwt + (8 * xt + xs_)), fx.Float32(0.0)), uwt + ix)
+                fx.ptr_store(
+                    xh.select(xt * MOE_SLOTS + xs_, fx.Int32(MID_ROWS)), urow + ix
+                )
+                fx.ptr_store(
+                    xh.select(fx.ptr_load(rwt + (8 * xt + xs_)), fx.Float32(0.0)),
+                    uwt + ix,
+                )
 
     def wide_ug(n_pairs):
         """The up / gate tasks as streams: round r is block pr = bid + G r (32
@@ -289,12 +329,14 @@ def moe_wide_defs(k4ctx):
             slot = ring + ((wave * UG_RING + f % UG_RING) * SLOT_WORDS) * 4
             for piece in range_constexpr(2):
                 async_to_lds(
-                    wb + fx.Int64((g * (HIDDEN // 64) + 2 * kc + piece) * 512 + lane * 16),
+                    wb
+                    + fx.Int64((g * (HIDDEN // 64) + 2 * kc + piece) * 512 + lane * 16),
                     slot + lane * 32 + 16 * piece,
                     cm=CM_NT,
                 )
             async_to_lds(
-                fx.Int64(s13) + fx.Int64((rr // 32) * HIDDEN + kc * 128 + (rr % 32) * 4),
+                fx.Int64(s13)
+                + fx.Int64((rr // 32) * HIDDEN + kc * 128 + (rr % 32) * 4),
                 slot + WAVE * 32 + lane * 4,
                 b128=False,
                 cm=CM_NT,
@@ -334,10 +376,18 @@ def moe_wide_defs(k4ctx):
         if has & live_k & (((m_u >> kk) & 1) != 0):
             if m % 4 == 0:
                 bo.buffer_store(
-                    word, rsrc(mb("mid8p")), row * MID_ROW_WORDS + blk_ * 8 + m // 4, cache_modifier=CM_DEV
+                    word,
+                    rsrc(mb("mid8p")),
+                    row * MID_ROW_WORDS + blk_ * 8 + m // 4,
+                    cache_modifier=CM_DEV,
                 )
             if m == 0:
-                bo.buffer_store(sc, rsrc(mb("midsp")), row * MIDSC_ROW_WORDS + blk_, cache_modifier=CM_DEV)
+                bo.buffer_store(
+                    sc,
+                    rsrc(mb("midsp")),
+                    row * MIDSC_ROW_WORDS + blk_,
+                    cache_modifier=CM_DEV,
+                )
 
     def wide_ug_run(state):
         """The rounds in order, a past-the-end one (and those after it) skipped:
@@ -364,7 +414,11 @@ def moe_wide_defs(k4ctx):
                 sa = fx.Int32(fx.ptr_load(ugring + (sw + WAVE * 8 + lane)))
                 kc = (wave % KQ) * QCH + c
                 acc = wmma_a8w4(
-                    wv, lds_b8(col * XN8_ROW + kc * 32), acc, sa, lds_scale4(XSC_LDS + col * XSC_ROW + kc * 4)
+                    wv,
+                    lds_b8(col * XN8_ROW + kc * 32),
+                    acc,
+                    sa,
+                    lds_scale4(XSC_LDS + col * XSC_ROW + kc * 4),
                 )
                 if const_expr(f + UG_RING < F):
                     lds_reads_done()  # chunk f's slot, refilled next
@@ -406,20 +460,32 @@ def moe_wide_defs(k4ctx):
                     scored[j][1],
                     fpool + W_SIG,
                     wave_mask,
-                    row_live(batch_ids, wave_toks[j]).select(fx.Int32(1) << wave_toks[j], fx.Int32(0)),
+                    row_live(batch_ids, wave_toks[j]).select(
+                        fx.Int32(1) << wave_toks[j], fx.Int32(0)
+                    ),
                 )
         stamp(2)
         gpu.barrier()
         build_experts()
         stamp(6)
-        if const_expr(k4ctx["timeline"]):  # point TL_EXPERTS: a count, not a time
+        # timeline point TL_EXPERTS: a count, not a time
+        if const_expr(k4ctx["timeline"]):  # noqa: SIM102
             if tid == 0:
-                fx.ptr_store(fx.Int64(uniform(fx.ptr_load(uexp + NU_AT)) + 1), k4ctx["tls"] + TL_EXPERTS)
+                fx.ptr_store(
+                    fx.Int64(uniform(fx.ptr_load(uexp + NU_AT)) + 1),
+                    k4ctx["tls"] + TL_EXPERTS,
+                )
         if (bid == BASE["down"]) & (tid < MOE_SLOTS * tokens):
             sk = tid // MOE_SLOTS
             sj = tid % MOE_SLOTS
-            mb_put(mr("sel"), sk * 2 * MOE_SLOTS + sj, fx.ptr_load(route + (8 * sk + sj)))
-            mb_put(mr("sel"), sk * 2 * MOE_SLOTS + MOE_SLOTS + sj, fx.ptr_load(rwt + (8 * sk + sj)))
+            mb_put(
+                mr("sel"), sk * 2 * MOE_SLOTS + sj, fx.ptr_load(route + (8 * sk + sj))
+            )
+            mb_put(
+                mr("sel"),
+                sk * 2 * MOE_SLOTS + MOE_SLOTS + sj,
+                fx.ptr_load(rwt + (8 * sk + sj)),
+            )
         n_pairs = (uniform(fx.ptr_load(uexp + NU_AT)) + 1) * UG_PAIRS
 
         def task(it):
@@ -435,14 +501,19 @@ def moe_wide_defs(k4ctx):
         stamp(7)
         n_rt = N_ROUTER * tokens
         if wave == 0:
-            mb_poll([(mr("xndone"), fx.min(lane + WAVE * c, n_rt - 1), 1) for c in range((n_rt + WAVE - 1) // WAVE)])
+            mb_poll(
+                [
+                    (mr("xndone"), fx.min(lane + WAVE * c, n_rt - 1), 1)
+                    for c in range((n_rt + WAVE - 1) // WAVE)
+                ]
+            )
         gpu.barrier()
         acquire()
         for base_w, n_row, lds_w, lds_row in (
             (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
             (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
         ):
-            rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
+            rows_to_lds_async(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
         if const_expr("ugold" in SKIP):
             y_lo = fx.Float32(0.0)
@@ -495,7 +566,9 @@ def moe_wide_defs(k4ctx):
         eids = []
         for c in range_constexpr((NT + UG_RING + WAVE - 1) // WAVE):
             _, i_l, _ = unit(lane + WAVE * c)
-            eids.append(fx.max(fx.min(fx.Int32(fx.ptr_load(uexp + i_l)), SHARED_EXPERT), 0))
+            eids.append(
+                fx.max(fx.min(fx.Int32(fx.ptr_load(uexp + i_l)), SHARED_EXPERT), 0)
+            )
 
         def issue(t):
             _, _, kc = unit(t)
@@ -510,7 +583,10 @@ def moe_wide_defs(k4ctx):
             slot = ring + ((wave * UG_RING + t % UG_RING) * SLOT_WORDS) * 4
             for piece in range_constexpr(2):
                 async_to_lds(
-                    wb + fx.Int64((rg_d * (INTER // 64) + 2 * kc + piece) * 512 + lane * 16),
+                    wb
+                    + fx.Int64(
+                        (rg_d * (INTER // 64) + 2 * kc + piece) * 512 + lane * 16
+                    ),
                     slot + lane * 32 + 16 * piece,
                     cm=CM_NT,
                 )
@@ -550,7 +626,9 @@ def moe_wide_defs(k4ctx):
             v = tid + THREADS * i
             if v < MID_ROWS * P16:
                 async_to_lds(
-                    fx.Int64(mb("mid8p")) + fx.Int64(v * 16), xs_b + (v // P16 * MID_ROW + v % P16 * 4) * 4, cm=CM_DEV
+                    fx.Int64(mb("mid8p")) + fx.Int64(v * 16),
+                    xs_b + (v // P16 * MID_ROW + v % P16 * 4) * 4,
+                    cm=CM_DEV,
                 )
         # the mid scales packed as WMMA scale words: word kc of a row, byte j
         # the code of its 32-block 4 kc + j
@@ -560,7 +638,10 @@ def moe_wide_defs(k4ctx):
             MID_ROWS * NPK,
             lambda v: fx.Vector(ld_dev(mb("midsp"), v * 4, 4)),
             lambda v, c: fx.ptr_store(
-                (c[0] & 0xFF) | ((c[1] & 0xFF) << 8) | ((c[2] & 0xFF) << 16) | (c[3] << 24),
+                (c[0] & 0xFF)
+                | ((c[1] & 0xFF) << 8)
+                | ((c[2] & 0xFF) << 16)
+                | (c[3] << 24),
                 xs + (W_MIDSC + v // NPK * MIDSC_ROW + v % NPK),
             ),
         )
@@ -608,10 +689,21 @@ def moe_wide_defs(k4ctx):
             a_n, sa_n = ring_read(t + 1)
             dcu = wmma_a8w4(a, b, fx.Vector.filled(8, 0.0, fx.Float32), sa, bsc)
             acc = [acc[e] + dcu[e] * dw for e in range(8)]
-            fin = yield acc + [a_n, sa_n, op_n[0], op_n[1], op_n[2], lk_n[0], lk_n[1], lk_n[2]]
+            fin = yield acc + [
+                a_n,
+                sa_n,
+                op_n[0],
+                op_n[1],
+                op_n[2],
+                lk_n[0],
+                lk_n[1],
+                lk_n[2],
+            ]
         acc = [fx.Float32(v) for v in fin[0:8]]
         stamp(19)
-        fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8)
+        fx.ptr_store(
+            fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8
+        )
         gpu.barrier()
         if tid < DN_ROWS * tokens:
             k = tid // DN_ROWS

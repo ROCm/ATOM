@@ -85,6 +85,7 @@ from atom.mono.device.gfx1250 import (
     acc_row_sum,
     butterfly,
     publish,
+    rows_to_lds_async,
     wave_max,
     wmma_fp8_k64,
 )
@@ -98,7 +99,6 @@ from atom.mono.device.ops import (
     kernel_symbol,
     lane_gather,
     launcher,
-    rows_to_lds,
     rsrc,
     traced,
     uniform,
@@ -107,7 +107,14 @@ from atom.mono.device.sync import Addr, Mailbox, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.trace import Space, enter_stage
 
-__all__ = ["K1_ABI", "K1_ARGS", "SCRATCH_BYTES", "TL_POINTS", "build_pre_attn_kernel", "emit_k1"]
+__all__ = [
+    "K1_ABI",
+    "K1_ARGS",
+    "SCRATCH_BYTES",
+    "TL_POINTS",
+    "build_pre_attn_kernel",
+    "emit_k1",
+]
 
 K_CHUNKS = HIDDEN // 64  # 64-k chunks: one WMMA each
 CHUNKS_PER_WAVE = K_CHUNKS // WAVES
@@ -138,7 +145,9 @@ def ar_block_sums(parts, lane, wave, red):
     gpu.barrier()
     tots = [
         butterfly(
-            (lane < 24).select(fx.ptr_load(red + (24 * k + fx.min(lane, 23))), fx.Float32(0.0)),
+            (lane < 24).select(
+                fx.ptr_load(red + (24 * k + fx.min(lane, 23))), fx.Float32(0.0)
+            ),
             (16, 8, 4, 2, 1),
         )
         for k in range(len(parts))
@@ -384,7 +393,7 @@ def emit_pre_attn(
             fx.memory_fence(
                 syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
             )
-            rows_to_lds(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
+            rows_to_lds_async(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
             gpu.barrier()
             stamp(2)
         # B column l % 16 is token l % 16 (the last token past the step's)
@@ -396,7 +405,10 @@ def emit_pre_attn(
             for h in range_constexpr(2):
                 x4 = fx.Vector(
                     fx.ptr_load(
-                        x8 + (col_tok * (HIDDEN // 4) + kc * 16 + h * 8 + (lane // 16) * 4),
+                        x8
+                        + (
+                            col_tok * (HIDDEN // 4) + kc * 16 + h * 8 + (lane // 16) * 4
+                        ),
                         result_type=fx.Vector.make_type(4, fx.Int32),
                     )
                 )
