@@ -51,6 +51,7 @@ from atom.multimodal.registry import get_native_multimodal_processor
 from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
+from atom.sampling_params import RequiredChannel
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -149,7 +150,9 @@ from .tool_parser import (
 )
 from .tool_parser.registry import (
     TOOL_CALL_PARSER_HELP,
+    channel_for_request,
     forbids_tool_calls,
+    required_call_channel,
     resolve_tool_call_parser,
 )
 
@@ -171,6 +174,9 @@ tokenizer: AutoTokenizer | None = None
 # chat template. `None` means none was recognised and tool calls, if any, are
 # delivered as plain text -- said out loud at startup, never discovered here.
 tool_call_parser_cls: type | None = None
+# The channel `tool_choice="required"` holds output to in that format, derived
+# with it at startup; None where the format defines none (all but Kimi-K3).
+required_tool_channel: RequiredChannel | None = None
 # Whether this model's output begins inside the reasoning channel even when
 # nothing in the prompt or the output says so -- DeepSeek-R1 closes a block it
 # never opens. Read from the chat template at startup, because a single
@@ -542,6 +548,7 @@ def _build_sampling_params(
     top_k: int = -1,
     top_p: float = 1.0,
     n: int = 1,
+    required_channel: RequiredChannel | None = None,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
@@ -551,6 +558,7 @@ def _build_sampling_params(
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
         n=n,
+        required_channel=required_channel,
     )
 
 
@@ -1700,6 +1708,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            required_channel=channel_for_request(
+                required_tool_channel, request.tool_choice, request.tools
+            ),
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2923,7 +2934,8 @@ async def stop_profile():
 def main():
     """Main entry point for the server."""
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
-    global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
+    global tool_call_parser_cls, required_tool_channel
+    global model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
 
@@ -3072,6 +3084,7 @@ def main():
         custom_message_encoder,
         model=args.model,
     )
+    required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
     # Forced acceptance emits draft tokens that nothing verified, and once the

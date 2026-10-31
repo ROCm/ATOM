@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from atom.sampling_params import RequiredChannel
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationError
 from atom.utils.tbo.ubatching import sync_dp_metadata
@@ -34,6 +35,7 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
     runner.model = SimpleNamespace()
     runner.use_mrope = True
     runner.enforce_eager = True
+    runner.tbo_decode_graphs = False
     runner.running_tokens_per_dp_rank = np.zeros(1, dtype=np.int32)
     runner.tokenID_processor = tokenIDProcessor(runner, 64)
     if speculative:
@@ -92,6 +94,7 @@ def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp
             top_ks=np.array(ks),
             top_ps=np.array(ps),
             needs_independent_noise=np.array([True] * len(temps)),
+            required_channel=None,
         )
         torch.cuda._sleep(2_000_000)
         t, k, p, greedy, noise = runner.prepare_sample(batch)
@@ -368,11 +371,18 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
         top_ps=np.array([0.8, 0.9, 0.7], dtype=np.float32),
         produces_output=lambda: True,
     )
+    channel = RequiredChannel(after=(1, 2), opening=(3,), opens_at=1, end_ids=(4,))
+    channel_states = np.array([-1, 0, 2], dtype=np.int32)
     for step in range(3):
+        # The optional channel states join the step and leave it again.
+        with_channel = step % 2 == 1
+        batch.required_channel = channel if with_channel else None
+        batch.required_channel_states = channel_states
         runner._gate_staging_reuse()
         torch.cuda._sleep(2_000_000)
         ids, temperatures, ks, ps, _, _ = runner.prepare_model(batch)
         observed = [x.clone() for x in (ids, temperatures, ks, ps)]
+        staged_states = runner.forward_vars["required_channel_states"].gpu[:3].clone()
         cu = runner.forward_vars["cu_seqlens_q"].gpu[:5].clone()
         runner._mark_staging_h2d_enqueued()
         runner.h2d_owner.completion.synchronize()
@@ -384,14 +394,21 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
         ):
             np.testing.assert_array_equal(value.cpu().numpy(), expected)
         assert cu.cpu().tolist() == [0, 1, 2, 3, 3]
+        if with_channel:
+            assert staged_states.cpu().tolist() == channel_states.tolist()
         if transport == "packed":
             group = runner.h2d_groups["token_inputs"]
             assert group._backend.kernel is not None
-            assert all(
-                b._epoch == runner.h2d_owner.epoch
-                for b in group.members
-                if b.name != "decode_src" or phase == "deferred"
-            )
+            # Optional members a step does not carry keep an older epoch.
+            unpublished = {
+                b.name for b in group.members if b._epoch != runner.h2d_owner.epoch
+            }
+            expected = set()
+            if phase != "deferred":
+                expected.add("decode_src")
+            if not with_channel:
+                expected.add("required_channel_states")
+            assert unpublished == expected
 
 
 def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeypatch):
@@ -444,6 +461,7 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
             top_ps=np.ones(3, dtype=np.float32),
             produces_output=lambda: True,
             next_token_ids=None,
+            required_channel=None,
         )
         runner._gate_staging_reuse()
         torch.cuda._sleep(2_000_000)
@@ -515,6 +533,7 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
                 temperatures=np.array([0.2, 0.4, 0.6]) + changed,
                 top_ks=np.array([4, 5, 6]) + changed,
                 top_ps=np.array([0.7, 0.8, 0.9]) - changed * 0.1,
+                required_channel=None,
             )
             runner.prepare_sample(batch, publication_group=combined)
             if combined is not None:
