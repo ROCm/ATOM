@@ -94,6 +94,7 @@ def test_sampling_optional_members_and_scalar_filters(monkeypatch, transport, pp
             top_ks=np.array(ks),
             top_ps=np.array(ps),
             needs_independent_noise=np.array([True] * len(temps)),
+            required_channel=None,
         )
         torch.cuda._sleep(2_000_000)
         t, k, p, greedy, noise = runner.prepare_sample(batch)
@@ -370,7 +371,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
         top_ps=np.array([0.8, 0.9, 0.7], dtype=np.float32),
         produces_output=lambda: True,
     )
-    channel = RequiredChannel(after=(1, 2), opening=(3,), end_ids=(4,))
+    channel = RequiredChannel(after=(1, 2), opening=(3,), opens_at=1, end_ids=(4,))
     channel_states = np.array([-1, 0, 2], dtype=np.int32)
     for step in range(3):
         # The optional channel states join the step and leave it again.
@@ -460,6 +461,7 @@ def test_packed_spec_indices_follow_decode_prefill_and_dummy_transitions(monkeyp
             top_ps=np.ones(3, dtype=np.float32),
             produces_output=lambda: True,
             next_token_ids=None,
+            required_channel=None,
         )
         runner._gate_staging_reuse()
         torch.cuda._sleep(2_000_000)
@@ -531,6 +533,7 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
                 temperatures=np.array([0.2, 0.4, 0.6]) + changed,
                 top_ks=np.array([4, 5, 6]) + changed,
                 top_ps=np.array([0.7, 0.8, 0.9]) - changed * 0.1,
+                required_channel=None,
             )
             runner.prepare_sample(batch, publication_group=combined)
             if combined is not None:

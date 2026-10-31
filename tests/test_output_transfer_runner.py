@@ -80,7 +80,9 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
             runner,
-            SimpleNamespace(total_seqs_num=bs, return_logprobs=[False] * bs),
+            SimpleNamespace(
+                total_seqs_num=bs, return_logprobs=[False] * bs, required_channel=None
+            ),
             torch.zeros(4, 8),
             torch.ones(bs),
             None,

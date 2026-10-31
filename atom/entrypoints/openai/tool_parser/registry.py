@@ -165,7 +165,9 @@ def channel_for_request(
 ) -> RequiredChannel | None:
     """The server's channel for a string ``tool_choice="required"`` with
     tools to call; None for every other request, which samples exactly as
-    before."""
+    before. That includes a named ``tool_choice`` (``{"type": "function",
+    ...}``): it requires a call too, but to one tool, which holding the
+    channel open does not express."""
     if channel is None or tool_choice != "required" or not tools:
         return None
     return channel

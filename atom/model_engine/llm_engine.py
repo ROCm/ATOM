@@ -17,7 +17,7 @@ from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -709,6 +709,11 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        # The one channel `tool_choice="required"` holds this engine's requests
+        # to (`_engine_channel`): as the server's format named it, and as built
+        # from that once with every id this engine stops on held back.
+        self._format_channel: RequiredChannel | None = None
+        self._required_channel: RequiredChannel | None = None
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -800,6 +805,33 @@ class InputOutputProcessor:
         )
         return seqs[0]
 
+    def _engine_channel(self, channel: RequiredChannel) -> RequiredChannel:
+        """The channel a required request is held to on this engine.
+
+        Hold its opening against every single id this engine ends a sequence
+        on (`Scheduler.postprocess` stops on EOS and on `stop_token_ids`), not
+        just the ones the tool-call format named. The third way a sequence
+        ends, the request's own `stop` strings, is left to end it: the client
+        asked for that stop, and a multi-token match is not one logits row's
+        mask.
+
+        Built once, from the first required request, and shared by every
+        later one. A request naming a different channel is refused here, at
+        admission, where it fails alone; the engine loop batches every
+        request together and holds one channel.
+        """
+        if self._required_channel is None:
+            held = channel.ending_on(
+                (self.config.eos_token_id, *self.config.stop_token_ids)
+            )
+            self._format_channel, self._required_channel = channel, held
+        elif channel != self._format_channel and channel != self._required_channel:
+            raise ValueError(
+                'this engine already holds tool_choice="required" requests to '
+                "another channel; a server resolves one tool-call format"
+            )
+        return self._required_channel
+
     def preprocess_fanout(
         self,
         prompt_or_tokens: str | list[int],
@@ -878,18 +910,10 @@ class InputOutputProcessor:
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
 
-        # Hold a required channel's opening against every single id this
-        # engine ends a sequence on (`Scheduler.postprocess` stops on EOS and
-        # on `stop_token_ids`), not just the ones the tool-call format named.
-        # The third way a sequence ends, the request's own `stop` strings
-        # (`stop_token_sequences` above), is left to end it: the client asked
-        # for that stop, and a multi-token match is not one logits row's mask.
         if sampling_params.required_channel is not None:
             sampling_params = replace(
                 sampling_params,
-                required_channel=sampling_params.required_channel.ending_on(
-                    (self.config.eos_token_id, *self.config.stop_token_ids)
-                ),
+                required_channel=self._engine_channel(sampling_params.required_channel),
             )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:

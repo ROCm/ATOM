@@ -295,15 +295,15 @@ class ScheduledBatch:
         # The channel the batch's requests must still open, when any row has
         # one left to open (a request whose channel is open is
         # `UNCONSTRAINED`), and then each row's committed state towards it.
-        # One per batch: a server resolves a single tool-call format. A batch
-        # with none stages no states and runs no channel kernels.
+        # A batch with none stages no states and runs no channel kernels. One
+        # per engine: `InputOutputProcessor` refuses a request naming another
+        # at admission, so the engine loop never meets two.
         channels = {
             seq.required_channel
             for seq in seqs.values()
             if seq.required_channel_state >= 0
         }
-        if len(channels) > 1:
-            raise ValueError(f"one batch holds {len(channels)} required channels")
+        assert len(channels) <= 1, f"one batch holds {len(channels)} channels"
         self.required_channel: RequiredChannel | None = (
             channels.pop() if channels else None
         )

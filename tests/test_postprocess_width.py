@@ -34,6 +34,7 @@ def _batch(seqs):
         total_tokens_num=seqs,
         req_ids=list(range(seqs)),
         return_logprobs=[False] * seqs,
+        required_channel=None,
     )
 
 

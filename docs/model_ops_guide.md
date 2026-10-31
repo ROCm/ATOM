@@ -499,8 +499,10 @@ Kimi-K3 under `tool_choice="required"`) to its tools channel by masking the
 target logits before any sampler reads them. Until the channel opens, the end
 ids (the format's own plus the engine's EOS and `stop_token_ids`) are `-inf`;
 once the output ends with `after` (K3: `<|close|>response<|sep|>`), each next
-row keeps only the forced id of `opening`. Once `opening` is written the state
-is `UNCONSTRAINED` and the request costs nothing more.
+row keeps only the forced id of `opening`. The channel is open once `opening`
+is written, or once the model writes `opening[:opens_at]` itself (K3:
+`<|open|>tools<|sep|>`); the state is then `UNCONSTRAINED` and the request
+costs nothing more.
 
 - `constrain_logits` masks a step's rows in place: plain decode and prefill
   rows by the request's state, verification rows as if the drafts before them
@@ -510,8 +512,12 @@ is `UNCONSTRAINED` and the request costs nothing more.
   a deferred-output step reads its predecessor's states through `decode_src`
   before the host has seen those ids.
 
-One Triton program per request; a batch with no unopened channel launches
-neither kernel. `constrain_logits_reference` / `advance_states_reference` are
+`constrain_logits` runs `VOCAB_PROGRAMS` (16) programs per request, each
+writing every 16th 1,024-column block of a forced row without reading it;
+`advance_states` runs one per request. On MI355X over K3's vocabulary a step
+with no forced row costs what one program per request did (5-7 us for a
+DSpark7 verify step at bs 1-64), and one with all seven draft rows forced
+15-52 us. A batch with no unopened channel launches neither kernel. `constrain_logits_reference` / `advance_states_reference` are
 the pure-torch twins the tests hold the kernels to.
 
 ### `RejectionSampler` (`rejection_sampler.py`)

@@ -320,9 +320,9 @@ class tokenIDProcessor:
         # ids and for the same reason: the host has not seen that output yet.
         # None when `prev_batch` had no channel.
         self.prev_channel_states: torch.Tensor | None = None
-        # This step's `decode_src`, the row each request held in `prev_batch`,
-        # when the step carries requests over on the GPU; None otherwise.
-        self.carried_from: torch.Tensor | None = None
+        # Whether this step carries requests over from `prev_batch` on the
+        # GPU, so that its `decode_src` holds the row each one held there.
+        self.carries_over = False
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
@@ -498,7 +498,7 @@ class tokenIDProcessor:
             bs * self.draft_tokens_per_seq,
         )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
-        self.carried_from = None if locs is None else self.decode_src.gpu[:bs]
+        self.carries_over = locs is not None
         # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
         # before postprocess when the batch produces no output (every prefill in
@@ -2679,9 +2679,8 @@ class ModelRunner:
                 top_p_count = bs
 
         # Read back by `postprocess` through `_constrain_required_channel`.
-        # Dummy and plugin batches carry no channel.
         channel_count = None
-        if getattr(batch, "required_channel", None) is not None:
+        if batch.required_channel is not None:
             self.forward_vars["required_channel_states"].np[
                 :bs
             ] = batch.required_channel_states
@@ -3255,7 +3254,7 @@ class ModelRunner:
         which the caller advances over the step's output; None when no request
         in the batch has one, which costs nothing.
         """
-        channel = getattr(batch, "required_channel", None)
+        channel = batch.required_channel
         if channel is None:
             return None
         device_channel = self._device_channels.get(channel)
@@ -3263,15 +3262,16 @@ class ModelRunner:
             device_channel = DeviceChannel.of(channel, self.device)
             self._device_channels[channel] = device_channel
         tp = self.tokenID_processor
+        bs = batch.total_seqs_num
         # Without states from the previous forward no carried request had a
         # channel then, so it has none now and the host's -1 is right.
-        carried = tp.carried_from is not None and tp.prev_channel_states is not None
+        carried = tp.carries_over and tp.prev_channel_states is not None
         md = spec_decode_metadata
         base = constrain_logits(
             device_channel,
-            self.forward_vars["required_channel_states"].gpu[: batch.total_seqs_num],
+            self.forward_vars["required_channel_states"].gpu[:bs],
             last_logits,
-            carried_from=tp.carried_from if carried else None,
+            carried_from=tp.decode_src.gpu[:bs] if carried else None,
             carried_states=tp.prev_channel_states if carried else None,
             target_logits=target_logits,
             cu_num_draft_tokens=None if md is None else md.cu_num_draft_tokens,
@@ -3308,13 +3308,18 @@ class ModelRunner:
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
             # `_constrain_required_channel` below masks `logits` in place, so
-            # the logprob copy is taken BEFORE it. Logprobs report the model's
-            # own distribution, as they do for a request without a channel and
-            # on the verification path, which masks copies: a forced token's
-            # is its real logprob, not the masked row's 0.0.
-            logprob_logits = logits
-            if need_logprobs and getattr(batch, "required_channel", None) is not None:
-                logprob_logits = logits.clone()
+            # each row's logsumexp is taken BEFORE it. Logprobs report the
+            # model's own distribution, as they do for a request without a
+            # channel and on the verification path, which masks copies. The
+            # mask never moves a logit that can still be sampled (an end id it
+            # bans cannot be, a forced id keeps its value), so the sampled
+            # token's logprob is its masked logit minus that logsumexp: a
+            # forced token's is its real logprob, not the masked row's 0.0.
+            # (A forced id the model itself gave -inf is written as 0, so it
+            # reports `-logsumexp` rather than -inf.)
+            premask_lse = None
+            if need_logprobs and batch.required_channel is not None:
+                premask_lse = torch.logsumexp(logits.float(), dim=-1)
             channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
@@ -3339,7 +3344,7 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
-            logprob_logits = logits
+            premask_lse = None
             channel = self._constrain_required_channel(
                 batch, bonus_logits, spec_decode_metadata, target_logits
             )
@@ -3401,11 +3406,15 @@ class ModelRunner:
 
         sampled_logprobs = None
         if need_logprobs:
-            logits_fp32 = logprob_logits.float()
-            log_probs = torch.log_softmax(logits_fp32, dim=-1)
-            sampled_logprobs = log_probs.gather(
-                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
-            ).squeeze(-1)
+            sampled_ids = sampled_tokens.to(torch.long).unsqueeze(-1)
+            if premask_lse is not None:
+                sampled_logprobs = (
+                    logits.gather(-1, sampled_ids).squeeze(-1).float() - premask_lse
+                )
+            else:
+                logits_fp32 = logits.float()
+                log_probs = torch.log_softmax(logits_fp32, dim=-1)
+                sampled_logprobs = log_probs.gather(-1, sampled_ids).squeeze(-1)
             # No PCP broadcast: logprobs never feed the next forward and only
             # worker 0's leave.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:

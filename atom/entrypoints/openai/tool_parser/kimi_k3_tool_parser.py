@@ -19,6 +19,7 @@ tokens, which are stripped from ``content``.
 """
 
 import json
+import logging
 import re
 from typing import ClassVar
 
@@ -35,6 +36,8 @@ from .tool_parser import (
     unique_tool_call_id,
     usable_tool_name,
 )
+
+logger = logging.getLogger("atom")
 
 # K3 channel tokens this parser matches on. Kept local so the parser is
 # self-contained; the reasoning splitter declares its own copies.
@@ -239,19 +242,29 @@ class KimiK3Parser(ToolCallParser):
         failures, writing the arguments as its answer. So the opening is
         forced through the call's name attribute, which is where vLLM's K3
         structural tag also commits to a call, and the message cannot end
-        before it. The tool name and arguments stay the model's.
+        before it. The tool name and arguments stay the model's. Writing
+        `<|open|>tools<|sep|>` itself, by any other way, opens it too.
 
-        None, constraining nothing, if this tokenizer does not read a control
-        token as a single id: forcing a split spelling would hand the model a
-        sequence it never writes.
+        None, constraining nothing and saying so at startup, if this tokenizer
+        does not read a control token as a single id: forcing a split spelling
+        would hand the model a sequence it never writes.
 
         Derived once per server, where the parser is resolved
         (`registry.required_call_channel`).
         """
         controls = ("<|open|>", "<|close|>", "<|sep|>", k3.END_OF_MSG)
-        if any(
-            len(tokenizer.encode(c, add_special_tokens=False)) != 1 for c in controls
-        ):
+        split = [
+            c
+            for c in controls
+            if len(tokenizer.encode(c, add_special_tokens=False)) != 1
+        ]
+        if split:
+            logger.warning(
+                "Kimi-K3 tool calls: this tokenizer splits %s into several ids, "
+                'so tool_choice="required" will not hold output to the tools '
+                "channel on this server.",
+                ", ".join(split),
+            )
             return None
 
         def ids(text: str) -> tuple[int, ...]:
@@ -262,6 +275,7 @@ class KimiK3Parser(ToolCallParser):
         return RequiredChannel(
             after=ids(k3.RESPONSE_END),
             opening=ids(k3.TOOLS_START + KIMI_K3_CALL_PREFIX),
+            opens_at=len(ids(k3.TOOLS_START)),
             end_ids=ids(k3.END_OF_MSG),
         )
 

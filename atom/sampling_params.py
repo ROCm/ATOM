@@ -17,61 +17,99 @@ class RequiredChannel:
     channel or closes the message; a required call must do the former. The
     sampler holds the output to it on the GPU, on the target logits:
 
-    - until ``opening`` is complete, no id in ``end_ids`` can be sampled;
+    - until the channel is open, no id in ``end_ids`` can be sampled;
     - once the output ends with ``after``, the next ``len(opening)`` tokens
       are ``opening``.
 
-    A sequence's state is how far its output has got. ``0 .. len(after) - 1``
-    is how much of ``after`` it currently ends with; ``len(after) + i`` means
-    the next token is ``opening[i]``. Once ``opening`` is written the channel
-    is open, nothing is constrained any more, and the state becomes
-    ``UNCONSTRAINED``: the sequence drops out of its batch's channel, so a
-    batch whose requests have all opened theirs costs nothing. The state
-    counts generated tokens only, so a sequence starts at 0 whatever its
-    prompt ends with.
+    ``opening[:opens_at]`` is what opens the channel itself (K3:
+    ``<|open|>tools<|sep|>``; the rest of ``opening`` starts the call). The
+    model writing it on its own, without ``after`` first, opens the channel
+    too. Otherwise a model that took any other way into the channel would
+    have its end ids banned until ``max_tokens``.
+
+    A sequence's state is how far its output has got:
+
+    - ``0 .. len(after) - 1``: how much of ``after`` it ends with (0 also
+      when it ends with nothing either pattern starts with);
+    - ``len(after) + i``: the next token is ``opening[i]``, forced;
+    - ``len(after) + len(opening) + k - 1``: it ends with ``opening[:k]``,
+      written by the model itself, for ``k`` in ``1 .. opens_at - 1``;
+    - ``UNCONSTRAINED`` once the channel is open, by either way: nothing is
+      held back any more, and the sequence drops out of its batch's channel,
+      so a batch whose requests have all opened theirs costs nothing.
+
+    The state counts generated tokens only, so a sequence starts at 0
+    whatever its prompt ends with.
     """
 
     after: tuple[int, ...]
     opening: tuple[int, ...]
+    opens_at: int
     end_ids: tuple[int, ...]
 
     def __post_init__(self):
         if not self.after or not self.opening:
             raise ValueError("a required channel needs both `after` and `opening`")
-        # On a mismatch `step` restarts the match at 1 or 0. That is the whole
-        # KMP failure function only while the first token of `after` does not
-        # recur in it.
-        if self.after[0] in self.after[1:]:
+        if not 1 <= self.opens_at <= len(self.opening):
             raise ValueError(
-                f"`after` may not repeat its first token, got {self.after}"
+                f"`opens_at` must be in 1..{len(self.opening)}, got {self.opens_at}"
+            )
+        # `step` follows `after` and the channel's own start at once and, on a
+        # mismatch, restarts at either one's first token or at nothing. That is
+        # the whole failure function only while the two first tokens differ
+        # and neither recurs inside either pattern.
+        own = self.opening[: self.opens_at]
+        firsts = {self.after[0], own[0]}
+        if len(firsts) < 2 or firsts & set(self.after[1:] + own[1:]):
+            raise ValueError(
+                f"`after` {self.after} and `opening[:opens_at]` {own} must start "
+                "with different ids, neither recurring inside either"
+            )
+        # A banned id the channel needs written could never be written: the
+        # request would never open it and run to `max_tokens`.
+        clash = set(self.end_ids) & set(self.after + self.opening)
+        if clash:
+            raise ValueError(
+                f"end ids {sorted(clash)} are part of the channel's own ids"
             )
 
     @property
-    def open_state(self) -> int:
-        """Where writing ``opening`` would take the state; ``step`` returns
-        ``UNCONSTRAINED`` instead, so no sequence is ever in it."""
-        return len(self.after) + len(self.opening)
+    def num_states(self) -> int:
+        """Every state a sequence held to this channel can be in is in
+        ``range(num_states)``; an open one is ``UNCONSTRAINED``."""
+        return len(self.after) + len(self.opening) + self.opens_at - 1
 
     @property
     def table(self) -> tuple[int, ...]:
         """``after + opening + end_ids``, the layout the GPU reads.
 
-        Below ``open_state`` a state indexes the token it waits for (while
-        matching ``after``) or forces (while opening)."""
+        A state indexes the token it waits for (``after[s]``, or
+        ``opening[k]`` at ``s - len(opening) + 1`` past the forced ones) or
+        forces (``opening[s - len(after)]``)."""
         return self.after + self.opening + self.end_ids
 
     def step(self, state: int, token_id: int) -> int:
         """The state after ``token_id``. The GPU kernels make the same moves."""
         if state < 0:
             return state
+        forced_end = len(self.after) + len(self.opening)
+        if len(self.after) <= state < forced_end:
+            # Forced tokens advance the state whatever they are: a row that saw
+            # a different one is a rejected draft, whose state nobody reads.
+            state += 1
+            return state if state < forced_end else UNCONSTRAINED
         if state < len(self.after):
             if token_id == self.after[state]:
                 return state + 1
-            return 1 if token_id == self.after[0] else 0
-        # Forced tokens advance the state whatever they are: a row that saw a
-        # different one is a rejected draft, whose state nobody reads.
-        state += 1
-        return state if state < self.open_state else UNCONSTRAINED
+        else:
+            own = state - forced_end + 1  # it ends with `opening[:own]`
+            if token_id == self.opening[own]:
+                return UNCONSTRAINED if own + 1 == self.opens_at else state + 1
+        if token_id == self.after[0]:
+            return 1
+        if token_id == self.opening[0]:
+            return UNCONSTRAINED if self.opens_at == 1 else forced_end
+        return 0
 
     def advance(self, state: int, token_ids: Iterable[int]) -> int:
         for token_id in token_ids:
