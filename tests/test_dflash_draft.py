@@ -1181,14 +1181,13 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     scale = d**-0.5
 
     read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8, max_model_len=W * E)
-    o = torch.empty_like(q)
     one = torch.ones(1, dtype=torch.float32, device=dev)
-    read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, one, one)
-
     # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
-    # takes the same q.
+    # takes the same q. Taken BEFORE the call, which clamps q in place.
     cast = kv_dtype == "fp8" and read.q_to_pool_dtype
-    q_ref = q.to(k_pool.dtype).to(q.dtype) if cast else q
+    q_ref = q.to(k_pool.dtype).to(q.dtype) if cast else q.clone()
+    o = read(q, k_pool, v_pool, block_tables, kv_lens, scale, one, one)
+
     args = (q_ref, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
     ref = _reference_block_attn(*args)
     # fp8 runs both dots at fp8 on gfx950 (Gluon); measured max 3.7e-2 there,
@@ -1294,3 +1293,29 @@ def test_dflash_draft_is_refused_on_a_non_k3_target():
         types.SimpleNamespace(architectures=["Eagle3LlamaModel"]),
     )
     cfg._check_dflash_draft_target(types.SimpleNamespace(architectures=[]), None)
+
+
+def test_fp8_q_cast_saturates_instead_of_producing_nan():
+    """A plain cast to fp8 turns |x| > fp8 max into NaN, and one NaN q row
+    poisons that row's softmax against every key; the read clamps first."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    pytest.importorskip("aiter")
+    from aiter import dtypes
+
+    dda = _fold_mod()
+    dev = torch.device("cuda")
+    bs, T, hkv, g, d, E = 2, 7, 2, 4, 64, 1024
+    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=4, max_model_len=E)
+    if not read.q_to_pool_dtype:
+        pytest.skip("q is only cast to fp8 where aiter's Gluon path serves the read")
+    k_pool = torch.randn(3, E, hkv, d, device=dev).to(dtypes.fp8)
+    v_pool = torch.randn_like(k_pool, dtype=torch.float32).to(dtypes.fp8)
+    q = torch.randn(bs * T, hkv * g, d, device=dev, dtype=torch.bfloat16)
+    q[0, 0, 0] = 1e4  # far past fp8_e4m3's 448
+    block_tables = torch.tensor([[1], [2]], dtype=torch.int32, device=dev)
+    kv_lens = torch.tensor([100, 200], dtype=torch.int32, device=dev)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    o = read(q, k_pool, v_pool, block_tables, kv_lens, d**-0.5, one, one)
+    assert torch.isfinite(o).all()

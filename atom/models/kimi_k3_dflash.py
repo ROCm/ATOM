@@ -361,22 +361,12 @@ class KimiK3DFlashAttention(nn.Module):
         global softmax over this rank's TP head slice.
         """
         bs = attn_metadata.block_tables.shape[0]
-        q3 = q.view(-1, self.num_heads, self.head_dim)
-        # Explicitly dense, NOT `empty_like`: `q` is a column slice of the
-        # fused QKV output, and an output inheriting that pitch would be a
-        # buffer with holes.
-        o = torch.empty(
-            (q3.shape[0], self.num_heads, self.head_dim),
-            dtype=q.dtype,
-            device=q.device,
-        )
-        self.block_attn(
-            q3,
+        o = self.block_attn(
+            q.view(-1, self.num_heads, self.head_dim),
             k_cache,
             v_cache,
             attn_metadata.block_tables,
             attn_metadata.context_lens[:bs],
-            o,
             self.scaling,
             self.kv.k_scale,
             self.kv.v_scale,
@@ -413,7 +403,7 @@ class KimiK3DFlashAttention(nn.Module):
         k = self.k_norm(k)
         # Rope at the token's ABSOLUTE position, before the write: that is what
         # makes a cached row valid on every later step without being rewritten.
-        _, k = self.rotary_emb(positions, torch.empty_like(k), k)
+        k = self.rotary_emb(positions, k)
         k_cache, v_cache = self._caches()
         if k_cache is None:
             return
