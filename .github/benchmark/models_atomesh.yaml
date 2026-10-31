@@ -1081,14 +1081,15 @@ models:
             expect_log:
               - "Kimi-K3 mono decode armed"
               - "Kimi-K3 mono decode on"
-            # Armed, then gone: the runner failed to build, or a step width had
-            # no build. Every width's line starts "declined the", so this still
-            # matches once num_speculative_tokens is retuned. A step mono does
-            # not serve, such as a prefill, logs "declined a step" and is no
-            # failure.
+            # Armed, then gone: the runner failed to build, or the width C1
+            # serves, one request plus its num_speculative_tokens drafts, had no
+            # build. The capture also builds 16 rows, which C1 never serves, so
+            # that width's line is no failure; a test holds the 8 to
+            # num_speculative_tokens. A step mono does not serve, such as a
+            # prefill, logs "declined a step" and is no failure either.
             reject_log:
               - "Kimi-K3 mono decode off"
-              - "Kimi-K3 mono decode declined the"
+              - "Kimi-K3 mono decode declined the 8-row build"
           server:
             common_args: &kimi_k3_pd_dspark7_args
               <<: *kimi_k3_agentic_dspark7_args

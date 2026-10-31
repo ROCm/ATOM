@@ -316,7 +316,7 @@ class ExpectedLogTest(unittest.TestCase):
 
 MONO_GONE = [
     "Kimi-K3 mono decode off",
-    "Kimi-K3 mono decode declined the",
+    "Kimi-K3 mono decode declined the 8-row build",
 ]
 
 
@@ -367,6 +367,8 @@ class RejectedLogTest(unittest.TestCase):
             "Kimi-K3 mono decode declined a step: prefill",
             "Kimi-K3 mono decode declined a step: 128 rows > the 16-row buffers",
             "Kimi-K3 mono decode on",
+            # a width the capture builds and C1 never serves
+            "Kimi-K3 mono decode declined the 16-row build; other widths unaffected",
         )
         result = self.check(decode=MONO_GONE)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -374,25 +376,20 @@ class RejectedLogTest(unittest.TestCase):
         self.assertTrue(result.stdout.endswith("OK\n"))
 
     def test_a_server_that_logged_one_fails_the_cell(self):
-        # Whichever width it was: 8 rows is C1's step, 16 its capture's widest.
-        for rows in (8, 16):
-            with self.subTest(rows=rows):
-                self.write("decode-rank-1.log", "Kimi-K3 mono decode armed (TP8)")
-                self.write(
-                    "decode-rank-1-worker-1.log",
-                    "Kimi-K3 mono decode armed (TP8)",
-                    f"Kimi-K3 mono decode declined the {rows}-row build; "
-                    "other widths unaffected",
-                )
-                result = self.check(decode=MONO_GONE)
-                self.assertEqual(result.returncode, 1)
-                self.assertNotIn("OK", result.stdout)
-                self.assertIn(
-                    "decode-rank-1-worker-1.log logged "
-                    "'Kimi-K3 mono decode declined the': "
-                    f"INFO Kimi-K3 mono decode declined the {rows}-row build",
-                    result.stderr,
-                )
+        self.write("decode-rank-1.log", "Kimi-K3 mono decode armed (TP8)")
+        self.write(
+            "decode-rank-1-worker-1.log",
+            "Kimi-K3 mono decode armed (TP8)",
+            "Kimi-K3 mono decode declined the 8-row build; other widths unaffected",
+        )
+        result = self.check(decode=MONO_GONE)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("OK", result.stdout)
+        self.assertIn(
+            "decode-rank-1-worker-1.log logged "
+            "'Kimi-K3 mono decode declined the 8-row build'",
+            result.stderr,
+        )
 
     def test_no_server_log_fails_the_cell(self):
         result = self.check(decode=MONO_GONE)
@@ -495,6 +492,16 @@ class SubmitLogLinesTest(unittest.TestCase):
                 self.assertEqual(prefill, "")
                 self.assertEqual(json.loads(decode), lines)
                 self.assertNotIn("\n", decode)
+
+    def test_c1_rejects_the_width_it_serves(self):
+        # One request at a time, each step that request plus its drafts.
+        self.assertEqual(self.cell["concurrency"], [1])
+        self.assertEqual(self.cell["accuracy"]["concurrency"], [1])
+        rows = 1 + int(self.cell["server_args"]["num_speculative_tokens"])
+        self.assertIn(
+            f"Kimi-K3 mono decode declined the {rows}-row build",
+            self.cell["service"]["decode"]["reject_log"],
+        )
 
     def test_a_single_line_is_a_list_of_one(self):
         for key in ("expect_log", "reject_log"):
