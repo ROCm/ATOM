@@ -671,8 +671,10 @@ def test_padded_pair_forward_matches_the_real_math(monkeypatch, tp_rank):
         layer.process_weights_after_loading()
 
     x = torch.randn(64, HIDDEN, dtype=torch.bfloat16, device="cuda")
-    gate, up = gate_up(x).float().chunk(2, -1)
-    y = down((torch.nn.functional.silu(gate) * up).to(torch.bfloat16)).float()
+    h = gate_up(x)
+    gate, up = h.float().chunk(2, -1)
+    act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+    y = down(act).float()
 
     # Reference: this rank's real shards, dequantized, in float.
     def deq(q, s):
@@ -692,9 +694,21 @@ def test_padded_pair_forward_matches_the_real_math(monkeypatch, tp_rank):
         d_q.view(torch.uint8)[:, r.start // 2 : r.stop // 2],
         d_s.view(torch.uint8)[:, r.start // 32 : r.stop // 32],
     )
-    a_ref = torch.nn.functional.silu(x.float() @ g_ref.T) * (x.float() @ u_ref.T)
-    y_ref = a_ref @ d_ref.T
 
-    assert gate.shape[-1] == PADDED and torch.isfinite(y).all()
-    cos = torch.nn.functional.cosine_similarity(y.flatten(), y_ref.flatten(), 0)
-    assert cos > 0.98, f"rank {tp_rank}: cosine {cos.item():.4f}"
+    def cos(a, b):
+        return torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), 0)
+
+    # Each stage against the float math on its own input, so each carries one
+    # fp4 activation-quant step (~0.99); a misplaced shard would be ~0.
+    assert gate.shape[-1] == PADDED
+    for name, got, ref in (
+        ("gate", gate[:, :REAL], x.float() @ g_ref.T),
+        ("up", up[:, :REAL], x.float() @ u_ref.T),
+    ):
+        assert cos(got, ref) > 0.98, f"rank {tp_rank} {name}: {cos(got, ref):.4f}"
+    # The padded tail is exactly zero, so down's padded K contributes nothing.
+    assert (gate[:, REAL:] == 0).all() and (up[:, REAL:] == 0).all()
+    assert (act[:, REAL:] == 0).all()
+    y_ref = act[:, :REAL].float() @ d_ref.T
+    assert torch.isfinite(y).all()
+    assert cos(y, y_ref) > 0.98, f"rank {tp_rank} down: {cos(y, y_ref):.4f}"
