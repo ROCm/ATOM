@@ -41,10 +41,12 @@ persistent, host-resident request mapping that ``CommonAttentionMetadata`` does
 not carry -- how many requests this step actually scheduled, their batch order,
 and the input ids -- which is what its STATE slots are keyed on.
 
-Not a host mirror of the block table, and not a way to avoid a sync: the V2
-runner's ``InputBatch`` has no full host block table, and its host sequence
+Not a host mirror of the PAGE table, and not a way to avoid that sync: the
+V2 runner's ``InputBatch`` has no full host block table, and its host sequence
 lengths can be optimistic under async speculation, so V4.1 still reads the
 exact lengths and PAGE rows with blocking copies (``snapshot_v41_batch``).
+The checkpoint groups' rows, read per element, come from the host
+(``install_v2_host_block_rows``).
 Removing the D2H is what this patch does for V4's slot assignment, above; it is
 not what V4.1 uses it for.
 """
@@ -72,6 +74,115 @@ class _HostMirror:
         self.np = array
 
 
+class _HostRows:
+    """The V2 runner's block-table rows on the host, by request id.
+
+    V2 keeps its tables on the device only, so reading one row on the host
+    cost a blocking copy of the pool-wide table on every step with a
+    checkpoint store or restore -- most decode steps, once any row's keep can
+    cross a boundary. The rows are rebuilt instead from the scheduler output
+    the runner applies, by the runner's own rules (`finish_requests`,
+    `add_requests`, `update_requests`): finished and preempted requests are
+    dropped, new requests and `block_table_updates` overwrite, cached requests
+    append.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[str, list[list[int]]] = {}
+
+    @staticmethod
+    def _expand(block_ids, per_kv_block: int) -> list[int]:
+        if per_kv_block > 1:
+            return [
+                b * per_kv_block + k for b in block_ids for k in range(per_kv_block)
+            ]
+        return list(block_ids)
+
+    def apply(self, scheduler_output, blocks_per_kv_block) -> None:
+        def expand(groups):
+            return [
+                self._expand(ids, blocks_per_kv_block[g] if blocks_per_kv_block else 1)
+                for g, ids in enumerate(groups)
+            ]
+
+        rows = self.rows
+        gone = set(getattr(scheduler_output, "finished_req_ids", None) or ())
+        gone |= set(getattr(scheduler_output, "preempted_req_ids", None) or ())
+        for req_id in gone:
+            rows.pop(req_id, None)
+        for new in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+            rows[new.req_id] = expand(new.block_ids)
+        updates = getattr(scheduler_output, "block_table_updates", None) or {}
+        for req_id, block_ids in updates.items():
+            if req_id in rows:
+                rows[req_id] = expand(block_ids)
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is None:
+            return
+        for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
+            row = rows.get(req_id)
+            if new_block_ids is None or req_id in updates or row is None:
+                continue
+            for group, ids in zip(row, expand(new_block_ids)):
+                group.extend(ids)
+
+
+class _HostRowIndex:
+    """`[row, col]` of one group's table, read from `_HostRows`.
+
+    Rows are batch rows (`req_ids` order); past a row's end reads 0, as the
+    gathered device table does.
+    """
+
+    __slots__ = ("_group", "_req_ids", "_rows")
+
+    def __init__(self, rows, req_ids, group: int) -> None:
+        self._rows = rows
+        self._req_ids = req_ids
+        self._group = group
+
+    def __getitem__(self, key) -> int:
+        row, col = key
+        groups = self._rows.get(self._req_ids[row])
+        if groups is None:
+            return 0
+        ids = groups[self._group]
+        return ids[col] if 0 <= col < len(ids) else 0
+
+
+#: Set by `install_v2_host_block_rows`; None leaves V2 reads on the device copy.
+_V2_HOST_ROWS: _HostRows | None = None
+
+
+def install_v2_host_block_rows() -> int:
+    """Keep `_HostRows` current on every runner class that has V2's
+    `update_requests`. Returns how many classes were patched."""
+    from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
+
+    global _V2_HOST_ROWS
+    if _V2_HOST_ROWS is None:
+        _V2_HOST_ROWS = _HostRows()
+    host_rows = _V2_HOST_ROWS
+    patched = 0
+    for cls in gpu_model_runner_classes():
+        original = getattr(cls, "update_requests", None)
+        if original is None or getattr(original, "_atom_v2_host_rows", False):
+            continue
+
+        @functools.wraps(original)
+        def update_requests(self, scheduler_output, *args, _orig=original, **kwargs):
+            tables = getattr(self, "block_tables", None)
+            host_rows.apply(
+                scheduler_output, getattr(tables, "blocks_per_kv_block", None)
+            )
+            return _orig(self, scheduler_output, *args, **kwargs)
+
+        update_requests._atom_v2_host_rows = True
+        cls.update_requests = update_requests
+        patched += 1
+    return patched
+
+
 class _BlockTableGroupView:
     """`batch.block_table[g]` for a runner that keeps no host mirror."""
 
@@ -88,20 +199,19 @@ class _V2InputBatchView:
     ``StagedWriteTensor``s that have only a `.gpu` side -- there is no host
     mirror to read, so `batch.block_table[g].block_table.np` (what the shared
     checkpoint mechanism uses to turn a (row, column) into a block id) has nothing
-    to resolve against. ``prepare_attn`` is handed the same tables as device
-    tensors, so copy the group's table down once per step, on first use, and
-    cache it for the rest of that step. Readers of every other attribute get
-    the real batch.
+    to resolve against. With `install_v2_host_block_rows` it reads the rows
+    kept on the host from the scheduler output (`_HostRows`); without it, the
+    group's device table is copied down once per step, on first use -- a sync
+    of the whole pool-wide table. Readers of every other attribute get the
+    real batch.
 
-    The copy is a sync of the whole pool-wide table. It happens only when
-    something asks for a checkpoint unit id -- a step the scheduler planned a
-    store or a restore for. `snapshot_v41_batch`, which reads every step,
-    takes its own trimmed copy instead (`copies_whole_table`).
+    Either way `.np` is not the trimmed host array `snapshot_v41_batch` reads
+    every step, so it takes its own (`copies_whole_table`).
     """
 
     __slots__ = ("_batch", "_cache", "_computed", "_tables")
 
-    #: Reading `block_table` copies every column of every row, not the step's.
+    #: `block_table` is not a host array of the step's rows (see above).
     copies_whole_table = True
 
     def __init__(self, batch, tables):
@@ -153,6 +263,13 @@ class _V2InputBatchView:
 
     def __getitem__(self, group_id):
         view = self._cache.get(group_id)
+        if view is None and _V2_HOST_ROWS is not None:
+            view = _BlockTableGroupView(
+                _HostMirror(
+                    _HostRowIndex(_V2_HOST_ROWS.rows, self._batch.req_ids, group_id)
+                )
+            )
+            self._cache[group_id] = view
         if view is None:
             table = self._tables[group_id]
             # Rows are already batch rows: `gather_block_tables` builds the

@@ -474,6 +474,9 @@ def apply_vllm_v41_prefix_install() -> None:
     install_v41_state_checkpoint_group_ids()
     install_v41_runner_state_events()
     install_v41_group_check_scope()
+    from atom.plugin.vllm.req_id_passthrough_patch import install_v2_host_block_rows
+
+    install_v2_host_block_rows()
 
 
 def install_v41_group_check_scope() -> bool:

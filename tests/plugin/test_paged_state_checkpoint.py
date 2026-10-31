@@ -742,3 +742,45 @@ def test_the_request_update_wrapper_takes_any_runner_class():
     finally:
         G._slot_allocators.remove(records)
         G._store_plan.clear()
+
+
+def test_v2_host_rows_follow_the_runners_block_table_rules(monkeypatch):
+    """New and updated rows overwrite, cached rows append, gone rows drop.
+
+    The rules are V2's `finish_requests` / `add_requests` / `update_requests`;
+    a row that diverged from the device table would name the wrong unit.
+    """
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+
+    rows = P._HostRows()
+
+    def out(new=(), cached=(), updates=None, finished=(), preempted=()):
+        return NS(
+            finished_req_ids=set(finished),
+            preempted_req_ids=set(preempted),
+            scheduled_new_reqs=[NS(req_id=r, block_ids=b) for r, b in new],
+            block_table_updates=updates,
+            scheduled_cached_reqs=NS(
+                req_ids=[r for r, _ in cached],
+                new_block_ids=[b for _, b in cached],
+            ),
+        )
+
+    bpk = [1, 2]
+    rows.apply(out(new=[("a", ([1, 2], [5])), ("b", ([3], [6]))]), bpk)
+    assert rows.rows["a"] == [[1, 2], [10, 11]]
+    rows.apply(out(cached=[("a", ([4], [7])), ("b", None)]), bpk)
+    assert rows.rows["a"] == [[1, 2, 4], [10, 11, 14, 15]]
+    assert rows.rows["b"] == [[3], [12, 13]]
+    # An update replaces the row and suppresses the same step's append.
+    rows.apply(out(updates={"a": ([9], [8])}, cached=[("a", ([99], [99]))]), bpk)
+    assert rows.rows["a"] == [[9], [16, 17]]
+    rows.apply(out(preempted={"b"}, finished={"a"}), bpk)
+    assert rows.rows == {}
+    rows.apply(out(new=[("b", ([20], [21]))]), bpk)
+    assert rows.rows["b"] == [[20], [42, 43]]
+
+    monkeypatch.setattr(P, "_V2_HOST_ROWS", rows)
+    view = P._V2InputBatchView(NS(req_ids=["x", "b"]), tables=None)
+    table = view.block_table[1].block_table.np
+    assert (table[1, 0], table[1, 1], table[1, 2], table[0, 0]) == (42, 43, 0, 0)
