@@ -2693,12 +2693,6 @@ class ModelRunner:
                 and envs.ATOM_V41_DECODER_GRAPH_ON_EAGER
                 else None
             ),
-            prefill_needs_eager=(
-                self.attn_metadata_builder.prefill_needs_eager(batch)
-                if batch.total_tokens_num_prefill > 0
-                and envs.ATOM_V41_PREFILL_GRAPH_ON_EAGER
-                else None
-            ),
             capture_sizes=self.capture_sizes_np,
             is_block_drafter=(
                 hasattr(self, "drafter") and self.drafter.is_block_drafter

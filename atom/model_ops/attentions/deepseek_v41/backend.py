@@ -412,11 +412,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         rows = np.where(finals, self.geometry.window_size, 0)
         return not self.score_workspace.fits(rows, batch.context_lens)
 
-    def prefill_needs_eager(self, batch):
-        """Images only. An over-band step still replays its token graph: the
-        scorer (`Attention._select`) is an eager region banding the live step."""
-        return batch.total_tokens_num_prefill > 0 and bool(batch.multimodal_data)
-
     def state_transfer(self):
         # Encoder SWA bounded replay: a hit rebuilds the state from the PAGE
         # below it instead of restoring a checkpoint (`BlockManager.

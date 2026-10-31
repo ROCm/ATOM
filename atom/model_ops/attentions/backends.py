@@ -160,10 +160,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """A prefill's decoder cannot replay its request graph (default: as the step)."""
         return self.step_needs_eager(batch)
 
-    def prefill_needs_eager(self, batch: ScheduledBatch) -> bool:
-        """A prefill cannot replay its token graph (default: as the step)."""
-        return self.step_needs_eager(batch)
-
     def close(self):
         """Release backend-owned host workers and mapped resources."""
         self.release_kv_pools()

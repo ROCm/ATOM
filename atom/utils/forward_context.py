@@ -184,7 +184,6 @@ class ForwardMode:
         graph_shapes: Container[tuple[int, int]] | None = None,
         tbo_decode_graphs: bool = False,
         decoder_needs_eager: bool | None = None,
-        prefill_needs_eager: bool | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -279,15 +278,11 @@ class ForwardMode:
         # (`tbo_decode_graphs`), where the bucket's recording is the split.
         tbo_eager = tbo_collective_active and (is_prefill or not tbo_decode_graphs)
         graphable = not (enforce_eager or step_needs_eager or tbo_eager)
-        # A prefill's token graph and decoder graph may answer for themselves
-        # instead of `step_needs_eager`. DP=1 only: not agreed across DP.
-        token_graphable = req_graphable = graphable
-        if is_prefill and dp_size == 1:
-            forced = enforce_eager or tbo_eager
-            if prefill_needs_eager is not None:
-                token_graphable = not (forced or prefill_needs_eager)
-            if decoder_needs_eager is not None:
-                req_graphable = not (forced or decoder_needs_eager)
+        # A prefill's decoder graph may answer for itself instead of
+        # `step_needs_eager`. DP=1 only: not agreed across DP.
+        req_graphable = graphable
+        if is_prefill and dp_size == 1 and decoder_needs_eager is not None:
+            req_graphable = not (enforce_eager or decoder_needs_eager or tbo_eager)
         # A recording holds every rank's rows in its collectives, so the group
         # replays request graphs as one, on a step every rank runs alike: all
         # decoding (`unified`) or all prefilling.
@@ -320,7 +315,7 @@ class ForwardMode:
             max_seqlen_q=max_seqlen_q,
         )
         token_graph = cls._pad_to_token_graph(
-            token_graphable, sync, running_tokens_per_dp_rank
+            graphable, sync, running_tokens_per_dp_rank
         )
         if token_graph:
             running_tokens = token_graph

@@ -586,7 +586,7 @@ def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
 
 
 # --------------------------------------------------------------------------- #
-# Over-band prefill (V4.1): each graph answers for itself.                    #
+# Over-band prefill (V4.1): the decoder graph answers for itself.             #
 # --------------------------------------------------------------------------- #
 
 
@@ -596,30 +596,30 @@ def _over_band(batch=None, **kw):
     return _decide(batch, step_needs_eager=True, captured_prefill=BUCKETS, **kw)
 
 
-def test_an_over_band_prefill_runs_eagerly_without_per_graph_answers():
-    mode = _over_band()
-    assert not mode.token_graph and not mode.req_graphs
-    assert mode.running_tokens == 300
+def test_an_over_band_prefill_runs_eagerly_without_the_decoders_answer():
+    for mode in (_over_band(), _over_band(decoder_needs_eager=True)):
+        assert not mode.token_graph and not mode.req_graphs
+        assert mode.running_tokens == 300
 
 
-def test_an_over_band_prefill_replays_each_graph_its_answer_allows():
-    both = _over_band(decoder_needs_eager=False, prefill_needs_eager=False)
-    assert both.token_graph and both.running_tokens == 384 and both.req_graphs
-    decoder = _over_band(decoder_needs_eager=False, prefill_needs_eager=True)
-    assert not decoder.token_graph and decoder.req_graphs
-    token = _over_band(decoder_needs_eager=True, prefill_needs_eager=False)
-    assert token.token_graph and not token.req_graphs
+def test_an_over_band_prefill_replays_only_the_decoder_graph_it_allows():
+    mode = _over_band(decoder_needs_eager=False)
+    assert mode.req_graphs and not mode.use_cudagraph
+    assert not mode.token_graph and mode.running_tokens == 300
 
 
-def test_per_graph_answers_do_not_override_forced_eager_decode_or_dp(monkeypatch):
-    allow = {"decoder_needs_eager": False, "prefill_needs_eager": False}
-    forced = _over_band(enforce_eager=True, **allow)
-    assert not forced.token_graph and not forced.req_graphs
-    decode = _decide(_batch(seqs=8, q=1), step_needs_eager=True, **allow)
+def test_the_decoders_answer_does_not_override_forced_eager_decode_or_dp(
+    monkeypatch,
+):
+    forced = _over_band(enforce_eager=True, decoder_needs_eager=False)
+    assert not forced.req_graphs
+    decode = _decide(
+        _batch(seqs=8, q=1), step_needs_eager=True, decoder_needs_eager=False
+    )
     assert not decode.use_cudagraph and not decode.req_graphs
     _fake_sync(monkeypatch, peer_tokens=300, peer_bs=2, peer_prefill=True)
-    dp = _over_band(dp_size=2, dp_group=object(), **allow)
-    assert not dp.token_graph and not dp.req_graphs
+    dp = _over_band(dp_size=2, dp_group=object(), decoder_needs_eager=False)
+    assert not dp.req_graphs
 
 
 # --------------------------------------------------------------------------- #
