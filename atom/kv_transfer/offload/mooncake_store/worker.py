@@ -427,9 +427,12 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                     )
                 _synchronize(pool.device)
                 if not torch.equal(source.tensor, target.tensor):
+                    detail = self._describe_probe_mismatch(
+                        client, pool, source, target, key, nbytes
+                    )
                     raise RuntimeError(
                         "Mooncake Store startup probe: the chunk read back differs "
-                        "from the one written"
+                        f"from the one written ({detail})"
                     )
             finally:
                 removed = client.remove(key, force=True)
@@ -444,6 +447,44 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
             self._release_once_device_idle(pool, leased)
             raise
         pool.release(leased)
+
+    def _describe_probe_mismatch(
+        self,
+        client: store_client.MooncakeStoreClient,
+        pool: TransferSlotPool,
+        source: Slot,
+        target: Slot,
+        key: str,
+        nbytes: int,
+    ) -> str:
+        """How a probe read-back differs: where, whether it settles, a re-get.
+
+        A tail that matches after a pause means the get's data reached GPU
+        memory after its completion; zeros mean it never landed; a re-get that
+        matches means the first read was transient.
+        """
+        diff = (source.tensor != target.tensor).nonzero().flatten()
+        parts = [
+            f"{diff.numel()} of {nbytes} bytes differ",
+            f"first={int(diff[0])} last={int(diff[-1])}",
+            f"target_zero_frac={(target.tensor == 0).float().mean().item():.4f}",
+            f"source_zero_frac={(source.tensor == 0).float().mean().item():.4f}",
+        ]
+        time.sleep(0.2)
+        _synchronize(pool.device)
+        parts.append(f"equal_after_200ms={torch.equal(source.tensor, target.tensor)}")
+        target.tensor.zero_()
+        _synchronize(pool.device)
+        try:
+            [code] = client.get([key], [target.ptr], [nbytes])
+            _synchronize(pool.device)
+            parts.append(
+                f"reget_rc={code} reget_equal={torch.equal(source.tensor, target.tensor)}"
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            parts.append(f"reget_raised={exc!r}")
+        logger.error("Mooncake Store startup probe mismatch: %s", "; ".join(parts))
+        return "; ".join(parts)
 
     @staticmethod
     def _probe_transfer(
