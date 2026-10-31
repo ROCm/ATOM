@@ -51,9 +51,36 @@ def schema_from_format(fmt, *, responses=False):
     return json.dumps(schema, ensure_ascii=False)
 
 
-def validate_output(schema, text, finish_reason):
+def structured_tool_format(parser_cls, tools, tool_choice):
+    """Describe the native tool alternative without accepting client grammars."""
+    if not tools or tool_choice == "none":
+        return None
+    from .tool_parser.deepseekv4_tool_parser import DsmlParser
+
+    if parser_cls is None or not issubclass(parser_cls, DsmlParser):
+        raise ValueError("Structured output with tools requires a DSML tool parser")
+    names = [tool["function"]["name"] for tool in tools]
+    required = tool_choice == "required" or isinstance(tool_choice, dict)
+    if isinstance(tool_choice, dict):
+        name = tool_choice.get("function", {}).get("name") or tool_choice.get("name")
+        if name not in names:
+            raise ValueError("The selected tool must be declared in tools")
+        names = [name]
+    return json.dumps(
+        {
+            "prefix": parser_cls.DSML_PREFIX,
+            "section": parser_cls.SECTION,
+            "names": names,
+            "required": required,
+        }
+    )
+
+
+def validate_output(schema, text, finish_reason, *, tool_calls=False):
     if schema is None or finish_reason in {"length", "max_tokens", "max_new_tokens"}:
         return
+    if tool_calls and not text.strip():
+        return  # A function-only turn has no response text to constrain.
     from jsonschema import Draft202012Validator
 
     try:
@@ -84,7 +111,10 @@ async def validate_chat_stream(source, schema):
                     )
                     if choice.get("finish_reason"):
                         validate_output(
-                            schema, "".join(texts[index]), choice["finish_reason"]
+                            schema,
+                            "".join(texts[index]),
+                            choice["finish_reason"],
+                            tool_calls=choice["finish_reason"] == "tool_calls",
                         )
             yield frame
     except RuntimeError as exc:

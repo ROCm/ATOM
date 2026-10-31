@@ -65,6 +65,35 @@ def test_length_is_incomplete_not_a_false_success():
         validate_output('{"type":"object"}', '{"x":', "stop")
 
 
+def test_tool_only_turn_has_no_text_but_text_still_must_conform():
+    validate_output('{"type":"object"}', "", "tool_calls", tool_calls=True)
+    with pytest.raises(RuntimeError):
+        validate_output('{"type":"object"}', "not JSON", "tool_calls", tool_calls=True)
+
+
+def test_tool_format_matches_the_selected_parser_and_tool_name():
+    import json
+
+    from atom.entrypoints.openai.structured_output import structured_tool_format
+    from atom.entrypoints.openai.tool_parser.deepseekv41_tool_parser import (
+        DsmlV41Parser,
+    )
+
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+    assert structured_tool_format(DsmlV41Parser, tools, "none") is None
+    spec = json.loads(
+        structured_tool_format(
+            DsmlV41Parser, tools, {"type": "function", "function": {"name": "weather"}}
+        )
+    )
+    assert spec["prefix"] == "｜DSML｜ " and spec["section"] == "calls"
+    assert spec["names"] == ["weather"] and spec["required"]
+    with pytest.raises(ValueError, match="declared"):
+        structured_tool_format(
+            DsmlV41Parser, tools, {"type": "function", "function": {"name": "unknown"}}
+        )
+
+
 def test_stream_failure_withholds_success_and_closes_source():
     closed = []
 

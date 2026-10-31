@@ -3327,6 +3327,11 @@ class ModelRunner:
                 tokenizer, logits.shape[-1], stop_ids
             )
         structured_prefixes = {}
+        logprob_snapshot = None
+        if structured_requests and any(batch.return_logprobs):
+            from atom.model_engine.token_logprobs import capture_token_logits
+
+            logprob_snapshot = capture_token_logits(logits, batch, spec_decode_metadata)
         if structured_requests:
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         elif structured is not None and (structured.pending or structured.current):

@@ -5,6 +5,7 @@
 
 import itertools
 import math
+import re
 
 from jsonschema import Draft202012Validator
 
@@ -15,6 +16,8 @@ _MISSING = object()
 
 
 def _finite(schema):
+    if schema is False:
+        return []
     if not isinstance(schema, dict):
         return None
     if "const" in schema:
@@ -67,9 +70,68 @@ def _negate(predicate):
     }
     if key in inverse:
         return {"type": "number", inverse[key]: value}
+    size_keys = {
+        "minLength": (
+            "string",
+            "maxLength",
+            value - 1 if isinstance(value, int) else 0,
+        ),
+        "maxLength": (
+            "string",
+            "minLength",
+            value + 1 if isinstance(value, int) else 0,
+        ),
+        "minItems": ("array", "maxItems", value - 1 if isinstance(value, int) else 0),
+        "maxItems": ("array", "minItems", value + 1 if isinstance(value, int) else 0),
+        "minProperties": (
+            "object",
+            "maxProperties",
+            value - 1 if isinstance(value, int) else 0,
+        ),
+        "maxProperties": (
+            "object",
+            "minProperties",
+            value + 1 if isinstance(value, int) else 0,
+        ),
+    }
+    if key in size_keys:
+        type_name, bound, size = size_keys[key]
+        return {"type": type_name, bound: size} if size >= 0 else False
+    if key == "required":
+        branches = [{"type": "object", "properties": {name: False}} for name in value]
+        return {"anyOf": branches} if branches else False
+    if key == "properties":
+        branches = [
+            {"type": "object", "required": [name], "properties": {name: _negate(child)}}
+            for name, child in value.items()
+        ]
+        return {"anyOf": branches} if branches else False
     if key == "enum":
         return {"allOf": [_negate({"const": v}) for v in value]}
     if key == "const":
+        if isinstance(value, str):
+            # All strings except one literal: shorter/longer strings or the
+            # same length with a differing character. No regex lookaround.
+            branches = [
+                {"type": [t for t in _TYPES if t != "string"]},
+                {"type": "string", "minLength": len(value) + 1},
+            ]
+            if value:
+                branches.extend(
+                    [
+                        {"type": "string", "maxLength": len(value) - 1},
+                        {
+                            "type": "string",
+                            "pattern": "^(?:"
+                            + "|".join(
+                                re.escape(value[:i]) + "[^" + re.escape(c) + "]"
+                                for i, c in enumerate(value)
+                            )
+                            + ")",
+                        },
+                    ]
+                )
+            return {"anyOf": branches}
         if value is None:
             return {"type": [t for t in _TYPES if t != "null"]}
         if isinstance(value, bool):
@@ -94,6 +156,19 @@ def _conditional(schema):
     guard = schema["if"]
     if isinstance(guard, bool):
         return schema.get("then" if guard else "else", True)
+    # Logical implication does not require a finite discriminator domain.
+    # Complements below preserve absent-property and non-object semantics.
+    try:
+        complement = _negate(guard)
+    except ValueError:
+        pass  # Retain exact finite enumeration for more complex predicates.
+    else:
+        return {
+            "anyOf": [
+                {"allOf": [guard, schema.get("then", True)]},
+                {"allOf": [complement, schema.get("else", True)]},
+            ]
+        }
     keys = set(guard) - _ANNOTATIONS
     if schema.get("type") != "object" or not keys <= {"properties", "required", "type"}:
         raise ValueError("Conditional schemas require finite object discriminators")
@@ -132,14 +207,14 @@ def _conditional(schema):
 
 
 def _unique(schema):
-    # Prefix positions may admit values outside the items domain. Expanding
-    # only items would silently discard valid arrays, so reject that unsupported
-    # combination rather than claiming an exact lowering.
-    if schema.get("prefixItems"):
-        raise ValueError("uniqueItems with prefixItems is not supported")
-    values = _finite(schema.get("items"))
-    if values is None:
-        raise ValueError("uniqueItems currently requires a finite items domain")
+    prefixes = schema.get("prefixItems", [])
+    domains = [_finite(p) for p in prefixes]
+    # items is irrelevant when maxItems ends within the prefix positions.
+    if schema.get("maxItems", math.inf) > len(prefixes):
+        domains.append(_finite(schema.get("items")))
+    if any(domain is None for domain in domains):
+        raise ValueError("uniqueItems currently requires finite item/prefix domains")
+    values = [v for domain in domains for v in domain]
     if len(values) > _LIMIT:
         raise ValueError("uniqueItems domain exceeds 256 values")
     # Deduplicate with JSON Schema equality (1 == 1.0, but true != 1).

@@ -39,7 +39,7 @@ class GrammarCompiler:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
-    def compile_json_schema(self, schema):
+    def compile_json_schema(self, schema, tool_format=None):
         from llguidance import LLMatcher
 
         from .schema_normalization import normalize_schema
@@ -53,6 +53,31 @@ class GrammarCompiler:
         grammar = LLMatcher.grammar_from_json_schema(
             value, overrides={"lenient": False, "coerce_one_of": False}
         )
+        if tool_format:
+            spec = json.loads(tool_format)
+            prefix, section = spec["prefix"], spec["section"]
+            # Only the response text is constrained by response_format. Normal
+            # function calls use the parser's native envelope, not beta strict
+            # argument schemas. Names and structural strings are quoted literals.
+            q = json.dumps
+            names = " | ".join(q(name) for name in spec["names"])
+            root = "calls" if spec["required"] else "answer | calls"
+            invoke_open = q("<" + prefix + 'invoke name="')
+            name_end = q('">')
+            value = (
+                dict(
+                    value, **{"x-guidance": {"lenient": False, "coerce_one_of": False}}
+                )
+                if isinstance(value, dict)
+                else value
+            )
+            lark = (
+                f"start: {root}\nanswer: %json {q(value)}\n"
+                f"calls: {q('<' + prefix + section + '>')} invoke+ {q('</' + prefix + section + '>')}\n"
+                f"invoke: {invoke_open} name {name_end} body\n"
+                f"name: {names}\nbody[suffix={q('</' + prefix + 'invoke>')}]: /(.|\\n)*/\n%ignore /[ \\t\\r\\n]+/\n"
+            )
+            grammar = {"grammars": [{"lark_grammar": lark}]}
         matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
         if matcher.is_error():
             raise ValueError(matcher.get_error())

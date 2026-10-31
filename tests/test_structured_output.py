@@ -218,6 +218,45 @@ def test_empty_batch_does_not_touch_gpu_metadata_or_logits(controller):
     assert controller.apply(object(), b, object()) == {}
 
 
+@pytest.mark.parametrize("required", [False, True])
+def test_native_tools_are_an_alternative_to_schema_text(controller, required):
+    spec = json.dumps(
+        {"prefix": "", "section": "calls", "names": ["weather"], "required": required}
+    )
+    compiled = controller.compile('{"const":{"answer":42}}', spec)
+    examples = [
+        ('{"answer":42}', not required),
+        ('{"answer":41}', False),
+        (
+            '<calls><invoke name="weather"><parameter name="city">Paris</parameter></invoke></calls>',
+            True,
+        ),
+        ('<calls><invoke name="unknown"></invoke></calls>', False),
+        ("plain non-JSON text", False),
+    ]
+    for text, expected in examples:
+        matcher = xgr.GrammarMatcher(compiled)
+        assert (
+            all(matcher.accept_token(t) for t in [*text.encode(), 127]) == expected
+        ), text
+
+
+def test_tool_format_is_part_of_incremental_state_identity(controller):
+    b = batch(schema={"const": {"answer": 42}})
+    fmt = json.dumps(
+        {"prefix": "", "section": "calls", "names": ["weather"], "required": False}
+    )
+    schema, marker, history = b.structured_requests[0]
+    b.structured_requests[0] = ((schema, fmt), marker, history)
+    logits = torch.zeros(1, 128)
+    p = controller.apply(logits, b, None)
+    assert torch.isfinite(logits[0, ord("<")])
+    controller.commit(torch.tensor([[ord("<")]]), b, p)
+    logits = torch.zeros(1, 128)
+    controller.apply(logits, batch(schema={"const": {"answer": 42}}, prefill=1), None)
+    assert torch.isneginf(logits[0, ord("<")])
+
+
 @pytest.mark.parametrize(
     "value_schema,good,bad",
     [
@@ -263,5 +302,5 @@ def test_unsupported_unique_cannot_enable_lenient_compilation(controller):
         "uniqueItems": True,
         "x-guidance": {"lenient": True},
     }
-    with pytest.raises(ValueError, match="finite items domain"):
+    with pytest.raises(ValueError, match="finite item/prefix domains"):
         controller.compile(json.dumps(schema))

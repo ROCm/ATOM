@@ -487,6 +487,7 @@ class Sequence:
         self.logprobs: array.array = array.array("d")
         self.json_schema = sampling_params.json_schema
         self.structured_reasoning_end = sampling_params.structured_reasoning_end
+        self.structured_tool_format = sampling_params.structured_tool_format
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every

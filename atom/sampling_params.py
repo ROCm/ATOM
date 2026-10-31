@@ -148,6 +148,7 @@ class SamplingParams:
     # defines one (Kimi-K3 only); None leaves the output unconstrained.
     required_channel: RequiredChannel | None = None
     json_schema: str | None = None
+    structured_tool_format: str | None = None
     # Generated reasoning tokens are unconstrained until this marker closes.
     structured_reasoning_end: tuple[int, ...] = ()
 

@@ -221,7 +221,9 @@ class ScheduledBatch:
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
         self.structured_requests = {
             i: (
-                seq.json_schema,
+                (seq.json_schema, seq.structured_tool_format)
+                if getattr(seq, "structured_tool_format", None)
+                else seq.json_schema,
                 seq.structured_reasoning_end,
                 list(
                     seq.output_tokens[
