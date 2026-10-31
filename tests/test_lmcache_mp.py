@@ -23,7 +23,6 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferTensors,
     LoadOperationId,
     PageRegion,
-    RecurrentPageGroup,
     SaveOperationId,
     SaveSourceGroupId,
 )
@@ -37,7 +36,6 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheReqMeta,
     LoadSpec,
     NativeStateTransfer,
-    RecurrentStateTransfer,
     SaveSpec,
 )
 from atom.kv_transfer.offload.mp import deployment, page_views, transfer
@@ -2331,220 +2329,6 @@ def test_a_page_only_worker_refuses_an_image_transfer(fake_lmcache_modules):
     assert worker.get_finished().failed_loading == {req.load_operation}
 
 
-def _recurrent_transfer_tensors(
-    *, groups: int = 2, num_blocks: int = 2, tokens_per_block: int = 8
-) -> KVTransferTensors:
-    """The PAGE layout above plus `groups` recurrent groups of one plane each."""
-    transfer = _transfer_tensors()
-    recurrent = []
-    for ordinal in range(groups):
-        plane = torch.zeros(num_blocks, 1, 12, dtype=torch.uint8)
-        recurrent.append(
-            RecurrentPageGroup(
-                pages=(page_region(plane, semantic_role=f"kda.{ordinal}"),),
-                num_blocks=num_blocks,
-                tokens_per_block=tokens_per_block,
-            )
-        )
-    transfer.recurrent_page_groups = tuple(recurrent)
-    # Keeps the planes alive: the transfer container does not own them.
-    transfer._test_recurrent_planes = [
-        group.pages[0].view for group in transfer.recurrent_page_groups
-    ]
-    return transfer
-
-
-def _register_recurrent(monkeypatch, chunk=None):
-    aiter = types.ModuleType("aiter")
-    aiter.__path__ = []
-    dist = types.ModuleType("aiter.dist")
-    dist.__path__ = []
-    parallel_state = types.ModuleType("aiter.dist.parallel_state")
-    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
-    monkeypatch.setitem(sys.modules, "aiter", aiter)
-    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
-    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
-
-    adapter = _WorkerAdapter()
-    if chunk is not None:
-        adapter.lmcache_tokens_per_chunk = chunk
-    monkeypatch.setattr(
-        mp_worker, "_make_worker_adapter", lambda _config, _rank: adapter
-    )
-    worker = mp_worker.LMCacheMPConnector(_config(model_type="ordinary_mha"))
-    worker.register_kv_caches(
-        {},
-        transfer_tensors=_recurrent_transfer_tensors(),
-        num_blocks=2,
-    )
-    return worker, adapter
-
-
-def test_recurrent_groups_register_after_every_page_plane():
-    """The plane order is the key space, so recurrent groups append to it."""
-    views = page_views._build_cache_views(_recurrent_transfer_tensors(), num_blocks=2)
-    assert list(views.tensors) == [
-        "page.0.primary.0",
-        "page.1.primary.1",
-        "page.2.sidecar.0",
-        "page.3.sidecar.1",
-        "recurrent.0.4.kda.0",
-        "recurrent.1.5.kda.1",
-    ]
-    assert [group.tensor_indices for group in views.recurrent] == [(4,), (5,)]
-    assert [group.bytes_per_block for group in views.recurrent] == [12, 12]
-    # A recurrent snapshot is not part of a KV block and is not billed as one.
-    assert views.bytes_per_block == 640
-
-
-@pytest.mark.parametrize(
-    ("num_blocks", "tokens_per_block", "match"),
-    [
-        # Checked against its own block count, not the PAGE one (2).
-        (3, 8, r"recurrent\[0\] view 4"),
-        (0, 8, "must.*be positive"),
-        (2, 0, "must.*be positive"),
-    ],
-)
-def test_recurrent_group_geometry_is_validated(num_blocks, tokens_per_block, match):
-    transfer = _recurrent_transfer_tensors(groups=1)
-    transfer.recurrent_page_groups = (
-        RecurrentPageGroup(
-            pages=transfer.recurrent_page_groups[0].pages,
-            num_blocks=num_blocks,
-            tokens_per_block=tokens_per_block,
-        ),
-    )
-    with pytest.raises(ValueError, match=match):
-        page_views._build_cache_views(transfer, num_blocks=2)
-
-
-@pytest.mark.parametrize(("chunk", "width"), [(None, 8), (16, 16)])
-def test_each_recurrent_ordinal_is_its_own_one_chunk_engine_group(
-    fake_lmcache_modules, monkeypatch, chunk, width
-):
-    """Ordinal `j` is engine group `1 + j`, marked recurrent, one chunk wide.
-
-    A snapshot exists only on a chunk boundary. Registered at its 8-token
-    block under a 16-token chunk, the server asks for two ids per chunk, finds
-    one, and skips every store ("STORE block ID underflow").
-    """
-    worker, adapter = _register_recurrent(monkeypatch, chunk)
-    assert [group.engine_group_id for group in adapter.groups] == [0, 0, 1, 2]
-    assert [group.recurrent_state for group in adapter.groups] == [
-        False,
-        False,
-        True,
-        True,
-    ]
-    assert [group.tokens_per_block for group in adapter.groups] == [4, 4, width, width]
-    assert [group.sw_size_tokens for group in adapter.groups] == [-1, -1, width, width]
-    assert [group.layer_indices for group in adapter.groups] == [
-        (0, 1),
-        (2, 3),
-        (4,),
-        (5,),
-    ]
-    assert worker._num_recurrent_groups == 2
-
-
-def test_a_chunk_off_the_recurrent_block_grid_is_refused(
-    fake_lmcache_modules, monkeypatch
-):
-    with pytest.raises(ValueError, match="whole number of recurrent blocks"):
-        _register_recurrent(monkeypatch, 12)
-
-
-def test_transfers_null_every_recurrent_chunk_but_the_boundary(fake_lmcache_modules):
-    """Only the boundary chunk carries a snapshot; the rest is vLLM's null block.
-
-    LMCache drops a chunk whose ids are all falsy, so the null id has to be 0.
-    A load names the same lists as the save that wrote them.
-    """
-    adapter = _WorkerAdapter()
-    worker = _worker(adapter)
-    worker._num_recurrent_groups = 2
-    worker._submit_save(
-        LMCacheReqMeta(
-            req_id=8,
-            token_ids=list(range(24)),
-            block_ids=[30, 31, 32, 33, 34, 35],
-            save_spec=SaveSpec(skip_leading_tokens=0),
-            save_operation=SaveOperationId(req_id=8, generation=2),
-            recurrent_state=RecurrentStateTransfer(
-                boundary_tokens=24, block_ids=(7, 9)
-            ),
-        ),
-        _step_event(),
-    )
-    submitted = adapter.saves[0][1]
-    assert submitted.start == 0 and submitted.end == 24
-    assert submitted.block_ids == [[30, 31, 32, 33, 34, 35], [0, 0, 7], [0, 0, 9]]
-
-    worker._submit_load(
-        LMCacheReqMeta(
-            req_id=5,
-            token_ids=list(range(24)),
-            block_ids=[10, 11, 12, 13, 14, 15],
-            load_spec=LoadSpec(
-                hbm_cached_tokens=0,
-                lmcache_cached_tokens=23,
-                can_load=True,
-                transfer_end_tokens=24,
-            ),
-            load_operation=LoadOperationId(req_id=5, generation=3),
-            recurrent_state=RecurrentStateTransfer(
-                boundary_tokens=24, block_ids=(4, 6)
-            ),
-        ),
-        _step_event(),
-    )
-    assert adapter.loads[0][1].block_ids == [
-        [10, 11, 12, 13, 14, 15],
-        [0, 0, 4],
-        [0, 0, 6],
-    ]
-
-
-def test_recurrent_state_mismatches_are_refused(fake_lmcache_modules):
-    """KV without its state, or state from another boundary, is never shipped."""
-    adapter = _WorkerAdapter()
-    worker = _worker(adapter)
-
-    def request(boundary=None):
-        return LMCacheReqMeta(
-            req_id=5,
-            token_ids=list(range(16)),
-            block_ids=[10, 11, 12, 13],
-            recurrent_state=(
-                None
-                if boundary is None
-                else RecurrentStateTransfer(boundary_tokens=boundary, block_ids=(4,))
-            ),
-        )
-
-    with pytest.raises(ValueError, match="no recurrent group was registered"):
-        worker._recurrent_block_ids(request(16), 0, 16)
-    worker._num_recurrent_groups = 1
-    with pytest.raises(ValueError, match="would not continue the KV"):
-        worker._recurrent_block_ids(request(8), 0, 16)
-
-    # A PAGE-only load on a model with recurrent groups fails terminally
-    # before anything is sent, rather than timing out.
-    operation = LoadOperationId(req_id=5, generation=3)
-    page_only = request()
-    page_only.load_spec = LoadSpec(
-        hbm_cached_tokens=0,
-        lmcache_cached_tokens=15,
-        can_load=True,
-        transfer_end_tokens=16,
-    )
-    page_only.load_operation = operation
-    worker._submit_load(page_only, _step_event())
-    assert adapter.loads == []
-    assert worker.get_finished().failed_loading == {operation}
-
-
 def _load_step(req_id: int) -> LMCacheOffloadMetadata:
     metadata = LMCacheOffloadMetadata()
     metadata.add_request(
@@ -2667,29 +2451,6 @@ def test_get_finished_wakes_the_drain_while_transfers_are_pending(
     )
     worker.get_finished()
     assert worker._drain_wake.is_set()
-
-
-def test_a_recurrent_load_keeps_the_logical_transfer_end(monkeypatch):
-    """The state is restored at the capped hit, so the PAGE end must match."""
-    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
-    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
-
-    monkeypatch.setattr(
-        ChunkedOffloadSchedulerBase,
-        "get_num_new_matched_tokens",
-        lambda self, seq: (768, True),
-    )
-    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
-    spec = LoadSpec(0, 1024, can_load=True)
-    sched._load_specs = {"r": spec}
-    sched._hit_save_floors = {}
-    sched.chunk_size = 256
-    sched.block_size = 256
-    sched._last_tier_hit = lambda seq, sid: 1024
-    sched._recurrent_state_hook = object()
-    seq = SimpleNamespace(id="r", num_prompt_tokens=1024)
-    assert sched.get_num_new_matched_tokens(seq) == (768, True)
-    assert spec.transfer_end_tokens is None
 
 
 def test_ipc_resources_are_destroyed_on_the_step_thread(

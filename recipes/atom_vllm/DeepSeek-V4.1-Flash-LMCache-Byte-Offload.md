@@ -43,7 +43,8 @@ vllm serve $MODEL --served-model-name DeepSeek-V4.1-Flash --port 8021 \
 ```
 
 - `--chunk-size` must equal `ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS` (a
-  multiple of 256). `--separate-object-groups` and `--no-l1-use-lazy` are
+  multiple of 256) and the client's LMCache chunk size (`LMCACHE_CHUNK_SIZE`,
+  default 256). `--separate-object-groups` and `--no-l1-use-lazy` are
   required. `OFFLOAD_MIN_LOAD_TOKENS` (default 8192) is the shortest tier
   load worth making. Give the MP server the model's `HIP_VISIBLE_DEVICES`:
   its GPU workers open the model's buffers by local device index.

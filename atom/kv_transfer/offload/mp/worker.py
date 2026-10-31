@@ -170,11 +170,6 @@ class LMCacheMPConnector(KVConnectorBase):
         # Set only when the backend publishes PAGE-backed checkpoint images
         # (`_register_native_state_layout`); every transfer then carries one.
         self._native_layout: Any = None
-        self._num_recurrent_groups = 0
-        # How many engine groups each snapshot was published as; see
-        # `register_kv_caches`. Empty until registration.
-        self._recurrent_splits: list[int] = []
-        self._num_recurrent_engine_groups = 0
         self._adapter: Any = None
         self._is_kv_writer = True
         self._pending_saves: dict[str, _PendingSave] = {}
@@ -317,60 +312,6 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             for layer_indices in views.layer_groups
         ]
-        # Recurrent ordinal ``j`` gets engine group ``1 + j`` -- the same
-        # numbering `native_state_layout` uses, and for the same reason: an
-        # engine group is an address space, and a recurrent snapshot is neither
-        # counted in attention blocks nor read in full. ``sw_size_tokens`` one
-        # block wide is what makes the server restore the last snapshot only;
-        # the earlier positions the transport fills with the null block id are
-        # never committed. The server must therefore run with
-        # ``--separate-object-groups``: without it every kernel group collapses
-        # into one object group (`kv_layer_groups.build_object_groups`), the
-        # null-chunk test then sees the attention group's real ids and skips
-        # nothing, and the window that restores only the last snapshot is gone.
-        #
-        # One info per copy-kernel identity, not per snapshot: the server
-        # splits each engine group by physical transfer identity and then
-        # requires exactly one info per resulting kernel group. A backend
-        # whose planes share a layout has one split per snapshot and is
-        # numbered exactly as before; V4.1's PAGE unit is heterogeneous and
-        # needs several. `_recurrent_splits` records how many each snapshot
-        # became so `_recurrent_block_ids` can name the same block in each.
-        #
-        # And one block per CHUNK, whatever the snapshot's own block size: a
-        # snapshot exists only at a chunk boundary (see `_recurrent_block_ids`),
-        # so that is the span one recurrent block id stands for. Registered at
-        # its own block size, a chunk wider than the block makes the server ask
-        # every recurrent group for chunk/block ids per chunk, find one, and
-        # skip every store ("STORE block ID underflow") -- a tier that never
-        # hits, with nothing failing. The adapter learned the server's chunk
-        # when it connected, so this is the size the server will use.
-        snapshot_tokens = int(getattr(adapter, "lmcache_tokens_per_chunk", 0) or 0)
-        next_group_id = 1
-        self._recurrent_splits = []
-        for recurrent in views.recurrent:
-            span = snapshot_tokens or int(recurrent.tokens_per_block)
-            if span % int(recurrent.tokens_per_block):
-                raise ValueError(
-                    f"LMCache MP chunk size {span} is not a whole number of "
-                    f"recurrent blocks ({recurrent.tokens_per_block} tokens); "
-                    "a snapshot could not sit on a chunk boundary"
-                )
-            splits = recurrent.layout_splits or (recurrent.tensor_indices,)
-            self._recurrent_splits.append(len(splits))
-            for indices in splits:
-                groups.append(
-                    EngineGroupInfo(
-                        engine_group_id=next_group_id,
-                        layer_indices=indices,
-                        tokens_per_block=span,
-                        sw_size_tokens=span,
-                        recurrent_state=True,
-                    )
-                )
-                next_group_id += 1
-        self._num_recurrent_groups = len(views.recurrent)
-        self._num_recurrent_engine_groups = sum(self._recurrent_splits)
         try:
             adapter.register_kv_caches(views.tensors, engine_group_infos=groups)
             chunk_size = offcfg._strict_integer(
@@ -392,14 +333,11 @@ class LMCacheMPConnector(KVConnectorBase):
         self.chunk_size = chunk_size
         logger.info(
             "LMCache MP registered rank=%d tensors=%d groups=%d "
-            "recurrent_groups=%d recurrent_engine_groups=%d "
-            "bytes_per_block=%d chunk=%d tp_replication=%d "
-            "writer=%s save=%s load=%s",
+            "bytes_per_block=%d chunk=%d tp_replication=%d writer=%s "
+            "save=%s load=%s",
             rank,
             len(views.tensors),
             len(views.layer_groups),
-            len(views.recurrent),
-            self._num_recurrent_engine_groups,
             views.bytes_per_block,
             self.chunk_size,
             requested_replication,
@@ -681,60 +619,6 @@ class LMCacheMPConnector(KVConnectorBase):
                 "transfer must not name one"
             )
 
-    def _recurrent_block_ids(
-        self, req: LMCacheReqMeta, start: int, end: int
-    ) -> list[list[int]]:
-        """One block-id list per recurrent group, null everywhere but the end.
-
-        A recurrent snapshot exists only at a chunk boundary, so an operation
-        spanning ``n`` chunks carries ``n - 1`` null ids and the boundary block
-        last. The null id is ``0``, the null block, which is what LMCache's
-        `all_null_chunk_masks` tests for -- it asks whether any id in the chunk
-        is truthy, so a sentinel of ``-1`` would read as a real block and the
-        empty chunks would be committed as content-hashed garbage. It is not
-        configurable: no released LMCache exposes a null-block-id knob.
-        """
-        if not self._num_recurrent_groups:
-            if req.recurrent_state is not None:
-                raise ValueError(
-                    f"LMCache MP request {req.req_id} carries recurrent state, "
-                    "but no recurrent group was registered"
-                )
-            return []
-        state = req.recurrent_state
-        if state is None:
-            raise ValueError(
-                f"LMCache MP request {req.req_id} has no recurrent state for "
-                f"[{start}, {end}), but {self._num_recurrent_groups} recurrent "
-                "group(s) are registered; a PAGE-only object would restore a "
-                "prefix whose recurrent state is someone else's"
-            )
-        if len(state.block_ids) != self._num_recurrent_groups:
-            raise ValueError(
-                f"LMCache MP request {req.req_id} named "
-                f"{len(state.block_ids)} recurrent blocks for "
-                f"{self._num_recurrent_groups} group(s)"
-            )
-        if int(state.boundary_tokens) != end:
-            raise ValueError(
-                f"LMCache MP request {req.req_id} snapshotted recurrent state "
-                f"at token {state.boundary_tokens}, but the transfer ends at "
-                f"{end}; the state would not continue the KV it ships with"
-            )
-        count = (end - start) // int(self.chunk_size)
-        # One list per ENGINE group. A snapshot published as several engine
-        # groups (heterogeneous planes; see `register_kv_caches`) names the
-        # same block in each of them -- they are different plane sets of one
-        # PAGE unit, not different units.
-        out: list[list[int]] = []
-        # One split each is what a homogeneous snapshot gets and what the
-        # mechanism did before splitting existed, so it is also the right
-        # reading of an empty list: the count is set, the shape is not.
-        splits_per_group = self._recurrent_splits or [1] * self._num_recurrent_groups
-        for block, splits in zip(state.block_ids, splits_per_group, strict=True):
-            out.extend([[0] * (count - 1) + [int(block)]] * splits)
-        return out
-
     def _submit_load(
         self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
     ) -> None:
@@ -769,8 +653,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
             op = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
-                block_ids=self._transfer_block_ids(req, start, end, loading=True)
-                + self._recurrent_block_ids(req, start, end),
+                block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
                 end=end,
             )
@@ -861,8 +744,7 @@ class LMCacheMPConnector(KVConnectorBase):
         try:
             op = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
-                block_ids=self._transfer_block_ids(req, start, end, loading=False)
-                + self._recurrent_block_ids(req, start, end),
+                block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
                 end=end,
             )

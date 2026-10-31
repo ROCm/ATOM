@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 """DeepSeek-V4.1 LMCache offload on the vLLM plugin: the MP ride and its guards.
 
-V4.1's state checkpoints ride the PAGE object as recurrent engine groups. These
-pin the decisions that keep a restored prefix and its state at one boundary,
-and the scheduler/connector fixes that a two-pass DSpark run depends on.
+V4.1's state checkpoints ride the PAGE object as a native-state image: a
+transfer names the checkpoint group blocks as the image's units. These pin the
+decisions that keep a restored prefix and its state at one boundary, and the
+scheduler/connector fixes that a two-pass DSpark run depends on.
 """
 
 from types import SimpleNamespace
@@ -116,17 +117,17 @@ def _ride():
 def test_a_load_rides_only_on_its_recorded_destination():
     """The committed source of a save is somebody else's state."""
     p, request = _ride()
-    assert p.take_ride_state(request, "r0", 512, operation=None) is None
+    assert p.take_ride_units(request, "r0", 512, operation=None) is None
     p._record_ride_boundary("r0", 512, (7,))
-    assert p.take_ride_state(request, "r0", 512, operation=None).block_ids == (7,)
+    assert p.take_ride_units(request, "r0", 512, operation=None) == (7,)
 
 
 def test_a_save_rides_on_the_committed_source_and_pins_it():
     """Never on a recorded load destination: a failed load leaves it stale."""
     p, request = _ride()
     p._record_ride_boundary("r0", 512, (7,))
-    assert p.take_ride_state(request, "r0", 512, operation="op").block_ids == (42,)
-    assert p.take_ride_state(request, "r0", 500, operation="op2") is None
+    assert p.take_ride_units(request, "r0", 512, operation="op") == (42,)
+    assert p.take_ride_units(request, "r0", 500, operation="op2") is None
     assert p._ride_pins == {"op": (42,)}
 
 
@@ -134,13 +135,11 @@ def test_a_finished_requests_save_still_finds_its_request():
     """The scheduler's SeqView outlives the connector's request map."""
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
     c._requests = {}
-    c._v41_planner = Mock()
     request = SimpleNamespace(request_id="r0")
-    seq = SimpleNamespace(id="r0", _request=request)
-    c._v41_state_for_transfer(seq, 512, operation="op")
-    c._v41_planner.take_ride_state.assert_called_once_with(
-        request, "r0", 512, operation="op"
-    )
+    assert c._v41_request_of(SimpleNamespace(id="r0", _request=request)) is request
+    c._requests = {"r1": request}
+    assert c._v41_request_of(SimpleNamespace(id="r1")) is request
+    assert c._v41_request_of(SimpleNamespace(id="r2")) is None
 
 
 def test_an_unridable_finished_save_retires_and_frees_its_lease():
@@ -161,6 +160,183 @@ def test_an_unridable_finished_save_retires_and_frees_its_lease():
     assert "r0" not in s._save_tracker
     assert s._pending_source_safe_releases == [frozenset({11, 12})]
     assert s._save_lease_blocks == {id(seq): {10}}
+
+
+# -- the MP scheduler ----------------------------------------------------------
+
+
+class _Pool:
+    """vLLM's block pool as the ride uses it: checkpoint blocks by hash."""
+
+    def __init__(self, cached):
+        self.cached = dict(cached)
+        self.blocks = {
+            block_id: SimpleNamespace(block_id=block_id, ref_cnt=1)
+            for block_ids in self.cached.values()
+            for block_id in block_ids
+        }
+        self.freed = []
+
+    def get_cached_block(self, block_hash, group_ids):
+        block_ids = self.cached.get(block_hash)
+        return None if block_ids is None else [self.blocks[b] for b in block_ids]
+
+    def touch(self, blocks):
+        pass
+
+    def free_blocks(self, blocks):
+        self.freed.append(tuple(block.block_id for block in blocks))
+
+
+# vLLM's hash of each 256-token block of a 1024-token prompt.
+_HASHES = (b"h256", b"h512", b"h768", b"h1024")
+
+
+def _v41_scheduler(cached):
+    """The V4.1 MP scheduler over a pool holding `cached` checkpoints.
+
+    Two checkpoint groups (1, 2), so an image is two units.
+    """
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+    from atom.plugin.vllm.kv_transfer.v41_mp_scheduler import V41StateMPScheduler
+
+    s = V41StateMPScheduler.__new__(V41StateMPScheduler)
+    ChunkedOffloadSchedulerBase.__init__(
+        s,
+        SimpleNamespace(
+            kv_cache_block_size=256, kv_transfer_config={"kv_role": "kv_both"}
+        ),
+        chunk_size=256,
+        lookup_client=SimpleNamespace(
+            prepare_retrieve=lambda *_a: None, clear_lookup_status=lambda _sid: None
+        ),
+    )
+    s._mp_adapter = SimpleNamespace(end_session=lambda _session: None)
+    s._scheduler_deadline_s = 3600.0
+    s._transfer_seen_at = {}
+    s._min_load_tokens = 0
+    planner = V41BoundaryPlanner(
+        hash_block_size=256, chunk_size=256, checkpoint_group_ids=(1, 2)
+    )
+    pool = _Pool(cached)
+    planner.bind_gpu_block_pool(pool)
+    s.bind_planner(planner, lambda seq: seq._request)
+    return s, planner, pool
+
+
+def _prompt(n, *, computed=None):
+    request = SimpleNamespace(
+        request_id="r0", block_hashes=_HASHES[: n // 256], num_tokens=n
+    )
+    return SimpleNamespace(
+        id="r0",
+        num_prompt_tokens=n,
+        num_cached_tokens=n if computed is None else computed,
+        token_ids=list(range(n)),
+        block_table=list(range(10, 10 + n // 256)),
+        _request=request,
+    )
+
+
+def _store_landed(s, operation):
+    from atom.kv_transfer.disaggregation.types import ConnectorCompletion
+    from atom.kv_transfer.offload.chunked_scheduler import DENSE_PAGE_STORE_CHANNEL
+
+    s.connector_completion(
+        ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, operation, True)
+    )
+
+
+def test_a_save_carries_its_checkpoint_units_and_its_pin_ends_with_it():
+    """The checkpoint rides as a native-state image, its units pinned while
+    the save is live; the build after its terminal report gives them back."""
+    from atom.kv_transfer.offload.metadata import NativeStateTransfer
+
+    s, planner, pool = _v41_scheduler({_HASHES[1]: (41, 42)})
+    seq = _prompt(512)
+    s.update_state_after_alloc(seq)
+    [save] = s.build_connector_meta().requests
+    assert save.token_ids == list(range(512))
+    assert save.native_state == NativeStateTransfer(
+        (41, 42), 512, int.from_bytes(b"h512", "big")
+    )
+    assert planner._ride_pins == {save.save_operation: (41, 42)}
+
+    s.build_connector_meta()
+    assert planner._ride_pins and pool.freed == []  # still in flight
+    _store_landed(s, save.save_operation)
+    assert planner._ride_pins  # a report alone gives nothing back
+    s.build_connector_meta()
+    assert planner._ride_pins == {} and pool.freed == [(41, 42)]
+
+
+def test_a_running_save_waits_for_the_checkpoint_at_its_end():
+    s, planner, _ = _v41_scheduler({_HASHES[0]: (41, 42)})
+    s.update_state_after_alloc(_prompt(512))
+    assert s.build_connector_meta().requests == []
+    assert s._save_tracker["r0"][1] == 0
+    assert planner._ride_pins == {}
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+def test_a_load_carries_its_recorded_destination_or_is_declined(recorded):
+    """Asked before vLLM allocates there is no destination yet, so the park
+    question stands; at dispatch a load without one is declined, not sent."""
+    from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
+
+    s, planner, _ = _v41_scheduler({})
+    seq = _prompt(1024, computed=0)
+    s._load_specs["r0"] = LoadSpec(0, 512)
+    s._lookup_results["r0"] = (seq, 512)
+    assert s.should_park_for_load_after_alloc(seq)
+    s.update_state_after_alloc(seq)
+    if recorded:
+        planner._record_ride_boundary("r0", 512, (41, 42))
+    loads = [r for r in s.build_connector_meta().requests if r.load_spec]
+    if not recorded:
+        assert loads == [] and s.declined_loads == {"r0"}
+        return
+    [load] = loads
+    assert load.token_ids == list(range(512))
+    assert load.native_state == NativeStateTransfer(
+        (41, 42), 512, int.from_bytes(b"h512", "big")
+    )
+    assert load.native_state.destination_slot is None
+    assert planner._ride_pins == {}  # vLLM holds a parked request's blocks
+
+
+def test_the_v41_layout_publishes_the_native_checkpoint_contract(monkeypatch):
+    """The fields native V4.1 publishes, so the worker takes the native layout."""
+    import torch
+
+    from atom.kv_transfer.disaggregation.page_region import page_region
+    from atom.kv_transfer.disaggregation.types import KVTransferTensors
+    from atom.plugin.vllm import deepseek_v41_state_checkpoint as checkpoint
+
+    copier = SimpleNamespace(execute_paged_state_copies=lambda *_a, **_k: None)
+    spec = SimpleNamespace(image_bytes=40, units_per_checkpoint=2)
+    worker = SimpleNamespace(copier=copier)
+    monkeypatch.setattr(
+        checkpoint, "current_state_checkpoint_worker", lambda *_a: worker
+    )
+    monkeypatch.setattr(
+        checkpoint, "v41_state_checkpoint_sizing", lambda _c: SimpleNamespace(spec=spec)
+    )
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._vllm_config = object()
+    planes = [torch.zeros(4, 16, dtype=torch.uint8) for _ in range(2)]
+    transfer = KVTransferTensors(
+        pages=[page_region(p, semantic_role=f"p{i}") for i, p in enumerate(planes)]
+    )
+    c._publish_v41_state_checkpoints(transfer, 4)
+    assert transfer.paged_state_checkpoint_spec is spec
+    assert transfer.execute_paged_state_copies == copier.execute_paged_state_copies
+    assert transfer.paged_state_region_count == 2
+    assert transfer.native_state_tp_replication_factor == 4
+
+    worker.copier = None
+    with pytest.raises(ValueError, match="no checkpoint copier"):
+        c._publish_v41_state_checkpoints(transfer, 4)
 
 
 # -- connector ---------------------------------------------------------------
@@ -837,7 +1013,7 @@ def test_a_failed_resolve_drops_an_earlier_admissions_destination():
     request = SimpleNamespace(request_id="r")
     assert p.resolve_load(request, 512, group_blocks=([3, 4], [7, 8]))
     assert not p.resolve_load(request, 512, group_blocks=([3, 4], [7, 0]))
-    assert p.take_ride_state(request, "r", 512, operation=None) is None
+    assert p.take_ride_units(request, "r", 512, operation=None) is None
 
 
 @pytest.mark.parametrize("ref_cnt, frees", [(1, True), (2, False)])
@@ -845,7 +1021,7 @@ def test_only_a_pin_that_holds_a_block_alone_frees_it(ref_cnt, frees):
     """Retiring a pin drops one share; a block its request still holds stays."""
     p, request = _ride()
     p._pool.blocks[42].ref_cnt = ref_cnt
-    p.take_ride_state(request, "r0", 512, operation="op")
+    p.take_ride_units(request, "r0", 512, operation="op")
     assert p.has_ride_pins(max_age_s=10.0)
     assert p.has_ride_pins(max_age_s=10.0, sole_holder=True) is frees
 

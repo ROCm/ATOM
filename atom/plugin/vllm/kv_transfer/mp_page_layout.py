@@ -40,10 +40,7 @@ import torch
 
 from atom.config import KVCacheTensor
 from atom.kv_transfer.disaggregation.page_region import page_region
-from atom.kv_transfer.disaggregation.types import (
-    KVTransferTensors,
-    RecurrentPageGroup,
-)
+from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
 # Fixed and total: every movable plane a ``KVCacheTensor`` can carry on the
 # attention leg. A plane added to that dataclass and not added here would be
@@ -62,9 +59,8 @@ _PAGE_ROLES: tuple[str, ...] = (
 # The recurrent planes. They are deliberately NOT published through the PAGE
 # layout: a recurrent group counts in its own block id space and only its last
 # snapshot is meaningful, so ``base + block_id * unit_bytes`` on the attention
-# block table addresses someone else's state. ``build_mp_recurrent_groups``
-# publishes them instead, as engine groups of their own. Named here so that
-# "absent from _PAGE_ROLES" is a decision on record rather than an omission.
+# block table addresses someone else's state. Named here so that "absent from
+# _PAGE_ROLES" is a decision on record rather than an omission.
 _NON_PAGE_ROLES: frozenset[str] = frozenset(
     {
         "layer_num",
@@ -145,10 +141,10 @@ def build_mp_transfer_tensors(
             # These bytes live in ``kv_cache_data`` like paged KV but are
             # indexed in the recurrent group's own block space, so ``base +
             # block_id * unit_bytes`` on the attention block table addresses
-            # someone else's state. The plugin routes recurrent groups to
-            # ``build_mp_recurrent_groups`` long before here; reaching it means
-            # that routing has a hole, and continuing would publish a layout
-            # whose every later check passes.
+            # someone else's state. The plugin refuses a recurrent group on
+            # the MP backend long before here; reaching it means that refusal
+            # has a hole, and continuing would publish a layout whose every
+            # later check passes.
             raise ValueError(
                 f"ATOM LMCache MP: layer {layer_num} is per-request recurrent "
                 "state, not paged KV; no block-addressed transport may move it"
@@ -198,59 +194,6 @@ def build_mp_transfer_tensors(
     return transfer_tensors
 
 
-def build_mp_recurrent_groups(
-    views: Any,
-    *,
-    tokens_per_block: int,
-) -> tuple[RecurrentPageGroup, ...]:
-    """Describe the state groups as recurrent engine groups of their own.
-
-    ``views.groups`` holds each group's planes in key-space order -- group
-    order, then plane order -- the same as for PAGE.
-
-    ``tokens_per_block`` is the block a snapshot is addressed in (the PAGE
-    block on DeepSeek-V4.1). It is passed rather than read off the tensors
-    because a snapshot's row count says nothing about how many tokens it
-    covers. The MP worker registers each group one LMCache chunk wide, which
-    this has to divide.
-    """
-    if type(tokens_per_block) is not int or tokens_per_block <= 0:
-        raise ValueError(
-            "ATOM LMCache MP: recurrent tokens_per_block must be a positive "
-            f"int, got {tokens_per_block!r}"
-        )
-    groups: list[RecurrentPageGroup] = []
-    for ordinal, (tensors, num_blocks) in enumerate(
-        zip(views.groups, views.num_blocks, strict=True)
-    ):
-        pages = []
-        for layer, plane in enumerate(tensors):
-            total_bytes = plane.numel() * plane.element_size()
-            if int(plane.shape[0]) != num_blocks or total_bytes % num_blocks:
-                raise ValueError(
-                    f"ATOM LMCache MP: recurrent group {ordinal} layer {layer} "
-                    f"has leading dimension {int(plane.shape[0])} and "
-                    f"{total_bytes} B over {num_blocks} blocks; its leading "
-                    "axis is not the block axis"
-                )
-            pages.append(
-                page_region(
-                    plane,
-                    semantic_role=f"R{ordinal:02d}.L{layer:04d}.state",
-                    unit_bytes=total_bytes // num_blocks,
-                    total_bytes=total_bytes,
-                )
-            )
-        groups.append(
-            RecurrentPageGroup(
-                pages=tuple(pages),
-                num_blocks=int(num_blocks),
-                tokens_per_block=tokens_per_block,
-            )
-        )
-    return tuple(groups)
-
-
 def summarize_layout(transfer_tensors: Any) -> str:
     """One line naming the plane count and the bytes one block costs."""
     regions = transfer_tensors.block_regions
@@ -259,20 +202,16 @@ def summarize_layout(transfer_tensors: Any) -> str:
         f"{len(regions)} planes, {bytes_per_block} B/block, "
         f"{transfer_tensors.num_blocks} blocks"
     )
-    recurrent = tuple(getattr(transfer_tensors, "recurrent_page_groups", None) or ())
-    if recurrent:
-        snapshot = sum(
-            int(page.region.unit_bytes) for group in recurrent for page in group.pages
-        )
+    spec = getattr(transfer_tensors, "paged_state_checkpoint_spec", None)
+    if spec is not None:
         line += (
-            f"; {len(recurrent)} recurrent group(s), {snapshot} B/snapshot, "
-            f"{recurrent[0].tokens_per_block} tokens/snapshot"
+            f"; checkpoint image {spec.image_bytes} B over "
+            f"{spec.units_per_checkpoint} units"
         )
     return line
 
 
 __all__ = [
-    "build_mp_recurrent_groups",
     "build_mp_transfer_tensors",
     "summarize_layout",
 ]

@@ -151,27 +151,6 @@ class NativeStateTransfer:
     kv_only: bool = False
 
 
-@dataclass(frozen=True)
-class RecurrentStateTransfer:
-    """The recurrent-state blocks one PAGE transfer operation also carries.
-
-    A hybrid model's recurrent layers are snapshotted once per chunk, so a
-    transfer covering several chunks has state for the last one only. This
-    names that boundary and, per recurrent group in ordinal order, the block
-    holding its snapshot. Earlier chunks are filled in with the null block id
-    by the transport -- a separate step because only the transport knows how
-    many chunks the operation spans.
-
-    Riding the PAGE operation rather than a leg of its own is the point: KV and
-    the state that continues it then commit and restore as one object, so a
-    reader can never find a prefix whose attention pages are present and whose
-    recurrent state is not.
-    """
-
-    boundary_tokens: int
-    block_ids: tuple[int, ...]
-
-
 @dataclass
 class LMCacheReqMeta:
     """Everything the worker needs to load/save one request's KV this step."""
@@ -206,8 +185,6 @@ class LMCacheReqMeta:
     # reclaim it.
     dispatched_at: float | None = None
     dispatch_clock: str | None = None
-    # Appended for positional compatibility.
-    recurrent_state: RecurrentStateTransfer | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

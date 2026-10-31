@@ -90,11 +90,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         hit = self._last_tier_hit(seq, sid)
         if hit != num_prompt or num_prompt % self.chunk_size:
             return matched
-        if self._recurrent_state_hook is not None:
-            # Recurrent state is restored at the logical hit, which the hook
-            # has already capped below the prompt; a PAGE transfer ending past
-            # it would have no state to continue from.
-            return matched
 
         load_spec = self._load_specs.get(sid)
         if load_spec is None:
@@ -200,6 +195,13 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         del timeout_s  # See abandon_save: no release without a report.
         return []
 
+    def _live_transfers(self) -> set[Any]:
+        """Dispatched operations still waiting for a terminal worker report."""
+        live: set[Any] = set(self._save_inflight.values())
+        live.update(self._save_operation_owner)
+        live.update(operation for _, operation in self._active_load_operations.values())
+        return live
+
     abandons_saves = False
 
     def enforce_transfer_deadlines(self) -> None:
@@ -213,10 +215,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         such as a lost completion or a TP rank that never reports.
         """
         live = self._live_transfers()
-        # Same set, second consumer: a ride's source pin is owned by the
-        # recurrent leg and released by this reconciliation, not by a store
-        # report -- a ride issues no store.
-        self._retire_recurrent_rides(live)
         seen = self._transfer_seen_at
         for operation in [op for op in seen if op not in live]:
             del seen[operation]

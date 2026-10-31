@@ -241,6 +241,10 @@ class OffloadConfigShim:
         # model_tag.
         self.model = str(getattr(model_config, "model", "") or "atom-model")
         self.model_tag = self.model
+        # No bounded state replay on the plugin: a tier hit restores its state
+        # from the checkpoint image the transfer carries, so the MP layout
+        # registers image groups (`stores_state_images`).
+        self.state_replay_tokens = 0
 
     @property
     def offload_speculative_config(self) -> Any:

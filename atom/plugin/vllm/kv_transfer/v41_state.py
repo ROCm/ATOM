@@ -12,12 +12,12 @@ the window ring holds raw per-token rows the compressed pages do not contain.
 
 So the two travel together or not at all. State checkpoints copy the entry into
 PAGE units at chunk boundaries, in blocks of single-layer checkpoint groups that
-vLLM hashes like any other group. The LMCache MP worker registers those groups
-as engine groups beside the PAGE planes, so a transfer names one block in each
-and the checkpoint commits and restores as part of the PAGE object it
-continues. This module is the scheduler half: it decides which boundary a
-transfer may carry and caps hits to one. The blocks themselves are resolved by
-`PageRideMixin`.
+vLLM hashes like any other group; the block in checkpoint group ``j`` is unit
+``j`` of the native checkpoint image. A transfer names those units as a
+native-state image (`v41_mp_scheduler`), so the checkpoint commits and restores
+as part of the PAGE object it continues. This module is the scheduler half: it
+decides which boundary a transfer may carry and caps hits to one. The units
+themselves are resolved by `PageRideMixin`.
 """
 
 from __future__ import annotations
@@ -72,9 +72,9 @@ class V41BoundaryPlanner(PageRideMixin):
         # that verifies and prefills. Two or more is a plain prefill, which the
         # scheduling patch keeps out of verification steps.
         self.prefill_tail = int(prefill_tail)
-        # The groups holding the checkpoint, in the order the worker registered
-        # them -- that order is the key space, so it is taken from the caller
-        # rather than rebuilt here.
+        # The groups holding the checkpoint, in image unit order -- that order
+        # is the key space, so it is taken from the caller rather than rebuilt
+        # here.
         self.ride_group_ids = tuple(int(g) for g in checkpoint_group_ids)
         # A V4.1 boundary may sit only on a whole PAGE edge, which with a
         # DSpark draft group is coarser than the engine-wide hash unit.
@@ -216,7 +216,7 @@ class V41BoundaryPlanner(PageRideMixin):
         # blocks vLLM has since freed (a failed or withdrawn load sends the
         # request back to WAITING). Dropped before the early returns: a
         # failure here must not leave the old destination for
-        # `take_ride_state` to find.
+        # `take_ride_units` to find.
         self.forget_ride(str(request.request_id))
         boundary = int(num_total_computed)
         if boundary <= 0 or boundary % self.hash_block_size:

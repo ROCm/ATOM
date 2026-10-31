@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The boundary blocks a PAGE transfer carries alongside its KV.
+"""The checkpoint units a PAGE transfer carries alongside its KV.
 
-Under the ``mp`` backend a recurrent snapshot is not a leg of its own: it is
-registered as an engine group beside the PAGE planes, and every transfer names
-one block per group. The scheduler asks for those blocks through
-``install_recurrent_state_hook``; this mixin is the answer for state that is a
-vLLM-hashed, block-addressed boundary -- DeepSeek-V4.1's state-checkpoint
-groups. Which group ids hold the boundary and on what grid it may sit are
-attributes of the host planner.
+Under the ``mp`` backend a state checkpoint is not a leg of its own: its PAGE
+units ride the transfer as a native-state image (`NativeStateTransfer.
+unit_ids`), registered by the worker through `native_state_layout`. The V4.1
+MP scheduler (`v41_mp_scheduler`) asks for those units here; this mixin is the
+answer for state that is a vLLM-hashed, block-addressed boundary --
+DeepSeek-V4.1's state-checkpoint groups, where the block in group ``j`` is
+image unit ``j``. Which group ids hold the boundary and on what grid it may sit
+are attributes of the host planner.
 
 The host planner must provide:
 
@@ -22,8 +23,7 @@ The host planner must provide:
     to it when the two do not differ.
 ``self.ride_group_ids``
     The kv cache groups holding the boundary, in the order the transfer names
-    them -- which is the order the worker registered them in, and therefore
-    the key space.
+    them -- image unit order, and therefore the key space.
 """
 
 from __future__ import annotations
@@ -104,6 +104,29 @@ class PageRideMixin:
         """Drop a finished request's recorded destinations."""
         self._ride_boundaries.pop(str(req_id), None)
 
+    def _boundary_block_hash(self, request, boundary_tokens: int):
+        """vLLM's hash of the block that ends at *boundary_tokens*, or None."""
+        block_hashes = getattr(request, "block_hashes", None) or ()
+        index = int(boundary_tokens) // self.hash_block_size - 1
+        if index < 0 or index >= len(block_hashes):
+            return None
+        return block_hashes[index]
+
+    def boundary_hash(self, request, boundary_tokens: int) -> int:
+        """The prefix hash a transfer ending at *boundary_tokens* names.
+
+        vLLM's block hash there, its leading 8 bytes as an integer (the width
+        of ATOM's own prefix hashes); 0 when the request has none. Carried for
+        the record (`NativeStateTransfer.prefix_hash`): the MP worker keys
+        nothing by it.
+        """
+        block_hash = self._boundary_block_hash(request, boundary_tokens)
+        if block_hash is None:
+            return 0
+        if isinstance(block_hash, int):
+            return block_hash
+        return int.from_bytes(bytes(block_hash)[:8], "big")
+
     def source_blocks_for(self, request, boundary_tokens: int) -> tuple[int, ...]:
         """This boundary's committed state block in each group, or ``()``.
 
@@ -116,18 +139,17 @@ class PageRideMixin:
         pool = self._pool
         if pool is None:
             return ()
-        block_hashes = getattr(request, "block_hashes", None) or ()
         boundary_tokens = int(boundary_tokens)
         # The grid, not the hash unit: with a draft group the hash unit is the
         # smallest group's and a boundary legal on it need not be one the
         # state can sit on. The grid is a multiple of the hash unit, so the
-        # index below is still exact.
+        # hash looked up below is still exact.
         if boundary_tokens <= 0 or boundary_tokens % self.ride_boundary_grid:
             return ()
-        index = boundary_tokens // self.hash_block_size - 1
-        if index < 0 or index >= len(block_hashes):
+        block_hash = self._boundary_block_hash(request, boundary_tokens)
+        if block_hash is None:
             return ()
-        blocks = pool.get_cached_block(block_hashes[index], list(self.ride_group_ids))
+        blocks = pool.get_cached_block(block_hash, list(self.ride_group_ids))
         if not blocks:
             return ()
         block_ids = tuple(int(block.block_id) for block in blocks)
@@ -135,8 +157,10 @@ class PageRideMixin:
             return ()
         return block_ids
 
-    def take_ride_state(self, request, req_id, end: int, operation=None):
-        """The state blocks a transfer ending at *end* should carry.
+    def take_ride_units(
+        self, request, req_id, end: int, operation=None
+    ) -> tuple[int, ...] | None:
+        """The checkpoint units a transfer ending at *end* should carry.
 
         A load's destination was resolved and allocated by vLLM at admission,
         so the recorded tuple is the only correct answer. A save's source is
@@ -151,12 +175,10 @@ class PageRideMixin:
         which is strictly longer than the H2D.
 
         ``None`` means this boundary has no whole state. The caller must then
-        not build the transfer at all -- a PAGE-only object on a model with
-        recurrent groups registered is refused by the transport, which is the
+        not build the transfer at all -- a PAGE-only object on a layout with
+        image groups registered is refused by the transport, which is the
         point: it would restore a prefix whose state is someone else's.
         """
-        from atom.kv_transfer.offload.metadata import RecurrentStateTransfer
-
         end = int(end)
         if operation is None:
             # A load. Its destination is what vLLM allocated for this
@@ -186,7 +208,7 @@ class PageRideMixin:
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
             self._ride_pins[operation] = tuple(block_ids)
             self._ride_pinned_at[operation] = time.monotonic()
-        return RecurrentStateTransfer(boundary_tokens=end, block_ids=tuple(block_ids))
+        return tuple(block_ids)
 
     def retire_ride_pins(self, live_operations) -> None:
         """Give back the shares of every ride whose save the scheduler forgot.
