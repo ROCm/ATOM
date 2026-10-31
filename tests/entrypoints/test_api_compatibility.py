@@ -965,3 +965,148 @@ def test_v41_alias_without_encoder_retains_generic_template_contract(
         assert "thinking_effort" not in server.templates[-1][1]
     if endpoint == "chat/completions" and stream:
         assert events([response.text])[-1]["choices"] == []
+
+
+@pytest.mark.parametrize("endpoint", ["chat/completions", "responses", "messages"])
+@pytest.mark.parametrize("key", ["reasoning_effort", "thinking_effort"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_effort_only_preserves_inherited_none(
+    server, monkeypatch, endpoint, key, stream
+):
+    defaults = {key: "none"}
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", defaults)
+    body = {"model": "renamed-model", "stream": stream}
+    if endpoint == "responses":
+        body.update(input="hi", reasoning={"effort": 37})
+    else:
+        body["messages"] = [{"role": "user", "content": "hi"}]
+        if endpoint == "messages":
+            body.update(max_tokens=16, output_config={"effort": "high"})
+        else:
+            body["reasoning_effort"] = 37
+    response = post("/v1/" + endpoint, body)
+    assert response.status_code == 200, response.text
+    kwargs = server.templates[-1][1]
+    assert kwargs["thinking_mode"] == "chat"
+    assert kwargs["reasoning_effort"] == ("high" if endpoint == "messages" else 37)
+    assert defaults == {key: "none"}
+
+
+@pytest.mark.parametrize(
+    "reason", ["unschedulable: insufficient capacity", "rejected", "aborted"]
+)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+def test_responses_engine_failure_is_not_success(
+    server, monkeypatch, reason, stream, partial
+):
+    server.chunks = [
+        {
+            "text": "partial" if partial else "",
+            "token_ids": [1] if partial else [],
+            "finished": True,
+            "finish_reason": reason,
+        }
+    ]
+
+    async def generate(*args, **kwargs):
+        yield {
+            "text": "partial" if partial else "",
+            "finish_reason": reason,
+            "num_cached_tokens": 0,
+        }
+
+    monkeypatch.setattr(api_server, "generate_async", generate)
+    response = post("/v1/responses", {"input": "hi", "stream": stream})
+    assert response.status_code == 200
+    parsed = events([response.text]) if stream else []
+    result = parsed[-1]["response"] if stream else response.json()
+    assert result["status"] == "failed"
+    assert result["error"] == {"code": reason.split(":", 1)[0], "message": reason}
+    assert result["incomplete_details"] is None
+    if partial:
+        assert result["output"][-1]["status"] == "incomplete"
+    else:
+        assert result["output"] == []
+    if stream:
+        assert parsed[-1]["type"] == "response.failed"
+        assert not any(e["type"] == "response.completed" for e in parsed)
+
+
+def test_stream_finalization_failure_preserves_terminal_and_item_state():
+    from atom.entrypoints.openai.serving_responses import CodexToolContext
+
+    emitter = ResponseStreamEmitter(
+        "r", "model", context=CodexToolContext(kinds={"search": "tool_search"})
+    )
+    frames = emitter.opening_frames()
+    frames += emitter.frames_for_events(
+        [
+            ("tool_call_start", {"id": "call", "function": {"name": "search"}}),
+            (
+                "tool_call_args",
+                {"function": {"arguments": "[" * 2000 + "0" + "]" * 2000}},
+            ),
+            ("reasoning", "pending reasoning"),
+        ]
+    )
+    next_sequence = emitter.sequence_number
+    with pytest.raises(RecursionError) as exc:
+        emitter.finish_frames(has_tool_calls=True)
+    assert not emitter.terminated
+    assert emitter.sequence_number == next_sequence
+    assert emitter.reasoning_buffer == "pending reasoning"
+    frames += list(stream_failure_frames(exc.value, emitter, opened=True))
+    parsed = events(frames)
+    assert [e["sequence_number"] for e in parsed] == list(range(len(parsed)))
+    assert parsed[-1]["type"] == "response.failed"
+    assert sum(e["type"] == "response.failed" for e in parsed) == 1
+    added = [
+        e["item"]["id"] for e in parsed if e["type"] == "response.output_item.added"
+    ]
+    done = [e["item"]["id"] for e in parsed if e["type"] == "response.output_item.done"]
+    assert sorted(added) == sorted(done)
+    assert all(
+        item["status"] == "incomplete" for item in parsed[-1]["response"]["output"]
+    )
+    assert emitter.finish_frames() == []
+    assert list(stream_failure_frames(exc.value, emitter, opened=True)) == []
+
+
+def test_responses_route_emits_failure_when_finalization_raises(server, monkeypatch):
+    from atom.entrypoints.openai import serving_responses
+
+    original = serving_responses.ResponseStreamEmitter._terminal_frame
+
+    def fail_success(self, usage, terminal):
+        if terminal["status"] == "completed":
+            raise ValueError("terminal conversion failed")
+        return original(self, usage, terminal)
+
+    monkeypatch.setattr(
+        serving_responses.ResponseStreamEmitter, "_terminal_frame", fail_success
+    )
+    response = post("/v1/responses", {"input": "hi", "stream": True})
+    parsed = events([response.text])
+    assert parsed[-1]["type"] == "response.failed"
+    assert parsed[-1]["response"]["error"]["message"] == "terminal conversion failed"
+    assert [e["sequence_number"] for e in parsed] == list(range(len(parsed)))
+    assert sum(e["type"] == "response.output_item.done" for e in parsed) == 1
+    assert parsed[-1]["response"]["output"][0]["status"] == "incomplete"
+    assert server.cleanups
+
+
+def test_nonstream_chat_rejects_stream_options_before_generation(server):
+    response = post(
+        "/v1/chat/completions",
+        {
+            "model": "renamed-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "stream_options": {"include_usage": True},
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "stream_options requires stream=true"
+    assert server.generations == 0
+    assert server.templates == []

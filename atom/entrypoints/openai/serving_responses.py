@@ -475,6 +475,10 @@ def _reasoning_text(content: Any) -> str:
 def response_status(
     finish_reason: str | None = None, error: dict | None = None
 ) -> dict:
+    if error is None and finish_reason:
+        reason = finish_reason.split(":", 1)[0]
+        if reason in ("unschedulable", "rejected", "aborted"):
+            error = {"code": reason, "message": finish_reason}
     status = (
         "failed"
         if error
@@ -509,7 +513,7 @@ def build_responses_response(
     """One Responses object from ordered engine events, then Codex rewrite."""
     output = _output_items_from_events(events, request_id, context)
     terminal = response_status(finish_reason)
-    if terminal["status"] == "incomplete" and output:
+    if terminal["status"] != "completed" and output:
         output[-1]["status"] = "incomplete"
     response = {
         "id": request_id,
@@ -697,7 +701,16 @@ class ResponseStreamEmitter:
     ) -> list[str]:
         if self.terminated:
             return []
-        self.terminated = True
+        # Build the entire terminal batch transactionally. A conversion failure
+        # must not consume item state or sequence numbers before frames are sent.
+        pending = copy.copy(self)
+        pending.completed_items = [dict(item) for item in self.completed_items]
+        frames = pending._finish_frames(usage, has_tool_calls, finish_reason, error)
+        pending.terminated = True
+        self.__dict__.update(pending.__dict__)
+        return frames
+
+    def _finish_frames(self, usage, has_tool_calls, finish_reason, error):
         terminal = response_status(finish_reason, error)
         self._item_status = (
             "completed" if terminal["status"] == "completed" else "incomplete"
@@ -705,7 +718,9 @@ class ResponseStreamEmitter:
         frames: list[str] = []
         frames.extend(self._flush_reasoning())
         if has_tool_calls or any(state.added for state in self.tool_call_items):
-            frames.extend(self._finish_tool_calls())
+            frames.extend(
+                self._finish_tool_calls(failed=terminal["status"] == "failed")
+            )
         else:
             frames.extend(self._finish_message())
         frames.append(self._terminal_frame(usage, terminal))
@@ -916,7 +931,7 @@ class ResponseStreamEmitter:
             )
         return frames
 
-    def _finish_tool_calls(self) -> list[str]:
+    def _finish_tool_calls(self, *, failed: bool = False) -> list[str]:
         frames: list[str] = []
         frames.extend(self._close_message_if_open())
         for state in self.tool_call_items:
@@ -928,7 +943,13 @@ class ResponseStreamEmitter:
             kind = self.context.kind(state.name)
             namespace = self.context.namespace(state.name)
             if kind == "custom":
-                input_text = custom_tool_input(state.accumulated_args)
+                # Failure finalization preserves raw partial input; it must not
+                # retry the converter that may have caused the original error.
+                input_text = (
+                    state.accumulated_args
+                    if failed
+                    else custom_tool_input(state.accumulated_args)
+                )
                 if input_text:
                     frames.append(
                         self._event(
@@ -970,7 +991,11 @@ class ResponseStreamEmitter:
                     "type": "tool_search_call",
                     "call_id": state.call_id,
                     "execution": "client",
-                    "arguments": parse_tool_search_arguments(state.accumulated_args),
+                    "arguments": (
+                        {"query": state.accumulated_args}
+                        if failed
+                        else parse_tool_search_arguments(state.accumulated_args)
+                    ),
                     "status": "completed",
                 }
             else:
@@ -1133,7 +1158,10 @@ class ResponseStreamEmitter:
             response_obj["tool_choice"] = (
                 req.tool_choice if req.tool_choice is not None else "auto"
             )
-        self.context.rewrite_response(response_obj)
+        # Items were already rewritten when completed. Only restore request
+        # tools here; re-converting failed partial items could fail again.
+        if self.context.original_tools is not None:
+            response_obj["tools"] = self.context.original_tools
         event_type = "response." + terminal["status"]
         return self._event(
             event_type,
