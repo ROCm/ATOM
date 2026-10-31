@@ -221,6 +221,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
     # inheriting their parent's owner.
+    # Prefix-spread DP routing (replaces sticky sessions when set): every
+    # request goes to the least-loaded rank (`least_tokens` score), except that
+    # the rank which last ran its longest prompt prefix -- found through the
+    # frontend prompt block-hash chain -- keeps it while within
+    # ATOM_DP_PREFIX_OWNER_MARGIN load tokens of the lightest rank. A request
+    # placed away from its prefix is queued first on its rank, so the tier
+    # (LMCache) load of that prefix starts on arrival.
+    "ATOM_DP_PREFIX_SPREAD": lambda: os.getenv("ATOM_DP_PREFIX_SPREAD", "0") == "1",
+    "ATOM_DP_PREFIX_OWNER_MARGIN": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN", "65536")
+    ),
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),

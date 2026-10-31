@@ -176,6 +176,11 @@ class LMCacheReqMeta:
     # reclaim it.
     dispatched_at: float | None = None
     dispatch_clock: str | None = None
+    # Incremental token shipping (LMCache MP): when >= 0, `token_ids` holds
+    # only tokens [token_base, ...) past the prefix the worker already holds
+    # for this request, and the transfer covers tokens [0, token_end).
+    token_base: int = -1
+    token_end: int = -1
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

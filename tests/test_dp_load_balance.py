@@ -542,3 +542,76 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
     assert progressed_while_router_locked
     assert sum(mgr._rank_reqs) == 1
     assert sum(mgr._rank_tokens) == 0
+
+
+# ── Prefix-spread routing ──────────────────────────────────────────────────
+
+
+def _make_spread_mgr(n_ranks=2, margin=65536):
+    from collections import OrderedDict
+
+    mgr = _make_mgr(n_ranks)
+    mgr._prefix_spread = True
+    mgr._prefix_owner_margin = margin
+    mgr._prefix_owner = OrderedDict()
+    mgr._prefix_owner_cap = 1 << 19
+    mgr._prefix_stride_tokens = 4096
+    mgr._dp_route_counters.update(
+        prefix_owner_total=0,
+        prefix_moved_total=0,
+        prefix_moved_tokens=0,
+        prefix_cold_total=0,
+    )
+    return mgr
+
+
+def _chain_seq(seq_id, tokens, first_block=0, session=None):
+    import array
+
+    from atom.model_engine.prefix_hash import ShippedChain
+
+    seq = _FakeSeq(seq_id, num_prompt_tokens=tokens, dp_session_id=session)
+    blocks = array.array("Q", range(first_block, first_block + tokens // 128))
+    seq.prompt_hash_chain = ShippedChain(128, 0, tokens, 0, blocks)
+    return seq
+
+
+def test_prefix_spread_keeps_prefix_owner_within_margin():
+    mgr = _make_spread_mgr()
+    first = _chain_seq(1, 100_000, session="s")
+    (owner,) = _route(mgr, [first])
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[owner] = 30_000  # busier, but within the margin
+    second = _chain_seq(2, 110_000, session="s")
+    assert _route(mgr, [second]) == [owner]
+    assert mgr._dp_route_counters["prefix_owner_total"] == 1
+    assert not getattr(second, "dp_prefetch_priority", False)
+    # Only the uncached extension is charged as prefill debt.
+    assert mgr._seq_load[2][2] == 110_000 - 98_304
+
+
+def test_prefix_spread_moves_past_margin_and_flags_prefetch():
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    moved = _chain_seq(2, 110_000)
+    (rank,) = _route(mgr, [moved])
+    assert rank != owner
+    assert moved.dp_prefetch_priority is True
+    assert mgr._dp_route_counters["prefix_moved_total"] == 1
+    assert mgr._dp_route_counters["prefix_moved_tokens"] == 98_304
+    # The prefix now names its new rank.
+    mgr._rank_tokens = [0, 0]
+    assert _route(mgr, [_chain_seq(3, 120_000)]) == [rank]
+
+
+def test_prefix_spread_ignores_sessions_for_new_prefixes():
+    mgr = _make_spread_mgr()
+    seqs = [
+        _chain_seq(i, 50_000, first_block=10_000 * i, session="same") for i in range(4)
+    ]
+    assert sorted(_route(mgr, seqs)) == [0, 0, 1, 1]
+    assert mgr._dp_route_counters["prefix_cold_total"] == 4

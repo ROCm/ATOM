@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+import weakref
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import (
@@ -18,7 +20,11 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
-from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+from atom.kv_transfer.offload.metadata import (
+    LMCacheOffloadMetadata,
+    LMCacheReqMeta,
+    SaveSpec,
+)
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
     _make_scheduler_adapter,
@@ -34,6 +40,16 @@ from atom.kv_transfer.offload.mp.transfer import (
 )
 
 logger = logging.getLogger("atom")
+
+
+class _StrongRef:
+    """`weakref.ref`'s call interface for objects that refuse weak references."""
+
+    def __init__(self, obj: Any) -> None:
+        self._obj = obj
+
+    def __call__(self) -> Any:
+        return self._obj
 
 
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
@@ -116,8 +132,81 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
 
+    # A save names its LMCache chunks by the request's token prefix. Long
+    # prompts are saved a chunk at a time, so shipping the whole prefix with
+    # every save is quadratic in the prompt. Workers keep each request's
+    # tokens (`LMCacheMPConnector._resolve_shipped_tokens`); only tokens past
+    # what they already hold travel. ATOM_MP_INCREMENTAL_TOKENS=0 ships whole
+    # prefixes again.
+    _INCREMENTAL_TOKENS = os.environ.get("ATOM_MP_INCREMENTAL_TOKENS", "1") == "1"
+
+    def _ship_tokens(self, seq: Any, end: int) -> tuple[int, list[int]]:
+        """(worker-held prefix length, tokens to append) for prefix ``[0, end)``."""
+        shipped = self.__dict__.setdefault("_shipped_tokens", {})
+        entry = shipped.get(seq.id)
+        base = 0
+        if entry is not None:
+            if entry[0]() is seq:
+                base = entry[1]
+            else:
+                self._drop_shipped_tokens(seq.id)
+        new = max(base, end)
+        delta = list(seq.token_ids[base:new]) if new > base else []
+        try:
+            ref = weakref.ref(seq)
+        except TypeError:  # test doubles without weakref support
+            ref = _StrongRef(seq)
+        shipped[seq.id] = (ref, new)
+        return base, delta
+
+    def _drop_shipped_tokens(self, req_id: Any) -> None:
+        shipped = self.__dict__.setdefault("_shipped_tokens", {})
+        if shipped.pop(req_id, None) is not None:
+            self.__dict__.setdefault("_shipped_drops", []).append(req_id)
+
+    def _build_save_request(
+        self, seq, saved, aligned, operation, block_ids, is_last_prefill
+    ):
+        if not self._INCREMENTAL_TOKENS:
+            return super()._build_save_request(
+                seq, saved, aligned, operation, block_ids, is_last_prefill
+            )
+        base, delta = self._ship_tokens(seq, aligned)
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=delta,
+            block_ids=block_ids,
+            save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
+            is_last_prefill=is_last_prefill,
+            save_operation=operation,
+            token_base=base,
+            token_end=aligned,
+        )
+
+    def _build_load_request(self, seq, load_spec, load_operation, transfer_end):
+        if not self._INCREMENTAL_TOKENS:
+            return super()._build_load_request(
+                seq, load_spec, load_operation, transfer_end
+            )
+        base, delta = self._ship_tokens(seq, transfer_end)
+        return LMCacheReqMeta(
+            req_id=seq.id,
+            token_ids=delta,
+            block_ids=list(seq.block_table),
+            load_spec=load_spec,
+            load_operation=load_operation,
+            token_base=base,
+            token_end=transfer_end,
+        )
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         metadata = super().build_connector_meta()
+        drops = self.__dict__.get("_shipped_drops")
+        if drops and metadata.requests:
+            # Only metadata with requests is sure to reach the workers; an
+            # empty snapshot may be dropped, so the drops wait for one.
+            metadata.token_cache_drops = drops
+            self._shipped_drops = []
         for req in metadata.requests:
             if req.load_spec is not None:
                 end = req.load_spec.transfer_end_tokens
@@ -225,6 +314,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
+        self._drop_shipped_tokens(seq.id)
         self._pending_session_ends()[str(seq.id)] = seq
         self._end_finished_sessions()
 
