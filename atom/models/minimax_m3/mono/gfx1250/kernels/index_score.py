@@ -74,11 +74,15 @@ def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
     wait_new_keys=None, prepare=None, heads=ONE_INDEX_HEAD, q_frag_head=None,
-    prepare_heads=None,
+    prepare_heads=None, new_keys=None,
 ):  # fmt: skip
     """``kernels.index_score.emit_index_scores`` on gfx1250. ``q_frag(k, c)``:
     this lane's B operand for token k, k-chunk c (16 bf16 at ``q_dims``);
-    ``red``: WAVES * 16 floats."""
+    ``red``: WAVES * 16 floats. ``new_keys``: (``make(first, last)``, LDS ``at``):
+    tokens first .. last's index keys as their insert writes them, token first
+    + j's HEAD_DIM / 4 words at ``at`` + j HEAD_DIM / 4, made by the CTA (behind
+    ``prepare``'s barrier) instead of waited for (``wait_new_keys``) where a
+    CTA's block holds the step's keys."""
     assert local_blocks >= 1, "the block of the current token must be pinned"
     l16 = lane % 16
     g = lane // 16
@@ -144,6 +148,28 @@ def emit_index_scores(
         return fx.Vector.from_elements(
             [lo[e] for e in range(8)] + [hi[e] for e in range(8)], fx.BFloat16
         )
+
+    def with_new_keys(w4s, tk, b, tile, at):
+        """``load_keys``' chunks of key 16 tile + lane % 16 of block b, the step's
+        keys of token tk's row (the last q_len positions of its sequence) taken
+        from LDS ``at`` instead."""
+        j = b * SPARSE_BLOCK + 16 * tile + l16 - (pick(seq, tk) - q_len)
+        new = (j >= 0) & (j < q_len)
+        jc = fx.min(fx.max(j, 0), q_len - 1)
+        out = []
+        for c in range_constexpr(CHUNKS):
+            nv = fx.Vector(
+                fx.ptr_load(
+                    at + (jc * (HEAD_DIM // 4) + 16 * g + 4 * c),
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            out.append(
+                fx.Vector.from_elements(
+                    [new.select(nv[e], w4s[c][e]) for e in range(4)], fx.Int32
+                )
+            )
+        return out
 
     def tiles_max(b, qb, col_seq, tiles, kw):
         """Max over key tiles ``tiles`` of block b of this lane's column's causal
@@ -218,12 +244,19 @@ def emit_index_scores(
         for u in range(slot, total, BLOCKS):
             tk, b = task_block(fx.Int32(u))
             page = uniform(page_of(tk, b))
-            if const_expr(wait_new_keys is not None):  # noqa: SIM102
+            if const_expr(new_keys is not None):
+                assert prepare is not None
+                if new_keys_in(tk, b):
+                    new_keys[0](tk - (q_len - 1), tk)
+            elif const_expr(wait_new_keys is not None):
                 if new_keys_in(tk, b):
                     wait_new_keys()
-            kw = load_keys(page, [fx.min(wave, KEY_TILES - 1)])
+            tile = fx.min(wave, KEY_TILES - 1)
+            kw = load_keys(page, [tile])
             if const_expr(prepare is not None):
                 prepare(tk - (q_len - 1), tk)
+            if const_expr(new_keys is not None):
+                kw = [with_new_keys(kw[0], tk, b, tile, new_keys[1])]
             col, col_seq = cols_of(tk)
             if tw:
                 qb = [q_frag(col, s) for s in range(CHUNKS)]
