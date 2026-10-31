@@ -70,34 +70,21 @@ def unfold_block_output(
 class DSparkDraftUnifiedAttention:
     """aiter ``unified_attention`` (3D split-KV) on the folded draft block."""
 
-    def __init__(self, device, max_bs: int = 0):
+    def __init__(self, device, max_bs: int, max_model_len: int):
         from aiter.jit.utils.chip_info import get_gfx
         from aiter.ops.triton.attention.unified_attention import unified_attention
 
         self.device = device
         self._ua = unified_attention
+        self.max_model_len = max_model_len
         # Whether an fp8 pool's q is cast to the pool dtype: only where that
         # selects the Gluon kernel (see the module docstring).
         self.q_to_pool_dtype = get_gfx() == "gfx950"
-        # q's descale when it is cast: the cast is a plain one, so 1.0. Built
-        # here so no replay allocates it.
+        # q's descale when it is cast: the cast is a plain one, so 1.0.
         self._q_descale = torch.ones(1, dtype=torch.float32, device=device)
-        # One query row per sequence: `cu_seqlens_q` is a constant ramp. Built
-        # here, ahead of any capture, for the engine's widest batch, so a
-        # replay slices storage the recording saw rather than allocating.
-        self._cu_seqlens_q = (
-            torch.arange(max_bs + 1, dtype=torch.int32, device=device)
-            if max_bs > 0
-            else None
-        )
-
-    def _cu_seqlens(self, bs: int) -> torch.Tensor:
-        if self._cu_seqlens_q is None or self._cu_seqlens_q.shape[0] < bs + 1:
-            # No ceiling was given, so only an eager caller lands here.
-            self._cu_seqlens_q = torch.arange(
-                bs + 1, dtype=torch.int32, device=self.device
-            )
-        return self._cu_seqlens_q[: bs + 1]
+        # One query row per sequence, so `cu_seqlens_q` is a constant ramp,
+        # sized for the engine's widest batch so a replay only slices it.
+        self._cu_seqlens_q = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
 
     def __call__(
         self,
@@ -123,7 +110,7 @@ class DSparkDraftUnifiedAttention:
             k=k_cache,
             v=v_cache,
             out=of,
-            cu_seqlens_q=self._cu_seqlens(bs),
+            cu_seqlens_q=self._cu_seqlens_q[: bs + 1],
             max_seqlen_q=1,
             seqused_k=kv_lens,
             # Static: the table's token span. A device-side max would sync.

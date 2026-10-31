@@ -1,6 +1,8 @@
 import logging
 from functools import partial
 
+import torch
+
 from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
@@ -157,6 +159,11 @@ class DraftKvBuilder(PoolRowsMixin):
         # Decides the LAYOUT this pool is bound in, not its size. See
         # `uses_dflash_pool` and `MhaKvPool.fa_views`.
         self._non_causal = non_causal
+        # The DFlash pool's one per-tensor scale, shared by every layer: a
+        # one-element fp32 tensor because both `reshape_and_cache_flash` and
+        # `unified_attention` take it as a device pointer. Built at the first
+        # bind, never in a forward.
+        self._unit_scale = None
         self._kv_pool = None
         self.num_blocks = 0  # set in allocate_kv_cache_tensors
 
@@ -290,21 +297,15 @@ class DraftKvBuilder(PoolRowsMixin):
         )
         module.max_model_len = runner.config.max_model_len
         if self._non_causal:
-            # PYTHON FLOATS, not views, and never `scale_views`: the DFlash
-            # draft's pool declares no scale planes (`per_tensor_scales`), so
-            # asking for them is the `KeyError` that method promises. 1.0 is
-            # SGLang's own default for an fp8 KV cache with nothing in the
-            # checkpoint to load -- "If no scales were loaded ... use the
-            # default value of 1.0" (`srt/layers/quantization/kv_cache.py`) --
-            # and it is what both ends of this pool consume:
-            # `reshape_and_cache_flash` divides by it on the write,
-            # `unified_attention` multiplies by it on the read. Set for bf16
-            # too, so the two ends never have to ask the dtype what kind of
-            # scale they hold.
-            #
-            # Gated, because a causal draft (Eagle3-llama) DOES own per-token
-            # scale planes and must keep reading them.
-            module.k_scale = module.v_scale = 1.0
+            # One per-tensor scale of 1.0: the pool declares no scale planes
+            # (`per_tensor_scales`), and the DFlash checkpoint ships no KV
+            # scales (all tensors BF16, no `quantization_config`), so 1.0 is
+            # the value both ends must agree on, as SGLang defaults it.
+            if self._unit_scale is None:
+                self._unit_scale = torch.ones(
+                    1, dtype=torch.float32, device=k_cache.device
+                )
+            module.k_scale = module.v_scale = self._unit_scale
         elif runner.config.kv_cache_dtype == "fp8":
             module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
         module.k_cache = k_cache

@@ -251,3 +251,31 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+def test_dflash_layers_share_one_bound_unit_scale_tensor():
+    """The DFlash pool binds every layer the same one-element 1.0 tensor, at
+    bind time: both its write and its read take the scale as a device pointer,
+    and nothing may be built for it inside a captured forward."""
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        per_tensor_scales=True,
+    )
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=2)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
+    builder = DraftKvBuilder(runner, lambda **_: pool, non_causal=True)
+    builder._kv_pool = pool
+
+    layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
+    for m in layers:
+        m.layer_num = 0
+        builder.build_kv_cache_tensor(m)
+
+    scale = layers[0].k_scale
+    assert torch.is_tensor(scale) and scale.numel() == 1 and float(scale) == 1.0
+    assert all(m.k_scale is scale and m.v_scale is scale for m in layers)

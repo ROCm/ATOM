@@ -112,14 +112,11 @@ neither can take anything else: `aiter.reshape_and_cache_flash` dereferences
 `v_descale` once per program. SGLang stores nothing else either -- it refuses,
 "Only support per-tensor scaling factor for fp8 KV cache"
 (`srt/layers/quantization/kv_cache.py:76`) -- and defaults the value to 1.0
-when the checkpoint carries no scale, which this one does not (verified, see
-`_store_cfg`). So the pool declares NO per-token scale planes
-(`mha_kv_scale_fields(per_tensor_scales=True)`) and the scale is 1.0.
-
-A per-token plane handed to either end would not raise: both read its first
-element and apply it to every token. Hence the explicit `numel() == 1` guard in
-`_store_cfg`, the same check as
-`AttentionImpl._reject_per_token_scales_on_unified` (attention_mha.py:182).
+when the checkpoint carries no scale, which this one does not (all 62 tensors
+BF16, no `quantization_config`). So the pool declares NO per-token scale planes
+(`mha_kv_scale_fields(per_tensor_scales=True)`), and the binder hands every
+layer one shared one-element 1.0 tensor (`DraftKvBuilder`). A draft that did
+ship a calibrated scalar scale would need a loader.
 
 The pool's fp8 is the platform's, `aiter.utility.dtypes.d_dtypes["fp8"]`, as
 the target's is: `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
@@ -140,8 +137,12 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.paged_attention import Attention
-from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
+from atom.models.dspark_draft import (
+    DSparkDraftModel,
+    DSparkMarkovHead,
+    KVCacheBinding,
+    linear_out,
+)
 
 logger = logging.getLogger("atom")
 
@@ -159,9 +160,9 @@ class KimiK3DFlashAttention(nn.Module):
         self,
         config,
         layer_num: int,
+        block_attn,
         quant_config=None,
         prefix: str = "",
-        max_num_seqs: int | None = None,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -192,12 +193,6 @@ class KimiK3DFlashAttention(nn.Module):
         # it in (`DSparkProposer._draft_entry_tokens`) -- one number, decided
         # where the pool is built, never re-derived here.
         tp_full = get_tensor_model_parallel_world_size()
-        # The engine's batch ceiling: it sizes the read's constant
-        # `cu_seqlens_q` ramp once, before any capture, so no replay ever
-        # allocates (`DSparkDraftUnifiedAttention`). None is the graceful
-        # answer, not a guess: the read then sizes off the live batch, which is
-        # correct eagerly but may reallocate once.
-        self.max_num_seqs = None if max_num_seqs is None else int(max_num_seqs)
         if self.total_num_heads % tp_full != 0:
             raise ValueError(
                 f"DFlash draft has {self.total_num_heads} query heads, which is "
@@ -220,13 +215,9 @@ class KimiK3DFlashAttention(nn.Module):
             )
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_full)
 
-        # The block's read, built on the first forward that has a pool --
-        # see `_attend_non_causal`.
-        self._block_attn = None
-        # `(kv_cache_dtype_str, k_scale_dev, v_scale_dev)` for the pool this
-        # layer ends up bound to, resolved once on the first forward that has
-        # one -- see `_store_cfg`.
-        self._store = None
+        # The block's read, one instance shared by every layer
+        # (`KimiK3DFlash.__init__`).
+        self.block_attn = block_attn
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -285,20 +276,9 @@ class KimiK3DFlashAttention(nn.Module):
             is_neox_style=True,
         )
 
-        self.attn = Attention(
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            scale=self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            kv_cache_dtype=getattr(config, "_atom_kv_cache_dtype", "bf16"),
-            layer_num=layer_num,
-            rotary_emb=self.rotary_emb,
-            prefix=f"{prefix}.attn",
-            # Deliberately None: see the module docstring. The op would rope
-            # before norming, which is the opposite of the reference.
-            q_norm=None,
-            k_norm=None,
-        )
+        # What the draft pool binds this layer's cache and scales onto
+        # (`DraftKvBuilder.build_kv_cache_tensor`).
+        self.kv = KVCacheBinding(layer_num)
 
     def _qkv(self, hidden_states: torch.Tensor):
         qkv = linear_out(self.qkv_proj(hidden_states))
@@ -307,7 +287,7 @@ class KimiK3DFlashAttention(nn.Module):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
         """One block pass: write this block's own K/V, then attend non-causally.
 
-        Deliberately NOT `self.attn(...)`. `PagedAttentionImpl.dispatch_backend`
+        Deliberately NOT the paged `Attention` op. `PagedAttentionImpl.dispatch_backend`
         is causal at every arm -- `causal=True` is a literal in all four runners
         and `attn_metadata.causal` is read only by the MLA impl -- so routing
         the block through it would silently apply a causal mask to an attention
@@ -327,7 +307,7 @@ class KimiK3DFlashAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         n = q.shape[0]
-        k_cache, v_cache = self._caches(fwd_ctx)
+        k_cache, v_cache = self._caches()
         if k_cache is None:
             # warmup_model() runs BEFORE allocate_kv_cache(), so there is no
             # paged state to write or read. The block forward still runs -- that
@@ -355,81 +335,18 @@ class KimiK3DFlashAttention(nn.Module):
         """
         import aiter
 
-        kind, k_dev, v_dev = self._store_cfg(k_cache)
         aiter.reshape_and_cache_flash(
             k.view(-1, self.num_kv_heads, self.head_dim),
             v.view(-1, self.num_kv_heads, self.head_dim),
             k_cache,
             v_cache,
             slot_mapping,
-            kind,
-            k_dev,
-            v_dev,
+            # `reshape_and_cache_flash`'s vocabulary: "fp8" divides by the
+            # scale and casts, "auto" stores the source dtype unchanged.
+            "fp8" if k_cache.dtype.itemsize == 1 else "auto",
+            self.kv.k_scale,
+            self.kv.v_scale,
         )
-
-    def _store_cfg(self, k_cache):
-        """How this layer writes and reads its pool: `(kind, k_dev, v_dev)`.
-
-        Resolved ONCE, on the first forward that has a bound pool, and cached:
-        it reads `self.attn.k_scale` -- a python float the binder set -- and
-        materializes the one-element device tensors
-        `aiter.reshape_and_cache_flash` types arg6/arg7 as, which the read
-        takes as its descales too. Doing it per forward
-        would be a host allocation inside a cudagraph-captured region.
-
-        Not resolvable at `__init__`: `warmup_model()` runs before
-        `allocate_kv_cache()`, so the binder has not run and the pool's dtype is
-        not knowable yet. Keyed on the cache's own dtype rather than on a
-        config string, so the write and the bytes it lands in cannot disagree.
-
-        `"fp8"` vs `"auto"` is `reshape_and_cache_flash`'s own vocabulary:
-        "auto" stores the source dtype unchanged (and then never dereferences
-        the scales), "fp8" divides by `*k_scale` and casts.
-
-        THE GUARD. `unified_attention` loads its `k_descale` once per program
-        -- the FIRST element of whatever it is handed -- so a per-token scale
-        plane reaching it is not an error, it is that one token's scale applied
-        to every key. Refused here instead, mirroring
-        `AttentionImpl._reject_per_token_scales_on_unified`
-        (attention_mha.py:182). It is also what SGLang does, one layer up:
-        "Only support per-tensor scaling factor for fp8 KV cache"
-        (`srt/layers/quantization/kv_cache.py:76`).
-
-        NO SCALE LOADER, AND NONE NEEDED FOR THIS CHECKPOINT. The 1.0 is never
-        read from disk, and here it does not shadow a calibrated value: the
-        SpecForge DFlash draft (RadixArk/Kimi-K3-DSpark @ 3c5bac30) ships no KV
-        scales -- all 62 tensors are BF16, config.json has no
-        quantization_config, and no tensor name contains "scale". A draft that
-        DID ship a calibrated scalar k_scale/v_scale would be silently run at
-        1.0 (this guard only catches multi-element ones), with lower acceptance
-        as the only symptom; supporting one needs a loader, not this guard.
-        """
-        if self._store is not None:
-            return self._store
-        k_scale = getattr(self.attn, "k_scale", 1.0)
-        v_scale = getattr(self.attn, "v_scale", 1.0)
-        for name, scale in (("k_scale", k_scale), ("v_scale", v_scale)):
-            if torch.is_tensor(scale) and scale.numel() != 1:
-                raise NotImplementedError(
-                    f"DFlash draft layer {self.attn.layer_num} was bound a "
-                    f"{name} with {scale.numel()} elements. Both its write "
-                    "(aiter.reshape_and_cache_flash) and its read "
-                    "(aiter unified_attention) take ONE per-tensor scale, "
-                    "and both read the first element of a multi-element one "
-                    "rather than raising."
-                )
-        k_f, v_f = float(k_scale), float(v_scale)
-        # Not `== torch.bfloat16`: any 1-byte cache element is a quantized one
-        # and anything wider holds its own values -- e4m3fn on gfx950, fnuz on
-        # gfx942, whichever `d_dtypes["fp8"]` the target's pool is.
-        quantized = k_cache.dtype.itemsize == 1
-        dev = k_cache.device
-        self._store = (
-            "fp8" if quantized else "auto",
-            torch.tensor([k_f], dtype=torch.float32, device=dev),
-            torch.tensor([v_f], dtype=torch.float32, device=dev),
-        )
-        return self._store
 
     def _attend_non_causal(self, q, k, v, attn_metadata, k_cache, v_cache):
         """The block's one non-causal read: aiter `unified_attention`, folded.
@@ -443,19 +360,6 @@ class KimiK3DFlashAttention(nn.Module):
         group, so there is one head count and the local read already is the
         global softmax over this rank's TP head slice.
         """
-        if self._block_attn is None:
-            from atom.model_ops.attentions.dspark_draft_attn import (
-                DSparkDraftUnifiedAttention,
-            )
-
-            # First forward with a pool is an eager one (`_store_cfg`), so the
-            # ramp it sizes is allocated ahead of any capture.
-            self._block_attn = DSparkDraftUnifiedAttention(
-                q.device, max_bs=self.max_num_seqs or 0
-            )
-        # The SAME scales the write just quantized with, as the one-element
-        # device tensors the write takes -- `_store_cfg` built them eagerly.
-        _, k_dev, v_dev = self._store_cfg(k_cache)
         bs = attn_metadata.block_tables.shape[0]
         q3 = q.view(-1, self.num_heads, self.head_dim)
         # Explicitly dense, NOT `empty_like`: `q` is a column slice of the
@@ -466,7 +370,7 @@ class KimiK3DFlashAttention(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        self._block_attn(
+        self.block_attn(
             q3,
             k_cache,
             v_cache,
@@ -474,36 +378,26 @@ class KimiK3DFlashAttention(nn.Module):
             attn_metadata.context_lens[:bs],
             o,
             self.scaling,
-            k_dev,
-            v_dev,
+            self.kv.k_scale,
+            self.kv.v_scale,
         )
         return o.reshape(-1, self.num_heads * self.head_dim)
 
-    def _caches(self, fwd_ctx):
-        """This layer's pool rows in FLASH layout, or `(None, None)` if unbound.
-
-        `DraftKvBuilder` bound them that way (`MhaKvPool.fa_views`): the read
-        takes the 4-D `[entries, entry_tokens, h_kv, head_dim]` page at any
-        width, where SHUFFLE's x-pack would need a power-of-two page.
+    def _caches(self):
+        """This layer's bound pool rows in FLASH layout, or `(None, None)`.
 
         Unbound is a real state, not an error: `warmup_model()` runs before
-        `allocate_kv_cache()`, so `kv_cache_data` is None on that pass. Keyed on
-        the POOL rather than on `is_dummy_run`, because the DP-alignment dummy
-        carries that flag with a fully bound pool.
+        `allocate_kv_cache()`, so the binding still holds its empty init tensor.
         """
-        cache_data = fwd_ctx.kv_cache_data or {}
-        entry = cache_data.get(f"layer_{self.attn.layer_num}")
-        k_cache = getattr(entry, "k_cache", None) if entry is not None else None
-        if k_cache is None or k_cache.numel() == 0:
+        if self.kv.k_cache.numel() == 0:
             return None, None
-        return k_cache, entry.v_cache
+        return self.kv.k_cache, self.kv.v_cache
 
     def write_context_kv(
         self,
         ctx_hidden: torch.Tensor,  # [N, hidden] projected aux context
         positions: torch.Tensor,  # [N] absolute positions
         slot_mapping: torch.Tensor,  # [N] destination slots in the draft pool
-        fwd_ctx,
     ) -> None:
         """Project the target-derived context and cache it as this layer's K/V.
 
@@ -520,7 +414,7 @@ class KimiK3DFlashAttention(nn.Module):
         # Rope at the token's ABSOLUTE position, before the write: that is what
         # makes a cached row valid on every later step without being rewritten.
         _, k = self.rotary_emb(positions, torch.empty_like(k), k)
-        k_cache, v_cache = self._caches(fwd_ctx)
+        k_cache, v_cache = self._caches()
         if k_cache is None:
             return
         self._write_block_kv(k, v, slot_mapping, k_cache, v_cache)
@@ -556,17 +450,17 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         self,
         config,
         layer_num: int,
+        block_attn,
         quant_config=None,
         prefix: str = "",
-        max_num_seqs: int | None = None,
     ):
         super().__init__()
         self.self_attn = KimiK3DFlashAttention(
             config,
             layer_num,
+            block_attn,
             quant_config,
             prefix=f"{prefix}.self_attn",
-            max_num_seqs=max_num_seqs,
         )
         self.mlp = KimiK3DFlashMLP(config, quant_config, prefix=f"{prefix}.mlp")
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -613,9 +507,7 @@ class KimiK3DFlashDecoderLayer(nn.Module):
                 f"DFlash context write has {rows} rows but only "
                 f"{slot_mapping.shape[0]} draft slots"
             )
-        self.self_attn.write_context_kv(
-            ctx_hidden, positions, slot_mapping[:rows], fwd_ctx
-        )
+        self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping[:rows])
 
 
 class KimiK3DFlash(DSparkDraftModel):
@@ -672,17 +564,26 @@ class KimiK3DFlash(DSparkDraftModel):
         )
         self.hidden_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
+        # One block read for every layer, built here -- on the engine's
+        # device, ahead of any capture -- and sized for the engine's widest
+        # batch and longest context.
+        from atom.model_ops.attentions.dspark_draft_attn import (
+            DSparkDraftUnifiedAttention,
+        )
+
+        block_attn = DSparkDraftUnifiedAttention(
+            torch.get_default_device(),
+            max_bs=int(atom_config.max_num_seqs),
+            max_model_len=int(atom_config.max_model_len),
+        )
         self.layers = nn.ModuleList(
             [
                 KimiK3DFlashDecoderLayer(
                     config,
                     layer_offset + i,
+                    block_attn,
                     quant_config,
                     prefix=f"layers.{i}",
-                    # The ENGINE's batch ceiling, off the atom config rather
-                    # than the draft's hf_config: it sizes the read's constant
-                    # buffers once, before any capture.
-                    max_num_seqs=getattr(atom_config, "max_num_seqs", None),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -824,8 +725,7 @@ class KimiK3DFlash(DSparkDraftModel):
 
     @property
     def first_attention_layer_num(self) -> int:
-        """GQA layers register their `Attention` as `attn`, not `mla_attn`."""
-        return self.layers[0].self_attn.attn.layer_num
+        return self.layers[0].self_attn.kv.layer_num
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
         return self.hidden_norm(linear_out(self.fc(aux_concat)))

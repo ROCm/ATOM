@@ -1180,7 +1180,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
         k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
     scale = d**-0.5
 
-    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8)
+    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8, max_model_len=W * E)
     o = torch.empty_like(q)
     one = torch.ones(1, dtype=torch.float32, device=dev)
     read(q, k_pool, v_pool, block_tables, kv_lens, o, scale, one, one)
