@@ -197,6 +197,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "lookup_requests_in_step",
         "state_loads",
         "state_stores",
+        "state_touches",
     )
 
     def __init__(self) -> None:
@@ -215,6 +216,11 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # generation) is what the source-release and index reports carry back to
         # settle the pin and index the hash.
         self.state_stores: list[tuple] = []
+        # StateTouchId per state image the engine voted a hit for: each worker
+        # refreshes the image in LMCache's LRU and reports whether it is still
+        # there. Work in its own right -- an admission can be waiting on the
+        # verdict.
+        self.state_touches: list = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

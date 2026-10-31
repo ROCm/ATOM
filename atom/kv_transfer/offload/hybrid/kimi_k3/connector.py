@@ -16,6 +16,7 @@ import time
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
     StateStoreOperationId,
+    StateTouchId,
 )
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
@@ -30,13 +31,19 @@ from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadScheduler,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.staging import StagedTransfer
-from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import StateByteCodec
+from atom.kv_transfer.offload.hybrid.kimi_k3.state_object import (
+    StateByteCodec,
+    TouchResult,
+)
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     StateOffloadTier,
     _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.model_engine.state_offload import state_tier_cpu_bytes
+from atom.model_engine.state_offload import (
+    state_tier_budget_warning,
+    state_tier_cpu_bytes,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -60,6 +67,16 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: the aggregator reaches quorum on the same step the KV load report does,
 #: rather than leaving a partially-reported key pending forever.
 STATE_LOAD_DISPOSITION_CHANNEL = "k3_state_load_disposition"
+
+#: One verdict per `StateTouchId`: the worker refreshed the image in LMCache's
+#: LRU (`succeeded=True`) or found it gone (`succeeded=False`). Failure-dominant
+#: across TP, like a joint load: one missing shard means the load would miss.
+STATE_TOUCH_CHANNEL = "k3_state_touch"
+
+#: Alongside each `STATE_TOUCH_CHANNEL` verdict, same id: `succeeded=False` when
+#: the image was present but outside LocalCPU's hot cache, so the touch did not
+#: refresh its eviction order. Failure-dominant: any such shard counts.
+STATE_TOUCH_REFRESH_CHANNEL = "k3_state_touch_refresh"
 
 #: The connector's standalone stall clock, used only when reclamation is
 #: disabled (`LMCACHE_EC_PIN_TIMEOUT_SEC <= 0`) so there is no abandon window to
@@ -115,6 +132,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # the no-tier store path and took the whole step's KV loads/saves down
         # with it (super().start_load_kv never ran).
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
+        # Touch verdicts since the last `get_finished`: (resident, refreshed).
+        self._touch_verdicts: dict[StateTouchId, tuple[bool, bool]] = {}
 
     def close(self) -> None:
         """Drain then join the state tier before the base executors.
@@ -230,6 +249,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             staging_buffer_bytes=entry_bytes,
             release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
         )
+        state_bytes = state_tier_cpu_bytes()
         codec = StateByteCodec(
             backend,
             staged,
@@ -238,11 +258,17 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             world_size=world,
             worker_id=rank,
             layout_id=layout_id,
-            max_cache_bytes=state_tier_cpu_bytes(),
+            max_cache_bytes=state_bytes,
         )
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
+        pool_gib = float(getattr(cfg, "max_local_cpu_size", 0) or 0)
+        budget_warning = state_tier_budget_warning(
+            state_bytes, int(pool_gib * (1 << 30)), entry_bytes
+        )
+        if budget_warning:
+            logger.warning("kimi_k3 offload: %s", budget_warning)
         # No index here: StateOffloadIndex lives in the engine process; both
         # directions report and the engine applies.
         self._state_tier = StateOffloadTier(codec)
@@ -278,11 +304,44 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # KV submit to run even when arming half-completed -- an arriving KV
         # completion then settles or evicts whatever the arm did file.
         try:
+            self._touch_states(metadata)
             self._arm_joint_loads(metadata)
             self._start_state_loads(metadata)
             self._start_state_stores(metadata)
         finally:
             super().start_load_kv(metadata)
+
+    def _touch_states(self, metadata) -> None:
+        """Refresh the state images the engine voted a hit for, and record
+        whether each is still there.
+
+        Inline on this thread, not on the tier's executors: a touch is one
+        dict move under LocalCPU's lock, and it must not queue behind an
+        image-sized store. With no tier every image is gone by definition, so
+        the engine's index drops what it still advertises.
+        """
+        touches = getattr(metadata, "state_touches", None)
+        if not touches:
+            return
+        tier = self._state_tier
+        for touch_id in touches:
+            if tier is None:
+                self._touch_verdicts[touch_id] = (False, True)
+                continue
+            try:
+                result = tier.codec.touch(int(touch_id.prefix_hash))
+            except Exception:
+                # Says nothing about the bytes; do not let it erase the index.
+                logger.warning(
+                    "kimi_k3 offload: touch of state hash %d failed",
+                    touch_id.prefix_hash,
+                    exc_info=True,
+                )
+                result = TouchResult.REFRESHED
+            self._touch_verdicts[touch_id] = (
+                bool(result),
+                result is not TouchResult.PRESENT,
+            )
 
     def _arm_joint_loads(self, metadata) -> None:
         """Hold a request owning both legs until both report.
@@ -463,6 +522,16 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                     ConnectorCompletion(STATE_SOURCE_CHANNEL, op, True)
                 )
             self._store_failed_no_tier = set()
+        # Before the tier-None return too: `_touch_states` answers for a
+        # missing tier, and the engine may be holding an admission for it.
+        for touch_id, (resident, refreshed) in self._touch_verdicts.items():
+            out.connector_completions.add(
+                ConnectorCompletion(STATE_TOUCH_CHANNEL, touch_id, resident)
+            )
+            out.connector_completions.add(
+                ConnectorCompletion(STATE_TOUCH_REFRESH_CHANNEL, touch_id, refreshed)
+            )
+        self._touch_verdicts = {}
         if self._state_tier is None:
             # `_arm_joint_loads` armed these even with no tier and
             # `_fail_state_loads` failed their state leg; drain the park here,
@@ -605,6 +674,14 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # block ids, no chunking -- only the park/report lifecycle.
         self._pending_state_loads: list[tuple] = []
         self._pending_state_stores: list[tuple] = []
+        # Hit refresh: touches waiting for the next metadata, the round
+        # counter that keeps each one a distinct aggregator identity, and the
+        # verdicts drained by the engine (`take_state_touch_verdicts`).
+        self._pending_state_touches: list[StateTouchId] = []
+        self._touch_round = 0
+        self._state_touch_verdicts: dict[int, bool] = {}
+        # Touches that only confirmed presence (`take_state_touches_unrefreshed`).
+        self._state_touches_unrefreshed = 0
         # A finished request whose save is queued keeps its blocks pinned
         # (`should_defer_free`), so the queue depth is also how much of the pool
         # a slow backend can hold. Same knob and default the DSV4 layout bounds
@@ -642,6 +719,32 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._pending_state_stores.extend(stores)
         return True
 
+    def enqueue_state_touches(self, hashes) -> bool:
+        """Queue LRU touches for state images the engine just voted a hit for.
+
+        Each gets its own round, so a hash touched again is a new aggregator
+        identity rather than a tombstoned duplicate.
+        """
+        if not hashes:
+            return False
+        for h in hashes:
+            self._pending_state_touches.append(StateTouchId(int(h), self._touch_round))
+            self._touch_round += 1
+        return True
+
+    def take_state_touch_verdicts(self) -> dict[int, bool]:
+        """`{hash: resident}` from the touches that reached TP quorum."""
+        verdicts = self._state_touch_verdicts
+        self._state_touch_verdicts = {}
+        return verdicts
+
+    def take_state_touches_unrefreshed(self) -> int:
+        """Touches since the last call that found an image present but could
+        not refresh it in LocalCPU's LRU."""
+        n = self._state_touches_unrefreshed
+        self._state_touches_unrefreshed = 0
+        return n
+
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         self._refresh_save_stall()
         meta = super().build_connector_meta()
@@ -654,6 +757,8 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # already released.
         meta.state_stores = self._pending_state_stores
         self._pending_state_stores = []
+        meta.state_touches = self._pending_state_touches
+        self._pending_state_touches = []
         return meta
 
     def _may_emit_save(self) -> bool:
@@ -679,6 +784,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             super().has_pending_work()
             or bool(self._pending_state_loads)
             or bool(self._pending_state_stores)
+            or bool(self._pending_state_touches)
         )
 
     # -- save stall --------------------------------------------------------
@@ -845,7 +951,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return max(hbm, min(joint, lmc)) if joint else max(hbm, lmc)
 
     # -- connector-owned channels -----------------------------------------
-    def connector_completion(self, completion) -> bool:
+    def connector_completion(self, completion) -> bool | None:
         if completion.channel == STATE_SOURCE_CHANNEL:
             self._state_source_released.add(completion.operation_id)
             return True
@@ -857,6 +963,18 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             )
             target.add(completion.operation_id)
             return True
+        if completion.channel == STATE_TOUCH_CHANNEL:
+            h = int(completion.operation_id.prefix_hash)
+            self._state_touch_verdicts[h] = self._state_touch_verdicts.get(
+                h, True
+            ) and bool(completion.succeeded)
+            # Handled, but not a terminal save: `process_completions` would
+            # file the touch id under `finished_saving`.
+            return None
+        if completion.channel == STATE_TOUCH_REFRESH_CHANNEL:
+            if not completion.succeeded:
+                self._state_touches_unrefreshed += 1
+            return None
         if completion.channel == STATE_LOAD_DISPOSITION_CHANNEL:
             # Finding #6: a state load whose bytes survived a failed pair. Record
             # only the survivors -- their `failed_loading` report must abandon

@@ -2406,7 +2406,15 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.record_allocation(seq, hbm_probe)
+            if not self.block_manager.record_allocation(
+                seq, hbm_probe, defer_unverified=True
+            ):
+                # The CPU state image this admission would load has not been
+                # confirmed in LMCache lately and its touch is out. Held like
+                # an in-flight prefix: an image found gone is forgotten when
+                # the verdict lands, and the retry plans without it.
+                prefix_waiters.append(seq)
+                continue
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
@@ -3802,6 +3810,42 @@ class Scheduler:
             # never reached a worker, so it is not a `stores_failed`.
             self.block_manager.settle_state_store(op, ok=False, attempted=False)
 
+    def _publish_state_touches(self) -> None:
+        """Hand the state images this pass voted a hit for to the connector,
+        which refreshes them in LMCache's LRU and reports whether each is
+        still there (`_apply_state_touch_verdicts`).
+
+        A connector that will not carry them turns the refresh off for good:
+        otherwise every admission that waits for a verdict would wait out
+        `OFFLOAD_LOOKUP_DEFER_S` for nothing.
+        """
+        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        if offload is None or not offload.refresh_hits:
+            return
+        hashes = offload.take_touches()
+        if not hashes:
+            return
+        enqueue = getattr(self.kv_connector, "enqueue_state_touches", None)
+        if enqueue is not None and enqueue(hashes):
+            return
+        logger.warning(
+            "state offload: %s does not carry state touches; state images "
+            "will not be refreshed in LMCache's LRU, and an image LMCache "
+            "evicts is only noticed when a load misses.",
+            type(self.kv_connector).__name__,
+        )
+        offload.stop_refreshing()
+
+    def _apply_state_touch_verdicts(self, offload) -> None:
+        take = getattr(self.kv_connector, "take_state_touch_verdicts", None)
+        if take is None:
+            return
+        for h, resident in take().items():
+            offload.apply_touch_verdict(h, resident)
+        unrefreshed = getattr(self.kv_connector, "take_state_touches_unrefreshed", None)
+        if unrefreshed is not None:
+            offload.touches_unrefreshed += int(unrefreshed())
+
     def _publish_state_loads(self) -> None:
         """Hand this pass's state-tier loads to the connector, before it builds
         its metadata.
@@ -3812,6 +3856,7 @@ class Scheduler:
         """
         if self.kv_connector is None:
             return
+        self._publish_state_touches()
         # Guarded like the `_settle_state_load` / `_publish_state_stores`
         # siblings: a scheduler built without a block manager (the connector
         # test doubles) would otherwise AttributeError on the bare deref.
@@ -4943,6 +4988,9 @@ class Scheduler:
         # against a `get` that must miss.
         bm = getattr(self, "block_manager", None)
         offload = getattr(bm, "state_offload", None)
+        if offload is not None:
+            # Before the next admission pass, which reads what they decide.
+            self._apply_state_touch_verdicts(offload)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
             indexed, failed = take()
