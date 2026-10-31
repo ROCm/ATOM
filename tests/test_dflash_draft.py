@@ -346,11 +346,7 @@ def _normalized_radixark():
 
 def test_dflash_uses_dflash_pool():
     """Only the SpecForge DFlash draft owns the DCP1 FLASH-layout pool."""
-    dk = pytest.importorskip(
-        "atom.spec_decode.draft_kv",
-        reason="draft_kv imports aiter lazily but config does not",
-        exc_type=(ImportError, RuntimeError),
-    )
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
     assert dk.uses_dflash_pool(_normalized_radixark()) is True
 
     # MiniMax-M3.1's DSpark draft is ALSO a non-MLA block drafter with a pool of
@@ -388,11 +384,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
     """
 
-    dk = pytest.importorskip(
-        "atom.spec_decode.draft_kv",
-        reason="draft_kv imports aiter at call time",
-        exc_type=(ImportError, RuntimeError),
-    )
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
     _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
 
     seen = {}
@@ -487,11 +479,7 @@ def test_dflash_pool_is_built_at_full_tp(tp, dcp):
     sharded), which a read that returns no LSE cannot merge across ranks.
     This is the test that pins which of the two is built.
     """
-    dk = pytest.importorskip(
-        "atom.spec_decode.draft_kv",
-        reason="draft_kv imports aiter at call time",
-        exc_type=(ImportError, RuntimeError),
-    )
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
     _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     from unittest import mock
 
@@ -924,8 +912,6 @@ def test_dcp_guard_admits_an_mtp_draft():
 
 def _entry_tokens(block_size, dcp, dflash_pool):
     """Call the real property against a minimal stub."""
-    # dspark_proposer imports triton at module load; the CPU-only CI runner has
-    # none. The pure-arithmetic mirrors below do not need it and keep running.
     proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
     DSparkProposer = proposer.DSparkProposer
 
@@ -1246,27 +1232,68 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     assert err_causal > 10 * err_bidir, (err_bidir, err_causal)
 
 
-def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan():
-    """The proposer's non-MLA hook returns before the generic CSR build.
+def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(monkeypatch):
+    """The real `_build_paged_block_metadata` for the DFlash pool.
 
-    Source-level, like the guard-message test above: the metadata build is a
-    method on a fully wired runner. It pins that `prepare_paged_block` -- the
-    hook every non-MLA block draft gets its addressing from -- runs and returns
-    AHEAD of `kv_indices_generate_triton`, so neither MiniMax-M3.1 nor the
-    DFlash draft pays for a CSR it never reads.
+    It hands `prepare_paged_block` every token of the block at entry
+    granularity, drops the pad row and the position past the table, and
+    returns before the CSR generator, which a non-MLA read never consumes.
     """
-    import os
+    import torch
 
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(root, "atom", "spec_decode", "dspark_proposer.py")
-    with open(path, encoding="utf-8") as fh:
-        src = fh.read()
-    body = src[src.index("    def _build_paged_block_metadata(") :]
-    early = body.index("        if not self.model.block_attention_is_mla:\n")
-    csr = body.index("kv_indices_generate_triton(")
-    assert early < csr
-    assert "self.model.prepare_paged_block(" in body[early:csr]
-    assert "            return\n" in body[early:csr]
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttentionMetaData
+
+    def _no_csr(*a, **k):
+        raise AssertionError("a non-MLA block draft built the CSR")
+
+    monkeypatch.setattr(proposer, "kv_indices_generate_triton", _no_csr)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    T, vblock, running_bs = 2, 1024, 3
+    bt = CpuGpuBuffer(running_bs, 2, dtype=torch.int32, device=dev)
+    bt.np[:] = [[5, 6], [8, 9], [0, 0]]
+    bt.copy_to_gpu()
+    seen = {}
+    i64 = {"dtype": torch.int64, "device": dev}
+    i32 = {"dtype": torch.int32, "device": dev}
+    stub = types.SimpleNamespace(
+        draft_tokens_per_seq=T,
+        runner=types.SimpleNamespace(block_size=128, forward_vars={"block_tables": bt}),
+        _blk_positions=torch.zeros(running_bs, T, **i64),
+        _blk_offsets=torch.arange(1, T + 1, **i64),
+        _blk_dtype_q=torch.bfloat16,
+        _bound_draft_k_cache=lambda fc: object(),
+        _blk_slots=torch.zeros(running_bs * T, **i64),
+        _blk_ctx_lens=torch.zeros(running_bs, **i32),
+        _draft_entry_tokens=vblock,
+        _draft_is_dcp_sharded=False,
+        _block_page_idx=proposer.DSparkProposer._block_page_idx,
+        _paged_pad_ctx_len=1 + T,
+        _blk_cu_seqlens_q=torch.zeros(running_bs + 1, **i32),
+        _blk_kv_indptr=torch.zeros(running_bs + 1, **i32),
+        _blk_kv_indices=torch.zeros(1, **i32),
+        _blk_last_page_lens=torch.ones(running_bs, **i32),
+        model=types.SimpleNamespace(
+            block_attention_is_mla=False,
+            prepare_paged_block=lambda md, bt_, pos, slots, ctx, *a: seen.update(
+                slots=slots.cpu().tolist(), ctx=ctx.cpu().tolist()
+            ),
+        ),
+    )
+    md = AttentionMetaData()
+    # Row 0 crosses into its second entry; row 1's block runs past its table.
+    anchors = torch.tensor([vblock - 2, 2 * vblock - 2, 0], **i64)
+    proposer.DSparkProposer._build_paged_block_metadata(
+        stub, None, md, anchors, scheduled_bs=2, max_seqlen_k=4 * vblock
+    )
+    assert seen["slots"] == [
+        [5 * vblock + vblock - 1, 6 * vblock],
+        [9 * vblock + vblock - 1, -1],
+        [-1, -1],
+    ]
+    assert seen["ctx"] == [vblock + 1, 2 * vblock, 1 + T]
+    assert md.causal is False
 
 
 def test_dflash_draft_declares_a_non_mla_block():
