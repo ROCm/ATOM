@@ -37,7 +37,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
-from atom.model_ops.triton_mrope import try_mrope_qk_fused
+from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope, try_mrope_qk_fused
 from atom.model_ops.utils import atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
@@ -441,8 +441,9 @@ class Qwen3NextAttention(nn.Module):
                 query=q, key=k, value=v, positions=positions, qkv=qkv
             )
         else:
-            q, k = self.qk_norm(q, k)
-            fused_qk = try_mrope_qk_fused(
+            # gfx1250: the norm and the MRoPE in one kernel. Else the norm, then the MRoPE.
+            fused_qk = try_fused_qk_norm_mrope(
+                self.qk_norm,
                 self.rotary_emb,
                 positions,
                 q,
@@ -451,6 +452,17 @@ class Qwen3NextAttention(nn.Module):
                 self.num_kv_heads,
                 self.head_dim,
             )
+            if fused_qk is None:
+                q, k = self.qk_norm(q, k)
+                fused_qk = try_mrope_qk_fused(
+                    self.rotary_emb,
+                    positions,
+                    q,
+                    k,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )
             if fused_qk is None:
                 q, k = self.rotary_emb(positions, q, k)
             else:
