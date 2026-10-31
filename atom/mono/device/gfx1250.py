@@ -128,6 +128,29 @@ def block_max(v, lane, wave, red):
     return t
 
 
+@traced
+def group_floor(keys32, k, red, lane, wave):
+    """``device.select.group_floor`` on wave32 (groups are lanes of one
+    ``tid % k``, as there). ``red``: WAVES * k + 1 words of LDS."""
+    assert k in (1, 2, 4, 8, 16, 32), k
+    top = keys32[0]
+    for v in keys32[1:]:
+        top = fx.max(top, v)
+    top = butterfly(top, tuple(o for o in (16, 8, 4, 2, 1) if o >= k), fx.max)
+    if lane < k:
+        fx.ptr_store(top, red + (wave * k + lane))
+    gpu.barrier()
+    if (wave == 0) & (lane < k):
+        g = fx.ptr_load(red + lane)
+        for w in range_constexpr(1, WAVES):
+            g = fx.max(g, fx.ptr_load(red + (w * k + lane)))
+        g = butterfly(g, tuple(o for o in (16, 8, 4, 2, 1) if o < k), fx.min)
+        if lane == 0:
+            fx.ptr_store(g, red + WAVES * k)
+    gpu.barrier()
+    return fx.ptr_load(red + WAVES * k)
+
+
 def ballot(pred):
     """The wave's lanes where ``pred`` holds, a bit a lane."""
     return fx.Int32(rocdl.ballot(T.i32, as_ir_value(pred)))
