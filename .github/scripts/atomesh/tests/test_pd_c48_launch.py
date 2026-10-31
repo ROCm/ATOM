@@ -319,6 +319,27 @@ class LaunchTest(unittest.TestCase):
                     self.assertRaises(ValueError):
                 enable_dcp_pbm(bad_config)
 
+    def test_c1_wide_reduce_case_only_adds_the_decode_gate(self):
+        stem = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C1-N3966"
+        base = json.loads((GAP / f"{stem}-MC.json").read_text())
+        candidate = json.loads((GAP / f"{stem}-WR-MC.json").read_text())
+        self.assertEqual(candidate["roles"]["decode"]["env"].pop("C48_D_MLA_WIDE_REDUCE"), "1")
+        candidate["name"] = base["name"]
+        self.assertEqual(candidate, base)
+
+    def test_mla_wide_reduce_gate_refuses_unsupported_role(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        import os
+        from unittest import mock
+        from pd_c48_worker import enable_mla_wide_reduce
+        config = lambda dtype: types.SimpleNamespace(cache_config=types.SimpleNamespace(cache_dtype=dtype))
+        with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": "decode"}):
+            self.assertIsNone(enable_mla_wide_reduce(config("fp8")))
+        for role, dtype in (("prefill", "fp8"), ("decode", "auto")):
+            with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": role, "C48_D_MLA_WIDE_REDUCE": "1"}), \
+                    self.assertRaises(ValueError):
+                enable_mla_wide_reduce(config(dtype))
+
     def test_store_memory_compacts_each_node_once(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
         import os

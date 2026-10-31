@@ -353,6 +353,31 @@ def enable_dcp_pbm(config):
     return {"sources_sha256": sources}
 
 
+# AITER dispatcher sha256 whose module-global _mla_decode_reduce_v1_dispatch the wide reduce replaces.
+WIDE_REDUCE_MLA = ("6eae0cd4cfe0724a0b4eae8f397594dbe30f2f69f34ddc434da7d90a6e5ce2f8",)
+
+
+def enable_mla_wide_reduce(config):
+    """Opt-in Triton split reduce for <= 16-row MLA decode (C1); stock kn_mla_reduce_v1 otherwise."""
+    if os.environ.get("C48_D_MLA_WIDE_REDUCE") != "1":
+        return None
+    import hashlib
+    import importlib
+
+    if os.environ.get("C48_DIAG_ROLE") != "decode" or config.cache_config.cache_dtype != "fp8":
+        raise ValueError("MLA wide reduce requires the decode role and an FP8 KV cache")
+    mla = importlib.import_module("aiter.mla")
+    mla_hash = hashlib.sha256(Path(mla.__file__).read_bytes()).hexdigest()
+    if mla.get_gfx() != "gfx950" or mla_hash not in WIDE_REDUCE_MLA:
+        raise RuntimeError(f"MLA wide reduce requires a pinned gfx950 AITER dispatcher, got {mla_hash}")
+    import pd_c48_mla_wide_reduce
+    if not getattr(mla, "_c48_wide_reduce", False):
+        pd_c48_mla_wide_reduce.install(mla)
+        mla._c48_wide_reduce = True
+    return {"aiter_mla_sha256": mla_hash, "gate_rows": pd_c48_mla_wide_reduce.GATE_ROWS,
+            "blocks": list(pd_c48_mla_wide_reduce.BLOCKS)}
+
+
 class ManifestWorker(Worker):
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
@@ -412,6 +437,9 @@ class ManifestWorker(Worker):
         from pd_c48_memory import LoadingMemoryProbe
         self._c48_native96 = enable_native_mla_96(self.vllm_config)
         pbm = enable_dcp_pbm(self.vllm_config)
+        wide_reduce = enable_mla_wide_reduce(self.vllm_config)
+        if wide_reduce is not None:
+            print(f"[C48-WIDE-REDUCE] rank={self.rank} {json.dumps(wide_reduce)}", flush=True)
         with LoadingMemoryProbe(self):
             super().load_model(load_dummy_weights=load_dummy_weights)
         runner = self.model_runner
@@ -437,6 +465,8 @@ class ManifestWorker(Worker):
             data["mla_native96"] = self._c48_native96
         if pbm is not None:
             data["dcp_pbm"] = pbm
+        if wide_reduce is not None:
+            data["mla_wide_reduce"] = wide_reduce
         if os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1":
             import hashlib
             from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker as store_worker
