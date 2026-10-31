@@ -193,7 +193,7 @@ def mla_builder_cls():
         "atom.model_ops.indexer": _module(
             "atom.model_ops.indexer",
             ConcatKeys=noop,
-            DcpSplit=noop,
+            RowSplit=noop,
             Fp4LaunchStorages=noop,
             IndexRows=object,
             concat_rows=noop,

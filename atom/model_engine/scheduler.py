@@ -671,6 +671,9 @@ class Scheduler:
             * getattr(config, "pipeline_parallel_size", 1)
             + getattr(pc, "pipeline_parallel_rank", 0),
             self._METRICS_ROLE or "default",
+            request_context_enabled=getattr(
+                config, "enable_request_context_metrics", False
+            ),
         )
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
@@ -847,6 +850,7 @@ class Scheduler:
             enable_prefix_caching=config.enable_prefix_caching,
             enable_log_stats=config.enable_log_stats,
             throughput_log_interval_s=config.throughput_log_interval,
+            throughput_log_interval_steps=config.throughput_log_interval_steps,
             cache_hit_rate_window=config.cache_hit_rate_window,
             pool_pressure=self.block_manager.pool_pressure,
         )
@@ -5105,6 +5109,9 @@ class PrefillScheduler:
             * getattr(config, "pipeline_parallel_size", 1)
             + getattr(pc, "pipeline_parallel_rank", 0),
             self._METRICS_ROLE or "default",
+            request_context_enabled=getattr(
+                config, "enable_request_context_metrics", False
+            ),
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -5127,6 +5134,7 @@ class PrefillScheduler:
             label="Prefill ",
             enable_log_stats=config.enable_log_stats,
             throughput_log_interval_s=config.throughput_log_interval,
+            throughput_log_interval_steps=config.throughput_log_interval_steps,
         )
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
