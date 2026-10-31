@@ -658,6 +658,13 @@ class Qwen4ExpLinearAttention(nn.Module):
         return self.out_proj(core_attn_out)
 
 
+def _pad_rows(x: torch.Tensor, missing: int) -> torch.Tensor:
+    """`x` with `missing` zero rows appended on dim 0, for any rank."""
+    if not missing:
+        return x
+    return nn.functional.pad(x, (0, 0) * (x.dim() - 1) + (0, missing))
+
+
 class _SequenceParallel:
     """Token sharding of the HC residual streams across the TP ranks.
 
@@ -678,16 +685,12 @@ class _SequenceParallel:
         self.start = tp_rank * self.chunk
         self.group = get_tp_group()
 
-    def _padded(self, x: torch.Tensor) -> torch.Tensor:
-        return nn.functional.pad(x, (0, 0, 0, self.pad)) if self.pad else x
-
     def shard(self, x: torch.Tensor) -> torch.Tensor:
         """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
 
         Only the local rows are padded, never the whole replicated tensor."""
         rows = x[self.start : self.start + self.chunk]
-        missing = self.chunk - rows.shape[0]
-        return nn.functional.pad(rows, (0, 0, 0, missing)) if missing else rows
+        return _pad_rows(rows, self.chunk - rows.shape[0])
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """This rank's rows -> all `[T, ...]` rows."""
@@ -695,9 +698,9 @@ class _SequenceParallel:
         return out[: self.num_tokens] if self.pad else out
 
     def scatter(self, x: torch.Tensor) -> torch.Tensor:
-        """Per-rank partial sums over all `[T, D]` rows -> summed local rows."""
+        """Per-rank partial sums over all `[T, ...]` rows -> summed local rows."""
         return self.group.reduce_scatter_tensor(
-            self._padded(x.contiguous()), use_custom=False, dim=0
+            _pad_rows(x.contiguous(), self.pad), use_custom=False, dim=0
         )
 
     @classmethod

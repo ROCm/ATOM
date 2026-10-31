@@ -73,9 +73,10 @@ def ranks(monkeypatch):
     return run
 
 
+@pytest.mark.parametrize("trailing", [(6,), (3, 4)], ids=["2d", "3d"])
 @pytest.mark.parametrize("world,tokens", [(2, 8), (4, 8), (4, 10), (4, 1027)])
-def test_shard_gather_round_trip_drops_padding(ranks, world, tokens):
-    full = torch.randn(tokens, 6)
+def test_shard_gather_round_trip_drops_padding(ranks, world, tokens, trailing):
+    full = torch.randn(tokens, *trailing)
 
     def on_rank(rank):
         sp = qwen4_exp._SequenceParallel(tokens, world, rank)
@@ -95,9 +96,10 @@ def test_shard_gather_round_trip_drops_padding(ranks, world, tokens):
         assert torch.equal(gathered, full)
 
 
+@pytest.mark.parametrize("trailing", [(5,), (2, 3)], ids=["2d", "3d"])
 @pytest.mark.parametrize("world,tokens", [(2, 8), (4, 10), (4, 1027)])
-def test_scatter_sums_partials_into_local_rows(ranks, world, tokens):
-    partials = torch.randn(world, tokens, 5, dtype=torch.float64)
+def test_scatter_sums_partials_into_local_rows(ranks, world, tokens, trailing):
+    partials = torch.randn(world, tokens, *trailing, dtype=torch.float64)
     total = partials.sum(0)
 
     def on_rank(rank):
