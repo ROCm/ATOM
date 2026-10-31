@@ -211,6 +211,9 @@ def test_model_forward_matches_unsharded(
         ("2048", 1025, False, False),
         ("2048", 2048, True, True),
         ("0", 4096, False, False),  # disabled
+        # Malformed or negative values warn and keep the default (1024).
+        ("1k", 1025, True, True),
+        ("-1", 1024, False, True),
     ],
 )
 def test_sp_gates(ranks, monkeypatch, env, tokens, target_shards, drafter_shards):

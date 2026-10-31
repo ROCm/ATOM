@@ -908,8 +908,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # additionally never shards forwards of at most HC_QUANT_ROWS_MAX (1024)
     # tokens, so they keep the fused HC FP8 quant; the MTP drafter (no fused
     # quant) follows this value alone. 0 disables.
-    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: int(
-        os.getenv("ATOM_QWEN4_EXP_SP_MIN_TOKENS", "1024")
+    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
     ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
