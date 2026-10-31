@@ -1776,10 +1776,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 raise ValueError(
                     "logprobs is unavailable with synthetic forced acceptance"
                 )
-            if (
-                request.kv_transfer_params
-                or _has_multimodal_content(messages)
-            ):
+            if request.kv_transfer_params or _has_multimodal_content(messages):
                 raise ValueError(
                     "Chat logprobs currently supports text without P/D transfer"
                 )
