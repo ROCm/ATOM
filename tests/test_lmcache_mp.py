@@ -1340,29 +1340,21 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
         _step_event(),
     )
 
+    worker._settle_transfers()
     load_future = worker._pending_loads["load:10:1"].future
     save_future = worker._pending_saves["save:11:2"].future
     load_future.query_error = RuntimeError("load query failed")
     save_future.query_error = RuntimeError("save query failed")
-    output = worker.get_finished()
-
-    assert output.finished_loading == set()
-    assert output.failed_loading == set()
-    assert output.finished_saving == set()
+    # Whichever poll meets its failure first stops the engine: the load's, on
+    # the step thread in `get_finished`, or the save's on the drain round that
+    # call wakes. Neither releases what it holds, and nothing resumes after a
+    # fail-stop, so both stay pending.
+    with pytest.raises(transfer.LMCacheTransferUnprovable, match="query failed"):
+        worker.get_finished()
+        _await_drain_stop(worker)
+        worker.get_finished()
     assert set(worker._pending_loads) == {"load:10:1"}
     assert set(worker._pending_saves) == {"save:11:2"}
-
-    load_future.query_error = None
-    save_future.query_error = None
-    _finish_load(worker, "load:10:1")
-    _finish_save(worker, "save:11:2", result=False)
-    output = worker.get_finished()
-
-    assert output.finished_loading == {load_operation}
-    assert output.failed_loading == set()
-    # A failed store loses this cache opportunity but is terminal and safe to
-    # release, matching the legacy connector's save-failure semantics.
-    assert output.finished_saving == {save_operation}
 
 
 def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
@@ -1521,22 +1513,32 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
     assert len(pending) == 1
 
 
-def test_worker_future_that_keeps_raising_is_bounded_by_the_deadline(
+@pytest.mark.parametrize("kind", ["load", "save"])
+def test_worker_failed_future_stops_immediately_without_releasing_lease(
     fake_lmcache_modules,
     monkeypatch,
+    kind,
 ):
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
-    worker._submit_save(_unprovable_request("save"), _step_event())
-    [pending] = worker._pending_saves.values()
+    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), _step_event())
+    # Submitted and polled once by the drain thread; not terminal yet.
+    worker._settle_transfers()
+    operations = getattr(worker, f"_pending_{kind}s")
+    [pending] = operations.values()
     pending.future.query_error = ConnectionError("IPC context torn down")
 
-    assert not worker.get_finished().finished_saving
-    now[0] += worker._transfer_deadline_s
-    _await_drain_stop(worker)
-    with pytest.raises(transfer.LMCacheTransferUnprovable):
+    # A load is polled once more by `get_finished`; a save by the drain round
+    # that call wakes, whose failure the next call raises.
+    with pytest.raises(
+        transfer.LMCacheTransferUnprovable, match="IPC context torn down"
+    ):
         worker.get_finished()
+        _await_drain_stop(worker)
+        worker.get_finished()
+    assert list(operations.values()) == [pending]
+    assert now[0] == 1000.0
 
 
 def test_worker_invalid_descriptor_fails_before_transport(
@@ -1562,18 +1564,56 @@ def test_worker_invalid_descriptor_fails_before_transport(
     assert not store.succeeded
 
 
-def test_transfer_deadline_defaults_to_twenty_minutes():
-    assert transfer._transfer_deadline_s(_config()) == 1200.0
+def test_transfer_deadline_defaults_to_thirty_seconds_and_can_be_overridden():
+    assert transfer._transfer_deadline_s(_config()) == 30.0
     assert (
         transfer._transfer_deadline_s(
-            _config(extra={"lmcache.mp.transfer_deadline_s": 30})
+            _config(extra={"lmcache.mp.transfer_deadline_s": 180})
         )
-        == 30.0
+        == 180.0
     )
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), -float("inf")])
+def test_transfer_deadline_rejects_unbounded_or_invalid_values(value):
     with pytest.raises(ValueError, match="transfer_deadline_s"):
         transfer._transfer_deadline_s(
-            _config(extra={"lmcache.mp.transfer_deadline_s": 0})
+            _config(extra={"lmcache.mp.transfer_deadline_s": value})
         )
+
+
+@pytest.mark.parametrize("kind", ["load", "save"])
+@pytest.mark.parametrize("completes", [False, True])
+def test_worker_silent_future_is_bounded_without_remote_errors(
+    fake_lmcache_modules, monkeypatch, kind, completes
+):
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _worker(_WorkerAdapter())
+    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), object())
+    worker._settle_transfers()
+    operations = getattr(worker, f"_pending_{kind}s")
+    [pending] = operations.values()
+    now[0] += 29
+    output = worker.get_finished()
+    assert not output.connector_completions
+    assert list(operations.values()) == [pending]
+    if completes:
+        finish = _finish_load if kind == "load" else _finish_save
+        finish(worker, f"{kind}:16:1")
+        worker.get_finished()
+        assert not operations
+    now[0] += 1
+    if completes:
+        worker.get_finished()
+    else:
+        # A load's deadline is checked by `get_finished` itself, a save's by
+        # the drain round that call wakes.
+        with pytest.raises(transfer.LMCacheTransferUnprovable, match="30s"):
+            worker.get_finished()
+            _await_drain_stop(worker)
+            worker.get_finished()
+        assert list(operations.values()) == [pending]
 
 
 def test_worker_save_slices_chunk_blocks_and_preserves_operation(

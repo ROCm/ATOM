@@ -19,7 +19,7 @@
       "display": "DeepSeek-V4-Pro",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
       "config": {
         "tp": 8,
@@ -66,7 +66,7 @@
       "display": "DeepSeek-V4-Pro EPLB r0 MegaMoE",
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro-eplb",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING\nMORI_SHMEM_HEAP_SIZE=16G\nATOM_BENCHMARK_STUCK_POLLS=60",
       "config": {
         "tp": 8,
@@ -103,7 +103,7 @@
       "display": "DeepSeek-V4.1-Flash",
       "path": "deepseek-ai/DeepSeek-V4.1-Flash",
       "prefix": "deepseek-v41-flash",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": {
         "tp": 4,
@@ -125,7 +125,7 @@
       "display": "DeepSeek-R1-0528-MXFP4",
       "path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
       "prefix": "deepseek-r1-0528-mxfp4",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": { "tp": 4, "kv_cache_dtype": "fp8" },
       "variants": [
@@ -144,7 +144,7 @@
       "display": "gpt-oss-120b",
       "path": "openai/gpt-oss-120b",
       "prefix": "gpt-oss-120b",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": {
         "kv_cache_dtype": "fp8",
@@ -156,7 +156,7 @@
       "display": "Kimi-K3",
       "path": "moonshotai/Kimi-K3",
       "prefix": "kimi-k3",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": {
         "tp": 8,
@@ -179,7 +179,7 @@
       "display": "MiniMax-M3-MXFP8",
       "path": "MiniMaxAI/MiniMax-M3-MXFP8",
       "prefix": "m3-mxfp8",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1",
       "config": {
         "tp": 4,
@@ -203,7 +203,7 @@
       "display": "MiniMax-M3-MXFP4",
       "path": "amd/MiniMax-M3-MXFP4",
       "prefix": "m3-mxfp4",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4\nATOM_FORCE_ATTN_TRITON=1",
       "config": {
         "tp": 4,
@@ -227,7 +227,7 @@
       "display": "Qwen3.5-397B-A17B-FP8",
       "path": "Qwen/Qwen3.5-397B-A17B-FP8",
       "prefix": "qwen35-397b-fp8",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": {
         "tp": 4,
@@ -250,7 +250,7 @@
       "display": "Qwen3.5-397B-A17B-MXFP4",
       "path": "amd/Qwen3.5-397B-A17B-MXFP4",
       "prefix": "qwen35-397b-mxfp4",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": {
         "tp": 4,
@@ -263,7 +263,7 @@
       "display": "Llama-3.3-70B-Instruct-MXFP4",
       "path": "amd/Llama-3.3-70B-Instruct-MXFP4-Preview",
       "prefix": "llama-3-3-70b-instruct-mxfp4",
-      "runner": "atom-mi355-8gpu.predownload",
+      "runner": "linux-atom-pitt-mi350x-8",
       "env_vars": "",
       "config": { "tp": 1, "kv_cache_dtype": "fp8" },
       "variants": [{ "label": "", "suffix": "", "conc_max": 256 }]

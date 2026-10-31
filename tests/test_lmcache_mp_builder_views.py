@@ -192,12 +192,20 @@ def mla_builder_cls():
         "atom.model_ops.indexer": _module(
             "atom.model_ops.indexer",
             ConcatKeys=noop,
-            DcpSplit=noop,
+            RowSplit=noop,
             Fp4LaunchStorages=noop,
             IndexRows=object,
             concat_rows=noop,
             fp4_rows=noop,
             fp8_rows=noop,
+        ),
+        "atom.model_ops.indexer.schedule": _module(
+            "atom.model_ops.indexer.schedule", any_layer_skips_index_topk=noop
+        ),
+        "atom.model_ops.attentions.sparse_mla_head_groups": _module(
+            "atom.model_ops.attentions.sparse_mla_head_groups",
+            HEADS=128,
+            SparsePrefillHeadGroups=noop,
         ),
         "atom.model_ops.attentions.backends": _builder_bases(),
         "atom.model_ops.attentions.pool_layout.sub_pool_spec": _sub_pool_module(),

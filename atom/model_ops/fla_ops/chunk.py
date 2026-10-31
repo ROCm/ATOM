@@ -388,3 +388,15 @@ def pop_last_intermediate_states():
     h = ChunkGatedDeltaRuleFunction.last_h
     ChunkGatedDeltaRuleFunction.last_h = None
     return h
+
+
+def publish_intermediate_states(h):
+    """Hand per-chunk states from another prefill kernel to the popper.
+
+    The FlyDSL prefill returns its chunk states instead of leaving them here.
+    Publishing them keeps one contract for consumers that only see the layer
+    from outside (the SGLang radix cache): same logical [K, V] layout and the
+    same row per chunk boundary over the flattened varlen batch, whichever
+    kernel ran the prefill.
+    """
+    ChunkGatedDeltaRuleFunction.last_h = h

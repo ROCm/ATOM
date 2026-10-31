@@ -823,6 +823,19 @@ def test_a_returning_request_id_does_not_inherit_its_old_slot():
     assert cache.cursor[:, 0].tolist() == [-1, 256]
 
 
+def test_slot_owner_records_are_released_with_the_slots():
+    """Registered once among the slot allocators every runner hook releases."""
+    from atom.plugin.vllm import paged_state_checkpoint as psc
+    from atom.plugin.vllm.deepseek_v41_bridge import V41_SLOT_OWNER_RECORDS
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        install_v41_slot_owner_release,
+    )
+
+    install_v41_slot_owner_release()
+    install_v41_slot_owner_release()
+    assert sum(a is V41_SLOT_OWNER_RECORDS for a in psc._slot_allocators) == 1
+
+
 def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
     """The V2 runner commits from `sample_tokens`, after `prepare_attn` has
     returned and the batch getters with it. The keep is still stored, at the

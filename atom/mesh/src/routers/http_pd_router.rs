@@ -670,13 +670,17 @@ impl PDRouter {
         }
 
         let mut tp_sizes = HashMap::new();
+        let mut chunked_transfer = HashMap::new();
         let mut queried_base_urls = HashSet::new();
         for worker in &prefill_workers {
             let worker_url = worker.url().to_string();
             let base_url = worker.base_url().trim_end_matches('/').to_string();
             if !queried_base_urls.insert(base_url.clone()) {
                 if let Some(tp) = tp_sizes.get(&base_url).copied() {
-                    tp_sizes.insert(worker_url, tp);
+                    tp_sizes.insert(worker_url.clone(), tp);
+                }
+                if let Some(meta) = chunked_transfer.get(&base_url).cloned() {
+                    chunked_transfer.insert(worker_url, meta);
                 }
                 continue;
             }
@@ -709,10 +713,17 @@ impl PDRouter {
                 ));
             }
             info!("ATOM prefill {} tp_size={}", base_url, tp);
+            if let Some(meta) = data.get("chunked_transfer").filter(|v| v.is_object()) {
+                chunked_transfer.insert(base_url.clone(), meta.clone());
+                chunked_transfer.insert(worker_url.clone(), meta.clone());
+            }
             tp_sizes.insert(base_url, tp);
             tp_sizes.insert(worker_url, tp);
         }
-        Ok(AtomPrefillInfo { tp_sizes })
+        Ok(AtomPrefillInfo {
+            tp_sizes,
+            chunked_transfer,
+        })
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -1051,6 +1062,17 @@ impl PDRouter {
         _start_time: Instant,
         correlation_id: Option<String>,
     ) -> Response {
+        if decode_request_json["kv_transfer_params"]["chunked_transfer"] == true {
+            return self
+                .dispatch_atom_chunked_internal(
+                    headers,
+                    prefill_request_json,
+                    decode_request_json,
+                    context,
+                    placement,
+                )
+                .await;
+        }
         // Take the reserved pair before the first await, including streaming requests.
         // D remains reserved while P runs because this request already selected D.
         let prefill = placement.prefill.clone();
@@ -1233,6 +1255,112 @@ impl PDRouter {
             }
         };
 
+        self.finish_atom_decode_response(res, context, decode, decode_guard)
+            .await
+    }
+
+    async fn dispatch_atom_chunked_internal(
+        &self,
+        headers: Option<&HeaderMap>,
+        prefill_body: Value,
+        decode_body: Value,
+        context: PDRequestContext<'_>,
+        placement: Arc<ReservedPair>,
+    ) -> Response {
+        // Transfer the selected pair's reservations into the concurrent requests.
+        let prefill = placement.prefill.clone();
+        let decode = placement.decode.clone();
+        let [prefill_guard, decode_guard] = match placement.take_load() {
+            Ok(guards) => guards,
+            Err(response) => return response,
+        };
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+
+        let p = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                prefill_body,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
+        let d = match self
+            .build_worker_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                decode_body,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(req) => req,
+            Err(resp) => return resp,
+        };
+        // Dropping the peer future on an HTTP failure cancels that request.
+        // Drain P independently; D can allocate and request writes immediately.
+        let results = tokio::try_join!(
+            async {
+                let response = self
+                    .send_worker(p, prefill.clone())
+                    .await
+                    .map_err(|e| error::bad_gateway("prefill_server_error", e.to_string()))?;
+                if !response.status().is_success() {
+                    return Err(error::create_error(
+                        response.status(),
+                        "prefill_error",
+                        "Chunked prefill failed",
+                    ));
+                }
+                response
+                    .drain()
+                    .await
+                    .map_err(|e| error::bad_gateway("prefill_read_error", e.to_string()))?;
+                drop(prefill_guard);
+                Ok(())
+            },
+            async {
+                let response = self
+                    .send_worker(d, decode.clone())
+                    .await
+                    .map_err(|e| error::bad_gateway("decode_server_error", e.to_string()))?;
+                events::RequestReceivedEvent {}.emit();
+                if !response.status().is_success() {
+                    return Err(error::create_error(
+                        response.status(),
+                        "decode_error",
+                        "Chunked decode failed",
+                    ));
+                }
+                Ok(response)
+            }
+        );
+        let res = match results {
+            Ok(((), res)) => res,
+            Err(response) => return response,
+        };
+        self.finish_atom_decode_response(res, context, decode, decode_guard)
+            .await
+    }
+
+    async fn finish_atom_decode_response(
+        &self,
+        res: WorkerResponse,
+        context: PDRequestContext<'_>,
+        decode: Arc<dyn Worker>,
+        decode_guard: WorkerLoadGuard,
+    ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 

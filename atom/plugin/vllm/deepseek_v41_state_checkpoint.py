@@ -472,7 +472,7 @@ def apply_vllm_v41_prefix_install() -> None:
     install()
     install_v41_store_sites()
     install_v41_state_checkpoint_group_ids()
-    install_v41_runner_state_events()
+    install_v41_slot_owner_release()
     install_v41_group_check_scope()
     from atom.plugin.vllm.req_id_passthrough_patch import install_v2_host_block_rows
 
@@ -530,28 +530,18 @@ def install_v41_group_check_scope() -> bool:
     return True
 
 
-def install_v41_runner_state_events() -> int:
-    """Carry the scheduler's per-step checkpoint plan into whichever runner runs.
+def install_v41_slot_owner_release() -> None:
+    """Release the bridge's slot-owner records with the slots.
 
-    Third site with the same gap as `install_v41_store_sites` and
-    `install_v41_state_checkpoint_group_ids`: `_apply_runner_patches` wraps
-    `_update_states` on the V1 `GPUModelRunner` only, so on V4.1's V2 runner
-    `_store_plan` stayed empty -- the scheduler planned a checkpoint at the
-    anchor, the worker was never told, and the next request's hit landed on a
-    boundary nothing had written (`needs state at N, found 1`). The same
-    wrapper goes on every runner class here.
-
-    The bridge's slot-owner records are released with the slots, so a
-    request id that comes back does not inherit its old slot.
+    `_apply_runner_patches` hands every runner's finished, preempted and
+    resumed ids to the registered slot allocators; registered among them, the
+    records go when the request does, so a request id that comes back does
+    not inherit its old slot.
     """
     from atom.plugin.vllm import paged_state_checkpoint as PSI
     from atom.plugin.vllm.deepseek_v41_bridge import V41_SLOT_OWNER_RECORDS
-    from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
     PSI.register_slot_allocator(V41_SLOT_OWNER_RECORDS)
-    return sum(
-        PSI.patch_runner_update_states(cls) for cls in gpu_model_runner_classes()
-    )
 
 
 def install_v41_state_checkpoint_group_ids() -> int:

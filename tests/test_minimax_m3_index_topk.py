@@ -42,6 +42,30 @@ from atom.model_ops.minimax_m3.index_topk import (
 TOPK = 16
 
 
+@pytest.mark.parametrize(
+    "arch,dtype,want",
+    [
+        ("gfx942", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
+        ("gfx942", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
+        ("gfx950", torch.bfloat16, (4, m.SCORE_NUM_STAGES)),
+        ("gfx950", torch.float8_e4m3fn, (4, m.SCORE_NUM_STAGES)),
+        ("gfx950", torch.float8_e4m3fnuz, (4, m.SCORE_NUM_STAGES)),
+        ("gfx1250", torch.bfloat16, (8, m.SCORE_NUM_STAGES)),
+        ("gfx1250", torch.float8_e4m3fn, (4, 1)),
+        ("gfx1250", torch.float8_e4m3fnuz, (4, 1)),
+        ("gfx1250", torch.float8_e5m2, (4, 1)),
+        ("gfx1250", torch.float8_e5m2fnuz, (4, 1)),
+    ],
+)
+def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    m._prefill_score_launch_config.cache_clear()
+    try:
+        assert m._prefill_score_launch_config(dtype) == want
+    finally:
+        m._prefill_score_launch_config.cache_clear()
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
@@ -562,3 +586,107 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("strided_q", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "qlens,prefixes,q_zero",
+    [
+        ([1], [128], False),
+        ([129, 17, 0], [127, 4096, 0], False),
+        ([257], [4096], True),
+        ([2517], [102784], False),
+    ],
+)
+def test_prefill_launch_policy_preserves_scores_and_selection(
+    monkeypatch, heads, strided_q, cache_dtype, qlens, prefixes, q_zero
+):
+    """The launch-only optimization must preserve the previous PR's exact output.
+
+    Compare every causally valid score and all top-k/page-table outputs against
+    the previous (8 warps, FP8 stages=1 / BF16 stages=3) launch, on identical
+    tensor values. This supplements rather than replaces the independent
+    selector/oracle tests above.
+    """
+    import triton
+
+    if m.get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 launch-policy regression")
+    kw = _inputs(qlens, prefixes, heads, "cuda")
+    q = kw["idx_q"]
+    if strided_q:
+        storage = torch.empty(
+            (q.shape[0], heads * 2, HEAD_DIM), dtype=q.dtype, device=q.device
+        )
+        storage[:, 1 : heads + 1].copy_(q)
+        q = storage[:, 1 : heads + 1]
+        kw["idx_q"] = q
+    if q_zero:
+        q.zero_()
+    cache = kw["index_kv_cache"].to(cache_dtype)
+    kw["index_kv_cache"] = cache
+    # Check that logical and physical page ids are not accidentally conflated.
+    kw["block_table"] = torch.randperm(
+        cache.shape[0], dtype=torch.int32, device=q.device
+    ).reshape(kw["block_table"].shape)
+    total_q = sum(qlens)
+    max_block = triton.cdiv(kw["max_seq_len"], SPARSE_BLOCK_SIZE)
+    q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
+    chunk = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, q.device)
+    valid_counts = torch.cat(
+        [
+            (torch.arange(length, device=q.device) + prefix + SPARSE_BLOCK_SIZE)
+            // SPARSE_BLOCK_SIZE
+            for length, prefix in zip(qlens, prefixes)
+        ]
+    )
+    valid = (
+        torch.arange(max_block, device=q.device)[None, None, :]
+        < valid_counts[None, :, None]
+    ).expand(heads, -1, -1)
+
+    def score(config):
+        result = torch.full((heads, total_q, max_block), float("nan"), device=q.device)
+        m._index_block_score_kernel[
+            (q_tiles, len(qlens) * heads, triton.cdiv(max_block, chunk))
+        ](
+            q,
+            cache,
+            result,
+            kw["block_table"],
+            kw["cu_seqlens_q"],
+            kw["seq_lens"],
+            kw["prefix_lens"],
+            heads,
+            HEAD_DIM,
+            kw["sm_scale"],
+            chunk,
+            *q.stride(),
+            *cache.stride(),
+            *result.stride(),
+            kw["block_table"].stride(0),
+            BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_warps=config[0],
+            num_stages=config[1],
+        )
+        return result
+
+    old_config = (8, 1 if cache_dtype == torch.float8_e4m3fn else m.SCORE_NUM_STAGES)
+    new_config = m._prefill_score_launch_config(cache_dtype)
+    old_score, new_score = score(old_config), score(new_config)
+    torch.cuda.synchronize()
+    assert torch.isfinite(old_score[valid]).all()
+    assert torch.equal(old_score[valid], new_score[valid])
+
+    # Exercise the production wrapper too; do not validate only a raw launch.
+    new_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(m, "_prefill_score_launch_config", lambda dtype: old_config)
+        old_outputs = m.minimax_m3_index_topk(**kw, emit_sparse_block_table=True)
+    torch.cuda.synchronize()
+    for old_output, new_output in zip(old_outputs, new_outputs):
+        assert torch.equal(old_output, new_output)

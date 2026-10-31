@@ -544,7 +544,9 @@ def test_rapidserve_entries_gate_sources_on_the_selected_stream(prefill):
     runner._record_kv_cache_ready = lambda batch: None
     results = []
     for value in range(6):
-        batch = SimpleNamespace(cu_stream_fraction=value % 2, value=value + 1)
+        batch = SimpleNamespace(
+            cu_stream_fraction=value % 2, value=value + 1, required_channel=None
+        )
         output = runner.prefill_forward(batch) if prefill else runner.forward(batch)
         results.append(output)
     torch.cuda.synchronize()

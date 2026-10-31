@@ -45,7 +45,7 @@
       "prefix": "deepseek-v4-pro-tp8",
       "extra_args": "deepseek_v4_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -66,7 +66,7 @@
         "--speculative-algorithm EAGLE --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -90,7 +90,7 @@
         "--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -111,7 +111,7 @@
       "prefix": "deepseek-v4-pro-prefix-cache-tp8",
       "extra_args": "deepseek_v4_prefix_cache_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -133,7 +133,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": [
         "deepseek_common",
@@ -152,7 +152,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": [
         "deepseek_common",
@@ -168,7 +168,7 @@
       "prefix": "deepseek-v3-2-fp8-tp4",
       "extra_args": ["trust_remote_code", "--tensor-parallel-size 4", "aiter_runtime"],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     },
@@ -181,7 +181,7 @@
       "prefix": "deepseek-v3-2-fp8-tp4-dp4-ep4",
       "extra_args": ["trust_remote_code", "--tensor-parallel-size 4 --data-parallel-size 4 --expert-parallel-size 4 --enable-dp-attention", "aiter_runtime"],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     },
@@ -194,7 +194,7 @@
       "prefix": "deepseek-v3-2-fp8-tp8-dp8-ep8",
       "extra_args": ["trust_remote_code", "--tensor-parallel-size 8 --data-parallel-size 8 --expert-parallel-size 8 --enable-dp-attention", "aiter_runtime"],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": ["deepseek_dp_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     },
@@ -211,7 +211,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": [
         "deepseek_common",
@@ -230,7 +230,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": [
         "deepseek_common",
@@ -250,7 +250,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": [
         "deepseek_dp_common",
@@ -270,7 +270,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": "deepseek_dp_common"
     },
@@ -287,7 +287,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": [
         "deepseek_dp_common",
@@ -308,7 +308,7 @@
         "mtp1_common"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": [
         "deepseek_mtp_common",
@@ -330,7 +330,7 @@
         "--max-running-requests 256"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": [
         "deepseek_mtp_common",
@@ -352,7 +352,7 @@
         "--max-running-requests 4096"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": [
         "deepseek_mtp_dp_common",
@@ -374,7 +374,7 @@
         "--max-running-requests 4096"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": [
         "deepseek_mtp_dp_common",
@@ -390,7 +390,7 @@
       "prefix": "kimi-k3-tp8",
       "extra_args": "kimi_k3_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -408,7 +408,7 @@
       "prefix": "minimax-m3-mxfp8-eagle3-tp4-mtp3",
       "extra_args": "minimax_m3_eagle3_runtime",
       "bench_args": "--use-chat-template",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "supported_input_output_pairs": ["1024x1024"],
       "supported_concurrency_values_by_pair": {
@@ -428,7 +428,7 @@
         "qwen_reasoning"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": "qwen_common"
     },
@@ -444,7 +444,7 @@
         "qwen_reasoning"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": "qwen_common"
     },
@@ -457,7 +457,7 @@
       "prefix": "qwen3-8-2-4t-a95b-quark-mxfp4-tp8",
       "extra_args": "qwen38_2_4t_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "supported_input_output_pairs": ["1024x1024", "8192x1024", "8192x64"],
       "supported_concurrency_values_by_pair": {
@@ -476,7 +476,7 @@
       "prefix": "qwen3-8-flash-next-fp8-tp2",
       "extra_args": "qwen38_flash_next_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -494,7 +494,7 @@
       "prefix": "deepseek-v3-2-fp8-tp8",
       "extra_args": ["trust_remote_code", "--tensor-parallel-size 8", "aiter_runtime"],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": ["deepseek_common", "SGLANG_AITER_FP8_PREFILL_ATTN=0"]
     },
@@ -511,7 +511,7 @@
         "aiter_runtime"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": [
         "deepseek_common",
@@ -527,7 +527,7 @@
       "prefix": "glm-5-2-fp8-tp4",
       "extra_args": "glm52_fp8_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": "glm52_common"
     },
@@ -540,7 +540,7 @@
       "prefix": "glm-5-2-fp8-tp4-pcp4",
       "extra_args": "glm52_pcp_fp8_runtime",
       "bench_args": "--num-prompts 192 --num-warmups 0",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "supported_input_output_pairs": ["61440x600"],
       "supported_concurrency_values_by_pair": {
@@ -557,7 +557,7 @@
       "prefix": "glm-5-2-fp4-tp4",
       "extra_args": "glm52_fp4_runtime",
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "env_vars": "glm52_common"
     },
@@ -570,7 +570,7 @@
       "prefix": "glm-5-2-fp4-tp4-mtp3",
       "extra_args": ["glm52_fp4_runtime", "glm52_mtp3_runtime"],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "A",
       "supported_input_output_pairs": ["1024x1024", "8192x1024"],
       "supported_concurrency_values_by_pair": {
@@ -605,7 +605,7 @@
         "--disable-radix-cache"
       ],
       "bench_args": "",
-      "runner": "atom-mi355-8gpu-aac-runner",
+      "runner": "linux-atom-pitt-mi350x-8",
       "nightly_group": "B",
       "env_vars": "minimax_m3_common"
     },
