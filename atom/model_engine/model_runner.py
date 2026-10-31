@@ -3237,7 +3237,8 @@ class ModelRunner:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
         structured = getattr(self, "structured_output", None)
-        if getattr(batch, "structured_requests", None) and structured is None:
+        structured_requests = getattr(batch, "structured_requests", None)
+        if structured_requests and structured is None:
             from transformers import AutoTokenizer
 
             from atom.model_engine.structured_output import (
@@ -3252,11 +3253,13 @@ class ModelRunner:
             structured = self.structured_output = StructuredOutput(
                 tokenizer, logits.shape[-1], stop_ids
             )
-        structured_prefixes = (
-            structured.apply(logits, batch, spec_decode_metadata)
-            if structured is not None
-            else {}
-        )
+        structured_prefixes = {}
+        if structured_requests:
+            structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
+        elif structured is not None and (structured.pending or structured.current):
+            # Release completed/cancelled state once. Ordinary batches never
+            # build masks, copy tensors to CPU, or synchronize for this feature.
+            structured.clear()
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that

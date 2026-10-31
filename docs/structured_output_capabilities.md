@@ -62,10 +62,19 @@ This initial draft rejects structured output combined with tools, P/D handoff,
 multimodal input, logprobs, custom stop strings, or `ignore_eos`. Synthetic forced
 acceptance is also rejected. No image implementation is included.
 
-The initial implementation replays grammar history and copies masks and committed
-tokens between CPU and GPU. This adds latency and host work; long outputs can
-accumulate substantial grammar replay cost. There is no zero-overhead claim.
-Performance qualification and broader topology coverage remain separate tasks.
+Committed grammar states are retained for the immediately preceding batch and
+advanced only by newly committed tokens. Each speculative request clones that
+state once and advances its draft branch incrementally; rejected drafts cannot
+mutate the committed state. Prefill/replay, history mismatches, or requests absent
+from the preceding batch reconstruct from the scheduler's authoritative history.
+An ordinary batch skips grammar processing and releases any prior states once;
+it does not allocate masks or add CPU/GPU synchronization for this feature.
+
+Enabled requests still copy masks and committed tokens between CPU and GPU and
+perform host grammar work. There is no zero-overhead claim. Performance results
+must distinguish enabled-request overhead from disabled-request regression and
+compare matching generated outputs. Production and broader-topology qualification
+remain separate tasks.
 
 ## Model discovery
 
