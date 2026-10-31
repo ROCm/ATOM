@@ -481,6 +481,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ZERO_RELEASED_CHECKPOINT_UNITS": lambda: (
         os.getenv("ATOM_ZERO_RELEASED_CHECKPOINT_UNITS", "1") == "1"
     ),
+    # A GDN prefill zeroes the speculative tail of its slots' conv window, which
+    # it neither reads nor writes, so no checkpoint image carries stale bytes.
+    "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
