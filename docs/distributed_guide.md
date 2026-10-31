@@ -8,6 +8,7 @@ ATOM (AiTer Optimized Model) supports three parallelism strategies for distribut
 |-------------|----------|---------|---------------|
 | Tensor Parallel (TP) | `-tp N` / `--tensor-parallel-size N` | Shard weights across GPUs | NCCL AllReduce |
 | Data Parallel (DP) | `-dp N` / `--data-parallel-size N` | Replicate model, split requests | Gloo AllReduce (CPU) |
+| Sequence Parallel (SP) | `-sp N` / `--sequence-parallel-size N` | Split each batch's tokens across GPUs (Ulysses; `-tp 1`, `-pp 1`, DP1, no EP / TBO / speculative decoding / KV transfer / image input, MHA with heads divisible across the ranks; validated only on MiniMax-M3 MXFP4 at SP4; KV replication, i.e. fewer KV heads than SP ranks, untested) | NCCL All-to-All, AllGather/ReduceScatter |
 | Expert Parallel (EP) | `--enable-expert-parallel` | Distribute MoE experts across GPUs | MORI All-to-All |
 | DP Attention | `--enable-dp-attention` | Flatten DP into TP for MoE layers | NCCL AllGather/ReduceScatter |
 
@@ -373,7 +374,7 @@ Environment variables in `atom/utils/envs.py` are evaluated lazily via `__getatt
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `AITER_QUICK_REDUCE_QUANTIZATION` | str | -- | Set to `INT4` to enable quantized AllReduce for prefill (read by AITER's AllReduce kernel) |
+| `AITER_QUICK_REDUCE_QUANTIZATION` | str | -- | Set to `INT4` to enable quantized AllReduce for prefill (read by AITER's AllReduce kernel). At SP4 on gfx950 it also quantizes the native SP MoE reduce-scatter of tensors from 24 MiB |
 
 ## Multi-GPU deployment examples
 

@@ -41,6 +41,16 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
+from atom.distributed.ulysses_sp import (
+    get_sp_world_size,
+    set_sp_world_size,
+    sp_gather_tokens,
+    sp_graph_capture,
+    sp_is_enabled,
+    sp_local_len,
+    sp_local_slice,
+    sp_split_tokens,
+)
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
     KVConnectorOutput,
@@ -140,6 +150,19 @@ def max_schedulable_decode_bs(
     `tokens_per_decode_seq`.
     """
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
+
+
+def split_rows_graph_ladder(sizes, step: int, max_bs: int) -> list[int]:
+    """Capture ladder for SP, which splits a batch's rows over ranks: one batch
+    size per local bucket.
+
+    Each rung is rounded up to a multiple of `step` batch sizes, chosen so its
+    rows split evenly: no layer pads them, and an SP token graph's bucket (its
+    local rows) keeps the largest batch it serves. Rounding past `max_bs` would
+    overrun the per-request buffers, so the top rung is clamped to it instead
+    of dropped.
+    """
+    return sorted({min(-(-bs // step) * step, max_bs) for bs in sizes}, reverse=True)
 
 
 # Re-exported under the old private name: this module is where the predicate
@@ -728,10 +751,12 @@ class ModelRunner:
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
         # world_size: the logical TP width, i.e. how many shards each weight is
-        # cut into -- what the KV-head math below divides by.
-        # tp_world_size: how many of those shards have a process.
-        # They differ only under simulated TP.
+        # cut into. tp_world_size: how many of those shards have a process;
+        # they differ only under simulated TP. kv_head_shards: how many the
+        # attention heads are cut into, which SP splits too -- what the
+        # KV-head math below divides by.
         self.world_size = config.tensor_parallel_size
+        self.kv_head_shards = self.world_size * config.sequence_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -835,6 +860,11 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
+        # After weight processing, before warmup and capture. Here rather than in
+        # the loader so a runner that builds its model differently still sets it.
+        from atom.model_ops.sp_mega_moe import initialize_sp_mega_moe
+
+        self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -1000,6 +1030,8 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
+        # Attention layers, KV pools and metadata need the SP head count.
+        set_sp_world_size(config.sequence_parallel_size)
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
         # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
@@ -1344,7 +1376,7 @@ class ModelRunner:
         max_tokens = self.config.max_num_batched_tokens
         if not self.config.enable_dp_attention:
             max_tokens //= get_dp_group().world_size
-        pcp_size = self.config.prefill_context_parallel_size
+        pcp_size = self.config.pcp_striping_size
         if pcp_size > 1:
             max_tokens = max(1, max_tokens // pcp_size)
         return max_tokens
@@ -1456,6 +1488,13 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
+        if sp_is_enabled():
+            # Each graph captures a fixed address for this rank's token shard.
+            self.forward_vars["sp_input_ids"] = torch.empty(
+                sp_local_len(self.max_num_batched_tokens),
+                dtype=self.tokenID_processor.input_ids.gpu.dtype,
+                device=self.device,
+            )
         if self.use_mrope:
             self.forward_vars["mrope_positions"] = CpuGpuBuffer(
                 3,
@@ -1665,14 +1704,25 @@ class ModelRunner:
             self.h2d_owner.fail()
             raise
 
+    def sp_graph_input_ids(self, num_tokens: int) -> torch.Tensor:
+        """Stage this rank's padded token shard at the graph's fixed address."""
+        local = sp_local_len(num_tokens)
+        buf = self.forward_vars["sp_input_ids"][:local]
+        src = self.forward_vars["input_ids"].gpu[:num_tokens]
+        shard = src[sp_local_slice(num_tokens)]
+        buf[: shard.numel()].copy_(shard)
+        # Pad the local buffer: the global buffer may end at num_tokens.
+        buf[shard.numel() :].zero_()
+        return buf
+
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            return hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.kv_head_shards:
+            assert hf_config.num_key_value_heads % self.kv_head_shards == 0
+            return hf_config.num_key_value_heads // self.kv_head_shards
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.kv_head_shards % hf_config.num_key_value_heads == 0
             return 1
 
     def _mrope_positions_view(self, running_tokens: int) -> torch.Tensor:
@@ -2176,11 +2226,11 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            assert hf_config.num_key_value_heads % self.world_size == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if hf_config.num_key_value_heads >= self.kv_head_shards:
+            assert hf_config.num_key_value_heads % self.kv_head_shards == 0
+            num_kv_heads = hf_config.num_key_value_heads // self.kv_head_shards
         else:
-            assert self.world_size % hf_config.num_key_value_heads == 0
+            assert self.kv_head_shards % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
@@ -2381,7 +2431,7 @@ class ModelRunner:
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
         # request subset". Requires num_reqs >= 2 (request-boundary split needs
         # two non-empty groups); bs=1 falls back to non-TBO.
-        pcp_size = self.config.prefill_context_parallel_size
+        pcp_size = self.config.pcp_striping_size
         # Read by build_ubatch / run_model / prepare_prefill to route the
         # per-group path; reset every step so a stale value cannot route one.
         self._pcp_tbo_balanced_active = False
@@ -2608,7 +2658,7 @@ class ModelRunner:
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
-        pcp_size = self.config.prefill_context_parallel_size
+        pcp_size = self.config.pcp_striping_size
         _pcp_tbo_balanced = (
             is_prefill
             and pcp_size > 1
@@ -3069,7 +3119,7 @@ class ModelRunner:
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
-        _pcp_size = self.config.prefill_context_parallel_size
+        _pcp_size = self.config.pcp_striping_size
         _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
         _pcp_tbo_balanced = (
             _pcp_size > 1
@@ -3084,6 +3134,9 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
+        if self.sp_mega_moe is not None:
+            self.sp_mega_moe.count_step()
+
         if not forward_mode.use_cudagraph:
             # prefill, or a decode no request graph serves (enforce_eager / DP
             # peer prefill / bs above the largest captured graph). Either may
@@ -3091,6 +3144,10 @@ class ModelRunner:
             with record_function(label):
                 if forward_mode.running_tokens > forward_mode.scheduled_tokens:
                     input_ids, positions = self._padded_inputs(forward_mode)
+                # Pad globally before SP shards the input; attention retains
+                # global positions to identify real sequence rows.
+                sp_total_tokens = input_ids.shape[0]
+                input_ids = sp_split_tokens(input_ids)
                 # The multimodal runtime owns request leases and span scatter.
                 # Only the first PP stage embeds tokens; later stages receive
                 # hidden states.
@@ -3192,17 +3249,25 @@ class ModelRunner:
                             model_output, _pcp_bal_groups, _pcp_size
                         )
                     # Middle chunk: no logits, but drafter needs hidden states.
-                    hidden_states = model_output
+                    # SP refuses drafters, so its token shards stay local.
+                    hidden_states = None if sp_is_enabled() else model_output
                     logits = None
                 else:
                     if _pcp_tbo_balanced:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    # PP carries the full run between stages. Only the last
-                    # stage returns scheduled rows to sampling/draft consumers.
-                    hidden_states = model_output[: context.scheduled_tokens]
-                    logits = self.model.compute_logits(hidden_states)
+                    if sp_is_enabled() and is_prefill:
+                        # The LM head gathers only each prompt's last row.
+                        hidden_states = None
+                        logits = self.model.compute_logits(model_output)
+                    else:
+                        # Restore global token order before selecting rows.
+                        model_output = sp_gather_tokens(model_output, sp_total_tokens)
+                        # PP carries the full run between stages. Only the last
+                        # stage returns scheduled rows to sampling/draft consumers.
+                        hidden_states = model_output[: context.scheduled_tokens]
+                        logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3215,7 +3280,10 @@ class ModelRunner:
                     # Replays its token graph when the step settled on one
                     # (`ForwardContext.tr_graph`).
                     _ids, _pos = self._padded_inputs(forward_mode)
+                    if sp_is_enabled():
+                        _ids = self.sp_graph_input_ids(running_tokens)
                     model_output = self.model(_ids, _pos)
+                    model_output = sp_gather_tokens(model_output, running_tokens)
                     # model_output is always a plain Tensor; drafter aux capture
                     # (if any) already wrote its own buffers inside the forward.
                     # Spec keeps the padded layout (postprocess/draft re-gather to
@@ -3235,8 +3303,16 @@ class ModelRunner:
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
+                if sp_is_enabled():
+                    self.sp_graph_input_ids(running_tokens)
                 logits = self.req_graph.replay(key=graph_key)
-                hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
+                if sp_is_enabled():
+                    local = sp_local_len(running_tokens)
+                    hidden_states = sp_gather_tokens(
+                        self.forward_vars["outputs"][:local], running_tokens
+                    )[:scheduled_tokens]
+                else:
+                    hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 if logits is not None:
@@ -3921,8 +3997,8 @@ class ModelRunner:
            fit in free GPU memory (adapts to GPU size / config, no hardcoded
            cap). DP amplifies the retained per-token footprint (MoE all_gather
            ~dp_size x tokens); scale the slope by dp**0.6 to match
-           _estimate_cudagraph_overhead. Free is min-reduced across DP so all
-           ranks skip the same set.
+           _estimate_cudagraph_overhead. Free is min-reduced across the DP, TP
+           and PCP groups so all ranks skip the same set.
         """
         dp_size = self.config.parallel_config.data_parallel_size
         if dp_size > 1 and hasattr(self, "drafter"):
@@ -3944,16 +4020,13 @@ class ModelRunner:
         slope = _GUARD_BYTES_PER_TOKEN_PER_DIM * self.config.hf_config.hidden_size
         if dp_size > 1:
             slope *= float(dp_size) ** 0.6
-        free = torch.cuda.mem_get_info()[0]
-        if dp_size > 1:
-            import torch.distributed as dist
-            from aiter.dist.parallel_state import get_dp_group
-
-            free_t = torch.tensor([free], device="cpu", dtype=torch.int64)
-            dist.all_reduce(
-                free_t, op=dist.ReduceOp.MIN, group=get_dp_group().cpu_group
-            )
-            free = int(free_t.item())
+        free_t = torch.tensor([torch.cuda.mem_get_info()[0]], dtype=torch.int64)
+        for group in (get_dp_group(), get_tp_group(), get_pcp_group()):
+            if group.world_size > 1:
+                torch.distributed.all_reduce(
+                    free_t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+                )
+        free = int(free_t.item())
         need = slope * running_tokens * 1.25 + (4 << 30)
         if (free >> 30) < (int(need) >> 30):
             if self.rank == 0:
@@ -4015,6 +4088,13 @@ class ModelRunner:
         max_bs = max_schedulable_decode_bs(
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
+        if tr_hybrid and sp_is_enabled():
+            split = get_sp_world_size()
+            q_lens = self._dspark_capture_q_buckets(full_q_len)
+            step = math.lcm(*(split // math.gcd(split, q) for q in q_lens))
+            self.capture_sizes = split_rows_graph_ladder(
+                self.capture_sizes, step, max_bs
+            )
         oversized = [s for s in self.capture_sizes if s > max_bs]
         if oversized:
             self.capture_sizes = [s for s in self.capture_sizes if s <= max_bs]
@@ -4059,7 +4139,8 @@ class ModelRunner:
                 "TBO decode has no token graph: under TR_HYBRID a decode step "
                 "split into microbatches runs eagerly."
             )
-        logits_in_graph = self.world_size == 1
+        # SP gathers hidden states before the LM head.
+        logits_in_graph = self.world_size == 1 and not sp_is_enabled()
 
         # start capture profiler
         self.start_capture_profiler()
@@ -4136,7 +4217,12 @@ class ModelRunner:
             # made by the drafter and ragged bucket builder.
             return self._build_capture(stage_and_build, *args, **kwargs)
 
-        with pause_gc(), graph_capture(), self.capture_profiler as prof:
+        with (
+            pause_gc(),
+            graph_capture() as capture_ctx,
+            sp_graph_capture(capture_ctx),
+            self.capture_profiler as prof,
+        ):
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)
@@ -4150,7 +4236,8 @@ class ModelRunner:
                     # The bucket's rows, which every DP rank records alike.
                     running_tokens = bs * max_q_len
                     if tr_hybrid and (
-                        running_tokens in TokenGraph.captured_sizes("decode")
+                        sp_local_len(running_tokens)
+                        in TokenGraph.captured_sizes("decode")
                         or self._skip_token_bucket(running_tokens)
                     ):
                         continue
@@ -4206,12 +4293,19 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:running_tokens]
                     )
-                    model_output = self.model(
-                        input_ids[:running_tokens], model_positions
+                    # Ulysses runs the model on this rank's token chunk while
+                    # positions stay whole, so the graph is captured at the
+                    # local width and writes that many output rows.
+                    local_tokens = sp_local_len(running_tokens)
+                    model_ids = (
+                        self.sp_graph_input_ids(running_tokens)
+                        if sp_is_enabled()
+                        else input_ids[:running_tokens]
                     )
-                    outputs[:running_tokens] = model_output
+                    model_output = self.model(model_ids, model_positions)
+                    outputs[:local_tokens] = model_output
                     if logits_in_graph:
-                        self.model.compute_logits(outputs[:running_tokens])
+                        self.model.compute_logits(outputs[:local_tokens])
 
                     if tr_hybrid:
                         # TR_HYBRID: no manual whole-forward graph. The model's
@@ -4219,7 +4313,7 @@ class ModelRunner:
                         # its rows replays, whatever its requests.
                         fc = get_forward_context()
                         fc.tr_graph = "record"
-                        self.model(input_ids[:running_tokens], model_positions)
+                        self.model(model_ids, model_positions)
                         fc.tr_graph = None
                         if prof is not None:
                             # Drain before closing the window so this bs's
@@ -4238,8 +4332,10 @@ class ModelRunner:
                     ):
                         # The drafter's aux capture hook runs inside the
                         # forward and writes its own buffers (in-graph).
-                        def full_forward(n=running_tokens, pos=model_positions):
-                            outputs[:n] = self.model(input_ids[:n], pos)
+                        def full_forward(
+                            n=local_tokens, ids=model_ids, pos=model_positions
+                        ):
+                            outputs[:n] = self.model(ids, pos)
                             if logits_in_graph:
                                 return self.model.compute_logits(outputs[:n])
                             return None
@@ -4334,6 +4430,13 @@ class ModelRunner:
         if self.config.disagg_is_decode:
             return
         if self.attn_metadata_builder.supports_token_graph:
+            # Their attention ops are recorded inline, so a prefill token graph
+            # would replay the synthetic prompt's attention on real prompts.
+            if sp_is_enabled():
+                raise ValueError(
+                    "Ulysses SP does not support an attention backend with "
+                    "prefill token graphs."
+                )
             self._record_tr_graphs()
         self._record_prefill_req_graphs()
         reset_forward_context()

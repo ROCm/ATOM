@@ -868,6 +868,8 @@ class InputOutputProcessor:
                 multimodal_data=multimodal_data,
                 enable_dp_attention=self.config.enable_dp_attention,
             )
+        if multimodal_data and self.config.sequence_parallel_size > 1:
+            raise ValueError("Ulysses SP does not support multimodal inputs.")
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
         prefix_encoding = None

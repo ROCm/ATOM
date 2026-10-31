@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from atom.config import Config, KVCacheTensor, ParallelConfig
+from atom.distributed.ulysses_sp import sp_local_len
 
 # A module, not its names: `region_graph` reads this one back at call time.
 from atom.utils import region_graph
@@ -394,7 +395,8 @@ class ForwardMode:
             # Rectangular layout: one row per (seq, query), which every per-token
             # buffer spans and `slot_mapping[i * q + j]` addresses through. Anything
             # under the product would leave the tail of that rectangle unwritten.
-            return running_tokens, running_tokens in captured
+            # Under SP a bucket is this rank's shard of it.
+            return running_tokens, sp_local_len(running_tokens) in captured
 
         # Marker-driven layout: the rows are one flat run, so the width is the
         # smallest recorded one that holds it, not a product -- q-divisible

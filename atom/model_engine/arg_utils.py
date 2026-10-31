@@ -122,6 +122,7 @@ class EngineArgs:
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     data_parallel_size: int = 1
     data_parallel_size_local: int | None = None
     data_parallel_rank: int = 0
@@ -227,6 +228,17 @@ class EngineArgs:
             default=1,
             help="Prefill context parallel size. Independent dimension "
             "(world = tp x pcp); splits the sequence during prefill.",
+        )
+        parser.add_argument(
+            "--sequence-parallel-size",
+            "-sp",
+            type=int,
+            default=1,
+            help="Ulysses sequence parallel size. Shards tokens across the "
+            "group and trades sequence for heads around attention via "
+            "all-to-all. Requires --tensor-parallel-size 1 and DP1/PP1; "
+            "refuses EP, TBO, speculative decoding, KV transfer and image "
+            "input. Attention heads must divide across the ranks.",
         )
         parser.add_argument(
             "--data-parallel-size",

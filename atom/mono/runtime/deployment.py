@@ -126,7 +126,7 @@ def common_refusals(
         *parallel,
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
         (atom_config.decode_context_parallel_size == 1, "decode CP"),
-        (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
+        (atom_config.prefill_context_parallel_size == 1, "prefill CP / Ulysses SP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (

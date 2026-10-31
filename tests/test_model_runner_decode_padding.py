@@ -2,17 +2,20 @@
 """Model execution must retain the step's padded height until sampling."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 pytest.importorskip("aiter")
 
+from atom.distributed import ulysses_sp
 from atom.model_engine import model_runner as runner_module
 from atom.utils.forward_context import ForwardMode
 from atom.utils.tbo.ubatching import sync_dp_metadata
 
 
+@pytest.mark.parametrize("sp_rank", [None, 0, 3])
 @pytest.mark.parametrize("mrope", [False, True])
 @pytest.mark.parametrize("dummy", [False, True])
 @pytest.mark.parametrize(
@@ -29,6 +32,7 @@ from atom.utils.tbo.ubatching import sync_dp_metadata
 )
 def test_runner_model_height_and_sampling_rows(
     monkeypatch,
+    sp_rank,
     mrope,
     dummy,
     scheduled,
@@ -39,9 +43,12 @@ def test_runner_model_height_and_sampling_rows(
     prefill,
     token_graph,
 ):
+    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1 if sp_rank is None else 4)
+    monkeypatch.setattr(ulysses_sp, "get_sp_rank", lambda: sp_rank or 0)
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
-    runner.config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.sp_mega_moe = Mock()
+    runner.config = SimpleNamespace(pcp_striping_size=1)
     runner._detailed_label_suffix = lambda batch: ""
     runner._tr_hybrid_active = lambda: token_graph
     runner._dynamic_chunking = runner_module.DynamicChunkingWorker(runner)
@@ -50,6 +57,7 @@ def test_runner_model_height_and_sampling_rows(
     pos = torch.full((32,), -99, dtype=torch.int64)
     pos[:scheduled] = torch.arange(11, scheduled + 11)
     runner.forward_vars = {
+        "sp_input_ids": torch.empty(8, dtype=ids.dtype),
         "input_ids": SimpleNamespace(gpu=ids),
         "positions": SimpleNamespace(gpu=pos),
         "mrope_positions": SimpleNamespace(gpu=torch.full((96,), -99)),
@@ -104,24 +112,50 @@ def test_runner_model_height_and_sampling_rows(
         runner_module, "get_pp_group", lambda: SimpleNamespace(world_size=1)
     )
     expected_rows = running if unified and not prefill else scheduled
+    sp_prefill = sp_rank is not None and prefill
+
+    def global_ids():
+        full = torch.zeros(expected_rows, dtype=ids.dtype)
+        full[:scheduled] = torch.arange(1, scheduled + 1)
+        return full
 
     class Model:
         def __call__(self, input_ids, model_positions):
-            assert input_ids.shape[0] == expected_rows
+            torch.testing.assert_close(
+                input_ids, ulysses_sp.sp_split_tokens(global_ids())
+            )
             assert model_positions.shape[-1] == expected_rows
-            torch.testing.assert_close(input_ids[:scheduled], ids[:scheduled])
             if expected_rows > scheduled:
-                assert torch.all(input_ids[scheduled:] == 0)
                 assert torch.all(model_positions[..., scheduled:] == 0)
             return input_ids[:, None].float()
 
         def compute_logits(self, hidden):
+            if sp_prefill:
+                # The LM head picks each prompt's last row from the local shard.
+                full = global_ids()[:, None].float()
+                torch.testing.assert_close(hidden, ulysses_sp.sp_split_tokens(full))
+                hidden = full[:scheduled]
             assert hidden.shape[0] == scheduled
             return hidden + 1
 
+    if sp_rank is not None:
+
+        def gather_shards(local, total_tokens):
+            assert total_tokens == expected_rows
+            full = global_ids()[:, None].float()
+            torch.testing.assert_close(local, ulysses_sp.sp_split_tokens(full))
+            return full
+
+        monkeypatch.setattr(runner_module, "sp_gather_tokens", gather_shards)
+
     runner.model = Model()
     logits, hidden = runner.run_model(ids[:scheduled])
-    assert hidden.shape == (scheduled, 1)
+    # MegaMoE epochs advance on graph replays as well as eager steps.
+    runner.sp_mega_moe.count_step.assert_called_once_with()
+    if sp_prefill:
+        assert hidden is None
+    else:
+        assert hidden.shape == (scheduled, 1)
     torch.testing.assert_close(logits[:, 0], torch.arange(2, scheduled + 2).float())
     assert torch.all(ids[running:] == -99)
     for name, (original, values) in original_metadata.items():

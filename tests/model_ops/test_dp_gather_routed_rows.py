@@ -116,6 +116,7 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     layer = SimpleNamespace(
         expert_layout=SimpleNamespace(mode=SharedExpertMode.LEGACY_AITER),
         top_k=top_k,
+        use_ep=True,
     )
 
     def prefill(rank, rows):
