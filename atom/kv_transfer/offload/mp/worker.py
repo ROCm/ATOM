@@ -198,6 +198,9 @@ class LMCacheMPConnector(KVConnectorBase):
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
         self._drain_round_cv = threading.Condition(self._lock)
+        # Serialises load polling between the drain thread and the step
+        # thread's last look in `get_finished`, so no future is polled twice.
+        self._load_poll_lock = threading.Lock()
 
     def register_kv_caches(
         self,
@@ -812,13 +815,19 @@ class LMCacheMPConnector(KVConnectorBase):
             )
 
     def _poll_pending_loads(self) -> None:
-        """Advance every pending load, off the step thread.
+        """Advance every pending load: each drain round, and once more from
+        `get_finished` while any is pending.
 
         The save twin's reasoning applies unchanged: a terminal poll imports
         the peer's IPC event and costs milliseconds, so it runs without `_lock`
-        held, and removal happens here alone -- the step thread only ever adds
-        -- so an entry the snapshot missed is picked up on the next round.
+        held, and removal happens here alone (one caller at a time, under
+        `_load_poll_lock`) -- `start_load_kv` only ever adds -- so an entry the
+        snapshot missed is picked up on the next call.
         """
+        with self._load_poll_lock:
+            self._poll_pending_loads_locked()
+
+    def _poll_pending_loads_locked(self) -> None:
         with self._lock:
             pending = list(self._pending_loads.items())
         if not pending:
@@ -962,6 +971,13 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._drain_error is not None:
             # The save drain thread cannot stop the engine; the step can.
             raise self._drain_error
+        if self._pending_loads:
+            # One last look before reporting. The drain round this step woke
+            # ran at `start_load_kv`, before the forward; a load that landed
+            # during the forward would otherwise wait a whole step in
+            # WAITING_FOR_REMOTE_KVS, which base, polling here, did not.
+            # Loads only: a save reported a step later delays no request.
+            self._poll_pending_loads()
         with self._lock:
             # A step that queues nothing (an idle engine waiting on a load)
             # raises no wake of its own; without this the result waits for

@@ -1268,6 +1268,32 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
     assert worker.get_finished().finished_loading == {operation}
 
 
+def test_a_load_landing_after_the_drain_round_is_reported_that_step(
+    fake_lmcache_modules,
+):
+    """The step's drain round ran before the forward; `get_finished` looks again.
+
+    Otherwise the request waits a whole step in WAITING_FOR_REMOTE_KVS, which
+    base, polling there, did not.
+    """
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    operation = LoadOperationId(req_id=7, generation=1)
+    request = LMCacheReqMeta(
+        req_id=7,
+        token_ids=list(range(8)),
+        block_ids=[30, 31],
+        load_spec=LoadSpec(0, 8, can_load=True),
+        load_operation=operation,
+    )
+    worker._submit_load(request, _step_event())
+    worker._settle_transfers()
+    future = worker._pending_loads["load:7:1"].future
+    future.value, future.ready = True, True
+    # No drain round in between.
+    assert worker.get_finished().finished_loading == {operation}
+
+
 def test_worker_reports_failed_load_from_future(fake_lmcache_modules):
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
