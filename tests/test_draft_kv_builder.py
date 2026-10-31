@@ -39,18 +39,34 @@ class _Norm(nn.Module):
     """A sibling the walk must not count."""
 
 
-# The target builder's block. A draft's pool takes it rather than picking one,
-# because the draft indexes that pool with the target's block tables.
+# The SCHEDULER's block. A draft's pool takes it rather than picking one,
+# because the draft indexes that pool with the target's block tables, and those
+# are numbered in scheduler blocks.
 TARGET_BLOCK = 128
 
 
-def _runner(draft_layers: int, block_size: int = TARGET_BLOCK):
+def _runner(
+    draft_layers: int,
+    block_size: int = TARGET_BLOCK,
+    builder_block_size: int | None = None,
+):
+    """A stand-in runner.
+
+    `block_size` is the scheduler's; `builder_block_size` is the target
+    builder's, which defaults to the same number because a paged target pages at
+    the block it is scheduled in. They are separate arguments because an MLA
+    target's builder does NOT: it pages at ATOM_MLA_PAGE_SIZE, a kernel page
+    that is 1 by default.
+    """
     model = nn.Sequential(
         *[m for _ in range(draft_layers) for m in (_PagedAttention(), _Norm())]
     )
     return SimpleNamespace(
+        block_size=block_size,
         drafter=SimpleNamespace(model=model),
-        attn_metadata_builder=SimpleNamespace(block_size=block_size),
+        attn_metadata_builder=SimpleNamespace(
+            block_size=block_size if builder_block_size is None else builder_block_size
+        ),
     )
 
 
@@ -76,7 +92,7 @@ def test_the_pool_is_built_at_the_row_count_the_walk_found():
     assert asked == [(3, TARGET_BLOCK)]
 
 
-def test_the_pool_is_built_at_the_target_builders_block():
+def test_the_pool_is_built_at_the_schedulers_block():
     """Not at one the draft's own backend would pick: `propose` hands the draft
     the target's block tables, and its kernels read the block off the cache it
     was bound to, so the two are the same number or it reads another page.
@@ -88,6 +104,24 @@ def test_the_pool_is_built_at_the_target_builders_block():
 
     assert builder.kv_pool is not None
     assert asked == [(2, 256)]
+
+
+def test_the_schedulers_block_wins_over_the_target_builders():
+    """An MLA target's builder pages at ATOM_MLA_PAGE_SIZE -- 1 by default --
+    which is a kernel page, not a block id. The block tables the draft is handed
+    are numbered in SCHEDULER blocks, and `allocate_kv_cache_tensors` raises
+    unless the pool's block is that one, so that is the number to size at.
+
+    Sizing at the builder's would also not merely be wrong, it would not
+    construct: MhaKvPool's SHUFFLE packing needs 16 to divide the block size.
+    """
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2, block_size=128, builder_block_size=1), make
+    )
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 128)]
 
 
 def test_siblings_are_not_rows():
