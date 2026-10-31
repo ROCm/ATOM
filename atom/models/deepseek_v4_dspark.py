@@ -598,6 +598,31 @@ class DSparkLayer(Block):  # type: ignore[misc]
         configs and ``swa_write`` asserts the relation rather than aliasing
         silently.
         """
+        self.write_context_kv_rows(self.context_kv_rows(main_x, positions), positions)
+
+    def context_kv_rows(
+        self,
+        main_x: torch.Tensor,  # [T, dim]  target hidden(s)
+        positions: torch.Tensor,  # [T]
+    ) -> torch.Tensor:  # [T, head_dim]
+        """The window KV rows `write_context_kv` writes, before writing them.
+        Each row is projected on its own, so a PCP rank can project just its
+        rows and gather the result."""
+        # An fp8 window is the planes' own 2buff layout, so the verified target
+        # KV is quantized for real on its way in and scattered across both
+        # planes, exactly as the draft block's own KV is by the fused quant in
+        # `dspark_attention`. The QAT fake round trip is skipped: it holds the
+        # same NoPE lanes at fp8 precision in bf16 storage, which is what the
+        # real quant supersedes.
+        to_2buff = self.attn.swa_plane.dtype != torch.bfloat16
+        return self._compute_main_kv(main_x, positions, fake_quant=not to_2buff)
+
+    def write_context_kv_rows(
+        self,
+        main_kv: torch.Tensor,  # [T, head_dim]  `context_kv_rows`
+        positions: torch.Tensor,  # [T]
+    ) -> None:
+        """The write half of `write_context_kv`."""
         from atom.utils.forward_context import get_forward_context
 
         fc = get_forward_context()
@@ -605,17 +630,7 @@ class DSparkLayer(Block):  # type: ignore[misc]
         B = fc.context.scheduled_bs
         cu_seqlens_q = attn_md.cu_seqlens_q[: B + 1]
         a = self.attn
-        # An fp8 window is the planes' own 2buff layout, so the verified target
-        # KV is quantized for real on its way in and scattered across both
-        # planes, exactly as the draft block's own KV is by the fused quant in
-        # `dspark_attention`. The QAT fake round trip is skipped: it holds the
-        # same NoPE lanes at fp8 precision in bf16 storage, which is what the
-        # real quant supersedes.
-        to_2buff = a.swa_plane.dtype != torch.bfloat16
-        main_kv = self._compute_main_kv(
-            main_x, positions, fake_quant=not to_2buff
-        )  # [T, head_dim]
-        if to_2buff:
+        if a.swa_plane.dtype != torch.bfloat16:
             k_packed, k_rope = quantize_bf16_to_v4_2buff_triton(main_kv)
             swa_write(
                 None,  # bf16 KV: unused once the 2buff pair is supplied
@@ -890,6 +905,8 @@ class DeepseekV4DSpark(DSparkDraftModel):
     backbone pass produces base logits, then ``forward_head`` runs the sequential
     Markov loop to sample the block left-to-right and emit confidence scores.
     """
+
+    context_kv_by_rows = True
 
     # Disk `mtp.{i}.*` -> wrapper param `model.mtp.{i}.*` (same as V4 MTP).
     if _ATOM_V4_AVAILABLE:

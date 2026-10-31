@@ -144,6 +144,7 @@ def _stub_v4_runtime_imports():
         "get_pcp_rank",
         "get_pcp_world_size",
         "pcp_is_enabled",
+        "pcp_local_indptr",
         "pcp_owned_rows_by_request",
         "pcp_pad_dense",
         "pcp_pad_indptr",
