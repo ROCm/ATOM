@@ -173,11 +173,12 @@ def _synchronize_producer_stream() -> None:
     producer_event.synchronize()
 
 
-def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
+@pytest.mark.parametrize("block_size,chunk_size", [(4, 8), (64, 1024)])
+def test_gpu_kv_round_trip_through_local_disk_backend(
+    tmp_path: Path, block_size: int, chunk_size: int
+):
     """Round-trip AITER-layout GPU KV bytes through LMCache local disk."""
-    num_blocks = 4
-    block_size = 4
-    chunk_size = 8
+    num_blocks = 2 * chunk_size // block_size
     tokens = list(range(num_blocks * block_size))
     block_ids = list(range(num_blocks))
     instance_id = f"atom-gpu-disk-e2e-{uuid.uuid4().hex}"
@@ -251,8 +252,8 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
             operation,
         ]
         assert [identity.ranges for identity in source_safe] == [
-            ((8, 16),),
-            ((0, 8),),
+            ((chunk_size, 2 * chunk_size),),
+            ((0, chunk_size),),
         ]
         disk_files = _wait_for_disk_hit(engine, tokens, tmp_path)
 
