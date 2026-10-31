@@ -2762,3 +2762,17 @@ models:
               max_num_seqs: 280
               spec_decode_acceptance_length: 4.04
               hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+        - <<: *m31_stack_cpp4_agentx_freq4
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-freq4-c120
+          concurrency: [120]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+            extra_args: "--gpu-memory-utilization 0.94"
+          server:
+            common_args:
+              max_model_len: 1048576
+              max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
