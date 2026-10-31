@@ -457,16 +457,12 @@ def register_model() -> None:
 
     apply_vllm_v41_state_reserve_patch()
 
-    # Same install site and reason as the state-reserve patch above. The
-    # alignment patch ends prefill chunks on the checkpoint grid; without it
-    # no checkpoint lands where a tier save ends, and the save ships zeros.
-    from atom.plugin.vllm.scheduler import (
-        apply_vllm_v41_local_hit_cap_patch,
-        apply_vllm_v41_prefill_alignment_patch,
-    )
+    # Same install site and reason as the state-reserve patch above. Prefill
+    # chunks end on the checkpoints through the checkpoint scheduler's own
+    # split (`apply_vllm_v41_prefix_install` below).
+    from atom.plugin.vllm.scheduler import apply_vllm_v41_local_hit_cap_patch
 
     apply_vllm_v41_local_hit_cap_patch()
-    apply_vllm_v41_prefill_alignment_patch()
 
     # vLLM auto-enables the breakable cudagraph for V4 while building
     # VllmConfig, which happens after this hook in every process.

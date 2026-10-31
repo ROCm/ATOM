@@ -48,7 +48,7 @@ class V41BoundaryPlanner(PageRideMixin):
         chunk_size: int,
         state_checkpoints_can_serve: bool = False,
         checkpoint_group_ids: tuple[int, ...] = (),
-        keep_a_prefill_tail: bool = False,
+        prefill_tail: int = 1,
     ) -> None:
         # `hash_block_size` is the unit `request.block_hashes` is in;
         # `boundary_grid` is where a STATE boundary may sit (V4.1's PAGE
@@ -64,14 +64,14 @@ class V41BoundaryPlanner(PageRideMixin):
                 "be hashed"
             )
         self.chunk_size = int(chunk_size)
-        # With speculative decoding, a hit must not leave exactly one token to
-        # compute. vLLM admits such a request as a decode row and pads it to
-        # `1 + num_spec_tokens` with placeholder drafts (`pad_spec_decode`);
-        # its only guard is against padding *after* a prefill was scheduled,
-        # not against a prefill being admitted after it -- and V4.1 refuses a
-        # step that verifies and prefills. A tail of two or more is a plain
-        # prefill, which the scheduling patch keeps out of verification steps.
-        self.keep_a_prefill_tail = bool(keep_a_prefill_tail)
+        # Tokens a hit leaves to compute (`PagedStateCheckpointAdapter.
+        # prefill_tail`). Two under speculative decoding: a hit leaving one is
+        # admitted as a decode row padded to `1 + num_spec_tokens` with
+        # placeholder drafts (`pad_spec_decode`), whose only guard is against
+        # padding *after* a prefill was scheduled -- and V4.1 refuses a step
+        # that verifies and prefills. Two or more is a plain prefill, which the
+        # scheduling patch keeps out of verification steps.
+        self.prefill_tail = int(prefill_tail)
         # The groups holding the checkpoint, in the order the worker registered
         # them -- that order is the key space, so it is taken from the caller
         # rather than rebuilt here.
@@ -141,7 +141,7 @@ class V41BoundaryPlanner(PageRideMixin):
             return 0
         boundary = (hit // self.boundary_grid) * self.boundary_grid
         total = int(getattr(request, "num_tokens", 0) or 0)
-        if self.keep_a_prefill_tail and total and total - boundary < 2:
+        if total and total - boundary < self.prefill_tail:
             # A one-token tail would be admitted as a padded verify row; one
             # grid back keeps it a prefill, at a PAGE of recompute.
             boundary -= self.boundary_grid
@@ -165,7 +165,7 @@ class V41BoundaryPlanner(PageRideMixin):
         if not self._state_checkpoints_can_serve:
             return 0
         total = int(getattr(request, "num_tokens", 0) or 0)
-        if self.keep_a_prefill_tail and total and total - hit < 2:
+        if total and total - hit < self.prefill_tail:
             # `cap_hit`'s rule: a one-token tail is admitted as a padded verify
             # row. The scheduler patch has already re-asked vLLM for a hit that
             # leaves two (`apply_vllm_v41_local_hit_cap_patch`), so this is the

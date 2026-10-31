@@ -105,6 +105,21 @@ class PagedStateCheckpointAdapter:
         """Native (state_checkpoint_interval_tokens, state_checkpoint_demand)."""
         return native_checkpoint_defaults()
 
+    #: Tokens a prefix hit leaves to compute under speculative decoding; see
+    #: `prefill_tail`. One is vLLM's own floor.
+    speculative_prefill_tail: int = 1
+
+    def prefill_tail(self, vllm_config) -> int:
+        """Tokens a prefix hit must leave to compute in this run.
+
+        The one owner of the rule: the checkpoint scheduler's anchor and chunk
+        cut, the local hit cap, and an offload connector's external hit cap
+        and lookup extent all read it, so they cannot disagree.
+        """
+        if getattr(vllm_config, "speculative_config", None) is None:
+            return 1
+        return int(self.speculative_prefill_tail)
+
     def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         """Whether the configured speculative drafter keeps all of its state in
         the target's slot, so a state checkpoint carries it. State checkpoints refuse to

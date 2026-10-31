@@ -737,8 +737,7 @@ def bind_scheduler_state_checkpoints(scheduler) -> SchedulerStateCheckpoints | N
     st = SchedulerStateCheckpoints(
         scheduler, placement, proxy, state_checkpoints, name=adapter.name
     )
-    if st.spec:
-        st.prefill_tail = getattr(adapter, "speculative_prefill_tail", 1)
+    st.prefill_tail = adapter.prefill_tail(getattr(scheduler, "vllm_config", None))
 
     orig_gcb = kvm.get_computed_blocks
 
@@ -878,6 +877,7 @@ def apply_scheduler_patches() -> bool:
         return out
 
     __init__._atom_state_checkpoint_patched = True
+    _mamba_block_aligned_split._atom_state_checkpoint_patched = True
     Scheduler.__init__ = __init__
     Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
     Scheduler.schedule = schedule

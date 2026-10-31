@@ -25,7 +25,7 @@ def _planner(hash_unit=256, grid=256, *, keep_tail=False, can_serve=False):
         chunk_size=256,
         state_checkpoints_can_serve=can_serve,
         checkpoint_group_ids=(1,),
-        keep_a_prefill_tail=keep_tail,
+        prefill_tail=2 if keep_tail else 1,
     )
 
 
@@ -411,49 +411,42 @@ def test_a_multi_group_failure_travels_by_request_and_stays_received():
 # -- vLLM scheduler patches --------------------------------------------------
 
 
-def _clip():
-    pytest.importorskip("vllm")
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    from atom.plugin.vllm.scheduler import apply_vllm_v41_prefill_alignment_patch
-
-    original = Scheduler._reserve_prefill_lookahead
-    Scheduler._reserve_prefill_lookahead = lambda self, r, computed, new: new
-    try:
-        apply_vllm_v41_prefill_alignment_patch()
-        return Scheduler._reserve_prefill_lookahead
-    finally:
-        Scheduler._reserve_prefill_lookahead = original
-
-
 @pytest.mark.parametrize(
     "prompt, start, budget, expected",
     [
-        (65536, 0, 4090, 3840),  # mid-prompt: back to a PAGE edge
+        (65536, 0, 4090, 3840),  # mid-prompt: back to a checkpoint
         (5000, 4096, 904, 768),  # last chunk: stop at the prompt-end anchor
-        (65536, 0, 200, 200),  # never clipped to nothing
+        (65536, 0, 200, 200),  # never cut to nothing
     ],
 )
 def test_prefill_chunks_end_where_a_checkpoint_can_sit(prompt, start, budget, expected):
-    sched = SimpleNamespace(
-        connector=SimpleNamespace(_v41_planner=SimpleNamespace(boundary_grid=256))
+    """The checkpoint split alone keeps chunk ends on the grid V4.1 rides.
+
+    The offload connector forces the checkpoint interval to its chunk, 256
+    here, so every rung is a PAGE edge.
+    """
+    from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
+        StateCheckpointPlacement,
     )
-    request = SimpleNamespace(num_prompt_tokens=prompt, num_tokens=prompt)
-    assert _clip()(sched, request, start, budget) == expected
+
+    placement = StateCheckpointPlacement(interval=256, demand=False, block=256)
+    anchor = placement.anchor(prompt, prompt, tail=2)
+    cut = placement.cut(start, start + budget, prompt, 0, anchor, tail=2)
+    assert (cut - start if cut else budget) == expected
 
 
-@pytest.mark.parametrize("anchor_on_request", [True, False])
-def test_the_last_chunk_stops_short_of_the_speculative_tail(anchor_on_request):
-    """Under DSpark a 4097-token prompt's anchor is 3840, not 4096: cutting at
-    4096 would leave a one-token prefill step and a boundary no hit is served
-    at. The checkpoint scheduler's anchor is read when it is on the request."""
-    planner = SimpleNamespace(boundary_grid=256, keep_a_prefill_tail=True)
-    sched = SimpleNamespace(connector=SimpleNamespace(_v41_planner=planner))
-    request = SimpleNamespace(num_prompt_tokens=4097, num_tokens=4097)
-    if anchor_on_request:
-        request._atom_img_anchor = 3840
-    assert _clip()(sched, request, 3840, 257) == 257
-    assert _clip()(sched, request, 3584, 513) == 256
+def test_the_prefill_tail_has_one_owner(monkeypatch):
+    """The hit caps, the chunk cut and the lookup extent read one number."""
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_v41_state_checkpoint_adapter,
+    )
+
+    adapter = register_v41_state_checkpoint_adapter()
+    spec = SimpleNamespace(speculative_config=object())
+    assert adapter.prefill_tail(spec) == 2
+    assert adapter.prefill_tail(SimpleNamespace(speculative_config=None)) == 1
+    planner = _planner(keep_tail=True)
+    assert planner.prefill_tail == adapter.prefill_tail(spec)
 
 
 def test_a_landed_load_in_kv_holding_waiting_clears_the_drafts():
@@ -707,8 +700,8 @@ def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):
     stub.register_deepseek_v41_state_checkpoint_layers.assert_called_once()
 
     # A vLLM whose Scheduler lacks a patched method is refused, not run uncapped.
-    patches.v41_scheduler_patches_missing = lambda: ["_reserve_prefill_lookahead"]
-    with pytest.raises(ValueError, match="_reserve_prefill_lookahead"):
+    patches.v41_scheduler_patches_missing = lambda: ["_mamba_block_aligned_split"]
+    with pytest.raises(ValueError, match="_mamba_block_aligned_split"):
         register(
             SimpleNamespace(
                 **vars(spec), scheduler_config=SimpleNamespace(async_scheduling=False)
@@ -741,7 +734,7 @@ def test_the_hit_cap_forwards_vllms_newer_arguments(monkeypatch):
         False,
     )
     assert seen == [1024]
-    assert patches.v41_scheduler_patches_missing() == ["_reserve_prefill_lookahead"]
+    assert patches.v41_scheduler_patches_missing() == ["_mamba_block_aligned_split"]
 
 
 def test_the_pool_hook_leaves_v41_without_checkpoints_to_the_reserve_patch(
@@ -906,10 +899,9 @@ def test_a_one_token_tail_hit_is_asked_again_not_dropped(monkeypatch):
 
     class Scheduler:
         kv_cache_manager = Manager()
+        _atom_state_checkpoints = SimpleNamespace(prefill_tail=2)
         connector = SimpleNamespace(
-            _v41_planner=SimpleNamespace(
-                keep_a_prefill_tail=True, cap_local_hit=lambda request, hit: hit
-            )
+            _v41_planner=SimpleNamespace(cap_local_hit=lambda request, hit: hit)
         )
 
         def _get_local_prefix_cache_hit(self, request):

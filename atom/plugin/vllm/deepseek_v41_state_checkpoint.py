@@ -352,7 +352,7 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
     block_size = 256
     backend_cls = AtomDeepseekV41StateCheckpointBackend
     state_checkpoint_drafters = "no drafter, or speculative method 'dspark'"
-    # Under speculation a hit leaves two tokens (`V41BoundaryPlanner`).
+    # Under speculation a hit leaves two tokens (`prefill_tail`).
     speculative_prefill_tail = 2
     # Without checkpoints `deepseek_v41_state_reserve_patch` withholds the STATE
     # tail and auto-fits the length, as it did before this adapter existed.

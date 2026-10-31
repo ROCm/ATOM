@@ -177,88 +177,6 @@ class _HybridKVLoadFailureMixin:
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
 
-def apply_vllm_v41_prefill_alignment_patch() -> None:
-    """End V4.1 prefill chunks on a PAGE edge. Idempotent, no-op elsewhere.
-
-    A STATE checkpoint exists only where the frontier *lands*, and vLLM spends one
-    token budget across the whole step: a prefill sharing a batch with six
-    decodes is scheduled 4,090 tokens, not 4,096, so the frontier lands at an
-    arbitrary offset and every chunk boundary after it is one no checkpoint was
-    written at. A tier save ends on a chunk boundary and carries the checkpoint
-    there, so a frontier off the grid is a save with no state to ride with.
-
-    This is the same invariant vLLM already enforces for Mamba in `align`
-    mode (`_mamba_block_aligned_split`: "chunk ends must be block aligned"),
-    with V4.1's PAGE block -- the checkpoint grid -- in place of the block.
-    """
-    from vllm.v1.core.sched.scheduler import Scheduler
-
-    # Private vLLM methods, so absence is a version difference rather than a
-    # bug. This runs from `register_model`, the plugin entry point for EVERY
-    # model, so raising here would stop GLM, M3 and K3 loading over a V4.1
-    # feature none of them use.
-    original = getattr(Scheduler, "_reserve_prefill_lookahead", None)
-    if original is None:
-        logger.warning(
-            "ATOM DeepSeek-V4.1: vLLM has no Scheduler._reserve_prefill_lookahead; "
-            "skipping this patch. V4.1 state checkpoints need it and refuse to "
-            "start without it (`v41_scheduler_patches_missing`)."
-        )
-        return
-    if getattr(original, "_atom_v41_prefill_aligned", False):
-        return
-
-    @functools.wraps(original)
-    def _wrapped(self, request, num_computed_tokens, num_new_tokens):
-        num_new_tokens = original(self, request, num_computed_tokens, num_new_tokens)
-        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
-        if planner is None or num_new_tokens <= 0:
-            return num_new_tokens
-
-        # The grid a STATE boundary sits on, not the unit vLLM hashes in.
-        # Those were one number until a second kv cache group made the hash
-        # unit engine-wide: with DSpark it is the draft's 32 against the
-        # proxy's 256, and clipping to 32 lands the frontier somewhere that
-        # is not a PAGE edge, which stores nothing.
-        block = int(planner.boundary_grid)
-        start = int(num_computed_tokens)
-        end = start + int(num_new_tokens)
-        total = int(request.num_prompt_tokens)
-        if end >= total:
-            # The last chunk. Decode reaches every boundary above the prompt
-            # on its own, so clipping for those would only delay the prompt.
-            #
-            # The one below it is different, and it is the valuable one: the
-            # prompt-end anchor is the last PAGE edge at or before `total`,
-            # and once the frontier is past it nothing returns to it. A prompt
-            # whose length is not a whole number of blocks reaches it only if
-            # a chunk ends there, which is this clip -- without it a prompt
-            # shorter than one chunk of tier has no boundary to be reused at.
-            #
-            # The checkpoint scheduler's anchor, which stops short of the
-            # speculative tail: one at `total // block * block` would leave a
-            # one-token prefill step after it and a boundary no hit is served
-            # at (`cap_hit`, `cap_local_hit`).
-            anchor = getattr(request, "_atom_img_anchor", None)
-            if anchor is None:
-                tail = 2 if getattr(planner, "keep_a_prefill_tail", False) else 1
-                anchor = min(total, int(request.num_tokens) - tail) // block * block
-            anchor = int(anchor)
-            if start < anchor < end:
-                return anchor - start
-            return num_new_tokens
-        aligned = (end // block) * block
-        if aligned <= start:
-            # Even one block is past this chunk. Clipping would schedule
-            # nothing; let it cross.
-            return num_new_tokens
-        return aligned - start
-
-    _wrapped._atom_v41_prefill_aligned = True
-    Scheduler._reserve_prefill_lookahead = _wrapped
-    logger.info("ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary.")
-
-
 def apply_vllm_v41_local_hit_cap_patch() -> None:
     """Wrap vLLM's local prefix-cache hit so V4.1's is capped. Idempotent.
 
@@ -287,8 +205,6 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
         return
     if getattr(original, "_atom_v41_hit_cap_patched", False):
         return
-
-    from atom.plugin.vllm.v41_speculative import _is_v41_speculating
 
     def _hit_leaving(self, request, tail: int):
         """vLLM's own hit, asked again to leave ``tail`` tokens to compute.
@@ -321,16 +237,16 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
         if num_local <= 0:
             return blocks, num_local, boundary, divergent
         planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
-        if int(request.num_tokens) - int(num_local) < 2 and (
-            planner.keep_a_prefill_tail
-            if planner is not None
-            else _is_v41_speculating(self)
-        ):
+        # The checkpoint scheduler's tail (`PagedStateCheckpointAdapter.
+        # prefill_tail`); one, vLLM's own floor, where none is bound.
+        st = getattr(self, "_atom_state_checkpoints", None)
+        tail = int(getattr(st, "prefill_tail", 1))
+        if int(request.num_tokens) - int(num_local) < tail:
             # Under speculation a one-token tail is admitted as a padded verify
             # row, which V4.1 refuses beside a prefill: re-ask for a hit that
-            # leaves two, rather than discard the whole hit (a resubmitted
+            # leaves the tail, rather than discard the whole hit (a resubmitted
             # prompt of N * PAGE + 1 tokens would recompute from 0).
-            again = _hit_leaving(self, request, 2)
+            again = _hit_leaving(self, request, tail)
             if again is not None:
                 blocks, num_local, boundary = again
                 divergent = False
@@ -338,7 +254,7 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
                     return blocks, num_local, boundary, divergent
         if planner is not None:
             capped = int(planner.cap_local_hit(request, int(num_local)))
-        elif int(request.num_tokens) - int(num_local) < 2 and _is_v41_speculating(self):
+        elif int(request.num_tokens) - int(num_local) < tail:
             # No connector, so vLLM's hit already sits on a held checkpoint.
             # Under speculation a one-token tail would still be admitted as a
             # padded verify row, which V4.1 refuses beside a prefill.
@@ -437,15 +353,16 @@ def select_scheduler_cls(scheduler_config) -> str | None:
 
 def v41_scheduler_patches_missing() -> list[str]:
     """The vLLM `Scheduler` methods V4.1's state checkpoints need but lack ATOM's
-    patch: a renamed method leaves local hits uncapped and prefill chunks off
-    the checkpoint grid, which is a stale-state failure at serving time."""
+    patch: a renamed method leaves local hits uncapped or prefill chunks off
+    the checkpoints (`SchedulerStateCheckpoints.chunk_len`), which is a
+    stale-state failure at serving time."""
     from vllm.v1.core.sched.scheduler import Scheduler
 
     return [
         name
         for name, marker in (
             ("_get_local_prefix_cache_hit", "_atom_v41_hit_cap_patched"),
-            ("_reserve_prefill_lookahead", "_atom_v41_prefill_aligned"),
+            ("_mamba_block_aligned_split", "_atom_state_checkpoint_patched"),
         )
         if not getattr(getattr(Scheduler, name, None), marker, False)
     ]

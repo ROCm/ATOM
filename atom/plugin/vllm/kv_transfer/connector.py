@@ -799,7 +799,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             register_v41_state_checkpoint_adapter,
         )
 
-        checkpoint_block = int(register_v41_state_checkpoint_adapter().block_size)
+        adapter = register_v41_state_checkpoint_adapter()
+        checkpoint_block = int(adapter.block_size)
         if checkpoint_block and checkpoint_block != grid:
             raise ValueError(
                 f"ATOM LMCache offload: V4.1 boundary grid {grid} does not match the "
@@ -813,13 +814,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             chunk_size=int(self._scheduler.chunk_size),
             state_checkpoints_can_serve=_v41_state_checkpoints_can_serve(vllm_config),
             checkpoint_group_ids=self._v41_checkpoint_group_ids,
-            keep_a_prefill_tail=getattr(vllm_config, "speculative_config", None)
-            is not None,
+            prefill_tail=adapter.prefill_tail(vllm_config),
         )
         self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
-        self._scheduler.truncate_lookup_query(
-            2 if self._v41_planner.keep_a_prefill_tail else 1
-        )
+        self._scheduler.truncate_lookup_query(self._v41_planner.prefill_tail)
         self._scheduler.install_recurrent_state_hook(
             self._v41_state_for_transfer,
             self._v41_planner.retire_ride_pins,
