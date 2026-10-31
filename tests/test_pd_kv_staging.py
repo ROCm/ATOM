@@ -131,9 +131,26 @@ def _request(dst, *, dcp_size, dcp_rank, interleave):
     }
 
 
-def _push(connector, request, src_ids, dst_ids):
+def _ready_event(device):
+    """The event the runner records after a batch's KV writes. CPU staging has
+    no side stream, so it never waits on one."""
+    if device == "cpu":
+        return object()
+    event = torch.cuda.Event()
+    event.record()
+    return event
+
+
+def _push(connector, request, src_ids, dst_ids, ready_event):
     return mc.MooncakeConnector._execute_block_slot_transfer(
-        connector, request, "consumer:1", src_ids, dst_ids, {"slot_index": -1}, "req-1"
+        connector,
+        request,
+        "consumer:1",
+        src_ids,
+        dst_ids,
+        {"slot_index": -1},
+        "req-1",
+        ready_event,
     )
 
 
@@ -159,7 +176,9 @@ def test_staged_push_lands_the_same_bytes_as_token_runs(
     for dst, kv_staging in ((staged_dst, staging), (direct_dst, None)):
         request = _request(dst, dcp_size=4, dcp_rank=dcp_rank, interleave=interleave)
         connector = _connector(src, nic, kv_staging)
-        assert _push(connector, request, list(_SRC_IDS), list(_DST_IDS))
+        assert _push(
+            connector, request, list(_SRC_IDS), list(_DST_IDS), _ready_event(device)
+        )
 
     for got, want in zip(staged_dst, direct_dst):
         assert torch.equal(got, want)
@@ -170,6 +189,26 @@ def test_staged_push_lands_the_same_bytes_as_token_runs(
     pages = len(_DST_IDS)
     assert nic.descriptors("staged-kv") == _REGIONS * (pages if chunk_pages == 1 else 1)
     assert nic.descriptors("block") == _REGIONS * 10 // interleave
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_without_a_ready_event_the_push_keeps_token_runs(device):
+    """Only the ready event orders the gather's side stream behind the batch's
+    KV writes, so without one nothing is staged."""
+    src = _producer(device)
+    dst = _consumer(device)
+    nic = _TensorNic(*src, *dst)
+    staging = _staging(src, chunk_pages=4)
+    nic._tensors.append(staging._pool.view(-1))
+    request = _request(dst, dcp_size=4, dcp_rank=3, interleave=1)
+
+    assert _push(
+        _connector(src, nic, staging), request, list(_SRC_IDS), list(_DST_IDS), None
+    )
+
+    assert nic.descriptors("staged-kv") == 0
+    assert nic.descriptors("block") == _REGIONS * 10
+    assert not all(bool((t == 0xAB).all()) for t in dst)
 
 
 @pytest.mark.parametrize("device", _DEVICES)

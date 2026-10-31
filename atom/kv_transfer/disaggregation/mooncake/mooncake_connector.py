@@ -3616,7 +3616,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         regions: list[tuple[int, int, int]],
         req_id: str,
-        kv_cache_ready_event: torch.cuda.Event | None = None,
+        kv_cache_ready_event: torch.cuda.Event,
         *,
         engine=None,
         deadline: float | None = None,
@@ -3837,7 +3837,12 @@ class MooncakeConnector(KVConnectorBase):
                 dst_pages=len(dst_block_ids),
             )
             sharded_runs = sharded_plan.token_runs(dst_block_ids)
-            staging = mla_staging_for(getattr(self, "_kv_staging", None), sharded_plan)
+            # Without the ready event the gather could read KV still being
+            # written, so such a request keeps the per-token path.
+            if kv_cache_ready_event is not None:
+                staging = mla_staging_for(
+                    getattr(self, "_kv_staging", None), sharded_plan
+                )
         staged_kv: list[tuple[int, int, int]] = []
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
