@@ -31,6 +31,13 @@ from .attention_mla import MLAModules
 
 
 @cache
+def gluon_pa_decode_supported() -> bool:
+    """Whether aiter's pa_decode_gluon (paged_attention_triton) runs here: it
+    asserts CDNA3/CDNA4, so on gfx1250 its decode shapes go to unified."""
+    return get_gfx() in ("gfx942", "gfx950")
+
+
+@cache
 def use_pa_decode_bf16_asm() -> bool:
     return (
         envs.ATOM_USE_UNIFIED_ATTN
@@ -1118,14 +1125,17 @@ class PagedAttentionImpl(nn.Module):
         wants_unified = (
             envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout or over_gluon
         )
+        # Where aiter has no gluon paged kernel (gfx1250), its shapes go to
+        # unified, which takes any shape; the ASM choices below are unchanged.
+        gluon = (
+            self.paged_attention_triton
+            if gluon_pa_decode_supported()
+            else self.paged_attention_unified
+        )
 
         # Sliding-window layers must use triton (ASM paths don't support it)
         if self.sliding_window != -1:
-            return (
-                self.paged_attention_unified
-                if wants_unified
-                else self.paged_attention_triton
-            )
+            return self.paged_attention_unified if wants_unified else gluon
 
         atom_config = get_current_atom_config()
 
@@ -1139,7 +1149,7 @@ class PagedAttentionImpl(nn.Module):
         if wants_unified:
             return self.paged_attention_unified
         if self.use_triton_attn:
-            return self.paged_attention_triton
+            return gluon
 
         # use_pa_decode_bf16_asm() requires ATOM_USE_UNIFIED_ATTN, which the
         # block above has already returned on, so it cannot be reached here.
@@ -1147,7 +1157,7 @@ class PagedAttentionImpl(nn.Module):
         # pa_persistent_fwd / pa_decode_bf16_asm, different kernels with their
         # own tables, so this envelope does not describe them.
         if over_asm:
-            return self.paged_attention_triton
+            return gluon
         return self.paged_attention_asm
 
     def dispatch_backend(
