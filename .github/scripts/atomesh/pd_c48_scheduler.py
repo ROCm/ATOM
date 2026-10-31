@@ -72,6 +72,32 @@ def align_tail_checkpoint_to_hash(scheduler):
     scheduler._mamba_block_aligned_split = hash_aligned_split
 
 
+def subblock_fill(scheduler):
+    """Let a non-final chunk end inside a Mamba block instead of flooring to 0 tokens.
+
+    Under PP8 the full KDA state sits on one GPU, so the Mamba block is 6400 tokens and `_mamba_block_aligned_split`
+    floors every non-final chunk to it. A long prefill then takes one block per 12288-token step, and any request
+    starting on a block boundary gets 0 of the 5888 left. The split already allows a sub-block chunk when the block
+    is wider than long_prefill_token_threshold; the next chunk re-aligns at the boundary, so cached states stay
+    block-aligned.
+    """
+    config = scheduler.scheduler_config
+    if config.long_prefill_token_threshold:
+        raise RuntimeError("C48_P_SUBBLOCK_FILL needs long_prefill_token_threshold 0")
+    split = scheduler._mamba_block_aligned_split
+    block = scheduler.cache_config.block_size
+
+    # The split reads the threshold only for that check; schedule() read its own copy before. Single-threaded.
+    def fill_split(*args, **kwargs):
+        config.long_prefill_token_threshold = block - 1
+        try:
+            return split(*args, **kwargs)
+        finally:
+            config.long_prefill_token_threshold = 0
+
+    scheduler._mamba_block_aligned_split = fill_split
+
+
 def track_superseded_states(store):
     """Mark each Mamba state a Prefill resumed from, or checkpointed past, as superseded by its next boundary state.
 
@@ -144,6 +170,9 @@ def create_scheduler(*args, **kwargs):
     tail_ckpt_hash = no_tail_split and os.environ.get("C48_P_TAIL_CKPT_HASH") == "1"
     if tail_ckpt_hash:
         align_tail_checkpoint_to_hash(scheduler)
+    fill = os.environ.get("C48_P_SUBBLOCK_FILL") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill"
+    if fill:
+        subblock_fill(scheduler)
     if os.environ.get("C48_DSPARK_JUNCTION") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
         enable_dspark_shared_prefix_checkpoint(scheduler, config)
     if os.environ.get("C48_STORE_DROP_SUPERSEDED") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill":
@@ -159,6 +188,7 @@ def create_scheduler(*args, **kwargs):
         "role": os.environ["C48_DIAG_ROLE"],
         "no_tail_split": no_tail_split,
         "tail_ckpt_hash": tail_ckpt_hash,
+        "subblock_fill": fill,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,
         "requested_shared_prefix_checkpoint": requested,

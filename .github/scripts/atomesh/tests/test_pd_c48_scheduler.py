@@ -8,7 +8,7 @@ from types import MethodType, SimpleNamespace as NS
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
     from vllm.v1.core.sched.scheduler import Scheduler
-    from pd_c48_scheduler import align_tail_checkpoint_to_hash
+    from pd_c48_scheduler import align_tail_checkpoint_to_hash, subblock_fill
 except ImportError:
     Scheduler = None
 
@@ -54,6 +54,41 @@ class TailCheckpointTest(unittest.TestCase):
         s.mamba_partial_cache_hit = True
         with self.assertRaises(RuntimeError):
             align_tail_checkpoint_to_hash(s)
+
+
+def pp8_scheduler():
+    s = fake_scheduler()
+    s.cache_config.block_size = s.block_size = 6400
+    s.num_hash_lookahead_tokens, s.mamba_prefill_checkpoint_alignment, s.max_num_scheduled_tokens = 0, 1, 12288
+    return s
+
+
+def split(s, start, prompt, budget):
+    request = NS(num_computed_tokens=start, num_prompt_tokens=prompt, num_tokens=prompt, shared_prefix_boundary=0)
+    return s._mamba_block_aligned_split(request, budget)
+
+
+@unittest.skipIf(Scheduler is None, "needs the vLLM image")
+class SubblockFillTest(unittest.TestCase):
+    def test_leftover_budget_advances_block_aligned_request(self):
+        for tail_hash in (False, True):
+            s = pp8_scheduler()
+            if tail_hash:
+                align_tail_checkpoint_to_hash(s)
+            self.assertEqual(split(s, 0, 100_000, 5888), 0)
+            subblock_fill(s)
+            self.assertEqual(split(s, 0, 100_000, 12288), 6400)
+            self.assertEqual(split(s, 0, 100_000, 5888), 5888)
+            self.assertEqual(split(s, 5888, 100_000, 12288), 512)
+            self.assertEqual(split(s, 102_400, 105_000, 2600), 2600)
+            self.assertEqual(s.scheduler_config.long_prefill_token_threshold, 0)
+            self.assertEqual(s.block_size, 6400)
+
+    def test_requires_zero_long_prefill_threshold(self):
+        s = pp8_scheduler()
+        s.scheduler_config.long_prefill_token_threshold = 4096
+        with self.assertRaises(RuntimeError):
+            subblock_fill(s)
 
 
 if __name__ == "__main__":

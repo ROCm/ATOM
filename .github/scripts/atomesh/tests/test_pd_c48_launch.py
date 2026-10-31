@@ -25,7 +25,8 @@ class LaunchTest(unittest.TestCase):
         start = source.index('role_tp="${PREFILL_TP_SIZE}"')
         bootstrap = source[start:source.index('rm -rf /root/.cache/atom/', start)]
         prefix = "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-"
-        for name in ("C32-MC", "C32-PP8-MC", "C32-AX109-PP8-MC"):
+        for name in ("C32-MC", "C32-PP8-MC", "C32-AX109-PP8-MC",
+                     *(f"C{c}-N3966-BF16-KVB-TH-GX-H96OPUS-P12K-FILL-PP8-MC" for c in (72, 88))):
             config = json.loads((GAP / (prefix + name + ".json")).read_text())
             for rank, role in enumerate(("prefill", "decode")):
                 with self.subTest(case=name, role=role):
@@ -343,6 +344,29 @@ class LaunchTest(unittest.TestCase):
         del dec["args"]["quantization-config"]["ignore"][-4:]
         candidate["name"] = base["name"]
         self.assertEqual(candidate, base)
+
+    def test_fill_pp8_cases_only_change_prefill_parallelism_pool_and_transfer(self):
+        for concurrency in (72, 88):
+            stem = f"V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5-PNT-SWB-C{concurrency}-N3966-BF16-KVB-TH-GX-H96OPUS-P12K"
+            base = json.loads((GAP / f"{stem}-MC.json").read_text())
+            candidate = json.loads((GAP / f"{stem}-FILL-PP8-MC.json").read_text())
+            pre, dec = candidate["roles"]["prefill"], candidate["roles"]["decode"]
+            for key, value in (("VLLM_PP_LAYER_PARTITION", "12,12,12,12,12,12,12,9"),
+                               ("VLLM_MLA_CONTEXT_WORKSPACE_TOKENS", "16384"),
+                               ("HIP_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"), ("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
+                               ("C48_MOONCAKE_DCP_TRANSFER", "1"), ("C48_P_SUBBLOCK_FILL", "1")):
+                self.assertEqual(pre["env"].pop(key), value, (concurrency, key))
+            self.assertEqual(dec["env"].pop("C48_MOONCAKE_DCP_TRANSFER"), "1")
+            args = pre["args"]
+            self.assertEqual(args.pop("pipeline-parallel-size"), 8)
+            self.assertEqual(args.pop("kv-cache-memory-bytes"), 48 << 30)
+            for key in ("tensor-parallel-size", "decode-context-parallel-size"):
+                self.assertEqual(args[key], 1)
+                args[key] = 8
+            producer = args["kv-transfer-config"]["kv_connector_extra_config"]["connectors"][0]
+            self.assertEqual(producer["kv_connector_extra_config"].pop("dcp_staging_bytes"), 64 << 20)
+            candidate["name"] = base["name"]
+            self.assertEqual(candidate, base)
 
     def test_mla_wide_reduce_gate_refuses_unsupported_role(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
