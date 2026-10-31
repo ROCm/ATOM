@@ -100,6 +100,12 @@ class TestPrefillTileWidth:
 class TestDecodeScoreChunks:
     """A grid dim, so: shape-constant, positive, and never past the blocks."""
 
+    @pytest.fixture(autouse=True)
+    def original_architecture_policy(self, monkeypatch):
+        # These original assertions describe the unchanged gfx950 chunk floor.
+        # gfx1250 has separate exact-policy/coverage checks below.
+        monkeypatch.setattr(m, "get_gfx", lambda: "gfx950")
+
     @pytest.mark.parametrize("batch", [1, 2, 7, 8, 50, 64, 256, 1024])
     @pytest.mark.parametrize("max_block", [1, 2, 63, 64, 256, 800, 8192])
     def test_bounds_and_coverage(self, batch, max_block):
@@ -690,3 +696,194 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
     torch.cuda.synchronize()
     for old_output, new_output in zip(old_outputs, new_outputs):
         assert torch.equal(old_output, new_output)
+
+
+def _previous_decode_score_chunks(batch, max_block):
+    """Previous policy, independent of the new gfx1250 floor."""
+    import triton
+
+    if max_block <= 0:
+        return 1
+    target = max(1, 16384 // max(1, batch))
+    chunks = min(1 << (target.bit_length() - 1), max_block)
+    chunks = min(chunks, max(1, triton.cdiv(max_block, 3)))
+    return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250"])
+@pytest.mark.parametrize("batch", [1, 2, 3, 8, 64, 1024])
+def test_decode_chunk_architecture_and_boundaries(monkeypatch, arch, batch):
+    import triton
+
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    for width in (
+        0,
+        1,
+        2,
+        3,
+        4,
+        63,
+        64,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        823,
+        1024,
+        1025,
+        8192,
+        65534,
+    ):
+        chunks = m._decode_score_chunks(batch, width)
+        previous = _previous_decode_score_chunks(batch, width)
+        if arch != "gfx1250" or batch > 2 or batch * width > 1024 or width <= 0:
+            assert chunks == previous
+        else:
+            # Literal boundaries deliberately do not follow production constants.
+            floor = 1 if batch * width <= 256 else 2
+            target = max(1, 16384 // max(1, batch))
+            want = min(
+                1 << (target.bit_length() - 1), width, max(1, triton.cdiv(width, floor))
+            )
+            want = triton.cdiv(width, triton.cdiv(width, want))
+            assert chunks == want
+        assert chunks > 0 and batch * chunks <= max(16384, batch)
+        if width:
+            size = triton.cdiv(width, chunks)
+            assert chunks <= width and size * (chunks - 1) < width <= size * chunks
+
+
+@gpu
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("heads,max_q", [(1, 1), (1, 4), (4, 4)])
+@pytest.mark.parametrize(
+    "batch,pages", [(1, 8), (1, 256), (1, 257), (2, 128), (2, 512), (2, 513)]
+)
+def test_decode_chunk_policy_scores_selection_and_replay(
+    monkeypatch, cache_dtype, heads, max_q, batch, pages
+):
+    """Launch policy only: exact previous scores and complete emitted outputs."""
+    import triton
+
+    if m.get_gfx() != "gfx1250":
+        pytest.skip("gfx1250 decode chunk policy")
+    device = "cuda"
+    torch.manual_seed(730)
+    context = pages * SPARSE_BLOCK_SIZE - 3
+    total_q = batch * max_q
+    q = torch.randn(
+        (total_q, heads, HEAD_DIM * 2), device=device, dtype=torch.bfloat16
+    )[..., ::2]
+    cache = (
+        torch.randn(
+            (batch * pages, SPARSE_BLOCK_SIZE, HEAD_DIM),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.2
+    ).to(cache_dtype)
+    table_storage = torch.full((batch, pages + 3), -1, device=device, dtype=torch.int32)
+    table = table_storage[:, :pages]
+    table.copy_(
+        torch.randperm(batch * pages, device=device, dtype=torch.int32).reshape(
+            batch, pages
+        )
+    )
+    lengths = torch.tensor(
+        [max(max_q, context - i * 129) for i in range(batch)],
+        device=device,
+        dtype=torch.int32,
+    )
+    new_policy = m._decode_score_chunks
+
+    def score(policy):
+        out = torch.full((heads, total_q, pages), float("-inf"), device=device)
+        chunks = policy(batch, pages)
+        m._decode_index_score_tiled_kernel[(batch, chunks)](
+            q,
+            cache,
+            out,
+            table,
+            lengths,
+            HEAD_DIM,
+            HEAD_DIM**-0.5,
+            triton.cdiv(pages, chunks),
+            *q.stride(),
+            *cache.stride(),
+            *out.stride(),
+            table.stride(0),
+            NUM_IDX_HEADS=heads,
+            MAX_Q=max_q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_stages=m.DECODE_SCORE_NUM_STAGES,
+        )
+        return out
+
+    def run(policy):
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "_decode_score_chunks", policy)
+            return m.minimax_m3_index_topk_decode(
+                q,
+                cache,
+                table,
+                lengths,
+                context,
+                TOPK,
+                INIT,
+                LOCAL,
+                heads,
+                HEAD_DIM**-0.5,
+                emit_sparse_block_table=True,
+                max_query_len=max_q,
+            )
+
+    for zero in (False, True):
+        if zero:
+            q.zero_()  # Stable tie direction and forced-block pins must agree.
+        a, b = score(_previous_decode_score_chunks), score(new_policy)
+        assert torch.equal(a, b)
+        old_outputs, new_outputs = run(_previous_decode_score_chunks), run(new_policy)
+        assert all(torch.equal(x, y) for x, y in zip(old_outputs, new_outputs))
+        # Independent sampled dot/max at the original decode query precision.
+        for req in range(batch):
+            for row in (0, max_q - 1):
+                page = (int(lengths[req].item()) - 1) // SPARSE_BLOCK_SIZE
+                physical = int(table[req, page].item())
+                dot = (
+                    cache[physical].to(q.dtype).float()
+                    @ q[req * max_q + row, 0].float()
+                ) * (HEAD_DIM**-0.5 * 1.4426950409)
+                pos = page * SPARSE_BLOCK_SIZE + torch.arange(
+                    SPARSE_BLOCK_SIZE, device=device
+                )
+                causal = int(lengths[req].item()) - max_q + row + 1
+                expected = torch.where(pos < causal, dot, float("-inf")).max()
+                torch.testing.assert_close(
+                    a[0, req * max_q + row, page], expected, rtol=3e-3, atol=3e-3
+                )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(new_policy)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            replayed = run(new_policy)
+        for delta in (17, 0):
+            q.copy_(torch.randn_like(q))
+            lengths.copy_(
+                torch.tensor(
+                    [max(max_q, context - delta - i * 7) for i in range(batch)],
+                    device=device,
+                    dtype=torch.int32,
+                )
+            )
+            graph.replay()
+            reference = run(_previous_decode_score_chunks)
+            assert all(torch.equal(x, y) for x, y in zip(replayed, reference))
+    torch.cuda.current_stream().wait_stream(stream)

@@ -644,8 +644,9 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     A count, not a size: the grid is (request, chunk), so this IS the second
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
-    CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
-    is what bounds the split, and TARGET_GRID still caps the largest batches.
+    CTAs. The default floor amortizes the query tile across several blocks;
+    small gfx1250 batch1/2 grids use a finer measured split. TARGET_GRID still
+    caps the largest batches.
 
     The round trip through the size is not redundant. The caller turns this
     count back into a size with the same cdiv, and a count that does not divide
@@ -655,6 +656,17 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     chunk non-empty, and both are still pure functions of launch-time bounds,
     so a cuda graph replays the grid it captured.
     """
+    # In this bounded gfx1250 region the existing target-grid cap cannot
+    # bind (at most 1024 blocks across one or two requests). One block/CTA
+    # below 256 total blocks, otherwise two, also leaves no empty tail CTA.
+    if (
+        0 < batch <= 2
+        and 0 < max_block
+        and batch * max_block <= 1024
+        and get_gfx() == "gfx1250"
+    ):
+        return max_block if batch * max_block <= 256 else triton.cdiv(max_block, 2)
+
     target = max(1, DECODE_SCORE_TARGET_GRID // max(1, batch))
     if max_block <= 0:
         # A grid dim still has to be positive. Capping `chunks` is not enough:
@@ -663,9 +675,7 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
         # wait in the collective that follows.
         return 1
     chunks = min(1 << (target.bit_length() - 1), max_block)
-    # Floor the blocks one chunk walks. The query tile is loaded once outside
-    # the block loop, so at one block per chunk that fixed cost is the whole
-    # cost -- every measured regression was a chunk down to a single block.
+    # Other architectures and larger batches/contexts keep the original floor.
     chunks = min(chunks, max(1, triton.cdiv(max_block, DECODE_SCORE_MIN_BLOCKS)))
     return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
 
