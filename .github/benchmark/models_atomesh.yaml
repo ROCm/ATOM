@@ -2726,6 +2726,17 @@ models:
           name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-freq4-c100
           display_topology: 1P1D-CPP4-TP4-DSPARK7-MXFP4-FREQ4-MCSTORE
           concurrency: [100]
+          env:
+            common: *m31_stack_cpp4_agentx_common_env
+            prefill:
+              <<: *m31_stack_cpp4_agentx_prefill_env
+              # Top-k is reused only within a stage, so every stage must start
+              # on a computing layer (sparse ordinal % 4 == 0); the even 15-layer
+              # split starts stages 1-3 on reusing layers and the first prefill
+              # step never completes. 12 layers on the last stage, which also
+              # holds the DSpark draft, balances its KV bytes and compute.
+              VLLM_PP_LAYER_PARTITION: "16,16,16,12"
+            decode: *m31_flash_mcstore_decode_env
           decode:
             workers: 1
             tp: 4
