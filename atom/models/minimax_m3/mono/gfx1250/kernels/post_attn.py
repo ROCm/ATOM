@@ -7,6 +7,7 @@ is the gfx950 kernel's; the stages are the gfx1250 modules under ``stages`` and
 the LDS partial buffers are sized for 16 waves' WMMA accumulators.
 """
 
+import os
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
@@ -98,6 +99,7 @@ class K4Build:
     shared_weight: float
     swiglu_limit: float
     debug: bool
+    skip: str  # debug: stages replaced by no-ops (ATOM_MONO_G1250_SKIP)
 
 
 def build_post_attn_kernel(
@@ -124,7 +126,9 @@ def build_post_attn_kernel(
         index_heads=heads.count, index_own=heads.own, index_topk=index_topk,
         fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
         shared_weight=shared_weight, swiglu_limit=swiglu_limit, debug=debug,
+        skip=os.environ.get("ATOM_MONO_G1250_SKIP", ""),
     )  # fmt: skip
+    SKIP = set(key.skip.split(",")) - {""}
     build_key = key_tuple(key, SOURCES)
     REGION_IDS = region_ids(d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk))
     W = npes
@@ -328,19 +332,22 @@ def build_post_attn_kernel(
             enter_stage("select_long")
             stage_select_long()
         enter_stage("split")
-        stage_split()
+        if const_expr("split" not in SKIP):
+            stage_split()
 
         k4ctx.update(locals())
         k4ctx.update(merge_defs(k4ctx))
         stage_merge = k4ctx["stage_merge"]
         enter_stage("merge")
-        stage_merge()
+        if const_expr("merge" not in SKIP):
+            stage_merge()
 
         k4ctx.update(locals())
         k4ctx.update(o_defs(k4ctx))
         stage_o = k4ctx["stage_o"]
         enter_stage("o")
-        stage_o()
+        if const_expr("o" not in SKIP):
+            stage_o()
 
         XN8_WORDS = HIDDEN // 4
         XSC_WORDS = HIDDEN // 32
@@ -355,7 +362,8 @@ def build_post_attn_kernel(
         k4ctx.update(router_defs(k4ctx))
         stage_router = k4ctx["stage_router"]
         enter_stage("router")
-        stage_router()
+        if const_expr("router" not in SKIP):
+            stage_router()
 
         UG_KC = HIDDEN // 128
         UG_CPW = UG_KC // WAVES
@@ -394,7 +402,8 @@ def build_post_attn_kernel(
         stage_moe = k4ctx["stage_moe"]
 
         enter_stage("ug")
-        (stage_moe_wide if WIDE else stage_moe)()
+        if const_expr("moe" not in SKIP):
+            (stage_moe_wide if WIDE else stage_moe)()
 
     @launcher(kernel_name)
     def launch_post_attn(
