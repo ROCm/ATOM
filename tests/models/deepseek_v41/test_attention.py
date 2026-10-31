@@ -236,6 +236,109 @@ def test_fused_seam_writes_the_fp8_pools_query_and_rows():
     )
 
 
+class _GridSpy:
+    """Wraps a Triton kernel to record each launch's grid and `HEAD_BLOCK`."""
+
+    def __init__(self, kernel):
+        self.kernel, self.launches = kernel, []
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def run(*args, **kwargs):
+            self.launches.append((tuple(grid), kwargs["HEAD_BLOCK"]))
+            return launch(*args, **kwargs)
+
+        return run
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("heads", [64, 4, 6])
+@pytest.mark.parametrize(
+    "sink", ["packed_ring", "bf16_ring", "prefill", "query", "query_fp8", "no_query"]
+)
+def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink):
+    """`ATOM_DSV41_ROPE_HEAD_BLOCK` against the default grid, byte for byte.
+
+    One program rotating a token's heads has to give the per-head programs'
+    query and leave the KV half -- now slot 1, not slot `heads` -- writing the
+    same rows. The launches are recorded, so a gate that never picks the
+    head-blocked grid fails here rather than comparing the default to itself.
+    Six heads is no power of two, the MXFP8 query (`query_fp8`) is not the
+    in-place rotation, and a query-less KV launch (`no_query`, a prefill whose
+    queries rotate separately) has no heads: all three keep a program a head.
+    """
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41 import rope_window
+
+    if sink == "no_query" and heads != 64:
+        pytest.skip("no_query has no heads")
+    torch.manual_seed(728)
+    device, tokens, dim, rope_dim, ring, slot, start = "cuda", 37, 512, 64, 8, 3, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    step = _Step(tokens, slot, device)
+    query_heads = 0 if sink == "no_query" else heads
+    query = torch.randn(tokens, query_heads, dim, device=device, dtype=torch.bfloat16)
+    normed = torch.randn(tokens, dim, device=device, dtype=torch.bfloat16)
+    packed = sink == "packed_ring"
+    run_rows = dim + dim // 32 if packed else 1
+    window = _window(packed, start, ring * run_rows, ring, run_rows)
+    rows = start + (slot + 1) * ring * run_rows
+    kv_half = sink != "query"
+    head_block = sink in ("packed_ring", "bf16_ring", "prefill", "query") and (
+        heads & (heads - 1) == 0
+    )
+    expected_grid = (tokens, (1 if head_block else query_heads) + kv_half)
+
+    def run(flag):
+        monkeypatch.setattr(rope_window, "_HEAD_BLOCK", flag)
+        spy = _GridSpy(rope_window._rope_window_kernel)
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy)
+        out = {"query": query.clone()}
+        kwargs = {}
+        if sink == "packed_ring":
+            out["pool"] = torch.zeros(rows, device=device, dtype=torch.uint8)
+            kwargs["ring"] = (out["pool"], step, window)
+        elif sink == "bf16_ring":
+            out["pool"] = torch.zeros(rows, dim, device=device, dtype=torch.bfloat16)
+            kwargs["ring"] = (out["pool"], step, window)
+        elif sink in ("prefill", "query_fp8", "no_query"):
+            out["qat"] = torch.empty_like(normed)
+            # Buffers of the dtypes the seam writes; it overwrites them.
+            out["values"], out["scales"] = quantize_fp8(normed)
+            kwargs.update(qat=out["qat"], values=out["values"], scales=out["scales"])
+        if sink == "query_fp8":
+            # Zeroed as bytes: not every FP8 dtype implements a fill.
+            def zeros(width, like):
+                buffer = torch.zeros(
+                    tokens, heads, width, device=device, dtype=torch.uint8
+                )
+                return buffer.view(like.dtype)
+
+            out["query_values"] = zeros(dim, out["values"])
+            out["query_scales"] = zeros(dim // 32, out["scales"])
+            kwargs["query_fp8"] = (out["query_values"], out["query_scales"])
+        rope_window.rope_quant_window(
+            out["query"],
+            normed if kv_half else None,
+            rope.cos_cache,
+            rope.sin_cache,
+            step.positions,
+            rope_dim=rope_dim,
+            **kwargs,
+        )
+        monkeypatch.setattr(rope_window, "_rope_window_kernel", spy.kernel)
+        return out, spy.launches
+
+    (expected, default_launches), (actual, launches) = run(False), run(True)
+    assert default_launches == [((tokens, query_heads + kv_half), False)]
+    assert launches == [(expected_grid, head_block)]
+    if sink in ("packed_ring", "bf16_ring", "prefill", "query"):
+        assert not torch.equal(expected["query"], query)
+    for name, tensor in expected.items():
+        assert torch.equal(actual[name].view(torch.uint8), tensor.view(torch.uint8))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_compressor_all_chunk_boundaries_against_official_decode(
