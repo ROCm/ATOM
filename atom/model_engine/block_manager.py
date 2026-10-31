@@ -541,10 +541,16 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        # Drained after the stores: a store's `ensure_free_units` may have just
+        # released units, which this batch must zero before its forward.
+        released, self.kv.released_raw_units = self.kv.released_raw_units, []
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            zero_blocks=(
+                tuple(released) if envs.ATOM_ZERO_RELEASED_CHECKPOINT_UNITS else ()
+            ),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:

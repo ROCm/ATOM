@@ -321,6 +321,25 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             "implement state_entry_views"
         )
 
+    def zero_kv_blocks(self, blocks: Sequence[int]) -> None:
+        """Zero every KV field of `blocks` in this builder's paged pools.
+
+        For units a PAGE state checkpoint just released. Their bytes are a state
+        image, and the attention kernels read the unwritten positions of a
+        sequence's last block (with zero weight, but `0 * Inf` is NaN), so a
+        non-finite value in an image would otherwise reach a later request.
+        One fill per field: a pool's per-field views are `[layers, blocks, ...]`.
+        """
+        pools = getattr(self, "kv_pools", None)
+        if not pools or not blocks:
+            return
+        idx = torch.tensor(list(blocks), dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
+        for pool in pools.values():
+            for view in getattr(pool, "_views", {}).values():
+                view.index_fill_(1, idx, 0)
+
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
         raise NotImplementedError(
@@ -1042,6 +1061,9 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        # First: a store below may take some of these units again for its image.
+        if state_ops.zero_blocks:
+            self.zero_kv_blocks(state_ops.zero_blocks)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
