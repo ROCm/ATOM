@@ -39,9 +39,8 @@ class _Norm(nn.Module):
     """A sibling the walk must not count."""
 
 
-# The SCHEDULER's block. A draft's pool takes it rather than picking one,
-# because the draft indexes that pool with the target's block tables, and those
-# are numbered in scheduler blocks.
+# The target builder's block. A draft's pool takes it rather than picking one,
+# because the draft indexes that pool with the target's block tables.
 TARGET_BLOCK = 128
 
 
@@ -92,7 +91,7 @@ def test_the_pool_is_built_at_the_row_count_the_walk_found():
     assert asked == [(3, TARGET_BLOCK)]
 
 
-def test_the_pool_is_built_at_the_schedulers_block():
+def test_the_pool_is_built_at_the_target_builders_block():
     """Not at one the draft's own backend would pick: `propose` hands the draft
     the target's block tables, and its kernels read the block off the cache it
     was bound to, so the two are the same number or it reads another page.
@@ -106,18 +105,29 @@ def test_the_pool_is_built_at_the_schedulers_block():
     assert asked == [(2, 256)]
 
 
-def test_the_schedulers_block_wins_over_the_target_builders():
-    """An MLA target's builder pages at ATOM_MLA_PAGE_SIZE -- 1 by default --
-    which is a kernel page, not a block id. The block tables the draft is handed
-    are numbered in SCHEDULER blocks, and `allocate_kv_cache_tensors` raises
-    unless the pool's block is that one, so that is the number to size at.
-
-    Sizing at the builder's would also not merely be wrong, it would not
-    construct: MhaKvPool's SHUFFLE packing needs 16 to divide the block size.
+def test_the_dflash_pool_takes_the_schedulers_block():
+    """The DFlash pool sits beside an MLA target, whose builder pages at
+    ATOM_MLA_PAGE_SIZE -- 1 by default -- a kernel page, not a block id. Its
+    block tables count SCHEDULER blocks, so that is the number to size at; at
+    the builder's, MhaKvPool's SHUFFLE packing would not even construct.
     """
     make, asked = _recording_factory(object())
     builder = DraftKvBuilder(
-        _runner(draft_layers=2, block_size=128, builder_block_size=1), make
+        _runner(draft_layers=2, block_size=128, builder_block_size=1),
+        make,
+        dflash_pool=True,
+    )
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 128)]
+
+
+def test_other_pools_keep_the_target_builders_block():
+    """MiniMax-M3.1 DSpark and Eagle3 page at the builder's block, and
+    `allocate_kv_cache_tensors` refuses a scheduler block that differs."""
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2, block_size=256, builder_block_size=128), make
     )
 
     assert builder.kv_pool is not None

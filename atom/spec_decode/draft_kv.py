@@ -76,7 +76,8 @@ def draft_kv_builder(model_runner, draft_hf):
     kv_cache_dtype = model_runner.config.kv_cache_dtype
 
     if not dflash_pool:
-        # Every other pool-owning draft (today: Eagle3-llama) keeps the geometry
+        # Every other pool-owning draft (Eagle3-llama, MiniMax-M3.1 DSpark)
+        # keeps the geometry
         # and the fp8 scale planes it already had. Everything below this point
         # is specific to a non-causal block draft that sits OUTSIDE the target's
         # DCP group, and none of it is a no-op for a draft that does not.
@@ -160,10 +161,10 @@ class DraftKvBuilder(PoolRowsMixin):
     target's builder. It does NOT drive prepare_decode/prepare_prefill; it
     piggybacks on the target builder's metadata flow during propose.
 
-    It knows nothing about attention: the caller that resolved the draft's
-    flavor hands over a way to build the pool. What is left is the part that is
-    genuinely about being a draft -- its blocks are the target's blocks,
-    re-paged at its own block size.
+    The caller that resolved the draft's flavor hands over a way to build the
+    pool; `dflash_pool` picks the block, the views and the scale binding for
+    the DFlash pool. What is left is the part that is genuinely about being a
+    draft -- its blocks are the target's blocks.
     """
 
     def __init__(self, model_runner, make_pool, dflash_pool: bool = False):
@@ -195,23 +196,29 @@ class DraftKvBuilder(PoolRowsMixin):
         at zero and binds nothing -- a draft running on no KV at all. The
         `KeyError` is the one `pool_rows` promises.
 
-        The block is the SCHEDULER's (`model_runner.block_size`): `propose`
-        hands the draft the target's block tables, whose ids count scheduler
-        blocks, and a draft has no metadata of its own to convert units in.
+        On demand is also what makes the block reachable, and it is the target
+        builder's: `propose` hands the draft the target's block tables, and the
+        draft's kernels take the block off the cache they were bound to, so a
+        block of its own would address one page with an id that counted
+        another. There is nowhere in a draft to convert between the two -- it
+        has no metadata of its own. The builder is constructed after
+        `build_drafter`, which is why this is read here and not bound earlier.
         """
         if self._kv_pool is None:
-            # The SCHEDULER's block, not the target builder's. The two agree for
-            # a paged target, but an MLA target's builder pages at
-            # ATOM_MLA_PAGE_SIZE -- 1 by default -- which is a kernel page, not
-            # a block id. Sizing the draft at 1 contradicts the invariant
-            # `allocate_kv_cache_tensors` enforces below (one entry per
-            # scheduler block, indexed by the target's block tables, so all
-            # three are one number), and an MHA draft on an MLA target cannot
-            # allocate at all: MhaKvPool's SHUFFLE packing needs 16 to divide
-            # the block size.
+            layers = self.row_counts()[DRAFT_KV_ROWS]
+            runner = self.model_runner
+            # The DFlash pool sits beside an MLA target, whose builder pages at
+            # ATOM_MLA_PAGE_SIZE (a kernel page, 1 by default), not at a block
+            # id; it takes the SCHEDULER's block, the unit the target's block
+            # tables count in.
+            block_size = (
+                runner.block_size
+                if self._dflash_pool
+                else runner.attn_metadata_builder.block_size
+            )
             self._kv_pool = self._make_pool(
-                layers=self.row_counts()[DRAFT_KV_ROWS],
-                target_block_size=self.model_runner.block_size,
+                layers=layers,
+                target_block_size=block_size,
             )
         return self._kv_pool
 
@@ -244,6 +251,19 @@ class DraftKvBuilder(PoolRowsMixin):
         """
         runner = self.model_runner
         pool = self.kv_pool
+        # `blocks` counts SCHEDULER blocks -- it is the budget `paged_pool_bytes`
+        # charged per -- and one entry answers one of them, so the block the
+        # pool took has to be that one too. It took the target builder's, which
+        # makes this the check that the target's and the scheduler's agree.
+        # Raised and not asserted because `python -O` drops what it does not
+        # run, and a short pool reads the next request's page rather than fault.
+        if pool.block_size != runner.block_size:
+            raise ValueError(
+                f"the draft's blocks are {pool.block_size} tokens and the "
+                f"scheduler's {runner.block_size}; a draft is allocated one "
+                "entry per scheduler block and indexed by the target's block "
+                "tables, so all three are one number"
+            )
         self.num_blocks = blocks
         pool.allocate(blocks, runner.device, buf=buf)
         logger.info(
