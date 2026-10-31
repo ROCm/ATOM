@@ -89,6 +89,26 @@ def _flydsl_attention_op():
     return qsa_sparse_prefill
 
 
+def flydsl_attention_supported(
+    compress_ratio: int, token_topk: int, *, kv_bf16: bool
+) -> bool:
+    """Whether QSA layers with this indexer and KV format can take the aiter
+    FlyDSL attention at all: the flag, gfx942, a BF16 KV cache, and
+    compression ratio 4 with a budget whose width the kernel serves. The kernel
+    expects min(v // 4, T) blocks for a row with v visible tokens (width
+    4T + 3); another budget or ratio selects a different number, so padding
+    its selection would give wrong output. The one authority for the layer's
+    fallback and the SGLang bridge's layout build; per-call conditions
+    (selection byte span, graph capture, head shape) stay with the layer."""
+    return (
+        envs.ATOM_QSA_FLYDSL_ATTN
+        and kv_bf16
+        and compress_ratio == 4
+        and token_topk + 3 in _FLYDSL_WIDTHS
+        and _flydsl_arch_supported()
+    )
+
+
 def build_qwen4_exp_rope(config, head_size: int):
     """mRoPE over the leading `rotary_dim` channels of `head_size`.
 
@@ -547,19 +567,16 @@ class Qwen4ExpAttention(nn.Module):
         """aiter FlyDSL sparse attention for an eager prefill, or None for the native kernel."""
         width = next((w for w in _FLYDSL_WIDTHS if w >= selected.shape[1]), None)
         if (
-            not envs.ATOM_QSA_FLYDSL_ATTN
+            # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
+            not flydsl_attention_supported(
+                self.indexer.compress_ratio,
+                self.indexer.token_topk,
+                kv_bf16=self.k_scale_cache is None,
+            )
             or qsa.host_lens is None
             or width is None
             # aiter rejects a padded selection spanning 2**31 bytes or more.
             or query.shape[0] * width * selected.element_size() >= 2**31
-            # The kernel expects min(v // 4, T) blocks for a row with v visible
-            # tokens (width 4T + 3); another budget or ratio selects a different
-            # number, so padding its selection would give wrong output.
-            or self.indexer.compress_ratio != 4
-            or self.indexer.token_topk + 3 not in _FLYDSL_WIDTHS
-            # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
-            or self.k_scale_cache is not None
-            or not _flydsl_arch_supported()
             or torch.cuda.is_current_stream_capturing()
             or self.num_kv_heads != 1
             or self.num_heads not in (12, 6, 3)

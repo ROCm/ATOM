@@ -1229,24 +1229,19 @@ def _flydsl_layout_needed(
     forward_batch: Any, compress_ratio: int, indexer_budget: int
 ) -> bool:
     """Whether this forward's QSA layers can take the FlyDSL attention, so
-    its host layout is worth building. Mirrors the forward-invariant
-    fallbacks of `Qwen4ExpAttention._flydsl_attention` (flag, GPU arch, BF16
-    KV, compression ratio 4 with a supported budget). The per-call and
-    per-layer ones (selection byte span, graph capture, head shape) stay with
-    the layer. An FP8 SGLang KV pool binds no scale planes, so the layer
-    cannot detect it: the KV dtype is checked here, on the same pool the QSA
-    caches are bound from, and a pool whose dtype cannot be read keeps the
+    its host layout is worth building: `qsa_attention.flydsl_attention_supported`,
+    the predicate the layer's fallback uses, on the KV dtype of the pool the
+    QSA caches are bound from. An FP8 SGLang KV pool binds no scale planes, so
+    the layer cannot detect it; a pool whose dtype cannot be read keeps the
     native kernel."""
     if not envs.ATOM_QSA_FLYDSL_ATTN:
-        return False
-    # Imported here: the flag-off path keeps the bridge free of the layer module.
+        return False  # flag off: keep the bridge free of the layer module
     from atom.model_ops.qwen4_exp import qsa_attention
 
-    if compress_ratio != 4 or indexer_budget + 3 not in qsa_attention._FLYDSL_WIDTHS:
-        return False
-    if getattr(_token_to_kv_pool(forward_batch), "dtype", None) != torch.bfloat16:
-        return False
-    return qsa_attention._flydsl_arch_supported()
+    kv_dtype = getattr(_token_to_kv_pool(forward_batch), "dtype", None)
+    return qsa_attention.flydsl_attention_supported(
+        compress_ratio, indexer_budget, kv_bf16=kv_dtype == torch.bfloat16
+    )
 
 
 def _token_to_kv_pool(forward_batch: Any) -> Any:
