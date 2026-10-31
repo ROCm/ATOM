@@ -292,8 +292,9 @@ def test_scheduler_success_closes_timer_at_completion_before_next_schedule(clock
 def test_pool_partition_and_waiting_queue_exclusion():
     scheduler = Scheduler(MockConfig(enable_prefix_caching=True))
     pool = scheduler.block_manager.kv
-    used = pool.allocate(0)
-    cached = pool.allocate(1)
+    # Block 0 may be the null page (ATOM_ZERO_EVICTED_BLOCKS): start above it.
+    used = pool.allocate(pool.first_block)
+    cached = pool.allocate(pool.first_block + 1)
     import array
 
     pool.publish(cached.block_id, 123, array.array("i", [1, 2, 3, 4]))
@@ -305,7 +306,7 @@ def test_pool_partition_and_waiting_queue_exclusion():
     snapshot = handler.collect_metrics()
     assert snapshot["kv_blocks_used"] == 1
     assert snapshot["kv_blocks_evictable"] == 1
-    assert snapshot["kv_blocks_vacant"] == pool.num_blocks - 2
+    assert snapshot["kv_blocks_vacant"] == pool.num_blocks - pool.first_block - 2
     assert snapshot["scheduler_metrics"]["waiting"] == 0
     assert snapshot["scheduler_metrics"]["waiting_kv"] == 1
     pool.free(used.block_id)

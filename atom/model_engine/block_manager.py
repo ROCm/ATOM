@@ -45,6 +45,7 @@ from atom.model_engine.state_runtime import (
     StateTransfer,
     midstep_target_ok,
     snap_midstep_position,
+    zeroes_released_units,
 )
 from atom.utils import envs
 
@@ -271,6 +272,16 @@ class BlockManager:
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            # ATOM_ZERO_EVICTED_BLOCKS: block 0 stays the zero null page and
+            # released checkpoint units are zeroed before reuse (see BlockPool).
+            # Only queued for a layout whose runner has the zero kernel: a
+            # drained id nobody zeroes would only look handled.
+            null_block=envs.ATOM_ZERO_EVICTED_BLOCKS,
+            scrub_released=(
+                envs.ATOM_ZERO_EVICTED_BLOCKS
+                and state_runtime.checkpoint_spec is not None
+                and zeroes_released_units(state_runtime.checkpoint_spec.layout_id)
+            ),
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -558,10 +569,15 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        # Drained after the checkpoint ops: a store begun above may have
+        # evicted another checkpoint, and its units must be zeroed in this
+        # batch, ahead of the copies that reuse them.
+        zero_units = self.kv.take_released_units()
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            zero_units=zero_units,
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:

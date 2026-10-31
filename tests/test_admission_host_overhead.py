@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 from aiter_stub import stubbed_aiter
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
 from test_state_checkpoint import (
     PAGED_COPY_RUNTIME,
@@ -343,7 +343,9 @@ def test_the_memo_follows_only_remaps_of_what_its_walk_read(watched):
 
 def test_the_memo_recounts_hit_blocks_another_seq_claimed():
     """No eviction, but the hit's blocks went from free to used."""
-    bm = published(range(40), BlockManager(prefix_config(num_kvcache_blocks=24)))
+    bm = published(
+        range(40), BlockManager(prefix_config(num_kvcache_blocks=kv_blocks(24)))
+    )
     head = Sequence(list(range(44)), BLOCK)
     assert bm.can_allocate_memoized(head) == 10
     other = Sequence(list(range(40)) + list(range(500, 520)), BLOCK)

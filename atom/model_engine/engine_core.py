@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import dataclasses
 import logging
 import pickle
 import queue
@@ -16,6 +17,7 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.dynamic_chunking import (
     DYNAMIC_CHUNKING_POLL_STEPS,
     ChunkSizePredictor,
@@ -515,6 +517,7 @@ class EngineCore:
             self.kv_transfer_enabled
             and scheduled_batch.connector_meta_output is not None
         ):
+            self._zero_released_units_before_loads(scheduled_batch)
             self.runner_mgr.call_func(
                 "process_kvconnector_output", scheduled_batch.connector_meta_output
             )
@@ -601,6 +604,31 @@ class EngineCore:
         if connector is None or not hasattr(connector, "has_pending_work"):
             return False
         return bool(connector.has_pending_work())
+
+    def _zero_released_units_before_loads(self, batch=None) -> None:
+        """Zero every released checkpoint unit before a connector dispatch.
+
+        ATOM_ZERO_EVICTED_BLOCKS. A load dispatched now may target a block
+        whose zero is still pending: in `batch`'s `zero_units`, or still in the
+        pool's queue when no batch drained it (an idle tick, or a decode pass
+        that scheduled no sequence and so carries no maintenance ops). Both
+        calls go to the runner in order and run on its current stream, which
+        is the stream `start_load_kv` records the event the load waits on, so
+        the zero lands before the loaded bytes. The batch's ids are dropped so
+        `build()` does not zero the loaded bytes again. Zeros drained by an
+        earlier batch were enqueued by that batch's `build()`, which the
+        runner executed before this dispatch.
+        """
+        ids: tuple[int, ...] = ()
+        ops = getattr(batch, "state_maintenance_ops", None)
+        if ops is not None and ops.zero_units:
+            ids = tuple(ops.zero_units)
+            batch.state_maintenance_ops = dataclasses.replace(ops, zero_units=())
+        pool = getattr(getattr(self.scheduler, "block_manager", None), "kv", None)
+        if isinstance(pool, BlockPool):
+            ids += pool.take_released_units()
+        if ids:
+            self.runner_mgr.call_func("zero_page_units", ids)
 
     def _advance_idle_kv_transfer(self, dispatch_new: bool = True) -> None:
         # No forward batch will run this tick, but offload load/save work may
@@ -729,6 +757,7 @@ class EngineCore:
         meta = connector.build_connector_meta()
         if not connector_metadata_has_work(meta):
             return
+        self._zero_released_units_before_loads()
         self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):

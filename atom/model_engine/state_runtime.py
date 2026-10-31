@@ -19,6 +19,16 @@ NONE = "none"
 # (`BlockManager.replay_start`), writing none of what the cache holds there.
 REPLAY = "replay"
 
+# PAGE checkpoint layout of the Qwen GDN + MHA builder. Its runner implements
+# `zero_page_units`, so released checkpoint units of this layout are zeroed
+# before reuse (ATOM_ZERO_EVICTED_BLOCKS); no other layout has a zero kernel.
+GDN_PAGED_LAYOUT_PREFIX = "gdn-paged-state-"
+
+
+def zeroes_released_units(layout_id: str | None) -> bool:
+    """Whether the runner of this PAGE layout zeroes released raw units."""
+    return bool(layout_id) and layout_id.startswith(GDN_PAGED_LAYOUT_PREFIX)
+
 
 @dataclass(frozen=True)
 class StateTransfer:
@@ -253,11 +263,17 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+    # PAGE ids a released state checkpoint held, to be zeroed before anything
+    # else in the batch (`BlockPool.take_released_units`).
+    zero_units: tuple[int, ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
+            or self.zero_units
         )
 
 

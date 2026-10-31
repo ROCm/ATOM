@@ -27,7 +27,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from conftest import MockConfig
+from conftest import MockConfig, kv_blocks
 
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
@@ -192,7 +192,7 @@ def test_admission_charges_the_lookahead_block(prefix):
     prompt, one for the draft round past it. One free block is not enough."""
     for blocks, admitted in ((1, False), (2, True)):
         sched = make_scheduler(
-            3, 16, num_kvcache_blocks=blocks, enable_prefix_caching=prefix
+            3, 16, num_kvcache_blocks=kv_blocks(blocks), enable_prefix_caching=prefix
         )
         seq = Sequence(list(range(16)), 16, num_draft_tokens=3)
         sched.add(seq)
