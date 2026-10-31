@@ -232,6 +232,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFIX_OWNER_MARGIN": lambda: int(
         os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN", "65536")
     ),
+    # Prefix-spread rule "margin" (default): also leave the prefix's rank
+    # when it runs more than this many requests over the lightest rank, so
+    # decode stays balanced across the lockstep DP ranks. -1 disables.
+    "ATOM_DP_PREFIX_MAX_REQ_GAP": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP", "-1")
+    ),
+    # Prefix-spread rule: "margin" (above) or "cost". "cost" places each
+    # request on the rank minimizing its estimated time to first token (the
+    # rank's queued prefill, its own uncached prefill, a tier load where the
+    # prefix is not resident) plus ATOM_DP_PREFIX_IMBALANCE_S seconds per
+    # request of in-flight imbalance the placement leaves between the ranks.
+    "ATOM_DP_PREFIX_POLICY": lambda: os.getenv("ATOM_DP_PREFIX_POLICY", "margin"),
+    "ATOM_DP_PREFIX_IMBALANCE_S": lambda: float(
+        os.getenv("ATOM_DP_PREFIX_IMBALANCE_S", "0.1")
+    ),
+    # Prefill work rate (`prefill_cost` units / s) and tier load rate
+    # (tokens / s) the "cost" rule converts work into seconds with.
+    "ATOM_DP_PREFIX_PREFILL_WORK_PER_S": lambda: float(
+        os.getenv("ATOM_DP_PREFIX_PREFILL_WORK_PER_S", "2.5e10")
+    ),
+    "ATOM_DP_PREFIX_LOAD_TOKENS_PER_S": lambda: float(
+        os.getenv("ATOM_DP_PREFIX_LOAD_TOKENS_PER_S", "2e6")
+    ),
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),

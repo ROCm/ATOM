@@ -298,6 +298,16 @@ class CoreManager:
         # last ran it. A bounded LRU of routing history, not KV residency.
         self._prefix_spread = envs.ATOM_DP_PREFIX_SPREAD
         self._prefix_owner_margin = envs.ATOM_DP_PREFIX_OWNER_MARGIN
+        self._prefix_max_req_gap = envs.ATOM_DP_PREFIX_MAX_REQ_GAP
+        self._prefix_policy = envs.ATOM_DP_PREFIX_POLICY
+        if self._prefix_policy not in ("margin", "cost"):
+            raise ValueError(
+                f"ATOM_DP_PREFIX_POLICY must be margin or cost, not {self._prefix_policy!r}"
+            )
+        self._prefix_imbalance_s = envs.ATOM_DP_PREFIX_IMBALANCE_S
+        self._prefix_work_per_s = envs.ATOM_DP_PREFIX_PREFILL_WORK_PER_S
+        self._prefix_load_tok_per_s = envs.ATOM_DP_PREFIX_LOAD_TOKENS_PER_S
+        self._prefill_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
         self._prefix_owner: OrderedDict[int, int] = OrderedDict()
         self._prefix_owner_cap = 1 << 19
         self._prefix_stride_tokens = 4096
@@ -1489,6 +1499,34 @@ class CoreManager:
         while len(index) > self._prefix_owner_cap:
             index.popitem(last=False)
 
+    def _prefix_cost_rank(self, seq: Sequence, owner: int, hit: int) -> int:
+        """The "cost" rule: minimum estimated TTFT plus decode-imbalance penalty.
+
+        A rank's queued prefill is its charged tokens (each with the
+        per-token weight of `prefill_cost`); the request's own prefill is its
+        uncached suffix attending to the prefix; a rank other than the
+        prefix's pays the tier load of the prefix. The penalty prices, in
+        seconds, each request of in-flight imbalance the placement leaves.
+        """
+        weight = self._prefill_token_weight
+        prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        n = self._routable_engine_count
+        best_rank, best_score = owner, None
+        for r in range(n):
+            prefix = hit if r == owner else 0
+            loaded = 0 if r == owner else hit
+            new = max(0, prompt - prefix - loaded)
+            queued = self._rank_tokens[r] * weight / self._prefix_work_per_s
+            own = new * (weight + prefix + loaded + new / 2) / self._prefix_work_per_s
+            load_s = loaded / self._prefix_load_tok_per_s if loaded else 0.0
+            reqs = list(self._rank_reqs)
+            reqs[r] += 1
+            imbalance = max(reqs) - min(reqs)
+            score = queued + own + load_s + self._prefix_imbalance_s * imbalance
+            if best_score is None or score < best_score:
+                best_rank, best_score = r, score
+        return best_rank
+
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
         """Least-loaded rank, unless the prefix's last rank is within the margin.
 
@@ -1512,9 +1550,16 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         lightest = min(((offset + i) % n for i in range(n)), key=load)
         rank = lightest
-        if (
+        if owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
+            rank = self._prefix_cost_rank(seq, owner, hit)
+        elif (
             owner is not None
             and load(owner) <= load(lightest) + self._prefix_owner_margin
+            and (
+                getattr(self, "_prefix_max_req_gap", -1) < 0
+                or self._rank_reqs[owner] - self._rank_reqs[lightest]
+                <= self._prefix_max_req_gap
+            )
         ):
             rank = owner
         # Either rank holds the prefix or loads it; only the rest is prefill.
