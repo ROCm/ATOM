@@ -28,10 +28,16 @@ from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -63,6 +69,7 @@ from atom.utils.gc_utils import (
     tune_gc,
 )
 
+from .api_compatibility import api_compatibility_for
 from .chat_encoders import (
     apply_chat_template,
     chat_template_source,
@@ -87,6 +94,12 @@ from .reasoning import (
     prompt_tokens_start_in_reasoning,
     template_opens_reasoning_implicitly,
     thinking_switched_off,
+)
+from .reasoning_controls import (
+    CHAT_REASONING_RULES,
+    RESPONSES_REASONING_RULES,
+    apply_reasoning_controls,
+    resolve_reasoning_controls,
 )
 from .reasoning_dialects import resolve_dialect
 from .request_timing import (
@@ -1626,6 +1639,59 @@ app.add_middleware(TraceMiddleware, model=lambda: model_name)
 # ---- Error handlers ----
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+):
+    path = request.url.path
+    if path not in {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/v1/messages",
+    }:
+        return await request_validation_exception_handler(request, exc)
+    # Do not serialize exc.body, input values or arbitrary Pydantic ctx objects.
+    message = "; ".join(
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        for error in exc.errors()
+    )
+    error = {"message": message, "type": "invalid_request_error"}
+    content = {"error": error}
+    if path == "/v1/messages":
+        content["type"] = "error"
+    else:
+        error["code"] = 422
+    return JSONResponse(status_code=422, content=content)
+
+
+@app.exception_handler(HTTPException)
+async def openai_http_error_handler(request: Request, exc: HTTPException):
+    # HTTPException bypasses the ValueError/Exception handlers. Keep its status
+    # and headers, but use the same OpenAI error envelope on generation routes.
+    if request.url.path not in {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+    }:
+        return await http_exception_handler(request, exc)
+    return JSONResponse(
+        status_code=exc.status_code,
+        headers=exc.headers,
+        content={
+            "error": {
+                "message": str(exc.detail),
+                "type": (
+                    "invalid_request_error"
+                    if exc.status_code < 500
+                    else "internal_server_error"
+                ),
+                "code": exc.status_code,
+            }
+        },
+    )
+
+
 @app.exception_handler(ValueError)
 async def value_error_handler(request: Request, exc: ValueError):
     return JSONResponse(
@@ -1658,6 +1724,23 @@ async def general_error_handler(request: Request, exc: Exception):
 # ---- Endpoints ----
 
 
+def _model_reasoning_rules(default=CHAT_REASONING_RULES):
+    return getattr(custom_message_encoder, "reasoning_rules", None) or default
+
+
+def _effective_thinking_enabled(kwargs):
+    # Validate against the same defaults and normalization used by the encoder,
+    # on a copy so a predicate cannot change the prompt configuration.
+    effective = dict(getattr(custom_message_encoder, "defaults", {}))
+    effective.update(kwargs)
+    if custom_message_encoder is not None:
+        effective = custom_message_encoder.prepare_kwargs(effective)
+    if reasoning_toggle is None:
+        return True
+    name, off_value, on_value = reasoning_toggle
+    return effective.get(name, on_value) != off_value
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1680,23 +1763,19 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             merged_kwargs["response_format"] = request.response_format
         if isinstance(request.tool_choice, str):
             merged_kwargs["tool_choice"] = request.tool_choice
-        _th_enabled, _th_effort = resolve_thinking(request)
-        if request.thinking is not None or request.reasoning_effort is not None:
-            # By the name this template actually reads. `thinking` was
-            # hardcoded, which is right for Kimi-K3 and a silent no-op for the
-            # whole Qwen family, whose templates read `enable_thinking` --
-            # measured, `thinking=False` left the `<think>` prefill in place.
-            # A template ignores a kwarg it does not know, so the failure was
-            # invisible: the model reasoned anyway.
-            # Only when the request said something about it. An effort is
-            # not an opt-in, and this is merged after the server defaults and
-            # after the client's own `chat_template_kwargs` -- so writing it
-            # unconditionally overrode both.
-            if reasoning_toggle is not None and _th_enabled is not None:
-                name, off_value, on_value = reasoning_toggle
-                merged_kwargs[name] = on_value if _th_enabled else off_value
-            if _th_effort is not None:
-                merged_kwargs["thinking_effort"] = _th_effort
+        rules = _model_reasoning_rules()
+        merged_kwargs = apply_reasoning_controls(
+            merged_kwargs,
+            reasoning_toggle,
+            resolve_thinking(request, rules=rules),
+            rules=rules,
+        )
+        compatibility = api_compatibility_for(custom_message_encoder)
+        if not compatibility.chat_forced_tools_with_thinking:
+            compatibility.validate_chat_tool_choice(
+                request.tool_choice,
+                thinking_enabled=_effective_thinking_enabled(merged_kwargs),
+            )
 
         effective_n = _coerce_n(request.n, request.temperature)
         _validate_return_token_ids(request.return_token_ids, request.stream)
@@ -1793,6 +1872,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    usage_on_finish=compatibility.chat_usage_on_finish,
+                    include_usage=bool(
+                        (request.stream_options or {}).get("include_usage")
+                    ),
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1817,6 +1900,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    usage_on_finish=compatibility.chat_usage_on_finish,
+                    include_usage=bool(
+                        (request.stream_options or {}).get("include_usage")
+                    ),
                 )
             return StreamingResponse(
                 _client_stream(gen, request_id),
@@ -2083,14 +2170,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     # a 500 -- wrong for a malformed request, and once the response is
     # streaming it arrives after the client was told the request succeeded.
     try:
+        validate_model(request.model)
         validate_tool_list(anthropic_to_openai_tools(request.tools))
         validate_max_tokens(request.max_tokens)
-    except ValueError as exc:
+    except (ValueError, HTTPException) as exc:
+        message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         return JSONResponse(
             status_code=400,
             content={
                 "type": "error",
-                "error": {"type": "invalid_request_error", "message": str(exc)},
+                "error": {"type": "invalid_request_error", "message": message},
             },
         )
 
@@ -2109,6 +2198,21 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # dealing with a chain of thought it had asked for by omission.
         merged_kwargs.update(anthropic_template_kwargs(request, reasoning_toggle))
         drop_reasoning = anthropic_drop_reasoning(request)
+        compatibility = api_compatibility_for(custom_message_encoder)
+        if compatibility.anthropic_output_effort:
+            # Messages thinking is controlled by thinking.type. Its output
+            # effort adjusts the budget without implicitly opting into thinking.
+            rules = replace(_model_reasoning_rules(), string_effort_enables=False)
+            controls = resolve_reasoning_controls(
+                thinking=request.thinking,
+                effort=(request.output_config or {}).get("effort"),
+                rules=rules,
+            )
+            merged_kwargs = apply_reasoning_controls(
+                merged_kwargs, reasoning_toggle, controls, rules=rules
+            )
+            if controls[0] is False:
+                drop_reasoning = True
         # Same answer-it-in-the-prompt rule as `thinking` above, and the chat
         # path already forwards its own spelling of this. `tool_choice` was
         # read off the Anthropic request and then used nowhere at all -- a
@@ -2488,6 +2592,8 @@ async def responses_create(raw_request: Request):
     _validate_chunked_receive(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
+    compatibility = api_compatibility_for(custom_message_encoder)
+    body = compatibility.responses_body(body)
     unsupported = unsupported_responses_parameter(body)
     if unsupported:
         return JSONResponse(
@@ -2504,6 +2610,7 @@ async def responses_create(raw_request: Request):
     try:
         body, codex_context = normalize_codex_request(body)
         request = ResponsesRequest.model_validate(body)
+        validate_model(request.model)
         openai_tools = responses_tools_to_openai(request.tools)
         validate_tool_list(openai_tools)
     except ValueError as exc:
@@ -2529,10 +2636,18 @@ async def responses_create(raw_request: Request):
             merged_kwargs["tool_choice"] = request.tool_choice
         elif forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        if isinstance(request.reasoning, dict):
-            effort = request.reasoning.get("effort")
-            if effort is not None:
-                merged_kwargs["thinking_effort"] = effort
+        rules = _model_reasoning_rules(RESPONSES_REASONING_RULES)
+        effort = (
+            request.reasoning.get("effort")
+            if isinstance(request.reasoning, dict)
+            else None
+        )
+        merged_kwargs = apply_reasoning_controls(
+            merged_kwargs,
+            reasoning_toggle,
+            resolve_reasoning_controls(effort=effort, rules=rules),
+            rules=rules,
+        )
 
         prompt = apply_chat_template(
             tokenizer,
@@ -2677,6 +2792,7 @@ async def responses_create(raw_request: Request):
                             for _frame in emitter.finish_frames(
                                 usage=usage,
                                 has_tool_calls=has_tool_calls,
+                                finish_reason=chunk_data.get("finish_reason"),
                             ):
                                 yield _frame
                             break
@@ -2732,6 +2848,7 @@ async def responses_create(raw_request: Request):
             output_tokens=output_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
             created_at=created_at,
+            finish_reason=final_output.get("finish_reason"),
         )
         return _with_kv_transfer_params(response, final_output)
 

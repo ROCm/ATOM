@@ -245,6 +245,7 @@ class ChatCompletionRequest(BaseModel):
     stop: list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    stream_options: dict[str, Any] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
