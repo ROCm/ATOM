@@ -214,6 +214,7 @@ def _v41_scheduler(cached):
     s._mp_adapter = SimpleNamespace(end_session=lambda _session: None)
     s._scheduler_deadline_s = 3600.0
     s._transfer_seen_at = {}
+    s._finished_frontiers = {}
     s._min_load_tokens = 0
     planner = V41BoundaryPlanner(
         hash_block_size=256, chunk_size=256, checkpoint_group_ids=(1, 2)
@@ -276,6 +277,35 @@ def test_a_running_save_waits_for_the_checkpoint_at_its_end():
     assert s.build_connector_meta().requests == []
     assert s._save_tracker["r0"][1] == 0
     assert planner._ride_pins == {}
+
+
+@pytest.mark.parametrize(
+    "cached, leased",
+    [({_HASHES[1]: (41, 42)}, {10, 11}), ({}, {10, 11, 12, 13})],
+)
+def test_a_finished_save_keeps_every_boundary_whose_checkpoint_exists(cached, leased):
+    """1024 tokens, a checkpoint at 512 only: the save ends at 512 rather than
+    dropping [0, 1024), and teardown leases only the blocks it reads. With no
+    checkpoint at all the save is retired and its lease given back."""
+    s, _, _ = _v41_scheduler(cached)
+    seq = _prompt(1024)
+    s.update_state_after_alloc(seq)
+    protected = s.protected_block_ids(seq)
+    assert protected == leased
+    s.activate_block_leases(seq, protected)
+    requests = s.build_connector_meta().requests
+    if not cached:
+        assert requests == []
+        assert "r0" not in s._save_tracker
+        assert s.take_source_safe_releases() == [frozenset(leased)]
+        return
+    [save] = requests
+    assert save.token_ids == list(range(512))
+    assert save.native_state.unit_ids == (41, 42)
+    assert save.native_state.boundary_tokens == 512
+    _store_landed(s, save.save_operation)
+    assert s.take_source_safe_releases() == [frozenset(leased)]
+    assert "r0" not in s._save_tracker
 
 
 @pytest.mark.parametrize("recorded", [True, False])

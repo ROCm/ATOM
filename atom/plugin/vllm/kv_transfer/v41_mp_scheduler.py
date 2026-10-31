@@ -41,6 +41,9 @@ class V41StateMPScheduler(LMCacheMPConnectorScheduler):
         super().__init__(config, checkpoint_spec=checkpoint_spec, images=True)
         self._planner: Any = None
         self._request_of: Any = None
+        # sid -> (seq, frontier): a finished request's save frontier, fixed
+        # the first time it is asked for; see `_save_frontier`.
+        self._finished_frontiers: dict[str, tuple[Any, int]] = {}
 
     def bind_planner(self, planner: Any, request_of: Any) -> None:
         """Take the planner that resolves checkpoint units (`V41BoundaryPlanner`)
@@ -119,6 +122,40 @@ class V41StateMPScheduler(LMCacheMPConnectorScheduler):
 
     # -- save ------------------------------------------------------------
 
+    def _save_frontier(self, seq: Any) -> int:
+        """A finished request saves to its last boundary that has a checkpoint.
+
+        A save carries one checkpoint, at its end. A running request whose end
+        has none yet waits for one; a finished request commits no further
+        checkpoint, so it would wait forever, and dropping the save would also
+        drop every earlier boundary whose checkpoint still exists. Fixed the
+        first time it is asked, at teardown, so the blocks leased for the save
+        and the blocks the save reads stay the same range.
+        """
+        aligned = super()._save_frontier(seq)
+        if not getattr(seq, "_offload_finished", False):
+            return aligned
+        sid = str(seq.id)
+        fixed = self._finished_frontiers.get(sid)
+        if fixed is not None and fixed[0] is seq:
+            return fixed[1]
+        frontier = self._last_checkpointed_boundary(seq, aligned)
+        self._finished_frontiers[sid] = (seq, frontier)
+        return frontier
+
+    def _last_checkpointed_boundary(self, seq: Any, aligned: int) -> int:
+        """The highest chunk edge in (saved, aligned] whose checkpoint vLLM
+        still holds in every group, or *aligned* when none does (the save is
+        then declined and retired, `_unbuilt_save_is_final`)."""
+        entry = self._save_tracker.get(str(seq.id))
+        saved = int(entry[1]) if entry is not None and entry[0] is seq else 0
+        request = self._request_of(seq)
+        if request is not None:
+            for boundary in range(int(aligned), saved, -int(self.chunk_size)):
+                if self._planner.source_blocks_for(request, boundary):
+                    return boundary
+        return int(aligned)
+
     def _build_save_request(
         self, seq, saved, aligned, operation, block_ids, is_last_prefill
     ):
@@ -163,6 +200,12 @@ class V41StateMPScheduler(LMCacheMPConnectorScheduler):
         # exit it has -- terminal report, abandonment, teardown -- so this is
         # the one place a pin is given back.
         self._planner.retire_ride_pins(self._live_transfers())
+        for sid in [
+            sid
+            for sid, (seq, _) in self._finished_frontiers.items()
+            if (entry := self._save_tracker.get(sid)) is None or entry[0] is not seq
+        ]:
+            del self._finished_frontiers[sid]
         return metadata
 
 
