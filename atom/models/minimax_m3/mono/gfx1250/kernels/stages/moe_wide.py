@@ -291,11 +291,13 @@ def moe_wide_defs(k4ctx):
                 async_to_lds(
                     wb + fx.Int64((g * (HIDDEN // 64) + 2 * kc + piece) * 512 + lane * 16),
                     slot + lane * 32 + 16 * piece,
+                    cm=CM_NT,
                 )
             async_to_lds(
                 fx.Int64(s13) + fx.Int64((rr // 32) * HIDDEN + kc * 128 + (rr % 32) * 4),
                 slot + WAVE * 32 + lane * 4,
                 b128=False,
+                cm=CM_NT,
             )
 
         F = UGR * QCH
@@ -510,12 +512,14 @@ def moe_wide_defs(k4ctx):
                 async_to_lds(
                     wb + fx.Int64((rg_d * (INTER // 64) + 2 * kc + piece) * 512 + lane * 16),
                     slot + lane * 32 + 16 * piece,
+                    cm=CM_NT,
                 )
             rr = de * HIDDEN + 16 * rg_d + l16
             async_to_lds(
                 fx.Int64(s2) + fx.Int64((rr // 32) * INTER + kc * 128 + (rr % 32) * 4),
                 slot + WAVE * 32 + lane * 4,
                 b128=False,
+                cm=CM_NT,
             )
 
         def lookup(t):
@@ -539,7 +543,15 @@ def moe_wide_defs(k4ctx):
         )
         gpu.barrier()
         acquire()
-        rows_to_lds(tid, mb("mid8p"), MID_ROWS, MID_ROW_WORDS, xs, MID_ROW)
+        # the mid rows: async copies, all out before the scales' loads
+        P16 = MID_ROW_WORDS // 4
+        xs_b = lds_addr(xs)
+        for i in range_constexpr((MID_ROWS * P16 + THREADS - 1) // THREADS):
+            v = tid + THREADS * i
+            if v < MID_ROWS * P16:
+                async_to_lds(
+                    fx.Int64(mb("mid8p")) + fx.Int64(v * 16), xs_b + (v // P16 * MID_ROW + v % P16 * 4) * 4, cm=CM_DEV
+                )
         # the mid scales packed as WMMA scale words: word kc of a row, byte j
         # the code of its 32-block 4 kc + j
         NPK = MIDSC_ROW_WORDS // 4
@@ -556,6 +568,7 @@ def moe_wide_defs(k4ctx):
             fx.ptr_store(fx.Int32(0), xs + (MID_ROWS * MID_ROW + tid))
         if tid < NPK:
             fx.ptr_store(fx.Int32(0), xs + (W_MIDSC + MID_ROWS * MIDSC_ROW + tid))
+        wait_async(0)
         gpu.barrier()
         stamp(10)
         v8i = fx.Vector.make_type(8, fx.Int32)
@@ -597,6 +610,7 @@ def moe_wide_defs(k4ctx):
             acc = [acc[e] + dcu[e] * dw for e in range(8)]
             fin = yield acc + [a_n, sa_n, op_n[0], op_n[1], op_n[2], lk_n[0], lk_n[1], lk_n[2]]
         acc = [fx.Float32(v) for v in fin[0:8]]
+        stamp(19)
         fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8)
         gpu.barrier()
         if tid < DN_ROWS * tokens:
@@ -606,6 +620,7 @@ def moe_wide_defs(k4ctx):
             tot = acc_row_sum(red, rr, k, [grp * DN_GW + w for w in range(DN_GW)])
             fx.ptr_store(bf16_round(tot), misc + tid)
         gpu.barrier()
+        stamp(20)
         ffn_finish(td)
         wait_async(0)  # the stand-in copies, before the CTA's LDS goes
 
