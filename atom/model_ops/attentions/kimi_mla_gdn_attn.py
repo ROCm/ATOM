@@ -208,31 +208,36 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def _kda_slot_tp_segments(self, num_regions: int) -> list:
         """How each KDA slot region's unit splits over TP ranks.
 
-        A conv unit is `W` rows of `[q | k | v]`, an SSM unit is
-        `(heads, dv, dk)` and a ReplaySSM record unit `(heads, cache_len, d)`,
-        all sharded by contiguous head blocks, so a peer at k times this TP
-        holds the same k-th of every q, k and v run and of the head axis. A
-        conv unit not shaped as above is left undescribed, and
-        `get_kv_transfer_tensors` refuses it. ReplaySSM's cursor, the last
-        region, is the same on every rank; `slot_region_tp_replicated` says so.
+        A conv unit is `W` rows of `[q | k | v]`, each run as wide as its conv
+        is built on this rank, an SSM unit is `(heads, dv, dk)` and a
+        ReplaySSM record unit `(heads, cache_len, d)`, all sharded by
+        contiguous head blocks, so a peer at k times this TP holds the same
+        k-th of every q, k and v run and of the head axis. A conv unit not
+        shaped as above is left undescribed, and `get_kv_transfer_tensors`
+        refuses it. ReplaySSM's cursor, the last region, is the same on every
+        rank; `slot_region_tp_replicated` says so.
 
         Units are read off the cache shapes, not a slot: a PP stage that holds
         no KDA layer has caches with a zero layer axis.
         """
         runner = self.model_runner
+        hf = runner.config.hf_config
         segments: list = [None] * num_regions
         conv_cache = runner.mamba_k_cache
         n_kda = conv_cache.shape[0]
         width, channels = conv_cache.shape[2:]
         # As `_state_shape_for_runner` sized it: from the runner's count, which
         # a drafter's `mtp_k` (`self.num_spec`) can differ from.
-        expected_width = (
-            runner.config.hf_config.linear_conv_kernel_dim - 1 + runner.num_spec_tokens
-        )
-        if width == expected_width and channels % 3 == 0:
-            run = channels // 3 * conv_cache.element_size()
+        expected_width = hf.linear_conv_kernel_dim - 1 + runner.num_spec_tokens
+        # How wide `KimiKDAAttention` builds each of its q, k and v convs on a
+        # rank. A row that is not three such runs is not split by guessing.
+        run = (
+            hf.linear_num_key_heads // get_tp_group().world_size
+        ) * hf.linear_key_head_dim
+        if width == expected_width and channels == 3 * run:
+            run_bytes = run * conv_cache.element_size()
             for i in range(min(n_kda, num_regions)):
-                segments[i] = (run,) * (3 * width)
+                segments[i] = (run_bytes,) * (3 * width)
         ssm_bytes = math.prod(runner.mamba_v_cache.shape[2:]) * (
             runner.mamba_v_cache.element_size()
         )

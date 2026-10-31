@@ -47,6 +47,15 @@ REC_K = (2, 5)
 REC_V = (2, 3)
 
 
+@pytest.fixture(autouse=True)
+def _tp_size(monkeypatch):
+    """The K3 builder reads its TP size from the TP group, which no test here
+    initializes. One rank unless a test sets another."""
+    tp = SimpleNamespace(world_size=1)
+    monkeypatch.setattr(K3, "get_tp_group", lambda: tp)
+    return tp
+
+
 def build(num_spec: int, replayssm: bool = False):
     """Caches whose every (layer, slot) plane carries a distinct value."""
     k = torch.zeros((LAYERS, SLOTS) + SHAPE_K)
@@ -378,6 +387,9 @@ def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
             model_type="kimi_linear",
             num_hidden_layers=NUM_HIDDEN_LAYERS,
             linear_conv_kernel_dim=SHAPE_K[0] + 1,
+            # q, k and v convs of 2 channels each: SHAPE_K's 6 at TP1
+            linear_num_key_heads=2,
+            linear_key_head_dim=1,
         ),
     )
     builder.model_runner.full_attention_layers = FULL_ATTENTION_LAYERS
@@ -585,6 +597,31 @@ def test_the_conv_width_is_read_from_the_count_the_cache_was_sized_by():
         tensors.slot_region_tp_segments[:LAYERS]
         == [(channels // 3 * 4,) * (3 * rows)] * LAYERS
     )
+
+
+def test_conv_channels_that_split_three_ways_are_not_enough():
+    """Six channels divide by three, but the convs are built one channel wide
+    here, so the row is not three runs of two and gets no segments."""
+    builder = kimi_builder({"kv_connector": "mooncake"})
+    builder.model_runner.config.hf_config.linear_num_key_heads = 1
+
+    with pytest.raises(
+        RuntimeError, match=r"slot regions \[0, 1, 2\] have no TP split"
+    ):
+        builder.get_kv_transfer_tensors()
+
+
+def test_the_conv_runs_are_this_rank_s_share_of_the_heads(_tp_size):
+    """At TP2 a rank builds each conv over half the heads: four heads of one
+    channel are runs of two on each rank."""
+    _tp_size.world_size = 2
+    builder = kimi_builder({"kv_connector": "mooncake"})
+    builder.model_runner.config.hf_config.linear_num_key_heads = 4
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    rows, _ = SHAPE_K
+    assert tensors.slot_region_tp_segments[:LAYERS] == [(2 * 4,) * (3 * rows)] * LAYERS
 
 
 def test_without_replayssm_no_slot_region_is_tp_replicated():
