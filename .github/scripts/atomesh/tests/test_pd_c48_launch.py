@@ -178,14 +178,19 @@ class LaunchTest(unittest.TestCase):
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX",
                                          "BF16-GX")),
                                      *((c, "N3966-BF16-GX") for c in (16, 32, 48, 56)),
-                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (56, 72, 88)),
-                                     *((c, "N3966-BF16-GX-H96OPUS-P12K") for c in (72, 88))):
+                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (48, 56, 72, 88)),
+                                     *((c, "N3966-BF16-GX-H96OPUS-P12K") for c in (72, 88)),
+                                     *((c, "N3966-BF16-GX-H96OPUS-PBM") for c in (48, 72, 88)),
+                                     (72, "N3966-BF16-GX-H96OPUS-P12K-PBM")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
             candidate["name"] = base["name"]
             if variant.startswith("N3966"):
                 # 3966924d fuses MLA g_proj into fused_qkv_a_proj: 24 fewer PTPC modules, same weights.
                 env = candidate["roles"]["prefill"]["env"]
+                if variant.endswith("-PBM"):
+                    self.assertEqual(candidate["roles"]["decode"]["env"].pop("C48_D_DCP_PBM"), "1")
+                    variant = variant.removesuffix("-PBM")
                 if variant.endswith("-P12K"):
                     args = candidate["roles"]["prefill"]["args"]
                     self.assertEqual(args["max-num-batched-tokens"], 12288)
@@ -294,6 +299,23 @@ class LaunchTest(unittest.TestCase):
         from pd_c48_worker import nic_limits
         with mock.patch.object(ctypes, "CDLL", side_effect=OSError("libibverbs.so.1")):
             self.assertTrue(nic_limits("rdma3").startswith("unavailable"))
+
+    def test_dcp_pbm_gate_refuses_unsupported_decode(self):
+        sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))
+        import os
+        from unittest import mock
+        from pd_c48_worker import enable_dcp_pbm
+        config = lambda backend, pcp=1: types.SimpleNamespace(parallel_config=types.SimpleNamespace(
+            decode_context_parallel_size=8, prefill_context_parallel_size=pcp, dcp_comm_backend=backend))
+        env = {"C48_DIAG_ROLE": "decode", "VLLM_USE_DIRECT_DCP_A2A": "0"}
+        with mock.patch.dict(os.environ, env):
+            self.assertIsNone(enable_dcp_pbm(config("a2a")))
+        for bad_env, bad_config in (({}, config("ag_rs")), ({}, config("a2a", pcp=2)),
+                                    ({"VLLM_USE_DIRECT_DCP_A2A": "1"}, config("a2a")),
+                                    ({"C48_DIAG_ROLE": "prefill"}, config("a2a"))):
+            with mock.patch.dict(os.environ, {**env, "C48_D_DCP_PBM": "1", **bad_env}), \
+                    self.assertRaises(ValueError):
+                enable_dcp_pbm(bad_config)
 
     def test_store_memory_compacts_each_node_once(self):
         sys.modules.setdefault("vllm.v1.worker.gpu_worker", types.SimpleNamespace(Worker=object))

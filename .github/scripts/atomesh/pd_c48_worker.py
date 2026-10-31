@@ -317,6 +317,42 @@ def native_mla_96_builders(runner):
     return observed
 
 
+# vLLM 3966924d sources pd_c48_dcp_pbm relies on: the dcp.py a2a privates and both combine -> _v_up_proj call sites.
+DCP_PBM_SOURCES = {
+    "vllm.v1.attention.ops.dcp": ("f76296c841363f26c83908229eaddabfce665a9a39b7e802d252885d6d15353e",),
+    # Stock, and the -PP8- pp-mla-context overlay (adds only VLLM_MLA_CONTEXT_WORKSPACE_TOKENS).
+    "vllm.model_executor.layers.attention.mla_attention": (
+        "52e7569308e82a08a11f09de18f81780e30e303d3e347547404c773b4639afd8",
+        "215bd083e002266955e7a8e54e31323dd34a2d226fd5f45534f583d14c47b25a"),
+    "vllm.models.kimi_k3.nvidia.mla": ("8e8b0948063084e706d105e4fcc929393d799735d0edd42dfec6003732989b22",),
+}
+DCP_PBM_CLASSES = (("vllm.model_executor.layers.attention.mla_attention", "MLAAttention"),
+                   ("vllm.models.kimi_k3.nvidia.mla", "MultiHeadLatentAttention"))
+
+
+def enable_dcp_pbm(config):
+    """Opt-in DCP project-before-merge on the decode MLA combine; patches the classes before the model is built."""
+    if os.environ.get("C48_D_DCP_PBM") != "1":
+        return None
+    import hashlib
+    import importlib
+
+    pc = config.parallel_config
+    if (os.environ.get("C48_DIAG_ROLE") != "decode" or pc.decode_context_parallel_size < 2
+            or pc.prefill_context_parallel_size != 1 or pc.dcp_comm_backend != "a2a"
+            or os.environ.get("VLLM_USE_DIRECT_DCP_A2A") != "0"):
+        raise ValueError("DCP PBM requires decode DCP>1, PCP1, the a2a backend and VLLM_USE_DIRECT_DCP_A2A=0")
+    sources = {}
+    for name, digests in DCP_PBM_SOURCES.items():
+        sources[name] = hashlib.sha256(Path(importlib.import_module(name).__file__).read_bytes()).hexdigest()
+        if sources[name] not in digests:
+            raise RuntimeError(f"DCP PBM requires a pinned {name}, got {sources[name]}")
+    import pd_c48_dcp_pbm
+    for name, cls in DCP_PBM_CLASSES:
+        pd_c48_dcp_pbm.patch_class(getattr(importlib.import_module(name), cls))
+    return {"sources_sha256": sources}
+
+
 class ManifestWorker(Worker):
     def compile_or_warm_up_model(self):
         result = super().compile_or_warm_up_model()
@@ -375,9 +411,17 @@ class ManifestWorker(Worker):
     def load_model(self, *, load_dummy_weights=False):
         from pd_c48_memory import LoadingMemoryProbe
         self._c48_native96 = enable_native_mla_96(self.vllm_config)
+        pbm = enable_dcp_pbm(self.vllm_config)
         with LoadingMemoryProbe(self):
             super().load_model(load_dummy_weights=load_dummy_weights)
         runner = self.model_runner
+        if pbm is not None:
+            import pd_c48_dcp_pbm
+            pbm.update(target=pd_c48_dcp_pbm.installed(runner.get_model()),
+                       draft=pd_c48_dcp_pbm.installed(runner.get_draft_model()))
+            if not pbm["target"]["layers"]:
+                raise RuntimeError("DCP PBM found no target MLA layer")
+            print(f"[C48-PBM] rank={self.rank} {json.dumps(pbm)}", flush=True)
         target = inspect_model(runner.get_model())
         draft = inspect_model(runner.get_draft_model())
         counts = {key: sum("Fp8PtpcOnlineLinearMethod" in item["quant_method"] for item in rows)
@@ -391,6 +435,8 @@ class ManifestWorker(Worker):
                     float(os.environ["C48_DIAG_AL"]) if os.environ["C48_DIAG_AL"] else None)}
         if self._c48_native96 is not None:
             data["mla_native96"] = self._c48_native96
+        if pbm is not None:
+            data["dcp_pbm"] = pbm
         if os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1":
             import hashlib
             from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import worker as store_worker
