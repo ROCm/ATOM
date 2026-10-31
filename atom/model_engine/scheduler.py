@@ -65,6 +65,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.observability import tracing
+from atom.sampling_params import RequiredChannel
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -290,6 +291,28 @@ class ScheduledBatch:
         self.needs_independent_noise = np.asarray(
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
+        )
+        # The channel the batch's requests must still open, when any row has
+        # one left to open (a request whose channel is open is
+        # `UNCONSTRAINED`), and then each row's committed state towards it.
+        # A batch with none stages no states and runs no channel kernels. One
+        # per engine: `InputOutputProcessor` refuses a request naming another
+        # at admission, so the engine loop never meets two.
+        channels = {
+            seq.required_channel
+            for seq in seqs.values()
+            if seq.required_channel_state >= 0
+        }
+        assert len(channels) <= 1, f"one batch holds {len(channels)} channels"
+        self.required_channel: RequiredChannel | None = (
+            channels.pop() if channels else None
+        )
+        self.required_channel_states = (
+            None
+            if self.required_channel is None
+            else np.asarray(
+                [seq.required_channel_state for seq in seqs.values()], dtype=np.int32
+            )
         )
 
         self.is_first_decode_without_local_prefill = [
@@ -3208,6 +3231,10 @@ class Scheduler:
         if first_token_id is not None:
             seq.append_token(first_token_id)
             seq._injected_t0 = first_token_id
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.step(
+                    seq.required_channel_state, first_token_id
+                )
             if self.mtp_k > 0:
                 drafts = list(
                     (seq.kv_transfer_params or {}).get("draft_token_ids") or []
@@ -4206,6 +4233,12 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            # Over the forward's own tokens only: a P/D consumer's T0 joins
+            # `new_tokens` below but was counted when it was appended.
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.advance(
+                    seq.required_channel_state, token_ids
+                )
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
@@ -5371,6 +5404,10 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.step(
+                    seq.required_channel_state, sampled_token_id
+                )
             seq.is_first_decode = True
             # Decode schedules a full target verification window.  The remote
             # prefill producer normally sends only T0, so pad the missing draft
