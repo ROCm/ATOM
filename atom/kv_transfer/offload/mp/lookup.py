@@ -30,32 +30,8 @@ _ORPHAN_STATUS_RETRIES = 8
 _ORPHAN_TIMEOUT_S = 120.0
 
 
-def _send(adapter: Any, method: str, request_type: str, payload: list) -> Any:
-    """One MP request as a future, on either LMCache client API.
-
-    Clients that name their requests (`lookup`, `query_prefetch_status`) are
-    called by name. LMCache 0.5.5's `MessageQueueClient` has neither and takes
-    `submit_request` with a `RequestType`, which is what its own ATOM adapter
-    does (`_send_request`); calling the named method there raised
-    AttributeError inside `schedule()` and killed the engine on the first
-    request.
-    """
-    client = adapter._client
-    call = getattr(client, method, None)
-    if call is not None:
-        return call(*payload)
-    from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
-
-    kind = getattr(RequestType, request_type)
-    return client.submit_request(kind, list(payload), get_response_class(kind))
-
-
-def _client_can_send(adapter: Any) -> bool:
-    client = getattr(adapter, "_client", None)
-    return all(
-        hasattr(client, name) for name in ("lookup", "query_prefetch_status")
-    ) or hasattr(client, "submit_request")
-
+#: Named requests the non-blocking path sends on the adapter's client.
+_ASYNC_CLIENT_METHODS = ("lookup", "query_prefetch_status")
 
 _ASYNC_LOOKUP_FAILED = (
     "LMCache MP async lookup failed for request %s in phase %s; "
@@ -109,8 +85,12 @@ class _MPLookupClient:
         # internals (message-queue client and result caches). An adapter
         # without them falls back to the synchronous lookup.
         missing = [name for name in _ASYNC_ADAPTER_ATTRS if not hasattr(adapter, name)]
-        if not missing and not _client_can_send(adapter):
-            missing = ["_client.submit_request"]
+        if not missing:
+            missing = [
+                f"_client.{name}"
+                for name in _ASYNC_CLIENT_METHODS
+                if not hasattr(adapter._client, name)
+            ]
         self._async_supported = not missing
         if missing:
             logger.warning(
@@ -156,7 +136,7 @@ class _MPLookupClient:
             request_id=request_id,
             worker_id=None,
         )
-        future = _send(adapter, "lookup", "LOOKUP", [key, adapter._parallel.tp_size])
+        future = adapter._client.lookup(key, adapter._parallel.tp_size)
         self._async[lookup_id] = [request_id, len(token_ids), "lookup", future]
         self._async_tokens[lookup_id] = token_ids
         return True
@@ -197,16 +177,12 @@ class _MPLookupClient:
             future.result(timeout=0)
             adapter._pending_lookups.add(request_id)
             entry[2] = phase = "status"
-            entry[3] = future = _send(
-                adapter, "query_prefetch_status", "QUERY_PREFETCH_STATUS", [request_id]
-            )
+            entry[3] = future = adapter._client.query_prefetch_status(request_id)
         if not future.query():
             return False
         result = future.result(timeout=0)
         if result is None:
-            entry[3] = _send(
-                adapter, "query_prefetch_status", "QUERY_PREFETCH_STATUS", [request_id]
-            )
+            entry[3] = adapter._client.query_prefetch_status(request_id)
             return False
         hit = int(result) * int(adapter.lmcache_tokens_per_chunk)
         adapter._lookup_results[request_id] = hit
@@ -278,12 +254,7 @@ class _MPLookupClient:
         # again, so the bound above is what ends it, not the first failure.
         self._status_retries[lookup_id] = tries + 1
         try:
-            entry[3] = _send(
-                self._adapter,
-                "query_prefetch_status",
-                "QUERY_PREFETCH_STATUS",
-                [entry[0]],
-            )
+            entry[3] = self._adapter._client.query_prefetch_status(entry[0])
         except Exception:
             logger.warning(
                 "LMCache MP: could not re-query discarded lookup %s (try %d/%d)",

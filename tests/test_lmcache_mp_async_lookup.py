@@ -272,37 +272,17 @@ def test_failed_lookup_warns_its_locks_are_left_to_the_ttl(caplog):
     assert "read TTL" in caplog.text and "phase status" in caplog.text
 
 
-class _SubmitOnlyClient:
-    """LMCache 0.5.5's MQ client: no named calls, only `submit_request`."""
+def test_a_client_without_named_calls_stays_synchronous():
+    """LMCache 0.5.5's MQ client has only `submit_request`.
 
-    def __init__(self, chunks):
-        self.chunks = chunks
-        self.requests = []
-
-    def submit_request(self, kind, payload, response_class):
-        self.requests.append((kind.name, payload))
-        return _Future(None if kind.name == "LOOKUP" else self.chunks)
-
-
-def test_a_client_without_named_calls_is_driven_through_submit_request(monkeypatch):
-    """Calling `client.lookup` there raised AttributeError inside schedule().
-
-    Needs the module the fallback imports, which LMCache 0.5.5 has and 0.5.6
-    (whose client names its calls) does not.
+    Calling `client.lookup` there raised AttributeError inside schedule(); the
+    adapter's own synchronous lookup still works, so the client is checked once
+    when the lookup client is built rather than adapted on every request.
     """
-    import pytest
-
-    pytest.importorskip("lmcache.v1.multiprocess.protocol")
-    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
-    fake = _SubmitOnlyClient(chunks=2)
-    adapter = _Adapter(fake)
+    adapter = _Adapter(SimpleNamespace(submit_request=lambda *a: None))
     client = _client(adapter)
-
-    assert client.supports_async()
-    assert client.submit(list(range(10)), "req")
-    client.pump()
-    assert client.lookup(list(range(10)), "req") == 2 * CHUNK
-    assert [name for name, _ in fake.requests] == ["LOOKUP", "QUERY_PREFETCH_STATUS"]
+    assert not client.supports_async()
+    assert not client.submit(list(range(10)), "req")
 
 
 def test_a_client_that_can_send_nothing_stays_synchronous():
