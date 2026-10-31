@@ -543,7 +543,9 @@ class TestAnthropicMessagesRequest:
         assert len(req.tools) == 1
 
     @pytest.mark.parametrize("value", [-5, -1, 0])
-    def test_non_positive_max_tokens_returns_invalid_request(self, value):
+    def test_non_positive_max_tokens_returns_invalid_request(self, value, monkeypatch):
+        # Use a served model so the request reaches max_tokens validation.
+        monkeypatch.setattr(api_server, "model_name", "test")
         request = AnthropicMessagesRequest(
             model="test",
             messages=[AnthropicMessage(role="user", content="Hi")],
