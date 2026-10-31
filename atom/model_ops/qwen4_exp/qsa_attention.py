@@ -141,10 +141,11 @@ def flydsl_fallback_reason(
 
 @functools.cache
 def log_flydsl_fallback(reason: str) -> None:
-    """Warn once per distinct reason, so a server started with the flag shows
-    whether, and why, QSA attention stays on the native kernel."""
+    """Warn once per distinct reason, so a server with the FlyDSL QSA attention
+    enabled shows whether, and why, QSA attention stays on the native kernel."""
     logger.warning(
-        "ATOM_QSA_FLYDSL_ATTN=1, but QSA attention uses the native kernel: %s",
+        "FlyDSL QSA prefill attention is enabled, but QSA attention uses the "
+        "native kernel: %s",
         reason,
     )
 
