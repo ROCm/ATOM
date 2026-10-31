@@ -22,11 +22,9 @@ class GrammarMatcher:
         return self.matcher.is_stopped()
 
     def fill_next_token_bitmask(self, mask):
-        data = bytearray(self.matcher.compute_bitmask())
-        # llguidance can include a padded trailing word. Only model-vocabulary
-        # bits are consumed by the runner; backend-only padding has no logits.
-        bits = torch.frombuffer(data, dtype=torch.int32)
-        mask.copy_(bits[: mask.numel()].reshape_as(mask))
+        from llguidance.torch import fill_next_token_bitmask
+
+        fill_next_token_bitmask(self.matcher, mask)
         if self.matcher.is_error():
             raise ValueError(self.matcher.get_error())
 
