@@ -14,9 +14,12 @@ from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
+from aiter_stub import stubbed_aiter
 
 torch = pytest.importorskip("torch")
-mc = pytest.importorskip("atom.kv_transfer.disaggregation.mooncake.mooncake_connector")
+
+with stubbed_aiter():
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
 from atom.kv_transfer.disaggregation.kv_staging import (
     MLAShardStaging,
