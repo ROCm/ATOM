@@ -611,6 +611,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )
         if s.strip()
     ),
+    # V4.1 over-band prefill still replays its decoder graph. DP=1 only.
+    "ATOM_V41_DECODER_GRAPH_ON_EAGER": lambda: os.getenv(
+        "ATOM_V41_DECODER_GRAPH_ON_EAGER", "0"
+    )
+    == "1",
     # Under DP with a drafter, the largest token-bucket TR graph to record: a
     # decode bucket past it never runs under DP, and recording it only grows
     # the graph pool.
