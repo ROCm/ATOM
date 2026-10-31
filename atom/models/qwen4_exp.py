@@ -9,6 +9,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from torch import nn
 
@@ -47,6 +48,7 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.quant_spec import LayerQuantConfig
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -368,7 +370,11 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             )
         return self._single_token_ok
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, reduce_results: bool = True
+    ) -> torch.Tensor:
+        """`reduce_results=False` returns this rank's partial sum (the caller
+        reduce-scatters it under sequence parallelism)."""
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         logits = self.gate(hidden_states)
@@ -378,7 +384,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
                 out = self._single_token_experts(hidden_states, logits)
             else:
                 out = self.experts(hidden_states=hidden_states, router_logits=logits)
-            if self.tp_size > 1:
+            if self.tp_size > 1 and reduce_results:
                 out = tensor_model_parallel_all_reduce(out)
             return out.view(orig_shape)
         routed = self.experts(
@@ -387,7 +393,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
         )
         shared = self.shared_expert(hidden_states)
         out = sigmoid_mul(shared, logits[:, self.n_routed_experts :], routed)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and reduce_results:
             out = tensor_model_parallel_all_reduce(out)
         return out.view(orig_shape)
 
@@ -649,6 +655,49 @@ class Qwen4ExpLinearAttention(nn.Module):
         return self.out_proj(core_attn_out)
 
 
+class _SequenceParallel:
+    """Token sharding of the HC residual streams across the TP ranks.
+
+    The four-stream residual and its hyper-connections (grouped norm, two
+    low-rank GEMMs, gated mean) are per-token and replicated under plain TP,
+    so every rank repeats the same work on all tokens. Sharding the tokens
+    splits that work TP ways; the sub-layers still see every token through an
+    all-gather of their 2560-wide input, and their partial sums come back by
+    reduce-scatter, which together move the same bytes as the all-reduce they
+    replace. Rows are padded to a multiple of the TP size; padded rows are
+    zero streams and are dropped on gather.
+    """
+
+    def __init__(self, num_tokens: int, tp_size: int, tp_rank: int) -> None:
+        self.num_tokens = num_tokens
+        self.chunk = -(-num_tokens // tp_size)
+        self.pad = self.chunk * tp_size - num_tokens
+        self.start = tp_rank * self.chunk
+        self.group = get_tp_group()
+
+    def _padded(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.pad(x, (0, 0, 0, self.pad)) if self.pad else x
+
+    def shard(self, x: torch.Tensor) -> torch.Tensor:
+        """Replicated `[T, ...]` -> this rank's rows (a view unless padded).
+
+        Only the local rows are padded, never the whole replicated tensor."""
+        rows = x[self.start : self.start + self.chunk]
+        missing = self.chunk - rows.shape[0]
+        return nn.functional.pad(rows, (0, 0, 0, missing)) if missing else rows
+
+    def gather(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's rows -> all `[T, ...]` rows."""
+        out = self.group.all_gather(x.contiguous(), use_custom=False, dim=0)
+        return out[: self.num_tokens] if self.pad else out
+
+    def scatter(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-rank partial sums over all `[T, D]` rows -> summed local rows."""
+        return self.group.reduce_scatter_tensor(
+            self._padded(x.contiguous()), use_custom=False, dim=0
+        )
+
+
 class Qwen4ExpDecoderLayer(nn.Module):
     """PLE (layer 1 only) -> HC(attn) -> attn -> HC(mlp) -> MoE.
 
@@ -735,20 +784,29 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
         pending: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sp: "_SequenceParallel | None" = None,
     ):
         """Fused: returns `(streams, pending)` where `pending` is this layer's
         MLP combine, deferred into the next hyper-connection. Unfused: returns
-        the streams; the MTP drafter runs its single layer this way."""
+        the streams; the MTP drafter runs its single layer this way.
+
+        With `sp`, `hidden_states` and `pending` hold only this rank's token
+        shard: the hyper-connections run on the shard, the sub-layer inputs
+        are all-gathered and the sub-layer partial sums reduce-scattered
+        (together the same traffic as the all-reduce they replace)."""
         if not self.fused_hc:
             return self._forward_unfused(positions, hidden_states, input_ids)
         if self.ple is not None:
+            assert sp is None, "the PLE layer needs the full token range"
             if pending is not None:
                 hidden_states = self.attn_hyper_connection.apply_pending(
                     hidden_states, pending
                 )
                 pending = None
             hidden_states = self._apply_ple(hidden_states, input_ids)
-        quant_dtype = self._attn_input_quant_dtype()
+        # Under `sp` the consumer quantizes the gathered rows itself, as the
+        # unsharded path does above HC_QUANT_ROWS_MAX rows.
+        quant_dtype = None if sp is not None else self._attn_input_quant_dtype()
         if quant_dtype is None:
             mixed, (hidden_states, raw) = self.attn_hyper_connection.mix_fused(
                 hidden_states, pending
@@ -760,15 +818,24 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     hidden_states, pending, quant_dtype
                 )
             )
+        if sp is not None:
+            mixed = sp.gather(mixed)
         if self.layer_type == "linear_attention":
             sub_output = self.linear_attn(mixed, quantized)
         else:
             sub_output = self.self_attn(positions, mixed, quantized)
-        if self.tp_size > 1:
+        if sp is not None:
+            sub_output = sp.scatter(sub_output)
+        elif self.tp_size > 1:
             sub_output = tensor_model_parallel_all_reduce(sub_output)
         mixed, (hidden_states, raw) = self.mlp_hyper_connection.mix_fused(
             hidden_states, (sub_output, raw)
         )
+        if sp is not None:
+            return hidden_states, (
+                sp.scatter(self.mlp(sp.gather(mixed), reduce_results=False)),
+                raw,
+            )
         # The MoE block owns its own all-reduce.
         return hidden_states, (self.mlp(mixed), raw)
 
@@ -892,6 +959,32 @@ class Qwen4ExpModel(nn.Module):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size * config.hc_count
         )
+        # Sequence parallelism starts after the last PLE layer, whose causal
+        # short convolution needs every token of the request; with no layer
+        # after it there is nothing to shard.
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.sp_start_layer = 1 + max(
+            (
+                i
+                for i in range(self.start_layer, self.end_layer)
+                if self.layers[i].ple is not None
+            ),
+            default=-1,
+        )
+
+    def _sequence_parallel(self, num_tokens: int) -> _SequenceParallel | None:
+        min_tokens = envs.ATOM_QWEN4_EXP_SP_MIN_TOKENS
+        if (
+            self.tp_size == 1
+            or self.sp_start_layer >= self.end_layer
+            or min_tokens <= 0
+            or num_tokens < min_tokens
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        return _SequenceParallel(
+            num_tokens, self.tp_size, get_tensor_model_parallel_rank()
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -915,16 +1008,29 @@ class Qwen4ExpModel(nn.Module):
             else self.get_input_embeddings(input_ids)
         ).repeat(1, self.hc_count)
 
+        sp = self._sequence_parallel(hidden_states.shape[0])
         pending = None
-        for layer in self.layers[self.start_layer : self.end_layer]:
-            hidden_states, pending = layer(positions, hidden_states, input_ids, pending)
+        for idx in range(self.start_layer, self.end_layer):
+            if sp is not None and idx == self.sp_start_layer:
+                hidden_states = sp.shard(hidden_states)
+                if pending is not None:
+                    pending = (sp.shard(pending[0]), sp.shard(pending[1]))
+            hidden_states, pending = self.layers[idx](
+                positions,
+                hidden_states,
+                input_ids,
+                pending,
+                sp if sp is not None and idx >= self.sp_start_layer else None,
+            )
         if self.return_hc_state:
             hidden_states = self.hyper_connection_mixer.apply_pending(
                 hidden_states, pending
             )
+            if sp is not None:
+                hidden_states = sp.gather(hidden_states)
             return hidden_states.view(-1, self.hc_count, self.config.hidden_size)
         mixed, _ = self.hyper_connection_mixer.mix_fused(hidden_states, pending)
-        return mixed
+        return sp.gather(mixed) if sp is not None else mixed
 
 
 class Qwen4ExpForConditionalGeneration(nn.Module):
