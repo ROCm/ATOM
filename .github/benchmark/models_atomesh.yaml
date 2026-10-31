@@ -1074,15 +1074,21 @@ models:
               - "*shared_experts.gate_up_proj*"
               - "*shared_experts.down_proj*"
             # Armed: the config admits mono. On: a decode step reached mono and
-            # its runner was built, which the engine does while starting up.
+            # its runner was built. While starting, the only such step is the
+            # warmup forward before a FULL CUDA graph capture, so under
+            # --enforce-eager the first comes with a request, after this check,
+            # and the cell fails.
             expect_log:
               - "Kimi-K3 mono decode armed"
               - "Kimi-K3 mono decode on"
-            # Armed, then gone: the runner failed to build, or C1's 8-row
-            # steps (one request plus seven drafts) have no build.
+            # Armed, then gone: the runner failed to build, or a step width had
+            # no build. Every width's line starts "declined the", so this still
+            # matches once num_speculative_tokens is retuned. A step mono does
+            # not serve, such as a prefill, logs "declined a step" and is no
+            # failure.
             reject_log:
               - "Kimi-K3 mono decode off"
-              - "Kimi-K3 mono decode declined the 8-row build"
+              - "Kimi-K3 mono decode declined the"
           server:
             common_args: &kimi_k3_pd_dspark7_args
               <<: *kimi_k3_agentic_dspark7_args
@@ -1229,7 +1235,14 @@ models:
             common_args:
               <<: *kimi_k3_pd_dspark4_args
               max_num_seqs: 64
-          requires_atom_env: *kimi_k3_pd_atom_env
+          # Plus the MLA staging settings its prefill sets, which an ATOM
+          # without them would ignore as well.
+          requires_atom_env:
+            - ATOM_KV_POLL_FRESH_WAIT_MS
+            - ATOM_PD_PROMPT_IDS_B64
+            - ATOM_PD_EARLY_T0
+            - ATOM_PD_MLA_STAGING_CHUNK_PAGES
+            - ATOM_PD_MLA_STAGING_STREAM_PRIORITY
           env:
             common: *kimi_k3_pd_replay_env
             prefill: &kimi_k3_pp8_lmcache128_prefill_env
@@ -1304,6 +1317,14 @@ models:
             common_args:
               <<: *kimi_k3_pd_dspark4_args
               max_num_seqs: 176
+          # Plus the in-flight cap.
+          requires_atom_env:
+            - ATOM_KV_POLL_FRESH_WAIT_MS
+            - ATOM_PD_PROMPT_IDS_B64
+            - ATOM_PD_EARLY_T0
+            - ATOM_PD_MLA_STAGING_CHUNK_PAGES
+            - ATOM_PD_MLA_STAGING_STREAM_PRIORITY
+            - ATOM_PP_MAX_INFLIGHT
           env:
             common: *kimi_k3_pp8_reuse_env
             prefill:

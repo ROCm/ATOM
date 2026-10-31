@@ -29,6 +29,42 @@ def shell_function(name):
     return source[start : source.index("\n}\n", start) + 3]
 
 
+def kimi_k3_cells(suite):
+    """The real Kimi-K3 cells of `suite`, as pd_matrix.py writes them."""
+    env = dict(
+        os.environ,
+        ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd",
+        ATOMESH_SLURM_ACCOUNT="",
+        ATOMESH_SLURM_PARTITION="",
+        ATOMESH_MODEL_ROOT="/models",
+        ATOMESH_LOG_ROOT="/logs",
+        ATOMESH_1P1D_NODES="",
+        ATOMESH_2P1D_NODES="",
+        ATOMESH_PD_RANK_MAPPING_POLICY="none",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "matrix.json"
+        subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "pd_matrix.py"),
+                "--suite",
+                suite,
+                "--model",
+                "Kimi-K3-MXFP4",
+                "--output",
+                str(output),
+            ],
+            cwd=ROOT,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return json.loads(output.read_text())["include"]
+
+
 class RequiredAtomEnvTest(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -133,6 +169,25 @@ class RequiredAtomEnvTest(unittest.TestCase):
             {cell["name"]: cell["requires_atom_env"] for cell in cells},
             {"c1": ["ATOM_PD_EARLY_T0"], "c2": []},
         )
+
+    def test_a_kimi_k3_cell_requires_each_newer_setting_it_sets(self):
+        newer = {
+            "ATOM_KV_POLL_FRESH_WAIT_MS",
+            "ATOM_PD_PROMPT_IDS_B64",
+            "ATOM_PD_EARLY_T0",
+            "ATOM_PD_MLA_STAGING_CHUNK_PAGES",
+            "ATOM_PD_MLA_STAGING_STREAM_PRIORITY",
+            "ATOM_PP_MAX_INFLIGHT",
+        }
+        in_flight_cells = 0
+        for suite in ("nightly", "profile"):
+            for cell in kimi_k3_cells(suite):
+                sets = {name for role in cell["env"].values() for name in role}
+                with self.subTest(cell=cell["name"]):
+                    self.assertLessEqual(sets & newer, set(cell["requires_atom_env"]))
+                in_flight_cells += "ATOM_PP_MAX_INFLIGHT" in sets
+        # C88's, which the env read above must have seen
+        self.assertEqual(in_flight_cells, 1)
 
 
 MONO_UP = ["Kimi-K3 mono decode armed", "Kimi-K3 mono decode on"]
@@ -261,7 +316,7 @@ class ExpectedLogTest(unittest.TestCase):
 
 MONO_GONE = [
     "Kimi-K3 mono decode off",
-    "Kimi-K3 mono decode declined the 8-row build",
+    "Kimi-K3 mono decode declined the",
 ]
 
 
@@ -310,6 +365,7 @@ class RejectedLogTest(unittest.TestCase):
             "decode-rank-1.log",
             "Kimi-K3 mono decode armed (TP8)",
             "Kimi-K3 mono decode declined a step: prefill",
+            "Kimi-K3 mono decode declined a step: 128 rows > the 16-row buffers",
             "Kimi-K3 mono decode on",
         )
         result = self.check(decode=MONO_GONE)
@@ -318,20 +374,25 @@ class RejectedLogTest(unittest.TestCase):
         self.assertTrue(result.stdout.endswith("OK\n"))
 
     def test_a_server_that_logged_one_fails_the_cell(self):
-        self.write("decode-rank-1.log", "Kimi-K3 mono decode armed (TP8)")
-        self.write(
-            "decode-rank-1-worker-1.log",
-            "Kimi-K3 mono decode armed (TP8)",
-            "Kimi-K3 mono decode declined the 8-row build; other widths unaffected",
-        )
-        result = self.check(decode=MONO_GONE)
-        self.assertEqual(result.returncode, 1)
-        self.assertNotIn("OK", result.stdout)
-        self.assertIn(
-            "decode-rank-1-worker-1.log logged "
-            "'Kimi-K3 mono decode declined the 8-row build'",
-            result.stderr,
-        )
+        # Whichever width it was: 8 rows is C1's step, 16 its capture's widest.
+        for rows in (8, 16):
+            with self.subTest(rows=rows):
+                self.write("decode-rank-1.log", "Kimi-K3 mono decode armed (TP8)")
+                self.write(
+                    "decode-rank-1-worker-1.log",
+                    "Kimi-K3 mono decode armed (TP8)",
+                    f"Kimi-K3 mono decode declined the {rows}-row build; "
+                    "other widths unaffected",
+                )
+                result = self.check(decode=MONO_GONE)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("OK", result.stdout)
+                self.assertIn(
+                    "decode-rank-1-worker-1.log logged "
+                    "'Kimi-K3 mono decode declined the': "
+                    f"INFO Kimi-K3 mono decode declined the {rows}-row build",
+                    result.stderr,
+                )
 
     def test_no_server_log_fails_the_cell(self):
         result = self.check(decode=MONO_GONE)
@@ -392,39 +453,11 @@ class SubmitLogLinesTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        env = dict(
-            os.environ,
-            ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd",
-            ATOMESH_SLURM_ACCOUNT="",
-            ATOMESH_SLURM_PARTITION="",
-            ATOMESH_MODEL_ROOT="/models",
-            ATOMESH_LOG_ROOT="/logs",
-            ATOMESH_1P1D_NODES="",
-            ATOMESH_2P1D_NODES="",
-            ATOMESH_PD_RANK_MAPPING_POLICY="none",
+        cls.cell = next(
+            cell
+            for cell in kimi_k3_cells("nightly")
+            if cell["name"].endswith("-c1-mono")
         )
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "matrix.json"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "pd_matrix.py"),
-                    "--suite",
-                    "nightly",
-                    "--model",
-                    "Kimi-K3-MXFP4",
-                    "--output",
-                    str(output),
-                ],
-                cwd=ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            cells = json.loads(output.read_text())["include"]
-        cls.cell = next(cell for cell in cells if cell["name"].endswith("-c1-mono"))
         source = (SCRIPTS / "pd_submit.sh").read_text()
         start = source.index("python3 - <<'PY'\nimport json\nimport os\nimport shlex")
         start = source.index("\n", start) + 1
