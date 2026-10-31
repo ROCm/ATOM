@@ -2806,11 +2806,23 @@ collect_role_logs() {
 }
 
 # Sets lines to the entries of a role's expect_log or reject_log, which
-# pd_submit.sh passes as a JSON list.
+# pd_submit.sh passes as a JSON list. A bare JSON string would load as well
+# and be split char by char, and an empty list or entry checks nothing.
 parse_log_lines() {
   local role="$1" key="$2" listed="$3" parsed
-  if ! parsed="$(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1])))' "${listed}")"; then
-    echo "[check][FAIL] ${role} ${key} is not a JSON list: ${listed}" >&2
+  if ! parsed="$(python3 -c '
+import json, sys
+lines = json.loads(sys.argv[1])
+if not (
+    isinstance(lines, list)
+    and lines
+    and all(isinstance(line, str) and line for line in lines)
+):
+    sys.exit(1)
+print("\n".join(lines))
+' "${listed}")"; then
+    echo "[check][FAIL] ${role} ${key} is not a non-empty JSON list of" \
+      "non-empty strings: ${listed}" >&2
     exit 1
   fi
   mapfile -t lines <<< "${parsed}"

@@ -237,12 +237,26 @@ class ExpectedLogTest(unittest.TestCase):
         self.assertNotIn("OK", result.stdout)
         self.assertIn("aggregated cell has no prefill server", result.stderr)
 
-    def test_a_value_that_is_not_a_json_list_fails_the_cell(self):
+    def test_a_value_that_is_not_a_list_of_lines_fails_the_cell(self):
+        # Read as lines, a bare string would be split char by char and an
+        # empty list or entry would check nothing, so either passes this log.
         self.write("decode-rank-1.log", *MONO_UP_LOG)
-        result = self.check_exported("0", "", "Kimi-K3 mono decode armed")
-        self.assertEqual(result.returncode, 1)
-        self.assertNotIn("OK", result.stdout)
-        self.assertIn("decode expect_log is not a JSON list", result.stderr)
+        for value in (
+            "Kimi-K3 mono decode armed",
+            json.dumps("Kimi-K3 mono decode armed"),
+            "[]",
+            json.dumps(["Kimi-K3 mono decode armed", ""]),
+            json.dumps(["Kimi-K3 mono decode armed", 1]),
+        ):
+            with self.subTest(value=value):
+                result = self.check_exported("0", "", value)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("OK", result.stdout)
+                self.assertIn(
+                    "decode expect_log is not a non-empty JSON list of "
+                    "non-empty strings",
+                    result.stderr,
+                )
 
 
 MONO_GONE = [
