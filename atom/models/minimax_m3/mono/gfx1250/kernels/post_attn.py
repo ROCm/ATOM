@@ -76,19 +76,22 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import K1_STAMPS, TL_POIN
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.gfx1250 import BLOCKS, THREADS, WAVE, WAVES
 from atom.mono.device.gfx1250 import block_max as block_max_of
-from atom.mono.device.ops import kernel_symbol, launcher, load_ptr64
-from atom.mono.device.stamps import stamp as stamp_point
-from atom.mono.device.stamps import stamp_begin, stamp_flush
+from atom.mono.device.ops import kernel_symbol, launcher, load_ptr64, memrealtime
 from atom.mono.device.sync import Mailbox, preg, shift, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import first_task
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.debug import region_ids
 
-__all__ = ["K4_ABI", "TL_POINTS", "build_post_attn_kernel"]
+__all__ = ["K4_ABI", "TL_POINTS", "TL_RECORD", "build_post_attn_kernel"]
 
 _CURRENT_STREAM = fx.Stream(None)
 TL_END = 16  # timeline point: the CTA's last stage done (free on gfx950's map)
+# a CTA's timeline record: point k of wave w at k WAVES + w, each wave stamping
+# its own (a tid == 0 stamp is a branch: a block split at every point, which
+# moved the build's spills and schedule away from the real kernel's)
+TL_RECORD = TL_POINTS * WAVES
+assert TL_RECORD == THREADS
 # gfx950 makes both all-reduces RS + AG from 12 tokens; on gfx1250 the one-hop
 # push measured faster there (bs 3 x 4 verify rows: 9.29 -> 8.47 ms a step)
 AG_RS_FROM_G1250 = MAX_TOKENS + 1
@@ -181,7 +184,7 @@ def build_post_attn_kernel(
         route: fx.Array[fx.Int32, 8 * MAX_TOKENS, 16]
         rwt: fx.Array[fx.Float32, 8 * MAX_TOKENS, 16]
         blk: fx.Array[fx.Int32, 32, 16]
-        tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]
+        tls: fx.Array[fx.Int64, TL_RECORD if timeline else 1, 16]
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens if heads.count == 1 else 1, 16]
 
     kernel_name = kernel_symbol(
@@ -299,8 +302,9 @@ def build_post_attn_kernel(
             return first_task(bid, BASE[name])
 
         def stamp(k):
-            """``timeline``: this CTA passing point k (steady clock)."""
-            stamp_point(timeline, tls, tid, k, True)
+            """``timeline``: this wave passing point k (steady clock)."""
+            if const_expr(timeline):
+                fx.ptr_store(memrealtime(True), tls + (k * WAVES + wave))
 
         def block_max(v):
             return block_max_of(v, lane, wave, red)
@@ -320,7 +324,9 @@ def build_post_attn_kernel(
                         [fx.ptr_load(misc + i * 2), fx.ptr_load(misc + (i * 2 + 1))],
                     )
 
-        stamp_begin(timeline, tls, tid, TL_POINTS, True)
+        if const_expr(timeline):
+            fx.ptr_store(fx.Int64(0), tls + tid)
+        stamp(0)
 
         if const_expr(fuse_k1):
 
@@ -453,7 +459,15 @@ def build_post_attn_kernel(
         if const_expr("moe" not in SKIP):
             (stage_moe_wide if WIDE else stage_moe)()
         stamp(TL_END)
-        stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
+        if const_expr(timeline):
+            gpu.barrier()
+            fx.generic_store(
+                fx.inttoptr(
+                    fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8),
+                    tl + fx.Int64((bid * TL_RECORD + tid) * 8),
+                ),
+                fx.ptr_load(tls + tid),
+            )
 
     @launcher(kernel_name)
     def launch_post_attn(
