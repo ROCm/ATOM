@@ -243,14 +243,18 @@ class tokenIDProcessor:
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
         copy_done: torch.cuda.Event | None = None,
-        gpu_logprobs: torch.Tensor | None = None,
+        gpu_logprobs: tuple[torch.Tensor, ...] | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             cpu_logprobs = (
-                gpu_logprobs.to("cpu", non_blocking=True)
+                (
+                    tuple(t.to("cpu", non_blocking=True) for t in gpu_logprobs)
+                    if isinstance(gpu_logprobs, tuple)
+                    else gpu_logprobs.to("cpu", non_blocking=True)
+                )
                 if gpu_logprobs is not None
                 else None
             )
@@ -279,7 +283,11 @@ class tokenIDProcessor:
             return None
         logprob_tensor = self.logprobs_cpu.pop(0)
         if logprob_tensor is not None:
-            return logprob_tensor.tolist()
+            return (
+                tuple(t.tolist() for t in logprob_tensor)
+                if isinstance(logprob_tensor, tuple)
+                else logprob_tensor.tolist()
+            )
         return None
 
     def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
@@ -349,7 +357,7 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-        sampled_logprobs: torch.Tensor | None = None,
+        sampled_logprobs: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -360,12 +368,14 @@ class tokenIDProcessor:
                 processed = [(tid,) for tid in token_ids]
             ret = dict(zip(req_ids, processed))
             ret[-1] = 0  # is_deferred_out flag
-            logprobs_map = None
-            if sampled_logprobs is not None:
-                logprobs = sampled_logprobs.tolist()
-                logprobs_map = {
-                    seq_id: logprob for seq_id, logprob in zip(req_ids, logprobs)
-                }
+            from atom.model_engine.token_logprobs import unpack_token_logprobs
+
+            payload = (
+                tuple(t.tolist() for t in sampled_logprobs)
+                if sampled_logprobs is not None
+                else None
+            )
+            logprobs_map = unpack_token_logprobs(payload, req_ids, ret)
             return ret, logprobs_map
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
@@ -390,10 +400,11 @@ class tokenIDProcessor:
                 processed = [(tid,) for tid in token_ids_list]
             token_id_dict = dict(zip(self.prev_req_ids, processed))
             if logprobs is not None:
-                logprobs_map = {
-                    seq_id: logprob
-                    for seq_id, logprob in zip(self.prev_req_ids, logprobs)
-                }
+                from atom.model_engine.token_logprobs import unpack_token_logprobs
+
+                logprobs_map = unpack_token_logprobs(
+                    logprobs, self.prev_req_ids, token_id_dict
+                )
         else:
             # first time, no previous tokens
             token_ids = {}
@@ -3312,15 +3323,17 @@ class ModelRunner:
         need_logprobs = any(batch.return_logprobs)
         sampled_logprobs = None
         if need_logprobs:
-            logits_fp32 = logits.float()
-            log_probs = torch.log_softmax(logits_fp32, dim=-1)
-            sampled_logprobs = log_probs.gather(
-                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
-            ).squeeze(-1)
+            from atom.model_engine.token_logprobs import gather_token_logprobs
+
+            sampled_logprobs = gather_token_logprobs(
+                logits, sampled_tokens, batch, spec_decode_metadata
+            )
             # No PCP broadcast: logprobs never feed the next forward and only
             # worker 0's leave.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
-                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
+                sampled_logprobs = tuple(
+                    get_tp_group().broadcast(t, src=0) for t in sampled_logprobs
+                )
 
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.

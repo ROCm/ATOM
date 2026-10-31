@@ -218,6 +218,7 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.top_logprobs = [seq.top_logprobs for seq in seqs.values()]
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.
@@ -3901,11 +3902,7 @@ class Scheduler:
             del seq.token_ids[-strip:]
             del seq.output_tokens[-strip:]
             seq.num_tokens -= strip
-            # Each placeholder pushed a 0.0 alongside it (postprocess patches
-            # that in place too), so they go together or the two lists stop
-            # describing the same tokens.
-            if seq.return_logprobs and len(seq.logprobs) >= strip:
-                del seq.logprobs[-strip:]
+            # Probabilities contain committed tokens only, never placeholders.
         seq.num_rejected = 0
         seq.num_bonus_tokens = 0
         seq.num_placeholder_tokens = 0
@@ -4269,18 +4266,11 @@ class Scheduler:
                 seq.num_placeholder_tokens = max(
                     0, required_placeholders - len(token_ids)
                 )
-                if seq.return_logprobs and token_logprob is not None:
-                    if seq.logprobs:
-                        seq.logprobs[-1] = token_logprob
-                    else:
-                        seq.logprobs.append(token_logprob)
             else:
                 num_rejected = 0
                 num_bonus = 0
                 for token_id in token_ids:
                     seq.append_token(token_id)
-                if seq.return_logprobs and token_logprob is not None:
-                    seq.logprobs.append(token_logprob)
             new_tokens = token_ids
 
             injected_t0 = getattr(seq, "_injected_t0", None)
@@ -4393,6 +4383,17 @@ class Scheduler:
                     # it aligned explicitly with the cropped completion.
                     del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
 
+            committed_logprobs = None
+            if seq.return_logprobs:
+                if injected_t0 is not None:
+                    raise RuntimeError(
+                        "logprobs with injected P/D tokens is unsupported"
+                    )
+                committed_logprobs = (token_logprob or [])[: len(new_tokens)]
+                if len(committed_logprobs) != len(new_tokens):
+                    raise RuntimeError("Token/logprob output length mismatch")
+                seq.logprobs.extend(item.logprob for item in committed_logprobs)
+
             # Record TTFT from the finalized retained length, after rejected
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
@@ -4441,6 +4442,7 @@ class Scheduler:
                 request_output = RequestOutput(
                     request_id=seq.id,
                     output_tokens=output_tokens_list,
+                    logprobs=committed_logprobs,
                     finished=(leave_reason is not None),
                     finish_reason=leave_reason,
                     kv_transfer_params_output=getattr(
@@ -4477,8 +4479,6 @@ class Scheduler:
                     num = max(0, num_placeholder - seq.num_rejected)
                     for _ in range(num):
                         seq.append_token(self.eos_token_id)
-                        if seq.return_logprobs:
-                            seq.logprobs.append(0.0)
                     # Added to what the overwrite above left unconsumed, not
                     # replacing it: both runs are trailing `eos_token_id` and
                     # both are what `preempt` has to strip. `=` also undercounted
