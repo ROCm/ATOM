@@ -49,7 +49,7 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
 
   n_prefillable   = #ranks with admittable prefill (SUM of a 0/1 flag)
   n_blocked       = #ranks with waiting work whose head cannot be admitted
-                    (no KV, max_num_seqs full, remote KV pending)
+                    (no KV for it, or its remote KV still loading)
   n_unreachable   = #ranks with neither, whose next decode completion (the
                     slot a new request would fill) lies past the hold's TTFT
                     bound, or that run no decode
@@ -463,9 +463,9 @@ class PrefillDelayer:
         # push (firing when this rank can't admit anything would be a no-op).
         low = self.token_usage_low_watermark
         kv_high = prefillable and kv_usage >= self.kv_high_watermark
-        # Waiting work this rank cannot admit (its head lacks KV, max_num_seqs
-        # is full, or remote KV is pending): only its own decode completions
-        # change that, so holding its peers cannot align it.
+        # Waiting work this rank cannot admit (no KV for its head, or the
+        # head's remote KV still loading): its own decode completions or the
+        # load change that, not its peers waiting, so holding cannot align it.
         blocked = not prefillable and (waiting_requests > 0 or has_partial)
         # A rank with neither aligns once a decode completes and its slot takes
         # the next request. If that cannot happen before the TTFT bound

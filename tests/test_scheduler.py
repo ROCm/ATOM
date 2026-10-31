@@ -1773,7 +1773,11 @@ class TestNextDecodeCompletionSteps:
         scheduler.running = deque([far, near])
         assert scheduler._next_decode_completion_steps() == 7
         scheduler.mtp_k = 3  # up to 4 tokens a step
+        scheduler.spec_decode_local = True
         assert scheduler._next_decode_completion_steps() == 2
+        # drafting only (PP): this engine verifies none, a token a step
+        scheduler.spec_decode_local = False
+        assert scheduler._next_decode_completion_steps() == 7
 
 
 def _spec_config(mtp_k):

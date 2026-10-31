@@ -1451,7 +1451,8 @@ class Scheduler:
     def _next_decode_completion_steps(self) -> int | None:
         """Decode steps until the first running decode reaches max_tokens if
         every step accepts all its draft tokens; None without decode. EOS can
-        come sooner, rejected drafts make it later."""
+        come sooner, rejected drafts make it later. Only an engine that
+        verifies drafts (`spec_decode_local`) gains more than a token a step."""
         fewest = None
         for seq in self.running:
             if seq.is_partial_prefill:
@@ -1461,7 +1462,8 @@ class Scheduler:
                 fewest = left
         if fewest is None:
             return None
-        return -(-fewest // (1 + self.mtp_k))
+        tokens_per_step = 1 + (self.mtp_k if self.spec_decode_local else 0)
+        return -(-fewest // tokens_per_step)
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
