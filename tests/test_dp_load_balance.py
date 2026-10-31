@@ -615,3 +615,33 @@ def test_prefix_spread_ignores_sessions_for_new_prefixes():
     ]
     assert sorted(_route(mgr, seqs)) == [0, 0, 1, 1]
     assert mgr._dp_route_counters["prefix_cold_total"] == 4
+
+
+def test_prefix_spread_req_gap_moves_off_crowded_owner():
+    mgr = _make_spread_mgr()
+    mgr._prefix_max_req_gap = 4
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_reqs[owner] = 6  # within the token margin, 6 requests ahead
+    (rank,) = _route(mgr, [_chain_seq(2, 110_000)])
+    assert rank != owner
+    assert mgr._dp_route_counters["prefix_moved_total"] == 1
+
+
+def test_prefix_cost_policy_prefers_owner_until_imbalance_costs_more():
+    mgr = _make_spread_mgr()
+    mgr._prefix_policy = "cost"
+    mgr._prefix_imbalance_s = 0.1
+    mgr._prefix_work_per_s = 2.5e10
+    mgr._prefix_load_tok_per_s = 2e6
+    mgr._prefill_token_weight = 360000
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_reqs[owner] = 20  # 20 requests ahead: 2 s of penalty
+    (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
+    assert rank != owner
