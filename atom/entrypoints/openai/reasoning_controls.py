@@ -29,7 +29,7 @@ class ReasoningRules:
     normalize_effort: Callable[[Any], Any] = _legacy_chat_effort
     string_effort_enables: bool = False
     none_disables: bool = True
-    clear_effort_when_disabled: bool = False
+    reconcile_effort_with_toggle: bool = False
 
 
 CHAT_REASONING_RULES = ReasoningRules()
@@ -73,13 +73,13 @@ def apply_reasoning_controls(kwargs, toggle, controls, *, rules=CHAT_REASONING_R
         result[name] = on_value if enabled else off_value
     if effort is not None:
         result["thinking_effort"] = effort
-    if enabled is True and rules.clear_effort_when_disabled:
+    if enabled is True and rules.reconcile_effort_with_toggle:
         # An explicit enable must override a disabled effort inherited from
         # template defaults, rather than being undone during encoder rendering.
         for key in ("thinking_effort", "reasoning_effort"):
             if result.get(key) == "none":
                 result.pop(key)
-    if enabled is False and rules.clear_effort_when_disabled:
+    if enabled is False and rules.reconcile_effort_with_toggle:
         result.pop("thinking_effort", None)
         result.pop("reasoning_effort", None)
     return result
