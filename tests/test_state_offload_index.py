@@ -1,7 +1,13 @@
 # SPDX-License-Identifier: MIT
 """StateOffloadIndex must stop advertising images the worker codec dropped."""
 
-from atom.model_engine.state_offload import StateOffloadIndex, state_tier_cpu_bytes
+import pytest
+
+from atom.model_engine.state_offload import (
+    StateOffloadIndex,
+    state_tier_cpu_bytes,
+    state_tier_gpu_bytes,
+)
 
 
 def _stored(idx, hashes):
@@ -49,3 +55,17 @@ def test_state_tier_cpu_bytes_reads_gib(monkeypatch):
     assert state_tier_cpu_bytes() == 32 << 30
     monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "96")
     assert state_tier_cpu_bytes() == 96 << 30
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "bad"])
+def test_state_tier_gpu_bytes_rejects_invalid_budgets(monkeypatch, value):
+    monkeypatch.setenv("OFFLOAD_STATE_GPU_SIZE", value)
+    with pytest.raises(ValueError):
+        state_tier_gpu_bytes()
+
+
+def test_state_tier_gpu_bytes_defaults_off_and_accepts_fractional_gib(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_STATE_GPU_SIZE", raising=False)
+    assert state_tier_gpu_bytes() == 0
+    monkeypatch.setenv("OFFLOAD_STATE_GPU_SIZE", "0.5")
+    assert state_tier_gpu_bytes() == 1 << 29

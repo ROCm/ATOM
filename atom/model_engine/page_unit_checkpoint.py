@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict, deque
-from collections.abc import Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from dataclasses import dataclass
 from time import monotonic
 
@@ -377,6 +377,28 @@ class PageUnitCheckpointStore:
             total_bytes=self.spec.image_bytes,
             layout_id=self.spec.layout_id,
         )
+
+    def trim_offloaded(
+        self, max_entries: int, can_serve: Callable[[int], bool]
+    ) -> None:
+        """Release old GPU images backed by the tier, without touching live DMA.
+
+        The pool's free list includes cached KV. Waiting for it to empty lets
+        checkpoint images displace reusable KV even after those images were
+        stored on CPU. This optional soft budget spends only unpinned READY
+        images whose successful store is still advertised by the tier. Copies,
+        restores and unconfirmed stores may temporarily exceed the budget.
+        A later CPU eviction is handled by the existing failed-load/recompute
+        path; tier membership is optimistic, just as for ordinary eviction.
+        """
+        if max_entries <= 0 or len(self.records) <= max_entries:
+            return
+        for checkpoint_id in list(self._lru):
+            if len(self.records) <= max_entries:
+                break
+            record = self.records[checkpoint_id]
+            if self._is_evictable(checkpoint_id) and can_serve(record.prefix_hash):
+                self._evict(checkpoint_id)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
         """Whether a queued restore will write `dst_slot` on the next batch."""
@@ -944,6 +966,7 @@ class PagedStateCheckpointCoordinator:
         # boundaries reachable. It is consulted in exactly two places,
         # `resumable_hit` (the vote) and `take_offload_stores` (the sink).
         self.offload = offload
+        self._offload_gpu_max_entries = 0
         self.store = PageUnitCheckpointStore(
             pool, spec, offload_sink=offload is not None
         )
@@ -961,6 +984,8 @@ class PagedStateCheckpointCoordinator:
         self.checkpoints_kept = 0
         self.checkpoints_dropped = 0
         self.checkpoints_orphaned = 0
+        if offload is not None:
+            self.attach_offload(offload)
 
     def applies(self, seq: Sequence) -> bool:
         return self.enabled and seq.has_per_req_cache
@@ -1175,6 +1200,10 @@ class PagedStateCheckpointCoordinator:
 
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
+        if self._offload_gpu_max_entries and self.offload is not None:
+            self.store.trim_offloaded(
+                self._offload_gpu_max_entries, self.offload.could_serve
+            )
         # The batch that carried these stores has been issued.
         issued, self._scratch_issued = self._scratch_issued, []
         for slot in issued:
@@ -1268,6 +1297,23 @@ class PagedStateCheckpointCoordinator:
         # off `hashes` but must nominate nothing, since a nomination that is
         # handed over takes a pin nobody will release.
         self.store._offload_sink = index is not None and bool(sink)
+        self._offload_gpu_max_entries = 0
+        if index is not None and sink and getattr(index, "can_load", False):
+            from atom.model_engine.state_offload import state_tier_gpu_bytes
+
+            budget = state_tier_gpu_bytes()
+            if budget:
+                entry_bytes = (
+                    self.store.units_per_checkpoint * self.store.spec.page_unit_bytes
+                )
+                if budget < entry_bytes:
+                    raise ValueError("OFFLOAD_STATE_GPU_SIZE must fit one checkpoint")
+                self._offload_gpu_max_entries = budget // entry_bytes
+                logger.info(
+                    "state offload: GPU checkpoint budget %.2f GiB (%d images)",
+                    budget / (1 << 30),
+                    self._offload_gpu_max_entries,
+                )
 
     def take_offload_stores(
         self, max_inflight: int
