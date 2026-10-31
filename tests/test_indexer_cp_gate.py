@@ -110,7 +110,6 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         tensor_parallel_size=4,
         prefill_context_parallel_size=1,
         sequence_parallel_size=1,
-        tp_replicated_o_proj=False,
         sp_mega_moe_enabled=False,
         dcp_config=SimpleNamespace(indexer_dcp_only=indexer_dcp_only),
         enable_dp_attention=False,

@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Token and head transport over one process group.
 
-Shared by Ulysses SP, the TP replicated o_proj and the MoE token gathers.
+Shared by Ulysses SP and the MoE token gathers.
 Every choice below depends only on the payload shape and the group, which are
 the same on every rank, so all ranks pick the same collective.
 """

@@ -28,9 +28,8 @@ def token_fp8_supported() -> bool:
     """Whether this deployment can quantize BF16 activations to per-token FP8.
 
     Only meaningful for rows that hold whole tokens with no all-reduce pending
-    (Ulysses SP, or after the replicated o_proj's head exchange); the caller
-    owns that layout check. Check at construction: querying it from forward
-    would introduce a graph break.
+    (Ulysses SP); the caller owns that layout check. Check at construction:
+    querying it from forward would introduce a graph break.
     """
     if not torch.cuda.is_available() or dtypes.fp8 != torch.float8_e4m3fn:
         return False
