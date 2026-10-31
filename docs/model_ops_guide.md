@@ -143,6 +143,7 @@ The MHA `Attention` class handles standard models (Llama, Qwen3, Mixtral, etc.).
 | `q_norm` + `k_norm` + `rotary_emb` present | `fused_qk_norm_rope_cache_quant_shuffle` (single fused kernel for QK norm, RoPE, cache write, optional FP8 quant) |
 | Triton path (`sliding_window != -1` or `head_dim != 128`) + `rotary_emb` | `fused_qk_rope_reshape_and_cache` (Triton fused RoPE + reshape + cache) |
 | ASM path + `rotary_emb` | `rotary_emb(position, q, k)` then `reshape_and_cache` or `reshape_and_cache_with_pertoken_quant` |
+| ASM path, FP8 KV, `ATOM_USE_UNIFIED_ATTN` | K / V clamped to the FP8 range and written by `reshape_and_cache` with the layer's per-tensor `kv_scale` (unified takes one descale for the whole tensor), Q clamped and cast to the cache dtype |
 
 **Attention dispatch:**
 
@@ -228,6 +229,7 @@ The `AttentionBackend` abstract class defines three required methods:
 |---|---|---|
 | Standard KV cache write | `aiter.reshape_and_cache` | MHA (BF16 KV) |
 | FP8 KV cache write | `aiter.reshape_and_cache_with_pertoken_quant` | MHA (FP8 KV) |
+| FP8 KV cache write, per tensor | `aiter.reshape_and_cache` with `kv_scale` | MHA (FP8 KV, `ATOM_USE_UNIFIED_ATTN`) |
 | MLA KV cache write | `aiter.concat_and_cache_mla` | MLA prefill |
 | Fused QK RoPE + MLA cache | `aiter.fused_qk_rope_concat_and_cache_mla` | MLA decode |
 
