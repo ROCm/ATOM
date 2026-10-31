@@ -99,8 +99,11 @@ TARGET's block ids, and under DCP8 one of those ids addresses `block_size`
 LOCAL tokens, i.e. `block_size * dcp_size` GLOBAL positions. So the draft's
 pool is built with `blocks_per_entry = dcp_size` and everything addressing it
 -- the block pass's `slot_mapping`, the context write's, and the read's
-`block_table` -- is in that virtual block. Per-rank bytes are unchanged: 8x the
-tokens against 8x fewer KV heads.
+`block_table` -- is in that virtual block. That costs the same per-rank bytes
+as sharding the tokens over DCP would (8x the tokens, 8x fewer KV heads), but
+it is not small: at TP8/DCP8 with fp8 KV the draft entry is 1,310,720 B, 42.6%
+of the 3,080,192 B paged block (the MLA draft's is 368,640 B), so the same
+memory holds about a third fewer blocks.
 
 fp8, AND THE ONE SCALE
 ----------------------
@@ -172,26 +175,12 @@ class KimiK3DFlashAttention(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
-        # PLAIN TP, no DCP anywhere in this module. The draft does not join the
-        # dcp group -- SGLang's does not either (`models/qwen3_5.py:1112`,
-        # "Drafts are TP-sharded and do not replicate KV under DCP"; DFlash's
-        # own attention shards by `tp_size` flat, `models/dflash.py:146-171`) --
-        # so there is ONE head count, `o_proj` consumes the same slice the read
-        # produces, and no LSE merge exists to get wrong.
-        #
-        # What used to be here was the opposite trade: KV heads REPLICATED
-        # across the DCP group at `tp_eff = tp // dcp` so the token round-robin
-        # could be the only shard. It is numerically fine and it is not what
-        # SGLang runs; it also forces every read through a kernel that returns
-        # an LSE for a cross-rank merge. The token axis is
-        # unsharded instead, and the pool pays for it in `blocks_per_entry`
-        # rather than in bytes (see the module docstring).
-        # NOTHING in this module reads `get_dcp_world_size()` any more, which
-        # is the point: `models/dflash.py` does not read `attn_dcp_size` either.
-        # The target's DCP survives only as the draft POOL's `blocks_per_entry`
-        # (`draft_kv_builder`) and as the virtual block the PROPOSER addresses
-        # it in (`DSparkProposer._draft_entry_tokens`) -- one number, decided
-        # where the pool is built, never re-derived here.
+        # PLAIN TP, no DCP anywhere in this module (see the module docstring):
+        # ONE head count, `o_proj` consumes the same slice the read produces,
+        # and no LSE merge exists to get wrong. The target's DCP survives only
+        # as the draft POOL's `blocks_per_entry` (`draft_kv_builder`) and as
+        # the virtual block the PROPOSER addresses it in
+        # (`DSparkProposer._draft_entry_tokens`).
         tp_full = get_tensor_model_parallel_world_size()
         if self.total_num_heads % tp_full != 0:
             raise ValueError(
@@ -201,9 +190,8 @@ class KimiK3DFlashAttention(nn.Module):
         self.num_heads = self.total_num_heads // tp_full
         # The GQA-tolerant form, not a bare divisibility assert: below TP the kv
         # heads replicate rather than shard, and QKVParallelLinear already does
-        # that. With 16 kv heads this only bites past TP16. Mirrors the same
-        # pair of checks in `models/dflash.py:161-171`, raised rather than
-        # asserted so `python -O` keeps them.
+        # that. With 16 kv heads this only bites past TP16. SGLang's DFlash
+        # makes the same pair of checks.
         if self.total_num_kv_heads >= tp_full:
             sharded = self.total_num_kv_heads % tp_full == 0
         else:

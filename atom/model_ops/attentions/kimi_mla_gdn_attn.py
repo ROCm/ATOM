@@ -252,9 +252,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         changes that: it joins this class rather than declaring its own
         (`DraftKvBuilder.sub_pool_specs` -> `page_pool`), which is what riding
         the target's block ids costs. The state image still lives in the
-        target's MLA rows -- the draft's are derived state, rewritten from the
-        target's hidden states every step -- so the charged class exceeds the
-        published regions by exactly the draft's entry bytes.
+        target's MLA rows -- the draft's are derived state, written from the
+        target's hidden states as each token is computed -- so the charged class
+        exceeds the published regions by exactly the draft's entry bytes.
 
         Answer with the target's own declaration, the same one `sub_pool_specs`
         prices above, so the two agree by construction. `MlaKvPool` answers

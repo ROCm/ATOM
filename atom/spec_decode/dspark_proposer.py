@@ -489,10 +489,9 @@ class DSparkProposer(Drafter):
         every address it builds is in LOCAL per-rank terms.
 
         False for the paged GQA draft, whatever `-dcp` says, because that draft
-        OWNS its pool and SGLang does not put a draft in the dcp group
-        (`models/qwen3_5.py:1112`; `models/dflash.py:146-171` never reads
-        `attn_dcp_size`). Its KV heads are TP-sharded and every rank holds the
-        whole token axis. The target is still at DCP8 -- see
+        OWNS its pool and, as in SGLang, is not in the dcp group (see the
+        `kimi_k3_dflash` module docstring). Its KV heads are TP-sharded and
+        every rank holds the whole token axis. The target is still at DCP8 -- see
         `_draft_entry_tokens` for what that costs.
         """
         return self.dcp_world_size > 1 and not self._draft_uses_dflash_pool

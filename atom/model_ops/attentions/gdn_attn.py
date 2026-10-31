@@ -1681,8 +1681,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         ``ModelRunner`` sizes the checkpoint unit from the paged pool's
         ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
-        that charged size. Kimi's MLA pool needs no override: its charged
-        entry is exactly the rows the page geometry walks.
+        that charged size. Kimi's MLA backend overrides it only for a draft
+        pool joined to its PAGE class (`kimi_mla_gdn_attn.py`); the MLA rows
+        alone are exactly what the page geometry walks.
 
         Qwen's ``MhaKvPool`` does not work that way. The pool is one
         allocation ATOM lays out itself. Each field (K, V, scale) is rounded

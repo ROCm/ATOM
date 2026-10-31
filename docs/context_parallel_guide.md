@@ -689,7 +689,7 @@ pass instead of `k` serial passes. Two properties decide how it meets DCP:
 
 | | Supported |
 |---|---|
-| Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark`) |
+| Target model | **Kimi-K3** (`--draft-model Inferact/Kimi-K3-DSpark` or `RadixArk/Kimi-K3-DSpark`) |
 | GPU arch | gfx950 |
 | DCP size | dcp8 validated (`tp8`) |
 | KV cache dtype | fp8 (per-tensor scale) |
@@ -700,6 +700,13 @@ an **87.1% acceptance rate** (1.74 of 2 draft tokens accepted per step). The
 per-step accepted-count distribution is `{0: 6.1%, 1: 13.7%, 2: 80.3%}` — 80% of
 steps take the whole draft and only 6% take none, so the draft is genuinely
 contributing under DCP rather than collapsing back to single-token decode.
+
+**The RadixArk DFlash draft** (`--draft-model RadixArk/Kimi-K3-DSpark`, GQA) is
+the exception to the first point. It owns its pool and stays out of the DCP
+group, as SGLang runs it, so every rank caches the draft KV of every token in
+entries of `block_size × dcp` tokens. At `tp8 -dcp 8` with fp8 KV that is about
+43% of each paged block (see the [recipe](../recipes/DSpark.md)). Any other
+draft that owns a GQA/MHA pool is refused under DCP at startup.
 
 ## Constraints & Compatibility
 
@@ -713,7 +720,7 @@ contributing under DCP rather than collapsing back to single-token decode.
 | Kimi-K3 gathered head width | Padded to a natively dispatched MLA width (16 / 32 / 64 / 128); past 128 it falls back to the folded kernel with a warning — lower `-dcp` or raise `-tp` |
 | gathered head width 64 | Native sparse / DSA prefill (bf16 or fp8 KV) and q_len=1 decode (fp8 KV) on gfx950 rebuild persistent metadata per full IndexShare layer and run gqa64 directly; unsupported non-persistent paths still pad to 128 — see [Sparse DCP persistent attention and gqa=64](#sparse-dcp-persistent-attention-and-gqa64) |
 | speculative decode (MTP), dense MLA | Supported on **gfx950 only** (bf16/fp8, `num_speculative_tokens` 1–3); raises at startup on gfx942 |
-| speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` |
+| speculative decode (DSpark), Kimi-K3 | Supported on gfx950; validated at `tp8 -dcp 8` with `num_speculative_tokens 2` (Inferact MLA draft) and 5 (RadixArk DFlash draft, which runs outside the DCP group) |
 | speculative decode (MTP), sparse / DSA | Supported on **gfx950 only**; validated on GLM-5.2-FP8 at fp8 KV, `num_speculative_tokens=3`, dcp8 |
 | vllm-atom plugin | Validated for dense MLA only; the sparse / DSA and Kimi-K3 plugin paths are not yet verified |
 | DCP + PCP | Independent dimensions (different phases); combined use not validated here |

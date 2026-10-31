@@ -88,11 +88,9 @@ def draft_kv_builder(model_runner, draft_hf):
         )
         return DraftKvBuilder(model_runner, make_pool)
 
-    # FULL TP, and a DCP group this pool is not in. SGLang's draft runner never
-    # joins the dcp group -- `dcp_size = 1 if is_nextn else attn_dcp_size`
-    # (`models/qwen3_5.py:1112`), and DFlash's attention shards q/k/v by
-    # `tp_size` flat (`models/dflash.py:146-171`) -- so the draft's KV heads are
-    # sharded normally and every rank holds the WHOLE token axis for its slice.
+    # FULL TP, and a DCP group this pool is not in, as in SGLang (see the
+    # `kimi_k3_dflash` module docstring): the draft's KV heads are sharded
+    # normally and every rank holds the WHOLE token axis for its slice.
     # The model builds its QKV at the same `tp_full`; the two must be one number
     # or the pool and the projections describe different geometries over the same
     # bytes, with nothing to catch it (`reshape_and_cache_flash` takes the head
@@ -116,9 +114,11 @@ def draft_kv_builder(model_runner, draft_hf):
     # stores every one of those positions, so its entry has to be that wide or
     # the id space it is handed overruns the id space it owns.
     #
-    # The per-rank byte count does not move: `dcp_size` times the tokens, and
-    # `tp_full` rather than `tp_full // dcp_size` gives `dcp_size` times fewer
-    # KV heads. `test_dflash_pool_footprint_is_dcp_invariant` pins it.
+    # Per rank this is the byte count a DCP-sharded draft would take:
+    # `dcp_size` times the tokens, and `tp_full` rather than
+    # `tp_full // dcp_size` gives `dcp_size` times fewer KV heads
+    # (`test_dflash_pool_footprint_is_dcp_invariant`). It is still a large
+    # share of each paged block; `allocate_kv_cache_tensors` logs the bytes.
     if dcp_size > 1:
         logger.info(
             "Draft KV pool built at full TP %d with %d blocks per entry "
@@ -140,9 +140,7 @@ def draft_kv_builder(model_runner, draft_hf):
         # `k_descale`/`v_descale` per program; its write is
         # `aiter.reshape_and_cache_flash`, whose HIP kernel dereferences
         # `*k_scale` once per launch. Neither can read a per-(kv head, token)
-        # plane, and SGLang stores none -- it refuses
-        # outright ("Only support per-tensor scaling factor for fp8 KV cache",
-        # `srt/layers/quantization/kv_cache.py:76`). So the planes are not
+        # plane, and SGLang stores none (see `MhaKvPool`). So the planes are not
         # declared rather than declared and ignored: `scale_views` then raises
         # the `KeyError` it promises if a binder ever asks for them.
         per_tensor_scales=True,
@@ -197,13 +195,9 @@ class DraftKvBuilder(PoolRowsMixin):
         at zero and binds nothing -- a draft running on no KV at all. The
         `KeyError` is the one `pool_rows` promises.
 
-        On demand is also what makes the block reachable, and it is the target
-        builder's: `propose` hands the draft the target's block tables, and the
-        draft's kernels take the block off the cache they were bound to, so a
-        block of its own would address one page with an id that counted
-        another. There is nowhere in a draft to convert between the two -- it
-        has no metadata of its own. The builder is constructed after
-        `build_drafter`, which is why this is read here and not bound earlier.
+        The block is the SCHEDULER's (`model_runner.block_size`): `propose`
+        hands the draft the target's block tables, whose ids count scheduler
+        blocks, and a draft has no metadata of its own to convert units in.
         """
         if self._kv_pool is None:
             # The SCHEDULER's block, not the target builder's. The two agree for
@@ -250,24 +244,13 @@ class DraftKvBuilder(PoolRowsMixin):
         """
         runner = self.model_runner
         pool = self.kv_pool
-        # `blocks` counts SCHEDULER blocks -- it is the budget `paged_pool_bytes`
-        # charged per -- and one entry answers one of them, so the block the
-        # pool took has to be that one too. It took the target builder's, which
-        # makes this the check that the target's and the scheduler's agree.
-        # Raised and not asserted because `python -O` drops what it does not
-        # run, and a short pool reads the next request's page rather than fault.
-        if pool.block_size != runner.block_size:
-            raise ValueError(
-                f"the draft's blocks are {pool.block_size} tokens and the "
-                f"scheduler's {runner.block_size}; a draft is allocated one "
-                "entry per scheduler block and indexed by the target's block "
-                "tables, so all three are one number"
-            )
         self.num_blocks = blocks
         pool.allocate(blocks, runner.device, buf=buf)
         logger.info(
-            "Allocated draft KV pool: %d blocks, %d B of the paged allocation",
+            "Allocated draft KV pool: %d blocks, %d B per block entry, "
+            "%d B of the paged allocation",
             blocks,
+            pool.entry_bytes,
             pool.pool_bytes(blocks),
         )
         return {}
