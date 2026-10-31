@@ -2716,3 +2716,38 @@ models:
               max_model_len: 1048576
               max_num_seqs: 280
               spec_decode_acceptance_length: 4.04
+        # Same cells with the decode-capacity levers the C100 gridlock points
+        # at: compact index rows with top-k reuse every 4 layers (#2839,
+        # validated on this stack at 95.9% GSM8K 20-shot) shrink decode KV and
+        # the replicated index bytes every P->D transfer carries; decode keeps
+        # 0.94 of HBM as the GLM-5.2 decode cells do.
+        - &m31_stack_cpp4_agentx_freq4
+          <<: *m31_stack_cpp4_agentx
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-freq4-c100
+          display_topology: 1P1D-CPP4-TP4-DSPARK7-MXFP4-FREQ4-MCSTORE
+          concurrency: [100]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,200]"
+            extra_args: "--gpu-memory-utilization 0.94"
+          server:
+            common_args:
+              max_model_len: 1048576
+              max_num_seqs: 200
+              spec_decode_acceptance_length: 4.04
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+        - <<: *m31_stack_cpp4_agentx_freq4
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-freq4-c140
+          concurrency: [140]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]"
+            extra_args: "--gpu-memory-utilization 0.94"
+          server:
+            common_args:
+              max_model_len: 1048576
+              max_num_seqs: 280
+              spec_decode_acceptance_length: 4.04
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
