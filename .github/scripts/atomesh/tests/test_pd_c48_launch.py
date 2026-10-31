@@ -178,9 +178,9 @@ class LaunchTest(unittest.TestCase):
                                          "SDROP", "BF16-KVB-TH-SDROP", "SDROP-GX", "BF16-KVB-TH-SDROP-GX",
                                          "BF16-GX")),
                                      *((c, "N3966-BF16-GX") for c in (16, 32, 48, 56)),
-                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (48, 56, 72, 88)),
+                                     *((c, "N3966-BF16-GX-H96OPUS") for c in (16, 32, 48, 56, 72, 88)),
                                      *((c, "N3966-BF16-GX-H96OPUS-P12K") for c in (72, 88)),
-                                     *((c, "N3966-BF16-GX-H96OPUS-PBM") for c in (48, 72, 88)),
+                                     *((c, "N3966-BF16-GX-H96OPUS-PBM") for c in (16, 32, 48, 56, 72, 88)),
                                      (72, "N3966-BF16-GX-H96OPUS-P12K-PBM")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
             candidate = json.loads((GAP / f"{prefix}C{concurrency}-{variant}-MC.json").read_text())
