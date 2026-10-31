@@ -10,7 +10,7 @@ import torch
 from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
-from atom.config import Config
+from atom.config import Config, QuantizationConfig, standalone_draft_quant_config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
@@ -315,9 +315,34 @@ class Drafter(abc.ABC):
         effect here so the value is available when buffers are sized.
         """
 
+    def standalone_draft_quant_config(self) -> QuantizationConfig:
+        """Static quant spec for a draft loaded from its OWN checkpoint.
+
+        A standalone draft carries its own quantization -- or none -- so it must
+        not inherit the target's static scheme. An MXFP4 target beside a bf16
+        draft otherwise declares the draft's weights Float4_e2m1fn_x2 and the
+        load dies in ``copy_``. This stayed invisible while the target was
+        quantized ONLINE from a bf16 checkpoint: the target's static spec was
+        no_quant too, so inheriting it was harmless.
+
+        The online override is passed through deliberately -- it is a property
+        of the RUN, not of either checkpoint, and the draft was already subject
+        to it. Only the static, checkpoint-derived half is re-sourced.
+
+        Both standalone flavors (``EagleProposer`` eagle3 and ``DSparkProposer``
+        with ``--draft-model``) already clone the config to swap ``hf_config``;
+        this is the quant half of that same swap, shared so the two cannot drift.
+        """
+        return standalone_draft_quant_config(
+            self.speculative_config.draft_model_hf_config, self.config.quant_config
+        )
+
     def _build_draft_model(self, model_class) -> nn.Module:
         """Construct the draft ``nn.Module``. Default builds a plain draft from
-        the target config; ``EagleProposer`` overrides for the eagle3 arch."""
+        the target config; ``EagleProposer`` and ``DSparkProposer`` override for
+        the standalone-checkpoint archs. This default path is MTP-style: the
+        draft lives inside the target checkpoint and shares its quantization by
+        construction."""
         return model_class(self.config)
 
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec | None:
