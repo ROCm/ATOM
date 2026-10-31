@@ -121,6 +121,8 @@ CHUNKS_PER_WAVE = K_CHUNKS // WAVES
 LT_SPLIT = THREADS  # logical threads past it are held by threads lt - LT_SPLIT
 N_LT = HIDDEN // 8
 RED_FLOATS = WAVES * WAVE * 8  # every wave's 16x16 f32 accumulator
+NEWK_AT = RED_FLOATS // 2  # red: the step's index keys a score CTA makes
+assert NEWK_AT + MAX_TOKENS * HEAD_DIM // 4 <= RED_FLOATS
 assert K_CHUNKS % WAVES == 0 and N_LT - LT_SPLIT <= THREADS // 2
 assert MAX_TOKENS <= WAVES
 _CURRENT_STREAM = fx.Stream(None)
@@ -589,6 +591,23 @@ def emit_k1(
         fx.ptr_store(bf16_pair(out[0], out[1]), row + lane * 2)
         fx.ptr_store(bf16_pair(out[2], out[3]), row + (lane * 2 + 1))
 
+    def index_k_rows(first, last):
+        """Tokens first .. last's index keys (FP8 words, as the IK head task
+        inserts them) -> red + NEWK_AT, token first + j's by wave j."""
+        tk = first + wave
+        if tk <= last:
+            d0 = lane * ELEMS
+            gw4, cs, sn = head_rope_inputs(tk, g_ik, d0, cos_sin, positions)
+            base = tk * heads.rows + heads.ik_off
+            got = mb_poll([(qkv_mb, base + d0, 2), (qkv_mb, base + d0 + 2, 2)])
+            e = [got[h][j].bitcast(fx.Float32) for h in range(2) for j in range(2)]
+            out = head_norm_rope(e, lane, gw4, cs, sn, eps)
+            qi = [bf16_round(out[j]) for j in range(ELEMS)]
+            fx.ptr_store(
+                fp8_pack4(qi[0], qi[1], qi[2], qi[3]).bitcast(fx.Float32),
+                red + (NEWK_AT + wave * (HEAD_DIM // 4) + lane),
+            )
+
     def make_index_q(first, last):
         for k0 in range_constexpr(0, tokens, WAVES):
             tk = wave + k0
@@ -650,6 +669,7 @@ def emit_k1(
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
             block_table, seq_lens, bt_width, wait_new_keys if signal else None,
             make_index_q, heads, q_frag_head, make_index_q_heads,
+            (index_k_rows, red + NEWK_AT) if signal else None,
         )  # fmt: skip
     stamp(6)
 
