@@ -266,9 +266,8 @@ class DSparkProposer(Drafter):
             # The DRAFT's own context slot mapping, one slot per token of the
             # TARGET forward -- see `_publish_draft_ctx_slots`. Sized at the
             # widest token axis the scheduler can hand over, because a prefill
-            # chunk is written through it too, and preallocated for the same
-            # reason as everything else here: nothing on the per-step path may
-            # allocate.
+            # chunk is written through it too, and preallocated so the map the
+            # layers read has one fixed home.
             n_tok = int(self.config.max_num_batched_tokens)
             self._blk_ctx_slots = torch.zeros(n_tok, **i64)
             # The token axis as a constant int32 ramp, the left operand of the

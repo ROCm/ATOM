@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Unit tests for the SpecForge DFlash draft (RadixArk/Kimi-K3-DSpark).
 
-GPU-free except the block-read check, which skips without one. Covers the
-things that decide whether the draft is even reachable, and that no amount of
-GPU bring-up would localize:
+The config-normalization and fold tests run on CPU; the rest need the
+aiter/triton stack and skip without it, and the kernel checks need a GPU.
+Covers the things that decide whether the draft is even reachable, and that no
+amount of GPU bring-up would localize:
 
 - config normalization: the arch rename and the nested ``dflash_config`` lift
 - attention-flavor resolution: the draft must resolve to MHA and own a KV pool
@@ -28,9 +29,7 @@ def _gpu_stack_import(name):
     Tries the import first, so a module that imports fine without the stack
     still runs on the CPU-only CI runner. A failure is turned into a skip only
     when the stack is genuinely absent -- no aiter or triton, or no GPU for
-    aiter to probe the arch of at import. On a GPU host any import error FAILS:
-    a broad `importorskip(..., exc_type=ImportError)` once turned a renamed
-    helper, which left the draft model unimportable, into silent skips there.
+    aiter to probe the arch of at import. On a GPU host any import error FAILS.
     """
     import importlib
 
@@ -48,34 +47,6 @@ def _gpu_stack_import(name):
         if not gpu:
             pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
         raise
-
-
-def _real_config_module():
-    """Load the real `atom/config.py` despite conftest's ``atom.config`` stub.
-
-    Same approach as tests/test_dspark.py: exec the real source by file path
-    under a throwaway module name, then restore the stub. An import error in
-    `config.py` FAILS the tests that need it rather than skipping them.
-    """
-    import importlib.util
-    import os
-    import sys
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(root, "atom", "config.py")
-    spec = importlib.util.spec_from_file_location("_atom_config_real_dflash", path)
-    mod = importlib.util.module_from_spec(spec)
-    saved = sys.modules.get("atom.config")
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        if saved is not None:
-            sys.modules["atom.config"] = saved
-    return mod
-
-
-def _real_hf_config_override():
-    return _real_config_module().SpeculativeConfig
 
 
 def _radixark_cfg(**overrides):
@@ -121,7 +92,7 @@ def _radixark_cfg(**overrides):
 
 def test_dflash_config_normalize():
     """DSparkDraftModel + dflash_config -> K3DFlashModel with lifted fields."""
-    SpeculativeConfig = _real_hf_config_override()
+    from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
@@ -146,9 +117,9 @@ def test_dflash_config_normalize():
 
 
 def test_dflash_rope_is_the_drafts_own():
-    """The draft keeps theta 10000 / YaRN x16; it must not inherit the target's
-    theta 50000 / x32. A shared rope loads clean and only moves acceptance."""
-    SpeculativeConfig = _real_hf_config_override()
+    """`hf_config_override` leaves the draft's theta 10000 / YaRN x16 alone; the
+    target's theta 50000 / x32 would load clean and only move acceptance."""
+    from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
@@ -160,7 +131,7 @@ def test_dflash_rope_is_the_drafts_own():
 
 def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
     """The MLA K3-DSpark draft keeps its own route and gains no block size."""
-    SpeculativeConfig = _real_hf_config_override()
+    from atom.config import SpeculativeConfig
 
     hf = types.SimpleNamespace(
         architectures=["K3DSparkModel"],
@@ -187,7 +158,7 @@ def test_dflash_branch_needs_dflash_config():
     SpecForge stamps that arch on every DFlash draft, so the arch string alone
     is not a model identity; claiming it would silently bind the wrong class.
     """
-    SpeculativeConfig = _real_hf_config_override()
+    from atom.config import SpeculativeConfig
 
     hf = _radixark_cfg(dflash_config=None)
     SpeculativeConfig.hf_config_override(hf, model_path=None)
@@ -202,7 +173,7 @@ def test_dflash_branch_needs_dflash_config():
 
 def test_dflash_plain_qwen3_target_is_untouched():
     """model_type qwen3 is a legitimate TARGET type and must not be routed."""
-    SpeculativeConfig = _real_hf_config_override()
+    from atom.config import SpeculativeConfig
 
     hf = types.SimpleNamespace(
         architectures=["Qwen3ForCausalLM"],
@@ -251,9 +222,6 @@ def test_dflash_backend_owns_a_kv_pool():
     own a sibling pool; `draft_kv_builder` returns None for any backend that
     says otherwise, and the draft would then silently have no KV at all.
     """
-    # RuntimeError as well as ImportError: importing the backend runs aiter's
-    # chip detection, which reads the GPU arch out of rocminfo and raises when
-    # there is no GPU. The flag itself is a ClassVar and needs neither.
     mod = _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     assert mod.AiterBackend.DRAFT_OWNS_KV_POOL is True
 
@@ -304,11 +272,8 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
     `blocks_per_entry = dcp` -- `entry_bytes` grows by dcp while the number of
     entries a request needs falls by dcp.
 
-    This is the invariant that lets capacity planning done at DCP1 carry to
-    DCP8. It held under the OLD geometry too (heads replicated at tp // dcp,
-    tokens sharded), by the opposite cancellation -- which is exactly why it
-    cannot be the only test of the decision; `test_dflash_pool_is_built_at_full_tp`
-    pins which of the two we build.
+    This pins the arithmetic; `test_dflash_pool_is_built_at_full_tp` pins that
+    `draft_kv_builder` builds this geometry.
     """
     _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
     pool = _pool(block_size=128, world_size=tp, blocks_per_entry=dcp)
@@ -321,9 +286,7 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
     # `dcp` times as wide. 163840 B is the one-block cost at 2 KV heads
     # (5 layers x {k,v} x 2 heads x 64 head_dim x 128 tokens x 1 B, and not a
     # byte of field alignment); the product below is what must not move.
-    # (163840 / 128 = 1280 B per token per rank.) It was 174080 while the pool
-    # declared per-token scale planes -- 5 x 2 x 2 x 128 x 4 B = 10240 of fp32
-    # the per-tensor scale does not need.
+    # (163840 / 128 = 1280 B per token per rank.)
     seq = 128 * 8 * 4
     entries = seq // (128 * dcp)
     assert pool.entry_bytes * entries == 163840 * (seq // 128), (
@@ -338,7 +301,8 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
 
 
 def _normalized_radixark():
-    SpeculativeConfig = _real_hf_config_override()
+    from atom.config import SpeculativeConfig
+
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
     return hf
@@ -468,16 +432,12 @@ def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
 def test_dflash_pool_is_built_at_full_tp(tp, dcp):
     """`draft_kv_builder` must size the pool at FULL TP, `dcp` blocks an entry.
 
-    The draft does not join the dcp group -- SGLang's does not either
-    (`models/qwen3_5.py:1112`) -- so its KV heads shard by the whole TP world
-    and every rank holds the whole token axis. What DCP costs it is the ENTRY:
-    one target block id spans `block_size * dcp` global positions.
-
-    The DCP-invariance test above builds the pool by calling `_pool` directly,
-    so it pins the ARITHMETIC but not the PLUMBING -- and that arithmetic is
-    satisfied by the OLD geometry too (heads replicated at tp // dcp, tokens
-    sharded), which a read that returns no LSE cannot merge across ranks.
-    This is the test that pins which of the two is built.
+    The draft does not join the dcp group, so its KV heads shard by the whole
+    TP world and every rank holds the whole token axis. What DCP costs it is
+    the ENTRY: one target block id spans `block_size * dcp` global positions.
+    The alternative (heads replicated at tp // dcp, tokens sharded) has the
+    same per-rank bytes but needs an LSE merge across ranks the read does not
+    return, so this pins which of the two is built.
     """
     dk = _gpu_stack_import("atom.spec_decode.draft_kv")
     _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
@@ -525,32 +485,18 @@ def test_dflash_pool_is_built_at_full_tp(tp, dcp):
 # they are just accepted less often.
 
 
-def _reference_mixture(prefix, bank, score_weight, eps):
-    """The mix `apply_attn_res` computes, transcribed into plain torch.
-
-    From `_attn_res_fused_kernel`: over the B bank rows plus the prefix,
-    score = <v, score_weight> * rsqrt(mean(v^2) + eps), softmax over the B+1,
-    then a weighted sum of the RAW candidates (the rmsnorm scales the SCORE,
-    it does not normalize what is summed).
-    """
-    import torch
-
-    rows = torch.cat([bank, prefix.unsqueeze(1)], dim=1).float()
-    rstd = torch.rsqrt(rows.pow(2).mean(-1) + eps)
-    probs = torch.softmax((rows * score_weight).sum(-1) * rstd, dim=-1)
-    return (probs.unsqueeze(-1) * rows).sum(1).to(prefix.dtype)
-
-
 def _fake_attn_res_kernel(monkeypatch, calls):
     """Stand in for `atom.model_ops.kimi_k3`, which needs aiter and a GPU.
 
     The draft imports `apply_attn_res` inside the extract, so swapping the
     module in `sys.modules` is enough -- and it keeps these tests CPU-only,
-    which is the only way they run in CI at all. The stand-in computes the real
-    mixture, so the assertions below pin the ARGUMENTS the draft marshals *and*
-    that what comes back is the mixture rather than the prefix.
+    which is the only way they run in CI at all. The stand-in records the
+    ARGUMENTS the draft marshals and returns a sentinel, so a test can check the
+    extract hands back the kernel's result rather than the prefix.
     """
     import sys
+
+    import torch
 
     module = types.ModuleType("atom.model_ops.kimi_k3")
 
@@ -565,8 +511,10 @@ def _fake_attn_res_kernel(monkeypatch, calls):
         add_hidden2=None,
         quant_dtype=None,
     ):
+        result = torch.full_like(prefix_sum, 7.0)
         calls.append(
             {
+                "result": result,
                 "prefix": prefix_sum,
                 "bank": block_residual,
                 "score_weight": score_weight,
@@ -575,7 +523,7 @@ def _fake_attn_res_kernel(monkeypatch, calls):
                 "quant_dtype": quant_dtype,
             }
         )
-        return _reference_mixture(prefix_sum, block_residual, score_weight, eps), None
+        return result, None
 
     module.apply_attn_res = apply_attn_res
     monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", module)
@@ -648,8 +596,7 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
 
     Both halves matter: resolving to its own spec is what makes the routing
     draft-owned, and the extract returning the mixture rather than the prefix is
-    the feature itself. The second is asserted against an independent
-    computation of the mixture, not merely "something different".
+    the feature itself.
     """
     torch = pytest.importorskip("torch")
     generic = _generic_extract()
@@ -698,12 +645,8 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     assert call["out_norm_weight"] is None
     assert call["quant_dtype"] is None
 
-    expected = _reference_mixture(
-        reconstructed, bank[:, :2, :], res.score_weight, res.eps
-    )
-    assert torch.allclose(out, expected)
-    # ...and it is NOT the plain post-layer hidden state, which is the bug.
-    assert not torch.allclose(out, reconstructed)
+    # The kernel's mixture, not the plain post-layer hidden state.
+    assert out is call["result"]
 
 
 def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
@@ -750,9 +693,8 @@ def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
 
     `Inferact/Kimi-K3-DSpark` was trained through vLLM/HF against the plain
     residual stream. Measured, the aggregate costs it ~2.6 pp acceptance -- and
-    it is the draft `.github/benchmark/models_accuracy.json` tracks, so an
-    earlier, globally-defaulted-on version of this feature regressed CI. It
-    keeps the prefix by not implementing the hook at all.
+    it is the draft `.github/benchmark/models_accuracy.json` tracks. It keeps
+    the prefix by not implementing the hook at all.
     """
     dspark = _gpu_stack_import("atom.models.kimi_k3_dspark")
     proposer_mod = _gpu_stack_import("atom.spec_decode.dspark_proposer")
@@ -834,12 +776,9 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 # --------------------------------------------------------------------------- #
 # the DCP admission guard (config.py __post_init__)
 #
-# The guard refuses DCP for a draft that OWNS a sibling KV pool and does NOT
-# read it non-causally. These exercise the PREDICATE exactly as `config.py`
-# computes it. They do NOT exercise the `raise` itself: reaching it needs
-# `aiter.jit.utils.chip_info.get_gfx` to answer "gfx950", so the end-to-end
-# refusal belongs in the GPU batch. What is covered here is the part that
-# decides WHICH configs are refused -- the half that silently regressed once.
+# The guard refuses DCP for a draft that owns a sibling KV pool unless it is
+# the DFlash pool (`uses_dflash_pool`). These call the predicate `config.py`
+# raises on (`draft_kv_conflicts_with_dcp`).
 # --------------------------------------------------------------------------- #
 
 
@@ -863,9 +802,9 @@ def test_dcp_guard_refuses_a_pool_owning_causal_draft():
     """An Eagle3-llama style MHA draft double-shards: head axis AND token axis.
 
     This is the case the guard exists for. It owns a sibling pool like DFlash
-    does, but reads it causally, so it has no DCP1 escape -- and the failure is
-    silent (lost acceptance length, no fault), which is why it must be refused
-    at launch rather than diagnosed later.
+    does, but is not the DFlash pool, so it would be DCP-sharded -- and the
+    failure is silent (lost acceptance length, no fault), which is why it must
+    be refused at launch rather than diagnosed later.
     """
     draft_hf = types.SimpleNamespace(
         architectures=["LlamaForCausalLMEagle3"],
@@ -879,7 +818,7 @@ def test_dcp_guard_refuses_a_pool_owning_causal_draft():
 
 
 def test_dcp_guard_admits_an_mtp_draft():
-    """`--method mtp` must still pass -- an earlier guard version broke it.
+    """`--method mtp` must still pass.
 
     For mtp the draft hf config IS the target's, so `attn_family` returns the
     TARGET's family (KIMI_MLA here), whose backend leaves `DRAFT_OWNS_KV_POOL`
@@ -1350,7 +1289,8 @@ def test_dflash_draft_is_refused_on_a_non_k3_target():
     """SpecForge stamps one arch on every DFlash draft, so the rename to
     `K3DFlashModel` cannot tell a Kimi-K3 draft from a Qwen3/Llama one; the
     target is checked where both configs are known."""
-    cfg = _real_config_module()
+    import atom.config as cfg
+
     draft = types.SimpleNamespace(architectures=["K3DFlashModel"])
     cfg._check_dflash_draft_target(
         types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]), draft

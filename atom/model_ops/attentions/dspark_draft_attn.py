@@ -80,8 +80,9 @@ class DSparkDraftUnifiedAttention:
 
         self.device = device
         self._ua = ua.unified_attention
-        # The context bound aiter sizes its split config from; no request's
-        # keys reach past it.
+        # What aiter picks its kernel and split config from. A heuristic, not a
+        # bound: tiles come from each request's own `seqused_k`, which may run
+        # T past it for a block anchored at the last position.
         self.max_model_len = max_model_len
         # Cast q to an fp8 pool's dtype only where that selects the Gluon
         # kernel: aiter's own gfx950 test plus its kernel having loaded.
