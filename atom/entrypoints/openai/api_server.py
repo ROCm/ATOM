@@ -33,7 +33,11 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.exception_handlers import http_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -120,7 +124,6 @@ from .serving_anthropic import (
 from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
-    chat_stream_usage_on_finish,
     normalize_chat_tools,
     resolve_thinking,
     stream_chat_response,
@@ -1647,6 +1650,32 @@ app.add_middleware(TraceMiddleware, model=lambda: model_name)
 # ---- Error handlers ----
 
 
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError
+):
+    path = request.url.path
+    if path not in {
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/v1/messages",
+    }:
+        return await request_validation_exception_handler(request, exc)
+    # Do not serialize exc.body, input values or arbitrary Pydantic ctx objects.
+    message = "; ".join(
+        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+        for error in exc.errors()
+    )
+    error = {"message": message, "type": "invalid_request_error"}
+    content = {"error": error}
+    if path == "/v1/messages":
+        content["type"] = "error"
+    else:
+        error["code"] = 422
+    return JSONResponse(status_code=422, content=content)
+
+
 @app.exception_handler(HTTPException)
 async def openai_http_error_handler(request: Request, exc: HTTPException):
     # HTTPException bypasses the ValueError/Exception handlers. Keep its status
@@ -1958,6 +1987,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    usage_on_finish=compatibility.chat_usage_on_finish,
+                    include_usage=bool(
+                        (request.stream_options or {}).get("include_usage")
+                    ),
                 )
             else:
                 seq_id, stream_collector, num_prompt_tokens = (
@@ -1988,6 +2021,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     tool_choice=request.tool_choice,
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
+                    usage_on_finish=compatibility.chat_usage_on_finish,
+                    include_usage=bool(
+                        (request.stream_options or {}).get("include_usage")
+                    ),
                 )
             if logprob_codec is not None:
                 from .chat_logprobs import stream_logprobs
@@ -1997,13 +2034,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 from .structured_output import validate_chat_stream
 
                 gen = validate_chat_stream(gen, schema)
-            if compatibility.chat_usage_on_finish:
-                gen = chat_stream_usage_on_finish(
-                    gen,
-                    include_usage=bool(
-                        (request.stream_options or {}).get("include_usage")
-                    ),
-                )
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",

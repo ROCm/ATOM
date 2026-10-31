@@ -711,18 +711,6 @@ class ResponseStreamEmitter:
         frames.append(self._terminal_frame(usage, terminal))
         return frames
 
-    def error_frame(self, message: str, error_type: str = "api_error") -> str:
-        return self._event(
-            "error",
-            {
-                "type": "error",
-                "code": error_type,
-                "message": message,
-                "param": None,
-                "sequence_number": self._next_sequence(),
-            },
-        )
-
     def _on_event(self, etype: str, data: Any) -> list[str]:
         if etype == "reasoning":
             if not data:
@@ -1201,7 +1189,3 @@ def stream_failure_frames(
     yield from emitter.finish_frames(
         error={"code": "server_error", "message": str(exc)}
     )
-
-
-def completes_a_tool_call(events) -> bool:
-    return any(etype == "tool_call_args" for etype, _ in events)

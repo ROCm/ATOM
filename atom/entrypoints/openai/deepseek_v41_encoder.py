@@ -33,7 +33,7 @@ def normalize_effort(effort: Any) -> str | int | None:
 REASONING_RULES = ReasoningRules(
     normalize_effort=normalize_effort,
     string_effort_enables=True,
-    clear_effort_when_disabled=True,
+    reconcile_effort_with_toggle=True,
 )
 
 

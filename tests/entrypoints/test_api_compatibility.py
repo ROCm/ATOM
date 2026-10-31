@@ -646,69 +646,6 @@ def test_tool_validation_does_not_mutate_server_defaults(server, monkeypatch):
     assert defaults == {"thinking_effort": "none", "reasoning_effort": 20}
 
 
-@pytest.mark.parametrize("coalesced", [False, True])
-def test_finish_usage_preserves_handoff_metadata(coalesced):
-    from atom.entrypoints.openai.serving_chat import chat_stream_usage_on_finish
-    from atom.entrypoints.openai.sse import data_frame
-
-    async def run():
-        frames = [
-            data_frame(
-                {"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]}
-            ),
-            data_frame({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-            data_frame(
-                {
-                    "choices": [],
-                    "usage": {"completion_tokens": 1},
-                    "kv_transfer_params": {"id": "handoff"},
-                }
-            ),
-            "data: [DONE]\n\n",
-        ]
-
-        async def source():
-            for frame in (["".join(frames)] if coalesced else frames):
-                yield frame
-
-        return [
-            chunk
-            async for chunk in chat_stream_usage_on_finish(source(), include_usage=True)
-        ]
-
-    frames = asyncio.run(run())
-    chunks = events(frames)
-    assert len(chunks) == 2
-    assert chunks[0]["usage"] is None
-    assert chunks[-1]["usage"] == {"completion_tokens": 1}
-    assert chunks[-1]["kv_transfer_params"] == {"id": "handoff"}
-    assert "".join(frames).endswith("data: [DONE]\n\n")
-
-
-def test_finish_usage_wrapper_closes_source_on_disconnect():
-    from atom.entrypoints.openai.serving_chat import chat_stream_usage_on_finish
-    from atom.entrypoints.openai.sse import data_frame
-
-    closed = []
-
-    async def source():
-        try:
-            yield data_frame(
-                {"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]}
-            )
-            raise AssertionError("consumer already disconnected")
-        finally:
-            closed.append(True)
-
-    async def run():
-        stream = chat_stream_usage_on_finish(source())
-        await anext(stream)
-        await stream.aclose()
-
-    asyncio.run(run())
-    assert closed == [True]
-
-
 @pytest.mark.parametrize("endpoint", ["chat/completions", "messages"])
 @pytest.mark.parametrize("key", ["thinking_effort", "reasoning_effort"])
 def test_explicit_enable_overrides_inherited_none_effort(
@@ -848,3 +785,221 @@ def test_http_error_handler_preserves_status_headers_and_other_routes():
     assert response.status_code == 429 and response.headers["Retry-After"] == "5"
     assert json.loads(response.body)["error"]["message"] == "slow down"
     assert json.loads(asyncio.run(run("/server_info")).body) == {"detail": "slow down"}
+
+
+@pytest.mark.parametrize(
+    "endpoint,body",
+    [
+        ("chat/completions", {"messages": "invalid"}),
+        ("completions", {"prompt": {}, "max_tokens": "invalid"}),
+        ("responses", {"input": "hi", "max_output_tokens": "invalid"}),
+        ("messages", {"messages": "invalid", "max_tokens": 16}),
+    ],
+)
+def test_pydantic_errors_use_endpoint_envelope_before_generation(
+    server, endpoint, body
+):
+    response = post("/v1/" + endpoint, {"model": "renamed-model", **body})
+    # Responses validates its rewritten body inside the endpoint, preserving
+    # its existing 400; FastAPI's typed-body validation retains 422 elsewhere.
+    expected_status = 400 if endpoint == "responses" else 422
+    assert response.status_code == expected_status
+    payload = response.json()
+    assert "detail" not in payload
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert payload["error"]["message"]
+    if endpoint == "messages":
+        assert payload["type"] == "error"
+    else:
+        assert payload["error"]["code"] == expected_status
+    assert server.generations == 0
+
+
+def test_malformed_json_uses_openai_validation_envelope(server):
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.post(
+                "/v1/chat/completions",
+                content='{"messages":',
+                headers={"Content-Type": "application/json"},
+            )
+
+    response = asyncio.run(run())
+    assert response.status_code == 422
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert server.generations == 0
+
+
+def test_validation_handler_preserves_non_generation_routes():
+    from fastapi.exceptions import RequestValidationError
+    from starlette.requests import Request
+
+    errors = [
+        {
+            "type": "missing",
+            "loc": ("query", "value"),
+            "msg": "Field required",
+            "input": {},
+        }
+    ]
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/server_info", "headers": []}
+    )
+    response = asyncio.run(
+        api_server.request_validation_error_handler(
+            request, RequestValidationError(errors)
+        )
+    )
+    assert response.status_code == 422
+    assert json.loads(response.body)["detail"][0]["loc"] == ["query", "value"]
+
+
+@pytest.mark.parametrize("n", [1, 3])
+@pytest.mark.parametrize("include_usage", [False, True])
+@pytest.mark.parametrize("usage_on_finish", [False, True])
+def test_stream_serializes_usage_once_and_preserves_every_finish(
+    n, include_usage, usage_on_finish, monkeypatch
+):
+    from atom.entrypoints.openai import serving_chat, sse
+
+    chunks = []
+    for i in reversed(range(n)):
+        chunk = {
+            "text": "answer",
+            "token_ids": [1, 2],
+            "finished": True,
+            "finish_reason": "length",
+            "kv_transfer_params": {"id": "handoff"},
+        }
+        chunks.append((i, chunk) if n > 1 else chunk)
+
+    class Collector:
+        def __init__(self):
+            self.items = iter(chunks)
+
+        async def get(self):
+            return next(self.items)
+
+    serialized = []
+    original = sse.data_frame
+
+    def record(payload):
+        serialized.append(payload)
+        return original(payload)
+
+    monkeypatch.setattr(serving_chat, "data_frame", record)
+    cleanups = []
+
+    async def run():
+        fn = (
+            serving_chat.stream_chat_response_fanout
+            if n > 1
+            else serving_chat.stream_chat_response
+        )
+        stream = fn(
+            "req",
+            "model",
+            Collector(),
+            list(range(n)) if n > 1 else 0,
+            5,
+            lambda *a, **kw: cleanups.append(kw),
+            lambda *a: None,
+            usage_on_finish=usage_on_finish,
+            include_usage=include_usage,
+        )
+        return [frame async for frame in stream]
+
+    frames = asyncio.run(run())
+    payloads = events(frames)
+    # Every output payload is serialized exactly once; no parse/re-encode wrapper.
+    assert payloads == serialized
+    finishes = [
+        p for p in payloads if p["choices"] and p["choices"][0]["finish_reason"]
+    ]
+    assert [p["choices"][0]["index"] for p in finishes] == list(range(n))
+    assert all(p["choices"][0]["finish_reason"] == "length" for p in finishes)
+    last = payloads[-1]
+    assert last["usage"]["completion_tokens"] == n * 2
+    assert last["usage"]["prompt_tokens"] == 5
+    assert last["kv_transfer_params"] == {"id": "handoff"}
+    if usage_on_finish:
+        assert all(p["choices"] for p in payloads)
+        assert last is finishes[-1]
+        assert all(
+            (p.get("usage") is None and ("usage" in p) == include_usage)
+            for p in payloads[:-1]
+        )
+    else:
+        assert last["choices"] == []
+        assert all("usage" not in p for p in payloads[:-1])
+    assert len(cleanups) == n and all(c["aborted"] is False for c in cleanups)
+    assert "".join(frames).endswith("data: [DONE]\n\n")
+
+
+def test_direct_stream_cleanup_on_disconnect():
+    from atom.entrypoints.openai.serving_chat import stream_chat_response
+
+    cleanups = []
+
+    class Collector:
+        async def get(self):
+            return {"text": "first", "token_ids": [1]}
+
+    async def run():
+        stream = stream_chat_response(
+            "req",
+            "model",
+            Collector(),
+            1,
+            5,
+            lambda *a, **kw: cleanups.append(kw),
+            lambda *a: None,
+            usage_on_finish=True,
+            include_usage=True,
+        )
+        await anext(stream)
+        await stream.aclose()
+
+    asyncio.run(run())
+    assert cleanups == [{"aborted": True}]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("endpoint", ["chat/completions", "responses", "messages"])
+def test_v41_alias_without_encoder_retains_generic_template_contract(
+    server, monkeypatch, stream, endpoint
+):
+    # A served alias/config is not an encoder adapter. Without one, retain the
+    # established generic Jinja behavior rather than guessing V4.1 controls.
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "model_name", "deepseek-ai/DeepSeek-V4.1-Flash")
+    api_server.engine.config.hf_config = SimpleNamespace(model_type="deepseek_v41")
+
+    def render(messages, **kwargs):
+        server.templates.append((messages, kwargs))
+        return "prompt"
+
+    monkeypatch.setattr(
+        api_server.tokenizer, "apply_chat_template", render, raising=False
+    )
+    body = {"model": api_server.model_name, "stream": stream}
+    if endpoint == "responses":
+        body.update(input="hi", reasoning={"effort": "medium"})
+    else:
+        body.update(messages=[{"role": "user", "content": "hi"}], max_tokens=16)
+        if endpoint == "chat/completions":
+            body["reasoning_effort"] = "medium"
+        else:
+            body["thinking"] = {"type": "disabled"}
+    response = post("/v1/" + endpoint, body)
+    assert response.status_code == 200, response.text
+    assert server.templates[-1][1]["tokenize"] is False
+    if endpoint == "responses":
+        assert server.templates[-1][1]["thinking_effort"] == "medium"
+    elif endpoint == "chat/completions":
+        # "medium" is a V4.1 alias, not a legacy Chat template effort.
+        assert "thinking_effort" not in server.templates[-1][1]
+    if endpoint == "chat/completions" and stream:
+        assert events([response.text])[-1]["choices"] == []
