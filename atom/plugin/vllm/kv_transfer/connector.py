@@ -65,6 +65,7 @@ from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
 )
 from atom.plugin.vllm.kv_transfer.offload_config import build_offload_config
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
+from atom.utils import envs
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -346,10 +347,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._scheduler = None
 
         self._seqs = SeqViewRegistry()
-        # Requests parked on a promised load, and how many steps ago. A promise
-        # that never turns into a dispatched load is an unrecoverable hang, so
-        # it is at least named in the log. See `_check_promised_loads`.
-        self._promised_loads: dict[str, int] = {}
+        # Loads promised to vLLM at lookup: request id -> [steps undispatched,
+        # first token, tokens promised, parked]. A promise no load honours is
+        # withdrawn through `finished_recving` so vLLM releases the request;
+        # see `_settle_promised_loads`.
+        self._promised_loads: dict[str, list] = {}
         # Parked promises of requests that finished before a load dispatched.
         # vLLM holds their blocks until a `finished_recving` names them, so the
         # withdrawal still goes out with the next step's metadata.
@@ -479,6 +481,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "ATOM offload connector: recurrent (mamba) state offloads "
                 "in-process only; use atom.offload.backend='inproc'."
             )
+        elif role == KVConnectorRole.SCHEDULER:
+            self._warn_unless_recompute()
 
         if role == KVConnectorRole.WORKER:
             if self._offload_backend == "mp":
@@ -519,9 +523,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 )
 
                 self._scheduler = DenseOffloadScheduler(self._config)
-            # Before the planners: they read the scheduler's chunk and block
-            # arithmetic when they arm their boundaries.
-            self._reconcile_scheduler_block_size()
             self._init_kda_planner(vllm_config, kv_cache_config)
             self._init_v41_planner(vllm_config, kv_cache_config)
 
@@ -585,12 +586,20 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "ATOM offload connector: DeepSeek-V4.1 offloads through the "
                 "LMCache MP server only; set atom.offload.backend='mp'."
             )
-        if not self._v41_checkpoint_group_ids:
+        cache_config = getattr(
+            getattr(self, "_vllm_config", None), "cache_config", None
+        )
+        if not self._v41_checkpoint_group_ids or not getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            # Both halves: the groups exist with the switch alone, but nothing
+            # writes or restores them without prefix caching, so the first
+            # tier hit would load a checkpoint no restore consumes.
             raise ValueError(
                 "ATOM offload connector: DeepSeek-V4.1 offload needs its state "
-                "checkpoint groups registered (ATOM_V41_STATE_CHECKPOINTS=1 with "
-                "prefix caching and --mamba-cache-mode align); the checkpoint is "
-                "what carries the state with the PAGE bytes."
+                "checkpoints live (ATOM_V41_STATE_CHECKPOINTS=1 with "
+                "--enable-prefix-caching and --mamba-cache-mode align); the "
+                "checkpoint is what carries the state with the PAGE bytes."
             )
         kv_transfer_config = getattr(
             getattr(self, "_vllm_config", None), "kv_transfer_config", None
@@ -603,6 +612,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "load that does not land through `failed_recving` -- a declined "
                 "state ride or a lost tier prefix as well as a fault -- and "
                 f"{policy!r} turns each into a failed request."
+            )
+
+    #: Async lookups `_lookup_in_flight` sent in the current scheduling pass;
+    #: reset by `build_connector_meta`.
+    _lookups_sent_this_step = 0
+
+    def _warn_unless_recompute(self) -> None:
+        """Name what vLLM's default load-failure policy does to a declined load.
+
+        A load declined at dispatch or a withdrawn promise is reported through
+        `failed_recving`. Under `fail` that request ends with an error rather
+        than recomputing; V4.1 refuses the policy outright, other models are
+        told once at startup.
+        """
+        kv_transfer_config = getattr(self._vllm_config, "kv_transfer_config", None)
+        policy = getattr(kv_transfer_config, "kv_load_failure_policy", "fail")
+        if policy != "recompute":
+            logger.warning(
+                "ATOM offload connector: kv_load_failure_policy=%r ends a request "
+                "whose tier load is declined or lost with an error; set "
+                "'recompute' to recompute it instead.",
+                policy,
             )
 
     def _page_tp_replication_factor(self) -> int:
@@ -676,46 +707,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         ):
             return 1
         return int(getattr(self._config, "tensor_parallel_size", 1) or 1)
-
-    def _reconcile_scheduler_block_size(self) -> None:
-        """Tell the scheduler how big the blocks it strides actually are.
-
-        Called AFTER the scheduler exists. Called before it, the early
-        return on `_scheduler is None` made this a no-op that logged
-        nothing -- the same shape as `_is_deepseek_v41` being assigned
-        after the resolution that reads it, one bug earlier in this file.
-
-        `cache_config.block_size` is engine-wide and becomes the SMALLEST
-        group's once a second group exists, but every block table this
-        scheduler indexes belongs to the attention group. With DSpark the
-        draft's 32 replaced the proxy's 256 and the two arithmetics that
-        read it both went wrong in the same direction: a 1345-token prompt's
-        six blocks were priced at 192 tokens, so the save frontier floored
-        to zero chunks, and the backing check then declared six blocks too
-        few to cover [0, 1280).
-
-        Fixed at the source rather than at each site, because the next site
-        to read it would be wrong in the same way and would say so just as
-        quietly -- neither of those two raised anything.
-        """
-        attn = int(getattr(self, "_attn_block_size", 0) or 0)
-        sched = getattr(self, "_scheduler", None)
-        if attn <= 0 or sched is None:
-            return
-        current = int(getattr(sched, "block_size", 0) or 0)
-        if current == attn:
-            return
-        virtual = int(getattr(sched, "virtual_block_size", current) or current)
-        dcp = max(1, virtual // current) if current > 0 else 1
-        sched.block_size = attn
-        sched.virtual_block_size = attn * dcp
-        logger.info(
-            "ATOM LMCache offload: block size for the strided group is %d, "
-            "not the engine-wide %d (dcp=%d); scheduler updated",
-            attn,
-            current,
-            dcp,
-        )
 
     def _resolve_attention_group(self, kv_cache_config) -> int:
         """Which group the existing byte-codec path owns.
@@ -1727,6 +1718,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
         self._requests[str(request.request_id)] = request
+        # A detach recorded for an admission that then failed allocation: this
+        # question is asked afresh, and the old frontier must not reach
+        # `update_state_after_alloc` and overwrite the save floor.
+        self._detach_after_alloc.pop(str(request.request_id), None)
         if self._lookup_detached(seq, num_computed_tokens):
             return 0, False
         if self._lookup_in_flight(seq):
@@ -1756,7 +1751,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # yet decided it can allocate for the request. Only
         # `update_state_after_alloc` -- which vLLM calls once it has, and
         # which is followed by parking the request in WAITING_FOR_REMOTE_KVS --
-        # makes it True. See `_check_promised_loads` for why that matters.
+        # makes it True. See `_settle_promised_loads` for why that matters.
         self._promised_loads[request.request_id] = [
             0,
             int(num_computed_tokens),
@@ -1810,13 +1805,27 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         same bounds: `OFFLOAD_ASYNC_LOOKUP_DEPTH=0` keeps lookups synchronous,
         and past `OFFLOAD_LOOKUP_DEFER_S` the lookup is waited for as before.
         A client that cannot look up asynchronously never reports one pending.
+
+        The depth is one budget per scheduling pass, as ATOM's own scheduler
+        spends it on the head of its waiting queue. vLLM asks once per waiting
+        request, so submitting (and pumping every lookup in flight) on each
+        call restarted the budget per request; past it a request is passed over
+        and sent next pass.
         """
         prefetch = getattr(self._scheduler, "prefetch_lookups", None)
         pending = getattr(self._scheduler, "lookup_pending", None)
         if prefetch is None or pending is None:
             return False
+        if pending(seq):
+            return True
+        depth = envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
+        if depth > 0 and self._lookups_sent_this_step >= depth:
+            return True
         prefetch([seq])
-        return bool(pending(seq))
+        sent = bool(pending(seq))
+        if sent:
+            self._lookups_sent_this_step += 1
+        return sent
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         """Record the allocation, and queue the recurrent half of any hit.
@@ -1864,7 +1873,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if self._v41_planner is not None and num_external_tokens > 0:
             # Names the checkpoint blocks the PAGE load restores. When it
             # cannot, the scheduler finds no destination in `take_ride_state`
-            # and declines the load, and `_check_promised_loads` withdraws the
+            # and declines the load, and `_settle_promised_loads` withdraws the
             # promise -- the request recomputes rather than resuming on a
             # state nobody restored.
             self._v41_planner.resolve_load(
@@ -1909,6 +1918,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         Preemptions are settled before any of that, and deferred frees after it
         -- both for ordering reasons spelled out at their helpers.
         """
+        self._lookups_sent_this_step = 0
         preempted = self._handle_preempted(scheduler_output)
         # Virtual, not physical: under decode context parallelism one scheduler
         # block id covers `kv_cache_block_size * decode_context_parallel_size`
@@ -1951,7 +1961,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 covered = len(seq.block_table) * block_size
                 seq.set_num_cached_tokens(min(int(num_tokens), covered))
         inner = self._scheduler.build_connector_meta()
-        abandoned_loads = self._check_promised_loads(inner)
+        abandoned_loads = self._settle_promised_loads(inner)
         # Before `_collect_releases`, so a save abandoned on this step turns
         # into a release on this step rather than on the next one.
         self._reconcile_stale_saves()
@@ -2282,7 +2292,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # produce noise.
     _PROMISE_GRACE_STEPS = 50
 
-    def _check_promised_loads(self, inner) -> list[tuple[str, list[int]]]:
+    def _settle_promised_loads(self, inner) -> list[tuple[str, list[int]]]:
         """Withdraw any promise this step did not turn into a dispatched load.
 
         The scheduler half cannot inject `finished_recving`, so what it returns

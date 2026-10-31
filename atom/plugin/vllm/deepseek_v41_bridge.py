@@ -1419,6 +1419,19 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
 _V41_SLOT_OWNERS: dict[int, object] = {}
 
 
+def forget_v41_slot_owners(req_ids) -> None:
+    """Drop the slot records of requests that finished, were preempted or resumed.
+
+    A request id can come back (a client reusing ids, or
+    `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1`). With the old record still on
+    the slot, the newcomer would read as the slot's own tenant, skip the
+    invalidation below, and continue from the old request's state.
+    """
+    gone = set(req_ids)
+    for slot in [slot for slot, owner in _V41_SLOT_OWNERS.items() if owner in gone]:
+        del _V41_SLOT_OWNERS[slot]
+
+
 def _v41_invalidate_reowned_slots(cache, slots, req_ids, num_computed) -> None:
     """Force a restore for a request entering a slot another request last held.
 

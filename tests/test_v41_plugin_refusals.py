@@ -32,7 +32,7 @@ _REFUSALS = ("_refuse_v41_multi_axis_parallelism", "_refuse_v41_kv_transfer")
 _HELPERS = ("_v41_state_tier_configured",)
 
 
-def _refusals():
+def _refusals(*, checkpoints=True):
     tree = ast.parse(PLATFORM.read_text())
     functions = [
         node
@@ -40,7 +40,12 @@ def _refusals():
         if isinstance(node, ast.FunctionDef) and node.name in _REFUSALS + _HELPERS
     ]
     assert {node.name for node in functions} == set(_REFUSALS + _HELPERS)
-    scope = {"logger": logging.getLogger("atom.test.refusals")}
+    scope = {
+        "logger": logging.getLogger("atom.test.refusals"),
+        # Stubbed rather than extracted: the real one imports the checkpoint
+        # module, which reads vLLM's config.
+        "_v41_state_checkpoints_configured": lambda _config: checkpoints,
+    }
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=functions, type_ignores=[]), str(PLATFORM), "exec"),
         scope,
@@ -151,6 +156,21 @@ def test_the_state_owning_connector_is_admitted():
         ),
     ):
         refuse(config)
+
+
+def test_the_state_owning_connector_needs_its_checkpoints():
+    """Admitted by name, it still needs the checkpoints its state rides.
+
+    Without them it would start, store nothing, and stop the engine on its
+    first tier hit; the refusal moves that failure to startup.
+    """
+    refuse = _refusals(checkpoints=False)._refuse_v41_kv_transfer
+    with pytest.raises(ValueError, match="only with its state checkpoints live"):
+        refuse(
+            SimpleNamespace(
+                kv_transfer_config={"kv_connector": "AtomLMCacheOffloadConnector"}
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

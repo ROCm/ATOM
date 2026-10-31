@@ -473,12 +473,12 @@ def test_a_promise_that_never_dispatches_is_named(caplog):
     empty = SimpleNamespace(requests=[])
     with caplog.at_level("ERROR", logger="atom"):
         for _ in range(adapter._PROMISE_GRACE_STEPS + 1):
-            adapter._check_promised_loads(empty)
+            adapter._settle_promised_loads(empty)
 
     assert "stuck" in caplog.text
     # Reported once, not every step afterwards.
     caplog.clear()
-    adapter._check_promised_loads(empty)
+    adapter._settle_promised_loads(empty)
     assert caplog.text == ""
 
 
@@ -487,7 +487,7 @@ def test_a_dispatched_load_is_not_reported():
     adapter = _lookup_adapter(scheduler)
     adapter.get_num_new_matched_tokens(_req("ok"), 0)
 
-    adapter._check_promised_loads(
+    adapter._settle_promised_loads(
         SimpleNamespace(
             requests=[SimpleNamespace(req_id="ok", load_operation=object())]
         )

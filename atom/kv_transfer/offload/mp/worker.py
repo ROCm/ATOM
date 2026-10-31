@@ -40,7 +40,6 @@ from atom.kv_transfer.offload.mp.deployment import (
     _mp_session_id,
     _published_tp_replication_factor,
     _tp_replication_factor,
-    _transfer_mode,
     _validate_mp_config,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
@@ -199,9 +198,6 @@ class LMCacheMPConnector(KVConnectorBase):
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
         self._drain_round_cv = threading.Condition(self._lock)
-        # Engine-driven transfers stay inside this process, so their step event
-        # needs no IPC handle; LMCache waits on the very object handed over.
-        self._share_step_event = True
 
     def register_kv_caches(
         self,
@@ -251,7 +247,6 @@ class LMCacheMPConnector(KVConnectorBase):
             )
 
         adapter = _make_worker_adapter(self._config, rank)
-        self._share_step_event = _transfer_mode(self._config) != "engine_driven"
         groups = [
             EngineGroupInfo(
                 engine_group_id=0,
@@ -428,7 +423,7 @@ class LMCacheMPConnector(KVConnectorBase):
         server still waits on it raises `HIP error: invalid argument`, measured
         on both transfer modes.
         """
-        event = torch.cuda.Event(interprocess=self._share_step_event)
+        event = torch.cuda.Event(interprocess=True)
         event.record(torch.cuda.current_stream())
         return event
 
@@ -707,7 +702,7 @@ class LMCacheMPConnector(KVConnectorBase):
             return
         self._drain_thread = threading.Thread(
             target=self._drain_loop,
-            name="atom-lmcache-mp-save",
+            name="atom-lmcache-mp-transfer",
             daemon=True,
         )
         self._drain_thread.start()
@@ -778,7 +773,7 @@ class LMCacheMPConnector(KVConnectorBase):
                         break
                     remaining = deadline - time.perf_counter()
                     if remaining <= 0:
-                        raise TimeoutError("LMCache MP save drain did not settle")
+                        raise TimeoutError("LMCache MP transfer drain did not settle")
                     self._drain_round_cv.wait(min(remaining, 0.05))
             if self._drain_error is not None:
                 raise self._drain_error

@@ -795,10 +795,19 @@ def execute_state_checkpoint_restores(copier, slots, units) -> None:
     copier.execute_paged_state_copies([], _ops(copier, slots, units, False), 0)
 
 
-def execute_state_checkpoint_stores(copier, slots, units) -> None:
+#: Descriptor buffers: restores on 0, boundary stores on 1, decode keeps on 2.
+#: A step can store both a prefill boundary and a decode keep; sharing one
+#: buffer made the second wait on the CPU for the first's upload, which is
+#: queued behind the whole forward.
+_DECODE_KEEP_DESCRIPTOR_SLOT = 2
+
+
+def execute_state_checkpoint_stores(copier, slots, units, descriptor_slot=1) -> None:
     if not slots:
         return
-    copier.execute_paged_state_copies(_ops(copier, slots, units, True), [], 1)
+    copier.execute_paged_state_copies(
+        _ops(copier, slots, units, True), [], descriptor_slot
+    )
 
 
 def flush_state_checkpoint_stores(model) -> None:
@@ -962,7 +971,9 @@ def store_decode_keeps(worker, req_ids, starts, fresh_rows) -> None:
             raise RuntimeError(
                 "decode keep state checkpoint stores reached a CUDA graph capture"
             )
-        execute_state_checkpoint_stores(worker.copier, slots, units)
+        execute_state_checkpoint_stores(
+            worker.copier, slots, units, _DECODE_KEEP_DESCRIPTOR_SLOT
+        )
         _store_counts["decode_keep"] += len(slots)
 
 

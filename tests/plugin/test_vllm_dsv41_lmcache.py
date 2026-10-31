@@ -166,11 +166,20 @@ def test_an_unridable_finished_save_retires_and_frees_its_lease():
 # -- connector ---------------------------------------------------------------
 
 
-def _options_stub(*, v41=True, groups=(1,), mamba=(), policy="recompute", **options):
+def _options_stub(
+    *,
+    v41=True,
+    groups=(1,),
+    mamba=(),
+    policy="recompute",
+    prefix_caching=True,
+    **options,
+):
     stub = SimpleNamespace(
         _config=SimpleNamespace(kv_transfer_config=dict(options)),
         _vllm_config=SimpleNamespace(
-            kv_transfer_config=SimpleNamespace(kv_load_failure_policy=policy)
+            kv_transfer_config=SimpleNamespace(kv_load_failure_policy=policy),
+            cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
         ),
         _is_deepseek_v41=v41,
         _v41_checkpoint_group_ids=tuple(groups),
@@ -184,7 +193,7 @@ def _options_stub(*, v41=True, groups=(1,), mamba=(), policy="recompute", **opti
     "options, groups, match",
     [
         ({}, (1,), "MP server only"),
-        ({"atom.offload.backend": "mp"}, (), "checkpoint groups"),
+        ({"atom.offload.backend": "mp"}, (), "state checkpoints live"),
         (
             {"atom.offload.backend": "mp", "lmcache.mp.state_transport": "mp"},
             (1,),
@@ -203,6 +212,25 @@ def test_v41_offload_refuses_the_fail_policy():
     stub = _options_stub(policy="fail", **{"atom.offload.backend": "mp"})
     with pytest.raises(ValueError, match="kv_load_failure_policy='recompute'"):
         AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
+
+
+def test_v41_offload_refuses_a_run_without_prefix_caching():
+    """The checkpoint groups exist with the switch alone; nothing fills them."""
+    stub = _options_stub(prefix_caching=False, **{"atom.offload.backend": "mp"})
+    with pytest.raises(ValueError, match="state checkpoints live"):
+        AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
+
+
+@pytest.mark.parametrize("policy, warned", [("fail", True), ("recompute", False)])
+def test_other_models_are_told_what_the_fail_policy_does(monkeypatch, policy, warned):
+    """V4.1 refuses `fail`; every other model hears it once, from the scheduler."""
+    from atom.plugin.vllm.kv_transfer import connector as connector_module
+
+    log = Mock()
+    monkeypatch.setattr(connector_module, "logger", log)
+    stub = _options_stub(v41=False, policy=policy)
+    AtomLMCacheOffloadConnector._warn_unless_recompute(stub)
+    assert log.warning.called == warned
 
 
 def test_v41_rides_its_checkpoint_groups_on_mp():
@@ -226,7 +254,7 @@ def _alloc_connector():
 
 
 def test_an_unresolved_ride_does_not_release_the_request_itself():
-    """`_check_promised_loads` withdraws it once; a second report asserts in vLLM."""
+    """`_settle_promised_loads` withdraws it once; a second report asserts in vLLM."""
     c = _alloc_connector()
     blocks = SimpleNamespace(get_block_ids=lambda: ([3, 4], [7, 8]))
     c.update_state_after_alloc(SimpleNamespace(request_id="r0"), blocks, 512)
@@ -253,7 +281,7 @@ def test_an_undispatched_promise_is_withdrawn_only_if_vllm_parked_it(parked):
     c = _promising_connector(parked)
     out = []
     for _ in range(c._PROMISE_GRACE_STEPS + 2):
-        out.extend(c._check_promised_loads(SimpleNamespace(requests=[])))
+        out.extend(c._settle_promised_loads(SimpleNamespace(requests=[])))
     assert out == ([("7", [102, 103, 104, 105])] if parked else [])
     assert c._promised_loads == {}
 
@@ -272,14 +300,14 @@ def test_a_parked_promise_is_withdrawn_when_its_request_finishes():
         drop=lambda req_id: None,
     )
     c._request_finished(SimpleNamespace(request_id="7"))
-    out = c._check_promised_loads(SimpleNamespace(requests=[]))
+    out = c._settle_promised_loads(SimpleNamespace(requests=[]))
     assert out == [("7", [102, 103, 104, 105])] and c._promised_loads == {}
 
 
 def test_a_load_declined_at_dispatch_is_withdrawn_that_step():
     """No later step dispatches it, so the parked request is released now."""
     c = _promising_connector(True, declined={"7"})
-    out = c._check_promised_loads(SimpleNamespace(requests=[]))
+    out = c._settle_promised_loads(SimpleNamespace(requests=[]))
     assert out == [("7", [102, 103, 104, 105])] and c._promised_loads == {}
 
 
@@ -331,6 +359,36 @@ def test_a_detached_lookup_is_sent_once_vllm_has_allocated():
     c.update_state_after_alloc(request, ([1, 2],), 0)
     c._scheduler.detach_lookup.assert_called_once()
     assert c._detach_after_alloc == {}
+
+
+def test_an_admission_that_failed_allocation_does_not_keep_its_detach():
+    """Asked again, the request's old frontier must not reach the save floor."""
+    c = _lookup_connector(pending=True, detachable=False)
+    c._detach_after_alloc["r"] = 512
+    assert c.get_num_new_matched_tokens(SimpleNamespace(request_id="r"), 0) == (
+        None,
+        False,
+    )
+    assert c._detach_after_alloc == {}
+
+
+def test_the_lookup_depth_is_one_budget_per_scheduling_pass(monkeypatch):
+    """vLLM asks once per waiting request; the depth bounds the whole pass."""
+    monkeypatch.setenv("OFFLOAD_ASYNC_LOOKUP_DEPTH", "2")
+    sent = []
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._scheduler = SimpleNamespace(
+        prefetch_lookups=lambda seqs: sent.extend(s.id for s in seqs),
+        lookup_pending=lambda seq: seq.id in sent,
+    )
+    seqs = [SimpleNamespace(id=str(i)) for i in range(4)]
+    # All four are passed over this pass; only two were sent.
+    assert all(c._lookup_in_flight(seq) for seq in seqs)
+    assert sent == ["0", "1"]
+    # One in flight is not sent again and spends nothing.
+    c._lookups_sent_this_step = 0
+    assert c._lookup_in_flight(seqs[0]) and sent == ["0", "1"]
+    assert c._lookup_in_flight(seqs[2]) and sent == ["0", "1", "2"]
 
 
 def test_a_multi_group_failure_travels_by_request_and_stays_received():
@@ -536,6 +594,35 @@ def test_a_mid_prompt_request_entering_another_requests_slot_is_restored():
     assert cache.cursor[0, 0].item() == -1
 
 
+def test_a_host_resident_group_is_refused_not_skipped():
+    """Skipped, its layers would have no cache tensor and nothing saying so."""
+    from atom.plugin.vllm.spec_decode_patch import _v41_overlay_split
+
+    group = SimpleNamespace(host_resident=True, layer_names=["model.layers.0.attn"])
+    with pytest.raises(NotImplementedError, match="host-resident"):
+        _v41_overlay_split([group])
+
+
+def test_a_returning_request_id_does_not_inherit_its_old_slot():
+    """Ids come back (client reuse, no randomization); the record must not."""
+    import torch
+
+    scope = {"torch": torch, "_V41_SLOT_OWNERS": {}}
+    bridge = "atom/plugin/vllm/deepseek_v41_bridge.py"
+    invalidate = _from_source(bridge, "_v41_invalidate_reowned_slots", scope)
+    forget = _from_source(bridge, "forget_v41_slot_owners", scope)
+    cache = SimpleNamespace(
+        cursor=torch.tensor([[256, 0], [256, 0]]), checkpoint_restore=object()
+    )
+    invalidate(cache, [0, 1], ["a", "b"], [256, 256])
+    cache.cursor[:, 0] = 256
+    forget({"a"})
+    assert scope["_V41_SLOT_OWNERS"] == {1: "b"}
+    # A new "a" mid-prompt in slot 0 is restored, not read as the old tenant.
+    invalidate(cache, [0, 1], ["a", "b"], [256, 256])
+    assert cache.cursor[:, 0].tolist() == [-1, 256]
+
+
 def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
     """The V2 runner commits from `sample_tokens`, after `prepare_attn` has
     returned and the batch getters with it. The keep is still stored, at the
@@ -574,7 +661,9 @@ def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
     monkeypatch.setattr(
         psc,
         "execute_state_checkpoint_stores",
-        lambda _copier, slots, units: stored.append((slots, units)),
+        lambda _copier, slots, units, descriptor_slot=1: stored.append(
+            (slots, units, descriptor_slot)
+        ),
     )
     batch = SimpleNamespace(
         req_ids=["a", "b"], num_computed_tokens_cpu=np.array([250, 1020])
@@ -584,7 +673,8 @@ def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
     # Six rows each (one token plus five drafts); "a" keeps 6, "b" keeps 4,
     # so "a" commits to 256 and "b" to 1024, block columns 0 and 3.
     psc.store_committed_decode_keeps(worker, np.array([0, 2]))
-    assert stored == [([3, 4], [(0,), (3,)])]
+    # On its own descriptor buffer, apart from the step's boundary stores.
+    assert stored == [([3, 4], [(0,), (3,)], 2)]
     assert worker.decode_candidates == {} and worker.decode_rows is None
 
 
@@ -723,7 +813,7 @@ def test_a_withdrawn_promise_names_its_blocks_in_virtual_units():
     """Under DCP one block id covers `kv_cache_block_size * DCP` tokens."""
     c = _promising_connector(True, declined={"7"})
     c._scheduler.virtual_block_size = 32
-    assert c._check_promised_loads(SimpleNamespace(requests=[])) == [("7", [101, 102])]
+    assert c._settle_promised_loads(SimpleNamespace(requests=[])) == [("7", [101, 102])]
 
 
 @pytest.mark.parametrize(

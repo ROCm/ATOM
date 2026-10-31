@@ -287,7 +287,19 @@ def _refuse_v41_kv_transfer(vllm_config) -> None:
     if not connector:
         return
     if _v41_state_tier_configured(vllm_config):
-        return
+        if _v41_state_checkpoints_configured(vllm_config):
+            return
+        # The connector's state rides the checkpoints, which are live only
+        # with the switch and prefix caching. Without either it would start,
+        # store nothing, and stop the engine on its first tier hit.
+        msg = (
+            "DeepSeek-V4.1 on the vLLM plugin runs AtomLMCacheOffloadConnector "
+            "only with its state checkpoints live: set "
+            "ATOM_V41_STATE_CHECKPOINTS=1, --enable-prefix-caching and "
+            "--mamba-cache-mode align, or run without --kv-transfer-config."
+        )
+        logger.error(msg)
+        raise ValueError(msg)
     msg = (
         f"DeepSeek-V4.1 on the vLLM plugin supports KV transfer only through "
         f"AtomLMCacheOffloadConnector, not {connector}: a request's window "

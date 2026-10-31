@@ -410,7 +410,15 @@ def _v41_overlay_split(kv_cache_groups):
     slice_pairs: list[tuple[str, object]] = []
     for group in kv_cache_groups:
         if getattr(group, "host_resident", False):
-            continue
+            # A HiSparse host pool is sized and backed by vLLM apart from the
+            # device pool this builder lays out, and nothing here would give
+            # its layers a tensor. Refused rather than skipped, which would
+            # leave those layers without a cache and nothing saying so.
+            raise NotImplementedError(
+                "ATOM's heterogeneous KV cache builder does not lay out "
+                "host-resident (HiSparse) groups; got layers "
+                f"{list(getattr(group, 'layer_names', ()))[:4]}"
+            )
         for layer_name, layer_spec in _iter_group_layer_specs(group):
             if layer_name.endswith(
                 ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME

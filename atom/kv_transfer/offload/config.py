@@ -191,6 +191,14 @@ def select_offload_layout(config) -> str:
             f"Drop the override, set it to {natural!r}, or disable offload for "
             "this model."
         )
+    # The reverse for the one layout this alias table gained for a single
+    # family: `dsv41` names DeepSeek-V4.1's PAGE+STATE pool, and any other
+    # model would run the dense codec under its namespace with collapse off.
+    if mapped == "dsv41" and natural != "dsv41":
+        raise ValueError(
+            f"lmcache_offload: offload_layout={override!r} is DeepSeek-V4.1's "
+            f"layout; this model resolves to {natural!r}. Drop the override."
+        )
     return mapped
 
 

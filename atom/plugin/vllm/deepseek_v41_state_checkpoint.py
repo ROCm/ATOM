@@ -209,6 +209,9 @@ class _PluginV41StateCopier:
         # cache, which is the cross-check this adapter relies on instead of
         # re-deriving the geometry.
         self._copies = StateCopies(cache, spec, max_batch)
+        # The store buffers too (`execute_state_checkpoint_stores`): a first
+        # use allocates pinned memory, which synchronizes.
+        self._copies.staging.reserve([1, 2])
         self.checkpoint_spec = spec
 
     def execute_paged_state_copies(self, stores, restores, descriptor_slot: int = 0):
@@ -579,6 +582,11 @@ def install_v41_runner_state_events() -> int:
             if gone:
                 for allocator in PSI._slot_allocators:
                     allocator.release(gone)
+                from atom.plugin.vllm.deepseek_v41_bridge import (
+                    forget_v41_slot_owners,
+                )
+
+                forget_v41_slot_owners(gone)
             PSI._event_counts["finished"] += len(finished)
             PSI._event_counts["preempted"] += len(preempted)
             PSI._event_counts["resumed"] += len(resumed)

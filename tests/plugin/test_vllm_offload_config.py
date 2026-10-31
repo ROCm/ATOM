@@ -142,3 +142,36 @@ def test_per_process_speculative_fields_stay_out_of_the_page_namespace():
         return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
 
     assert namespace(0, False) == namespace(3, True)
+
+
+def _v41_vllm_config(cache_dtype="nvfp4", **kw):
+    cfg = _vllm_config(cache_dtype=cache_dtype, **kw)
+    cfg.model_config.hf_config = NS(
+        num_hidden_layers=43,
+        model_type="deepseek_v41",
+        architectures=["DeepseekV41ForCausalLM"],
+    )
+    return cfg
+
+
+@pytest.mark.parametrize("raw, expected", [("nvfp4", "fp4"), ("auto", "bf16")])
+def test_v41_names_its_pool_dtype_as_the_bridge_sizes_it(raw, expected):
+    """`nvfp4` is ATOM's packed fp4 pool, which the generic map refuses."""
+    assert build_offload_config(_v41_vllm_config(raw)).kv_cache_dtype == expected
+
+
+@pytest.mark.parametrize(
+    "given, resolved", [(None, True), ("auto", True), (False, False)]
+)
+def test_v41_resolves_auto_collapse_itself(given, resolved):
+    """The shared `auto` rule reads fields V4.1's pool does not describe."""
+    extra = {} if given is None else {"lmcache.mp.tp_rank_collapse": given}
+    cfg = build_offload_config(_v41_vllm_config(extra=extra))
+    assert cfg.kv_transfer_config["lmcache.mp.tp_rank_collapse"] is resolved
+    nested = cfg.kv_transfer_config["kv_connector_extra_config"]
+    assert nested["lmcache.mp.tp_rank_collapse"] is resolved
+
+
+def test_other_models_keep_auto_collapse_for_the_shared_rule():
+    cfg = build_offload_config(_vllm_config(extra={}))
+    assert "lmcache.mp.tp_rank_collapse" not in cfg.kv_transfer_config

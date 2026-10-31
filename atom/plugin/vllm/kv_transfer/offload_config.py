@@ -151,12 +151,32 @@ class OffloadConfigShim:
                 "the codec addresses KV by block and cannot proceed without it"
             )
         self.kv_cache_block_size = int(block_size)
-        self.kv_cache_dtype = _atom_kv_dtype(cache_config, model_config)
+        from atom.plugin.vllm.deepseek_v41_bridge import (
+            is_deepseek_v41_vllm_config,
+            v41_kv_cache_dtype,
+        )
+
+        is_v41 = is_deepseek_v41_vllm_config(vllm_config)
+        if is_v41:
+            # V4.1's pool is bf16 or ATOM's packed fp4 (`--kv-cache-dtype
+            # nvfp4`), named the way the bridge sizes it; V4.1 offloads over MP
+            # only, so no in-process codec sizes segments from this.
+            self.kv_cache_dtype = v41_kv_cache_dtype(vllm_config)
+        else:
+            self.kv_cache_dtype = _atom_kv_dtype(cache_config, model_config)
 
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         role = getattr(kv_transfer_config, "kv_role", None) or "kv_both"
         extra = getattr(kv_transfer_config, "kv_connector_extra_config", None)
         extra = dict(extra) if isinstance(extra, dict) else {}
+        collapse = extra.get("lmcache.mp.tp_rank_collapse", "auto")
+        if is_v41 and isinstance(collapse, str) and collapse.strip().lower() == "auto":
+            # Resolved here rather than by the shared `auto` rule, which reads
+            # `kv_lora_rank` and the state-owning layouts: V4.1's pool geometry
+            # never asks for the TP width, so every rank holds the same PAGE and
+            # checkpoint bytes, and the connector declares that factor
+            # (`_page_tp_replication_factor`) for the worker to check.
+            extra["lmcache.mp.tp_rank_collapse"] = True
         # Published in BOTH spellings on purpose. ATOM's offload readers
         # disagree about where the option bag lives, and the disagreement is
         # silent in one direction: ``offload/config.py`` reads

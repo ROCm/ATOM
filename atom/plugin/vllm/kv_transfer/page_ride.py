@@ -165,7 +165,7 @@ class PageRideMixin:
             # source -- blocks committed under this hash, possibly another
             # request's -- so it is never a load's destination. None makes the
             # scheduler decline the load, and the connector withdraws the
-            # promise through `_check_promised_loads`.
+            # promise through `_settle_promised_loads`.
             by_boundary = self._ride_boundaries.get(str(req_id))
             block_ids = None if by_boundary is None else by_boundary.get(end)
         else:

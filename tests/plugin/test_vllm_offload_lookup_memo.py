@@ -85,14 +85,14 @@ def _end_of_step(adapter):
     result that was always there.
 
     The adapter's own `build_connector_meta` wraps the inner one and feeds the
-    result to `_check_promised_loads`; that watchdog is the only thing that ages
+    result to `_settle_promised_loads`; that watchdog is the only thing that ages
     `_promised_loads`, so a step that skips it cannot tell a promise held for
     one step from one held forever. Calling the inner build plus the watchdog
     reproduces that pair without standing up a whole `scheduler_output`.
     """
 
     inner = adapter._scheduler.build_connector_meta()
-    adapter._check_promised_loads(inner)
+    adapter._settle_promised_loads(inner)
 
 
 def test_a_declined_request_stuck_in_waiting_is_looked_up_twice_in_64_steps():
