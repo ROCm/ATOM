@@ -95,9 +95,17 @@ def moe_narrow_defs(k4ctx):
                 specs = []
                 for c in range_constexpr((N_ROUTER * tokens + WAVE - 1) // WAVE):
                     ix = lane + WAVE * c
-                    gate_tok = fx.min(ix // N_ROUTER, tokens - 1) if tok is None else tok
+                    gate_tok = (
+                        fx.min(ix // N_ROUTER, tokens - 1) if tok is None else tok
+                    )
                     specs.append(
-                        (mr("xn8"), gate_tok * XN8_WORDS + (ix % N_ROUTER + 1) * (XN_SLICE // 4) - 1, 1)
+                        (
+                            mr("xn8"),
+                            gate_tok * XN8_WORDS
+                            + (ix % N_ROUTER + 1) * (XN_SLICE // 4)
+                            - 1,
+                            1,
+                        )
                     )
                 mb_poll(specs)
             gpu.barrier()
@@ -135,8 +143,16 @@ def moe_narrow_defs(k4ctx):
             if (bid == BASE["down"]) & (tid < MOE_SLOTS * tokens):
                 sk = tid // MOE_SLOTS
                 sj = tid % MOE_SLOTS
-                mb_put(mr("sel"), sk * 2 * MOE_SLOTS + sj, fx.ptr_load(route + (8 * sk + sj)))
-                mb_put(mr("sel"), sk * 2 * MOE_SLOTS + MOE_SLOTS + sj, fx.ptr_load(rwt + (8 * sk + sj)))
+                mb_put(
+                    mr("sel"),
+                    sk * 2 * MOE_SLOTS + sj,
+                    fx.ptr_load(route + (8 * sk + sj)),
+                )
+                mb_put(
+                    mr("sel"),
+                    sk * 2 * MOE_SLOTS + MOE_SLOTS + sj,
+                    fx.ptr_load(rwt + (8 * sk + sj)),
+                )
             cur = ug_load(ug_task_id(0)[0])
             stamp(7)
             if const_expr(sh_late):  # noqa: SIM102
@@ -168,7 +184,12 @@ def moe_narrow_defs(k4ctx):
         def stage_mids(k):
             mids = mb_poll(
                 [
-                    (mr("mid"), k * MOE_SLOTS * INTER + fx.min(tid * 2 + i * 2 * THREADS, MOE_SLOTS * INTER - 2), 2)
+                    (
+                        mr("mid"),
+                        k * MOE_SLOTS * INTER
+                        + fx.min(tid * 2 + i * 2 * THREADS, MOE_SLOTS * INTER - 2),
+                        2,
+                    )
                     for i in range(4)
                 ]
             )
@@ -176,7 +197,10 @@ def moe_narrow_defs(k4ctx):
                 e = tid * 2 + i * 2 * THREADS
                 if e < MOE_SLOTS * INTER:
                     fx.ptr_store(
-                        bf16_pair(mids[i][0].bitcast(fx.Float32), mids[i][1].bitcast(fx.Float32)),
+                        bf16_pair(
+                            mids[i][0].bitcast(fx.Float32),
+                            mids[i][1].bitcast(fx.Float32),
+                        ),
                         xs + (k * (MOE_SLOTS * INTER // 2) + e // 2),
                     )
 
@@ -186,12 +210,18 @@ def moe_narrow_defs(k4ctx):
         gpu.barrier()
         for k in range_constexpr(tokens):
             if tid < MID8_WORDS // 2:  # 8 elements a lane, 4 lanes a 32-block
-                w = fx.Vector(fx.ptr_load(xs + (k * MID16_WORDS + tid * 4), result_type=v4i))
+                w = fx.Vector(
+                    fx.ptr_load(xs + (k * MID16_WORDS + tid * 4), result_type=v4i)
+                )
                 f = [v for j in range(4) for v in bf2_f32(w[j])]
                 sc, inv = mx8_scale(f, (1, 2))
                 qv = [mx8_q(v, inv) for v in f]
-                fx.ptr_store(fp8_pack4(*qv[:4]), xs + (MID8_LDS + k * MID8_WORDS + tid * 2))
-                fx.ptr_store(fp8_pack4(*qv[4:]), xs + (MID8_LDS + k * MID8_WORDS + tid * 2 + 1))
+                fx.ptr_store(
+                    fp8_pack4(*qv[:4]), xs + (MID8_LDS + k * MID8_WORDS + tid * 2)
+                )
+                fx.ptr_store(
+                    fp8_pack4(*qv[4:]), xs + (MID8_LDS + k * MID8_WORDS + tid * 2 + 1)
+                )
                 if tid % 4 == 0:
                     fx.ptr_store(sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4))
         gpu.barrier()
@@ -207,7 +237,9 @@ def moe_narrow_defs(k4ctx):
                 sc,
                 lds_scale4(MIDSC_LDS + col_tok * MIDSC_WORDS + off // 32),
             )
-            sh = fx.Vector.from_elements([sh[j] + cu[j] * wgt for j in range(8)], fx.Float32)
+            sh = fx.Vector.from_elements(
+                [sh[j] + cu[j] * wgt for j in range(8)], fx.Float32
+            )
         fx.ptr_store(sh, opart + (wave * WAVE + lane) * 8)
         for k in range_constexpr(tokens):
             if const_expr(k + 2 < tokens):
@@ -233,7 +265,9 @@ def moe_narrow_defs(k4ctx):
             grp = (tid % DN_ROWS) // 16
             rr = tid % 16
             waves = [grp * DN_GW + w for w in range(DN_GW)]
-            tot = acc_row_sum(opart + (k + 1) * ACC_WORDS, rr, 0, waves) + acc_row_sum(opart, rr, k, waves)
+            tot = acc_row_sum(opart + (k + 1) * ACC_WORDS, rr, 0, waves) + acc_row_sum(
+                opart, rr, k, waves
+            )
             fx.ptr_store(bf16_round(tot), misc + tid)
         gpu.barrier()
         ffn_finish(t)
