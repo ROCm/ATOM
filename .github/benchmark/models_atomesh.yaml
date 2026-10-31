@@ -2196,8 +2196,9 @@ models:
         # commit instead of the ATOMesh runtime patch.
         - <<: *m31_vllm_pd
           name: m31-vllm-1p1d-tp4-mcstore-srcport-smoke-c32
+          # g15: rdma7 refuses ibv_create_cq (ENODEV), Decode TP3 cannot start (jobs 11374, 11379).
           runner: &m31_vllm_srcport_runner
-            exclude_nodes: pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g23,pit2-p03-g25,pit2-p03-g40,pit2-p03-g42,pit2-p03-g53
+            exclude_nodes: pit2-p03-g09,pit2-p03-g10,pit2-p03-g12,pit2-p03-g15,pit2-p03-g23,pit2-p03-g25,pit2-p03-g40,pit2-p03-g42,pit2-p03-g53
           concurrency: [32]
           env:
             common: &m31_vllm_srcport_env
