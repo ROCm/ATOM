@@ -454,11 +454,12 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
 
     if is_deepseek_v41_vllm_config(config):
         kv_cache_dtype = v41_kv_cache_dtype(config)
-        # V4.1's transport is gated against vLLM's connector names by
-        # `enforce_deepseek_v41_constraints` and driven by vLLM, which hands
-        # AtomLMCacheOffloadConnector its own view of the config. The model's
-        # validator only knows ATOM's connector registry, where every vLLM name
-        # is unknown, so it is not given one.
+        # A naming boundary, not a workaround. V4.1's transport is a vLLM
+        # connector, gated by vLLM name in `enforce_deepseek_v41_constraints`
+        # and handed its own view of the config by vLLM. The model's validator
+        # resolves names through ATOM's connector registry, where every vLLM
+        # name is unknown, and `atom/models` carries no vLLM knowledge, so it
+        # is not given one.
         kv_transfer_config = {}
 
     return Config(
