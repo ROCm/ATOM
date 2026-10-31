@@ -11,8 +11,6 @@ history mismatch reconstructs from the scheduler rather than reusing stale state
 
 from functools import lru_cache
 
-import torch
-
 
 def structured_stop_token_ids(config, tokenizer):
     stops = list(getattr(config, "stop_token_ids", None) or [])
@@ -90,8 +88,14 @@ class StructuredOutput:
         bonus = metadata.bonus_logits_indices.tolist() if metadata else []
         lengths = metadata.num_draft_tokens_np.tolist() if metadata else []
         input_ids = metadata.input_ids.tolist() if metadata else []
+        if getattr(self, "mask_buffer", None) is None:
+            from .structured_output_mask import StructuredOutputMask
+
+            self.mask_buffer = StructuredOutputMask(self.vocab_size)
+        mask_count = len(target) + len(bonus) if metadata else len(requests)
+        masks = self.mask_buffer.prepare(mask_count, logits.device)
         prefixes = {}
-        rows, masks = [], []
+        rows = []
         for i, (schema, marker, committed) in requests.items():
             if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
                 continue
@@ -128,7 +132,7 @@ class StructuredOutput:
             branch = list(history)
             unreachable = False
             for pos, row in enumerate(branch_rows):
-                mask = self.xgr.allocate_token_bitmask(1, self.vocab_size)
+                mask = masks[len(rows) : len(rows) + 1]
                 if active and matcher.is_terminated():
                     # Deferred delivery may leave a final forward in flight
                     # after EOS, before the scheduler retires this request.
@@ -152,7 +156,6 @@ class StructuredOutput:
                                 value if value < 2**31 else value - 2**32
                             )
                 rows.append(row)
-                masks.append(mask)
                 if metadata and pos < len(branch_rows) - 1:
                     draft = input_ids[row + 1]
                     if active and not unreachable and not matcher.accept_token(draft):
@@ -166,13 +169,7 @@ class StructuredOutput:
                         ):
                             active = True
         if rows:
-            bits = torch.cat(masks).to(logits.device)
-            tokens = torch.arange(self.vocab_size, device=logits.device)
-            allowed = ((bits[:, tokens // 32] >> (tokens % 32)) & 1).bool()
-            indexes = torch.tensor(rows, device=logits.device)
-            selected = logits[indexes]
-            selected.masked_fill_(~allowed, float("-inf"))
-            logits[indexes] = selected
+            self.mask_buffer.apply(logits, rows)
         return prefixes
 
     def commit(self, sampled, batch, prefixes):

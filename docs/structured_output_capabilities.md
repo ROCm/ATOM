@@ -86,6 +86,17 @@ from the preceding batch reconstruct from the scheduler's authoritative history.
 An ordinary batch skips grammar processing and releases any prior states once;
 it does not allocate masks or add CPU/GPU synchronization for this feature.
 
+Constrained requests fill reusable CPU bitmask rows directly through llguidance.
+On GPU, a Triton kernel reads packed 32-bit words and writes negative infinity
+only to forbidden logits in the selected target/bonus rows. It does not expand
+a vocabulary-sized Boolean tensor or gather and scatter complete logit rows.
+CPU execution retains a reference implementation. Pinned host and device mask
+buffers grow on demand and are reused; events protect host writes from an
+unfinished copy and device reuse from an unfinished kernel, including when the
+runner changes streams. No buffers or kernel imports are needed for a request
+batch without constraints. Speculative matcher cloning and committed-state
+semantics are unchanged by this mask optimization.
+
 Enabled requests still copy masks and committed tokens between CPU and GPU and
 perform host grammar work. There is no zero-overhead claim. Performance results
 must distinguish enabled-request overhead from disabled-request regression and
