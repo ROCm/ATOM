@@ -47,6 +47,17 @@ logger = logging.getLogger("atom")
 # ---------------------------------------------------------------------------
 
 
+def native_checkpoint_defaults() -> tuple[int, bool]:
+    """ATOM's own defaults for the checkpoint interval and on-demand stores."""
+    from atom.config import Config
+
+    fields = Config.__dataclass_fields__
+    return (
+        int(fields["state_checkpoint_interval_tokens"].default),
+        bool(fields["state_checkpoint_demand"].default),
+    )
+
+
 class PagedStateCheckpointAdapter:
     """One model family's side of the state checkpoint path.
 
@@ -92,7 +103,7 @@ class PagedStateCheckpointAdapter:
 
     def checkpoint_defaults(self) -> tuple[int, bool]:
         """Native (state_checkpoint_interval_tokens, state_checkpoint_demand)."""
-        raise NotImplementedError
+        return native_checkpoint_defaults()
 
     def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         """Whether the configured speculative drafter keeps all of its state in
@@ -611,16 +622,27 @@ def store_counts() -> dict:
 
 
 def register_slot_allocator(allocator) -> None:
-    """``allocator.release(req_ids)`` gets vLLM's finished / preempted / resumed ids."""
+    """``allocator.release(req_ids)`` gets vLLM's finished / preempted / resumed ids.
+
+    Anything that keys per-slot records by request id registers here, so the
+    records go when the request does.
+    """
     if not any(a is allocator for a in _slot_allocators):
         _slot_allocators.append(allocator)
 
 
-def _apply_runner_patches() -> bool:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+def patch_runner_update_states(cls) -> bool:
+    """Carry each step's checkpoint plan and request events into `cls`'s runner.
 
-    original_update = GPUModelRunner._update_states
-    if getattr(original_update, "_atom_state_checkpoint_patched", False):
+    Wraps its per-step request update: `_update_states` on V1's
+    `GPUModelRunner`, `update_requests` on V2's. False if `cls` has neither or
+    is already wrapped.
+    """
+    name = "_update_states" if hasattr(cls, "_update_states") else "update_requests"
+    original_update = getattr(cls, name, None)
+    if original_update is None or getattr(
+        original_update, "_atom_state_checkpoint_patched", False
+    ):
         return False
 
     @functools.wraps(original_update)
@@ -654,7 +676,15 @@ def _apply_runner_patches() -> bool:
         return original_update(self, scheduler_output, *args, **kwargs)
 
     wrapped_update_states._atom_state_checkpoint_patched = True
-    GPUModelRunner._update_states = wrapped_update_states
+    setattr(cls, name, wrapped_update_states)
+    return True
+
+
+def _apply_runner_patches() -> bool:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    if not patch_runner_update_states(GPUModelRunner):
+        return False
 
     original_init_kv = GPUModelRunner.initialize_kv_cache
 

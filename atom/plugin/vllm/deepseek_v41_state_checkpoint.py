@@ -50,6 +50,7 @@ from atom.plugin.vllm.paged_state_checkpoint import (
     PagedStateCheckpointBackend,
     PagedStateCheckpointLayer,
     install,
+    native_checkpoint_defaults,
     register_state_checkpoint_adapter,
     register_state_checkpoint_layers,
     state_checkpoints_on,
@@ -291,16 +292,6 @@ def register_deepseek_v41_state_checkpoint_layers(vllm_config) -> list[str]:
     )
 
 
-def _native_checkpoint_defaults() -> tuple[int, bool]:
-    from atom.config import Config
-
-    fields = Config.__dataclass_fields__
-    return (
-        int(fields["state_checkpoint_interval_tokens"].default),
-        bool(fields["state_checkpoint_demand"].default),
-    )
-
-
 @dataclass(frozen=True)
 class V41CheckpointPlacement(StateCheckpointPlacement):
     """Native placement at V4.1's 256-token block."""
@@ -312,7 +303,7 @@ class V41CheckpointPlacement(StateCheckpointPlacement):
         cls, defaults=None, block: int | None = None
     ) -> V41CheckpointPlacement:
         return super().from_env(
-            defaults or _native_checkpoint_defaults(), block or _block_size()
+            defaults or native_checkpoint_defaults(), block or _block_size()
         )
 
 
@@ -391,9 +382,6 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
     def state_checkpoint_layer_names(self, k: int) -> list[str]:
         return deepseek_v41_state_checkpoint_layer_names(k)
 
-    def checkpoint_defaults(self) -> tuple[int, bool]:
-        return _native_checkpoint_defaults()
-
     def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         return v41_drafter_in_target_slot(vllm_config)
 
@@ -464,9 +452,8 @@ def current_state_checkpoint_worker(adapter=None):
     """This process's `StateCheckpointWorker` for V4.1, or None before the pool binds.
 
     `paged_state_checkpoint` keeps the workers in a private dict keyed by adapter
-    name and only exposes a setter (`register_state_checkpoint_worker`). Reading it back
-    belongs here rather than in the vendored file, which stays byte-identical
-    to #2502 so it can be deleted when that lands.
+    name and only exposes a setter (`register_state_checkpoint_worker`); the
+    V4.1 reader lives with the V4.1 adapter.
     """
     from atom.plugin.vllm.paged_state_checkpoint import _workers
 
@@ -501,9 +488,8 @@ def install_v41_group_check_scope() -> bool:
     supported (`state_checkpoint_drafters`), so checkpoints and speculative decoding could
     never run together.
 
-    Done by wrapping the module attribute, so the vendored file stays
-    byte-identical; the check itself is unchanged and still runs over the
-    proxy and all k checkpoint groups. Upstream fix: have `check_state_checkpoint_groups`
+    Done by wrapping the module attribute; the check itself is unchanged and
+    still runs over the proxy and all k checkpoint groups. Upstream fix: have `check_state_checkpoint_groups`
     skip groups that hold neither the proxy nor a checkpoint layer.
     """
     import functools
@@ -545,73 +531,24 @@ def install_v41_runner_state_events() -> int:
     """Carry the scheduler's per-step checkpoint plan into whichever runner runs.
 
     Third site with the same gap as `install_v41_store_sites` and
-    `install_v41_state_checkpoint_group_ids`: the vendored `_apply_runner_patches` wraps
+    `install_v41_state_checkpoint_group_ids`: `_apply_runner_patches` wraps
     `_update_states` on the V1 `GPUModelRunner` only, so on V4.1's V2 runner
     `_store_plan` stayed empty -- the scheduler planned a checkpoint at the
     anchor, the worker was never told, and the next request's hit landed on a
-    boundary nothing had written (`needs state at N, found 1`).
+    boundary nothing had written (`needs state at N, found 1`). The same
+    wrapper goes on every runner class here.
 
-    The body mirrors the vendored wrapper and shares its module-level state,
-    so both agree if a runner ends up with either one. Upstream fix: let
-    `_apply_runner_patches` take the runner class, as `install_store_sites`
-    already does.
+    The bridge's slot-owner records are released with the slots, so a
+    request id that comes back does not inherit its old slot.
     """
-    import functools
-
     from atom.plugin.vllm import paged_state_checkpoint as PSI
+    from atom.plugin.vllm.deepseek_v41_bridge import V41_SLOT_OWNER_RECORDS
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
-    patched = 0
-    for cls in gpu_model_runner_classes():
-        name = "_update_states" if hasattr(cls, "_update_states") else "update_requests"
-        original = getattr(cls, name, None)
-        if original is None:
-            continue
-        if getattr(original, "_atom_state_checkpoint_patched", False) or getattr(
-            original, "_atom_v41_state_events", False
-        ):
-            continue
-
-        @functools.wraps(original)
-        def _update_states(self, scheduler_output, *args, _orig=original, **kwargs):
-            finished = getattr(scheduler_output, "finished_req_ids", None) or ()
-            preempted = getattr(scheduler_output, "preempted_req_ids", None) or ()
-            cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
-            resumed = getattr(cached, "resumed_req_ids", None) or ()
-            gone = set(finished) | set(preempted) | set(resumed)
-            if gone:
-                for allocator in PSI._slot_allocators:
-                    allocator.release(gone)
-                from atom.plugin.vllm.deepseek_v41_bridge import (
-                    forget_v41_slot_owners,
-                )
-
-                forget_v41_slot_owners(gone)
-            PSI._event_counts["finished"] += len(finished)
-            PSI._event_counts["preempted"] += len(preempted)
-            PSI._event_counts["resumed"] += len(resumed)
-            _plan = getattr(scheduler_output, "atom_state_checkpoint_stores", None)
-            PSI._store_plan.clear()
-            PSI._store_plan.update(_plan or {})
-            PSI._decode_plan.clear()
-            PSI._decode_plan.update(
-                getattr(
-                    scheduler_output, "atom_state_checkpoint_decode_candidates", None
-                )
-                or {}
-            )
-            copies = getattr(scheduler_output, "kv_cache_block_copies", None)
-            if copies and PSI._config_has_proxy(getattr(self, "kv_cache_config", None)):
-                raise RuntimeError(
-                    "vLLM scheduled whole-block copies on an ATOM proxy pool; its "
-                    "view of a block is not ATOM's carve, so they would corrupt it"
-                )
-            return _orig(self, scheduler_output, *args, **kwargs)
-
-        _update_states._atom_v41_state_events = True
-        setattr(cls, name, _update_states)
-        patched += 1
-    return patched
+    PSI.register_slot_allocator(V41_SLOT_OWNER_RECORDS)
+    return sum(
+        PSI.patch_runner_update_states(cls) for cls in gpu_model_runner_classes()
+    )
 
 
 def install_v41_state_checkpoint_group_ids() -> int:

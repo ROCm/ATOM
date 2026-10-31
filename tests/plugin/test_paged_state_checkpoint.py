@@ -137,6 +137,8 @@ def test_generic_layer_imports_no_model_code():
             "vllm",
             "torch",
             "numpy",
+            # ATOM's own checkpoint defaults (`native_checkpoint_defaults`).
+            "atom.config",
             "atom.model_engine.page_unit_checkpoint",
             "atom.plugin.vllm.paged_state_checkpoint",
             "atom.plugin.vllm.req_id_passthrough_patch",
@@ -711,3 +713,32 @@ def test_decode_keeps_take_the_callers_exact_starts(monkeypatch):
         starts=np.array([9, 300]),
     )
     assert seen == {"keep": [9, 300], "candidates": [9, 300]}
+
+
+def test_the_request_update_wrapper_takes_any_runner_class():
+    """V2's runner names it `update_requests`; one wrapper serves both."""
+
+    class _V2Runner:
+        kv_cache_config = None
+
+        def update_requests(self, scheduler_output):
+            return "updated"
+
+    released = []
+    records = NS(release=released.append)
+    G.register_slot_allocator(records)
+    try:
+        assert G.patch_runner_update_states(_V2Runner)
+        assert not G.patch_runner_update_states(_V2Runner)
+        out = NS(
+            finished_req_ids={"a"},
+            preempted_req_ids=set(),
+            scheduled_cached_reqs=NS(resumed_req_ids=()),
+            atom_state_checkpoint_stores={"b": 3},
+        )
+        assert _V2Runner().update_requests(out) == "updated"
+        assert released == [{"a"}]
+        assert G.current_state_checkpoint_store_plan() == {"b": 3}
+    finally:
+        G._slot_allocators.remove(records)
+        G._store_plan.clear()

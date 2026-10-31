@@ -1432,6 +1432,10 @@ def forget_v41_slot_owners(req_ids) -> None:
         del _V41_SLOT_OWNERS[slot]
 
 
+#: Released with the slots (`paged_state_checkpoint.register_slot_allocator`).
+V41_SLOT_OWNER_RECORDS = SimpleNamespace(release=forget_v41_slot_owners)
+
+
 def _v41_invalidate_reowned_slots(cache, slots, req_ids, num_computed) -> None:
     """Force a restore for a request entering a slot another request last held.
 
