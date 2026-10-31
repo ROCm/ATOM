@@ -23,7 +23,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "[host-memory] sync and drop_caches=3 before service startup (timeout=${cleanup_timeout}s)"
+echo "[host-memory] sync, drop_caches=3 and compact_memory before service startup (timeout=${cleanup_timeout}s)"
 # The Spur service runs as the Slurm uid. Use a short root helper for this
 # host sysctl; no model/log mounts or network access are needed.
 if timeout --kill-after=10s "${cleanup_timeout}s" \
@@ -37,10 +37,22 @@ if timeout --kill-after=10s "${cleanup_timeout}s" \
           awk "/ (MemTotal|MemFree|FilePages|SReclaimable|Shmem):/" "${info}"
         done
       }
+      # Free memory in blocks of 2 MiB or more, per NUMA node: what THP
+      # faults (the Store owners) can take without compacting.
+      huge_free() {
+        awk "/Normal/ { s = 0; for (i = 14; i <= NF; i++) s += \$i * 2 ^ (i - 5);
+          printf \"[host-memory] %s node %s: %.0f GiB free in >= 2 MiB blocks\\n\", \"$1\", substr(\$2, 1, length(\$2) - 1), s * 4 / 1048576 }" \
+          /proc/buddyinfo
+      }
       snapshot before
+      huge_free before
       sync
       echo 3 > /proc/sys/vm/drop_caches
+      # Store owners fault their segments in as THP: compact once here, as
+      # root, instead of leaving it to their slower fault-driven compaction.
+      echo 1 > /proc/sys/vm/compact_memory
       snapshot after
+      huge_free after
     '; then
   echo "[host-memory] cache cleanup completed"
 else

@@ -2619,3 +2619,100 @@ models:
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
             decode: *m31_flash_pp4_direct_decode_env
+      # AgentX on one node: CPP4 prefill (TP1 x PP4, GPUs 0-3) -> TP4 decode
+      # (GPUs 4-7) at C80-C140, the stack's MXFP4 KV/index and real DSpark7
+      # draft with InferenceX's golden AL for K=7 (4.04, performance only).
+      # The prefix tier is a Mooncake Store on both NUMA nodes' DRAM: two
+      # single-NIC owners per node (an owner above 832 GiB may not register on
+      # an ionic NIC), 2 TiB in all. The image
+      # rocm/atom-dev:m31-mxfp4-stack-20261031 bakes AITER 1053d8d18 and
+      # FlyDSL 0.4.0, so the job-local AITER install is off. Needs a node whose
+      # docker allows a privileged helper (ATOMESH_DROP_HOST_CACHES).
+      mooncake_store:
+        - &m31_stack_cpp4_agentx
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-c80
+          topology: 1p1d
+          display_topology: 1P1D-CPP4-TP4-DSPARK7-MXFP4-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [80]
+          prefill: *m31_flash_pp4_prefill
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160]"
+          server:
+            common_args:
+              # AgentX warmup primers replay contexts up to ~1M tokens.
+              max_model_len: 1048576
+              # Recipe rule: max-num-seqs = 2 x concurrency on both roles.
+              max_num_seqs: 160
+              spec_decode_acceptance_length: 4.04
+          env:
+            common: &m31_stack_cpp4_agentx_common_env
+              ATOMESH_M31_AITER_REF: ""
+              PYTHONNOUSERSITE: "1"
+              PYTHONHASHSEED: "0"
+              ATOMESH_TORCH_PROFILE_DURATION: "0"
+              ATOMESH_DROP_HOST_CACHES: "1"
+            prefill: &m31_stack_cpp4_agentx_prefill_env
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+              MOONCAKE_STORE: "1"
+              MOONCAKE_STORE_OWNERS: "0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              MOONCAKE_STORE_COMPACT_TIMEOUT: "1800"
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_MIN_LOAD_TOKENS: "0"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":false}
+            decode: *m31_flash_mcstore_decode_env
+          benchmark:
+            kind: aiperf_agentic
+            agentx_harness_version: "1.0.12"
+            agentx_recipe_defaults: true
+            scenario: agentx
+            max_context_length: 1048576
+            public_dataset: semianalysis_cc_traces_weka_062126
+            benchmark_duration: 3600
+            http_tcp_user_timeout: 900000
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          run_eval: false
+        - <<: *m31_stack_cpp4_agentx
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-c100
+          concurrency: [100]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,200]"
+          server:
+            common_args:
+              max_model_len: 1048576
+              max_num_seqs: 200
+              spec_decode_acceptance_length: 4.04
+        - <<: *m31_stack_cpp4_agentx
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-c120
+          concurrency: [120]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240]"
+          server:
+            common_args:
+              max_model_len: 1048576
+              max_num_seqs: 240
+              spec_decode_acceptance_length: 4.04
+        - <<: *m31_stack_cpp4_agentx
+          name: m31-stack-mxfp4-1p1d-cpp4-tp4-dspark7-mcstore-agentx-c140
+          concurrency: [140]
+          decode:
+            workers: 1
+            tp: 4
+            cudagraph: "[1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128,144,160,176,192,208,224,240,256,272,280]"
+          server:
+            common_args:
+              max_model_len: 1048576
+              max_num_seqs: 280
+              spec_decode_acceptance_length: 4.04
