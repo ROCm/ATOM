@@ -53,7 +53,6 @@ from atom.plugin.vllm.kv_transfer.kda_state import (
     KdaStateTier,
     build_layout_id,
     find_mamba_groups,
-    step_boundary_offloads,
     summarize_layout_id,
 )
 from atom.plugin.vllm.kv_transfer.kv_cache_layout import (
@@ -318,6 +317,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # -- takes the non-V4.1 path rather than raising AttributeError from a
     # branch that has nothing to do with what is under test.
     _is_deepseek_v41 = False
+    # The same, for the boundary planners: a stub that sets neither has none.
+    _kda_planner = None
+    _v41_planner = None
     #: Block size of the group this connector's codec owns, 0 when unknown.
     #: Distinct from the engine-wide `cache_config.block_size`, which is the
     #: smallest across groups once a second group exists.
@@ -891,6 +893,21 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         already let it go.
         """
         return getattr(seq, "_request", None) or self._requests.get(str(seq.id))
+
+    @property
+    def _planners(self) -> tuple:
+        """This model's boundary planners, in a fixed order; at most one.
+
+        Each keeps one recurrent-state leg and the KV prefix at one boundary.
+        Every scheduler hook drives them through `BoundaryPlanner`'s API, in a
+        loop over this, rather than by name -- so a rule a hook applies to one
+        leg reaches every leg.
+        """
+        return tuple(
+            planner
+            for planner in (self._kda_planner, self._v41_planner)
+            if planner is not None
+        )
 
     def _init_kda_planner(self, vllm_config, kv_cache_config) -> None:
         """Stand up the scheduler half of the recurrent leg, if there is one."""
@@ -1652,7 +1669,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         running request: nothing in vLLM holds it for the duration of an
         asynchronous store, so the request can free it, the pool can reissue it,
         and the store then reads the new occupant. The pin is how the block is
-        kept until every rank reports; `KdaBoundaryPlanner` owns both ends of it.
+        kept until every rank reports; the planner owns both ends of it.
 
         The pool is also kept on `self` for the exact-lease release path. vLLM
         calls this unconditionally on the scheduler half before any request
@@ -1661,10 +1678,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         whole-request fallback correct on a vLLM too old to call this at all.
         """
         self._gpu_block_pool = gpu_block_pool
-        if self._kda_planner is not None:
-            self._kda_planner.bind_gpu_block_pool(gpu_block_pool)
-        if self._v41_planner is not None:
-            self._v41_planner.bind_gpu_block_pool(gpu_block_pool)
+        for planner in self._planners:
+            planner.bind_gpu_block_pool(gpu_block_pool)
 
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
@@ -1712,21 +1727,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
         if self._lookup_in_flight(seq):
             return None, False
-        if self._kda_planner is not None:
+        planners = self._planners
+        for planner in planners:
             # ATOM's scheduler hands the cap hook a SeqView, which carries no
             # block hashes; this is how the hook reaches the vLLM Request whose
             # lookup is running. Armed per lookup and cleared unconditionally,
             # so a hook firing outside one has nothing stale to read.
-            self._kda_planner.begin_lookup(request)
-        if self._v41_planner is not None:
-            self._v41_planner.begin_lookup(request)
+            planner.begin_lookup(request)
         try:
             need, _ = self._scheduler.get_num_new_matched_tokens(seq)
         finally:
-            if self._kda_planner is not None:
-                self._kda_planner.end_lookup()
-            if self._v41_planner is not None:
-                self._v41_planner.end_lookup()
+            for planner in planners:
+                planner.end_lookup()
         parked = need > 0 and self._scheduler.should_park_for_load_after_alloc(seq)
         if not parked:
             return 0, False
@@ -1847,24 +1859,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # itself, so the queued load would write blocks this step's forward
             # fills and report `finished_recving` for a request never parked.
             self._scheduler.cancel_pending_load(seq)
-        if self._kda_planner is not None and num_external_tokens > 0:
-            self._kda_planner.resolve_load(
-                request,
-                groups,
-                num_total_computed,
-                self._attn_group_id,
-                int(num_external_tokens),
-                int(self._config.kv_cache_block_size),
-            )
-        if self._v41_planner is not None and num_external_tokens > 0:
-            # Names the checkpoint blocks the PAGE load restores. When it
-            # cannot, the scheduler finds no destination in `take_ride_units`
-            # and declines the load, and `_settle_promised_loads` withdraws the
-            # promise -- the request recomputes rather than resuming on a
-            # state nobody restored.
-            self._v41_planner.resolve_load(
-                request, num_total_computed, group_blocks=groups
-            )
+        if int(num_external_tokens) > 0:
+            for planner in self._planners:
+                planner.admit_load(
+                    request,
+                    group_blocks=groups,
+                    num_total_computed=num_total_computed,
+                    num_external_tokens=int(num_external_tokens),
+                    attention_group_id=self._attn_group_id,
+                    attention_block_size=int(self._config.kv_cache_block_size),
+                )
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         """Snapshot this step's transfers.
@@ -1951,18 +1955,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Before `_collect_releases`, so a save abandoned on this step turns
         # into a release on this step rather than on the next one.
         self._reconcile_stale_saves()
-        kda_stores = self._collect_kda_stores(scheduler_output, preempted, frontiers)
-        kda_loads = (
-            self._kda_planner.take_loads() if self._kda_planner is not None else []
+        state_stores, state_loads = self._collect_state_transfers(
+            scheduler_output, preempted, frontiers
         )
-        if self._v41_planner is not None:
-            skip = set(preempted)
-            skip.update(
-                str(r)
-                for r in getattr(scheduler_output, "finished_req_ids", None) or ()
-            )
-            for req_id in skip:
-                self._v41_planner.forget_request(req_id)
 
         # After this step's saves: an operation built here is in the live set
         # the deadline walks.
@@ -1971,43 +1966,43 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             inner,
             preempted,
             self._collect_releases(),
-            kda_stores,
-            kda_loads,
+            state_stores,
+            state_loads,
             abandoned_loads,
         )
 
-    def _collect_kda_stores(self, scheduler_output, preempted, frontiers) -> list:
-        """This step's recurrent boundary stores, from both sources.
+    def _collect_state_transfers(
+        self, scheduler_output, preempted, frontiers
+    ) -> tuple[list, list]:
+        """This step's recurrent-state stores and loads, from every planner.
 
-        The hand-off has to be taken in the step it exists: the KV cache
-        manager hands the pending offloads over while the step is being built
-        and is not shipped to the workers, so there is no later step to read it
-        in. It is also, on its own, empty on any model whose mamba block size
-        equals its hash block size -- Kimi-K3 among them -- which is why the
-        content-addressed sweep runs beside it rather than as a fallback. See
-        ``kda_state``'s module docstring for why the two sources do not overlap.
+        A request preempted or finished in this step is forgotten first: its
+        blocks are going away, and a preempted one comes back with its frontier
+        rewound, so whatever a planner kept for it (the KDA sweep cursor, a
+        V4.1 load destination) has to be gone before this step's stores are
+        collected. The stores are collected here because vLLM's boundary
+        hand-off exists only in the step it is built for.
         """
-        if self._kda_planner is None:
-            return []
+        planners = self._planners
+        if not planners:
+            return [], []
         skip = set(preempted)
         skip.update(
             str(r) for r in getattr(scheduler_output, "finished_req_ids", None) or ()
         )
-        for req_id in skip:
-            self._kda_planner.forget_request(req_id)
         stores: list = []
-        offloads = step_boundary_offloads(scheduler_output)
-        if offloads:
+        loads: list = []
+        for planner in planners:
+            for req_id in skip:
+                planner.forget_request(req_id)
             stores.extend(
-                self._kda_planner.collect_stores(offloads, self._requests, skip)
+                planner.collect_step_stores(
+                    scheduler_output, frontiers, self._requests, skip
+                )
             )
-        stores.extend(
-            self._kda_planner.collect_cached_boundary_stores(
-                frontiers, self._requests, skip
-            )
-        )
-        self._kda_planner.log_stats()
-        return stores
+            loads.extend(planner.take_loads())
+            planner.log_stats()
+        return stores, loads
 
     def _handle_preempted(self, scheduler_output) -> list[str]:
         """Forget the block table of every request vLLM just preempted.
@@ -2037,16 +2032,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             str(r) for r in getattr(scheduler_output, "preempted_req_ids", None) or ()
         ]
         for req_id in req_ids:
-            if self._kda_planner is not None:
-                # The recurrent destination was this request's boundary block,
-                # which is back in the pool. Nothing can be loaded into it, and
-                # leaving the claim pending would keep the index from ever
-                # deciding whether that boundary is still there.
-                self._kda_planner.forget_pending(req_id)
-                # And the sweep cursor: the request comes back with its
-                # frontier rewound, and a cursor left at the old high-water
-                # mark would skip every boundary it recomputes.
-                self._kda_planner.forget_request(req_id)
+            for planner in self._planners:
+                # The recurrent destination was this request's own block,
+                # which is back in the pool, and the request comes back with
+                # its frontier rewound: drop both the pending load's claim and
+                # what the planner kept for its old life.
+                planner.abandon_pending_load(req_id)
+                planner.forget_request(req_id)
             seq = self._seqs.get(req_id)
             if seq is None:
                 continue
@@ -2190,14 +2182,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         KV capacity. This is the hook that says there is still work.
 
         A pinned boundary block is the same problem in the other tier: its
-        release also rides on a worker report that only a step can deliver.
+        release also rides on a worker report, or a reconciliation, that only a
+        step can deliver.
         """
-        if self._kda_planner is not None and self._kda_planner.has_pending_work():
+        if any(planner.has_pending_work() for planner in self._planners):
             return True
-        # A ride pin is given back by the step's reconciliation, and the MP
-        # scheduler pumps lookups and ends sessions from a step as well.
-        if self._v41_planner is not None and self._v41_planner.has_ride_pins():
-            return True
+        # The MP scheduler pumps lookups and ends sessions from a step as well.
         pending = getattr(getattr(self, "_scheduler", None), "has_pending_work", None)
         if pending is not None and pending():
             return True
@@ -2232,13 +2222,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             for req_id in self._deferred_frees
         ):
             return True
-        if self._kda_planner is not None and self._kda_planner.has_pending_work():
-            return True
-        # A ride's pin is retired in `build_connector_meta`, after vLLM asks
-        # this. Only a recent pin that is a block's last holder is blocks about
-        # to come back; retiring any other drops a share and frees nothing.
-        if self._v41_planner is not None and self._v41_planner.has_ride_pins(
-            max_age_s=self._PENDING_FREE_HORIZON_S, sole_holder=True
+        if any(
+            planner.has_pending_frees(self._PENDING_FREE_HORIZON_S)
+            for planner in self._planners
         ):
             return True
         scheduler = self._scheduler
@@ -2397,11 +2383,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             self._promised_loads.pop(rid, None)
             state_failed = self._state_load_failure_reports.pop(rid, 0) > 0
             page_failed = self._load_failure_reports.pop(rid, 0) > 0
-            if self._kda_planner is not None:
-                # Retract the index's claim on a boundary whose bytes are gone,
-                # so the next lookup caps at a boundary that is really there
-                # instead of failing the same load again.
-                self._kda_planner.on_load_result(rid, not state_failed)
+            for planner in self._planners:
+                # Retract a claim on a boundary whose bytes are gone, so the
+                # next lookup caps at a boundary that is really there instead
+                # of failing the same load again.
+                planner.on_load_result(rid, not state_failed)
             if state_failed or page_failed or rid in failed_recving:
                 # One rank that could not fill its shard makes the whole load a
                 # failure. Routing it through `load_finished` instead would pop
@@ -2435,11 +2421,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if meta is None:
             return
         self._apply_completions(getattr(meta, "completions", None) or ())
-        if self._kda_planner is not None:
+        for planner in self._planners:
             # Before the loops below: a store quorum releases a pinned block and
             # publishes the boundary, and both want to be true by the time this
             # step's `finished_recving` ids are resolved.
-            self._kda_planner.absorb_reports(
+            planner.absorb_reports(
                 getattr(meta, "state_stored", None),
                 getattr(meta, "state_store_failed", None),
             )
@@ -2568,9 +2554,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
         self._requests.pop(str(req_id), None)
         self._detach_after_alloc.pop(str(req_id), None)
-        if self._kda_planner is not None:
-            self._kda_planner.forget_pending(str(req_id))
-            self._kda_planner.forget_request(str(req_id))
+        for planner in self._planners:
+            planner.abandon_pending_load(str(req_id))
+            planner.forget_request(str(req_id))
         seq = self._seqs.get(req_id)
         if seq is not None:
             self._scheduler.request_finished(seq)

@@ -166,6 +166,26 @@ class V41BoundaryPlanner(BoundaryPlanner, PageRideMixin):
         return hit
 
     # -- load ------------------------------------------------------------
+    def admit_load(
+        self,
+        request,
+        *,
+        group_blocks,
+        num_total_computed: int,
+        num_external_tokens: int,
+        attention_group_id: int,
+        attention_block_size: int,
+    ) -> None:
+        """Name the checkpoint blocks an admitted PAGE load restores.
+
+        The answer of `resolve_load` is not passed on: when it cannot name
+        them, the scheduler finds no destination in `take_ride_units` and
+        declines the load, and the connector withdraws the promise
+        (`_settle_promised_loads`) -- the request recomputes rather than
+        resuming on a state nobody restored.
+        """
+        self.resolve_load(request, num_total_computed, group_blocks=group_blocks)
+
     def resolve_load(self, request, num_total_computed: int, group_blocks=()) -> bool:
         """Name the checkpoint blocks a restored PAGE prefix fills.
 
@@ -198,3 +218,15 @@ class V41BoundaryPlanner(BoundaryPlanner, PageRideMixin):
         bytes.
         """
         self.forget_ride(req_id)
+
+    def has_pending_work(self) -> bool:
+        """A ride pin is given back by a step's reconciliation
+        (`V41StateMPScheduler.build_connector_meta`), so one still held needs
+        the engine to keep stepping."""
+        return self.has_ride_pins()
+
+    def has_pending_frees(self, horizon_s: float) -> bool:
+        """Only a recent pin that is a block's last holder is blocks about to
+        come back; retiring any other drops a share and frees nothing. The pin
+        is retired in the step's metadata build, after vLLM asks this."""
+        return self.has_ride_pins(max_age_s=horizon_s, sole_holder=True)

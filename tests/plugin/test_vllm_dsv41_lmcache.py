@@ -448,6 +448,7 @@ def test_v41_rides_its_checkpoint_groups_on_mp():
 def _alloc_connector():
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
     c._attn_group_id = 0
+    c._config = SimpleNamespace(kv_cache_block_size=256)
     c._requests = {}
     c._abandoned_loads = set()
     c._promised_loads, c._detach_after_alloc = {}, {}
@@ -455,7 +456,7 @@ def _alloc_connector():
     c._scheduler = SimpleNamespace(update_state_after_alloc=lambda seq: None)
     seq = SimpleNamespace(num_cached_tokens=0, set_block_table=lambda ids: None)
     c._seqs = SimpleNamespace(get_or_create=lambda request: seq)
-    c._v41_planner = SimpleNamespace(resolve_load=Mock(return_value=False))
+    c._v41_planner = SimpleNamespace(admit_load=Mock())
     return c
 
 
@@ -464,7 +465,7 @@ def test_an_unresolved_ride_does_not_release_the_request_itself():
     c = _alloc_connector()
     blocks = SimpleNamespace(get_block_ids=lambda: ([3, 4], [7, 8]))
     c.update_state_after_alloc(SimpleNamespace(request_id="r0"), blocks, 512)
-    assert c._v41_planner.resolve_load.call_args.kwargs["group_blocks"] == (
+    assert c._v41_planner.admit_load.call_args.kwargs["group_blocks"] == (
         [3, 4],
         [7, 8],
     )

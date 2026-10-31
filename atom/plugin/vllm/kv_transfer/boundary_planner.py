@@ -12,7 +12,10 @@ is one block per state group at the boundary's row, every group or none. Those
 rules are written once, here, so the two legs cannot drift apart on them.
 
 A subclass supplies what genuinely differs: where its boundaries may sit, how a
-hit is shortened to one, and which way a cap fired outside a lookup fails.
+hit is shortened to one, which way a cap fired outside a lookup fails, and what
+an admitted load queues. The connector drives every planner through this API
+alone (`AtomLMCacheOffloadConnector._planners`), so a hook it calls on one leg
+is called on every leg.
 """
 
 from __future__ import annotations
@@ -144,3 +147,71 @@ class BoundaryPlanner(ABC):
                 return ()
             block_ids.append(block_id)
         return tuple(block_ids)
+
+    @abstractmethod
+    def admit_load(
+        self,
+        request,
+        *,
+        group_blocks,
+        num_total_computed: int,
+        num_external_tokens: int,
+        attention_group_id: int,
+        attention_block_size: int,
+    ) -> None:
+        """Take a request whose external hit vLLM has just allocated for.
+
+        Called only with ``num_external_tokens > 0``. *group_blocks* is the
+        request's block ids per kv cache group, and *num_total_computed* the
+        frontier the restored prefix ends on; the attention group's id and
+        block size name the blocks the dense load fills.
+        """
+
+    def abandon_pending_load(self, req_id: str) -> None:
+        """Drop the claim of a load that will not run (preempted, finished)."""
+
+    def take_loads(self) -> list:
+        """The loads this leg queued since the last step, for the worker."""
+        return []
+
+    def on_load_result(self, req_id: str, ok: bool) -> None:
+        """Learn whether a load this leg queued landed on every rank."""
+
+    # -- store -----------------------------------------------------------
+    def collect_step_stores(
+        self, scheduler_output, frontiers, requests_by_id, skip_req_ids
+    ) -> list:
+        """The stores this step produces, for the worker.
+
+        *frontiers* is ``{req_id: num_computed_tokens}`` for the requests this
+        step scheduled; *skip_req_ids* are the ones preempted or finished in
+        it, whose blocks are going away.
+        """
+        return []
+
+    def absorb_reports(self, stored, failed) -> None:
+        """Take the workers' store reports, ``{op_id: ranks}`` each."""
+
+    # -- lifetime --------------------------------------------------------
+    @abstractmethod
+    def forget_request(self, req_id: str) -> None:
+        """Drop what this leg keeps for a finished or preempted request.
+
+        Idempotent: a request can be forgotten when it finishes and again in
+        the step that reports it.
+        """
+
+    def has_pending_work(self) -> bool:
+        """Whether only a further engine step can finish this leg's work."""
+        return False
+
+    def has_pending_frees(self, horizon_s: float) -> bool:
+        """Whether blocks this leg holds are about to go back to the pool.
+
+        *horizon_s* bounds how recent a hold must be to count, for a leg that
+        can tell; this one counts all of its pending work.
+        """
+        return self.has_pending_work()
+
+    def log_stats(self) -> None:
+        """Print this leg's counters, if it keeps any."""

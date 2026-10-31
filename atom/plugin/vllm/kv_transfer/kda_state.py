@@ -621,6 +621,26 @@ class KdaBoundaryPlanner(BoundaryPlanner):
         return boundary_prefix_hash(block_hashes[index])
 
     # -- load ------------------------------------------------------------
+    def admit_load(
+        self,
+        request,
+        *,
+        group_blocks,
+        num_total_computed: int,
+        num_external_tokens: int,
+        attention_group_id: int,
+        attention_block_size: int,
+    ) -> None:
+        """Queue this leg's load for an admitted hit; see `resolve_load`."""
+        self.resolve_load(
+            request,
+            group_blocks,
+            num_total_computed,
+            attention_group_id,
+            num_external_tokens,
+            attention_block_size,
+        )
+
     def resolve_load(
         self,
         request,
@@ -729,10 +749,39 @@ class KdaBoundaryPlanner(BoundaryPlanner):
         else:
             self._index.fail_load(req_id)
 
-    def forget_pending(self, req_id: str) -> None:
+    def abandon_pending_load(self, req_id: str) -> None:
+        """Retract a queued load's claim on its boundary.
+
+        The destination was this request's boundary block, which is back in
+        the pool. Nothing can be loaded into it, and leaving the claim pending
+        would keep the index from ever deciding whether that boundary is still
+        there.
+        """
         self._index.abandon_load(req_id)
 
     # -- store -----------------------------------------------------------
+    def collect_step_stores(
+        self, scheduler_output, frontiers, requests_by_id, skip_req_ids
+    ) -> list[KdaStore]:
+        """This step's recurrent boundary stores, from both sources.
+
+        The hand-off has to be taken in the step it exists: the KV cache
+        manager hands the pending offloads over while the step is being built
+        and is not shipped to the workers, so there is no later step to read it
+        in. It is also, on its own, empty on any model whose mamba block size
+        equals its hash block size -- Kimi-K3 among them -- which is why the
+        content-addressed sweep runs beside it rather than as a fallback. See
+        the module docstring for why the two sources do not overlap.
+        """
+        stores: list[KdaStore] = []
+        offloads = step_boundary_offloads(scheduler_output)
+        if offloads:
+            stores.extend(self.collect_stores(offloads, requests_by_id, skip_req_ids))
+        stores.extend(
+            self.collect_cached_boundary_stores(frontiers, requests_by_id, skip_req_ids)
+        )
+        return stores
+
     def collect_stores(
         self, offloads, requests_by_id, skip_req_ids=()
     ) -> list[KdaStore]:
