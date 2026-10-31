@@ -15,7 +15,8 @@ are attributes of the host planner.
 The host planner must provide:
 
 ``self._pool``
-    vLLM's GPU block pool, or None before :meth:`bind_gpu_block_pool`.
+    vLLM's GPU block pool, or None before the host binds it
+    (`BoundaryPlanner.bind_gpu_block_pool`).
 ``self.hash_block_size``
     The unit ``request.block_hashes`` is indexed in.
 ``self.ride_boundary_grid``
@@ -32,13 +33,9 @@ import logging
 import time
 from typing import Any
 
-#: vLLM's placeholder block. ``vllm.v1.attention.backends.utils.NULL_BLOCK_ID``
-#: is the authority; it is mirrored rather than imported so this module stays
-#: importable in a unit test that has no vLLM. A block id at or below it is
-#: not a real block.
-logger = logging.getLogger("atom")
+from .boundary_planner import NULL_BLOCK_ID
 
-NULL_BLOCK_ID = 0
+logger = logging.getLogger("atom")
 
 
 class PageRideMixin:
@@ -46,7 +43,6 @@ class PageRideMixin:
 
     def _init_page_ride(self) -> None:
         """Set up the ride state. Called from the host's ``__init__``."""
-        self._pool = None
         # req_id -> {boundary: blocks}. A load's destination, recorded when it
         # is resolved; see `_record_ride_boundary` for why it is not looked up.
         self._ride_boundaries: dict[str, dict[int, tuple[int, ...]]] = {}
@@ -80,9 +76,6 @@ class PageRideMixin:
             ):
                 return True
         return False
-
-    def bind_gpu_block_pool(self, pool) -> None:
-        self._pool = pool
 
     def _record_ride_boundary(
         self, req_id: str, boundary_tokens: int, block_ids: tuple[int, ...]

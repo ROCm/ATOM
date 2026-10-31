@@ -23,14 +23,14 @@ themselves are resolved by `PageRideMixin`.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from .page_ride import NULL_BLOCK_ID, PageRideMixin
+from .boundary_planner import BoundaryPlanner
+from .page_ride import PageRideMixin
 
 logger = logging.getLogger("atom")
 
 
-class V41BoundaryPlanner(PageRideMixin):
+class V41BoundaryPlanner(BoundaryPlanner, PageRideMixin):
     """Scheduler half: picks the boundary a transfer carries, and caps hits to it.
 
     Everything this decides is about keeping one invariant: a request that vLLM
@@ -39,6 +39,8 @@ class V41BoundaryPlanner(PageRideMixin):
     shortened to one (`cap_hit`), and a load is only admitted with the
     checkpoint blocks it restores named (`resolve_load`).
     """
+
+    leg_name = "V4.1 state offload"
 
     def __init__(
         self,
@@ -54,8 +56,14 @@ class V41BoundaryPlanner(PageRideMixin):
         # `boundary_grid` is where a STATE boundary may sit (V4.1's PAGE
         # block). They differ once a second kv cache group makes the hash unit
         # the smallest group's -- with DSpark, 32 against the proxy's 256.
+        # The groups holding the checkpoint are in image unit order -- that
+        # order is the key space, so it is taken from the caller rather than
+        # rebuilt here.
+        super().__init__(
+            boundary_grid=int(boundary_grid or hash_block_size),
+            boundary_group_ids=checkpoint_group_ids,
+        )
         self.hash_block_size = int(hash_block_size)
-        self.boundary_grid = int(boundary_grid or hash_block_size)
         if self.boundary_grid % self.hash_block_size:
             raise ValueError(
                 f"DeepSeek-V4.1 state boundary grid {self.boundary_grid} is "
@@ -72,14 +80,12 @@ class V41BoundaryPlanner(PageRideMixin):
         # that verifies and prefills. Two or more is a plain prefill, which the
         # scheduling patch keeps out of verification steps.
         self.prefill_tail = int(prefill_tail)
-        # The groups holding the checkpoint, in image unit order -- that order
-        # is the key space, so it is taken from the caller rather than rebuilt
-        # here.
-        self.ride_group_ids = tuple(int(g) for g in checkpoint_group_ids)
-        # A V4.1 boundary may sit only on a whole PAGE edge, which with a
-        # DSpark draft group is coarser than the engine-wide hash unit.
+        # `PageRideMixin`'s names for the same geometry. A V4.1 boundary may
+        # sit only on a whole PAGE edge, which with a DSpark draft group is
+        # coarser than the engine-wide hash unit.
+        self.ride_group_ids = self.boundary_group_ids
         self.ride_boundary_grid = self.boundary_grid
-        if not self.ride_group_ids:
+        if not self.boundary_group_ids:
             raise ValueError(
                 "DeepSeek-V4.1 state offload: the checkpoint cannot ride the PAGE "
                 "object with no checkpoint group to name it; a transfer would "
@@ -88,20 +94,34 @@ class V41BoundaryPlanner(PageRideMixin):
         # Decided by the caller, which holds the VllmConfig: the scheduler
         # calls `cap_local_hit` outside any `set_current_vllm_config` scope.
         self._state_checkpoints_can_serve = bool(state_checkpoints_can_serve)
-        self._lookup_ctx: tuple[str, Any] | None = None
         self._init_page_ride()
         # One warning per planner, not per hit: an unarmed cap fires once
         # per request on whatever path is missing its arming.
         self._warned_unarmed = False
 
     # -- lookup ----------------------------------------------------------
-    def begin_lookup(self, request) -> None:
-        self._lookup_ctx = (str(request.request_id), request)
+    def _cap_unarmed(self, seq, hit: int) -> int:
+        """Decline a hit reported outside any lookup.
 
-    def end_lookup(self) -> None:
-        self._lookup_ctx = None
+        Returning a shorter hit costs a recompute. Returning a longer one
+        hands the forward a cursor that disagrees with the scheduler, which
+        `_report_stale_state` turns into a dead engine -- so when the hit
+        cannot be tested the answer is 0, never *hit*.
+        """
+        # Fail closed: an external hit that never reached a boundary test
+        # would restore PAGE to a position whose STATE was never written.
+        if not self._warned_unarmed:
+            self._warned_unarmed = True
+            logger.warning(
+                "%s: the hit cap fired outside a lookup (seq=%s, hit=%d); "
+                "declining the external hit",
+                self.leg_name,
+                getattr(seq, "id", None),
+                hit,
+            )
+        return 0
 
-    def cap_hit(self, seq, hit: int) -> int:
+    def _cap_armed(self, request, hit: int) -> int:
         """Shorten *hit* to the last PAGE edge, where a checkpoint can sit.
 
         No index to probe: the KV and the checkpoint that continues it are one
@@ -109,36 +129,7 @@ class V41BoundaryPlanner(PageRideMixin):
         its checkpoint. What still has to hold is the *shape* -- a hit must end
         on a whole PAGE edge for there to be a stored checkpoint at all -- and
         that is what this truncation is.
-
-        Returning a shorter hit costs a recompute. Returning a longer one
-        hands the forward a cursor that disagrees with the scheduler, which
-        `_report_stale_state` turns into a dead engine -- so when the hit
-        cannot be tested the answer is 0, never *hit*.
         """
-        hit = int(hit)
-        if hit <= 0:
-            return hit
-        if self._lookup_ctx is None:
-            # Fail closed: an external hit that never reached a boundary test
-            # would restore PAGE to a position whose STATE was never written.
-            if not self._warned_unarmed:
-                self._warned_unarmed = True
-                logger.warning(
-                    "V4.1 state offload: the hit cap fired outside a lookup "
-                    "(seq=%s, hit=%d); declining the external hit",
-                    getattr(seq, "id", None),
-                    hit,
-                )
-            return 0
-        req_id, request = self._lookup_ctx
-        if str(seq.id) != req_id:
-            logger.warning(
-                "V4.1 state offload: hit cap armed for %s but called for %s; "
-                "declining the external hit",
-                req_id,
-                seq.id,
-            )
-            return 0
         boundary = (hit // self.boundary_grid) * self.boundary_grid
         total = int(getattr(request, "num_tokens", 0) or 0)
         if total and total - boundary < self.prefill_tail:
@@ -175,33 +166,6 @@ class V41BoundaryPlanner(PageRideMixin):
         return hit
 
     # -- load ------------------------------------------------------------
-    def _boundary_blocks(
-        self, group_blocks, num_total_computed: int
-    ) -> tuple[int, ...]:
-        """This boundary's destination block in each checkpoint group, or ``()``.
-
-        All or nothing: a checkpoint scattered into some of its groups leaves the
-        rest holding the previous occupant's state, which is the half restore
-        this module exists to prevent. One unresolved group fails the load.
-        """
-        if not group_blocks or num_total_computed % self.boundary_grid:
-            return ()
-        row = (int(num_total_computed) - 1) // self.boundary_grid
-        if row < 0:
-            return ()
-        block_ids: list[int] = []
-        for group_id in self.ride_group_ids:
-            if group_id >= len(group_blocks):
-                return ()
-            blocks = group_blocks[group_id]
-            if row >= len(blocks):
-                return ()
-            block_id = int(blocks[row])
-            if block_id <= NULL_BLOCK_ID:
-                return ()
-            block_ids.append(block_id)
-        return tuple(block_ids)
-
     def resolve_load(self, request, num_total_computed: int, group_blocks=()) -> bool:
         """Name the checkpoint blocks a restored PAGE prefix fills.
 

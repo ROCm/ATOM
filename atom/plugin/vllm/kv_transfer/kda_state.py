@@ -78,13 +78,12 @@ from typing import Any
 import torch
 
 from atom.model_engine.state_offload import StateOffloadIndex
+from atom.plugin.vllm.kv_transfer.boundary_planner import (
+    NULL_BLOCK_ID,
+    BoundaryPlanner,
+)
 
 logger = logging.getLogger("atom")
-
-#: vLLM's placeholder block. ``vllm.v1.attention.backends.utils.NULL_BLOCK_ID``
-#: is the authority; it is mirrored rather than imported so this module stays
-#: importable in a unit test that has no vLLM.
-NULL_BLOCK_ID = 0
 
 #: How many chunk-sized steps :meth:`KdaBoundaryPlanner.cap_hit` will walk back
 #: looking for a boundary the index still claims. Stores are emitted for every
@@ -495,13 +494,15 @@ class KdaStateTier:
         self._load_executor.shutdown(wait=True)
 
 
-class KdaBoundaryPlanner:
+class KdaBoundaryPlanner(BoundaryPlanner):
     """Scheduler half: what to store, what to load, and how far a hit is valid.
 
     Owns the index of boundaries believed present, the block-pool pins that keep
     a handed-off boundary block alive across its asynchronous store, and the cap
     that makes a missing recurrent state shorten a prefix rather than corrupt it.
     """
+
+    leg_name = "KDA state offload"
 
     def __init__(
         self,
@@ -518,19 +519,18 @@ class KdaBoundaryPlanner:
         if not self.group_ids:
             raise ValueError("KDA state offload: no mamba KV cache group to plan for")
         self.mamba_block_size = int(mamba_block_size)
+        # A boundary is one mamba block in every mamba group.
+        super().__init__(
+            boundary_grid=self.mamba_block_size, boundary_group_ids=self.group_ids
+        )
         self.hash_block_size = int(hash_block_size)
         self.chunk_size = int(chunk_size)
         self._world_size = max(1, int(world_size))
         self._index = StateOffloadIndex(can_store=can_store, can_load=can_load)
-        self._pool = None
         self._next_op_id = 0
         self._pending_stores: dict[int, _PendingStore] = {}
         self._stores: list[KdaStore] = []
         self._loads: list[KdaLoad] = []
-        # Set by the connector immediately before it delegates a lookup, and
-        # read by `cap_hit` -- ATOM's scheduler hands the hook a SeqView, which
-        # carries no block hashes of its own.
-        self._lookup_ctx: tuple[str, Any] | None = None
         # How far each live request's sweep has contiguously resolved.
         # A boundary the pool does not hold yet stays behind this cursor, so
         # a later step can store it once the state is actually registered.
@@ -562,18 +562,17 @@ class KdaBoundaryPlanner:
                 "could ever be reported"
             )
 
-    # -- block pool ------------------------------------------------------
-    def bind_gpu_block_pool(self, pool) -> None:
-        self._pool = pool
-
     # -- lookup ----------------------------------------------------------
-    def begin_lookup(self, request) -> None:
-        self._lookup_ctx = (str(request.request_id), request)
+    def _cap_unarmed(self, seq, hit: int) -> int:
+        """Pass a hit reported outside any lookup through unchanged.
 
-    def end_lookup(self) -> None:
-        self._lookup_ctx = None
+        The connector arms the cap around every lookup it delegates, so on its
+        path no hit arrives unarmed, and this leg has always let one through.
+        V4.1 fails closed here instead (`V41BoundaryPlanner._cap_unarmed`).
+        """
+        return hit
 
-    def cap_hit(self, seq, hit: int) -> int:
+    def _cap_armed(self, request, hit: int) -> int:
         """Shorten *hit* to the last boundary this index still claims.
 
         The whole joint-correctness argument is this method. An MLA prefix
@@ -587,21 +586,6 @@ class KdaBoundaryPlanner:
         descends in chunk steps, so a finer probe could not produce a usable
         pair anyway.
         """
-        hit = int(hit)
-        if hit <= 0 or self._lookup_ctx is None:
-            return hit
-        req_id, request = self._lookup_ctx
-        if str(seq.id) != req_id:
-            # The hook is armed per lookup; a mismatch means the scheduler
-            # called it for a different sequence than the one the connector is
-            # in. Refusing the hit is the safe direction.
-            logger.warning(
-                "KDA state offload: hit cap armed for %s but called for %s; "
-                "declining the external hit",
-                req_id,
-                seq.id,
-            )
-            return 0
         block_hashes = getattr(request, "block_hashes", None) or ()
         boundary = (hit // self.chunk_size) * self.chunk_size
         for _ in range(_MAX_CAP_DESCENT):
@@ -619,7 +603,7 @@ class KdaBoundaryPlanner:
             "for %s; declining the external hit",
             _MAX_CAP_DESCENT,
             hit,
-            req_id,
+            request.request_id,
         )
         return 0
 
@@ -699,38 +683,6 @@ class KdaBoundaryPlanner:
             return
         self._index.request_load(req_id, h)
         self._loads.append(KdaLoad(req_id, h, block_ids, error_blocks))
-
-    def _boundary_blocks(
-        self, group_blocks: tuple[list[int], ...], num_total_computed: int
-    ) -> tuple[int, ...]:
-        """This boundary's destination block in each mamba group, or ``()``.
-
-        All or nothing: a state scattered into some of its groups leaves the
-        rest holding the previous occupant's recurrence, which is exactly the
-        half restore this module exists to prevent. One unresolved group
-        therefore fails the whole load.
-        """
-        # Same row ``preprocess_mamba`` reads as the initial state:
-        # ``(num_computed_tokens - 1) // block_size``. Equal to
-        # ``num_computed // block_size - 1`` only when num_computed is a
-        # whole number of mamba blocks; the caller rejects the other case.
-        if num_total_computed % self.mamba_block_size != 0:
-            return ()
-        row = (num_total_computed - 1) // self.mamba_block_size
-        if row < 0:
-            return ()
-        block_ids: list[int] = []
-        for group_id in self.group_ids:
-            if group_id >= len(group_blocks):
-                return ()
-            blocks = group_blocks[group_id]
-            if row >= len(blocks):
-                return ()
-            block_id = int(blocks[row])
-            if block_id <= NULL_BLOCK_ID:
-                return ()
-            block_ids.append(block_id)
-        return tuple(block_ids)
 
     def _attention_error_blocks(
         self,
