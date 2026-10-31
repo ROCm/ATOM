@@ -44,6 +44,8 @@ def _call(layer, selected=None, tokens=8):
 def flydsl(monkeypatch):
     calls = []
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+    qsa_attention.log_flydsl_fallback.cache_clear()
+    qsa_attention._log_flydsl_active.cache_clear()
     monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
@@ -108,6 +110,51 @@ def test_flag_off_falls_back(flydsl, monkeypatch):
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
     assert _call(_layer()) is None
     assert flydsl == []
+
+
+def _warnings(caplog):
+    return [r.getMessage() for r in caplog.records if "native kernel" in r.message]
+
+
+def test_each_fallback_reason_is_logged_once(flydsl, monkeypatch, caplog):
+    budget = _layer(indexer=SimpleNamespace(compress_ratio=4, token_topk=1536))
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert _call(budget, _selection(8, 1539)) is None
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        for _ in range(3):
+            assert _call(_layer()) is None
+    reasons = _warnings(caplog)
+    assert len(reasons) == 2
+    assert "budget 1536" in reasons[0] and "graph capture" in reasons[1]
+
+
+def test_unlaid_forward_and_flag_off_log_nothing(flydsl, monkeypatch, caplog):
+    """A forward the bridge did not lay out (target verify, warmup) is not a
+    fallback, and with the flag off nothing is."""
+    no_layout = SimpleNamespace(host_lens=None, context_slots=None)
+    query = torch.zeros(8, 12, 256, dtype=torch.bfloat16)
+    with caplog.at_level("WARNING"):
+        assert (
+            Qwen4ExpAttention._flydsl_attention(
+                _layer(), query, query, query, _selection(8, 2051), no_layout
+            )
+            is None
+        )
+        monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
+        assert (
+            _call(_layer(indexer=SimpleNamespace(compress_ratio=8, token_topk=2048)))
+            is None
+        )
+    assert _warnings(caplog) == [] and flydsl == []
+
+
+def test_first_flydsl_call_is_logged_once(flydsl, caplog):
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            assert _call(_layer()) is not None
+    active = [r for r in caplog.records if "FlyDSL kernel" in r.message]
+    assert len(active) == 1 and len(flydsl) == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

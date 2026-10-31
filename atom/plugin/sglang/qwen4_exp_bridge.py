@@ -1204,9 +1204,9 @@ def build_qsa_metadata(
     host_lens = context_slots = None
     # Only eager unpacked extends reach here (packed draft steps returned
     # above), so this covers the target prefill and the drafter's prefill
-    # extend over the same tokens; both have one KV head per rank.
+    # extend over the same tokens.
     if not packed_step and _flydsl_layout_needed(
-        forward_batch, compress_ratio, indexer_budget
+        forward_batch, atom_config, compress_ratio, indexer_budget
     ):
         host_lens, context_slots = _flydsl_prefill_layout(
             forward_batch, live_bs, num_tokens, block_tables, block_size
@@ -1226,22 +1226,40 @@ def build_qsa_metadata(
 
 
 def _flydsl_layout_needed(
-    forward_batch: Any, compress_ratio: int, indexer_budget: int
+    forward_batch: Any, atom_config: Any, compress_ratio: int, indexer_budget: int
 ) -> bool:
     """Whether this forward's QSA layers can take the FlyDSL attention, so
-    its host layout is worth building: `qsa_attention.flydsl_attention_supported`,
-    the predicate the layer's fallback uses, on the KV dtype of the pool the
-    QSA caches are bound from. An FP8 SGLang KV pool binds no scale planes, so
-    the layer cannot detect it; a pool whose dtype cannot be read keeps the
-    native kernel."""
+    its host layout is worth building: `qsa_attention.flydsl_fallback_reason`,
+    the predicate the layer's fallback uses, on the per-rank head shape of
+    this model's config and the KV dtype of the pool the QSA caches are bound
+    from. An FP8 SGLang KV pool binds no scale planes, so the layer cannot
+    detect it; a pool whose dtype cannot be read keeps the native kernel. With
+    the flag on, each reason is logged once."""
     if not envs.ATOM_QSA_FLYDSL_ATTN:
         return False  # flag off: keep the bridge free of the layer module
+    from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+
     from atom.model_ops.qwen4_exp import qsa_attention
 
-    kv_dtype = getattr(_token_to_kv_pool(forward_batch), "dtype", None)
-    return qsa_attention.flydsl_attention_supported(
-        compress_ratio, indexer_budget, kv_bf16=kv_dtype == torch.bfloat16
+    hf = _hf_text_config(atom_config)
+    num_heads, num_kv_heads = qsa_attention.qsa_rank_heads(
+        int(hf.num_attention_heads),
+        int(hf.num_key_value_heads),
+        get_tensor_model_parallel_world_size(),
     )
+    kv_dtype = getattr(_token_to_kv_pool(forward_batch), "dtype", None)
+    reason = qsa_attention.flydsl_fallback_reason(
+        compress_ratio,
+        indexer_budget,
+        num_heads,
+        num_kv_heads,
+        int(hf.head_dim),
+        kv_bf16=kv_dtype == torch.bfloat16,
+    )
+    if reason is not None:
+        qsa_attention.log_flydsl_fallback(reason)
+        return False
+    return True
 
 
 def _token_to_kv_pool(forward_batch: Any) -> Any:

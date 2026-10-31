@@ -1171,6 +1171,9 @@ def test_eager_prefill_max_seq_len_ignores_stale_decode_graph_flag(monkeypatch):
     """Leftover ``_DECODE_GRAPH.active`` must not score a prefill at context_length."""
     from atom.plugin.sglang import qwen4_exp_bridge as bridge
 
+    # Not about FlyDSL: the config below has no head shape for its gate.
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "0")
+
     class _Prefill:
         @staticmethod
         def is_decode_or_idle():
@@ -1391,33 +1394,67 @@ def test_flydsl_prefill_layout_falls_back_unless_tokens_are_the_extends(
     assert _flydsl_layout(extends, seqs, live_bs, num_tokens) == (None, None)
 
 
+def _flydsl_gate_env(monkeypatch, tp=4, arch=True):
+    """Flag on, `tp` ranks, `arch` for gfx942; returns the layer module."""
+    qsa_attention = pytest.importorskip(
+        "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
+    )
+    from aiter.dist import parallel_state
+
+    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
+    monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: arch)
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: tp
+    )
+    qsa_attention.log_flydsl_fallback.cache_clear()
+    return qsa_attention
+
+
+# Qwen3.8-Flash-Next: 24 q heads, 2 KV heads, head_dim 256.
+_FLASH_CONFIG = SimpleNamespace(
+    hf_config=SimpleNamespace(
+        num_attention_heads=24, num_key_value_heads=2, head_dim=256
+    )
+)
+
+
 @pytest.mark.parametrize(
-    "flag,arch,kv_dtype,ratio,budget,needed",
+    "flag,arch,kv_dtype,ratio,budget,tp,needed",
     [
-        ("1", True, torch.bfloat16, 4, 2048, True),
-        ("1", True, None, 4, 4096, False),  # dtype unreadable: keep the native kernel
-        ("0", True, torch.bfloat16, 4, 2048, False),  # flag off
-        ("1", False, torch.bfloat16, 4, 2048, False),  # not gfx942
-        ("1", True, torch.float8_e4m3fn, 4, 2048, False),  # FP8 KV pool
-        ("1", True, torch.bfloat16, 8, 2048, False),  # compression ratio
-        ("1", True, torch.bfloat16, 4, 1536, False),  # budget the kernel lacks
+        ("1", True, torch.bfloat16, 4, 2048, 4, True),
+        ("1", True, torch.bfloat16, 4, 2048, 2, True),  # 12 q heads per rank
+        ("1", True, torch.bfloat16, 4, 2048, 8, True),  # 3 q heads per rank
+        ("1", True, torch.bfloat16, 4, 2048, 1, False),  # 24 q / 2 kv heads
+        ("1", True, None, 4, 4096, 4, False),  # dtype unreadable: native
+        ("0", True, torch.bfloat16, 4, 2048, 4, False),  # flag off
+        ("1", False, torch.bfloat16, 4, 2048, 4, False),  # not gfx942
+        ("1", True, torch.float8_e4m3fn, 4, 2048, 4, False),  # FP8 KV pool
+        ("1", True, torch.bfloat16, 8, 2048, 4, False),  # compression ratio
+        ("1", True, torch.bfloat16, 4, 1536, 4, False),  # budget the kernel lacks
     ],
 )
 def test_flydsl_layout_built_only_when_the_kernel_can_run(
-    monkeypatch, flag, arch, kv_dtype, ratio, budget, needed
+    monkeypatch, flag, arch, kv_dtype, ratio, budget, tp, needed
 ):
     """The FlyDSL host layout (host lengths, and an H2D of the context rows
     when prefixed) is only worth building when a QSA layer can take the
     kernel; otherwise every prefill would pay for it and fall back."""
+    _flydsl_gate_env(monkeypatch, tp=tp, arch=arch)
     monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", flag)
-    if flag == "1":
-        qsa_attention = pytest.importorskip(
-            "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
-        )
-        monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: arch)
     pool = SimpleNamespace() if kv_dtype is None else SimpleNamespace(dtype=kv_dtype)
     batch = SimpleNamespace(token_to_kv_pool=pool)
-    assert _flydsl_layout_needed(batch, ratio, budget) is needed
+    assert _flydsl_layout_needed(batch, _FLASH_CONFIG, ratio, budget) is needed
+
+
+def test_flydsl_layout_logs_each_fallback_reason_once(monkeypatch, caplog):
+    """With the flag on, a fallback names its reason in the log, once."""
+    _flydsl_gate_env(monkeypatch, tp=1)
+    batch = SimpleNamespace(token_to_kv_pool=SimpleNamespace(dtype=torch.bfloat16))
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            assert not _flydsl_layout_needed(batch, _FLASH_CONFIG, 4, 2048)
+    reasons = [r.getMessage() for r in caplog.records if "native kernel" in r.message]
+    assert len(reasons) == 1 and "24 q / 2 kv heads" in reasons[0]
 
 
 @pytest.mark.parametrize(
@@ -1442,13 +1479,9 @@ def test_flydsl_layout_built_only_when_the_kernel_can_run(
 def test_flydsl_layout_reads_kv_dtype_from_the_bound_pool(monkeypatch, backend, needed):
     from atom.plugin.sglang import qwen4_exp_bridge as bridge
 
-    qsa_attention = pytest.importorskip(
-        "atom.model_ops.qwen4_exp.qsa_attention", exc_type=ImportError
-    )
-    monkeypatch.setenv("ATOM_QSA_FLYDSL_ATTN", "1")
-    monkeypatch.setattr(qsa_attention, "_flydsl_arch_supported", lambda: True)
+    _flydsl_gate_env(monkeypatch)
     monkeypatch.setattr(bridge, "resolve_attn_backend", lambda fb: backend)
-    assert _flydsl_layout_needed(SimpleNamespace(), 4, 2048) is needed
+    assert _flydsl_layout_needed(SimpleNamespace(), _FLASH_CONFIG, 4, 2048) is needed
 
 
 def test_flydsl_prefill_layout_context_rows_on_device_tensors():
