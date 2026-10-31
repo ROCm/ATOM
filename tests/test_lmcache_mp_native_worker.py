@@ -764,8 +764,13 @@ def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
     assert "::native-page-v1-" in page_alone
 
 
-def test_a_native_transfer_holds_its_step_event_until_terminal(worker):
+def test_a_native_transfer_holds_its_step_event_until_terminal(worker, monkeypatch):
     """The step's event is re-recorded only once the server no longer waits."""
+    # CPU-only torch has no constructible cuda.Event.
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda **_kw: SimpleNamespace(record=lambda _s: None)
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
     index, _ = worker._step_events.record(worker._lock)
     worker._submit_save(request(), object(), index)
     assert worker._step_events._holds[index] == 1

@@ -787,3 +787,48 @@ def test_v2_host_rows_follow_the_runners_block_table_rules(monkeypatch):
     view = P._V2InputBatchView(NS(req_ids=["x", "b"]), tables=None)
     table = view.block_table[1].block_table.np
     assert (table[1, 0], table[1, 1], table[1, 2], table[0, 0]) == (42, 43, 0, 0)
+
+
+def test_v2_host_rows_replace_a_resumed_request():
+    """Its blocks were freed at preemption: the ids it comes back with are the
+    whole row, recreated if the preemption dropped it."""
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+
+    rows = P._HostRows()
+    rows.rows["a"] = [[1, 2]]
+    out = NS(
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        block_table_updates=None,
+        scheduled_cached_reqs=NS(
+            req_ids=["a", "b"],
+            new_block_ids=[([7, 8],), ([9],)],
+            resumed_req_ids={"a", "b"},
+        ),
+    )
+    rows.apply(out, [1])
+    assert rows.rows == {"a": [[7, 8]], "b": [[9]]}
+
+
+def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
+    """Armed with nothing keeping it current, every unit id would read 0."""
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+    from atom.plugin.vllm import vllm_runtime
+
+    monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [])
+    assert P.install_v2_host_block_rows() == 0
+    assert P._V2_HOST_ROWS is None
+
+    class _V2Runner:
+        def update_requests(self, scheduler_output):
+            return None
+
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_V2Runner])
+    assert P.install_v2_host_block_rows() == 1
+    assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
+    # Already patched: armed again without patching twice.
+    monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
+    assert P.install_v2_host_block_rows() == 0
+    assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT

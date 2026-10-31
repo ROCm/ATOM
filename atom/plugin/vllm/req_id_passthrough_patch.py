@@ -84,7 +84,8 @@ class _HostRows:
     the runner applies, by the runner's own rules (`finish_requests`,
     `add_requests`, `update_requests`): finished and preempted requests are
     dropped, new requests and `block_table_updates` overwrite, cached requests
-    append.
+    append. A resumed request is overwritten too, as V1 does: vLLM 0.31 sends
+    it to V2 as a new request, so this only matters if that changes.
     """
 
     def __init__(self) -> None:
@@ -119,9 +120,16 @@ class _HostRows:
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached is None:
             return
+        resumed = set(getattr(cached, "resumed_req_ids", None) or ())
         for req_id, new_block_ids in zip(cached.req_ids, cached.new_block_ids):
+            if new_block_ids is None or req_id in updates:
+                continue
+            if req_id in resumed:
+                # Its blocks were freed at preemption: the ids are the whole row.
+                rows[req_id] = expand(new_block_ids)
+                continue
             row = rows.get(req_id)
-            if new_block_ids is None or req_id in updates or row is None:
+            if row is None:
                 continue
             for group, ids in zip(row, expand(new_block_ids)):
                 group.extend(ids)
@@ -150,21 +158,24 @@ class _HostRowIndex:
         return ids[col] if 0 <= col < len(ids) else 0
 
 
-#: Set by `install_v2_host_block_rows`; None leaves V2 reads on the device copy.
+#: The rows `install_v2_host_block_rows` keeps current.
+_HOST_ROWS_KEPT = _HostRows()
+#: `_HOST_ROWS_KEPT` once a runner class keeps it current; None leaves V2 reads
+#: on the device copy, which is right rather than all zeros.
 _V2_HOST_ROWS: _HostRows | None = None
 
 
 def install_v2_host_block_rows() -> int:
     """Keep `_HostRows` current on every runner class that has V2's
-    `update_requests`. Returns how many classes were patched."""
+    `update_requests`, and read from it only once one does. Returns how many
+    classes this call patched."""
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
     global _V2_HOST_ROWS
-    if _V2_HOST_ROWS is None:
-        _V2_HOST_ROWS = _HostRows()
-    host_rows = _V2_HOST_ROWS
+    host_rows = _HOST_ROWS_KEPT
+    classes = gpu_model_runner_classes()
     patched = 0
-    for cls in gpu_model_runner_classes():
+    for cls in classes:
         original = getattr(cls, "update_requests", None)
         if original is None or getattr(original, "_atom_v2_host_rows", False):
             continue
@@ -180,6 +191,11 @@ def install_v2_host_block_rows() -> int:
         update_requests._atom_v2_host_rows = True
         cls.update_requests = update_requests
         patched += 1
+    if any(
+        getattr(getattr(cls, "update_requests", None), "_atom_v2_host_rows", False)
+        for cls in classes
+    ):
+        _V2_HOST_ROWS = host_rows
     return patched
 
 
