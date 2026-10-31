@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import (
     max_pending_saves,
+    tier_token_ids,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
@@ -34,6 +35,16 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 _MAX_SAVE_ATTEMPTS = 3
+
+
+class _SaveFrontierMemo(NamedTuple):
+    """`_save_frontier`'s last answer for one request, and what it depended on."""
+
+    frontier: int
+    floor: int
+    saved: int
+    generation: int
+    found: int
 
 
 @dataclass
@@ -142,6 +153,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 "every hit replays %d tokens below the KV it loads.",
                 self._replay_tokens,
             )
+        else:
+            # An image is saved only at a chunk boundary (`_save_frontier`), so
+            # a prompt-end anchor off the chunk grid never reaches LMCache and
+            # the next turn resumes from the ladder, 8192 tokens apart by
+            # default, or from nothing.
+            block_manager.align_checkpoint_anchor(self.chunk_size)
         # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
         # its answer until admission weighs it. The lookup keeps the PAGE KV
         # locked up to the reach meanwhile, so nothing releases it before then.
@@ -190,7 +207,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         # locks belong to the requested endpoint. A full-prompt query followed
         # by rounding the result would pair the earlier KV with later state.
         boundary = self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
-        return list(seq.token_ids[:boundary])
+        return tier_token_ids(seq, boundary)
 
     def _lookup_len(self, seq: Any) -> int:
         return self._chunk_floor(max(0, int(seq.num_prompt_tokens) - 1))
@@ -334,38 +351,51 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if self._page_only:
             # No image to wait for: any computed chunk boundary will do.
             return frontier if frontier > floor else 0
-        # Every tracked request asks every step. The answer changes only when
-        # its frontier moves or one of ITS boundary checkpoints is published or
-        # dropped, so rescan only then -- not whenever any request's
-        # checkpoint traffic moves the store.
+        sid = str(seq.id)
+        saved = int(self._save_tracker[sid][1]) if self._is_tracked(sid, seq) else 0
+        start = max(floor, saved)
         store = self._checkpoints.store
         memo = getattr(seq, "_mp_save_frontier_memo", None)
-        if memo is not None and memo[:2] == (frontier, floor):
-            changed = store.changed_since(memo[2])
+        if memo is not None and (memo.frontier, memo.floor, memo.saved) == (
+            frontier,
+            floor,
+            saved,
+        ):
+            changed = store.changed_since(memo.generation)
             boundaries = getattr(seq, "_mp_boundary_by_hash", {})
             if changed is not None and not any(
-                floor < boundaries.get(prefix_hash, 0) <= frontier
+                start < boundaries.get(prefix_hash, 0) <= frontier
                 for prefix_hash in changed
             ):
-                seq._mp_save_frontier_memo = (
-                    frontier,
-                    floor,
-                    store.generation,
-                    memo[3],
-                )
-                return memo[3]
-        found = 0
+                seq._mp_save_frontier_memo = memo._replace(generation=store.generation)
+                return memo.found
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
-        for boundary in range(frontier, floor, -self.chunk_size):
-            prefix_hash = self._boundary_hash(seq, boundary)
-            boundaries[prefix_hash] = boundary
-            if self._checkpoints.contains(prefix_hash):
-                found = boundary
-                break
-        seq._mp_save_frontier_memo = (frontier, floor, store.generation, found)
+        found = self._highest_image(seq, start, frontier, boundaries)
+        seq._mp_save_frontier_memo = _SaveFrontierMemo(
+            frontier, floor, saved, store.generation, found
+        )
         return found
+
+    def _highest_image(
+        self, seq: Any, low: int, high: int, boundaries: dict | None = None
+    ) -> int:
+        """Highest chunk boundary in `(low, high]` holding a checkpoint, or 0.
+
+        The image a save stores: a rung at the prompt's end, which a
+        continuation loads, and otherwise the prompt-end anchor
+        (`align_checkpoint_anchor`), which a resend loads. One per save, as
+        HBM holds them when it is issued; storing every rung would hold
+        `should_defer_free` and the state budget for a whole ladder per prompt.
+        """
+        for boundary in range(self._chunk_floor(high), low, -self.chunk_size):
+            prefix_hash = self._boundary_hash(seq, boundary)
+            if boundaries is not None:
+                boundaries[prefix_hash] = boundary
+            if self._checkpoints.contains(prefix_hash):
+                return boundary
+        return 0
 
     def _save_floor(self, lower: int) -> int:
         """Exclusive lower bound for boundaries worth storing (never 0)."""
@@ -375,10 +405,7 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         available = self._chunk_floor(available)
         if self._page_only:
             return available if available > self._save_floor(saved) else saved
-        for boundary in range(available, self._save_floor(saved), -self.chunk_size):
-            if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
-                return boundary
-        return saved
+        return self._highest_image(seq, self._save_floor(saved), available) or saved
 
     def _may_emit_save(self) -> bool:
         return len(self._save_inflight) < self._max_pending_saves

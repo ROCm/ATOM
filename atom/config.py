@@ -66,6 +66,13 @@ class KVCacheTensor:
     # without their exponents, and every index it computes stays in bounds while
     # doing it. Whatever moves one must move the other.
     index_scale: torch.Tensor | None = None
+    # Qwen3.8 QSA side caches. They share the block table with K/V but are not
+    # attributes the dense codec already walked. None on every other model, and
+    # appended after ``index_scale`` so an existing layout's byte order is
+    # unchanged. ``rope_positions`` is present only when image prompts are on.
+    index_raw: torch.Tensor | None = None
+    index_compressed: torch.Tensor | None = None
+    rope_positions: torch.Tensor | None = None
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in

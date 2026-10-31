@@ -121,7 +121,9 @@ def make_scheduler(
         enable_prefix_caching=True,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+        anchor_grids=[],
     )
+    manager.align_checkpoint_anchor = manager.anchor_grids.append
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
@@ -140,6 +142,8 @@ def make_scheduler(
     scheduler.bind_block_manager(manager)
     scheduler.bind_block_manager(manager)
     assert connections == [checkpoints.store.spec]
+    # Once, on the chunk grid images are stored on (the rebind is a no-op).
+    assert manager.anchor_grids == [8]
     scheduler._min_load_tokens = 0
     return scheduler, checkpoints, adapter
 
@@ -305,6 +309,71 @@ def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
     checkpoints.store.unindex(scheduler._boundary_hash(seq, 16))  # ours drops
     assert scheduler._save_frontier(seq) == 8
     assert len(calls) > rescanned
+
+
+def _images(scheduler, checkpoints, seq, boundaries):
+    return {
+        boundary: checkpoints.store.lookup(
+            checkpoint(scheduler, checkpoints, seq, boundary)[0]
+        )
+        for boundary in boundaries
+    }
+
+
+def _the_only_save(scheduler, seq):
+    [save] = scheduler.build_connector_meta().requests
+    terminal(scheduler, save.save_operation)
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler._has_pending_save(seq) is False
+    assert scheduler.should_defer_free(seq) is False
+    return save
+
+
+def test_a_rung_at_the_prompt_end_is_stored_directly_and_pinned(monkeypatch):
+    """A continuation loads the rung at the prompt's end (24). It is the one
+    save, pinned from the moment it is issued, with nothing stored first that
+    it would have to outlive."""
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    ids = _images(scheduler, checkpoints, seq, (8, 16, 24))
+    scheduler.update_state_after_alloc(seq)
+
+    [end] = scheduler.build_connector_meta().requests
+    assert end.native_state.boundary_tokens == 24
+    assert end.save_spec.skip_leading_tokens == 0
+    assert checkpoints.store.records[ids[24]].pin_count == 1
+    assert checkpoints.store.records[ids[16]].pin_count == 0
+    terminal(scheduler, end.save_operation)
+    assert scheduler.build_connector_meta().requests == []
+    assert scheduler.should_defer_free(seq) is False
+
+
+def test_the_prompt_end_anchor_is_stored_when_no_rung_sits_at_the_end(monkeypatch):
+    """Off the chunk grid, the highest image is the anchor (16), the chunk a
+    resend of this prompt loads."""
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(count=22, computed=22)
+    _images(scheduler, checkpoints, seq, (8, 16))
+    scheduler.update_state_after_alloc(seq)
+    assert _the_only_save(scheduler, seq).native_state.boundary_tokens == 16
+
+
+def test_an_end_rung_evicted_before_the_save_yields_the_anchor(monkeypatch):
+    """What is stored is whatever is highest when the save is issued."""
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    _images(scheduler, checkpoints, seq, (8, 16, 24))
+    checkpoints.store.unindex(scheduler._boundary_hash(seq, 24))
+    scheduler.update_state_after_alloc(seq)
+    assert _the_only_save(scheduler, seq).native_state.boundary_tokens == 16
+
+
+def test_mid_prefill_saves_the_highest_image_it_has_computed(monkeypatch):
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(count=40, computed=24)
+    for boundary in (8, 16, 24):
+        checkpoint(scheduler, checkpoints, seq, boundary)
+    assert scheduler._save_frontier(seq) == 24
 
 
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):

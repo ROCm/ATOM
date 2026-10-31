@@ -423,6 +423,10 @@ class BlockManager:
                 f"snapping to {snapped or 'off (0)'}."
             )
             self.state_checkpoint_interval_tokens = snapped
+        # The grid the prompt-end anchor is floored to: the hash block, unless
+        # an offload tier keeps checkpoints only on a coarser one
+        # (`align_checkpoint_anchor`).
+        self.checkpoint_anchor_grid = self.hash_block_size
 
         # Every Pool.STATE class. A tuple of one today — the sliding window
         # used to be the second member, back when it was a content-addressed
@@ -812,15 +816,23 @@ class BlockManager:
         the connector loads the KV past the HBM hit first (`replay_kv_load`).
         Records on `seq` whether the hit it returns replays (`replay_start`).
         """
+        hit, seq.replays_hit, seq.replay_kv_load = self._replay_decision(
+            seq, compressed_hit, hit, int(seq.offload_joint.kv_prefix_tokens or 0)
+        )
+        return hit
+
+    def _replay_decision(
+        self, seq: Sequence, compressed_hit: int, hit: int, tier_hit: int
+    ) -> tuple[int, bool, bool]:
+        """`_replay_hit` for an LMCache hit of `tier_hit` tokens, writing
+        nothing: `(hit, replays_hit, replay_kv_load)`."""
         hbs = self.hash_block_size
-        seq.replays_hit = seq.replay_kv_load = False
         if not self.state_replay_tokens or not seq.has_per_req_cache:
-            return hit
+            return hit, False, False
         # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
         # LMCache figure counts unless it clears that above where it starts.
         min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
         resume = hit * hbs
-        tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
         if tier_hit - resume >= min_load:
             resume = tier_hit
         in_hbm = compressed_hit * hbs
@@ -829,10 +841,8 @@ class BlockManager:
         if tier_kv - in_hbm >= min_load:
             end = tier_kv
         if end - resume <= self.state_replay_tokens:
-            return hit
-        seq.replays_hit = True
-        seq.replay_kv_load = end > in_hbm
-        return compressed_hit
+            return hit, False, False
+        return compressed_hit, True, end > in_hbm
 
     def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
         """A replay's KV-only load will not run: replay below the HBM hit.
@@ -970,11 +980,33 @@ class BlockManager:
             "evicted_total": self.total_evicted_blocks,
         }
 
+    def joint_boundary_tokens(self, seq: Sequence, kv_prefix_tokens: int) -> int:
+        """The joint boundary a tier hit of `kv_prefix_tokens` would land on, or 0.
+
+        A read-only probe for a connector shaping the hit it reports: the
+        admission recomputes the boundary from the hit the connector settled
+        on. Measured against the hit admission holds, the gated HBM hit as
+        `_replay_hit` widens it for this lookup, so the two agree. The walk is
+        `can_allocate_memoized`'s: a request waiting at the backpressure gate
+        re-asks this every pass without walking its prompt again.
+        """
+        if not self.enable_prefix_caching:
+            return 0
+        walk = (self._memoised_walk if self.walk_memo else self._walk_prefix)(seq)
+        compressed = len(walk.hashes)
+        gated = self._gated_hit(seq, compressed, walk.hashes)
+        hit, _, _ = self._replay_decision(seq, compressed, gated, kv_prefix_tokens)
+        return self._joint_kv_boundary(
+            seq, hit, walk.hashes, kv_prefix_tokens=kv_prefix_tokens
+        ).boundary_tokens
+
     def _joint_kv_boundary(
         self,
         seq: Sequence,
         hbm_boundary: int,
         block_hashes: list[int],
+        *,
+        kv_prefix_tokens: int | None = None,
     ) -> JointBoundaryDecision:
         """The boundary above the HBM hit that BOTH legs can reach, as a value.
 
@@ -1015,13 +1047,15 @@ class BlockManager:
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
         chunk = self._joint_chunk_tokens
-        lmc_tokens = int(seq.offload_joint.kv_prefix_tokens or 0)
+        if kv_prefix_tokens is None:
+            kv_prefix_tokens = seq.offload_joint.kv_prefix_tokens
+        lmc_tokens = int(kv_prefix_tokens or 0)
         if chunk <= 0:
             return self._no_joint("no_chunk_size")
         # Floored to the grid everything below compares against, so the
         # covering-chunk check becomes true by construction rather than by
-        # luck. (`get_num_new_matched_tokens` withholds one token on a
-        # full-prompt hit, which takes the lookup off the grid.)
+        # luck. (A layout that withholds the last token of a full-prompt hit
+        # takes the lookup off the grid; see `_withholds_last_prompt_token`.)
         lmc_tokens = (lmc_tokens // chunk) * chunk
         hbm_tokens = hbm_boundary * hbs
         if lmc_tokens <= hbm_tokens:
@@ -1283,7 +1317,15 @@ class BlockManager:
             live_blocks=num_new_blocks,
             protected_hash=protected_hash,
         )
-        self._record_checkpoint_end(seq)
+        # Where the prefill resumes: the HBM hit, or the tier's load point when
+        # that is further (an LMCache MP load lands there with no joint).
+        self._record_checkpoint_end(
+            seq,
+            max(
+                num_cached_blocks * self.hash_block_size,
+                int(seq.offload_joint.kv_prefix_tokens or 0),
+            ),
+        )
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
         # `record_allocation` re-checks a joint against this demand instead of
@@ -1303,7 +1345,8 @@ class BlockManager:
         # request per scheduling pass for a list nobody read. Nothing above
         # consumes it: `_record_checkpoint_demand` takes `block_hashes` as an
         # argument, and `_record_checkpoint_end` derives its position from
-        # `num_prompt_tokens` alone. Its one reader is `midstep_positions`.
+        # the prompt length, the resume point and `checkpoint_anchor_grid`.
+        # Its one reader is `midstep_positions`.
         #
         # Free unless a backend declares `readable_midstep`: the call returns
         # at its first line otherwise. Qwen GDN does under
@@ -1544,6 +1587,11 @@ class BlockManager:
             )
             decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
+            # The prefill resumes at the joint boundary, which can sit below
+            # the lookup's hit `can_allocate` placed the anchor against.
+            hbm_tokens = probe.num_cached_blocks * self.hash_block_size
+            if decision.boundary_tokens > hbm_tokens:
+                self._record_checkpoint_end(seq, decision.boundary_tokens)
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -2473,6 +2521,30 @@ class BlockManager:
         seq.state_fork_src = -1
         return True
 
+    def align_checkpoint_anchor(self, tokens: int) -> None:
+        """Put the prompt-end anchor on a multiple of `tokens`.
+
+        For an offload tier that stores a checkpoint only on its own grid:
+        LMCache MP keeps a state image only at a chunk boundary, so an anchor
+        off that grid is kept in HBM and never reaches the tier, and the next
+        turn finds nothing there. The anchor is the resume point of nearly
+        every continuation (see `_record_checkpoint_end`), and the 8192 ladder
+        is too coarse to stand in for it. On the grid it costs HBM less than
+        one grid of reuse.
+
+        Set by the LMCache MP native-state scheduler, so it applies to every
+        GDN model on that tier (Qwen3-Next and Qwen3.5 as well as Qwen3.8). A
+        prompt too short to reach the grid keeps its hash-block anchor, which
+        only HBM serves, exactly as without a grid.
+        """
+        tokens = int(tokens)
+        if tokens <= 0 or tokens % self.hash_block_size:
+            raise ValueError(
+                f"checkpoint anchor grid {tokens} is not a positive multiple of "
+                f"the hash block size {self.hash_block_size}"
+            )
+        self.checkpoint_anchor_grid = tokens
+
     def checkpoint_limit(self, seq: Sequence) -> int:
         """Rightmost prompt position any state class may checkpoint at, 0 none.
 
@@ -2612,7 +2684,7 @@ class BlockManager:
             self.demands_recorded += not seq.checkpoint_demand_counted
             seq.checkpoint_demand_counted = True
 
-    def _record_checkpoint_end(self, seq: Sequence) -> None:
+    def _record_checkpoint_end(self, seq: Sequence, cached_tokens: int) -> None:
         """Reserve this prompt's own end as a resume point.
 
         The ladder guesses where reuse will resume and the demand learns it one
@@ -2631,6 +2703,12 @@ class BlockManager:
         position keepable, and `checkpointers_at` re-checks it against the
         forward that actually lands. Applying it here as well keeps the cut and
         the keep from disagreeing, which is the standing contract between them.
+
+        `cached_tokens` is where this request's prefill resumes: from
+        `can_allocate`, the HBM hit or the LMCache hit the lookup reported
+        (`kv_prefix_tokens`, where an LMCache MP load lands), whichever is
+        further; then the joint boundary from `record_allocation` when a joint
+        load commits one.
         """
         seq.checkpoint_end_pos = 0
         if not self.state.enabled:
@@ -2693,6 +2771,16 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
+        # Floored after the cap, which is a hash-block position: a tier grid
+        # (`align_checkpoint_anchor`) need not contain it. Moving left keeps
+        # both tests above. A grid position at or below `cached_tokens`, where
+        # this request resumes, is one no forward of it reaches (every reader
+        # wants `start < pos`). A prompt with no grid position past it keeps
+        # the hash-block anchor instead: the tier never stores it, but the
+        # next turn still resumes from it in HBM, as it did before the grid.
+        aligned = end - end % self.checkpoint_anchor_grid
+        if aligned > cached_tokens:
+            end = aligned
         if end > 0:
             seq.checkpoint_end_pos = end
 
@@ -2826,8 +2914,24 @@ class BlockManager:
 
         Unchanged when the chunk finishes the prompt, or when it is shorter
         than reaching the next boundary.
+
+        Under a tier anchor grid (`align_checkpoint_anchor`) the chunk ends at
+        the prompt-end anchor instead when the forward would snapshot it
+        elsewhere: a forward from off the midstep grid moves the anchor off the
+        tier grid, where the tier never stores it. The end of a forward is
+        read exactly.
         """
-        if not self._midstep_applies(seq) or start + chunk >= seq.num_tokens:
+        if not self._midstep_applies(seq):
+            return chunk
+        anchor = seq.checkpoint_end_pos
+        if (
+            self.checkpoint_anchor_grid != self.hash_block_size
+            and start < anchor < start + chunk
+            and snap_midstep_position(anchor, start, start + chunk, self.midstep_grid)
+            != anchor
+        ):
+            return anchor - start
+        if start + chunk >= seq.num_tokens:
             return chunk
         hbs = self.hash_block_size
         aligned = (start + chunk) // hbs * hbs - start
