@@ -68,6 +68,17 @@ def apply_reasoning_controls(kwargs, toggle, controls, *, rules=CHAT_REASONING_R
     """Merge resolved controls into a copy; validation never mutates defaults."""
     result = dict(kwargs)
     enabled, effort = controls
+    if (
+        enabled is None
+        and effort is not None
+        and toggle is not None
+        and rules.reconcile_effort_with_toggle
+        and result.get("thinking_effort", result.get("reasoning_effort")) == "none"
+    ):
+        # Materialize the inherited off switch before an effort-only request
+        # replaces the value that encoded it. Updating a budget is not enabling
+        # thinking (integer Chat/Responses effort, or Messages output effort).
+        result[toggle[0]] = toggle[1]
     if toggle is not None and enabled is not None:
         name, off_value, on_value = toggle
         result[name] = on_value if enabled else off_value
