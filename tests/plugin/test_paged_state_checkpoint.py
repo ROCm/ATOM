@@ -817,7 +817,7 @@ def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
     from atom.plugin.vllm import vllm_runtime
 
     monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
-    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [])
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", list)
     assert P.install_v2_host_block_rows() == 0
     assert P._V2_HOST_ROWS is None
 
