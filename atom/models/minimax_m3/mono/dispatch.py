@@ -13,6 +13,7 @@ that disagreed would wait on each other forever (a per-rank flag such as
 import logging
 
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 
 from atom.models.minimax_m3.mono.check import (
     forward_checked,
@@ -50,7 +51,9 @@ def _dspark_mode_supported(atom_config) -> bool:
 
 def _config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use mono, or None."""
-    checks = common_refusals(atom_config, Dims, SUPPORTED_TP) + [
+    # gfx1250 runs its own kernels (``mono.gfx1250``); any other arch the gfx950 ones
+    arch = "gfx1250" if get_gfx() == "gfx1250" else "gfx950"
+    checks = common_refusals(atom_config, Dims, SUPPORTED_TP, arch=arch) + [
         (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
         (
             (atom_config.index_cache_dtype or atom_config.kv_cache_dtype) == "fp8",

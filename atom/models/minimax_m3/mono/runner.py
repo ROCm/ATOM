@@ -34,6 +34,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 import atom.model_ops.topK as topk_meta
@@ -51,6 +52,9 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     TP,
     IndexHeads,
+)
+from atom.models.minimax_m3.mono.gfx1250.kernels.post_attn import (
+    build_post_attn_kernel as build_post_attn_kernel_gfx1250,
 )
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
@@ -186,7 +190,10 @@ class MonoDecodeRunner:
         if npes != TP:
             raise MonoUnsupported(f"TP {npes}")
         layers = model.layers
-        self.dense_mono = dense_prefix_mono(layers)
+        # gfx1250 runs the kernels of ``mono.gfx1250``: no dense-prefix kernels
+        # yet (the prefix runs on the original modules) and bounded waits only
+        self.gfx1250 = get_gfx() == "gfx1250"
+        self.dense_mono = dense_prefix_mono(layers) and not self.gfx1250
         if require_aux and drafter is None:
             raise MonoUnsupported("no DSpark drafter")
         self.aux = bind_aux_taps(drafter, config.hidden_size) if require_aux else None
@@ -198,7 +205,7 @@ class MonoDecodeRunner:
         heads = IndexHeads(TP, self.rank) if indexer_cp_enabled() else ONE_INDEX_HEAD
         self.index_heads = heads.count
         # bounded mailbox waits, their records raised after the step (finish_step)
-        self.debug = envs.ATOM_MONO_DEBUG
+        self.debug = envs.ATOM_MONO_DEBUG or self.gfx1250
         self.sparse = [
             SparseMoeLayer.from_layer(layers[i], i, heads)
             for i in range(N_DENSE, len(layers))
@@ -247,6 +254,8 @@ class MonoDecodeRunner:
                 f"{cus} CUs: the kernels need all {BLOCKS} CTAs co-resident"
             )
         tl_prefix = envs.ATOM_MONO_TIMELINE
+        if tl_prefix and self.gfx1250:
+            raise MonoUnsupported("no gfx1250 timeline build")
         self.timeline = (
             LayerTimeline(tl_prefix, len(self.sparse), TL_POINTS, self.rank, self.dev)
             if tl_prefix
@@ -254,7 +263,7 @@ class MonoDecodeRunner:
         )
         # the s-token layer kernel is ``self._build_k4(s)`` (``WidthBuilds``)
         self._build_k4 = functools.partial(
-            build_post_attn_kernel,
+            build_post_attn_kernel_gfx1250 if self.gfx1250 else build_post_attn_kernel,
             npes,
             self.sm_scale,
             eps,
@@ -302,7 +311,8 @@ class MonoDecodeRunner:
         )
         # every mailbox pair, zeroed at each step's start (forward)
         self.mailboxes = StepMailboxes(
-            self.peers, self.scratch1, self.scratch4, debug=self.debug
+            self.peers, self.scratch1, self.scratch4, debug=self.debug,
+            gfx1250=self.gfx1250,
         )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
