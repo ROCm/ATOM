@@ -144,6 +144,16 @@ def release_stores():
     rocdl.s_wait_storecnt(0)
 
 
+@traced
+def publish(put, a, i, v, who):
+    """``sync.publish`` on gfx12, where stores drain by storecnt: this CTA's plain
+    stores readable by every CTA, then (thread ``who``) the pair (``a``, i) := v."""
+    release_stores()
+    gpu.barrier()
+    if who:
+        put(a, i, v)
+
+
 # --- WMMA ---------------------------------------------------------------------
 
 
