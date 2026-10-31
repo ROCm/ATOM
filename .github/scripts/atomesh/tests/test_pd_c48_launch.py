@@ -378,7 +378,8 @@ class LaunchTest(unittest.TestCase):
             guards = types.SimpleNamespace(weight_reasons=lambda m: ["layer 0 in_proj: shape", "layer 1 in_proj: shape"])
             pkg = "vllm.models.kimi_k3.amd.specialized_decode"
             mods = {pkg + ".runtime": rt, pkg + ".runtime.guards": guards, pkg + ".mono.attention.kda": kda}
-            kv = types.SimpleNamespace(kv_connector="MooncakeConnector", kv_role="kv_consumer")
+            kv = types.SimpleNamespace(kv_connector="MooncakeConnector", kv_role="kv_consumer",
+                                       kv_connector_module_path=None)
             config = types.SimpleNamespace(kv_transfer_config=kv)
             w = torch.zeros(6, 2, dtype=torch.bfloat16)
             layer = lambda w, pad: types.SimpleNamespace(
@@ -393,7 +394,9 @@ class LaunchTest(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"C48_DIAG_ROLE": "decode", "C48_D_SPECDEC": "1"}):
                     self.assertTrue(pd_c48_worker.enable_specdec(config)["mooncake_consumer"])
                 self.assertEqual(rt.unsupported(config), ["LoRA"])
-                kv.kv_connector = "NixlConnector"
+                kv.kv_connector_module_path = "x.Mooncake"
+                self.assertEqual(rt.unsupported(config), [moriio, "LoRA"])
+                kv.kv_connector_module_path, kv.kv_connector = None, "NixlConnector"
                 self.assertEqual(rt.unsupported(config), [moriio, "LoRA"])
                 kda.kda_pre("k", w_in=w)
                 self.assertEqual(seen["k"].shape, (4, 2))
