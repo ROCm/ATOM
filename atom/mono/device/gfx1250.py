@@ -162,6 +162,33 @@ def lanes_below(bal, lane):
     return fx.Int32(fx.ctpop(bal & ((fx.Int32(1) << lane) - 1)))
 
 
+def _llvm_ptr(addr, space):
+    pt = fx.PointerType.get(fx.Int32.ir_type, address_space=space, alignment=4)
+    ptr = fx.to_llvm_ptr(fx.inttoptr(pt, addr))
+    return ptr._value if hasattr(ptr, "_value") else ptr
+
+
+def lds_addr(ptr):
+    """The LDS byte address of an LDS array pointer."""
+    return fx.Int32(fx.ptrtoint(ptr))
+
+
+def async_to_lds(gaddr, laddr, b128=True):
+    """16 B (``b128``) or 4 B global -> LDS a lane, counted by ASYNCcnt: the copy
+    is an op with side effects, so it stays where it is issued (``wait_async``)."""
+    g = _llvm_ptr(fx.Int64(gaddr), fx.AddressSpace.Global)
+    lp = _llvm_ptr(fx.Int32(laddr), fx.AddressSpace.Shared)
+    if b128:
+        rocdl.global_load_async_to_lds_b128(g, lp, 0)
+    else:
+        rocdl.global_load_async_to_lds_b32(g, lp, 0)
+
+
+def wait_async(n):
+    """Until at most ``n`` of this wave's async copies are in flight (in order)."""
+    rocdl.s_wait_asynccnt(n)
+
+
 def release_stores():
     """Until this wave's stores have completed at their scope: a flag published
     after it is seen after the data (a release fence orders, it does not wait)."""
