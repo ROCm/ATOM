@@ -18,6 +18,7 @@ from atom.models.qwen3_5 import (
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+from atom.utils import envs
 
 from .utils import maybe_prefix
 
@@ -92,7 +93,15 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
         hidden_states = self.fc(hidden_states)
-        hidden_states = get_tp_group().all_gather(hidden_states)
+        # Custom, like the LM head's gather (`embed_head.py`). The default
+        # `use_custom=False` lands on RCCL: ~14 us per call at decode plus a
+        # ~15 us GPU idle gap after it, once per draft step. The fc output is
+        # [N, hidden / tp] bf16, so the last-dim gather qualifies (row bytes
+        # are a multiple of 16), and `graph_capture()` arms the custom path
+        # for the draft mid-step recordings.
+        hidden_states = get_tp_group().all_gather(
+            hidden_states, use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER
+        )
         residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
