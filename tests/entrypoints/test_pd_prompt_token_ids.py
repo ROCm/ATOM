@@ -19,6 +19,7 @@ from atom.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
 )
+from atom.sampling_params import SamplingParams
 
 PROMPT_IDS = [101, 102, 103, 104]
 
@@ -347,9 +348,9 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
             else api_server.generate_async
         )
         args = (
-            ([11, 12], {"image": "fixture"}, object(), "req-1")
+            ([11, 12], {"image": "fixture"}, SamplingParams(), "req-1")
             if multimodal
-            else ([11, 12], object(), "req-1")
+            else ([11, 12], SamplingParams(), "req-1")
         )
         return [output async for output in generate(*args, return_token_ids=return_ids)]
 
