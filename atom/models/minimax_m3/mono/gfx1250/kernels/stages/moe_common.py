@@ -98,7 +98,7 @@ def moe_common_defs(k4ctx):
         shared, tk, slot, cg = ug_task(t)
         e_u = shared.select(
             fx.Int32(SHARED_EXPERT),
-            fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), SHARED_EXPERT),
+            fx.max(fx.min(uniform(fx.ptr_load(route + (8 * tk + slot))), SHARED_EXPERT), 0),
         )
         r_w = rsrc(w13 + fx.Int64(e_u) * W13_BYTES)
         r_s = rsrc(s13)
@@ -185,7 +185,7 @@ def moe_common_defs(k4ctx):
             jj = fx.min(j, DN_UNITS - 1)
             sl = jj // DN_KC
             kc = jj % DN_KC
-            e_d = fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT)
+            e_d = fx.max(fx.min(uniform(fx.ptr_load(route + (8 * k + sl))), SHARED_EXPERT), 0)
             wv = shuffled_rows(rsrc(w2 + fx.Int64(e_d) * W2_BYTES, dn_bytes), rg_d, INTER // 2, kc, lane, 64, CM_NT)
             sc = n32k4_word(rsrc(s2, dn_scale_bytes), e_d * HIDDEN + 16 * rg_d + l16, kc, INTER)
             wgt = (j < DN_UNITS).select(fx.ptr_load(rwt + (8 * k + sl)), fx.Float32(0.0))
