@@ -158,6 +158,11 @@ def _constrain_row_block(
             x = tl.load(row_ptr + forced)
             tl.store(row_ptr + forced, tl.where(x == neg_inf, 0.0, x))
     elif (s >= 0) & (vb == 0):
+        # No all -inf guard here, unlike the forced branch: this writes only
+        # the few end ids and leaves every other column as the LM head wrote
+        # it, finite, so the row keeps all of them. A guard would have to read
+        # the whole row to know, on the step a request takes every time until
+        # its channel opens.
         for e in tl.static_range(END_LEN):
             tl.store(row_ptr + tl.load(table_ptr + forced_end + e), neg_inf)
 

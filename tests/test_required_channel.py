@@ -158,9 +158,32 @@ def test_ending_on_adds_only_real_ids():
     assert ch.ending_on([5, 2, 3]).end_ids == (2, 3, 5)
 
 
-def test_k3_constrains_nothing_when_its_control_tokens_split():
-    """Forcing a split spelling would hand the model ids it never writes."""
-    assert KimiK3Parser.required_call_channel(K3Tokenizer(split_controls=True)) is None
+def test_k3_constrains_nothing_when_its_control_tokens_split(caplog):
+    """Forcing a split spelling would hand the model ids it never writes, and
+    the server says so at startup."""
+    tokenizer = K3Tokenizer(split_controls=True)
+    with caplog.at_level("WARNING", logger="atom"):
+        assert KimiK3Parser.required_call_channel(tokenizer) is None
+    assert "will not hold output to the tools channel" in caplog.text
+
+
+def test_k3_constrains_nothing_when_the_opening_does_not_start_with_its_channel(
+    caplog,
+):
+    """`opens_at` counts `<|open|>tools<|sep|>` at the head of the opening; a
+    tokenizer that encodes that head differently in context would misplace
+    where the channel counts as open."""
+
+    class MergingTokenizer(K3Tokenizer):
+        def encode(self, text, add_special_tokens=False):
+            ids = super().encode(text, add_special_tokens)
+            if text.startswith("<|open|>tools<|sep|><|open|>call"):
+                ids[1] = 99999  # `tools` read another way in context
+            return ids
+
+    with caplog.at_level("WARNING", logger="atom"):
+        assert KimiK3Parser.required_call_channel(MergingTokenizer()) is None
+    assert "head of the forced opening" in caplog.text
 
 
 def test_the_server_derives_k3s_channel_once_beside_its_parser():
