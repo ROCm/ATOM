@@ -1235,10 +1235,12 @@ class ModelRunner:
                     t0 = time.monotonic()
                     prof.export_chrome_trace(tmp_json_path)
                     # Chunked gzip: read 64 MB at a time to avoid loading
-                    # the entire JSON (~30 GB) into memory at once.
+                    # the entire JSON (~30 GB) into memory at once. Level 3,
+                    # not the default 9, since stop_profile waits for it: on
+                    # a PP8 stage trace it is ~6x faster, for a file ~25% larger.
                     with (
                         open(tmp_json_path, "rb") as src,
-                        _gzip.open(output_path, "wb") as dst,
+                        _gzip.open(output_path, "wb", compresslevel=3) as dst,
                     ):
                         while chunk := src.read(64 * 1024 * 1024):
                             dst.write(chunk)

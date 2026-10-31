@@ -137,6 +137,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Non-PP engines: while requests are parked for remote KV, block up to this
+    # many ms after each forward for a fresh worker completion poll, so a
+    # receive that landed during the forward is scheduled the next step rather
+    # than the one after. 0 = off (the poll stays one step behind).
+    "ATOM_KV_POLL_FRESH_WAIT_MS": lambda: _nonnegative_int_env(
+        "ATOM_KV_POLL_FRESH_WAIT_MS", 0
+    ),
+    # Prefill only: answer a router's PD prefill request (`do_remote_decode`)
+    # with its prompt ids as base64 int32 inside `kv_transfer_params`
+    # (`prompt_token_ids_b64`), which the router forwards to decode verbatim,
+    # instead of a top-level JSON int list. Other requests, decode's included,
+    # keep the list. Every decode accepts both. 0 = the JSON list.
+    "ATOM_PD_PROMPT_IDS_B64": lambda: _flag_env("ATOM_PD_PROMPT_IDS_B64", "0"),
+    # Decode (`kv_consumer`) only: stream the prefill's sampled first token
+    # (T0) to the client when the request's KV lands, ahead of the first local
+    # decode, whose output deferred output makes visible two forwards later.
+    # 0 = T0 rides with that first decode output.
+    "ATOM_PD_EARLY_T0": lambda: _flag_env("ATOM_PD_EARLY_T0", "0"),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.

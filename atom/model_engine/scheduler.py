@@ -680,6 +680,9 @@ class Scheduler:
         # by `take_rejected` each EngineCore step; routed through the same
         # output_queue path as forward-finished seqs.
         self._rejected: list[Sequence] = []
+        # `ATOM_PD_EARLY_T0` stream outputs, drained by `take_early_outputs`
+        # after every `schedule()`, in the PP head loop too, before the forward.
+        self._early_outputs: list[tuple[int, RequestOutput]] = []
 
         # KV transfer bookkeeping
         self.finished_recving_kv_req_ids: list[int] = []
@@ -1963,6 +1966,14 @@ class Scheduler:
             return []
         out = self._rejected
         self._rejected = []
+        return out
+
+    def take_early_outputs(self) -> list[tuple[int, RequestOutput]]:
+        """Pop the T0 stream outputs `ATOM_PD_EARLY_T0` queued this schedule."""
+        if not self._early_outputs:
+            return []
+        out = self._early_outputs
+        self._early_outputs = []
         return out
 
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
@@ -3255,6 +3266,33 @@ class Scheduler:
                 # so counting only `len(drafts)` would leave that EOS behind as
                 # real context. T0 is excluded: it is a real generated token.
                 seq.num_placeholder_tokens = self.mtp_k
+            if envs.ATOM_PD_EARLY_T0 and seq.max_tokens > 0:
+                # Emitted now, so postprocess must not prepend it again. Stop
+                # checks never looked at T0 alone, so none is skipped.
+                seq._injected_t0 = None
+                # Postprocess no longer sees T0, so TTFT and the generation
+                # count are taken here, when the client gets it.
+                if seq.first_token_time == 0.0:
+                    seq.first_token_time = time.time()
+                    tracing.first_token(seq)
+                self.engine_stats.update_throughput(num_generation_tokens=1)
+                self._early_outputs.append(
+                    (
+                        seq.id,
+                        RequestOutput(
+                            request_id=seq.id,
+                            output_tokens=[first_token_id],
+                            finished=False,
+                            finish_reason=None,
+                            kv_transfer_params_output=getattr(
+                                seq, "kv_transfer_params_output", None
+                            ),
+                            num_cached_tokens=getattr(
+                                seq, "prefix_cache_hit_tokens", 0
+                            ),
+                        ),
+                    )
+                )
         logger.debug(
             "[PD-TRANSITION] seq %s: num_tokens=%d, "
             "num_prompt=%d, blocks=%d, first_token=%s, "
