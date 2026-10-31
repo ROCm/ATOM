@@ -2110,6 +2110,21 @@ def test_a_consumer_outside_this_rank_s_head_group_is_refused():
         _run_slot_transfer(mc, connector, _dcp_tp_request(4, 2))
 
 
+@pytest.mark.parametrize("consumer_tp_size", [1, 3], ids=["smaller", "not-a-multiple"])
+def test_a_decode_tp_that_is_not_a_multiple_of_this_one_is_refused(consumer_tp_size):
+    """Flooring the ratio to 1 would compare whole slot units and report a
+    model or spec mismatch instead."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    connector = _pp_stage_connector(mc, nic, tp_size=2, tp_rank=0)
+
+    with pytest.raises(RuntimeError, match="not a multiple of prefill TP 2"):
+        _run_slot_transfer(mc, connector, _dcp_tp_request(consumer_tp_size, 0))
+    assert nic.descriptors == 0
+
+
 _REC_SRC, _REC_BPS = 1024, 16
 _CUR_SRC, _CUR_BPS = 2048, 4
 _REC_DST, _CUR_DST = 14336, 15360

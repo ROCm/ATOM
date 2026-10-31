@@ -3729,11 +3729,24 @@ class MooncakeConnector(KVConnectorBase):
         # shard this rank holds, which is only this rank's when q's group is.
         # A backend that publishes no segments keeps whole-unit writes.
         consumer_tp_size = request_data.get("consumer_tp_size")
+        tp_segments = getattr(self, "_slot_region_tp_segments", None)
+        tp_replicated = getattr(self, "_slot_region_tp_replicated", None)
+        # Any other consumer TP would floor to whole-unit writes and fail
+        # below as a model or spec mismatch.
+        if (
+            tp_segments is not None
+            and consumer_tp_size is not None
+            and consumer_tp_size % self.tp_size
+        ):
+            raise RuntimeError(
+                f"Decode TP {consumer_tp_size} is not a multiple of prefill TP "
+                f"{self.tp_size} for req {req_id}: only then does each decode "
+                "rank hold part of exactly one prefill rank's TP-sharded slot "
+                "state"
+            )
         tp_ratio = (
             1 if consumer_tp_size is None else max(1, consumer_tp_size // self.tp_size)
         )
-        tp_segments = getattr(self, "_slot_region_tp_segments", None)
-        tp_replicated = getattr(self, "_slot_region_tp_replicated", None)
         split = tp_ratio > 1 and tp_segments is not None
         # A split slot is a k-th of this one; Phase 2a sizes it against its
         # segments.
