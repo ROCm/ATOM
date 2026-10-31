@@ -100,12 +100,6 @@ class TestPrefillTileWidth:
 class TestDecodeScoreChunks:
     """A grid dim, so: shape-constant, positive, and never past the blocks."""
 
-    @pytest.fixture(autouse=True)
-    def original_architecture_policy(self, monkeypatch):
-        # These original assertions describe the unchanged gfx950 chunk floor.
-        # gfx1250 has separate exact-policy/coverage checks below.
-        monkeypatch.setattr(m, "get_gfx", lambda: "gfx950")
-
     @pytest.mark.parametrize("batch", [1, 2, 7, 8, 50, 64, 256, 1024])
     @pytest.mark.parametrize("max_block", [1, 2, 63, 64, 256, 800, 8192])
     def test_bounds_and_coverage(self, batch, max_block):
@@ -739,7 +733,7 @@ def test_decode_chunk_architecture_and_boundaries(monkeypatch, arch, batch):
         8192,
         65534,
     ):
-        chunks = m._decode_score_chunks(batch, width)
+        chunks = m._native_decode_score_chunks(batch, width)
         previous = _previous_decode_score_chunks(batch, width)
         if arch != "gfx1250" or batch > 2 or batch * width > 1024 or width <= 0:
             assert chunks == previous
@@ -799,7 +793,7 @@ def test_decode_chunk_policy_scores_selection_and_replay(
         device=device,
         dtype=torch.int32,
     )
-    new_policy = m._decode_score_chunks
+    new_policy = m._native_decode_score_chunks
 
     def score(policy):
         out = torch.full((heads, total_q, pages), float("-inf"), device=device)
@@ -826,7 +820,7 @@ def test_decode_chunk_policy_scores_selection_and_replay(
 
     def run(policy):
         with monkeypatch.context() as patch:
-            patch.setattr(m, "_decode_score_chunks", policy)
+            patch.setattr(m, "_native_decode_score_chunks", policy)
             return m.minimax_m3_index_topk_decode(
                 q,
                 cache,
@@ -887,3 +881,79 @@ def test_decode_chunk_policy_scores_selection_and_replay(
             reference = run(_previous_decode_score_chunks)
             assert all(torch.equal(x, y) for x, y in zip(replayed, reference))
     torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250"])
+@pytest.mark.parametrize("batch", [1, 2, 8])
+def test_cp_retains_shared_chunk_policy(monkeypatch, arch, batch):
+    from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
+
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    assert cp._decode_score_chunks is m._decode_score_chunks
+    for local_pages in (1, 8, 16, 64, 128, 256, 257, 512, 823, 1024):
+        assert cp._decode_score_chunks(batch, local_pages) == (
+            _previous_decode_score_chunks(batch, local_pages)
+        )
+
+
+@gpu
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("pages", [64, 1024])
+def test_cp_actual_launch_grid_and_replay_unchanged(monkeypatch, batch, pages):
+    from atom.model_ops.minimax_m3 import indexer_context_parallel as cp
+
+    if m.get_gfx() != "gfx1250":
+        pytest.skip("CP exclusion from gfx1250 native launch tuning")
+    qrows, heads, world, rank = 4, 4, 4, 1
+    context = pages * 128 - 3
+    torch.manual_seed(833)
+    q = torch.randn(batch * qrows, heads, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn(batch * pages, 128, 128, device="cuda").to(torch.float8_e4m3fn)
+    table = torch.randperm(batch * pages, device="cuda").int().reshape(batch, pages)
+    lengths = torch.full((batch,), context, dtype=torch.int32, device="cuda")
+    kernel = cp._context_score
+    grids = []
+
+    class RecordActualLaunch:
+        def __getitem__(self, grid):
+            grids.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(cp, "_context_score", RecordActualLaunch())
+    monkeypatch.setattr(
+        m,
+        "_native_decode_score_chunks",
+        lambda *args: pytest.fail("CP must not call native-only chunk policy"),
+    )
+
+    def call():
+        return cp.indexer_context_scores(
+            q, cache, table, lengths, context, rank, world, qrows, 128**-0.5
+        )
+
+    local_pages = (pages + world - 1) // world
+    expected_grid = (batch, _previous_decode_score_chunks(batch, local_pages))
+    actual = call()
+    assert grids == [expected_grid]
+    with monkeypatch.context() as legacy:
+        legacy.setattr(cp, "_decode_score_chunks", _previous_decode_score_chunks)
+        expected = call()
+    assert torch.equal(actual, expected)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            replayed = call()
+        for length in (qrows, context):
+            q.neg_()
+            lengths.fill_(length)
+            graph.replay()
+            with monkeypatch.context() as legacy:
+                legacy.setattr(
+                    cp, "_decode_score_chunks", _previous_decode_score_chunks
+                )
+                expected = call()
+            assert torch.equal(replayed, expected)
+    torch.cuda.current_stream().wait_stream(stream)
+    assert all(grid == expected_grid for grid in grids)
