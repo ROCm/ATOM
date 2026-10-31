@@ -101,7 +101,9 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
 
     logger.info("Initializing engine with model %s...", args.model)
     engine_args = EngineArgs.from_cli_args(args)
-    engine = engine_args.create_engine(tokenizer=tokenizer)
+    # `AtomStandaloneService` answers through per-request callbacks and never
+    # reads `get_output()`.
+    engine = engine_args.create_engine(tokenizer=tokenizer, keep_finished_outputs=False)
     return engine, tokenizer
 
 

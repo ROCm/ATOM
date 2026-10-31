@@ -3,6 +3,7 @@
 
 """Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
+import array
 import asyncio
 from types import SimpleNamespace
 from uuid import UUID
@@ -15,9 +16,12 @@ from fastapi.responses import JSONResponse
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import (
+    PROMPT_TOKEN_IDS_B64,
     ChatCompletionRequest,
     ChatMessage,
     CompletionRequest,
+    encode_prompt_token_ids,
+    resolve_prompt_token_ids,
 )
 
 PROMPT_IDS = [101, 102, 103, 104]
@@ -151,6 +155,26 @@ class TestPromptTokenIdRequests:
         )
         assert request.kv_transfer_params is original
         assert original == {**metadata, "prompt_token_ids": PROMPT_IDS}
+        assert server.templates == 0
+
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    def test_b64_ids_reach_generation_as_array_and_leave_kv(self, server, endpoint):
+        metadata = {"do_remote_prefill": True, "remote_block_ids": [10]}
+        kwargs = {"prompt": "hi"} if endpoint == "completion" else {}
+        request, handler = _request(
+            endpoint,
+            kv_transfer_params={
+                **metadata,
+                PROMPT_TOKEN_IDS_B64: encode_prompt_token_ids(PROMPT_IDS),
+            },
+            **kwargs,
+        )
+
+        asyncio.run(handler(request, None))
+
+        sent, options = server.generate[0]
+        assert isinstance(sent, array.array) and sent.tolist() == PROMPT_IDS
+        assert options["kv_transfer_params"] == metadata
         assert server.templates == 0
 
     @pytest.mark.parametrize("endpoint", ["chat", "completion"])
@@ -303,10 +327,8 @@ class TestHttpResponseSerialization:
         assert server.templates == (1 if endpoint == "chat" else 0)
 
 
-@pytest.mark.parametrize("return_ids", [False, True])
-@pytest.mark.parametrize("multimodal", [False, True])
-def test_generate_async_reads_prompt_ids_from_local_sequence(
-    monkeypatch, return_ids, multimodal
+def _run_generate_async(
+    monkeypatch, return_ids, kv_meta=None, multimodal=False, kv_params=None
 ):
     seq = SimpleNamespace(
         id=7,
@@ -323,6 +345,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
                 finished=True,
                 finish_reason="eos",
                 num_cached_tokens=0,
+                kv_transfer_params_output=kv_meta,
             )
         )
         return seq
@@ -351,11 +374,23 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
             if multimodal
             else ([11, 12], object(), "req-1")
         )
-        return [output async for output in generate(*args, return_token_ids=return_ids)]
+        kwargs = {} if kv_params is None else {"kv_transfer_params": kv_params}
+        return [
+            output
+            async for output in generate(*args, return_token_ids=return_ids, **kwargs)
+        ]
 
     outputs = asyncio.run(collect())
     assert len(outputs) == 1
-    output = outputs[0]
+    return outputs[0]
+
+
+@pytest.mark.parametrize("return_ids", [False, True])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_generate_async_reads_prompt_ids_from_local_sequence(
+    monkeypatch, return_ids, multimodal
+):
+    output = _run_generate_async(monkeypatch, return_ids, multimodal=multimodal)
     assert output["num_tokens_input"] == len(PROMPT_IDS)
     if return_ids:
         assert output["prompt_token_ids"] == PROMPT_IDS
@@ -564,3 +599,34 @@ def test_multimodal_chat_returns_requested_prompt_ids(
     assert body["usage"]["prompt_tokens"] == len(PROMPT_IDS)
     assert len(body["choices"]) == n
     assert calls == ["single" if n == 1 else "fanout"] and server.templates == 0
+
+
+@pytest.mark.parametrize(
+    ("kv_params", "kv_meta", "b64"),
+    [
+        # A router's P/D prefill request.
+        ({"do_remote_decode": True}, {"remote_block_ids": [1]}, True),
+        # Without metadata there is nowhere to carry it.
+        ({"do_remote_decode": True}, None, False),
+        # A decode: connectors fill the output metadata there too.
+        ({"do_remote_prefill": True}, {"remote_block_ids": [1]}, False),
+        # A client asking a prefill directly.
+        (None, {"remote_block_ids": [1]}, False),
+    ],
+)
+def test_b64_prompt_ids_only_answer_a_pd_prefill_request(
+    monkeypatch, kv_params, kv_meta, b64
+):
+    monkeypatch.setenv("ATOM_PD_PROMPT_IDS_B64", "1")
+
+    output = _run_generate_async(monkeypatch, True, kv_meta, kv_params=kv_params)
+
+    meta = output.get("kv_transfer_output_meta_info")
+    if b64:
+        assert "prompt_token_ids" not in output
+        assert meta["remote_block_ids"] == [1]
+        assert kv_meta == {"remote_block_ids": [1]}
+        assert resolve_prompt_token_ids(None, meta).tolist() == PROMPT_IDS
+    else:
+        assert output["prompt_token_ids"] == PROMPT_IDS
+        assert meta == kv_meta

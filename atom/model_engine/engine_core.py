@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 
 import torch
 import zmq
@@ -60,6 +61,20 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 # mid-transfer leaves a completion that never arrives; exiting late beats
 # never exiting.
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
+
+# How often `ATOM_KV_POLL_FRESH_WAIT_MS` logs its polls.
+FRESH_KV_POLL_LOG_INTERVAL_S = 30.0
+
+
+@dataclass
+class FreshKVPollStats:
+    """`ATOM_KV_POLL_FRESH_WAIT_MS` polls since the last log line."""
+
+    start: float = field(default_factory=time.monotonic)
+    polls: int = 0
+    completed: int = 0
+    total_s: float = 0.0
+    max_s: float = 0.0
 
 
 class EngineCore:
@@ -219,6 +234,8 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
+        self._fresh_kv_poll_s = envs.ATOM_KV_POLL_FRESH_WAIT_MS / 1e3
+        self._fresh_kv_poll_stats = FreshKVPollStats()
         if self.kv_transfer_enabled:
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
@@ -488,6 +505,15 @@ class EngineCore:
             # final/aborted requests when there will be no subsequent batch.
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
+    def _put_early_outputs(self):
+        # Every loop that calls `schedule()` must call this: the scheduler has
+        # already cleared each seq's `_injected_t0`, so postprocess will not
+        # send T0 again. Ahead of the forward, and on the queue every later
+        # output of the same seqs takes, so the client sees T0 first.
+        early = getattr(self.scheduler, "take_early_outputs", None)
+        if early is not None and (early_outputs := early()):
+            self.output_queue.put_nowait(("STREAM", early_outputs))
+
     def _process_engine_step_inner(self):
         result = self.scheduler.schedule()
 
@@ -499,6 +525,8 @@ class EngineCore:
         if rejected:
             self._release_multimodal_requests(rejected)
             self.output_queue.put_nowait(rejected)
+
+        self._put_early_outputs()
 
         if result is None:
             self._advance_idle_kv_transfer()
@@ -644,11 +672,47 @@ class EngineCore:
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
 
+    def _record_fresh_poll(self, elapsed_s: float, completed: bool) -> None:
+        """Log the fresh polls' count, hit rate and blocking time every 30s."""
+        stats = self._fresh_kv_poll_stats
+        stats.polls += 1
+        stats.completed += int(completed)
+        stats.total_s += elapsed_s
+        stats.max_s = max(stats.max_s, elapsed_s)
+        now = time.monotonic()
+        if now - stats.start < FRESH_KV_POLL_LOG_INTERVAL_S:
+            return
+        logger.info(
+            "%s: fresh KV poll: window_s=%.1f n=%d done=%d mean_ms=%.2f max_ms=%.2f",
+            self.label,
+            now - stats.start,
+            stats.polls,
+            stats.completed,
+            stats.total_s / stats.polls * 1e3,
+            stats.max_s * 1e3,
+        )
+        self._fresh_kv_poll_stats = FreshKVPollStats(start=now)
+
     def _poll_kv_transfer_progress(self) -> None:
         if not self.kv_transfer_enabled:
             return
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        wait_s = self._fresh_kv_poll_s
+        if (
+            kvoutput is not None
+            and wait_s > 0
+            and getattr(self.scheduler, "_num_parked_remote_kv", 0) > 0
+        ):
+            # What just completed was taken right after the previous forward;
+            # the workers are idle now, so the poll it re-armed answers at once
+            # with whatever landed during this one.
+            t0 = time.perf_counter()
+            fresh = self.runner_mgr.call_func_with_aggregation(
+                "async_proc_aggregation", wait_s=wait_s
+            )
+            self._record_fresh_poll(time.perf_counter() - t0, fresh is not None)
+            self.scheduler._update_from_kv_xfer_finished(fresh)
         # Reclaim any offload save whose completion report never came (LMCache
         # force-unpinned it upstream). Self-throttled, so calling it on every
         # poll is cheap; without it a stalled save hangs the engine forever.
