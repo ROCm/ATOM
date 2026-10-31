@@ -133,7 +133,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
-from atom.model_ops.layernorm import RMSNorm
+from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -231,11 +231,19 @@ class KimiK3DFlashAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # Per-head QK-norm, Qwen3 style: RMSNorm over head_dim is row-wise, so a
-        # flat [N, q_size] tensor is normalized in head_dim-wide groups without
-        # an explicit reshape.
+        # Per-head QK-norm, Qwen3 style. The block pass norms q and k in one
+        # launch straight off the fused qkv's split views; the context write
+        # norms k alone.
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.qk_norm = DualRMSNorm(
+            self.q_norm,
+            self.k_norm,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            prefix=f"{prefix}.qk_norm",
+        )
 
         # The DRAFT'S OWN rope, never the target's. This checkpoint is YaRN x16
         # from 65536 at theta 10000; Kimi-K3 is x32 from 32768 at theta 50000.
@@ -288,8 +296,7 @@ class KimiK3DFlashAttention(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
 
         q, k, v = self._qkv(hidden_states)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        q, k = self.qk_norm(q, k)
         # Norm, THEN rope -- the reference's order, and the reason the norms are
         # not handed to the op (its non-fused path ropes first).
         q, k = self.rotary_emb(positions, q, k)
@@ -594,7 +601,7 @@ class KimiK3DFlash(DSparkDraftModel):
         self_attention_res_proj.weight`, folded at load) and the kernel is the
         one the target itself runs, called with ``out_norm_weight=None`` so the
         result comes back un-normed -- exactly SGLang's "softmax mixture, no
-        output norm". `kimi_k3.py` is `@support_torch_compile` and is not
+        output norm". `kimi_k3/model.py` is `@support_torch_compile` and is not
         touched; the whole reconstruction lives here, in the draft that wants it.
         """
         # Local: `drafter` imports the model loader, so a module-level import
