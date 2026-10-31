@@ -2269,6 +2269,123 @@ class TestPagedCopyCheckpoint:
         assert copying._checkpoint_room(seq, True) == 0
 
 
+# ── Rungs with several forwards in flight ──────────────────────────────────
+
+
+def pipelined_scheduler(state_runtime=PAGED_COPY_RUNTIME):
+    """A PP head: the next chunk is scheduled before the last one retires."""
+    return make_scheduler(
+        paged_copy_config(
+            pipeline_parallel_size=2,
+            state_checkpoint_interval_tokens=3 * BLOCK,
+        ),
+        state_runtime=state_runtime,
+    )
+
+
+class TestPipelinedRungCheckpoints:
+    """The chunk after a rung is issued before the rung's chunk retires.
+
+    Filing at retire would read a slot that chunk has already written, so a
+    fork holds it back until then. A PAGE image is a copy the runner makes,
+    which the next batch can carry between the two forwards, so it is filed
+    as the rung is scheduled and the tail goes out at once.
+    """
+
+    PROMPT = 40
+    # The last rung of the 12-token grid short of the prompt end. A fork's
+    # `min_fork_tokens` of successor room moves it one rung back.
+    RUNG = 36
+    FORK_RUNG = 24
+
+    def test_the_tail_goes_out_before_the_rung_retires(self):
+        sched = pipelined_scheduler()
+        bm = sched.block_manager
+        seq = stateful_seq(list(range(self.PROMPT)))
+        sched.add(seq)
+
+        first, _ = sched.schedule()
+        assert list(first.num_scheduled_tokens) == [self.RUNG]
+        assert (
+            not first.state_maintenance_ops.checkpoint_stores
+        ), "its copy would run before the forward that fills the slot"
+
+        second, _ = sched.schedule()
+        assert list(second.req_ids) == [seq.id]
+        stores = second.state_maintenance_ops.checkpoint_stores
+        assert [op.src_slot for op in stores] == [seq.state_slot]
+
+        bm.complete_previous_state_batch()
+        rung_hash = bm.prefix_hash_chain(seq, [], self.RUNG // BLOCK)[-1]
+        assert bm.paged_state_checkpoints.store.contains(rung_hash)
+        sched.register_prefill_hashes(first, [seq])
+        assert bm.kv.block(seq.block_table[self.RUNG // BLOCK - 1]).hash == rung_hash
+
+    def test_retire_does_not_refile_a_dropped_rung(self, monkeypatch):
+        """By retire the slot holds the tail's state, not the rung's."""
+        sched = pipelined_scheduler()
+        bm = sched.block_manager
+        store = bm.paged_state_checkpoints.store
+        seq = stateful_seq(list(range(self.PROMPT)))
+        sched.add(seq)
+        first, _ = sched.schedule()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "begin_store", lambda h, src_slot: None)
+            second, _ = sched.schedule()
+        assert not second.state_maintenance_ops.checkpoint_stores
+
+        sched.register_prefill_hashes(first, [seq])
+        assert not bm.take_state_maintenance_ops().checkpoint_stores
+
+    def test_the_hash_resumes_from_published_blocks(self):
+        bm = make_block_manager(
+            paged_copy_config(state_checkpoint_interval_tokens=3 * BLOCK),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = stateful_seq(list(range(self.PROMPT)))
+        bm.allocate(seq, bm.can_allocate(seq))
+        bm.hash_blocks(seq, 2 * BLOCK, start_tokens=0)
+        bm.take_state_maintenance_ops()
+
+        assert bm.checkpoint_when_scheduled(seq, self.RUNG)
+        assert not bm.take_state_maintenance_ops().checkpoint_stores
+        assert len(bm.take_state_maintenance_ops().checkpoint_stores) == 1
+        bm.complete_previous_state_batch()
+
+        rung_hash = bm.prefix_hash_chain(seq, [], self.RUNG // BLOCK)[-1]
+        assert bm.paged_state_checkpoints.store.contains(rung_hash)
+
+    def test_a_seq_freed_before_the_drain_files_nothing(self):
+        bm = make_block_manager(
+            paged_copy_config(state_checkpoint_interval_tokens=3 * BLOCK),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        seq = stateful_seq(list(range(self.PROMPT)))
+        bm.allocate(seq, bm.can_allocate(seq))
+
+        assert bm.checkpoint_when_scheduled(seq, self.RUNG)
+        bm.deallocate(seq)
+
+        assert seq.scheduled_checkpoint_pos == 0
+        assert not bm.take_state_maintenance_ops().checkpoint_stores
+        assert not bm.take_state_maintenance_ops().checkpoint_stores
+
+    def test_a_fork_still_holds_the_tail(self):
+        sched = pipelined_scheduler(DEFAULT_STATE_RUNTIME)
+        seq = stateful_seq(list(range(self.PROMPT)))
+        sched.add(seq)
+
+        first, _ = sched.schedule()
+        assert list(first.num_scheduled_tokens) == [self.FORK_RUNG]
+        _, held = sched.schedule()
+        assert seq.id not in held
+
+        sched.register_prefill_hashes(first, [seq])
+        second, _ = sched.schedule()
+        assert list(second.req_ids) == [seq.id]
+
+
 # ── Checkpoints past the prompt ────────────────────────────────────────────
 
 
@@ -2700,6 +2817,31 @@ class TestDemandDrivenCheckpoints:
         assert 28 % INTERVAL
         assert bm.checkpoint_limit(second) == 32
 
+    def test_the_demand_lands_on_the_joint_chunk_grid(self):
+        """An HBM hit stopping on an off-grid demand cannot continue from LMCache.
+
+        The joint load's KV leg starts on the chunk grid, so `_joint_kv_boundary`
+        refuses an HBM boundary off it and the evicted tail is recomputed. A
+        chunk equal to the hash block (DCP's case) or off its grid leaves the
+        demand where it was; one that floors it to the hit drops it.
+        """
+        for chunk, want in (
+            (0, 28),
+            (BLOCK, 28),
+            (2 * BLOCK, 24),
+            (4 * BLOCK, 16),
+            (6, 28),
+            (8 * BLOCK, 0),
+        ):
+            bm = make_block_manager(demand_config())
+            bm._joint_chunk_tokens = chunk
+            run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+            second = stateful_seq(BRANCH)
+            assert bm.can_allocate(second) == 0, chunk
+            assert second.num_wanted_hit_blocks == 7, chunk  # still measured
+            assert second.checkpoint_demand_pos == want, chunk
+            assert not want or bm.checkpointers_at(second, want), chunk
+
     def test_the_rung_can_be_switched_off_without_the_grid(self):
         """`--no-state-checkpoint-demand` drops the rung, nothing else.
 
@@ -3128,6 +3270,45 @@ class TestPromptEndAnchor:
         seq = stateful_seq(list(range(MIN_FORK)))
         bm.can_allocate(seq)
         assert seq.checkpoint_end_pos == 0
+
+    def test_the_anchor_lands_on_the_joint_chunk_grid(self):
+        """Past an HBM eviction only the joint load can resume the anchor.
+
+        Its KV leg moves whole LMCache chunks, and the chunk covering an
+        off-grid anchor runs past the prompt, so nothing ever stored it. A
+        chunk equal to the hash block (DCP's case) or off its grid leaves the
+        anchor where it was.
+        """
+        for chunk, want in (
+            (0, 36),
+            (BLOCK, 36),
+            (2 * BLOCK, 32),
+            (4 * BLOCK, 32),
+            (6, 36),
+        ):
+            bm = make_block_manager(demand_config())
+            bm._joint_chunk_tokens = chunk
+            seq = stateful_seq(PROMPT)
+            bm.can_allocate(seq)
+            assert seq.checkpoint_end_pos == want, chunk
+            assert bm.checkpointers_at(seq, want), chunk
+
+        bm = make_block_manager(demand_config())
+        bm._joint_chunk_tokens = 16 * BLOCK
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0  # shorter than one chunk
+
+        # The serving regime: no grid, no demand, the anchor is the only rung.
+        bm = make_block_manager(
+            demand_config(
+                state_checkpoint_interval_tokens=-1, state_checkpoint_demand=False
+            )
+        )
+        bm._joint_chunk_tokens = 4 * BLOCK
+        assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == [32]
+        second = stateful_seq(CONTINUATION)
+        assert bm.can_allocate(second) == 8  # resumes at the chunk-aligned 32
 
     def test_the_cut_and_the_keep_agree_at_every_anchor(self):
         """Swept, because a cut nothing keeps is a forward spent on nothing."""

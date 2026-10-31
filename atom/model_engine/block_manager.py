@@ -2387,7 +2387,11 @@ class BlockManager:
                 )
             )
         pos = base + num_new_tokens
-        kept = self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+        kept = (
+            self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+            if pos > seq.scheduled_checkpoint_pos
+            else []
+        )
         for cache in kept:
             cache.checkpoint(seq, end, h)
         if kept:
@@ -2398,6 +2402,47 @@ class BlockManager:
         # is precisely when the reserved bytes exist. A no-op with nothing
         # reserved, so decode and unreadable backends pay a branch.
         self.commit_midstep(seq)
+
+    def checkpoint_when_scheduled(self, seq: Sequence, pos: int) -> bool:
+        """Decide the checkpoint a prefill chunk ending at `pos` lands on, as
+        the chunk is scheduled rather than when it retires.
+
+        With several forwards in flight, the chunk after the rung is issued
+        before this one retires and writes the slot retire would file from.
+        A PAGE image is a copy the runner makes out of the slot, so filing it
+        now, to be carried by the next batch, puts the copy between the two
+        forwards. A fork hands the slot itself over at filing time, which only
+        retire can do: False when any class kept here is of that kind, and the
+        caller holds the next chunk back instead.
+
+        True also covers keeping nothing; either way retire files nothing up
+        to `pos`.
+        """
+        kept = self.checkpointers_at(seq, pos)
+        if any(c is not self.paged_state_checkpoints for c in kept):
+            return False
+        seq.scheduled_checkpoint_pos = max(seq.scheduled_checkpoint_pos, pos)
+        if kept:
+            h = self._prompt_chain_hash(seq, pos // self.hash_block_size)
+            self.paged_state_checkpoints.checkpoint_when_scheduled(seq, h)
+            seq.last_checkpoint_pos = pos
+        return True
+
+    def _prompt_chain_hash(self, seq: Sequence, blocks: int) -> int:
+        """Chained hash of the first `blocks` blocks of `seq`'s tokens.
+
+        Blocks still in flight are not hashed yet, so this resumes from the
+        last one that is, or from the seed when none is.
+        """
+        start, h = 0, seq.cache_seed
+        for i in range(min(blocks, len(seq.block_table)) - 1, -1, -1):
+            published = self.kv.block(seq.block_table[i]).hash
+            if published != -1:
+                start, h = i + 1, published
+                break
+        for i in range(start, blocks):
+            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+        return h
 
     def hash_decode_blocks(
         self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
@@ -2565,6 +2610,24 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # Onto the LMCache chunk grid when the joint load serves this tier, as
+        # the prompt-end anchor is (`_record_checkpoint_end`). A demand sits
+        # where a shared prefix forks, the part of a prompt HBM keeps longest,
+        # so it is what an evicted prompt's HBM hit stops on. Off the grid that
+        # hit cannot be continued from LMCache at all (`_joint_kv_boundary`
+        # refuses `hbm_off_chunk_grid`) and the whole evicted tail is
+        # recomputed; on it, the joint load resumes the tail. Flooring costs
+        # the forks under one chunk each while the prefix is in HBM. A floored
+        # demand at or below the hit is no rung anybody gains from.
+        chunk = self._joint_chunk_tokens
+        if (
+            demand
+            and chunk > self.hash_block_size
+            and chunk % self.hash_block_size == 0
+        ):
+            demand -= demand % chunk
+            if demand <= hit * self.hash_block_size:
+                demand = 0
         # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
         # replay bounds what the missing checkpoint costs. A demand would cut
         # every replay admission's forward at the hit and write a checkpoint
@@ -2693,6 +2756,17 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
+        # Onto the LMCache chunk grid when the joint load serves this tier. HBM
+        # keeps a checkpoint only as long as its KV (`_record_evicted`), so past
+        # an eviction the anchor resumes only through `_joint_kv_boundary`,
+        # whose KV leg needs the whole chunk covering it -- and for an off-grid
+        # anchor that chunk runs past this prompt, so no store ever holds it.
+        # A hash block finer than the chunk (PP: 128 against 1024) otherwise
+        # loses 7 anchors in 8 once the prompt leaves HBM; flooring costs under
+        # one chunk of reuse while it is still there.
+        chunk = self._joint_chunk_tokens
+        if chunk > self.hash_block_size and chunk % self.hash_block_size == 0:
+            end -= end % chunk
         if end > 0:
             seq.checkpoint_end_pos = end
 
@@ -3432,6 +3506,7 @@ class BlockManager:
         # re-validated against the current `state_caches`.
         seq.checkpoint_end_pos = 0
         seq.last_checkpoint_pos = 0
+        seq.scheduled_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a slot that is about to
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:

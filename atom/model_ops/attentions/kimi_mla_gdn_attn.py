@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
@@ -24,7 +26,7 @@ from .aiter_mla import (
     aligned_index_cache_dim,
 )
 from .backends import AttentionBackend
-from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
+from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin, slot_indexed_caches
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
 from .triton_mla import TritonMLAMetadataBuilder
@@ -82,7 +84,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         TP-replicated even though the MLA KV beside it is.
         """
         transfer = super().get_kv_transfer_tensors()
-        if transfer is None or not self._uses_paged_checkpoints():
+        # Under PP an op names every stage's image at once, which a per-stage
+        # LMCache MP worker cannot store; it keeps refusing K3 there.
+        if (
+            transfer is None
+            or not self._uses_paged_checkpoints()
+            or self.model_runner.config.pipeline_parallel_size > 1
+        ):
             return self._with_kda_disagg_regions(transfer)
         spec = self.model_runner.state_runtime.checkpoint_spec
         if spec is None:
@@ -144,43 +152,191 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"{model_type} disaggregated serving requires the mooncake or "
                 f"moriio connector, but kv_connector={connector!r} is configured. "
                 "Only those two move the slot-indexed KDA recurrent state; any "
-                f"other connector would move the {len(self.mla_idx_by_layer)} "
-                "full-attention layers and silently drop the state of the other "
-                f"{len(self.kda_idx_by_layer)}."
+                "other connector would move the full-attention layers and "
+                "silently drop the state of the KDA layers."
             )
 
-        if getattr(config, "pipeline_parallel_size", 1) > 1:
-            # `_consumer_region_map` shifts a stage's regions onto the peer's
-            # list group-major over `num_hidden_layers`. The slot regions below
-            # are group-major over the KDA layers only, a shorter axis, so the
-            # shift would land them on the wrong peer regions -- writing one
-            # layer's state over another's rather than failing.
-            raise NotImplementedError(
-                f"{model_type} disaggregated serving does not support pipeline "
-                f"parallelism (pipeline_parallel_size="
-                f"{config.pipeline_parallel_size}): the KDA state regions are "
-                "keyed by KDA layer index, which `_consumer_region_map` cannot "
-                "align across stages. Run the P and D instances with PP=1."
-            )
+        if connector == "moriio":
+            # MoRIIO reads none of the placement the Mooncake path below
+            # publishes for a PP stage's MLA rows and KDA slots.
+            if getattr(config, "pipeline_parallel_size", 1) > 1:
+                raise NotImplementedError(
+                    f"{model_type} disaggregated serving over moriio does not "
+                    "support pipeline parallelism (pipeline_parallel_size="
+                    f"{config.pipeline_parallel_size}). Use the mooncake "
+                    "connector, or run the P and D instances with PP=1."
+                )
+            tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+            return tensors
 
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+        tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
+            len(tensors.slot_regions)
+        )
+        tensors.slot_region_tp_replicated = [False] * len(tensors.slot_regions)
+        if self.replayssm and tensors.slot_regions:
+            tensors.slot_region_tp_replicated[-1] = True
+        # Only a decode at a larger TP reads the split, but the layout is the
+        # model's and fixed by now: refuse here, on every deployment, rather
+        # than on the first mixed-TP transfer.
+        undescribed = [
+            idx
+            for idx, (segments, replicated) in enumerate(
+                zip(tensors.slot_region_tp_segments, tensors.slot_region_tp_replicated)
+            )
+            if segments is None and not replicated
+        ]
+        if undescribed:
+            raise RuntimeError(
+                f"{model_type} slot regions {undescribed} have no TP split: "
+                "`_kda_slot_tp_segments` does not recognise their unit layout "
+                "(a conv unit is linear_conv_kernel_dim - 1 + num_spec rows of "
+                "[q | k | v]), which a decode at another TP needs"
+            )
+        if getattr(config, "pipeline_parallel_size", 1) > 1:
+            # `_consumer_region_map` shifts a stage's regions onto the peer's
+            # list group-major over `num_hidden_layers`, but the MLA rows and
+            # KDA slots are each numbered over their own kind only; the shift
+            # would write one layer's KV or state over another's.
+            mla, slots = self._pp_consumer_region_indices(
+                len(tensors.block_regions), len(tensors.slot_regions)
+            )
+            tensors.block_region_consumer_indices = mla
+            tensors.slot_region_consumer_indices = slots
         return tensors
+
+    def _kda_slot_tp_segments(self, num_regions: int) -> list:
+        """How each KDA slot region's unit splits over TP ranks.
+
+        A conv unit is `W` rows of `[q | k | v]`, each run as wide as its conv
+        is built on this rank, an SSM unit is `(heads, dv, dk)` and a
+        ReplaySSM record unit `(heads, cache_len, d)`, all sharded by
+        contiguous head blocks, so a peer at k times this TP holds the same
+        k-th of every q, k and v run and of the head axis. A conv unit not
+        shaped as above is left undescribed, and `get_kv_transfer_tensors`
+        refuses it. ReplaySSM's cursor, the last region, is the same on every
+        rank; `slot_region_tp_replicated` says so.
+
+        Units are read off the cache shapes, not a slot: a PP stage that holds
+        no KDA layer has caches with a zero layer axis.
+        """
+        runner = self.model_runner
+        hf = runner.config.hf_config
+        segments: list = [None] * num_regions
+        conv_cache = runner.mamba_k_cache
+        n_kda = conv_cache.shape[0]
+        width, channels = conv_cache.shape[2:]
+        # As `_state_shape_for_runner` sized it: from the runner's count, which
+        # a drafter's `mtp_k` (`self.num_spec`) can differ from.
+        expected_width = hf.linear_conv_kernel_dim - 1 + runner.num_spec_tokens
+        # How wide `KimiKDAAttention` builds each of its q, k and v convs on a
+        # rank. A row that is not three such runs is not split by guessing.
+        run = (
+            hf.linear_num_key_heads // get_tp_group().world_size
+        ) * hf.linear_key_head_dim
+        if width == expected_width and channels == 3 * run:
+            run_bytes = run * conv_cache.element_size()
+            for i in range(min(n_kda, num_regions)):
+                segments[i] = (run_bytes,) * (3 * width)
+        ssm_bytes = math.prod(runner.mamba_v_cache.shape[2:]) * (
+            runner.mamba_v_cache.element_size()
+        )
+        for i in range(n_kda, min(2 * n_kda, num_regions)):
+            segments[i] = (ssm_bytes,)
+        if self.replayssm:
+            records = (
+                runner.replayssm_buf_k,
+                runner.replayssm_buf_u,
+                runner.replayssm_buf_g,
+            )
+            for group, buf in enumerate(records, start=2):
+                unit = math.prod(buf.shape[2:]) * buf.element_size()
+                for i in range(group * n_kda, min((group + 1) * n_kda, num_regions)):
+                    segments[i] = (unit,)
+        return segments
+
+    def _pp_consumer_region_indices(
+        self, num_block_regions: int, num_slot_regions: int
+    ) -> tuple[list[int], list[int]]:
+        """This stage's MLA and KDA regions, placed in a PP=1 peer's lists.
+
+        Each row is placed by its module's own layer number: the peer numbers
+        its MLA rows over the full-attention layers and its slots over the KDA
+        layers, group by group (conv, SSM, then ReplaySSM's records and its
+        one cursor), the same order `state_slot_regions` publishes here.
+        """
+        runner = self.model_runner
+        num_hidden_layers = runner.config.hf_config.num_hidden_layers
+        full = sorted(set(runner.full_attention_layers))
+        if not full:
+            raise RuntimeError(
+                "PP disaggregation needs the hybrid's full-attention layer "
+                "list to place this stage's rows; it is empty"
+            )
+        mla_pos = {layer: i for i, layer in enumerate(full)}
+        kda_pos = {
+            layer: i
+            for i, layer in enumerate(
+                layer for layer in range(num_hidden_layers) if layer not in mla_pos
+            )
+        }
+
+        def place(kind: str, positions: dict, drafts_from: int | None) -> list[int]:
+            rows = self.pool_rows.get(kind, {})
+            placed = [-1] * len(rows)
+            drafts = 0
+            for module, row in rows.items():
+                layer = module.layer_num
+                if layer in positions:
+                    placed[row] = positions[layer]
+                elif drafts_from is not None and layer >= num_hidden_layers:
+                    placed[row] = drafts_from + drafts
+                    drafts += 1
+                else:
+                    raise RuntimeError(
+                        f"PP disaggregation cannot place {kind} row {row}: "
+                        f"layer {layer} is not one of the model's "
+                        f"{len(positions)} layers of that kind"
+                    )
+            return placed
+
+        mla = place(MLA_ROWS, mla_pos, len(full))
+        if len(mla) != num_block_regions:
+            raise RuntimeError(
+                f"{num_block_regions} PAGE regions published for {len(mla)} "
+                "MLA rows; PP disaggregation places one region per row"
+            )
+        kda = place(LINEAR_STATE_ROWS, kda_pos, None)
+        # Counted from the caches, not from the regions: a stage without a
+        # KDA layer publishes no per-layer group, only ReplaySSM's cursor.
+        groups = len(slot_indexed_caches(runner, self.replayssm))
+        cursor = int(bool(self.replayssm))
+        if num_slot_regions != groups * len(kda) + cursor:
+            raise RuntimeError(
+                f"{num_slot_regions} slot regions over {len(kda)} KDA rows "
+                f"(replayssm={self.replayssm}) are not {groups} per-layer "
+                f"groups of {len(kda)} plus {cursor} cursor"
+            )
+        slots = [g * len(kda_pos) + pos for g in range(groups) for pos in kda]
+        if cursor:
+            slots.append(groups * len(kda_pos))
+        return mla, slots
+
+    # Every PP stage scatters its own layers' state into the unit ids the head
+    # names; `ModelRunner._agree_pipeline_checkpoint_spec` sizes them.
+    paged_checkpoints_span_pipeline = True
 
     def _uses_paged_checkpoints(self) -> bool:
         """Whether this run keeps checkpoints as PAGE images rather than slots.
 
-        Off under pipeline parallelism and RapidServe, which `get_num_blocks`
-        *raises* on when the transfer copies. Answering yes there would turn
-        "K3 under PP keeps no state cache" into "K3 under PP does not start".
+        Off under RapidServe, which `get_num_blocks` *raises* on when the
+        transfer copies. Answering yes there would turn "K3 under RapidServe
+        keeps no state cache" into "K3 under RapidServe does not start".
 
         One predicate for both `state_transfer` and `state_spec`, because the
         two disagreeing would size a pool for one mechanism and run the other.
         """
-        config = self.model_runner.config
-        return not (
-            config.pipeline_parallel_size > 1
-            or getattr(config, "enable_rapidserve", False)
-        )
+        return not getattr(self.model_runner.config, "enable_rapidserve", False)
 
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
