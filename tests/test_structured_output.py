@@ -44,6 +44,8 @@ def controller():
     obj.compiler = xgr.GrammarCompiler(info)
     obj.compile = obj.compiler.compile_json_schema
     obj.pending = {}
+    obj.states = {}
+    obj.current = {}
     return obj
 
 
@@ -134,6 +136,86 @@ def test_valid_output_and_stop(controller):
         controller.commit(torch.tensor([[token]]), b, prefixes)
         history.append(token)
     assert json.loads(expected) == {"x": 1}
+
+
+def test_incremental_masks_match_replay_without_reconsuming_history(controller):
+    original = controller.matcher
+    replayed = []
+
+    def counted(schema, marker, history):
+        replayed.append(list(history))
+        return original(schema, marker, history)
+
+    controller.matcher = counted
+    history = []
+    for token in list(map(ord, '{"x": 1}')) + [127]:
+        b = batch(history)
+        logits = torch.zeros(1, 128)
+        prefixes = controller.apply(logits, b, None)
+        reference, active = original(*b.structured_requests[0])
+        mask = xgr.allocate_token_bitmask(1, 128)
+        reference.fill_next_token_bitmask(mask)
+        allowed = (
+            (mask[0, torch.arange(128) // 32] >> (torch.arange(128) % 32)) & 1
+        ).bool()
+        assert active and torch.equal(torch.isfinite(logits[0]), allowed)
+        controller.commit(torch.tensor([[token]]), b, prefixes)
+        history.append(token)
+    assert replayed == [[]]
+
+
+def test_speculative_reasoning_marker_can_end_inside_a_draft(controller):
+    marker = tuple(map(ord, "</t>"))
+    b = batch(list(map(ord, "abc</t")), marker)
+    metadata = NS(
+        target_logits_indices=torch.tensor([0, 1]),
+        bonus_logits_indices=torch.tensor([2]),
+        num_draft_tokens_np=np.array([2]),
+        input_ids=torch.tensor([0, ord(">"), ord("{")]),
+    )
+    logits = torch.zeros(3, 128)
+    prefixes = controller.apply(logits, b, metadata)
+    assert torch.isfinite(logits[0, ord("x")])
+    assert torch.isneginf(logits[1, ord("x")])
+    assert torch.isfinite(logits[1, ord("{")])
+    assert torch.isfinite(logits[2, ord('"')])
+    # Reject the entire draft: committed reasoning has not ended.
+    controller.commit(torch.tensor([[ord("x"), -1, -1]]), b, prefixes)
+    logits = torch.zeros(1, 128)
+    controller.apply(logits, batch(list(map(ord, "abc</t")), marker), None)
+    assert torch.isfinite(logits[0, ord("x")])
+    assert torch.isneginf(logits[0, 127])
+
+
+def test_completed_reasoning_state_advances_only_committed_tokens(controller):
+    marker = tuple(map(ord, "</t>"))
+    b = batch(list(map(ord, "abc</t")), marker)
+    prefixes = controller.apply(torch.zeros(1, 128), b, None)
+    controller.commit(torch.tensor([[ord(">"), ord("{")]]), b, prefixes)
+    logits = torch.zeros(1, 128)
+    controller.apply(logits, batch(list(map(ord, "abc</t")), marker), None)
+    assert torch.isfinite(logits[0, ord('"')])
+    assert torch.isneginf(logits[0, ord("{")])
+
+
+def test_state_does_not_leak_across_schema_change_or_request_retirement(controller):
+    b = batch()
+    prefixes = controller.apply(torch.zeros(1, 128), b, None)
+    controller.commit(torch.tensor([[ord("{")]]), b, prefixes)
+    changed = batch(schema={"const": 3}, prefill=1)
+    logits = torch.zeros(1, 128)
+    controller.apply(logits, changed, None)
+    assert torch.isfinite(logits[0, ord("3")])
+    assert torch.isneginf(logits[0, ord('"')])
+    controller.clear()
+    assert not controller.pending and not controller.states and not controller.current
+
+
+def test_empty_batch_does_not_touch_gpu_metadata_or_logits(controller):
+    b = batch()
+    b.structured_requests = {}
+    # Any tensor access would raise on these sentinels.
+    assert controller.apply(object(), b, object()) == {}
 
 
 @pytest.mark.parametrize(

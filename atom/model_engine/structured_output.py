@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness-first target-logit constraints, including speculative branches.
+"""Target-logit constraints with incremental committed grammar state.
 
 Only the previous forward's output prefix is retained to bridge deferred CPU
 delivery. Older requests reconstruct from the scheduler's committed history.
-Grammar compilation is cached; grammar matching is replayed from that history.
-This deliberately trades CPU work for simple rollback/preemption semantics.
+Only the immediately preceding batch retains matchers. Prefill/replay or a
+history mismatch reconstructs from the scheduler rather than reusing stale state.
 """
 
 from functools import lru_cache
@@ -36,6 +36,21 @@ class StructuredOutput:
         self.compile = lru_cache(maxsize=128)(self.compiler.compile_json_schema)
         self.vocab_size = vocab_size
         self.pending = {}
+        self.states = {}
+        self.current = {}
+
+    def clear(self):
+        self.pending.clear()
+        self.states.clear()
+        self.current.clear()
+
+    def advance(self, matcher, active, marker, history, token):
+        if active and not matcher.accept_token(token):
+            raise ValueError("Committed output violates the structured-output grammar")
+        history.append(token)
+        if not active and tuple(history[-len(marker) :]) == tuple(marker):
+            active = True
+        return active
 
     def matcher(self, schema, marker, history):
         matcher = self.xgr.GrammarMatcher(self.compile(schema))
@@ -64,6 +79,8 @@ class StructuredOutput:
     def apply(self, logits, batch, metadata):
         requests = getattr(batch, "structured_requests", {})
         previous, self.pending = self.pending, {}
+        states, self.states = self.states, {}
+        self.current = {}
         if not requests:
             return {}
         target = metadata.target_logits_indices.tolist() if metadata else []
@@ -86,6 +103,20 @@ class StructuredOutput:
             ):
                 history = list(pending)
             prefixes[i] = (schema, marker, history)
+            state = states.get(req_id)
+            if (
+                i >= batch.total_seqs_num_prefill
+                and state is not None
+                and state[:3] == (schema, marker, history)
+            ):
+                matcher, active = state[3:]
+            else:
+                matcher, active = self.matcher(schema, marker, history)
+            self.current[i] = (matcher, active)
+            # The speculative branch may be rejected. Never advance the
+            # committed matcher with draft tokens; clone it once per request.
+            if metadata:
+                matcher = matcher.copy()
             if metadata:
                 start = sum(lengths[:i])
                 branch_rows = target[start : start + lengths[i]] + [bonus[i]]
@@ -95,7 +126,6 @@ class StructuredOutput:
             unreachable = False
             for pos, row in enumerate(branch_rows):
                 mask = self.xgr.allocate_token_bitmask(1, self.vocab_size)
-                matcher, active = self.matcher(schema, marker, branch)
                 if active and matcher.is_terminated():
                     # Deferred delivery may leave a final forward in flight
                     # after EOS, before the scheduler retires this request.
@@ -128,6 +158,10 @@ class StructuredOutput:
                         unreachable = True
                     if not unreachable:
                         branch.append(draft)
+                        if not active and tuple(branch[-len(marker) :]) == tuple(
+                            marker
+                        ):
+                            active = True
         if rows:
             bits = torch.cat(masks).to(logits.device)
             tokens = torch.arange(self.vocab_size, device=logits.device)
@@ -148,8 +182,14 @@ class StructuredOutput:
                 if token in self.stop_ids:
                     emitted = emitted[: j + 1]
                     break
-            full = history + emitted
-            # Validate only the committed branch. Rejected draft branches must
-            # never advance the next step's matcher.
-            self.matcher(schema, marker, full)
+            full = list(history)
+            matcher, active = self.current[i]
+            for token in emitted:
+                # An already-finished request can have one forward in flight.
+                if active and matcher.is_terminated() and token in self.stop_ids:
+                    full.append(token)
+                    break
+                active = self.advance(matcher, active, marker, full, token)
             self.pending[batch.req_ids[i]] = full
+            self.states[batch.req_ids[i]] = (schema, marker, full, matcher, active)
+        self.current.clear()

@@ -12,6 +12,9 @@ class GrammarMatcher:
     def __init__(self, compiled):
         self.matcher = compiled.deep_copy()
 
+    def copy(self):
+        return GrammarMatcher(self.matcher)
+
     def accept_token(self, token):
         return self.matcher.consume_token(int(token))
 
