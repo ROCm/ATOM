@@ -54,6 +54,33 @@ def _apply_greedy_tokens(
     )
 
 
+def sample_topk_candidates(
+    vals: torch.Tensor,
+    ids: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    top_ps: float | torch.Tensor | None,
+) -> torch.Tensor:
+    """Top-k / top-p sampling from each row's candidates (``TopKCandidates``: the
+    top logits of every vocab shard, ``[rows, tp * k]`` fp32 values and token ids,
+    with ``top_k`` at most ``k``). The same distribution as the sampler over the
+    full logits: the row's top ``top_k`` tokens, temperature, top-p over their
+    renormalized probabilities (the smallest prefix reaching ``top_p``), drawn by
+    an exponential race. Greedy rows (temperature at ``SAMPLER_EPS``) take the
+    largest logit. Returns int32 ``[rows]``."""
+    vals, pos = torch.topk(vals, top_k, dim=-1)  # descending
+    tokens = torch.gather(ids, 1, pos)
+    probs = torch.softmax(vals / temperatures.unsqueeze(-1), dim=-1)
+    if top_ps is not None:
+        top_p = top_ps.unsqueeze(-1) if isinstance(top_ps, torch.Tensor) else top_ps
+        probs = probs.masked_fill(probs.cumsum(dim=-1) - probs >= top_p, 0.0)
+    race = probs / torch.empty_like(probs).exponential_(1)
+    sampled = torch.gather(tokens, 1, race.argmax(dim=-1, keepdim=True)).view(-1)
+    return torch.where(temperatures <= SAMPLER_EPS, tokens[:, 0], sampled).to(
+        torch.int32
+    )
+
+
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
     This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.

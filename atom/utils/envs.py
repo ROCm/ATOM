@@ -996,6 +996,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GREEDY_ARGMAX_HEAD": lambda: (
         os.getenv("ATOM_GREEDY_ARGMAX_HEAD", "1").lower() in ("1", "true")
     ),
+    # Speculative verify at TP > 1 with top-k sampling (k <= ATOM_TOPK_CANDIDATES):
+    # the LM head hands the sampler each row's top candidates of every vocab shard
+    # instead of all-gathering the [rows, vocab] logits, and the sampler draws from
+    # those (ModelRunner._topk_candidates_step).
+    "ATOM_TOPK_CANDIDATE_HEAD": lambda: (
+        os.getenv("ATOM_TOPK_CANDIDATE_HEAD", "0").lower() in ("1", "true")
+    ),
+    "ATOM_TOPK_CANDIDATES": lambda: int(os.getenv("ATOM_TOPK_CANDIDATES", "20")),
     # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP

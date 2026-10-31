@@ -286,6 +286,28 @@ class ParallelLMHead(VocabParallelEmbedding):
             # logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits
 
+    def compute_topk_candidates(
+        self, x: torch.Tensor, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``k`` largest logits of each row over the TP-sharded vocab, without
+        all-gathering the ``[N, vocab]`` logits: each rank takes its shard's top ``k``
+        and the ranks all-gather those ``[N, 2k]`` packs. Returns fp32 values and
+        int64 token ids, ``[N, tp * k]`` each; the global top ``k`` of a row is the
+        top ``k`` of its candidates (the same bf16 logits as the gathered path).
+
+        A sampler that keeps at most ``k`` tokens a row (top-k sampling) needs only
+        these. Decode at TP > 1 only (see ``ModelRunner._topk_candidates_step``)."""
+        logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab / tp]
+        vals, idx = torch.topk(logits, k, dim=-1, sorted=False)
+        # Ids below 2^24 are exact in fp32, so values and ids travel as one pack.
+        packed = torch.cat([vals.float(), (idx + self.vocab_start_idx).float()], dim=-1)
+        gathered = get_tp_group().all_gather(
+            packed, dim=0, use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER
+        )  # [tp * N, 2k]
+        gathered = gathered.view(self.tp_size, -1, 2, k).permute(1, 2, 0, 3)
+        gathered = gathered.reshape(gathered.shape[0], 2, self.tp_size * k)
+        return gathered[:, 0], gathered[:, 1].long()
+
     def compute_argmax_token(
         self, x: torch.Tensor, *, out: torch.Tensor
     ) -> torch.Tensor:
