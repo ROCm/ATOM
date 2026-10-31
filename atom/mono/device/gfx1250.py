@@ -189,6 +189,12 @@ def wait_async(n):
     rocdl.s_wait_asynccnt(n)
 
 
+def lds_reads_done():
+    """Until this wave's LDS reads are done: an async copy into LDS a read of the
+    wave may still be reading (its write lands whenever the copy returns)."""
+    rocdl.s_wait_dscnt(0)
+
+
 def release_stores():
     """Until this wave's stores have completed at their scope: a flag published
     after it is seen after the data (a release fence orders, it does not wait)."""
