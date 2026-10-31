@@ -7,6 +7,7 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from torch import nn
 
 from atom.config import Config, QuantizationConfig
@@ -53,13 +54,16 @@ logger = logging.getLogger("atom")
 def allreduce_norm_fusion_enabled() -> bool:
     """Whether row-parallel outputs skip their all-reduce and the following
     Gemma RMSNorm folds it in. Off under PP (stage-boundary activations must
-    be reduced), in plugin mode (not validated there), and on an aiter whose
-    per-group fused kernel cannot do the Gemma norm."""
+    be reduced), in plugin mode (not validated there), on an aiter whose
+    per-group fused kernel cannot do the Gemma norm, and on gfx1250, where the
+    fused AR + Gemma RMSNorm returns rows missing peer partial sums in the model
+    (TP4 GSM8K 0.62 vs 0.89 unfused) although each kernel passes standalone."""
     enabled = (
         ENABLE_ALLREDUCE_RMSNORM_FUSION
         and get_tensor_model_parallel_world_size() > 1
         and get_pp_group().world_size == 1
         and not is_plugin_mode()
+        and get_gfx() != "gfx1250"
     )
     if enabled and not fused_ar_gemma_per_group_supported():
         logger.warning(
