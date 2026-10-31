@@ -44,6 +44,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     uses_mxfp4_n32k4_scale,
@@ -64,7 +65,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.quant_spec import should_skip_online_quant
+from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -196,26 +197,9 @@ _RMS_FUSABLE_QUANT_TYPES = (
 )
 
 
-def _effective_layer_quant(
-    quant_config: QuantizationConfig | None, prefix: str
-) -> tuple[QuantType, torch.dtype | None]:
-    """Resolve the ``(quant_type, quant_dtype)`` a Linear runs with at runtime.
-
-    Same resolution the Linear itself performs (mirrors
-    ``LinearBase.online_quantize_weight`` and deepseek_v2's MLA setup): the static
-    checkpoint scheme, overridden by the online-quant target when that override
-    actually applies (``should_skip_online_quant``). A preceding RMSNorm uses this
-    to decide whether -- and in which scheme (fp8 / fp4x2, per-token / block) -- to
-    fuse its activation quant, rather than hard-coding one layout.
-    """
-    if quant_config is None:
-        return QuantType.No, None
-    cfg = quant_config.get_layer_quant_config(prefix)
-    if quant_config.online_quant:
-        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
-        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
-            cfg = online_cfg
-    return cfg.quant_type, cfg.quant_dtype
+# The runtime scheme of a layer; shared with the MLP pair's K padding decision
+# (``mxfp4_k_pad_align``) so the two cannot disagree.
+_effective_layer_quant = effective_layer_quant
 
 
 def _is_e8m0_blockscale(
@@ -308,12 +292,21 @@ class KimiMLP(nn.Module):
         super().__init__()
         hidden_size = hidden_size or config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
+        down_type, down_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.down_proj"
+        )
+        # An MXFP4 down_proj's K is the per-rank intermediate (33792 / TP8 = 4224
+        # on the dense layer), which the MXFP4 GEMMs cannot take unaligned. The
+        # pair pads it together (gate_up zero rows, down zero columns); situ(0) *
+        # 0 == 0, so the activation's padded tail is exactly zero.
+        pad_align = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=pad_align,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -322,15 +315,13 @@ class KimiMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=pad_align,
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
         # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
         # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
         # standalone quant. gate_up/down share a scheme, so probe down_proj.
-        down_type, down_dtype = _effective_layer_quant(
-            quant_config, f"{prefix}.down_proj"
-        )
         self._fuse_act_quant = (
             down_type == QuantType.per_Token and down_dtype == dtypes.fp8
         )

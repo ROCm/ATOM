@@ -114,8 +114,13 @@ class OnlineQuantStreamer:
             # Mixed semantic and generic accounting cannot trigger early.
             m._stream_moe_declined_param_ids = set()
             m._stream_tracking_invalid = False
+            # A K-padded MLP linear's padded slots are never loaded. Asked of
+            # the module, so this file stays importable without AITER.
+            pad_numel = getattr(m, "pad_slot_numel", None)
             m._stream_expected_numel = sum(
-                p.numel() for _, p in m.named_parameters(recurse=False) if p is not None
+                p.numel() - (pad_numel(p) if pad_numel is not None else 0)
+                for _, p in m.named_parameters(recurse=False)
+                if p is not None
             )
             for _, p in m.named_parameters(recurse=False):
                 if p is not None:
