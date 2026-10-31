@@ -266,6 +266,15 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
 | **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
 
+### Qwen3-Next / Qwen3.5 decode fusions
+
+Each removes one kernel launch per layer on the decode / MTP-verify path. All
+default to `0` (opt-in).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_GDN_REPLAYSSM_FUSED_GATING** | bool | 0 (false) | Set to `1` to compute the GDN gate `g = -exp(A_log)·softplus(a + dt_bias)` and `beta = sigmoid(b)` inside the ReplaySSM serial kernel instead of a separate `fused_gdn_gating` launch. Applies to pure spec-verify and pure decode batches under ReplaySSM; mixed prefill/decode batches, the UT route, FlyDSL and the lossy decode path keep the separate launch. Bit-identical output (beta is rounded through bf16 in-kernel exactly as the separate kernel stores it). |
+
 ### Llama-style
 
 | Variable | Type | Default | Description |
