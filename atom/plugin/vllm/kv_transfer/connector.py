@@ -840,24 +840,24 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def _refuse_v41_ride_without_dense_checkpoints(self, grid: int) -> None:
-        """A ride needs a state checkpoint at EVERY chunk boundary.
+        """A save needs a state checkpoint at the boundary it ends on.
 
-        One save spans many chunks and carries exactly one checkpoint -- the
-        boundary it ends on -- with the earlier chunks' image ids nulled.
-        If a later lookup can report a hit at one of those earlier chunk
-        boundaries, the PAGE bytes come back with no checkpoint behind them, and
-        `cap_hit` under a ride has no index left to catch it with: it trusts
-        that whatever the lookup reported present is present with its state.
-        That trust is only earned when every chunk boundary is a checkpoint,
-        which is what the recurrent backends this mechanism was built for
-        (K3's KDA, GDN) get for free -- they snapshot every align block.
+        One save spans many chunks and carries one checkpoint image, the one
+        at its end; its earlier chunks name the null block, and the MP server
+        stores no image for them. The server serves a hit length only if every
+        image group holds the length's last chunk (with
+        `--separate-object-groups`, which keeps the image groups apart from
+        PAGE), so a hit never ends inside a save: the hit grain is the set of
+        saved forward ends, not the chunk. `cap_hit` relies on that.
 
-        V4.1 does not: its checkpoints are placed on an interval, 8192 tokens
-        by default, so 31 of every 32 chunk boundaries would have none. Rather
-        than serve a prefix whose state is someone else's, refuse here and
-        name the setting that fixes it. The cost of the fix is more checkpoint
-        blocks held in the proxy pool; the cost of not refusing is a wrong
-        answer nothing reports.
+        What has to hold on this side is that a save's end has a checkpoint
+        at all. A prefill forward ends on a rung of the checkpoint interval
+        (`Placement.cut`) and a save ends on a chunk boundary; with the two
+        equal they coincide. With V4.1's default interval of 8192 against a
+        chunk of 256, most saves would end where no forward did, find no
+        checkpoint, and be dropped -- correct, but a tier that fills only at
+        interval multiples and says nothing about it. Refused instead, naming
+        the setting that fixes it.
         """
         from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
             V41CheckpointPlacement,
@@ -871,9 +871,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         raise ValueError(
             "ATOM offload connector: DeepSeek-V4.1 state cannot ride the PAGE "
             f"object with a checkpoint interval of {interval} tokens against "
-            f"an LMCache chunk of {chunk}. A save carries one checkpoint, at the "
-            "boundary it ends on, so every chunk boundary must be a "
-            "checkpoint. Bring the two together from either side -- "
+            f"an LMCache chunk of {chunk}. A save carries the checkpoint at the "
+            "boundary it ends on and a prefill forward ends on a rung of the "
+            "interval, so with the two unequal most saves find no checkpoint "
+            "and are dropped. Bring the two together from either side -- "
             f"ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS={chunk}, or an LMCache "
             f"chunk of {interval} on the server and the client, which is the "
             "cheaper one: the interval decides how often a checkpoint is "
