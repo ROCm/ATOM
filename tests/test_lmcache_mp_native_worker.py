@@ -35,12 +35,12 @@ from atom.kv_transfer.offload.mp.deployment import (
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
+    require_native_state_server,
+    stores_state_images,
 )
 from atom.kv_transfer.offload.mp.native_state_worker import (
     NATIVE_STATE_MP_STORE_CHANNEL,
     NativeStateLMCacheMPConnector,
-    require_native_state_server,
-    stores_state_images,
 )
 from atom.model_engine.arg_utils import (
     compose_kv_offload_config,
@@ -633,6 +633,7 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
     import types
 
     from atom.kv_transfer.offload.mp import native_state_layout, native_state_worker
+    from atom.kv_transfer.offload.mp import worker as mp_worker
 
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
@@ -642,12 +643,9 @@ def test_registration_reserves_every_restore_descriptor_slot(monkeypatch):
         register_kv_caches=lambda tensors, engine_group_infos: None,
         shutdown=lambda: None,
     )
-    monkeypatch.setattr(
-        native_state_worker, "_make_worker_adapter", lambda *_a, **_k: adapter
-    )
-    monkeypatch.setattr(
-        native_state_worker, "require_native_state_server", lambda *_a: None
-    )
+    # The registration both MP workers share lives on the base worker.
+    monkeypatch.setattr(mp_worker, "_make_worker_adapter", lambda *_a, **_k: adapter)
+    monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
     monkeypatch.setattr(
         native_state_layout.NativeStateMPLayout, "engine_group_infos", lambda _s: []
     )
@@ -716,10 +714,10 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
 
 
 def test_native_server_chunk_mismatch_fails_before_registration(monkeypatch):
-    from atom.kv_transfer.offload.mp import native_state_worker
+    from atom.kv_transfer.offload.mp import native_state_layout
 
     monkeypatch.setattr(
-        native_state_worker.offcfg,
+        native_state_layout.offcfg,
         "build_lmcache_config",
         lambda _: SimpleNamespace(chunk_size=256),
     )

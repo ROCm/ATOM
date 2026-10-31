@@ -36,6 +36,7 @@ from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
+    NativeStateTransfer,
     RecurrentStateTransfer,
     SaveSpec,
 )
@@ -2163,6 +2164,171 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
+
+
+def _checkpointed_transfer_tensors(*, num_blocks: int = 16) -> KVTransferTensors:
+    """Two 16-byte PAGE planes whose units also hold a 40-byte checkpoint image
+    (two units), declared the way a backend publishes native state."""
+    from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+
+    planes = [torch.zeros(num_blocks, 16, dtype=torch.uint8) for _ in range(2)]
+    transfer = KVTransferTensors(
+        pages=[
+            page_region(plane, semantic_role=f"plane.{index}")
+            for index, plane in enumerate(planes)
+        ],
+        paged_state_checkpoint_spec=PagedStateCheckpointSpec(
+            page_unit_bytes=32,
+            slot_bytes=64,
+            layout_id="checkpointed-test",
+            image_bytes=40,
+        ),
+        execute_paged_state_copies=lambda stores, restores, descriptor_slot=0: None,
+        paged_state_region_count=2,
+    )
+    transfer.set_block_count(num_blocks)
+    # Keeps the planes alive: the transfer container does not own them.
+    transfer._test_planes = planes
+    return transfer
+
+
+def _register_checkpointed(monkeypatch, *, null_block_id=0):
+    """A base worker registered on a layout that publishes checkpoint images."""
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+
+    adapter = _WorkerAdapter()
+    namespaces = []
+
+    def connect(_config, _rank, **kwargs):
+        namespaces.append(kwargs)
+        return adapter
+
+    monkeypatch.setattr(mp_worker, "_make_worker_adapter", connect)
+    monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
+    worker = mp_worker.LMCacheMPConnector(_config(), null_block_id=null_block_id)
+    worker.register_kv_caches({}, _checkpointed_transfer_tensors(), 16)
+    adapter.namespaces = namespaces
+    return worker, adapter
+
+
+def test_a_published_checkpoint_spec_registers_through_the_native_layout(
+    fake_lmcache_modules, monkeypatch
+):
+    """The base worker registers the native layout, under its namespace.
+
+    PAGE is engine group 0; image ordinal `j` is group `1 + j`, one chunk wide
+    and marked recurrent -- the same registration the native-state worker
+    makes, so the two cannot drift apart.
+    """
+    worker, adapter = _register_checkpointed(monkeypatch)
+    spec = worker._native_layout.checkpoint_spec
+    assert adapter.namespaces == [{"checkpoint_spec": spec, "images": True}]
+    assert worker._native_layout.null_block_id == 0
+    assert worker.chunk_size == 8
+    assert list(adapter.registered) == [f"native_state.{i}" for i in range(5)]
+    assert [g.engine_group_id for g in adapter.groups] == [0, 1, 2]
+    assert [g.recurrent_state for g in adapter.groups] == [False, True, True]
+    assert [g.tokens_per_block for g in adapter.groups] == [4, 8, 8]
+    assert [g.sw_size_tokens for g in adapter.groups] == [-1, 8, 8]
+
+
+def _settled(worker, submit, req):
+    submit(req, _step_event())
+    worker._settle_transfers()
+
+
+def test_the_base_worker_carries_a_checkpoint_image_with_its_page_kv(
+    fake_lmcache_modules, monkeypatch
+):
+    """Only the boundary chunk names the image's units; every earlier chunk
+    names the server's null block, here 0. A load names the same lists as
+    the save that wrote them."""
+    worker, adapter = _register_checkpointed(monkeypatch)
+    _settled(
+        worker,
+        worker._submit_save,
+        LMCacheReqMeta(
+            req_id=8,
+            token_ids=list(range(24)),
+            block_ids=[1, 2, 3, 4, 5, 6],
+            save_spec=SaveSpec(skip_leading_tokens=0),
+            save_operation=SaveOperationId(req_id=8, generation=2),
+            native_state=NativeStateTransfer((7, 9), 24, 99),
+        ),
+    )
+    assert adapter.saves[0][1].block_ids == [[1, 2, 3, 4, 5, 6], [0, 0, 7], [0, 0, 9]]
+
+    _settled(
+        worker,
+        worker._submit_load,
+        LMCacheReqMeta(
+            req_id=5,
+            token_ids=list(range(24)),
+            block_ids=[1, 2, 3, 4, 5, 6],
+            load_spec=LoadSpec(
+                hbm_cached_tokens=0, lmcache_cached_tokens=24, can_load=True
+            ),
+            load_operation=LoadOperationId(req_id=5, generation=3),
+            native_state=NativeStateTransfer((7, 9), 24, 99),
+        ),
+    )
+    assert adapter.loads[0][1].block_ids == [[1, 2, 3, 4, 5, 6], [0, 0, 7], [0, 0, 9]]
+
+
+def _checkpointed_load(state):
+    return LMCacheReqMeta(
+        req_id=5,
+        token_ids=list(range(16)),
+        block_ids=[1, 2, 3, 4],
+        load_spec=LoadSpec(
+            hbm_cached_tokens=0, lmcache_cached_tokens=16, can_load=True
+        ),
+        load_operation=LoadOperationId(req_id=5, generation=3),
+        native_state=state,
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        # This worker restores no SLOT: the image stays in the PAGE units.
+        NativeStateTransfer((7, 9), 16, 99, destination_slot=2),
+        # PAGE alone on a layout with images: someone else's state.
+        None,
+        # An image from another boundary would not continue this KV.
+        NativeStateTransfer((7, 9), 8, 99),
+        # The null block cannot hold an image.
+        NativeStateTransfer((0, 9), 16, 99),
+        # Image units that are also KV blocks of the same transfer.
+        NativeStateTransfer((3, 9), 16, 99),
+    ],
+)
+def test_the_base_worker_refuses_an_image_transfer_it_cannot_carry(
+    fake_lmcache_modules, monkeypatch, state
+):
+    """Refused before anything is sent: a terminal failure, not a timeout."""
+    worker, adapter = _register_checkpointed(monkeypatch)
+    req = _checkpointed_load(state)
+    _settled(worker, worker._submit_load, req)
+    assert adapter.loads == []
+    assert worker.get_finished().failed_loading == {req.load_operation}
+
+
+def test_a_page_only_worker_refuses_an_image_transfer(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _worker(adapter)
+    req = _checkpointed_load(NativeStateTransfer((7, 9), 16, 99))
+    worker._submit_load(req, _step_event())
+    assert adapter.loads == []
+    assert worker.get_finished().failed_loading == {req.load_operation}
 
 
 def _recurrent_transfer_tensors(

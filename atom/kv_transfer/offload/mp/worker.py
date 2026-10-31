@@ -42,6 +42,11 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
 )
+from atom.kv_transfer.offload.mp.native_state_layout import (
+    build_native_state_mp_layout,
+    require_native_state_server,
+    stores_state_images,
+)
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
@@ -144,7 +149,11 @@ class LMCacheMPConnector(KVConnectorBase):
 
     is_producer = False
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, *, null_block_id: int = -1) -> None:
+        """``null_block_id`` is the MP server's ``--null-block-id``, which a
+        native-state layout names for every chunk before the one holding its
+        image (`build_native_state_mp_layout`). Unused by a PAGE-only layout.
+        """
         _validate_mp_config(config)
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -157,6 +166,10 @@ class LMCacheMPConnector(KVConnectorBase):
             minimum=1,
         )
         self.chunk_size: int | None = None
+        self._null_block_id = int(null_block_id)
+        # Set only when the backend publishes PAGE-backed checkpoint images
+        # (`_register_native_state_layout`); every transfer then carries one.
+        self._native_layout: Any = None
         self._num_recurrent_groups = 0
         # How many engine groups each snapshot was published as; see
         # `register_kv_caches`. Empty until registration.
@@ -246,6 +259,14 @@ class LMCacheMPConnector(KVConnectorBase):
         transfer_tensors: Any = None,
         num_blocks: int | None = None,
     ) -> None:
+        if getattr(transfer_tensors, "paged_state_checkpoint_spec", None) is not None:
+            # PAGE units that also hold state checkpoint images. The connector
+            # shell hands such a layout to `NativeStateLMCacheMPConnector`,
+            # which restores a loaded image into an Active SLOT. A backend that
+            # restores its checkpoints from the PAGE units themselves registers
+            # the same layout here, and its transfers name no SLOT.
+            self._register_native_state_layout(transfer_tensors, num_blocks)
+            return
         if num_blocks is None:
             num_blocks = getattr(transfer_tensors, "num_blocks", None)
         if num_blocks is None:
@@ -387,6 +408,78 @@ class LMCacheMPConnector(KVConnectorBase):
             self._do_load,
         )
 
+    def _register_native_state_layout(
+        self, transfer_tensors: Any, num_blocks: int | None
+    ) -> None:
+        """Register PAGE plus its checkpoint image groups, once for every worker.
+
+        The layout is `build_native_state_mp_layout`'s, under the namespace
+        its checkpoint spec and `stores_state_images` name, so a scheduler
+        connected with the same spec finds what these workers store. TP rank
+        collapse needs both PAGE and the images declared replicated.
+        """
+        from aiter.dist.parallel_state import get_tp_group
+
+        spec = transfer_tensors.paged_state_checkpoint_spec
+        tp_size, _ = _validate_mp_config(self._config)
+        rank = int(get_tp_group().rank_in_group)
+        requested_replication = _tp_replication_factor(self._config)
+        published_page_replication = _published_tp_replication_factor(
+            transfer_tensors, tp_size=tp_size
+        )
+        published_state_replication = _published_tp_replication_factor(
+            transfer_tensors, tp_size=tp_size, native_state=True
+        )
+        if requested_replication > min(
+            published_page_replication, published_state_replication
+        ):
+            raise ValueError(
+                "LMCache MP native TP rank collapse was requested, but the "
+                "attention backend did not declare both PAGE and STATE fully "
+                "replicated"
+            )
+        self._is_kv_writer = rank % requested_replication == 0
+        images = stores_state_images(
+            int(getattr(self._config, "state_replay_tokens", 0) or 0)
+        )
+        adapter = _make_worker_adapter(
+            self._config, rank, checkpoint_spec=spec, images=images
+        )
+        try:
+            require_native_state_server(adapter, self._config)
+            chunk_size = int(adapter.lmcache_tokens_per_chunk)
+            layout = build_native_state_mp_layout(
+                transfer_tensors,
+                block_size=self.block_size,
+                chunk_size=chunk_size,
+                num_blocks=num_blocks,
+                images=images,
+                null_block_id=self._null_block_id,
+            )
+            adapter.register_kv_caches(
+                {
+                    f"native_state.{i}": tensor
+                    for i, tensor in enumerate(layout.tensors)
+                },
+                engine_group_infos=layout.engine_group_infos(),
+            )
+        except Exception:
+            adapter.shutdown()
+            raise
+        self._adapter = adapter
+        self.chunk_size = chunk_size
+        self._native_layout = layout
+        logger.info(
+            "LMCache MP native state registered rank=%d images=%s native_image=%d "
+            "units=%d groups=%d chunk=%d",
+            rank,
+            images,
+            spec.image_bytes,
+            spec.units_per_checkpoint,
+            len(layout.kernel_groups),
+            chunk_size,
+        )
+
     def close(self) -> None:
         """Unregister this rank's cache views from the MP server.
 
@@ -524,6 +617,70 @@ class LMCacheMPConnector(KVConnectorBase):
             )
         return block_ids
 
+    def _transfer_block_ids(
+        self, req: LMCacheReqMeta, start: int, end: int, *, loading: bool
+    ) -> list[list[int]]:
+        """The block-id list per engine group that one transfer names."""
+        if self._native_layout is not None:
+            return self._native_block_ids(req, start, end, loading=loading)
+        if req.native_state is not None:
+            raise ValueError(
+                f"LMCache MP request {req.req_id} carries a state image, but "
+                "no image group was registered"
+            )
+        return [self._block_slice(req, start, end)]
+
+    def _native_block_ids(
+        self,
+        req: LMCacheReqMeta,
+        start: int,
+        end: int,
+        *,
+        loading: bool,
+    ) -> list[list[int]]:
+        state = req.native_state
+        if state is None:
+            raise ValueError(
+                "native-state LMCache MP transfers require an exact checkpoint"
+            )
+        if start % self.chunk_size or end % self.chunk_size or start >= end:
+            raise ValueError(
+                "native-state LMCache MP requires a nonempty chunk-aligned range"
+            )
+        if state.boundary_tokens != end or len(req.token_ids) != end:
+            raise ValueError("native STATE and PAGE endpoints must match")
+        count = (end - start) // self.chunk_size
+        if state.kv_only != (not self._native_layout.images):
+            # PAGE alone exactly when the layout registered no image group: the
+            # scheduler and this worker asked `stores_state_images` the same.
+            raise ValueError(
+                "a KV-only native transfer needs a layout without images, and "
+                "only it"
+            )
+        if state.kv_only:
+            if state.unit_ids or state.destination_slot is not None:
+                raise ValueError("a KV-only native transfer moves no image")
+            return [self._block_slice(req, start, end)]
+        self._check_state_destination(state, loading=loading)
+        unit_ids = self._native_layout.validate_unit_ids(state.unit_ids)
+        pages = self._block_slice(req, start, end)
+        if set(pages) & set(unit_ids):
+            raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
+        return self._native_layout.transfer_block_ids(pages, unit_ids, count)
+
+    def _check_state_destination(self, state: Any, *, loading: bool) -> None:
+        """Refuse an image transfer that names an Active SLOT.
+
+        This worker restores no SLOT: a load leaves the image in the PAGE units
+        it names, and the backend restores it from there.
+        """
+        del loading
+        if state.destination_slot is not None:
+            raise ValueError(
+                "this LMCache MP worker restores no Active SLOT; a native-state "
+                "transfer must not name one"
+            )
+
     def _recurrent_block_ids(
         self, req: LMCacheReqMeta, start: int, end: int
     ) -> list[list[int]]:
@@ -610,10 +767,10 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"load range [{start}, {end}) is not LMCache chunk aligned "
                     f"({self.chunk_size})"
                 )
-            block_ids = self._block_slice(req, start, end)
             op = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
-                block_ids=[block_ids] + self._recurrent_block_ids(req, start, end),
+                block_ids=self._transfer_block_ids(req, start, end, loading=True)
+                + self._recurrent_block_ids(req, start, end),
                 start=start,
                 end=end,
             )
@@ -702,11 +859,10 @@ class LMCacheMPConnector(KVConnectorBase):
                 self._immediate_saves[completion] = None
             return
         try:
-            block_ids = self._block_slice(req, start, end)
-            recurrent_block_ids = self._recurrent_block_ids(req, start, end)
             op = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
-                block_ids=[block_ids] + recurrent_block_ids,
+                block_ids=self._transfer_block_ids(req, start, end, loading=False)
+                + self._recurrent_block_ids(req, start, end),
                 start=start,
                 end=end,
             )

@@ -22,10 +22,12 @@ from atom.kv_transfer.offload._offload_common import (
 )
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _validate_mp_config
-from atom.kv_transfer.offload.mp.native_state_worker import (
-    NATIVE_STATE_MP_STORE_CHANNEL,
+from atom.kv_transfer.offload.mp.native_state_layout import (
     require_native_state_server,
     stores_state_images,
+)
+from atom.kv_transfer.offload.mp.native_state_worker import (
+    NATIVE_STATE_MP_STORE_CHANNEL,
 )
 from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
 from atom.model_engine.page_unit_checkpoint import SuspendedCheckpointRestore
