@@ -294,14 +294,14 @@ class KimiMLP(nn.Module):
         # on the dense layer), which the MXFP4 GEMMs cannot take unaligned. The
         # pair pads it together (gate_up zero rows, down zero columns); situ(0) *
         # 0 == 0, so the activation's padded tail is exactly zero.
-        pad_align = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            output_pad_align=pad_align,
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -310,7 +310,7 @@ class KimiMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            input_pad_align=pad_align,
+            input_pad_align=intermediate_pad,
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")

@@ -131,14 +131,14 @@ class Qwen3NextMLP(nn.Module):
         super().__init__()
         # An MXFP4 down_proj cannot take an unaligned K (its per-rank
         # intermediate); the pair pads it together. See mxfp4_k_pad_align.
-        pad_align = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
-            output_pad_align=pad_align,
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -147,7 +147,7 @@ class Qwen3NextMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
-            input_pad_align=pad_align,
+            input_pad_align=intermediate_pad,
         )
         if hidden_act != "silu":
             raise ValueError(
