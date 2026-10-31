@@ -1062,6 +1062,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QWEN_SHARED_EXPERT_STREAM": lambda: (
         os.getenv("ATOM_QWEN_SHARED_EXPERT_STREAM", "0").lower() in ("1", "true")
     ),
+    # Qwen3-Next / Qwen3.5: pad each rank's MXFP4 experts to 128 columns instead
+    # of 256 when the shard is a multiple of 128 (TP4: 128 rather than 256).
+    "ATOM_QWEN_MOE_PAD_ALIGN_128": lambda: (
+        os.getenv("ATOM_QWEN_MOE_PAD_ALIGN_128", "0").lower() in ("1", "true")
+    ),
     # Run the engine-core and worker loops under a frame that holds one large
     # CPython data-stack chunk (atom/utils/deep_stack.py): on CPython 3.11 / 3.12
     # a hot path straddling the end of a 16 KiB frame chunk maps and unmaps a
