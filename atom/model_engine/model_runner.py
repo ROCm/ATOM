@@ -3254,6 +3254,11 @@ class ModelRunner:
                 tokenizer, logits.shape[-1], stop_ids
             )
         structured_prefixes = {}
+        logprob_snapshot = None
+        if structured_requests and any(batch.return_logprobs):
+            from atom.model_engine.token_logprobs import capture_token_logits
+
+            logprob_snapshot = capture_token_logits(logits, batch, spec_decode_metadata)
         if structured_requests:
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         elif structured is not None and (structured.pending or structured.current):
@@ -3353,7 +3358,11 @@ class ModelRunner:
             from atom.model_engine.token_logprobs import gather_token_logprobs
 
             sampled_logprobs = gather_token_logprobs(
-                logits, sampled_tokens, batch, spec_decode_metadata
+                logits,
+                sampled_tokens,
+                batch,
+                spec_decode_metadata,
+                snapshot=logprob_snapshot,
             )
             # No PCP broadcast: logprobs never feed the next forward and only
             # worker 0's leave.

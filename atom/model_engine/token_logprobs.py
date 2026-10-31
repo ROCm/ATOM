@@ -15,7 +15,32 @@ class TokenLogprob:
     top: tuple[tuple[int, float], ...] = ()
 
 
-def gather_token_logprobs(logits, sampled_ids, batch, metadata=None):
+def capture_token_logits(logits, batch, metadata=None):
+    """Preserve requested target rows before in-place grammar masking.
+
+    Ordinary requests never call this. The snapshot contains only rows for
+    logprob requests, including their speculative bonus row, not the full batch.
+    """
+    requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
+    if metadata is None:
+        rows = torch.tensor(requested, device=logits.device, dtype=torch.long)
+    else:
+        counts = metadata.num_draft_tokens_np.tolist()
+        offsets = [0]
+        for count in counts:
+            offsets.append(offsets[-1] + count)
+        parts = [
+            metadata.target_logits_indices[offsets[i] : offsets[i + 1]]
+            for i in requested
+        ]
+        parts.append(metadata.bonus_logits_indices[requested])
+        rows = torch.cat(parts).long()
+    row_map = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.long)
+    row_map[rows] = torch.arange(len(rows), device=logits.device)
+    return logits.index_select(0, rows), row_map
+
+
+def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot=None):
     """Return (values, candidate IDs, ranks), retaining the sampled-ID layout.
 
     Values slot 0 holds the sampled token; remaining slots hold top candidates.
@@ -55,7 +80,9 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None):
     # No full log-softmax matrix: only the normalizer and selected/top logits
     # survive this operation. These torch operations are correctness-first;
     # reducing the gather/conversion workspace is a separate profiling task.
-    selected = logits[rows].float()
+    selected = (
+        logits[rows] if snapshot is None else snapshot[0][snapshot[1][rows]]
+    ).float()
     normalizer = torch.logsumexp(selected, dim=-1)
     token_logits = selected.gather(-1, selected_ids[..., None]).squeeze(-1)
     values[chosen, :, 0] = token_logits - normalizer

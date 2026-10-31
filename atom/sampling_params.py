@@ -21,6 +21,7 @@ class SamplingParams:
     logprobs: bool | int | None = None
     top_logprobs: int = 0
     json_schema: str | None = None
+    structured_tool_format: str | None = None
     # Generated reasoning tokens are unconstrained until this marker closes.
     structured_reasoning_end: tuple[int, ...] = ()
 

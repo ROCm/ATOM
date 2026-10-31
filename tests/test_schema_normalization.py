@@ -36,6 +36,13 @@ VALUES = [
         {"const": 0},
         {"const": True},
         {"const": None},
+        {"const": "a"},
+        {"const": ""},
+        {"const": "[中]\\\n"},
+        {"minLength": 0},
+        {"maxLength": 2},
+        {"required": ["x", "y"]},
+        {"properties": {"x": {"const": 1}}},
         {"minimum": 0},
         {"exclusiveMaximum": 2},
         {"enum": [0, True, None]},
@@ -107,8 +114,12 @@ def test_unique_prefix_items_must_not_drop_values_outside_items_domain():
         "minItems": 1,
     }
     assert Draft202012Validator(schema).is_valid(["head", 1])
-    with pytest.raises(ValueError, match="prefixItems"):
-        normalize_schema(schema)
+    lowered = normalize_schema(schema)
+    for size in range(4):
+        for value in itertools.product(["head", 1, 2, 3], repeat=size):
+            assert Draft202012Validator(schema).is_valid(
+                list(value)
+            ) == Draft202012Validator(lowered).is_valid(list(value))
 
 
 @pytest.mark.parametrize(
@@ -117,9 +128,40 @@ def test_unique_prefix_items_must_not_drop_values_outside_items_domain():
         {"type": "array", "items": {"type": "integer"}, "uniqueItems": True},
         {"type": "array", "items": {"enum": list(range(20))}, "uniqueItems": True},
         {"not": {"pattern": "x"}},
-        {"type": "object", "if": {"properties": {"x": {"const": 1}}}, "then": False},
+        {
+            "type": "object",
+            "if": {"properties": {"x": {"pattern": "x"}}},
+            "then": False,
+        },
     ],
 )
 def test_unsupported_or_excessive_expansions_are_explicit(schema):
     with pytest.raises(ValueError):
         normalize_schema(schema)
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        {"properties": {"kind": {"const": "special"}}},
+        {"properties": {"kind": {"minimum": 5}}, "required": ["kind"]},
+        {"required": ["kind", "v"]},
+        {"type": "string", "minLength": 2},
+    ],
+)
+def test_unbounded_conditionals_preserve_absence_and_type_semantics(guard):
+    schema = {
+        "if": guard,
+        "then": {"properties": {"v": {"const": 1}}},
+        "else": {"properties": {"v": {"const": 2}}},
+    }
+    lowered = normalize_schema(schema)
+    examples = VALUES + [
+        {"kind": k, "v": v}
+        for k, v in itertools.product(["special", "other", 4, 6, None], [1, 2, None])
+    ]
+    examples += [{"v": v} for v in [1, 2, 3]]
+    for value in examples:
+        assert Draft202012Validator(schema).is_valid(value) == Draft202012Validator(
+            lowered
+        ).is_valid(value), value

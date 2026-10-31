@@ -53,7 +53,10 @@ class StructuredOutput:
         return active
 
     def matcher(self, schema, marker, history):
-        matcher = self.xgr.GrammarMatcher(self.compile(schema))
+        compiled = (
+            self.compile(*schema) if isinstance(schema, tuple) else self.compile(schema)
+        )
+        matcher = self.xgr.GrammarMatcher(compiled)
         body = history
         if marker:
             end = next(

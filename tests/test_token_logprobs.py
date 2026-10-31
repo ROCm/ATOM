@@ -6,9 +6,43 @@ import pytest
 import torch
 
 from atom.model_engine.token_logprobs import (
+    capture_token_logits,
     gather_token_logprobs,
     unpack_token_logprobs,
 )
+
+
+@pytest.mark.parametrize("speculative", [False, True])
+@pytest.mark.parametrize("k", [0, 20])
+def test_grammar_masking_preserves_raw_target_probabilities(speculative, k):
+    import numpy as np
+
+    logits = torch.arange(6 * 32).reshape(6, 32).float().sin()
+    original = logits.clone()
+    batch = SimpleNamespace(return_logprobs=[False, True], top_logprobs=[0, k])
+    metadata = (
+        SimpleNamespace(
+            num_draft_tokens_np=np.array([3, 1]),
+            cu_num_draft_tokens=torch.tensor([3, 4]),
+            target_logits_indices=torch.tensor([0, 1, 2, 4]),
+            bonus_logits_indices=torch.tensor([3, 5]),
+        )
+        if speculative
+        else None
+    )
+    ids = (
+        torch.tensor([[1, 2, -1, -1], [5, 6, -1, -1]])
+        if speculative
+        else torch.tensor([1, 5])
+    )
+    snapshot = capture_token_logits(logits, batch, metadata)
+    assert snapshot[0].shape == (2 if speculative else 1, 32)
+    logits[:, :20] = float("-inf")
+    actual = gather_token_logprobs(logits, ids, batch, metadata, snapshot=snapshot)
+    expected = gather_token_logprobs(original, ids, batch, metadata)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference)
+    assert torch.isfinite(actual[0]).all()
 
 
 @pytest.mark.parametrize("k", [0, 1, 5, 20])

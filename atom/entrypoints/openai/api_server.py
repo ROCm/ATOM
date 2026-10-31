@@ -1724,14 +1724,19 @@ def _effective_thinking_enabled(kwargs):
 
 
 async def _configure_structured_output(
-    sampling_params, schema, kwargs, *, tools=None, kv_transfer=None, multimodal=False
+    sampling_params,
+    schema,
+    kwargs,
+    *,
+    tools=None,
+    tool_choice=None,
+    kv_transfer=None,
+    multimodal=False,
 ):
     if schema is None:
         return
-    if tools or kv_transfer or multimodal or sampling_params.logprobs:
-        raise ValueError(
-            "Structured output currently requires text without tools, P/D or logprobs"
-        )
+    if kv_transfer or multimodal:
+        raise ValueError("Structured output currently requires text without P/D")
     config = _get_engine_config()
     spec = getattr(config, "speculative_config", None)
     if synthetic_token_text is not None or getattr(
@@ -1748,6 +1753,9 @@ async def _configure_structured_output(
     )
 
     # Compile before enqueue so invalid/unsupported schemas cannot crash workers.
+    from .structured_output import structured_tool_format
+
+    tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
     compiler = getattr(_configure_structured_output, "compiler", None)
     if (
         compiler is None
@@ -1765,10 +1773,11 @@ async def _configure_structured_output(
         _configure_structured_output.compiler = compiler
         _configure_structured_output.tokenizer = tokenizer
     try:
-        await asyncio.to_thread(compiler.compile, schema)
+        await asyncio.to_thread(compiler.compile, schema, tool_format)
     except Exception as exc:
         raise ValueError(f"Cannot compile JSON Schema: {exc}") from exc
     sampling_params.json_schema = schema
+    sampling_params.structured_tool_format = tool_format
     if _effective_thinking_enabled(kwargs):
         marker = getattr(reasoning_dialect, "think_end_marker", None)
         if not marker:
@@ -1803,13 +1812,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 raise ValueError(
                     "logprobs is unavailable with synthetic forced acceptance"
                 )
-            if (
-                request.kv_transfer_params
-                or request.tools
-                or _has_multimodal_content(messages)
-            ):
+            if request.kv_transfer_params or _has_multimodal_content(messages):
                 raise ValueError(
-                    "Chat logprobs currently supports text without tools or P/D transfer"
+                    "Chat logprobs currently supports text without P/D transfer"
                 )
             logprob_codec = token_bytes(tokenizer)
 
@@ -1859,6 +1864,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             schema,
             merged_kwargs,
             tools=request.tools,
+            tool_choice=request.tool_choice,
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
@@ -2111,6 +2117,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     schema,
                     choice["message"].get("content") or "",
                     choice.get("finish_reason"),
+                    tool_calls=bool(choice["message"].get("tool_calls")),
                 )
         if logprob_codec is not None:
             from .chat_logprobs import response_logprobs
@@ -2808,6 +2815,7 @@ async def responses_create(raw_request: Request):
             schema,
             merged_kwargs,
             tools=openai_tools,
+            tool_choice=request.tool_choice,
             kv_transfer=kv_transfer_params,
         )
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -2892,9 +2900,13 @@ async def responses_create(raw_request: Request):
                                 ):
                                     yield _frame
                             else:
-                                if schema is not None:
-                                    structured_text.append(text)
                                 events = tool_parser.process(text)
+                                if schema is not None:
+                                    structured_text.extend(
+                                        value
+                                        for kind, value in events
+                                        if kind == "content"
+                                    )
                                 has_tool_calls = has_tool_calls or (
                                     completes_a_tool_call(events)
                                 )
@@ -2903,6 +2915,10 @@ async def responses_create(raw_request: Request):
 
                         if finished:
                             events = tool_parser.flush()
+                            if schema is not None:
+                                structured_text.extend(
+                                    value for kind, value in events if kind == "content"
+                                )
                             has_tool_calls = has_tool_calls or (
                                 completes_a_tool_call(events)
                             )
@@ -2912,6 +2928,7 @@ async def responses_create(raw_request: Request):
                                 schema,
                                 "".join(structured_text),
                                 chunk_data.get("finish_reason"),
+                                tool_calls=has_tool_calls,
                             )
                             aborted = False
                             cache_read = chunk_data.get("num_cached_tokens", 0)
@@ -2990,7 +3007,15 @@ async def responses_create(raw_request: Request):
                 for part in item.get("content", [])
                 if part.get("type") == "output_text"
             )
-            validate_output(schema, visible, final_output.get("finish_reason"))
+            validate_output(
+                schema,
+                visible,
+                final_output.get("finish_reason"),
+                tool_calls=any(
+                    item.get("type") == "function_call"
+                    for item in response.get("output", [])
+                ),
+            )
         return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:

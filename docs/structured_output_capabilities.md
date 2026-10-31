@@ -40,10 +40,14 @@ Responses reports `incomplete` in that case.
 
 Supported intersections and numeric `multipleOf` constraints are compiled into
 the grammar. An exact normalization pass additionally supports numeric/Boolean/null
-negation, negation over finite enums, conditions on finite object discriminators,
-and `uniqueItems` over finite item domains. Finite expansions are capped at 256
-branches or arrays. General negation, unbounded discriminator domains and
-unbounded `uniqueItems`, and `uniqueItems` combined with `prefixItems` remain unsupported and fail before generation. A 400 for
+negation, literal string negation, length/cardinality bounds, required/property
+negation, and conditions whose guards can be complemented exactly. Those guards
+do not require a finite discriminator domain. More complex guards may use finite
+enumeration. `uniqueItems` supports finite item and prefix-item domains, including
+prefix values outside the trailing `items` domain. Finite expansions are capped
+at 256 branches or arrays. General regex negation, unbounded `uniqueItems`, and
+other predicates without an exact lowering remain unsupported and fail before
+generation. A 400 for
 an unsupported schema is not positive feature support. Client `x-guidance`
 annotations cannot enable lenient compilation or change JSON separators.
 
@@ -58,9 +62,21 @@ prefix; rejected drafts never advance the committed state. The implementation
 bridges deferred output delivery and reconstructs grammar state from committed
 history on replay. No target-model forward or AITER operator is added.
 
-This initial draft rejects structured output combined with tools, P/D handoff,
-multimodal input, logprobs, custom stop strings, or `ignore_eos`. Synthetic forced
-acceptance is also rejected. No image implementation is included.
+Chat can combine constraints with `logprobs` and `top_logprobs`. Probabilities
+still describe the raw target distribution: only requested target/bonus logit
+rows are preserved before grammar masking. This extra snapshot is made only
+when constraints and probabilities are both enabled. The ordinary path does not
+copy logits for this feature.
+
+With a DSML parser, normal function tools can accompany Chat `response_format`
+or Responses `text.format`. The grammar admits the parser's canonical function
+envelope or a schema-conforming answer. Required/named choices select the tool
+branch; `tool_choice="none"` selects JSON text. Function-only turns have no
+response text to validate; subsequent text answers remain constrained. This is
+not beta strict-tool argument validation. Other tool parser formats, P/D handoff,
+multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
+constraints. Synthetic forced acceptance is also rejected. No image
+implementation is included.
 
 Committed grammar states are retained for the immediately preceding batch and
 advanced only by newly committed tokens. Each speculative request clones that
