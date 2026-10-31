@@ -20,20 +20,24 @@ available; enabling on-demand does not eliminate capacity-driven eviction.
 
 The matching cases are in
 [models_atomesh.yaml](../../.github/benchmark/models_atomesh.yaml), under
-`Kimi-K3-MXFP4` → `nightly`:
+`Kimi-K3-MXFP4` → `nightly`. They run this decode server, state cache and
+on-demand setting, but behind a PP8xTP1 prefill server (eight one-GPU
+pipeline stages) instead of the TP8/DCP8 prefill below, because PP8 measured
+best at these concurrencies. The cells' comments list the few P/D settings
+they add on top.
 
-| CONC | Case suffix | `max-num-seqs` | Decode graph capture sizes | Comm-group reuse |
-|---:|---|---:|---|---:|
-| 48 | `dspark4-agentic-lmcache-1m-c48` | 96 | 1…480 | 0 |
-| 56 | `dspark4-agentic-lmcache-1m-c56` | 112 | 1…560 | 1 |
-| 72 | `dspark4-agentic-lmcache-1m-c72` | 144 | 1…720 | 1 |
-| 88 | `dspark4-agentic-lmcache-1m-c88` | 176 | 1…880 | 1 |
+| CONC | Case suffix | `max-num-seqs` | Decode graph capture sizes | Comm-group reuse | Decode MLA on OPUS |
+|---:|---|---:|---|---:|---:|
+| 48 | `dspark4-agentic-lmcache-1m-c48` | 96 | 1…480 | 0 | 0 |
+| 56 | `dspark4-agentic-lmcache-1m-c56` | 112 | 1…560 | 1 | 0 |
+| 72 | `dspark4-agentic-lmcache-1m-c72-opus` | 144 | 1…720 | 1 | 1 |
+| 88 | `dspark4-agentic-lmcache-1m-c88-opus` | 176 | 1…880 | 1 | 1 |
 
-Every case has the prefix `kimi-k3-mxfp4-1p1d-tp8-dcp8-` and uses the same
+Every case has the prefix `kimi-k3-mxfp4-1p1d-pp8-dcp8-` and uses the same
 128 GiB state cap, 224 GiB shared CPU pool, and on-demand setting. The
 commands below default to C72. Start fresh servers for each concurrency.
 These are configuration recommendations; performance at the 128 GiB state
-cap must be measured with the corresponding CI run.
+cap must be measured, and the CI cases measure it with the PP8 prefill.
 
 ## Prerequisites
 
@@ -136,9 +140,13 @@ reports its entry size and retention capacity.
 After applying the common block in a separate shell on the decode node,
 start the Mooncake consumer. Decode uses no LMCache CPU offload in this recipe.
 Its dense graph range matches CI's `cudagraph: auto` calculation:
-`2 * CONC * (1 + 4)` query tokens.
+`2 * CONC * (1 + 4)` query tokens. At C72 and C88 the decode runs its MLA on
+aiter's OPUS kernel, as the `-opus` cases do; the prefill does not.
 
 ```bash
+case "${CONC}" in
+  72|88) export AITER_MLA_USE_OPUS=1 ;;
+esac
 GRAPH_MAX=$((MAX_NUM_SEQS * 5))
 CUDAGRAPH_CAPTURE_SIZES="[$(seq -s, 1 "${GRAPH_MAX}")]"
 DECODE_KV_TRANSFER_CONFIG="{\"kv_connector\":\"mooncake\",\"kv_role\":\"kv_consumer\",\"proxy_ip\":\"${ATOM_HOST_IP}\",\"handshake_port\":6301}"
@@ -182,4 +190,6 @@ each concurrency for 3,600 seconds with 10 warmup requests per lane.
 
 For CI, select `ATOMesh Benchmark`, suite `nightly`, model `Kimi-K3-MXFP4`,
 and one exact case name, for example
-`kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c72`.
+`kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-opus`, which runs
+the PP8 prefill rather than the TP8/DCP8 prefill above, and from C72 the
+decode's MLA on aiter's OPUS kernel (the `-opus` suffix).

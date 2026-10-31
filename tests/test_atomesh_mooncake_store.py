@@ -376,6 +376,7 @@ start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
 }
 build_server_cache_env() { local -n out="$3"; out=("HOME=/cache/$1"); }
+build_online_quant_args() { local -n out="$2"; out=(); }
 build_torch_profiler_args() { local -n out="$2"; out=(); }
 ATOM_SOURCE_ENV=()
 server_common=(--model /models/m)
@@ -406,6 +407,8 @@ stop_mooncake_store
             OSL="1024",
             PREFILL_SERVER_ARGS="",
             DECODE_SERVER_ARGS="",
+            PREFILL_ONLINE_QUANT_CONFIG="",
+            DECODE_ONLINE_QUANT_CONFIG="",
             host_name="node0",
         )
 
