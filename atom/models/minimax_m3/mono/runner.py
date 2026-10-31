@@ -205,7 +205,9 @@ class MonoDecodeRunner:
         heads = IndexHeads(TP, self.rank) if indexer_cp_enabled() else ONE_INDEX_HEAD
         self.index_heads = heads.count
         # bounded mailbox waits, their records raised after the step (finish_step)
-        self.debug = envs.ATOM_MONO_DEBUG or self.gfx1250
+        # gfx1250's step fence is bounded (``StepMailboxes``); its kernels' waits
+        # only with ATOM_MONO_DEBUG, as on gfx950
+        self.debug = envs.ATOM_MONO_DEBUG
         self.sparse = [
             SparseMoeLayer.from_layer(layers[i], i, heads)
             for i in range(N_DENSE, len(layers))
@@ -254,8 +256,6 @@ class MonoDecodeRunner:
                 f"{cus} CUs: the kernels need all {BLOCKS} CTAs co-resident"
             )
         tl_prefix = envs.ATOM_MONO_TIMELINE
-        if tl_prefix and self.gfx1250:
-            raise MonoUnsupported("no gfx1250 timeline build")
         self.timeline = (
             LayerTimeline(tl_prefix, len(self.sparse), TL_POINTS, self.rank, self.dev)
             if tl_prefix
@@ -311,8 +311,8 @@ class MonoDecodeRunner:
         )
         # every mailbox pair, zeroed at each step's start (forward)
         self.mailboxes = StepMailboxes(
-            self.peers, self.scratch1, self.scratch4, debug=self.debug,
-            gfx1250=self.gfx1250,
+            self.peers, self.scratch1, self.scratch4,
+            debug=self.debug or self.gfx1250, gfx1250=self.gfx1250,
         )
         bf16 = torch.bfloat16
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the

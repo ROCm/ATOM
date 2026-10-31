@@ -68,19 +68,26 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_RDONE as K1_SCRATCH_RDONE,
 )
 from atom.models.minimax_m3.mono.kernels.stages.ffn_reduce import ffn_reduce_defs
+from atom.models.minimax_m3.mono.kernels.stages.shared import K1_STAMPS, TL_POINTS
 from atom.models.minimax_m3.mono.sources import SOURCES
 from atom.mono.device.gfx1250 import BLOCKS, THREADS, WAVE, WAVES
 from atom.mono.device.gfx1250 import block_max as block_max_of
 from atom.mono.device.ops import kernel_symbol, launcher, load_ptr64
+from atom.mono.device.stamps import stamp as stamp_point
+from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, shift, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import first_task
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.debug import region_ids
 
-__all__ = ["K4_ABI", "build_post_attn_kernel"]
+__all__ = ["K4_ABI", "TL_POINTS", "build_post_attn_kernel"]
 
 _CURRENT_STREAM = fx.Stream(None)
+TL_END = 16  # timeline point: the CTA's last stage done (free on gfx950's map)
+# gfx950 makes both all-reduces RS + AG from 12 tokens; on gfx1250 the one-hop
+# push measured faster there (bs 3 x 4 verify rows: 9.29 -> 8.47 ms a step)
+AG_RS_FROM_G1250 = MAX_TOKENS + 1
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,7 @@ class K4Build:
     index_heads: int = field(metadata={"sym": "ih"})
     index_own: int = field(metadata={"sym": "io"})
     index_topk: bool = field(metadata={"sym": "it"})
+    timeline: bool = field(metadata={"sym": "tl"})
     fuse_k1: bool
     sm_scale: float
     eps: float
@@ -100,6 +108,7 @@ class K4Build:
     swiglu_limit: float
     debug: bool
     skip: str  # debug: stages replaced by no-ops (ATOM_MONO_G1250_SKIP)
+    ag_rs_from: int  # tokens from which the all-reduces are RS + AG
 
 
 def build_post_attn_kernel(
@@ -120,13 +129,13 @@ def build_post_attn_kernel(
 ):
     """``kernels.post_attn.build_post_attn_kernel`` on gfx1250 (no timeline)."""
     assert 1 <= tokens <= MAX_TOKENS
-    assert not timeline, "gfx1250 K4 has no timeline build"
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, index_topk=index_topk,
-        fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
+        timeline=timeline, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
         shared_weight=shared_weight, swiglu_limit=swiglu_limit, debug=debug,
         skip=os.environ.get("ATOM_MONO_G1250_SKIP", ""),
+        ag_rs_from=int(os.environ.get("ATOM_MONO_G1250_AGRS_FROM", AG_RS_FROM_G1250)),
     )  # fmt: skip
     SKIP = set(key.skip.split(",")) - {""}
     build_key = key_tuple(key, SOURCES)
@@ -159,6 +168,7 @@ def build_post_attn_kernel(
         route: fx.Array[fx.Int32, 8 * MAX_TOKENS, 16]
         rwt: fx.Array[fx.Float32, 8 * MAX_TOKENS, 16]
         blk: fx.Array[fx.Int32, 32, 16]
+        tls: fx.Array[fx.Int64, TL_POINTS if timeline else 1, 16]
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens if heads.count == 1 else 1, 16]
 
     kernel_name = kernel_symbol(
@@ -230,6 +240,7 @@ def build_post_attn_kernel(
         rwt = lds.rwt.ptr
         keys = xs
         blk = lds.blk.ptr
+        tls = lds.tls.ptr
         v4f = fx.Vector.make_type(4, fx.Float32)
         v2i = fx.Vector.make_type(2, fx.Int32)
 
@@ -258,7 +269,7 @@ def build_post_attn_kernel(
             return (b & fx.Int32(-128)) | (127 - e)
 
         peer_dst = load_ptr64(peers, fx.min(wave, W - 1))
-        AG_RS = tokens >= AG_RS_FROM
+        AG_RS = tokens >= key.ag_rs_from
 
         def peer_addr(w):
             return load_ptr64(peers, w)
@@ -267,7 +278,8 @@ def build_post_attn_kernel(
             return first_task(bid, BASE[name])
 
         def stamp(k):
-            pass
+            """``timeline``: this CTA passing point k (steady clock)."""
+            stamp_point(timeline, tls, tid, k, True)
 
         def block_max(v):
             return block_max_of(v, lane, wave, red)
@@ -285,7 +297,15 @@ def build_post_attn_kernel(
                         [fx.ptr_load(misc + i * 2), fx.ptr_load(misc + (i * 2 + 1))],
                     )
 
+        stamp_begin(timeline, tls, tid, TL_POINTS, True)
+
         if const_expr(fuse_k1):
+
+            def k1_stamp(k):
+                """K1's points 1-4 and 6 on K4's free stamps 27-31."""
+                if const_expr(k in K1_STAMPS):
+                    stamp(K1_STAMPS[k])
+
             (
                 ar_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, index_cache,
                 iq_out, scratch1,
@@ -294,7 +314,7 @@ def build_post_attn_kernel(
             if const_expr(ih_count > 1):
                 qs_k1 = fpool + QS_CP
             emit_k1(
-                tid, bid, lane, wave, xs, red, qs_k1, stamp, layer,
+                tid, bid, lane, wave, xs, red, qs_k1, k1_stamp, layer,
                 eps, index_scale_log2e(sm_scale), tokens, q_len, init_blocks,
                 local_blocks, IndexHeads(ih_count, ih_own),
                 (
@@ -334,6 +354,7 @@ def build_post_attn_kernel(
         enter_stage("split")
         if const_expr("split" not in SKIP):
             stage_split()
+        stamp(1)
 
         k4ctx.update(locals())
         k4ctx.update(merge_defs(k4ctx))
@@ -348,6 +369,7 @@ def build_post_attn_kernel(
         enter_stage("o")
         if const_expr("o" not in SKIP):
             stage_o()
+        stamp(4)
 
         XN8_WORDS = HIDDEN // 4
         XSC_WORDS = HIDDEN // 32
@@ -364,6 +386,7 @@ def build_post_attn_kernel(
         enter_stage("router")
         if const_expr("router" not in SKIP):
             stage_router()
+        stamp(5)
 
         UG_KC = HIDDEN // 128
         UG_CPW = UG_KC // WAVES
@@ -404,6 +427,8 @@ def build_post_attn_kernel(
         enter_stage("ug")
         if const_expr("moe" not in SKIP):
             (stage_moe_wide if WIDE else stage_moe)()
+        stamp(TL_END)
+        stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 
     @launcher(kernel_name)
     def launch_post_attn(
