@@ -216,9 +216,16 @@ print(json.dumps({"path": path, "mtime": Path(path).stat().st_mtime_ns}))
 
 
 @pytest.mark.parametrize(
-    "adapter_name", ["InductorAdaptor", "InductorStandaloneAdaptor"]
+    "adapter_name,external_inductor",
+    [
+        ("InductorAdaptor", False),
+        ("InductorStandaloneAdaptor", False),
+        ("InductorStandaloneAdaptor", True),
+    ],
 )
-def test_compiled_triton_kernel_reused_in_new_process(tmp_path, adapter_name):
+def test_compiled_triton_kernel_reused_in_new_process(
+    tmp_path, adapter_name, external_inductor
+):
     """Real kernel artifact reuse; the second process must not recompile."""
     import importlib.util
     import json
@@ -252,6 +259,10 @@ def add_one(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Y + offsets, values + 1, offsets < N)
 
 root = Path(sys.argv[1])
+external_inductor = sys.argv[4] == "1"
+if external_inductor:
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(root / "operator_inductor")
+expected_triton = root / "operator_inductor/triton" if external_inductor else root / "triton_cache"
 getattr(ci, sys.argv[2])().initialize_cache(str(root / "backbone"), prefix="backbone")
 events = []
 def listener(**kw):
@@ -268,7 +279,7 @@ torch.testing.assert_close(y, x + 1, rtol=0, atol=0)
 assert len(events) == 1
 assert events[0]["cache_hit"] == (sys.argv[3] == "1")
 for value in events[0]["files"].values():
-    assert Path(value).is_relative_to(root / "triton_cache")
+    assert Path(value).is_relative_to(expected_triton)
 print(json.dumps(events[0]))
 """)
     env = os.environ.copy()
@@ -287,6 +298,7 @@ print(json.dumps(events[0]))
                 str(tmp_path / "rank_0"),
                 adapter_name,
                 str(process),
+                str(int(external_inductor)),
             ],
             env=env,
             text=True,
@@ -553,3 +565,103 @@ def test_cache_fixture_restores_environment(monkeypatch, initial, mutation):
             else:
                 os.environ.pop(name, None)
     assert {name: os.environ.get(name) for name in names} == before
+
+
+@pytest.mark.parametrize("triton_origin", ["unset", "default", "managed", "explicit"])
+def test_external_inductor_owns_automatic_triton(tmp_path, monkeypatch, triton_origin):
+    import os
+
+    from torch._inductor.runtime import runtime_utils
+
+    from atom.utils import compiler_inferface as ci
+
+    default = tmp_path / "torchinductor_default"
+    monkeypatch.setattr(runtime_utils, "default_cache_dir", lambda: str(default))
+    external = tmp_path / "mounted_inductor"
+    explicit = tmp_path / "explicit_triton"
+    old_managed = tmp_path / "prior_atom/triton_cache"
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(external))
+    if triton_origin == "unset":
+        monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    elif triton_origin == "default":
+        monkeypatch.setenv("TRITON_CACHE_DIR", str(default / "triton/0"))
+    elif triton_origin == "managed":
+        monkeypatch.setenv("TRITON_CACHE_DIR", str(old_managed))
+        ci._managed_compiler_cache_dirs["TRITON_CACHE_DIR"] = str(old_managed)
+    else:
+        monkeypatch.setenv("TRITON_CACHE_DIR", str(explicit))
+    expected = explicit if triton_origin == "explicit" else external / "triton"
+    adaptor = ci.InductorStandaloneAdaptor()
+    for rank in ("rank_0", "rank_1"):
+        adaptor.initialize_cache(str(tmp_path / "atom" / rank))
+        assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(external)
+        assert os.environ["TRITON_CACHE_DIR"] == str(expected)
+    if triton_origin != "explicit":
+        assert expected.is_dir()
+        assert not (tmp_path / "atom").exists()
+
+
+def test_default_root_snapshot_precedes_environment_mutation(tmp_path, monkeypatch):
+    import os
+
+    from torch._inductor.runtime import runtime_utils
+
+    from atom.utils import compiler_inferface as ci
+
+    default = tmp_path / "torchinductor_default"
+    original = {
+        "TORCHINDUCTOR_CACHE_DIR": str(default),
+        "TRITON_CACHE_DIR": str(default / "triton/0"),
+    }
+    for name, value in original.items():
+        monkeypatch.setenv(name, value)
+    observed = []
+
+    def default_root():
+        observed.append({k: os.environ.get(k) for k in original})
+        return str(default)
+
+    monkeypatch.setattr(runtime_utils, "default_cache_dir", default_root)
+    ci.InductorStandaloneAdaptor().initialize_cache(str(tmp_path / "atom"))
+    assert observed == [original]
+
+
+def test_inherited_triton_follows_external_owner_change(tmp_path, monkeypatch):
+    import os
+
+    from atom.utils import compiler_inferface as ci
+
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "external_a"))
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    adaptor = ci.InductorStandaloneAdaptor()
+    adaptor.initialize_cache(str(tmp_path / "atom_a"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "external_b"))
+    adaptor.initialize_cache(str(tmp_path / "atom_b"))
+    assert os.environ["TRITON_CACHE_DIR"] == str(tmp_path / "external_b/triton")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "operator_override"))
+    adaptor.initialize_cache(str(tmp_path / "atom_c"))
+    assert os.environ["TRITON_CACHE_DIR"] == str(tmp_path / "operator_override")
+
+
+def test_empty_external_inductor_is_not_a_triton_parent(tmp_path, monkeypatch):
+    import os
+
+    from atom.utils import compiler_inferface as ci
+
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "")
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    ci.InductorStandaloneAdaptor().initialize_cache(str(tmp_path / "atom"))
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == ""
+    assert os.environ["TRITON_CACHE_DIR"] == str(tmp_path / "atom/triton_cache")
+
+
+def test_external_triton_creation_error_is_not_silenced(tmp_path, monkeypatch):
+    from atom.utils import compiler_inferface as ci
+
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "triton").write_text("not a directory")
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(external))
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    with pytest.raises(FileExistsError):
+        ci.InductorStandaloneAdaptor().initialize_cache(str(tmp_path / "atom"))

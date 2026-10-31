@@ -299,9 +299,19 @@ An explicit value equal to a recognized PyTorch default is indistinguishable
 from an automatically assigned one and is redirected too.
 
 If deployment scripts set either variable before startup, standalone preserves
-that variable independently; the other can still be automatically managed.
-Those deployment-selected directories must be mounted persistently and writable
-by the worker. ATOM does not add rank suffixes to caller-owned paths.
+that caller-owned value. When only `TORCHINDUCTOR_CACHE_DIR` is caller-owned,
+an unset, recognized temporary-default, or ATOM-managed Triton path is selected
+as `<TORCHINDUCTOR_CACHE_DIR>/triton`. Mounting the external Inductor root
+persistently therefore retains both sets of compiler artifacts. An explicit
+`TRITON_CACHE_DIR` always wins, even when it is outside that root. If only Triton
+is caller-owned, Inductor remains managed under the ATOM rank cache.
+An explicitly empty Inductor value is preserved but is not used as a parent;
+the normal ATOM Triton default applies in that case.
+
+Environment values and PyTorch's default root are snapshotted once before either
+variable is modified. These paths must be mounted persistently and writable by
+the worker. ATOM does not add rank suffixes to caller-owned or inherited external
+paths. The regular adaptor retains the historical rule in the table above.
 Changing a variable after initialization transfers ownership back to the caller
 when its value differs from the last value assigned by the initializer.
 

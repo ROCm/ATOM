@@ -284,11 +284,9 @@ class AlwaysHitShapeEnv:
 _managed_compiler_cache_dirs: dict[str, str] = {}
 
 
-def _is_default_compiler_cache(name: str, path: str) -> bool:
+def _is_default_compiler_cache(name: str, path: str, default_root: str) -> bool:
     """Recognize PyTorch's temporary defaults, not arbitrary user temp paths."""
-    from torch._inductor.runtime.runtime_utils import default_cache_dir
-
-    root = os.path.abspath(default_cache_dir())
+    root = default_root
     path = os.path.abspath(path)
     if name == "TORCHINDUCTOR_CACHE_DIR":
         return path == root
@@ -307,26 +305,46 @@ def _initialize_inductor_cache_dirs(
     Standalone may inherit defaults installed by PyTorch before the backend
     runs. Redirect those defaults, unset values, and paths we set ourselves.
     Respect other existing values (e.g. atomesh deployment configuration).
+    When only Inductor has a caller-owned root, automatically selected Triton
+    storage follows its ``triton`` child so a single persistent mount suffices.
     The regular adaptor retains its historical unconditional redirection.
     Earlier artifacts are not migrated. Level-0 execution bypasses this
     backend and should configure its cache environment at process startup.
     """
-    for name, subdir in (
+    names = (
         ("TORCHINDUCTOR_CACHE_DIR", "inductor_cache"),
         ("TRITON_CACHE_DIR", "triton_cache"),
-    ):
-        previous = os.environ.get(name)
-        managed = previous is not None and previous == _managed_compiler_cache_dirs.get(
-            name
-        )
-        if (
-            preserve_user_paths
-            and previous is not None
-            and not managed
-            and not _is_default_compiler_cache(name, previous)
-        ):
+    )
+    # Classify both variables against one pre-mutation snapshot. Do not let
+    # selecting the Inductor destination change how Triton's old value is read.
+    previous = {name: os.environ.get(name) for name, _ in names}
+    caller_owned: set[str] = set()
+    if preserve_user_paths:
+        from torch._inductor.runtime.runtime_utils import default_cache_dir
+
+        default_root = os.path.abspath(default_cache_dir())
+        for name, value in previous.items():
+            if (
+                value is not None
+                and value != _managed_compiler_cache_dirs.get(name)
+                and not _is_default_compiler_cache(name, value, default_root)
+            ):
+                caller_owned.add(name)
+
+    for name, subdir in names:
+        if name in caller_owned:
             continue
         selected = os.path.join(base_cache_dir, subdir)
+        # If the deployment mounts only its explicit Inductor root, keep an
+        # automatically selected Triton cache under that same persistent mount.
+        # An explicit Triton path always wins. An explicitly empty Inductor
+        # value is preserved, but is not treated as a usable parent directory.
+        if (
+            name == "TRITON_CACHE_DIR"
+            and "TORCHINDUCTOR_CACHE_DIR" in caller_owned
+            and previous["TORCHINDUCTOR_CACHE_DIR"]
+        ):
+            selected = os.path.join(previous["TORCHINDUCTOR_CACHE_DIR"], "triton")
         os.makedirs(selected, exist_ok=True)
         os.environ[name] = selected
         _managed_compiler_cache_dirs[name] = selected
