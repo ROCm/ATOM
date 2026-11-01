@@ -724,6 +724,10 @@ def standalone_draft_quant_config(
     The online override is passed through deliberately: it is a property of the
     run, not of either checkpoint, and the draft was already subject to it.
 
+    A *quantized* standalone draft is not supported yet: it would also need the
+    draft's checkpoint path (``model=``) and its model's packed-module remap,
+    which this does not apply.
+
     Used by the native proposers and by the vLLM plugin's standalone-draft path,
     so the two cannot drift.
     """
