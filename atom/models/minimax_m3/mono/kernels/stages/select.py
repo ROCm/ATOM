@@ -18,11 +18,7 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
     CAND_BATCH,
     CAND_CAP,
 )
-from atom.models.minimax_m3.mono.layout import (
-    N_SPLIT,
-    PAGES_PER_BLOCK,
-    SPARSE_TABLE_WORDS,
-)
+from atom.models.minimax_m3.mono.layout import N_SPLIT, SPARSE_TABLE_WORDS
 from atom.mono.device.ops import (
     rsrc,
     traced,
@@ -45,6 +41,7 @@ from atom.mono.plan.execution import THREADS, WAVES
 def select_defs(k4ctx):
     """The functions of the indexer's top-k selection (every block ranked, or a long
     context's shares)."""
+    PPB = k4ctx["PPB"]  # page ids a block takes in a split task's table
     SY = k4ctx["SY"]
     blk = k4ctx["blk"]
     block_table = k4ctx["block_table"]
@@ -189,19 +186,15 @@ def select_defs(k4ctx):
         ``part``'s) and, part 0, into the token's sparse table; thread 0 the
         sparse context length."""
         if sel & (slot // 2 == part):
-            for j in range_constexpr(PAGES_PER_BLOCK):
-                fx.ptr_store(
-                    page * PAGES_PER_BLOCK + j, blk + ((slot % 2) * PAGES_PER_BLOCK + j)
-                )
+            for j in range_constexpr(PPB):
+                fx.ptr_store(page * PPB + j, blk + ((slot % 2) * PPB + j))
         if sel & (part == 0):
-            for j in range_constexpr(PAGES_PER_BLOCK):
-                bo.buffer_store(
-                    page * PAGES_PER_BLOCK + j, table, slot * PAGES_PER_BLOCK + j
-                )
+            for j in range_constexpr(PPB):
+                bo.buffer_store(page * PPB + j, table, slot * PPB + j)
         if tid == 0:
             fx.ptr_store(n_ctx, blk + 16)
             if part == 0:
-                bo.buffer_store(n_ctx, table, TOPK_BLOCKS * PAGES_PER_BLOCK)
+                bo.buffer_store(n_ctx, table, TOPK_BLOCKS * PPB)
 
     def table_of(k):
         return rsrc(mb("sparse_table") + fx.Int64(k) * (SPARSE_TABLE_WORDS * 4))
@@ -225,7 +218,7 @@ def select_defs(k4ctx):
         seq_len = pick(seq_lens_k, k)
         r_bt = rsrc(bt_row(k))
         table = table_of(k)
-        if tid < 2 * PAGES_PER_BLOCK + 2:
+        if tid < 18:  # the pages, the sparse context length, the tail flag
             fx.ptr_store(fx.Int32(0), blk + tid)
         entry, page, kt = rank_blocks(iscore, n_blk, r_bt, pick(scored, k))
         (sel, slot), n_ctx = place(entry, kt, n_blk, seq_len)
@@ -239,12 +232,12 @@ def select_defs(k4ctx):
         cleared at the step's start and every selection of a token fills the
         same slots."""
         table = table_of(k)
-        if tid < 2 * PAGES_PER_BLOCK + 1:
-            j = (tid < 2 * PAGES_PER_BLOCK).select(
-                2 * t * PAGES_PER_BLOCK + tid, fx.Int32(TOPK_BLOCKS * PAGES_PER_BLOCK)
-            )
+        if tid < 2 * PPB + 1:
+            j = (tid < 2 * PPB).select(2 * t * PPB + tid, fx.Int32(TOPK_BLOCKS * PPB))
+            # the context length lands at blk[16], whatever the pages a block takes
+            at = (tid < 2 * PPB).select(tid, fx.Int32(16))
             fx.ptr_store(
-                fx.Int32(bo.buffer_load(table, j, vec_width=1, dtype=T.i32)), blk + tid
+                fx.Int32(bo.buffer_load(table, j, vec_width=1, dtype=T.i32)), blk + at
             )
         gpu.barrier()
 

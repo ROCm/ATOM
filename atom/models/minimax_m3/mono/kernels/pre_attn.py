@@ -46,11 +46,14 @@ from atom.models.minimax_m3.mono.kernels.common import (
     ar_block_sums,
     ar_pack_sumsq,
     ld_bf16x4,
+    mxfp4_row_store,
+    pack_q_e4m3,
     per_token_fp8_scale,
 )
 from atom.models.minimax_m3.mono.kernels.index_score import (
     emit_index_scores,
     index_scale_log2e,
+    q_chunk_offset,
     step_rows,
 )
 from atom.models.minimax_m3.mono.sources import SOURCES
@@ -175,7 +178,8 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
-    index_topk=True, dense=False, plain_norm=False,
+    index_topk=True, dense=False, plain_norm=False, index_mxfp4=False,
+    kv_mxfp4=False,
 ):  # fmt: skip
     """K1's body: the GEMV tasks (ROWS_PER_TASK of the ``heads`` projection's rows
     each: the rank's own on CTAs 0 .. ONE_GEMV, its other index q heads' on CTAs
@@ -186,7 +190,10 @@ def emit_pre_attn(
     ``dense`` (a dense layer, no index heads, ``index_topk`` off): K inserted as
     the dense path's Triton rope-cache does -- quantized from f32, page-128.
     ``plain_norm`` (layer 0: no all-reduce in front): the norm's output rounded
-    to bf16, then the linear's own per-token quant, as the original layer does."""
+    to bf16, then the linear's own per-token quant, as the original layer does.
+    ``index_mxfp4``: the index cache holds 8704 B MXFP4 pages, not E4M3 rows;
+    ``kv_mxfp4``: so do the K / V caches (no per-token scales, page-128, not
+    SHUFFLE)."""
     rows = heads.rows
     (
         ar,
@@ -496,37 +503,55 @@ def emit_pre_attn(
                 got[1][1].bitcast(fx.Float32),
             ]
             if is_v:
-                # raw V: per-token amax over the head, scale = amax / FP8_MAX
-                am = fx.Float32(0.0)
-                for j in range_constexpr(ELEMS):
-                    am = fx.max(am, fmath.absf(e[j]))
-                am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
-                vs = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
-                if slot >= 0:
-                    b = slot // PAGE16
-                    t = slot % PAGE16
-                    if l32 == 0:
-                        bo.buffer_store(
-                            vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
-                        )
-                    r_v = rsrc(v_cache)
+                if const_expr(kv_mxfp4):
+                    # the aiter writer's page (kv_mxfp4): raw V, bf16 rows
+                    if slot >= 0:
+                        mxfp4_row_store(
+                            rsrc(v_cache), slot, [bf16_round(e[j]) for j in range(ELEMS)],
+                            l32, cm_out,
+                        )  # fmt: skip
+                else:
+                    # raw V: per-token amax over the head, scale = amax / FP8_MAX
+                    am = fx.Float32(0.0)
                     for j in range_constexpr(ELEMS):
-                        q8 = fp8_pack4(e[j] / vs, 0.0, 0.0, 0.0) & 0xFF
-                        bo.buffer_store(
-                            fx.Int8(q8),
-                            r_v,
-                            b * PAGE_BYTES + (d0 + j) * PAGE16 + t,
-                            cache_modifier=cm_out,
-                        )
+                        am = fx.max(am, fmath.absf(e[j]))
+                    am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
+                    vs = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
+                    if slot >= 0:
+                        b = slot // PAGE16
+                        t = slot % PAGE16
+                        if l32 == 0:
+                            bo.buffer_store(
+                                vs, rsrc(v_scale), b * PAGE16 + t, cache_modifier=cm_out
+                            )
+                        r_v = rsrc(v_cache)
+                        for j in range_constexpr(ELEMS):
+                            q8 = fp8_pack4(e[j] / vs, 0.0, 0.0, 0.0) & 0xFF
+                            bo.buffer_store(
+                                fx.Int8(q8),
+                                r_v,
+                                b * PAGE_BYTES + (d0 + j) * PAGE16 + t,
+                                cache_modifier=cm_out,
+                            )
             else:
                 out = head_norm_rope(e, lane, gw4, cs, sn, eps)
                 if is_q:
-                    bo.buffer_store(
-                        fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
-                        rsrc(q_out),
-                        (tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0,
-                        cache_modifier=cm_out,
-                    )
+                    if const_expr(kv_mxfp4):
+                        # e4m3, unit scale, saturating, cast from the f32 elements:
+                        # the aiter writer's q_out convention (the split stage reads it as is)
+                        bo.buffer_store(
+                            pack_q_e4m3(out),
+                            rsrc(q_out),
+                            ((tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0) // 4,
+                            cache_modifier=cm_out,
+                        )
+                    else:
+                        bo.buffer_store(
+                            fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
+                            rsrc(q_out),
+                            (tk * LOCAL_Q_HEADS + ht) * HEAD_DIM + d0,
+                            cache_modifier=cm_out,
+                        )
                 if is_iq:
                     bo.buffer_store(
                         fx.Vector.from_elements(out, fx.Float32).to(fx.BFloat16),
@@ -534,53 +559,63 @@ def emit_pre_attn(
                         tk * HEAD_DIM + d0,
                     )
                 if is_k:
-                    am = fx.Float32(0.0)
-                    for j in range_constexpr(ELEMS):
-                        am = fx.max(am, fmath.absf(out[j]))
-                    am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
-                    ksc = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
-                    if slot >= 0:
-                        b = slot // PAGE16
-                        t = slot % PAGE16
-                        if l32 == 0:
+                    if const_expr(kv_mxfp4):
+                        if slot >= 0:
+                            mxfp4_row_store(
+                                rsrc(k_cache), slot,
+                                [bf16_round(out[j]) for j in range(ELEMS)], l32, cm_out,
+                            )  # fmt: skip
+                    else:
+                        am = fx.Float32(0.0)
+                        for j in range_constexpr(ELEMS):
+                            am = fx.max(am, fmath.absf(out[j]))
+                        am = butterfly(am, (16, 8, 4, 2, 1), fx.max)
+                        ksc = (am > 0.0).select(am / FP8_MAX, fx.Float32(1.0))
+                        if slot >= 0:
+                            b = slot // PAGE16
+                            t = slot % PAGE16
+                            if l32 == 0:
+                                bo.buffer_store(
+                                    ksc,
+                                    rsrc(k_scale),
+                                    b * PAGE16 + t,
+                                    cache_modifier=cm_out,
+                                )
+                            if const_expr(dense):
+                                # the dense path's Triton rope-cache: K quantized
+                                # from f32, page-128 SHUFFLE [b128][d / 16][t][16]
+                                qk = [out[j] / ksc for j in range(ELEMS)]
+                                k_off = (
+                                    slot // DENSE_PAGE * (DENSE_PAGE * HEAD_DIM)
+                                    + (d0 // 16) * (DENSE_PAGE * 16)
+                                    + slot % DENSE_PAGE * 16
+                                    + d0 % 16
+                                )
+                            else:
+                                qk = [bf16_round(out[j]) / ksc for j in range(ELEMS)]
+                                k_off = (
+                                    b * PAGE_BYTES
+                                    + (d0 // 16) * (PAGE16 * 16)
+                                    + t * 16
+                                    + d0 % 16
+                                )
                             bo.buffer_store(
-                                ksc,
-                                rsrc(k_scale),
-                                b * PAGE16 + t,
+                                fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
+                                rsrc(k_cache),
+                                k_off // 4,
                                 cache_modifier=cm_out,
                             )
-                        if const_expr(dense):
-                            # the dense path's Triton rope-cache: K quantized
-                            # from f32, page-128 SHUFFLE [b128][d / 16][t][16]
-                            qk = [out[j] / ksc for j in range(ELEMS)]
-                            k_off = (
-                                slot // DENSE_PAGE * (DENSE_PAGE * HEAD_DIM)
-                                + (d0 // 16) * (DENSE_PAGE * 16)
-                                + slot % DENSE_PAGE * 16
-                                + d0 % 16
-                            )
-                        else:
-                            qk = [bf16_round(out[j]) / ksc for j in range(ELEMS)]
-                            k_off = (
-                                b * PAGE_BYTES
-                                + (d0 // 16) * (PAGE16 * 16)
-                                + t * 16
-                                + d0 % 16
-                            )
-                        bo.buffer_store(
-                            fp8_pack4(qk[0], qk[1], qk[2], qk[3]),
-                            rsrc(k_cache),
-                            k_off // 4,
-                            cache_modifier=cm_out,
-                        )
                 if (ht == IK_TASK) & (slot >= 0):
                     qi = [bf16_round(out[j]) for j in range(ELEMS)]
-                    bo.buffer_store(
-                        fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
-                        rsrc(index_cache),
-                        (slot * HEAD_DIM + d0) // 4,
-                        cache_modifier=cm_out,
-                    )
+                    if const_expr(index_mxfp4):
+                        mxfp4_row_store(rsrc(index_cache), slot, qi, l32, cm_out)
+                    else:
+                        bo.buffer_store(
+                            fp8_pack4(qi[0], qi[1], qi[2], qi[3]),
+                            rsrc(index_cache),
+                            (slot * HEAD_DIM + d0) // 4,
+                            cache_modifier=cm_out,
+                        )
 
         if const_expr(signal is not None):
             # every token's flag once the whole CTA's stores are out
@@ -600,6 +635,7 @@ def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
     region_ids=None, index_topk=True, dense=False, plain_norm=False,
+    index_mxfp4=False, kv_mxfp4=False,
 ):  # fmt: skip
     """K1 whole: the GEMV / head / norm tasks, then every CTA's indexer scores
     (``index_topk``; else the layer reuses a selection: no index q / k, no scores).
@@ -664,7 +700,7 @@ def emit_k1(
         row = (tk * heads.count + head) * (HEAD_DIM // 2)
         return fx.Vector(
             fx.ptr_load(
-                qs + (row + (32 * s + 8 * (lane // 16)) // 2),
+                qs + (row + q_chunk_offset(s, lane // 16, index_mxfp4) // 2),
                 result_type=fx.Vector.make_type(4, fx.Float32),
             )
         ).bitcast(fx.BFloat16)
@@ -691,6 +727,8 @@ def emit_k1(
         index_topk,
         dense,
         plain_norm,
+        index_mxfp4,
+        kv_mxfp4,
     )  # fmt: skip
     stamp(5)
 
@@ -711,7 +749,7 @@ def emit_k1(
             Addr("iscore", Space.SCRATCH, iscore),
             q_frag, tokens, q_len, init_blocks, local_blocks, index_scale, index_cache,
             block_table, seq_lens, bt_width, wait_new_keys if signal else None,
-            make_index_q, heads, q_frag_head, make_index_q_heads,
+            make_index_q, heads, q_frag_head, make_index_q_heads, index_mxfp4,
         )  # fmt: skip
     stamp(6)
 
@@ -741,6 +779,8 @@ class K1Build:
     timeline: bool = field(metadata={"sym": "tl"})
     dense: bool = field(metadata={"sym": "dn"})
     plain_norm: bool = field(metadata={"sym": "pn"})
+    index_mxfp4: bool = field(metadata={"sym": "im"})
+    kv_mxfp4: bool = field(metadata={"sym": "km"})
     eps: float
     sm_scale: float
 
@@ -755,18 +795,22 @@ def build_pre_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     dense: bool = False,
     plain_norm: bool = False,
+    index_mxfp4: bool = False,
+    kv_mxfp4: bool = False,
 ):
     """``@flyc.jit`` launcher of K1 for this model's RMSNorm epsilon, attention
     scale and sparse pinned blocks, a decode batch of ``tokens`` (<= MAX_TOKENS)
     rows and the fused projection's index q ``heads``. ``dense``: a dense layer's
     (``dense_pre``): q | k | v rows only, no indexer, K inserted as the dense
     path's rope-cache does; ``plain_norm``: layer 0's input norm
-    (``emit_pre_attn``)."""
+    (``emit_pre_attn``); ``index_mxfp4`` / ``kv_mxfp4``: the index / K and V caches
+    are MXFP4 pages."""
     assert 1 <= tokens <= MAX_TOKENS
     key = K1Build(
         tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
-        dense=dense, plain_norm=plain_norm, eps=eps, sm_scale=sm_scale,
+        dense=dense, plain_norm=plain_norm, index_mxfp4=index_mxfp4, kv_mxfp4=kv_mxfp4,
+        eps=eps, sm_scale=sm_scale,
     )  # fmt: skip
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     index_scale = index_scale_log2e(sm_scale)
@@ -844,6 +888,8 @@ def build_pre_attn_kernel(
             index_topk=not dense,
             dense=dense,
             plain_norm=plain_norm,
+            index_mxfp4=index_mxfp4,
+            kv_mxfp4=kv_mxfp4,
         )  # fmt: skip
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
 

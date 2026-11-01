@@ -57,6 +57,27 @@ def test_supported_deployment_has_no_refusal(native):
     assert dispatch._config_refusal(_atom_config()) is None
 
 
+def test_an_mxfp4_index_cache_with_fp8_kv_is_served(native):
+    assert dispatch._config_refusal(_atom_config(index_cache_dtype="mxfp4")) is None
+
+
+def test_an_nvfp4_index_cache_is_refused(native):
+    # on M3 ``--index-cache-dtype fp4`` is NVFP4: another pool and another scorer
+    assert "index cache" in dispatch._config_refusal(
+        _atom_config(index_cache_dtype="fp4")
+    )
+
+
+def test_an_mxfp4_main_kv_cache_is_served(native, monkeypatch):
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_MXFP4", "1")
+    assert dispatch._config_refusal(_atom_config(index_cache_dtype="mxfp4")) is None
+
+
+def test_an_nvfp4_main_kv_cache_is_refused(native, monkeypatch):
+    monkeypatch.setenv("ATOM_M3_SPARSE_KV_NVFP4", "1")
+    assert "NVFP4" in dispatch._config_refusal(_atom_config())
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [

@@ -23,11 +23,29 @@ from aiter import topk_select
 
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.models.minimax_m3.mono.config import HIDDEN
-from atom.models.minimax_m3.mono.runner import N_DENSE, token_rows
+from atom.models.minimax_m3.mono.runner import N_DENSE, _sparse_metadata, token_rows
 from atom.mono.runtime.compare import compare
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+def _cache_pages(lw, fwd, n: int) -> dict[str, torch.Tensor]:
+    """The cache pages this step's tokens land on (the index cache, K and V and,
+    of an FP8 cache, their scales), as bytes: a mono layer and the original one
+    must leave the same ones."""
+    slots = _sparse_metadata(fwd).slot_mapping[:n]
+    pages = (slots[slots >= 0] // 128).unique()
+    kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
+    caches = {"K": kv.k_cache, "V": kv.v_cache}
+    caches |= {"K scale": kv.k_scale, "V scale": kv.v_scale}
+    if lw.index_topk:
+        caches["index"] = lw.attn_impl.index_cache
+    return {
+        name: c[pages].clone().view(torch.uint8)
+        for name, c in caches.items()
+        if c is not None
+    }
 
 
 def forward_checked(
@@ -67,8 +85,21 @@ def forward_checked(
         res_in = res.clone()
         # mono first: it reads only the caches it inserts itself, as in a real step
         res = runner.run_sparse_layer(i, lw, fwd, positions, res, rows)
+        mono_pages = _cache_pages(lw, fwd, n)
         ref_partial, ref_res = layer(positions, h_in, res_in)
         ref_ar = tensor_model_parallel_all_reduce(ref_partial).view(n, HIDDEN)
+        if runner.rank == 0:
+            ref_pages = _cache_pages(lw, fwd, n)
+            logger.info(
+                "mono check layer %d cache bytes that differ (K/V %s, index %s): %s",
+                lw.layer_id,
+                "MXFP4" if lw.kv_mxfp4 else "FP8",
+                "MXFP4" if lw.index_mxfp4 else "FP8",
+                ", ".join(
+                    f"{name} {int((c != ref_pages[name]).sum())} of {c.numel()}"
+                    for name, c in mono_pages.items()
+                ),
+            )
         if runner.rank == 0:
             for k in range(n):
                 logger.info(

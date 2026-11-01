@@ -268,6 +268,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GROUP32_WEIGHT_PRESHUFFLE": lambda: (
         os.getenv("ATOM_GROUP32_WEIGHT_PRESHUFFLE", "1") == "1"
     ),
+    # gfx950: also store native 1x32 E8M0 FP8 weights (e.g. the MiniMax-M3.1
+    # DSpark draft's MXFP8 linears) (16, 16)-preshuffled, so AITER's preshuffled
+    # group32 GEMM reads them instead of the Triton group32 GEMM. Layout only: the
+    # weight bytes and scales are the checkpoint's.
+    "ATOM_MXFP8_1X32_PRESHUFFLE": lambda: (
+        os.getenv("ATOM_MXFP8_1X32_PRESHUFFLE", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
@@ -514,7 +521,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MiniMax-M3: store the sparse layers' K/V as MXFP4 (e2m1 + e8m0 per 32, one
     # 8704 B page per (page, kv head)); the fused qk-norm/rope kernel writes it
     # and an FP8 main Q, and FlyDSL's pa_decode_mxfp4 reads it. Pair with
-    # --index-cache-dtype mxfp4. Exclusive with ATOM_M3_SPARSE_KV_NVFP4.
+    # --index-cache-dtype mxfp4. Exclusive with ATOM_M3_SPARSE_KV_NVFP4. The mono
+    # decode (<= 16 tokens a step) writes and reads the same pages.
     "ATOM_M3_SPARSE_KV_MXFP4": lambda: (
         os.getenv("ATOM_M3_SPARSE_KV_MXFP4", "0") == "1"
     ),

@@ -1,6 +1,6 @@
 # MiniMax-M3 — Agentic serving recipe (InferenceX)
 
-MiniMax-M3.1-Flash (TP4 + DSpark) has its own section: [MiniMax-M3.1-Flash — TP4 + DSpark](#minimax-m31-flash--tp4--dspark).
+MiniMax-M3.1-Flash (TP4 + DSpark, MXFP4 KV and index cache, Mono decode) has its own section: [MiniMax-M3.1-Flash — TP4 + DSpark](#minimax-m31-flash--tp4--dspark).
 
 TP4 + EAGLE3, MXFP4 weights, concurrency 1–48. This is the configuration the SemiAnalysis InferenceX reference benchmarks for this model (`configs/amd-master.yaml`: `{tp: 4, spec-decoding: mtp}`); CONC 40/48 add the LMCache CPU tier.
 
@@ -206,48 +206,48 @@ MiniMax-M3.1-Flash runs a different configuration from the M3 recipe above:
 
 The reference is the SemiAnalysis InferenceX SGLang recipe `minimaxm31flash-fp4-mi355x-sglang-agentic-dspark` (TP4, K=7, golden accepted length 4.04, CI run 40110172586).
 
-The concurrency range splits in two:
+One configuration serves every concurrency: **MXFP4 sparse KV and MXFP4 index cache, with Mono decode**. Per point only the prefill delayer, `--max-num-seqs` and the CUDA-graph sizes change:
 
-| CONC | KV / index cache | decode | needs |
-|---|---|---|---|
-| 1–16 | FP8 / FP8 | Mono (fused per-layer decode) | #2686 (Mono with fixed DSpark verify) |
-| 32–48 | **NVFP4 / FP4** + fused verify top-k | production path (Mono refuses NVFP4 KV) | #2744, #2745, #2746 |
+| CONC | prefill delayer | `--max-num-seqs` | `--cudagraph-capture-sizes` |
+|---:|---|---:|---|
+| 1 | on | 1 | `[1]` |
+| 2 | on | 2 | `[1,2]` |
+| 4 | on | 8 | `[1..8]` |
+| 8 | on | 16 | `[1..8,10,12,14,16]` |
+| 16 | on | 32 | `[1..8,10,12,14,16,20,24,28,32]` |
+| 32 | off | 64 | every size `1..64` |
+| 48 | off | 96 | `[1..8,10,12,14,16,20,24,28,32,40,48,56,64,80,96]` |
 
-Both bands also use the per-channel FP8 draft from #2743. All five PRs are open as of 2026-10-27; on `main` without them, the first band runs without Mono and the second band's flags do not exist.
+- **Delayer** (`ATOM_PREFILL_DECODE_INTERVAL=20000`) protects that many scheduler passes after an executed prefill, so prefills coalesce instead of interrupting decode (see `docs/environment_variables.md`). Up to CONC 16 it buys interactivity; from 32 it costs throughput. At c16 it trades: P90 interactivity 250.0 vs 207.5 for 15% less throughput and a 3.1 s TTFT p50 (both rows in [Measured](#measured-m31)). Drop it at c16 when throughput or TTFT matters more.
+- **Every capture size at c32.** With the stepped list a running batch of 9, 11, 13 or 15 replays the next even graph. In a c32 trace those padded steps were 38% of the decode steps, and the MoE down projection alone took about 3.6 ms longer on each of them. Capturing 1..64 raised c32 P90 interactivity from 122.7 to 140.6 and throughput by 1.9%. c48 has not been measured with every size.
+- **`--max-num-seqs`** is 2 × CONC from c4, as above. c1 and c2 run at exactly CONC. `--max-num-seqs 1` needs this branch's warmup fix: a DSpark block drafter used to warm up at two sequences, past the one-row buffers.
 
-**Why the second band needs NVFP4.** With FP8 KV and FP8 index the cache cannot hold the agentic working set from CONC 48. At c48 with `--gpu-memory-utilization 0.8`:
-- the cache holds 6.06M tokens, against 7.97M tokens in flight at p50;
-- the prefix-cache hit rate collapses to 17% (the traces allow 96.6%);
-- TTFT p50 is 44 s and output is ~94 tok/s/GPU.
+Needs:
+- ATOM: this branch, `ganyi/m31-mono-fp4-pr` (#2812: Mono decode over the MXFP4 caches). It sits on #2770 (the MXFP4 KV and index caches), which sits on `yuhua/m3.1-flash` (#2686, #2743, #2744, #2745, #2746). All are open as of 2026-10-31.
+- aiter: `ganyi/m31-mxfp4-testing` (`1053d8d18`), JIT-built and first on `PYTHONPATH`. It is aiter `main` plus ROCm/aiter#7056 (MXFP4 paged-attention decode), #7057 (the MXFP4 KV / index-K writer), #7060 and #7061 (MXFP4 index scoring, decode and prefill).
+- Image `rocm/atom-dev:nightly_202610261558`.
 
-KV block bytes for TP4 (from the server log, 128-token blocks) and the capacity at `--gpu-memory-utilization 0.9`:
-
-| KV | index | block_bytes | blocks | tokens |
-|---|---|---:|---:|---:|
-| FP8 | FP8 | 3,179,520 | 57,011 | 7.3M |
-| FP8 | FP4 | 2,749,440 | ~66,000 | 8.4M |
-| NVFP4 | FP8 | 2,257,920 | ~80,400 | 10.3M |
-| NVFP4 | FP4 | 1,827,840 | ~99,200 | **12.7M** |
-
-At c16 the NVFP4 band is the slower one: 156.4 tok/s/GPU and P90 interactivity 137.9 over 1200 s, against 181.6 and 191.2 for the FP8 + Mono band. The NVFP4 figure was measured before #2746's on-device decode-row fix and has not been re-measured. Keep the split.
+The draft stays as shipped: no `ATOM_M3_DSPARK_DRAFT_PTPC`, because the draft's MXFP8 weights are not re-quantized.
 
 ```bash
 MODEL=/shared/data/amd_int/models/amd/MiniMax-M3.1-Flash-Quark-MXFP4   # draft at $MODEL/dspark
-CONC=1      # then 2, 4, 8, 16 (FP8 band); 32, 48 (NVFP4 band)
+AITER_DIR=/path/to/aiter            # ganyi/m31-mxfp4-testing, JIT-built
+CONC=1                              # then 2, 4, 8, 16, 32, 48
 ```
 
-Capture every batch size up to 8, then in steps of 2 / 4 / 8 / 16 up to the running-batch ceiling. `--max-num-seqs` is 2 × CONC, as above.
-
 ```bash
-CAPTURE=$(python3 -c "m=2*$CONC; print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96,112,128] if s<=max(m,2)])")
-BAND_ENV="ATOM_M3_DSPARK_DRAFT_PTPC=1"
-BAND_ARGS="--kv_cache_dtype fp8 --index-cache-dtype fp8"
-if [ "$CONC" -ge 32 ]; then
-  BAND_ENV="$BAND_ENV ATOM_M3_SPARSE_KV_NVFP4=1"          # ATOM_M3_FUSED_VERIFY_TOPK defaults to 1
-  BAND_ARGS="--kv_cache_dtype fp8 --index-cache-dtype fp4"  # sparse layers' KV goes NVFP4 via the env
+case $CONC in 1|2) MAXSEQS=$CONC ;; *) MAXSEQS=$((2 * CONC)) ;; esac
+if [ "$CONC" -eq 32 ]; then
+  CAPTURE=$(python3 -c "print(list(range(1, $MAXSEQS + 1)))")
+else
+  CAPTURE=$(python3 -c "print([s for s in [1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,32,40,48,56,64,80,96] if s <= $MAXSEQS])")
 fi
+DELAYER=""
+[ "$CONC" -le 16 ] && DELAYER="ATOM_PREFILL_DECODE_INTERVAL=20000"
 
-env $BAND_ENV \
+env $DELAYER \
+  PYTHONPATH="$AITER_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+  ATOM_M3_SPARSE_KV_MXFP4=1 \
   AITER_LOG_LEVEL=WARNING \
   ATOM_FORCE_ATTN_TRITON=1 \
   AITER_QUICK_REDUCE_QUANTIZATION=INT4 \
@@ -256,8 +256,8 @@ env $BAND_ENV \
   python3 -u -m atom.entrypoints.openai_server \
     --model "$MODEL" --served-model-name MiniMaxAI/MiniMax-M3.1-Flash \
     --tensor-parallel-size 4 --host 0.0.0.0 --port 8006 --server-port 8000 \
-    --trust-remote-code $BAND_ARGS \
-    --block-size 128 --max-model-len 1048576 --max-num-seqs $((2 * CONC > 2 ? 2 * CONC : 2)) \
+    --trust-remote-code --kv_cache_dtype fp8 --index-cache-dtype mxfp4 \
+    --block-size 128 --max-model-len 1048576 --max-num-seqs $MAXSEQS \
     --max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 \
     --enable-prefix-caching \
     --cudagraph-capture-sizes "$CAPTURE" \
@@ -268,12 +268,23 @@ env $BAND_ENV \
 ```
 
 - `--spec-decode-acceptance-length 4.04` is SGLang CI's golden accepted length, applied the way InferenceX applies it. It is performance-only. Drop it for accuracy runs.
-- Check which band actually came up from the startup lines:
-  - FP8 band: `MiniMax-M3 mono decode on` on all four ranks.
-  - NVFP4 band: `block_bytes=1827840`, `sparse KV is NVFP4`, and `mono decode off: sparse KV is NVFP4`.
-- Leave `ATOM_M3_INDEXER_CP` unset:
-  - At c16 the decode batch × context is ~0.84M tokens, under the ~1M break-even.
-  - The FP4 index refuses CP (its context scorer reads FP8/BF16 keys only).
+- `--kv_cache_dtype fp8` stays: with `ATOM_M3_SPARSE_KV_MXFP4=1` the sparse layers get their own MXFP4 pool (#2770), and the rest of the KV, the draft's included, stays FP8.
+- Check the startup lines:
+  - `block_bytes=1735680` (about 104,600 blocks per GPU at `--gpu-memory-utilization 0.9`, about 13.4M tokens);
+  - `MiniMax-M3 mono decode on` on all four ranks;
+  - with the delayer, `PrefillDelayer initialized`.
+- Leave `ATOM_M3_INDEXER_CP` unset. Indexer CP over the MXFP4 index falls back with a warning.
+
+### Optional: the draft's MXFP8 linears on AITER's preshuffled GEMM
+
+`ATOM_MXFP8_1X32_PRESHUFFLE=1` holds the draft's MXFP8 weights (16, 16)-preshuffled. AITER's preshuffled group32 GEMM then runs them on the FlyDSL MXFP8 bmm kernels that AITER tunes for these shapes (ROCm/aiter#6060), instead of the Triton group32 GEMM. Weight bytes and scales are untouched, and the output is bit-identical.
+
+Measured per draft layer (2 x qkv + o + gate_up + down, TP4 shapes, activation quantization included), Triton -> preshuffled: 106.5 -> 38.7 us at 8 rows, 133.6 -> 50.3 us at 64, 195.7 -> 87.5 us at 256. A per-token FP8 requantization of the same weights would take 33.8 / 47.0 / 74.5 us. End to end at c32 (every capture size, one run each), off -> on:
+- P90 interactivity 140.6 -> 144.9;
+- P50 interactivity 213.7 -> 220.8 (ITL p50 4.68 -> 4.53 ms);
+- total tok/s/GPU 57,943 -> 57,943.
+
+gsm8k with it on: strict-match 0.9666 ± 0.0049, 4.58 accepted tokens per forward. It needs the aiter above, or any aiter with ROCm/aiter#6060. Only the c32 row marked *preshuffle* in the table below was measured with it.
 
 Client: the InferenceX AgentX harness (`agentx-harness` 1.0.12), which drives the same `semianalysis_cc_traces_weka_062126` replay as the aiperf command above:
 
@@ -291,36 +302,33 @@ agentx profile \
 ### Measured (M3.1)
 
 Setup:
-- one MI355X node, TP4, 3600 s per point, synthetic accepted length 4.04;
-- tree: #2686 + #2743 + the NVFP4 stack;
-- output tok/s/GPU = output token throughput / 4;
-- interactivity = 1000 / ITL at the stated percentile;
-- SGLang is CI run 40110172586 on the same recipe.
+- one MI355X node (gfx950), TP4, 3600 s per point, one run per point, synthetic accepted length 4.04;
+- the command above, on `ganyi/m31-mono-fp4-pr` `f328ca296` plus the warmup fix, with the aiter above;
+- total and output tok/s/GPU = total / output token throughput / 4; P90 interactivity = 1000 / p90 inter-token latency;
+- recomputed from each run's aiperf export the way the InferenceX API computes them;
+- SGLang is CI run 40110172586, as served by the InferenceX API.
 
-| CONC | band | tok/s/GPU | SGLang | P90 intvty | SGLang | p50 ITL ms | SGLang | prefix hit | TTFT p50 |
+| CONC | delayer | total tok/s/GPU | SGLang | output tok/s/GPU | SGLang | P90 intvty | SGLang | TTFT p50 | prefix hit |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | FP8 + Mono | 43.9 | 41.42 | 542.4 | 420.2 | 1.72 | 2.17 | 0.966 | 638 ms |
-| 2 | FP8 + Mono | 52.5 | 50.11 | 456.4 | 365.0 | 1.71 | 2.14 | 0.957 | 364 ms |
-| 4 | FP8 + Mono | 65.9 | 63.09 | 411.7 | 347.2 | 1.72 | 2.09 | 0.956 | 351 ms |
-| 8 | FP8 + Mono | 113.0 | 110.59 | 301.1 | 314.5 | 2.19 | 2.55 | 0.948 | 285 ms |
-| 16 | FP8 + Mono | 181.6 | 181.86 | 191.2 | 226.2 | 3.15 | 3.08 | 0.930 | 323 ms |
-| 32 | NVFP4 | 324.1 | 335.4 | 106.6 | 141.6 | 5.60 | 4.12 | 0.940 | 431 ms |
-| 48 | NVFP4 | 434.8 | 436.1 | 67.8 | 70.9 | 8.62 | 6.88 | 0.929 | 439 ms |
+| 1 | on | 7,062 | 6,311 | 43.6 | 41.4 | 552.5 | 420.2 | 528 ms | 0.966 |
+| 2 | on | 6,983 | 6,766 | 51.3 | 50.1 | 555.6 | 365.0 | 347 ms | 0.954 |
+| 4 | on | 9,202 | 9,063 | 63.5 | 63.1 | 546.4 | 347.2 | 343 ms | 0.956 |
+| 8 | on | 14,866 | 15,306 | 106.9 | 110.6 | 355.9 | 314.5 | 761 ms | 0.947 |
+| 16 | on | 24,531 | 28,567 | 161.1 | 181.9 | 250.0 | 226.2 | 3100 ms | 0.926 |
+| 16 | off | 28,711 | 28,567 | 182.8 | 181.9 | 207.5 | 226.2 | 256 ms | 0.932 |
+| 32 | off | 57,943 | 57,928 | 335.8 | 335.4 | 140.6 | 141.6 | 330 ms | 0.942 |
+| 32 | off, *preshuffle* | 57,943 | 57,928 | 335.4 | 335.4 | 144.9 | 141.6 | 332 ms | 0.943 |
+| 48 | off | 69,500 | 65,820 | 468.5 | 436.1 | 75.3 | 70.9 | 333 ms | 0.933 |
 
-The SGLang p50 ITL comes from the run's `bmk_agentic_*` artifact (`itl.p50`, stored to 10 µs). The other SGLang columns come from the InferenceX API.
+c32 is the only point measured with every capture size. *preshuffle* = plus `ATOM_MXFP8_1X32_PRESHUFFLE=1`. Locally, the SGLang CI command at c32 reproduced CI within 0.5%: 57,749 total tok/s/GPU and 141.0 P90 interactivity. At c32 the gap left is P50 interactivity: 213.7 here (220.8 with *preshuffle*) against SGLang CI's 236.4.
 
 gsm8k (lm-eval, InferenceX CI's method: 5-shot, chat template, temperature 0, all 1319 samples, real acceptance), strict-match:
 
-| band | strict-match |
-|---|---|
-| FP8 band | 0.9621 ± 0.0053 |
-| NVFP4 band | 0.9659 ± 0.0050 |
-| SGLang CI | 0.9598 ± 0.0054 |
-
-On `main` 481c2bfd4 plus the NVFP4 stack and #2743, without #2686:
-- image `rocm/atom-dev:nightly_202610261558` — older images lack the aiter `topk_gating(num_valid_rows=)` that `main` calls;
-- c48, 1200 s: 396.7 tok/s/GPU, P90 interactivity 70.5;
-- gsm8k: 0.9644 (NVFP4 band), 0.9598 (FP8 band without Mono).
+| configuration | strict-match | accepted tokens / forward |
+|---|---|---:|
+| MXFP4 + Mono (two runs) | 0.9621 ± 0.0053 / 0.9629 ± 0.0052 | 4.74 / 4.58 |
+| MXFP4 + Mono + `ATOM_MXFP8_1X32_PRESHUFFLE=1` | 0.9666 ± 0.0049 | 4.58 |
+| SGLang CI | 0.9598 ± 0.0054 | — |
 
 ## Notes
 

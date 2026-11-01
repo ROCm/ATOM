@@ -86,6 +86,11 @@ MAX_SPARSE_KEYS = SPARSE_BLOCK * TOPK_BLOCKS
 MAX_CONTEXT = 1 << 20
 MAX_INDEX_BLOCKS = MAX_CONTEXT // SPARSE_BLOCK
 PAGE16 = 16
+# an MXFP4 page of one head (``atom.model_ops.minimax_m3.kv_mxfp4``): a block's
+# 128 token rows of 64 B e2m1, then their 4 B e8m0 scales
+FP4_PAGE_TOKENS = SPARSE_BLOCK
+FP4_SCALE_OFFSET = SPARSE_BLOCK * HEAD_DIM // 2
+FP4_PAGE_BYTES = FP4_SCALE_OFFSET + SPARSE_BLOCK * HEAD_DIM // 32
 
 MAX_TOKENS = 16  # tokens one mono step serves (the MFMA B operand holds 16)
 # indexer context parallelism: a rank computes every index q head

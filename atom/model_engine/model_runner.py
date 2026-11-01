@@ -1375,9 +1375,11 @@ class ModelRunner:
         # torch.compile's mark_dynamic can't make a size-1 batch dim dynamic, so
         # a DSpark block drafter (rows == num_seqs) must first-compile at B >= 2
         # (EAGLE gets that free -- its first draft step is a many-row prefill).
-        # Other cases only need the usual >= 1 floor.
+        # Other cases only need the usual >= 1 floor, and so does max_num_seqs 1:
+        # its batch never exceeds 1, and the per-seq buffers hold one row.
         drafter = getattr(self, "drafter", None)
-        min_seqs = 2 if getattr(drafter, "is_block_drafter", False) else 1
+        block_drafter = getattr(drafter, "is_block_drafter", False)
+        min_seqs = 2 if block_drafter and self.config.max_num_seqs >= 2 else 1
         num_seqs = max(num_seqs, min_seqs)
 
         # Split the token budget across the seqs so >1 sequences never exceed it

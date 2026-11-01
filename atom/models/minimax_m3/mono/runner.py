@@ -202,6 +202,18 @@ class MonoDecodeRunner:
             SparseMoeLayer.from_layer(layers[i], i, heads)
             for i in range(N_DENSE, len(layers))
         ]
+        # every layer's index cache is one format: E4M3 rows or MXFP4 pages
+        formats = {lw.index_mxfp4 for lw in self.sparse}
+        if len(formats) != 1:
+            raise MonoUnsupported("layers disagree on the index cache format")
+        self.index_mxfp4 = formats.pop()
+        # and the K / V caches likewise: SHUFFLE E4M3 with scales, or MXFP4 pages
+        formats = {lw.kv_mxfp4 for lw in self.sparse}
+        if len(formats) != 1:
+            raise MonoUnsupported("layers disagree on the K / V cache format")
+        self.kv_mxfp4 = formats.pop()
+        if self.kv_mxfp4 and self.dense_mono:
+            raise MonoUnsupported("MXFP4 K / V caches: no dense-prefix kernels")
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -266,6 +278,8 @@ class MonoDecodeRunner:
             timeline=self.timeline is not None,
             heads=heads,
             debug=self.debug,
+            index_mxfp4=self.index_mxfp4,
+            kv_mxfp4=self.kv_mxfp4,
         )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
@@ -313,9 +327,11 @@ class MonoDecodeRunner:
             torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
         ]
         self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        # kv_mxfp4: e4m3 bytes (unit scale), the aiter writer's q_out convention
         self.q = torch.empty(
-            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
-        )
+            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM,
+            dtype=torch.uint8 if self.kv_mxfp4 else bf16, device=dev,
+        )  # fmt: skip
         self.iq = torch.empty(MAX_TOKENS, 1, HEAD_DIM, dtype=bf16, device=dev)
         # layer 0's residual input: its K1 takes (embedding, 0), acc = embedding
         self.zero_res = torch.zeros(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
@@ -480,13 +496,18 @@ class MonoDecodeRunner:
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = to_page16_shuffle(
-            kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
-        )
+        if self.kv_mxfp4:
+            # [pages, 1, 8704] uint8 pages: the page-128 view the kernel reads as is
+            k16, v16, ks16, vs16 = kv.k_cache, kv.v_cache, None, None
+        else:
+            k16, v16, ks16, vs16 = to_page16_shuffle(
+                kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
+            )
         args = {
             "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
-            "k_scale": _ptr(ks16), "v_scale": _ptr(vs16), "w_o": _ptr(lw.w_o),
+            "k_scale": 0 if ks16 is None else _ptr(ks16),
+            "v_scale": 0 if vs16 is None else _ptr(vs16), "w_o": _ptr(lw.w_o),
             "s_o": _ptr(lw.s_o), "g_post": _ptr(lw.g_post), "w_gate": _ptr(lw.gate),
             "bias": _ptr(lw.bias), "w13": _ptr(lw.w13), "s13": _ptr(lw.s13),
             "w2": _ptr(lw.w2), "s2": _ptr(lw.s2), "h_mid": _ptr(self.h_mids[(i + 1) % 2]),
