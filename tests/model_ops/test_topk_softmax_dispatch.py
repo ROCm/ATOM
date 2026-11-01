@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Which kernel routes renormalized softmax top-k, checked without a GPU.
+
+`test_triton_topk_softmax_gpu.py` compares the two kernels bit for bit but
+skips on a GPU-less runner. These pin the choice itself, which a MoE layer
+makes once when it is built (`triton_topk_softmax_rows`): the Triton kernel
+takes exactly the shapes AITER's fused `topkGatingSoftmax` handles (its
+dispatch stops at 512 experts), only in launches of up to 20 rows per CU on
+MI355X (gfx950; other architectures, not measured, stay on AITER), counting
+only a CU-masked stream's CUs when the layer may run on one, and only with
+the switch on when the layer is built.
+"""
+
+import pytest
+
+from atom.model_ops import topk_softmax_dispatch
+from atom.model_ops.topk_softmax_dispatch import (
+    triton_topk_softmax_max_rows,
+    triton_topk_softmax_rows,
+    triton_topk_softmax_supported,
+)
+from atom.utils import envs
+
+# MI355X: 256 CUs, so launches of up to 20 * 256 rows take the Triton kernel.
+MI355X_CUS, MI355X_MAX_ROWS = 256, 5120
+# Before the autouse `gfx` fixture replaces it.
+_RUNTIME_GFX = topk_softmax_dispatch._gfx
+
+
+@pytest.fixture(autouse=True)
+def cu_num(monkeypatch):
+    """The CU count, which the dispatch asks AITER for (absent on this CI)."""
+
+    def set_cu_num(n):
+        monkeypatch.setattr(topk_softmax_dispatch, "_cu_num", lambda: n)
+
+    set_cu_num(MI355X_CUS)
+    return set_cu_num
+
+
+@pytest.fixture(autouse=True)
+def gfx(monkeypatch):
+    """The GPU architecture, which the dispatch also asks AITER for."""
+
+    def set_gfx(arch):
+        monkeypatch.setattr(topk_softmax_dispatch, "_gfx", lambda: arch)
+
+    set_gfx("gfx950")
+    return set_gfx
+
+
+def _scoring(shared):
+    return "sigmoid" if shared else ""
+
+
+@pytest.mark.parametrize("shared", [0, 1, 2, 4, 8])
+@pytest.mark.parametrize("k", [1, 8, 10, 32])
+@pytest.mark.parametrize("experts", [32, 64, 128, 256, 512])
+def test_takes_aiter_fused_kernel_shapes(experts, k, shared):
+    assert triton_topk_softmax_supported(experts, k, True, shared, _scoring(shared))
+
+
+@pytest.mark.parametrize(
+    "experts,k,shared",
+    [
+        (1024, 8, 0),  # AITER: moeSoftmax + moeTopK
+        (1024, 10, 1),
+        (2048, 8, 0),
+        (16, 1, 0),
+        (384, 8, 0),
+        (513, 10, 0),
+        (512, 33, 0),
+        (512, 0, 0),
+        (512, 10, 3),
+    ],
+)
+def test_refuses_other_shapes(experts, k, shared):
+    assert not triton_topk_softmax_supported(experts, k, True, shared, _scoring(shared))
+
+
+def test_refuses_unnormalized_and_other_scoring_funcs():
+    assert triton_topk_softmax_supported(512, 10, True, 1, "sigmoid")
+    assert not triton_topk_softmax_supported(512, 10, False, 1, "sigmoid")
+    assert not triton_topk_softmax_supported(512, 10, True, 1, "softplus")
+
+
+def test_row_cutoff_scales_with_the_cu_count(cu_num):
+    assert triton_topk_softmax_max_rows() == MI355X_MAX_ROWS
+    cu_num(128)  # a gfx950 partition
+    assert triton_topk_softmax_max_rows() == 2560
+    cu_num(32)
+    assert triton_topk_softmax_max_rows() == 640
+
+
+@pytest.mark.parametrize(
+    "fraction,cus,max_rows", [(0.5, 256, 2560), (0.25, 256, 1280), (0.5, 80, 800)]
+)
+def test_cu_masked_cutoff_counts_the_streams_cus(
+    fraction, cus, max_rows, cu_num, monkeypatch
+):
+    """On a CU-masked stream a launch only gets the stream's CUs, and the
+    crossover is per CU it gets."""
+    monkeypatch.setattr(topk_softmax_dispatch, "_masked_cu_fraction", lambda: fraction)
+    cu_num(cus)
+    assert triton_topk_softmax_max_rows(cu_masked=True) == max_rows
+    assert triton_topk_softmax_max_rows() == 20 * cus
+
+
+# The softmax top-k shapes of the models that route through it: Qwen3.8 /
+# Qwen3.5-397B / Qwen3-Next (512 / top-10, a fused shared expert or not),
+# Qwen3.5-35B (256 / top-8 + shared), Qwen3 MoE (128 / top-8), gpt-oss-120b /
+# -20b (128 and 32 / top-4).
+MODEL_SHAPES = [
+    (512, 10, 1),
+    (512, 10, 0),
+    (256, 8, 1),
+    (256, 8, 0),
+    (128, 8, 0),
+    (128, 4, 0),
+    (32, 4, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "arch,cus", [("gfx942", 304), ("gfx942", 80), ("gfx1250", 256)]
+)
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_unmeasured_architectures_stay_on_aiter(
+    experts, k, shared, arch, cus, cu_num, gfx, monkeypatch
+):
+    """The crossover was measured on MI355X only; elsewhere no layer takes the
+    Triton kernel, as before it existed."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    gfx(arch)
+    cu_num(cus)
+    assert triton_topk_softmax_max_rows() is None
+    scoring_func = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) is None
+
+
+@pytest.mark.parametrize(
+    "built,running,max_rows",
+    [("gfx950", "gfx942", None), ("gfx942", "gfx950", MI355X_MAX_ROWS)],
+)
+def test_cutoff_follows_the_running_gpu_not_the_build_target(
+    built, running, max_rows, monkeypatch
+):
+    """`get_gfx()` reports `GPU_ARCHS`' target, so an MI300 running a
+    `gfx942;gfx950` build would take MI355X's cutoff; the GPU running decides.
+    Needs AITER's `chip_info`, so it skips where AITER is not installed."""
+    chip_info = pytest.importorskip("aiter.jit.utils.chip_info")
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: built)
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: running)
+    monkeypatch.setattr(topk_softmax_dispatch, "_gfx", _RUNTIME_GFX)
+    assert triton_topk_softmax_max_rows() == max_rows
+
+
+@pytest.mark.parametrize("cus,max_rows", [(MI355X_CUS, MI355X_MAX_ROWS), (128, 2560)])
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_model_layers_take_triton_up_to_the_cutoff(
+    experts, k, shared, cus, max_rows, cu_num, monkeypatch
+):
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    cu_num(cus)
+    scoring_func = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) == max_rows
+
+
+@pytest.mark.parametrize("arch,max_rows", [("gfx950", 2560), ("gfx942", None)])
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_cu_masked_model_layers_take_triton_up_to_half_the_cutoff(
+    experts, k, shared, arch, max_rows, gfx, monkeypatch
+):
+    """RapidServe's `--disagg-constrained` streams get half of MI355X's CUs."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    monkeypatch.setattr(topk_softmax_dispatch, "_masked_cu_fraction", lambda: 0.5)
+    gfx(arch)
+    scoring_func = "sigmoid" if shared else None
+    rows = triton_topk_softmax_rows(
+        experts, k, True, shared, scoring_func, cu_masked=True
+    )
+    assert rows == max_rows
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (512, 10, False, 1, "sigmoid"),  # not renormalized
+        (512, 10, True, 1, "softplus"),
+        (1024, 10, True, 1, "sigmoid"),  # AITER: moeSoftmax + moeTopK
+        (8, 2, True, 0, None),  # Mixtral
+        (160, 8, True, 0, None),  # Qwen3-Coder-480B
+        (512, 10, True, 3, "sigmoid"),
+    ],
+)
+def test_other_layers_never_take_triton(args, monkeypatch):
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    assert triton_topk_softmax_rows(*args) is None
+
+
+def test_unscored_shared_experts_are_not_the_kernels(monkeypatch):
+    """Without a scoring func the kernels leave the shared columns alone (they
+    are prefilled), so any shared count routes like none."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    assert triton_topk_softmax_rows(512, 10, True, 3, None) == MI355X_MAX_ROWS
+    assert triton_topk_softmax_rows(512, 10, True, 3, "sigmoid") is None
+
+
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_unnormalized_layers_never_take_triton(experts, k, shared, monkeypatch):
+    """The Triton kernel always renormalizes: an unnormalized layer gets no
+    cutoff."""
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    scoring_func = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func)
+    assert triton_topk_softmax_rows(experts, k, False, shared, scoring_func) is None
+
+
+@pytest.mark.parametrize("experts,k,shared", MODEL_SHAPES)
+def test_switch_off_puts_every_layer_on_aiter(experts, k, shared, monkeypatch):
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0")
+    scoring_func = "sigmoid" if shared else None
+    assert triton_topk_softmax_rows(experts, k, True, shared, scoring_func) is None
+
+
+def test_decides_once_from_the_switch_and_the_gpu(monkeypatch):
+    """The layer reads the switch, the architecture and the CU count when it
+    decides; nothing a launch does reads them again, so changing them later
+    moves no layer."""
+    reads = []
+    get_env = envs.__getattr__
+
+    def counting_getattr(name):
+        reads.append(name)
+        return get_env(name)
+
+    monkeypatch.setattr(envs, "__getattr__", counting_getattr)
+    monkeypatch.setattr(
+        topk_softmax_dispatch, "_cu_num", lambda: reads.append("cu") or MI355X_CUS
+    )
+    monkeypatch.setattr(
+        topk_softmax_dispatch, "_gfx", lambda: reads.append("gfx") or "gfx950"
+    )
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
+    max_rows = triton_topk_softmax_rows(512, 10, True, 1, "sigmoid")
+    assert max_rows == MI355X_MAX_ROWS
+    assert reads == ["ATOM_TRITON_TOPK_SOFTMAX", "gfx", "cu"]
+    reads.clear()
+    monkeypatch.setattr(
+        topk_softmax_dispatch,
+        "_masked_cu_fraction",
+        lambda: reads.append("mask") or 0.5,
+    )
+    max_rows = triton_topk_softmax_rows(512, 10, True, 1, "sigmoid", cu_masked=True)
+    assert max_rows == MI355X_MAX_ROWS // 2
+    assert reads == ["ATOM_TRITON_TOPK_SOFTMAX", "gfx", "cu", "mask"]
+    # The switch off: no GPU query needed.
+    reads.clear()
+    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0")
+    assert triton_topk_softmax_rows(512, 10, True, 1, "sigmoid") is None
+    assert reads == ["ATOM_TRITON_TOPK_SOFTMAX"]

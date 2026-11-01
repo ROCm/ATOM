@@ -54,6 +54,7 @@ def _dispatch_layer(*, ep_rank: int = 1) -> _FakeMoELayer:
         scoring_func="softmax",
         e_score_correction_bias=None,
         shared_expert_scoring_func=None,
+        triton_topk_softmax_max_rows=5120,
     )
     return ns
 
@@ -116,6 +117,51 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
     assert captured["eplb_mapped"] is False
     assert ids.tolist() == [[0, 5, 9]]
     assert weights.tolist() == [[0.75, 0.25, 1.0]]
+
+
+@pytest.mark.parametrize(
+    "use_all2all,scoring_func,expected",
+    [
+        (False, "sigmoid", 5120),
+        (False, None, 5120),
+        # The dispatch carries the shared expert; its scored logit is still
+        # in the router logits, a width the layer did not decide for.
+        (True, "sigmoid", None),
+        (True, None, 5120),
+    ],
+)
+def test_select_experts_passes_the_layer_kernel_choice(
+    use_all2all, scoring_func, expected, monkeypatch
+):
+    layer = _dispatch_layer(ep_rank=1)
+    layer.shared_expert_scoring_func = scoring_func
+    layer.expert_layout = MoEExpertLayout.make(
+        num_routed=8,
+        num_fused_shared_experts=1,
+        num_configured_redundant=0,
+        ep_size=2,
+        use_all2all=use_all2all,
+        eplb_enabled=False,
+    )
+    captured = {}
+
+    def fake_select_experts(**kwargs):
+        captured.update(kwargs)
+        return torch.empty(1, 2), torch.zeros(1, 2, dtype=torch.int32)
+
+    monkeypatch.setattr(FusedMoE, "select_experts", fake_select_experts)
+    Mxfp4MoEMethod.select_experts(object(), layer, torch.empty(1, 4), torch.empty(1, 9))
+    assert captured["triton_max_rows"] == expected
+    assert captured["num_fused_shared_experts"] == (0 if use_all2all else 1)
+    assert captured["num_routing_experts"] == 8
+    captured.clear()
+    moe_module.FusedMoEMethodBase.select_experts(
+        object(), layer, torch.empty(1, 4), torch.empty(1, 9)
+    )
+    assert captured["triton_max_rows"] == 5120
+    # The routed width the Triton launch checks its logits against, not the
+    # dispatch space (`global_num_experts`, 10 here).
+    assert captured["num_routing_experts"] == 8
 
 
 def test_eplb_appends_unscaled_shared_weight(monkeypatch):

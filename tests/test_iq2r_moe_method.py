@@ -248,6 +248,10 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     layer = SimpleNamespace(
         num_fused_shared_experts=1,
         routed_scaling_factor=2.5,
+        triton_topk_softmax_max_rows=None,
+        # Routed width, unlike `global_num_experts` below, which a dispatch
+        # space with redundant experts would grow.
+        expert_layout=SimpleNamespace(num_routed=255),
         w13_weight=torch.empty((257, 3), dtype=torch.uint8),
         w13_weight_scale=torch.empty((257, 5), dtype=torch.uint8),
         w2_weight=torch.empty((257, 2), dtype=torch.uint8),
@@ -258,10 +262,14 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     topk_ids = torch.arange(18, dtype=torch.int32).reshape(2, 9)
     calls = []
 
+    routed = []
     monkeypatch.setattr(
         moe_mod.FusedMoE,
         "select_experts",
-        staticmethod(lambda **kwargs: (topk_weights, topk_ids)),
+        staticmethod(
+            lambda **kwargs: routed.append(kwargs["num_routing_experts"])
+            or (topk_weights, topk_ids)
+        ),
     )
     monkeypatch.setattr(
         method, "_glm53_workspace", lambda device: ("workspace", device)
@@ -287,6 +295,7 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
     output = method.apply(**arguments)
 
     assert len(calls) == 1
+    assert routed == [255]
     assert torch.equal(calls[0][0], hidden)
     assert calls[0][1] is layer.w13_weight
     assert calls[0][5] is topk_weights
