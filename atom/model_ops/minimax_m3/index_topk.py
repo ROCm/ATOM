@@ -644,8 +644,10 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     A count, not a size: the grid is (request, chunk), so this IS the second
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
-    CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
-    is what bounds the split, and TARGET_GRID still caps the largest batches.
+    CTAs. This shared legacy policy uses DECODE_SCORE_MIN_BLOCKS to amortize
+    query loads, while TARGET_GRID caps large batches. Native gfx1250 decode
+    has a separately measured finer-split exception in _native_decode_score_chunks;
+    CP continues to use this shared policy.
 
     The round trip through the size is not redundant. The caller turns this
     count back into a size with the same cdiv, and a count that does not divide
@@ -663,11 +665,28 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
         # wait in the collective that follows.
         return 1
     chunks = min(1 << (target.bit_length() - 1), max_block)
-    # Floor the blocks one chunk walks. The query tile is loaded once outside
-    # the block loop, so at one block per chunk that fixed cost is the whole
-    # cost -- every measured regression was a chunk down to a single block.
+    # Shared legacy floor: amortize the query-tile load across several blocks.
+    # This is not a universal minimum; _native_decode_score_chunks below uses
+    # a measured one/two-block exception for small native gfx1250 grids.
     chunks = min(chunks, max(1, triton.cdiv(max_block, DECODE_SCORE_MIN_BLOCKS)))
     return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
+
+
+def _native_decode_score_chunks(batch: int, max_block: int) -> int:
+    """Measured native decode policy; CP keeps the shared legacy policy.
+
+    The native tiled scorer was measured on gfx1250 batch1/2. The CP scorer
+    has a different kernel and local-page traversal, so it must not inherit
+    this launch tuning without its own validation.
+    """
+    if (
+        0 < batch <= 2
+        and 0 < max_block
+        and batch * max_block <= 1024
+        and get_gfx() == "gfx1250"
+    ):
+        return max_block if batch * max_block <= 256 else triton.cdiv(max_block, 2)
+    return _decode_score_chunks(batch, max_block)
 
 
 def _require_packable(max_block: int) -> None:
@@ -1301,7 +1320,7 @@ def minimax_m3_index_topk_decode(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    num_score_chunks = _decode_score_chunks(batch, max_block)
+    num_score_chunks = _native_decode_score_chunks(batch, max_block)
     _decode_index_score_tiled_kernel[(batch, num_score_chunks)](
         idx_q,
         index_kv_cache,
