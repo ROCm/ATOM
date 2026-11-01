@@ -3,7 +3,7 @@
 
 import weakref
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -75,10 +75,15 @@ def test_postprocess_submits_prefill_or_final_broadcast_counts(
         drafter=SimpleNamespace(),
         forward_done_event=mock.Mock(),
     )
+    runner._constrain_required_channel = MethodType(
+        runner_module.ModelRunner._constrain_required_channel, runner
+    )
     with pytest.raises(StatusSubmitted):
         runner_module.ModelRunner.postprocess(
             runner,
-            SimpleNamespace(total_seqs_num=bs, return_logprobs=[False] * bs),
+            SimpleNamespace(
+                total_seqs_num=bs, return_logprobs=[False] * bs, required_channel=None
+            ),
             torch.zeros(4, 8),
             torch.ones(bs),
             None,
@@ -135,13 +140,18 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
         rejection_sampler=SimpleNamespace(forward=mock.Mock(side_effect=_Reached)),
         drafter=drafter,
     )
+    runner._constrain_required_channel = MethodType(
+        runner_module.ModelRunner._constrain_required_channel, runner
+    )
     runner.sampler.sample_verification_tokens = mock.Mock(
         return_value=torch.zeros(bs, dtype=torch.int32)
     )
     with pytest.raises(_Reached):
         runner_module.ModelRunner.postprocess(
             runner,
-            SimpleNamespace(total_seqs_num=bs, return_logprobs=[False] * bs),
+            SimpleNamespace(
+                total_seqs_num=bs, return_logprobs=[False] * bs, required_channel=None
+            ),
             torch.zeros(4, 8),
             torch.ones(bs),
             top_ks,
@@ -175,6 +185,7 @@ def test_a_rapidserve_prefill_draws_by_its_samplers_own_law(monkeypatch):
             "_mark_staging_h2d_enqueued",
             "run_model",
             "sampler",
+            "_constrain_required_channel",
             "_record_forward_vars_event",
             "_record_kv_cache_ready",
         ]
@@ -217,7 +228,7 @@ def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
             ("top_ps", np.float32),
         )
     }
-    names = list(buffers)
+    names = [*buffers, "required_channel_states"]
     group = SimpleNamespace(
         counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
     )
@@ -229,6 +240,7 @@ def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
         temperatures=np.ones(bs, np.float32),
         top_ks=np.array(ks, np.int32),
         top_ps=np.array(ps, np.float32),
+        required_channel=None,
     )
     _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(
         runner, batch, publication_group=group

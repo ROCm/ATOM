@@ -228,8 +228,9 @@ def test_invalid_native_source_fails_before_transport(worker, units):
 
 
 @pytest.mark.parametrize("loading", [False, True])
+@pytest.mark.parametrize("submit_raises", [False, True])
 def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine(
-    worker, monkeypatch, loading
+    worker, monkeypatch, loading, submit_raises
 ):
     """No clock releases a lease the server may still be using: the operation
     stays pending, and past the transfer deadline the worker fails stop."""
@@ -241,8 +242,9 @@ def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine
     def unprovable(*_):
         raise ConnectionError("server may have received request")
 
-    worker._adapter.submit_store_request = unprovable
-    worker._adapter.submit_retrieve_request = unprovable
+    if submit_raises:
+        worker._adapter.submit_store_request = unprovable
+        worker._adapter.submit_retrieve_request = unprovable
     pending = worker._native_loads if loading else worker._native_saves
     if loading:
         worker._submit_load(request(loading=True), object())
@@ -422,12 +424,15 @@ def test_load_completion_waits_for_native_restore(worker, monkeypatch):
 
 
 def test_query_exception_never_releases_dma_source(worker):
+    from atom.kv_transfer.offload.mp.transfer import LMCacheTransferUnprovable
+
     def broken():
         raise RuntimeError("IPC event unavailable")
 
     worker.future.query = broken
     worker._submit_save(request(), object())
-    assert not worker.get_finished().connector_completions
+    with pytest.raises(LMCacheTransferUnprovable, match="IPC event unavailable"):
+        worker.get_finished()
     assert worker._native_saves
 
 

@@ -26,23 +26,11 @@ logger = logging.getLogger("atom")
 
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
-    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
-    # No model needs that gate when PCP is disabled. In particular, avoid
-    # importing DeepSeek-only optional kernels for Qwen MTP in this case.
-    if get_pcp_world_size() == 1:
-        return False
-
-    from atom.models.deepseek_v2 import _pcp_active
-
-    if _pcp_active():
-        return True
-
-    if draft_model.__class__.__name__ != "DeepseekV4MTP":
-        return False
-
-    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
-
-    return _pcp_active_v4()
+    """Whether this draft prefill must be split onto 1/pcp query rows: the
+    target forward's answer, cached by ModelRunner before drafting."""
+    del draft_model  # a property of the batch, not of the draft model
+    ctx = getattr(get_forward_context(), "context", None)
+    return bool(getattr(ctx, "target_pcp_split", False))
 
 
 def _pcp_split_draft_inputs(
@@ -55,7 +43,7 @@ def _pcp_split_draft_inputs(
     A draft prefill reuses the target's attn_metadata, already reindexed to
     1/pcp by the builder, so its q rows must be split to match or aiter aborts
     on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
-    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+    need this: `propose()`'s i==0 step and `compute_draft_kv`.
 
     Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
     plus (n_global, pcp_ws) for callers that must all-gather back.
@@ -334,9 +322,6 @@ class EagleProposer(Drafter):
         `propose(align_only=True)` for its collectives -- the same redo -- so
         `draft_kv_duplicates_propose` has the runner skip this call there.
 
-        NOTE: unverified against real weights. `build_drafter` routes anything
-        carrying `dspark_block_size` to `DSparkProposer`, and every model on
-        hand takes that branch.
         """
         if not next_token_ids:
             return

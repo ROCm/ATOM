@@ -42,6 +42,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
@@ -459,7 +460,9 @@ class K3MonoDecodeRunner:
         launcher = build.k1_launchers[key]
         if taps is not None:
             key = replace(key, debug=True)
-            launcher = k1.build(key)
+            if key not in build.k1_launchers:
+                build.k1_launchers[key] = k1.build(key)
+            launcher = build.k1_launchers[key]
         state = self._conv_state(plan.layer_id)
         if state.size(-1) != key.state_len:
             raise MonoUnsupported(
@@ -489,7 +492,7 @@ class K3MonoDecodeRunner:
         })  # fmt: skip
         # the caller's stream: a FlyDSL launcher left to its default submits on
         # the NULL stream outside a graph capture
-        launcher(*args, stream=torch.cuda.current_stream())
+        _run_compiled(launcher, *args, torch.cuda.current_stream())
         return core
 
     def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
@@ -513,5 +516,5 @@ class K3MonoDecodeRunner:
             "peers": self.peers.addresses.data_ptr(), "rank": self.peers.rank,
             "layer": K2_TAG0 + plan.layer_id, "diag": self._diag_ptr(), "tl": 0,
         })  # fmt: skip
-        build.k2_launchers[key](*args, stream=torch.cuda.current_stream())
+        _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())
         return out

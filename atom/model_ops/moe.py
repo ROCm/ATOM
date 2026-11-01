@@ -523,6 +523,9 @@ def _select_logical(
         num_fused_shared_experts=num_fused_shared_experts,
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
+        # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
+        # found, pure TP routes and runs its pad rows like real ones.
+        mask_pad_rows=layer.use_ep,
     )
 
 
@@ -642,23 +645,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ),
             )
 
+        # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
+        # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
+        # .all2all_manager, which would pin the default (v1) manager.
+        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_mori_v2_prepare_finalize,
+            )
+
+            return make_mori_v2_prepare_finalize(
+                moe,
+                ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
+            )
+
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
-            from atom.utils import envs as _atom_envs
-
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
-            if _atom_envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    make_mori_v2_prepare_finalize,
-                )
-
-                return make_mori_v2_prepare_finalize(moe, all2all_manager)
-
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will
@@ -791,9 +796,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # told the expert-GEMM recipe that only the layer + this quant method
             # know. Here is also the last point before any cudagraph capture, and
             # it allocates a cco arena and JIT-compiles its kernels.
-            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
-            if bind_mega is not None:
-                bind_mega(layer, self)
+            if mori_v2:
+                prepare_finalize.bind_mega_transport(layer, self)
+                assert (
+                    prepare_finalize.mega is not None
+                ), "MoriV2ModularKernel has no MegaMoE to run"
 
         comm_fused = getattr(layer, "_comm_fused_moe", None)
         if comm_fused is not None:
@@ -5195,6 +5202,7 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
+        mask_pad_rows: bool = True,
     ):
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
@@ -5212,7 +5220,9 @@ class FusedMoE(torch.nn.Module):
 
         # Every kernel below routes the rows at or past the pass's real row
         # count to -1, which dispatch and the experts skip.
-        num_valid_rows = pass_scheduled_tokens_gpu(router_logits.shape[0])
+        num_valid_rows = (
+            pass_scheduled_tokens_gpu(router_logits.shape[0]) if mask_pad_rows else None
+        )
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
             assert topk_group is not None
@@ -5395,7 +5405,9 @@ class FusedMoE(torch.nn.Module):
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
             scheduled_tokens_gpu=(
-                None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+                None
+                if gathered or not self.use_ep
+                else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
         )
         if split:

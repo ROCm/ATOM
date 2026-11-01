@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_loader.weight_utils import (
+    checkpoint_layer_key,
+    unquantized_layer_keys,
+)
+
 # plugin-related utilities
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -302,7 +307,12 @@ class QuantizationConfig:
         self,
         config: PretrainedConfig = None,
         online_quant_config: dict | None = None,
+        model: str | None = None,
     ):
+        # Layers the checkpoint at `model` stores in a plain float dtype.
+        self._stored_unquantized = (
+            unquantized_layer_keys(model) if model else frozenset()
+        )
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -439,8 +449,14 @@ class QuantizationConfig:
             global_spec = self.global_spec
             exclude_layers = self.exclude_layers
 
-        # 1. Exclude list
+        # 1. Exclude list, and (checkpoint specs only) a layer stored
+        # unquantized whatever the config's patterns say.
         if self._is_excluded(layer_name, exclude_layers, check_children=check_children):
+            return LayerQuantConfig(quant_dtype=self.torch_dtype)
+        if (
+            not use_online_quant
+            and checkpoint_layer_key(layer_name) in self._stored_unquantized
+        ):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
@@ -761,6 +777,21 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 }
 
 
+def flatten_dsa_config(hf_config) -> None:
+    """Publish a nested ``dsa_config`` as the flat fields the shared DSA code
+    reads: its ``index_*`` entries (``index_num_heads`` as ``index_n_heads``)
+    and the zero-based ``dsa_layer_indices`` of its one-based ``dsa_layers``.
+    Done before the attention backend is chosen, which keys on ``index_topk``."""
+    dsa = getattr(hf_config, "dsa_config", None)
+    if not dsa:
+        return
+    for name, value in dsa.items():
+        if name != "dsa_layers":
+            dest = "index_n_heads" if name == "index_num_heads" else name
+            setattr(hf_config, dest, value)
+    hf_config.dsa_layer_indices = tuple(sorted(i - 1 for i in dsa["dsa_layers"]))
+
+
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
@@ -815,6 +846,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         original_arch = config_dict.get("architectures", [])
         if original_arch:
             hf_config.architectures = original_arch
+        flatten_dsa_config(hf_config)
         # Propagate top-level token IDs if missing in text config
         for field in ("bos_token_id", "eos_token_id", "pad_token_id"):
             if getattr(hf_config, field, None) is None and field in config_dict:
@@ -2047,8 +2079,13 @@ class Config:
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     # Seconds between engine-status lines. Validated > 0 by EngineStats.
     throughput_log_interval: float = 10.0
+    # Forwards between engine-status lines, replacing the clock above when
+    # positive. For offline / MLPerf runs comparing one DP rank's lines against
+    # another's; the clock lands on a different step number on each rank.
+    throughput_log_interval_steps: int = 0
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
@@ -2186,6 +2223,58 @@ class Config:
         if len(sizes) == 1:
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
+
+    def _resolve_throughput_step_interval(self) -> None:
+        """Keep the step trigger to the topologies it has been validated on.
+
+        Two different reasons, and only the first is a hard one. PP replaces
+        `busy_loop` outright (`pp_engine_core.py`), so `bump_step` is never
+        reached and the line would go silent after announcing a logging mode.
+        RapidServe and P/D are a scope choice: `PrefillEngineCore` and
+        `DecodeEngineCore` inherit the base loop and override only
+        `_process_engine_step`, so the counter would in fact advance there --
+        it is simply untested, and a step number nobody has lined up across a
+        disaggregated pair is worth less than the clock. Degrade rather than
+        raise: a stale flag in a shared launch script must not stop a server
+        from starting.
+        """
+        if self.throughput_log_interval_steps <= 0 or not self.enable_log_stats:
+            # Nothing to warn about with the line itself off: the fallback a
+            # warning would name is the clock, which is equally silent.
+            self.throughput_log_interval_steps = 0
+            return
+        # Shared with the P/D classifier rather than re-derived here. It walks
+        # a MultiConnector's nested entries (a prefill node carries `kv_role`
+        # one level down with nothing at the top) and tolerates any shape,
+        # which this blob needs: it is user-supplied CLI JSON, and raising
+        # would take the server down at construction. It also keys on the
+        # connector name, because an offload tier legally takes `kv_producer`
+        # and `kv_consumer` while running the loop that counts.
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        kv_role = disaggregated_kv_role(self)
+        if self.pipeline_parallel_size > 1:
+            reason = (
+                f"pipeline_parallel_size is {self.pipeline_parallel_size}, which "
+                "replaces the busy loop that counts the forwards"
+            )
+        elif self.enable_rapidserve:
+            reason = "RapidServe is not covered by the step counter yet"
+        elif kv_role is not None:
+            reason = f"a P/D engine (kv_role={kv_role}) is not covered yet"
+        else:
+            return
+        logger.warning(
+            "throughput_log_interval_steps=%d ignored because %s; the "
+            "engine-status line stays on the %.1fs clock. Step-aligned "
+            "windows are supported on the base and DP engines only.",
+            self.throughput_log_interval_steps,
+            reason,
+            self.throughput_log_interval,
+        )
+        self.throughput_log_interval_steps = 0
 
     def __post_init__(self):
         self.moe_all2all_backend = (
@@ -2389,6 +2478,7 @@ class Config:
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,
+            model=self.model,
         )
         # In plugin mode, supplement exclude_layers with vLLM's ignored_layers when
         # the HF quant config didn't produce any exclusions (non-quark quant methods).
@@ -2467,6 +2557,9 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        # After the parse above: the P/D clause reads `kv_role` off
+        # `kv_transfer_config`, which arrives from the CLI as a string.
+        self._resolve_throughput_step_interval()
         if self.kv_transfer_config:
             # The offload namespace hashes the model's cache geometry. A worker
             # normalises `hf_config` while it builds the model (Kimi-K3 derives

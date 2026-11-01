@@ -140,9 +140,8 @@ exports = {
     "REQUEST_RATE": cell["request_rate"],
     "BENCH_NUM_PROMPTS_MULTIPLIER": cell["num_prompts_multiplier"],
     "BENCHMARK_KIND": benchmark.get("kind", "random"),
-    "AIPERF_DIR": benchmark.get("aiperf_dir", ""),
-    "AIPERF_VENV": benchmark.get("aiperf_venv", ""),
-    "AIPERF_COMMIT": benchmark.get("aiperf_commit", ""),
+    "AGENTX_HARNESS_VERSION": benchmark.get("agentx_harness_version", ""),
+    "AGENTX_VENV": benchmark.get("agentx_venv", ""),
     "AIPERF_SCENARIO": benchmark.get("scenario", ""),
     "AIPERF_PUBLIC_DATASET": benchmark.get("public_dataset", ""),
     "AIPERF_APPLY_CHAT_TEMPLATE": str(
@@ -170,9 +169,6 @@ exports = {
         "cancel_drain_timeout", ""
     ),
     "AIPERF_HTTP_TCP_USER_TIMEOUT": benchmark.get("http_tcp_user_timeout", ""),
-    "AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES": benchmark.get(
-        "dataset_weka_live_assistant_responses", ""
-    ),
     "AIPERF_DATASET_CONFIGURATION_TIMEOUT": benchmark.get(
         "dataset_configuration_timeout", ""
     ),

@@ -72,6 +72,14 @@ jobs:
           restore-keys: |
             atomesh-mocker-cargo-${{ runner.os }}-
 
+      - name: Test P/D router request lifecycle
+        run: |
+          set -euo pipefail
+          cargo test \
+            --manifest-path atom/mesh/Cargo.toml \
+            --target-dir atom/mesh/mocker/target/mesh \
+            --release --lib routers::http_pd_router
+
       - name: Run Atomesh test harness
         run: |
           set -euo pipefail

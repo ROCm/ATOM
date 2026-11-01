@@ -379,7 +379,7 @@ def test_glm_native_fp4_agentx_concurrency_contract():
     "override",
     [
         {"samples": 4},
-        {"tp_size": 8},
+        {"tp_size": 2},
         {"kv_cache_dtype": "auto"},
         {"kv_cache_dtype": "bf16"},
         {"mtp": False},
@@ -499,6 +499,18 @@ def test_glm_scaled_fp4_dispatch_contract():
         query_length=5,
     )
     assert config == glm5_tp_config(4)
+
+
+def test_glm_tp8_dispatches_the_reference_shard():
+    # TP8 is the kernel's reference shard (8 heads / 256 intermediate per rank).
+    config = glm52_native_config(
+        samples=4,
+        tp_size=8,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        query_length=4,
+    )
+    assert config == glm5_tp_config(8) == GLM5_CONFIG
 
 
 def test_glm_tp4_geometry_and_padded_graph_ladder():

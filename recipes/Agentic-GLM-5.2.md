@@ -256,6 +256,7 @@ depth is chosen per concurrency point.
 | Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
 |---|---|---:|---:|
 | C1, C2 | TP4, mono decode | 3 | `2.99` |
+| C1, C2 on 8 GPUs | TP8, mono decode (see [TP8 C1/C2](#tp8-c1c2-mono-decode)) | 3 | `2.99` |
 | C4, C8 | TP4 | 5 | `3.61` |
 | C10 | TP4 | 4 | `3.33` |
 | C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
@@ -352,6 +353,56 @@ python -m atom.entrypoints.openai_server \
   --max-num-batched-tokens 16384 \
   2>&1 | tee "server-glm52-mtp${MTP_K}-c${CONC}.log"
 ```
+
+##### TP8 C1/C2 (mono decode)
+
+Mono decode also serves TP8, on the external-indexer path (the fused indexer is
+TP4-only). To run `C1` or `C2` on all eight GPUs, set `TP=8` and the `CONC`
+before the block above and change nothing else: each point is the TP4 command
+for that `CONC` with `-tp 8`, so both run mono at MTP3 with AL `2.99`, and each
+admits exactly `CONC` sequences.
+
+| Concurrency | `--max-num-seqs` | `--cudagraph-capture-sizes` | Mono width (`S`) |
+|---|---:|---|---:|
+| C1 | 1 | `[1]` | 4 |
+| C2 | 2 | `[1,2]` | 4, 8 |
+
+```bash
+TP=8 CONC=1   # C1: --max-num-seqs 1
+# or
+TP=8 CONC=2   # C2: --max-num-seqs 2
+# then run the server block above unchanged
+```
+
+An armed run logs `GLM-5.2 MonoKernel on: S=<width> ... indexer=external` on its
+first served step at each width (`S=4` for one request, `S=8` for two).
+
+The numbers below are C1 only; TP8 C2 has not been measured yet.
+
+AgentX C1, 3,600 s, forced AL `2.99`, `rocm/atom-dev:nightly_202610181506`
+(ATOM `df86c482` plus this TP8 admission). The TP4 column is InferenceX run
+39540045682 (job 121211066939) on a CI node; the TP8 column was measured on a
+different MI355X node.
+
+| Metric | TP8, mono | TP4, mono |
+|---|---:|---:|
+| p90 interactivity (tok/s/user, `1 / p90 ITL`) | 310.30 | 265.94 |
+| p50 interactivity (tok/s/user) | 324.00 | 275.76 |
+| Mean ITL (ms) | 3.07 | 3.61 |
+| Mean TTFT (ms) | 1,102.64 | 1,389.68 |
+| Total token throughput (tok/s) | 19,931.82 | 18,044.52 |
+| Total token throughput per GPU (tok/s) | 2,491.48 | 4,511.13 |
+| Requests completed | 266 | 253 |
+
+The replay runs for a fixed duration, so the faster server reaches further into
+the trace (266 vs 253 requests, mean ISL 267K vs 254K); the throughput rows
+compare different request mixes, the latency rows much less so.
+
+Accuracy at TP8 C1 (GSM8K, first 250, 3-shot completions, real MTP3
+acceptance, one request at a time so every decode step is mono's): mono on
+0.932 / 0.928 across two runs, mono off 0.932 / 0.932 (flexible-extract); MTP
+acceptance 76.4% / 76.5% on vs 75.1% / 75.2% off. Mono-on and mono-off outputs
+differ no more than two mono-off runs differ from each other.
 
 ##### Forced Acceptance Semantics
 
