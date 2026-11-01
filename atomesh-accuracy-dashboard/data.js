@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793466093649,
+  "lastUpdate": 1793552838676,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4626,6 +4626,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8969,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41218363316 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610311450 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1713 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "99ebf633ac7a327c54282c3b244ea8519f3eef29",
+          "message": "feat(mono): shared DSA indexer mono launch; Kimi-K3 mono to 64 rows, plain decode and ReplaySSM (#2871)\n\nShared DSA indexer (atom/mono/dsa_indexer/): one FlyDSL launch per DSA layer\nat decode for wq_b, the index-cache writer (NoPE or the fused RoPE writer),\nFP8 scoring and the exact top-K selection to the MLA's KV slots, with a\ndistributed radix selection over the TP ranks under DCP or without it\n(replicated cache). Models are routed through one opaque op by a wrapper,\nrefused before routing when the kernel cannot serve them. GLM-5.2 is\nregistered; deepseek_v2 folds the indexer's wk / weights_proj into\nfused_qkv_a_proj when the attention is not quantized.\n\nKimi-K3 mono: K1 / K2 up to 64 rows (16-row token groups), plain decode and\nuniform verify, with or without ReplaySSM; the bf16 GEMV moves to\natom/mono/device/gemv.py.\n\nShared runtime: uncached step scratch and peer buffers, lean rebuild of a\nspilled width, shared device helpers. Also: get_dcp_group reuses the TP\ncoordinator when the groups match, one-thread OpenMP teams for loader\nthreads, quant_spec.effective_layer_quant, a dense DSpark draft owns KV rows\nbut no index-key slices.",
+          "timestamp": "2026-11-01T15:52:44Z",
+          "url": "https://github.com/ROCm/ATOM/commit/99ebf633ac7a327c54282c3b244ea8519f3eef29"
+        },
+        "date": 1793552837965,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41324946066 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611011456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8923,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41324946066 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611011456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1312 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
