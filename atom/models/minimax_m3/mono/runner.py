@@ -59,6 +59,7 @@ from atom.models.minimax_m3.mono.gfx1250.kernels.post_attn import (
 from atom.models.minimax_m3.mono.gfx1250.kernels.post_attn import (
     build_post_attn_kernel as build_post_attn_kernel_gfx1250,
 )
+from atom.models.minimax_m3.mono.gfx1250.kernels.pre_attn import K1_ARGS_G1250
 from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
@@ -76,7 +77,12 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
-from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
+from atom.models.minimax_m3.mono.layout import (
+    SCRATCH,
+    diag_region_names,
+    sym_layout,
+    wide_moe,
+)
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
@@ -160,17 +166,27 @@ class MonoDecodeRunner:
         bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
         # per decode batch size (every graph captures its own) a sparse layer
-        # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
+        # kernel of each kind the layers use (``self.k4[n][(lw.index_topk, x8_in)]``),
         # with a mono dense prefix, the dense layers' (``self.k4[n]["dense_pre0"
         # | "dense_pre" | "dense_post"]``), built and compiled on its first step
         self.k4 = WidthBuilds(
             self._build_layer_kernels, self._layer_kernels, group, "MiniMax-M3 mono"
         )
 
+    def _x8_in(self, i: int, n: int) -> bool:
+        """gfx1250: sparse layer i's K1 takes the MXFP8 rows layer i - 1 made (wide
+        widths: a narrow kernel is VGPR-bound and normalizes its rows itself)."""
+        return self.gfx1250 and i > 0 and wide_moe(n)
+
     def _build_layer_kernels(self, n: int) -> dict:
+        kinds = {(lw.index_topk, self._x8_in(i, n)) for i, lw in enumerate(self.sparse)}
         kernels = {
-            index_topk: self._build_k4(n, index_topk=index_topk)
-            for index_topk in {lw.index_topk for lw in self.sparse}
+            kind: (
+                self._build_k4(n, index_topk=kind[0], x8_in=kind[1])
+                if self.gfx1250
+                else self._build_k4(n, index_topk=kind[0])
+            )
+            for kind in kinds
         }
         if self.dense_mono:
             kernels["dense_pre0"] = self._build_dense_pre(n, plain_norm=True)
@@ -336,6 +352,22 @@ class MonoDecodeRunner:
             torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
         ]
         self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        # gfx1250: sparse layer i's residual in hs[i % 2]; layer i - 1's FFN finish
+        # writes it with the MXFP8 rows of acc (g_in + 1) its K1 takes, their
+        # E8M0 codes (a byte a 32-block) and the blocks' sums of acc^2
+        self.hs = [self.h, torch.empty_like(self.h)]
+        self.x8 = [
+            torch.empty(MAX_TOKENS, HIDDEN, dtype=torch.uint8, device=dev)
+            for _ in range(2)
+        ]
+        self.x8s = [
+            torch.empty(MAX_TOKENS, HIDDEN // 32, dtype=torch.uint8, device=dev)
+            for _ in range(2)
+        ]
+        self.ss = [
+            torch.empty(MAX_TOKENS, HIDDEN // 32, dtype=torch.float32, device=dev)
+            for _ in range(2)
+        ]
         self.q = torch.empty(
             MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
         )
@@ -345,15 +377,22 @@ class MonoDecodeRunner:
         # each layer's K1 pointers that do not change per step (K1_ARGS order)
         self.k1_args = []
         for i, lw in enumerate(self.sparse):
+            nxt = self.sparse[min(i + 1, len(self.sparse) - 1)]
             ptrs = {
+                "x8_prev": _ptr(self.x8[i % 2]), "x8s_prev": _ptr(self.x8s[i % 2]),
+                "ss_prev": _ptr(self.ss[i % 2]), "h_next": _ptr(self.hs[(i + 1) % 2]),
+                "x8_next": _ptr(self.x8[(i + 1) % 2]),
+                "x8s_next": _ptr(self.x8s[(i + 1) % 2]),
+                "ss_next": _ptr(self.ss[(i + 1) % 2]), "g_next": _ptr(nxt.g_in),
                 "ar": _ptr(self.ars[i % 2]), "g_in": _ptr(lw.g_in), "w_qkv": _ptr(lw.w_qkv),
                 "s_qkv": _ptr(lw.s_qkv), "g_q": _ptr(lw.g_q), "g_k": _ptr(lw.g_k),
                 "g_iq": _ptr(lw.g_iq), "g_ik": _ptr(lw.g_ik), "cos_sin": _ptr(lw.cos_sin),
                 "index_cache": _ptr(lw.attn_impl.index_cache), "iq_out": _ptr(self.iq),
                 "scratch": _ptr(self.scratch1),
             }  # fmt: skip
+            names = K1_ARGS_G1250 if self.gfx1250 else K1_ARGS
             self.k1_args.append(
-                torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
+                torch.tensor([ptrs[a] for a in names], dtype=torch.int64, device=dev)
             )
 
     def prepare(self, n: int) -> bool:
@@ -381,9 +420,10 @@ class MonoDecodeRunner:
         rows = token_rows(fwd, res.shape[0])
         for i, lw in enumerate(self.sparse):
             res = self.run_sparse_layer(i, lw, fwd, positions, res, rows)
-            self._write_aux(lw.layer_id - 1, self.h[: res.shape[0]])
+            h = self.hs[i % 2] if self.gfx1250 else self.h
+            self._write_aux(lw.layer_id - 1, h[: res.shape[0]])
             if lw.layer_id in aux_layers:
-                aux.append(self.h[: res.shape[0]].clone())
+                aux.append(h[: res.shape[0]].clone())
         hidden = self.finish_step(res)
         if self.timeline is not None:
             self.timeline.step_done(res.shape[0])
@@ -509,7 +549,8 @@ class MonoDecodeRunner:
             kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
         )
         args = {
-            "h_in": _ptr(self.h), "q": _ptr(self.q), "block_table": _ptr(block_table),
+            "h_in": _ptr(self.hs[i % 2] if self.gfx1250 else self.h), "q": _ptr(self.q),
+            "block_table": _ptr(block_table),
             "seq_lens": _ptr(seq_lens), "k_cache": _ptr(k16), "v_cache": _ptr(v16),
             "k_scale": _ptr(ks16), "v_scale": _ptr(vs16), "w_o": _ptr(lw.w_o),
             "s_o": _ptr(lw.s_o), "g_post": _ptr(lw.g_post), "w_gate": _ptr(lw.gate),
@@ -524,7 +565,8 @@ class MonoDecodeRunner:
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
         }  # fmt: skip
-        _run_compiled(self.k4[n][lw.index_topk], *K4_ABI.pack(args), stream)
+        kind = (lw.index_topk, self._x8_in(i, n))
+        _run_compiled(self.k4[n][kind], *K4_ABI.pack(args), stream)
         return self.h_mids[(i + 1) % 2][:n]
 
     def finish_step(self, res: torch.Tensor) -> torch.Tensor:

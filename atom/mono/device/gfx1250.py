@@ -192,10 +192,11 @@ def wait_async(n):
     rocdl.s_wait_asynccnt(n)
 
 
-def rows_to_lds_async(tid, src, rows, row_words, dst, dst_row):
+def rows_to_lds_async(tid, src, rows, row_words, dst, dst_row, wait=True):
     """``ops.rows_to_lds`` as device-scope async copies, every one out at once and
-    waited for here (one latency, not a batched loop's several); the caller's
-    barrier shares them. A lane past the rows copies the last 16 B again."""
+    waited for here (one latency, not a batched loop's several; ``wait`` False:
+    by a later call's); the caller's barrier shares them. A lane past the rows
+    copies the last 16 B again."""
     assert row_words % 4 == 0, row_words
     p16 = row_words // 4
     n = rows * p16
@@ -207,7 +208,8 @@ def rows_to_lds_async(tid, src, rows, row_words, dst, dst_row):
             db + (v // p16 * dst_row + v % p16 * 4) * 4,
             cm=CM_DEV,
         )
-    wait_async(0)
+    if wait:
+        wait_async(0)
 
 
 def lds_reads_done():
@@ -273,6 +275,17 @@ def wmma_a8w4(a, b, c, sa, sb):
     return fx.Vector(
         rocdl.wmma_scale_f32_16x16x128_f8f6f4(
             fx.Vector.make_type(8, fx.Float32), a, b, c, sa, sb, fmtA=4, fmtB=0
+        )
+    )
+
+
+def wmma_fp8_scaled(a, b, c, sa, sb):
+    """Scaled 16x16x128 E4M3 x E4M3 -> f32: ``a`` / ``b`` 16 i32 (k as
+    ``wmma_fp8_k128``), ``sa`` / ``sb`` the i32 of A's row / B's column four E8M0
+    codes (k-blocks 0 .. 3)."""
+    return fx.Vector(
+        rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+            fx.Vector.make_type(8, fx.Float32), a, b, c, sa, sb, fmtA=0, fmtB=0
         )
     )
 

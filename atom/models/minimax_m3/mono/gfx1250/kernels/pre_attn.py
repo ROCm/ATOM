@@ -86,8 +86,11 @@ from atom.mono.device.gfx1250 import (
     butterfly,
     publish,
     rows_to_lds_async,
+    shuffled_rows,
     wave_max,
+    wave_sum,
     wmma_fp8_k64,
+    wmma_fp8_scaled,
 )
 from atom.mono.device.mx import FP8_MAX
 from atom.mono.device.ops import (
@@ -99,6 +102,7 @@ from atom.mono.device.ops import (
     kernel_symbol,
     lane_gather,
     launcher,
+    ld_dev,
     rsrc,
     traced,
     uniform,
@@ -107,9 +111,17 @@ from atom.mono.device.sync import Addr, Mailbox, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.trace import Space, enter_stage
 
+# gfx1250's per-layer pointer table: K1's, then the previous layer's MXFP8 rows of
+# acc (g_in + 1) (``x8_in``) and those this layer's FFN finish makes for the next
+K1_ARGS_G1250 = K1_ARGS + (
+    "x8_prev", "x8s_prev", "ss_prev", "h_next", "x8_next", "x8s_next", "ss_next",
+    "g_next",
+)  # fmt: skip
+
 __all__ = [
     "K1_ABI",
     "K1_ARGS",
+    "K1_ARGS_G1250",
     "SCRATCH_BYTES",
     "TL_POINTS",
     "build_pre_attn_kernel",
@@ -186,9 +198,13 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
-    index_topk=True, dense=False, plain_norm=False,
+    index_topk=True, dense=False, plain_norm=False, x8_in=None,
 ):  # fmt: skip
-    """``kernels.pre_attn.emit_pre_attn`` on gfx1250 (see the module)."""
+    """``kernels.pre_attn.emit_pre_attn`` on gfx1250 (see the module). ``x8_in``:
+    (MXFP8 rows of acc (g_in + 1), their E8M0 codes a byte a 32-block, the
+    blocks' sums of acc^2, LDS for the codes, LDS for the tokens' rstd): the
+    previous layer's FFN finish wrote them (and acc, ``h_out``) in its launch, so
+    the GEMV starts on them, no norm tasks, nothing to wait for."""
     rows = heads.rows
     (
         ar,
@@ -311,7 +327,7 @@ def emit_pre_attn(
 
     # ============================================ norm tasks (S > 2)
     enter_stage("k1.norm")
-    if const_expr(tokens > 2):  # noqa: SIM102
+    if const_expr(tokens > 2 and x8_in is None):  # noqa: SIM102
         if (bid >= NT0) & (bid < NT0 + tokens):
             tk = bid - NT0
             raw_g, raw_ar = load_norm_inputs([tk])
@@ -352,14 +368,31 @@ def emit_pre_attn(
             rg = (LOCAL_Q_HEADS + 2 + head) * HEAD_ROW_GROUPS + xt % HEAD_ROW_GROUPS
             gemv = long_step()
     if gemv:
-        if const_expr(tokens <= 2):
+        if const_expr(x8_in is not None):
+            x8g, x8sg, ssg, xsc, rst = x8_in
+            rows_to_lds_async(
+                tid, x8sg, tokens, HIDDEN // 128, xsc, HIDDEN // 128, wait=False
+            )
+            rows_to_lds_async(tid, x8g, tokens, HIDDEN // 4, x8, HIDDEN // 4)
+            # a wave a token: rstd from its blocks' sums
+            if wave < tokens:
+                NB = HIDDEN // 32
+                part = fx.Float32(0.0)
+                for j in range_constexpr(NB // WAVE):
+                    part = part + fx.Int32(
+                        ld_dev(ssg, wave * NB + lane * (NB // WAVE) + j)
+                    ).bitcast(fx.Float32)
+                tot = wave_sum(part)
+                if lane == 0:
+                    fx.ptr_store(hw_rsq(tot / float(HIDDEN) + eps), rst + wave)
+        elif const_expr(tokens <= 2):
             raw_g, raw_ar = load_norm_inputs(list(range(tokens)))
         rocdl.sched_barrier(0)
         r_w = rsrc(w_qkv)
         # chunk kc's 512 B blocks 2 kc, 2 kc + 1 of row group rg: lane l's 16 B
         # of each, row l % 16, k = 64 kc + 32 c + 16 (l / 16) + [0, 16)
         wts = []
-        for cc in range_constexpr(CHUNKS_PER_WAVE):
+        for cc in range_constexpr(CHUNKS_PER_WAVE if x8_in is None else 0):
             kc = wave * CHUNKS_PER_WAVE + cc
             parts = []
             for c in range_constexpr(2):
@@ -374,6 +407,13 @@ def emit_pre_attn(
                 )
                 parts += [w4[e] for e in range(4)]
             wts.append(fx.Vector.from_elements(parts, fx.Int32))
+        # x8_in: k128 chunks (four 512 B blocks: k64 chunks 2 m, 2 m + 1)
+        for m in range_constexpr(CHUNKS_PER_WAVE // 2 if x8_in is not None else 0):
+            wts.append(
+                shuffled_rows(
+                    r_w, rg, HIDDEN, wave * (CHUNKS_PER_WAVE // 2) + m, lane, 128, CM_NT
+                )
+            )
         ws = fx.Float32(
             bo.buffer_load(
                 rsrc(s_qkv),
@@ -382,7 +422,11 @@ def emit_pre_attn(
                 dtype=T.f32,
             )
         )
-        if const_expr(tokens <= 2):
+        if const_expr(x8_in is not None):
+            gpu.barrier()
+            x_scales = [fx.ptr_load(rst + k) for k in range(tokens)]
+            stamp(2)
+        elif const_expr(tokens <= 2):
             x_scales = norm_quant(
                 list(range(tokens)), raw_g, raw_ar, lambda j: bid == j
             )
@@ -401,7 +445,34 @@ def emit_pre_attn(
         # B column l % 16 is token l % 16 (the last token past the step's)
         col_tok = fx.min(lane % 16, tokens - 1)
         c = fx.Vector.filled(8, 0.0, fx.Float32)
-        for cc in range_constexpr(CHUNKS_PER_WAVE):
+        # x8_in: k128 chunks of two k64 weight chunks, B's E8M0 codes of its
+        # token's 4 blocks, A's all 1.0 (the rows' PTPC scale is ws)
+        for m in range_constexpr(CHUNKS_PER_WAVE // 2 if x8_in is not None else 0):
+            kc2 = wave * (CHUNKS_PER_WAVE // 2) + m
+            xb = []
+            for j in range_constexpr(4):
+                x4 = fx.Vector(
+                    fx.ptr_load(
+                        x8
+                        + (
+                            col_tok * (HIDDEN // 4)
+                            + kc2 * 32
+                            + 8 * j
+                            + (lane // 16) * 4
+                        ),
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+                xb += [x4[e] for e in range(4)]
+            sb = fx.Int32(fx.ptr_load(xsc + (col_tok * (HIDDEN // 128) + kc2)))
+            c = wmma_fp8_scaled(
+                wts[m],
+                fx.Vector.from_elements(xb, fx.Int32),
+                c,
+                fx.Int32(0x7F7F7F7F),
+                sb,
+            )
+        for cc in range_constexpr(CHUNKS_PER_WAVE if x8_in is None else 0):
             kc = wave * CHUNKS_PER_WAVE + cc
             xb = []
             for h in range_constexpr(2):
@@ -559,9 +630,9 @@ def emit_pre_attn(
 def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
-    region_ids=None, index_topk=True, dense=False, plain_norm=False,
+    region_ids=None, index_topk=True, dense=False, plain_norm=False, x8_in=None,
 ):  # fmt: skip
-    """``kernels.pre_attn.emit_k1`` on gfx1250. ``x8``: tokens * HIDDEN / 4 words
+    """``kernels.pre_attn.emit_k1`` on gfx1250 (``x8_in``: ``emit_pre_attn``'s). ``x8``: tokens * HIDDEN / 4 words
     of LDS, ``red``: RED_FLOATS floats, ``qs``: tokens * heads.count * HEAD_DIM / 2
     floats."""
     (
@@ -651,6 +722,7 @@ def emit_k1(
         index_topk,
         dense,
         plain_norm,
+        x8_in,
     )  # fmt: skip
     stamp(5)
 
