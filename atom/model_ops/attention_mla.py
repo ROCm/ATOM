@@ -72,6 +72,7 @@ from atom.model_ops.dcp_ops import dcp_all_gather_prefill_query_heads
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.mla_query_heads import _MLA_MIN_HEADS
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -217,8 +218,6 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 
 logger = logging.getLogger("atom")
 
-_MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
-
 
 def check_kv_shuffled_supported(
     atom_config,
@@ -245,26 +244,6 @@ def check_kv_shuffled_supported(
         raise ValueError(
             "ATOM_MLA_KV_SHUFFLED does not support: " + ", ".join(unsupported)
         )
-
-
-def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
-    """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
-
-    aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
-    a 2-wide non-causal block has no kernel at gqa=16: the asm dispatch hits
-    AITER_CHECK and aborts the whole process. Padding to 32 instead reaches the
-    4-wide non-causal kernel through aiter's own (gqa=32, width 2) remap.
-
-    Only width 2 needs this. Widths 1, 3 and 4 have gqa=16 kernels, and aiter
-    remaps anything wider onto gqa=32 itself. Padding rather than remapping
-    width 2 to the 4-wide kernel at gqa=16 is deliberate: the persistent work
-    descriptors are sized from the block width, so a 2-wide plan driving a
-    4-wide kernel writes its partials past the reduce buffers (illegal access
-    at some batch sizes, a non-terminating kernel at others).
-    """
-    if block_width == 2 and kv_cache_dtype.startswith("fp8"):
-        return 32
-    return _MLA_MIN_HEADS
 
 
 def mla_kernel_num_heads(num_heads: int) -> int:
