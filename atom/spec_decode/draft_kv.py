@@ -37,6 +37,37 @@ def uses_dflash_pool(draft_hf) -> bool:
     return arch in _DFLASH_POOL_ARCHS
 
 
+def draft_ctx_slots(out, positions, cu_ends, block_tables, tok_ramp, vblock):
+    """The DFlash draft's own slot for each target token, into ``out``.
+
+        slot = block_tables[req, pos // vblock] * vblock + pos % vblock
+
+    ``cu_ends`` is ``cu_seqlens_q[1 : rows + 1]``, the requests' exclusive
+    token ends; ``tok_ramp`` is ``arange(n)`` in their dtype. All on the
+    device, no host sync.
+    """
+    rows = cu_ends.shape[0]
+    # `right=True` on the EXCLUSIVE ends: token t belongs to the first request
+    # whose end is strictly past it. The clamp is for the one token that can
+    # equal the last end; a gather out of bounds is a fault rather than a wrong
+    # answer, so it is cheap insurance.
+    req = torch.searchsorted(cu_ends, tok_ramp, right=True).clamp_(max=rows - 1)
+    page = torch.div(positions, vblock, rounding_mode="floor")
+    # A column the table does not have is DROPPED, never clamped into another
+    # request's page (the `_block_page_idx` rule).
+    in_table = page < block_tables.shape[1]
+    page = page.clamp_(max=block_tables.shape[1] - 1)
+    out.copy_(
+        torch.where(
+            in_table,
+            block_tables[req, page].to(torch.int64) * vblock
+            + torch.remainder(positions, vblock),
+            -1,
+        )
+    )
+    return out
+
+
 def draft_kv_conflicts_with_dcp(spec) -> bool:
     """Whether DCP > 1 would shard this draft's own KV pool on both axes.
 

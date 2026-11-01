@@ -497,8 +497,9 @@ def _fake_attn_res_kernel(monkeypatch, calls):
     """Stand in for `atom.model_ops.kimi_k3`, which needs aiter and a GPU.
 
     The draft imports `apply_attn_res` inside the extract, so swapping the
-    module in `sys.modules` is enough -- and it keeps these tests CPU-only,
-    which is the only way they run in CI at all. The stand-in records the
+    module in `sys.modules` is enough to keep the kernel out of these tests;
+    they still import `kimi_k3_dflash`, which needs aiter, so they skip on the
+    CPU-only CI job and run where aiter is installed. The stand-in records the
     ARGUMENTS the draft marshals and returns a sentinel, so a test can check the
     extract hands back the kernel's result rather than the prefix.
     """
@@ -888,9 +889,10 @@ def test_dcp_guard_admits_an_mtp_draft(target_hf):
 # --------------------------------------------------------------------------- #
 # draft pool addressing (dspark_proposer)
 #
-# The property and `_publish_draft_ctx_slots` are the REAL methods, called on a
-# stub carrying real forward buffers. The proposer module imports triton, so
-# these skip on the CPU-only runner and run in the GPU batch.
+# The slot math (`draft_kv.draft_ctx_slots`) runs on CPU. The property and
+# `_publish_draft_ctx_slots` are the REAL proposer methods on a stub carrying
+# real forward buffers; the proposer module imports triton, so those skip on the
+# CPU-only CI job (ATOM's CI runs no unit tests on a GPU).
 # --------------------------------------------------------------------------- #
 
 
@@ -966,6 +968,30 @@ def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
     return None if out is None else out.cpu()
 
 
+def _slots(vblock, tables, seqlens, positions, running_bs=None):
+    """The device slot math (`draft_kv.draft_ctx_slots`), on CPU tensors."""
+    import torch
+
+    from atom.spec_decode.draft_kv import draft_ctx_slots
+
+    rows = max(running_bs or 0, len(seqlens))
+    bt = torch.zeros(rows, len(tables[0]), dtype=torch.int32)
+    bt[: len(tables)] = torch.tensor(tables, dtype=torch.int32)
+    ends = torch.tensor(seqlens, dtype=torch.int32).cumsum(0).to(torch.int32)
+    # Flat over the padded tail, as `prepare_cu_seqlens_q` leaves it.
+    cu_ends = torch.cat([ends, ends[-1:].expand(rows - len(seqlens))])
+    n = len(positions)
+    out = torch.full((n,), 7, dtype=torch.int64)
+    return draft_ctx_slots(
+        out,
+        torch.tensor(positions, dtype=torch.int64),
+        cu_ends,
+        bt,
+        torch.arange(n, dtype=torch.int32),
+        vblock,
+    )
+
+
 def _host_slots(tables, seqlens, positions, block_size):
     """The host builder (`token_layout/slots.py`) for the same tokens."""
     import numpy as np
@@ -995,7 +1021,7 @@ def test_draft_slots_store_every_token_at_entry_granularity(dcp):
     """
     vblock = 128 * dcp
     positions = [vblock - 2, vblock - 1, vblock, 5, 6]
-    got = _publish(128, dcp, _TABLES, _SEQLENS, positions).tolist()
+    got = _slots(vblock, _TABLES, _SEQLENS, positions).tolist()
     assert got == [
         7 * vblock + vblock - 2,
         7 * vblock + vblock - 1,
@@ -1010,7 +1036,7 @@ def test_draft_slots_store_every_token_at_entry_granularity(dcp):
 
 def test_draft_slots_ignore_padded_rows():
     """Padded graph rows past `scheduled_bs` resolve no token."""
-    got = _publish(128, 8, _TABLES, _SEQLENS, [0, 1, 2, 3, 4], running_bs=4)
+    got = _slots(1024, _TABLES, _SEQLENS, [0, 1, 2, 3, 4], running_bs=4)
     assert got.tolist() == [
         7 * 1024,
         7 * 1024 + 1,
@@ -1026,8 +1052,18 @@ def test_draft_slots_past_the_table_are_dropped_not_clamped():
     Clamping it into the last column instead would hand the row ANOTHER
     request's KV, which reads as a plausible answer rather than a fault.
     """
-    got = _publish(128, 8, [[10, 11, 12, 13]], [3], [0, 3 * 1024, 4 * 1024])
+    got = _slots(1024, [[10, 11, 12, 13]], [3], [0, 3 * 1024, 4 * 1024])
     assert got.tolist() == [10 * 1024, 13 * 1024, -1]
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_the_proposer_publishes_the_draft_slots(dcp):
+    """The real `_publish_draft_ctx_slots` publishes, at entry granularity,
+    exactly what the slot math computes."""
+    vblock = 128 * dcp
+    positions = [vblock - 2, vblock - 1, vblock, 5, 6]
+    got = _publish(128, dcp, _TABLES, _SEQLENS, positions, running_bs=4)
+    assert got.tolist() == _slots(vblock, _TABLES, _SEQLENS, positions).tolist()
 
 
 def test_draft_slots_are_published_for_an_empty_forward():

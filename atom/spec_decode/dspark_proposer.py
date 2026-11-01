@@ -760,31 +760,15 @@ class DSparkProposer(Drafter):
         # slice stays non-decreasing and `searchsorted` stays defined).
         rows = max(int(ctx.running_bs), int(ctx.scheduled_bs), 1)
         block_tables = var["block_tables"].gpu[:rows]
-        # `right=True` on the EXCLUSIVE ends: token t belongs to the first
-        # request whose end is strictly past it. The clamp is for the one token
-        # that can equal the last end -- it cannot happen while
-        # `n == cu[scheduled_bs]`, and a gather out of bounds is a fault rather
-        # than a wrong answer, so it is cheap insurance.
-        req = torch.searchsorted(
+        from atom.spec_decode.draft_kv import draft_ctx_slots
+
+        draft_ctx_slots(
+            out,
+            positions[:n],
             var["cu_seqlens_q"].gpu[1 : rows + 1],
+            block_tables,
             self._blk_tok_ramp[:n],
-            right=True,
-        ).clamp_(max=rows - 1)
-        vblock = self._draft_entry_tokens
-        pos = positions[:n]
-        page = torch.div(pos, vblock, rounding_mode="floor")
-        # Same rule as `_block_page_idx`: a column the table does not have is
-        # DROPPED, never clamped into another request's page. A prefill chunk
-        # always has its own columns, so this only fires on a malformed table.
-        in_table = page < block_tables.shape[1]
-        page = page.clamp_(max=block_tables.shape[1] - 1)
-        out.copy_(
-            torch.where(
-                in_table,
-                block_tables[req, page].to(torch.int64) * vblock
-                + torch.remainder(pos, vblock),
-                -1,
-            )
+            self._draft_entry_tokens,
         )
 
     def propose(
