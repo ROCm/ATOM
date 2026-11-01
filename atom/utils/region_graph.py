@@ -52,6 +52,8 @@ __all__ = [
     "forks",
     "graph_pool",
     "join_stream",
+    "on_scheduled_rows",
+    "padded_prefill_rows",
     "token_graph",
 ]
 
@@ -285,6 +287,42 @@ def eager_region(
         return wrapper
 
     return decorate
+
+
+def padded_prefill_rows(rows: int) -> int | None:
+    """The scheduled rows of a prefill padded to a token-graph bucket
+    (`ForwardMode.prefill_token_graph`) whose region is handed ``rows`` -- the
+    bucket -- or None when nothing past the scheduled rows was padded.
+
+    A region whose launches follow the requests (attention, a recurrence)
+    attends those rows alone, as the eager step would, and hands the bucket
+    back with zeros past them (`on_scheduled_rows`): its metadata describes
+    the scheduled rows, not the bucket."""
+    context = getattr(forward_context.get_forward_context(), "context", None)
+    if context is None or not context.is_prefill:
+        return None
+    scheduled = context.scheduled_tokens
+    return scheduled if 0 < scheduled < rows else None
+
+
+def on_scheduled_rows(fn: Callable[..., torch.Tensor], rows: int | None, *args):
+    """``fn(*args)`` on the first ``rows`` rows of each tensor argument whose
+    leading dim is the bucket, its result raised back to the bucket with zero
+    rows past ``rows``; ``fn(*args)`` itself when ``rows`` is None
+    (`padded_prefill_rows`)."""
+    if rows is None:
+        return fn(*args)
+    height = next(a.shape[0] for a in args if isinstance(a, torch.Tensor))
+    result = fn(
+        *(
+            a[:rows] if isinstance(a, torch.Tensor) and a.shape[0] == height else a
+            for a in args
+        )
+    )
+    padded = result.new_empty((height, *result.shape[1:]))
+    padded[:rows].copy_(result)
+    padded[rows:].zero_()
+    return padded
 
 
 def forks(stream: torch.cuda.Stream | None) -> bool:
