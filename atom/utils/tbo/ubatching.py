@@ -211,6 +211,9 @@ class DPSyncResult:
     max_seqlen_q_across_dp: int | None = None
     # DP-MAX of the requests whose prompt a rank's prefill finishes this step.
     max_final_requests_across_dp: int = 0
+    # [dp_size, len(extra)] float64 -- every rank's ``extra`` payload, when the
+    # caller rode one on the exchange.
+    extra_across_dp: np.ndarray | None = None
 
     @property
     def any_rank_has_prefill(self) -> bool:
@@ -231,6 +234,7 @@ def sync_dp_metadata(
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
     max_seqlen_q: int | None = None,
+    extra: np.ndarray | None = None,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, whether the
@@ -295,15 +299,22 @@ def sync_dp_metadata(
     if dspark_on:
         local[tbo_fields + 0] = max_seqlen_q
 
+    if extra is not None:
+        local = torch.cat(
+            (local.double(), torch.from_numpy(np.asarray(extra, dtype=np.float64)))
+        )
+
     # A group of one is its own row, with nothing to exchange.
     gathered = [local]
     if dp_size > 1:
-        gathered = [
-            torch.empty(n_fields, dtype=torch.int32, device="cpu")
-            for _ in range(dp_size)
-        ]
+        gathered = [torch.empty_like(local) for _ in range(dp_size)]
         torch.distributed.all_gather(gathered, local, group=dp_group)
-    sync = torch.stack(gathered, dim=1).numpy()  # [n_fields, dp_size]
+    packed = torch.stack(gathered, dim=1).numpy()  # [fields, dp_size]
+    extra_across_dp = None
+    if extra is not None:
+        extra_across_dp = np.ascontiguousarray(packed[n_fields:].T)
+        packed = packed[:n_fields].astype(np.int32)
+    sync = packed  # [n_fields, dp_size]
 
     scheduled_tokens_per_dp_rank = sync[0]
     max_bs_across_dp = int(sync[1].max())
@@ -345,6 +356,7 @@ def sync_dp_metadata(
         ub_tokens_across_dp=ub_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
         max_final_requests_across_dp=int(sync[4].max()),
+        extra_across_dp=extra_across_dp,
     )
 
 

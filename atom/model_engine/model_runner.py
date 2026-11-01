@@ -713,6 +713,10 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # DSpark's online machinery (`DSparkController`); None without a
+    # confidence-scheduled block drafter.
+    dspark = None
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
@@ -854,6 +858,9 @@ class ModelRunner:
             torch.set_default_device(self.device)
             with set_model_tag("drafter"):
                 self.drafter = build_drafter(self.config, self.device, self)
+            from atom.spec_decode.dspark_controller import DSparkController
+
+            self.dspark = DSparkController.of(self)
             self.rejection_sampler = RejectionSampler(
                 synthetic_acceptance_rates=(
                     self.config.speculative_config.synthetic_acceptance_rates
@@ -2511,6 +2518,11 @@ class ModelRunner:
             if not self._tr_hybrid_active():
                 return  # stay rectangular
 
+            if self.dspark is not None and self.dspark.keeps_reserved_width(
+                int(new_len.sum()), q_eff, int(old_nst[:scheduled_bs].sum()), full_q
+            ):
+                return
+
         # Rebuild scheduled_tokens (flat) to the ragged per-seq layout: keep the
         # first new_len[i] of each seq's old segment (token[0]=anchor, rest=draft
         # placeholders already populated by the scheduler from seq.token_ids).
@@ -2716,6 +2728,9 @@ class ModelRunner:
 
     @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
+        # Before the per-rank ragged shrink below: the plan rewrites from the
+        # scheduled layout, and its payload rides `decide`'s one DP exchange.
+        dp_plan = self.dspark.dp_plan(batch) if self.dspark is not None else None
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
@@ -2738,6 +2753,7 @@ class ModelRunner:
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,
+            dp_plan=dp_plan,
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3447,10 +3463,16 @@ class ModelRunner:
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
         draft_token_ids: np.ndarray | None = None
+        dspark_observed = False
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
+                if self.dspark is not None:
+                    # Before this forward drafts its own.
+                    dspark_observed = self.dspark.observe_verdict(
+                        prev_batch, prev_bonus_num
+                    )
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
@@ -3496,6 +3518,9 @@ class ModelRunner:
                     num_reject_tokens,
                     anchors,
                 )
+
+        if self.dspark is not None and not dspark_observed:
+            self.dspark.observe_no_verdict()
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
         # as a {req_id: ell} dict (req_id-keyed avoids any output/draft batch
@@ -3571,7 +3596,11 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if self.dspark is not None:
+            self.dspark.forward_begin(batch, get_forward_context().context.forward_mode)
         logits, hidden_states = self.run_model(input_ids, batch)
+        if self.dspark is not None:
+            self.dspark.target_done()
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 
@@ -3640,6 +3669,9 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+
+        if self.dspark is not None:
+            self.dspark.forward_end()
 
         reset_forward_context()
         self._record_forward_vars_event()
@@ -4453,6 +4485,8 @@ class ModelRunner:
             return
         if verify_scheduler.calibration_profile is not None:
             return  # Explicit offline measurements must not be overwritten.
+        if self.dspark is not None and self.dspark.bind_startup_sps(max_q_len):
+            return
         if self.req_graph is None or not self.req_graph.keys():
             return
         if self.config.dspark.disable_sps_calib:

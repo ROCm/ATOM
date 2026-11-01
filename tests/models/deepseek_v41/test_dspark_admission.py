@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.config import DSparkConfig
+from atom.config import CUDAGraphMode, DSparkConfig
 from atom.models.deepseek_v41.config import (
     DeepseekV41TextConfig,
     validate_speculative_config,
@@ -26,6 +26,8 @@ def config():
             synthetic_acceptance_rates=None,
         ),
         dspark=DSparkConfig(),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.TR_HYBRID),
+        enforce_eager=False,
     )
 
 
@@ -68,10 +70,36 @@ def test_incompatible_draft_contract_is_rejected(field, value):
         validate_speculative_config(cfg)
 
 
-def test_dynamic_schedule_cannot_use_synthetic_costs():
+def test_dynamic_schedule_measures_costs_at_startup_on_token_graphs():
+    """No profile: the curve is measured on TR_HYBRID decode token graphs."""
     cfg = config()
     cfg.dspark = DSparkConfig(confidence_schedule=True, ragged=True)
+    validate_speculative_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "mode,eager",
+    [(CUDAGraphMode.FULL, False), (None, False), (CUDAGraphMode.TR_HYBRID, True)],
+)
+def test_dynamic_schedule_without_token_graphs_needs_a_profile(mode, eager):
+    """Nothing to time at startup, and no synthetic stub: a profile is required,
+    and with one the graph mode does not matter."""
+    cfg = config()
+    cfg.compilation_config.cudagraph_mode = mode
+    cfg.enforce_eager = eager
+    cfg.dspark = DSparkConfig(confidence_schedule=True, ragged=True)
     with pytest.raises(ValueError, match="calibration_profile"):
+        validate_speculative_config(cfg)
+    cfg.dspark = DSparkConfig(
+        confidence_schedule=True, ragged=True, calibration_profile="profile.json"
+    )
+    validate_speculative_config(cfg)
+
+
+def test_dynamic_schedule_requires_ragged_verification():
+    cfg = config()
+    cfg.dspark = DSparkConfig(confidence_schedule=True)
+    with pytest.raises(ValueError, match="ragged"):
         validate_speculative_config(cfg)
 
 

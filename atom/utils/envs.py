@@ -1089,6 +1089,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL": lambda: (
         os.getenv("ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL", "0") == "1"
     ),
+    # Where DSpark's startup SPS sweep caches its per-deployment measurements
+    # (`atom/spec_decode/startup_sps.py`), keyed by the deployment identity.
+    # Unset: ~/.cache/atom/dspark_sps. Empty: measure on every start.
+    "ATOM_DSPARK_SPS_CACHE_DIR": lambda: os.getenv("ATOM_DSPARK_SPS_CACHE_DIR"),
     # Run the DSpark draft model eager, bypassing torch.compile, while leaving
     # the target compiled. Rollback lever for the draft's compiled path; prefer
     # it over --level 0, which disables compilation for BOTH models. Note that
