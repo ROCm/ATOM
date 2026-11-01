@@ -1244,7 +1244,30 @@ def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
     return None
 
 
-def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
+# Targets the Kimi-K3 DFlash draft (`K3DFlashModel`) can serve. The rename in
+# `hf_config_override` cannot check this itself: it sees only the draft, and
+# SpecForge stamps the same `DSparkDraftModel` arch on every DFlash draft.
+_K3_DFLASH_TARGET_ARCHS: frozenset[str] = frozenset({"KimiK3ForConditionalGeneration"})
+
+
+def _check_dflash_draft_target(
+    target_hf: PretrainedConfig, draft_hf: PretrainedConfig | None
+) -> None:
+    """Refuse a SpecForge DFlash draft paired with a non-Kimi-K3 target."""
+    draft_arch = (getattr(draft_hf, "architectures", None) or [""])[0]
+    if draft_arch != "K3DFlashModel":
+        return
+    target_arch = (getattr(target_hf, "architectures", None) or [""])[0]
+    if target_arch not in _K3_DFLASH_TARGET_ARCHS:
+        raise ValueError(
+            f"This SpecForge DFlash draft is only supported on a Kimi-K3 target "
+            f"({sorted(_K3_DFLASH_TARGET_ARCHS)}); the target is {target_arch!r}."
+        )
+
+
+def _normalize_draft_dspark_config(
+    hf_config: PretrainedConfig, *, dflash: bool = False
+) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
     DSpark checkpoints come in two shapes and name the same quantities
@@ -1256,6 +1279,12 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
       and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
       lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
+    - SpecForge-trained (DFlash) drafts are standalone too, but nest the first
+      two under ``dflash_config`` (an alias above) and record the trained block
+      width as ``block_size``, which only ``dflash=True`` promotes. SpecForge
+      builds them on a plain ``Qwen3Config``, so the backbone is GQA rather
+      than MLA -- which this function does not care about, but the log line
+      below does.
     """
     target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
@@ -1284,17 +1313,39 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
 
-    # NOTE: no `dspark_block_size` here. Unlike V4-Pro-DSpark and the SpecForge
-    # SpecForge DFlash checkpoints, this config carries no block width: the draft is
-    # width-agnostic in its weights and the block is sized by
-    # --num-speculative-tokens (7 in the checkpoint's own serving recipe).
-    # DSparkProposer._resolve_mtp_k falls back to that.
+    # The trained block width, where the checkpoint records one. K3-DSpark does
+    # not: its draft is width-agnostic in its weights and the block is sized by
+    # --num-speculative-tokens (7 in that checkpoint's own serving recipe), so
+    # `dspark_block_size` stays unset and DSparkProposer._resolve_mtp_k falls
+    # back to the flag. SpecForge DFlash checkpoints DO record it, as a
+    # `block_size`. Recording it does not pin the verify horizon --
+    # `_resolve_mtp_k` still returns --num-speculative-tokens -- it
+    # only lets Config.__post_init__ warn when the horizon runs past the
+    # trained width.
+    #
+    # Read ONLY on the DFlash path. `block_size` is a loose generic HF key that
+    # another checkpoint may carry meaning something else entirely (a paging or
+    # windowing width), and this function also normalizes the MLA K3-DSpark
+    # shape, which must keep falling through to --num-speculative-tokens.
+    # `dflash` is the caller's assertion that this checkpoint's `block_size` is
+    # the SpecForge-trained verify width; nothing else promotes one.
+    if dflash:
+        dflash_config = getattr(hf_config, "dflash_config", None) or {}
+        block_size = dflash_config.get("block_size") or getattr(
+            hf_config, "block_size", None
+        )
+        if block_size:
+            hf_config.dspark_block_size = int(block_size)
 
+    # The backbone is the draft's own business, but say which one so a
+    # mis-detected flavor is visible in the log rather than only in acceptance.
+    backbone = "MLA" if getattr(hf_config, "kv_lora_rank", None) else "GQA"
     logger.info(
-        "Detected DSpark drafter with a separate draft model "
+        f"Detected {backbone} DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
-        f"mask_token_id={hf_config.dspark_noise_token_id})"
+        f"mask_token_id={hf_config.dspark_noise_token_id}, "
+        f"block_size={getattr(hf_config, 'dspark_block_size', None)})"
     )
 
 
@@ -1416,10 +1467,12 @@ class SpeculativeConfig:
 
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
-        :func:`_normalize_draft_dspark_config`, which runs from
-        :meth:`hf_config_override` when the draft's architecture is in
-        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
-        through that normalization.
+        :func:`_normalize_draft_dspark_config`, which :meth:`hf_config_override`
+        runs for every architecture in ``_STANDALONE_DSPARK_ARCHS`` AND for a
+        SpecForge DFlash draft (``DSparkDraftModel`` with a ``dflash_config``,
+        renamed to ``K3DFlashModel``, which is not in that set). So it is set for
+        exactly the configs that went through that normalization -- ask this, not
+        set membership.
         """
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
@@ -1523,6 +1576,20 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        # SpecForge DFlash drafts, before the standalone-arch test below: they
+        # are standalone DSpark checkpoints too, but their arch is
+        # `DSparkDraftModel` -- not in `_STANDALONE_DSPARK_ARCHS` -- and
+        # SpecForge stamps that same string on every DFlash draft regardless of
+        # target. So key on the nested `dflash_config` the
+        # backbone actually needs, and rename to an arch that identifies the
+        # model. The rename also resolves a collision: `DSparkDraftModel` is
+        # already the name of ATOM's draft base class in
+        # atom/models/dspark_draft.py, and `support_draft_model_arch_dict` is a
+        # bare dict index keyed on this string.
+        if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
+            hf_config.architectures = ["K3DFlashModel"]
+            _normalize_draft_dspark_config(hf_config, dflash=True)
+            return
         if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
@@ -2394,6 +2461,27 @@ class Config:
                     "decode and DCP is unverified. Use --enable-tbo (prefill "
                     "only), or drop DCP or speculative decode."
                 )
+                # A draft that owns its own GQA/MHA pool would be sharded on the
+                # head axis (TP) and the token axis (DCP) at once, which cannot
+                # be reassembled and shows only as lost acceptance. The DFlash
+                # draft avoids it by staying out of the DCP group; MLA drafts
+                # share the target's latent rows and own no pool. Keyed on pool
+                # ownership, not the attention family: `--method mtp` reuses the
+                # target's hf config, whose family is never `Family.MLA`.
+                from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
+
+                draft_hf = self.speculative_config.draft_model_hf_config
+                if draft_kv_conflicts_with_dcp(draft_hf):
+                    raise ValueError(
+                        "Decode context parallel (--decode-context-parallel-size "
+                        f"{self.decode_context_parallel_size}) with a non-MLA "
+                        "draft that owns its own KV pool is only supported for the "
+                        "DFlash block drafter, which stays out of the DCP "
+                        "group so its tokens are never DCP-sharded. This draft "
+                        f"({(getattr(draft_hf, 'architectures', None) or ['?'])[0]}) "
+                        "would be sharded on BOTH the head and the token axis, "
+                        "which is unreconstructible. Disable DCP for this draft."
+                    )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups
@@ -2583,6 +2671,7 @@ class Config:
             num_spec = self.speculative_config.num_speculative_tokens
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
+            _check_dflash_draft_target(self.hf_config, draft_cfg)
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
                 # backbone pass, and the drafter just repeats that pass, so the

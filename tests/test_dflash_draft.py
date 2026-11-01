@@ -1,0 +1,1359 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Unit tests for the SpecForge DFlash draft (RadixArk/Kimi-K3-DSpark).
+
+The config-normalization and fold tests run on CPU; the rest need the
+aiter/triton stack and skip without it, and the kernel checks need a GPU.
+Covers the things that decide whether the draft is even reachable, and that no
+amount of GPU bring-up would localize:
+
+- config normalization: the arch rename and the nested ``dflash_config`` lift
+- attention-flavor resolution: the draft must resolve to MHA and own a KV pool
+- KV-pool geometry: the scheduler block size, and the DCP head-sharding
+  invariant that makes a DCP8 step additive rather than a rewrite
+- the block read: the fold that makes aiter's causal `unified_attention` read
+  the block bidirectionally, and that read against an fp32 reference
+
+The checkpoint these mirror is ``RadixArk/Kimi-K3-DSpark``: a 5-layer Qwen3-style
+GQA draft (64 q / 16 kv heads, head_dim 64) for the Kimi-K3 MLA+KDA target.
+"""
+
+import types
+
+import pytest
+
+
+def _gpu_stack_import(name):
+    """Import an atom module that may need the aiter/triton GPU stack.
+
+    Tries the import first, so a module that imports fine without the stack
+    still runs on the CPU-only CI runner. A failure is turned into a skip only
+    when the stack is genuinely absent -- no aiter or triton, or no GPU for
+    aiter to probe the arch of at import. On a GPU host any import error FAILS.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        try:
+            importlib.import_module("aiter")
+            importlib.import_module("triton")
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception as e:  # noqa: BLE001 - any failure here means no stack
+            pytest.skip(f"{name} needs the aiter/triton stack, absent here: {e}")
+        if not gpu:
+            pytest.skip(f"{name} needs a GPU: aiter probes the arch at import")
+        raise
+
+
+def _radixark_cfg(**overrides):
+    """The RadixArk checkpoint's config.json, as transformers hands it over."""
+    cfg = types.SimpleNamespace(
+        architectures=["DSparkDraftModel"],
+        model_type="qwen3",
+        block_size=7,
+        dflash_config={
+            "mask_token_id": 163824,
+            "target_layer_ids": [7, 23, 51, 67, 83],
+        },
+        head_dim=64,
+        hidden_size=7168,
+        intermediate_size=14336,
+        num_attention_heads=64,
+        num_hidden_layers=5,
+        num_key_value_heads=16,
+        num_target_layers=93,
+        markov_rank=256,
+        markov_head_type="vanilla",
+        enable_confidence_head=True,
+        vocab_size=163840,
+        max_position_embeddings=1048576,
+        rms_norm_eps=1e-05,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 16.0,
+            "original_max_position_embeddings": 65536,
+            "rope_theta": 10000.0,
+        },
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    cfg.update = lambda d: [setattr(cfg, k, v) for k, v in d.items()]
+    return cfg
+
+
+# --------------------------------------------------------------------------
+# Config normalization
+# --------------------------------------------------------------------------
+
+
+def test_dflash_config_normalize():
+    """DSparkDraftModel + dflash_config -> K3DFlashModel with lifted fields."""
+    from atom.config import SpeculativeConfig
+
+    hf = _radixark_cfg()
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+
+    # Renamed away from the SpecForge string, which collides with ATOM's own
+    # draft base class and is reused across every DFlash draft.
+    assert hf.architectures == ["K3DFlashModel"]
+
+    # Lifted out of the nested dflash_config onto the canonical names.
+    assert hf.dspark_target_layer_ids == [7, 23, 51, 67, 83]
+    assert hf.dspark_noise_token_id == 163824
+    assert hf.dspark_markov_rank == 256
+    assert hf.dspark_with_draft is True
+
+    # The trained block width, recorded so the horizon can be warned against.
+    assert hf.dspark_block_size == 7
+
+    # num_target_layers is the TARGET's depth, not the aux-tap count. The fusion
+    # width is len(target_layer_ids); sizing off 93 would be a 93/5 overshoot.
+    assert hf.num_target_layers == 93
+    assert len(hf.dspark_target_layer_ids) == 5
+
+
+def test_dflash_rope_is_the_drafts_own():
+    """`hf_config_override` leaves the draft's theta 10000 / YaRN x16 alone; the
+    target's theta 50000 / x32 would load clean and only move acceptance."""
+    from atom.config import SpeculativeConfig
+
+    hf = _radixark_cfg()
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+
+    assert hf.rope_parameters["rope_theta"] == 10000.0
+    assert hf.rope_parameters["factor"] == 16.0
+    assert hf.rope_parameters["original_max_position_embeddings"] == 65536
+
+
+def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
+    """The MLA K3-DSpark draft keeps its own route and gains no block size."""
+    from atom.config import SpeculativeConfig
+
+    hf = types.SimpleNamespace(
+        architectures=["K3DSparkModel"],
+        model_type="k3_dspark",
+        target_layer_ids=[2, 23, 47, 71, 89],
+        mask_token_id=163837,
+        markov_rank=256,
+        kv_lora_rank=512,
+    )
+    hf.update = lambda d: [setattr(hf, k, v) for k, v in d.items()]
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+
+    assert hf.architectures == ["K3DSparkModel"]
+    assert hf.dspark_target_layer_ids == [2, 23, 47, 71, 89]
+    assert hf.dspark_noise_token_id == 163837
+    assert hf.dspark_with_draft is True
+    # This checkpoint records no width; the block is --num-speculative-tokens.
+    assert getattr(hf, "dspark_block_size", None) is None
+
+
+def test_dflash_branch_needs_dflash_config():
+    """A bare DSparkDraftModel with no dflash_config is NOT claimed as DFlash.
+
+    SpecForge stamps that arch on every DFlash draft, so the arch string alone
+    is not a model identity; claiming it would silently bind the wrong class.
+    """
+    from atom.config import SpeculativeConfig
+
+    hf = _radixark_cfg(dflash_config=None)
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+
+    # Unclaimed: the arch is left alone and no dspark_* marker is synthesized,
+    # so the drafter registry raises a KeyError on an unknown arch rather than
+    # binding this checkpoint to the Kimi-K3 draft class.
+    assert hf.architectures == ["DSparkDraftModel"]
+    assert getattr(hf, "dspark_with_draft", False) is False
+    assert getattr(hf, "dspark_target_layer_ids", None) is None
+
+
+def test_dflash_plain_qwen3_target_is_untouched():
+    """model_type qwen3 is a legitimate TARGET type and must not be routed."""
+    from atom.config import SpeculativeConfig
+
+    hf = types.SimpleNamespace(
+        architectures=["Qwen3ForCausalLM"],
+        model_type="qwen3",
+        num_hidden_layers=64,
+    )
+    hf.update = lambda d: [setattr(hf, k, v) for k, v in d.items()]
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+
+    assert hf.architectures == ["Qwen3ForCausalLM"]
+    assert getattr(hf, "dspark_with_draft", False) is False
+
+
+# --------------------------------------------------------------------------
+# Attention flavor
+# --------------------------------------------------------------------------
+
+
+def test_dflash_resolves_to_mha_not_mla():
+    """No kv_lora_rank -> MHA family.
+
+    This is the fork that hands the draft a sibling KV pool instead of binding
+    it into the target's latent rows, and it is decided by SHAPE (the absence of
+    a latent rank), not by a model-type list -- so it must hold for a draft
+    whose model_type is the same `qwen3` a target could carry.
+
+    Kept off `get_attn_backend`, which reads the GPU arch through rocminfo; the
+    DRAFT_OWNS_KV_POOL flag it would return is asserted separately below.
+    """
+    selector = _gpu_stack_import("atom.utils.selector")
+
+    assert selector.attn_family(_radixark_cfg()) is selector.Family.MHA
+    # The MLA draft it sits beside must still resolve the other way.
+    assert (
+        selector.attn_family(
+            types.SimpleNamespace(model_type="k3_dspark", kv_lora_rank=512)
+        )
+        is not selector.Family.MHA
+    )
+
+
+def test_dflash_backend_owns_a_kv_pool():
+    """The MHA backend answers "yes" to owning a draft pool.
+
+    A GQA draft caches rows the target's MLA pool cannot express, so it has to
+    own a sibling pool; `draft_kv_builder` returns None for any backend that
+    says otherwise, and the draft would then silently have no KV at all.
+    """
+    mod = _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+    assert mod.AiterBackend.DRAFT_OWNS_KV_POOL is True
+
+
+# --------------------------------------------------------------------------
+# KV pool geometry
+# --------------------------------------------------------------------------
+
+
+def _pool(block_size, world_size, kv_dtype=None, blocks_per_entry=1):
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+
+    hf = _radixark_cfg()
+    return MhaKvPool.from_hf_config(
+        hf,
+        world_size=world_size,
+        kv_dtype=kv_dtype or torch.float8_e4m3fn,
+        layers=5,
+        block_size=block_size,
+        blocks_per_entry=blocks_per_entry,
+        per_tensor_scales=True,
+    )
+
+
+def test_dflash_pool_needs_the_scheduler_block_size():
+    """The pool must be built at the scheduler's block, not an MLA kernel page.
+
+    An MLA target's builder pages at ATOM_MLA_PAGE_SIZE (1 by default). Sizing
+    the draft pool from it cannot even construct -- SHUFFLE packs 16 elements
+    per tile and 16 does not divide 1 -- which is why DraftKvBuilder reads
+    model_runner.block_size.
+    """
+    _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
+    assert _pool(block_size=128, world_size=8).block_size == 128
+    with pytest.raises(ValueError, match="SHUFFLE"):
+        _pool(block_size=1, world_size=8)
+
+
+@pytest.mark.parametrize("tp,dcp", [(8, 1), (8, 2), (8, 8)])
+def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
+    """A wider entry over fewer blocks is the same per-rank footprint.
+
+    The draft is NOT in the dcp group: its KV heads are sharded by the full TP
+    world size whatever `-dcp` says, and every rank holds the whole token axis.
+    What moves with dcp is the ENTRY: one target block id addresses
+    `block_size * dcp` global positions, so the pool is built with
+    `blocks_per_entry = dcp` -- `entry_bytes` grows by dcp while the number of
+    entries a request needs falls by dcp.
+
+    This pins the arithmetic; `test_dflash_pool_is_built_at_full_tp` pins that
+    `draft_kv_builder` builds this geometry.
+    """
+    _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
+    pool = _pool(block_size=128, world_size=tp, blocks_per_entry=dcp)
+
+    # Full TP, every dcp: 16 KV heads over 8 ranks is 2 each.
+    assert pool.num_kv_heads == 16 // tp
+    assert pool.entry_tokens == 128 * dcp
+
+    # A sequence of SEQ global tokens needs SEQ/(128*dcp) entries, each
+    # `dcp` times as wide. 163840 B is the one-block cost at 2 KV heads
+    # (5 layers x {k,v} x 2 heads x 64 head_dim x 128 tokens x 1 B, and not a
+    # byte of field alignment); the product below is what must not move.
+    # (163840 / 128 = 1280 B per token per rank.)
+    seq = 128 * 8 * 4
+    entries = seq // (128 * dcp)
+    assert pool.entry_bytes * entries == 163840 * (seq // 128), (
+        f"per-rank draft KV moved with dcp: {pool.entry_bytes} B/entry x "
+        f"{entries} entries at dcp={dcp}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Non-causal KV: the predicate and the dtype it forces
+# --------------------------------------------------------------------------
+
+
+def _normalized_radixark():
+    from atom.config import SpeculativeConfig
+
+    hf = _radixark_cfg()
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+    return hf
+
+
+def test_dflash_uses_dflash_pool():
+    """Only the SpecForge DFlash draft owns the DCP1 FLASH-layout pool."""
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
+    assert dk.uses_dflash_pool(_normalized_radixark()) is True
+
+    # MiniMax-M3.1's DSpark draft is ALSO a non-MLA block drafter with a pool of
+    # its own, but it binds a SHUFFLE pool with per-token scales; keying on
+    # "non-MLA block drafter" handed it this one.
+    minimax = types.SimpleNamespace(
+        architectures=["DSparkMiniMaxDraftModel"], dspark_with_draft=True
+    )
+    assert dk.uses_dflash_pool(minimax) is False
+
+    # The MLA DSpark draft binds into the target's latent rows: no pool.
+    mla = types.SimpleNamespace(
+        architectures=["K3DSparkModel"], dspark_with_draft=True, kv_lora_rank=512
+    )
+    assert dk.uses_dflash_pool(mla) is False
+
+    # A serial MTP/EAGLE draft, and a config with no architectures at all.
+    eagle = types.SimpleNamespace(architectures=["Eagle3LlamaModel"])
+    assert dk.uses_dflash_pool(eagle) is False
+    assert dk.uses_dflash_pool(types.SimpleNamespace(num_hidden_layers=1)) is False
+
+
+def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
+    """The draft caches fp8 beside an fp8 target, at ONE per-tensor scale.
+
+    SGLang serves this checkpoint with `--speculative-draft-kv-cache-dtype
+    fp8_e4m3`, and both ends of ATOM's pool take exactly the scale it stores:
+    `aiter.reshape_and_cache_flash` dereferences `*k_scale` once per launch and
+    `unified_attention` loads one `k_descale` per program. Neither can read a
+    per-(kv head, token) plane, so the pool must declare none -- `per_tensor_
+    scales=True`. Getting that wrong is not a crash: both read the plane's
+    first element and apply it to every token.
+
+    The platform's fp8 -- `d_dtypes["fp8"]`, as the target's pool is:
+    `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
+    """
+
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
+    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+
+    seen = {}
+
+    class _Backend:
+        DRAFT_OWNS_KV_POOL = True
+
+        @staticmethod
+        def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
+            seen["kv_dtype"] = kv_dtype
+            seen.update(kw)
+            return object()
+
+    runner = _stub_runner()
+    hf = _normalized_radixark()
+
+    # Patch the SELECTOR module, not draft_kv: `draft_kv_builder` imports
+    # attn_family/get_attn_backend function-locally, so a module-attribute
+    # patch on draft_kv would never be consulted.
+    from unittest import mock
+
+    from atom.utils import selector
+
+    with (
+        mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
+        mock.patch.object(selector, "attn_family", lambda _c: None),
+    ):
+        builder = dk.draft_kv_builder(runner, hf)
+
+    assert builder is not None
+    builder._make_pool(layers=5, target_block_size=128)
+    from aiter import dtypes
+
+    assert seen["kv_dtype"] is dtypes.d_dtypes["fp8"], (
+        f"draft pool must take the target's fp8 ({dtypes.d_dtypes['fp8']}), "
+        f"got {seen['kv_dtype']}"
+    )
+    assert seen["per_tensor_scales"] is True
+
+    # ... and the pool it describes really has no scale region.
+    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
+
+    pool = MhaKvPool.from_hf_config(
+        hf,
+        world_size=8,
+        block_size=128,
+        layers=5,
+        kv_dtype=dtypes.d_dtypes["fp8"],
+        per_tensor_scales=True,
+    )
+    assert pool.scale_fields == []
+    pool.allocate(4, "cpu")
+    with pytest.raises(KeyError):
+        pool.scale_views(0)
+
+
+# --------------------------------------------------------------------------
+# D1: the draft's effective TP, and the plumbing that carries it
+# --------------------------------------------------------------------------
+
+
+def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
+    """A ModelRunner stand-in carrying only what `draft_kv_builder` reads.
+
+    `world_size` IS `config.tensor_parallel_size` on the real runner
+    (model_runner.py); both are present so a regression that goes back to
+    reading `world_size` is visible as a wrong number rather than an
+    AttributeError.
+    """
+    return types.SimpleNamespace(
+        world_size=tp,
+        config=types.SimpleNamespace(
+            kv_cache_dtype=kv_cache_dtype,
+            tensor_parallel_size=tp,
+            decode_context_parallel_size=dcp,
+        ),
+    )
+
+
+@pytest.mark.parametrize("tp,dcp", [(8, 1), (8, 2), (8, 8)])
+def test_dflash_pool_is_built_at_full_tp(tp, dcp):
+    """`draft_kv_builder` must size the pool at FULL TP, `dcp` blocks an entry.
+
+    The draft does not join the dcp group, so its KV heads shard by the whole
+    TP world and every rank holds the whole token axis. What DCP costs it is
+    the ENTRY: one target block id spans `block_size * dcp` global positions.
+    The alternative (heads replicated at tp // dcp, tokens sharded) has the
+    same per-rank bytes but needs an LSE merge across ranks the read does not
+    return, so this pins which of the two is built.
+    """
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
+    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+    from unittest import mock
+
+    from atom.utils import selector
+
+    seen = {}
+
+    class _Backend:
+        DRAFT_OWNS_KV_POOL = True
+
+        @staticmethod
+        def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
+            seen["world_size"] = world_size
+            seen.update(kw)
+            return object()
+
+    hf = _normalized_radixark()
+    with (
+        mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
+        mock.patch.object(selector, "attn_family", lambda _c: None),
+    ):
+        builder = dk.draft_kv_builder(_stub_runner(tp=tp, dcp=dcp), hf)
+
+    builder._make_pool(layers=5, target_block_size=128)
+    assert seen["world_size"] == tp
+    assert seen["blocks_per_entry"] == dcp
+
+
+# --------------------------------------------------------------------------
+# The target feature: Kimi-K3's aggregate stream
+# --------------------------------------------------------------------------
+#
+# Kimi-K3 carries a BANK of per-`attn_res_block_size` snapshots plus a running
+# PREFIX, recombined by a softmax mixture. The generic aux extractor hands a
+# draft the prefix; SpecForge trained THIS draft against a live SGLang target,
+# whose dspark tap returns the mixture. Feeding it the prefix instead measured
+# -6.43 pp acceptance on GSM8K.
+#
+# The routing is by draft CLASS, not by a flag: `KimiK3DFlash` implements
+# `target_aux_capture_spec`, the MLA draft beside it deliberately does not. The
+# tests below pin both halves of that, because the failure mode in either
+# direction is silent -- a draft fed the wrong feature still proposes tokens,
+# they are just accepted less often.
+
+
+def _fake_attn_res_kernel(monkeypatch, calls):
+    """Stand in for `atom.model_ops.kimi_k3`, which needs aiter and a GPU.
+
+    The draft imports `apply_attn_res` inside the extract, so swapping the
+    module in `sys.modules` is enough -- and it keeps these tests CPU-only,
+    which is the only way they run in CI at all. The stand-in records the
+    ARGUMENTS the draft marshals and returns a sentinel, so a test can check the
+    extract hands back the kernel's result rather than the prefix.
+    """
+    import sys
+
+    import torch
+
+    module = types.ModuleType("atom.model_ops.kimi_k3")
+
+    def apply_attn_res(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden=None,
+        out_norm_weight=None,
+        out_eps=1e-6,
+        add_hidden2=None,
+        quant_dtype=None,
+    ):
+        result = torch.full_like(prefix_sum, 7.0)
+        calls.append(
+            {
+                "result": result,
+                "prefix": prefix_sum,
+                "bank": block_residual,
+                "score_weight": score_weight,
+                "eps": eps,
+                "out_norm_weight": out_norm_weight,
+                "quant_dtype": quant_dtype,
+            }
+        )
+        return result, None
+
+    module.apply_attn_res = apply_attn_res
+    monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", module)
+    return calls
+
+
+def _k3_aux_hidden_state(output):
+    """`KimiDecoderLayer.aux_hidden_state`, transcribed.
+
+    The real one lives on a `@support_torch_compile` model whose import pulls in
+    aiter; its contract -- (prefix_sum, *pendings, block_residual), pendings
+    summed back into the prefix -- is all the extract under test depends on.
+    """
+    prefix_sum, *pendings, _bank = output
+    if prefix_sum is None:
+        return None
+    for pending in pendings:
+        if pending is not None:
+            prefix_sum = prefix_sum + pending
+    return prefix_sum
+
+
+def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
+    """A Kimi-K3 target, down to what aux capture reads off it.
+
+    `_resolve_decoder_layers` wants `.layers`; the extract wants each layer's
+    `layer_idx` and `aux_hidden_state`, and the NEXT layer's
+    `self_attention_attn_res` (that is the whole reason the hook needs the
+    target model and not just the tapped block).
+    """
+    import torch
+
+    torch.manual_seed(0)
+    layers = [
+        types.SimpleNamespace(
+            layer_idx=i,
+            aux_hidden_state=_k3_aux_hidden_state,
+            self_attention_attn_res=types.SimpleNamespace(
+                enabled=enabled,
+                block_size=block_size,
+                eps=1e-6,
+                out_eps=1e-5,
+                score_weight=torch.randn(hidden) * 0.1,
+            ),
+        )
+        for i in range(n_layers)
+    ]
+    return types.SimpleNamespace(layers=layers)
+
+
+def _dflash_spec(target, layer_ids, hidden=16):
+    """Resolve `KimiK3DFlash`'s capture spec without building the draft.
+
+    Called unbound on purpose: the method reads nothing off `self` (its inputs
+    are the tap ids, the target's hidden size, and the target model), and
+    constructing the real draft would want a loaded checkpoint, a TP group and
+    a GPU.
+    """
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    return dflash.KimiK3DFlash.target_aux_capture_spec(None, layer_ids, hidden, target)
+
+
+def _generic_extract():
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    return proposer.DSparkProposer._extract_layer_hidden
+
+
+def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
+    """(a) The draft resolves to its OWN extract, and that extract mixes.
+
+    Both halves matter: resolving to its own spec is what makes the routing
+    draft-owned, and the extract returning the mixture rather than the prefix is
+    the feature itself.
+    """
+    torch = pytest.importorskip("torch")
+    generic = _generic_extract()
+
+    hidden, block_size = 16, 4
+    target = _k3_target_stub(hidden=hidden, n_layers=16, block_size=block_size)
+    # Tap 6, not 7: with block_size 4 the ceiling and the floor of
+    # (lid + 1) / block_size differ there, so the bank slice below actually
+    # pins the rounding.
+    spec = _dflash_spec(target, (6, 11), hidden=hidden)
+
+    assert spec.layer_ids == (6, 11)
+    assert spec.hidden_size == hidden
+    assert spec.capture == "output"  # an OUTPUT tap; V4.1's is an input tap
+    assert spec.extract is not generic
+
+    calls = _fake_attn_res_kernel(monkeypatch, [])
+    rows = 5
+    prefix = torch.randn(rows, hidden)
+    pending = torch.randn(rows, hidden)
+    bank = torch.randn(rows, 6, hidden)
+    block = target.layers[6]
+
+    out = spec.extract((prefix, pending, bank), block)
+
+    # The prefix half is still the generic reconstruction: the layer's deferred
+    # addends folded back in. The aggregate is a mixture OF that, not a
+    # replacement for it.
+    reconstructed = generic((prefix, pending, bank), block)
+    assert torch.allclose(reconstructed, prefix + pending)
+
+    # nvb is a CEILING, matching SGLang's `prev_valid_blocks`: layer 6 sits
+    # above ceil(7 / 4) = 2 closed blocks (a floor would say 1), so only 2 of
+    # the bank's 6 rows are candidates.
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["bank"].shape == (rows, 2, hidden)
+    assert torch.equal(call["bank"], bank[:, :2, :])
+    assert torch.equal(call["prefix"], reconstructed)
+    # Scored by the NEXT layer's attn-residual weights -- the one thing only the
+    # target model can supply.
+    res = target.layers[7].self_attention_attn_res
+    assert call["score_weight"] is res.score_weight
+    assert call["eps"] == res.eps
+    # Un-normed and unquantized: SGLang's aggregate is the bare mixture.
+    assert call["out_norm_weight"] is None
+    assert call["quant_dtype"] is None
+
+    # The kernel's mixture, not the plain post-layer hidden state.
+    assert out is call["result"]
+
+
+def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
+    """A layer the draft does not tap keeps the plain reconstruction.
+
+    The hook is installed per tapped layer, but ONE extract serves all of them,
+    so it dispatches on the block it is handed. A miss must degrade to the
+    prefix rather than mix against another layer's bank.
+    """
+    torch = pytest.importorskip("torch")
+    hidden = 16
+    target = _k3_target_stub(hidden=hidden)
+    spec = _dflash_spec(target, (6, 11), hidden=hidden)
+
+    calls = _fake_attn_res_kernel(monkeypatch, [])
+    prefix = torch.randn(3, hidden)
+    bank = torch.randn(3, 6, hidden)
+
+    out = spec.extract((prefix, None, bank), target.layers[5])
+    assert torch.equal(out, prefix)
+    assert calls == []
+
+    # Fewer closed blocks than the tap implies: nothing to mix against.
+    short = spec.extract((prefix, None, bank[:, :1, :]), target.layers[6])
+    assert torch.equal(short, prefix)
+    assert calls == []
+
+
+def test_dflash_falls_back_when_the_target_has_no_attn_residuals():
+    """No attn-residual sites -> the prefix IS the whole stream.
+
+    Guards the shape of the degradation: the draft must not try to mix against
+    a bank that does not exist, and must not raise either -- the generic
+    extractor is a correct answer for a target with no mixture.
+    """
+    generic = _generic_extract()
+    target = _k3_target_stub(enabled=False)
+    spec = _dflash_spec(target, (7, 11))
+    assert spec.extract is generic
+
+
+def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
+    """(b) REGRESSION GUARD. The Inferact MLA draft must NOT get the aggregate.
+
+    `Inferact/Kimi-K3-DSpark` was trained through vLLM/HF against the plain
+    residual stream. Measured, the aggregate costs it ~2.6 pp acceptance -- and
+    it is the draft `.github/benchmark/models_accuracy.json` tracks. It keeps
+    the prefix by not implementing the hook at all.
+    """
+    dspark = _gpu_stack_import("atom.models.kimi_k3_dspark")
+    proposer_mod = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    DSparkProposer = proposer_mod.DSparkProposer
+
+    assert not hasattr(dspark.KimiK3DSpark, "target_aux_capture_spec")
+
+    # ...and that absence must actually route it to the generic extractor.
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.model = dspark.KimiK3DSpark.__new__(dspark.KimiK3DSpark)
+    proposer.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(dspark_target_layer_ids=[7, 11])
+    )
+    proposer.config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(hidden_size=16)
+    )
+    spec = proposer._aux_capture_spec(_k3_target_stub())
+    assert spec.extract is DSparkProposer._extract_layer_hidden
+    assert spec.capture == "output"
+    assert spec.layer_ids == (7, 11)
+
+
+def test_dsv41_dspark_still_owns_its_input_tap():
+    """(c) The signature widening must not disturb the other implementor.
+
+    V4.1 reads its feature off the tapped block's own input and needs nothing
+    from the target model; it takes the new argument and ignores it. Pinned
+    because the call site passes it POSITIONALLY to every implementor -- there
+    is no `inspect.signature` sniffing that could quietly skip it.
+    """
+    v41 = _gpu_stack_import("atom.models.deepseek_v41.dspark")
+    model = v41.DeepseekV41DSpark.__new__(v41.DeepseekV41DSpark)
+    model.config = types.SimpleNamespace(engram_layer_ids=[1, 2, 3])
+
+    spec = model.target_aux_capture_spec((37, 38, 39), 7168, _k3_target_stub())
+    assert spec.layer_ids == (37, 38, 39)
+    assert spec.hidden_size == 7168
+    assert spec.capture == "input"
+    assert spec.extract is v41.DeepseekV41DSpark._target_layer_input
+
+    # The Engram guard still fires, i.e. the extra argument did not shift the
+    # ones it reads.
+    with pytest.raises(ValueError, match="Engram"):
+        model.target_aux_capture_spec((1, 37), 7168, _k3_target_stub())
+
+
+def test_dspark_proposer_hands_the_target_model_to_the_draft():
+    """The call site passes the target model through, positionally.
+
+    This is the plumbing the K3 aggregate needs: without it the draft cannot
+    reach layer `lid + 1`'s scoring weights, and the feature silently degrades
+    to the prefix.
+    """
+    proposer_mod = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    from atom.spec_decode.drafter import AuxCaptureSpec
+
+    seen = {}
+
+    def own(layer_ids, hidden_size, target_model):
+        seen.update(
+            layer_ids=layer_ids, hidden_size=hidden_size, target_model=target_model
+        )
+        return AuxCaptureSpec(layer_ids, hidden_size, lambda output, block: None)
+
+    proposer = proposer_mod.DSparkProposer.__new__(proposer_mod.DSparkProposer)
+    proposer.model = types.SimpleNamespace(target_aux_capture_spec=own)
+    proposer.speculative_config = types.SimpleNamespace(
+        draft_model_hf_config=types.SimpleNamespace(dspark_target_layer_ids=[7, 11])
+    )
+    proposer.config = types.SimpleNamespace(
+        hf_config=types.SimpleNamespace(hidden_size=16)
+    )
+    target = _k3_target_stub()
+
+    proposer._aux_capture_spec(target)
+    assert seen == {"layer_ids": (7, 11), "hidden_size": 16, "target_model": target}
+
+
+# --------------------------------------------------------------------------- #
+# the DCP admission guard (config.py __post_init__)
+#
+# The guard refuses DCP for a draft that owns a sibling KV pool unless it is
+# the DFlash pool (`uses_dflash_pool`). These call the predicate `config.py`
+# raises on (`draft_kv_conflicts_with_dcp`).
+# --------------------------------------------------------------------------- #
+
+
+def _guard_refuses(draft_hf):
+    """The production predicate under `Config`'s DCP guard."""
+    # get_attn_backend resolves to aiter_attention, which imports aiter at module
+    # load and probes the GPU arch there.
+    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+    from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
+
+    return draft_kv_conflicts_with_dcp(draft_hf)
+
+
+def test_dcp_guard_admits_the_dflash_draft():
+    """DFlash owns a pool but stays out of the dcp group, so DCP is fine."""
+    draft_hf = _normalized_radixark()
+    assert _guard_refuses(draft_hf) is False
+
+
+def test_dcp_guard_refuses_a_pool_owning_causal_draft():
+    """An Eagle3-llama style MHA draft double-shards: head axis AND token axis.
+
+    This is the case the guard exists for. It owns a sibling pool like DFlash
+    does, but is not the DFlash pool, so it would be DCP-sharded -- and the
+    failure is silent (lost acceptance length, no fault), which is why it must
+    be refused at launch rather than diagnosed later.
+    """
+    draft_hf = types.SimpleNamespace(
+        architectures=["LlamaForCausalLMEagle3"],
+        model_type="llama",
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        num_hidden_layers=1,
+    )
+    assert _guard_refuses(draft_hf) is True
+
+
+def test_dcp_guard_admits_an_mtp_draft():
+    """`--method mtp` must still pass.
+
+    For mtp the draft hf config IS the target's, so `attn_family` returns the
+    TARGET's family (KIMI_MLA here), whose backend leaves `DRAFT_OWNS_KV_POOL`
+    at the default False: a latent-KV draft shares the target's cache and owns
+    no sibling pool. Keying on ownership rather than on `Family.MLA` is what
+    keeps `recipes/Agentic-GLM-5.2.md`'s documented
+    `--method mtp --decode-context-parallel-size 4` working.
+    """
+    target_hf = types.SimpleNamespace(
+        architectures=["KimiK3ForCausalLM"],
+        model_type="kimi_k3",
+        num_attention_heads=64,
+        num_hidden_layers=2,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+    )
+    assert _guard_refuses(target_hf) is False
+
+
+# --------------------------------------------------------------------------- #
+# draft pool addressing (dspark_proposer)
+#
+# The property and `_publish_draft_ctx_slots` are the REAL methods, called on a
+# stub carrying real forward buffers. The proposer module imports triton, so
+# these skip on the CPU-only runner and run in the GPU batch.
+# --------------------------------------------------------------------------- #
+
+
+def _entry_tokens(block_size, dcp, dflash_pool):
+    """Call the real property against a minimal stub."""
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    DSparkProposer = proposer.DSparkProposer
+
+    stub = types.SimpleNamespace(
+        runner=types.SimpleNamespace(block_size=block_size),
+        dcp_world_size=dcp,
+        _draft_uses_dflash_pool=dflash_pool,
+    )
+    return DSparkProposer._draft_entry_tokens.fget(stub)
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 8])
+def test_draft_entry_spans_the_global_block_for_the_gqa_draft(dcp):
+    """A draft outside the dcp group stores all `block_size * dcp` positions.
+
+    The target's block id addresses `block_size` LOCAL tokens per rank. The
+    DFlash draft is not in the dcp group, so one id has to cover the whole
+    virtual block `dcp_prefill_slot_mapping` writes.
+    """
+    assert _entry_tokens(128, dcp, dflash_pool=True) == 128 * dcp
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 8])
+def test_draft_entry_is_the_plain_block_for_the_mla_draft(dcp):
+    """A DCP-sharded draft addresses in LOCAL terms -- one id, one block."""
+    assert _entry_tokens(128, dcp, dflash_pool=False) == 128
+
+
+def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
+    """Drive the real `_publish_draft_ctx_slots`; return what it published."""
+    import torch
+
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttentionMetaData
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    rows = max(running_bs or 0, len(seqlens))
+    bt = CpuGpuBuffer(rows, len(tables[0]), dtype=torch.int32, device=dev)
+    bt.np[: len(tables)] = tables
+    cu = CpuGpuBuffer(rows + 1, dtype=torch.int32, device=dev)
+    # Flat over the padded tail, as `prepare_cu_seqlens_q` leaves it.
+    cu.np[1 : len(seqlens) + 1] = torch.tensor(seqlens).cumsum(0).numpy()
+    cu.np[len(seqlens) + 1 :] = cu.np[len(seqlens)]
+    cu.copy_to_gpu()
+    n_tok = 64
+    stub = types.SimpleNamespace(
+        runner=types.SimpleNamespace(
+            block_size=block_size,
+            forward_vars={"block_tables": bt, "cu_seqlens_q": cu},
+        ),
+        dcp_world_size=dcp,
+        _draft_uses_dflash_pool=True,
+        _blk_ctx_slots=torch.full((n_tok,), 7, dtype=torch.int64, device=dev),
+        _blk_tok_ramp=torch.arange(n_tok, dtype=torch.int32, device=dev),
+    )
+    stub._draft_entry_tokens = proposer.DSparkProposer._draft_entry_tokens.fget(stub)
+    fwd = types.SimpleNamespace(
+        context=types.SimpleNamespace(
+            running_bs=running_bs or len(seqlens), scheduled_bs=len(seqlens)
+        ),
+        attn_metadata=AttentionMetaData(),
+    )
+    pos = torch.tensor(positions, dtype=torch.int64, device=dev)
+    proposer.DSparkProposer._publish_draft_ctx_slots(stub, fwd, pos)
+    out = fwd.attn_metadata.draft_ctx_slot_mapping
+    return None if out is None else out.cpu()
+
+
+def _host_slots(tables, seqlens, positions, block_size):
+    """The host builder (`token_layout/slots.py`) for the same tokens."""
+    import numpy as np
+
+    from atom.model_ops.attentions.token_layout.slots import slot_mapping
+
+    return slot_mapping(
+        np.asarray(positions, dtype=np.int64),
+        np.asarray(seqlens),
+        np.ascontiguousarray(tables, dtype=np.int32),
+        block_size,
+    ).tolist()
+
+
+# A prefill chunk crossing an entry boundary, then two decode tokens.
+_TABLES = [[7, 9] + [0] * 14, [4] + [0] * 15]
+_SEQLENS = [3, 2]
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_draft_slots_store_every_token_at_entry_granularity(dcp):
+    """Every token gets a slot, addressed in `block_size * dcp`-token entries.
+
+    The host builder answers the same numbers when handed the entry size, and
+    at DCP>1 they differ from the target's `block_size` addressing -- which
+    would alias `dcp` requests' entries onto one range.
+    """
+    vblock = 128 * dcp
+    positions = [vblock - 2, vblock - 1, vblock, 5, 6]
+    got = _publish(128, dcp, _TABLES, _SEQLENS, positions).tolist()
+    assert got == [
+        7 * vblock + vblock - 2,
+        7 * vblock + vblock - 1,
+        9 * vblock,
+        4 * vblock + 5,
+        4 * vblock + 6,
+    ]
+    assert got == _host_slots(_TABLES, _SEQLENS, positions, vblock)
+    if dcp > 1:
+        assert got != _host_slots(_TABLES, _SEQLENS, positions, 128)
+
+
+def test_draft_slots_ignore_padded_rows():
+    """Padded graph rows past `scheduled_bs` resolve no token."""
+    got = _publish(128, 8, _TABLES, _SEQLENS, [0, 1, 2, 3, 4], running_bs=4)
+    assert got.tolist() == [
+        7 * 1024,
+        7 * 1024 + 1,
+        7 * 1024 + 2,
+        4 * 1024 + 3,
+        4 * 1024 + 4,
+    ]
+
+
+def test_draft_slots_past_the_table_are_dropped_not_clamped():
+    """A column the table does not have becomes -1.
+
+    Clamping it into the last column instead would hand the row ANOTHER
+    request's KV, which reads as a plausible answer rather than a fault.
+    """
+    got = _publish(128, 8, [[10, 11, 12, 13]], [3], [0, 3 * 1024, 4 * 1024])
+    assert got.tolist() == [10 * 1024, 13 * 1024, -1]
+
+
+def test_draft_slots_are_published_for_an_empty_forward():
+    """Zero tokens still publish (an empty map), so the layer never sees None."""
+    got = _publish(128, 8, _TABLES, [0, 0], [])
+    assert got is not None and got.numel() == 0
+
+
+def test_dflash_context_write_refuses_a_missing_draft_slot_map(monkeypatch):
+    """No silent fallback to the target's DCP-filtered `slot_mapping`."""
+    import torch
+
+    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    from atom.utils import forward_context as fc
+
+    meta = fc.AttentionMetaData(slot_mapping=torch.zeros(4, dtype=torch.int64))
+    monkeypatch.setattr(
+        fc, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=meta)
+    )
+    with pytest.raises(RuntimeError, match="draft slot mapping"):
+        m.KimiK3DFlashDecoderLayer.write_context_kv(
+            types.SimpleNamespace(), torch.zeros(4, 8), torch.arange(4)
+        )
+
+
+# --------------------------------------------------------------------------- #
+# the block read (model_ops/attentions/dspark_draft_attn.py)
+#
+# `unified_attention` asserts causal; the read gets a non-causal block out of it
+# by folding each request's T rows into its head axis and decoding ONE row per
+# request. The fold is pure tensor reshaping and runs anywhere; the kernel check
+# below needs a GPU.
+# --------------------------------------------------------------------------- #
+
+
+def _fold_mod():
+    pytest.importorskip("torch")
+    from atom.model_ops.attentions import dspark_draft_attn
+
+    return dspark_draft_attn
+
+
+@pytest.mark.parametrize("bs,T,hkv,g", [(1, 7, 2, 4), (3, 7, 2, 4), (2, 4, 1, 8)])
+def test_block_fold_puts_every_row_on_its_own_kv_head(bs, T, hkv, g):
+    """`unified_attention` reads head `j` against KV head `j // (T * G)`.
+
+    So in the folded layout, every one of a request's T rows times its G query
+    heads per KV head must sit in that KV head's contiguous run -- and nothing
+    of another request's. Tag each element with (request, row, query head) and
+    read the tags back.
+    """
+    import torch
+
+    dda = _fold_mod()
+    hq = hkv * g
+    b = torch.arange(bs).view(bs, 1, 1).expand(bs, T, hq)
+    t = torch.arange(T).view(1, T, 1).expand(bs, T, hq)
+    h = torch.arange(hq).view(1, 1, hq).expand(bs, T, hq)
+    # One scalar per (b, t, h), carried in the D axis so the fold moves it.
+    tag = torch.stack([b, t, h], dim=-1).reshape(bs * T, hq, 3)
+
+    qf = dda.fold_block_queries(tag, bs, hkv)
+    assert qf.shape == (bs, hkv * T * g, 3)
+    for req in range(bs):
+        for j in range(hkv * T * g):
+            fb, ft, fh = qf[req, j].tolist()
+            assert fb == req
+            # The head the kernel assigns, and the head the row's query head
+            # belongs to in the unfolded GQA layer.
+            assert j // (T * g) == fh // g
+            # Inside that run: row-major over (t, g), i.e. `(kv_head, t, g)`.
+            assert (j % (T * g)) // g == ft
+            assert j % g == fh % g
+
+    out = torch.empty_like(tag)
+    dda.unfold_block_output(qf, out, hkv)
+    assert torch.equal(out, tag)
+
+
+def _reference_block_attn(
+    q, k_pool, v_pool, block_tables, kv_lens, scale, hkv, causal=False
+):
+    """GQA attention of each request's T rows over its pool rows, in fp32,
+    gathered slot by slot from the block table. Bidirectional by default;
+    `causal` masks block row t to keys `< kv_len - T + t + 1`, the mask a
+    non-folded read of the same block would apply."""
+    import torch
+
+    bs = kv_lens.shape[0]
+    rows, hq, d = q.shape
+    T, g, E = rows // bs, hq // hkv, k_pool.shape[1]
+    out = torch.empty(rows, hq, d, dtype=torch.float32, device=q.device)
+    for b in range(bs):
+        n = int(kv_lens[b])
+        pos = torch.arange(n, device=q.device)
+        ent = block_tables[b, pos // E].long()
+        k = k_pool[ent, pos % E].float()  # [n, hkv, d]
+        v = v_pool[ent, pos % E].float()
+        qb = q[b * T : (b + 1) * T].float().view(T, hkv, g, d)
+        s = torch.einsum("thgd,nhd->thgn", qb, k) * scale
+        if causal:
+            last = n - T + torch.arange(T, device=q.device)  # [T]
+            hide = pos.view(1, n) > last.view(T, 1)  # [T, n]
+            s = s.masked_fill(hide.view(T, 1, 1, n), float("-inf"))
+        p = torch.softmax(s, dim=-1)
+        out[b * T : (b + 1) * T] = torch.einsum("thgn,nhd->thgd", p, v).reshape(
+            T, hq, d
+        )
+    return out
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("far_entries", [False, True])
+def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_entries):
+    """The folded `unified_attention` read IS the block's non-causal attention.
+
+    Draft shape at TP8: 8 q / 2 kv heads, head_dim 64, T = 7, an entry of
+    `block_size 128 * dcp 8 = 1024` tokens. Requests of different lengths, one
+    ending mid-entry.
+
+    Over ~1000 random keys the block's own T keys would carry under 1% of the
+    softmax mass, and a causal mask -- it hides at most T - 1 of them from a row
+    -- would move the output by less than fp8 noise. So the data gives them
+    weight: q and every key share one direction, pushed apart for the prefix
+    and together for the block, which makes a block key worth ~50 prefix keys.
+    The read must then sit far closer to the bidirectional reference than to
+    the causal one (measured: 38x and up at fp8, 74x at bf16, over 8 seeds).
+
+    `far_entries` puts a request's pages past entry 16384, where
+    `entry * page_stride` (1024 * 2 * 64 per entry) passes 2**31: the boundary
+    a 32-bit address computation wraps at.
+    """
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    pytest.importorskip("aiter")
+    dda = _fold_mod()
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    bs, T, hkv, g, d, E = 3, 7, 2, 4, 64, 1024
+    hq = hkv * g
+    kv_lens = torch.tensor([3 * E + 5, E - 1, 2 * E], dtype=torch.int32, device=dev)
+    W = 4
+    base = 16383 if far_entries else 0
+    n_entries = base + bs * W + 1
+    # Distinct, shuffled entry ids per request, so a wrong row of the table
+    # reads another request's keys rather than the right ones by accident.
+    ids = (base + torch.randperm(bs * W)).view(bs, W).to(torch.int32)
+    block_tables = ids.to(dev)
+
+    k_pool = torch.randn(n_entries, E, hkv, d, device=dev, dtype=torch.bfloat16)
+    v_pool = torch.randn_like(k_pool)
+    q = torch.randn(bs * T, hq, d, device=dev, dtype=torch.bfloat16)
+    # See the docstring: one shared lane, prefix keys pushed off it, block keys
+    # onto it.
+    q[..., 0] += 4
+    k_pool[..., 0] -= 4
+    for b in range(bs):
+        n = int(kv_lens[b])
+        pos = torch.arange(n - T, n, device=dev)
+        k_pool[block_tables[b, pos // E].long(), pos % E, :, 0] += 8
+    if kv_dtype == "fp8":
+        from aiter import dtypes
+
+        k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
+    scale = d**-0.5
+
+    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8, max_model_len=W * E)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
+    # takes the same q. Taken BEFORE the call, which clamps q in place.
+    cast = kv_dtype == "fp8" and read.q_to_pool_dtype
+    q_ref = q.to(k_pool.dtype).to(q.dtype) if cast else q.clone()
+    o = read(q, k_pool, v_pool, block_tables, kv_lens, scale, one, one)
+
+    args = (q_ref, k_pool, v_pool, block_tables, kv_lens, scale, hkv)
+    ref = _reference_block_attn(*args)
+    # fp8 runs both dots at fp8 on gfx950 (Gluon); measured max 3.7e-2 there,
+    # 1.3e-2 at bf16, on O(1) outputs.
+    tol = 6e-2 if kv_dtype == "fp8" else 2.5e-2
+    torch.testing.assert_close(o.float(), ref, atol=tol, rtol=5e-2)
+
+    causal = _reference_block_attn(*args, causal=True)
+    err_bidir = (o.float() - ref).abs().max().item()
+    err_causal = (o.float() - causal).abs().max().item()
+    assert err_causal > 10 * err_bidir, (err_bidir, err_causal)
+
+
+def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(monkeypatch):
+    """The real `_build_paged_block_metadata` for the DFlash pool.
+
+    It hands `prepare_paged_block` every token of the block at entry
+    granularity, drops the pad row and the position past the table, and
+    returns before the CSR generator, which a non-MLA read never consumes.
+    """
+    import torch
+
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttentionMetaData
+
+    def _no_csr(*a, **k):
+        raise AssertionError("a non-MLA block draft built the CSR")
+
+    monkeypatch.setattr(proposer, "kv_indices_generate_triton", _no_csr)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    T, vblock, running_bs = 2, 1024, 3
+    bt = CpuGpuBuffer(running_bs, 2, dtype=torch.int32, device=dev)
+    bt.np[:] = [[5, 6], [8, 9], [0, 0]]
+    bt.copy_to_gpu()
+    seen = {}
+    i64 = {"dtype": torch.int64, "device": dev}
+    i32 = {"dtype": torch.int32, "device": dev}
+    stub = types.SimpleNamespace(
+        draft_tokens_per_seq=T,
+        runner=types.SimpleNamespace(block_size=128, forward_vars={"block_tables": bt}),
+        _blk_positions=torch.zeros(running_bs, T, **i64),
+        _blk_offsets=torch.arange(1, T + 1, **i64),
+        _blk_dtype_q=torch.bfloat16,
+        _bound_draft_k_cache=lambda fc: object(),
+        _blk_slots=torch.zeros(running_bs * T, **i64),
+        _blk_ctx_lens=torch.zeros(running_bs, **i32),
+        _draft_entry_tokens=vblock,
+        _draft_is_dcp_sharded=False,
+        _block_page_idx=proposer.DSparkProposer._block_page_idx,
+        _paged_pad_ctx_len=1 + T,
+        _blk_cu_seqlens_q=torch.zeros(running_bs + 1, **i32),
+        _blk_kv_indptr=torch.zeros(running_bs + 1, **i32),
+        _blk_kv_indices=torch.zeros(1, **i32),
+        _blk_last_page_lens=torch.ones(running_bs, **i32),
+        model=types.SimpleNamespace(
+            block_attention_is_mla=False,
+            prepare_paged_block=lambda md, bt_, pos, slots, ctx, *a: seen.update(
+                slots=slots.cpu().tolist(), ctx=ctx.cpu().tolist()
+            ),
+        ),
+    )
+    md = AttentionMetaData()
+    # Row 0 crosses into its second entry; row 1's block runs past its table.
+    anchors = torch.tensor([vblock - 2, 2 * vblock - 2, 0], **i64)
+    proposer.DSparkProposer._build_paged_block_metadata(
+        stub, None, md, anchors, scheduled_bs=2, max_seqlen_k=4 * vblock
+    )
+    assert seen["slots"] == [
+        [5 * vblock + vblock - 1, 6 * vblock],
+        [9 * vblock + vblock - 1, -1],
+        [-1, -1],
+    ]
+    assert seen["ctx"] == [vblock + 1, 2 * vblock, 1 + T]
+    assert md.causal is False
+
+
+def test_dflash_draft_declares_a_non_mla_block():
+    """KimiK3DFlash takes the proposer's non-MLA path, not the MLA plan."""
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    assert dflash.KimiK3DFlash.block_attention_is_mla is False
+
+
+@pytest.mark.parametrize("is_mla", [True, False])
+def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(is_mla):
+    """Only the MLA block plan fills `_blk_kv_indices` (max_bs x max_model_len).
+
+    A non-MLA draft (DFlash, MiniMax-M3.1) returns from
+    `_build_paged_block_metadata` before the CSR build, so it gets an empty
+    placeholder instead of the full buffer.
+    """
+    torch = pytest.importorskip("torch")
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+
+    p = proposer.DSparkProposer.__new__(proposer.DSparkProposer)
+    p.config = types.SimpleNamespace(
+        max_num_seqs=8, max_model_len=4096, max_num_batched_tokens=1024
+    )
+    p.device = torch.device("cpu")
+    p.mtp_k = 7
+    p.model = types.SimpleNamespace(block_attention_is_mla=is_mla)
+    p._init_draft_block_buffers()
+
+    if is_mla:
+        assert p._blk_kv_indices.numel() == 8 * (4096 + 7)
+    else:
+        assert p._blk_kv_indices.numel() == 0
+
+
+def test_context_write_drops_padded_target_rows(monkeypatch):
+    """Under TR_HYBRID the runner passes `running_tokens` hidden rows but only
+    the scheduled rows' positions; only those rows may reach the projection."""
+    torch = pytest.importorskip("torch")
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    from atom.models import dspark_draft
+
+    seen = {}
+    monkeypatch.setattr(
+        dspark_draft.DSparkDraftModel,
+        "write_context_kv",
+        lambda self, aux, pos: seen.update(rows=aux.shape[0], pos=pos.shape[0]),
+    )
+    draft = dflash.KimiK3DFlash.__new__(dflash.KimiK3DFlash)
+    draft.write_context_kv(torch.zeros(12, 4), torch.arange(9))
+    assert seen == {"rows": 9, "pos": 9}
+
+
+def test_dflash_draft_is_refused_on_a_non_k3_target():
+    """SpecForge stamps one arch on every DFlash draft, so the rename to
+    `K3DFlashModel` cannot tell a Kimi-K3 draft from a Qwen3/Llama one; the
+    target is checked where both configs are known."""
+    import atom.config as cfg
+
+    draft = types.SimpleNamespace(architectures=["K3DFlashModel"])
+    cfg._check_dflash_draft_target(
+        types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]), draft
+    )
+    with pytest.raises(ValueError, match="Kimi-K3 target"):
+        cfg._check_dflash_draft_target(
+            types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]), draft
+        )
+    # Any other draft is not this check's business.
+    cfg._check_dflash_draft_target(
+        types.SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+        types.SimpleNamespace(architectures=["Eagle3LlamaModel"]),
+    )
+    cfg._check_dflash_draft_target(types.SimpleNamespace(architectures=[]), None)
+
+
+def test_fp8_q_cast_saturates_instead_of_producing_nan():
+    """A plain cast to fp8 turns |x| > fp8 max into NaN, and one NaN q row
+    poisons that row's softmax against every key; the read clamps first."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    pytest.importorskip("aiter")
+    from aiter import dtypes
+
+    dda = _fold_mod()
+    dev = torch.device("cuda")
+    bs, T, hkv, g, d, E = 2, 7, 2, 4, 64, 1024
+    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=4, max_model_len=E)
+    if not read.q_to_pool_dtype:
+        pytest.skip("q is only cast to fp8 where aiter's Gluon path serves the read")
+    k_pool = torch.randn(3, E, hkv, d, device=dev).to(dtypes.fp8)
+    v_pool = torch.randn_like(k_pool, dtype=torch.float32).to(dtypes.fp8)
+    q = torch.randn(bs * T, hkv * g, d, device=dev, dtype=torch.bfloat16)
+    q[0, 0, 0] = 1e4  # far past fp8_e4m3's 448
+    block_tables = torch.tensor([[1], [2]], dtype=torch.int32, device=dev)
+    kv_lens = torch.tensor([100, 200], dtype=torch.int32, device=dev)
+    one = torch.ones(1, dtype=torch.float32, device=dev)
+    o = read(q, k_pool, v_pool, block_tables, kv_lens, d**-0.5, one, one)
+    assert torch.isfinite(o).all()
+
+
+def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
+    """The block runs up to T past the anchor, which can pass the request's
+    allocation; that column reads as block 0, another request's entry. The real
+    `KimiK3DFlash.prepare_paged_block` drops those writes and caps the read."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU: pinned staging and a CUDA event")
+    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    draft = m.KimiK3DFlash.__new__(m.KimiK3DFlash)
+    vblock, T = 1024, 3
+    draft._entry_tokens = vblock
+    draft._alloc = torch.zeros(4, dtype=torch.int32, device="cuda")
+    draft._alloc_host = torch.zeros(4, dtype=torch.int32, pin_memory=True)
+    draft._alloc_copied = torch.cuda.Event()
+    # Row 0 holds one block and its block crosses into a second; row 1 holds
+    # two and stays inside; row 2 is a pad row.
+    pos = torch.tensor(
+        [[vblock - 2, vblock - 1, vblock], [5, 6, 7], [1, 2, 3]], device="cuda"
+    )
+    slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]], device="cuda")
+    ctx = torch.tensor([vblock + 1, 8, 1 + T], dtype=torch.int32, device="cuda")
+    draft.prepare_paged_block(None, None, pos, slots, ctx, [1, 2], 2)
+    assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
+    assert ctx.tolist() == [vblock, 8, 1 + T]

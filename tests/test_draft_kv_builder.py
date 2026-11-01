@@ -44,13 +44,28 @@ class _Norm(nn.Module):
 TARGET_BLOCK = 128
 
 
-def _runner(draft_layers: int, block_size: int = TARGET_BLOCK):
+def _runner(
+    draft_layers: int,
+    block_size: int = TARGET_BLOCK,
+    builder_block_size: int | None = None,
+):
+    """A stand-in runner.
+
+    `block_size` is the scheduler's; `builder_block_size` is the target
+    builder's, which defaults to the same number because a paged target pages at
+    the block it is scheduled in. They are separate arguments because an MLA
+    target's builder does NOT: it pages at ATOM_MLA_PAGE_SIZE, a kernel page
+    that is 1 by default.
+    """
     model = nn.Sequential(
         *[m for _ in range(draft_layers) for m in (_PagedAttention(), _Norm())]
     )
     return SimpleNamespace(
+        block_size=block_size,
         drafter=SimpleNamespace(model=model),
-        attn_metadata_builder=SimpleNamespace(block_size=block_size),
+        attn_metadata_builder=SimpleNamespace(
+            block_size=block_size if builder_block_size is None else builder_block_size
+        ),
     )
 
 
@@ -88,6 +103,35 @@ def test_the_pool_is_built_at_the_target_builders_block():
 
     assert builder.kv_pool is not None
     assert asked == [(2, 256)]
+
+
+def test_the_dflash_pool_takes_the_schedulers_block():
+    """The DFlash pool sits beside an MLA target, whose builder pages at
+    ATOM_MLA_PAGE_SIZE -- 1 by default -- a kernel page, not a block id. Its
+    block tables count SCHEDULER blocks, so that is the number to size at; at
+    the builder's, MhaKvPool's SHUFFLE packing would not even construct.
+    """
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2, block_size=128, builder_block_size=1),
+        make,
+        dflash_pool=True,
+    )
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 128)]
+
+
+def test_other_pools_keep_the_target_builders_block():
+    """MiniMax-M3.1 DSpark and Eagle3 page at the builder's block, and
+    `allocate_kv_cache_tensors` refuses a scheduler block that differs."""
+    make, asked = _recording_factory(object())
+    builder = DraftKvBuilder(
+        _runner(draft_layers=2, block_size=256, builder_block_size=128), make
+    )
+
+    assert builder.kv_pool is not None
+    assert asked == [(2, 128)]
 
 
 def test_siblings_are_not_rows():
@@ -217,3 +261,31 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+def test_dflash_layers_share_one_bound_unit_scale_tensor():
+    """The DFlash pool binds every layer the same one-element 1.0 tensor, at
+    bind time: both its write and its read take the scale as a device pointer,
+    and nothing may be built for it inside a captured forward."""
+    pool = MhaKvPool(
+        layers=2,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        per_tensor_scales=True,
+    )
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=2)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
+    builder = DraftKvBuilder(runner, lambda **_: pool, dflash_pool=True)
+    builder._kv_pool = pool
+
+    layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
+    for m in layers:
+        m.layer_num = 0
+        builder.build_kv_cache_tensor(m)
+
+    scale = layers[0].k_scale
+    assert torch.is_tensor(scale) and scale.numel() == 1 and float(scale) == 1.0
+    assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
