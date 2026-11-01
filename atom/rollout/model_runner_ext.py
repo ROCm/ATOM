@@ -322,6 +322,11 @@ class RLHFModelRunner(
                 f"{self.label}: hidden-state export reads every prefill row; "
                 "launch with --no-decoder-swa-bounded-replay"
             )
+        # The export prefill feeds the model every row, not this rank's shard.
+        if self.config.sequence_parallel_size > 1:
+            raise ValueError(
+                f"{self.label}: hidden-state export does not support Ulysses SP (-sp)"
+            )
         from torchspec.config.mooncake_config import MooncakeConfig
         from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore
 

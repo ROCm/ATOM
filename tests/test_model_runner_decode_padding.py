@@ -150,8 +150,10 @@ def test_runner_model_height_and_sampling_rows(
 
     runner.model = Model()
     logits, hidden = runner.run_model(ids[:scheduled])
-    # MegaMoE epochs advance on graph replays as well as eager steps.
-    runner.sp_mega_moe.count_step.assert_called_once_with()
+    # MegaMoE epochs advance on graph replays as well as eager steps, by this
+    # rank's share of the step's padded rows.
+    world = 1 if sp_rank is None else 4
+    runner.sp_mega_moe.count_step.assert_called_once_with(-(-running // world))
     if sp_prefill:
         assert hidden is None
     else:

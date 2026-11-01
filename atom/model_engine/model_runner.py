@@ -3135,7 +3135,7 @@ class ModelRunner:
             )
 
         if self.sp_mega_moe is not None:
-            self.sp_mega_moe.count_step()
+            self.sp_mega_moe.count_step(sp_local_len(forward_mode.running_tokens))
 
         if not forward_mode.use_cudagraph:
             # prefill, or a decode no request graph serves (enforce_eager / DP
@@ -4020,7 +4020,9 @@ class ModelRunner:
         slope = _GUARD_BYTES_PER_TOKEN_PER_DIM * self.config.hf_config.hidden_size
         if dp_size > 1:
             slope *= float(dp_size) ** 0.6
-        free_t = torch.tensor([torch.cuda.mem_get_info()[0]], dtype=torch.int64)
+        free_t = torch.tensor(
+            [torch.cuda.mem_get_info()[0]], device="cpu", dtype=torch.int64
+        )
         for group in (get_dp_group(), get_tp_group(), get_pcp_group()):
             if group.world_size > 1:
                 torch.distributed.all_reduce(
@@ -4089,11 +4091,8 @@ class ModelRunner:
             max_seq_bs, self.config.max_num_batched_tokens, full_q_len
         )
         if tr_hybrid and sp_is_enabled():
-            split = get_sp_world_size()
-            q_lens = self._dspark_capture_q_buckets(full_q_len)
-            step = math.lcm(*(split // math.gcd(split, q) for q in q_lens))
             self.capture_sizes = split_rows_graph_ladder(
-                self.capture_sizes, step, max_bs
+                self.capture_sizes, get_sp_world_size(), max_bs
             )
         oversized = [s for s in self.capture_sizes if s > max_bs]
         if oversized:
@@ -4432,11 +4431,6 @@ class ModelRunner:
         if self.attn_metadata_builder.supports_token_graph:
             # Their attention ops are recorded inline, so a prefill token graph
             # would replay the synthetic prompt's attention on real prompts.
-            if sp_is_enabled():
-                raise ValueError(
-                    "Ulysses SP does not support an attention backend with "
-                    "prefill token graphs."
-                )
             self._record_tr_graphs()
         self._record_prefill_req_graphs()
         reset_forward_context()

@@ -374,11 +374,7 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(
-        self, hidden_states: torch.Tensor, x_scale: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        if x_scale is not None:
-            raise ValueError("MiniMaxM3MoE does not accept prequantized input")
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
@@ -784,8 +780,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj),
             fused=self._fused_norm_quant,
         )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        if self.is_moe_layer:
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states, x_scale=hidden_states_scale)
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual

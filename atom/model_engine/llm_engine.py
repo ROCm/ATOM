@@ -65,6 +65,9 @@ class LLMEngine:
                     data_parallel_master_port
                 )
         self.data_parallel_size = config.parallel_config.data_parallel_size
+        # Config validated SP before the legacy DP kwargs above landed.
+        if config.sequence_parallel_size > 1 and self.data_parallel_size != 1:
+            raise ValueError("Ulysses SP currently requires data_parallel_size=1")
         # TBO's two concurrent ubatches are supported by the mori EP
         # dispatch/combine path. The EP collective fallback instead issues
         # full DP all-gather/reduce-scatter operations from both ubatch streams;

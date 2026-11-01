@@ -2544,6 +2544,11 @@ class Config:
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
+        if self.enable_rapidserve and self.prefill_context_parallel_size > 1:
+            raise ValueError(
+                "--enable-rapidserve hands KV over by TP rank only; it does not "
+                "support -pcp or -sp."
+            )
         self.sp_mega_moe_enabled = (
             envs.ATOM_SP_MOE_MEGA and self.sequence_parallel_size > 1
         )

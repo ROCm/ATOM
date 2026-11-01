@@ -15,6 +15,8 @@ import math
 
 import torch
 
+from atom.distributed.group_agreement import group_agree, group_max
+from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 
 logger = logging.getLogger("atom")
@@ -117,14 +119,18 @@ def _router_logits(hidden, gate_weight):
 class SPMegaMoE:
     """Shared collective runtime; outputs own their storage across layer calls."""
 
-    def __init__(self, runtime, launches_per_step, group):
+    def __init__(self, runtime, layer, num_layers, group):
         self.runtime = runtime
-        self.launches_per_step = launches_per_step
+        # The layers share one expert format, so one of them decides for all.
+        self.layer = layer
+        self.num_layers = num_layers
         self.launches = 0
         # The SP CPU group, to agree on timeouts before the collective reset().
         self.group = group
         # Host copy of the runtime's sticky timeout bits, and the event after it.
         self._errors = self._errors_copied = None
+        # A copy not read yet; launches enqueued after the last copy.
+        self._copy_pending = self._uncopied = False
 
     def _timed_out(self, bits):
         raise RuntimeError(
@@ -138,35 +144,45 @@ class SPMegaMoE:
         A timeout invalidates that step's output and the KV written from it, and
         its bits are only cleared by the collective reset(), so it is fatal.
         """
-        if self._errors_copied is not None:
+        if self._copy_pending:
             if not self._errors_copied.query():
                 return
+            self._copy_pending = False
             if self._errors.item():
                 self._timed_out(self._errors.item())
+        if not self._uncopied:
+            return
         flag = self.runtime.error_flag()
         if self._errors is None:
             self._errors = torch.empty_like(flag, device="cpu").pin_memory()
             self._errors_copied = torch.cuda.Event()
         self._errors.copy_(flag, non_blocking=True)
         self._errors_copied.record()
+        self._copy_pending, self._uncopied = True, False
 
-    def count_step(self):
-        """Count a model step's launches up front, so graph replays count too."""
+    def count_step(self, rows):
+        """Count a model step's launches up front, so graph replays count too.
+
+        ``rows`` is this rank's share of the step's padded tokens. A step that
+        keeps the native MoE (decode) launches nothing and adds no copy.
+        """
         self._raise_on_timeout()
-        self.launches += self.launches_per_step
+        if not self.supports(rows):
+            return
+        self._uncopied = True
+        self.launches += self.num_layers * math.ceil(
+            rows / self.runtime.max_local_tokens
+        )
         if self.launches >= RESET_LAUNCHES:
             # reset() clears bits the copy above may not have read yet: read
             # them now, on every SP rank, which all run the same steps.
-            bits = torch.tensor([self.runtime.poll_errors()], dtype=torch.int64)
-            torch.distributed.all_reduce(
-                bits, op=torch.distributed.ReduceOp.MAX, group=self.group
-            )
-            if bits.item():
-                self._timed_out(bits.item())
+            bits = group_max(self.runtime.poll_errors(), self.group)
+            if bits:
+                self._timed_out(bits)
             self.runtime.reset()
             self.launches = 0
 
-    def supports(self, layer, rows):
+    def supports(self, rows):
         """Keep the native path whenever MegaMoE would change activation precision.
 
         Use the padded global row count, exactly as the native SP gather does.
@@ -174,19 +190,10 @@ class SPMegaMoE:
         cannot produce. All ranks make the same shape decision.
         """
         from aiter import dtypes
-        from aiter.fused_moe import resolve_activation_dtype
-        from aiter.ops.flydsl.moe_common import GateMode
 
-        native_dtype = resolve_activation_dtype(
-            layer.quant_method.quant_type,
-            layer.w13_weight.dtype,
-            activation=layer.activation,
-            gate_mode=GateMode.SEPARATED,
-            M=rows * self.runtime.cfg.world_size,
-            hidden_dtype=torch.bfloat16,
-            gfx="gfx950",
-        )
-        return native_dtype == dtypes.fp4x2
+        method = self.layer.quant_method
+        tokens = rows * self.runtime.cfg.world_size
+        return method.activation_dtype(self.layer, tokens) == dtypes.fp4x2
 
     @staticmethod
     def _route(layer, hidden_states, router_logits):
@@ -220,7 +227,7 @@ class SPMegaMoE:
             attention, residual, post_weight, post_eps, False
         )
         logits = _router_logits(hidden, gate_weight)
-        if not self.supports(layer, rows):
+        if not self.supports(rows):
             # Small batches (decode) keep the native A16W4 MoE.
             output = layer.forward_impl(hidden, logits)
             return _norm_input(output, post_res, next_weight, next_eps, fp8_output)
@@ -381,6 +388,9 @@ def _unsupported_config(config):
         )
     if get_gfx_runtime() != "gfx950":
         return "needs gfx950"
+    # Forward hooks on the decoder layers and their MoE never see a fused block.
+    if envs.ATOM_FWD_DUMP_DIR:
+        return "ATOM_FWD_DUMP_DIR hooks every layer's forward"
     return None
 
 
@@ -453,7 +463,6 @@ def initialize_sp_mega_moe(model, config):
     all or nothing: one layer it cannot serve keeps every layer native.
     """
     from atom.distributed.ulysses_sp import get_sp_group, get_sp_world_size
-    from atom.mono.runtime.consensus import tp_agree
 
     if config is None or not config.sp_mega_moe_enabled or get_sp_world_size() < 2:
         return
@@ -471,12 +480,11 @@ def initialize_sp_mega_moe(model, config):
     plan = _plan(config, layers)
     # A rank-local verdict (an import, a layout) must not split the ranks before
     # the collective MegaMoeTP setup.
-    if not tp_agree(not isinstance(plan, str), group.cpu_group):
+    if not group_agree(not isinstance(plan, str), group.cpu_group):
         return skip(plan if isinstance(plan, str) else "another SP rank refused it")
     hidden, inter, experts, top_k, activation, swiglu_limit = plan
     from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 
-    local_rows = math.ceil(config.max_num_batched_tokens / group.world_size)
     max_local_rows = local_token_tile(config.max_num_batched_tokens, group.world_size)
     # Prefill needs larger row tiles than AITER's default.
     lb_mt = "6"
@@ -518,9 +526,12 @@ def initialize_sp_mega_moe(model, config):
         if not str(exc).startswith(_AGREED_SETUP_FAILURES):
             raise
         return skip(f"MegaMoeTP setup failed on every rank: {exc}")
-    backend = SPMegaMoE(
-        runtime, len(layers) * math.ceil(local_rows / tile), group.cpu_group
-    )
+    # The big-M warmup leaves a timed-out wait in the sticky bits only.
+    bits = group_max(runtime.poll_errors(), group.cpu_group)
+    if bits:
+        runtime.close()
+        return skip(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
+    backend = SPMegaMoE(runtime, layers[0], len(layers), group.cpu_group)
     for layer in layers:
         layer.sp_mega_moe = backend
     logger.info(
