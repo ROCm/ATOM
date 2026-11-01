@@ -137,6 +137,7 @@ class K4Build:
     swiglu_limit: float
     debug: bool
     skip: str  # debug: stages replaced by no-ops (ATOM_MONO_G1250_SKIP)
+    tl_points: str  # debug: the timeline's points stamped (ATOM_MONO_TL_POINTS)
     ag_rs_from: int  # tokens from which the all-reduces are RS + AG
 
 
@@ -168,9 +169,14 @@ def build_post_attn_kernel(
         x8_in=x8_in, timeline=timeline, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
         shared_weight=shared_weight, swiglu_limit=swiglu_limit, debug=debug,
         skip=os.environ.get("ATOM_MONO_G1250_SKIP", ""),
+        tl_points=os.environ.get("ATOM_MONO_TL_POINTS", ""),
         ag_rs_from=int(os.environ.get("ATOM_MONO_G1250_AGRS_FROM", AG_RS_FROM_G1250)),
     )  # fmt: skip
     SKIP = set(key.skip.split(",")) - {""}
+    # a stamp stalls its wave on the clock read: fewer points, a timeline nearer
+    # the real kernel's (0 and TL_END always)
+    TL_SET = {int(p) for p in key.tl_points.split(",") if p} | {0, TL_END}
+    TL_ALL = not key.tl_points
     build_key = key_tuple(key, SOURCES)
     REGION_IDS = region_ids(
         d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk)
@@ -334,7 +340,7 @@ def build_post_attn_kernel(
 
         def stamp(k):
             """``timeline``: this wave passing point k (steady clock)."""
-            if const_expr(timeline):
+            if const_expr(timeline and (TL_ALL or k in TL_SET)):
                 fx.ptr_store(memrealtime(True), tls + (k * WAVES + wave))
 
         def block_max(v):
