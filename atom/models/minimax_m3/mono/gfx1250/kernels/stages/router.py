@@ -58,6 +58,7 @@ def router_defs(k4ctx):
     bias = k4ctx["bias"]
     eps = k4ctx["eps"]
     fuse_k1 = k4ctx["fuse_k1"]
+    x8_in = k4ctx["x8_in"]
     g4 = k4ctx["g4"]
     g_post = k4ctx["g_post"]
     h_in = k4ctx["h_in"]
@@ -184,7 +185,8 @@ def router_defs(k4ctx):
                 for i in range(GATE_ROUNDS)
             ]
             gp = ld_bf16x12(r_g, rw0)
-            if const_expr(fuse_k1):
+            # x8_in: h_in is the previous launch's
+            if const_expr(fuse_k1 and not x8_in):
                 if wave == 0:
                     k1_poll([(rdone_mb, k, 1)])
                 gpu.barrier()

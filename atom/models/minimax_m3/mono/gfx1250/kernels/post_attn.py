@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
@@ -27,7 +28,7 @@ from atom.models.minimax_m3.mono.config import (
     TOPK_BLOCKS,
     IndexHeads,
 )
-from atom.models.minimax_m3.mono.gfx1250.kernels.pre_attn import K1_ARGS, emit_k1
+from atom.models.minimax_m3.mono.gfx1250.kernels.pre_attn import K1_ARGS_G1250, emit_k1
 from atom.models.minimax_m3.mono.gfx1250.kernels.stages.attention import (
     merge_defs,
     o_defs,
@@ -74,9 +75,29 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 from atom.models.minimax_m3.mono.kernels.stages.ffn_reduce import ffn_reduce_defs
 from atom.models.minimax_m3.mono.kernels.stages.shared import K1_STAMPS, TL_POINTS
 from atom.models.minimax_m3.mono.sources import SOURCES
-from atom.mono.device.gfx1250 import BLOCKS, THREADS, WAVE, WAVES
+from atom.mono.device.gfx1250 import (
+    BLOCKS,
+    CM_DEV,
+    THREADS,
+    WAVE,
+    WAVES,
+    async_to_lds,
+    butterfly,
+    lds_addr,
+    wait_async,
+    xshfl,
+)
 from atom.mono.device.gfx1250 import block_max as block_max_of
-from atom.mono.device.ops import kernel_symbol, launcher, load_ptr64, memrealtime
+from atom.mono.device.ops import (
+    bf2_f32,
+    bf16_round,
+    kernel_symbol,
+    launcher,
+    ld_dev,
+    load_ptr64,
+    memrealtime,
+    rsrc,
+)
 from atom.mono.device.sync import Mailbox, preg, shift, sreg
 from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import first_task
@@ -106,6 +127,7 @@ class K4Build:
     index_heads: int = field(metadata={"sym": "ih"})
     index_own: int = field(metadata={"sym": "io"})
     index_topk: bool = field(metadata={"sym": "it"})
+    x8_in: bool = field(metadata={"sym": "xi"})
     timeline: bool = field(metadata={"sym": "tl"})
     fuse_k1: bool
     sm_scale: float
@@ -133,13 +155,17 @@ def build_post_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
+    x8_in: bool = False,
 ):
-    """``kernels.post_attn.build_post_attn_kernel`` on gfx1250 (no timeline)."""
+    """``kernels.post_attn.build_post_attn_kernel`` on gfx1250. ``x8_in``: K1 takes
+    the MXFP8 rows the previous layer's FFN finish made (every sparse layer but
+    the first); every layer's FFN finish makes them for the next."""
+    assert not x8_in or fuse_k1
     assert 1 <= tokens <= MAX_TOKENS
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, index_topk=index_topk,
-        timeline=timeline, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
+        x8_in=x8_in, timeline=timeline, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
         shared_weight=shared_weight, swiglu_limit=swiglu_limit, debug=debug,
         skip=os.environ.get("ATOM_MONO_G1250_SKIP", ""),
         ag_rs_from=int(os.environ.get("ATOM_MONO_G1250_AGRS_FROM", AG_RS_FROM_G1250)),
@@ -181,6 +207,11 @@ def build_post_attn_kernel(
         uwt: fx.Array[fx.Float32, (U_MAX + 1) * 16 if WIDE else 1, 16]
         hst: fx.Array[fx.Float32, 3 * WAVES * H + WAVES, 16]
         misc: fx.Array[fx.Float32, O_ROWS * tokens, 16]
+        # (wide: K1's codes live in the up / gate rings, not in use before the MoE)
+        k1xsc: fx.Array[
+            fx.Int32, tokens * (HIDDEN // 128) if x8_in and not WIDE else 1, 16
+        ]
+        k1rst: fx.Array[fx.Float32, 16, 16]
         route: fx.Array[fx.Int32, 8 * tokens, 16]
         rwt: fx.Array[fx.Float32, 8 * tokens, 16]
         blk: fx.Array[fx.Int32, 32, 16]
@@ -337,8 +368,9 @@ def build_post_attn_kernel(
 
             (
                 ar_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, index_cache,
-                iq_out, scratch1,
-            ) = [load_ptr64(k1_args, i) for i in range(len(K1_ARGS))]  # fmt: skip
+                iq_out, scratch1, x8_prev, x8s_prev, ss_prev, h_next, x8_next,
+                x8s_next, ss_next, g_next,
+            ) = [load_ptr64(k1_args, i) for i in range(len(K1_ARGS_G1250))]  # fmt: skip
             qs_k1 = lds.qs.ptr
             if const_expr(ih_count > 1):
                 qs_k1 = fpool + QS_CP
@@ -356,6 +388,17 @@ def build_post_attn_kernel(
                 diag,
                 REGION_IDS,
                 index_topk,
+                x8_in=(
+                    (
+                        x8_prev,
+                        x8s_prev,
+                        ss_prev,
+                        lds.ugring.ptr if WIDE else lds.k1xsc.ptr,
+                        lds.k1rst.ptr,
+                    )
+                    if x8_in
+                    else None
+                ),
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(
@@ -432,6 +475,72 @@ def build_post_attn_kernel(
         CPT = ug_ctas_per_token(tokens)
         UG_ITERS = max(ug_tasks_of(c, tokens) for c in range(G))
 
+        mx8_scale = k4ctx["mx8_scale"]
+        mx8_q = k4ctx["mx8_q"]
+
+        def ffn_next_pre(t, row_tok, row_pair, row):
+            """``ffn_next``'s inputs, out before the peers' wait: "a" polled (long
+            landed), h_in (device scope) and g_next copied to the thread's red
+            words (red is free in the FFN finish; a copy is not sunk to its use)."""
+            got = mb_poll([(mr("a"), (row_tok * HIDDEN + row) // 2, 1)])
+            slot = lds_addr(red) + tid * 8
+            async_to_lds(
+                fx.Int64(h_in) + fx.Int64((row_tok * HIDDEN + row) // 2 * 4),
+                slot,
+                b128=False,
+                cm=CM_DEV,
+            )
+            async_to_lds(
+                fx.Int64(g_next) + fx.Int64(row // 2 * 4), slot + 4, b128=False
+            )
+            return got[0][0]
+
+        def ffn_next(t, row_tok, row_pair, row, f0, f1, a_word):
+            """The next layer's K1 inputs of this layer's output rows row, row + 1
+            of token row_tok (block t: the token's 16 threads): its residual acc =
+            bf16(ffn) + h_mid (h_mid as the o reduce stores it, from "a" and h_in),
+            acc (g_next + 1) as MXFP8, the block's sum of acc^2."""
+            if const_expr(WIDE):
+                wait_async(0)
+                a0, a1 = bf2_f32(a_word)
+                r0, r1 = bf2_f32(fx.ptr_load(red + tid * 2).bitcast(fx.Int32))
+                gn0, gn1 = bf2_f32(fx.ptr_load(red + (tid * 2 + 1)).bitcast(fx.Int32))
+            else:  # narrow: no live ranges across the peers' wait (VGPR-bound)
+                got = mb_poll([(mr("a"), (row_tok * HIDDEN + row) // 2, 1)])
+                a0, a1 = bf2_f32(got[0][0])
+                r0, r1 = bf2_f32(fx.Int32(ld_dev(h_in, (row_tok * HIDDEN + row) // 2)))
+                gn0, gn1 = bf2_f32(
+                    fx.Int32(
+                        bo.buffer_load(rsrc(g_next), row // 2, vec_width=1, dtype=T.i32)
+                    )
+                )
+            h0 = bf16_round(f0) + bf16_round(a0 + r0)
+            h1 = bf16_round(f1) + bf16_round(a1 + r1)
+            bo.buffer_store(
+                fx.Vector.from_elements([h0, h1], fx.Float32).to(fx.BFloat16),
+                rsrc(h_next),
+                row_tok * HIDDEN + row,
+            )
+            y0 = h0 * (gn0 + 1.0)
+            y1 = h1 * (gn1 + 1.0)
+            sc, inv = mx8_scale([y0, y1], (1, 2, 4, 8))
+            lo = fx.Int32(
+                rocdl.cvt_pk_fp8_f32(
+                    T.i32, mx8_q(y0, inv), mx8_q(y1, inv), fx.Int32(0), False
+                )
+            )
+            word = (lo & 0xFFFF) | (xshfl(lo, 1) << 16)
+            ssq = butterfly(h0 * h0 + h1 * h1, (1, 2, 4, 8))
+            if row_pair % 2 == 0:
+                bo.buffer_store(word, rsrc(x8_next), (row_tok * HIDDEN + row) // 4)
+            if row_pair == 0:
+                bo.buffer_store(
+                    fx.Int8(sc), rsrc(x8s_next), row_tok * (HIDDEN // 32) + t
+                )
+                bo.buffer_store(ssq, rsrc(ss_next), row_tok * (HIDDEN // 32) + t)
+
+        if const_expr(not WIDE):
+            ffn_next_pre = None
         k4ctx.update(locals())
         k4ctx.update(moe_common_defs(k4ctx))
         k4ctx.update(ffn_reduce_defs(k4ctx))
