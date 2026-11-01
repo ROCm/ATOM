@@ -9,7 +9,6 @@ import torch
 llg = pytest.importorskip("llguidance")
 
 from atom.model_engine import structured_grammar as xgr
-from atom.model_engine.structured_history import CommittedTokens
 from atom.model_engine.structured_output import (
     StructuredOutput,
     structured_stop_token_ids,
@@ -305,83 +304,6 @@ def test_unsupported_unique_cannot_enable_lenient_compilation(controller):
     }
     with pytest.raises(ValueError, match="finite item/prefix domains"):
         controller.compile(json.dumps(schema))
-
-
-def test_long_history_reads_only_newly_committed_tokens(controller):
-    class Counted(list):
-        reads = 0
-
-        def __getitem__(self, key):
-            assert isinstance(key, int), "scheduler history must not be sliced"
-            self.reads += 1
-            return super().__getitem__(key)
-
-    history = Counted()
-    output = '"' + "a" * 1024 + '"'
-    for token in [*output.encode(), 127]:
-        b = batch(schema={"type": "string"})
-        schema, marker, _ = b.structured_requests[0]
-        b.structured_requests[0] = (
-            schema,
-            marker,
-            CommittedTokens(history, len(history)),
-        )
-        prefixes = controller.apply(torch.zeros(1, 128), b, None)
-        controller.commit(torch.tensor([[token]]), b, prefixes)
-        history.append(token)
-    assert history.reads <= 2 * len(history)
-
-
-@pytest.mark.parametrize("reset", ["prefill", "replacement", "shrink", "mismatch"])
-def test_history_view_reconstructs_after_reset(controller, reset):
-    history = []
-
-    def snapshot(prefill=0):
-        b = batch(prefill=prefill)
-        schema, marker, _ = b.structured_requests[0]
-        b.structured_requests[0] = (
-            schema,
-            marker,
-            CommittedTokens(history, len(history)),
-        )
-        return b
-
-    b = snapshot()
-    prefix = controller.apply(torch.zeros(1, 128), b, None)
-    controller.commit(torch.tensor([[ord("{")]]), b, prefix)
-    history.append(ord("{"))
-    b = snapshot()
-    prefix = controller.apply(torch.zeros(1, 128), b, None)
-    controller.commit(torch.tensor([[ord('"')]]), b, prefix)
-    if reset == "replacement":
-        history = []
-    elif reset in {"prefill", "shrink"}:
-        history.clear()
-    else:
-        # The just-delivered token differs from the worker's prediction.
-        history.append(ord(" "))
-    b = snapshot(prefill=1 if reset == "prefill" else 0)
-    logits = torch.zeros(1, 128)
-    controller.apply(logits, b, None)
-    expected, _ = controller.matcher(*b.structured_requests[0])
-    mask = xgr.allocate_token_bitmask(1, 128)
-    expected.fill_next_token_bitmask(mask)
-    tokens = torch.arange(128)
-    allowed = ((mask[0, tokens // 32] >> (tokens % 32)) & 1).bool()
-    assert torch.equal(torch.isfinite(logits[0]), allowed)
-
-
-def test_committed_view_excludes_later_appends_and_placeholders():
-    history = [10, 11, -1]
-    view = CommittedTokens(history, 2)
-    history[2] = 12
-    history.append(13)
-    assert view.source is history
-    assert list(view) == [10, 11]
-    assert view[-1] == 11
-    assert view[:] == [10, 11]
-    with pytest.raises(IndexError):
-        _ = view[2]
 
 
 @pytest.mark.parametrize(

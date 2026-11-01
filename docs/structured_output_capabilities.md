@@ -93,12 +93,6 @@ multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
 
-The scheduler passes a bounded reference to its committed output prefix, excluding
-mutable placeholder slots. On uninterrupted decode, the worker checks only newly
-delivered tokens and extends its owned history in place; it does not copy or compare
-the full history at every step. Replay, replacement, shrinkage or a mismatch rebuilds
-from the authoritative prefix. Draft marker matching needs only a marker-sized tail.
-
 Committed grammar states are retained for the immediately preceding batch and
 advanced only by newly committed tokens. Each speculative request clones that
 state once and advances its draft branch incrementally; rejected drafts cannot
