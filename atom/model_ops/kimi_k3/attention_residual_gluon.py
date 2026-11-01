@@ -73,6 +73,20 @@ def _attn_res_tdm_kernel(
     o_d = gl.arange(0, BD, layout=layout)
     m_d = o_d < H
     sw = gl.amd.cdna5.buffer_load(sw_ptr, o_d, mask=m_d, other=0.0).to(gl.float32)
+    # The prefix and addend loads go out before the TDM transfers and are only
+    # consumed after them, so all of the token's independent loads are in flight
+    # together.
+    ps_raw = gl.amd.cdna5.buffer_load(
+        ps_ptr + t * stride_ps_t, o_d, mask=m_d, other=0.0
+    )
+    if DO_ADD:
+        hs_raw = gl.amd.cdna5.buffer_load(
+            hs_ptr + t * stride_hs_t, o_d, mask=m_d, other=0.0
+        )
+    if DO_ADD2:
+        hs2_raw = gl.amd.cdna5.buffer_load(
+            hs2_ptr + t * stride_hs2_t, o_d, mask=m_d, other=0.0
+        )
 
     # One [1, BD] tile per block_residual row; columns H..BD read as zero.
     shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
@@ -86,21 +100,15 @@ def _attn_res_tdm_kernel(
     rows = gl.allocate_shared_memory(
         br_ptr.dtype.element_ty, [PREFETCH + 1, 1, BD], shared
     )
-    # Issued before the prefix loads so their latency overlaps the prefix work.
+    # Their latency overlaps the prefix work.
     for j in gl.static_range(PREFETCH):
         gl.amd.cdna5.tdm.async_load(desc, [j, 0], rows.index(j), pred=j < B)
 
-    ps = gl.amd.cdna5.buffer_load(
-        ps_ptr + t * stride_ps_t, o_d, mask=m_d, other=0.0
-    ).to(gl.float32)
+    ps = ps_raw.to(gl.float32)
     if DO_ADD:
-        ps += gl.amd.cdna5.buffer_load(
-            hs_ptr + t * stride_hs_t, o_d, mask=m_d, other=0.0
-        ).to(gl.float32)
+        ps += hs_raw.to(gl.float32)
     if DO_ADD2:
-        ps += gl.amd.cdna5.buffer_load(
-            hs2_ptr + t * stride_hs2_t, o_d, mask=m_d, other=0.0
-        ).to(gl.float32)
+        ps += hs2_raw.to(gl.float32)
     if WRITE_PREF:
         gl.amd.cdna5.buffer_store(
             ps.to(pref_ptr.dtype.element_ty),
@@ -132,10 +140,12 @@ def _attn_res_tdm_kernel(
             else:
                 gl.amd.cdna5.tdm.async_wait(0)
         # Every wave issues its slice of each transfer (TDM ignores EXEC, so a
-        # single-lane producer is not an option). After this barrier all slices
-        # of row i_l are in LDS, and every wave is done reading row i_l - 1,
-        # whose buffer the next transfer refills.
-        gl.barrier()
+        # single-lane producer is not an option). The compiler's membar pass puts
+        # an s_barrier right after this wait, ahead of the refill and the reads
+        # of row i_l below. After it all slices of row i_l are in LDS, and every
+        # wave is done reading row i_l - 1, whose buffer the refill overwrites.
+        # An explicit gl.barrier() here would add a second barrier per row and,
+        # being a full fence, an s_wait_storecnt that drains the prefix_out store.
         gl.amd.cdna5.tdm.async_load(
             desc,
             [i_l + PREFETCH, 0],
