@@ -780,6 +780,28 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             self._save_tracker.pop(str(seq.id), None)
 
     # -- joint boundary ----------------------------------------------------
+    def _withholds_last_prompt_token(self, seq) -> bool:
+        """Not for a hybrid whose joint boundary lies in the withheld chunk.
+
+        A hybrid claims the joint boundary, never the hit: `_joint_kv_boundary`
+        caps the boundary at the last hash block that leaves a token to
+        compute, and `_claim_after_load` stops the claim there. Withholding
+        floors a chunk-aligned prompt one whole chunk below its end, under the
+        rungs that prompt kept there (the anchor a block before its end): no
+        boundary forms and the CPU copy is never read. So the full hit is
+        reported when the block manager would land a boundary in that chunk,
+        and withheld otherwise: a hit no boundary backs is a load
+        `_decide_load_after_alloc` refuses, after it held a parked slot at the
+        scheduler's backpressure gate.
+        """
+        if not getattr(seq, "has_per_req_cache", False):
+            return super()._withholds_last_prompt_token(seq)
+        num_prompt = int(seq.num_prompt_tokens)
+        withheld = self._chunk_floor(num_prompt - 1)
+        if self._block_manager is None or withheld == self._chunk_floor(num_prompt):
+            return True
+        return self._block_manager.joint_boundary_tokens(seq, num_prompt) <= withheld
+
     def _decide_load_after_alloc(self, seq, ls):
         """Clamp a hybrid's KV leg to the boundary the state leg is aimed at.
 

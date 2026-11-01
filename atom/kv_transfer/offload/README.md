@@ -25,8 +25,16 @@ For the in-process path, the public configuration remains
 layouts: `m3` for MiniMax-M3 PAGE regions
 (including its NSA index cache), `kimi_k3` when the text config has
 `model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
-tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`; a subclass of the
-K3 tier over an MHA page image), `hybrid` when `hf_config.compress_ratios` is
+tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`, and Qwen3.8's
+`qwen4_exp`; a subclass of the K3 tier over a PAGE image, held in the MHA pool
+for Qwen3-Next/3.5 and in the QSA arena -- K, V, raw and compressed index
+keys, `k_scale`/`v_scale` and `index_compressed_scale` when those caches are
+quantized, `*_draft` copies of them for an MTP draft kept in BF16 under a
+quantized target (`ATOM_QSA_DRAFT_KV_BF16`), plus `rope_positions` with image
+input -- for Qwen3.8, whose image also carries the PLE conv/n-gram windows;
+until ROCm/ATOM#2655, Qwen3.8 refuses `lmcache_offload` with a quantized QSA
+KV or index cache at startup and only `lmcache_mp` stores those fields),
+`hybrid` when `hf_config.compress_ratios` is
 present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be
@@ -97,7 +105,7 @@ Four rules carry the module:
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
 | `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
-| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool. |
+| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool (Qwen3-Next/3.5) or the QSA arena (Qwen3.8). |
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
@@ -1178,6 +1186,31 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
+### Multimodal prompts: seeded keys
+
+LMCache keys a chunk on the token ids up to its end, and a multimodal prompt's
+image placeholder ids are the same for every picture. Keyed on the raw ids, two
+prompts that differ only in their images would share every KV chunk, while a
+hybrid's state images (filed under `BlockManager` hashes seeded with
+`Sequence.cache_seed`) would not. Every LMCache lookup, save and load therefore
+passes its ids through `tier_token_ids(seq, end)` (`_offload_common.py`): the
+in-process chunked scheduler, the `lmcache_mp` native state scheduler and the
+DSV4 connector.
+
+- A text prompt (`cache_seed == -1`) keys on its ids unchanged, so existing
+  text entries stay valid.
+- Otherwise the first 4 ids are each replaced by a 31-bit BLAKE2b digest of
+  `(cache_seed, position, id)` with bit 31 set, i.e. a value in `[2^31, 2^32)`.
+  Real vocab ids stay below `2^31`, so a seeded key never equals a text key,
+  and the value still fits the big-endian uint32 that `lmcache_mp` packs ids
+  into.
+- Each replaced id depends only on its own position and id, so a prefix's keys
+  are the prefix of the whole prompt's keys and partial hits still line up.
+
+mooncake_store seeds its chain hash the same way (`chain_seed`, see
+[Keys and lookup](#keys-and-lookup)). `tests/test_offload_media_keys.py` covers
+all three LMCache paths.
+
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
@@ -1409,7 +1442,10 @@ env var. This per-thread isolation is exactly why load and save never contend.
   `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
   TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
   shared `engine_id` so the scheduler's lookup client and the workers' lookup
-  servers derive the **same** ZMQ socket path.
+  servers derive the **same** ZMQ socket path. `lmcache_engine_id()` names it
+  per server and DP rank: the server is told apart by its resolved
+  `data_parallel_base_port` (the runners' TCPStore port, unique per live
+  server on a host), so two servers on one host do not bind one socket.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
   `nblocks × bytes_per_block`) and asserts

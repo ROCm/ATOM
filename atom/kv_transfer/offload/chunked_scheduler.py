@@ -19,6 +19,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._offload_common import (
     OffloadSchedulerMixin,
+    tier_token_ids,
     validated_kv_role,
 )
 from atom.kv_transfer.offload.metadata import (
@@ -172,7 +173,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def _lookup_token_ids(self, seq) -> list[int]:
         """The prompt extent this layout can safely ask the tier to resume."""
-        return list(seq.token_ids[: seq.num_prompt_tokens])
+        return tier_token_ids(seq, seq.num_prompt_tokens)
 
     def _lookup_len(self, seq) -> int:
         """`len(self._lookup_token_ids(seq))` without copying the prompt."""
@@ -509,9 +510,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         if not hit:
             return 0, False
-        num_prompt = seq.num_prompt_tokens
         frontier = int(seq.num_cached_tokens)
-        hit = self._loadable_hit(hit, num_prompt)
+        hit = self._loadable_hit(seq, hit)
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will
             # actually be requested; before the save floor is recorded, so a
@@ -656,7 +656,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Admit any layout-specific sources before advancing the watermark."""
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:aligned]),
+            token_ids=tier_token_ids(seq, aligned),
             block_ids=block_ids,
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
@@ -677,7 +677,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:transfer_end]),
+            token_ids=tier_token_ids(seq, transfer_end),
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,

@@ -56,6 +56,7 @@ from atom.kv_transfer.offload._offload_common import (
     build_offload_engine,
     max_pending_saves,
     pp_aware_rank_and_world,
+    tier_token_ids,
     tokens_to_tensor,
     validated_kv_role,
 )
@@ -1968,7 +1969,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
 
         num_prompt = seq.num_prompt_tokens
-        token_ids = list(seq.token_ids[:num_prompt])
+        token_ids = tier_token_ids(seq, num_prompt)
         if sid not in self._lookup_in_step:
             self._lookup_in_step.append(sid)
         try:
@@ -2008,8 +2009,10 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
         if not hit:
             self._clear_lookup_retry_state(sid)
             return 0, False
-        num_prompt = seq.num_prompt_tokens
-        hit = self._loadable_hit(hit, num_prompt)
+        # Withheld (the default `_withholds_last_prompt_token`): unlike the
+        # chunked hybrids, V4 claims the sidecar boundary it reports below, so
+        # a full-prompt hit has to leave a token.
+        hit = self._loadable_hit(seq, hit)
         self._hit_save_floors[sid] = hit
         if bool(getattr(seq, "has_per_req_cache", False)):
             boundary_hashes, _ = self._sidecar_hash_data(seq)
@@ -2371,7 +2374,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:lmc]),
+                    token_ids=tier_token_ids(seq, lmc),
                     block_ids=list(seq.block_table),
                     load_spec=ls,
                     slot_load_spec=slot_load_spec,
@@ -2438,7 +2441,7 @@ class DSV4OffloadScheduler(OffloadSchedulerMixin, KVConnectorSchedulerBase):
             meta.add_request(
                 LMCacheReqMeta(
                     req_id=seq.id,
-                    token_ids=list(seq.token_ids[:token_end]),
+                    token_ids=tier_token_ids(seq, token_end),
                     block_ids=list(seq.block_table),
                     save_spec=(
                         SaveSpec(skip_leading_tokens=saved, can_save=True)
