@@ -5,13 +5,15 @@
 
 The preshuffled MXFP4 GEMMs cannot take a K that is not a multiple of 256. An
 MLP's down_proj K is its per-rank intermediate (Kimi-K3's dense MLP: 33792 / TP8
-= 4224), so the pair pads it together: MergedColumnParallelLinear(
-output_pad_align=) gives each per-rank output shard zero rows, RowParallelLinear(
-input_pad_align=) zero columns. The checkpoint still holds the real sizes.
+= 4224), so the pair pads it together, like MoE's intermediate_pad:
+MergedColumnParallelLinear(output_pad_align=) gives each per-rank output shard
+zero rows, RowParallelLinear(input_pad_align=) zero columns. Only a pair that is
+MXFP4 (or unquantized) in the checkpoint is padded, zeroed at allocation; online
+requant into a padded layer is refused at construction.
 
 Every load path has to write each rank's real shard at the front of its padded
 slot -- including a gate_up merged on disk, and the module-level weight_loader
-an online weight sync calls -- and the padded slots have to be inert.
+an online weight sync calls -- and the padded slots have to stay zero.
 """
 
 from types import SimpleNamespace
@@ -29,7 +31,6 @@ if not torch.cuda.is_available():
 from aiter import QuantType, dtypes
 
 from atom.config import QuantizationConfig
-from atom.model_loader.online_quant_streaming import OnlineQuantStreamer
 from atom.model_ops import linear as linear_mod
 from atom.model_ops.linear import (
     MXFP4_N32K4_K_ALIGN,
@@ -37,12 +38,9 @@ from atom.model_ops.linear import (
     LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
-    _fill_pad_tails,
     mxfp4_k_pad_align,
-    pad_slot_numel,
 )
 from atom.quant_spec import NVFP4_DTYPE, LayerQuantConfig
-from atom.quantization.quark.utils import dequantize_nvfp4
 
 TP = 8
 INTER = 33792  # Kimi-K3 dense MLP
@@ -137,16 +135,16 @@ def test_mxfp4_pair_is_padded(tp_rank):
     gate_up, down = _pair()
     assert gate_up.weight.shape == (2 * PADDED, HIDDEN // 2)
     assert down.weight.shape == (HIDDEN, PADDED // 2)
-    assert gate_up._pad_output_rows == [(REAL, PADDED), (PADDED + REAL, 2 * PADDED)]
-    assert down._pad_input == (REAL, PADDED)
+    assert gate_up._ckpt_output_sizes == [INTER, INTER]
+    assert down._k_padded
 
 
 def test_unquantized_pair_is_untouched(tp_rank):
     gate_up, down = _pair((QuantType.No, torch.bfloat16))
     assert gate_up.weight.shape == (2 * REAL, HIDDEN)
     assert down.weight.shape == (HIDDEN, REAL)
-    assert getattr(gate_up, "_pad_output_rows", None) is None
-    assert down._pad_input is None
+    assert gate_up.output_sizes == gate_up._ckpt_output_sizes
+    assert not down._k_padded
 
 
 # ── every load path lands the real shard at the front of the padded slot ──
@@ -220,26 +218,33 @@ def _process(monkeypatch, layer):
     LinearBase.process_weights_after_loading(layer)
 
 
-def test_padded_slots_are_zero_weights_and_unit_scales(monkeypatch, tp_rank):
+@pytest.mark.parametrize("tp_rank", [0, 3, 7], indirect=True)
+def test_padded_slots_are_zeroed_at_allocation_and_stay_zero(monkeypatch, tp_rank):
+    """Zeroed when built (byte 0 is finite in e8m0, as in MoE); loading the
+    real shards and process_weights_after_loading leave the pad zero."""
     gate_up, down = _pair()
     for layer in (gate_up, down):
-        layer.weight.data.view(torch.uint8).fill_(
-            0xAB
-        )  # what an empty alloc might hold
-        layer.weight_scale.data.view(torch.uint8).fill_(0xCD)
+        assert (_u8(layer.weight) == 0).all() and (_u8(layer.weight_scale) == 0).all()
+    w = _pattern(INTER, HIDDEN // 2) | 1  # nonzero real bytes
+    sc = _pattern(INTER, HIDDEN // 32) | 1
+    for shard_id in (0, 1):
+        gate_up.weight_loader(gate_up.weight, w, shard_id)
+        gate_up.weight_loader(gate_up.weight_scale, sc, shard_id)
+    down.weight_loader(down.weight, _pattern(HIDDEN, INTER // 2) | 1)
+    down.weight_loader(down.weight_scale, _pattern(HIDDEN, INTER // 32) | 1)
+    for layer in (gate_up, down):
         _process(monkeypatch, layer)
 
     gw, gs = _u8(gate_up.weight), _u8(gate_up.weight_scale)
-    for start, end in gate_up._pad_output_rows:
-        assert (gw[start:end] == 0).all() and (gs[start:end] == 127).all()
-    for real in (slice(0, REAL), slice(PADDED, PADDED + REAL)):  # gate, up
-        assert (gw[real] == 0xAB).all(), "real rows must not be touched"
-        assert (gs[real] == 0xCD).all(), "real scale rows must not be touched"
-
+    for real, pad in (
+        (slice(0, REAL), slice(REAL, PADDED)),
+        (slice(PADDED, PADDED + REAL), slice(PADDED + REAL, 2 * PADDED)),
+    ):
+        assert (gw[pad] == 0).all() and (gs[pad] == 0).all()
+        assert (gw[real] != 0).all() and (gs[real] != 0).all()
     dw, ds = _u8(down.weight), _u8(down.weight_scale)
-    assert (dw[:, REAL // 2 :] == 0).all() and (ds[:, REAL // 32 :] == 127).all()
-    assert (dw[:, : REAL // 2] == 0xAB).all(), "real columns must not be touched"
-    assert (ds[:, : REAL // 32] == 0xCD).all(), "real scale columns untouched"
+    assert (dw[:, REAL // 2 :] == 0).all() and (ds[:, REAL // 32 :] == 0).all()
+    assert (dw[:, : REAL // 2] != 0).all() and (ds[:, : REAL // 32] != 0).all()
 
 
 def test_an_unpadded_mxfp4_down_is_refused(monkeypatch, tp_rank):
@@ -250,7 +255,7 @@ def test_an_unpadded_mxfp4_down_is_refused(monkeypatch, tp_rank):
         _process(monkeypatch, down)
 
 
-# ── a source requantized online to MXFP4 is padded in its own scheme ──────
+# ── online requant into a padded layer is refused at construction ────────
 
 
 def _online_to_mxfp4(source):
@@ -271,6 +276,10 @@ FP8_BLOCK_SRC = LayerQuantConfig(
     quant_dtype=dtypes.fp8,
     weight_block_size=[128, 128],
 )
+FP8_PER_TOKEN_SRC = LayerQuantConfig(
+    quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8
+)
+BF16_SRC = LayerQuantConfig(quant_type=QuantType.No, quant_dtype=torch.bfloat16)
 
 
 @pytest.fixture
@@ -283,152 +292,61 @@ def online_build(monkeypatch):
     )
 
 
-def _online_pair(source, inter=INTER):
+@pytest.mark.parametrize(
+    "source",
+    [NVFP4_SRC, FP8_BLOCK_SRC, FP8_PER_TOKEN_SRC, BF16_SRC],
+    ids=["nvfp4", "fp8_block", "fp8_per_token", "bf16"],
+)
+def test_online_requant_into_a_padded_layer_is_refused(tp_rank, online_build, source):
+    """Padding a source scheme before requant is what MoE never does either;
+    an unaligned pair that only becomes MXFP4 online is refused, loudly."""
     qc = _online_to_mxfp4(source)
     align = mxfp4_k_pad_align(qc, "mlp.down_proj")
     assert align == MXFP4_PRESHUFFLE_K_ALIGN
-    gate_up = MergedColumnParallelLinear(
-        HIDDEN,
-        [inter, inter],
-        quant_config=qc,
-        prefix="mlp.gate_up_proj",
-        output_pad_align=align,
-    )
+    with pytest.raises(NotImplementedError, match="exclude_layer"):
+        RowParallelLinear(
+            INTER,
+            HIDDEN,
+            quant_config=qc,
+            prefix="mlp.down_proj",
+            input_pad_align=align,
+        )
+    with pytest.raises(NotImplementedError, match="exclude_layer"):
+        MergedColumnParallelLinear(
+            HIDDEN,
+            [INTER, INTER],
+            quant_config=qc,
+            prefix="mlp.gate_up_proj",
+            output_pad_align=align,
+        )
+
+
+def test_an_aligned_online_requant_pair_is_built_unpadded(tp_rank, online_build):
+    """The refusal is only for a layer padding would change."""
+    qc = _online_to_mxfp4(BF16_SRC)
+    align = mxfp4_k_pad_align(qc, "mlp.down_proj")
+    aligned = PADDED * TP  # per rank already a multiple of 256
     down = RowParallelLinear(
-        inter,
+        aligned,
         HIDDEN,
         quant_config=qc,
-        reduce_results=False,
         prefix="mlp.down_proj",
         input_pad_align=align,
     )
-    return gate_up, down
+    assert not down._k_padded
 
 
-def _poison(layer):
-    layer.weight.data.view(torch.uint8).fill_(0xAB)
-    layer.weight_scale.data.view(torch.uint8).fill_(0x7F)  # NaN as e4m3fn
-    _fill_pad_tails(layer)
-
-
-def test_nvfp4_source_pad_scales_are_one_not_nan(tp_rank, online_build):
-    """NVFP4 scales are e4m3fn, where the e8m0 "1.0" byte 0x7F is NaN; the
-    online requant dequantizes them, so a NaN there would reach the output."""
-    gate_up, down = _online_pair(NVFP4_SRC)
-    assert gate_up.weight_scale.dtype == torch.float8_e4m3fn
-    for layer in (gate_up, down):
-        _poison(layer)
-
-    for start, end in gate_up._pad_output_rows:
-        assert (gate_up.weight_scale.data[start:end].float() == 1.0).all()
-        tail = dequantize_nvfp4(
-            gate_up.weight.data[start:end],
-            gate_up.weight_scale.data[start:end],
-            torch.tensor(1.0),
-        )
-        assert (tail == 0).all()
-    s_start = REAL // 16  # one e4m3fn scale per 16 of K
-    assert (down.weight_scale.data[:, s_start:].float() == 1.0).all()
-    tail = dequantize_nvfp4(
-        down.weight.data[:, REAL // 2 :],
-        down.weight_scale.data[:, s_start:],
-        torch.tensor(1.0),
+def test_an_unquantized_gate_up_half_is_padded_with_zeros(tp_rank):
+    """A bf16 gate_up feeding an MXFP4 down: zero rows are trivially exact."""
+    gate_up = MergedColumnParallelLinear(
+        HIDDEN,
+        [INTER, INTER],
+        quant_config=_qc(QuantType.No, torch.bfloat16),
+        prefix="mlp.gate_up_proj",
+        output_pad_align=MXFP4_PRESHUFFLE_K_ALIGN,
     )
-    assert (tail == 0).all()
-
-
-@pytest.mark.parametrize("tp_rank", [0, 3, 7], indirect=True)
-def test_fp8_block_source_is_padded_by_whole_blocks(tp_rank, online_build):
-    """Kimi-K3's 4224 per rank is 33 blocks of 128: the pad is one more block
-    of zero weights with scale 1.0, and each rank's real blocks load in front."""
-    gate_up, down = _online_pair(FP8_BLOCK_SRC)
-    assert gate_up.weight_scale.shape == (2 * PADDED // 128, HIDDEN // 128)
-    assert down.weight_scale.shape == (HIDDEN // 128, PADDED // 128)
-
-    blocks = INTER // 128
-    gs = torch.arange(blocks * 2, dtype=torch.float32).view(blocks, 2) + 2
-    us = gs + 1000
-    gate_up.weight_loader(gate_up.weight_scale, gs, 0)
-    gate_up.weight_loader(gate_up.weight_scale, us, 1)
-    ds = torch.arange(2 * blocks, dtype=torch.float32).view(2, blocks) + 2
-    down.weight_loader(down.weight_scale, ds)
-    for layer in (gate_up, down):
-        layer.weight.data.view(torch.uint8).fill_(0xAB)
-        _fill_pad_tails(layer)
-
-    real_b, pad_b = REAL // 128, PADDED // 128  # 33, 34
-    g = gate_up.weight_scale.data.cpu()
-    assert torch.equal(g[:real_b], gs.chunk(TP, 0)[tp_rank])
-    assert torch.equal(g[pad_b : pad_b + real_b], us.chunk(TP, 0)[tp_rank])
-    assert (g[real_b:pad_b] == 1.0).all() and (g[pad_b + real_b :] == 1.0).all()
-    d = down.weight_scale.data.cpu()
-    assert torch.equal(d[:, :real_b], ds.chunk(TP, 1)[tp_rank])
-    assert (d[:, real_b:] == 1.0).all()
-    assert (_u8(gate_up.weight)[REAL:PADDED] == 0).all()
-    assert (_u8(down.weight)[:, REAL:] == 0).all()
-
-
-@pytest.mark.parametrize("tp_rank", [0], indirect=True)
-def test_fp8_block_source_refused_when_blocks_straddle_the_pad(tp_rank, online_build):
-    """Qwen3-Next's 512-wide shared expert at TP8 is 64 per rank: a 128-row
-    scale block would cover real and padded rows, so it can't be padded."""
-    with pytest.raises(NotImplementedError, match=r"per_1x128.*straddle"):
-        _online_pair(FP8_BLOCK_SRC, inter=512)
-
-
-# ── online-quant streaming does not wait for the padded slots ─────────────
-
-
-@pytest.mark.parametrize("tp_rank", [0, 7], indirect=True)
-def test_streaming_expects_only_the_real_shards(monkeypatch, tp_rank):
-    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
-    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING", "1")
-    monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING_THREADS", "0")
-    monkeypatch.setattr(
-        linear_mod,
-        "get_current_atom_config",
-        lambda: SimpleNamespace(torch_dtype=torch.bfloat16),
-    )
-    gate_up, down = _online_pair(NVFP4_SRC)
-    for layer in (gate_up, down):
-        assert layer._stream_online_quant and layer.weight.is_meta
-        streamer = OnlineQuantStreamer.maybe_create(layer, load_dummy=None)
-        padded = sum(
-            pad_slot_numel(layer, p) for p in (layer.weight, layer.weight_scale)
-        )
-        assert padded > 0
-        full = sum(p.numel() for p in layer.parameters(recurse=False))
-        assert layer._stream_expected_numel == full - padded
-        del streamer
-
-    # gate_up: the real shards (and global scales) alone complete the module.
-    monkeypatch.setattr(
-        linear_mod,
-        "quant_weight_online",
-        lambda w, *_a, **_k: (
-            torch.zeros(w.shape[0], w.shape[1] // 2, dtype=torch.uint8).view(
-                dtypes.fp4x2
-            ),
-            torch.full((w.shape[0], w.shape[1] // 32), 127, dtype=torch.uint8).view(
-                dtypes.fp8_e8m0
-            ),
-        ),
-    )
-    gate_up, _ = _online_pair(NVFP4_SRC)
-    # Built padded for the preshuffled GEMM; skip only the shuffle at finalize.
-    monkeypatch.setattr(linear_mod, "use_fp4_non_shuffle_triton_gemm", lambda: True)
-    streamer = OnlineQuantStreamer.maybe_create(gate_up, load_dummy=None)
-    for shard_id in (0, 1):
-        for param, value in (
-            (gate_up.weight, torch.full((INTER, HIDDEN // 2), 0x22, dtype=torch.uint8)),
-            (
-                gate_up.weight_scale,
-                torch.full((INTER, HIDDEN // 16), 2.0, dtype=torch.float8_e4m3fn),
-            ),
-            (gate_up.weight_scale_2, torch.tensor(1.0)),
-        ):
-            streamer.run(param.weight_loader, (param, value, shard_id))
-    assert id(gate_up) in streamer.done_module_ids
+    assert gate_up.weight.shape == (2 * PADDED, HIDDEN)
+    assert (_u8(gate_up.weight) == 0).all()
 
 
 # ── the alignment follows the GEMM the layer will run on ──────────────────
@@ -450,15 +368,16 @@ def test_no_padding_when_the_backend_takes_the_real_k(monkeypatch, tp_rank):
     gate_up, down = _pair()
     assert gate_up.weight.shape == (2 * REAL, HIDDEN // 2)
     assert down.weight.shape == (HIDDEN, REAL // 2)
-    assert down._pad_input is None
+    assert not down._k_padded
 
 
-# ── W4A8: the native group32 path pads, so its slots are filled too ───────
+# ── W4A8: the native group32 path is padded too, zeroed at allocation ─────
 
 
-def test_w4a8_native_pad_slots_are_filled(monkeypatch, tp_rank):
+def test_w4a8_native_pad_slots_stay_zero(monkeypatch, tp_rank):
     """fp4 weights + FP8 activations take the native group32 branch of
-    process_weights_after_loading, which returns early; the fill runs first."""
+    process_weights_after_loading, which returns early; the pad was zeroed when
+    the layer was built, so nothing there needs to run."""
     qc = QuantizationConfig()
     qc.global_spec = LayerQuantConfig(
         quant_type=QuantType.per_1x32,
@@ -485,41 +404,13 @@ def test_w4a8_native_pad_slots_are_filled(monkeypatch, tp_rank):
     )
     assert gate_up.native_a8_group_rows is not None
     for layer in (gate_up, down):
-        layer.weight.data.view(torch.uint8).fill_(0xAB)
-        layer.weight_scale.data.view(torch.uint8).fill_(0xFF)  # NaN as e8m0
         _process(monkeypatch, layer)
-
     gw, gs = _u8(gate_up.weight), _u8(gate_up.weight_scale)
-    for start, end in gate_up._pad_output_rows:
-        assert (gw[start:end] == 0).all() and (gs[start:end] == 127).all()
+    for start in (REAL, PADDED + REAL):
+        assert (gw[start : start + PADDED - REAL] == 0).all()
+        assert (gs[start : start + PADDED - REAL] == 0).all()
     dw, ds = _u8(down.weight), _u8(down.weight_scale)
-    assert (dw[:, REAL // 2 :] == 0).all() and (ds[:, REAL // 32 :] == 127).all()
-
-
-# ── TP=1: a per-token (N, 1) scale has no K to pad ────────────────────────
-
-
-def test_tp1_per_token_scale_loads_into_a_padded_down(monkeypatch, online_build):
-    group = SimpleNamespace(world_size=1, rank_in_group=0)
-    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: group)
-    src = LayerQuantConfig(quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8)
-    qc = _online_to_mxfp4(src)
-    down = RowParallelLinear(
-        REAL,
-        HIDDEN,
-        quant_config=qc,
-        reduce_results=False,
-        prefix="mlp.down_proj",
-        input_pad_align=mxfp4_k_pad_align(qc, "mlp.down_proj"),
-    )
-    assert down._pad_input == (REAL, PADDED)
-    assert down.weight_scale.shape == (HIDDEN, 1)
-    scale = torch.arange(HIDDEN, dtype=torch.float32).view(HIDDEN, 1) + 1
-    down.weight_loader(down.weight_scale, scale)
-    assert torch.equal(down.weight_scale.data.cpu(), scale)
-    w = _pattern(HIDDEN, REAL)
-    down.weight_loader(down.weight, w.view(dtypes.fp8))
-    assert torch.equal(_u8(down.weight)[:, :REAL], w)
+    assert (dw[:, REAL // 2 :] == 0).all() and (ds[:, REAL // 32 :] == 0).all()
 
 
 # ── a padded param never takes the fused-on-disk direct copy ──────────────
@@ -565,8 +456,7 @@ def test_effective_layer_quant_resolves_the_online_target():
 
 
 def test_weight_scale_row_group_compares_by_value():
-    """A per_1x128 QuantType from another aiter import still groups by 128;
-    the padding's block-straddle check and scale slicing read this."""
+    """A per_1x128 QuantType from another aiter import still groups by 128."""
 
     class Foreign:
         value = QuantType.per_1x128.value
@@ -578,78 +468,6 @@ def test_weight_scale_row_group_compares_by_value():
 
     double = SimpleNamespace(native_a8_group_rows=None, quant_type=Foreign())
     assert LinearBase.weight_scale_row_group.fget(double) == 128
-
-
-# ── a per-tensor FP8 gate_up next to an MXFP4 down ────────────────────────
-
-FP8_PER_TENSOR = (QuantType.per_Tensor, dtypes.fp8)
-TP2_INTER = 2 * REAL  # 4224 per rank at TP2, padded to 4352
-
-
-def _tp2(monkeypatch, rank):
-    group = SimpleNamespace(world_size=2, rank_in_group=rank)
-    monkeypatch.setattr(linear_mod, "get_tp_group", lambda: group)
-
-
-def _per_tensor_gate_up(**kw):
-    return MergedColumnParallelLinear(
-        HIDDEN,
-        [TP2_INTER, TP2_INTER],
-        quant_config=_qc(*FP8_PER_TENSOR),
-        prefix="mlp.gate_up_proj",
-        output_pad_align=MXFP4_PRESHUFFLE_K_ALIGN,
-        **kw,
-    )
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_fused_per_tensor_scale_loads_into_a_padded_gate_up(monkeypatch, rank):
-    """A fused-on-disk per-tensor scale has one entry per shard and no padded
-    slots: it copies as is, padded or not (it used to be split by rows)."""
-    _tp2(monkeypatch, rank)
-    gate_up = _per_tensor_gate_up()
-    assert gate_up.weight_scale.shape == (2, 1)
-    assert pad_slot_numel(gate_up, gate_up.weight_scale) == 0
-    gate_up.weight_loader(gate_up.weight_scale, torch.tensor([[2.0], [3.0]]), None)
-    assert gate_up.weight_scale.data.flatten().tolist() == [2.0, 3.0]
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("scale_range", [(0.5, 4.0), (1e-3, 4e-3)])
-def test_per_row_scales_requantize_row_for_row_when_padded(
-    monkeypatch, rank, scale_range
-):
-    """A per-tensor gate_up whose checkpoint carries one scale per row is
-    requantized to one max scale. Each row must be dequantized with its own
-    scale: the saved scale parts hold the real rows, the weight the padded."""
-    _tp2(monkeypatch, rank)
-    with torch.device("cuda"):
-        gate_up = _per_tensor_gate_up()
-    torch.manual_seed(rank)
-    shards, local_scales = [], []
-    for shard_id in (0, 1):
-        w = (torch.randn(TP2_INTER, HIDDEN) * 50).to(dtypes.fp8)
-        # Scales that differ a lot from row to row, so a wrong one shows.
-        # Real FP8 scales are usually << 1: the pad rows must not lift the
-        # max the whole weight is requantized to.
-        s = torch.linspace(*scale_range, TP2_INTER).view(-1, 1) * (shard_id + 1)
-        gate_up.weight_loader(gate_up.weight, w, shard_id)
-        gate_up.weight_loader(gate_up.weight_scale, s, shard_id)
-        shards.append(w.chunk(2, 0)[rank].float() * s.chunk(2, 0)[rank])
-        local_scales.append(s.chunk(2, 0)[rank])
-    monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **kw: None)
-    gate_up.process_weights_after_loading()
-
-    max_scale = gate_up.weight_scale.data.max().cpu()
-    # The requant target is this rank's largest real scale, not a pad row's.
-    expected = max(part.max() for part in local_scales)
-    assert max_scale == pytest.approx(expected.item()), "requant scale"
-    deq = gate_up.weight.data.float().cpu() * max_scale
-    for i, ref in enumerate(shards):
-        got = deq[i * PADDED : i * PADDED + REAL]
-        rel = (got - ref).norm() / ref.norm()
-        assert rel < 0.1, f"shard {i}: relative error {rel:.3f}"
-        assert (deq[i * PADDED + REAL : (i + 1) * PADDED] == 0).all()
 
 
 # ── the padded pair runs forward like the unpadded math ───────────────────

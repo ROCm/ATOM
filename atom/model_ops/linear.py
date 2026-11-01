@@ -143,39 +143,25 @@ else:
     gemm_afp4wfp4 = None
 
 
-# The preshuffled MXFP4 GEMMs on the e8m0-shuffled scale layout walk K in
-# 256-wide steps and none of them masks a tail: at a K that is not a multiple of
-# 256 the last step reads activation scale columns the quant never wrote and the
-# bytes past each row, and the result is garbage whenever that memory is. The
-# triton preshuffle kernel asserts on this at call time; the ASM `gemm_a4w4`
-# does not. So `process_weights_after_loading` refuses such a weight at load; an
-# MLP pair pads its K instead (see mxfp4_k_pad_align). Exempt: gfx1250's 32x4
-# scale layout (K % 128, below) and the non-shuffle Triton GEMM, which reads the
-# raw layout.
+# Preshuffled MXFP4 GEMMs on the e8m0-shuffled scale layout step K by 256 and do
+# not mask a tail; gfx1250's 32x4 layout steps by 128; non-shuffle Triton masks.
 MXFP4_PRESHUFFLE_K_ALIGN = 256
-# gfx1250's 32x4-scale gemm_a4w4 kernels take K in steps of 128 (4 x 32).
 MXFP4_N32K4_K_ALIGN = 128
 
 
 def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
-    """Raise if a preshuffled MXFP4 (fp4x2) weight's K would leave a tail."""
     k = weight.shape[-1] * 2  # fp4x2 packs two K elements per byte
     if k % MXFP4_PRESHUFFLE_K_ALIGN:
         raise RuntimeError(
-            f"{prefix}: MXFP4 weight has K={k}, which is not a multiple of "
-            f"{MXFP4_PRESHUFFLE_K_ALIGN}. The preshuffled MXFP4 GEMMs do not "
-            "handle a K tail and would read uninitialized memory. If this is an "
-            "MLP down_proj, build its pair with output_pad_align / "
-            "input_pad_align from mxfp4_k_pad_align(). Otherwise keep this "
-            "layer out of MXFP4 (for online quant, list it in exclude_layer of "
-            "--online_quant_config), or set ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 "
-            "to run every MXFP4 GEMM on the non-shuffle Triton kernel."
+            f"{prefix}: preshuffled MXFP4 GEMM needs K % "
+            f"{MXFP4_PRESHUFFLE_K_ALIGN} == 0, got K={k}. Pad the MLP pair via "
+            "mxfp4_k_pad_align(), list the layer in exclude_layer of "
+            "--online_quant_config, or set ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1."
         )
 
 
 def _is_mxfp4(quant_type, quant_dtype) -> bool:
-    # By value: QuantType members from different aiter imports (plugin mode, a
-    # re-import) do not compare equal under `==` (see weight_is_stored_preshuffled).
+    # By value: plugin-mode QuantType members do not compare equal under `==`.
     return (
         quant_type is not None
         and quant_type.value == QuantType.per_1x32.value
@@ -183,19 +169,10 @@ def _is_mxfp4(quant_type, quant_dtype) -> bool:
     )
 
 
-def mxfp4_k_pad_align(
-    quant_config: QuantizationConfig | None, prefix: str
-) -> int | None:
-    """K alignment a gate_up -> act -> down MLP must pad its intermediate to.
+def mxfp4_k_pad_align(quant_config, prefix: str) -> int | None:
+    """K step an MLP pair pads its intermediate to; ``prefix`` is down_proj's.
 
-    ``prefix`` is the down_proj's: its K is the per-rank intermediate. When
-    that layer ends up MXFP4 -- statically, or through an online-quant override
-    that applies to it -- returns the K step of the GEMM it will run on:
-    ``MXFP4_PRESHUFFLE_K_ALIGN`` for the preshuffled e8m0 kernels, 128 for
-    gfx1250's 32x4-scale kernels, and ``None`` (no padding) for the
-    non-shuffle Triton GEMM, which reads the raw layout. ``None`` otherwise.
-    Pass the result to BOTH linears of the pair (``output_pad_align`` on
-    gate_up, ``input_pad_align`` on down) so they agree on the padding.
+    Pass the result as gate_up's output_pad_align and down's input_pad_align.
     """
     if quant_config is None or use_fp4_non_shuffle_triton_gemm():
         return None
@@ -204,117 +181,26 @@ def mxfp4_k_pad_align(
     return MXFP4_N32K4_K_ALIGN if _mxfp4_n32k4_backend() else MXFP4_PRESHUFFLE_K_ALIGN
 
 
-def padded_partition_size(size_per_partition: int, align: int | None) -> int:
-    """Round a per-rank size up to ``align`` (unchanged when ``align`` is None)."""
-    if not align:
-        return size_per_partition
-    return (size_per_partition + align - 1) // align * align
+def padded_partition_size(size: int, align: int | None) -> int:
+    return size if not align else (size + align - 1) // align * align
 
 
-def _fill_unit_scale(scale: torch.Tensor) -> None:
-    """Write 1.0 in the scale's own encoding (e8m0 0x7F, e4m3fn 0x38, ...).
-
-    MoE's ``intermediate_pad`` zeroes its pad scales' bytes instead. Either is
-    inert, since the weights beside them are zero; this uses 1.0 because these
-    slots may be dequantized for online requant from any source encoding, and
-    1.0 is the same exact value in all of them (byte 0 is 0 in e4m3fn but
-    2**-127 in e8m0).
-    """
-    if scale.dtype == torch.uint8:  # e8m0 held as raw bytes
-        scale.fill_(127)
-    else:
-        scale.fill_(1.0)
-
-
-def _pad_slots(layer: nn.Module):
-    """The padded slots of a K-padded MLP pair: ``(param, index, is_scale)``.
-
-    Nothing in the checkpoint writes them. Weights (and bias) there must be
-    zero; scales 1.0 only so they are finite. Scales that follow the weight's
-    rows (one per row, or per 128-row block) and its K (one per 32 / 16 / 128
-    of K) have slots too; per-tensor ones don't.
-    """
-    rows = getattr(layer, "_pad_output_rows", None)  # gate_up: [(start, end), ...]
-    cols = getattr(layer, "_pad_input", None)  # down: (real_k, padded_k)
-    if not rows and not cols:
-        return
-    weight = layer.weight
-    scale = getattr(layer, "weight_scale", None)
-    bias = getattr(layer, "bias", None)
-    qt = getattr(layer, "quant_type", None)
-    qv = None if qt is None else qt.value
-    row_scales = qv in (
-        QuantType.per_Token.value,
-        QuantType.per_1x32.value,
-        QuantType.per_1x128.value,
-    )
-    k_scales = qv in (QuantType.per_1x32.value, QuantType.per_1x128.value)
-    group = layer.weight_scale_row_group if qv == QuantType.per_1x128.value else 1
-    for start, end in rows or ():
-        yield weight, (slice(start, end),), False
-        if scale is not None and row_scales:
-            yield scale, (slice(start // group, end // group),), True
-        if bias is not None:
-            yield bias, (slice(start, end),), False
-    if cols:
-        real_k, padded_k = cols
-        # In each param's own K units: elements, fp4x2 bytes, or one per group.
-        w_start = weight.shape[1] * real_k // padded_k
-        yield weight, (slice(None), slice(w_start, None)), False
-        if scale is not None and k_scales:
-            s_start = scale.shape[1] * real_k // padded_k
-            yield scale, (slice(None), slice(s_start, None)), True
-
-
-def pad_slot_numel(layer: nn.Module, param: nn.Parameter) -> int:
-    """Elements of ``param`` in padded slots, which no checkpoint load writes."""
-    return sum(p[idx].numel() for p, idx, _ in _pad_slots(layer) if p is param)
-
-
-def _fill_pad_tails(layer: nn.Module) -> None:
-    """Make the padded part of a K-padded MLP pair inert, before any quant/shuffle.
-
-    Weights are zeroed through a byte view, the same for bf16, fp8 and fp4x2.
-    Scales get 1.0 in their own dtype: a source dequantized for online requant
-    (an NVFP4 e4m3fn scale, say) multiplies them in, so they must be finite.
-    Run at load because parameters are allocated empty.
-    """
-    for param, idx, is_scale in _pad_slots(layer):
-        if is_scale:
-            _fill_unit_scale(param.data[idx])
-        else:
-            param.data[idx].view(torch.uint8).zero_()
-
-
-def _check_pad_source(layer: nn.Module, prefix: str, real: int, padded: int) -> None:
-    """Refuse, at construction, a padded pair whose SOURCE weights can't be padded.
-
-    Padding is decided from the scheme the layer ends up in (MXFP4, possibly by
-    online requant), but it is applied to the parameters as allocated, i.e. in
-    the checkpoint's scheme; the padded slots are filled before any requant.
-    That works when the source scales can hold a pad boundary: none, per-tensor,
-    per-row, per-32/16 of K, or 128x128 blocks that end exactly at the real size.
-    """
-    qv = layer.quant_type.value
-    group = layer.weight_scale_row_group
-    if qv == QuantType.per_1x128.value:
-        if real % group == 0:
-            return
-        reason = (
-            f"its {group}x{group} scale blocks would straddle the pad boundary "
-            f"(real per-rank size {real} is not a multiple of {group})"
+def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
+    """Like MoE's intermediate_pad: only a half that is MXFP4 (or unquantized) in
+    the checkpoint is padded, zeroed at allocation (byte 0 is finite in e8m0);
+    loads fill the front. Online requant into a padded layer is refused."""
+    qt, dt = layer.quant_type, layer.params_dtype
+    static = not will_online_requant(quant_config, prefix, qt, dt)
+    if not (static and (_is_mxfp4(qt, dt) or qt.value == QuantType.No.value)):
+        raise NotImplementedError(
+            f"{prefix}: MXFP4 K padding needs the MLP pair to be MXFP4 (or "
+            "unquantized) in the checkpoint, not online requant; list this MLP "
+            "in exclude_layer of --online_quant_config."
         )
-    elif qv in (QuantType.No.value, QuantType.per_Tensor.value) or (
-        qv in (QuantType.per_Token.value, QuantType.per_1x32.value) and group == 1
-    ):
-        return
-    else:
-        reason = "padding is not implemented for that scheme"
-    raise NotImplementedError(
-        f"{prefix}: this MLP pair pads its per-rank K {real} -> {padded} for the "
-        f"preshuffled MXFP4 GEMM, but the checkpoint's {layer.quant_type.name} "
-        f"weights can't be padded: {reason}."
-    )
+    for name in ("weight", "weight_scale", "bias"):
+        p = getattr(layer, name, None)
+        if p is not None:
+            p.data.view(torch.uint8).zero_()
 
 
 if use_triton_gemm():
@@ -1094,17 +980,11 @@ class LinearBase(nn.Module):
         self.quant_func = get_hip_quant(self.quant_type)
         self.is_output_padded = False
 
-    def pad_slot_numel(self, param: nn.Parameter) -> int:
-        """Elements of ``param`` in a K-padded pair's padded slots (see
-        ``pad_slot_numel``); online-quant streaming does not wait for them."""
-        return pad_slot_numel(self, param)
-
     @property
     def weight_scale_row_group(self) -> int:
         """Number of weight rows represented by one row of source scales."""
         if self.native_a8_group_rows is not None:
             return self.native_a8_group_rows
-        # By value, like the padding code that reads it (plugin-mode QuantType).
         return 128 if self.quant_type.value == QuantType.per_1x128.value else 1
 
     @staticmethod
@@ -1444,11 +1324,6 @@ class LinearBase(nn.Module):
         shuffled and its N left unpadded, with the RuntimeError that exists to
         catch exactly that skipped along with the padding.
         """
-        # Before any requant or shuffle, and before the native group32 return
-        # below (W4A8 pads too): the padded slots of a K-padded MLP pair were
-        # allocated empty and nothing in the checkpoint writes them.
-        if self.weight.numel():
-            _fill_pad_tails(self)
         # A native group32 weight keeps its compact scales, and its bytes too
         # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
@@ -1488,22 +1363,7 @@ class LinearBase(nn.Module):
                 and loaded_weight_scale_parts is not None
                 and all(part is not None for part in loaded_weight_scale_parts)
             ):
-                parts = loaded_weight_scale_parts
-                if getattr(self, "_pad_output_rows", None):
-                    # Each part holds its shard's real rows; the weight has the
-                    # padded ones. Give the (zero) pad rows a scale of 0 so the
-                    # per-row requant below lines up row for row; 0, not 1.0,
-                    # because the requant target is the max over all rows.
-                    parts = [
-                        torch.cat(
-                            [
-                                part,
-                                part.new_zeros(padded - part.shape[0], *part.shape[1:]),
-                            ]
-                        )
-                        for part, padded in zip(parts, self.output_partition_sizes)
-                    ]
-                loaded_weight_scale = torch.cat(parts, dim=0)
+                loaded_weight_scale = torch.cat(loaded_weight_scale_parts, dim=0)
             weight_scale_for_requant = (
                 loaded_weight_scale
                 if loaded_weight_scale is not None
@@ -1582,7 +1442,6 @@ class LinearBase(nn.Module):
                 self.fp4_n32k4_scale = True
                 self.weight_scale.data = shuffle_mxfp8fp4_scale(self.weight_scale.data)
             else:
-                # The 32x4 layout's kernels take K % 128; this one's need K % 256.
                 if self.params_dtype == dtypes.fp4x2 and self.weight.dim() == 2:
                     check_mxfp4_preshuffle_k(getattr(self, "prefix", ""), self.weight)
                 self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
@@ -2010,10 +1869,8 @@ class MergedColumnParallelLinear(LinearBase):
         output_pad_align: int | None = None,
         **kwargs,
     ):
-        # `output_pad_align` pads every per-rank output shard up to that multiple
-        # with zero rows: the gate_up half of a K-padded MLP pair, whose output
-        # is the down_proj's K (see mxfp4_k_pad_align). The checkpoint still
-        # holds the real sizes, which the loader slices by.
+        # Pads each per-rank shard with zero rows (gate_up of a K-padded pair,
+        # see mxfp4_k_pad_align); the checkpoint keeps the real sizes.
         self._ckpt_output_sizes = list(output_sizes)
         if output_pad_align:
             tp = get_tp_group().world_size
@@ -2032,13 +1889,7 @@ class MergedColumnParallelLinear(LinearBase):
             prefix=prefix,
         )
         if self.output_sizes != self._ckpt_output_sizes:
-            rows, off = [], 0
-            for real, padded in zip(self._ckpt_output_sizes, self.output_sizes):
-                r, p = real // self.tp_size, padded // self.tp_size
-                _check_pad_source(self, prefix, r, p)
-                rows.append((off + r, off + p))
-                off += p
-            self._pad_output_rows = rows
+            _zero_k_pad(self, quant_config, prefix)
 
     def weight_loader(
         self,
@@ -2064,10 +1915,9 @@ class MergedColumnParallelLinear(LinearBase):
                     f"Got shard id {loaded_shard_id}."
                 )
 
-            # Split loaded_weight by the requested shard sizes (pre-TP), as the
-            # checkpoint holds them, then load each shard individually.
-            ckpt_sizes = self._ckpt_output_sizes
-            shard_sizes = [ckpt_sizes[i] for i in loaded_shard_id]
+            # Split loaded_weight by the requested shard sizes (pre-TP),
+            # then load each shard individually.
+            shard_sizes = [self._ckpt_output_sizes[i] for i in loaded_shard_id]
             current_offset = 0
             for shard_id, shard_size in zip(loaded_shard_id, shard_sizes):
                 if param is getattr(self, "weight_scale", None) or param is getattr(
@@ -2091,24 +1941,17 @@ class MergedColumnParallelLinear(LinearBase):
                 self, "weight_scale", None
             ) or param is getattr(self, "input_scale", None)
 
-            # For fused weight, need to match param shape. A param with padded
-            # slots can coincide in shape with the unsharded tensor (128 per
-            # rank padded to 256 at TP2) while holding a different layout, so it
-            # always splits; one without (a per-tensor scale, one per shard)
-            # copies as before.
-            if (
-                self.pad_slot_numel(param) == 0
-                and param_data.shape == loaded_weight.shape
-            ):
+            # For fused weight, need to match param shape
+            # A padded param can match the unsharded shape (TP2); always split.
+            padded = self.output_sizes != self._ckpt_output_sizes
+            if not padded and param_data.shape == loaded_weight.shape:
                 # Shapes match - direct copy
                 param.weight_loader_process(param_data, loaded_weight)
                 return
 
-            # Otherwise, split the fused weight -- at the sizes the checkpoint
-            # holds, not any padded ones -- and load each output shard.
+            # Otherwise, split the fused weight and load each output shard
             current_offset = 0
-            ckpt_sizes = self._ckpt_output_sizes
-            for shard_id, output_size in enumerate(ckpt_sizes):
+            for shard_id, output_size in enumerate(self._ckpt_output_sizes):
                 shard_size = output_size
                 if is_scale_param and self.weight_scale_row_group > 1:
                     shard_size //= self.weight_scale_row_group
@@ -2119,11 +1962,9 @@ class MergedColumnParallelLinear(LinearBase):
             return
 
         param_data = param.data
-        # Offset in the (possibly padded) parameter; size of the real shard the
-        # checkpoint holds, written at the front of its padded slot.
+        # Padded offset; the real shard goes at the front of its slot.
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
-        ckpt_sizes = self._ckpt_output_sizes
-        shard_size = ckpt_sizes[loaded_shard_id] // self.tp_size
+        shard_size = self._ckpt_output_sizes[loaded_shard_id] // self.tp_size
         if param is getattr(self, "weight_scale", None) or param is getattr(
             self, "input_scale", None
         ):
@@ -2899,17 +2740,12 @@ class RowParallelLinear(LinearBase):
         **kwargs,
     ):
         self.tp_rank = get_tp_group().rank_in_group
-        # `input_pad_align` pads the per-rank K up to that multiple with zero
-        # columns: the down half of a K-padded MLP pair, fed by a gate_up built
-        # with the same `output_pad_align` (see mxfp4_k_pad_align).
-        pad_input = None
+        # Pads the per-rank K with zero columns (down of a K-padded pair).
+        real_k, self._k_padded = input_size, False
         if input_pad_align:
             tp = get_tp_group().world_size
-            real_local = divide(input_size, tp)
-            padded_local = padded_partition_size(real_local, input_pad_align)
-            if padded_local != real_local:
-                input_size = padded_local * tp
-                pad_input = (real_local, padded_local)
+            input_size = padded_partition_size(divide(real_k, tp), input_pad_align) * tp
+            self._k_padded = input_size != real_k
         super().__init__(
             input_size,
             output_size,
@@ -2920,9 +2756,8 @@ class RowParallelLinear(LinearBase):
             source_quant_dtype=source_quant_dtype,
             prefix=prefix,
         )
-        self._pad_input = pad_input
-        if pad_input is not None:
-            _check_pad_source(self, prefix, *pad_input)
+        if self._k_padded:
+            _zero_k_pad(self, quant_config, prefix)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -2943,17 +2778,10 @@ class RowParallelLinear(LinearBase):
                 param.weight_loader_process(param_data, loaded_weight)
                 return
             shard_size = param_data.size(self.tp_dim)
-            pad_input = self._pad_input
             if loaded_weight.size(self.tp_dim) == 1 and self.tp_size > 1:
                 loaded_weight = loaded_weight.repeat(1, self.tp_size)
-            elif pad_input is not None and param_data.size(self.tp_dim) > 1:
-                # The checkpoint holds the real K per rank; write it at the
-                # front of the padded slot. In this param's own units, which
-                # are elements, fp4x2 bytes or one-per-32 scales alike. A
-                # param with no K extent (a per-token (N, 1) scale) has none.
-                real_k, padded_k = pad_input
-                shard_size, rem = divmod(shard_size * real_k, padded_k)
-                assert rem == 0, (self.prefix, param_data.shape, pad_input)
+            elif self._k_padded:  # real K, as MoE: sized by the checkpoint
+                shard_size = divide(loaded_weight.size(self.tp_dim), self.tp_size)
                 param_data = param_data.narrow(self.tp_dim, 0, shard_size)
             start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
