@@ -562,6 +562,8 @@ def _build_sampling_params(
     top_p: float = 1.0,
     n: int = 1,
     required_channel: RequiredChannel | None = None,
+
+    max_tokens_is_default: bool = False,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -569,12 +571,18 @@ def _build_sampling_params(
         _get_engine_config(), custom_message_encoder
     ).get("max_output_tokens")
     if output_limit is not None and max_tokens > output_limit:
-        raise ValueError(f"max_tokens must be <= {output_limit} for this deployment")
+        if max_tokens_is_default:
+            max_tokens = output_limit
+        else:
+            raise ValueError(
+                f"max_tokens must be <= {output_limit} for this deployment"
+            )
     return SamplingParams(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         max_tokens=max_tokens,
+        max_tokens_is_default=max_tokens_is_default,
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
         n=n,
@@ -672,7 +680,13 @@ def _validate_pool_capacity(
     )
 
 
-def _validate_sequence_context_length(seq) -> None:
+def _validate_sequence_context_length(seq, sampling_params=None) -> None:
+    limit = _get_engine_max_model_len()
+    if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
+        remaining = limit - seq.num_prompt_tokens
+        if remaining <= 0:
+            raise ValueError("The prompt leaves no context space for output tokens")
+        seq.max_tokens = min(seq.max_tokens, remaining)
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
@@ -858,7 +872,7 @@ async def generate_async(
 
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
-        _validate_sequence_context_length(seq)
+        _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
@@ -981,7 +995,7 @@ async def generate_async_multimodal(
 
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
-        _validate_sequence_context_length(seq)
+        _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
@@ -1107,7 +1121,8 @@ async def generate_async_fanout(
 
     seqs = await loop.run_in_executor(None, do_preprocess)
     try:
-        _validate_sequence_context_length(seqs[0])
+        for seq in seqs:
+            _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         for seq in seqs:
             engine.io_processor.requests.pop(seq.id, None)
@@ -1308,7 +1323,7 @@ async def setup_streaming_request(
     seq = None
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
-        _validate_sequence_context_length(seq)
+        _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
@@ -1530,7 +1545,8 @@ async def setup_streaming_request_fanout(
     seqs = []
     try:
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
-        _validate_sequence_context_length(seqs[0])
+        for seq in seqs:
+            _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
@@ -1772,33 +1788,22 @@ async def _configure_structured_output(
         raise ValueError(
             "Structured output does not support ignore_eos or custom stop strings"
         )
-    from atom.model_engine.structured_output import (
-        StructuredOutput,
-        structured_stop_token_ids,
-    )
-
-    # Compile before enqueue so invalid/unsupported schemas cannot crash workers.
     from .structured_output import structured_tool_format
+    from .structured_preflight import WorkerGrammarPreflight
 
     tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
-    compiler = getattr(_configure_structured_output, "compiler", None)
-    if (
-        compiler is None
-        or getattr(_configure_structured_output, "tokenizer", None) is not tokenizer
-    ):
-        hf = config.hf_config
-        vocab = getattr(hf, "text_config", hf).vocab_size
-        stops = structured_stop_token_ids(config, tokenizer)
-        compiler = await asyncio.to_thread(
-            StructuredOutput,
-            tokenizer,
-            vocab,
-            stops,
-        )
-        _configure_structured_output.compiler = compiler
-        _configure_structured_output.tokenizer = tokenizer
+    preflight = getattr(_configure_structured_output, "preflight", None)
     try:
-        await asyncio.to_thread(compiler.compile, schema, tool_format)
+        if (
+            preflight is None
+            or preflight.engine is not engine
+            or preflight.tokenizer is not tokenizer
+        ):
+            preflight = await asyncio.to_thread(
+                WorkerGrammarPreflight, engine, tokenizer, config
+            )
+            _configure_structured_output.preflight = preflight
+        await preflight.prepare(schema, tool_format)
     except Exception as exc:
         raise ValueError(f"Cannot compile JSON Schema: {exc}") from exc
     sampling_params.json_schema = schema
@@ -1855,6 +1860,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
+            max_tokens_is_default=not any(
+                name in request.model_fields_set and getattr(request, name) is not None
+                for name in ("max_tokens", "max_completion_tokens")
+            ),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -2138,6 +2147,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
+            max_tokens_is_default=not any(
+                name in request.model_fields_set and getattr(request, name) is not None
+                for name in ("max_tokens", "max_completion_tokens")
+            ),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -2348,6 +2361,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 else model_temperature
             ),
             max_tokens=request.max_tokens,
+            max_tokens_is_default="max_tokens" not in request.model_fields_set,
             stop_strings=request.stop_sequences,
             ignore_eos=False,
             top_k=(request.top_k if request.top_k is not None else model_top_k),
@@ -2377,9 +2391,17 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if not max_ctx:
             max_ctx = 30720
         logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = _prompt_headroom(request.max_tokens, max_ctx, kv_transfer_params)
+        headroom = (
+            1
+            if sampling_params.max_tokens_is_default and kv_transfer_params is None
+            else _prompt_headroom(
+                sampling_params.max_tokens, max_ctx, kv_transfer_params
+            )
+        )
         max_input = max_ctx - headroom
         if input_tokens > max_input:
+            if sampling_params.max_tokens_is_default and kv_transfer_params is None:
+                raise ValueError("The prompt leaves no context space for output tokens")
             logger.warning(
                 f"Prompt too long ({input_tokens} > {max_input}), truncating"
             )
@@ -2780,6 +2802,7 @@ async def responses_create(raw_request: Request):
                 else model_temperature
             ),
             max_tokens=max_tokens,
+            max_tokens_is_default=request.max_output_tokens is None,
             stop_strings=request.stop,
             ignore_eos=False,
             top_k=(request.top_k if request.top_k is not None else model_top_k),
@@ -2815,9 +2838,17 @@ async def responses_create(raw_request: Request):
             if value:
                 max_ctx = int(value)
                 break
-        headroom = _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+        headroom = (
+            1
+            if sampling_params.max_tokens_is_default and kv_transfer_params is None
+            else _prompt_headroom(
+                sampling_params.max_tokens, max_ctx, kv_transfer_params
+            )
+        )
         max_input = max_ctx - headroom
         if input_tokens > max_input:
+            if sampling_params.max_tokens_is_default and kv_transfer_params is None:
+                raise ValueError("The prompt leaves no context space for output tokens")
             logger.warning(
                 f"Prompt too long ({input_tokens} > {max_input}), truncating"
             )

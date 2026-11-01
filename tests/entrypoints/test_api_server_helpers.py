@@ -874,3 +874,58 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
     asyncio.run(drive())
     assert events == ["initialize", "serving", "shutdown"]
+
+
+class TestDeploymentDefaultOutputCap:
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_small_deployment_distinguishes_default_from_explicit(
+        self, monkeypatch, explicit
+    ):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(
+            api_server, "_get_engine_config", lambda: NS(max_model_len=4096)
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        kwargs = {
+            "temperature": 1.0,
+            "max_tokens": 8192,
+            "stop_strings": None,
+            "ignore_eos": False,
+            "max_tokens_is_default": not explicit,
+        }
+        if explicit:
+            with pytest.raises(ValueError, match="max_tokens must be <= 4096"):
+                api_server._build_sampling_params(**kwargs)
+            return
+        sampling = api_server._build_sampling_params(**kwargs)
+        assert sampling.max_tokens == 4096
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: None)
+        seq = NS(num_prompt_tokens=100, max_tokens=sampling.max_tokens)
+        api_server._validate_sequence_context_length(seq, sampling)
+        assert seq.max_tokens == 3996
+
+    @pytest.mark.parametrize("prompt", [4096, 4097])
+    def test_full_prompt_is_not_given_zero_or_negative_output(
+        self, monkeypatch, prompt
+    ):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        with pytest.raises(ValueError, match="no context space"):
+            api_server._validate_sequence_context_length(
+                NS(num_prompt_tokens=prompt, max_tokens=4096),
+                NS(max_tokens_is_default=True),
+            )
+
+    def test_explicit_cap_is_not_silently_reduced_after_tokenization(self, monkeypatch):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        seq = NS(num_prompt_tokens=4000, max_tokens=512)
+        with pytest.raises(ValueError, match="maximum context length"):
+            api_server._validate_sequence_context_length(
+                seq, NS(max_tokens_is_default=False)
+            )
+        assert seq.max_tokens == 512

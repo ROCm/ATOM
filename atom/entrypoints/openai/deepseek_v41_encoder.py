@@ -11,6 +11,9 @@ from typing import Any
 
 from .reasoning_controls import ReasoningRules
 
+SUPPORTED_EFFORT_LEVELS = ("low", "high", "max")
+DEFAULT_EFFORT_LEVEL = "high"
+
 
 def normalize_effort(effort: Any) -> str | int | None:
     """Translate the hosted API aliases while retaining ATOM's integer budget."""
@@ -20,7 +23,7 @@ def normalize_effort(effort: Any) -> str | int | None:
         effort = {"minimal": "low", "medium": "high", "xhigh": "high"}.get(
             effort, effort
         )
-        if effort in ("none", "low", "high", "max"):
+        if effort == "none" or effort in SUPPORTED_EFFORT_LEVELS:
             return effort
     elif type(effort) is int and 1 <= effort <= 100:
         return effort

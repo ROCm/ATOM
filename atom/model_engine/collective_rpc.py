@@ -33,6 +33,8 @@ COLLECTIVE_RPC_METHODS = frozenset(
         "configure_hidden_states",
         # capability discovery itself
         "get_worker_capabilities",
+        # Request admission; compilation only, no GPU work or collectives.
+        "prepare_structured_output",
     }
 )
 

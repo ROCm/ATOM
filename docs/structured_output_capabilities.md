@@ -29,7 +29,39 @@ Responses uses the same schema under
 `text.format: {"type": "json_schema", "name": "answer", "schema": {...}}`.
 `text.format: {"type": "json_object"}` is also supported.
 
-Schemas are checked before enqueue and compiled with llguidance 1.9.1 in strict mode. Only local
+Schemas are checked before enqueue and compiled with llguidance 1.9.1 in strict mode.
+Admission uses a worker RPC: each execution rank checks the API tokenizer/stop-token
+fingerprint and configured vocabulary against its target LM head, then compiles
+and caches the grammar used by decoding. Any rank failure rejects the request
+before generation (HTTP 400). Supported deployments need collective worker RPC
+and a `ParallelLMHead` target projection; unsupported topologies/projections are
+rejected at admission. Cold compilation pauses scheduling on the affected ranks;
+repeated schema/tool-format pairs use bounded caches. Ordinary requests do not
+initialize this path or perform these RPCs.
+Admission uses a worker RPC: each execution rank checks the API tokenizer/stop-token
+fingerprint and configured vocabulary against its target LM head, then compiles
+and caches the grammar used by decoding. Any rank failure rejects the request
+before generation (HTTP 400). Supported deployments need collective worker RPC
+and a `ParallelLMHead` target projection; unsupported topologies/projections are
+rejected at admission. Cold compilation pauses scheduling on the affected ranks;
+repeated schema/tool-format pairs use bounded caches. Ordinary requests do not
+initialize this path or perform these RPCs.
+Admission uses a worker RPC: each execution rank checks the API tokenizer/stop-token
+fingerprint and configured vocabulary against its target LM head, then compiles
+and caches the grammar used by decoding. Any rank failure rejects the request
+before generation (HTTP 400). Supported deployments need collective worker RPC
+and a `ParallelLMHead` target projection; unsupported topologies/projections are
+rejected at admission. Cold compilation pauses scheduling on the affected ranks;
+repeated schema/tool-format pairs use bounded caches. Ordinary requests do not
+initialize this path or perform these RPCs.
+Admission uses a worker RPC: each execution rank checks the API tokenizer/stop-token
+fingerprint and configured vocabulary against its target LM head, then compiles
+and caches the grammar used by decoding. Any rank failure rejects the request
+before generation (HTTP 400). Supported deployments need collective worker RPC
+and a `ParallelLMHead` target projection; unsupported topologies/projections are
+rejected at admission. Cold compilation pauses scheduling on the affected ranks;
+repeated schema/tool-format pairs use bounded caches. Ordinary requests do not
+initialize this path or perform these RPCs. Only local
 references are allowed. Unsupported grammar constructs cause a request error;
 compilation is not a claim of complete JSON Schema vocabulary support. A final
 JSON Schema validator additionally checks the visible answer before a successful
@@ -129,3 +161,31 @@ search credentials, fabricated search results, or citations in this change.
 
 References: [Responses contract](https://api-docs.deepseek.com/api/create-response/)
 and [model discovery](https://api-docs.deepseek.com/api/list-models/).
+
+
+When an OpenAI output cap is omitted (or null), its default is bounded by the
+deployment limit and, after tokenization, the remaining prompt context budget.
+An explicitly supplied cap is validated without silently reducing it. A prompt
+that leaves no room for output is rejected. Model-specific discovery values and
+effort levels come from the same API contract as request adaptation.
+
+
+When an OpenAI output cap is omitted (or null), its default is bounded by the
+deployment limit and, after tokenization, the remaining prompt context budget.
+An explicitly supplied cap is validated without silently reducing it. A prompt
+that leaves no room for output is rejected. Model-specific discovery values and
+effort levels come from the same API contract as request adaptation.
+
+
+When an OpenAI output cap is omitted (or null), its default is bounded by the
+deployment limit and, after tokenization, the remaining prompt context budget.
+An explicitly supplied cap is validated without silently reducing it. A prompt
+that leaves no room for output is rejected. Model-specific discovery values and
+effort levels come from the same API contract as request adaptation.
+
+
+When an OpenAI output cap is omitted (or null), its default is bounded by the
+deployment limit and, after tokenization, the remaining prompt context budget.
+An explicitly supplied cap is validated without silently reducing it. A prompt
+that leaves no room for output is rejected. Model-specific discovery values and
+effort levels come from the same API contract as request adaptation.

@@ -21,6 +21,62 @@ def structured_stop_token_ids(config, tokenizer):
     return list(dict.fromkeys(stops))
 
 
+def tokenizer_fingerprint(tokenizer, stop_token_ids):
+    """Identify the actual token mapping/decoder and effective termination IDs."""
+    import hashlib
+    import json
+
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None:
+        raise ValueError("Structured output requires a serializable fast tokenizer")
+    payload = {
+        "tokenizer": json.loads(backend.to_str()),
+        "stops": sorted(stop_token_ids),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def prepare_worker_grammar(runner, schema, tool_format, fingerprint, vocab_size):
+    """Compile on the execution rank via RPC, before the request is enqueued.
+
+    The RPC dispatcher catches failures without terminating the worker loop.
+    No GPU operation or inter-rank collective is performed here.
+    """
+    structured = getattr(runner, "structured_output", None)
+    if structured is None:
+        from atom.model_engine.llm_engine import _load_tokenizer
+        from atom.model_ops.embed_head import ParallelLMHead
+
+        # Use the physical target projection, never a first-forward tensor or
+        # an independently guessed HF vocab. Reject unsupported projections at
+        # admission instead of discovering a mismatch during model execution.
+        sizes = {
+            head.num_embeddings
+            for head in runner.model.modules()
+            if isinstance(head, ParallelLMHead)
+        }
+        if sizes != {vocab_size}:
+            raise ValueError(
+                "Structured output vocabulary differs from the target LM head"
+            )
+        tokenizer = _load_tokenizer(
+            runner.config.model, runner.config.trust_remote_code
+        )
+        stops = structured_stop_token_ids(runner.config, tokenizer)
+        worker_fingerprint = tokenizer_fingerprint(tokenizer, stops)
+        if worker_fingerprint != fingerprint:
+            raise ValueError(
+                "Structured output tokenizer/stop tokens differ from the API"
+            )
+        structured = StructuredOutput(tokenizer, vocab_size, stops)
+        structured.fingerprint = worker_fingerprint
+        runner.structured_output = structured
+    if structured.vocab_size != vocab_size or structured.fingerprint != fingerprint:
+        raise ValueError("Structured output deployment changed; restart the server")
+    structured.compile(schema, tool_format)
+    return {"fingerprint": fingerprint, "vocab_size": vocab_size}
+
+
 class StructuredOutput:
     def __init__(self, tokenizer, vocab_size, stop_token_ids):
         from llguidance.hf import from_tokenizer

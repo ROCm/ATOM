@@ -3292,6 +3292,13 @@ class ModelRunner:
         )
         return device_channel, base
 
+    def prepare_structured_output(self, schema, tool_format, fingerprint, vocab_size):
+        from atom.model_engine.structured_output import prepare_worker_grammar
+
+        return prepare_worker_grammar(
+            self, schema, tool_format, fingerprint, vocab_size
+        )
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3312,19 +3319,10 @@ class ModelRunner:
         structured = getattr(self, "structured_output", None)
         structured_requests = getattr(batch, "structured_requests", None)
         if structured_requests and structured is None:
-            from transformers import AutoTokenizer
-
-            from atom.model_engine.structured_output import (
-                StructuredOutput,
-                structured_stop_token_ids,
-            )
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                self.config.model, trust_remote_code=self.config.trust_remote_code
-            )
-            stop_ids = structured_stop_token_ids(self.config, tokenizer)
-            structured = self.structured_output = StructuredOutput(
-                tokenizer, logits.shape[-1], stop_ids
+            raise ValueError("Structured output must be prepared before enqueue")
+        if structured_requests and logits.shape[-1] != structured.vocab_size:
+            raise ValueError(
+                "Target logits do not match the prepared structured vocabulary"
             )
         structured_prefixes = {}
         logprob_snapshot = None

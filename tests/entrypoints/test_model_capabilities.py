@@ -35,3 +35,24 @@ def test_checkpoint_limit_and_output_cap():
 def test_unknown_model_does_not_invent_capabilities():
     result = deployment_metadata(None, None)
     assert result == {"output_modalities": ["text"]}
+
+
+def test_metadata_effort_levels_share_the_request_contract():
+    from atom.entrypoints.openai.deepseek_v41_encoder import normalize_effort
+
+    caps = deployment_metadata(None, NS(name="encoding_dsv41"))
+    for level in caps["effort"]["supported_levels"]:
+        assert normalize_effort(level) == level
+    assert normalize_effort(caps["effort"]["default_level"]) == "high"
+
+
+def test_unknown_encoder_only_reports_deployment_limits():
+    result = deployment_metadata(
+        NS(max_model_len=4096, hf_config=NS(max_position_embeddings=8192)),
+        NS(name="another_encoder"),
+    )
+    assert result == {
+        "output_modalities": ["text"],
+        "context_window": 4096,
+        "max_output_tokens": 4096,
+    }

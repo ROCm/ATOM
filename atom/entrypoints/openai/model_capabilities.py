@@ -17,15 +17,19 @@ def deployment_metadata(config, encoder):
     method = getattr(getattr(config, "speculative_config", None), "method", None)
     if (method or getattr(config, "method", None)) == "dspark":
         result["input_modalities"] = ["text"]
-    if getattr(encoder, "name", None) == "encoding_dsv41":
-        result["name"] = "DeepSeek-V4.1-Flash"
+    from .api_compatibility import api_compatibility_for
+
+    contract = api_compatibility_for(encoder)
+    if contract.display_name is not None:
+        result["name"] = contract.display_name
+    if contract.effort_levels:
         result["effort"] = {
-            "supported_levels": ["low", "high", "max"],
-            "default_level": "high",
+            "supported_levels": list(contract.effort_levels),
+            "default_level": contract.default_effort,
         }
-        # Match the accepted output cap; context plus prompt validation may
-        # reduce the tokens available to a particular request further.
+    if contract.output_token_limit is not None:
         result["max_output_tokens"] = min(
-            result.get("max_output_tokens", 393216), 393216
+            result.get("max_output_tokens", contract.output_token_limit),
+            contract.output_token_limit,
         )
     return result

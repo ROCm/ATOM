@@ -5,6 +5,8 @@
 
 from dataclasses import dataclass
 
+from .deepseek_v41_encoder import DEFAULT_EFFORT_LEVEL, SUPPORTED_EFFORT_LEVELS
+
 
 @dataclass(frozen=True)
 class APICompatibility:
@@ -12,6 +14,10 @@ class APICompatibility:
     chat_forced_tools_with_thinking: bool = True
     responses_ignored_fields: frozenset[str] = frozenset()
     anthropic_output_effort: bool = False
+    display_name: str | None = None
+    output_token_limit: int | None = None
+    effort_levels: tuple[str, ...] = ()
+    default_effort: str | None = None
 
     def responses_body(self, body: dict) -> dict:
         return {k: v for k, v in body.items() if k not in self.responses_ignored_fields}
@@ -29,6 +35,10 @@ class APICompatibility:
 
 DEFAULT_API_COMPATIBILITY = APICompatibility()
 DEEPSEEK_API_COMPATIBILITY = APICompatibility(
+    display_name="DeepSeek-V4.1-Flash",
+    output_token_limit=393216,
+    effort_levels=SUPPORTED_EFFORT_LEVELS,
+    default_effort=DEFAULT_EFFORT_LEVEL,
     chat_usage_on_finish=True,
     chat_forced_tools_with_thinking=False,
     anthropic_output_effort=True,
