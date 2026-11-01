@@ -262,6 +262,8 @@ def initialize_dummy_weights(model: nn.Module, mode: str) -> None:
                 data.fill_(1.0)
         elif dt in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
             data.fill_(1.0)  # fp8 packed weight
+        elif not dt.is_floating_point:
+            data.zero_()  # int/bool params (e.g. t2d/d2t vocab mapping)
         else:  # fp4x2 packed weight, viewable as uint8
             data.view(torch.uint8).fill_(_FP4_UNIT_BYTE)
 
