@@ -615,7 +615,10 @@ def test_fused_per_tensor_scale_loads_into_a_padded_gate_up(monkeypatch, rank):
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_per_row_scales_requantize_row_for_row_when_padded(monkeypatch, rank):
+@pytest.mark.parametrize("scale_range", [(0.5, 4.0), (1e-3, 4e-3)])
+def test_per_row_scales_requantize_row_for_row_when_padded(
+    monkeypatch, rank, scale_range
+):
     """A per-tensor gate_up whose checkpoint carries one scale per row is
     requantized to one max scale. Each row must be dequantized with its own
     scale: the saved scale parts hold the real rows, the weight the padded."""
@@ -623,18 +626,25 @@ def test_per_row_scales_requantize_row_for_row_when_padded(monkeypatch, rank):
     with torch.device("cuda"):
         gate_up = _per_tensor_gate_up()
     torch.manual_seed(rank)
-    shards = []
+    shards, local_scales = [], []
     for shard_id in (0, 1):
         w = (torch.randn(TP2_INTER, HIDDEN) * 50).to(dtypes.fp8)
         # Scales that differ a lot from row to row, so a wrong one shows.
-        s = torch.linspace(0.5, 4.0, TP2_INTER).view(-1, 1) * (shard_id + 1)
+        # Real FP8 scales are usually << 1: the pad rows must not lift the
+        # max the whole weight is requantized to.
+        s = torch.linspace(*scale_range, TP2_INTER).view(-1, 1) * (shard_id + 1)
         gate_up.weight_loader(gate_up.weight, w, shard_id)
         gate_up.weight_loader(gate_up.weight_scale, s, shard_id)
         shards.append(w.chunk(2, 0)[rank].float() * s.chunk(2, 0)[rank])
+        local_scales.append(s.chunk(2, 0)[rank])
     monkeypatch.setattr(linear_mod, "shuffle_weights", lambda *a, **kw: None)
     gate_up.process_weights_after_loading()
 
-    deq = gate_up.weight.data.float().cpu() * gate_up.weight_scale.data.max().cpu()
+    max_scale = gate_up.weight_scale.data.max().cpu()
+    # The requant target is this rank's largest real scale, not a pad row's.
+    expected = max(part.max() for part in local_scales)
+    assert max_scale == pytest.approx(expected.item()), "requant scale"
+    deq = gate_up.weight.data.float().cpu() * max_scale
     for i, ref in enumerate(shards):
         got = deq[i * PADDED : i * PADDED + REAL]
         rel = (got - ref).norm() / ref.norm()

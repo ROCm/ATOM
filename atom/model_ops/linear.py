@@ -1491,13 +1491,14 @@ class LinearBase(nn.Module):
                 parts = loaded_weight_scale_parts
                 if getattr(self, "_pad_output_rows", None):
                     # Each part holds its shard's real rows; the weight has the
-                    # padded ones. Give the (zero) pad rows a scale of 1.0 so the
-                    # per-row requant below lines up row for row.
+                    # padded ones. Give the (zero) pad rows a scale of 0 so the
+                    # per-row requant below lines up row for row; 0, not 1.0,
+                    # because the requant target is the max over all rows.
                     parts = [
                         torch.cat(
                             [
                                 part,
-                                part.new_ones(padded - part.shape[0], *part.shape[1:]),
+                                part.new_zeros(padded - part.shape[0], *part.shape[1:]),
                             ]
                         )
                         for part, padded in zip(parts, self.output_partition_sizes)
