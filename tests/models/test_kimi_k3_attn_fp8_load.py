@@ -142,6 +142,25 @@ def test_an_unsupported_scheme_is_refused():
         KimiKDAAttention.process_weights_after_loading(attn)
 
 
+def test_a_missing_per_token_scale_is_reported_by_the_guard():
+    """The guard, not an AttributeError on `.data`, reports a missing scale."""
+    attn = _kda_double(QuantType.per_Token)
+    attn.b_proj.weight_scale = None
+    with pytest.raises(AssertionError, match="one row per output channel"):
+        KimiKDAAttention.process_weights_after_loading(attn)
+
+
+def test_glm_refuses_a_quantized_in_proj_before_its_gate_fold():
+    """GLM-5.3's KDA subclass folds a bf16 gate into in_proj by a plain cast;
+    with the parent now accepting per_Token, the subclass must refuse it
+    rather than write unscaled FP8 rows."""
+    from atom.models.glm5_next import Glm5NextKDAAttention
+
+    attn = _kda_double(QuantType.per_Token)
+    with pytest.raises(NotImplementedError, match="statically quantized in_proj"):
+        Glm5NextKDAAttention.process_weights_after_loading(attn)
+
+
 def test_b_proj_is_deferred_with_the_other_fused_projections():
     """Under online quant b_proj must stay bf16 until the fuse, like in_proj and
     f_a_proj, or it reaches the fuse as a per_Token tail beside a bf16 in_proj."""

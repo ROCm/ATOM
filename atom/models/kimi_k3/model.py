@@ -1293,11 +1293,12 @@ class KimiKDAAttention(nn.Module):
             #
             # Shapes differ by provenance -- [N, 1] as allocated, flat [N] after
             # a checkpoint requant -- so normalize to 2-D before concatenating.
-            scales = [m.weight_scale.data for m in mods]
+            scale_params = [getattr(m, "weight_scale", None) for m in mods]
             assert all(
-                s is not None and s.shape[0] == m.weight.shape[0]
-                for s, m in zip(scales, mods)
+                p is not None and p.data.shape[0] == m.weight.shape[0]
+                for p, m in zip(scale_params, mods)
             ), "per_Token weight scales must be one row per output channel"
+            scales = [p.data for p in scale_params]
             fused_scale = torch.cat(
                 [s.reshape(s.shape[0], -1) for s in scales], dim=0
             ).contiguous()
