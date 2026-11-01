@@ -138,6 +138,97 @@ def track_superseded_states(store):
     store.build_connector_meta = build_connector_meta
 
 
+def demote_superseded_states(manager):
+    """Free each Mamba state a finished Prefill request resumed from, or checkpointed past, to the free-queue head.
+
+    A warm turn hits its conversation's previous checkpoint and exports a later one, so the hit state (one block
+    per Mamba group) is dead locally, yet free_blocks appends it to the MRU tail. At C88 those blocks push the
+    conversations past the 4,790-block pool and LRU evicts the next conversation in line. The hash stays until the
+    pool hands the block out, so a branch can still hit it, and unlike C48_STORE_DROP_SUPERSEDED the Store keeps
+    its copy.
+    """
+    import collections
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+    pool, queue = manager.block_pool, manager.block_pool.free_block_queue
+    states = collections.defaultdict(dict)  # request id -> {block id: (group, hash, tokens)}
+    superseded = {}  # block id -> hash, until the block is reused or hit
+    stats = collections.Counter()
+
+    def note(group, request_id, blocks):
+        for b in blocks:
+            if not b.is_null and b.block_hash is not None:
+                states[request_id][b.block_id] = (group, b.block_hash, b.block_hash_num_tokens)
+
+    def is_superseded(b):
+        return b.block_hash is not None and superseded.get(b.block_id) == b.block_hash
+
+    def to_head(blocks):
+        for b in blocks:
+            queue.remove(b)
+        queue.prepend_n(blocks)
+        stats["to_head"] += len(blocks)
+
+    for m in manager.coordinator.single_type_managers:
+        if isinstance(m, MambaManager):
+            def add_local(request_id, new_computed_blocks, *args, _add=m.add_local_computed_blocks, _m=m):
+                _add(request_id, new_computed_blocks, *args)
+                note(_m.kv_cache_group_id, request_id, new_computed_blocks[-1:])
+
+            def cache_blocks(request, *args, _cache=m.cache_blocks, _m=m, **kwargs):
+                _cache(request, *args, **kwargs)
+                rid = request.request_id
+                note(_m.kv_cache_group_id, rid, _m.req_to_blocks.get(rid, [])[_m._num_retired_blocks.get(rid, 0):])
+
+            m.add_local_computed_blocks, m.cache_blocks = add_local, cache_blocks
+
+    free_blocks, touch, evict = pool.free_blocks, pool.touch, pool._maybe_evict_cached_block
+
+    def free(ordered_blocks):
+        blocks = list(ordered_blocks)
+        free_blocks(blocks)
+        to_head(list({b.block_id: b for b in blocks if b.ref_cnt == 0 and is_superseded(b)}.values()))
+
+    def touched(blocks):
+        for b in blocks:
+            stats["hit"] += is_superseded(b)
+            superseded.pop(b.block_id, None)
+        touch(blocks)
+
+    def evicted(block):
+        stats["reused"] += is_superseded(block)
+        superseded.pop(block.block_id, None)
+        return evict(block)
+
+    pool.free_blocks, pool.touch, pool._maybe_evict_cached_block = free, touched, evicted
+    kv_free, kv_pop = manager.free, manager.pop_blocks_for_free
+
+    def finish(request):
+        # Preempted requests resume from their states.
+        own = states.pop(request.request_id, {}) if request.is_finished() else {}
+        live = [(pool.blocks[i], g, n) for i, (g, h, n) in own.items() if pool.blocks[i].block_hash == h]
+        latest = {}
+        for _, g, n in live:
+            latest[g] = max(latest.get(g, n), n)
+        old = [b for b, g, n in live if n < latest[g]]
+        superseded.update((b.block_id, b.block_hash) for b in old)
+        to_head([b for b in old if b.ref_cnt == 0])
+        stats.update(finished=1, superseded=len(old))
+        if stats["finished"] % 500 == 0:
+            print("[C48-SUPERSEDED] " + json.dumps({**stats, "listed": len(superseded),
+                                                    "free": pool.get_num_free_blocks()}), flush=True)
+
+    def free_request(request):
+        finish(request)
+        kv_free(request)
+
+    def pop_request(request):
+        finish(request)
+        return kv_pop(request)
+
+    manager.free, manager.pop_blocks_for_free = free_request, pop_request
+    return stats
+
+
 def mooncake_store_scheduler(scheduler):
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import MooncakeStoreConnector
     stores = [c.connector_scheduler for c in getattr(scheduler.connector, "_connectors", [scheduler.connector])
@@ -183,6 +274,11 @@ def create_scheduler(*args, **kwargs):
         if scheduler.mamba_shared_prefix_checkpoint:
             raise RuntimeError("C48_STORE_DROP_SUPERSEDED would remove shared-prefix checkpoints")
         track_superseded_states(mooncake_store_scheduler(scheduler))
+    superseded_head = os.environ.get("C48_P_SUPERSEDED_HEAD") == "1" and os.environ["C48_DIAG_ROLE"] == "prefill"
+    if superseded_head:
+        if scheduler.mamba_shared_prefix_checkpoint:
+            raise RuntimeError("C48_P_SUPERSEDED_HEAD would demote shared-prefix checkpoints")
+        demote_superseded_states(manager)
     if (os.environ.get("C48_EXPECT_SHARED_PREFIX_CHECKPOINT") == "1"
             and os.environ["C48_DIAG_ROLE"] == "prefill"
             and not (requested and scheduler.mamba_shared_prefix_checkpoint
@@ -193,6 +289,7 @@ def create_scheduler(*args, **kwargs):
         "no_tail_split": no_tail_split,
         "tail_ckpt_hash": tail_ckpt_hash,
         "subblock_fill": fill,
+        "superseded_head": superseded_head,
         "pp_inflight": pd_c48_pp.INFLIGHT,
         "pp_output_cap": pp_output_cap,
         "max_concurrent_batches": config.max_concurrent_batches,

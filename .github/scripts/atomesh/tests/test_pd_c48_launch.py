@@ -185,7 +185,7 @@ class LaunchTest(unittest.TestCase):
                                      *((c, f"N3966-BF16-KVB-TH-SDROP-GX-H96OPUS{tag}") for c in (72, 88)
                                        for tag in ("", "-P12K")),
                                      *((c, f"N3966-BF16-KVB-TH-GX-H96OPUS-P12K{tag}") for c in (72, 88)
-                                       for tag in ("", "-LPT")),
+                                       for tag in ("", "-LPT", "-SH")),
                                      *((c, "N3966-BF16-GX-H96OPUS-PBM") for c in (16, 32, 48, 56, 72, 88)),
                                      (72, "N3966-BF16-GX-H96OPUS-P12K-PBM")):
             base = json.loads((GAP / f"{prefix}C{concurrency}-MC.json").read_text())
@@ -201,6 +201,9 @@ class LaunchTest(unittest.TestCase):
                     # 7 x the 896-token TP8 Mamba block, so non-final chunks stay block aligned.
                     self.assertEqual(candidate["roles"]["prefill"]["args"].pop("long-prefill-token-threshold"), 6272)
                     variant = variant.removesuffix("-LPT")
+                if variant.endswith("-SH"):
+                    self.assertEqual(env.pop("C48_P_SUPERSEDED_HEAD"), "1")
+                    variant = variant.removesuffix("-SH")
                 if variant.endswith("-P12K"):
                     args = candidate["roles"]["prefill"]["args"]
                     self.assertEqual(args["max-num-batched-tokens"], 12288)
