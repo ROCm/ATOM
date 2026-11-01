@@ -29,8 +29,6 @@ from atom.models.deepseek_v41.mono.config import (
     MAX_ROWS,
     config_refusal,
 )
-from atom.models.deepseek_v41.mono.draft_runner import DraftMonoRunner
-from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
 from atom.mono.runtime.deployment import dp_attention_ranks
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
@@ -77,15 +75,21 @@ class MonoDecodeModel(nn.Module):
         max_model_len: int,
         index_fp4: bool,
         dp_ranks: int,
+        *,
+        runner_type=None,
     ) -> None:
         super().__init__()
         self.model = model
         self._drafter = drafter
         # DP attention's ranks, 0 without it (``step_supported``)
         self._dp_ranks = dp_ranks
+        if runner_type is None:
+            from .gfx950.runner import V41MonoDecodeRunner
+
+            runner_type = V41MonoDecodeRunner
         # created on its first eligible step (``LazyRunner``)
         self._mono = LazyRunner(
-            lambda: V41MonoDecodeRunner(model, drafter, max_model_len, index_fp4),
+            lambda: runner_type(model, drafter, max_model_len, index_fp4),
             "V4.1 mono decode",
         )
 
@@ -121,7 +125,7 @@ class MonoDraftModel(nn.Module):
     ``MAX_REQUESTS`` a rank while the MoE's rows over every rank stay within
     ``MAX_MOE_ROWS``."""
 
-    def __init__(self, draft: nn.Module, dp_ranks: int = 0) -> None:
+    def __init__(self, draft: nn.Module, dp_ranks: int = 0, *, runner_type=None) -> None:
         super().__init__()
         self.model = draft
         self._max_requests = (
@@ -129,7 +133,11 @@ class MonoDraftModel(nn.Module):
             if dp_ranks
             else MAX_REQUESTS
         )
-        self._mono = LazyRunner(lambda: DraftMonoRunner(draft), "V4.1 mono draft")
+        if runner_type is None:
+            from .gfx950.draft_runner import DraftMonoRunner
+
+            runner_type = DraftMonoRunner
+        self._mono = LazyRunner(lambda: runner_type(draft), "V4.1 mono draft")
 
     def block_backbone(self, input_ids, positions, num_draft):
         width = self.model.block_size if num_draft is None else num_draft
@@ -155,6 +163,16 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
+    import os
+
+    if os.getenv("DSV41_GFX1250_MODEL_TRIAL", "0") == "1":
+        from .gfx1250.dispatch import install_dspark_decode
+
+        return install_dspark_decode(model, atom_config, drafter)
+    if os.getenv("ATOM_DSV41_GFX1250_REFERENCE_MHTJSTEST", "0") == "1":
+        from atom.models.deepseek_v41.mono.gfx1250.gfx1250_reference_runner import install_reference_decode
+
+        return install_reference_decode(model, atom_config, drafter, metadata_builder)
     why = config_refusal(atom_config)
     if why is not None:
         logger.info("V4.1 mono decode off: %s", why)

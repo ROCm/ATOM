@@ -48,7 +48,7 @@ def _unit_table_kernel(
     tl.store(out + token * out_stride + offsets, tile, mask=mask)
 
 
-def unit_table(block_tables, batch_ids, units_per_page, workspace=None, ratio=None):
+def unit_table(block_tables, batch_ids, units_per_page, workspace=None, ratio=None, *, out=None):
     """`[tokens, columns * units_per_page]` int32 tile ids, in `workspace`'s
     table for `ratio` (`ScoreWorkspace.unit_table`) when given.
 
@@ -63,7 +63,12 @@ def unit_table(block_tables, batch_ids, units_per_page, workspace=None, ratio=No
     that assumed one could not be told apart by comparing the two.
     """
     tokens, columns = batch_ids.numel(), block_tables.shape[1]
-    out = (
+    if out is not None and (
+        out.shape != (tokens, columns * units_per_page) or out.dtype != torch.int32
+        or out.device != block_tables.device or not out.is_contiguous()
+    ):
+        raise ValueError("unit table output must match contiguous int32 tile geometry")
+    out = out if out is not None else (
         torch.empty(
             tokens,
             columns * units_per_page,

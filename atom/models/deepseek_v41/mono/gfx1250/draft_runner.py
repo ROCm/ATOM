@@ -27,10 +27,10 @@ import torch
 from atom.model_ops.deepseek_v41.dspark import build_block_state
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.models.deepseek_v41.mono.config import MAX_REQUESTS
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
-from atom.models.deepseek_v41.mono.runner import V41MonoDecodeRunner
+from atom.models.deepseek_v41.mono.gfx950.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx1250.runner import V41MonoDecodeRunner
 from atom.models.deepseek_v41.mono.step_meta import write_draft_step_meta
-from atom.models.deepseek_v41.mono.weights import bind_layer
+from atom.models.deepseek_v41.mono.gfx1250.gfx1250_dspark_weights import bind_layer
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -44,7 +44,8 @@ class DraftMonoRunner(V41MonoDecodeRunner):
     def __init__(self, draft) -> None:
         config = draft.config
         self.width = draft.block_size
-        self.max_rows = self.width * MAX_REQUESTS
+        self.mhtjstest_widths = tuple(self.width * n for n in range(1, 9))
+        self.max_rows = max(self.mhtjstest_widths)
         self.experts = config.dspark_n_routed_experts
         self.topk = config.dspark_num_experts_per_tok
         self.ug_groups = 1

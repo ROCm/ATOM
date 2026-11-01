@@ -41,13 +41,13 @@ from atom.models.deepseek_v41.mono.check import (
     decode_keys,
 )
 from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
-from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
-from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
+from atom.models.deepseek_v41.mono.gfx950.kernels import attn_post as k2a
+from atom.models.deepseek_v41.mono.gfx950.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
-from atom.models.deepseek_v41.mono.kernels import layer_post as k2
-from atom.models.deepseek_v41.mono.kernels import moe as k2b
+from atom.models.deepseek_v41.mono.gfx950.kernels import layer_post as k2
+from atom.models.deepseek_v41.mono.gfx950.kernels import moe as k2b
 from atom.models.deepseek_v41.mono.kernels.dims import Dims
-from atom.models.deepseek_v41.mono.kernels.index_query import (
+from atom.models.deepseek_v41.mono.gfx950.kernels.index_query import (
     QS_BYTES,
     QS_M_TILES,
 )
@@ -55,13 +55,15 @@ from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
-from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.models.deepseek_v41.mono.gfx1250.gfx1250_dspark_weights import bind_model
+from atom.models.deepseek_v41.mono.gfx1250.dataflow import SQ_WORDS, builders
+from atom.models.deepseek_v41.mono.gfx1250.gfx1250_dspark_runtime import with_default_stream
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
 from atom.mono.runtime.lifecycle import owned_peer_buffer
-from atom.mono.runtime.mailboxes import StepMailboxes
+from atom.models.deepseek_v41.mono.gfx1250.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
@@ -133,7 +135,8 @@ class V41MonoDecodeRunner:
     routing, the K1 builds and where RoPE positions come from are the target's
     here; ``draft_runner.DraftMonoRunner`` sets its own."""
 
-    max_rows = MAX_ROWS
+    mhtjstest_widths = (6, 12, 18, 24, 30, 36, 42, 48)
+    max_rows = max(mhtjstest_widths)
     experts, topk = EXPERTS, TOPK
     ug_groups = 2
     # below this many rows an ug task takes one FP4 group, not ug_groups: a
@@ -171,6 +174,10 @@ class V41MonoDecodeRunner:
         self._place_index_outputs(plain)
         self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
         self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
+        self._sq = None
+        if len(self.layers) == 40:
+            self._sq = torch.zeros(SQ_WORDS, dtype=torch.int32, device=self.scratch.device)
+            self.mailboxes._scratch = (*self.mailboxes._scratch, self._sq)
         self.widths = WidthBuilds(
             self._rows_build, self._row_kernels, group, "V4.1 mono"
         )
@@ -194,7 +201,16 @@ class V41MonoDecodeRunner:
 
     def prepare(self, rows: int) -> bool:
         """Whether every rank holds the ``rows``-row kernels (``WidthBuilds``)."""
-        return 0 < rows <= self.max_rows and self.widths.prepare(rows)
+        if rows not in self.mhtjstest_widths:
+            return False
+        ready = self.widths.prepare(rows)
+        if ready and rows not in getattr(self, '_residency_checked', {}):
+            from atom.models.deepseek_v41.mono.gfx1250.gfx1250_dspark_runtime import check_residency
+            evidence = check_residency(self._row_kernels(self.widths[rows]))
+            if not hasattr(self, '_residency_checked'):
+                self._residency_checked = {}
+            self._residency_checked[rows] = evidence
+        return ready
 
     def _bind(self, model, drafter) -> None:
         self.model = model
@@ -206,7 +222,7 @@ class V41MonoDecodeRunner:
             if drafter is None
             else bind_aux_taps(drafter, model.config.hidden_size)
         )
-        self.tok_par_from = TOK_PAR_FROM.get(self.tp, self.max_rows + 1)
+        self.tok_par_from = self.max_rows + 1
         # DP attention gathers no rows: a rank's step is its own
         if self.dp == 1 and not self._custom_gather_fits():
             logger.warning(
@@ -220,6 +236,8 @@ class V41MonoDecodeRunner:
                     raise MonoUnsupported(
                         f"rope table {table.dtype} {tuple(table.shape)}"
                     )
+        if envs.ATOM_MONO_CHECK or envs.ATOM_MONO_DEBUG or envs.ATOM_MONO_TIMELINE:
+            raise MonoUnsupported('gfx1250 DSpark trial has no split-K2/debug/timeline build')
         self.check = envs.ATOM_MONO_CHECK
         if self.check and self.dp > 1:
             # its K2b alone would wait for rows no K2a of this launch publishes
@@ -378,7 +396,8 @@ class V41MonoDecodeRunner:
     def _rows_build(self, s: int) -> RowsBuild:
         """The s-row step's kernels."""
         keys = self._layer_keys(s)
-        launchers = {key: k1.build_attn_pre(key) for key in set(keys)}
+        build_dspark_k1, build_dspark_down = builders(s, len(self.layers))
+        launchers = {key: build_dspark_k1(key) for key in set(keys)}
         post_key = self._post_key(s)
         if self.split_k2:
             key_a, key_b = post_key.halves()
@@ -388,7 +407,8 @@ class V41MonoDecodeRunner:
                 attn_post=k2a.build_attn_post(key_a),
                 moe=k2b.build_moe(key_b),
             )
-        return RowsBuild(keys, launchers, layer_post=k2.build_layer_post(post_key))
+        return RowsBuild(keys, launchers, layer_post=with_default_stream(build_dspark_down(
+            post_key, seam=True, gates=True, front=True, ug=True, down=True)))
 
     @staticmethod
     def _row_kernels(build: RowsBuild) -> list:
@@ -669,7 +689,7 @@ class V41MonoDecodeRunner:
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
-        _run_compiled(self.build.layer_post, *args, torch.cuda.current_stream())
+        _run_compiled(self.build.layer_post.launcher, *args, torch.cuda.current_stream())
 
     def _attn_post(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2a: the decode sparse attention over this layer's keys (its class's
@@ -780,6 +800,8 @@ class V41MonoDecodeRunner:
         return cache.rope_positions(step)
 
     def _timeline_ptr(self, kernel, layer_id) -> int:
+        if self._sq is not None and kernel in ("k1", "k2"):
+            return self._sq.data_ptr()
         timeline = self.timelines.get(kernel)
         return timeline.ptr(layer_id) if timeline is not None else 0
 
