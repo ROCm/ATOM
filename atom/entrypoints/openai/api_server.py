@@ -1766,7 +1766,7 @@ def _effective_thinking_enabled(kwargs):
 async def _configure_structured_output(
     sampling_params,
     schema,
-    kwargs,
+    channel,
     *,
     tools=None,
     tool_choice=None,
@@ -1787,9 +1787,10 @@ async def _configure_structured_output(
         raise ValueError(
             "Structured output does not support ignore_eos or custom stop strings"
         )
-    from .structured_output import structured_tool_format
+    from .structured_output import structured_reasoning_marker, structured_tool_format
     from .structured_preflight import WorkerGrammarPreflight
 
+    marker = structured_reasoning_marker(channel, tokenizer)
     tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
     preflight = getattr(_configure_structured_output, "preflight", None)
     try:
@@ -1807,15 +1808,7 @@ async def _configure_structured_output(
         raise ValueError(f"Cannot compile JSON Schema: {exc}") from exc
     sampling_params.json_schema = schema
     sampling_params.structured_tool_format = tool_format
-    if _effective_thinking_enabled(kwargs):
-        marker = getattr(reasoning_dialect, "think_end_marker", None)
-        if not marker:
-            raise ValueError(
-                "Structured thinking requires an explicit reasoning end marker"
-            )
-        sampling_params.structured_reasoning_end = tuple(
-            tokenizer.encode(marker, add_special_tokens=False)
-        )
+    sampling_params.structured_reasoning_end = marker
 
 
 @app.post("/v1/chat/completions")
@@ -1876,15 +1869,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         from .structured_output import schema_from_format
 
         schema = schema_from_format(request.response_format)
-        await _configure_structured_output(
-            sampling_params,
-            schema,
-            merged_kwargs,
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            kv_transfer=request.kv_transfer_params,
-            multimodal=_has_multimodal_content(messages),
-        )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1937,6 +1921,16 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 )
             ),
             template_kwargs=merged_kwargs,
+        )
+
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            _reasoning,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            kv_transfer=request.kv_transfer_params,
+            multimodal=_has_multimodal_content(messages),
         )
 
         # Streaming
@@ -2814,14 +2808,6 @@ async def responses_create(raw_request: Request):
         if text_config is not None and not isinstance(text_config, dict):
             raise ValueError("text must be an object")
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
-        await _configure_structured_output(
-            sampling_params,
-            schema,
-            merged_kwargs,
-            tools=openai_tools,
-            tool_choice=request.tool_choice,
-            kv_transfer=kv_transfer_params,
-        )
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
@@ -2856,6 +2842,17 @@ async def responses_create(raw_request: Request):
             input_tokens = max_input
 
         created_at = int(time.time())
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            reasoning_channel(
+                prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
+            ),
+            tools=openai_tools,
+            tool_choice=request.tool_choice,
+            kv_transfer=kv_transfer_params,
+        )
+
         if request.stream:
             seq_id, stream_collector, _num_prompt_tokens = (
                 await setup_streaming_request(

@@ -100,6 +100,62 @@ def test_worker_failure_is_value_error_before_schema_is_attached(monkeypatch):
         api_server._configure_structured_output, "preflight", preflight, raising=False
     )
     params = NS(ignore_eos=False, stop_strings=None)
+    from atom.entrypoints.openai.reasoning import NO_REASONING
+
     with pytest.raises(ValueError, match="Cannot compile JSON Schema"):
-        asyncio.run(api_server._configure_structured_output(params, "{}", {}))
+        asyncio.run(api_server._configure_structured_output(params, "{}", NO_REASONING))
+    assert not hasattr(params, "json_schema")
+
+
+@pytest.mark.parametrize("opened", [False, True])
+def test_admission_uses_actual_channel_state(monkeypatch, opened):
+    from atom.entrypoints.openai import api_server
+    from atom.entrypoints.openai.reasoning import ReasoningChannel
+
+    rpc = Mock()
+    preflight = frontend(rpc)
+    preflight.tokenizer.encode = lambda text, **kw: list(text.encode())
+    rpc.return_value = [
+        NS(ok=True, value={"fingerprint": preflight.fingerprint, "vocab_size": 8})
+    ]
+    monkeypatch.setattr(api_server, "engine", preflight.engine)
+    monkeypatch.setattr(api_server, "tokenizer", preflight.tokenizer)
+    monkeypatch.setattr(
+        api_server, "_get_engine_config", lambda: NS(speculative_config=None)
+    )
+    monkeypatch.setattr(api_server, "synthetic_token_text", None)
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
+    monkeypatch.setattr(
+        api_server._configure_structured_output, "preflight", preflight, raising=False
+    )
+    params = NS(ignore_eos=False, stop_strings=None)
+    asyncio.run(
+        api_server._configure_structured_output(
+            params, "{}", ReasoningChannel(starts_open=opened)
+        )
+    )
+    assert params.structured_reasoning_end == (tuple(b"</think>") if opened else ())
+    rpc.assert_called_once()
+
+
+def test_framed_channel_rejected_before_worker_rpc(monkeypatch):
+    from atom.entrypoints.openai import api_server
+    from atom.entrypoints.openai.reasoning import ReasoningChannel
+    from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+
+    rpc = Mock(side_effect=AssertionError("unsupported channel must fail before RPC"))
+    monkeypatch.setattr(api_server, "engine", NS(core_mgr=NS(collective_rpc=rpc)))
+    monkeypatch.setattr(
+        api_server, "_get_engine_config", lambda: NS(speculative_config=None)
+    )
+    monkeypatch.setattr(api_server, "synthetic_token_text", None)
+    dialect, _ = resolve_dialect("<|open|>think<|sep|>")
+    params = NS(ignore_eos=False, stop_strings=None)
+    with pytest.raises(ValueError, match="framed reasoning channels"):
+        asyncio.run(
+            api_server._configure_structured_output(
+                params, "{}", ReasoningChannel(dialect, True)
+            )
+        )
+    rpc.assert_not_called()
     assert not hasattr(params, "json_schema")

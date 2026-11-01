@@ -18,9 +18,9 @@ def _mask_logits(
     vocab_size,
     BLOCK: tl.constexpr,
 ):
-    mask_row = tl.program_id(0)
-    row = tl.load(rows + mask_row)
-    token = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask_row = tl.program_id(0).to(tl.int64)
+    row = tl.load(rows + mask_row).to(tl.int64)
+    token = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     word = tl.load(
         masks + mask_row * mask_stride + token // 32,
         mask=token < vocab_size,

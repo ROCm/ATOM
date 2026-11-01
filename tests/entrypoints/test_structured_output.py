@@ -1,4 +1,6 @@
 import asyncio
+import json
+from types import SimpleNamespace as NS
 
 import pytest
 
@@ -7,9 +9,93 @@ pytest.importorskip("jsonschema")
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.structured_output import (
     schema_from_format,
+    structured_reasoning_marker,
     validate_chat_stream,
     validate_output,
 )
+
+
+@pytest.mark.parametrize(
+    "name", ["$ref", "$dynamicRef", "const", "enum", "default", "examples"]
+)
+@pytest.mark.parametrize("position", ["properties", "$defs", "dependentSchemas"])
+def test_schema_map_names_are_not_keywords(name, position):
+    schema = {position: {name: {"type": "string"}}}
+    fmt = {"type": "json_schema", "name": "test", "schema": schema}
+    assert json.loads(schema_from_format(fmt, responses=True)) == schema
+    schema[position][name] = {"$ref": "https://invalid.example/schema"}
+    with pytest.raises(ValueError, match="Only local"):
+        schema_from_format(fmt, responses=True)
+
+
+@pytest.mark.parametrize("keyword", ["const", "enum", "default", "examples"])
+def test_literal_objects_do_not_trigger_reference_checks(keyword):
+    literal = {"$ref": "https://invalid.example/literal"}
+    value = [literal] if keyword in {"enum", "examples"} else literal
+    fmt = {"type": "json_schema", "name": "literal", "schema": {keyword: value}}
+    schema_from_format(fmt, responses=True)
+
+
+@pytest.mark.parametrize(
+    "prompt", ["assistant", "assistant<think></think>", "assistant<think>"]
+)
+@pytest.mark.parametrize("tokenized", [False, True])
+def test_grammar_activation_uses_rendered_prompt(prompt, tokenized):
+    from atom.entrypoints.openai.reasoning import (
+        ReasoningChannel,
+        prompt_starts_in_reasoning,
+        prompt_tokens_start_in_reasoning,
+    )
+
+    tokenizer = NS(
+        encode=lambda value, **kw: list(value.encode()),
+        decode=lambda ids: bytes(ids).decode(),
+    )
+    opened = (
+        prompt_tokens_start_in_reasoning(list(prompt.encode()), tokenizer.decode)
+        if tokenized
+        else prompt_starts_in_reasoning(prompt)
+    )
+    channel = ReasoningChannel(starts_open=opened)
+    assert structured_reasoning_marker(channel, tokenizer) == (
+        tuple(b"</think>") if prompt.endswith("<think>") else ()
+    )
+
+
+@pytest.mark.parametrize("opened", [False, True])
+def test_framed_channels_fail_admission_even_without_explicit_think_close(opened):
+    from atom.entrypoints.openai.reasoning import ReasoningChannel
+    from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+
+    dialect, _ = resolve_dialect("<|open|>think<|sep|>")
+    with pytest.raises(ValueError, match="framed reasoning channels"):
+        structured_reasoning_marker(ReasoningChannel(dialect, opened), object())
+
+
+@pytest.mark.parametrize(
+    "choice",
+    [
+        "auto",
+        "required",
+        {"function": {"name": "files::lookup"}},
+        {"function": {"name": "lookup"}, "namespace": "files"},
+    ],
+)
+def test_namespaced_tools_keep_dispatch_identity(choice):
+    from atom.entrypoints.openai.structured_output import structured_tool_format
+    from atom.entrypoints.openai.tool_parser.deepseekv41_tool_parser import (
+        DsmlV41Parser,
+    )
+
+    tools = [
+        {"function": {"name": "lookup"}, "namespace": ns} for ns in ("search", "files")
+    ]
+    fmt = json.loads(structured_tool_format(DsmlV41Parser, tools, choice))
+    assert fmt["names"] == (
+        ["files::lookup"]
+        if isinstance(choice, dict)
+        else ["search::lookup", "files::lookup"]
+    )
 
 
 @pytest.mark.parametrize("responses", [False, True])

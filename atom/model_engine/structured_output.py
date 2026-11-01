@@ -11,6 +11,8 @@ history mismatch reconstructs from the scheduler rather than reusing stale state
 
 from functools import lru_cache
 
+from .structured_history import CommittedTokens
+
 
 def structured_stop_token_ids(config, tokenizer):
     stops = list(getattr(config, "stop_token_ids", None) or [])
@@ -156,23 +158,47 @@ class StructuredOutput:
             if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
                 continue
             req_id = batch.req_ids[i]
-            history = list(committed)
+            state = states.get(req_id)
+            source = (
+                committed.source if isinstance(committed, CommittedTokens) else None
+            )
+            reuse = (
+                i >= batch.total_seqs_num_prefill
+                and state is not None
+                and state[:2] == (schema, marker)
+                and source is not None
+                and state[5] is source
+                and state[6] <= len(committed) <= len(state[2])
+                and committed[state[6] :] == state[2][state[6] : len(committed)]
+            )
+            # On the same append-only source, compare only the newly delivered
+            # suffix. Prefill, source replacement, shrinkage or mismatch replay
+            # the authoritative committed prefix instead.
+            history = state[2] if reuse else list(committed)
             pending = previous.get(req_id)
             # A prefill/replay uses the scheduler's authoritative history.
             if (
-                i >= batch.total_seqs_num_prefill
+                not reuse
+                and i >= batch.total_seqs_num_prefill
+                and (
+                    source is None
+                    or (
+                        state is not None
+                        and state[5] is source
+                        and len(committed) >= state[6]
+                    )
+                )
                 and pending is not None
                 and pending[: len(history)] == history
             ):
-                history = list(pending)
-            prefixes[i] = (schema, marker, history)
-            state = states.get(req_id)
+                history = pending
+            prefixes[i] = (schema, marker, history, source, len(committed))
             if (
                 i >= batch.total_seqs_num_prefill
                 and state is not None
-                and state[:3] == (schema, marker, history)
+                and (reuse or state[:3] == (schema, marker, history))
             ):
-                matcher, active = state[3:]
+                matcher, active = state[3:5]
             else:
                 matcher, active = self.matcher(schema, marker, history)
             self.current[i] = (matcher, active)
@@ -185,7 +211,9 @@ class StructuredOutput:
                 branch_rows = target[start : start + lengths[i]] + [bonus[i]]
             else:
                 branch_rows = [i]
-            branch = list(history)
+            # Only the marker-sized tail is needed to detect a closer split
+            # across steps. Grammar state already owns the visible JSON prefix.
+            branch = list(history[-len(marker) :]) if marker and not active else []
             unreachable = False
             for pos, row in enumerate(branch_rows):
                 mask = masks[len(rows) : len(rows) + 1]
@@ -232,13 +260,13 @@ class StructuredOutput:
         if not prefixes:
             return
         ids = sampled.reshape(len(batch.req_ids), -1).tolist()
-        for i, (schema, marker, history) in prefixes.items():
+        for i, (schema, marker, history, source, confirmed) in prefixes.items():
             emitted = [token for token in ids[i] if token >= 0]
             for j, token in enumerate(emitted):
                 if token in self.stop_ids:
                     emitted = emitted[: j + 1]
                     break
-            full = list(history)
+            full = history
             matcher, active = self.current[i]
             for token in emitted:
                 # An already-finished request can have one forward in flight.
@@ -247,5 +275,13 @@ class StructuredOutput:
                     break
                 active = self.advance(matcher, active, marker, full, token)
             self.pending[batch.req_ids[i]] = full
-            self.states[batch.req_ids[i]] = (schema, marker, full, matcher, active)
+            self.states[batch.req_ids[i]] = (
+                schema,
+                marker,
+                full,
+                matcher,
+                active,
+                source,
+                confirmed,
+            )
         self.current.clear()

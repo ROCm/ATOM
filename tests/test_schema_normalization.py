@@ -27,6 +27,34 @@ VALUES = [
 ]
 
 
+@pytest.mark.parametrize("bound", [0.0, 1.0, 2.0])
+@pytest.mark.parametrize(
+    "key,kind,values",
+    [
+        (key, kind, values)
+        for low, high, kind, values in [
+            ("minLength", "maxLength", "string", ["", "x", "xx", "xxx"]),
+            ("minItems", "maxItems", "array", [[], [1], [1, 2], [1, 2, 3]]),
+            (
+                "minProperties",
+                "maxProperties",
+                "object",
+                [{}, {"a": 1}, {"a": 1, "b": 2}, {"a": 1, "b": 2, "c": 3}],
+            ),
+        ]
+        for key in (low, high)
+    ],
+)
+def test_integer_valued_float_bounds_have_exact_complements(bound, key, kind, values):
+    schema = {"type": kind, "not": {key: bound}}
+    Draft202012Validator.check_schema(schema)
+    lowered = normalize_schema(schema)
+    Draft202012Validator.check_schema(lowered)
+    assert [Draft202012Validator(schema).is_valid(v) for v in values] == [
+        Draft202012Validator(lowered).is_valid(v) for v in values
+    ]
+
+
 @pytest.mark.parametrize(
     "predicate",
     [

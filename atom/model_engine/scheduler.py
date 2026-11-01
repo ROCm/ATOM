@@ -64,6 +64,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
+from atom.model_engine.structured_history import CommittedTokens
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
 from atom.utils import envs
@@ -227,10 +228,9 @@ class ScheduledBatch:
                     else seq.json_schema
                 ),
                 seq.structured_reasoning_end,
-                list(
-                    seq.output_tokens[
-                        : len(seq.output_tokens) - seq.num_placeholder_tokens
-                    ]
+                CommittedTokens(
+                    seq.output_tokens,
+                    len(seq.output_tokens) - seq.num_placeholder_tokens,
                 ),
             )
             for i, seq in enumerate(seqs.values())

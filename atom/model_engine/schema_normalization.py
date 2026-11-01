@@ -71,31 +71,17 @@ def _negate(predicate):
     if key in inverse:
         return {"type": "number", inverse[key]: value}
     size_keys = {
-        "minLength": (
-            "string",
-            "maxLength",
-            value - 1 if isinstance(value, int) else 0,
-        ),
-        "maxLength": (
-            "string",
-            "minLength",
-            value + 1 if isinstance(value, int) else 0,
-        ),
-        "minItems": ("array", "maxItems", value - 1 if isinstance(value, int) else 0),
-        "maxItems": ("array", "minItems", value + 1 if isinstance(value, int) else 0),
-        "minProperties": (
-            "object",
-            "maxProperties",
-            value - 1 if isinstance(value, int) else 0,
-        ),
-        "maxProperties": (
-            "object",
-            "minProperties",
-            value + 1 if isinstance(value, int) else 0,
-        ),
+        "minLength": ("string", "maxLength", -1),
+        "maxLength": ("string", "minLength", 1),
+        "minItems": ("array", "maxItems", -1),
+        "maxItems": ("array", "minItems", 1),
+        "minProperties": ("object", "maxProperties", -1),
+        "maxProperties": ("object", "minProperties", 1),
     }
     if key in size_keys:
-        type_name, bound, size = size_keys[key]
+        type_name, bound, delta = size_keys[key]
+        # JSON Schema integers include integer-valued JSON numbers such as 2.0.
+        size = int(value) + delta
         return {"type": type_name, bound: size} if size >= 0 else False
     if key == "required":
         branches = [{"type": "object", "properties": {name: False}} for name in value]
@@ -245,6 +231,16 @@ def normalize_schema(schema):
     if not isinstance(schema, dict):
         return schema
     result = dict(schema)
+    for key in (
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minProperties",
+        "maxProperties",
+    ):
+        if key in result:
+            result[key] = int(result[key])
     additions = []
     if "not" in result:
         predicate = result.pop("not")

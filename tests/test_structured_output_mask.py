@@ -4,6 +4,28 @@ import torch
 from atom.model_engine.structured_output_mask import StructuredOutputMask
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_large_row_stride_uses_64_bit_addresses():
+    stride = 2**30 + 17
+    if torch.cuda.mem_get_info()[0] < 6 * 2**30:
+        pytest.skip("requires 6 GiB free GPU memory for a >2**31 element offset")
+    logits = torch.empty_strided(
+        (3, 33), (stride, 1), device="cuda", dtype=torch.float16
+    )
+    logits.fill_(7)
+    buffer = StructuredOutputMask(33)
+    masks = buffer.prepare(2, logits.device)
+    masks.fill_(-1)
+    masks[0, 1] = 0  # mask row 2, token 32, beyond the signed-int32 offset limit
+    masks[1, 0] = 0  # also exercise row zero
+    buffer.apply(logits, [2, 0])
+    actual = logits.cpu()
+    expected = torch.full((3, 33), 7, dtype=torch.float16)
+    expected[2, 32] = -float("inf")
+    expected[0, :32] = -float("inf")
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("vocab", [1, 31, 32, 33, 127, 129, 131073])

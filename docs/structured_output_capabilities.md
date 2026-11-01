@@ -65,8 +65,13 @@ The initial XGrammar-based candidate silently ignored some constraints and
 returned 500 only at final validation. This revision replaces that behavior;
 it does not claim complete coverage of the JSON Schema standard.
 
-Constraints apply to the final answer; reasoning remains unconstrained until its
-configured end marker. Target logits are masked before sampling. For speculative
+Constraints apply to the final answer. Grammar activation uses the same rendered
+prompt or token-ID prefix and reasoning-channel state as response parsing, rather
+than assuming a missing reasoning toggle means thinking is enabled. If generation
+starts inside an inline reasoning block, it remains unconstrained until its
+configured end marker; otherwise JSON is constrained immediately. Framed/multiple-
+transition reasoning dialects such as Kimi-K3 are rejected before worker admission
+until their complete channel framing is supported. Target logits are masked before sampling. For speculative
 decoding each verification row uses the grammar state after its proposed draft
 prefix; rejected drafts never advance the committed state. The implementation
 bridges deferred output delivery and reconstructs grammar state from committed
@@ -87,6 +92,12 @@ not beta strict-tool argument validation. Other tool parser formats, P/D handoff
 multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
+
+The scheduler passes a bounded reference to its committed output prefix, excluding
+mutable placeholder slots. On uninterrupted decode, the worker checks only newly
+delivered tokens and extends its owned history in place; it does not copy or compare
+the full history at every step. Replay, replacement, shrinkage or a mismatch rebuilds
+from the authoritative prefix. Draft marker matching needs only a marker-sized tail.
 
 Committed grammar states are retained for the immediately preceding batch and
 advanced only by newly committed tokens. Each speculative request clones that

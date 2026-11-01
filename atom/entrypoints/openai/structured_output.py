@@ -34,17 +34,36 @@ def schema_from_format(fmt, *, responses=False):
 
     # Resolve only document-local references. Never fetch schemas from URLs.
     def check(value):
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if key in {"const", "enum", "default", "examples"}:
-                    continue
-                if key in {"$ref", "$dynamicRef"} and (
-                    not isinstance(child, str) or not child.startswith("#")
-                ):
-                    raise ValueError("Only local JSON Schema references are supported")
+        if not isinstance(value, dict):
+            return
+        for key in ("$ref", "$dynamicRef"):
+            if key in value and not value[key].startswith("#"):
+                raise ValueError("Only local JSON Schema references are supported")
+        # Names in these maps are user data, not schema keywords.
+        for key in (
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+        ):
+            for child in value.get(key, {}).values():
                 check(child)
-        elif isinstance(value, list):
-            for child in value:
+        for key in (
+            "items",
+            "additionalProperties",
+            "contains",
+            "propertyNames",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+            "not",
+            "if",
+            "then",
+            "else",
+        ):
+            check(value.get(key))
+        for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            for child in value.get(key, []):
                 check(child)
 
     check(schema)
@@ -56,13 +75,14 @@ def structured_tool_format(parser_cls, tools, tool_choice):
     if not tools or tool_choice == "none":
         return None
     from .tool_parser.deepseekv4_tool_parser import DsmlParser
+    from .tool_parser.tool_parser import qualified_tool_name
 
     if parser_cls is None or not issubclass(parser_cls, DsmlParser):
         raise ValueError("Structured output with tools requires a DSML tool parser")
-    names = [tool["function"]["name"] for tool in tools]
+    names = [qualified_tool_name(tool) for tool in tools]
     required = tool_choice == "required" or isinstance(tool_choice, dict)
     if isinstance(tool_choice, dict):
-        name = tool_choice.get("function", {}).get("name") or tool_choice.get("name")
+        name = qualified_tool_name(tool_choice)
         if name not in names:
             raise ValueError("The selected tool must be declared in tools")
         names = [name]
@@ -74,6 +94,26 @@ def structured_tool_format(parser_cls, tools, tool_choice):
             "required": required,
         }
     )
+
+
+def structured_reasoning_marker(channel, tokenizer):
+    """Only suspend the JSON grammar when generation starts inside reasoning."""
+    from .reasoning_dialects import FALLBACK_DIALECT
+
+    dialect = channel.dialect or FALLBACK_DIALECT
+    if dialect.content_framing or len(dialect.end_markers) != 1:
+        raise ValueError(
+            "Structured output does not yet support framed reasoning channels"
+        )
+    if not channel.starts_open:
+        return ()
+    marker = dialect.think_end_marker
+    tokens = tuple(tokenizer.encode(marker, add_special_tokens=False)) if marker else ()
+    if not tokens:
+        raise ValueError(
+            "Structured thinking requires an explicit reasoning end marker"
+        )
+    return tokens
 
 
 def validate_output(schema, text, finish_reason, *, tool_calls=False):
