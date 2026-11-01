@@ -14,6 +14,7 @@ import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.observability import timeline
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -181,6 +182,7 @@ class SchedulerMetrics:
             if not timing.observed:
                 self.queue_time.observe(now - timing.received_at)
                 timing.observed = True
+                timeline.mark(req_id, "sched")
             if (
                 i < batch.total_seqs_num_decode
                 and context_lens is not None

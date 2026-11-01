@@ -60,7 +60,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
-from atom.observability import tracing
+from atom.observability import timeline, tracing
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -4056,6 +4056,7 @@ class Scheduler:
                     pp_middle_chunk_ids.add(req_id)
                 elif i >= batch.total_seqs_num_decode:
                     tracing.prefill_complete(seq)
+                    timeline.mark(seq.id, "prefill_done")
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -4092,6 +4093,7 @@ class Scheduler:
                     seq.is_partial_prefill = now_partial
                 if not now_partial:
                     tracing.prefill_complete(seq)
+                    timeline.mark(seq.id, "prefill_done")
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
@@ -4379,6 +4381,7 @@ class Scheduler:
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
                 tracing.first_token(seq)
+                timeline.mark(seq.id, "first_tok", seq.first_token_time)
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's
