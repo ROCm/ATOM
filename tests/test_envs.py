@@ -397,3 +397,26 @@ def test_otel_version_environment(monkeypatch):
     assert _get_envs().ATOM_TRACE_VERSION == "unknown"
     monkeypatch.setenv("ATOM_TRACE_VERSION", "build-test")
     assert _get_envs().ATOM_TRACE_VERSION == "build-test"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("0", False),
+        ("off", False),
+        ("1", True),
+        ("true", True),
+        ("On ", True),
+    ],
+)
+def test_lossless_sampling_reads_as_its_neighbouring_flags(
+    monkeypatch, value, expected
+):
+    """`=true` must arm it, as it arms every `_flag_env` flag."""
+    if value is None:
+        monkeypatch.delenv("ATOM_SPEC_LOSSLESS_SAMPLING", raising=False)
+    else:
+        monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", value)
+    assert _get_envs().ATOM_SPEC_LOSSLESS_SAMPLING is expected

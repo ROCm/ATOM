@@ -612,8 +612,8 @@ def dspark_markov_argmax_tp(
 # probabilities, renormalized over the stored set -- and the draft samples from
 # exactly those, so q is 0 for every id not stored and the ratio rule stays
 # exact against it. What the truncation costs is q's tail mass, i.e. a little
-# acceptance, never correctness. See `envs.ATOM_SPEC_LOSSLESS_SAMPLING` and
-# `ATOM_SPEC_LOSSLESS_Q_TOPK` for the trade, and
+# acceptance, never correctness. See `ATOM_SPEC_LOSSLESS_SAMPLING` in
+# docs/model_ops_guide.md and `sparse_q_store.Q_WIDTH` for the trade, and
 # `atom/model_ops/rejection_sampler.py` for the consumer.
 #
 # The store (`sparse_q_store.SparseQStore`) holds, per draft row

@@ -141,22 +141,16 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
     assert prop._draft_top_p_buf.gpu.tolist() == [1.0] * MAX_BS
 
 
-@pytest.mark.parametrize("topk, width", [(None, VOCAB), ("5", 5), ("99999", VOCAB)])
+@pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
 def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk, width):
     if topk is not None:
-        monkeypatch.setenv("ATOM_SPEC_LOSSLESS_Q_TOPK", topk)
+        monkeypatch.setattr(dspark_proposer, "Q_WIDTH", topk)
     sampling = proposer(monkeypatch).model.bound
     store = sampling.q_store
     assert store.ids.shape == store.probs.shape == (2 * MAX_BS * T, width)
     assert store.meta.shape == (2 * MAX_BS * T, 2)
     # The draft's dense scores are per batch row, whatever K is.
     assert sampling.s_scratch.shape == (MAX_BS, VOCAB)
-
-
-def test_a_q_store_of_no_entries_is_refused(monkeypatch):
-    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_Q_TOPK", "0")
-    with pytest.raises(ValueError, match="ATOM_SPEC_LOSSLESS_Q_TOPK"):
-        proposer(monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -289,7 +283,7 @@ def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossl
 
 
 def test_the_documented_verify_scratch_figures_hold():
-    """The env text quantifies the verify scratch at 512, T=16, V=163840:
+    """docs/model_ops_guide.md quantifies the verify scratch at 512, T=16, V=163840:
     191 MiB, 160 MiB of it the counted top-k's run maxima."""
     num_tokens, vocab = 512 * 16, 163840
     run_maxima = ratio_count_scratch_bytes(num_tokens, vocab)

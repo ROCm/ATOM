@@ -19,7 +19,7 @@ from atom.model_ops.rejection_sampler import (
     warmup_ratio_verify,
 )
 from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
-from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
+from atom.model_ops.sparse_q_store import Q_WIDTH, RatioDraftQ, SparseQStore
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_q_slots import DraftQSlots, DraftQStaging
@@ -103,8 +103,9 @@ class DSparkProposer(Drafter):
     def _init_lossless_sampling(self) -> None:
         """Bind the draft's sampling buffers, or leave the greedy path in place.
 
-        See `envs.ATOM_SPEC_LOSSLESS_SAMPLING` for what this buys and costs,
-        why it defaults off, and why it arms both halves of the feature at once.
+        See `ATOM_SPEC_LOSSLESS_SAMPLING` in `docs/model_ops_guide.md` for what
+        this buys and costs, why it defaults off, and why it arms both halves
+        of the feature at once.
         """
         self.draft_sampling = None
         self._q_store = None
@@ -194,12 +195,7 @@ class DSparkProposer(Drafter):
         vocab = int(self.model.vocab_size)
         q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
         # Past V there is nothing more to store.
-        q_width = min(envs.ATOM_SPEC_LOSSLESS_Q_TOPK, vocab)
-        if q_width < 1:
-            raise ValueError(
-                f"ATOM_SPEC_LOSSLESS_Q_TOPK={envs.ATOM_SPEC_LOSSLESS_Q_TOPK}: the "
-                "draft must store at least the id it emits"
-            )
+        q_width = min(Q_WIDTH, vocab)
         # [slots * T, K], allocated once, before the KV cache is sized, so the
         # budget sees it. One row block per live request rather than per batch
         # slot: the verify that reads a request's q runs a step after the
