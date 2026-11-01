@@ -7,6 +7,7 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from aiter.jit.utils.chip_info import get_gfx
 from torch import nn
 
 from atom.config import Config, QuantizationConfig
@@ -50,16 +51,27 @@ from atom.utils.region_graph import token_graph
 logger = logging.getLogger("atom")
 
 
+def _gfx1250_fused_ar_rmsnorm_supported() -> bool:
+    """Whether this aiter has a gfx1250 fused AR + RMSNorm kernel. Without one,
+    aiter hands the gfx1250 communicator to the CDNA fused kernel, which reads
+    it as its own struct (TP4 GSM8K 0.62 vs 0.89 unfused)."""
+    from aiter.ops import custom_all_reduce
+
+    return hasattr(custom_all_reduce, "fused_allreduce_rmsnorm_gfx1250")
+
+
 def allreduce_norm_fusion_enabled() -> bool:
     """Whether row-parallel outputs skip their all-reduce and the following
     Gemma RMSNorm folds it in. Off under PP (stage-boundary activations must
-    be reduced), in plugin mode (not validated there), and on an aiter whose
-    per-group fused kernel cannot do the Gemma norm."""
+    be reduced), in plugin mode (not validated there), on an aiter whose
+    per-group fused kernel cannot do the Gemma norm, and on gfx1250 with an
+    aiter that has no gfx1250 fused kernel."""
     enabled = (
         ENABLE_ALLREDUCE_RMSNORM_FUSION
         and get_tensor_model_parallel_world_size() > 1
         and get_pp_group().world_size == 1
         and not is_plugin_mode()
+        and (get_gfx() != "gfx1250" or _gfx1250_fused_ar_rmsnorm_supported())
     )
     if enabled and not fused_ar_gemma_per_group_supported():
         logger.warning(

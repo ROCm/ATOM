@@ -15,6 +15,22 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
 
 
+def _effective_layer_quant_config(quant_config, prefix: str):
+    """The spec a layer runs with: its online-quantization target when one
+    applies, else its checkpoint spec. A layer the checkpoint stores in BF16 but
+    online quantization converts (the Qwen3.5 MTP experts) runs as the target."""
+    from aiter import QuantType
+
+    spec = quant_config.get_layer_quant_config(prefix, check_children=True)
+    if getattr(quant_config, "online_quant", False):
+        online = quant_config.get_layer_quant_config(
+            prefix, use_online_quant=True, check_children=True
+        )
+        if online.quant_type != QuantType.No:
+            return online
+    return spec
+
+
 def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     quant_config,
     shared_expert_prefix: str | None = None,
@@ -48,15 +64,9 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:
-        shared_spec = quant_config.get_layer_quant_config(
-            shared_expert_prefix,
-            check_children=True,
-        )
+        shared_spec = _effective_layer_quant_config(quant_config, shared_expert_prefix)
         routed_spec = (
-            quant_config.get_layer_quant_config(
-                routed_expert_prefix,
-                check_children=True,
-            )
+            _effective_layer_quant_config(quant_config, routed_expert_prefix)
             if routed_expert_prefix is not None
             else quant_config.global_quant_config
         )
