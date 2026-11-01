@@ -349,6 +349,9 @@ EOF
 
   docker_args=(
     run --name "${container}"
+    # Spur's epilog removes the containers labeled with its job, also after a
+    # cancel kills this script before cleanup_spur runs.
+    --label "spur_job_id=${SPUR_JOB_ID:-${JOB_ID}}"
     --user "$(id -u):$(id -g)"
     --network host --ipc host
     --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband
