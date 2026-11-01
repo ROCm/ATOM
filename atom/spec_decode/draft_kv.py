@@ -3,7 +3,7 @@ from functools import partial
 
 import torch
 
-from atom.config import KVCacheTensor
+from atom.config import K3_DFLASH_ARCH, KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
@@ -18,7 +18,7 @@ DRAFT_KV_ROWS = "draft_kv"
 #: entry-granular in FLASH layout, with one per-tensor scale. Keyed on the
 #: architecture `SpeculativeConfig.hf_config_override` renames the SpecForge
 #: DFlash checkpoint to.
-_DFLASH_POOL_ARCHS = frozenset({"K3DFlashModel"})
+_DFLASH_POOL_ARCHS = frozenset({K3_DFLASH_ARCH})
 
 
 def uses_dflash_pool(draft_hf) -> bool:

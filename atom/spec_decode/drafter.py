@@ -10,7 +10,7 @@ import torch
 from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
-from atom.config import Config
+from atom.config import K3_DFLASH_ARCH, Config
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
@@ -137,7 +137,7 @@ support_draft_model_arch_dict = {
     # string is `DSparkDraftModel` -- stamped on every DFlash draft regardless
     # of target, and colliding with the base class in atom/models/dspark_draft.py
     # -- so `SpeculativeConfig.hf_config_override` renames it to this.
-    "K3DFlashModel": "atom.models.kimi_k3_dflash.KimiK3DFlash",
+    K3_DFLASH_ARCH: "atom.models.kimi_k3_dflash.KimiK3DFlash",
 }
 
 

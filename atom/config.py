@@ -1212,7 +1212,12 @@ def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
     return None
 
 
-# Targets the Kimi-K3 DFlash draft (`K3DFlashModel`) can serve. The rename in
+# The architecture `hf_config_override` renames a SpecForge DFlash draft to,
+# the one name the DFlash draft is keyed on (`draft_kv.uses_dflash_pool`, the
+# drafter registry).
+K3_DFLASH_ARCH = "K3DFlashModel"
+
+# Targets the Kimi-K3 DFlash draft (`K3_DFLASH_ARCH`) can serve. The rename in
 # `hf_config_override` cannot check this itself: it sees only the draft, and
 # SpecForge stamps the same `DSparkDraftModel` arch on every DFlash draft.
 _K3_DFLASH_TARGET_ARCHS: frozenset[str] = frozenset({"KimiK3ForConditionalGeneration"})
@@ -1223,7 +1228,7 @@ def _check_dflash_draft_target(
 ) -> None:
     """Refuse a SpecForge DFlash draft paired with a non-Kimi-K3 target."""
     draft_arch = (getattr(draft_hf, "architectures", None) or [""])[0]
-    if draft_arch != "K3DFlashModel":
+    if draft_arch != K3_DFLASH_ARCH:
         return
     target_arch = (getattr(target_hf, "architectures", None) or [""])[0]
     if target_arch not in _K3_DFLASH_TARGET_ARCHS:
@@ -1557,7 +1562,7 @@ class SpeculativeConfig:
         # atom/models/dspark_draft.py, and `support_draft_model_arch_dict` is a
         # bare dict index keyed on this string.
         if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
-            hf_config.architectures = ["K3DFlashModel"]
+            hf_config.architectures = [K3_DFLASH_ARCH]
             _normalize_draft_dspark_config(hf_config, dflash=True)
             return
         if arch in _STANDALONE_DSPARK_ARCHS:
