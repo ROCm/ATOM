@@ -4,9 +4,9 @@
 import logging
 from abc import abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from functools import lru_cache
+from functools import cached_property, lru_cache
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -31,6 +31,11 @@ from atom.config import (
 from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_reduce_scatter,
+)
+from atom.distributed.ulysses_sp import (
+    get_sp_group,
+    sp_is_enabled,
+    sp_moe_reduce_scatter,
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
@@ -320,12 +325,12 @@ class FusedMoEParallelConfig:
             get_prefill_context_model_parallel_world_size,
         )
 
-        pcp_merge = (
-            envs.ATOM_PCP_MOE_MERGE
-            and get_prefill_context_model_parallel_world_size() > 1
-        )
-        if pcp_merge:
-            pcp_size = get_prefill_context_model_parallel_world_size()
+        pcp_size = get_prefill_context_model_parallel_world_size()
+        # SP always shards MoE weights over the PCP rank dimension, but reduces
+        # its gathered rows itself; ordinary PCP makes the fold optional.
+        sp_fold = pcp_size > 1 and sp_is_enabled()
+        pcp_merge = pcp_size > 1 and envs.ATOM_PCP_MOE_MERGE and not sp_fold
+        if pcp_merge or sp_fold:
             pcp_rank = get_prefill_context_model_parallel_rank()
             tp_rank = pcp_rank * tp_size + tp_rank
             tp_size = pcp_size * tp_size
@@ -448,6 +453,18 @@ def all_gatherv(
 
 def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
     return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
+
+
+def gather_routed_rows(layer, rows: tuple[torch.Tensor, ...], group):
+    """`pack_routed_rows` output, one height on every rank of `group`, gathered
+    rank-major in one grouped collective: hidden states, top-k weights and
+    ids, and their scales (None when unquantized)."""
+    heights = [rows[0].shape[0]] * group.world_size
+    hidden_states, topk_weights, topk_ids, *scale = gather_rows(
+        lambda ts: all_gatherv(ts, heights, group), rows
+    )
+    reassign_gathered_shared_ids(layer, topk_ids)
+    return hidden_states, topk_weights, topk_ids, scale[0] if scale else None
 
 
 def dp_gather_routed_rows(
@@ -608,6 +625,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         gather (`gathered`: the rows are the group's, held alike by every
         rank). The logical ids themselves where nothing remaps them."""
         return topk_weights, topk_ids
+
+    def gathered_rows_wire(self, layer: torch.nn.Module, rows: int):
+        """The wire for routed rows a token gather hands to every rank, `rows`
+        of them in all."""
+        return self.routed_rows_wire
 
     @abstractmethod
     def get_fused_moe_quant_config(
@@ -1459,6 +1481,8 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
+        # Keep cached layer references within this model's lifetime.
+        self._takes_prequantized = lru_cache(maxsize=64)(self._takes_prequantized)
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
@@ -2064,6 +2088,119 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    @cached_property
+    def _fp4_rows_wire(self):
+        return resolve_routed_rows_wire(
+            self.moe.in_dtype, self.moe.hidden_dim, fp4=True
+        )
+
+    def gathered_rows_wire(self, layer, rows):
+        # fused_moe would quantize these rows to MXFP4 itself: do it before the
+        # gather, on the rows' owner, and move a quarter of the bytes.
+        if self.routed_rows_wire is None and self._fused_moe_prequantizes(
+            layer, rows, self.moe.in_dtype
+        ):
+            return self._fp4_rows_wire
+        return self.routed_rows_wire
+
+    def activation_dtype(self, layer, tokens):
+        """The activation dtype fused_moe quantizes `tokens` rows to."""
+        from aiter.fused_moe import resolve_activation_dtype
+
+        return resolve_activation_dtype(
+            self.quant_type,
+            layer.w13_weight.dtype,
+            activation=layer.activation,
+            gate_mode=(
+                GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+            ),
+            M=tokens,
+            gate_up_interleave=getattr(layer.w13_weight, "gate_up_interleave", None),
+        )
+
+    def _fused_moe_prequantizes(self, layer, tokens, dtype):
+        """Whether fused_moe would take `tokens` gathered rows quantized as by
+        `_fp4_rows_wire`: the resolution of a call with those rows and scales."""
+        # Below this a gather is latency bound and inline-quant kernels read
+        # BF16, so moving quantized rows saves nothing.
+        if (
+            tokens < 8192
+            or dtype != torch.bfloat16
+            or self.quant_type != QuantType.per_1x32
+            or self.fp8_activations
+            or self.use_triton
+            or self.use_triton_ep
+            or self.fused_experts is not None
+            or layer.custom_routing_function is not None
+            or layer.apply_router_weight_on_input
+            or layer.activation not in (ActivationType.Silu, ActivationType.Swiglu)
+            or layer.w13_input_scale is not None
+            or layer.hidden_size % 256
+            or get_gfx() != "gfx950"
+            or self.activation_dtype(layer, tokens) != dtypes.fp4x2
+        ):
+            return False
+        from aiter.fused_moe import get_padded_M
+
+        return self._takes_prequantized(layer, get_padded_M(tokens), dtype)
+
+    def _takes_prequantized(self, layer, padded_tokens, dtype):
+        from aiter.fused_moe import (
+            AUX_SORT_OPUS,
+            _mxfp4_a4w4_stage1_fw,
+            get_2stage_cfgs,
+            get_inter_dim,
+        )
+
+        w1, w2 = layer.w13_weight, layer.w2_weight
+        gate_mode = GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+        experts, hidden, intermediate = get_inter_dim(w1.shape, w2.shape)
+        shuffled = getattr(w1, "is_shuffled", False) or getattr(
+            w2, "is_shuffled", False
+        )
+        metadata = get_2stage_cfgs(
+            padded_tokens,
+            hidden,
+            intermediate,
+            experts,
+            layer.top_k + layer.num_fused_shared_experts,
+            dtype,
+            dtypes.fp4x2,
+            w1.dtype,
+            self.quant_type,
+            intermediate != w1.shape[1],
+            layer.activation,
+            False,
+            0,
+            0,
+            shuffled,
+            gate_mode,
+            is_ep=layer.expert_mask is not None,
+            has_stage1_bias=layer.w13_bias is not None,
+            has_stage2_bias=layer.w2_bias is not None,
+            swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+            # Inline-sort rows read BF16; fused_moe re-resolves without them.
+            _disable_inline_sort=True,
+            input_dtype=dtypes.fp4x2,
+            has_activation_scales=True,
+        )
+        # fused_moe_2stages prequantizes the Opus-sorted a4w4 GEMM1 too.
+        if (
+            getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+            and metadata.output_aux == AUX_SORT_OPUS
+            and int(metadata.block_m) != 16
+        ):
+            metadata = replace(metadata, prequant=True)
+        return (
+            metadata.full_impl is None
+            and metadata.prequant
+            and not metadata.run_1stage
+            and metadata.ksplit <= 1
+        )
+
     @mark_trace
     def select_experts(
         self, layer: torch.nn.Module, x: torch.Tensor, router_logits: torch.Tensor
@@ -2425,8 +2562,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "scale layout is skipped under use_triton_ep."
             )
             if x_scale is not None:
-                # MXFP8 rows as they arrived: fused_moe skips its own quant and
-                # writes the output in the model dtype, not x's.
+                # Quantized rows as they arrived: fused_moe skips its own quant
+                # and writes the output in the model dtype, not x's.
                 a1_scale = x_scale
                 moe_extra_args["dtype"] = self.moe.in_dtype
             return fused_moe(
@@ -3470,6 +3607,8 @@ class FusedMoE(torch.nn.Module):
 
     # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
     shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
+    # The SPMegaMoE backend, set when it runs this layer's FFN region.
+    sp_mega_moe = None
 
     def __init__(
         self,
@@ -5379,14 +5518,9 @@ class FusedMoE(torch.nn.Module):
             tbo = tbo_active()
             if tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            # One grouped collective, rank-major: every PCP shard is one height.
-            pcp_group = get_pcp_group()
-            heights = [hidden_states.shape[0]] * pcp_group.world_size
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, pcp_group), rows
+            hidden_states, topk_weights, topk_ids, x_scale = gather_routed_rows(
+                self, rows, get_pcp_group()
             )
-            x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
             if tbo:
                 tbo_switch_to_compute_sync()
         gathered = gathered or split
@@ -5512,28 +5646,54 @@ class FusedMoE(torch.nn.Module):
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
 
-        # Simulated DP with no peers to gather from: the absent ranks' token
-        # shards are stood in for locally, same as after the gather in
-        # forward_impl_graph. Dropped again below.
+        # Route the SP token shards on their owners, gather the routed rows for
+        # local expert computation, then sum partials back to each owner.
+        sp_moe = sp_is_enabled()
         topk_weights, topk_ids = self.quant_method.select_experts(
             self, hidden_states, router_logits
         )
+        x_scale = None
         dp_repeat = self.moe_parallel_config.dp_logical_ratio
+        if sp_moe:
+            group = get_sp_group()
+            # Chosen for the rows fused_moe sees, after the stand-in repeat below.
+            gathered_rows = hidden_states.shape[0] * group.world_size * dp_repeat
+            rows = pack_routed_rows(
+                self.quant_method.gathered_rows_wire(self, gathered_rows),
+                hidden_states,
+                topk_weights,
+                topk_ids,
+            )
+            hidden_states, topk_weights, topk_ids, x_scale = gather_routed_rows(
+                self, rows, group
+            )
+
+        # Simulated DP with no peers to gather from: the absent ranks' token
+        # shards are stood in for locally, same as after the gather in
+        # forward_impl_graph. Dropped again below.
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:
             hidden_states, topk_weights, topk_ids = (
                 repeat_rows(t, dp_repeat)
                 for t in (hidden_states, topk_weights, topk_ids)
             )
+            if x_scale is not None:
+                x_scale = repeat_rows(x_scale, dp_repeat)
 
-        # The stand-in copies make the rows the logical group's, as a gather
-        # would.
+        # The SP gather and the stand-in copies both make the rows the group's.
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, gathered=dp_repeat > 1
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            x_scale,
+            gathered=sp_moe or dp_repeat > 1,
         )
 
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
+
+        if sp_moe:
+            final_hidden_states = sp_moe_reduce_scatter(final_hidden_states)
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

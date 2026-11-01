@@ -62,3 +62,13 @@ mono_decode_installers = {
         "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
     ),
 }
+# SP MegaMoE (atom/model_ops/sp_mega_moe.py): from the loaded model to the
+# FusedMoE layers whose FFN region the model can run through `sp_mega_moe_block`,
+# and the eps the fused tail norm is built for. Other architectures keep the
+# native MoE under SP.
+sp_mega_moe_layers = {
+    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.model.sp_mega_moe_layers",
+    "MiniMaxM3SparseForConditionalGeneration": (
+        "atom.models.minimax_m3.model.sp_mega_moe_layers"
+    ),
+}

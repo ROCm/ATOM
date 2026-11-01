@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from atom.config import get_current_atom_config
+from atom.distributed.ulysses_sp import check_sp_attention_layer, get_sp_world_size
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils.selector import Family, get_attn_backend
 
@@ -42,6 +43,27 @@ class Attention(BaseAttention):
         assert (
             not is_plugin_mode()
         ), "ATOM native Attention is only supported for ATOM native/server mode"
+
+        # Projections keep all heads; attention and its KV pool own 1/SP.
+        sp_size = get_sp_world_size()
+        if sp_size > 1:
+            check_sp_attention_layer(
+                sp_size,
+                prefix or f"layer {layer_num}",
+                sinks,
+                alibi_slopes,
+                rotary_emb,
+                (kwargs.get("index_q_size") or 0) // kwargs.get("index_head_dim", 1),
+            )
+        num_heads //= sp_size
+        num_kv_heads = max(1, num_kv_heads // sp_size)
+        # Indexer query heads follow the kv heads through the same all-to-all.
+        if kwargs.get("index_q_size"):
+            index_dim = kwargs["index_head_dim"]
+            kwargs["index_q_size"] = (
+                max(1, kwargs["index_q_size"] // index_dim // sp_size) * index_dim
+            )
+
         super().__init__(
             num_heads=num_heads,
             head_dim=head_dim,

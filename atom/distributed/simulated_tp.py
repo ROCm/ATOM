@@ -98,7 +98,7 @@ def _reject_unsupported(config: "Config", logical: int, physical: int) -> None:
         # next_rank/prev_rank index `ranks` by (rank ± 1) % world_size.
         _reject("does not support pipeline parallel")
     if config.prefill_context_parallel_size > 1:
-        _reject("does not support prefill context parallel")
+        _reject("does not support prefill context parallel or Ulysses SP")
     if config.decode_context_parallel_size > 1:
         _reject("does not support decode context parallel")
     if config.parallel_config.data_parallel_size > 1 or config.enable_dp_attention:

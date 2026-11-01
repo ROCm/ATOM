@@ -750,8 +750,26 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         returns_tuple = graph_returns_tuple(graph)
 
+        # A cache-backed artifact (every one before torch 2.10,
+        # CacheCompiledArtifact since) reloads the flat AOT callable, without
+        # the flatten_graph_inputs wrapper that compile_fx adds for nested
+        # inputs. A split attention op can supply (activation, scale) as one
+        # argument; forwarding that tuple shifts subsequent mutation/shape
+        # argument indices in the loaded callable. AOTCompiledArtifact owns its
+        # own serialized call convention and must not receive this adaptation.
+        from torch.utils._pytree import arg_tree_leaves
+
+        try:
+            from torch._inductor.standalone_compile import AOTCompiledArtifact
+        except ImportError:
+            AOTCompiledArtifact = ()
+        flatten_inputs = not isinstance(
+            inductor_compiled_graph, AOTCompiledArtifact
+        ) and any(isinstance(x, (list, tuple, dict)) for x in example_inputs)
+
         def compiled_graph_wrapper(*args):
-            graph_output = inductor_compiled_graph(*args)
+            call_args = arg_tree_leaves(*args) if flatten_inputs else args
+            graph_output = inductor_compiled_graph(*call_args)
             # unpack the tuple if needed
             # TODO(rzou): the implication is that we're not
             # reading the python bytecode correctly in vLLM?

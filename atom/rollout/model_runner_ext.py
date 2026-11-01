@@ -141,6 +141,12 @@ class RLHFModelRunner(
             device_map = os.environ.get(self.DP_DEVICE_MAP_ENV)
             if device_map is None:
                 return super()._setup_device_and_distributed(rank, config)
+        if config.prefill_context_parallel_size > 1:
+            # These worlds have no PCP group: attention would shard heads by TP
+            # alone while the KV pool is sized for TP x SP.
+            raise ValueError(
+                "DP-isolated RLHF workers do not support -pcp or Ulysses SP (-sp)."
+            )
 
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         local_device_rank = dp_rank_local * config.tensor_parallel_size + rank
@@ -315,6 +321,11 @@ class RLHFModelRunner(
             raise ValueError(
                 f"{self.label}: hidden-state export reads every prefill row; "
                 "launch with --no-decoder-swa-bounded-replay"
+            )
+        # The export prefill feeds the model every row, not this rank's shard.
+        if self.config.sequence_parallel_size > 1:
+            raise ValueError(
+                f"{self.label}: hidden-state export does not support Ulysses SP (-sp)"
             )
         from torchspec.config.mooncake_config import MooncakeConfig
         from torchspec.transfer.mooncake.eagle_store import EagleMooncakeStore

@@ -34,6 +34,18 @@ def test_moe_kernel_token_capacity(
     )
 
 
+@pytest.mark.parametrize(
+    "budget,sp_size,expected", [(131072, 8, 131072), (17, 4, 20), (1, 8, 8)]
+)
+def test_sp_capacity_covers_padded_gather(budget, sp_size, expected):
+    config = SimpleNamespace(
+        max_num_batched_tokens=budget,
+        sequence_parallel_size=sp_size,
+        enable_dp_attention=False,
+    )
+    assert moe_kernel_token_capacity(config, dp_size=1, use_all2all=False) == expected
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="topK metadata is CUDA")
 def test_dpa_capacity_fits_gathered_topk_metadata():
     import atom.model_ops.topK as topK_mod
