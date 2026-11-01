@@ -14506,6 +14506,112 @@ models:
           dcp: 1
           port: 6100
           extra_args: --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail","kv_connector_extra_config":{"mooncake_protocol":"rdma","num_workers":10}}' --speculative-config '{"model":"/models/Inferact-Kimi-K3-DSpark","method":"dspark","num_speculative_tokens":7,"attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"synthetic","synthetic_acceptance_length":3.84}' --served-model-name moonshotai/Kimi-K3 --trust-remote-code --tensor-parallel-size 8 --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.9 --language-model-only --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576 --stream-interval 10 --no-enable-prefix-caching --prefix-match-unit 128 --kv-cache-dtype fp8 --mamba-ssm-cache-dtype float32 --block-size 128 --attention-backend ROCM_AITER_MLA --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}' --max-num-seqs 32 --max-num-batched-tokens 512 --compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":40,"cudagraph_capture_sizes":[8,16,24,32,40],"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}' --quantization-config '{"linear":"fp8_per_channel","ignore":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","*self_attn.in_proj_qkvgfab*","*self_attn.f_b_proj*","*self_attn.o_proj*","*block_sparse_moe.shared_experts*"]}' --scheduler-cls pd_c48_scheduler.create_scheduler --additional-config '{"decode_backend":"latency_specialized"}'
+      - name: kimi-k3-vllm-c48-gap-v-qd-cpuref3-fp8attn-fq3-pq-ldfp4-inpad-warm-sw-c1-n3966-spec-mc
+        image: vllm/vllm-openai-rocm:nightly-3966924d566340e971a6da313e790d05492aa505@sha256:8649354473843f477a96d3aa659d0ae56bcc7df743d2d02d52aaa318178ac881
+        topology: 1p1d
+        display_topology: 1P1D-TP8-DSPARK7
+        pd_worker_layout: multi_node
+        nodes: ${ATOMESH_1P1D_NODES}
+        isl:
+        - 1048576
+        osl: 1024
+        concurrency:
+        - 1
+        run_eval: true
+        benchmark:
+          <<: *id001
+          aiperf_commit: ""
+        env:
+          common:
+            ATOMESH_C48_CASE: V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-SW-C1-N3966-SPEC-MC
+            AGENTX_HARNESS_VERSION: "1.0.9"
+            ATOMESH_PRE_CLEAN_GPU: '1'
+            ATOMESH_AGENTIC_TORCH_PROFILE: '0'
+          prefill:
+            VLLM_ROCM_USE_AITER: '1'
+            AITER_BF16_FP8_MOE_BOUND: '0'
+            AITER_FLYDSL_STAGE2_FP8: '1'
+            VLLM_ROCM_AITER_MLA_ASM_PADDING: asm
+            VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
+            VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: INT4
+            VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: '256'
+            SAFETENSORS_FAST_GPU: '1'
+            VLLM_SSM_CONV_STATE_LAYOUT: DS
+            VLLM_KV_CACHE_LAYOUT: HND
+            NCCL_DMABUF_ENABLE: '0'
+            HSA_ENABLE_IPC_MODE_LEGACY: '1'
+            HIP_FORCE_DEV_KERNARG: '1'
+            PYTHONHASHSEED: '42'
+            VLLM_USE_DIRECT_DCP_A2A: '0'
+            VLLM_USE_DIRECT_DCP_Q_GATHER: '0'
+            VLLM_USE_DIRECT_DCP_KV_GATHER: '0'
+            VLLM_ENGINE_READY_TIMEOUT_S: '7200'
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1200'
+            PYTHONNOUSERSITE: '1'
+            VLLM_SERVER_DEV_MODE: '0'
+            MORI_IO_SQ_BACKOFF_TIMEOUT_US: '50000'
+            MORI_IO_QP_MAX_SEND_WR: '16384'
+            MORI_IO_QP_MAX_CQE: '32768'
+            MORI_IO_QP_MAX_SGE: '2'
+            MORI_IO_TC_DISABLE: '0'
+            MC_GID_INDEX: '1'
+            MC_MAX_CONCURRENT_REG_MR: '1'
+            VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            MC_IB_TC: '104'
+            HSA_NO_SCRATCH_RECLAIM: '0'
+            VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8: '1'
+            C48_EXPECT_QUANT: '{"Fp8PtpcOnlineLinearMethod":489,"Mxfp4OnlineLinearMethod":92}'
+            VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: '1'
+            C48_P_GEMM_WARMUP: '1'
+          decode:
+            VLLM_ROCM_USE_AITER: '1'
+            AITER_BF16_FP8_MOE_BOUND: '0'
+            AITER_FLYDSL_STAGE2_FP8: '1'
+            VLLM_ROCM_AITER_MLA_ASM_PADDING: asm
+            VLLM_ROCM_AITER_MLA_DCP_VERIFY: asm
+            VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: INT4
+            VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: '256'
+            SAFETENSORS_FAST_GPU: '1'
+            VLLM_SSM_CONV_STATE_LAYOUT: DS
+            VLLM_KV_CACHE_LAYOUT: HND
+            NCCL_DMABUF_ENABLE: '0'
+            HSA_ENABLE_IPC_MODE_LEGACY: '1'
+            HIP_FORCE_DEV_KERNARG: '1'
+            PYTHONHASHSEED: '42'
+            VLLM_USE_DIRECT_DCP_A2A: '0'
+            VLLM_USE_DIRECT_DCP_Q_GATHER: '0'
+            VLLM_USE_DIRECT_DCP_KV_GATHER: '0'
+            VLLM_ENGINE_READY_TIMEOUT_S: '7200'
+            VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1200'
+            PYTHONNOUSERSITE: '1'
+            VLLM_SERVER_DEV_MODE: '0'
+            MORI_IO_SQ_BACKOFF_TIMEOUT_US: '50000'
+            MORI_IO_QP_MAX_SEND_WR: '16384'
+            MORI_IO_QP_MAX_CQE: '32768'
+            MORI_IO_QP_MAX_SGE: '2'
+            MORI_IO_TC_DISABLE: '0'
+            MC_GID_INDEX: '1'
+            MC_MAX_CONCURRENT_REG_MR: '1'
+            VLLM_MOONCAKE_CONNECTOR_TIMEOUT: '600'
+            MC_MAX_MR_SIZE: '268435456'
+            C48_MOONCAKE_HCA_PER_GPU: '1'
+            MC_IB_TC: '104'
+            C48_MOONCAKE_DIVERGENT_HITS: '1'
+            C48_D_SPECDEC: '1'
+        prefill:
+          workers: 1
+          tp: 8
+          dcp: 1
+          port: 6100
+          extra_args: --served-model-name moonshotai/Kimi-K3 --trust-remote-code --tensor-parallel-size 8 --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.85 --language-model-only --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576 --stream-interval 10 --enable-prefix-caching --prefix-match-unit 128 --kv-cache-dtype fp8 --mamba-ssm-cache-dtype float32 --block-size 128 --attention-backend ROCM_AITER_MLA --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}' --speculative-config '{"model":"/models/Inferact-Kimi-K3-DSpark","method":"dspark","num_speculative_tokens":7,"attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"synthetic","synthetic_acceptance_length":3.84}' --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail","kv_connector_extra_config":{"mooncake_protocol":"rdma","num_workers":10}}' --max-num-seqs 32 --max-num-batched-tokens 8192 --compilation-config '{"mode":3,"cudagraph_mode":"NONE","max_cudagraph_capture_size":0,"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}' --scheduler-cls pd_c48_scheduler.create_scheduler --quantization-config '{"targets":{"re:.*\\.self_attn\\.(in_proj_qkvgfab|f_b_proj|o_proj|fused_qkv_a_proj|q_b_proj|kv_b_proj|g_proj)$":"fp8_per_channel","re:.*\\.shared_experts\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.mlp\\.(gate_up_proj|down_proj)$":"fp8_per_channel","re:.*\\.routed_expert_down_proj$":"mxfp4"}}'
+        decode:
+          workers: 1
+          tp: 8
+          dcp: 1
+          port: 6100
+          extra_args: --kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail","kv_connector_extra_config":{"mooncake_protocol":"rdma","num_workers":10}}' --speculative-config '{"model":"/models/Inferact-Kimi-K3-DSpark","method":"dspark","num_speculative_tokens":7,"attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"synthetic","synthetic_acceptance_length":3.84}' --served-model-name moonshotai/Kimi-K3 --trust-remote-code --tensor-parallel-size 8 --moe-backend auto --load-format fastsafetensors --gpu-memory-utilization 0.9 --language-model-only --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --max-model-len 1048576 --stream-interval 10 --no-enable-prefix-caching --prefix-match-unit 128 --kv-cache-dtype fp8 --mamba-ssm-cache-dtype float32 --block-size 128 --attention-backend ROCM_AITER_MLA --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}' --max-num-seqs 32 --max-num-batched-tokens 512 --compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":40,"cudagraph_capture_sizes":[8,16,24,32,40],"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}' --quantization-config '{"linear":"fp8_per_channel","ignore":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","*self_attn.in_proj_qkvgfab*","*self_attn.f_b_proj*","*self_attn.o_proj*","*block_sparse_moe.shared_experts*"]}' --scheduler-cls pd_c48_scheduler.create_scheduler --additional-config '{"decode_backend":"latency_specialized"}'
       - name: kimi-k3-vllm-c48-gap-v-qd-cpuref3-fp8attn-fq3-pq-ldfp4-inpad-warm-dg5-pnt-swb-c72-n3966-bf16-kvb-th-gx-h96opus-p12k-mc
         image: vllm/vllm-openai-rocm:nightly-3966924d566340e971a6da313e790d05492aa505@sha256:8649354473843f477a96d3aa659d0ae56bcc7df743d2d02d52aaa318178ac881
         topology: 1p1d
