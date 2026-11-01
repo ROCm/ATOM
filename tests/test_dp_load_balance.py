@@ -561,6 +561,7 @@ def _make_spread_mgr(n_ranks=2, margin=65536):
         prefix_moved_total=0,
         prefix_moved_tokens=0,
         prefix_cold_total=0,
+        prefix_source_busy_total=0,
     )
     return mgr
 
@@ -580,6 +581,7 @@ def test_prefix_spread_keeps_prefix_owner_within_margin():
     mgr = _make_spread_mgr()
     first = _chain_seq(1, 100_000, session="s")
     (owner,) = _route(mgr, [first])
+    mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
     mgr._rank_reqs = [0, 0]
     mgr._rank_tokens[owner] = 30_000  # busier, but within the margin
@@ -594,11 +596,13 @@ def test_prefix_spread_keeps_prefix_owner_within_margin():
 def test_prefix_spread_moves_past_margin_and_flags_prefetch():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
     mgr._rank_reqs = [0, 0]
     mgr._rank_tokens[owner] = 200_000
     moved = _chain_seq(2, 110_000)
     (rank,) = _route(mgr, [moved])
+    mgr._mark_seq_prefill_complete(2)
     assert rank != owner
     assert moved.dp_prefetch_priority is True
     assert mgr._dp_route_counters["prefix_moved_total"] == 1
@@ -621,6 +625,7 @@ def test_prefix_spread_req_gap_moves_off_crowded_owner():
     mgr = _make_spread_mgr()
     mgr._prefix_max_req_gap = 4
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
     mgr._rank_reqs = [0, 0]
     mgr._rank_reqs[owner] = 6  # within the token margin, 6 requests ahead
@@ -637,11 +642,27 @@ def test_prefix_cost_policy_prefers_owner_until_imbalance_costs_more():
     mgr._prefix_load_tok_per_s = 2e6
     mgr._prefill_token_weight = 360000
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
     mgr._rank_reqs = [0, 0]
     assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
+    mgr._mark_seq_prefill_complete(2)
     mgr._rank_tokens = [0, 0]
     mgr._rank_reqs = [0, 0]
     mgr._rank_reqs[owner] = 20  # 20 requests ahead: 2 s of penalty
+    (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
+    assert rank != owner
+
+
+def test_prefix_spread_keeps_prefix_while_its_source_still_prefills():
+    mgr = _make_spread_mgr()
+    first = _chain_seq(1, 100_000)
+    (owner,) = _route(mgr, [first])  # still charged: prefill not complete
+    mgr._rank_tokens[owner] += 200_000  # owner busy past the margin
+    (rank,) = _route(mgr, [_chain_seq(2, 110_000)])
+    assert rank == owner
+    assert mgr._dp_route_counters["prefix_source_busy_total"] == 1
+    mgr._mark_seq_prefill_complete(1)  # source done: its KV is in the tier
+    mgr._mark_seq_prefill_complete(2)
     (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
     assert rank != owner

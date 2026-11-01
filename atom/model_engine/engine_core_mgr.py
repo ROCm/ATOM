@@ -316,6 +316,7 @@ class CoreManager:
             "prefix_moved_total": 0,
             "prefix_moved_tokens": 0,
             "prefix_cold_total": 0,
+            "prefix_source_busy_total": 0,
             "affinity_new_total": 0,
             "affinity_owner_hit_total": 0,
             # Kept as an explicit invariant/metric: strict affinity must leave
@@ -1473,20 +1474,21 @@ class CoreManager:
 
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
 
-    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int]:
-        """(rank that last ran this prompt's longest sampled prefix, its tokens)."""
+    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int, object]:
+        """(rank that last ran this prompt's longest sampled prefix, its tokens,
+        the request that ran it)."""
         if chain is None or not self._prefix_owner:
-            return None, 0
+            return None, 0, None
         hbs = int(chain.hash_block_size)
         stride = max(1, self._prefix_stride_tokens // hbs)
         hashes = chain.hashes
         for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
-            owner = self._prefix_owner.get(hashes[i])
-            if owner is not None and 0 <= owner < self._routable_engine_count:
-                return owner, (i + 1) * hbs
-        return None, 0
+            entry = self._prefix_owner.get(hashes[i])
+            if entry is not None and 0 <= entry[0] < self._routable_engine_count:
+                return entry[0], (i + 1) * hbs, entry[1]
+        return None, 0, None
 
-    def _prefix_owner_record(self, chain, rank: int) -> None:
+    def _prefix_owner_record(self, chain, rank: int, seq_id=None) -> None:
         if chain is None:
             return
         hbs = int(chain.hash_block_size)
@@ -1494,7 +1496,7 @@ class CoreManager:
         index = self._prefix_owner
         hashes = chain.hashes
         for i in range(stride - 1, len(hashes), stride):
-            index[hashes[i]] = rank
+            index[hashes[i]] = (rank, seq_id)
             index.move_to_end(hashes[i])
         while len(index) > self._prefix_owner_cap:
             index.popitem(last=False)
@@ -1536,7 +1538,7 @@ class CoreManager:
         that rank's HBM starts on arrival, not when it reaches the queue head.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        owner, hit = self._prefix_owner_lookup(chain)
+        owner, hit, source = self._prefix_owner_lookup(chain)
 
         def load(rank: int) -> int:
             return (
@@ -1550,7 +1552,14 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         lightest = min(((offset + i) % n for i in range(n)), key=load)
         rank = lightest
-        if owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
+        source_load = self._seq_load.get(source) if source is not None else None
+        if owner is not None and source_load is not None and source_load[2] > 0:
+            # The request that ran this prefix is still prefilling it: its KV
+            # is not in the offload tier yet, so another rank would recompute
+            # what the tier cannot supply. Share the prefix's rank instead.
+            rank = owner
+            self._dp_route_counters["prefix_source_busy_total"] += 1
+        elif owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
             rank = self._prefix_cost_rank(seq, owner, hit)
         elif (
             owner is not None
@@ -1573,7 +1582,7 @@ class CoreManager:
             self._dp_route_counters["prefix_moved_tokens"] += hit
             if hit >= envs.OFFLOAD_MIN_LOAD_TOKENS:
                 seq.dp_prefetch_priority = True
-        self._prefix_owner_record(chain, rank)
+        self._prefix_owner_record(chain, rank, seq.id)
         return self._record_dp_route_locked(decision, rank)
 
     def get_dp_router_statistics(self) -> dict:
