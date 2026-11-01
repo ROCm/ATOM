@@ -376,22 +376,10 @@ class DSparkProposer(Drafter):
                 logger.info("DSpark draft: torch.compile disabled by env.")
             return model
 
-        # Standalone draft: build from the DRAFT's own hf_config, exactly as
-        # EagleProposer does for eagle3. Shallow-copy rather than deepcopy --
-        # atom_config can hold non-picklable cuda.Stream objects, and only
-        # hf_config / compilation_config / quant_config are mutated here.
-        import copy
-
-        from atom.config import CompilationLevel
-
+        # Standalone draft: build from the DRAFT's own hf_config, as
+        # EagleProposer does for eagle3.
         draft_hf = self.speculative_config.draft_model_hf_config
-        draft_atom_config = copy.copy(self.config)
-        draft_atom_config.hf_config = draft_hf
-        draft_atom_config.compilation_config = copy.copy(self.config.compilation_config)
-        draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
-        # The draft's weights come from its own checkpoint, so its static quant
-        # scheme must too -- see Drafter.standalone_draft_quant_config.
-        draft_atom_config.quant_config = self.standalone_draft_quant_config()
+        draft_atom_config = self._standalone_draft_config()
         model = model_class(
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,

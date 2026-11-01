@@ -362,15 +362,11 @@ def _patch_required_act_dtype_post_load_hooks(
 
 def _standalone_draft_atom_config(vllm_config, draft_hf_config, is_dspark_draft: bool):
     """The ATOM config a standalone draft (eagle3, or DSpark with a separate
-    draft checkpoint) is built with under vLLM.
-
-    It starts from the TARGET's config, so two halves are swapped for the
-    draft's own: the model description, and the static quant spec -- otherwise
-    an MXFP4 target declares a bf16 draft's weights fp4 and the load fails.
-    Same quant rebuild as the native proposers; it has to happen before the
-    caller's remap.
+    draft checkpoint) is built with under vLLM: the target's config with the
+    draft's own hf_config and static quant spec (the run's online override
+    still applies). It has to be built before the caller's remap.
     """
-    from atom.config import standalone_draft_quant_config
+    from atom.config import QuantizationConfig
 
     atom_config = _generate_atom_config_from_vllm_config(vllm_config)
     # Prefer ATOM's normalized copy: building the atom_config ran
@@ -384,8 +380,10 @@ def _standalone_draft_atom_config(vllm_config, draft_hf_config, is_dspark_draft:
         if is_dspark_draft and normalized_hf_config is not None
         else draft_hf_config
     )
-    atom_config.quant_config = standalone_draft_quant_config(
-        atom_config.hf_config, atom_config.quant_config
+    atom_config.quant_config = QuantizationConfig(
+        atom_config.hf_config,
+        getattr(atom_config, "online_quant_config", None),
+        model=getattr(atom_spec_config, "model", None),
     )
     return atom_config
 

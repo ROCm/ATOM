@@ -1048,6 +1048,36 @@ def kda_attention_with_output(
     return self._forward_impl(hidden_states, hidden_states_scale)
 
 
+def _fused_per_token_scale(mods) -> torch.Tensor | None:
+    """The scale of KDA's fused in-proj, from the projections it concatenates.
+
+    They must share one scheme: bf16 (returns None) or per_Token FP8, whose
+    per-row scales concatenate in the weights' order. Compared by value: in a
+    plugin process QuantType members from different aiter imports differ.
+    """
+    quant_values = {m.quant_type.value for m in mods}
+    if len(quant_values) != 1:
+        raise NotImplementedError(
+            "KDA in-proj fusion needs one scheme across the projections it "
+            f"concatenates; got {sorted({m.quant_type.name for m in mods})}."
+        )
+    value = quant_values.pop()
+    if value == QuantType.No.value:
+        return None
+    if value != QuantType.per_Token.value:
+        raise NotImplementedError(
+            "KDA in-proj fusion supports unquantized (bf16) or per-output-channel "
+            f"FP8 (per_Token) attention weights; got {mods[0].quant_type.name}."
+        )
+    scales = [getattr(m, "weight_scale", None) for m in mods]
+    if not all(
+        p is not None and p.data.shape[0] == m.weight.shape[0]
+        for p, m in zip(scales, mods)
+    ):
+        raise ValueError("per_Token weight scales must be one row per output channel")
+    return torch.cat([p.data for p in scales])
+
+
 class KimiKDAAttention(nn.Module):
     @property
     def mamba_type(self) -> str:
@@ -1106,14 +1136,7 @@ class KimiKDAAttention(nn.Module):
         )
         # Keep beta separate so the fused in-proj output width remains the
         # tile-aligned 4 * local_proj_size. Beta is widened to fp32 in _run_kda.
-        # quant_config is passed so a statically quantized checkpoint's
-        # b_proj.weight_scale is allocated and loaded. It used to be hardcoded
-        # None, which is right for a bf16 checkpoint but silently wrong for an
-        # FP8 one: the module declares a bf16 weight, so the FP8 rows land
-        # value-cast with their per-channel scale dropped on the floor. The fuse
-        # keeps b's rows in the same GEMM as q|k|v|g either way, so this does
-        # not add a GEMM or change the scheme b runs under -- under online quant
-        # b's rows are already quantized today, as part of the grown in_proj.
+        # quant_config: a statically FP8 checkpoint's b_proj has a per-row scale.
         self.b_proj = ColumnParallelLinear(
             self.hidden_size,
             self.num_heads,
@@ -1214,13 +1237,7 @@ class KimiKDAAttention(nn.Module):
         )
 
     def get_streaming_deferred_modules(self) -> tuple[nn.Module, ...]:
-        """Children that must remain unquantized until KDA fuses their weights.
-
-        b_proj joins the other two now that it takes a quant_config at all:
-        streaming-quantizing it before the fuse would leave an online-quant run
-        with a per_Token tail beside a still-bf16 in_proj, which the fuse
-        rejects as a mixed scheme.
-        """
+        """Children that must remain unquantized until KDA fuses their weights."""
         return self.in_proj, self.b_proj, self.f_a_proj
 
     def process_weights_after_loading(self) -> None:
@@ -1233,7 +1250,7 @@ class KimiKDAAttention(nn.Module):
         so ``forward`` runs one ``self.in_proj(...)`` producing
         ``[q | k | v | g | b | f_a]`` instead of three separate launches. The
         tail storage is then released (the modules stay as empty shells; their
-        bf16 post-load hooks are no-ops and never re-run). Runs once; idempotent.
+        post-load hooks no-op on the emptied weight). Runs once; idempotent.
 
         f_b_proj is NOT fused: it consumes ``f_a_proj``'s output, not
         ``hidden_states``, so it is a data-dependent second GEMM and cannot ride
@@ -1245,16 +1262,8 @@ class KimiKDAAttention(nn.Module):
         untuned tgemm config until one is tuned for it; the saved launches
         dominate on the launch-bound decode path.
 
-        Assumes bf16 (unquantized) attention weights, which the Kimi-K3
-        checkpoint guarantees (``re:.*self_attn.*`` is in the quant ignore
-        list), or per-output-channel FP8 (``per_Token``), which a statically
-        quantized checkpoint such as ``amd/Kimi-K3-Quark-MXFP4-AttnFP8``
-        carries. The two arrive by opposite orders and meet in the same place:
-        the loader walks parents first, so under online ptpc this fuse runs
-        while the weights are still bf16 and the child quantizes the grown
-        weight afterwards, whereas a quantized checkpoint is already FP8 here
-        and the scales are concatenated alongside the rows. Any other scheme is
-        rejected rather than silently mis-fused.
+        Supports bf16 or per-output-channel FP8 (``per_Token``) attention
+        weights; any other scheme is rejected (see ``_fused_per_token_scale``).
         """
         if getattr(self, "_in_proj_fused", False):
             return
@@ -1262,60 +1271,26 @@ class KimiKDAAttention(nn.Module):
         # in_proj already holds the fused [q | k | v | g] (4 * local_proj_size);
         # b_proj and f_a_proj are appended as the two tails.
         tails = (self.b_proj, self.f_a_proj)
-        mods = (self.in_proj, *tails)
-        # Compared by value: QuantType is a pybind enum, and in a plugin process
-        # members from differently identified aiter imports share a value but do
-        # not compare (or hash) equal -- see weight_is_stored_preshuffled.
-        quant_values = {m.quant_type.value for m in mods}
-        assert len(quant_values) == 1, (
-            "KDA in-proj fusion needs one scheme across the projections it "
-            f"concatenates; got {sorted({m.quant_type.name for m in mods})}."
-        )
-        fused_quant_value = quant_values.pop()
-        assert fused_quant_value in (QuantType.No.value, QuantType.per_Token.value), (
-            "KDA in-proj fusion supports unquantized (bf16) or per-output-channel "
-            f"FP8 (per_Token) attention weights; got {self.in_proj.quant_type.name}."
-        )
-        # Built BEFORE in_proj's weight is grown: the check below pairs each
-        # scale against its own module's row count, and in_proj's stops being
-        # the pre-fusion one the moment the wide weight is installed.
-        fused_scale = None
-        if fused_quant_value == QuantType.per_Token.value:
-            # per_Token's weight scale is indexed by output channel -- the same
-            # axis this concatenates -- so a row keeps its own scale wherever it
-            # lands and no requantization is needed. Concatenating the scales in
-            # the weights' order is the whole of the "per-shard scale handling".
-            #
-            # This reaches the same state the online-quant path already reaches
-            # by the other order: the loader walks parents first, so an online
-            # ptpc run quantizes the *grown* bf16 weight after this fuse, and a
-            # per-row scale is invariant to which rows sit beside it.
-            #
-            # Shapes differ by provenance -- [N, 1] as allocated, flat [N] after
-            # a checkpoint requant -- so normalize to 2-D before concatenating.
-            scale_params = [getattr(m, "weight_scale", None) for m in mods]
-            assert all(
-                p is not None and p.data.shape[0] == m.weight.shape[0]
-                for p, m in zip(scale_params, mods)
-            ), "per_Token weight scales must be one row per output channel"
-            scales = [p.data for p in scale_params]
-            fused_scale = torch.cat(
-                [s.reshape(s.shape[0], -1) for s in scales], dim=0
-            ).contiguous()
+        # Before in_proj's weight grows: each scale is checked against its own
+        # module's rows.
+        fused_scale = _fused_per_token_scale((self.in_proj, *tails))
         fused = torch.cat(
             [self.in_proj.weight.data, *[m.weight.data for m in tails]], dim=0
         ).contiguous()
         # Grow in_proj's weight in place so the existing module (and its
-        # tgemm path) produces the wide fused output directly. The child's own
-        # post-load hook runs after this one and does the FP8 output padding and
-        # preshuffle on the fused shape, exactly as it does under online quant.
+        # tgemm path) produces the wide fused output directly; its own post-load
+        # hook runs after this one and pads/preshuffles the fused shape if FP8.
         self.in_proj.weight = nn.Parameter(fused, requires_grad=False)
         if fused_scale is not None:
             self.in_proj.weight_scale = nn.Parameter(fused_scale, requires_grad=False)
-        # Release the tail weight storage. The modules stay as empty shells;
-        # their bf16 post-load hooks are no-ops and are never re-run.
+        # Release the tails' storage (weight and, if FP8, its scale now live in
+        # in_proj). Their post-load hooks are no-ops because LinearBase returns
+        # early on an empty weight.
         for m in tails:
             m.weight.data = m.weight.data.new_empty(0)
+            scale = getattr(m, "weight_scale", None)
+            if scale is not None:
+                scale.data = scale.data.new_empty(0)
 
         # Pre-concatenate the static q/k/v causal-conv weights once here instead
         # of rebuilding the [3*local_proj_size, K] tensor on every forward.

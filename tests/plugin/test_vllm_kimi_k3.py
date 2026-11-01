@@ -902,12 +902,15 @@ def _standalone_draft_case(monkeypatch, online_raw):
     target_qc.global_spec = LayerQuantConfig(
         quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2
     )
-    target_qc.online_quant_config_raw = online_raw
+    target_qc.online_quant_config_raw = {"stale": "target copy"}
     draft_hf = SimpleNamespace(torch_dtype=torch.bfloat16, quantization_config=None)
     target_atom_config = SimpleNamespace(
         hf_config=SimpleNamespace(name="target"),
         quant_config=target_qc,
-        speculative_config=SimpleNamespace(draft_model_hf_config=draft_hf),
+        online_quant_config=online_raw,
+        speculative_config=SimpleNamespace(
+            draft_model_hf_config=draft_hf, model="/ckpt/draft"
+        ),
     )
     monkeypatch.setattr(
         model_wrapper,
@@ -922,8 +925,8 @@ def _standalone_draft_case(monkeypatch, online_raw):
 
 
 def test_vllm_standalone_draft_does_not_inherit_the_target_static_quant(monkeypatch):
-    """A bf16 DSpark draft beside an MXFP4 target used to keep the target's
-    quant_config here (only hf_config was swapped) and load as fp4."""
+    """A bf16 DSpark draft beside an MXFP4 target is built unquantized, from
+    the normalized draft config."""
     cfg, draft_hf, QuantType = _standalone_draft_case(monkeypatch, None)
     assert cfg.hf_config is draft_hf, "the normalized draft config must be used"
     assert cfg.quant_config.global_spec.quant_type.value == QuantType.No.value
