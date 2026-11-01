@@ -373,12 +373,15 @@ class KimiK3DFlashAttention(nn.Module):
     ) -> None:
         """Project the target-derived context and cache it as this layer's K/V.
 
-        The whole fused QKV GEMM runs and the q columns are dropped. Not
-        bookkeeping that could be avoided by slicing the weight: with
-        per-output-channel quant and preshuffled rows, a row slice of the merged
-        weight is not that shard's weight. The MLA draft does the same.
+        Only the k and v rows of the fused QKV weight run: the context rows
+        never need a query. The draft is BF16 (`_draft_quant_config`), whose
+        merged weight is the shards' rows laid end to end, so the row slice is a
+        contiguous view of exactly the k and v shards.
         """
-        _, k, v = self._qkv(ctx_hidden)
+        from aiter.tuned_gemm import tgemm
+
+        kv = tgemm.mm(ctx_hidden, self.qkv_proj.weight[self.q_size :], None)
+        k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         # Only k is normed -- v is not, matching the reference. Row-wise RMSNorm
         # makes norming this half separately identical to norming the concat,
         # which is what lets the context live in the pool at all.
