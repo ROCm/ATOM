@@ -973,11 +973,24 @@ class Scheduler:
                 return True
         return False
 
+    def _still_loading(self, seq: Sequence) -> bool:
+        """A remote/tier KV load still in flight: nothing to prefill yet.
+
+        A finished load is prefill work the admission pass will run this tick
+        (`_resolve_waiting_remote_kv`), so the delayer must hear of it: left
+        out, the peers decode while this rank prefills, and their decode runs
+        eagerly at the prefill's width beside it.
+        """
+        return seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and not (
+            self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+            or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+        )
+
     def _waiting_prefills(self):
         for seq in self.waiting:
             if (
-                seq.status
-                not in (SequenceStatus.ABORTED, SequenceStatus.WAITING_FOR_REMOTE_KVS)
+                seq.status != SequenceStatus.ABORTED
+                and not self._still_loading(seq)
                 and self._unschedulable_reason(seq) is None
             ):
                 yield seq
@@ -1307,11 +1320,12 @@ class Scheduler:
                 break
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status in (
-                SequenceStatus.ABORTED,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ):
+            if seq.status == SequenceStatus.ABORTED or self._still_loading(seq):
                 continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                # Its load finished: it already holds its blocks and resumes
+                # this tick. A probe would recompute its hit flags.
+                return True
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
                 not self.enable_chunked_prefill
@@ -1402,10 +1416,7 @@ class Scheduler:
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status in (
-                SequenceStatus.ABORTED,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ):
+            if seq.status == SequenceStatus.ABORTED or self._still_loading(seq):
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -1465,10 +1476,7 @@ class Scheduler:
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status in (
-                SequenceStatus.ABORTED,
-                SequenceStatus.WAITING_FOR_REMOTE_KVS,
-            ):
+            if seq.status == SequenceStatus.ABORTED or self._still_loading(seq):
                 continue
             if oldest_arrive is None or seq.arrive_time < oldest_arrive:
                 oldest_arrive = seq.arrive_time
