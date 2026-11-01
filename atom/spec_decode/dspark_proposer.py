@@ -737,13 +737,10 @@ class DSparkProposer(Drafter):
         `publish_cu_seqlens_q` (`model_ops/attentions/backends.py`) and is the only thing needed to
         resolve a token to its request -- `searchsorted` over its tail does on
         the device what `build_batch_ids` does with `np.repeat` on the host.
-        The block tables are re-published rather than assumed:
-        `BlockTableState.publish` is revision-guarded
-        (`utils/block_tables.py`), so this is free on
-        the steps that already uploaded them and correct on the ones that did
-        not -- a cache-miss prefill never publishes them
-        (`_prefill_block_table_rows` answers None), and this hook runs after
-        EVERY target forward, including those.
+        The block tables are the ones the target's builder already uploaded
+        for this forward (the Kimi MLA builder uploads them on every prefill
+        when a drafter exists, and on every decode); this hook runs after the
+        metadata owner is sealed, so it reads them and does not publish.
 
         No-op for a draft that has no pool of its own; the MLA draft writes
         through the target's latent rows, where the target's own mapping -- DCP
@@ -762,7 +759,7 @@ class DSparkProposer(Drafter):
         # (`prepare_cu_seqlens_q` writes the flat cumsum over the tail, so the
         # slice stays non-decreasing and `searchsorted` stays defined).
         rows = max(int(ctx.running_bs), int(ctx.scheduled_bs), 1)
-        block_tables = block_table_state(var["block_tables"]).publish(rows)
+        block_tables = var["block_tables"].gpu[:rows]
         # `right=True` on the EXCLUSIVE ends: token t belongs to the first
         # request whose end is strictly past it. The clamp is for the one token
         # that can equal the last end -- it cannot happen while
