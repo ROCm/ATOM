@@ -1270,6 +1270,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
     # A nonzero interval also enables local coalescing on TP without PP.
+    # Latency over coalescing: with a TP-local PrefillDelayer holding, still
+    # finish mid-chunked-prefill seqs that have at most this many tokens left
+    # (the tail after a state-checkpoint cut). 0 disables.
+    "ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS": lambda: int(
+        os.getenv("ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS", "0")
+    ),
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),

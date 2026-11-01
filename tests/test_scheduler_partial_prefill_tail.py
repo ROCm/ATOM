@@ -159,3 +159,72 @@ class TestSpecDraftRowsAlignToBatchOrder:
 
         assert rows.shape == (2, mtp_k)
         assert not rows.any()
+
+
+class _LocalVetoDelayer(_VetoDelayer):
+    """A TP-local delayer (one scheduler drives every rank) that holds prefill."""
+
+    is_local = True
+
+
+class TestPartialTailSkipsHold:
+    """ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS: under a TP-local hold, a partial with
+    at most that many tokens left still finishes; fresh prefills keep waiting."""
+
+    def _sched_with_partial(self, seq_factory, delayer, cached):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=8,
+                num_kvcache_blocks=64,
+                kv_cache_block_size=4,
+                max_model_len=256,
+                max_num_batched_tokens=256,
+            )
+        )
+        s_partial = seq_factory([5, 6, 7, 8, 9, 10, 11, 12])
+        sched.add(s_partial)
+        sched.schedule()
+        s_partial.num_cached_tokens = cached
+        s_partial.is_partial_prefill = True
+        sched._partial_prefill_count = 1
+        s_fresh = seq_factory([1, 2, 3, 4])
+        sched.add(s_fresh)
+        sched.set_prefill_delayer(delayer)
+        return sched, s_partial, s_fresh
+
+    def _prefill_ids(self, result):
+        batch, _ = result
+        return list(batch.req_ids[: batch.total_seqs_num_prefill])
+
+    def test_small_tail_resumes_under_local_hold(self, seq_factory, monkeypatch):
+        monkeypatch.setenv("ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS", "4")
+        sched, s_partial, s_fresh = self._sched_with_partial(
+            seq_factory, _LocalVetoDelayer(), cached=6
+        )
+        ids = self._prefill_ids(sched.schedule())
+        assert s_partial.id in ids, "the 2-token tail must finish under the hold"
+        assert s_fresh.id not in ids, "a fresh prefill must still wait"
+
+    def test_long_remainder_still_held(self, seq_factory, monkeypatch):
+        monkeypatch.setenv("ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS", "4")
+        sched, s_partial, _ = self._sched_with_partial(
+            seq_factory, _LocalVetoDelayer(), cached=2
+        )
+        result = sched.schedule()
+        assert result is None or s_partial.id not in self._prefill_ids(result)
+
+    def test_off_by_default(self, seq_factory, monkeypatch):
+        monkeypatch.delenv("ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS", raising=False)
+        sched, s_partial, _ = self._sched_with_partial(
+            seq_factory, _LocalVetoDelayer(), cached=6
+        )
+        result = sched.schedule()
+        assert result is None or s_partial.id not in self._prefill_ids(result)
+
+    def test_cross_dp_delayer_keeps_the_hold(self, seq_factory, monkeypatch):
+        monkeypatch.setenv("ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS", "4")
+        sched, s_partial, _ = self._sched_with_partial(
+            seq_factory, _VetoDelayer(), cached=6
+        )
+        result = sched.schedule()
+        assert result is None or s_partial.id not in self._prefill_ids(result)
