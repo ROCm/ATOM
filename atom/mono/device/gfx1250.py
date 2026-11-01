@@ -22,7 +22,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.mono.device.ops import CM_NT_GFX1250, CM_SYS_GFX1250, traced
@@ -103,10 +103,10 @@ def block_excl_scan(v, lane, wave, buf):
     """(exclusive prefix of v over the CTA in thread order, CTA total); ``buf``
     needs WAVES words."""
     incl = wave_incl_scan(v, lane)
-    gpu.barrier()
+    lds_barrier()
     if lane == WAVE - 1:
         fx.ptr_store(incl, buf + wave)
-    gpu.barrier()
+    lds_barrier()
     off = fx.Int32(0)
     tot = fx.Int32(0)
     for w in range_constexpr(WAVES):
@@ -120,14 +120,14 @@ def block_excl_scan(v, lane, wave, buf):
 def block_max(v, lane, wave, red):
     """Max of v over the CTA's WAVES waves; ``red`` needs WAVES words."""
     wv = wave_max(v)
-    gpu.barrier()
+    lds_barrier()
     if lane == 0:
         fx.ptr_store(wv, red + wave)
-    gpu.barrier()
+    lds_barrier()
     t = fx.ptr_load(red + 0)
     for w in range_constexpr(1, WAVES):
         t = fx.max(t, fx.ptr_load(red + w))
-    gpu.barrier()
+    lds_barrier()
     return t
 
 
@@ -142,7 +142,7 @@ def group_floor(keys32, k, red, lane, wave):
     top = butterfly(top, tuple(o for o in (16, 8, 4, 2, 1) if o >= k), fx.max)
     if lane < k:
         fx.ptr_store(top, red + (wave * k + lane))
-    gpu.barrier()
+    lds_barrier()
     if (wave == 0) & (lane < k):
         g = fx.ptr_load(red + lane)
         for w in range_constexpr(1, WAVES):
@@ -150,7 +150,7 @@ def group_floor(keys32, k, red, lane, wave):
         g = butterfly(g, tuple(o for o in (16, 8, 4, 2, 1) if o < k), fx.min)
         if lane == 0:
             fx.ptr_store(g, red + WAVES * k)
-    gpu.barrier()
+    lds_barrier()
     return fx.ptr_load(red + WAVES * k)
 
 
@@ -244,7 +244,7 @@ def publish(put, a, i, v, who):
     """``sync.publish`` on gfx12, where stores drain by storecnt: this CTA's plain
     stores readable by every CTA, then (thread ``who``) the pair (``a``, i) := v."""
     release_stores()
-    gpu.barrier()
+    lds_barrier()
     if who:
         put(a, i, v)
 
