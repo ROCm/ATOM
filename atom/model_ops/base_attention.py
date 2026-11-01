@@ -567,7 +567,12 @@ def _flydsl_prepare_explicit_plan(
         )
         # A refresh keeps the plan's max_batch_size, so set it at creation.
         if num_seqs > _FLYDSL_PLAN_MAX_BATCH:
-            budget["max_batch_size"] = num_seqs
+            # A power of two (within the planner's LDS bound), not the row
+            # count: the planner compiles per max_batch_size (aiter #7205), and
+            # sparse prefill plans a row a query token.
+            budget["max_batch_size"] = max(
+                num_seqs, min(1 << (num_seqs - 1).bit_length(), _flydsl_plan_max_batch())
+            )
         plan = plan_pa_decode(
             lengths,
             num_kv_heads,
