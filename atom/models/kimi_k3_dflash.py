@@ -133,6 +133,7 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.config import QuantizationConfig
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
@@ -481,6 +482,24 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping[:rows])
 
 
+def _draft_quant_config(config) -> QuantizationConfig:
+    """The draft's own quantization: none.
+
+    The atom config copied onto the draft carries the TARGET's offline and
+    online quantization, which do not describe this checkpoint (BF16, no
+    `quantization_config`). Taken as is, `--online_quant_config` would
+    re-quantize every draft linear its exclude list misses, and the draft would
+    run as a model it was not validated as.
+    """
+    draft_qc = QuantizationConfig(config)
+    if draft_qc.quant_method:
+        raise ValueError(
+            "the Kimi-K3 DFlash draft supports BF16 weights only, got "
+            f"quant_method={draft_qc.quant_method!r}"
+        )
+    return draft_qc
+
+
 class KimiK3DFlash(DSparkDraftModel):
     """The SpecForge DFlash draft for Kimi-K3.
 
@@ -514,7 +533,7 @@ class KimiK3DFlash(DSparkDraftModel):
     def __init__(self, atom_config, layer_offset: int = 0):
         super().__init__()
         config = atom_config.hf_config
-        quant_config = getattr(atom_config, "quant_config", None)
+        quant_config = _draft_quant_config(config)
 
         self.config = config
         self.vocab_size = int(config.vocab_size)

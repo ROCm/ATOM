@@ -1357,3 +1357,15 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     draft.prepare_paged_block(None, None, pos, slots, ctx, [1, 2], 2)
     assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
     assert ctx.tolist() == [vblock, 8, 1 + T]
+
+
+def test_the_draft_ignores_the_targets_quantization():
+    """The draft atom config is a copy of the target's; its quant config, and
+    the online re-quantization it carries, must not reach this BF16 draft."""
+    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    qc = m._draft_quant_config(_radixark_cfg())
+    assert qc.quant_method == "" and qc.online_quant is False
+    with pytest.raises(ValueError, match="BF16 weights only"):
+        m._draft_quant_config(
+            _radixark_cfg(quantization_config={"quant_method": "fp8"})
+        )
