@@ -624,7 +624,7 @@ class TestVerifiedWindow:
         assert so.tier_verified_for_s(0) == so._TIER_VERIFIED_MIN_S
 
     def test_the_index_holds_by_its_own_window(self, clock):
-        idx = _index(7, pool_bytes=32 * self.GIB, defer_s=2)
+        idx = _index(7, verified_for_s=so.tier_verified_for_s(32 * self.GIB), defer_s=2)
         assert idx.verified_for_s == pytest.approx(8.0)
         clock[0] += 7.5
         assert not idx.needs_verify(7)
@@ -637,11 +637,25 @@ class TestVerifiedWindow:
         from test_block_manager import _OFFLOAD_KVC, _bm_with_state_tier
 
         monkeypatch.setattr(
-            so, "state_tier_lmcache_sizes", lambda config: (256, 100 * self.GIB)
+            so,
+            "_lmcache_engine_config",
+            lambda config: SimpleNamespace(chunk_size=256, max_local_cpu_size=100),
         )
         bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
         assert bm._joint_chunk_tokens == 256
         assert bm.state_offload.verified_for_s == pytest.approx(25.0)
+
+    def test_an_unreadable_lmcache_config_gets_the_floor(self, monkeypatch, caplog):
+        import sys
+
+        from test_block_manager import _OFFLOAD_KVC, _bm_with_state_tier
+
+        monkeypatch.setitem(sys.modules, "lmcache.v1.config", None)
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
+        assert bm._joint_chunk_tokens == 0
+        assert bm.state_offload.verified_for_s == so._TIER_VERIFIED_MIN_S
+        assert sum(r.exc_info is not None for r in caplog.records) == 1
 
 
 # ── the connector: touches out in the metadata, verdicts back by quorum ────

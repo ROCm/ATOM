@@ -335,8 +335,9 @@ class BlockManager:
         # releases holds a whole image out of the pool forever.
         from atom.model_engine.state_offload import (
             state_tier_capability,
+            state_tier_chunk_tokens,
             state_tier_cpu_bytes,
-            state_tier_lmcache_sizes,
+            state_tier_verified_for_s,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -461,16 +462,13 @@ class BlockManager:
         # The LMCache chunk size in tokens, read where the config is rather than
         # off the connector object.
         self._joint_chunk_tokens = 0
-        lmcache_pool_bytes = 0
         # Only when a joint KV load is possible at all. Reading it reaches into
         # LMCache, an optional dependency: probing on an engine that hosts no
         # state tier logged a full `ModuleNotFoundError` traceback at WARNING
         # on every start, for a number that engine has no use for. The
         # capability above is the same gate the tier itself uses.
         if kv_offload_enabled:
-            self._joint_chunk_tokens, lmcache_pool_bytes = state_tier_lmcache_sizes(
-                config
-            )
+            self._joint_chunk_tokens = state_tier_chunk_tokens(config)
         self.state_offload: StateOffloadIndex | None = None
         # (req_id, hash, target_group) admitted this pass and not yet handed to
         # the connector. Kept here rather than in the index because the slot
@@ -521,8 +519,8 @@ class BlockManager:
                 # Off again (`stop_refreshing`) if the connector turns out not
                 # to carry state touches.
                 refresh_hits=True,
-                # Sizes how long a confirmed image is trusted.
-                pool_bytes=lmcache_pool_bytes,
+                # How long a confirmed image is trusted.
+                verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1018,7 +1016,7 @@ class BlockManager:
         if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
             return self._no_joint("no_paged_checkpoints")
         hbs = self._hash_block_size()
-        # Resolved once from config at construction (`state_tier_lmcache_sizes`),
+        # Resolved once from config at construction (`state_tier_chunk_tokens`),
         # not off the connector object: the scheduler holds whatever
         # `get_kvconnector` returned, and one without `chunk_size` would zero
         # this and disable the feature silently.
@@ -1555,7 +1553,7 @@ class BlockManager:
 
         With `defer_unverified`, returns False and commits nothing when the
         state this admission would load from the CPU tier has not been
-        confirmed in LMCache lately (`StateOffloadIndex.needs_verify`). The
+        confirmed there lately (`StateOffloadIndex.needs_verify`). The
         caller holds the request for a pass while that image's touch comes
         back, rather than parking a joint load that may miss and recompute the
         whole prompt.
