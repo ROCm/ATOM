@@ -299,7 +299,8 @@ class KimiK3DFlashAttention(nn.Module):
         return linear_out(self.o_proj(o))
 
     def _write_block_kv(self, k, v, slot_mapping, k_cache, v_cache) -> None:
-        """Scatter the block's own K/V into this layer's rows of the pool.
+        """Scatter K/V into this layer's rows of the pool: the block's own rows
+        on the block pass, the context rows on `write_context_kv`.
 
         Unlike V4's rolling window, this block WRITES the KV it attends: the T
         draft rows join the context rows already there, and the single read

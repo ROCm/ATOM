@@ -10,8 +10,9 @@ a pool of MHA layers can have one -- the model's own, and a draft's.
 
 Two units, and the pool shapes by exactly one. `block_size` is the caller's
 block, the unit every view is taken at; an entry is `blocks_per_entry` of them
-laid end to end, and exists only because that is what `page_pool` charges per.
-Nothing reads at an entry.
+laid end to end, and exists because that is what `page_pool` charges per.
+Only `fa_views` reads at an entry, for a pool whose caller indexes it by entry
+(the DFlash draft's, `blocks_per_entry = dcp`).
 
 A field says what an entry costs; `kv_views` says how those bytes read, and is
 the only place the element order may be written -- a second copy of it agrees

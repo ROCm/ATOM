@@ -704,8 +704,9 @@ contributing under DCP rather than collapsing back to single-token decode.
 **The RadixArk DFlash draft** (`--draft-model RadixArk/Kimi-K3-DSpark`, GQA) is
 the exception to the first point. It owns its pool and stays out of the DCP
 group, as SGLang runs it, so every rank caches the draft KV of every token in
-entries of `block_size × dcp` tokens. At `tp8 -dcp 8` with fp8 KV that is about
-43% of each paged block (see the [recipe](../recipes/DSpark.md)). Any other
+entries of `block_size × dcp` tokens. At `tp8 -dcp 8` with fp8 KV the draft
+entry is 43% of each paged block, draft included (74% on top of the target's
+MLA rows; see the [recipe](../recipes/DSpark.md)). Any other
 draft that owns a GQA/MHA pool is refused under DCP at startup.
 
 ## Constraints & Compatibility

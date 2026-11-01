@@ -1407,18 +1407,20 @@ class SpeculativeConfig:
     }
 
     def use_dspark(self) -> bool:
-        """DSpark semi-autoregressive block drafter (either flavor).
+        """DSpark semi-autoregressive block drafter (any flavor).
 
         DSpark is a parallel block drafter (parallel backbone + Markov
-        sequential head + confidence head), NOT serial MTP. Two checkpoint
-        flavors reach here, and both normalize to `dspark_block_size` in
-        `hf_config_override`:
+        sequential head + confidence head), NOT serial MTP. Checkpoints that
+        reach here:
 
-        - V4-Pro-DSpark: ships INSIDE the V4 target checkpoint under the same
-          `mtp.*` namespace serial MTP uses, so only the DSpark-only
+        - V4-Pro-DSpark / V4.1: ships INSIDE the V4 target checkpoint under the
+          same `mtp.*` namespace serial MTP uses, so only the DSpark-only
           `dspark_block_size` field distinguishes the two.
-        - Kimi-K3-DSpark: a standalone MLA-backbone checkpoint with its own
-          `architectures: ["K3DSparkModel"]`.
+        - Standalone drafts passed with --draft-model, which
+          `hf_config_override` marks `dspark_with_draft`: Kimi-K3-DSpark's MLA
+          `K3DSparkModel`, MiniMax-M3.1's `DSparkMiniMaxDraftModel`, and a
+          SpecForge DFlash draft (`DSparkDraftModel` with a `dflash_config`,
+          renamed `K3DFlashModel`).
 
         We intentionally never silently fall back to MTP: a wrong fallback
         loads cleanly but measures the wrong algorithm.
