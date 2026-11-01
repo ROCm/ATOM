@@ -839,6 +839,21 @@ def gluon_gemm_allreduce_gemma_rmsnorm(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def gluon_gemma_rmsnorm():
+    """aiter's Gluon `fused_rmsnorm_add` (with `gemma_norm`) on gfx1250, else None:
+    other GPUs, ATOM_ENABLE_GLUON_GEMMA_RMSNORM=0, or an aiter without it."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if not envs.ATOM_ENABLE_GLUON_GEMMA_RMSNORM or get_gfx() != "gfx1250":
+        return None
+    try:
+        from aiter.ops.triton.fusions.fused_rmsnorm_add import fused_rmsnorm_add
+    except ImportError:
+        return None
+    return fused_rmsnorm_add
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -920,14 +935,31 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        ori_shape = x.shape
+        x_2d = x.view(-1, ori_shape[-1])
+
+        # On gfx1250: aiter's Gluon RMSNorm, the same math in one kernel.
+        gluon_norm = gluon_gemma_rmsnorm()
+        if gluon_norm is not None and self.weight.dtype == x.dtype:
+            if residual is None:
+                out = gluon_norm(
+                    x_2d, self.weight.data, self.variance_epsilon, gemma_norm=True
+                )
+                return out.view(ori_shape)
+            out, res_out = gluon_norm(
+                x_2d,
+                self.weight.data,
+                self.variance_epsilon,
+                residual.view(-1, ori_shape[-1]),
+                gemma_norm=True,
+            )
+            return out.view(ori_shape), res_out.view(ori_shape)
+
         # Use the aiter HIP fused_qk_rmsnorm_group_quant kernel in no-quant mode
         # (q_out_scale=None) to perform Gemma RMSNorm + optional residual add.
         # Same math as the Triton kernel: out = rmsnorm(x [+ residual]) * (1 + w),
         # but executed by the aiter kernel for higher achieved bandwidth.
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
-
-        ori_shape = x.shape
-        x_2d = x.view(-1, ori_shape[-1])
 
         out = torch.empty_like(x_2d)
         if residual is not None:

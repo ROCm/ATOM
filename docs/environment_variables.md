@@ -232,6 +232,7 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 | **ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION** | bool | 1 (true) | If set to `1`, fuse allreduce with RMSNorm in tensor parallel mode. |
 | **ATOM_ENABLE_GLUON_FUSED_AR** | bool | 1 (true) | If set to `1`, ATOM sets `AITER_GLUON_FUSED_AR=1`, and aiter runs its Gluon all-reduce + residual add + RMSNorm for decode (fused calls up to 2 MiB) at TP4. aiter uses it on gfx1250 only. |
 | **ATOM_ENABLE_GLUON_GEMM_AR** | bool | 1 (true) | If set to `1`, the bf16 o_proj / out_proj of a Qwen3.5 layer and the all-reduce + residual add + RMSNorm after it run as one aiter Gluon kernel (`gemm_a16w16_all_reduce_rmsnorm`) up to 128 tokens, at TP4 on gfx1250. It needs an aiter with that op; other cases are not changed. |
+| **ATOM_ENABLE_GLUON_GEMMA_RMSNORM** | bool | 1 (true) | If set to `1`, `GemmaRMSNorm` (with or without the residual add) runs aiter's Gluon `fused_rmsnorm_add` (`gemma_norm=True`) in place of the HIP `fused_qk_rmsnorm_group_quant` kernel. gfx1250 only; ATOM keeps the HIP kernel on other GPUs and with an aiter that does not have the Gluon op. |
 
 ### DeepSeek-style
 
