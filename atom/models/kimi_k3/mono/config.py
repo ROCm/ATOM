@@ -191,6 +191,8 @@ def num_blocks(layers: int) -> int:
 
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use K3 mono decode, or None."""
+    from atom.spec_decode.draft_kv import uses_dflash_pool
+
     hf = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
     linear = getattr(hf, "linear_attn_config", None) or {}
     spec = atom_config.speculative_config
@@ -313,6 +315,15 @@ def config_refusal(atom_config) -> str | None:
         # already states it (`deepseek_v41/mono/config.py`); another method
         # would be admitted here on a path never built or measured for it
         (spec is None or spec.method == "dspark", "not DSpark"),
+        # The DFlash draft reads the target's aggregate stream, formed in its
+        # own forward hook; a mono step writes the drafter's taps from
+        # `aux_hidden_state` (the prefix), so it would draft from features it
+        # was not trained on.
+        (
+            spec is None
+            or not uses_dflash_pool(getattr(spec, "draft_model_hf_config", None)),
+            "the DFlash draft's aggregate tap",
+        ),
         (
             spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_ROWS,
             f"speculative width past the {MAX_ROWS}-row buffers",
