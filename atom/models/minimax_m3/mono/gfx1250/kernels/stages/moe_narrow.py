@@ -4,7 +4,7 @@
 (``kernels.stages.moe_narrow`` on wave32 and the a8w4 WMMA)."""
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 
 from atom.models.minimax_m3.mono.config import INTER, MOE_SLOTS, TOP_K
 from atom.models.minimax_m3.mono.gfx1250.kernels.stages.moe_common import DN_GW
@@ -20,7 +20,7 @@ from atom.models.minimax_m3.mono.gfx1250.layout import (
     XSC_ROW,
     shared_after_routing,
 )
-from atom.mono.device.gfx1250 import THREADS, WAVE, acc_row_sum, wmma_a8w4
+from atom.mono.device.gfx1250 import THREADS, WAVE, acc_row_sum, lds_barrier, wmma_a8w4
 from atom.mono.device.ops import bf2_f32, bf16_pair, bf16_round, fp8_pack4, traced
 from atom.mono.plan.trace import enter_stage
 
@@ -108,7 +108,7 @@ def moe_narrow_defs(k4ctx):
                         )
                     )
                 mb_poll(specs)
-            gpu.barrier()
+            lds_barrier()
             if tok is None:
                 got = mb_poll([sp for k in range(tokens) for sp in xn_specs(k)])
                 for k in range_constexpr(tokens):
@@ -126,7 +126,7 @@ def moe_narrow_defs(k4ctx):
             sh_j0 = start("shared")
             sh_w0 = sh_load(sh_j0)
             fetch_xn()
-            gpu.barrier()
+            lds_barrier()
             sh_compute(sh_j0, sh_w0[0], sh_w0[1])
         if ug_task_id(0)[1] | has_dn:
             if start("shared") >= SH_TASKS:
@@ -138,7 +138,7 @@ def moe_narrow_defs(k4ctx):
                     stamp(21)
                     route_top4(k, keys, sigs, opart)
             stamp(2)
-            gpu.barrier()
+            lds_barrier()
             stamp(6)
             if (bid == BASE["down"]) & (tid < MOE_SLOTS * tokens):
                 sk = tid // MOE_SLOTS
@@ -207,7 +207,7 @@ def moe_narrow_defs(k4ctx):
         for k in range_constexpr(tokens):
             stage_mids(k)
         stamp(10)
-        gpu.barrier()
+        lds_barrier()
         for k in range_constexpr(tokens):
             if tid < MID8_WORDS // 2:  # 8 elements a lane, 4 lanes a 32-block
                 w = fx.Vector(
@@ -224,7 +224,7 @@ def moe_narrow_defs(k4ctx):
                 )
                 if tid % 4 == 0:
                     fx.ptr_store(sc, xs + (MIDSC_LDS + k * MIDSC_WORDS + tid // 4))
-        gpu.barrier()
+        lds_barrier()
         # the shared expert once, B column l % 16 = token l % 16 -> opart[0]
         col_tok = fx.min(l16, tokens - 1)
         sh = fx.Vector.filled(8, 0.0, fx.Float32)
@@ -259,7 +259,7 @@ def moe_narrow_defs(k4ctx):
                 fx.Vector.from_elements(acc, fx.Float32),
                 opart + ((k + 1) * ACC_WORDS + (wave * WAVE + lane) * 8),
             )
-        gpu.barrier()
+        lds_barrier()
         if tid < DN_ROWS * tokens:
             k = tid // DN_ROWS
             grp = (tid % DN_ROWS) // 16
@@ -269,7 +269,7 @@ def moe_narrow_defs(k4ctx):
                 opart, rr, k, waves
             )
             fx.ptr_store(bf16_round(tot), misc + tid)
-        gpu.barrier()
+        lds_barrier()
         ffn_finish(t)
 
     return {"stage_moe": stage_moe, "moe_down": moe_down}

@@ -13,7 +13,7 @@ the expert alone.
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.minimax_m3.mono.config import (
@@ -55,6 +55,7 @@ from atom.mono.device.gfx1250 import (
     ballot,
     lanes_below,
     lds_addr,
+    lds_barrier,
     lds_reads_done,
     n32k4_word,
     publish,
@@ -164,7 +165,7 @@ def moe_wide_defs(k4ctx):
         below = lanes_below(bal, lane)
         if (tid < N_ROUTED) & (lane == 0):
             fx.ptr_store(fx.Int32(fx.ctpop(bal)), umask + (CNT_AT + wave))
-        gpu.barrier()
+        lds_barrier()
         if tid < N_ROUTED:
             off = fx.Int32(0)
             tot = fx.Int32(0)
@@ -180,7 +181,7 @@ def moe_wide_defs(k4ctx):
                 fx.ptr_store(tot, uexp + NU_AT)
                 fx.ptr_store(fx.Int32(SHARED_EXPERT), uexp + tot)
                 fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + tot)
-        gpu.barrier()
+        lds_barrier()
 
     def wug_load(t, has):
         """Up / gate weights and scales of task t = (distinct expert t / 48, mid
@@ -222,7 +223,7 @@ def moe_wide_defs(k4ctx):
                 acc[h] = wmma_a8w4(wts[h][i], xb, acc[h], scs[h][i], sbs[i])
         fx.ptr_store(acc[0], red + (wave * WAVE + lane) * 8)
         fx.ptr_store(acc[1], fpool + (W_UPP + (wave * WAVE + lane) * 8))
-        gpu.barrier()
+        lds_barrier()
         r = tid % UG_ROWS
         k = fx.min(tid // UG_ROWS, tokens - 1)
         p = r % 8
@@ -233,7 +234,7 @@ def moe_wide_defs(k4ctx):
         u = first.select(
             acc_row_sum(red, 2 * p + 1, k), acc_row_sum(fpool + W_UPP, 2 * p + 1, k)
         )
-        gpu.barrier()
+        lds_barrier()
         return swiglu_mul_batch([g], [u], fx.Float32(-swiglu_limit))[0]
 
     def fp8_lanes4(q):
@@ -428,7 +429,7 @@ def moe_wide_defs(k4ctx):
                         if has_n:
                             issue(f + UG_RING)
             fx.ptr_store(acc, upart + ((r % 2) * ACC_WORDS + (wave * WAVE + lane) * 8))
-            gpu.barrier()
+            lds_barrier()
             reduce_round(r, rounds)
 
         for r in range_constexpr(UGR):
@@ -436,7 +437,7 @@ def moe_wide_defs(k4ctx):
                 ug_round(r)
         stamp(9)
         release_stores()
-        gpu.barrier()
+        lds_barrier()
         if tid < UGR:
             pr = bid + tid * G
             if pr < n_pairs:
@@ -465,7 +466,7 @@ def moe_wide_defs(k4ctx):
                     ),
                 )
         stamp(2)
-        gpu.barrier()
+        lds_barrier()
         build_experts()
         stamp(6)
         # timeline point TL_EXPERTS: a count, not a time
@@ -507,14 +508,14 @@ def moe_wide_defs(k4ctx):
                     for c in range((n_rt + WAVE - 1) // WAVE)
                 ]
             )
-        gpu.barrier()
+        lds_barrier()
         acquire()
         for base_w, n_row, lds_w, lds_row in (
             (mb("xn8p"), XN8_WORDS, 0, XN8_ROW),
             (mb("xscp"), XSC_WORDS, XSC_LDS, XSC_ROW),
         ):
             rows_to_lds_async(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
-        gpu.barrier()
+        lds_barrier()
         if const_expr("ugold" in SKIP):
             y_lo = fx.Float32(0.0)
             for it in range_constexpr(UGW_ITERS):
@@ -617,7 +618,7 @@ def moe_wide_defs(k4ctx):
                 for i in range((U_MAX * UG_PAIRS + THREADS - 1) // THREADS)
             ]
         )
-        gpu.barrier()
+        lds_barrier()
         acquire()
         # the mid rows: async copies, all out before the scales' loads
         P16 = MID_ROW_WORDS // 4
@@ -650,7 +651,7 @@ def moe_wide_defs(k4ctx):
         if tid < NPK:
             fx.ptr_store(fx.Int32(0), xs + (W_MIDSC + MID_ROWS * MIDSC_ROW + tid))
         wait_async(0)
-        gpu.barrier()
+        lds_barrier()
         stamp(10)
         v8i = fx.Vector.make_type(8, fx.Int32)
         # this wave's live units, a prefix: q + 8 t < 6 (nu + 1)
@@ -704,14 +705,14 @@ def moe_wide_defs(k4ctx):
         fx.ptr_store(
             fx.Vector.from_elements(acc, fx.Float32), red + (wave * WAVE + lane) * 8
         )
-        gpu.barrier()
+        lds_barrier()
         if tid < DN_ROWS * tokens:
             k = tid // DN_ROWS
             grp = (tid % DN_ROWS) // 16
             rr = tid % 16
             tot = acc_row_sum(red, rr, k, [grp * DN_GW + w for w in range(DN_GW)])
             fx.ptr_store(bf16_round(tot), misc + tid)
-        gpu.barrier()
+        lds_barrier()
         stamp(20)
         ffn_finish(td)
         wait_async(0)  # the stand-in copies, before the CTA's LDS goes

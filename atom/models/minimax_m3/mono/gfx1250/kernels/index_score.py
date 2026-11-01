@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.mono.config import (
@@ -39,6 +39,7 @@ from atom.mono.device.gfx1250 import (
     WAVE,
     WAVES,
     fp8x8_bf16,
+    lds_barrier,
     wmma_bf16_k32,
     xshfl,
 )
@@ -263,13 +264,13 @@ def emit_index_scores(
                 v = tiles_max(b, qb, col_seq, [wave], kw)
                 if lane < 16:
                     fx.ptr_store(v, red + (wave * 16 + l16))
-            gpu.barrier()
+            lds_barrier()
             if wave == 0:
                 v = fx.ptr_load(red + l16)
                 for w in range_constexpr(1, KEY_TILES):
                     v = fx.max(v, fx.ptr_load(red + (w * 16 + l16)))
                 put(b, col, v)
-            gpu.barrier()
+            lds_barrier()
     if total > BLOCKS:
         if const_expr(prepare is not None):
             prepare(fx.Int32(0), fx.Int32(tokens - 1))

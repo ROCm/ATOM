@@ -8,7 +8,7 @@ K half a wave, the halves summed in that order; a lane routes four experts,
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -21,6 +21,7 @@ from atom.mono.device.gfx1250 import (
     WAVE,
     WAVES,
     butterfly,
+    lds_barrier,
     publish,
     wave_sum,
 )
@@ -189,7 +190,7 @@ def router_defs(k4ctx):
             if const_expr(fuse_k1 and not x8_in):
                 if wave == 0:
                     k1_poll([(rdone_mb, k, 1)])
-                gpu.barrier()
+                lds_barrier()
                 acquire()
             hres = ld_bf16x12(rsrc(h_in), k * (HIDDEN // 2) + rw0, CM_K1)
             a_src = preg(sym, SY["a_ag"], "a_ag") if AG_RS else mr("a")
@@ -230,7 +231,7 @@ def router_defs(k4ctx):
             ssw = wave_sum(ssw)
             if lane == 0:
                 fx.ptr_store(ssw, red + wave)
-            gpu.barrier()
+            lds_barrier()
             ss = fx.ptr_load(red)
             for w in range_constexpr(1, WAVES):
                 ss = ss + fx.ptr_load(red + w)
@@ -244,7 +245,7 @@ def router_defs(k4ctx):
                     ),
                     xs + (rw0 + j),
                 )
-            gpu.barrier()
+            lds_barrier()
             stamp(25)
             if tid < XN_SLICE // 4:  # 4 elements a lane, 8 lanes a 32-block
                 w0 = t * (XN_SLICE // 2) + tid * 2
@@ -282,7 +283,7 @@ def router_defs(k4ctx):
             part = wave_sum((accs[0] + accs[1]) + (accs[2] + accs[3]))
             if lane == 0:
                 fx.ptr_store(part, red + (WAVES + wave))
-            gpu.barrier()
+            lds_barrier()
             stamp(23)
             if kh == 0:
                 logit = fx.ptr_load(red + (WAVES + wave)) + fx.ptr_load(

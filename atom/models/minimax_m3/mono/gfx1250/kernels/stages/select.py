@@ -5,7 +5,7 @@ with the wave32 group floor)."""
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.minimax_m3.mono.config import (
@@ -23,7 +23,7 @@ from atom.models.minimax_m3.mono.kernels.stages.shared import (
     CAND_BATCH,
     CAND_CAP,
 )
-from atom.mono.device.gfx1250 import THREADS, WAVES, group_floor
+from atom.mono.device.gfx1250 import THREADS, WAVES, group_floor, lds_barrier
 from atom.mono.device.ops import (
     rsrc,
     traced,
@@ -119,7 +119,7 @@ def select_defs(k4ctx):
             TOPK_BLOCKS, floor_red, lane, wave,
         )  # fmt: skip
         compact(cand, counter, CAND_CAP, entries, floor)
-        gpu.barrier()
+        lds_barrier()
         stamp(20)
         n_cand = fx.ptr_load(counter)
         every = n_cand > CAND_CAP
@@ -170,7 +170,7 @@ def select_defs(k4ctx):
         is_tail = sel & (bb == tail)
         if is_tail:
             fx.ptr_store(fx.Int32(1), blk + 17)
-        gpu.barrier()
+        lds_barrier()
         tail_sel = fx.ptr_load(blk + 17) != 0
         n_full = n_sel - tail_sel.select(fx.Int32(1), fx.Int32(0))
         tail_first = (kt > key) | ((kt == key) & (tail > bb))
@@ -215,7 +215,7 @@ def select_defs(k4ctx):
         A long request's blk is ``stage_select_long``'s: nothing runs here."""
         if ~pick(long_rows, k):
             place_short(k, t)
-        gpu.barrier()
+        lds_barrier()
 
     def place_short(k, t):
         """``select_blocks`` of a short request's token k (every thread)."""
@@ -245,7 +245,7 @@ def select_defs(k4ctx):
             fx.ptr_store(
                 fx.Int32(bo.buffer_load(table, j, vec_width=1, dtype=T.i32)), blk + tid
             )
-        gpu.barrier()
+        lds_barrier()
 
     def select_long(k, part):
         """Split task (k, part) of a long request's token, before the
@@ -310,7 +310,7 @@ def select_defs(k4ctx):
         for h, b, lv, c in zip(hs, blocks, live, cnts):
             if lv & (c < TOPK_BLOCKS):
                 mb_put_words(out, 2 * (first + out_slot * TOPK_BLOCKS + c), [h, b])
-        gpu.barrier()
+        lds_barrier()
         # the shares' candidates (every share sends TOPK_BLOCKS distinct ranks:
         # all live), a thread each, ranked among themselves (``count_beaten``);
         # a candidate's page load goes out before the count, under it
@@ -319,7 +319,7 @@ def select_defs(k4ctx):
             got = mb_poll([(got_from, 2 * (first + tid), 2)])[0]
             fx.ptr_store(got[1], keys + 2 * tid)  # put_key's (block, key)
             fx.ptr_store(got[0], keys + (2 * tid + 1))
-        gpu.barrier()
+        lds_barrier()
         held = tid < n_c
         cl = fx.ptr_load(keys + 2 * fx.min(tid, n_c - 1))
         ch = fx.ptr_load(keys + (2 * fx.min(tid, n_c - 1) + 1))
@@ -332,7 +332,7 @@ def select_defs(k4ctx):
         kt = index_key(n_blk - 1, fx.Int32(0), n_blk)
         (sel, slot), n_ctx = place((ch, cl, cnt, held), kt, n_blk, pick(seq_lens_k, k))
         write_slot(sel, slot, page, n_ctx, part, table)
-        gpu.barrier()
+        lds_barrier()
 
     def stage_select_long():
         """The split tasks of a long request's token select before the

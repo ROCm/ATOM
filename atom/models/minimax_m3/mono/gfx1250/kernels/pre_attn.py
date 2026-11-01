@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -84,6 +84,7 @@ from atom.mono.device.gfx1250 import (
     WAVES,
     acc_row_sum,
     butterfly,
+    lds_barrier,
     publish,
     rows_to_lds_async,
     shuffled_rows,
@@ -149,14 +150,14 @@ def ar_block_sums(parts, lane, wave, red):
         (butterfly(p0, (16, 8, 4, 2, 1)), butterfly(p1, (16, 8, 4, 2, 1)))
         for p0, p1 in parts
     ]
-    gpu.barrier()
+    lds_barrier()
     for k in range_constexpr(len(bs)):
         b0, b1 = bs[k]
         if lane == 0:
             fx.ptr_store(b0, red + (24 * k + wave))
         if (lane == 0) & (wave < 8):
             fx.ptr_store(b1, red + (24 * k + 16 + wave))
-    gpu.barrier()
+    lds_barrier()
     tots = [
         butterfly(
             (lane < 24).select(
@@ -166,7 +167,7 @@ def ar_block_sums(parts, lane, wave, red):
         )
         for k in range(len(parts))
     ]
-    gpu.barrier()
+    lds_barrier()
     return tots
 
 
@@ -296,7 +297,7 @@ def emit_pre_attn(
             w_max = wave_max(amax)
             if lane == 0:
                 fx.ptr_store(w_max, red + (j * WAVES + wave))
-        gpu.barrier()
+        lds_barrier()
         x_scales = []
         for j in range_constexpr(len(toks)):
             amax = fx.ptr_load(red + j * WAVES)
@@ -321,7 +322,7 @@ def emit_pre_attn(
                 if (i == 0) | has1:
                     fx.ptr_store(w01[0].bitcast(fx.Float32), xo)
                     fx.ptr_store(w01[1].bitcast(fx.Float32), xo + 1)
-        gpu.barrier()
+        lds_barrier()
         stamp(2)
         return x_scales
 
@@ -423,7 +424,7 @@ def emit_pre_attn(
             )
         )
         if const_expr(x8_in is not None):
-            gpu.barrier()
+            lds_barrier()
             x_scales = [fx.ptr_load(rst + k) for k in range(tokens)]
             stamp(2)
         elif const_expr(tokens <= 2):
@@ -440,7 +441,7 @@ def emit_pre_attn(
                 syncscope=rocdl.SyncScope.Workgroup, ordering=fx.AtomicOrdering.Acquire
             )
             rows_to_lds_async(tid, x8_mb, tokens, HIDDEN // 4, x8, HIDDEN // 4)
-            gpu.barrier()
+            lds_barrier()
             stamp(2)
         # B column l % 16 is token l % 16 (the last token past the step's)
         col_tok = fx.min(lane % 16, tokens - 1)
@@ -488,7 +489,7 @@ def emit_pre_attn(
                 xb += [x4[e] for e in range(4)]
             c = wmma_fp8_k64(wts[cc], fx.Vector.from_elements(xb, fx.Int32), c)
         fx.ptr_store(c, red + (wave * WAVE + lane) * 8)
-        gpu.barrier()
+        lds_barrier()
         if tid < ROWS_PER_TASK * tokens:
             r = tid % ROWS_PER_TASK
             tk = tid // ROWS_PER_TASK
@@ -684,14 +685,14 @@ def emit_k1(
             tk = wave + k0
             if (tk < tokens) & (tk >= first) & (tk <= last):
                 index_q_row(tk, heads.own)
-        gpu.barrier()
+        lds_barrier()
 
     def make_index_q_heads():
         for j0 in range_constexpr(0, tokens * heads.count, WAVES):
             j = wave + j0
             if j < tokens * heads.count:
                 index_q_row(j // heads.count, j % heads.count)
-        gpu.barrier()
+        lds_barrier()
 
     def q_frag_head(tk, c, head):
         """This lane's WMMA B operand of token tk's index q of head ``head``,
