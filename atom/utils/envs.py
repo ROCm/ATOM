@@ -656,6 +656,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_GLUON_FUSED_AR": lambda: (
         os.getenv("ATOM_ENABLE_GLUON_FUSED_AR", "1") == "1"
     ),
+    # aiter's Gluon bf16 GEMM + all-reduce + residual add + RMSNorm in one kernel
+    # (gemm_a16w16_all_reduce_rmsnorm) for the Qwen3.5 o_proj / out_proj and the
+    # norm after it, up to 128 tokens, at TP4 on gfx1250.
+    "ATOM_ENABLE_GLUON_GEMM_AR": lambda: (
+        os.getenv("ATOM_ENABLE_GLUON_GEMM_AR", "1") == "1"
+    ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
     # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
