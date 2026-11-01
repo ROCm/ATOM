@@ -19,10 +19,15 @@ thread reads off `self`, both managers must provide.
 
 import ast
 import pathlib
+import pickle
 import unittest
+import uuid
 from types import SimpleNamespace
 
+import zmq
+
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 
 MODULE_PATH = pathlib.Path(CoreManager.__module__.replace(".", "/") + ".py")
 SOURCE = pathlib.Path(__file__).resolve().parent.parent / MODULE_PATH
@@ -84,6 +89,46 @@ class OutputThreadStateTest(unittest.TestCase):
     def setUp(self):
         self.managers = [_bare_manager(CoreManager), _bare_manager(DisaggCoreManager)]
         self.addCleanup(self._terminate)
+
+    def test_health_detects_nested_failure_even_when_all_cores_are_alive(self):
+        for mgr in self.managers:
+            mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)] * 2
+            self.assertTrue(mgr.is_healthy())
+            mgr._engine_failed.set()
+            self.assertFalse(mgr.is_healthy())
+
+    def test_health_requires_every_local_core_and_open_manager(self):
+        for mgr in self.managers:
+            mgr.engine_core_processes = []
+            self.assertFalse(mgr.is_healthy())
+            mgr.engine_core_processes = [
+                SimpleNamespace(is_alive=lambda: True),
+                SimpleNamespace(is_alive=lambda: False),
+            ]
+            self.assertFalse(mgr.is_healthy())
+            mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)]
+            mgr._closed = True
+            self.assertFalse(mgr.is_healthy())
+
+    def test_shutdown_frame_marks_unhealthy_before_cleanup(self):
+        mgr = self.managers[0]
+        mgr.engine_core_processes = [SimpleNamespace(is_alive=lambda: True)]
+        url = f"inproc://failure-{uuid.uuid4().hex}"
+        receiver = mgr.ctx.socket(zmq.PULL)
+        receiver.bind(url)
+        sender = mgr.ctx.socket(zmq.PUSH)
+        sender.connect(url)
+        observed = []
+        mgr._shutdown_engine_core_rank = lambda rank: observed.append(mgr.is_healthy())
+        thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
+        thread.start()
+        try:
+            sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(observed, [False])
+        finally:
+            sender.close(linger=0)
 
     def _terminate(self):
         for mgr in self.managers:

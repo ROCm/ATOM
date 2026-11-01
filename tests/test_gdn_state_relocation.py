@@ -22,7 +22,11 @@ pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 from atom.kv_transfer.disaggregation.mooncake.mooncake_connector import (
     MooncakeConnector,
 )
-from atom.kv_transfer.disaggregation.types import KVTransferRegion, KVTransferTensors
+from atom.kv_transfer.disaggregation.types import (
+    KVTransferRegion,
+    KVTransferTensors,
+    PageRegion,
+)
 from atom.model_ops.attentions.gdn_attn import GDNStateMixin, slot_indexed_caches
 
 K3 = pytest.importorskip(
@@ -322,7 +326,7 @@ class _MLABase:
 
     def get_kv_transfer_tensors(self):
         tensors = KVTransferTensors(
-            block_regions=[KVTransferRegion(0x1000, 64 * self.BLOCKS, 64)],
+            pages=[PageRegion(KVTransferRegion(0x1000, 64 * self.BLOCKS, 64))],
             slot_regions=[],
         )
         tensors.set_block_count(self.BLOCKS)
@@ -352,6 +356,9 @@ def kimi_builder(kv_transfer_config, pp_size=1, replayssm=False):
         pipeline_parallel_size=pp_size,
         hf_config=SimpleNamespace(model_type="kimi_linear"),
     )
+    # No checkpoint spec, so the answer is the P/D join alone rather than the
+    # `lmcache_mp` checkpoint contract layered on it.
+    builder.model_runner.state_runtime = SimpleNamespace(checkpoint_spec=None)
     return builder
 
 
@@ -398,12 +405,15 @@ def test_an_aggregated_engine_is_left_exactly_as_the_base_class_answered(
             },
             id="multi",
         ),
+        # MoRIIO moves the state from the `per_request_state` tensors it
+        # registers; the regions it is handed are the same pools.
+        pytest.param({"kv_connector": "moriio"}, id="moriio"),
     ],
 )
-def test_a_mooncake_peer_gets_both_halves(kv_transfer_config):
+def test_a_pd_peer_gets_both_halves(kv_transfer_config):
     """Including behind `multi`, which is how a prefill node that also offloads
-    is configured -- the slot half must not depend on mooncake being named at
-    the top level.
+    is configured -- the slot half must not depend on the P/D backend being
+    named at the top level.
     """
     builder = kimi_builder(kv_transfer_config)
 
@@ -416,14 +426,17 @@ def test_a_mooncake_peer_gets_both_halves(kv_transfer_config):
     assert tensors.num_blocks == _MLABase.BLOCKS
 
 
-def test_a_connector_that_ignores_slot_regions_is_refused():
-    """MoRIIO transfers block regions only. Handing it this region map would
-    move the full-attention layers, report success and leave decode running
-    the linear-attention ones on a zeroed state.
+def test_a_pd_connector_that_cannot_move_the_state_is_refused(monkeypatch):
+    """A P/D backend that moves block regions only would move the
+    full-attention layers, report success and leave decode running the
+    linear-attention ones on a zeroed state.
     """
-    builder = kimi_builder({"kv_connector": "moriio"})
+    from atom.kv_transfer.disaggregation import factory
 
-    with pytest.raises(NotImplementedError, match="mooncake"):
+    monkeypatch.setattr(factory, "resolve_pd_backend", lambda config: "nixl")
+    builder = kimi_builder({"kv_connector": "nixl"})
+
+    with pytest.raises(NotImplementedError, match="mooncake or moriio"):
         builder.get_kv_transfer_tensors()
 
 

@@ -463,8 +463,11 @@ class AsyncIOProcManager:
         {*_PROTOCOL_RPC_NAMES, *UTILITY_MANAGED_RUNNER_METHODS}
     )
 
-    def __init__(self, finalizer, proc_num: int, runner: str, *args):
+    def __init__(
+        self, finalizer, proc_num: int, runner: str, *args, on_worker_failure=None
+    ):
         self.parent_finalizer = finalizer
+        self.on_worker_failure = on_worker_failure
         self.proc_num = proc_num
 
         io_addrs = [get_open_zmq_ipc_path(), get_open_zmq_ipc_path()]
@@ -995,6 +998,14 @@ class AsyncIOProcManager:
                 f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
                 f"(exitcode={dead_proc.exitcode}), shutting down.",
             )
+            # Notify the frontend before exit() can block draining GPU work.
+            # A live EngineCore process alone does not imply healthy runners.
+            try:
+                callback = getattr(_self, "on_worker_failure", None)
+                if callback is not None:
+                    callback()
+            except Exception:
+                logger.exception("Failed to report ModelRunner death")
             _self.exit()
 
         Thread(
