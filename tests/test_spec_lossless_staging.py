@@ -185,6 +185,22 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     )
 
 
+def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, caplog):
+    """A window caps the drafted rows below `mtp_k`, which the verify walks;
+    q rows that short would let the verify read into the next slot."""
+    model = FakeDraftModel()
+    model.window_size = T - 1
+    with caplog.at_level("WARNING", logger="atom"):
+        prop = proposer(monkeypatch, model=model)
+    assert prop.draft_sampling is None and prop._q_store is None
+    assert not set(LOSSLESS) & set(prop.metadata_buffers)
+    assert f"draft_tokens_per_seq={T - 1}, mtp_k={T}" in caplog.text
+    # A window at least as wide as the block arms.
+    model = FakeDraftModel()
+    model.window_size = T
+    assert proposer(monkeypatch, model=model).draft_sampling is not None
+
+
 @pytest.mark.parametrize(
     "config",
     [

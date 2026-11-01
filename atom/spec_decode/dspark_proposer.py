@@ -118,6 +118,20 @@ class DSparkProposer(Drafter):
             # This flavor's block sampler has no sampled entry point. Silent,
             # because "not ported yet" is not an operator error.
             return
+        if self.draft_tokens_per_seq != self.mtp_k:
+            # The store holds `draft_tokens_per_seq` rows per slot, while the
+            # verify (and `warmup_lossless_verify`) walks `mtp_k` positions: a
+            # windowed flavor drafting fewer rows than it verifies would read
+            # past its slot into the next one.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING needs the draft block to be as "
+                "wide as the verify (draft_tokens_per_seq=%d, mtp_k=%d): the "
+                "verify would read q rows past each request's slot. Falling "
+                "back to greedy proposal with exact-match acceptance.",
+                self.draft_tokens_per_seq,
+                self.mtp_k,
+            )
+            return
         if not AITER_TOPK_TOPP_AVAILABLE:
             # The verify serves a filtered request aiter's kept set (whole tie
             # groups, top-p over the unfiltered mass), the one `Sampler` draws
