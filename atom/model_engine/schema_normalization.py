@@ -96,6 +96,11 @@ def _negate(predicate):
         return {"allOf": [_negate({"const": v}) for v in value]}
     if key == "const":
         if isinstance(value, str):
+            # The regex below emits one escaped prefix per character. Check
+            # before slicing/escaping so a small request cannot allocate a
+            # quadratic expansion while worker scheduling is paused.
+            if len(value) > _LIMIT:
+                raise ValueError("Literal-string negation exceeds 256 characters")
             # All strings except one literal: shorter/longer strings or the
             # same length with a differing character. No regex lookaround.
             branches = [

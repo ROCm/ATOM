@@ -168,6 +168,28 @@ def test_unsupported_or_excessive_expansions_are_explicit(schema):
         normalize_schema(schema)
 
 
+@pytest.mark.parametrize("size", [257, 100_000])
+def test_literal_negation_budget_checked_before_regex_allocation(monkeypatch, size):
+    from atom.model_engine import schema_normalization as module
+
+    def no_escape(_value):
+        raise AssertionError("oversized literal must be rejected before expansion")
+
+    monkeypatch.setattr(module.re, "escape", no_escape)
+    with pytest.raises(ValueError, match="exceeds 256 characters"):
+        normalize_schema({"not": {"const": "a" * size}})
+
+
+def test_literal_negation_at_budget_remains_exact():
+    literal = "a" * 256
+    lowered = Draft202012Validator(normalize_schema({"not": {"const": literal}}))
+    assert not lowered.is_valid(literal)
+    assert all(
+        lowered.is_valid(value)
+        for value in [literal[:-1], literal + "a", literal[:-1] + "b", 1]
+    )
+
+
 @pytest.mark.parametrize(
     "guard",
     [

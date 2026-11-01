@@ -55,7 +55,8 @@ negation, and conditions whose guards can be complemented exactly. Those guards
 do not require a finite discriminator domain. More complex guards may use finite
 enumeration. `uniqueItems` supports finite item and prefix-item domains, including
 prefix values outside the trailing `items` domain. Finite expansions are capped
-at 256 branches or arrays. General regex negation, unbounded `uniqueItems`, and
+at 256 branches or arrays. Literal-string negation is capped at 256 characters
+before constructing its prefix regex. General regex negation, unbounded `uniqueItems`, and
 other predicates without an exact lowering remain unsupported and fail before
 generation. A 400 for
 an unsupported schema is not positive feature support. Client `x-guidance`
