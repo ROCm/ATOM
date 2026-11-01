@@ -46,7 +46,14 @@ DIAG_TICKS = 10 * 100_000_000
 
 @traced
 def _spin_bounded(
-    load_all, pending, diag, region_id, index, tag, steady=False, failure=None,
+    load_all,
+    pending,
+    diag,
+    region_id,
+    index,
+    tag,
+    steady=False,
+    failure=None,
     wait_ticks=DIAG_TICKS,
 ):
     """``_spin`` giving up after wait_ticks: the CTA's record in ``diag`` names the
@@ -163,8 +170,15 @@ class Mailbox:
     """
 
     def __init__(
-        self, layer, diag=None, region_ids=None, *, steady=False, failure=None,
-        wait_ticks=DIAG_TICKS, gfx1250=False,
+        self,
+        layer,
+        diag=None,
+        region_ids=None,
+        *,
+        steady=False,
+        failure=None,
+        wait_ticks=DIAG_TICKS,
+        gfx1250=False,
     ):
         """``diag`` (a debug build): the address of the per-CTA wait records, every
         wait bounded (``_spin_bounded``); ``region_ids``: region name -> the id a

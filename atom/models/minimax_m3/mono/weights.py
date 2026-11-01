@@ -156,8 +156,7 @@ class SparseMoeLayer:
         # shuffle (``mono.gfx1250``)
         gugu = getattr(qm, "is_guinterleave", None)
         _need(
-            experts.top_k == TOP_K
-            and gugu is (get_gfx() == "gfx1250"),
+            experts.top_k == TOP_K and gugu is (get_gfx() == "gfx1250"),
             f"layer {layer_id}: moe layout",
         )
         _need(
