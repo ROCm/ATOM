@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused DSpark Markov block-sampling step: low-rank bias GEMV + argmax.
+"""Fused DSpark Markov block-sampling step: low-rank bias GEMV, then an
+argmax or a sampled draw.
 
 DSpark drafts a T-token block in one backbone pass, then samples it
 left-to-right with a first-order Markov head whose ``V x V`` transition matrix
@@ -9,13 +10,20 @@ is factorized as ``W1 @ W2^T`` (``W1, W2 in R^{V x r}``)::
 
     logits_k = base_logits_k + W1[x_{k-1}] @ W2^T ;   x_k = argmax(logits_k)
 
-Only the argmax and the ``[B, r]`` row the bias came from leave this step, so
+For the greedy op (`dspark_markov_argmax`, which the notes below describe)
+only the argmax and the ``[B, r]`` row the bias came from leave this step, so
 nothing needs the ``[B, V]`` biased logits. The unfused spelling materializes
 them three times over -- an fp32 copy of the whole ``W2`` table, the ``[B, V]``
 bias, and the ``[B, V]`` sum -- and then reads the sum back for the reduction.
 This op keeps ``W2`` bf16, adds the base logits in the GEMM epilogue and
 reduces to ids in registers, so per block position the only large read is
 ``W2`` itself, exactly once.
+
+The sampled op (`dspark_markov_sample`, the lossless draft) draws ``x_k`` from
+``softmax(logits_k / T)`` instead, and choosing and storing the q it draws from
+reads the row several times. So it does write the scaled ``[B, V]`` scores,
+once, to an fp32 ``s`` scratch the later stages read; see the notes above
+`_dspark_markov_sample_stage1`.
 
 Numerics. The reference does the GEMV as an fp32 matmul over an fp32 copy of
 bf16 data. Here ``tl.dot`` takes the bf16 operands directly into MFMA with an
