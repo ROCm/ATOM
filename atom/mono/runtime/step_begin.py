@@ -194,7 +194,10 @@ def _build(key: StepBeginBuild):
         # the peer data first, at system scope: in memory before the epoch
         # announces it to a peer
         _zero(
-            load_ptr64(peers, rank), fence_off, lane0, stride,
+            load_ptr64(peers, rank),
+            fence_off,
+            lane0,
+            stride,
             CM_SYS_GFX1250 if key.gfx1250 else CM_SYS,
         )
         if const_expr(key.gfx1250):
