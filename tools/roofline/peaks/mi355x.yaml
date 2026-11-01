@@ -1,0 +1,93 @@
+platform: mi355x
+spec_source: AMD Instinct MI355X Datasheet GD-83
+# Theoretical peaks, NO efficiency derate, so t_roofline is a strict lower bound
+# and gap = measured / t_roofline >= 1 by construction. Achieved-vs-theoretical
+# efficiency (HBM ~0.85, MAF, ...) is a runtime property that belongs in the gap,
+# not baked into the ceiling.
+convention: dense_theoretical_peak_per_package
+
+# Matrix (MFMA) peaks in TFLOPS, per package, dense, no sparsity.
+# The full published set, per AMD's MI355X product page (checked 2026-08-31), all
+# DENSE and per package. Drawn as a family of roofs whether or not this run uses
+# them: "fp4 is 2x above the fp8 roof" is itself a reading, and a chart that only
+# shows the precisions already in use cannot deliver it.
+#   https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
+compute_tflops:
+  matrix_fp4: 10066    # MXFP4; no separate dense/sparse split
+  matrix_fp6: 10066    # MXFP6 matches MXFP4 on CDNA4
+  matrix_fp8: 5033     # dense; 10066 with 2:4 structured sparsity
+  matrix_bf16: 2516    # dense; 5033 with sparsity
+  matrix_fp16: 2516
+  matrix_fp32: 157.3   # equals the VECTOR fp32 rate -- see below
+  matrix_fp64: 78.6
+
+# Matrix fp32 deserves the note it gets. CDNA4 keeps the fp32-input MFMA shapes
+# (16x16x4, 32x32x2) at CDNA3's cycle counts and 256 FLOPS/clk/CU, so
+# 256 CU x 256 x 2.4 GHz = 157.3 TF -- numerically identical to vector fp32.
+# The Matrix Core buys nothing at fp32. That is why a kernel that falls back to
+# the fp32 MFMA path gives up 16x against the bf16 ceiling (2516), not some
+# smaller penalty, and it is why `matrix_fp32` and `vector_fp32` agreeing here
+# is a property of this chip rather than a copied number.
+# Corroborated three ways: the CDNA4 whitepaper per-CU table (256 FLOPS/clk/CU,
+# 157.3 TF at 2.4 GHz); the ROCm matrix-cores blog (Matrix FP32 163.4 TF on
+# MI325X -> 157.3 TF on MI355X, fp32 MFMA still supported on gfx950); and the
+# ISA arithmetic for v_mfma_f32_16x16x4_f32 (2*16*16*4 FLOPs / 32 cycles x 4
+# matrix cores = 256 FLOPS/clk/CU).
+
+# NOT matrix rates. Elementwise work -- norms, RoPE, quantisers, pooling, memsets
+# -- runs on the vector units, and pricing it against an MFMA peak is a category
+# error even when it changes no bound (every such operator here sits at AI < 4,
+# far under the 19.6 ridge a vector fp32 roof would imply).
+vector_tflops:
+  vector_fp32: 157.3
+  vector_fp64: 78.6
+
+# HBM3e peak bandwidth, GB/s, per package (288 GB @ 8 TB/s).
+mem_bw_gbps: 8000
+
+# xGMI per-link unidirectional. 7 links x 153.6 GB/s bidirectional = 1075 GB/s
+# aggregate; per-link unidirectional = 76.8 GB/s.
+interconnect_bw_gbps: 76.8
+
+# Maximum Achievable FLOPs. Empty until measured (see ERT / Empirical Roofline
+# Toolkit). When populated, the chart draws a second, lower ceiling next to the
+# theoretical one.
+maf:
+  matrix_fp8: null
+  matrix_fp4: null
+
+# RESOLVED 2026-08-31: matrix_fp4 was 20133, which is 2x too high. AMD's product
+# page lists MI355X MXFP4 matrix at 10.1 PFLOPS -- there is no separate dense/
+# sparse split for MXFP4, 10.1 PF is the peak rate. The 20.1 PF figure in
+# circulation is the 8-GPU platform total (80.5 PF / 8 = 10.1 PF per OAM), not a
+# per-package number. Every fp4 operator had been measured against a ceiling 2x
+# too high, which halves its apparent efficiency.
+#   https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
+# The same source confirms matrix_fp8 = 5033 is the DENSE figure (5.0 PF dense,
+# 10.1 PF with 2:4 sparsity) and matrix_bf16 = 2516 is dense (2.5 PF). Those two
+# were previously flagged as possibly-sparsity numbers; they are not.
+
+# Cache. Capacity is published; bandwidth is not.
+#
+# The tool uses capacity to tell two causes apart when an operator is measured
+# FASTER than its own HBM roof: a working set inside the cache means HBM was never
+# its ceiling, while one far above means the formula overcounts. Four prefill
+# operators land there, at 8.6-13.0 TB/s against an 8 TB/s HBM peak.
+#
+# ⚠️ The threshold is uncertain by 2x, and it matters. AMD documents 256 MB
+# "shared across 8 XCDs", but the part uses two mirrored I/O dies, so the
+# effective per-partition capacity may be 128 MB. Two of the four flagged
+# operators have 157 MB working sets -- inside 256, outside 128 -- so which
+# explanation applies to them is currently undecided. They are flagged and kept
+# out of every total either way.
+#
+# No cache ROOF is drawn: AMD publishes no Infinity Cache bandwidth (the widely
+# quoted 8 TB/s is HBM3E). The measurements imply >= 13.0 TB/s, but that is an
+# inference from this run, not a spec, and a ceiling built from the measurement it
+# is meant to judge is not a ceiling. Populate llc_bw_gbps from the CDNA 4
+# whitepaper if it states one.
+#   https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
+cache:
+  llc_bytes: 256e6
+  llc_bytes_uncertain: "may be 128e6 per I/O die; 2 mirrored IODs"
+  llc_bw_gbps: null
