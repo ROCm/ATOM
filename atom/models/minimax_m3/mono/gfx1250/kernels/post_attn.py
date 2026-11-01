@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.minimax_m3.mono.config import (
@@ -409,7 +409,7 @@ def build_post_attn_kernel(
                     else None
                 ),
             )  # fmt: skip
-            gpu.barrier()
+            lds_barrier()
             k1_mbox = Mailbox(
                 layer, diag, REGION_IDS, gfx1250=True, steady=diag is not None
             )
@@ -578,7 +578,7 @@ def build_post_attn_kernel(
             (stage_moe_wide if WIDE else stage_moe)()
         stamp(TL_END)
         if const_expr(timeline):
-            gpu.barrier()
+            lds_barrier()
             fx.generic_store(
                 fx.inttoptr(
                     fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8),

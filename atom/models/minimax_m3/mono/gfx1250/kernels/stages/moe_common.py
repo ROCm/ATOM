@@ -12,7 +12,7 @@ in LDS a code a word, as on gfx950, and read four at a time (``lds_scale4``).
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 
 from atom.models.minimax_m3.mono.config import (
     HIDDEN,
@@ -39,6 +39,7 @@ from atom.mono.device.gfx1250 import (
     CM_NT,
     WAVE,
     acc_row_sum,
+    lds_barrier,
     n32k4_word,
     shuffled_rows,
     wmma_a8w4,
@@ -141,7 +142,7 @@ def moe_common_defs(k4ctx):
         stamp(9)
         fx.ptr_store(acc[0], red + (wave * WAVE + lane) * 8)
         fx.ptr_store(acc[1], opart + (wave * WAVE + lane) * 8)
-        gpu.barrier()
+        lds_barrier()
         if tid < shared.select(fx.Int32(UG_ROWS * tokens), fx.Int32(UG_ROWS)):
             m = tid % UG_ROWS
             c = tid // UG_ROWS
@@ -159,7 +160,7 @@ def moe_common_defs(k4ctx):
                 (kk * MOE_SLOTS + slot) * INTER + cg * UG_ROWS + m,
                 bf16_round(y),
             )
-        gpu.barrier()
+        lds_barrier()
 
     def sh_load(j, has=None):
         """The shared expert's half task j: interleaved row group j (8 pairs)."""
@@ -192,7 +193,7 @@ def moe_common_defs(k4ctx):
             kc = wave * UG_CPW + i
             c = wmma_a8w4(wts[i], lds_b8(col * XN8_ROW + kc * 32), c, scs[i], sbs[i])
         fx.ptr_store(c, red + (wave * WAVE + lane) * 8)
-        gpu.barrier()
+        lds_barrier()
         if tid < SH_ROWS * tokens:
             r = tid % SH_ROWS
             cl = tid // SH_ROWS
@@ -204,7 +205,7 @@ def moe_common_defs(k4ctx):
                 (cl * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
                 bf16_round(y),
             )
-        gpu.barrier()
+        lds_barrier()
 
     def down_load(k, td, has_dn):
         """Token k's route-weighted down units of row group td * 2 + wave // 8."""

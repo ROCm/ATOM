@@ -15,7 +15,7 @@ row: no transposes.
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -136,7 +136,7 @@ def split_defs(k4ctx):
                             (hdone_mb, kv_task(lane + WAVE - H), 1),
                         ]
                     )
-                gpu.barrier()
+                lds_barrier()
                 acquire()
             n_ctx = uniform(fx.ptr_load(blk + 16))
             pages = [uniform(fx.ptr_load(blk + j)) for j in range(PAGES)]
@@ -219,7 +219,7 @@ def split_defs(k4ctx):
                 )
             )
             fx.ptr_store(fp8_pack4(qv[0], qv[1], qv[2], qv[3]), q8 + tid)
-            gpu.barrier()
+            lds_barrier()
             stamp(12)
             # QK: C[head][key], lane holds key l16, heads 8 g4 + e
             key = t * SPLIT_KEYS + wave * PAGE16 + l16
@@ -247,7 +247,7 @@ def split_defs(k4ctx):
                     fx.ptr_store(mh, hst + (wave * H + 8 * g4 + e))
             if lane == 0:
                 fx.ptr_store(vmax_w, hst + (3 * WAVES * H + wave))
-            gpu.barrier()
+            lds_barrier()
             stamp(13)
             vmax = fx.ptr_load(hst + 3 * WAVES * H)
             for w in range_constexpr(1, WAVES):
@@ -275,7 +275,7 @@ def split_defs(k4ctx):
                 if l16 == 0:
                     fx.ptr_store(ls, hst + (WAVES * H + wave * H + head))
                     fx.ptr_store(mxs[e], hst + (2 * WAVES * H + head))
-            gpu.barrier()
+            lds_barrier()
             stamp(14)
             # PV: C[head][dim], lane holds dim l16 of the tile, heads 8 g4 + e
             cv = fx.Vector.filled(8, 0.0, fx.Float32)
@@ -299,7 +299,7 @@ def split_defs(k4ctx):
                 cv = wmma_fp8_k64(pa, vw[j], cv)
             for e in range_constexpr(8):
                 fx.ptr_store(cv[e], opart + (kh * O_K + (8 * g4 + e) * HEAD_DIM + dim))
-            gpu.barrier()
+            lds_barrier()
             stamp(15)
             e0 = tid * 4
             head = e0 // HEAD_DIM
@@ -322,7 +322,7 @@ def split_defs(k4ctx):
                 for w in range_constexpr(1, WAVES):
                     lt = lt + fx.ptr_load(hst + (WAVES * H + w * H + tid))
                 mb_put(mr("sp_l"), ts * H + tid, lt)
-            gpu.barrier()
+            lds_barrier()
 
     return {"stage_split": stage_split}
 
@@ -354,7 +354,7 @@ def merge_defs(k4ctx):
                     for i in range(N_SPLIT * H // WAVE)
                 ]
             )
-        gpu.barrier()
+        lds_barrier()
         got = mb_poll(
             [(mr("sp_m"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
             + [(mr("sp_l"), (sp0 + i) * H + hm, 1) for i in range(N_SPLIT)]
@@ -475,7 +475,7 @@ def o_defs(k4ctx):
                 x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
                 rows_to_lds_async(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
-            gpu.barrier()
+            lds_barrier()
             col_tok = fx.min(l16, tokens - 1)
             row_w = 1 if tokens == 1 else O_ROW
             c = fx.Vector.filled(8, 0.0, fx.Float32)
@@ -494,14 +494,14 @@ def o_defs(k4ctx):
                 )
                 c = wmma_fp8_k128(wts[cc], xb, c)
             fx.ptr_store(c, red + (wave * WAVE + lane) * 8)
-            gpu.barrier()
+            lds_barrier()
             if tid < O_ROWS * tokens:
                 tk = tid // O_ROWS
                 grp = (tid % O_ROWS) // 16
                 rr = tid % 16
                 tot = acc_row_sum(red, rr, tk, [grp * GW + w for w in range(GW)])
                 fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
-            gpu.barrier()
+            lds_barrier()
             push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None)
             lds_barrier()
             if const_expr(AG_RS):  # noqa: SIM102
