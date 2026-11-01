@@ -13,7 +13,16 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
+from atom.mono.device.ops import (
+    CM_DEV,
+    CM_SYS,
+    CM_SYS_GFX1250,
+    ballot,
+    bf16_pair,
+    memrealtime,
+    rsrc,
+    traced,
+)
 from atom.mono.plan.layout import DIAG_WORDS
 from atom.mono.plan.trace import Space, note
 
@@ -36,28 +45,71 @@ DIAG_TICKS = 10 * 100_000_000
 
 
 @traced
-def _spin_bounded(load_all, pending, diag, region_id, index, tag):
-    """``_spin`` giving up after DIAG_TICKS: the CTA's record in ``diag`` names the
+def _spin_bounded(
+    load_all,
+    pending,
+    diag,
+    region_id,
+    index,
+    tag,
+    steady=False,
+    failure=None,
+    wait_ticks=DIAG_TICKS,
+):
+    """``_spin`` giving up after wait_ticks: the CTA's record in ``diag`` names the
     wait (the runner raises with it after the step), and the kernel runs on."""
-    t0 = memrealtime()
+    t0 = memrealtime(steady)
     v = load_all()
     late = fx.Int32(0)
-    while pending(v) & (late == 0):
-        rocdl.s_sleep(1)
+
+    def waiting(words):
+        bad = pending(words)
+        if const_expr(steady):
+            # All wave32 lanes reissue loads and leave the wait together.
+            bad = ballot(bad) != 0
+        return bad
+
+    while waiting(v) & (late == 0):
+        if const_expr(steady):
+            # On gfx1250 the original one-unit polling interval can delay
+            # producer progress when many wave32 consumers are waiting.
+            # Retain the same wait set/publication protocol, but back off
+            # stale reads. Verified with the full front and 216 consumers.
+            rocdl.s_sleep(64)
+        else:
+            rocdl.s_sleep(1)
         v = load_all()
-        late = (memrealtime() - t0 > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
+        timed_out = memrealtime(steady) - t0 > wait_ticks
+        if const_expr(failure is not None):
+            stopped = (
+                fx.generic_load(
+                    failure, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"
+                )
+                != 0
+            )
+            timed_out = timed_out | (ballot(stopped) != 0)
+        late = timed_out.select(fx.Int32(1), fx.Int32(0))
     if late != 0:
         bid = fx.block_idx.x
+        if const_expr(failure is not None):
+            fx.atomic_cas(
+                failure,
+                fx.Int32(0),
+                fx.Int32(30_000_000) + fx.Int32(bid),
+                success_ordering=fx.AtomicOrdering.Release,
+                failure_ordering=fx.AtomicOrdering.Monotonic,
+                syncscope="agent",
+            )
         # the CTA's first give-up of the step: the later ones wait on its fallout
         seen = bo.buffer_load(
             rsrc(diag),
             bid * DIAG_WORDS,
             vec_width=1,
             dtype=T.i32,
-            cache_modifier=CM_SYS,
+            cache_modifier=CM_SYS_GFX1250 if steady else CM_SYS,
         )
         if fx.Int32(seen) == 0:
-            at = fx.Int32(memrealtime() & 0x7FFFFFFF)
+            at = fx.Int32(memrealtime(steady) & 0x7FFFFFFF)
             record = [1, region_id, index, tag, v[1], bid, at, 0]
             for h in range_constexpr(2):  # 16 B a store
                 bo.buffer_store(
@@ -66,7 +118,7 @@ def _spin_bounded(load_all, pending, diag, region_id, index, tag):
                     ),
                     rsrc(diag),
                     bid * DIAG_WORDS + 4 * h,
-                    cache_modifier=CM_SYS,
+                    cache_modifier=CM_SYS_GFX1250 if steady else CM_SYS,
                 )
     return v
 
@@ -117,13 +169,34 @@ class Mailbox:
     carries a live tag. Every address is an ``Addr``: its space picks the scope.
     """
 
-    def __init__(self, layer, diag=None, region_ids=None):
+    def __init__(
+        self,
+        layer,
+        diag=None,
+        region_ids=None,
+        *,
+        steady=False,
+        failure=None,
+        wait_ticks=DIAG_TICKS,
+        gfx1250=False,
+    ):
         """``diag`` (a debug build): the address of the per-CTA wait records, every
         wait bounded (``_spin_bounded``); ``region_ids``: region name -> the id a
         record names it by."""
         self.tag = layer + 1
         self.diag = diag
         self.region_ids = region_ids or {}
+        self.steady = steady
+        self.failure = failure
+        if not isinstance(wait_ticks, int) or wait_ticks <= 0:
+            raise ValueError("mailbox wait_ticks must be a positive integer")
+        self.wait_ticks = wait_ticks
+        self.scope_cm = {
+            Space.SCRATCH: CM_DEV,
+            Space.PEER: CM_SYS_GFX1250 if (gfx1250 or steady) else CM_SYS,
+        }
+        if steady and diag is None:
+            raise ValueError("gfx1250 peer waits require bounded diagnostics")
 
     def put(self, a, i, v):
         bits = v.bitcast(fx.Int32) if isinstance(v, fx.Float32) else fx.Int32(v)
@@ -131,7 +204,7 @@ class Mailbox:
             fx.Vector.from_elements([bits, self.tag], fx.Int32),
             rsrc(_noted(a, "put")),
             i * 2,
-            cache_modifier=_SCOPE_CM[a.space],
+            cache_modifier=self.scope_cm[a.space],
         )
 
     def put_bf(self, a, i, vs):
@@ -143,7 +216,7 @@ class Mailbox:
             fx.Vector.from_elements(words, fx.Int32),
             rsrc(_noted(a, "put")),
             i,
-            cache_modifier=_SCOPE_CM[a.space],
+            cache_modifier=self.scope_cm[a.space],
         )
 
     def put_words(self, a, i, words):
@@ -157,7 +230,7 @@ class Mailbox:
             fx.Vector.from_elements(vals, fx.Int32),
             rsrc(_noted(a, "put")),
             i * 2,
-            cache_modifier=_SCOPE_CM[a.space],
+            cache_modifier=self.scope_cm[a.space],
         )
 
     def poll(self, specs, batch=POLL_MAX):
@@ -170,7 +243,7 @@ class Mailbox:
             return []
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
-        cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
+        cms = [self.scope_cm[a.space] for a, _, _ in specs]
         bases = [_noted(a, "poll") for a, _, _ in specs]
         tag = self.tag
 
@@ -201,10 +274,29 @@ class Mailbox:
             v = _spin(load_all, pending)
         else:
             rid = self.region_ids.get(specs[0][0].region, -1)
-            v = _spin_bounded(load_all, pending, self.diag, rid, specs[0][1], tag)
+            v = _spin_bounded(
+                load_all,
+                pending,
+                self.diag,
+                rid,
+                specs[0][1],
+                tag,
+                self.steady,
+                self.failure,
+                self.wait_ticks,
+            )
         outs, e = [], 0
         for _, _, n in specs:
-            outs.append([v[e + 2 * q] for q in range(n)])
+            outs.append(
+                [
+                    (
+                        (v[e + 2 * q + 1] == tag).select(v[e + 2 * q], fx.Int32(0))
+                        if self.steady
+                        else v[e + 2 * q]
+                    )
+                    for q in range(n)
+                ]
+            )
             e += 2 * n
         return outs
 

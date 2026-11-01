@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import torch
 from aiter import QuantType, dtypes
+from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.linear import weight_is_stored_preshuffled
 from atom.models.minimax_m3.mono.config import (
@@ -151,8 +152,11 @@ class SparseMoeLayer:
             moe.fuse_shared_experts and experts.num_fused_shared_experts == 1,
             f"layer {layer_id}: shared expert",
         )
+        # gfx950's kernels read GGUU experts, gfx1250's the GUGU rows of its
+        # shuffle (``mono.gfx1250``)
+        gugu = getattr(qm, "is_guinterleave", None)
         _need(
-            experts.top_k == TOP_K and not getattr(qm, "is_guinterleave", True),
+            experts.top_k == TOP_K and gugu is (get_gfx() == "gfx1250"),
             f"layer {layer_id}: moe layout",
         )
         _need(
