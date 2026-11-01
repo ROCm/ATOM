@@ -118,6 +118,36 @@ def _install_v4_nm_aiter_compat_patch() -> None:
     aiter.mla.mla_decode_fwd_v4_nm = mla_decode_fwd_v4_nm
 
 
+def _draft_extend_fused_swa_kwargs(attn, attn_md) -> dict | None:
+    """Fused SWA kwargs for the current kernel, or None to keep ``swa_write``.
+
+    ``qk_norm_rope_maybe_quant`` scatters only through precomputed
+    ``swa_dest_rows``. Draft-extend metadata that does not publish them must
+    fall through to ``swa_write``. The previous kwargs (``swa_cache_size``,
+    ``swa_cu_seqlens_q``, ``swa_write_per_batch``) are not parameters anymore;
+    passing them raises TypeError and drops the draft-extend CUDA graph.
+    """
+    dest_map = getattr(attn_md, "swa_dest_rows", None)
+    if not isinstance(dest_map, dict):
+        return None
+    ratio = int(getattr(attn, "compress_ratio", 0) or 0)
+    dest = dest_map.get(ratio)
+    if dest is None:
+        return None
+    kv_fp8 = bool(getattr(attn, "kv_fp8", False))
+    extra = {
+        "fp8_2buff": kv_fp8,
+        "swa_dest_rows": dest,
+        "batch_id_per_q_token": getattr(attn_md, "batch_id_per_q_token", None),
+    }
+    if kv_fp8:
+        extra["swa_nope_scale_buff"] = getattr(attn, "swa_kv", None)
+        extra["swa_rope_buff"] = getattr(attn, "swa_kv_rope", None)
+    else:
+        extra["swa_kv"] = getattr(attn, "swa_kv", None)
+    return extra
+
+
 def _install_draft_extend_fused_swa_patch() -> None:
     """Patch ATOM DSV4 symbols only while SGLang graph integration needs them."""
 
@@ -136,31 +166,24 @@ def _install_draft_extend_fused_swa_patch() -> None:
 
     def qk_norm_rope_maybe_quant(*args, **kwargs):
         ctx = _draft_extend_fused_swa_ctx.get()
-        if ctx is not None and kwargs.get("swa_kv") is None:
-            attn = ctx["attn"]
-            attn_md = ctx["attn_md"]
-            # swa_kv is the flat [num_slots * cs, head_dim] ring region; the
-            # ring stride (cs) lives on attn.swa_cache_size.
-            cache_size = int(attn.swa_cache_size)
-            kv_fp8 = bool(getattr(attn, "kv_fp8", False))
-            kwargs.update(
-                fp8_2buff=kv_fp8,
-                swa_cache_size=cache_size,
-                batch_id_per_q_token=attn_md.batch_id_per_q_token,
-                swa_cu_seqlens_q=attn_md.cu_seqlens_q,
-                swa_write_per_batch=min(int(attn_md.max_seqlen_q), cache_size),
+        if ctx is not None:
+            # One qk call pairs with the following swa_write in this layer.
+            ctx["fused_this_layer"] = False
+            already_fused = (
+                kwargs.get("swa_kv") is not None
+                or kwargs.get("swa_nope_scale_buff") is not None
             )
-            if kv_fp8:
-                kwargs.update(
-                    swa_nope_scale_buff=attn.swa_kv,
-                    swa_rope_buff=attn.swa_kv_rope,
-                )
-            else:
-                kwargs["swa_kv"] = attn.swa_kv
+            if not already_fused:
+                extra = _draft_extend_fused_swa_kwargs(ctx["attn"], ctx["attn_md"])
+                if extra is not None:
+                    kwargs.update(extra)
+                    ctx["fused_this_layer"] = True
         return original_qk_norm_rope_maybe_quant(*args, **kwargs)
 
     def swa_write(*args, **kwargs):
-        if _draft_extend_fused_swa_ctx.get() is not None:
+        ctx = _draft_extend_fused_swa_ctx.get()
+        if ctx is not None and ctx.get("fused_this_layer"):
+            ctx["fused_this_layer"] = False
             return None
         return original_swa_write(*args, **kwargs)
 
@@ -218,7 +241,11 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
             if not is_draft_extend_graph:
                 return self._sglang_v4_forward_impl(x_arg, positions_arg)
             token = _draft_extend_fused_swa_ctx.set(
-                {"attn": self, "attn_md": fc.attn_metadata}
+                {
+                    "attn": self,
+                    "attn_md": fc.attn_metadata,
+                    "fused_this_layer": False,
+                }
             )
             try:
                 return self._sglang_v4_forward_impl(x_arg, positions_arg)

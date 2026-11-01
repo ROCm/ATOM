@@ -1890,7 +1890,6 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     req_to_token_pool,
     model: Any = None,
 ):
-    from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
     from atom.utils.forward_context import AttentionMetaData, AttnState
 
     index_topk = _resolve_v4_index_topk(model=model, proxy_pool=proxy_pool)
@@ -1928,10 +1927,15 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         # Draft-extend graph capture can be invoked with dummy seq_lens from a
         # decode-shaped draft backend. Keep capture metadata structurally valid:
         # an extend chunk cannot be longer than the context length it is appended to.
+        # The capture buffer's positions stay zero until replay, so the index
+        # writer must use this reconstructed vector. Mixing the two makes
+        # token_pos_in_chunk negative and torch.arange rejects the range
+        # ("upper bound and lower bound inconsistent with step sign").
         seq_np = np.maximum(seq_np, tokens_per_req).astype(np.int32)
         prefix_np = np.maximum(seq_np[:bs].astype(np.int32) - tokens_per_req, 0)
         offsets_np = np.arange(tokens_per_req, dtype=np.int32)
         pos_np = (prefix_np[:, None] + offsets_np[None, :]).reshape(-1)
+        positions = torch.as_tensor(pos_np, device=device, dtype=torch.int64)
     else:
         # Target-verify and experimental draft-extend replay positions come from
         # the tensor copied into the CUDA graph input buffer.  Deriving them from
@@ -2086,6 +2090,8 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
 
     geometry = md.pool_geometry
     if _geometry_supports_shared_prefill_writer(geometry):
+        from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
+
         write_v4_paged_prefill_indices(
             positions=positions[:total].to(torch.int32),
             bid_per_token=md.batch_id_per_q_token.to(torch.int64),

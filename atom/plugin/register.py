@@ -475,7 +475,14 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     and not _target_verify_graph_enabled()
                 ):
                     return False
-                if is_supported_model and is_draft_extend:
+                # Generic runners must not replay a draft-extend batch. The
+                # dedicated EAGLE draft-extend runner has its own can_run and
+                # is the path that stayed on in the passing MTP jobs.
+                if (
+                    is_supported_model
+                    and is_draft_extend
+                    and not isinstance(self, EAGLEDraftExtendCudaGraphRunner)
+                ):
                     return False
             except Exception:  # noqa: S110
                 pass
