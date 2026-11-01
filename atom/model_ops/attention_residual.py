@@ -24,7 +24,7 @@ from torch import nn
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import ReplicatedLinear
 
-__all__ = ["AttnRes"]
+__all__ = ["AttnRes", "new_block_bank"]
 
 
 def _rms_eps(norm: RMSNorm) -> float:
@@ -51,6 +51,24 @@ def _fused_quant_dtype(norm: RMSNorm | None) -> torch.dtype | None:
     if getattr(quant_type, "value", None) != QuantType.per_Token.value:
         return None
     return params_dtype
+
+
+def new_block_bank(hidden_states: torch.Tensor, num_blocks: int) -> torch.Tensor:
+    """The block-residual bank for one forward: ``[T, num_blocks, H]``, every slot
+    allocated up front.
+
+    Each closed block is copied into its slot (``AttnRes.maybe_close_block``)
+    and each AttnRes site mixes a ``[:, :n]`` view of the slots written so far,
+    so no site re-copies the blocks behind it, as growing the bank with
+    ``torch.cat`` did once per block (at T=16365 that was ~4.4 ms of copies per
+    Kimi-K3 forward). The memory is slot-major (``[num_blocks, T, H]``
+    transposed): a slot is a dense ``[T, H]``, so its copy is contiguous, and
+    the kernels, which take the token and candidate strides, read a
+    ``[:, :n]`` view at the speed of a dense ``[T, n, H]``.
+    """
+    return hidden_states.new_empty(
+        num_blocks, hidden_states.shape[0], hidden_states.shape[1]
+    ).transpose(0, 1)
 
 
 class AttnRes(nn.Module):
@@ -199,22 +217,38 @@ class AttnRes(nn.Module):
         mixed = prefix_sum if self.out_norm is None else self.out_norm(prefix_sum)
         return mixed, prefix_sum
 
+    def blocks_before(self, bank: torch.Tensor | None) -> torch.Tensor | None:
+        """The candidates this (block-closing) site mixes: the
+        ``ceil(layer_idx / block_size)`` blocks closed before this layer."""
+        if bank is None or not self.enabled or self.block_size is None:
+            return bank
+        return bank[:, : -(-self.layer_idx // self.block_size)]
+
+    def blocks_after(self, bank: torch.Tensor | None) -> torch.Tensor | None:
+        """The candidates the rest of this layer mixes: ``blocks_before`` plus
+        the block this layer closes, if it closes one."""
+        if bank is None or not self.enabled or self.block_size is None:
+            return bank
+        closes = self.layer_idx % self.block_size == 0
+        return bank[:, : -(-self.layer_idx // self.block_size) + closes]
+
     def maybe_close_block(
         self,
         prefix_sum: torch.Tensor,
-        block_residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Append ``prefix_sum`` as a candidate every ``block_size`` layers.
+        bank: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Bank ``prefix_sum`` as a candidate every ``block_size`` layers.
 
-        Returns the new ``(block_residual, prefix_sum)``. A closed-out block
-        leaves prefix_sum None: the running sum has been banked as a candidate
-        and the next site starts a fresh one from whatever it is handed.
-        Residuals disabled, or a layer mid-block, means no change.
+        ``bank`` is the forward's ``new_block_bank``; this layer's block goes
+        into slot ``layer_idx // block_size``. Returns the new prefix_sum: None
+        when the block was closed out (the running sum is now a candidate and
+        the next site starts a fresh one from whatever it is handed), else
+        ``prefix_sum`` unchanged (residuals disabled, or a layer mid-block).
         """
         if not self.enabled or self.block_size is None:
-            return block_residual, prefix_sum
+            return prefix_sum
         if self.layer_idx % self.block_size != 0:
-            return block_residual, prefix_sum
-        assert block_residual is not None
-        block_residual = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1)
-        return block_residual, None
+            return prefix_sum
+        assert bank is not None
+        bank[:, self.layer_idx // self.block_size].copy_(prefix_sum)
+        return None

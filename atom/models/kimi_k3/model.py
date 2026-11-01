@@ -28,7 +28,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 # forwards (shared with deepseek_v2/v4). Imported for the registration only.
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mla import MLAModules, qrep_tp_override
-from atom.model_ops.attention_residual import AttnRes
+from atom.model_ops.attention_residual import AttnRes, new_block_bank
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
@@ -73,6 +73,16 @@ from atom.utils.region_graph import eager_region, token_graph
 
 def _text_config(config):
     return getattr(config, "text_config", config)
+
+
+def _new_block_bank(config, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    """The forward's attention-residual block bank: one slot per block the
+    layers close (one every ``attn_res_block_size`` layers, from layer 0), or
+    None with attention residuals off."""
+    block_size = getattr(config, "attn_res_block_size", None)
+    if block_size is None:
+        return None
+    return new_block_bank(hidden_states, -(-config.num_hidden_layers // block_size))
 
 
 def _normalize_kimi_config(config) -> None:
@@ -1777,12 +1787,17 @@ class KimiDecoderLayer(nn.Module):
         # ordinary pre-norm residual step. input_layernorm and
         # post_attention_layernorm are its out_norms, so hidden_states comes
         # back already normed at both.
-        hidden_states, prefix_sum = self.self_attention_attn_res(
-            hidden_states, block_residual, pending_add, pending_add2
+        # block_residual is the forward's whole block bank (new_block_bank); each
+        # site mixes the [:, :n] view of the blocks closed so far, and a block
+        # boundary copies the prefix into its slot instead of growing the bank.
+        attn_res = self.self_attention_attn_res
+        hidden_states, prefix_sum = attn_res(
+            hidden_states,
+            attn_res.blocks_before(block_residual),
+            pending_add,
+            pending_add2,
         )
-        block_residual, prefix_sum = self.self_attention_attn_res.maybe_close_block(
-            prefix_sum, block_residual
-        )
+        prefix_sum = attn_res.maybe_close_block(prefix_sum, block_residual)
 
         if self.is_linear_attn:
             hidden_states = self.self_attn(hidden_states)
@@ -1790,7 +1805,7 @@ class KimiDecoderLayer(nn.Module):
             hidden_states = self.self_attn(positions, hidden_states)
 
         hidden_states, prefix_sum = self.mlp_attn_res(
-            prefix_sum, block_residual, hidden_states
+            prefix_sum, attn_res.blocks_after(block_residual), hidden_states
         )
         # Routed and shared expert outputs come back unsummed: the next layer's
         # attn_res kernel folds both into its prefix on-load, so the [T, H]
@@ -1913,13 +1928,7 @@ class KimiLinearModel(nn.Module):
                 if inputs_embeds is not None
                 else self.embed_tokens(input_ids)
             )
-            block_residual = (
-                hidden_states.new_zeros(
-                    hidden_states.shape[0], 0, hidden_states.shape[1]
-                )
-                if getattr(self.config, "attn_res_block_size", None) is not None
-                else None
-            )
+            block_residual = _new_block_bank(self.config, hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]

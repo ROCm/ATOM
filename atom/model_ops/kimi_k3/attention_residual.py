@@ -264,7 +264,15 @@ def _apply_attn_res_impl(
     if quant and not out_norm:
         raise ValueError("quant_dtype requires out_norm_weight")
     fp8_max = float(torch.finfo(quant_dtype).max) if quant else 1.0
-    br = block_residual.contiguous()
+    # The attn-res kernels take the token and candidate strides, so a
+    # block_residual that is a [:, :B] view of a wider preallocated bank is read
+    # in place; only the hidden dim has to be contiguous. .contiguous() on such
+    # a view would copy all B candidates on every call.
+    br = (
+        block_residual
+        if block_residual.stride(-1) == 1
+        else block_residual.contiguous()
+    )
     ps = prefix_sum.contiguous()
     sw = score_weight.contiguous()
     y = torch.empty(
