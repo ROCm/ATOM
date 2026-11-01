@@ -2316,8 +2316,11 @@ run_torch_profile_window() {
   # Wait on the curl pids only: a bare `wait` also waits on the caller's tee
   # process substitution, which cannot end before this function does.
   local -a pids=()
-  local start_marker="${out_dir}/.torch_trace_start"
-  touch "${start_marker}"
+  # Names, not mtimes, tell a rank's new trace from an older one: mtimes on the
+  # shared log mount come from clocks that disagree by more than a window lasts.
+  local traces_before="${out_dir}/.torch_traces_before"
+  find "${RUN_DIR}/torch_traces" -name '*.pt.trace.json.gz' -printf '%f\n' \
+    > "${traces_before}" 2>/dev/null
   echo "[profile] start_profile at $(date -Is)"
   for target in "${targets[@]}"; do
     curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
@@ -2352,7 +2355,7 @@ run_torch_profile_window() {
   wait "${pids[@]}"
   echo "[profile] stop_profile returned at $(date -Is)"
 
-  if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
+  if ! wait_for_torch_traces "${traces_before}" "${stop_files[@]}"; then
     echo "[profile] traces incomplete; leaving aiperf to finish on its own"
     return 0
   fi
@@ -2369,12 +2372,13 @@ run_torch_profile_window() {
 
 # stop_profile returns once TP rank 0 has exported, while the other ranks may
 # still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
-# removes the raw file, so a rank is done once it holds a .gz newer than the
-# window start and no raw .json. The ranks are the dirs stop_profile reported
-# and their siblings that ModelRunner named for a rank: rank_<tp> or
-# dp<d>_tp<tp>, prefixed pp<k>_ under PP. Any other subdir is not a rank.
+# removes the raw file, so a rank is done once it holds a .gz whose name is not
+# in $1, the traces on disk when the window opened, and no raw .json. The ranks
+# are the dirs stop_profile reported and their siblings that ModelRunner named
+# for a rank: rank_<tp> or dp<d>_tp<tp>, prefixed pp<k>_ under PP. Any other
+# subdir is not a rank.
 wait_for_torch_traces() {
-  local marker="$1"
+  local traces_before="$1"
   shift
   local stop_file trace_dir worker_dir rank_dir
   local rank_dir_re='^(pp[0-9]+_)?(rank_[0-9]+|dp[0-9]+_tp[0-9]+)$'
@@ -2409,8 +2413,8 @@ wait_for_torch_traces() {
     for rank_dir in "${!rank_dirs[@]}"; do
       if [[ ! -d "${rank_dir}" ]] \
         || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
-        || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
-          -newer "${marker}" -print -quit)" ]]; then
+        || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' -printf '%f\n' \
+          | grep -vxF -f "${traces_before}")" ]]; then
         pending=$(( pending + 1 ))
       fi
     done
