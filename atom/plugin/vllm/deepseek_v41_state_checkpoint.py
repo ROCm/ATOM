@@ -474,9 +474,13 @@ def apply_vllm_v41_prefix_install() -> None:
     install_v41_state_checkpoint_group_ids()
     install_v41_slot_owner_release()
     install_v41_group_check_scope()
+    from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
     from atom.plugin.vllm.req_id_passthrough_patch import install_v2_host_block_rows
 
-    install_v2_host_block_rows()
+    # Only V4.1's runner reads the rows; every other model skips keeping them.
+    install_v2_host_block_rows(
+        lambda runner: is_deepseek_v41_vllm_config(getattr(runner, "vllm_config", None))
+    )
 
 
 def install_v41_group_check_scope() -> bool:

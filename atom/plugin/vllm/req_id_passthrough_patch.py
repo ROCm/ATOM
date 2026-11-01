@@ -165,13 +165,24 @@ _HOST_ROWS_KEPT = _HostRows()
 _V2_HOST_ROWS: _HostRows | None = None
 
 
-def install_v2_host_block_rows() -> int:
+#: Which runners keep `_HOST_ROWS_KEPT`; set by `install_v2_host_block_rows`.
+_HOST_ROWS_WANTED = None
+
+
+def install_v2_host_block_rows(wanted) -> int:
     """Keep `_HostRows` current on every runner class that has V2's
     `update_requests`, and read from it only once one does. Returns how many
-    classes this call patched."""
+    classes this call patched.
+
+    `wanted(runner)` names the runners whose model reads the rows; it is
+    asked once per runner, and every other runner's step skips the
+    bookkeeping. Installed from the plugin's entry point, which runs for
+    every model.
+    """
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
-    global _V2_HOST_ROWS
+    global _V2_HOST_ROWS, _HOST_ROWS_WANTED
+    _HOST_ROWS_WANTED = wanted
     host_rows = _HOST_ROWS_KEPT
     classes = gpu_model_runner_classes()
     patched = 0
@@ -182,10 +193,15 @@ def install_v2_host_block_rows() -> int:
 
         @functools.wraps(original)
         def update_requests(self, scheduler_output, *args, _orig=original, **kwargs):
-            tables = getattr(self, "block_tables", None)
-            host_rows.apply(
-                scheduler_output, getattr(tables, "blocks_per_kv_block", None)
-            )
+            keeps = self.__dict__.get("_atom_keeps_host_rows")
+            if keeps is None:
+                keeps = bool(_HOST_ROWS_WANTED is not None and _HOST_ROWS_WANTED(self))
+                self._atom_keeps_host_rows = keeps
+            if keeps:
+                tables = getattr(self, "block_tables", None)
+                host_rows.apply(
+                    scheduler_output, getattr(tables, "blocks_per_kv_block", None)
+                )
             return _orig(self, scheduler_output, *args, **kwargs)
 
         update_requests._atom_v2_host_rows = True

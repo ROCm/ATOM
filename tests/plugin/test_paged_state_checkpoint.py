@@ -818,7 +818,7 @@ def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
 
     monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
     monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", list)
-    assert P.install_v2_host_block_rows() == 0
+    assert P.install_v2_host_block_rows(lambda _runner: True) == 0
     assert P._V2_HOST_ROWS is None
 
     class _V2Runner:
@@ -826,9 +826,37 @@ def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
             return None
 
     monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_V2Runner])
-    assert P.install_v2_host_block_rows() == 1
+    assert P.install_v2_host_block_rows(lambda _runner: True) == 1
     assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
     # Already patched: armed again without patching twice.
     monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
-    assert P.install_v2_host_block_rows() == 0
+    assert P.install_v2_host_block_rows(lambda _runner: True) == 0
     assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
+
+
+def test_only_the_runners_that_read_host_rows_keep_them(monkeypatch):
+    """The entry point installs for every model; only V4.1 pays per step."""
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+    from atom.plugin.vllm import vllm_runtime
+
+    applied = []
+
+    class _Rows:
+        def apply(self, scheduler_output, blocks_per_kv_block):
+            applied.append(scheduler_output)
+
+    class _V2Runner:
+        def __init__(self, v41):
+            self.v41 = v41
+
+        def update_requests(self, scheduler_output):
+            return None
+
+    monkeypatch.setattr(P, "_HOST_ROWS_KEPT", _Rows())
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_V2Runner])
+    P.install_v2_host_block_rows(lambda runner: runner.v41)
+    other, v41 = _V2Runner(False), _V2Runner(True)
+    other.update_requests("a")
+    v41.update_requests("b")
+    other.update_requests("c")
+    assert applied == ["b"]
