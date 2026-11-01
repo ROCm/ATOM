@@ -4039,6 +4039,24 @@ class ModelRunner:
             f"--max-num-batched-tokens."
         )
 
+        if envs.ATOM_DP_LOGITS_PEER_EXCHANGE:
+            if self.config.enable_tbo_decode:
+                raise ValueError(
+                    "DP logits peer exchange requires serial decode streams"
+                )
+            import hashlib
+
+            from atom.model_ops.embed_head import ParallelLMHead
+
+            for name, module in self.model.named_modules():
+                if isinstance(module, ParallelLMHead):
+                    channel = (
+                        "dp_logits_" + hashlib.sha256(name.encode()).hexdigest()[:12]
+                    )
+                    module.prepare_dp_logits_exchange(
+                        [size * full_q_len for size in self.capture_sizes], channel
+                    )
+
         if "kv_indptr" in self.forward_vars:
             self.forward_vars["kv_indptr"].gpu.zero_()
         # Present exactly when the model has an indexer -- the builder makes it
