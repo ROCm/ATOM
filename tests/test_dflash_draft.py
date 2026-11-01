@@ -782,14 +782,20 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 # --------------------------------------------------------------------------- #
 
 
-def _guard_refuses(draft_hf):
+def _guard_refuses(draft_hf, method="dspark"):
     """The production predicate under `Config`'s DCP guard."""
     # get_attn_backend resolves to aiter_attention, which imports aiter at module
     # load and probes the GPU arch there.
     _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
     from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
 
-    return draft_kv_conflicts_with_dcp(draft_hf)
+    standalone = bool(getattr(draft_hf, "dspark_with_draft", False))
+    spec = types.SimpleNamespace(
+        method=method,
+        draft_model_hf_config=draft_hf,
+        use_dspark_with_draft=lambda: method == "dspark" and standalone,
+    )
+    return draft_kv_conflicts_with_dcp(spec)
 
 
 def test_dcp_guard_admits_the_dflash_draft():
@@ -798,13 +804,13 @@ def test_dcp_guard_admits_the_dflash_draft():
     assert _guard_refuses(draft_hf) is False
 
 
-def test_dcp_guard_refuses_a_pool_owning_causal_draft():
+def test_dcp_guard_refuses_a_pool_owning_eagle3_draft():
     """An Eagle3-llama style MHA draft double-shards: head axis AND token axis.
 
-    This is the case the guard exists for. It owns a sibling pool like DFlash
-    does, but is not the DFlash pool, so it would be DCP-sharded -- and the
-    failure is silent (lost acceptance length, no fault), which is why it must
-    be refused at launch rather than diagnosed later.
+    This is the case the guard exists for. It builds a pool of its own like
+    DFlash does, but is not the DFlash pool, so it would be DCP-sharded -- and
+    the failure is silent (lost acceptance length, no fault), which is why it
+    must be refused at launch rather than diagnosed later.
     """
     draft_hf = types.SimpleNamespace(
         architectures=["LlamaForCausalLMEagle3"],
@@ -814,30 +820,48 @@ def test_dcp_guard_refuses_a_pool_owning_causal_draft():
         head_dim=128,
         num_hidden_layers=1,
     )
-    assert _guard_refuses(draft_hf) is True
+    assert _guard_refuses(draft_hf, method="eagle3") is True
 
 
-def test_dcp_guard_admits_an_mtp_draft():
-    """`--method mtp` must still pass.
+@pytest.mark.parametrize(
+    "target_hf",
+    [
+        types.SimpleNamespace(
+            architectures=["KimiK3ForCausalLM"],
+            model_type="kimi_k3",
+            num_attention_heads=64,
+            num_hidden_layers=2,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+        ),
+        types.SimpleNamespace(
+            architectures=["Qwen3NextForCausalLM"],
+            model_type="qwen3_next",
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            head_dim=256,
+            num_hidden_layers=2,
+        ),
+        types.SimpleNamespace(
+            architectures=["Qwen3_5ForCausalLM"],
+            model_type="qwen3_5",
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            head_dim=256,
+            num_hidden_layers=2,
+        ),
+    ],
+)
+def test_dcp_guard_admits_an_mtp_draft(target_hf):
+    """`--method mtp` builds no draft pool, so the guard never refuses it.
 
-    For mtp the draft hf config IS the target's, so `attn_family` returns the
-    TARGET's family (KIMI_MLA here), whose backend leaves `DRAFT_OWNS_KV_POOL`
-    at the default False: a latent-KV draft shares the target's cache and owns
-    no sibling pool. Keying on ownership rather than on `Family.MLA` is what
-    keeps `recipes/Agentic-GLM-5.2.md`'s documented
-    `--method mtp --decode-context-parallel-size 4` working.
+    For mtp the draft hf config IS the target's. A GDN or MHA target's backend
+    answers `DRAFT_OWNS_KV_POOL` True, but no proposer calls `draft_kv_builder`
+    for mtp, so there is no pool to double-shard.
     """
-    target_hf = types.SimpleNamespace(
-        architectures=["KimiK3ForCausalLM"],
-        model_type="kimi_k3",
-        num_attention_heads=64,
-        num_hidden_layers=2,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        qk_nope_head_dim=128,
-        v_head_dim=128,
-    )
-    assert _guard_refuses(target_hf) is False
+    assert _guard_refuses(target_hf, method="mtp") is False
 
 
 # --------------------------------------------------------------------------- #

@@ -37,13 +37,19 @@ def uses_dflash_pool(draft_hf) -> bool:
     return arch in _DFLASH_POOL_ARCHS
 
 
-def draft_kv_conflicts_with_dcp(draft_hf) -> bool:
+def draft_kv_conflicts_with_dcp(spec) -> bool:
     """Whether DCP > 1 would shard this draft's own KV pool on both axes.
 
     A draft that owns a GQA/MHA pool is head-sharded by TP; DCP would shard its
     tokens too. Only the DFlash pool (`uses_dflash_pool`) stays out of the DCP
-    group. Drafts with no pool of their own (MLA, MTP) are unaffected.
+    group. A pool is built only for a draft built from its own config (eagle3,
+    a standalone DSpark draft) -- the condition the proposers call
+    `draft_kv_builder` under; MTP and V4's built-in DSpark reuse the target's
+    rows and own none.
     """
+    if spec is None or not (spec.method == "eagle3" or spec.use_dspark_with_draft()):
+        return False
+    draft_hf = spec.draft_model_hf_config
     if draft_hf is None:
         return False
     from atom.utils.selector import attn_family, get_attn_backend

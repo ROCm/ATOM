@@ -2375,14 +2375,12 @@ class Config:
                 # A draft that owns its own GQA/MHA pool would be sharded on the
                 # head axis (TP) and the token axis (DCP) at once, which cannot
                 # be reassembled and shows only as lost acceptance. The DFlash
-                # draft avoids it by staying out of the DCP group; MLA drafts
-                # share the target's latent rows and own no pool. Keyed on pool
-                # ownership, not the attention family: `--method mtp` reuses the
-                # target's hf config, whose family is never `Family.MLA`.
+                # draft avoids it by staying out of the DCP group; MLA, MTP and
+                # built-in DSpark drafts build no pool of their own.
                 from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
 
                 draft_hf = self.speculative_config.draft_model_hf_config
-                if draft_kv_conflicts_with_dcp(draft_hf):
+                if draft_kv_conflicts_with_dcp(self.speculative_config):
                     raise ValueError(
                         "Decode context parallel (--decode-context-parallel-size "
                         f"{self.decode_context_parallel_size}) with a non-MLA "
