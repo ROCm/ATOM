@@ -491,8 +491,7 @@ class KimiK3DFlash(DSparkDraftModel):
     """
 
     # GQA, read through `unified_attention` straight off `block_tables` /
-    # `context_lens`: no MLA decode plan and no CSR to build, and nothing for
-    # `prepare_paged_block` to add.
+    # `context_lens`: no MLA decode plan and no CSR to build.
     block_attention_is_mla = False
 
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
@@ -567,6 +566,55 @@ class KimiK3DFlash(DSparkDraftModel):
         # Bound by `share_with_target`.
         self.embed_tokens = None
         self.lm_head = None
+
+        # `prepare_paged_block`'s per-request allocation, in tokens. One block
+        # id is `block_size * dcp` tokens of this pool (the draft is outside the
+        # dcp group). Pinned host staging; the event guards its reuse.
+        self._entry_tokens = int(atom_config.kv_cache_block_size) * int(
+            atom_config.decode_context_parallel_size
+        )
+        max_bs = int(atom_config.max_num_seqs)
+        self._alloc = torch.zeros(
+            max_bs, dtype=torch.int32, device=torch.get_default_device()
+        )
+        self._alloc_host = torch.zeros(
+            max_bs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._alloc_copied = torch.cuda.Event()
+
+    def prepare_paged_block(
+        self,
+        attn_metadata,
+        block_tables,
+        block_positions,  # [running_bs, T]
+        slots,  # [running_bs, T] the block's KV write slots
+        ctx_lens,  # [running_bs] anchor + 1 + T, read as `context_lens`
+        allocated_pages,  # [>= scheduled_bs] host, blocks each request holds
+        scheduled_bs: int,
+    ) -> None:
+        """Keep the block inside the blocks each request was allocated.
+
+        The block writes up to T positions past the anchor, which can run past
+        the scheduler's allocation; that table column reads as block 0, another
+        request's entry. Such positions are neither written (slot -1) nor read
+        (the context is capped at the allocation), as MiniMax-M3.1's draft does.
+        """
+        running_bs = block_positions.shape[0]
+        # The host can run a step ahead of the device: the previous copy must
+        # have read the pinned buffer before it is rewritten.
+        self._alloc_copied.synchronize()
+        pages = self._alloc_host.numpy()[:running_bs]
+        n = min(len(allocated_pages), scheduled_bs)
+        pages[:n] = allocated_pages[:n]
+        # Pad rows address block 0 by convention and read one entry.
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
+        alloc = self._alloc[:running_bs]
+        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
+        self._alloc_copied.record()
+        alloc.mul_(self._entry_tokens)
+        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        torch.minimum(ctx_lens, alloc, out=ctx_lens)
 
     # -- the target feature this draft was trained on ----------------------
 

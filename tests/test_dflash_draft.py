@@ -1331,3 +1331,29 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
     one = torch.ones(1, dtype=torch.float32, device=dev)
     o = read(q, k_pool, v_pool, block_tables, kv_lens, d**-0.5, one, one)
     assert torch.isfinite(o).all()
+
+
+def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
+    """The block runs up to T past the anchor, which can pass the request's
+    allocation; that column reads as block 0, another request's entry. The real
+    `KimiK3DFlash.prepare_paged_block` drops those writes and caps the read."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU: pinned staging and a CUDA event")
+    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    draft = m.KimiK3DFlash.__new__(m.KimiK3DFlash)
+    vblock, T = 1024, 3
+    draft._entry_tokens = vblock
+    draft._alloc = torch.zeros(4, dtype=torch.int32, device="cuda")
+    draft._alloc_host = torch.zeros(4, dtype=torch.int32, pin_memory=True)
+    draft._alloc_copied = torch.cuda.Event()
+    # Row 0 holds one block and its block crosses into a second; row 1 holds
+    # two and stays inside; row 2 is a pad row.
+    pos = torch.tensor(
+        [[vblock - 2, vblock - 1, vblock], [5, 6, 7], [1, 2, 3]], device="cuda"
+    )
+    slots = torch.tensor([[10, 11, 12], [20, 21, 22], [-1, -1, -1]], device="cuda")
+    ctx = torch.tensor([vblock + 1, 8, 1 + T], dtype=torch.int32, device="cuda")
+    draft.prepare_paged_block(None, None, pos, slots, ctx, [1, 2], 2)
+    assert slots.tolist() == [[10, 11, -1], [20, 21, 22], [-1, -1, -1]]
+    assert ctx.tolist() == [vblock, 8, 1 + T]
