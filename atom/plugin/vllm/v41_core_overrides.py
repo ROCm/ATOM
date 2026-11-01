@@ -320,18 +320,14 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         super().__init__(*args, **kwargs)
 
     def prepare_state(self, step, *, histories=True):
-        """Keep the blocking probe workaround on this frontend by default.
+        """Read the cursors as native ATOM does, except before a restore.
 
-        A concurrent FULL_AND_PIECEWISE run reported stale state with the
-        deferred probe while the later cursor dump was consistent. Those are
-        different observation times, not proof that the probe buffer raced.
-        Explicit metadata publication does not establish the probe's safety;
-        keep this workaround until a separate test does.
-
-        `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out, except on a step that
-        may restore a state checkpoint (`_may_restore`): a restore has to see
-        this step's cursors before the reset and the Engram staging, and the
-        deferred read judges them only on the next call.
+        The caller's deferred read (`histories=False`) is kept, so a stale
+        slot is named one step late, as on native ATOM. A step that may
+        restore a state checkpoint (`_may_restore`) still reads before the
+        forward: a restore has to see this step's cursors before the reset
+        and the Engram staging, and the deferred read judges them only on the
+        next call. `ATOM_V41_BLOCKING_STATE_PROBE=1` reads every step.
         """
         from atom.utils import envs
 

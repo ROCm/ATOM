@@ -834,6 +834,45 @@ def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
     assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
 
 
+def test_host_lengths_are_exact_after_warmup_under_sync_scheduling(monkeypatch):
+    """vLLM's warmup schedules every draft as accepted, so the host lengths
+    are trusted only after it returns, on V2 under a synchronous scheduler."""
+    import sys
+    import types
+
+    from atom.plugin.vllm import req_id_passthrough_patch as P
+
+    during = []
+
+    class _Worker:
+        def __init__(self, async_scheduling, v2=True):
+            self.use_v2_model_runner = v2
+            self.vllm_config = NS(
+                scheduler_config=NS(async_scheduling=async_scheduling)
+            )
+
+        def compile_or_warm_up_model(self):
+            during.append(P.host_lengths_exact())
+
+    module = types.ModuleType("vllm.v1.worker.gpu_worker")
+    module.Worker = _Worker
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", module)
+    monkeypatch.setattr(P, "_HOST_LENGTHS_EXACT", False)
+    assert P.install_host_lengths_gate()
+    assert not P.install_host_lengths_gate()
+
+    assert not P.host_lengths_exact()
+    _Worker(False).compile_or_warm_up_model()
+    assert P.host_lengths_exact()
+    # Warming up again (an elastic scale-up) shuts it while it runs.
+    _Worker(False).compile_or_warm_up_model()
+    assert during == [False, False]
+    _Worker(True).compile_or_warm_up_model()
+    assert not P.host_lengths_exact()
+    _Worker(False, v2=False).compile_or_warm_up_model()
+    assert not P.host_lengths_exact()
+
+
 def test_only_the_runners_that_read_host_rows_keep_them(monkeypatch):
     """The entry point installs for every model; only V4.1 pays per step."""
     from atom.plugin.vllm import req_id_passthrough_patch as P

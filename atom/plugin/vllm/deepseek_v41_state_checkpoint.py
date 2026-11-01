@@ -471,16 +471,20 @@ def apply_vllm_v41_prefix_install() -> None:
     register_v41_state_checkpoint_adapter()
     install()
     install_v41_store_sites()
-    install_v41_state_checkpoint_group_ids()
+    install_v41_kv_cache_group_ids()
     install_v41_slot_owner_release()
     install_v41_group_check_scope()
     from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
-    from atom.plugin.vllm.req_id_passthrough_patch import install_v2_host_block_rows
+    from atom.plugin.vllm.req_id_passthrough_patch import (
+        install_host_lengths_gate,
+        install_v2_host_block_rows,
+    )
 
     # Only V4.1's runner reads the rows; every other model skips keeping them.
     install_v2_host_block_rows(
         lambda runner: is_deepseek_v41_vllm_config(getattr(runner, "vllm_config", None))
     )
+    install_host_lengths_gate()
 
 
 def install_v41_group_check_scope() -> bool:
@@ -548,8 +552,12 @@ def install_v41_slot_owner_release() -> None:
     PSI.register_slot_allocator(V41_SLOT_OWNER_RECORDS)
 
 
-def install_v41_state_checkpoint_group_ids() -> int:
-    """Record each checkpoint layer's KV cache group id on whichever runner runs.
+def install_v41_kv_cache_group_ids() -> int:
+    """Record the KV cache group id of each checkpoint layer and of the proxy.
+
+    The proxy's id names the group whose host rows are the step's PAGE rows
+    (`snapshot_v41_batch`). The checkpoint layers' ids are recorded on
+    whichever runner runs, for the reason below.
 
     Same gap as `install_v41_store_sites`, on a different site and with a
     worse failure: the vendored installer wraps
@@ -572,7 +580,7 @@ def install_v41_state_checkpoint_group_ids() -> int:
     patched = 0
     for cls in gpu_model_runner_classes():
         original = getattr(cls, "initialize_kv_cache", None)
-        if original is None or getattr(original, "_atom_v41_checkpoint_gids", False):
+        if original is None or getattr(original, "_atom_v41_kv_cache_gids", False):
             continue
 
         @functools.wraps(original)
@@ -583,9 +591,11 @@ def install_v41_state_checkpoint_group_ids() -> int:
                     layer = sfc.get(name)
                     if isinstance(layer, PagedStateCheckpointLayer):
                         layer._atom_state_checkpoint_group_id = gid
+                    elif getattr(layer, "_atom_v41_proxy_layer", False):
+                        layer._atom_v41_page_group_id = gid
             return _orig(self, kv_cache_config, *args, **kwargs)
 
-        initialize_kv_cache._atom_v41_checkpoint_gids = True
+        initialize_kv_cache._atom_v41_kv_cache_gids = True
         cls.initialize_kv_cache = initialize_kv_cache
         patched += 1
     return patched

@@ -41,14 +41,12 @@ persistent, host-resident request mapping that ``CommonAttentionMetadata`` does
 not carry -- how many requests this step actually scheduled, their batch order,
 and the input ids -- which is what its STATE slots are keyed on.
 
-Not a host mirror of the PAGE table, and not a way to avoid that sync: the
-V2 runner's ``InputBatch`` has no full host block table, and its host sequence
-lengths can be optimistic under async speculation, so V4.1 still reads the
-exact lengths and PAGE rows with blocking copies (``snapshot_v41_batch``).
-The checkpoint groups' rows, read per element, come from the host
-(``install_v2_host_block_rows``).
-Removing the D2H is what this patch does for V4's slot assignment, above; it is
-not what V4.1 uses it for.
+The V2 runner's ``InputBatch`` has no host block table, and its host sequence
+lengths run ahead of the device's while a step's drafts are unverified. V4.1
+takes its PAGE rows from the rows this module rebuilds on the host
+(``install_v2_host_block_rows``, ``host_block_rows``), and its lengths from the
+host once they are exact (``host_lengths_exact``); otherwise
+``snapshot_v41_batch`` reads them from the device.
 """
 
 from __future__ import annotations
@@ -215,6 +213,74 @@ def install_v2_host_block_rows(wanted) -> int:
     return patched
 
 
+def host_block_rows(req_ids, group: int, widths):
+    """The first `widths[i]` block ids of `group` for each of `req_ids`.
+
+    Read from `_HostRows`. None when the rows are not kept, or when any
+    request is not among them or holds fewer blocks than asked: the caller
+    then reads the step's device table instead.
+    """
+    host_rows = _V2_HOST_ROWS
+    if host_rows is None:
+        return None
+    rows = host_rows.rows
+    out = []
+    for req_id, width in zip(req_ids, widths):
+        groups = rows.get(req_id)
+        if groups is None or group >= len(groups) or len(groups[group]) < width:
+            return None
+        out.append(tuple(groups[group][:width]))
+    return out
+
+
+#: Whether this worker's step lengths on the host are exact; see
+#: `install_host_lengths_gate`.
+_HOST_LENGTHS_EXACT = False
+
+
+def host_lengths_exact() -> bool:
+    """Whether a V2 step's host `seq_lens_cpu_upper_bound` is its exact length."""
+    return _HOST_LENGTHS_EXACT
+
+
+def install_host_lengths_gate() -> bool:
+    """Open `host_lengths_exact` once vLLM's warmup has returned.
+
+    V2 keeps two counts per request: the scheduler's, on the host, and its
+    own, on the device, which is what positions and `seq_lens` are built
+    from. A synchronous scheduler has the previous step's accepted drafts
+    before it schedules the next, so the two agree on every step it schedules.
+    vLLM's warmup (`warmup_kernels`) schedules its own speculative steps as if
+    every draft were accepted, so there the host runs ahead (13 against 9).
+    The gate is shut during `Worker.compile_or_warm_up_model` and opens after
+    it only for the V2 runner under synchronous scheduling; never installed,
+    it stays shut. Returns whether this call patched.
+    """
+    try:
+        from vllm.v1.worker.gpu_worker import Worker
+    except ImportError:
+        return False
+    original = getattr(Worker, "compile_or_warm_up_model", None)
+    if original is None or getattr(original, "_atom_host_lengths_gate", False):
+        return False
+
+    @functools.wraps(original)
+    def compile_or_warm_up_model(self, *args, **kwargs):
+        global _HOST_LENGTHS_EXACT
+        _HOST_LENGTHS_EXACT = False
+        result = original(self, *args, **kwargs)
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        _HOST_LENGTHS_EXACT = bool(
+            getattr(self, "use_v2_model_runner", False)
+            and getattr(scheduler_config, "async_scheduling", None) is False
+        )
+        return result
+
+    compile_or_warm_up_model._atom_host_lengths_gate = True
+    Worker.compile_or_warm_up_model = compile_or_warm_up_model
+    return True
+
+
 class _BlockTableGroupView:
     """`batch.block_table[g]` for a runner that keeps no host mirror."""
 
@@ -237,8 +303,8 @@ class _V2InputBatchView:
     of the whole pool-wide table. Readers of every other attribute get the
     real batch.
 
-    Either way `.np` is not the trimmed host array `snapshot_v41_batch` reads
-    every step, so it takes its own (`copies_whole_table`).
+    Either way `.np` is not a trimmed host array of the step's rows, so
+    `snapshot_v41_batch` takes its own (`copies_whole_table`).
     """
 
     __slots__ = ("_batch", "_cache", "_computed", "_tables")
@@ -264,15 +330,14 @@ class _V2InputBatchView:
         """V1's name for the per-row computed counts; V2 calls it `_np`.
 
         Batch-row order, NOT the block table's order. On V2 this is the
-        batch's own count and is NOT independent of the step: measured, it
-        disagrees with `seq_lens - query_lens` on some batches (13 vs 9) and
-        agrees on others, and no field of the V2 batch reproduces the step's
-        number (`num_draft_tokens_per_req` corrects one case and breaks the
-        other). V4.1 therefore takes its decode-keep starts from the step's own
-        `seq_lens - query_lens` (`snapshot_v41_batch`), not from here; the
-        class declares `atom_row_order_unverifiable`, and the row-order
-        cross-check skips rather than fire on a difference that says nothing
-        about row order. The two index spaces are
+        scheduler's count, built in the same row order as the step: it is
+        not an independent ordering to check rows against, and it runs ahead
+        of `seq_lens - query_lens` (13 vs 9) on the steps vLLM's warmup
+        schedules (see `install_host_lengths_gate`). `snapshot_v41_batch`
+        takes its lengths from the step, and the class declares
+        `atom_row_order_unverifiable`, so the row-order cross-check skips
+        rather than fire on a difference that says nothing about row order.
+        The two index spaces are
         the same object on V1's persistent batch and different on V2, so this
         one is left in row order deliberately: its readers are row-order
         readers -- `_check_row_alignment` compares it against the step's own

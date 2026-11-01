@@ -256,7 +256,7 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
     stage.side_effect = lambda *_, **__: order.append("stage") or prepared
     scope = {
         "ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME": "proxy",
-        "snapshot_v41_batch": lambda _: snapshot,
+        "snapshot_v41_batch": lambda _, page_group=None: snapshot,
         "bind_deepseek_v41_proxy_cache": lambda *_: bound,
         "_v41_store_last_steps_decode_keeps": keeps,
         "_v41_stage_outside_forward": stage,

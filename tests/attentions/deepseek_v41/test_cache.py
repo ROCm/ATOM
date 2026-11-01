@@ -664,13 +664,13 @@ def test_the_plugin_cache_restores_on_a_deferred_read(small_config, monkeypatch)
     """A restore has to land before the reset and the Engram staging.
 
     The deferred read judges a step's cursors only on the next call, after
-    both, so with a restore installed the read blocks even when the caller and
-    `ATOM_V41_BLOCKING_STATE_PROBE=0` ask for the deferred one.
+    both, so with a restore installed the read blocks even when the caller
+    asks for the deferred one, which is the default.
     """
-    monkeypatch.setenv("ATOM_V41_BLOCKING_STATE_PROBE", "0")
+    monkeypatch.delenv("ATOM_V41_BLOCKING_STATE_PROBE", raising=False)
     geo = replace(geometry(small_config), window_size=32)
     resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
-    # Without a restore the opt-out still defers the read.
+    # Without a restore the read stays deferred.
     plain = _plugin_cache(geo, 8, 4)
     assert plain.prepare_state(begin_step(plain, [resumed]), histories=False) is None
 
@@ -693,9 +693,18 @@ def test_the_plugin_cache_restores_on_a_deferred_read(small_config, monkeypatch)
     cache.prepare_state(begin_step(cache, [replace(resumed, position=8)]))
 
 
+def test_the_blocking_probe_switch_reads_every_step(small_config, monkeypatch):
+    """`ATOM_V41_BLOCKING_STATE_PROBE=1` reads before the forward even with
+    nothing to restore."""
+    monkeypatch.setenv("ATOM_V41_BLOCKING_STATE_PROBE", "1")
+    cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
+    fresh = PagedRequest(27, 0, 0, 1, 0, (0, 1))
+    assert cache.prepare_state(begin_step(cache, [fresh]), histories=False) is not None
+
+
 def test_the_plugin_cache_defers_a_step_with_nothing_to_restore(small_config):
     """Only a row above its floor that did not run last step can need a
-    restore; with the opt-out every other step keeps the deferred read."""
+    restore; every other step keeps the deferred read."""
     cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
     resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
     assert cache._may_restore(begin_step(cache, [resumed]))

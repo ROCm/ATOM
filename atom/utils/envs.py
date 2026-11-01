@@ -473,10 +473,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_V41_STATE_CHECKPOINTS", "0").lower() in ("1", "true")
     ),
     # vLLM plugin, DeepSeek-V4.1: read the state cursors with a blocking D2H
-    # every step. 0 defers the read a step, except on a step that may restore
-    # a state checkpoint.
+    # every step. Off (the default), the read is judged a step later, as on
+    # native ATOM, except on a step that may restore a state checkpoint.
     "ATOM_V41_BLOCKING_STATE_PROBE": lambda: (
-        os.getenv("ATOM_V41_BLOCKING_STATE_PROBE", "1").lower() not in ("0", "false")
+        os.getenv("ATOM_V41_BLOCKING_STATE_PROBE", "0").lower() in ("1", "true")
     ),
     # vLLM plugin, state checkpoints: after every schedule, check that no
     # request holds more than two blocks per state checkpoint group (diagnostic).

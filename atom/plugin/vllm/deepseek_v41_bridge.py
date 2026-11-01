@@ -716,8 +716,9 @@ def _v41_step_input_ids(running_tokens):
 class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
     """Snapshot and prepare the step before entering the captured forward.
 
-    The snapshot retains the exact sequence lengths and PAGE rows, including
-    their required device-to-host reads. ATOM's metadata builder then stages
+    The snapshot takes the exact sequence lengths and PAGE rows from the host
+    where the host has them, and from the device otherwise
+    (`snapshot_v41_batch`). ATOM's metadata builder then stages
     Engram rows, cursor advances and slot resets once, outside the graph. The
     forward consumes ``atom_v41_prepared`` and kernels read the persistent
     buffers refreshed here. Profiling FULL capture uses private scratch;
@@ -790,11 +791,12 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
         """
         if common_attn_metadata is None:
             return common_attn_metadata
-        common_attn_metadata.atom_v41_snapshot = snapshot_v41_batch(
-            common_attn_metadata
-        )
         sfc = self.vllm_config.compilation_config.static_forward_context
         proxy = sfc.get(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME)
+        common_attn_metadata.atom_v41_snapshot = snapshot_v41_batch(
+            common_attn_metadata,
+            page_group=getattr(proxy, "_atom_v41_page_group_id", None),
+        )
         model = getattr(proxy, "_atom_v41_model", None)
         builder = getattr(proxy, "_atom_v41_builder", None)
         if model is None or builder is None:
@@ -903,6 +905,10 @@ class AtomDeepseekV41ProxyAttention(nn.Module, AttentionLayerBase):
         # `bind_deepseek_v41_proxy_cache`.
         self._atom_v4_proxy_layer = True
         self._atom_v4_profiling_kv_cache = False
+        # This layer's KV cache group, written by
+        # `install_v41_kv_cache_group_ids`; the builder reads the step's PAGE
+        # rows from the host rows of this group.
+        self._atom_v41_page_group_id = None
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AtomDeepseekV41ProxyBackend
@@ -964,14 +970,16 @@ def _v41_scheduled_request_count(common_attn_metadata) -> int:
     return padded if scheduled is None else min(padded, int(scheduled))
 
 
-def snapshot_v41_batch(common_attn_metadata):
+def snapshot_v41_batch(common_attn_metadata, page_group=None):
     """Snapshot exact step metadata and V2's persistent request indices.
 
-    V2 normally needs blocking D2H reads for exact sequence lengths and PAGE
-    rows: its host sequence lengths can be optimistic under async speculation,
-    and its InputBatch has no full host block table. Do not replace these reads
-    with upper bounds. Request ids and STATE indices are already in batch order
-    on the host; their copies must describe this same metadata preparation.
+    Like native ATOM, from the host where the host is exact: the lengths once
+    `host_lengths_exact` says the host upper bound is the step's own, and the
+    PAGE rows from the host rows of `page_group` (the proxy layer's KV cache
+    group) when every row of the step is there. Otherwise each is read from
+    the device, with a blocking copy. Request ids and STATE indices are
+    already in batch order on the host; their copies must describe this same
+    metadata preparation.
     """
     num_reqs = _v41_scheduled_request_count(common_attn_metadata)
     qsl = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].numpy()
@@ -996,19 +1004,21 @@ def snapshot_v41_batch(common_attn_metadata):
     # one request's `num_computed` with another's `query_len` yields a span
     # whose position is some other request's, and the V4.1 state cursor --
     # which is checked exactly -- then refuses the forward.
-    seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
-    if seq_lens_cpu is None:
-        seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].cpu()
+    from atom.plugin.vllm.req_id_passthrough_patch import (
+        host_block_rows,
+        host_lengths_exact,
+    )
+
+    seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+    if seq_lens_cpu is None or not host_lengths_exact():
+        seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].cpu()
     seq_lens_np = np.asarray(seq_lens_cpu[:num_reqs], dtype=np.int64)
     num_computed = seq_lens_np - query_lens
 
     block_table_np = None
     req_ids = None
-    # The end position each request reaches this step, which is what decides
-    # how many PAGE columns are live. Computed here because the fallback copy
-    # below is sized from it; `ends` below is the same arithmetic kept in the
-    # order the batch protocol documents.
-    ends_preview = (num_computed + query_lens).astype(np.int64)
     if input_batch is not None:
         # Two separate acquisitions, because the two live on different
         # runners. The V2 `InputBatch` has `req_ids` and no block table at
@@ -1022,8 +1032,9 @@ def snapshot_v41_batch(common_attn_metadata):
             # The accessor is an ATOM patch over another engine's internals;
             # absent is the caller's ordinary "fall back" case.
             req_ids = None
-        # Not V2's view: it copies the pool-wide table, and the trimmed copy
-        # below reads only the columns this step needs.
+        # Not V2's view: it reads the pool-wide table per element. This
+        # step's rows come from `host_block_rows` below, or from a copy of
+        # only the columns this step needs.
         host_table = (
             None
             if getattr(input_batch, "copies_whole_table", False)
@@ -1040,23 +1051,27 @@ def snapshot_v41_batch(common_attn_metadata):
             # slot by one request and the position by another, which is wrong
             # output rather than a crash, so it has to reach the caller.
             _check_row_alignment(input_batch, num_computed, num_reqs)
-    if block_table_np is None:
-        # Only the columns this step reads. The whole table was being copied
-        # and then sliced per request; its width is the pool's, not this
-        # step's, so the copy was paying for every PAGE a request could ever
-        # own rather than the ones it owns now.
-        widest = -(-int(max(ends_preview, default=0)) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
-        table = common_attn_metadata.block_table_tensor
-        block_table_np = table[:num_reqs, : max(widest, 1)].cpu().numpy()
-
     # `context_lens` in ATOM's batch protocol is the request's end position
-    # after this step -- vLLM's `seq_lens`.
+    # after this step -- vLLM's `seq_lens`. It decides how many PAGE columns
+    # are live.
     ends = (num_computed + query_lens).astype(np.int64)
-    block_rows = []
-    for i in range(num_reqs):
-        needed = -(-int(ends[i]) // ATOM_DEEPSEEK_V41_BLOCK_SIZE)
-        row = block_table_np[i, :needed]
-        block_rows.append(tuple(int(block) for block in row))
+    widths = [-(-int(end) // ATOM_DEEPSEEK_V41_BLOCK_SIZE) for end in ends]
+    block_rows = None
+    if block_table_np is None and page_group is not None and req_ids is not None:
+        block_rows = host_block_rows(req_ids, page_group, widths)
+    if block_rows is None:
+        if block_table_np is None:
+            # Only the columns this step reads. The whole table was being
+            # copied and then sliced per request; its width is the pool's, not
+            # this step's, so the copy was paying for every PAGE a request
+            # could ever own rather than the ones it owns now.
+            table = common_attn_metadata.block_table_tensor
+            widest = max(widths, default=0)
+            block_table_np = table[:num_reqs, : max(widest, 1)].cpu().numpy()
+        block_rows = [
+            tuple(int(block) for block in block_table_np[i, : widths[i]])
+            for i in range(num_reqs)
+        ]
     ids_from_patch = req_ids is not None
     if req_ids is None:
         # No pass-through patch: key on the request's first block, which vLLM

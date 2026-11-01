@@ -836,6 +836,54 @@ def test_slot_owner_records_are_released_with_the_slots():
     assert sum(a is V41_SLOT_OWNER_RECORDS for a in psc._slot_allocators) == 1
 
 
+def test_the_proxy_and_checkpoint_layers_learn_their_kv_cache_groups(monkeypatch):
+    """Written before `initialize_kv_cache` runs, from its own argument: the
+    proxy's group is where the step's PAGE rows are read on the host."""
+    from atom.plugin.vllm import vllm_runtime
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+        AtomDeepseekV41ProxyAttention,
+    )
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        install_v41_kv_cache_group_ids,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import PagedStateCheckpointLayer
+
+    proxy = AtomDeepseekV41ProxyAttention()
+    checkpoint = PagedStateCheckpointLayer("ckpt.0", 0, 1, adapter=None)
+    seen = []
+
+    class _Runner:
+        compilation_config = SimpleNamespace(
+            static_forward_context={
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME: proxy,
+                "ckpt.0": checkpoint,
+            }
+        )
+
+        def initialize_kv_cache(self, kv_cache_config):
+            seen.append(
+                (
+                    proxy._atom_v41_page_group_id,
+                    checkpoint._atom_state_checkpoint_group_id,
+                )
+            )
+
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_Runner])
+    assert install_v41_kv_cache_group_ids() == 1
+    assert install_v41_kv_cache_group_ids() == 0
+    _Runner().initialize_kv_cache(
+        SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=["draft.0"]),
+                SimpleNamespace(layer_names=[ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME]),
+                SimpleNamespace(layer_names=["ckpt.0"]),
+            ]
+        )
+    )
+    assert seen == [(1, 2)]
+
+
 def test_decode_keeps_are_stored_by_the_next_build_before_it_stages(monkeypatch):
     """The keep a step committed to is stored at the next build, at the start
     that build's snapshot reports, and on its own descriptor buffer -- no copy
