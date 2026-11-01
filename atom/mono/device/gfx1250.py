@@ -21,6 +21,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -216,6 +217,20 @@ def lds_reads_done():
     """Until this wave's LDS reads are done: an async copy into LDS a read of the
     wave may still be reading (its write lands whenever the copy returns)."""
     rocdl.s_wait_dscnt(0)
+
+
+def lds_barrier():
+    """The workgroup's barrier for its LDS alone: every wave's LDS operations
+    done, then s_barrier, nothing waited for of its global stores. ``gpu.barrier``'s
+    release fence waits for every store to complete, a peer GPU's stores a fabric
+    round trip; the asm's memory clobber still keeps every access on its side."""
+    llvm.InlineAsmOp(
+        None,
+        [],
+        "s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait 0xffff",
+        "~{memory}",
+        has_side_effects=True,
+    )
 
 
 def release_stores():
