@@ -611,7 +611,6 @@ def install_v41_store_sites() -> int:
         _workers,
         flush_worker,
         install_store_sites,
-        store_committed_decode_keeps,
     )
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
@@ -659,7 +658,6 @@ def install_v41_store_sites() -> int:
             if not v41_speculative_step_is_pending():
                 for worker in list(_workers.values()):
                     flush_worker(worker)
-                    store_committed_decode_keeps(worker)
             return output
 
         execute_model._atom_v41_store_site = True

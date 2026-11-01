@@ -351,12 +351,10 @@ def patch_v41_speculative_commit() -> int:
                 from atom.plugin.vllm.paged_state_checkpoint import (
                     _workers,
                     flush_worker,
-                    store_committed_decode_keeps,
                 )
 
                 for _worker in list(_workers.values()):
                     flush_worker(_worker)
-                    store_committed_decode_keeps(_worker, num_rejected)
             # Forwarded by keyword, so a caller that omitted the optional
             # argument reaches the original having omitted it too rather than
             # being given a None this wrapper invented.

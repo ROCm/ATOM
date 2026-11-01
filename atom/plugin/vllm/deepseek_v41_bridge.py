@@ -807,6 +807,10 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
         )
         if not bound and not profiling:
             return common_attn_metadata
+        if not capturing:
+            _v41_store_last_steps_decode_keeps(
+                self.vllm_config, common_attn_metadata.atom_v41_snapshot
+            )
         prepared = _v41_stage_outside_forward(
             builder,
             model,
@@ -2024,6 +2028,41 @@ def atom_deepseek_v41_forward_context(
         reset_forward_context()
 
 
+def _v41_store_last_steps_decode_keeps(vllm_config, snapshot) -> None:
+    """The decode keeps the last step committed to, before this step stages.
+
+    Each row starts this step at the end the last one committed
+    (`snapshot.num_computed`, the step's own `seq_lens - query_lens`), which is
+    the boundary a keep is looked up by. The scheduler keeps one only for a
+    request continuing on its own slot into this step (`_decide_committed`),
+    so that slot still holds the committed state -- until `_prepare`: a step
+    that is not speculative advances the cursor while it stages, and a keep
+    stored after that pairs the last step's window with this step's cursor.
+    Native ATOM issues these copies at the same point, in the next batch's
+    build before the batch writes the slot. Its starts are the snapshot's, so
+    nothing waits on the sampler's rejection counts.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        current_state_checkpoint_worker,
+        register_v41_state_checkpoint_adapter,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import (
+        state_checkpoints_on,
+        store_decode_keeps,
+    )
+    from atom.plugin.vllm.req_id_passthrough_patch import get_current_req_ids
+
+    adapter = register_v41_state_checkpoint_adapter()
+    if snapshot is None or not state_checkpoints_on(adapter, vllm_config):
+        return
+    worker = current_state_checkpoint_worker(adapter)
+    if worker is None or not worker.decode_candidates:
+        return
+    starts = np.asarray(snapshot.num_computed, dtype=np.int64)
+    req_ids = list(get_current_req_ids() or [])[: len(starts)]
+    store_decode_keeps(worker, req_ids, starts, fresh_rows=())
+
+
 def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, prepared):
     """This step's checkpoint work, through `paged_state_checkpoint`.
 
@@ -2037,8 +2076,8 @@ def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, pre
     Speculation needs no special case here. A speculative step's own ends are
     the drafted ends, and the mechanism already defers on that through
     `StateCheckpointWorker.decode_candidates` -- every boundary the step could
-    commit to is recorded, and `store_committed_decode_keeps` stores the one
-    it did once the step commits.
+    commit to is recorded, and the next build stores the one it did
+    (`_v41_store_last_steps_decode_keeps`).
     """
     from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
         current_state_checkpoint_worker,

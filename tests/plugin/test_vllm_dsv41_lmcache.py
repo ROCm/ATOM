@@ -836,35 +836,26 @@ def test_slot_owner_records_are_released_with_the_slots():
     assert sum(a is V41_SLOT_OWNER_RECORDS for a in psc._slot_allocators) == 1
 
 
-def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
-    """The V2 runner commits from `sample_tokens`, after `prepare_attn` has
-    returned and the batch getters with it. The keep is still stored, at the
-    committed end, from the rows its build recorded."""
+def test_decode_keeps_are_stored_by_the_next_build_before_it_stages(monkeypatch):
+    """The keep a step committed to is stored at the next build, at the start
+    that build's snapshot reports, and on its own descriptor buffer -- no copy
+    of the sampler's rejection counts. A row that did not land on a boundary
+    stores nothing."""
     import numpy as np
 
+    from atom.plugin.vllm import deepseek_v41_state_checkpoint as v41ckpt
     from atom.plugin.vllm import paged_state_checkpoint as psc
     from atom.plugin.vllm import req_id_passthrough_patch as passthrough
 
-    worker = SimpleNamespace(
-        group_ids=[0], copier=None, decode_candidates={}, decode_rows=None
-    )
-
-    class _ModelState:
-        def prepare_attn(self, input_batch, cudagraph_mode, block_tables):
-            psc.record_decode_candidates(
-                worker,
-                passthrough.get_current_req_ids(),
-                [3, 4],
-                input_batch.num_computed_tokens_cpu,
-                np.array([6, 6]),
-                256,
-                "V4.1",
-            )
-
-    passthrough._wrap_with_req_id_snapshot(
-        _ModelState, "prepare_attn", batch_from_arg=True
+    worker = SimpleNamespace(group_ids=[0], copier=None, decode_candidates={})
+    store_keeps = _from_source(
+        "atom/plugin/vllm/deepseek_v41_bridge.py",
+        "_v41_store_last_steps_decode_keeps",
+        {"np": np},
     )
     monkeypatch.setattr(psc, "_decode_plan", {"a": 0, "b": 0})
+    monkeypatch.setattr(psc, "state_checkpoints_on", lambda _adapter, _config: True)
+    monkeypatch.setattr(v41ckpt, "current_state_checkpoint_worker", lambda _a: worker)
     monkeypatch.setattr(
         psc,
         "state_checkpoint_unit_ids",
@@ -878,17 +869,62 @@ def test_decode_keeps_are_stored_after_prepare_attn_returns(monkeypatch):
             (slots, units, descriptor_slot)
         ),
     )
-    batch = SimpleNamespace(
-        req_ids=["a", "b"], num_computed_tokens_cpu=np.array([250, 1020])
+
+    class _ModelState:
+        def prepare_attn(self, input_batch, cudagraph_mode, block_tables, step):
+            step(input_batch)
+
+    passthrough._wrap_with_req_id_snapshot(
+        _ModelState, "prepare_attn", batch_from_arg=True
     )
-    _ModelState().prepare_attn(batch, None, None)
-    assert passthrough.get_current_req_ids() is None
-    # Six rows each (one token plus five drafts); "a" keeps 6, "b" keeps 4,
-    # so "a" commits to 256 and "b" to 1024, block columns 0 and 3.
-    psc.store_committed_decode_keeps(worker, np.array([0, 2]))
-    # On its own descriptor buffer, apart from the step's boundary stores.
-    assert stored == [([3, 4], [(0,), (3,)], 2)]
-    assert worker.decode_candidates == {} and worker.decode_rows is None
+    batch = SimpleNamespace(req_ids=["a", "b"])
+    # Six rows each (one token plus five drafts): "a" could commit to 256,
+    # "b" to 1024 (block columns 0 and 3).
+    _ModelState().prepare_attn(
+        batch,
+        None,
+        None,
+        lambda _b: psc.record_decode_candidates(
+            worker,
+            passthrough.get_current_req_ids(),
+            [3, 4],
+            np.array([250, 1020]),
+            np.array([6, 6]),
+            256,
+            "V4.1",
+        ),
+    )
+    # Next build: "a" committed all six and starts at 256, "b" three of six.
+    snapshot = SimpleNamespace(num_computed=np.array([256, 1023]))
+    _ModelState().prepare_attn(
+        batch, None, None, lambda _b: store_keeps(None, snapshot)
+    )
+    assert stored == [([3], [(0,)], 2)]
+    assert worker.decode_candidates == {}
+
+
+def test_the_next_build_stores_keeps_before_it_stages():
+    """A step that is not speculative advances the cursor while it stages."""
+    import ast
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[2] / "atom/plugin/vllm/deepseek_v41_bridge.py"
+    )
+    tree = ast.parse(path.read_text())
+    build = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_build_and_attach"
+    )
+    calls = [
+        n.func.id
+        for n in sorted(ast.walk(build), key=lambda n: getattr(n, "lineno", 0))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    ]
+    assert calls.index("_v41_store_last_steps_decode_keeps") < calls.index(
+        "_v41_stage_outside_forward"
+    )
 
 
 def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):
