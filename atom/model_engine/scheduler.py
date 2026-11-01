@@ -3556,13 +3556,10 @@ class Scheduler:
           batch to issue a copy on either;
         - the seq is still on its prompt, where the prefill call site has
           already decided using the prompt's own remainder;
-        - speculative decode, for a class that checkpoints by forking. Two
-          reasons, and either is enough. The spec path's state index has no
-          read-side counterpart (see
-          `GDNAttentionMetadataBuilder.prepare_state_indices`), so a fork must
-          never reach it. And a spec step commits `1 + accepted_drafts` tokens,
-          which is what a fork's successor actually gets — the rest is rolled
-          back and re-forwarded — so no promise made here can be kept.
+        - speculative decode, for a class that checkpoints by forking. A spec
+          step commits `1 + accepted_drafts` tokens, which is what a fork's
+          successor actually gets — the rest is rolled back and re-forwarded —
+          so no promise made here can be kept.
           Checkpointing during *prefill* stays safe on the same models:
           `min_fork_tokens` guarantees prompt is left over, and prompt always
           forwards down the non-spec path.
