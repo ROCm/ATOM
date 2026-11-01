@@ -26,7 +26,11 @@ import torch
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
 # never reuse one another's objects even when the HF model config is identical.
-PAGE_LAYOUT_VERSION = 3
+# Version 4 hashes `sliding_window` and `candidate_block_size`, a canonical
+# `head_dim`, and the speculative config without per-process or nested
+# model-config fields. That moves every model's digest, so objects stored under
+# version 3 are unreachable.
+PAGE_LAYOUT_VERSION = 4
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -34,6 +38,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "kimi_k3": "kimi_k3",
     "qwen": "qwen",
     "m3": "m3",
+    "dsv41": "dsv41",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -53,6 +58,11 @@ _HF_PAGE_FIELDS = (
     "compress_ratios",
     "indexer_dtype",
     "indexer_types",
+    # DeepSeek-V4.1: `sliding_window` sizes the per-request window ring and
+    # `candidate_block_size` pages the index plane, so either one moves the
+    # bytes a stored object holds while every field above stays put.
+    "sliding_window",
+    "candidate_block_size",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
@@ -80,12 +90,23 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
 
 # Layouts that own a tier for a model's per-request *recurrent* state.
 # `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
-# PAGE image. `hybrid` (DSV4 sparse-attention checkpoints) is not
+# PAGE image; `dsv41` is DeepSeek-V4.1's CSA2 window rings, compressor rings
+# and Engram cursor. `hybrid` (DSV4 sparse-attention checkpoints) is not
 # recurrent-state and dense<->hybrid is a legitimate operator override for
 # namespace separation. An explicit `offload_layout` override may not
 # downgrade a recurrent-state model to a layout that owns no tier for it
 # (silent wrong output) -- see `select_offload_layout`.
-_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen"})
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen", "dsv41"})
+
+# Every spelling of the V4.1 family, mirroring `atom.utils.selector._V41_TYPES`.
+# Matching only the text config's own type left the wrapper and DSpark
+# spellings to fall through to the `compress_ratios` probe below and resolve to
+# `hybrid` -- outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense`
+# override would be honoured on a model that carries per-request state, and
+# sharing DSV4's key space besides.
+_DSV41_MODEL_TYPES = frozenset(
+    {"deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"}
+)
 
 logger = logging.getLogger("atom")
 
@@ -155,17 +176,28 @@ def select_offload_layout(config) -> str:
             "does not preserve the NSA index cache. Drop the override or set "
             "it to 'm3'."
         )
-    # An override may pick between compatible layouts, but it may not strip a
-    # state-owning model down to a layout with no tier for its per-request state
-    # -- the same silent-wrong-output the GDN refusal pre-empts, reached by a
-    # different door (an explicit `dense` rather than a fall-through).
-    if natural in _STATE_OWNING_LAYOUTS and mapped not in _STATE_OWNING_LAYOUTS:
+    # An override may pick between compatible layouts, but a state-owning
+    # model's state tier is its own: any other layout, state-owning or not,
+    # has no tier for that state -- the same silent-wrong-output the GDN
+    # refusal pre-empts, reached by a different door (an explicit override
+    # rather than a fall-through). `dsv41` on a K3 model, say, reaches the
+    # dense connector with the state tier off.
+    if natural in _STATE_OWNING_LAYOUTS and mapped != natural:
         raise ValueError(
             f"lmcache_offload: offload_layout={override!r} would run a "
             f"{natural!r}-family model (per-request recurrent state) on the "
             f"{mapped!r} layout, which owns no tier for that state -- its KV "
             "prefix would be restored over stale state (silent wrong output). "
-            "Drop the override, or disable offload for this model."
+            f"Drop the override, set it to {natural!r}, or disable offload for "
+            "this model."
+        )
+    # The reverse for the one layout this alias table gained for a single
+    # family: `dsv41` names DeepSeek-V4.1's PAGE+STATE pool, and any other
+    # model would run the dense codec under its namespace with collapse off.
+    if mapped == "dsv41" and natural != "dsv41":
+        raise ValueError(
+            f"lmcache_offload: offload_layout={override!r} is DeepSeek-V4.1's "
+            f"layout; this model resolves to {natural!r}. Drop the override."
         )
     return mapped
 
@@ -207,6 +239,16 @@ def _layout_from_model(config) -> str:
     # KDA per-request state that a reusable prefix also needs.
     if model_type == "kimi_linear":
         return "kimi_k3"
+    # DeepSeek-V4.1 before the `compress_ratios` probe below, which it would
+    # otherwise answer: V4.1 declares compress ratios exactly as DSV4 does, but
+    # it also carries per-request CSA2 state (window ring per layer, the
+    # compressor's incomplete group, the Engram cursor) that the `hybrid`
+    # PAGE+SLOT codec owns no tier for. Resolving it to `hybrid` would both
+    # share DSV4's key space and leave it outside `_STATE_OWNING_LAYOUTS`, so
+    # an `offload_layout: dense` override would silently restore a KV prefix
+    # over a window ring that never existed.
+    if model_type in _DSV41_MODEL_TYPES:
+        return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
     # GDN publishes the same PAGE-image contract the kimi_k3 tier already
@@ -256,10 +298,42 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
+def _canonical_head_dim(hf: object) -> int | None:
+    """Return the attention head dim every process agrees on.
+
+    ``head_dim`` is not a stable property of the checkpoint: for MLA models it
+    is absent from ``config.json`` and each process fills it in on its own.
+    A scheduler process can keep transformers' computed default
+    (``hidden_size // num_attention_heads``, 74 for Kimi K3) while the workers
+    that build the model end up with the MLA head dim (``qk_nope + qk_rope``,
+    192), as `Config.__post_init__` notes for ATOM's own.  Hashing the
+    attribute therefore splits the PAGE namespace in two: the workers publish
+    their layout under one name, every lookup asks for the other, and the tier
+    answers every lookup with a miss and no error.  Derive it from the fields
+    that do come from the checkpoint instead.
+    """
+
+    qk_nope = getattr(hf, "qk_nope_head_dim", None)
+    qk_rope = getattr(hf, "qk_rope_head_dim", None)
+    if qk_nope and qk_rope:
+        return int(qk_nope) + int(qk_rope)
+    head_dim = getattr(hf, "head_dim", None)
+    if head_dim:
+        return int(head_dim)
+    hidden_size = getattr(hf, "hidden_size", None)
+    num_heads = getattr(hf, "num_attention_heads", None)
+    if hidden_size and num_heads:
+        return int(hidden_size) // int(num_heads)
+    return None
+
+
 def _stable_hf_geometry(hf: object) -> dict[str, Any]:
     geometry: dict[str, Any] = {}
     for name in _HF_PAGE_FIELDS:
-        value = getattr(hf, name, None)
+        if name == "head_dim":
+            value = _canonical_head_dim(hf)
+        else:
+            value = getattr(hf, name, None)
         if value is not None and name in _HF_INTEGER_GEOMETRY_FIELDS:
             value = _strict_integer(f"PAGE {name}", value)
         elif value is not None and name == "compress_ratios":
@@ -349,6 +423,7 @@ def build_page_namespace(
         "page_mode": {
             "hybrid": "dsv4-page-regions",
             "m3": "m3-page-regions",
+            "dsv41": "dsv41-page-state",
         }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
@@ -375,9 +450,10 @@ def build_page_namespace(
         # The config-time snapshot when there is one; see `Config.__post_init__`.
         "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
         or _stable_hf_geometry(hf),
-        "speculative_config": _stable_config_value(
-            getattr(config, "speculative_config", None)
-        ),
+        # A frontend's own stable form when it supplies one, as for the HF
+        # geometry above: only it knows which of its fields are per-process.
+        "speculative_config": getattr(config, "offload_speculative_config", None)
+        or _stable_config_value(getattr(config, "speculative_config", None)),
     }
     canonical = json.dumps(
         document,
@@ -716,7 +792,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
             minimum=1,
         )
         num_kv_heads_local = max(1, num_kv_heads // tp)
-        raw_head_dim = getattr(hf, "head_dim", 0)
+        # Same derivation the PAGE namespace hashes, so the shape a worker
+        # publishes and the shape the scheduler looks up cannot drift apart.
+        raw_head_dim = _canonical_head_dim(hf) or 0
         normalized_head_dim = (
             0
             if raw_head_dim is None

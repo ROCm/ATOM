@@ -158,10 +158,44 @@ def _admission_is_possible(scheduler) -> bool:
     return len(scheduler.running) + streaming < cap
 
 
+def _kv_holding_request_will_prefill(scheduler) -> bool:
+    """Whether a request that already holds KV blocks is about to prefill.
+
+    vLLM 0.31 keeps a waiting request that holds blocks -- one parked in
+    WAITING_FOR_REMOTE_KVS for a KV connector's load, or one resuming with its
+    blocks -- in `kv_holding_waiting`, not `waiting`, and drains that queue
+    *first*. A parked request whose load has finished is promoted inside
+    `schedule` and prefills the rest of its prompt in the same step, so a
+    check of `waiting` alone never sees it. Measured once a connector could
+    park a V4.1 request at all: a resumed row `(768, 171, 0)` in the same step
+    as a verify row `(1024, 6, 5)`, refused by `_v41_prepare_kwargs`.
+
+    Only requests that will actually prefill count. One still waiting for its
+    load stays parked this step, and an idle streaming-input session waits for
+    its client; counting either would clear the batch's drafts for as long as
+    it waits.
+    """
+    queue = getattr(scheduler, "kv_holding_waiting", None)
+    if not queue:
+        return False
+    from vllm.v1.request import RequestStatus
+
+    done = getattr(scheduler, "finished_recving_kv_req_ids", None) or ()
+    parked = {
+        RequestStatus.WAITING_FOR_REMOTE_KVS,
+        getattr(RequestStatus, "WAITING_FOR_STREAMING_REQ", None),
+    }
+    return any(
+        request.status not in parked or request.request_id in done for request in queue
+    )
+
+
 def _would_mix_prefill_with_drafts(scheduler) -> bool:
     if not any(request.spec_token_ids for request in scheduler.running):
         return False
-    if scheduler.waiting and _admission_is_possible(scheduler):
+    if (
+        scheduler.waiting or _kv_holding_request_will_prefill(scheduler)
+    ) and _admission_is_possible(scheduler):
         return True
     # A running request can still be mid-prompt: chunked prefill keeps it in
     # `running` while it works through the rest of its tokens, and a preempted
@@ -309,6 +343,18 @@ def patch_v41_speculative_commit() -> int:
                     )
                 count = int(num_rejected.shape[0])
                 v41_commit_speculative_state(_anchors(num_rejected, starts, count))
+                # The step's checkpoint stores waited for this commit: the
+                # copier validates every slot against the cache's committed
+                # cursor, so one issued from `execute_model` (before the
+                # sampler ran) raises instead of storing. Flushing here is the
+                # speculative path's equivalent of that site.
+                from atom.plugin.vllm.paged_state_checkpoint import (
+                    _workers,
+                    flush_worker,
+                )
+
+                for _worker in list(_workers.values()):
+                    flush_worker(_worker)
             # Forwarded by keyword, so a caller that omitted the optional
             # argument reaches the original having omitted it too rather than
             # being given a None this wrapper invented.

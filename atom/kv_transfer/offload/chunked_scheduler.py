@@ -99,6 +99,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_specs: dict[str, LoadSpec] = {}
         # req_id -> Sequence (queued to recv this step)
         self._reqs_need_recv: dict[str, object] = {}
+        # Loads this step's `build_connector_meta` declined at dispatch. A
+        # frontend that parked the request on its load reads them to release it
+        # now (`_decline_load`); reset every build.
+        self.declined_loads: set[str] = set()
         # req_id -> HBM chunk frontier for an emitted load. If the load fails,
         # lower the save frontier to this value so recomputed chunks can be
         # stored again.
@@ -226,6 +230,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if not remembered:
                 hit = self._fresh_tier_lookup(seq, sid)
         if hit is None:
+            return 0, False
+        if not hit:
+            # Distinct from `tier_none`: the tier answered and holds nothing
+            # for this prefix. Labelling both of them "hit" is how a run in
+            # which the tier was empty read as a run in which it was full --
+            # `_answer_from_tier_hit` returns at its own `if not hit` and
+            # every probe inside it stays silent.
             return 0, False
         return self._answer_from_tier_hit(seq, sid, hit)
 
@@ -635,6 +646,18 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         adjusted = min(int(chunk), limit)
         return max(1, adjusted)
 
+    #: Whether `abandon_save` really gives a stalled save's blocks back. A
+    #: backend that cannot prove its server stopped reading sets it False and
+    #: bounds a stalled transfer with `enforce_transfer_deadlines` instead.
+    abandons_saves: bool = True
+
+    def enforce_transfer_deadlines(self) -> None:
+        """Fail-stop on a transfer past its deadline, once per scheduler step.
+
+        Called by whoever drives the step after that step's saves are built.
+        Nothing to bound here; the MP backend overrides it.
+        """
+
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
         return True
@@ -661,6 +684,71 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
+        )
+
+    def _decline_load(self, sid, seq, reason, hbm, lmc, need, chunk) -> None:
+        """Skip a load at dispatch, and name it in `declined_loads`.
+
+        A frontend that parked the request on this load before dispatch
+        releases it this step instead of waiting it out.
+        """
+        self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
+        self._clear_pending_load(sid)
+        self.declined_loads.add(sid)
+
+    def _unbuilt_save_is_final(self) -> bool:
+        """Whether a save `_build_save_request` declined stays unbuildable once
+        its request has finished, so its tracker is retired rather than kept
+        for a retry. A layout that declines for a reason that clears (a full
+        pin budget, a source still being written) answers False."""
+        return True
+
+    def _retire_finished_save(self, sid: str, seq) -> None:
+        """Retire a finished request's save that can never be emitted.
+
+        Gives back the suffix leased at teardown, except blocks an earlier
+        operation of this request may still read; `_release_operation_lease`
+        frees those when that operation becomes source-safe.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return
+        self._save_tracker.pop(sid, None)
+        lease_key = id(seq)
+        leased = self._save_lease_blocks.get(lease_key)
+        if not leased:
+            return
+        still_read: set[int] = set()
+        for operation, owner in self._save_operation_owner.items():
+            if owner is seq:
+                still_read.update(
+                    self._save_operation_blocks.get(operation, {}).values()
+                )
+        free = leased - still_read
+        if free:
+            leased.difference_update(free)
+            self._pending_source_safe_releases.append(frozenset(free))
+            self.total_source_safe_released_blocks += len(free)
+        if not leased:
+            self._save_lease_blocks.pop(lease_key, None)
+            self._save_lease_at.pop(lease_key, None)
+            self._save_lease_owner.pop(lease_key, None)
+
+    def _save_source_is_backed(
+        self,
+        block_ids: list[int],
+        saved: int,
+        aligned: int,
+    ) -> bool:
+        """Whether the block table still covers every token the save claims."""
+
+        source_block_size = int(getattr(self, "virtual_block_size", self.block_size))
+        end_block = -(-int(aligned) // source_block_size)  # ceil div
+        if len(block_ids) < end_block:
+            return False
+        start_block = int(saved) // source_block_size
+        return all(
+            block_ids[index] is not None for index in range(start_block, end_block)
         )
 
     def _build_load_request(
@@ -744,6 +832,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         _perf_t0 = time.perf_counter()
         meta = LMCacheOffloadMetadata()
+        self.declined_loads = set()
 
         # Loads
         logger.debug("[OFFLOAD-BUILD] reqs_need_recv=%d", len(self._reqs_need_recv))
@@ -752,6 +841,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         for sid, seq in load_items:
             ls = self._load_specs.pop(sid, None)
             if ls is None or not ls.can_load:
+                self.declined_loads.add(sid)
                 logger.debug(
                     "[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
                     sid,
@@ -770,15 +860,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 seq, ls
             )
             if not should_load:
-                self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
-                self._clear_pending_load(sid)
+                self._decline_load(sid, seq, reason, hbm, lmc, need, chunk)
                 continue
             # This is the one place a retrieve is handed to the worker, so it
             # is where the load's lookup pin has to be live -- a spec derived
             # from a remembered hit has none yet.
             if not self._ensure_lookup_pin(seq, sid, ls):
-                self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
-                self._clear_pending_load(sid)
+                self._decline_load(sid, seq, "tier_lost_prefix", hbm, lmc, need, chunk)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
             # The scheduler needs the physical load floor to publish the
@@ -885,6 +973,29 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 block_ids = list(
                     getattr(seq, "_offload_finished_block_ids", seq.block_table)
                 )
+            if not self._save_source_is_backed(block_ids, saved, aligned):
+                # The blocks holding [saved, aligned) are gone -- a preemption
+                # cleared this sequence's block table while the save was still
+                # queued. Emitting anyway ships a descriptor the worker cannot
+                # honour ("needs N blocks for [start, end), got 0") and kills
+                # the transfer; the tokens are simply not resident to read.
+                self.total_unbacked_saves += 1
+                if late_acquired:
+                    self._block_manager.free_leased_blocks(late_acquired)
+                if getattr(seq, "_offload_finished", False):
+                    # A finished request gets no blocks back, so this would
+                    # repeat every step with the tracker holding its lease.
+                    self._retire_finished_save(sid, seq)
+                logger.warning(
+                    "Offload save of seq %s covers [%d, %d) but its block table "
+                    "holds %d blocks; skipping (total unbacked_saves=%d)",
+                    seq.id,
+                    saved,
+                    aligned,
+                    len(block_ids),
+                    self.total_unbacked_saves,
+                )
+                continue
             try:
                 request = self._build_save_request(
                     seq, saved, aligned, save_operation, block_ids, is_last_prefill
@@ -896,6 +1007,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if request is None:
                 if late_acquired:
                     self._block_manager.free_leased_blocks(late_acquired)
+                if (
+                    getattr(seq, "_offload_finished", False)
+                    and self._unbuilt_save_is_final()
+                ):
+                    # A tracker left behind would hold its lease forever.
+                    self._retire_finished_save(sid, seq)
                 continue
             self._track_save_statistics(save_operation, aligned - saved)
             meta.add_request(request)
@@ -1018,6 +1135,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if added:
             self._save_lease_at.setdefault(lease_key, time.monotonic())
             self.total_leased_source_blocks += len(added)
+
+    def has_active_save_leases(self, max_age_s: float | None = None) -> bool:
+        """Whether any block lease is still held for a save in flight.
+
+        These blocks are protected by a refcount rather than by the frontend
+        holding the request, so nothing about the request's state says they
+        exist. A frontend can report them as pending frees: they are precisely
+        "blocks a pending transfer will release", which is what lets the
+        scheduler wait a step instead of preempting a running request to make
+        room. ``max_age_s`` counts only leases taken that recently: an older
+        one is a save that is not about to land.
+        """
+        if max_age_s is None:
+            return bool(self._save_lease_blocks)
+        oldest = time.monotonic() - max_age_s
+        return any(
+            self._save_lease_at.get(lease_key, oldest) > oldest
+            for lease_key in self._save_lease_blocks
+        )
 
     def take_source_safe_releases(self) -> list[frozenset]:
         """Drain block-ID sets whose lease became source-safe since the last poll."""
@@ -1415,9 +1551,29 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         active = self._active_load_operations.get(sid)
         if isinstance(req_id, LoadOperationId):
             if active is None or active[1] != req_id:
+                # A completion for a load this scheduler no longer considers
+                # active. Dropping it is right -- it belongs to a lifecycle
+                # that has been cancelled or replaced -- but it is the only
+                # place a performed load can vanish, and silence here reads
+                # exactly like a load that was never performed.
+                self._dropped_load_completions += 1
+                logger.warning(
+                    "ATOM offload: completion for %s does not match the "
+                    "active load (%s); dropping it. Total %d",
+                    req_id,
+                    active[1] if active else None,
+                    self._dropped_load_completions,
+                )
                 return False
             self._active_load_operations.pop(sid, None)
         elif active is not None:
+            self._dropped_load_completions += 1
+            logger.warning(
+                "ATOM offload: plain-id completion for %s while a load "
+                "operation is active; dropping it. Total %d",
+                sid,
+                self._dropped_load_completions,
+            )
             return False
         self._finish_load_statistics(req_id, succeeded=True)
         self._load_save_floors.pop(sid, None)

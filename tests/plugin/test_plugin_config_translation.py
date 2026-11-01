@@ -108,6 +108,27 @@ def test_online_quant_config_from_additional_config(monkeypatch):
     assert cfg.online_quant_config == oqc
 
 
+@pytest.mark.parametrize("v41", [False, True])
+def test_v41_transport_is_left_to_the_platform(monkeypatch, v41):
+    """V4.1's model validator knows only ATOM's connector registry, so a vLLM
+    connector is gated by `enforce_deepseek_v41_constraints` instead; every
+    other model's validator still sees the transport."""
+    import atom.plugin.vllm.deepseek_v41_bridge as bridge
+
+    _patch_atom_config_module(monkeypatch)
+    monkeypatch.setattr(bridge, "is_deepseek_v41_vllm_config", lambda _cfg: v41)
+    monkeypatch.setattr(bridge, "v41_kv_cache_dtype", lambda _cfg: "bf16")
+    vllm_cfg = _vllm_cfg()
+    vllm_cfg.kv_transfer_config = {
+        "kv_connector": "AtomLMCacheOffloadConnector",
+        "kv_load_failure_policy": "recompute",
+    }
+
+    cfg = plugin_config._generate_atom_config_from_vllm_config(vllm_cfg)
+
+    assert cfg.kv_transfer_config == ({} if v41 else vllm_cfg.kv_transfer_config)
+
+
 def test_generate_atom_config_requires_plugin_mode(monkeypatch):
     import atom.config as atom_config_module
     import atom.plugin as plugin_module

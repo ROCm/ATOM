@@ -168,6 +168,21 @@ def _split_v41_proxy_layers(kv_cache_spec):
     return proxy, rest
 
 
+def _is_v41_checkpoint_layer(name: str) -> bool:
+    """Whether a layer is one PAGE unit of a V4.1 checkpoint.
+
+    Asks the adapter rather than matching a string here, so the suffix has one
+    owner, without registering it: a name check has no business changing
+    which adapters the hooks see. False when the mechanism is not importable,
+    which is every build that has no checkpoints at all.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import _V41_ADAPTER
+    except ImportError:
+        return False
+    return bool(_V41_ADAPTER.is_state_checkpoint_layer(name))
+
+
 def _spec_is_v41_proxy_with_draft(kv_cache_spec) -> bool:
     proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
     return bool(proxy) and bool(rest)
@@ -187,41 +202,75 @@ def _build_v41_proxy_draft_groups(kv_cache_spec):
     from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
     proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
+    # Checkpoint layers are neither the proxy nor the draft: each is one PAGE
+    # unit of a STATE checkpoint and `paged_state_checkpoint` requires them as k
+    # SINGLE-layer MambaSpec groups. Lumping them in with the draft is what
+    # vLLM rejects as "All layers in the same KV cache group must be the
+    # same" -- measured, engine down at startup with checkpoints on.
+    checkpoints = {
+        name: spec for name, spec in rest.items() if _is_v41_checkpoint_layer(name)
+    }
+    rest = {name: spec for name, spec in rest.items() if name not in checkpoints}
     proxy_specs = list(proxy.values())
-    draft_specs = list(rest.values())
     groups = [
         KVCacheGroupSpec(
             layer_names=list(proxy),
             kv_cache_spec=proxy_specs[0].merge(proxy_specs),
-        ),
-        KVCacheGroupSpec(
-            layer_names=list(rest),
-            kv_cache_spec=draft_specs[0].merge(draft_specs),
-        ),
+        )
     ]
+    groups += [
+        KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+        for name, spec in checkpoints.items()
+    ]
+    if rest:
+        draft_specs = list(rest.values())
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(rest),
+                kv_cache_spec=draft_specs[0].merge(draft_specs),
+            )
+        )
     logger.info(
-        "ATOM plugin: V4.1 target pool and draft KV kept in separate groups "
-        "(proxy page %d B at block %d, draft page %d B at block %d).",
+        "ATOM plugin: V4.1 kept in %d separate KV cache groups "
+        "(proxy page %d B at block %d; %d checkpoint group(s); "
+        "%d draft group(s)).",
+        len(groups),
         groups[0].kv_cache_spec.page_size_bytes,
         groups[0].kv_cache_spec.block_size,
-        groups[1].kv_cache_spec.page_size_bytes,
-        groups[1].kv_cache_spec.block_size,
+        len(checkpoints),
+        1 if rest else 0,
     )
     return groups
 
 
 def _groups_have_v41_proxy(kv_cache_groups) -> bool:
+    """True when the heterogeneous (per-layer slice) allocator is needed.
+
+    It is needed for the draft's pool, whose page is not a whole multiple of
+    the proxy's. Checkpoint groups are NOT a second pool: their page is the
+    proxy's page, and `check_state_checkpoint_groups` requires them overlaid
+    on it at byte 0 (vLLM's own allocator does exactly that). Counting them
+    here gave every checkpoint its own slice -- they landed at
+    `i * page * num_blocks` and the pool divisor became the sum of all nine
+    pages -- so checkpoints without a draft could never boot.
+
+    With no checkpoint layers this is the previous test: a proxy occupies one
+    group, so "some group is neither proxy nor checkpoint" and "len >= 2"
+    agree.
+    """
     from atom.plugin.vllm.deepseek_v41_bridge import (
         ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
     )
 
-    if len(kv_cache_groups) < 2:
-        return False
-    return any(
-        name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME)
-        for group in kv_cache_groups
-        for name in group.layer_names
-    )
+    has_proxy = False
+    has_other_pool = False
+    for group in kv_cache_groups:
+        for name in group.layer_names:
+            if name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME):
+                has_proxy = True
+            elif not _is_v41_checkpoint_layer(name):
+                has_other_pool = True
+    return has_proxy and has_other_pool
 
 
 def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
@@ -337,6 +386,55 @@ def _groups_are_heterogeneous_mla_mha(kv_cache_groups) -> bool:
     return (_is_mla(g0) and _is_mha(g1)) or (_is_mla(g1) and _is_mha(g0))
 
 
+def _v41_overlay_split(kv_cache_groups):
+    """Split the layers into the overlaid pool and the per-layer slices.
+
+    V4.1's proxy and its checkpoint-checkpoint layers are one pool: they have the
+    same page and the block manager hands each group its own block ids, so a
+    block index costs ONE page across all of them and every one of them starts
+    at byte 0 (this is what vLLM's own allocator does, and what
+    `check_state_checkpoint_groups` requires). The draft's layers are a second, genuinely
+    separate pool -- its page is not a multiple of the proxy's -- so each gets
+    its own slice.
+
+    Returns ``(overlay_names, overlay_page, slice_pairs)``. With no checkpoint
+    layers the overlay is the proxy alone, which is the previous behaviour
+    (one page, one slice) layer for layer.
+    """
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+
+    overlay_names: list[str] = []
+    overlay_pages: set[int] = set()
+    slice_pairs: list[tuple[str, object]] = []
+    for group in kv_cache_groups:
+        if getattr(group, "host_resident", False):
+            # A HiSparse host pool is sized and backed by vLLM apart from the
+            # device pool this builder lays out, and nothing here would give
+            # its layers a tensor. Refused rather than skipped, which would
+            # leave those layers without a cache and nothing saying so.
+            raise NotImplementedError(
+                "ATOM's heterogeneous KV cache builder does not lay out "
+                "host-resident (HiSparse) groups; got layers "
+                f"{list(getattr(group, 'layer_names', ()))[:4]}"
+            )
+        for layer_name, layer_spec in _iter_group_layer_specs(group):
+            if layer_name.endswith(
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+            ) or _is_v41_checkpoint_layer(layer_name):
+                overlay_names.append(layer_name)
+                overlay_pages.add(int(layer_spec.page_size_bytes))
+            else:
+                slice_pairs.append((layer_name, layer_spec))
+    if len(overlay_pages) > 1:
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy and checkpoint-checkpoint layers must share one "
+            f"page to be overlaid on one pool; got {sorted(overlay_pages)}"
+        )
+    return overlay_names, (overlay_pages.pop() if overlay_pages else 0), slice_pairs
+
+
 def _build_heterogeneous_kv_cache_config_from_groups(
     vllm_config, kv_cache_groups, available_memory
 ):
@@ -359,10 +457,10 @@ def _build_heterogeneous_kv_cache_config_from_groups(
             for layer_name in group.layer_names:
                 yield layer_name, spec
 
-    bytes_per_block_all_layers = 0
-    for group in kv_cache_groups:
-        for _layer_name, layer_spec in _iter_layer_specs(group):
-            bytes_per_block_all_layers += layer_spec.page_size_bytes
+    overlay_names, overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)
+    bytes_per_block_all_layers = overlay_page + sum(
+        int(spec.page_size_bytes) for _name, spec in slice_pairs
+    )
 
     assert bytes_per_block_all_layers > 0, "Zero per-block bytes"
     num_blocks = available_memory // bytes_per_block_all_layers
@@ -378,21 +476,42 @@ def _build_heterogeneous_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     offset = 0
-    for group in kv_cache_groups:
-        for layer_name, layer_spec in _iter_layer_specs(group):
-            layer_stride, block_stride = compute_layout_strides(
-                layer_spec, num_blocks, 1, layout
-            )[:2]
-            kv_cache_tensors.append(
-                KVCacheTensor(
-                    size=total_size,
-                    layers=[layer_name],
-                    layer_stride=layer_stride,
-                    block_stride=block_stride,
-                    offset=offset,
-                )
+    specs_by_name = {
+        name: spec
+        for group in kv_cache_groups
+        for name, spec in _iter_layer_specs(group)
+    }
+    # The overlaid pool first, every member at byte 0.
+    for layer_name in overlay_names:
+        layer_spec = specs_by_name[layer_name]
+        layer_stride, block_stride = compute_layout_strides(
+            layer_spec, num_blocks, 1, layout
+        )[:2]
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=total_size,
+                layers=[layer_name],
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+                offset=0,
             )
-            offset += layer_spec.page_size_bytes * num_blocks
+        )
+    offset = overlay_page * num_blocks
+    # Then one slice per draft layer, after the overlaid pool.
+    for layer_name, layer_spec in slice_pairs:
+        layer_stride, block_stride = compute_layout_strides(
+            layer_spec, num_blocks, 1, layout
+        )[:2]
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=total_size,
+                layers=[layer_name],
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+                offset=offset,
+            )
+        )
+        offset += int(layer_spec.page_size_bytes) * num_blocks
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -407,22 +526,23 @@ def _build_heterogeneous_kv_cache_config_from_groups(
 def _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups):
     # Max bytes needed for both groups to hold max_model_len tokens
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
     max_model_len = vllm_config.model_config.max_model_len
+    # Same split as the builder and the divisor: the proxy and its checkpoint
+    # layers are one overlaid pool and cost one page per block between them,
+    # so counting them per layer would overstate the requirement k+1 times.
+    overlay_names, overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)
+    specs_by_name = {
+        name: spec
+        for group in kv_cache_groups
+        for name, spec in _iter_group_layer_specs(group)
+    }
     total = 0
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            block_size = spec.block_size
-            per_block_bytes = sum(
-                s.page_size_bytes for s in spec.kv_cache_specs.values()
-            )
-        else:
-            block_size = spec.block_size
-            per_block_bytes = spec.page_size_bytes * len(group.layer_names)
-        num_blocks_for_len = cdiv(max_model_len, block_size)
-        total += num_blocks_for_len * per_block_bytes
+    if overlay_names:
+        block_size = int(specs_by_name[overlay_names[0]].block_size)
+        total += cdiv(max_model_len, block_size) * overlay_page
+    for name, spec in slice_pairs:
+        total += cdiv(max_model_len, int(spec.block_size)) * int(spec.page_size_bytes)
     return total
 
 
@@ -438,12 +558,8 @@ def _heterogeneous_pool_bytes_per_block(kv_cache_groups) -> int:
     divisor that disagrees with the builder's yields a different `num_blocks`
     per rank, which the scheduler then rejects.
     """
-    return sum(
-        layer_spec.page_size_bytes
-        for group in kv_cache_groups
-        if not getattr(group, "host_resident", False)
-        for _layer_name, layer_spec in _iter_group_layer_specs(group)
-    )
+    overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)[1:]
+    return overlay_page + sum(int(spec.page_size_bytes) for _n, spec in slice_pairs)
 
 
 def _iter_group_layer_specs(group):
@@ -592,7 +708,7 @@ def _patch_vllm_llm_base_model_sharing() -> None:
                     "DeepSeek-V4 MTP draft attention type check."
                 )
 
-    setattr(wrapped_load_model, "_atom_share_with_target_patched", True)
+    wrapped_load_model._atom_share_with_target_patched = True
     SpecDecodeBaseProposer.load_model = wrapped_load_model
 
 
@@ -661,16 +777,8 @@ def _patch_vllm_draft_kv_group_validation() -> None:
             return
         return original_initialize(self, kv_cache_config, kernel_block_sizes)
 
-    setattr(
-        wrapped_validate_same_kv_cache_group,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
-    setattr(
-        wrapped_initialize_attn_backend,
-        "_atom_kv_group_validation_patched",
-        True,
-    )
+    wrapped_validate_same_kv_cache_group._atom_kv_group_validation_patched = True
+    wrapped_initialize_attn_backend._atom_kv_group_validation_patched = True
     SpecDecodeBaseProposer.validate_same_kv_cache_group = (
         wrapped_validate_same_kv_cache_group
     )
@@ -716,9 +824,7 @@ def _patch_vllm_draft_positions_on_metadata() -> None:
             common_attn_metadata.positions = self._get_positions(num_tokens)
         return original_build(self, common_attn_metadata, draft_index)
 
-    setattr(
-        wrapped_build_per_group_and_layer_attn_metadata, "_atom_positions_patched", True
-    )
+    wrapped_build_per_group_and_layer_attn_metadata._atom_positions_patched = True
     SpecDecodeBaseProposer.build_per_group_and_layer_attn_metadata = (
         wrapped_build_per_group_and_layer_attn_metadata
     )
@@ -765,7 +871,7 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
             num_rejected_tokens_gpu,
         )
 
-    setattr(wrapped_set_inputs_first_pass, "_atom_v4_mtp_inputs_patched", True)
+    wrapped_set_inputs_first_pass._atom_v4_mtp_inputs_patched = True
     SpecDecodeBaseProposer.set_inputs_first_pass = wrapped_set_inputs_first_pass
 
 
@@ -832,7 +938,7 @@ def apply_vllm_spec_decode_patch() -> None:
                 dict.fromkeys((*allowed, *atom_allowed_attn_types))
             )
 
-    setattr(wrapped_init, "_atom_allowed_attn_types_patched", True)
+    wrapped_init._atom_allowed_attn_types_patched = True
     SpecDecodeBaseProposer.__init__ = wrapped_init
 
     logger.info(

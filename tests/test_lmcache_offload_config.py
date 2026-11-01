@@ -492,3 +492,29 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "model_type, compress_ratios", [("deepseek_v4", [4, 128, 0]), ("llama", None)]
+)
+def test_only_v41_runs_on_its_layout(model_type, compress_ratios):
+    """Another model would run the dense codec under V4.1's namespace."""
+    config = _config()
+    config.hf_config.model_type = model_type
+    config.hf_config.compress_ratios = compress_ratios
+    config.kv_transfer_config = {"offload_layout": "dsv41"}
+    with pytest.raises(ValueError, match="DeepSeek-V4.1's layout"):
+        offcfg.select_offload_layout(config)
+
+
+@pytest.mark.parametrize("override", ["dsv41", "kimi_k3"])
+def test_a_state_owning_model_keeps_its_own_layout(override):
+    """Another state-owning layout has no tier for this model's state either."""
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen3_next"
+    config.kv_transfer_config = {"offload_layout": override}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+    config.kv_transfer_config = {"offload_layout": "qwen"}
+    assert offcfg.select_offload_layout(config) == "qwen"

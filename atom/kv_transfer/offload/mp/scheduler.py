@@ -202,6 +202,12 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         live.update(operation for _, operation in self._active_load_operations.values())
         return live
 
+    abandons_saves = False
+
+    def enforce_transfer_deadlines(self) -> None:
+        # For a frontend that never calls `process_completions`.
+        self._enforce_transfer_deadlines()
+
     def _enforce_transfer_deadlines(self) -> None:
         """Fail-stop when a dispatched transfer never reports.
 
