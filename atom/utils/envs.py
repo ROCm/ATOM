@@ -652,6 +652,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with the p/q ratio test (lossless). Off by default; read when the drafter
     # is built and at import of the sampling module.
     "ATOM_DSPARK_PROB_DRAFT": lambda: os.getenv("ATOM_DSPARK_PROB_DRAFT", "0") == "1",
+    # Preserve sampled-prefix q and RNG while fusing Markov reductions on
+    # gfx1250: BF16 full vocabulary, rank 256, B <= 32, and five positions.
+    # Read before allocating the persistent probabilistic-draft state.
+    "ATOM_DSPARK_PROB_FUSED_CHAIN": lambda: (
+        os.getenv("ATOM_DSPARK_PROB_FUSED_CHAIN", "0") == "1"
+    ),
     # With ATOM_DSPARK_PROB_DRAFT=1: block verification (Sun et al. 2024,
     # vLLM's rejection_sample_method=block) instead of per-token min(1, p/q).
     "ATOM_DSPARK_BLOCK_VERIFY": lambda: (

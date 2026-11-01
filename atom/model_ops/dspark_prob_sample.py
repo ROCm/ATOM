@@ -73,6 +73,7 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 PROB_DRAFT = envs.ATOM_DSPARK_PROB_DRAFT
+FUSED_MARKOV_CHAIN = envs.ATOM_DSPARK_PROB_FUSED_CHAIN
 BLOCK_VERIFY = envs.ATOM_DSPARK_BLOCK_VERIFY
 DRAFT_TSCALE = envs.ATOM_DSPARK_PROB_DRAFT_TSCALE
 # 1 (default) => draft off the sharded LM head whenever the greedy path would;
@@ -324,6 +325,9 @@ class ProbDraftState:
     q_vs: int = 0
     q_cols: int = 0
     q_tp: int = 1
+    # A position-major packed maximum, reset by the chain's final kernel.
+    # Allocate before graph capture; one ordered draft stream owns this state.
+    markov_keys: torch.Tensor | None = None
 
     @classmethod
     def allocate(cls, max_bs: int, width: int, vocab: int, device) -> "ProbDraftState":
@@ -332,6 +336,11 @@ class ProbDraftState:
             ids=torch.full((max_bs, width), -1, dtype=torch.int32, device=device),
             temps=torch.ones(max_bs, dtype=torch.float32, device=device),
             seed=torch.zeros(1, dtype=torch.int64, device=device),
+            markov_keys=(
+                torch.zeros(width, max_bs, dtype=torch.uint64, device=device)
+                if FUSED_MARKOV_CHAIN
+                else None
+            ),
         )
         st.q_cols = vocab
         st.src_cpu = [

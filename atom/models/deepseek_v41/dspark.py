@@ -601,6 +601,10 @@ class DeepseekV41DSpark(DSparkDraftModel):
         layout in ``st.set_layout``) and the ids in ``st.ids`` for the
         runner's probability-ratio verification of this block.
         """
+        from atom.model_ops.dspark_prob_markov_chain import (
+            can_use_prob_markov_chain,
+            prob_markov_sample_chain,
+        )
         from atom.model_ops.dspark_prob_sample import (
             SHARDED_DRAFT,
             prob_markov_sample,
@@ -631,23 +635,41 @@ class DeepseekV41DSpark(DSparkDraftModel):
         markov_w2 = last.markov_head.markov_w2.weight
         out_ids = anchor_ids.new_empty(B, T)
         markov_embeds = markov_w1.new_empty(B, T, markov_w1.shape[1])
-        for k in range(T):
-            prob_markov_sample(
-                base_logits[:, k],
-                anchor_ids if k == 0 else out_ids[:, k - 1],
+        fused_chain = tp_group is None and can_use_prob_markov_chain(
+            base_logits, markov_w1, markov_w2, st.markov_keys
+        )
+        if fused_chain:
+            prob_markov_sample_chain(
+                base_logits,
+                anchor_ids,
                 markov_w1,
                 markov_w2,
-                out_ids[:, k],
-                st.q[:B, k],
+                out_ids,
+                st.q[:B, :T, : base_logits.shape[-1]],
                 st.temps[:B],
                 st.seed,
-                k,
-                markov_embeds[:, k],
-                vocab_start=head.vocab_start_idx if sharded else 0,
-                tp_group=tp_group,
-                use_custom=use_custom,
+                markov_embeds,
+                st.markov_keys,
+                saved_ids=st.ids[:B, :T],
             )
-        st.ids[:B].copy_(out_ids)
+        else:
+            for k in range(T):
+                prob_markov_sample(
+                    base_logits[:, k],
+                    anchor_ids if k == 0 else out_ids[:, k - 1],
+                    markov_w1,
+                    markov_w2,
+                    out_ids[:, k],
+                    st.q[:B, k],
+                    st.temps[:B],
+                    st.seed,
+                    k,
+                    markov_embeds[:, k],
+                    vocab_start=head.vocab_start_idx if sharded else 0,
+                    tp_group=tp_group,
+                    use_custom=use_custom,
+                )
+            st.ids[:B].copy_(out_ids)
         confidence = last.confidence_head(hc_hidden, markov_embeds)
         return out_ids, confidence
 
