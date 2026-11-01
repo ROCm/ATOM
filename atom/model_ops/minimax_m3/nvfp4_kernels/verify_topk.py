@@ -19,7 +19,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import buffer_load, mfma
 
-from .nvfp4 import Nvfp4Cache, nvfp4_buffer_loadable, nvfp4_even_odd_w
+from .nvfp4 import Nvfp4Cache
+from .nvfp4_gluon import nvfp4_buffer_loadable, nvfp4_even_odd_w
 
 _KP = 16
 _WARPS = 4

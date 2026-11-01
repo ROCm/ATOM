@@ -21,7 +21,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd.cdna4 import buffer_load, mfma
 
-from .nvfp4 import Nvfp4Cache, fits_buffer_offsets
+from .nvfp4 import Nvfp4Cache
+from .nvfp4_gluon import fits_buffer_offsets
 
 _LOG2E = 1.4426950408889634
 _LN2 = gl.constexpr(0.6931471805599453)
