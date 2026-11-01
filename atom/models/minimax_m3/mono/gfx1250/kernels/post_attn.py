@@ -84,6 +84,7 @@ from atom.mono.device.gfx1250 import (
     async_to_lds,
     butterfly,
     lds_addr,
+    lds_barrier,
     wait_async,
     xshfl,
 )
@@ -345,6 +346,8 @@ def build_post_attn_kernel(
 
         def block_max(v):
             return block_max_of(v, lane, wave, red)
+
+        push_barrier = lds_barrier
 
         def push_rows(region, row0, n_rows, only=None):
             """``post_attn.push_rows``, a pair a lane of wave w -> peer w."""
