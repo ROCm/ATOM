@@ -1079,7 +1079,7 @@ def test_propose_puts_the_pass_on_the_path_its_own_shape_is_on(monkeypatch):
 class _BareFlavor(mod_drafter.Drafter):
     """The abstract methods, stubbed. `_publish_draft_shape` reads neither."""
 
-    _resolve_mtp_k = propose = staticmethod(lambda *a, **k: None)
+    _resolve_mtp_k = _propose = staticmethod(lambda *a, **k: None)
 
 
 def _bare_drafter(dp_size):

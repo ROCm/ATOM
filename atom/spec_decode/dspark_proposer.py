@@ -344,8 +344,16 @@ class DSparkProposer(Drafter):
         ):
             counts[index[name]] = rows[key]
 
-    def _consume_staging(self) -> None:
-        """Claim this step's staging for the propose about to run, or refuse."""
+    def _before_propose(self) -> None:
+        """Claim this forward's staging for the propose about to run, or refuse.
+
+        This step's temperatures / greedy mask / Philox key / q row bases are
+        already in the buffers the captured block head baked the addresses of,
+        carried by `prepare_sample`'s `sampling` H2D, so there is nothing to
+        launch -- provided that staging happened for this propose. A propose
+        reached without it (one that skipped `prepare_sample`) would draft
+        through the previous step's row bases, so it is refused.
+        """
         if self.draft_sampling is None:
             return
         self._staging.consume(self.runner.forward_step)
@@ -383,20 +391,14 @@ class DSparkProposer(Drafter):
             self._verify_scratch,
         )
 
-    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
-        """Warm (and capture) the block with every row aimed at no q row.
+    def _before_draft_warmup(self) -> None:
+        """Point every draft row at no q row, on the host and the device.
 
         The warmup runs the captured block directly, not through `propose`, so
         it drafts through whatever destination row bases are staged. At startup
         those are -1, but a recapture after a rollout sleep/wake finds the last
         served step's bases there, and the synthetic batch would overwrite the
         q of requests that still own those slots.
-        """
-        self._clear_draft_destinations()
-        super().warmup_draft_graphs(build_context, end_trace)
-
-    def _clear_draft_destinations(self) -> None:
-        """Point every draft row at no q row, on the host and the device.
 
         The device fill goes on the current stream, the one the warmup that
         follows runs on, so it lands before the block reads the bases.
@@ -958,7 +960,7 @@ class DSparkProposer(Drafter):
         ):
             self.model.write_context_kv(main_hidden_all, positions)
 
-    def propose(
+    def _propose(
         self,
         # [num_tokens] (unused: DSpark seeds from the verified anchor, not the
         # full target token stream)
@@ -1022,14 +1024,6 @@ class DSparkProposer(Drafter):
         staged = self._stage_anchors(
             running_bs, next_token_ids, target_positions, last_token_indices
         )
-
-        # This step's temperatures / greedy mask / Philox key / q row bases are
-        # already in the buffers the captured block head baked the addresses
-        # of, carried by `prepare_sample`'s `sampling` H2D, so there is nothing
-        # to launch here -- provided that staging happened for this propose. A
-        # propose reached without it (one that skipped `prepare_sample`) would
-        # draft through the previous step's row bases, so refuse it.
-        self._consume_staging()
 
         if self._with_draft:
             return self._propose_with_draft(

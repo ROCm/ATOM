@@ -295,11 +295,13 @@ class DraftQStaging:
         returns first), so what is checked is that this very forward staged,
         and only once consumed.
         """
-        assert self._staged == step and self._consumed != step, (
-            f"propose in forward {step} without a fresh "
-            f"stage_draft_sampling_host (last staged {self._staged}, last "
-            f"consumed {self._consumed}): the q row bases are another forward's"
-        )
+        if self._staged != step or self._consumed == step:
+            raise RuntimeError(
+                f"propose in forward {step} without a fresh "
+                f"stage_draft_sampling_host (last staged {self._staged}, last "
+                f"consumed {self._consumed}): the q row bases are another "
+                "forward's"
+            )
         self._consumed = step
 
     def clear_destinations(self) -> None:

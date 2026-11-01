@@ -150,7 +150,10 @@ class Drafter(abc.ABC):
     concretes share — buffer setup, DP-metadata refresh, weight loading /
     sharing, anchor-index preparation, and spec-decode metadata — while the
     flavor hooks (``_resolve_mtp_k``, ``_build_draft_model``) and the hot
-    ``propose`` are subclass-supplied.
+    ``_propose`` are subclass-supplied. ``propose`` and ``warmup_draft_graphs``
+    are templates that run ``_before_propose`` / ``_before_draft_warmup``
+    first, then ``_propose`` / ``_warmup_draft_graphs``; a flavor overrides
+    those, never the templates.
 
     The capability properties (``is_block_drafter`` / ``uses_confidence_schedule``
     / ``verify_scheduler``) are the typed replacements for the historical
@@ -230,8 +233,20 @@ class Drafter(abc.ABC):
             for pass_ in self._declare_draft_graphs()
         )
 
-    @torch.inference_mode()
     def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+        """Warm the draft passes: `_before_draft_warmup`, then the flavor's
+        `_warmup_draft_graphs`. A template, so no flavor that replaces the
+        warmup can skip the step before it."""
+        self._before_draft_warmup()
+        self._warmup_draft_graphs(build_context, end_trace)
+
+    def _before_draft_warmup(self) -> None:
+        """Run before every draft warmup. A no-op; the lossless DSpark draft
+        aims every draft row at no q row here."""
+        return
+
+    @torch.inference_mode()
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         """Run every declared pass once per captured size, paying its JIT here.
 
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
@@ -338,8 +353,35 @@ class Drafter(abc.ABC):
         this; the base ``arm_aux_capture`` turns the spec into forward hooks."""
         return None
 
-    @abc.abstractmethod
     def propose(
+        self,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        num_reject_tokens: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draft this step's speculative tokens: `_before_propose`, then the
+        flavor's `_propose`. A template, so no flavor can skip the step before
+        it."""
+        self._before_propose()
+        return self._propose(
+            target_token_ids,
+            target_positions,
+            target_hidden_states,
+            num_reject_tokens,
+            next_token_ids,
+            last_token_indices,
+        )
+
+    def _before_propose(self) -> None:
+        """Run before every propose. A no-op; the lossless DSpark draft claims
+        this forward's staging here, or refuses."""
+        return
+
+    @abc.abstractmethod
+    def _propose(
         self,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,

@@ -301,11 +301,37 @@ def test_a_propose_drafts_only_through_its_own_forwards_staging(monkeypatch):
     whose propose skipped staging must not draft through those row bases."""
     prop = proposer(monkeypatch)
     stage(prop, batch(["a"]))
-    prop._consume_staging()
+    prop._before_propose()
     stage(prop, batch(["m"]), verifiable=False)
     prop.runner.forward_step += 1
-    with pytest.raises(AssertionError, match="fresh stage_draft_sampling_host"):
-        prop._consume_staging()
+    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
+        prop._before_propose()
+
+
+def test_every_flavors_propose_claims_its_staging(monkeypatch):
+    """`Drafter.propose` claims the staging before any flavor's `_propose`,
+    so a flavor that replaces the native one (V4 mono) cannot forget it."""
+    from atom.models.deepseek_v4.mono.proposer import MonoDSparkProposer
+
+    prop = proposer(monkeypatch)
+    mono = MonoDSparkProposer.__new__(MonoDSparkProposer)
+    mono.__dict__.update(vars(prop))
+    drafted = []
+    monkeypatch.setattr(
+        MonoDSparkProposer, "_propose", lambda self, *args: drafted.append(args)
+    )
+    args = tuple(range(6))
+    stage(mono, batch(["a"]))
+    mono.propose(*args)
+    assert drafted == [args]
+    # A second propose in the same forward, or one in a forward that staged
+    # nothing, never reaches the flavor.
+    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
+        mono.propose(*args)
+    mono.runner.forward_step += 1
+    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
+        mono.propose(*args)
+    assert drafted == [args]
 
 
 def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
@@ -321,7 +347,7 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
         seen["np"] = self._draft_row_base_buf.np.tolist()
         seen["gpu"] = self._draft_row_base_buf.gpu.tolist()
 
-    monkeypatch.setattr(dspark_proposer.Drafter, "warmup_draft_graphs", base_warmup)
+    monkeypatch.setattr(dspark_proposer.Drafter, "_warmup_draft_graphs", base_warmup)
     prop.warmup_draft_graphs(None)
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
     # The slot map is untouched: those requests still own their q rows.
@@ -329,8 +355,8 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
 
 
 def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
-    """The V4 mono proposer replaces the native warmup without calling it, so
-    it clears the staged row bases itself before warming."""
+    """The V4 mono proposer replaces the native warmup without calling it;
+    `Drafter.warmup_draft_graphs` still clears the staged row bases first."""
     from atom.models.deepseek_v4.mono.proposer import MonoDSparkProposer
 
     prop = proposer(monkeypatch)
@@ -406,7 +432,7 @@ class _Bare(Drafter):
     def _resolve_mtp_k(self):
         return 1
 
-    def propose(self, *args, **kwargs):
+    def _propose(self, *args, **kwargs):
         raise NotImplementedError
 
 

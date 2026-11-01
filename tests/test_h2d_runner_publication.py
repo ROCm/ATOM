@@ -47,7 +47,7 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
             def _resolve_mtp_k(self):
                 return 3
 
-            def propose(self, *args):
+            def _propose(self, *args):
                 raise NotImplementedError
 
         runner.drafter = MetadataDrafter.__new__(MetadataDrafter)

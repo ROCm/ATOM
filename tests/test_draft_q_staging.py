@@ -215,12 +215,12 @@ def test_a_propose_needs_a_staging_of_its_own():
     """Same batch size twice in a row is not enough: each propose must consume
     a staging of its own, or it would draft through stale row bases."""
     st, _ = staging()
-    with pytest.raises(AssertionError, match="fresh stage_draft_sampling_host"):
+    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
         st.consume(1)
     for step in (1, 2):
         stage(st, batch(["a", "b"]), step=step)
         st.consume(step)
-        with pytest.raises(AssertionError):
+        with pytest.raises(RuntimeError):
             st.consume(step)
 
 
@@ -232,7 +232,7 @@ def test_a_staging_from_another_forward_is_refused():
     stage(st, batch(["a"]), step=1)
     st.consume(1)
     stage(st, batch(["m"]), verifiable=False, verifies=False, step=2)
-    with pytest.raises(AssertionError, match="fresh stage_draft_sampling_host"):
+    with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
         st.consume(3)
 
 

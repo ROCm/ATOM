@@ -29,12 +29,9 @@ class MonoDSparkProposer(DSparkProposer):
         self.block.warmup_inputs = self._block_warmup_inputs
 
     @torch.inference_mode()
-    def warmup_draft_graphs(self, build_context, end_trace=None) -> None:
+    def _warmup_draft_graphs(self, build_context, end_trace=None) -> None:
         mono = self._mono_session
         capture = self.block.will_capture
-        # Native's warmup aims every draft row at no q row first; this one
-        # replaces it, so it must too (`DSparkProposer.warmup_draft_graphs`).
-        self._clear_draft_destinations()
         mono.retire_draft_captures_for_startup()
         self.block.release_graphs()
         ladder = sorted(self.runner.capture_sizes)
@@ -144,7 +141,7 @@ class MonoDSparkProposer(DSparkProposer):
             ),
         )
 
-    def propose(
+    def _propose(
         self,
         target_token_ids,
         target_positions,
@@ -193,8 +190,6 @@ class MonoDSparkProposer(DSparkProposer):
         staged = self._stage_anchors(
             running_bs, next_token_ids, target_positions, last_token_indices
         )
-        # As native's propose: refuse to draft without this forward's staging.
-        self._consume_staging()
         width = self.draft_tokens_per_seq
         self.model.prepare_block(
             self.runner.attn_metadata_builder, width, bs, running_bs
