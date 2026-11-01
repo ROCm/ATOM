@@ -73,11 +73,13 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
     uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
-from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
+from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
+from atom.quant_spec import effective_layer_quant
 
 if TYPE_CHECKING:
     from atom.config import Config
@@ -282,7 +284,7 @@ class K3DSparkMLAAttention(nn.Module):
         # norms instead of feeding a GEMM the wrong layout.
         #
         # q side: q_b_proj consumes the normed query, inside the MLA impl.
-        qknorm_type, qknorm_dtype = _effective_layer_quant(
+        qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
         self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
@@ -294,7 +296,7 @@ class K3DSparkMLAAttention(nn.Module):
         # decoder's input_layernorm here (the draft has no g_proj gate), so one
         # scheme decides it. The layer reads these two back off the attention.
         self.fuse_input_norm_quant = (
-            _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
+            effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.input_quant_prefix = f"{prefix}.fused_qkv_a_proj"
@@ -401,12 +403,16 @@ class K3DSparkMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # An MXFP4 down_proj cannot take an unaligned K (its per-rank
+        # intermediate); the pair pads it together. See mxfp4_k_pad_align.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -414,6 +420,7 @@ class K3DSparkMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
         self.act_fn = SiluAndMul()
 
@@ -464,7 +471,7 @@ class K3DSparkDecoderLayer(nn.Module):
             prefix=self.self_attn.input_quant_prefix,
         )
         self.fuse_ffn_norm_quant = (
-            _effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
+            effective_layer_quant(quant_config, f"{prefix}.mlp.gate_up_proj")[0]
             in _RMS_FUSABLE_QUANT_TYPES
         )
         self.post_attention_layernorm = RMSNorm(

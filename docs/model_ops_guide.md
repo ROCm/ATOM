@@ -90,7 +90,7 @@ LinearBase (nn.Module)
 | `per_Token` (INT8) | INT8 | `gemm_a8w8` | `[output_size, 1]` |
 | `per_Token` (FP8) | FP8 | `gemm_a8w8_bpreshuffle` | `[output_size, 1]` |
 | `per_1x128` | FP8 | `gemm_a8w8_blockscale_bpreshuffle` | `[ceil(N/128), ceil(K/128)]` |
-| `per_1x32` | MXFP4 (`fp4x2`) | `gemm_a4w4` | `[N, ceil(K/32)]` (e8m0) |
+| `per_1x32` | MXFP4 (`fp4x2`) | `gemm_a4w4` (preshuffled: K a multiple of 256, see MXFP4 K alignment) | `[N, ceil(K/32)]` (e8m0) |
 
 When `x_scale` is not provided, the input is dynamically quantized via `get_hip_quant(quant_type)`.
 
@@ -107,6 +107,7 @@ After loading, `process_weights_after_loading()` handles:
 - **e4m3fn to e4m3fnuz normalization** (AMD FP8 format conversion).
 - **Weight reshuffling** via `shuffle_weights()` for pre-shuffled GEMM kernels.
 - **Scale reshuffling** via `fp4_utils.e8m0_shuffle()` for MXFP4 block scales.
+- **MXFP4 K alignment**: a preshuffled MXFP4 weight must have K a multiple of 256 (`MXFP4_PRESHUFFLE_K_ALIGN`); the preshuffled GEMMs walk K in 256-wide steps and do not mask a tail. A `gate_up -> act -> down` MLP whose per-rank intermediate is unaligned pads it as a pair, like MoE's `intermediate_pad`: pass `mxfp4_k_pad_align(quant_config, down_prefix)` as `output_pad_align` to `MergedColumnParallelLinear` and `input_pad_align` to `RowParallelLinear`. The checkpoint keeps the real sizes; every load path writes the real shard at the front of its padded slot, and the padding is zero weights with unit scales in the scale's own dtype (requires `act(0, 0) == 0`). Padding is applied in the checkpoint's scheme, before any online requant; a source whose scales can't hold the pad boundary (128x128 blocks that straddle it) is refused at construction. Any preshuffled MXFP4 weight still unaligned is refused here at load. Exempt: the gfx1250 32x4 scale layout, whose kernels take K % 128 (`mxfp4_k_pad_align` pads to 128 there), and `ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1`, whose GEMM reads the raw layout (no padding, no check). A refused non-MLP layer can be kept out of MXFP4 (online quant: `exclude_layer`).
 - **Per-tensor requantization** via `requantize_with_max_scale()` when multiple output partitions have separate scales.
 
 ## Attention operations
