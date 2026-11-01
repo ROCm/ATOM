@@ -237,12 +237,7 @@ class Sampler(nn.Module):
 
         if AITER_TOPK_TOPP_AVAILABLE:
             return self._aiter_sample(
-                probs,
-                top_ks,
-                top_ps,
-                has_topk,
-                has_topp,
-                temperatures,
+                probs, top_ks, top_ps, has_topk, has_topp, temperatures
             )
         else:
             return self._native_sample(probs, top_ks, top_ps, temperatures)
