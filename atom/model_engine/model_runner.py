@@ -2960,13 +2960,7 @@ class ModelRunner:
             spec = build_aux_capture_spec(self.config)
         if spec is None:
             return
-        relay = PPAuxRelay(
-            spec,
-            self.model,
-            self.config.max_num_batched_tokens,
-            self.device,
-            self.config.torch_dtype,
-        )
+        relay = PPAuxRelay(spec, self.model)
         if not relay.incoming_ids and not relay.outgoing_ids:
             return
         relay.arm(self.model, lambda: get_forward_context().context.is_draft)

@@ -46,7 +46,7 @@ def _relay(layer_ids, n_layers, resident_range, *, first, last, hidden=8):
     )
     group = types.SimpleNamespace(is_first_rank=first, is_last_rank=last)
     with mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group):
-        relay = PPAuxRelay(spec, target, 4, torch.device("cpu"), torch.float32)
+        relay = PPAuxRelay(spec, target)
         relay.arm(target, lambda: False)
     return relay, target
 
@@ -62,11 +62,19 @@ def test_relay_embedding_tap_hooks_the_embedding_not_the_last_layer():
     assert not target.layers[-1]._forward_pre_hooks
 
 
+def _run_target(relay, target, n, hidden):
+    """A target forward on this stage: each own tap's module outputs `lid`."""
+    for lid in relay.own_ids:
+        module = target.embed_tokens if lid == -1 else target.layers[lid]
+        module(torch.full((n, hidden), float(lid)))
+
+
 def test_relay_embedding_tap_captures_through_the_hook():
     relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
     rows = torch.arange(2 * 8, dtype=torch.float32).reshape(2, 8)
     target.embed_tokens(rows)
-    torch.testing.assert_close(relay.buffers[-1][:2], rows)
+    target.layers[2](torch.zeros(2, 8))
+    torch.testing.assert_close(relay.pack(None, 2)[:, :8], rows)
 
 
 def test_relay_embedding_tap_ignores_capture_input():
@@ -115,15 +123,14 @@ def test_relay_round_trip_lands_each_tap_in_its_drafter_buffer(pp_size, layer_id
     for rank in range(pp_size):
         lo, hi = get_pp_indices(n_layers, rank, pp_size)
         last = rank == pp_size - 1
-        relay, _ = _relay(
+        relay, target = _relay(
             layer_ids, n_layers, (lo, hi), first=rank == 0, last=last, hidden=hidden
         )
         if last:
             aux = [torch.zeros(4, hidden) for _ in layer_ids]
             relay.absorb(payload, aux)
             break
-        for lid in relay.own_ids:
-            relay.buffers[lid].fill_(lid)
+        _run_target(relay, target, n, hidden)
         payload = relay.pack(payload, n)
     for lid, buf in zip(layer_ids, aux):
         if lid in relay.incoming_ids:
@@ -137,11 +144,14 @@ def test_relay_rejects_a_payload_of_the_wrong_width():
         relay.absorb(torch.zeros(3, 8), [torch.zeros(4, 8) for _ in range(3)])
 
 
-def test_relay_pack_reuses_one_send_buffer():
-    # A middle stage that both receives and owns taps: packing must not allocate.
-    relay, _ = _relay([-1, 2, 6], 8, (4, 8), first=False, last=False)
-    received = torch.ones(3, 16)
-    first = relay.pack(received, 3)
-    second = relay.pack(received, 2)
-    assert first.data_ptr() == second.data_ptr() == relay._send.data_ptr()
-    assert relay.buffers[6].data_ptr() == relay._send[:, 16:].data_ptr()
+def test_relay_send_is_sized_to_the_forward_rows():
+    # Nothing resident: each forward's first own tap allocates its own rows.
+    relay, target = _relay([-1, 2, 6], 8, (4, 8), first=False, last=False)
+    assert relay._send is None
+    for n in (3, 5, 2):
+        _run_target(relay, target, n, 8)
+        sent = relay.pack(torch.ones(n, 16), n)
+        assert sent.shape == (n, 24)
+        torch.testing.assert_close(sent[:, :16], torch.ones(n, 16))
+        torch.testing.assert_close(sent[:, 16:], torch.full((n, 8), 6.0))
+        assert relay._send is None, "pack must hand the buffer over"

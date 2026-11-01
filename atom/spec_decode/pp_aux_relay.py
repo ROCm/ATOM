@@ -38,9 +38,6 @@ class PPAuxRelay:
         self,
         spec: AuxCaptureSpec,
         target_model: torch.nn.Module,
-        max_num_tokens: int,
-        device: torch.device,
-        dtype: torch.dtype,
     ) -> None:
         pp = get_pp_group()
         layers = _resolve_decoder_layers(target_model)
@@ -68,20 +65,15 @@ class PPAuxRelay:
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
-        # The send payload, preallocated: received taps are copied into its
-        # leading columns and the hooks capture straight into the rest, so
-        # packing allocates nothing. The last stage's hooks write into the
-        # drafter's own buffers instead.
-        self.buffers: dict[int, torch.Tensor] = {}
-        self._send = None
-        if self.outgoing_ids:
-            h = spec.hidden_size
-            self._send = torch.zeros(
-                max_num_tokens, len(self.outgoing_ids) * h, device=device, dtype=dtype
-            )
-            for col, lid in enumerate(self.outgoing_ids):
-                if lid in self.own_ids:
-                    self.buffers[lid] = self._send[:, col * h : (col + 1) * h]
+        # The send payload, allocated per step at the forward's row count (a
+        # resident max_num_batched_tokens buffer is ~0.5 GB per rank): the
+        # first own tap allocates it, every own tap captures into its columns
+        # and pack() copies the received taps into the leading ones. The last
+        # stage's hooks write into the drafter's own buffers instead.
+        # shortcut: a recorded graph would bake the capture-time buffer, so
+        # this holds only while PP stages run their target eagerly.
+        self._send: torch.Tensor | None = None
+        self._col = {lid: col for col, lid in enumerate(self.outgoing_ids)}
 
         self._armed = False
 
@@ -102,7 +94,7 @@ class PPAuxRelay:
                 if lid == -1
                 else (layers[lid], self.spec.extract)
             )
-            hook = self._make_hook(self.buffers[lid], extract, is_draft_forward)
+            hook = self._make_hook(lid, extract, is_draft_forward)
             if lid != -1 and self.spec.capture == "input":
 
                 def pre_hook(module, inputs, hook=hook):
@@ -117,15 +109,21 @@ class PPAuxRelay:
             list(self.outgoing_ids),
         )
 
-    @staticmethod
-    def _make_hook(buffer, extract, is_draft_forward):
+    def _make_hook(self, lid, extract, is_draft_forward):
+        h, col = self.hidden_size, self._col[lid]
+        width = len(self.outgoing_ids) * h
+
         def _hook(module, _inputs, output):
             if is_draft_forward():
                 return
             tensor = extract(output, module)
             if tensor is None:
                 return
-            buffer[: tensor.shape[0]].copy_(tensor)
+            if lid == self.own_ids[0]:
+                self._send = torch.empty(
+                    tensor.shape[0], width, device=tensor.device, dtype=tensor.dtype
+                )
+            self._send[:, col * h : (col + 1) * h].copy_(tensor)
 
         return _hook
 
@@ -140,9 +138,16 @@ class PPAuxRelay:
                     f"{list(self.incoming_ids)} from the previous stage, got none."
                 )
             self._check_width(received)
-            self._send[:num_tokens, : received.shape[-1]].copy_(received[:num_tokens])
-        # A view: the send path clones it before the next step's hooks write.
-        return self._send[:num_tokens]
+            if not self.own_ids:
+                return received[:num_tokens]
+        # Hand the step's buffer over: the send path clones it.
+        send, self._send = self._send, None
+        assert (
+            send is not None and send.shape[0] == num_tokens
+        ), f"PPAuxRelay: no capture of {num_tokens} rows to send"
+        if self.incoming_ids:
+            send[:, : received.shape[-1]].copy_(received[:num_tokens])
+        return send
 
     def _check_width(self, received: torch.Tensor) -> None:
         expected = len(self.incoming_ids) * self.hidden_size
