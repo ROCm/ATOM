@@ -39,6 +39,7 @@ from atom.mono.device.gfx1250 import (
     WAVES,
     acc_row_sum,
     butterfly,
+    lds_barrier,
     publish,
     rows_to_lds_async,
     shuffled_rows,
@@ -502,7 +503,7 @@ def o_defs(k4ctx):
                 fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
             gpu.barrier()
             push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None)
-            gpu.barrier()
+            lds_barrier()
             if const_expr(AG_RS):  # noqa: SIM102
                 if (t % W == rank) & (tid < O_ROWS // 2 * tokens):
                     ptk = tid // (O_ROWS // 2)
