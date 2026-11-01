@@ -461,6 +461,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_END_MARGIN": lambda: max(
         0, int(os.getenv("ATOM_STATE_CHECKPOINT_END_MARGIN", "0"))
     ),
+    # GPU budget for PAGE state checkpoint images, in GiB; 0 (default) sets none.
+    # Without one, an image is spent only once the KV pool's free list runs dry,
+    # and that list holds reusable cached KV, so images displace the prefix
+    # cache. Past the budget the coordinator releases the least recently used
+    # unpinned READY images after each batch. With the CPU state tier attached,
+    # OFFLOAD_STATE_GPU_SIZE governs instead (it releases only images the tier
+    # holds). See `PagedStateCheckpointCoordinator.complete_previous_batch`.
+    "ATOM_STATE_CHECKPOINT_GPU_SIZE": lambda: float(
+        os.getenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", "0")
+    ),
+    # Log `[Image Diag]` each stats interval: how state checkpoint images were
+    # released, and which kind a resume short of its KV frontier needed.
+    "ATOM_STATE_CHECKPOINT_DIAG": lambda: os.getenv("ATOM_STATE_CHECKPOINT_DIAG", "0")
+    == "1",
     # vLLM plugin, state checkpoints: overrides the native checkpoint interval
     # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
     # Unset: the model's native default.
@@ -911,7 +925,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A step that writes state checkpoints, or holds more prefill requests than
     # ATOM_GDN_GRAPH_MAX_SEQS, runs eagerly as before. 0 keeps every GDN
     # prefill eager.
-    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
+    "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1")
+    == "1",
     "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
     # Prefill token graphs for the GDN/MHA builder (Qwen3.5 / Qwen3-Next) under
     # DP attention. A DP group replays a prefill bucket only on a step every

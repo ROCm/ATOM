@@ -3562,6 +3562,11 @@ class Scheduler:
             )
             hbm_cached_tokens = min(cached_tokens, wanted_tokens)
             offload_tokens = cached_tokens - hbm_cached_tokens
+            psc = self.block_manager.paged_state_checkpoints
+            kind = getattr(seq, "short_resume_kind", None)
+            lost = wanted_tokens - hbm_cached_tokens
+            if psc is not None and psc.diag and kind is not None and lost > 0:
+                psc.note_shortfall(kind, lost)
             self.engine_stats.update_cache(
                 hbm_cached_tokens,
                 seq.num_tokens,
