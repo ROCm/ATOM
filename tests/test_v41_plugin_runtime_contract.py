@@ -251,10 +251,14 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
         compilation_config=SimpleNamespace(static_forward_context={"proxy": proxy})
     )
     checkpoints = Mock()
+    order = []
+    keeps = Mock(side_effect=lambda *_: order.append("keeps"))
+    stage.side_effect = lambda *_, **__: order.append("stage") or prepared
     scope = {
         "ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME": "proxy",
         "snapshot_v41_batch": lambda _: snapshot,
         "bind_deepseek_v41_proxy_cache": lambda *_: bound,
+        "_v41_store_last_steps_decode_keeps": keeps,
         "_v41_stage_outside_forward": stage,
         "_v41_state_checkpoints_around_forward": checkpoints,
     }
@@ -285,5 +289,10 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
     # step to checkpoint either.
     if staged_on is not None and not capturing:
         checkpoints.assert_called_once_with(config, common, prepared)
+        # The keeps the last step committed to are stored before this step's
+        # staging can move the state they are read from.
+        keeps.assert_called_once_with(config, snapshot)
+        assert order == ["keeps", "stage"]
     else:
         checkpoints.assert_not_called()
+        keeps.assert_not_called()
