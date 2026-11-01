@@ -68,7 +68,12 @@ from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.utils.region_graph import eager_region, token_graph
+from atom.utils.region_graph import (
+    eager_region,
+    on_scheduled_rows,
+    padded_prefill_rows,
+    token_graph,
+)
 
 
 def _text_config(config):
@@ -1045,7 +1050,14 @@ def kda_attention_with_output(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._forward_impl(hidden_states, hidden_states_scale)
+    # A prefill padded to a token-graph bucket runs the recurrence on its
+    # scheduled rows alone: the conv/ssm state reads each request's last rows.
+    return on_scheduled_rows(
+        self._forward_impl,
+        padded_prefill_rows(hidden_states.shape[0]),
+        hidden_states,
+        hidden_states_scale,
+    )
 
 
 class KimiKDAAttention(nn.Module):

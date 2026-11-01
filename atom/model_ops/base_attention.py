@@ -18,7 +18,11 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.utils import envs, mark_spliting_op
-from atom.utils.region_graph import eager_region
+from atom.utils.region_graph import (
+    eager_region,
+    on_scheduled_rows,
+    padded_prefill_rows,
+)
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
@@ -1060,15 +1064,20 @@ def unified_attention_with_output_base(
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    if use_mla:
-        return self.impl.forward(
-            query=q,
-            k_nope=k,
-            k_rope=v,
-            positions=positions,
-            q_scale=q_scale,
-        )
-    else:
+    rows = padded_prefill_rows(q.shape[0])
+    if rows is not None:
+        # Rows are positions' last dim (an mrope table leads with its axes).
+        positions = positions[..., :rows]
+
+    def attend(q, q_scale, k, v, qkv):
+        if use_mla:
+            return self.impl.forward(
+                query=q,
+                k_nope=k,
+                k_rope=v,
+                positions=positions,
+                q_scale=q_scale,
+            )
         return self.impl.forward(
             query=q,
             key=k,
@@ -1077,6 +1086,8 @@ def unified_attention_with_output_base(
             q_scale=q_scale,
             qkv=qkv,
         )
+
+    return on_scheduled_rows(attend, rows, q, q_scale, k, v, qkv)
 
 
 def linear_attention_with_output_base_fake(
