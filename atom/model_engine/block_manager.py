@@ -337,6 +337,7 @@ class BlockManager:
             state_tier_capability,
             state_tier_chunk_tokens,
             state_tier_cpu_bytes,
+            state_tier_verified_for_s,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -515,6 +516,11 @@ class BlockManager:
                     if checkpoint_spec is not None
                     else None
                 ),
+                # Off again (`stop_refreshing`) if the connector turns out not
+                # to carry state touches.
+                refresh_hits=True,
+                # How long a confirmed image is trusted.
+                verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -1536,14 +1542,90 @@ class BlockManager:
             or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
         )
 
-    def record_allocation(self, seq: Sequence, probe: AdmissionProbe) -> None:
-        """Commit the fit probe before any allocation changes the pool."""
-        if self.enable_prefix_caching:
-            decision = self._joint_kv_boundary(
-                seq, probe.num_cached_blocks, probe.block_hashes
-            )
-            decision = self._fit_joint(decision, probe)
-            self._commit_joint_boundary(seq, decision)
+    def record_allocation(
+        self,
+        seq: Sequence,
+        probe: AdmissionProbe,
+        *,
+        defer_unverified: bool = False,
+    ) -> bool:
+        """Commit the fit probe before any allocation changes the pool.
+
+        With `defer_unverified`, returns False and commits nothing when the
+        state this admission would load from the CPU tier has not been
+        confirmed there lately (`StateOffloadIndex.needs_verify`). The
+        caller holds the request for a pass while that image's touch comes
+        back, rather than parking a joint load that may miss and recompute the
+        whole prompt.
+        """
+        if not self.enable_prefix_caching:
+            return True
+        decision = self._joint_kv_boundary(
+            seq, probe.num_cached_blocks, probe.block_hashes
+        )
+        decision = self._fit_joint(decision, probe)
+        if defer_unverified and self._tier_state_unverified(
+            seq, probe.num_cached_blocks, probe.block_hashes, decision
+        ):
+            self.state_offload.loads_deferred_for_verify += 1
+            return False
+        self._commit_joint_boundary(seq, decision)
+        return True
+
+    def _tier_state_unverified(
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        block_hashes: list[int],
+        decision: JointBoundaryDecision,
+    ) -> bool:
+        """Whether `allocate` would load this seq's state from the CPU tier
+        under a hash not confirmed resident recently.
+
+        Judges the hash `allocate` will hand `_attach_state_slots`
+        (`_state_resume_hash`), which the tier only serves when HBM does not
+        hold it.
+        """
+        offload = self.state_offload
+        if offload is None or not offload.refresh_hits or not seq.has_per_req_cache:
+            return False
+        joint = decision.skip_reason is None
+        if joint and decision.state_from_hbm:
+            return False
+        hit_hash = (
+            block_hashes[num_cached_blocks - 1]
+            if 0 < num_cached_blocks <= len(block_hashes)
+            else -1
+        )
+        h = self._state_resume_hash(
+            seq, decision.boundary_hash if joint else -1, hit_hash
+        )
+        if h == -1:
+            return False
+        if not joint:
+            if self.paged_state_checkpoints is not None:
+                if self.paged_state_checkpoints.contains(h):
+                    return False
+            elif self.state.lookup(h) >= 0:
+                return False
+        return offload.needs_verify(h)
+
+    def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
+        """The hash whose state `seq` resumes from, or -1 for none.
+
+        The joint boundary when there is one (above the HBM hit by
+        construction), else the HBM hit's last block. A replay rebuilds the
+        state instead of restoring it, so it resumes from none. `allocate`
+        hands this to `_attach_state_slots`, and `_tier_state_unverified` asks
+        about it, so the admission hold judges the hash that will be loaded.
+        """
+        if joint_hash != -1:
+            return joint_hash
+        if self.state.transfer.replays or (
+            self.state_replay_tokens and seq.replays_hit
+        ):
+            return -1
+        return hit_hash
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -1740,13 +1822,16 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
-        if self.state_replay_tokens and seq.replays_hit:
-            # A replay starts from a fresh state slot, never a checkpoint: it
-            # rebuilds the state below whatever the claim above reached.
-            hit_hash = -1
-            if num_cached_blocks < requested_blocks:
-                # A KV-only load past the hit would start above a gap.
-                seq.replay_kv_load = False
+        # A replay starts from a fresh state slot, never a checkpoint: it
+        # rebuilds the state below whatever the claim above reached
+        # (`_state_resume_hash` gives it none). A KV-only load past the hit
+        # would start above a gap.
+        if (
+            self.state_replay_tokens
+            and seq.replays_hit
+            and num_cached_blocks < requested_blocks
+        ):
+            seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1762,9 +1847,9 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
@@ -1781,9 +1866,9 @@ class BlockManager:
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False
@@ -2031,6 +2116,7 @@ class BlockManager:
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False
+        self.state_offload.want_touch(hit_hash)
         seq.offload_joint.load_hash = hit_hash
         self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True
