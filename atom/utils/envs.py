@@ -329,6 +329,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE_DECODE": lambda: (
         os.getenv("ATOM_USE_TRITON_MOE_DECODE", "0") == "1"
     ),
+    # FlyDSL HERD also routes hash layers (custom_routing_function) from the
+    # router logits on decode; 0 keeps their hash-table routing.
+    "ATOM_FLYDSL_HERD_HASH_LAYERS": lambda: (
+        os.getenv("ATOM_FLYDSL_HERD_HASH_LAYERS", "1") == "1"
+    ),
     # Select the a4w4 Triton wrapper instead of the a8w4 default, on both the TP
     # and EP paths. Only chooses *which* wrapper runs -- it cannot enable the
     # Triton path on its own, and asserts if set without ATOM_USE_TRITON_MOE.
