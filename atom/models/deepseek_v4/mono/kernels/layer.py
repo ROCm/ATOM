@@ -116,6 +116,7 @@ from atom.models.deepseek_v4.mono.kernels.plan import (
 )
 from atom.models.deepseek_v4.mono.kernels.primitives import rsrc, uniform
 from atom.models.deepseek_v4.mono.sources import SOURCES
+from atom.mono.device.ops import kernel_symbol
 
 
 def build_dsv4_kernel(
@@ -630,8 +631,21 @@ def build_dsv4_kernel(
         for n, v in sorted(bc.items())
         if isinstance(v, (bool, int, float, str, tuple, type(None), enum.Enum))
     )
+    kernel_name = kernel_symbol(
+        "dsv4_mono",
+        s=S,
+        q=tokens_per_seq,
+        tp=npes,
+        ph=phase,
+        c=compress_ratio,
+        moe=MoeMode(moe_mode).value,
+        attn=attention_mode,
+        r=index_topk_refresh,
+        kv="fp8" if kv_fp8 else "bf16",
+        t=timeline,
+    )
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def dsv4_kernel(
         h_in: Int64,
         x_out: Int64,

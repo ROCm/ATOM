@@ -14,33 +14,12 @@ from atom.mono.runtime.hip_ipc import (
     get_ipc_handle,
     open_ipc_handle,
 )
-
-
-def _ipc_heap():
-    """aiter's uncached IPC heap, imported on use.
-
-    `PeerBuffer` needs it; `SymmetricPeerBuffer` below drives HIP directly and
-    needs nothing from aiter. Importing it at module scope would make the whole
-    module -- and so every test of either class -- require an AITER build,
-    which the CPU test gate does not have.
-    """
-
-    from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap
-
-    return UncachedIpcHeap
-
-
-class _DeviceBytes:
-    """``__cuda_array_interface__`` of ``nbytes`` bytes at a raw device address, for a
-    non-owning torch view."""
-
-    def __init__(self, ptr: int, nbytes: int):
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (ptr, False),
-            "version": 3,
-        }
+from atom.mono.runtime.uncached import (
+    DeviceBytes,
+    alloc_uncached,
+    ipc_heap,
+    uncached_bytes,
+)
 
 
 class PeerBuffer:
@@ -71,18 +50,18 @@ class PeerBuffer:
         # the way in, and `SymmetricPeerBuffer` below needs neither.
         from atom.mono.runtime.step_begin import FENCE_BYTES
 
-        self.local = _ipc_heap().alloc_uncached(nbytes + FENCE_BYTES + plain_bytes)
-        # views, not owners: close() frees the memory under them
-        self.bytes = torch.as_tensor(_DeviceBytes(self.local, nbytes), device=device)
+        # kept until the process exits (``uncached``): close() only drops the views
+        self.local = alloc_uncached(nbytes + FENCE_BYTES + plain_bytes)
+        self.bytes = torch.as_tensor(DeviceBytes(self.local, nbytes), device=device)
         self.plain = torch.as_tensor(
-            _DeviceBytes(self.local + nbytes + FENCE_BYTES, plain_bytes), device=device
+            DeviceBytes(self.local + nbytes + FENCE_BYTES, plain_bytes), device=device
         )
         self.rank = rank
         self._opened: list[int] = []
         addresses = [self.local]
         if npes > 1:
-            handles = _ipc_heap().gather_object_list_via_broadcast(
-                group, _ipc_heap().get_mem_handle_bytes(self.local)
+            handles = ipc_heap().gather_object_list_via_broadcast(
+                group, ipc_heap().get_mem_handle_bytes(self.local)
             )
             addresses, failure = [], None
             try:
@@ -90,7 +69,7 @@ class PeerBuffer:
                     if peer == rank:
                         addresses.append(self.local)
                     else:
-                        base = _ipc_heap().open_mem_handle(handle)
+                        base = ipc_heap().open_mem_handle(handle)
                         self._opened.append(base)
                         addresses.append(base)
             except RuntimeError as err:  # every rank must still reach the agreement
@@ -113,24 +92,25 @@ class PeerBuffer:
         }
 
     def close(self) -> None:
-        """Close the peer mappings and free the local buffer; idempotent. Only once no
-        kernel of any rank can still touch it (the runner is being dropped)."""
+        """Close the peer mappings and drop the local buffer's views; idempotent.
+        Only once no kernel of any rank can still touch it (the runner is being
+        dropped). The memory itself stays (``uncached``)."""
         opened, self._opened = self._opened, []
         for base in opened:
-            _ipc_heap().close_mem_handle(base)
+            ipc_heap().close_mem_handle(base)
         if self.local:
             self.bytes = self.plain = None
-            _ipc_heap().free_device_mem(self.local)
             self.local = 0
 
 
 # ---------------------------------------------------------------------------
 # A SECOND implementation of the same idea, used by GLM-5.2's kernel.
 #
-# `PeerBuffer` above gets its memory from aiter (`UncachedIpcHeap`);
-# `SymmetricPeerBuffer` below drives HIP directly through `hip_ipc`. They are
-# not two copies of one routine -- they differ in how they allocate, exchange
-# and free IPC handles -- so merging them is a behaviour change on a GPU, not a
+# Both take their memory from `uncached.alloc_uncached`; `PeerBuffer` above
+# exchanges IPC handles through aiter (`UncachedIpcHeap`), `SymmetricPeerBuffer`
+# below through `hip_ipc` and torch.distributed. They are not two copies of one
+# routine -- they differ in how they exchange and close IPC handles -- so
+# merging them is a behaviour change on a GPU, not a
 # move, and a wrong merge is silent wrong numerics rather than a failing
 # import. They sit together so the duplication is visible and the next person
 # to touch peer memory has to decide, instead of finding the second one later.
@@ -141,7 +121,8 @@ class SymmetricPeerBuffer:
     """Allocate one symmetric buffer and exchange its address with every rank.
 
     Remote HIP IPC mappings are closed by :meth:`close`. The local allocation is
-    owned by ``storage`` and stays alive for the wrapper's lifetime.
+    uncached memory viewed by ``storage``, kept until the process exits
+    (``uncached``).
     """
 
     def __init__(self, nbytes: int, rank: int = 0, npes: int = 1, group=None):
@@ -158,7 +139,7 @@ class SymmetricPeerBuffer:
 
         if npes == 1:
             device = torch.device("cuda", torch.cuda.current_device())
-            self.storage = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+            self.storage = uncached_bytes(nbytes, device)
             self.local_address = self.storage.data_ptr()
             addresses = [self.local_address]
         else:
@@ -168,7 +149,7 @@ class SymmetricPeerBuffer:
             mine = None
             try:
                 device = torch.device("cuda", torch.cuda.current_device())
-                self.storage = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+                self.storage = uncached_bytes(nbytes, device)
                 self.local_address = self.storage.data_ptr()
                 base = get_allocation_base(self.local_address)
                 mine = (get_ipc_handle(base), self.local_address - base)
