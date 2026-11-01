@@ -1,0 +1,242 @@
+# atom-review-bot — on-demand PR review triggered by an `atom-bot review` comment.
+# Native issue_comment trigger, no polling and no local daemon.
+#
+# Install at ROCm/ATOM as .github/workflows/atom-review-bot.yml and merge to the default
+# branch (issue_comment workflows only run from the definition on the default branch).
+#
+# Trigger (an authorized ATOM reviewer comments on a PR):
+#   atom-bot review   reviews the PR. Comment again after pushing fixes for a fresh pass —
+#                       a new head SHA is reviewed, repeats on the same SHA are deduped, so this
+#                       one command covers both the first pass and repeat passes.
+#                   No `@` — the bot's account is `rocm-atom-bot`, and GitHub notifies on an
+#                   `@handle` regardless of what we document, so the documented form is written
+#                   to not carry one. Writing `@rocm-atom-bot review` out of habit still works
+#                   (the bare phrase is a substring of it) and still notifies that account —
+#                   that is GitHub's doing, not this workflow's, the moment the comment is sent.
+# Commands inside quote (`>`) lines do not trigger, and the bare phrase must open the line (after
+# trimming leading whitespace) so it cannot fire from inside ordinary prose, a quoted log or a
+# code block; non-allowlisted commenters are ignored.
+#
+# Two jobs so an unauthorized comment never touches the self-hosted box:
+#   gate    (ubuntu-latest, free): quote-aware trigger + allowlist check, reading
+#           authorized.txt from the default branch (or the ATOM_REVIEW_AUTHORIZED repo var).
+#   review  (self-hosted atom-bot): only when gate passes — checkout, claim 👀, run_one.sh
+#           (headless GLM review), then _publish.py (posts the card for EVERY verdict) or
+#           _notify.py (routes a failed run to its owner).
+name: atom-review-bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read          # read-only; comments are posted with the rocm-atom-bot PAT
+
+concurrency:
+  # Serialize repeated triggers on the same PR; do not cancel an in-flight review.
+  group: atom-review-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # Cheap pre-filter (a PR comment carrying the phrase); the real, quote-aware + allowlist
+    # check runs in the step below on this free GitHub-hosted runner, so an unauthorized comment
+    # never starts a job on the single self-hosted box.
+    # The bot's own comments are issue_comment events too, so every card, queue notice and
+    # failure report used to start a run of this workflow -- gated off a moment later, but only
+    # after taking a hosted-runner slot that the real requests are queueing for. Eighteen reviews
+    # produced thirty-six such runs competing with themselves.
+    if: >
+      github.event.issue.pull_request &&
+      github.event.comment.user.login != 'rocm-atom-bot' &&
+      contains(github.event.comment.body, 'atom-bot review')
+    runs-on: ubuntu-latest
+    # A few API calls and, on the rare stalled-queue path, one 60s pause. Without this the
+    # default is six hours, which is a long time to hold a runner because an API call hung.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read           # read other runs to see how deep the queue already is
+    outputs:
+      ok: ${{ steps.queue.outputs.ok }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false      # queue_gate.py ships with the skill
+      - name: Authorize (trigger + allowlist) before any self-hosted checkout
+        id: auth
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          ATOM_REVIEW_AUTHORIZED: ${{ vars.ATOM_REVIEW_AUTHORIZED }}   # optional; empty -> authorized.txt
+        with:
+          script: |
+            const body = context.payload.comment.body || '';
+            const who = (context.payload.comment.user.login || '').toLowerCase();
+            // real trigger: line-based, skip quote (>) lines. The bare phrase must open the
+            // (trimmed) line -- unlike an @-mention it can otherwise appear mid-sentence, in a
+            // quoted log, or inside a code block, none of which is a review request.
+            // An optional leading @ (and rocm- prefix) is still accepted, so habit still works:
+            // '@rocm-atom-bot review' and '@atom-bot review' both contain 'atom-bot review'.
+            let trig = false;
+            for (const raw of body.split('\n')) {
+              const line = raw.replace(/^\s+/, '');
+              if (line.startsWith('>')) continue;
+              if (/^@?(?:rocm-)?atom-bot\s+review\b/i.test(line)) { trig = true; break; }
+            }
+            // allowlist: the repo var wins, else authorized.txt from the default branch
+            let allow = new Set();
+            const v = (process.env.ATOM_REVIEW_AUTHORIZED || '').trim();
+            if (v) {
+              for (const x of v.split(',')) if (x.trim()) allow.add(x.trim().toLowerCase());
+            } else {
+              try {
+                const r = await github.rest.repos.getContent({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: '.claude/skills/review-pr/authorized.txt' });
+                const txt = Buffer.from(r.data.content, 'base64').toString('utf8');
+                for (const l of txt.split('\n')) {
+                  const s = l.trim();
+                  if (s && !s.startsWith('#')) allow.add(s.toLowerCase());
+                }
+              } catch (e) { core.warning('authorized.txt read failed: ' + e); }
+            }
+            const ok = trig && allow.has(who);
+            core.setOutput('ok', ok ? 'true' : 'false');
+            core.notice(`commenter=${who} trigger=${trig} authorized=${allow.has(who)} -> ${ok ? 'run' : 'ignored'}`);
+
+      # Accepting a request the box cannot work through is how one gets lost: a queued job is
+      # cancelled after 24 h, and the notifier lives inside the job that never ran. Answer the
+      # requester here instead -- on their PR, at the moment they ask.
+      - name: Queue depth — answer the requester, refuse work the box cannot do
+        id: queue
+        if: always()
+        env:
+          AUTHORIZED: ${{ steps.auth.outputs.ok }}
+          PR: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+          ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
+          MAX_WAIT_HOURS: ${{ vars.ATOM_MAX_WAIT_HOURS }}   # optional; default 8
+        run: python3 .claude/skills/review-pr/queue_gate.py
+
+  watchdog:
+    # The one failure the in-job notifier cannot reach. With no runner the review job stays
+    # `queued`: run_one.sh never starts, so _notify.py never runs, GitHub sends no failure mail,
+    # and the run reads as "in progress" indefinitely -- this box sat dead for days that way.
+    # This job runs on GitHub-hosted infra, so it is alive exactly when the box is not.
+    needs: gate
+    if: needs.gate.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read           # read this run's own jobs to see whether the review ever started
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Report a review that never got a runner
+        env:
+          STUCK_MINUTES: '20'          # a healthy runner claims a job in seconds
+          PR: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+          ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
+        run: python3 .claude/skills/review-pr/watchdog.py
+  review:
+    needs: gate
+    if: needs.gate.outputs.ok == 'true'
+    runs-on: [self-hosted, atom-bot]        # label the runner with these at registration
+    outputs:
+      notified: ${{ steps.notify.outputs.notified }}
+    timeout-minutes: 150    # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
+    env:
+      PR: ${{ github.event.issue.number }}          # issue number == PR number here
+      COMMENTER: ${{ github.event.comment.user.login }}
+      REVIEW_AUTO_VALIDATE: '0'   # kernel validation off by default (self-hosted + public repo)
+    steps:
+      - name: Checkout tooling (base/main, trusted)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0                 # full history: fetch.sh needs the PR + merge-target refs
+          persist-credentials: false
+
+      - name: Resolve tooling dir
+        id: rl
+        run: echo "dir=${GITHUB_WORKSPACE}/.claude/skills/review-pr" >> "$GITHUB_OUTPUT"
+
+      # P0.5: ATOM_BOT_TOKEN is now a configured repo secret, so this condition passes and
+      # the reaction goes live. The condition itself stays -- it is the step's closure
+      # against an empty Authorization header if the secret is ever removed again, not a
+      # P0-only guard. The `secrets` context is not reliably available in a step-level
+      # `if`, so the secret is bound to the step's own env and that is what gets tested.
+      - name: Claim 👀 (as rocm-atom-bot)
+        env:
+          ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
+        if: env.ATOM_BOT_TOKEN != ''
+        run: |
+          curl -s -X POST -H "Authorization: token $ATOM_BOT_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -d '{"content":"eyes"}' >/dev/null || true
+
+      - name: Review (headless GLM)
+        id: review
+        run: bash "${{ steps.rl.outputs.dir }}/run_one.sh" "$PR" "$GITHUB_REPOSITORY"
+
+      # P0.5: ATOM_BOT_TOKEN is live, so _publish.py is invoked with --post and actually
+      # posts the card as rocm-atom-bot. It posts over its own token directly (never
+      # GITHUB_TOKEN), which is why this job still needs no issues/pull-requests write
+      # permission -- see check_prompts.py's check_publish_needs_post_flag. The review
+      # step itself never uses the token -- the agent runs --dangerously-skip-permissions
+      # over untrusted PR content.
+      - name: Render and post the review card (as rocm-atom-bot)
+        if: success()
+        run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
+
+      - name: Report a failed review to the owner (as rocm-atom-bot)
+        id: notify
+        # Runs even when the review step failed. run_one.sh writes .atom-review-status as
+        # "<class>\t<message>"; _notify.py maps the class to its owner and posts one comment
+        # @-mentioning them, reading the class->owner map from _notify.py's OWNERS table
+        # (the single source of truth, as in aiter's), never the PR author. check_prompts.py
+        # fails if run_one emits a class that table does not know -- so they cannot drift.
+        if: always()
+        env:
+          ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
+        run: |
+          # belt-and-suspenders: if the review step failed but left no status (a hard job-timeout
+          # kill before run_one's trap ran), synthesize one so it still routes to an owner.
+          if [ "${{ steps.review.outcome }}" = "failure" ] && [ ! -f "$GITHUB_WORKSPACE/.atom-review-status" ]; then
+            printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.atom-review-status"
+          fi
+          # _notify.py sets the `notified` output itself, and only once a post has actually
+          # landed. It returns 0 without posting in three cases -- no status file, no token, a
+          # POST that threw -- and in every one of them the report job must still speak.
+          python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
+
+  report:
+    # `if: always()` inside the review job covers a step that failed; it cannot cover a job that
+    # stopped existing. When the self-hosted runner loses contact mid-review, not one step runs,
+    # so nothing is written and nothing is posted -- from the PR it reads as a review still in
+    # progress, forever. This job lives on hosted infra, so it is alive exactly when the box is
+    # not, and it speaks only when the review ended badly having reported nothing itself.
+    needs: [gate, review]
+    # Skips the common case entirely rather than spinning a runner to decide it did not
+    # need one. lost_review.py keeps its own guard, so this is a saving, not the decision.
+    if: always() && needs.gate.outputs.ok == 'true' && needs.review.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Report a review that vanished without reporting
+        env:
+          REVIEW_RESULT: ${{ needs.review.result }}
+          NOTIFIED: ${{ needs.review.outputs.notified }}
+          PR: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
+        run: python3 .claude/skills/review-pr/lost_review.py
