@@ -102,6 +102,10 @@ HC_EPS = 1e-6
 HC_MIX = (2 + HC_MULT) * HC_MULT  # pre | post | comb, packed in that order
 
 EPS = 1e-6
+
+# A normal layer takes milliseconds. A missing peer must fail the queue
+# instead of waiting forever or forwarding stale mailbox values.
+POLL_TIMEOUT_US = 10_000_000
 SCALE_BM = 128
 FP8_MAX = 448.0
 SOFTMAX_SCALE = HEAD_DIM**-0.5
@@ -394,6 +398,9 @@ def _variant_key(
         cfg.top_k,
         cfg.inter,
         cfg.softmax_scale,
+        cfg.eps,
+        cfg.rope_dim,
+        cfg.route_scale,
         cfg.swiglu_limit,
         cfg.hc_sinkhorn_iters,
         cfg.hc_eps,

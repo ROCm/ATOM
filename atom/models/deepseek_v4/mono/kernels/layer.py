@@ -56,6 +56,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v4.mono.config import (
     BLOCK_TOKENS,
+    EPS,
     HC_EPS,
     HC_SINKHORN_ITERS,
     HEAD_DIM,
@@ -64,8 +65,10 @@ from atom.models.deepseek_v4.mono.config import (
     N_EXPERTS,
     O_GROUPS,
     O_LORA,
+    POLL_TIMEOUT_US,
     Q_LORA,
     ROPE_DIM,
+    ROUTE_SCALE,
     SOFTMAX_SCALE,
     SWIGLU_LIMIT,
     TOP_K,
@@ -126,7 +129,7 @@ def build_dsv4_kernel(
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
     moe_mode: MoeMode | str = MoeMode.A8W4,
-    poll_timeout_us: int | None = None,
+    poll_timeout_us: int = POLL_TIMEOUT_US,
     tokens_per_seq: int = 1,
     compressor_ring_rows: int | None = None,
     hidden: int = HIDDEN,
@@ -138,6 +141,9 @@ def build_dsv4_kernel(
     top_k: int = TOP_K,
     inter: int = INTER,
     swiglu_limit: float = SWIGLU_LIMIT,
+    eps: float = EPS,
+    rope_dim: int = ROPE_DIM,
+    route_scale: float = ROUTE_SCALE,
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = HC_SINKHORN_ITERS,
     hc_eps: float = HC_EPS,
@@ -179,6 +185,9 @@ def build_dsv4_kernel(
     All phases retain the same ABI, scratch and epoch; advance only after
     the chain completes. The final attention phase publishes MoE's ``a``.
     """
+    if type(poll_timeout_us) is not int or poll_timeout_us <= 0:
+        raise ValueError("mailbox timeout must be a positive number of microseconds")
+    EPS, ROPE_DIM, ROUTE_SCALE = eps, rope_dim, route_scale
     # Draft block attention has forward-row dependencies. Keep it distinct
     # from target verify and require a completed producer launch before core.
     # V4's current draft stages have no compressor/indexer; compressed draft
@@ -549,8 +558,33 @@ def build_dsv4_kernel(
             KT_OFF + SPLIT_KEYS * KS,
             index_heads * IHD * 3 // 2,
         )
+    # One exact build profile owns UG/Down selection and its LDS geometry.
+    # Other widths, draft blocks and formats keep their existing path.
+    # These are Python build constants. A tuple avoids expanding a long
+    # short-circuit tree in FlyDSL's device-control-flow rewriter.
+    expert_union = all(
+        (
+            S == 7,
+            TOK == 7,
+            phase == "moe",
+            not DRAFT_BLOCK,
+            npes == 8,
+            TOP_K == 6,
+            N_EXPERTS == 384,
+            HC == 4,
+            HIDDEN == 7168,
+            INTER == 384,
+            G == 256,
+            use_mxfp4_weight,
+            use_mxfp8_block32,
+            shared_bf16_block128,
+            routed_down_bf16,
+        )
+    )
+    DN_TILE = 128 if expert_union else dn_tile(S, HIDDEN)
     ON = S * max(ROW_TILE, QKV_A_TILE, UG_TILE * 2)
-    DN_TILE = dn_tile(S, HIDDEN)
+    if expert_union:
+        ON = max(ON, S * DN_TILE)
     N_DN_TILES = HIDDEN // DN_TILE
 
     st_args = {
@@ -893,6 +927,7 @@ def build_dsv4_kernel(
         index_topk_source_layer: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        _ = _cache_tag
         dsv4_kernel(
             h_in,
             x_out,
@@ -1034,6 +1069,7 @@ def build_advance_step(scr_pairs: int, sym_pairs: int):
     def advance_step(
         step: Int64, scratch: Int64, sym: Int64, stream: fx.Stream = fx.Stream(None)
     ):
+        _ = _cache_tag
         advance_kernel(step, scratch, sym).launch(
             grid=(1,), block=(THREADS,), stream=stream
         )

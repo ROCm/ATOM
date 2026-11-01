@@ -23,14 +23,16 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from atom.models.deepseek_v4.mono.config import EPS
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels import dpp_utils
 from atom.models.deepseek_v4.mono.kernels import primitives as ops
 
-EPS, FP8_MAX, SCALE_BM = 1e-5, 448.0, 128
+FP8_MAX, SCALE_BM = 448.0, 128
 CM_DEV, CM_SYS, POLL_MAX = 16, 17, 12
 ROW_TILE, THREADS, TL_COLS, WAVES = 32, 512, 8, 8
 from atom.models.deepseek_v4.mono.kernels.primitives import (
+    abort_kernel,
     bf2_f32,
     bf16_pair,
     f8_word,
@@ -125,8 +127,10 @@ def poll(
     sc0 sc1 for peer memory); while any tag is not ``expected_tag`` (default: this launch's)
     the whole batch is re-loaded, so a batch costs one round trip after its last producer
     lands. A side-effecting op in the retry loop keeps the loads from being hoisted. With
-    ``poll_timeout_ticks`` a timed-out poll stores the tag into ``hang``, and later polls
-    seeing it give up. Returns one list of Int32 value bits per spec."""
+    ``poll_timeout_ticks`` bounds system-scope peer waits. A missing rank
+    traps the device queue, including its locally waiting CTAs; no stale
+    peer payload returns. Local producer waits keep the resident schedule's
+    cheaper polling loop. Returns one list of Int32 value bits per spec."""
     tag = st.tag
     poll = st.poll
     if const_expr(len(specs) == 0):
@@ -169,24 +173,16 @@ def poll(
         return bad
 
     v = load_all()
-    if const_expr(poll_timeout_ticks is not None):
+    if const_expr(poll_timeout_ticks is not None and scope != "agent"):
+        # Test the deadline at the loop boundary. Trapping inside its body
+        # retains an extra exec mask and can spill a resident attention phase.
         t0 = mem_realtime()
-        stop = fx.Int32(0)
-        while pending(v) & (stop == 0):
+        while pending(v) & ((mem_realtime() - t0) < fx.Int64(poll_timeout_ticks)):
             rocdl.s_nop(0)
             v = load_all()
-            flagged = (
-                uniform(
-                    bo.buffer_load(
-                        rsrc(hang), 0, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV
-                    )
-                )
-                == tag
-            )
-            late = (mem_realtime() - t0) > fx.Int64(poll_timeout_ticks)
-            stop = late.select(fx.Int32(2), flagged.select(fx.Int32(1), fx.Int32(0)))
-        if stop == 2:
+        if pending(v):
             bo.buffer_store(tag, rsrc(hang), 0, cache_modifier=CM_DEV)
+            abort_kernel()
     else:
         while pending(v):
             if const_expr(retry_spin_pause):
