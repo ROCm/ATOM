@@ -26,6 +26,7 @@ import logging
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from atom.model_ops.attentions.qwen4_exp_attn import (
@@ -37,7 +38,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -1200,6 +1201,11 @@ def build_qsa_metadata(
 
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
+    host_lens = context_slots = None
+    if not packed_step and envs.ATOM_QSA_FLYDSL_ATTN and not _is_draft_forward():
+        host_lens, context_slots = _flydsl_prefill_layout(
+            forward_batch, live_bs, num_tokens, block_tables, block_size
+        )
     qsa = Qwen4ExpQSAMetadata(
         block_tables=block_tables,
         slot_mapping=slot_mapping,
@@ -1208,8 +1214,48 @@ def build_qsa_metadata(
         logical_positions=logical,
         seq_lens=seq_lens,
         max_seq_len=max(max_seq_len, 1),
+        host_lens=host_lens,
+        context_slots=context_slots,
     )
     return qsa
+
+
+def _flydsl_prefill_layout(
+    forward_batch: Any,
+    live_bs: int,
+    num_tokens: int,
+    block_tables: torch.Tensor,
+    block_size: int,
+) -> tuple[tuple | None, torch.Tensor | None]:
+    """Host lengths for FlyDSL QSA attention, plus context rows when prefixed.
+
+    Returns (None, None) unless the packed tokens are exactly the scheduled
+    extends, so padded or partial batches keep the native kernel.
+    """
+    extends = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seqs = getattr(forward_batch, "seq_lens_cpu", None)
+    if extends is None or seqs is None:
+        return None, None
+    extends = tuple(int(n) for n in list(extends)[:live_bs])
+    seqs = tuple(int(n) for n in list(seqs)[:live_bs])
+    if (
+        len(extends) != live_bs
+        or len(seqs) != live_bs
+        or sum(extends) != num_tokens
+        or any(e < 0 or s < e for e, s in zip(extends, seqs))
+    ):
+        return None, None
+    if all(s == e for e, s in zip(extends, seqs)):
+        return (extends, seqs), None
+    lengths = np.asarray(seqs, dtype=np.int64)
+    requests = np.repeat(np.arange(live_bs, dtype=np.int64), lengths)
+    tokens = np.arange(len(requests), dtype=np.int64) - np.repeat(
+        np.cumsum(lengths) - lengths, lengths
+    )
+    host = torch.from_numpy(np.stack((requests, tokens))).pin_memory()
+    requests, tokens = host.to(block_tables.device, non_blocking=True)
+    pages = block_tables[requests, tokens // block_size].to(torch.int64)
+    return (extends, seqs), pages * block_size + tokens % block_size
 
 
 def _mamba_physical_slots(pool: Any) -> int:
