@@ -246,31 +246,8 @@ class KimiK3DFlashAttention(nn.Module):
             prefix=f"{prefix}.qk_norm",
         )
 
-        # The DRAFT'S OWN rope, never the target's. This checkpoint is YaRN x16
-        # from 65536 at theta 10000; Kimi-K3 is x32 from 32768 at theta 50000.
-        # Inheriting the target's loads clean and only costs acceptance length.
-        rope_params = dict(getattr(config, "rope_parameters", None) or {})
-        rope_theta = rope_params.get("rope_theta") or getattr(
-            config, "rope_theta", 10000.0
-        )
-        rope_scaling = None
-        if rope_params.get("rope_type") == "yarn" or rope_params.get(
-            "factor", 1.0
-        ) not in (
-            1.0,
-            None,
-        ):
-            rope_scaling = dict(rope_params)
-            rope_scaling.setdefault(
-                "original_max_position_embeddings", config.max_position_embeddings
-            )
         self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=True,
+            self.head_dim, rotary_dim=self.head_dim, **_draft_rope_kwargs(config)
         )
 
         # What the draft pool binds this layer's cache and scales onto
@@ -488,6 +465,32 @@ class KimiK3DFlashDecoderLayer(nn.Module):
                 f"{slot_mapping.shape[0]} draft slots"
             )
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping[:rows])
+
+
+def _draft_rope_kwargs(config) -> dict:
+    """`get_rope` arguments from the DRAFT's own config, never the target's.
+
+    This checkpoint is YaRN x16 from 65536 at theta 10000, neox-style; Kimi-K3
+    is x32 from 32768 at theta 50000. Inheriting the target's loads clean and
+    only costs acceptance length.
+    """
+    rope_params = dict(getattr(config, "rope_parameters", None) or {})
+    rope_theta = rope_params.get("rope_theta") or getattr(config, "rope_theta", 10000.0)
+    rope_scaling = None
+    if rope_params.get("rope_type") == "yarn" or rope_params.get("factor", 1.0) not in (
+        1.0,
+        None,
+    ):
+        rope_scaling = dict(rope_params)
+        rope_scaling.setdefault(
+            "original_max_position_embeddings", config.max_position_embeddings
+        )
+    return {
+        "max_position": config.max_position_embeddings,
+        "base": rope_theta,
+        "rope_scaling": rope_scaling,
+        "is_neox_style": True,
+    }
 
 
 def _draft_quant_config(config) -> QuantizationConfig:

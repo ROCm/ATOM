@@ -117,16 +117,24 @@ def test_dflash_config_normalize():
 
 
 def test_dflash_rope_is_the_drafts_own():
-    """`hf_config_override` leaves the draft's theta 10000 / YaRN x16 alone; the
-    target's theta 50000 / x32 would load clean and only move acceptance."""
+    """The rope the draft attention builds comes from the draft's config:
+    theta 10000 / YaRN x16 from 65536, neox-style -- not the target's theta
+    50000 / x32. A wrong rope loads clean and only moves acceptance."""
     from atom.config import SpeculativeConfig
 
+    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
+    kw = m._draft_rope_kwargs(hf)
+    assert kw["base"] == 10000.0
+    assert kw["is_neox_style"] is True
+    assert kw["rope_scaling"]["rope_type"] == "yarn"
+    assert kw["rope_scaling"]["factor"] == 16.0
+    assert kw["rope_scaling"]["original_max_position_embeddings"] == 65536
 
-    assert hf.rope_parameters["rope_theta"] == 10000.0
-    assert hf.rope_parameters["factor"] == 16.0
-    assert hf.rope_parameters["original_max_position_embeddings"] == 65536
+    # No scaling in the config: a plain rope, not YaRN.
+    plain = _radixark_cfg(rope_parameters={"rope_theta": 10000.0})
+    assert m._draft_rope_kwargs(plain)["rope_scaling"] is None
 
 
 def test_dflash_does_not_capture_the_k3_dspark_checkpoint():
