@@ -709,6 +709,28 @@ class QuantizationConfig:
                 )
 
 
+def standalone_draft_quant_config(
+    draft_hf_config: PretrainedConfig, target_quant_config: "QuantizationConfig | None"
+) -> QuantizationConfig:
+    """Quant config for a draft loaded from its OWN checkpoint.
+
+    A standalone draft (eagle3, or DSpark with --draft-model) carries its own
+    quantization -- or none -- so it must not inherit the target's static
+    scheme: an MXFP4 target beside a bf16 draft otherwise declares the draft's
+    weights fp4 and the load dies in ``copy_``. This stayed invisible while the
+    target was quantized online from a bf16 checkpoint, whose static spec is
+    no_quant too.
+
+    The online override is passed through deliberately: it is a property of the
+    run, not of either checkpoint, and the draft was already subject to it.
+
+    Used by the native proposers and by the vLLM plugin's standalone-draft path,
+    so the two cannot drift.
+    """
+    online = getattr(target_quant_config, "online_quant_config_raw", None)
+    return QuantizationConfig(draft_hf_config, online)
+
+
 def glm5_kpool_block_size(index_kpool: int) -> int:
     """Tokens per KV block that lets GLM-5.3's pooled index cache be exact.
 

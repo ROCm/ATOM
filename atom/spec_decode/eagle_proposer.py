@@ -217,6 +217,10 @@ class EagleProposer(Drafter):
                 self.config.compilation_config
             )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+            # The draft's weights come from its own checkpoint, so its static
+            # quant scheme must too -- see
+            # Drafter.standalone_draft_quant_config.
+            draft_atom_config.quant_config = self.standalone_draft_quant_config()
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
             model = model_class(

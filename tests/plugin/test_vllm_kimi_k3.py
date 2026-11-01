@@ -236,6 +236,8 @@ def test_kimi_k3_vision_quant_excludes_cover_regex_and_globs():
             "vision_tower*",
             "*.vision_tower.*",
             "model.vision_tower",
+            # Excluded layer by layer, as amd/Kimi-K3-Quark-MXFP4-AttnFP8 does.
+            "vision_tower.encoder.blocks.0.mlp.fc0",
         ):
             assert (
                 KimiK3ForConditionalGeneration_._maybe_ignore_quant_config(
@@ -246,6 +248,32 @@ def test_kimi_k3_vision_quant_excludes_cover_regex_and_globs():
                 )
                 is None
             ), exclude
+        """)
+
+
+def test_kimi_k3_projector_excluded_layer_by_layer():
+    """Exact per-layer excludes on the projector exclude the projector; an
+    exclude elsewhere does not."""
+    _run_without_test_stubs("""
+        from types import SimpleNamespace
+
+        from atom.config import QuantizationConfig
+        from atom.plugin.vllm.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration_,
+        )
+
+        model = SimpleNamespace(
+            atom_config=SimpleNamespace(quant_config=QuantizationConfig())
+        )
+        quant_config = object()
+        ignore = KimiK3ForConditionalGeneration_._maybe_ignore_quant_config
+        excludes = ["mm_projector.proj.0", "mm_projector.proj.2"]
+        assert ignore(model, quant_config, excludes, "mm_projector") is None
+        assert ignore(model, quant_config, excludes, "vision_tower") is quant_config
+        assert (
+            ignore(model, quant_config, ["mm_projector_extra.x"], "mm_projector")
+            is quant_config
+        )
         """)
 
 
@@ -884,3 +912,54 @@ def test_dcp_multi_token_decode_selects_the_round_robin_kernel():
         assert single["cp_world_size"] == 1
         assert single["g_kv_indptr"] is None
         """)
+
+
+def _standalone_draft_case(monkeypatch, online_raw):
+    from types import SimpleNamespace
+
+    import torch
+    from aiter import QuantType, dtypes
+
+    from atom.config import QuantizationConfig
+    from atom.plugin.vllm import model_wrapper
+    from atom.quant_spec import LayerQuantConfig
+
+    # The target's config, as _generate_atom_config_from_vllm_config builds it:
+    # a statically MXFP4 target (e.g. amd/Kimi-K3-Quark-MXFP4-AttnFP8).
+    target_qc = QuantizationConfig()
+    target_qc.global_spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2
+    )
+    target_qc.online_quant_config_raw = online_raw
+    draft_hf = SimpleNamespace(torch_dtype=torch.bfloat16, quantization_config=None)
+    target_atom_config = SimpleNamespace(
+        hf_config=SimpleNamespace(name="target"),
+        quant_config=target_qc,
+        speculative_config=SimpleNamespace(draft_model_hf_config=draft_hf),
+    )
+    monkeypatch.setattr(
+        model_wrapper,
+        "_generate_atom_config_from_vllm_config",
+        lambda vllm_config: target_atom_config,
+    )
+    vllm_draft_hf = SimpleNamespace(name="vllm's un-normalized copy")
+    cfg = model_wrapper._standalone_draft_atom_config(
+        object(), vllm_draft_hf, is_dspark_draft=True
+    )
+    return cfg, draft_hf, QuantType
+
+
+def test_vllm_standalone_draft_does_not_inherit_the_target_static_quant(monkeypatch):
+    """A bf16 DSpark draft beside an MXFP4 target used to keep the target's
+    quant_config here (only hf_config was swapped) and load as fp4."""
+    cfg, draft_hf, QuantType = _standalone_draft_case(monkeypatch, None)
+    assert cfg.hf_config is draft_hf, "the normalized draft config must be used"
+    assert cfg.quant_config.global_spec.quant_type.value == QuantType.No.value
+    assert not cfg.quant_config.online_quant
+
+
+def test_vllm_standalone_draft_keeps_the_online_override(monkeypatch):
+    online = {"global_quant_config": "ptpc_fp8"}
+    cfg, _, _ = _standalone_draft_case(monkeypatch, online)
+    assert cfg.quant_config.online_quant
+    assert cfg.quant_config.online_quant_config_raw == online

@@ -523,6 +523,16 @@ class Glm5NextKDAAttention(KimiKDAAttention):
     def process_weights_after_loading(self) -> None:
         if getattr(self, "_in_proj_fused", False):
             return
+        # The fold below casts the bf16 gate into in_proj's g rows. That is only
+        # right for an unquantized in_proj (an online ptpc run is still bf16
+        # here: the parent hook runs before the child quantizes); a statically
+        # quantized one would need the folded rows quantized and scaled too.
+        if self.in_proj.quant_type.value != aiter.QuantType.No.value:
+            raise NotImplementedError(
+                "GLM-5.3 folds its low-rank KDA gate into in_proj in bf16; a "
+                f"statically quantized in_proj ({self.in_proj.quant_type.name}) "
+                "is not supported."
+            )
         # `--load_dummy` never runs a weight_loader, so the shard set is empty
         # by design and this coverage check would refuse to start on all 34 KDA
         # layers. The check exists to catch a checkpoint that silently supplied

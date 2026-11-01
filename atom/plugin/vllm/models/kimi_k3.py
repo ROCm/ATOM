@@ -633,7 +633,9 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
         if layer_name is not None:
             # Check the container and a representative child, both with and
             # without ATOMModelBase's outer ``model.`` root. The child form is
-            # required for patterns such as ``*.vision_tower.*``.
+            # required for patterns such as ``*.vision_tower.*``; check_children
+            # for a checkpoint that excludes the tower layer by layer
+            # (``mm_projector.proj.0``, ``vision_tower.encoder.blocks.0.wo``, ...).
             candidates = (
                 layer_name,
                 f"{layer_name}.__atom_child__",
@@ -642,7 +644,7 @@ class KimiK3ForConditionalGeneration_(vLLMKimiK3):
             )
             if any(
                 self.atom_config.quant_config._is_excluded(
-                    candidate, exclude_layers or []
+                    candidate, exclude_layers or [], check_children=True
                 )
                 for candidate in candidates
             ):

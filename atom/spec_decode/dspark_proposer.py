@@ -379,7 +379,7 @@ class DSparkProposer(Drafter):
         # Standalone draft: build from the DRAFT's own hf_config, exactly as
         # EagleProposer does for eagle3. Shallow-copy rather than deepcopy --
         # atom_config can hold non-picklable cuda.Stream objects, and only
-        # hf_config / compilation_config are mutated here.
+        # hf_config / compilation_config / quant_config are mutated here.
         import copy
 
         from atom.config import CompilationLevel
@@ -389,6 +389,9 @@ class DSparkProposer(Drafter):
         draft_atom_config.hf_config = draft_hf
         draft_atom_config.compilation_config = copy.copy(self.config.compilation_config)
         draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
+        # The draft's weights come from its own checkpoint, so its static quant
+        # scheme must too -- see Drafter.standalone_draft_quant_config.
+        draft_atom_config.quant_config = self.standalone_draft_quant_config()
         model = model_class(
             draft_atom_config,
             layer_offset=self.config.hf_config.num_hidden_layers,
