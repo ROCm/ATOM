@@ -14,6 +14,7 @@ from pathlib import Path
 SERVER_SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/atomesh/pd_server_atom.sh"
 )
+TRACE = "Kimi-K3_ts_20261026_110452_335.pt.trace.json.gz"
 
 
 class WaitForTorchTracesTest(unittest.TestCase):
@@ -27,10 +28,8 @@ class WaitForTorchTracesTest(unittest.TestCase):
                 "run_aiperf_agentic_benchmark() {"
             )
         ]
-        self.marker = self.root / ".torch_trace_start"
-        self.marker.touch()
-        past = time.time() - 100
-        os.utime(self.marker, (past, past))
+        self.traces_before = self.root / ".torch_traces_before"
+        self.traces_before.write_text("")
 
     def write_stop_file(self, name, trace_dirs):
         path = self.root / f".stop_profile_{name}.json"
@@ -46,14 +45,14 @@ class WaitForTorchTracesTest(unittest.TestCase):
         )
         return path
 
-    def write_trace(self, rank_dir, raw=False, mtime=None):
+    def write_trace(self, rank_dir, raw=False, mtime=None, name=TRACE):
         rank_dir.mkdir(parents=True, exist_ok=True)
-        gz = rank_dir / "Kimi-K3_ts_20261026_110452_335.pt.trace.json.gz"
+        gz = rank_dir / name
         gz.write_bytes(b"gz")
         if mtime is not None:
             os.utime(gz, (mtime, mtime))
         if raw:
-            (rank_dir / "Kimi-K3_ts_20261026_110452_335.pt.trace.json").write_text("{}")
+            (rank_dir / name.removesuffix(".gz")).write_text("{}")
 
     def run_wait(self, *stop_files):
         return subprocess.run(
@@ -62,7 +61,7 @@ class WaitForTorchTracesTest(unittest.TestCase):
                 "-c",
                 "set -uo pipefail\n" + self.functions + 'wait_for_torch_traces "$@"',
                 "bash",
-                str(self.marker),
+                str(self.traces_before),
                 *map(str, stop_files),
             ],
             env={**os.environ, "ATOM_PROFILER_TIMEOUT": "0"},
@@ -138,14 +137,27 @@ class WaitForTorchTracesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("1/4 rank traces still missing", result.stdout)
 
-    def test_trace_older_than_window_is_pending(self):
+    def test_trace_on_disk_before_the_window_is_pending(self):
         rank_dirs, stop_files = self.pp_prefill_and_tp_decode()
+        stale = "Kimi-K3_ts_20261026_105000_001.pt.trace.json.gz"
+        self.traces_before.write_text(stale + "\n")
         for rank_dir in rank_dirs:
-            stale = rank_dir.name == "rank_1"
-            self.write_trace(rank_dir, mtime=time.time() - 200 if stale else None)
+            self.write_trace(
+                rank_dir, name=stale if rank_dir.name == "rank_1" else TRACE
+            )
         result = self.run_wait(*stop_files)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("1/4 rank traces still missing", result.stdout)
+
+    def test_new_trace_counts_whatever_its_mtime(self):
+        # Another host's clock can stamp a trace written in the window as older
+        # than the window itself.
+        rank_dirs, stop_files = self.pp_prefill_and_tp_decode()
+        for rank_dir in rank_dirs:
+            self.write_trace(rank_dir, mtime=time.time() - 200)
+        result = self.run_wait(*stop_files)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("all 4 rank traces on disk", result.stdout)
 
 
 if __name__ == "__main__":
