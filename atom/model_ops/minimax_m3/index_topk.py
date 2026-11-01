@@ -644,8 +644,10 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
     A count, not a size: the grid is (request, chunk), so this IS the second
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
-    CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
-    is what bounds the split, and TARGET_GRID still caps the largest batches.
+    CTAs. This shared legacy policy uses DECODE_SCORE_MIN_BLOCKS to amortize
+    query loads, while TARGET_GRID caps large batches. Native gfx1250 decode
+    has a separately measured finer-split exception in _native_decode_score_chunks;
+    CP continues to use this shared policy.
 
     The round trip through the size is not redundant. The caller turns this
     count back into a size with the same cdiv, and a count that does not divide
@@ -663,9 +665,9 @@ def _decode_score_chunks(batch: int, max_block: int) -> int:
         # wait in the collective that follows.
         return 1
     chunks = min(1 << (target.bit_length() - 1), max_block)
-    # Floor the blocks one chunk walks. The query tile is loaded once outside
-    # the block loop, so at one block per chunk that fixed cost is the whole
-    # cost -- every measured regression was a chunk down to a single block.
+    # Shared legacy floor: amortize the query-tile load across several blocks.
+    # This is not a universal minimum; _native_decode_score_chunks below uses
+    # a measured one/two-block exception for small native gfx1250 grids.
     chunks = min(chunks, max(1, triton.cdiv(max_block, DECODE_SCORE_MIN_BLOCKS)))
     return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
 
