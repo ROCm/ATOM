@@ -477,6 +477,7 @@ class EngineCore:
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
     def _process_engine_step_inner(self):
+        step_t0 = time.time()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -509,6 +510,15 @@ class EngineCore:
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
+        step_key = None
+        if has_seqs and timeline.enabled():
+            self._timeline_step = getattr(self, "_timeline_step", 0) + 1
+            kind = "P" if scheduled_batch.total_seqs_num_prefill else "D"
+            step_key = (
+                f"e{self._timeline_step}:{kind}{scheduled_batch.total_tokens_num}"
+            )
+            timeline.mark(step_key, "step_start", step_t0)
+            timeline.mark(step_key, "scheduled")
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             tracing.record_forward(scheduled_batch, seqs)
@@ -516,6 +526,8 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if step_key is not None:
+                timeline.mark(step_key, "forwarded")
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -533,6 +545,8 @@ class EngineCore:
             return False
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
+        if step_key is not None:
+            timeline.mark(step_key, "postprocessed")
         return True
 
     def _postprocess(self, seqs, fwd_out, batch):
