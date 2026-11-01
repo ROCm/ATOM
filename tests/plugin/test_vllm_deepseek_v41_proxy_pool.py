@@ -249,7 +249,7 @@ class TestBatchSnapshot:
         device, whatever the host upper bound says."""
         from atom.plugin.vllm import req_id_passthrough_patch as passthrough
 
-        monkeypatch.setattr(passthrough, "_HOST_LENGTHS_EXACT", False)
+        monkeypatch.setattr(passthrough, "_SERVING_SYNCHRONOUSLY", False)
         batch = SimpleNamespace(
             num_reqs=2,
             num_reqs_after_padding=4,
@@ -287,7 +287,7 @@ class TestBatchSnapshot:
         rows = passthrough._HostRows()
         rows.rows.update(host_rows)
         monkeypatch.setattr(passthrough, "_V2_HOST_ROWS", rows)
-        monkeypatch.setattr(passthrough, "_HOST_LENGTHS_EXACT", True)
+        monkeypatch.setattr(passthrough, "_SERVING_SYNCHRONOUSLY", True)
         batch = SimpleNamespace(
             num_reqs=2,
             num_reqs_after_padding=2,

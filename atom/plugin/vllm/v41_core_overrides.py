@@ -320,24 +320,36 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         super().__init__(*args, **kwargs)
 
     def prepare_state(self, step, *, histories=True):
-        """Read the cursors as native ATOM does, except before a restore.
+        """Defer the cursor read as native ATOM does, where that is measured.
 
-        The caller's deferred read (`histories=False`) is kept, so a stale
-        slot is named one step late, as on native ATOM. A step that may
-        restore a state checkpoint (`_may_restore`) still reads before the
-        forward: a restore has to see this step's cursors before the reset
-        and the Engram staging, and the deferred read judges them only on the
-        next call. `ATOM_V41_BLOCKING_STATE_PROBE=1` reads every step.
+        The caller's deferred read (`histories=False`) is kept only while
+        `serving_synchronously`: the host there waits for each step's sampled
+        tokens before it builds the next, so the rows a step shipped have
+        landed by the next call. Under async scheduling, which is where this
+        frontend's deferred read reported state that was not stale, and
+        during vLLM's warmup, the read blocks. A step that may restore a state
+        checkpoint (`_may_restore`) blocks too: a restore has to see this
+        step's cursors before the reset and the Engram staging, and the
+        deferred read judges them only on the next call.
+        `ATOM_V41_BLOCKING_STATE_PROBE=1` blocks every step.
         """
+        from atom.plugin.vllm.req_id_passthrough_patch import serving_synchronously
         from atom.utils import envs
 
-        blocking = envs.ATOM_V41_BLOCKING_STATE_PROBE
+        blocking = envs.ATOM_V41_BLOCKING_STATE_PROBE or not serving_synchronously()
         if self.checkpoint_restore is not None:
             # Tracked every step, so the previous step's rows are known when
             # the switch lets a step go without the read.
             may_restore = self._may_restore(step)
             blocking = blocking or may_restore
-        return super().prepare_state(step, histories=histories or blocking)
+        histories = histories or blocking
+        pending = self._probe_claim is not None and self._probe_done is not None
+        if not histories and pending:
+            # The judge skips rows that have not landed, and the deferred read
+            # then ships over them: that step's verdict would be dropped
+            # unread. Waiting keeps every deferred read judged.
+            self._probe_done.synchronize()
+        return super().prepare_state(step, histories=histories)
 
     def _may_restore(self, step) -> bool:
         """Whether a row of this step could need a checkpoint restore.

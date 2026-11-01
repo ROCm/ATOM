@@ -974,7 +974,7 @@ def snapshot_v41_batch(common_attn_metadata, page_group=None):
     """Snapshot exact step metadata and V2's persistent request indices.
 
     Like native ATOM, from the host where the host is exact: the lengths once
-    `host_lengths_exact` says the host upper bound is the step's own, and the
+    `serving_synchronously` says the host upper bound is the step's own, and the
     PAGE rows from the host rows of `page_group` (the proxy layer's KV cache
     group) when every row of the step is there. Otherwise each is read from
     the device, with a blocking copy. Request ids and STATE indices are
@@ -1006,11 +1006,11 @@ def snapshot_v41_batch(common_attn_metadata, page_group=None):
     # which is checked exactly -- then refuses the forward.
     from atom.plugin.vllm.req_id_passthrough_patch import (
         host_block_rows,
-        host_lengths_exact,
+        serving_synchronously,
     )
 
     seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
-    if seq_lens_cpu is None or not host_lengths_exact():
+    if seq_lens_cpu is None or not serving_synchronously():
         seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = common_attn_metadata.seq_lens[:num_reqs].cpu()

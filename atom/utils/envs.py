@@ -474,7 +474,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # vLLM plugin, DeepSeek-V4.1: read the state cursors with a blocking D2H
     # every step. Off (the default), the read is judged a step later, as on
-    # native ATOM, except on a step that may restore a state checkpoint.
+    # native ATOM, while vLLM schedules synchronously; it still blocks under
+    # async scheduling, during vLLM's warmup and on a step that may restore a
+    # state checkpoint.
     "ATOM_V41_BLOCKING_STATE_PROBE": lambda: (
         os.getenv("ATOM_V41_BLOCKING_STATE_PROBE", "0").lower() in ("1", "true")
     ),

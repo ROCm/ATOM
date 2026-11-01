@@ -644,6 +644,11 @@ def test_a_frontend_restore_runs_before_the_contract(small_config):
     assert offered == [(7, 27)]
 
 
+def _serving_synchronously(monkeypatch, value=True):
+    passthrough = pytest.importorskip("atom.plugin.vllm.req_id_passthrough_patch")
+    monkeypatch.setattr(passthrough, "_SERVING_SYNCHRONOUSLY", value)
+
+
 def _plugin_cache(geo, pages, slots):
     overrides = pytest.importorskip("atom.plugin.vllm.v41_core_overrides")
     sizes = []
@@ -665,9 +670,11 @@ def test_the_plugin_cache_restores_on_a_deferred_read(small_config, monkeypatch)
 
     The deferred read judges a step's cursors only on the next call, after
     both, so with a restore installed the read blocks even when the caller
-    asks for the deferred one, which is the default.
+    asks for the deferred one, which is the default while serving
+    synchronously.
     """
     monkeypatch.delenv("ATOM_V41_BLOCKING_STATE_PROBE", raising=False)
+    _serving_synchronously(monkeypatch)
     geo = replace(geometry(small_config), window_size=32)
     resumed = PagedRequest(27, 7, 0, 1, 0, (0, 1))
     # Without a restore the read stays deferred.
@@ -697,9 +704,58 @@ def test_the_blocking_probe_switch_reads_every_step(small_config, monkeypatch):
     """`ATOM_V41_BLOCKING_STATE_PROBE=1` reads before the forward even with
     nothing to restore."""
     monkeypatch.setenv("ATOM_V41_BLOCKING_STATE_PROBE", "1")
+    _serving_synchronously(monkeypatch)
     cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
     fresh = PagedRequest(27, 0, 0, 1, 0, (0, 1))
     assert cache.prepare_state(begin_step(cache, [fresh]), histories=False) is not None
+
+
+def test_the_plugin_cache_blocks_unless_serving_synchronously(
+    small_config, monkeypatch
+):
+    """Under async scheduling, and during vLLM's warmup, the deferred read
+    was not measured safe on this frontend, so it blocks there."""
+    monkeypatch.delenv("ATOM_V41_BLOCKING_STATE_PROBE", raising=False)
+    cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
+    fresh = PagedRequest(27, 0, 0, 1, 0, (0, 1))
+    _serving_synchronously(monkeypatch, False)
+    assert cache.prepare_state(begin_step(cache, [fresh]), histories=False) is not None
+    _serving_synchronously(monkeypatch, True)
+    nxt = replace(fresh, position=1)
+    assert cache.prepare_state(begin_step(cache, [nxt]), histories=False) is None
+
+
+def test_a_deferred_read_waits_for_the_last_probe_rather_than_drop_it(
+    small_config, monkeypatch
+):
+    """Core's judge skips rows that have not landed and the next deferred read
+    ships over them; the plugin waits, so a stale row is still named."""
+    monkeypatch.delenv("ATOM_V41_BLOCKING_STATE_PROBE", raising=False)
+    _serving_synchronously(monkeypatch)
+    cache = _plugin_cache(replace(geometry(small_config), window_size=32), 8, 4)
+    request = PagedRequest(27, 7, 0, 1, 0, (0, 1))
+    cache.cursor[0] = torch.tensor([7, 19, -1, 27])
+    assert cache.prepare_state(begin_step(cache, [request]), histories=False) is None
+
+    class _Unlanded:
+        landed = False
+
+        def query(self):
+            return self.landed
+
+        def synchronize(self):
+            self.landed = True
+
+        def record(self):
+            self.landed = False
+
+    cache._probe_done = _Unlanded()
+    # What the last step shipped, once it lands: a cursor behind its position.
+    cache._probe[0, 0] = 3
+    with pytest.raises(ValueError, match="Request 27 needs state at 7, found 3"):
+        cache.prepare_state(
+            begin_step(cache, [replace(request, position=8)]), histories=False
+        )
 
 
 def test_the_plugin_cache_defers_a_step_with_nothing_to_restore(small_config):

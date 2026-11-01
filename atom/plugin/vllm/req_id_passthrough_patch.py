@@ -45,7 +45,7 @@ The V2 runner's ``InputBatch`` has no host block table, and its host sequence
 lengths run ahead of the device's while a step's drafts are unverified. V4.1
 takes its PAGE rows from the rows this module rebuilds on the host
 (``install_v2_host_block_rows``, ``host_block_rows``), and its lengths from the
-host once they are exact (``host_lengths_exact``); otherwise
+host while they are exact (``serving_synchronously``); otherwise
 ``snapshot_v41_batch`` reads them from the device.
 """
 
@@ -158,8 +158,8 @@ class _HostRowIndex:
 
 #: The rows `install_v2_host_block_rows` keeps current.
 _HOST_ROWS_KEPT = _HostRows()
-#: `_HOST_ROWS_KEPT` once a runner class keeps it current; None leaves V2 reads
-#: on the device copy, which is right rather than all zeros.
+#: `_HOST_ROWS_KEPT` once a runner keeps it current; None leaves V2 reads on
+#: the device copy, which is right rather than all zeros.
 _V2_HOST_ROWS: _HostRows | None = None
 
 
@@ -168,18 +168,19 @@ _HOST_ROWS_WANTED = None
 
 
 def install_v2_host_block_rows(wanted) -> int:
-    """Keep `_HostRows` current on every runner class that has V2's
-    `update_requests`, and read from it only once one does. Returns how many
-    classes this call patched.
+    """Keep `_HostRows` current on the V2 runners that read it, and read from
+    it only once one does. Returns how many classes this call patched.
 
     `wanted(runner)` names the runners whose model reads the rows; it is
-    asked once per runner, and every other runner's step skips the
-    bookkeeping. Installed from the plugin's entry point, which runs for
-    every model.
+    asked once per runner, at its first step, and every other runner's step
+    skips the bookkeeping. The rows are armed for readers by the first runner
+    that keeps them, so a worker whose runner does not keep them reads the
+    device copy rather than an empty mirror. Installed from the plugin's entry
+    point, which runs for every model; one worker runs one runner.
     """
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
 
-    global _V2_HOST_ROWS, _HOST_ROWS_WANTED
+    global _HOST_ROWS_WANTED
     _HOST_ROWS_WANTED = wanted
     host_rows = _HOST_ROWS_KEPT
     classes = gpu_model_runner_classes()
@@ -191,10 +192,13 @@ def install_v2_host_block_rows(wanted) -> int:
 
         @functools.wraps(original)
         def update_requests(self, scheduler_output, *args, _orig=original, **kwargs):
+            global _V2_HOST_ROWS
             keeps = self.__dict__.get("_atom_keeps_host_rows")
             if keeps is None:
                 keeps = bool(_HOST_ROWS_WANTED is not None and _HOST_ROWS_WANTED(self))
                 self._atom_keeps_host_rows = keeps
+                if keeps:
+                    _V2_HOST_ROWS = host_rows
             if keeps:
                 tables = getattr(self, "block_tables", None)
                 host_rows.apply(
@@ -205,11 +209,6 @@ def install_v2_host_block_rows(wanted) -> int:
         update_requests._atom_v2_host_rows = True
         cls.update_requests = update_requests
         patched += 1
-    if any(
-        getattr(getattr(cls, "update_requests", None), "_atom_v2_host_rows", False)
-        for cls in classes
-    ):
-        _V2_HOST_ROWS = host_rows
     return patched
 
 
@@ -233,18 +232,24 @@ def host_block_rows(req_ids, group: int, widths):
     return out
 
 
-#: Whether this worker's step lengths on the host are exact; see
-#: `install_host_lengths_gate`.
-_HOST_LENGTHS_EXACT = False
+#: Whether this worker serves steps from vLLM's synchronous scheduler; see
+#: `install_synchronous_serving_gate`.
+_SERVING_SYNCHRONOUSLY = False
 
 
-def host_lengths_exact() -> bool:
-    """Whether a V2 step's host `seq_lens_cpu_upper_bound` is its exact length."""
-    return _HOST_LENGTHS_EXACT
+def serving_synchronously() -> bool:
+    """Whether this V2 worker serves steps from a synchronous scheduler.
+
+    Two things then hold on every step. Its host `seq_lens_cpu_upper_bound`
+    is its exact length. And the host waited for the previous step's sampled
+    tokens before building this one, so whatever that step shipped to the
+    host without waiting has landed.
+    """
+    return _SERVING_SYNCHRONOUSLY
 
 
-def install_host_lengths_gate() -> bool:
-    """Open `host_lengths_exact` once vLLM's warmup has returned.
+def install_synchronous_serving_gate() -> bool:
+    """Open `serving_synchronously` once vLLM's warmup has returned.
 
     V2 keeps two counts per request: the scheduler's, on the host, and its
     own, on the device, which is what positions and `seq_lens` are built
@@ -261,22 +266,22 @@ def install_host_lengths_gate() -> bool:
     except ImportError:
         return False
     original = getattr(Worker, "compile_or_warm_up_model", None)
-    if original is None or getattr(original, "_atom_host_lengths_gate", False):
+    if original is None or getattr(original, "_atom_synchronous_serving_gate", False):
         return False
 
     @functools.wraps(original)
     def compile_or_warm_up_model(self, *args, **kwargs):
-        global _HOST_LENGTHS_EXACT
-        _HOST_LENGTHS_EXACT = False
+        global _SERVING_SYNCHRONOUSLY
+        _SERVING_SYNCHRONOUSLY = False
         result = original(self, *args, **kwargs)
-        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
-        _HOST_LENGTHS_EXACT = bool(
-            getattr(self, "use_v2_model_runner", False)
-            and getattr(scheduler_config, "async_scheduling", None) is False
+        config = self.vllm_config
+        _SERVING_SYNCHRONOUSLY = bool(
+            getattr(config, "use_v2_model_runner", False)
+            and getattr(config.scheduler_config, "async_scheduling", None) is False
         )
         return result
 
-    compile_or_warm_up_model._atom_host_lengths_gate = True
+    compile_or_warm_up_model._atom_synchronous_serving_gate = True
     Worker.compile_or_warm_up_model = compile_or_warm_up_model
     return True
 
@@ -333,7 +338,7 @@ class _V2InputBatchView:
         scheduler's count, built in the same row order as the step: it is
         not an independent ordering to check rows against, and it runs ahead
         of `seq_lens - query_lens` (13 vs 9) on the steps vLLM's warmup
-        schedules (see `install_host_lengths_gate`). `snapshot_v41_batch`
+        schedules (see `install_synchronous_serving_gate`). `snapshot_v41_batch`
         takes its lengths from the step, and the class declares
         `atom_row_order_unverifiable`, so the row-order cross-check skips
         rather than fire on a difference that says nothing about row order.

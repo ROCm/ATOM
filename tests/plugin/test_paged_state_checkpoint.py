@@ -812,29 +812,32 @@ def test_v2_host_rows_replace_a_resumed_request():
 
 
 def test_v2_host_rows_are_read_only_once_a_runner_keeps_them(monkeypatch):
-    """Armed with nothing keeping it current, every unit id would read 0."""
+    """Armed with nothing keeping it current, every unit id would read 0: a
+    patched class is not enough, nor is a runner whose model does not read
+    the rows."""
     from atom.plugin.vllm import req_id_passthrough_patch as P
     from atom.plugin.vllm import vllm_runtime
 
-    monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
-    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", list)
-    assert P.install_v2_host_block_rows(lambda _runner: True) == 0
-    assert P._V2_HOST_ROWS is None
-
     class _V2Runner:
+        def __init__(self, reads):
+            self.reads = reads
+
         def update_requests(self, scheduler_output):
             return None
 
-    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_V2Runner])
-    assert P.install_v2_host_block_rows(lambda _runner: True) == 1
-    assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
-    # Already patched: armed again without patching twice.
     monkeypatch.setattr(P, "_V2_HOST_ROWS", None)
-    assert P.install_v2_host_block_rows(lambda _runner: True) == 0
+    monkeypatch.setattr(vllm_runtime, "gpu_model_runner_classes", lambda: [_V2Runner])
+    assert P.install_v2_host_block_rows(lambda runner: runner.reads) == 1
+    assert P.install_v2_host_block_rows(lambda runner: runner.reads) == 0
+    assert P._V2_HOST_ROWS is None
+
+    _V2Runner(False).update_requests(NS(finished_req_ids=set()))
+    assert P._V2_HOST_ROWS is None
+    _V2Runner(True).update_requests(NS(finished_req_ids=set()))
     assert P._V2_HOST_ROWS is P._HOST_ROWS_KEPT
 
 
-def test_host_lengths_are_exact_after_warmup_under_sync_scheduling(monkeypatch):
+def test_serving_synchronously_opens_after_warmup_under_sync_scheduling(monkeypatch):
     """vLLM's warmup schedules every draft as accepted, so the host lengths
     are trusted only after it returns, on V2 under a synchronous scheduler."""
     import sys
@@ -846,31 +849,31 @@ def test_host_lengths_are_exact_after_warmup_under_sync_scheduling(monkeypatch):
 
     class _Worker:
         def __init__(self, async_scheduling, v2=True):
-            self.use_v2_model_runner = v2
             self.vllm_config = NS(
-                scheduler_config=NS(async_scheduling=async_scheduling)
+                use_v2_model_runner=v2,
+                scheduler_config=NS(async_scheduling=async_scheduling),
             )
 
         def compile_or_warm_up_model(self):
-            during.append(P.host_lengths_exact())
+            during.append(P.serving_synchronously())
 
     module = types.ModuleType("vllm.v1.worker.gpu_worker")
     module.Worker = _Worker
     monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_worker", module)
-    monkeypatch.setattr(P, "_HOST_LENGTHS_EXACT", False)
-    assert P.install_host_lengths_gate()
-    assert not P.install_host_lengths_gate()
+    monkeypatch.setattr(P, "_SERVING_SYNCHRONOUSLY", False)
+    assert P.install_synchronous_serving_gate()
+    assert not P.install_synchronous_serving_gate()
 
-    assert not P.host_lengths_exact()
+    assert not P.serving_synchronously()
     _Worker(False).compile_or_warm_up_model()
-    assert P.host_lengths_exact()
+    assert P.serving_synchronously()
     # Warming up again (an elastic scale-up) shuts it while it runs.
     _Worker(False).compile_or_warm_up_model()
     assert during == [False, False]
     _Worker(True).compile_or_warm_up_model()
-    assert not P.host_lengths_exact()
+    assert not P.serving_synchronously()
     _Worker(False, v2=False).compile_or_warm_up_model()
-    assert not P.host_lengths_exact()
+    assert not P.serving_synchronously()
 
 
 def test_only_the_runners_that_read_host_rows_keep_them(monkeypatch):

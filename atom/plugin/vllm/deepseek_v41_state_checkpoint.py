@@ -476,7 +476,7 @@ def apply_vllm_v41_prefix_install() -> None:
     install_v41_group_check_scope()
     from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
     from atom.plugin.vllm.req_id_passthrough_patch import (
-        install_host_lengths_gate,
+        install_synchronous_serving_gate,
         install_v2_host_block_rows,
     )
 
@@ -484,7 +484,7 @@ def apply_vllm_v41_prefix_install() -> None:
     install_v2_host_block_rows(
         lambda runner: is_deepseek_v41_vllm_config(getattr(runner, "vllm_config", None))
     )
-    install_host_lengths_gate()
+    install_synchronous_serving_gate()
 
 
 def install_v41_group_check_scope() -> bool:
