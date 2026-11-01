@@ -562,7 +562,6 @@ def _build_sampling_params(
     top_p: float = 1.0,
     n: int = 1,
     required_channel: RequiredChannel | None = None,
-
     max_tokens_is_default: bool = False,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata

@@ -3325,11 +3325,11 @@ class ModelRunner:
                 "Target logits do not match the prepared structured vocabulary"
             )
         structured_prefixes = {}
-        logprob_snapshot = None
-        if structured_requests and any(batch.return_logprobs):
-            from atom.model_engine.token_logprobs import capture_token_logits
-
-            logprob_snapshot = capture_token_logits(logits, batch, spec_decode_metadata)
+        premask_lse = None
+        if structured_requests and need_logprobs and spec_decode_metadata is None:
+            # Keep main's scalar engine logprobs normalized to the raw model
+            # distribution, before either grammar or required-channel masks.
+            premask_lse = torch.logsumexp(logits[:bs].float(), dim=-1)
         if structured_requests:
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         elif structured is not None and (structured.pending or structured.current):
@@ -3346,18 +3346,11 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            # `_constrain_required_channel` below masks `logits` in place, so
-            # each row's logsumexp is taken BEFORE it. Logprobs report the
-            # model's own distribution, as they do for a request without a
-            # channel and on the verification path, which masks copies. The
-            # mask never moves a logit that can still be sampled (an end id it
-            # bans cannot be, a forced id keeps its value), so the sampled
-            # token's logprob is its masked logit minus that logsumexp: a
-            # forced token's is its real logprob, not the masked row's 0.0.
-            # (A forced id the model itself gave -inf is written as 0, so it
-            # reports `-logsumexp` rather than -inf.)
-            premask_lse = None
-            if need_logprobs and batch.required_channel is not None:
+            if (
+                need_logprobs
+                and batch.required_channel is not None
+                and premask_lse is None
+            ):
                 premask_lse = torch.logsumexp(logits.float(), dim=-1)
             channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(

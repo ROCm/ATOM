@@ -159,7 +159,8 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     assert captured["logprobs"].shape == (scheduled_bs,)
 
 
-def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
+@pytest.mark.parametrize("with_schema", [False, True])
+def test_a_masked_row_still_reports_the_models_logprob(monkeypatch, with_schema):
     """A required channel masks the logits in place. The logprob a client asked
     for is the model's own, as on every other request, not the forced row's
     0.0."""
@@ -176,6 +177,19 @@ def test_a_masked_row_still_reports_the_models_logprob(monkeypatch):
     batch.required_channel = object()
     captured = {}
     runner = _runner({})
+
+    if with_schema:
+        # A batch may contain both schema and required-channel requests.
+        # The second mask must reuse the snapshot from before the first mask.
+        batch.structured_requests = {1: ("schema", (), ())}
+
+        def mask_schema_rows(logits, *_):
+            logits[1, 4:] = float("-inf")
+            return {}
+
+        runner.structured_output = types.SimpleNamespace(
+            vocab_size=8, apply=mask_schema_rows
+        )
 
     def force_column_zero(_batch, logits, *_args):
         logits[:, 1:] = float("-inf")  # the sampler's `_runner` samples id 0

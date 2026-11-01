@@ -72,11 +72,11 @@ prefix; rejected drafts never advance the committed state. The implementation
 bridges deferred output delivery and reconstructs grammar state from committed
 history on replay. No target-model forward or AITER operator is added.
 
-Chat can combine constraints with `logprobs` and `top_logprobs`. Probabilities
-still describe the raw target distribution: only requested target/bonus logit
-rows are preserved before grammar masking. This extra snapshot is made only
-when constraints and probabilities are both enabled. The ordinary path does not
-copy logits for this feature.
+This change preserves the existing non-speculative engine's scalar logprob
+semantics: normalization uses the raw model distribution before grammar and
+required-channel masks. Chat token-logprob responses, top candidates, and
+DSpark speculative logprobs are a separate change, not a prerequisite for
+structured output. The ordinary path does not copy logits for this feature.
 
 With a DSML parser, normal function tools can accompany Chat `response_format`
 or Responses `text.format`. The grammar admits the parser's canonical function
