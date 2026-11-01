@@ -287,7 +287,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         return logits
 
     def compute_topk_candidates(
-        self, x: torch.Tensor, k: int
+        self, x: torch.Tensor, k: int, logits_hook=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The ``k`` largest logits of each row over the TP-sharded vocab, without
         all-gathering the ``[N, vocab]`` logits: each rank takes its shard's top ``k``
@@ -296,8 +296,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         top ``k`` of its candidates (the same bf16 logits as the gathered path).
 
         A sampler that keeps at most ``k`` tokens a row (top-k sampling) needs only
-        these. Decode at TP > 1 only (see ``ModelRunner._topk_candidates_step``)."""
+        these. Decode at TP > 1 only (see ``ModelRunner._topk_candidates_step``).
+        ``logits_hook(logits, vocab_start)``, if given, edits the shard's logits in
+        place before the top ``k``."""
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab / tp]
+        if logits_hook is not None:  # in place on this shard, e.g. presence_penalty
+            logits_hook(logits, self.vocab_start_idx)
         vals, idx = torch.topk(logits, k, dim=-1, sorted=False)
         # Ids below 2^24 are exact in fp32, so values and ids travel as one pack.
         packed = torch.cat([vals.float(), (idx + self.vocab_start_idx).float()], dim=-1)

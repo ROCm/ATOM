@@ -78,6 +78,7 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.presence_penalty import PresencePenaltyState, PresencePenaltyStep
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler, sample_topk_candidates
 from atom.spec_decode.drafter import Drafter
@@ -862,6 +863,9 @@ class ModelRunner:
             self.num_spec_tokens,
         )
         self.sampler = Sampler()
+        # presence_penalty: per-request generated-token masks, made on first use
+        self._presence_state: PresencePenaltyState | None = None
+        self._presence_step: PresencePenaltyStep | None = None
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -2825,6 +2829,7 @@ class ModelRunner:
                 forward_context.context.draft_anchor_overrides = (
                     self.drafter.anchors_to_gpu(batch.next_token_ids)
                 )
+        self._presence_step = self._begin_presence_step(batch, input_ids)
         return (
             input_ids,
             temperatures,
@@ -3304,6 +3309,8 @@ class ModelRunner:
                 # copy ops were captured into the graph.
                 if logits is not None:
                     logits = logits[:scheduled_tokens]
+                    if self._presence_step is not None:
+                        self._presence_step.apply(logits)
                 else:
                     logits = self._compute_logits(hidden_states, greedy_ids, topk_cands)
 
@@ -3318,6 +3325,30 @@ class ModelRunner:
                 head if hasattr(head, "compute_argmax_token") else None
             )
         return self._greedy_head_cache
+
+    def _begin_presence_step(
+        self, batch: ScheduledBatch, input_ids: torch.Tensor
+    ) -> PresencePenaltyStep | None:
+        """This forward's presence-penalty rows (`atom.model_ops.presence_penalty`),
+        or None: no request in it has a penalty, or it is not a decode step."""
+        pens = getattr(batch, "presence_penalties", None)
+        if pens is None or not np.any(pens != 0):
+            return None
+        if self._presence_state is None:
+            if (
+                self.config.parallel_config.data_parallel_size > 1
+                or get_pcp_world_size() > 1
+            ):
+                logger.warning("presence_penalty is untested under DP or PCP")
+            head = self._greedy_lm_head()
+            vocab = max(
+                self.config.hf_config.vocab_size,
+                getattr(head, "num_embeddings", 0) if head is not None else 0,
+            )
+            self._presence_state = PresencePenaltyState(
+                vocab, self.config.max_num_seqs, max_extra=8, device=self.device
+            )
+        return self._presence_state.begin_step(batch, input_ids)
 
     def _greedy_ids_step(self, batch: ScheduledBatch | None, all_greedy: bool) -> bool:
         """Whether this step's LM head may hand back argmax ids instead of logits.
@@ -3335,6 +3366,7 @@ class ModelRunner:
             envs.ATOM_GREEDY_ARGMAX_HEAD
             and all_greedy
             and batch is not None
+            and self._presence_step is None
             and not envs.ATOM_ENABLE_RELAXED_MTP
             and self.config.parallel_config.data_parallel_size == 1
             and not any(batch.return_logprobs)
@@ -3381,14 +3413,20 @@ class ModelRunner:
     def _compute_logits(
         self, hidden_states: torch.Tensor, greedy_ids: bool, topk_cands: int = 0
     ) -> torch.Tensor | GreedyTokenIds | TopKCandidates:
+        step = self._presence_step
         if topk_cands:
             return TopKCandidates(
                 *self._greedy_lm_head().compute_topk_candidates(
-                    hidden_states, topk_cands
+                    hidden_states,
+                    topk_cands,
+                    logits_hook=None if step is None else step.apply,
                 )
             )
         if not greedy_ids:
-            return self.model.compute_logits(hidden_states)
+            logits = self.model.compute_logits(hidden_states)
+            if step is not None and isinstance(logits, torch.Tensor):
+                step.apply(logits)
+            return logits
         ids = torch.empty(
             hidden_states.shape[0], dtype=torch.int32, device=hidden_states.device
         )
@@ -3589,6 +3627,8 @@ class ModelRunner:
             and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
         ):
             sampled_tokens = broadcast_from_rank0(sampled_tokens, get_tp_group())
+        if self._presence_step is not None:
+            self._presence_step.mark(sampled_tokens.view(bs, -1))
 
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)
