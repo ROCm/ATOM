@@ -331,6 +331,14 @@ class KimiK3DFlashAttention(nn.Module):
         """
         import aiter
 
+        if k_cache.dtype.itemsize == 1:
+            # The pool's scale is 1.0 (`DraftKvBuilder`), and a plain cast turns
+            # an out-of-range value into NaN, which a context row -- written
+            # once -- would carry for the request's life. Saturate, as the read
+            # does for q.
+            fmax = torch.finfo(k_cache.dtype).max
+            k = k.clamp(-fmax, fmax)
+            v = v.clamp(-fmax, fmax)
         aiter.reshape_and_cache_flash(
             k.view(-1, self.num_kv_heads, self.head_dim),
             v.view(-1, self.num_kv_heads, self.head_dim),
@@ -578,6 +586,12 @@ class KimiK3DFlash(DSparkDraftModel):
             ]
         )
         self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        # The last row of the rope cache. YaRN sizes it from
+        # `original_max_position_embeddings * factor`, which equals the target's
+        # default `max_model_len`, while block positions reach T past it.
+        self._rope_max_row = (
+            int(self.layers[0].self_attn.rotary_emb.cos_cache.shape[0]) - 1
+        )
         self.markov_head = DSparkMarkovHead(
             self.vocab_size, int(config.dspark_markov_rank)
         )
@@ -703,6 +717,15 @@ class KimiK3DFlash(DSparkDraftModel):
             # holds one snapshot per closed block below this layer.
             nvb = -(-(lid + 1) // block_size)
             if nvb > 0:
+                # Folded here, once after load, never inside the traced and
+                # captured target forward the extract runs in.
+                if res.score_weight is None:
+                    res.process_weights_after_loading()
+                if res.score_weight is None:
+                    raise RuntimeError(
+                        f"DFlash aggregate tap: target layer {lid + 1}'s "
+                        "attn-residual has no score weight"
+                    )
                 taps[lid] = (nvb, res)
 
         if not taps:
@@ -727,13 +750,13 @@ class KimiK3DFlash(DSparkDraftModel):
             # `KimiDecoderLayer.forward` returns (prefix_sum, *pendings, bank).
             bank = output[-1] if isinstance(output, tuple) else None
             if bank is None or bank.shape[1] < nvb:
-                # Fewer closed blocks than this layer implies: nothing to mix
-                # against, so the prefix already is the whole stream.
-                return prefix
-            score_weight = res.score_weight
-            if score_weight is None:  # loader hook did not run (plugin hosts)
-                res.process_weights_after_loading()
-                score_weight = res.score_weight
+                # A layout change in the target's return would otherwise drop
+                # the draft back to the prefix feature with no error.
+                raise RuntimeError(
+                    f"DFlash aggregate tap on target layer {block.layer_idx}: "
+                    f"expected a bank of >= {nvb} blocks, got "
+                    f"{None if bank is None else tuple(bank.shape)}"
+                )
             from atom.model_ops.kimi_k3 import apply_attn_res
 
             # `out_norm_weight=None` -> the mix comes back un-normed. The base
@@ -743,7 +766,7 @@ class KimiK3DFlash(DSparkDraftModel):
             mixed, _ = apply_attn_res(
                 prefix,
                 bank[:, :nvb, :],
-                score_weight,
+                res.score_weight,
                 res.eps,
                 None,
                 None,
@@ -783,6 +806,9 @@ class KimiK3DFlash(DSparkDraftModel):
         draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
         draft_ids[:, 0] = input_ids
         hidden = self.embed_tokens(draft_ids.view(-1))
+        # Positions past the cache only occur in the last T of a max-length
+        # context, whose drafts cannot be verified anyway.
+        positions = positions.clamp(max=self._rope_max_row)
         residual = None
         for layer in self.layers:
             hidden, residual = layer(positions, hidden, residual)

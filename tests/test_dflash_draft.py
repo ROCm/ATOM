@@ -653,7 +653,7 @@ def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
     """A layer the draft does not tap keeps the plain reconstruction.
 
     The hook is installed per tapped layer, but ONE extract serves all of them,
-    so it dispatches on the block it is handed. A miss must degrade to the
+    so it dispatches on the block it is handed. An untapped layer keeps the
     prefix rather than mix against another layer's bank.
     """
     torch = pytest.importorskip("torch")
@@ -669,10 +669,23 @@ def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
     assert torch.equal(out, prefix)
     assert calls == []
 
-    # Fewer closed blocks than the tap implies: nothing to mix against.
-    short = spec.extract((prefix, None, bank[:, :1, :]), target.layers[6])
-    assert torch.equal(short, prefix)
+    # Fewer closed blocks than the tap implies is a target layout change, not
+    # a reason to drop silently back to the prefix feature.
+    with pytest.raises(RuntimeError, match="expected a bank"):
+        spec.extract((prefix, None, bank[:, :1, :]), target.layers[6])
     assert calls == []
+
+
+def test_dflash_aggregate_folds_the_score_weight_when_armed():
+    """The fold runs once at arm time, never inside the traced forward."""
+    pytest.importorskip("torch")
+    target = _k3_target_stub(hidden=16)
+    res = target.layers[7].self_attention_attn_res
+    folded = res.score_weight
+    res.score_weight = None
+    res.process_weights_after_loading = lambda: setattr(res, "score_weight", folded)
+    _dflash_spec(target, (6, 11), hidden=16)
+    assert res.score_weight is folded
 
 
 def test_dflash_falls_back_when_the_target_has_no_attn_residuals():
@@ -915,6 +928,7 @@ def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
     rows = max(running_bs or 0, len(seqlens))
     bt = CpuGpuBuffer(rows, len(tables[0]), dtype=torch.int32, device=dev)
     bt.np[: len(tables)] = tables
+    bt.copy_to_gpu()  # the target's builder uploads it before the hook runs
     cu = CpuGpuBuffer(rows + 1, dtype=torch.int32, device=dev)
     # Flat over the padded tail, as `prepare_cu_seqlens_q` leaves it.
     cu.np[1 : len(seqlens) + 1] = torch.tensor(seqlens).cumsum(0).numpy()
