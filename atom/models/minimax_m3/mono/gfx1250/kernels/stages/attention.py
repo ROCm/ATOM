@@ -418,6 +418,7 @@ def o_defs(k4ctx):
     W = k4ctx["W"]
     acquire = k4ctx["acquire"]
     fuse_k1 = k4ctx["fuse_k1"]
+    x8_in = k4ctx["x8_in"]
     g4 = k4ctx["g4"]
     h_in = k4ctx["h_in"]
     h_mid = k4ctx["h_mid"]
@@ -525,7 +526,8 @@ def o_defs(k4ctx):
                 if tid < O_ROWS // 2 * tokens:
                     ptk = tid // (O_ROWS // 2)
                     row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
-                    if const_expr(fuse_k1):
+                    # x8_in: h_in is the previous launch's
+                    if const_expr(fuse_k1 and not x8_in):
                         k1_poll([(rdone_mb, ptk, 1)])
                         acquire()
                     hr = fx.Int32(
