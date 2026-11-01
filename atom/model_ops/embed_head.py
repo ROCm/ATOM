@@ -12,7 +12,6 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
-from atom.distributed.token_transport import gather_tokens
 from atom.distributed.ulysses_sp import (
     get_sp_group,
     get_sp_world_size,
@@ -352,20 +351,24 @@ class ParallelLMHead(VocabParallelEmbedding):
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
         return out.copy_(token)
 
+    def _vocab_shard_logits(
+        self, x: torch.Tensor, rank: int, world: int
+    ) -> torch.Tensor:
+        """``x``'s logits over the ``rank``-th of ``world`` equal vocab slices of
+        a replicated head."""
+        vshard = self.num_embeddings // world
+        vocab = slice(rank * vshard, (rank + 1) * vshard)
+        bias = None if self.bias is None else self.bias[vocab]
+        return tgemm.mm(x, self.weight[vocab], bias)
+
     def _sp_sharded_logits(self, x: torch.Tensor) -> torch.Tensor:
         """Every Ulysses SP rank (TP1) holds the same rows here: project them
         onto this rank's vocab slice and gather the slices, rather than have
         every rank read the whole LM head."""
         group = get_sp_group()
-        world, rank = group.world_size, group.rank_in_group
-        vshard = self.num_embeddings // world
-        vocab = slice(rank * vshard, (rank + 1) * vshard)
-        bias = None if self.bias is None else self.bias[vocab]
-        shard = tgemm.mm(x, self.weight[vocab], bias)
-        rows = x.shape[0]
-        # Rank-major [world * rows, V/world] -> [rows, V].
-        gathered = gather_tokens(shard, group).view(world, rows, vshard)
-        return gathered.transpose(0, 1).reshape(rows, self.num_embeddings)
+        shard = self._vocab_shard_logits(x, group.rank_in_group, group.world_size)
+        use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+        return group.all_gather(shard, dim=-1, use_custom=use_custom)
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).
@@ -443,13 +446,8 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         # [max_rows, dim] -> [dp_size * max_rows, dim] (rank-major concat).
         gathered = dp_group.all_gather(x.contiguous(), dim=0, use_custom=use_custom)
-        w = self.weight[dp_rank * vshard : (dp_rank + 1) * vshard]  # [V/dp, dim]
-        b = (
-            None
-            if self.bias is None
-            else self.bias[dp_rank * vshard : (dp_rank + 1) * vshard]
-        )
-        logits_shard = tgemm.mm(gathered, w, b)  # [dp_size * max_rows, V/dp]
+        # [dp_size * max_rows, V/dp]
+        logits_shard = self._vocab_shard_logits(gathered, dp_rank, dp_size)
         start = dp_rank * max_rows
 
         if mode == "argmax":

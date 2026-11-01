@@ -60,19 +60,17 @@ def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, world):
         embed_head, "tgemm", SimpleNamespace(mm=lambda x, w, b: x @ w.t())
     )
 
-    def on_each_rank():
+    def on_each_rank(all_gather):
         out = []
         for rank in range(world):
-            group = SimpleNamespace(world_size=world, rank_in_group=rank)
+            group = SimpleNamespace(
+                world_size=world, rank_in_group=rank, all_gather=all_gather
+            )
             monkeypatch.setattr(embed_head, "get_sp_group", lambda g=group: g)
             out.append(head._sp_sharded_logits(x))
         return out
 
     sent = []
-    monkeypatch.setattr(
-        embed_head, "gather_tokens", lambda s, g: sent.append(s) or s.repeat(world, 1)
-    )
-    on_each_rank()
-    monkeypatch.setattr(embed_head, "gather_tokens", lambda s, g: torch.cat(sent))
-    for logits in on_each_rank():
+    on_each_rank(lambda s, dim, use_custom: sent.append(s) or s.repeat(1, world))
+    for logits in on_each_rank(lambda s, dim, use_custom: torch.cat(sent, dim)):
         torch.testing.assert_close(logits, x @ weight.t())

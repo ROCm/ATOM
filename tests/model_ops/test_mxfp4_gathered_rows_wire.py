@@ -30,8 +30,9 @@ pytestmark = pytest.mark.skipif(
     reason="the MXFP4 rows wire is gfx950 only",
 )
 
-# MiniMax-M3 at TP1: 128 routed experts, top-4, one shared expert fused last.
-HIDDEN, INTER, ROUTED, TOPK = 6144, 3072, 128, 4
+# MiniMax-M3 at SP4, as deployed: 128 routed experts, top-4, one shared expert
+# fused last, and the MoE TP-sharded over the 4 SP ranks (3072 / 4 = 768).
+HIDDEN, INTER, ROUTED, TOPK = 6144, 768, 128, 4
 EXPERTS = ROUTED + 1
 
 

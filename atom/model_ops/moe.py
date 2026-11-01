@@ -1482,9 +1482,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         # Keep cached layer references within this model's lifetime.
-        self._fused_moe_prequantizes = lru_cache(maxsize=64)(
-            self._fused_moe_prequantizes
-        )
+        self._takes_prequantized = lru_cache(maxsize=64)(self._takes_prequantized)
         self.quant_config = quant_config
         self.quant_type = quant_config.quant_type
         self.quant_dtype = quant_config.quant_dtype
@@ -2105,6 +2103,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return self._fp4_rows_wire
         return self.routed_rows_wire
 
+    def activation_dtype(self, layer, tokens):
+        """The activation dtype fused_moe quantizes `tokens` rows to."""
+        from aiter.fused_moe import resolve_activation_dtype
+
+        return resolve_activation_dtype(
+            self.quant_type,
+            layer.w13_weight.dtype,
+            activation=layer.activation,
+            gate_mode=(
+                GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
+            ),
+            M=tokens,
+            gate_up_interleave=getattr(layer.w13_weight, "gate_up_interleave", None),
+        )
+
     def _fused_moe_prequantizes(self, layer, tokens, dtype):
         """Whether fused_moe would take `tokens` gathered rows quantized as by
         `_fp4_rows_wire`: the resolution of a call with those rows and scales."""
@@ -2124,44 +2137,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or layer.w13_input_scale is not None
             or layer.hidden_size % 256
             or get_gfx() != "gfx950"
+            or self.activation_dtype(layer, tokens) != dtypes.fp4x2
         ):
             return False
+        from aiter.fused_moe import get_padded_M
+
+        return self._takes_prequantized(layer, get_padded_M(tokens), dtype)
+
+    def _takes_prequantized(self, layer, padded_tokens, dtype):
         from aiter.fused_moe import (
             AUX_SORT_OPUS,
             _mxfp4_a4w4_stage1_fw,
             get_2stage_cfgs,
             get_inter_dim,
-            get_padded_M,
-            resolve_activation_dtype,
         )
 
         w1, w2 = layer.w13_weight, layer.w2_weight
         gate_mode = GateMode.INTERLEAVE if self.is_guinterleave else GateMode.SEPARATED
-        gate_up_interleave = getattr(w1, "gate_up_interleave", None)
-        q_dtype = resolve_activation_dtype(
-            self.quant_type,
-            w1.dtype,
-            activation=layer.activation,
-            gate_mode=gate_mode,
-            M=tokens,
-            hidden_dtype=dtypes.fp4x2,
-            has_a1_scale=True,
-            gate_up_interleave=gate_up_interleave,
-        )
-        if q_dtype != dtypes.fp4x2:
-            return False
         experts, hidden, intermediate = get_inter_dim(w1.shape, w2.shape)
         shuffled = getattr(w1, "is_shuffled", False) or getattr(
             w2, "is_shuffled", False
         )
         metadata = get_2stage_cfgs(
-            get_padded_M(tokens),
+            padded_tokens,
             hidden,
             intermediate,
             experts,
             layer.top_k + layer.num_fused_shared_experts,
             dtype,
-            q_dtype,
+            dtypes.fp4x2,
             w1.dtype,
             self.quant_type,
             intermediate != w1.shape[1],
@@ -2177,7 +2181,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
             opus_weights_shuffled=getattr(w1, "is_shuffled", False)
             and getattr(w2, "is_shuffled", False),
-            gate_up_interleave=gate_up_interleave,
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
             # Inline-sort rows read BF16; fused_moe re-resolves without them.
             _disable_inline_sort=True,
             input_dtype=dtypes.fp4x2,

@@ -8,23 +8,11 @@ on the GPU for ever. Each such decision is a local verdict agreed on over the TP
 group's CPU group before anything collective (peer handshake, launch) follows.
 """
 
-import torch
-import torch.distributed as dist
+from atom.distributed.group_agreement import group_agree as tp_agree
 
 
 class MonoUnsupported(Exception):
     """The loaded model or runtime configuration is outside what mono serves."""
-
-
-def tp_agree(ok: bool, group) -> bool:
-    """True when every rank of ``group`` passed ``ok`` true. Every rank must call
-    it at the same point; ``group`` is a CPU (gloo) process group, or None for a
-    single rank."""
-    if group is None:
-        return ok
-    flag = torch.tensor([int(ok)], dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
-    return bool(flag.item())
 
 
 def bind_agreed(bind, group) -> None:

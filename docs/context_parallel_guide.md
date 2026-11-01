@@ -198,6 +198,7 @@ PCP baseline (not the `-tp 4 -pcp 2` numbers above).
 | PCP + TBO decode (`--enable-tbo all`) | Not supported (raises at startup); use `--enable-tbo` prefill-only |
 | `ATOM_PCP_MOE_MERGE=0` + `--enable-tbo` | TBO auto-disabled (warning logged) |
 | PCP + TBO with `tp > 1` | **Not supported.** May hang under long-sequence / high-concurrency workloads. TBO requires `-tp 1` (all GPUs in PCP, e.g. `-tp 1 -pcp 8`) |
+| PCP + Ulysses SP (`-sp`) | `-sp N` runs on the PCP rank dimension, so it does not combine with a different `-pcp`. Its MoE is TP-sharded across the SP ranks, and `ATOM_PCP_MOE_MERGE` is ignored. See `docs/distributed_guide.md` |
 
 PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 `-tp 1`**. Decode is unchanged by PCP in all configurations.
