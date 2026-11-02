@@ -59,6 +59,21 @@ cfg["settings"]["load_pattern"]["target_concurrency"] = int(conc)
 cfg["settings"].setdefault("runtime", {})["max_issue_duration_ms"] = int(
     float(os.environ.get("CAP_MIN", "30")) * 60 * 1000
 )
+# Client capacity, YAML-only (rules 2.1.1: the reference client is unmodified; runtime behavior is set here).
+# CLIENT_WORKERS: HTTP worker processes (default auto). METRICS_TOKENIZER_WORKERS: the metrics aggregator's
+# response-tokenizer pool (default 4). Unset leaves the base yaml's values.
+if os.environ.get("CLIENT_WORKERS"):
+    cfg["settings"].setdefault("client", {})["num_workers"] = int(os.environ["CLIENT_WORKERS"])
+# CLIENT_WARMUP_CONNECTIONS: TCP connections opened before the run (base yaml: 0). CLIENT_MAX_IDLE: seconds an
+# idle pooled connection is kept (base yaml: 0.5; turns wait up to ~10 s of think time between requests).
+if os.environ.get("CLIENT_WARMUP_CONNECTIONS"):
+    cfg["settings"].setdefault("client", {})["warmup_connections"] = int(
+        os.environ["CLIENT_WARMUP_CONNECTIONS"]
+    )
+if os.environ.get("CLIENT_MAX_IDLE"):
+    cfg["settings"].setdefault("client", {})["max_idle_time"] = float(os.environ["CLIENT_MAX_IDLE"])
+if os.environ.get("METRICS_TOKENIZER_WORKERS"):
+    cfg["settings"]["metrics_tokenizer_workers"] = int(os.environ["METRICS_TOKENIZER_WORKERS"])
 cfg["endpoint_config"]["endpoints"] = ["http://localhost:8000"]
 cfg["report_dir"] = report_dir
 
