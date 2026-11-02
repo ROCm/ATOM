@@ -150,3 +150,24 @@ def test_triton_router_cuda_graph_replay(topk_mod, monkeypatch):
         new = (w_out.clone(), i_out.clone())
         old = tuple(t.clone() for t in _route(topk_mod, monkeypatch, fresh, 0))
         _assert_same_routing(new, old, fresh)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_triton_router_signed_zeros_tie_on_lowest_id(dtype):
+    from atom.model_ops.triton_topk_softmax import triton_topk_softmax
+
+    # Nine positive logits, then -0.0 at expert 9 and +0.0 at expert 10: the
+    # tenth pick is a tie between equal logits and must be expert 9.
+    logits = torch.full((2, N_ROUTED), -1.0, device="cuda")
+    logits[:, :9] = torch.arange(9, 0, -1, device="cuda", dtype=torch.float32)
+    logits[:, 9] = -0.0
+    logits[:, 10] = 0.0
+    logits[1, 9], logits[1, 10] = 0.0, -0.0  # either sign order
+    logits = logits.to(dtype)
+    assert torch.signbit(logits[0, 9]) and not torch.signbit(logits[0, 10])
+    w = torch.zeros(2, TOP_K, device="cuda")
+    i = torch.zeros(2, TOP_K, dtype=torch.int32, device="cuda")
+    triton_topk_softmax(w, i, logits, TOP_K, True, 0)
+    expected = torch.arange(TOP_K, device="cuda", dtype=torch.int32)
+    assert torch.equal(i, expected.expand(2, TOP_K))
+    torch.testing.assert_close(w[0], w[1])

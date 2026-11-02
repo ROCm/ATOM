@@ -39,14 +39,22 @@ def apply_qwen3_next_rtpllm_patch() -> None:
     ) -> torch.Tensor:
         if shared_expert_gate_logits is None:
             return shared_output
-        return torch.sigmoid(shared_expert_gate_logits) * shared_output
+        # fp32 router logits must not widen the hidden state.
+        return (
+            torch.sigmoid(shared_expert_gate_logits).to(shared_output.dtype)
+            * shared_output
+        )
 
     def _patched_sparse_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         _, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        router_logits = self.gate(hidden_states)
+        # Same router dtype policy as Qwen3NextSparseMoeBlock.forward.
+        router_logits = self.gate(
+            hidden_states,
+            otype=getattr(self, "router_logits_dtype", None) or hidden_states.dtype,
+        )
         router_logits, shared_expert_gate_logits = self._split_router_logits(
             router_logits
         )

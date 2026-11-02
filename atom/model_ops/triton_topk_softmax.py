@@ -14,7 +14,8 @@ batches: same outputs, one Triton program (one wave) per token row.
 
 Each logit is packed with its expert id into one integer key (order-preserving
 logit bits in the high half, ``BLOCK_N - 1 - id`` in the low half), so each of
-the K selection rounds is a single max-reduction. bf16 logits (the gate GEMM
+the K selection rounds is a single max-reduction. -0.0 is keyed as +0.0 so equal
+logits of either sign still tie-break on the lowest id. bf16 logits (the gate GEMM
 output) fit an int32 key exactly; other dtypes use int64.
 
 The row-per-wave layout follows SGLang's ``_router_triton_kernel``
@@ -61,10 +62,12 @@ def _topk_softmax_kernel(
     # Order-preserving integer view of the logit bits, expert id in the low half.
     if BF16_KEY:
         b16 = raw.to(tl.int16, bitcast=True).to(tl.int32)
+        b16 = tl.where(b16 == -32768, 0, b16)  # -0.0 -> +0.0
         okey = tl.where(b16 >= 0, b16, b16 ^ 0x7FFF)
         key = (okey << 16) | (BLOCK_N - 1 - offs_n)
     else:
         bits = x.to(tl.int32, bitcast=True)
+        bits = tl.where(x == 0.0, 0, bits)  # -0.0 -> +0.0
         okey = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
         key = (okey.to(tl.int64) << 32) | (BLOCK_N - 1 - offs_n).to(tl.int64)
 

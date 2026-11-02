@@ -17,8 +17,14 @@ the padded GEMM on a FlyDSL hgemm kernel aiter already ships; any larger M
 device and padded shape, so a model or device it was not measured on keeps the
 unpadded ``tgemm.mm`` path untouched.
 
-Pure Python (no AITER import) so the CPU CI can check the table.
+Pure Python (no AITER import at module scope) so the CPU CI can check the
+table.
 """
+
+import functools
+import logging
+
+logger = logging.getLogger("atom")
 
 ROUTER_ROW_ALIGN = 16
 
@@ -65,6 +71,20 @@ _FLYDSL_ROUTER_KERNELS: dict[tuple[str, int, int, int], tuple[tuple[int, str], .
 }
 
 
+@functools.cache
+def router_flydsl_params(kernel_name: str) -> dict | None:
+    """aiter's FlyDSL hgemm parameters for ``kernel_name``, or None when this
+    aiter cannot run it: the name is not in its catalog, or the FlyDSL module
+    itself is missing (``aiter.ops.flydsl.gemm_kernels`` imports ``flydsl`` at
+    module scope, so an install without FlyDSL raises on import)."""
+    try:
+        from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
+    except (ImportError, AttributeError, RuntimeError, OSError) as error:
+        logger.warning("AITER FlyDSL hgemm unavailable for the router: %s", error)
+        return None
+    return get_flydsl_hgemm_kernel_params(kernel_name)
+
+
 def padded_router_rows(rows: int) -> int:
     """The row count the router weight is padded to (a multiple of 16)."""
     return -(-rows // ROUTER_ROW_ALIGN) * ROUTER_ROW_ALIGN
@@ -83,3 +103,29 @@ def select_router_kernel(table: tuple[tuple[int, str], ...], m: int) -> str | No
         if m <= largest_m:
             return kernel_name
     return None
+
+
+def use_triton_topk_softmax(
+    gating_output,
+    num_fused_shared_experts: int,
+    fused_shared_experts_scoring_func: str,
+    num_valid_rows,
+    max_tokens: int,
+) -> bool:
+    """Whether ``atom/model_ops/triton_topk_softmax.py`` routes this batch
+    instead of AITER ``topk_softmax``.
+
+    Small-M Qwen3-Next / Qwen3.5 routing only: softmax top-k plus a
+    sigmoid-gated fused shared expert, at most ``max_tokens`` rows. AITER's
+    kernel takes ~9.5 us here at 512 experts; the Triton router gives the same
+    outputs. A batch with ``num_valid_rows`` (EP: graph-padding rows must route
+    to -1) stays on AITER, which masks them; the Triton router does not.
+    """
+    return (
+        num_valid_rows is None
+        and num_fused_shared_experts > 0
+        and fused_shared_experts_scoring_func == "sigmoid"
+        and gating_output.dim() == 2
+        and gating_output.stride(1) == 1
+        and gating_output.shape[0] <= max_tokens
+    )

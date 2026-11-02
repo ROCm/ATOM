@@ -32,6 +32,7 @@ from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
 from atom.model_ops.router_gemm import (
     padded_router_rows,
+    router_flydsl_params,
     router_kernel_table,
     select_router_kernel,
 )
@@ -2769,13 +2770,6 @@ class MergedReplicatedLinear(ReplicatedLinear):
 
 
 @functools.cache
-def _router_flydsl_params(kernel_name: str) -> dict | None:
-    from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
-
-    return get_flydsl_hgemm_kernel_params(kernel_name)
-
-
-@functools.cache
 def _router_kernel_table(padded_rows: int, k: int):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
@@ -2806,7 +2800,7 @@ def padded_router_gemm(
         return tgemm.mm(x, weight, None, otype=out_dtype)
     from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 
-    p = _router_flydsl_params(kernel_name)
+    p = router_flydsl_params(kernel_name)
     return flydsl_hgemm(
         x,
         weight,
@@ -2854,12 +2848,13 @@ class MergedReplicatedRouterLinear(MergedReplicatedLinear):
         table = _router_kernel_table(padded_rows, k)
         if not table:
             return
-        unknown = [n for _, n in table if _router_flydsl_params(n) is None]
+        unknown = [n for _, n in table if router_flydsl_params(n) is None]
         if unknown:
             # The installed aiter's FlyDSL catalog no longer parses a name the
-            # table was tuned with; the old path is still correct.
+            # table was tuned with, or FlyDSL is not installed; the old path is
+            # still correct.
             logger.warning(
-                "%s: router FlyDSL kernels %s unknown to this aiter; "
+                "%s: router FlyDSL kernels %s unavailable in this aiter; "
                 "keeping the tgemm path",
                 self.prefix,
                 unknown,

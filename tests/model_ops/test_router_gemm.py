@@ -10,6 +10,7 @@ the same as contiguous ones.
 """
 
 import re
+import sys
 
 import pytest
 import torch
@@ -18,7 +19,9 @@ from atom.model_ops.router_gemm import (
     _FLYDSL_ROUTER_KERNELS,
     ROUTER_ROW_ALIGN,
     padded_router_rows,
+    router_flydsl_params,
     select_router_kernel,
+    use_triton_topk_softmax,
 )
 
 # aiter's tuned-CSV FlyDSL hgemm name, bf16 in and out, no bias, no K tail.
@@ -59,6 +62,32 @@ def test_select_router_kernel_buckets_m():
         "c",
     ]
     assert select_router_kernel(table, 65) is None
+
+
+def test_triton_topk_softmax_only_without_padding_rows():
+    # EP passes num_valid_rows so graph-padding rows route to -1; only AITER
+    # masks them, so any batch carrying the count must stay on AITER.
+    logits = torch.empty(40, 513)
+    count = torch.tensor([3], dtype=torch.int32)
+    assert use_triton_topk_softmax(logits, 1, "sigmoid", None, 128)
+    assert not use_triton_topk_softmax(logits, 1, "sigmoid", count, 128)
+    assert not use_triton_topk_softmax(logits, 1, "sigmoid", None, 39)
+    assert not use_triton_topk_softmax(logits, 1, "", None, 128)
+    assert not use_triton_topk_softmax(logits, 0, "sigmoid", None, 128)
+    assert not use_triton_topk_softmax(logits.t(), 1, "sigmoid", None, 1024)
+
+
+def test_router_kernels_unavailable_without_flydsl(monkeypatch):
+    # aiter's gemm_kernels imports flydsl at module scope: an aiter without
+    # FlyDSL must read as "no kernel" (keep tgemm), not raise during load.
+    monkeypatch.setitem(sys.modules, "aiter.ops.flydsl.gemm_kernels", None)
+    router_flydsl_params.cache_clear()
+    try:
+        for table in _FLYDSL_ROUTER_KERNELS.values():
+            for _, name in table:
+                assert router_flydsl_params(name) is None
+    finally:
+        router_flydsl_params.cache_clear()
 
 
 # ── GPU ────────────────────────────────────────────────────────────────────
@@ -120,12 +149,12 @@ def test_router_gemm_matches_fp32(m, out_dtype):
 
 @gpu
 def test_every_table_kernel_resolves_and_runs():
-    from atom.model_ops.linear import _router_flydsl_params, padded_router_gemm
+    from atom.model_ops.linear import padded_router_gemm
 
     table = _require_table()
     w, padded = _padded_weight()
     for largest_m, name in table:
-        assert _router_flydsl_params(name) is not None, name
+        assert router_flydsl_params(name) is not None, name
         x = torch.randn(largest_m, K, device="cuda", dtype=torch.bfloat16)
         _check_against_fp32(padded_router_gemm(x, padded, torch.bfloat16), x, w)
 
@@ -268,10 +297,20 @@ def test_router_linear_traces_under_torch_compile(monkeypatch, otype):
 
 
 @gpu
+@pytest.mark.parametrize("triton_max_tokens", [128, 0])  # Triton / AITER router
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_fused_shared_topk_reads_padded_stride_logits(dtype):
+def test_fused_shared_topk_reads_padded_stride_logits(
+    monkeypatch, dtype, triton_max_tokens
+):
     """The FP8 path hands all 513 columns (sigmoid-scored shared expert last)."""
     import atom.model_ops.topK as topK_mod
+
+    monkeypatch.setattr(
+        topK_mod, "_triton_topk_softmax_max_tokens", lambda: triton_max_tokens
+    )
+    assert topK_mod._use_triton_topk_softmax(
+        torch.empty(40, N, device="cuda"), 1, "sigmoid"
+    ) == bool(triton_max_tokens)
 
     topK_mod.init_aiter_topK_meta_data.cache_clear()
     topK_mod.init_aiter_topK_meta_data(
@@ -304,3 +343,59 @@ def test_fused_shared_topk_reads_padded_stride_logits(dtype):
     torch.testing.assert_close(
         w_view[:, 10], torch.sigmoid(view[:, N_ROUTED].float()), atol=1e-6, rtol=1e-6
     )
+
+
+@pytest.mark.parametrize("logits_dtype", [None, torch.float32])
+def test_rtpllm_patched_moe_forward_keeps_router_dtype_policy(
+    monkeypatch, logits_dtype
+):
+    # The RTP-LLM plugin replaces Qwen3NextSparseMoeBlock.forward; it must ask
+    # the gate for the same logits dtype as the native forward and keep the
+    # shared-expert output in the activation dtype.
+    import importlib.util
+    from pathlib import Path
+    from types import ModuleType
+
+    stub = ModuleType("atom.models.qwen3_next")
+    for name in ("Qwen3NextSparseMoeBlock", "Qwen3NextDecoderLayer"):
+        setattr(stub, name, type(name, (), {}))
+    stub.Qwen3NextGatedDeltaNet = type("Qwen3NextGatedDeltaNet", (), {})
+    stub.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
+    monkeypatch.setitem(sys.modules, "atom.models.qwen3_next", stub)
+    if "atom.models" not in sys.modules:  # its real __init__ needs AITER
+        monkeypatch.setitem(sys.modules, "atom.models", ModuleType("atom.models"))
+    path = (
+        Path(__file__).resolve().parents[2] / "atom/plugin/rtpllm/models/qwen3_next.py"
+    )
+    spec = importlib.util.spec_from_file_location("_rtp_qwen3_next_under_test", path)
+    rtp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rtp)
+    rtp.apply_qwen3_next_rtpllm_patch()
+
+    hidden, n_routed = 8, 4
+    seen = {}
+
+    def gate(x, otype=torch.bfloat16):
+        seen["otype"] = otype
+        return torch.zeros(x.shape[0], n_routed + 1, dtype=otype)
+
+    def experts(hidden_states, router_logits):
+        seen["router_logits"] = router_logits.dtype
+        return torch.zeros_like(hidden_states)
+
+    block = stub.Qwen3NextSparseMoeBlock()
+    block.__dict__.update(
+        gate=gate,
+        experts=experts,
+        shared_expert=lambda x: torch.ones_like(x),
+        n_routed_experts=n_routed,
+        n_shared_experts=1,
+        router_logits_dtype=logits_dtype,
+        tp_size=1,
+    )
+    x = torch.randn(3, hidden, dtype=torch.bfloat16)
+    out = block.forward(x)
+    expected = logits_dtype or torch.bfloat16
+    assert seen == {"otype": expected, "router_logits": expected}
+    assert out.dtype == torch.bfloat16
+    torch.testing.assert_close(out, torch.full_like(x, 0.5))

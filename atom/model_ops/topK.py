@@ -8,6 +8,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.router_gemm import use_triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -210,16 +211,15 @@ def _use_triton_topk_softmax(
     gating_output: torch.Tensor,
     num_fused_shared_experts: int,
     fused_shared_experts_scoring_func: str,
+    num_valid_rows: torch.Tensor | None = None,
 ) -> bool:
-    """Small-M Qwen3-Next / Qwen3.5 routing: softmax top-k plus a sigmoid-gated
-    fused shared expert. AITER's kernel takes ~9.5 us here at 512 experts; the
-    Triton router (same outputs) replaces it up to the token threshold."""
-    return (
-        num_fused_shared_experts > 0
-        and fused_shared_experts_scoring_func == "sigmoid"
-        and gating_output.dim() == 2
-        and gating_output.stride(1) == 1
-        and gating_output.shape[0] <= _triton_topk_softmax_max_tokens()
+    """See ``router_gemm.use_triton_topk_softmax``."""
+    return use_triton_topk_softmax(
+        gating_output,
+        num_fused_shared_experts,
+        fused_shared_experts_scoring_func,
+        num_valid_rows,
+        _triton_topk_softmax_max_tokens(),
     )
 
 
@@ -250,7 +250,10 @@ def rocm_aiter_topk_softmax_impl(
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
     if _use_triton_topk_softmax(
-        gating_output, num_fused_shared_experts, fused_shared_experts_scoring_func
+        gating_output,
+        num_fused_shared_experts,
+        fused_shared_experts_scoring_func,
+        num_valid_rows,
     ):
         from atom.model_ops.triton_topk_softmax import triton_topk_softmax_op
 
