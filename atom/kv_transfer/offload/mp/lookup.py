@@ -39,11 +39,14 @@ _ASYNC_LOOKUP_FAILED = (
     "read locks it may hold are left to the read TTL"
 )
 
-# How long the lookup driver lets an answered lookup wait for its request's
-# admission before releasing its read locks and asking again. Well below
-# LMCache's default L1 read TTL (300 s): a lookup that outlives the TTL hands
-# the retrieve chunks the server may already have evicted.
-_MAX_UNCONSUMED_HOLD_S = 120.0
+# The MP server's `--l1-read-ttl-seconds` when `lmcache.mp.read_ttl_seconds`
+# does not say otherwise (LMCache's own default).
+_DEFAULT_READ_TTL_S = 300.0
+# Fraction of the read TTL the lookup driver lets an answered lookup wait for
+# its request's admission before releasing its read locks and asking again.
+# Well below 1: a lookup that outlives the TTL hands the retrieve chunks the
+# server may already have evicted.
+_UNCONSUMED_HOLD_TTL_FRACTION = 0.4
 
 
 def _locked(method):
@@ -79,9 +82,12 @@ class _MPLookupClient:
         poll_interval: float,
         lock: Any = None,
         driver_window: int | None = None,
+        read_ttl_s: float = _DEFAULT_READ_TTL_S,
     ) -> None:
         if timeout <= 0 or poll_interval <= 0:
             raise ValueError("LMCache MP lookup timeout and poll interval must be > 0")
+        if not 0 < read_ttl_s < float("inf"):
+            raise ValueError("lmcache.mp.read_ttl_seconds must be finite and > 0")
         # Every public method holds it. Reentrant: methods call one another,
         # and a `_LockedAdapter` around `adapter` takes the same lock.
         self._lock = lock if lock is not None else threading.RLock()
@@ -110,6 +116,7 @@ class _MPLookupClient:
         self._offered: OrderedDict[str, Callable[[], list[int] | None]] = OrderedDict()
         # When each unconsumed async hit was answered (monotonic seconds).
         self._answered_at: dict[str, float] = {}
+        self._max_unconsumed_hold_s = read_ttl_s * _UNCONSUMED_HOLD_TTL_FRACTION
         self.driver_stats = {"sent": 0, "stale_released": 0}
         # The non-blocking path drives LMCache's ATOM adapter through its
         # internals (message-queue client and result caches). An adapter
@@ -194,7 +201,7 @@ class _MPLookupClient:
             return bool(self._async)
 
     def _release_stale(self) -> None:
-        """Release answers left unconsumed past `_MAX_UNCONSUMED_HOLD_S`; re-ask.
+        """Release answers left unconsumed past `_max_unconsumed_hold_s`; re-ask.
 
         The request is still waiting (an admitted one consumes its answer and a
         finished one discards it), so it gets a fresh lookup whose locks start
@@ -204,7 +211,7 @@ class _MPLookupClient:
             return
         now = time.monotonic()
         for lookup_id, answered in list(self._answered_at.items()):
-            if now - answered < _MAX_UNCONSUMED_HOLD_S:
+            if now - answered < self._max_unconsumed_hold_s:
                 continue
             del self._answered_at[lookup_id]
             token_ids = self._async_tokens.get(lookup_id)

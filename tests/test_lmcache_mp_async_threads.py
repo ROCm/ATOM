@@ -130,7 +130,7 @@ def test_driver_releases_an_answer_left_unconsumed_and_asks_again(monkeypatch):
         client.offer("req", lambda: list(range(8)))
         assert _wait_until(lambda: "req" in client._async_hits)
         with client._lock:
-            client._answered_at["req"] -= mp_lookup._MAX_UNCONSUMED_HOLD_S + 1
+            client._answered_at["req"] -= client._max_unconsumed_hold_s + 1
         client._driver.notify()
         assert _wait_until(lambda: client.driver_stats["stale_released"] == 1)
         assert adapter.freed[0]["end"] == CHUNK
@@ -140,6 +140,26 @@ def test_driver_releases_an_answer_left_unconsumed_and_asks_again(monkeypatch):
         assert client.pop_discarded_hits() == {}
     finally:
         client.close()
+
+
+def test_unconsumed_hold_follows_the_configured_read_ttl():
+    adapter = _Adapter(_PerRequestClient(chunks=1))
+    client = mp_lookup._MPLookupClient(
+        adapter, config=_config(), timeout=5.0, poll_interval=0.01, read_ttl_s=900.0
+    )
+    try:
+        assert client._max_unconsumed_hold_s == pytest.approx(360.0)
+    finally:
+        client.close()
+    for bad in (0.0, -1.0, float("inf")):
+        with pytest.raises(ValueError, match="read_ttl_seconds"):
+            mp_lookup._MPLookupClient(
+                adapter,
+                config=_config(),
+                timeout=5.0,
+                poll_interval=0.01,
+                read_ttl_s=bad,
+            )
 
 
 def test_offer_is_a_noop_without_a_driver():

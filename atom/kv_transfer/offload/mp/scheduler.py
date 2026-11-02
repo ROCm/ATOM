@@ -27,7 +27,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _mp_session_id,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.lookup import _MPLookupClient
+from atom.kv_transfer.offload.mp.lookup import _DEFAULT_READ_TTL_S, _MPLookupClient
 from atom.kv_transfer.offload.mp.lookup_driver import _LockedAdapter
 from atom.kv_transfer.offload.mp.transfer import (
     _SCHEDULER_DEADLINE_MARGIN_S,
@@ -75,6 +75,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             extra = _extra_config(config)
             timeout = float(extra.get("lmcache.mp.lookup_timeout", 30.0))
             poll_interval = float(extra.get("lmcache.mp.lookup_poll_interval", 0.01))
+            read_ttl_s = float(
+                extra.get("lmcache.mp.read_ttl_seconds", _DEFAULT_READ_TTL_S)
+            )
             lookup_client = _MPLookupClient(
                 adapter,
                 config=config,
@@ -82,6 +85,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 poll_interval=poll_interval,
                 lock=lock,
                 driver_window=driver_window,
+                read_ttl_s=read_ttl_s,
             )
             self._mp_adapter = adapter
             self._scheduler_deadline_s = (
