@@ -404,6 +404,8 @@ def _step_peak_pack_indices(
     a steady load (every GPU equally flat) shows as worse than naive. A GPU
     already holding a replica of the same expert is skipped while another GPU
     has room: two copies on one GPU split nothing.
+
+    The GPU loads accumulate in float64 whatever the dtype of ``vectors``.
     """
     weights = vectors.sum(dim=-1)
     phys = p2l.to(torch.int64)
@@ -412,9 +414,10 @@ def _step_peak_pack_indices(
     num_layers, num_logical, num_steps = vectors.shape
     num_physical = order.size(1)
     num_gpus = num_physical // capacity
-    loads = vectors.new_zeros((num_layers, num_gpus, num_steps))
-    peaks = vectors.new_zeros((num_layers, num_steps))
-    totals = vectors.new_zeros((num_layers, num_gpus))
+    f64 = torch.float64
+    loads = vectors.new_zeros((num_layers, num_gpus, num_steps), dtype=f64)
+    peaks = vectors.new_zeros((num_layers, num_steps), dtype=f64)
+    totals = vectors.new_zeros((num_layers, num_gpus), dtype=f64)
     occupancy = torch.zeros(
         (num_layers, num_gpus), dtype=torch.int64, device=vectors.device
     )
@@ -426,7 +429,7 @@ def _step_peak_pack_indices(
     inf = float("inf")
     for job in range(num_physical):
         expert = expert_order[:, job]
-        vector = vectors[layers, expert]
+        vector = vectors[layers, expert].to(f64)
         # Score of each GPU: sum over steps of that step's peak if this replica
         # lands there.
         cand = torch.maximum(loads + vector.unsqueeze(1), peaks.unsqueeze(1))
@@ -471,40 +474,61 @@ def step_peak_rebalance(
     onto GPUs against the same objective. All layers are solved together.
 
     step_load: [S, L, Lg] logical load per step. Returns p2l [L, num_physical].
+
+    The fit keeps two [S, L, Lg] float32 tensors, the counts and the
+    per-replica load: a step's count for one expert is at most the step's
+    routed rows, far below 2**24, so float32 holds it exactly, a replica's
+    share is a single rounding of it and equal shares stay tied. The cost, a
+    sum over the steps, accumulates in float64; the window loads, which only
+    order candidates of equal cost, are float32 sums (a float64 sum would
+    first copy the whole tensor to float64).
     """
-    _, num_layers, num_logical = step_load.shape
+    num_steps, num_layers, num_logical = step_load.shape
+    assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
+    assert num_physical >= num_logical
     device = step_load.device
-    tokens = step_load.to(torch.float64)
+    tokens = step_load.to(torch.float32)
+    score = tokens.clone()  # per-replica load: tokens / logcnt, kept per copy
+    window = tokens.sum(0)
     arange_logical = torch.arange(num_logical, device=device)
     layers = torch.arange(num_layers, device=device)
+    step_layers = layers.expand(num_steps, -1)
     p2l = torch.empty((num_layers, num_physical), dtype=torch.int64, device=device)
     p2l[:, :num_logical] = arange_logical
-    logcnt = torch.ones((num_layers, num_logical), dtype=torch.float64, device=device)
+    logcnt = torch.ones((num_layers, num_logical), dtype=torch.float32, device=device)
     for i in range(num_physical - num_logical):
-        score = tokens / logcnt
         # A copy of expert j changes a step's peak only if j alone holds it:
         # the new peak is max(second highest, j's per-replica load with the
         # copy). When the peak is tied, no single copy lowers it.
         top = score.topk(min(2, num_logical), dim=-1)
-        first = top.values[..., :1]
-        second = top.values[..., -1:]
-        peak = first.expand_as(score).clone()
-        lead = top.indices[..., :1]
+        first = top.values[..., 0]
+        second = top.values[..., -1]
+        lead = top.indices[..., 0]
         # The leader's per-replica load with the copy, at the leader only.
-        lead_tokens = tokens.gather(-1, lead)
-        lead_count = (logcnt + 1).expand_as(tokens).gather(-1, lead)
-        peak.scatter_(-1, lead, torch.maximum(second, lead_tokens / lead_count))
-        cost = peak.sum(0)  # [L, Lg]: sum of per-step peaks if j gets the copy
+        lead_tokens = tokens.gather(-1, lead.unsqueeze(-1)).squeeze(-1)
+        peak = torch.maximum(second, lead_tokens / (logcnt[step_layers, lead] + 1))
+        # [L, Lg]: sum of per-step peaks if j gets the copy, less the sum of the
+        # current peaks every candidate shares. Only a step's leader moves its
+        # peak, so this accumulates [S, L] changes at the leaders (sort-based
+        # and deterministic on GPU, unlike scatter_add_).
+        cost = torch.zeros(
+            (num_layers, num_logical), dtype=torch.float64, device=device
+        )
+        cost.index_put_(
+            (step_layers, lead), peak.to(torch.float64) - first, accumulate=True
+        )
         # Among equal-cost candidates take the one with the highest per-replica
         # load over the window (then the lowest id), never an arbitrary idle
         # expert: a copy of an expert that carries no load lowers no step.
         best = cost == cost.min(-1, keepdim=True).values
-        pick = torch.where(best, score.sum(0), -1.0).argmax(-1)
+        pick = torch.where(best, window / logcnt, -1.0).argmax(-1)
         p2l[:, num_logical + i] = pick
         logcnt[layers, pick] += 1
+        score[:, layers, pick] = tokens[:, layers, pick] / logcnt[layers, pick]
+    del tokens
     capacity = num_physical // num_gpus
     if capacity > 1:
-        vectors = tokens.permute(1, 2, 0) / logcnt.unsqueeze(-1)
+        vectors = score.permute(1, 2, 0)  # [L, Lg, S], no copy
         p2l = p2l.gather(-1, _step_peak_pack_indices(vectors, p2l, logcnt, capacity))
     return p2l
 
@@ -1753,7 +1777,7 @@ class ExpertLoadMonitor:
         return self._reduce_steps(self._step_gpu_window)
 
     def dump_global_step_load(self) -> torch.Tensor | None:
-        """Group-summed physical load per step, oldest first: [S, L, P] int64.
+        """Group-summed physical load per step, oldest first: [S, L, P] int32.
         Only kept when ``track_step_load`` (the step_peak policy)."""
         return self._reduce_steps(self._step_load_window)
 
@@ -1764,7 +1788,10 @@ class ExpertLoadMonitor:
             (self._step_slot - self._step_filled + i) % self.window_size
             for i in range(self._step_filled)
         ]
-        load = window[order].to(torch.int64)
+        # Reduced in int32, the window's own dtype: one step's group-summed
+        # count is at most the step's routed rows times top-k, nowhere near
+        # 2**31. The gather is the one copy of the window, reduced in place.
+        load = window[order]
         group = self._load_group if self._load_group is not None else get_tp_group()
         device_group = getattr(group, "device_group", None)
         if int(getattr(group, "world_size", 1)) > 1:
@@ -2693,12 +2720,16 @@ class EPLBManager:
             idx = meta.physical_to_logical_map.to(
                 device=step_load.device, dtype=torch.int64
             ).clamp(min=0)
+            # Folded straight into float32 (exact for per-step counts, see
+            # step_peak_rebalance): the fit takes it as its counts, no copy.
             logical = torch.zeros(
                 (*step_load.shape[:2], num_logical),
-                dtype=torch.int64,
+                dtype=torch.float32,
                 device=step_load.device,
             )
-            logical.scatter_add_(-1, idx.expand_as(step_load), step_load)
+            logical.scatter_add_(
+                -1, idx.expand_as(step_load), step_load.to(torch.float32)
+            )
             p2l.copy_(
                 step_peak_rebalance(
                     logical, num_physical=num_physical, num_gpus=meta.ep_size

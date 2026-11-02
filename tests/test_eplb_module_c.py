@@ -221,6 +221,14 @@ def test_step_peak_invariants(num_gpus, num_physical):
         assert int(counts.min()) >= 1 and int(counts.sum()) == num_physical
 
 
+def test_step_peak_rejects_physical_not_divisible_by_gpus():
+    # 10 slots on 4 GPUs: capacity would truncate to 2 and the packed blocks
+    # would cover 8 slots, not the ep_size layout.
+    step_load = torch.ones((2, 1, 8), dtype=torch.int64)
+    with pytest.raises(AssertionError, match="divisible"):
+        step_peak_rebalance(step_load, num_physical=10, num_gpus=4)
+
+
 def _steady_peak(p2l, weight, num_gpus):
     """Busiest GPU's load under a steady (every step equal) load, no replicas."""
     return int(weight[p2l.long()].view(num_gpus, -1).sum(-1).max())
