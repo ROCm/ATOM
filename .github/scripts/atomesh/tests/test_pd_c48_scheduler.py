@@ -148,9 +148,9 @@ class SupersededHeadTest(unittest.TestCase):
         self.warm = self.cold + [rng.randrange(1000, 160000) for _ in range(2_500)]
         self.branch = self.cold + [rng.randrange(1000, 160000) for _ in range(2_500)]
 
-    def warm_turn(self, demote):
+    def warm_turn(self, demote, hits_only=False):
         kv = tp8_kv_manager()
-        stats = demote_superseded_states(kv) if demote else None
+        stats = demote_superseded_states(kv, hits_only) if demote else None
         self.assertEqual(run_prompt(kv, "cold", self.cold, [11_648, 8_352]), 0)  # exports the checkpoint 19,968
         self.assertEqual(run_prompt(kv, "warm", self.warm, [2_532]), 19_968)  # resumes there, exports 22,400
         q = free_queue(kv)
@@ -158,7 +158,11 @@ class SupersededHeadTest(unittest.TestCase):
         return kv, stats, [b.block_id for b in q], hashed
 
     def test_hit_states_lead_the_free_queue_and_serve_branches_until_reused(self):
-        kv, stats, q, hashed = self.warm_turn(demote=True)
+        for hits_only in (False, True):
+            with self.subTest(hits_only=hits_only):
+                self.check_hit_states_lead(*self.warm_turn(True, hits_only))
+
+    def check_hit_states_lead(self, kv, stats, q, hashed):
         self.assertEqual((stats["superseded"], stats["finished"]), (3, 2))  # one hit state per Mamba group
         s = [i for i, n in hashed[:3]]
         self.assertEqual(hashed[:3], [(i, 19_968) for i in s])  # ahead of every other cached block
@@ -176,11 +180,22 @@ class SupersededHeadTest(unittest.TestCase):
         self.assertEqual([i for i in q if kv.block_pool.blocks[i].block_hash is not None], q[-len(hashed):])
         self.assertEqual([n for _, n in hashed[:7]], [19_968] * 4 + [22_400] * 3)
 
-    def test_turn_inside_its_hit_block_supersedes_nothing(self):
-        kv, stats, _, _ = self.warm_turn(demote=True)
-        self.assertEqual(run_prompt(kv, "short", self.warm + self.cold[:300], [400]), 22_400)
-        self.assertEqual(stats["superseded"], 3)
+    def test_tail_split_turn_demotes_only_its_hit_states(self):
+        long_warm = self.warm + self.branch[20_000:21_564]
+        for hits_only in (False, True):
+            kv = tp8_kv_manager()
+            stats = demote_superseded_states(kv, hits_only)
+            run_prompt(kv, "cold", self.cold, [11_648, 8_352])
+            # The stock tail split caches the block boundary 23,296 and the 128-grid state 23,936.
+            self.assertEqual(run_prompt(kv, "warm", long_warm, [3_328, 640, 128]), 19_968)
+            hashed = [b.block_hash_num_tokens for b in free_queue(kv) if b.block_hash is not None]
+            self.assertEqual((stats["superseded"], hashed[:3]), (3, [19_968] * 3), hits_only)
 
+    def test_turn_inside_its_hit_block_supersedes_nothing(self):
+        for hits_only in (False, True):
+            kv, stats, _, _ = self.warm_turn(True, hits_only)
+            self.assertEqual(run_prompt(kv, "short", self.warm + self.cold[:300], [400]), 22_400)
+            self.assertEqual(stats["superseded"], 3, hits_only)
 
 if __name__ == "__main__":
     unittest.main()
