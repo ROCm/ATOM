@@ -28,7 +28,6 @@ def main():
         recv_intermediate_tensors,
         send_intermediate_tensors,
     )
-    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
     from atom.models.utils import IntermediateTensors
 
     # Exercise the real tensor-dict protocol without allocating custom-AR pools.
@@ -40,46 +39,66 @@ def main():
     for gather in ("0", "1"):
         os.environ["ATOM_PP_SEND_ALLGATHER"] = gather
         for asynchronous in (False, True):
-            for carry in (True, False, True):
+            for layout in ("pages", "absent", "ids_only"):
+                carry = layout != "absent"
                 hidden = torch.arange(96, device="cuda").reshape(6, 16)
                 indices = (
                     torch.arange(48, dtype=torch.int32, device="cuda").reshape(1, 3, 16)
                     + 1000 * tp.rank_in_group
                 )
-                metadata = {
-                    "source": (12, 12),
-                    "signature": ("prefill", torch.bfloat16),
-                }
                 payload = {
                     "hidden_states": hidden.clone(),
                     "residual": hidden.clone() + 1,
                     "draft_aux_7": hidden.clone() + 2,
                 }
-                if carry:
-                    payload.update(
-                        {PP_TOPK_INDICES: indices.clone(), PP_TOPK_METADATA: metadata}
+                keys = (
+                    (
+                        "sparse_kv_indices",
+                        "sparse_kv_block_table",
+                        "sparse_kv_context_lens",
                     )
+                    if carry
+                    else ()
+                )
+                expected = (
+                    (
+                        indices,
+                        indices.flatten().clone(),
+                        torch.arange(3, dtype=torch.int32, device="cuda"),
+                    )
+                    if carry
+                    else ()
+                )
+                # NVFP4 consumes only IDs; page-based attention consumes all three.
+                if layout == "ids_only":
+                    expected = (indices, None, None)
+                payload.update(
+                    {
+                        k: v.clone() if v is not None else None
+                        for k, v in zip(keys, expected)
+                    }
+                )
                 if pp.rank_in_group == 0:
                     out = IntermediateTensors(payload)
                     if asynchronous:
-                        works = async_send_intermediate_tensors(out)
+                        works = async_send_intermediate_tensors(
+                            out, rank_local_keys=keys
+                        )
                         for value in payload.values():
                             if isinstance(value, torch.Tensor):
                                 value.fill_(-99)
                         commit_pp_send_work(works)
                     else:
-                        send_intermediate_tensors(out)
+                        send_intermediate_tensors(out, rank_local_keys=keys)
                 else:
-                    received = recv_intermediate_tensors().tensors
+                    received = recv_intermediate_tensors(rank_local_keys=keys).tensors
                     torch.testing.assert_close(received["hidden_states"], hidden)
                     torch.testing.assert_close(received["residual"], hidden + 1)
                     torch.testing.assert_close(received["draft_aux_7"], hidden + 2)
-                    if carry:
-                        torch.testing.assert_close(received[PP_TOPK_INDICES], indices)
-                        assert received[PP_TOPK_METADATA] == metadata
-                    else:
-                        assert PP_TOPK_INDICES not in received
-                        assert PP_TOPK_METADATA not in received
+                    for k, v in zip(keys, expected):
+                        torch.testing.assert_close(received[k], v)
+                    if not carry:
+                        assert "sparse_kv_indices" not in received
                 dist.barrier()
     if dist.get_rank() == 0:
         print(

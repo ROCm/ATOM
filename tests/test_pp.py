@@ -1151,7 +1151,7 @@ def test_dynamic_pp_prefill_registers_prefix_hashes():
 
 @pytest.mark.parametrize("allgather", [False, True])
 def test_m3_topk_transport_preserves_rank_local_heads(monkeypatch, allgather):
-    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
+    keys = ("sparse_kv_indices", "sparse_kv_block_table", "sparse_kv_context_lens")
 
     grp, _ = _fake_pp_group(monkeypatch)
     tp = SimpleNamespace(world_size=4, rank_in_group=1)
@@ -1161,25 +1161,26 @@ def test_m3_topk_transport_preserves_rank_local_heads(monkeypatch, allgather):
     it = IntermediateTensors(
         {
             "hidden_states": torch.ones(8, 8),
-            PP_TOPK_INDICES: ids,
-            PP_TOPK_METADATA: {"source": (12, 12)},
+            "sparse_kv_indices": ids,
+            "sparse_kv_block_table": None,
+            "sparse_kv_context_lens": None,
         }
     )
-    pp_comm.send_intermediate_tensors(it)
+    pp_comm.send_intermediate_tensors(it, rank_local_keys=keys)
     calls = grp.send_tensor_dict.call_args_list
     assert len(calls) == 2
     assert calls[0].kwargs["all_gather_group"] is (tp if allgather else None)
-    assert PP_TOPK_INDICES not in calls[0].args[0]
+    assert "sparse_kv_indices" not in calls[0].args[0]
     assert calls[1].kwargs["all_gather_group"] is None
-    assert calls[1].args[0][PP_TOPK_INDICES] is ids
+    assert calls[1].args[0]["sparse_kv_indices"] is ids
     grp.recv_tensor_dict.side_effect = [c.args[0] for c in calls]
-    out = pp_comm.recv_intermediate_tensors()
-    torch.testing.assert_close(out[PP_TOPK_INDICES], ids)
+    out = pp_comm.recv_intermediate_tensors(rank_local_keys=keys)
+    torch.testing.assert_close(out["sparse_kv_indices"], ids)
     assert grp.recv_tensor_dict.call_args_list[1].kwargs["all_gather_group"] is None
 
 
 def test_m3_async_topk_is_full_rank_local_owned_buffer(monkeypatch):
-    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
+    keys = ("sparse_kv_indices", "sparse_kv_block_table", "sparse_kv_context_lens")
 
     _fake_async_pp_group(monkeypatch)
     tp = SimpleNamespace(world_size=4, rank_in_group=1)
@@ -1190,11 +1191,12 @@ def test_m3_async_topk_is_full_rank_local_owned_buffer(monkeypatch):
     it = IntermediateTensors(
         {
             "hidden_states": torch.ones(8, 8),
-            PP_TOPK_INDICES: ids,
-            PP_TOPK_METADATA: {"source": (12, 12)},
+            "sparse_kv_indices": ids,
+            "sparse_kv_block_table": None,
+            "sparse_kv_context_lens": None,
         }
     )
-    work = pp_comm.async_send_intermediate_tensors(it)
+    work = pp_comm.async_send_intermediate_tensors(it, rank_local_keys=keys)
     assert sizes[2] == 16  # hidden-state TP slice
     assert sizes[-1] == 48  # full index heads, no TP slice
     saved = work[-1].payload.clone()
@@ -1203,10 +1205,11 @@ def test_m3_async_topk_is_full_rank_local_owned_buffer(monkeypatch):
     assert work[-1].payload.data_ptr() != ids.data_ptr()
 
 
-def test_incomplete_m3_payload_rejected_before_send(monkeypatch):
-    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_METADATA
-
+def test_missing_rank_local_payload_rejected_before_send(monkeypatch):
     grp, _ = _fake_pp_group(monkeypatch)
-    with pytest.raises(RuntimeError, match="Incomplete"):
-        pp_comm.send_intermediate_tensors(IntermediateTensors({PP_TOPK_METADATA: {}}))
+    with pytest.raises(KeyError):
+        pp_comm.send_intermediate_tensors(
+            IntermediateTensors({"hidden_states": torch.zeros(2, 4)}),
+            rank_local_keys=("sparse_kv_indices",),
+        )
     grp.send_tensor_dict.assert_not_called()

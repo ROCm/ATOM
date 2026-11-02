@@ -15,7 +15,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.communication import set_custom_all_reduce
 
-from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
 from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
@@ -23,7 +22,13 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
-_PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices", PP_TOPK_METADATA)
+_PP_PROXY_KEYS = (
+    "hidden_states",
+    "residual",
+    "sparse_kv_indices",
+    "sparse_kv_block_table",
+    "sparse_kv_context_lens",
+)
 # And a drafter's taps on their way to the last stage (`pp_aux_relay`).
 PP_DRAFT_AUX_PREFIX = "draft_aux_"
 
@@ -36,12 +41,14 @@ def _stage_payload(it: IntermediateTensors) -> dict:
     }
 
 
-def _rank_local_topk(it: IntermediateTensors) -> dict:
-    has_metadata = PP_TOPK_METADATA in it.tensors
-    has_indices = PP_TOPK_INDICES in it.tensors
-    if has_metadata != has_indices:
-        raise RuntimeError("Incomplete MiniMax-M3 PP top-k payload")
-    return {PP_TOPK_INDICES: it.tensors[PP_TOPK_INDICES]} if has_indices else {}
+def _stage_payloads(it: IntermediateTensors, rank_local_keys: tuple[str, ...]):
+    """Keep head-sharded tensors out of the replicated-activation all-gather."""
+    tensors = _stage_payload(it)
+    local = {k: tensors.pop(k) for k in rank_local_keys}
+    payloads = [(tensors, pp_send_allgather_group())]
+    if local:
+        payloads.append((local, None))
+    return payloads
 
 
 def pp_send_allgather_group():
@@ -112,29 +119,25 @@ def init_pp_aware_dist_env(
     )
 
 
-def send_intermediate_tensors(it: IntermediateTensors) -> None:
-    """Blocking send of hidden_states/residual to the next PP stage."""
+def send_intermediate_tensors(
+    it: IntermediateTensors, *, rank_local_keys: tuple[str, ...] = ()
+) -> None:
+    """Send activations and optional rank-local tensors to the next PP stage."""
     pp = get_pp_group()
-    tensors = _stage_payload(it)
-    topk = _rank_local_topk(it)
     dst = (pp.rank_in_group + 1) % pp.world_size
-    pp.send_tensor_dict(tensors, dst=dst, all_gather_group=pp_send_allgather_group())
-    if topk:
-        # Each TP rank selects its own heads: gathering other ranks' slices
-        # would silently substitute a different head's selected blocks.
-        pp.send_tensor_dict(topk, dst=dst, all_gather_group=None)
+    for tensors, ag_group in _stage_payloads(it, rank_local_keys):
+        pp.send_tensor_dict(tensors, dst=dst, all_gather_group=ag_group)
 
 
-def recv_intermediate_tensors() -> IntermediateTensors:
-    """Receive hidden_states/residual from the previous PP stage."""
+def recv_intermediate_tensors(
+    *, rank_local_keys: tuple[str, ...] = ()
+) -> IntermediateTensors:
+    """Receive the payloads selected by the caller's static PP boundary policy."""
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
     tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
-    if PP_TOPK_METADATA in tensors:
-        topk = pp.recv_tensor_dict(src=src, all_gather_group=None)
-        if set(topk) != {PP_TOPK_INDICES}:
-            raise RuntimeError("Missing MiniMax-M3 rank-local PP top-k indices")
-        tensors.update(topk)
+    if rank_local_keys:
+        tensors.update(pp.recv_tensor_dict(src=src, all_gather_group=None))
     return IntermediateTensors(tensors)
 
 
@@ -181,13 +184,12 @@ def _async_send_tensor_dict(tensors: dict, ag_group) -> list[P2PWork]:
 
 
 def async_send_intermediate_tensors(
-    it: IntermediateTensors,
+    it: IntermediateTensors, *, rank_local_keys: tuple[str, ...] = ()
 ) -> list[P2PWork]:
-    """Send activations and, when needed, rank-local MiniMax index heads."""
-    topk = _rank_local_topk(it)
-    works = _async_send_tensor_dict(_stage_payload(it), pp_send_allgather_group())
-    if topk:
-        works.extend(_async_send_tensor_dict(topk, None))
+    """Non-blocking send with owned buffers for both payload classes."""
+    works = []
+    for tensors, ag_group in _stage_payloads(it, rank_local_keys):
+        works.extend(_async_send_tensor_dict(tensors, ag_group))
     return works
 
 

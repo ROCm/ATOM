@@ -737,48 +737,6 @@ def _alloc_emit(
     return (sparse_bt, sparse_ctx), args
 
 
-def emit_sparse_block_table(
-    topk_idx,
-    block_table,
-    row_starts,
-    row_prefix,
-    *,
-    max_query_len,
-    decode=False,
-    pages_per_block=PAGES_PER_SPARSE_BLOCK,
-    block_page_stride=PAGES_PER_SPARSE_BLOCK,
-):
-    """Rebuild stage-local pages from received logical IDs, without rescoring.
-
-    Reuse the selector's exact emission kernel so multi-head layouts, causal
-    tails and the order of selected blocks match its fused output.
-    """
-    heads, rows, topk = topk_idx.shape
-    outputs, args = _alloc_emit(
-        rows, heads, topk, block_table, True, topk_idx.device, pages_per_block
-    )
-    batch = row_prefix.shape[0]
-    if rows:
-        _emit_sparse_block_table_kernel[(max_query_len, batch, heads)](
-            topk_idx,
-            row_starts,
-            row_prefix,
-            topk,
-            *topk_idx.stride(),
-            block_table,
-            *args,
-            1,
-            SPARSE_BLOCK_SIZE,
-            NUM_KV_HEADS=heads,
-            DECODE_MAX_Q=max_query_len if decode else 0,
-            pages_per_block=pages_per_block,
-            block_page_stride=block_page_stride,
-            BLOCK_SIZE_T=triton.next_power_of_2(topk),
-            num_warps=1,
-        )
-    return outputs
-
-
 # Row widths (in 128-blocks) from which aiter's selector is the cheaper way to
 # serve the call; under them the fused Triton kernel is, being one launch that
 # also emits. Device us, MI355X, topk=16, rows 1..512, rocprofv3-attributed

@@ -1593,17 +1593,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         state = self._topk_cache_state(sparse_metadata)
         if state is None:
             return None
+        # PP imports the current forward's cache value; bind its local key once.
+        if "pp_topk" in state:
+            state["topk"] = {"key": key, "value": state.pop("pp_topk")}
         entry = state.get("topk")
-        if entry is not None and entry.get("key") is None and "pp_signature" in entry:
-            from atom.model_ops.minimax_m3.pp_topk import bind_received_topk
-
-            bind_received_topk(
-                entry,
-                key,
-                sparse_metadata,
-                nvfp4=self.kv_nvfp4,
-                mxfp4=self.kv_mxfp4,
-            )
         if entry is None or entry.get("key") != key:
             return None
         return entry["value"]

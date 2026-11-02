@@ -842,20 +842,6 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.model.make_empty_intermediate_tensors
         )
         self._mono = MonoDecode(self, atom_config)
-        self._pp_topk = None
-        if get_pp_group().world_size > 1 and getattr(config, "use_index_cache", False):
-            from atom.model_ops.minimax_m3.pp_topk import MiniMaxM3PPTopK
-
-            schedule = []
-            for layer in sorted(_sparse_attention_layer_ids(config)):
-                reuse, ordinal = _should_skip_minimax_m3_index_topk(config, layer)
-                schedule.append((layer, ordinal, reuse))
-            self._pp_topk = MiniMaxM3PPTopK(
-                self.model.start_layer,
-                self.model.end_layer,
-                config.num_hidden_layers,
-                schedule,
-            )
         # Set by a VL model with a vision tower: its compiled MiniMaxM3Model is
         # captured once, so it must always see inputs_embeds -- a text-only
         # capture would replay without them and drop the image embeddings.
@@ -919,19 +905,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return self._mono.forward(input_ids, positions)
         if self.embed_before_model and inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        sparse_metadata = None
-        if self._pp_topk is not None:
-            from atom.utils.forward_context import get_forward_context
-
-            attn_metadata = get_forward_context().attn_metadata
-            sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
-            if sparse_metadata is None:
-                sparse_metadata = attn_metadata
-            self._pp_topk.begin(sparse_metadata, intermediate_tensors)
-        output = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
-        if self._pp_topk is not None and isinstance(output, IntermediateTensors):
-            self._pp_topk.attach(sparse_metadata, output)
-        return output
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.lm_head(hidden_states)
