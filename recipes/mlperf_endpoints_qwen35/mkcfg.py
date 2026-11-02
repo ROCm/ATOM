@@ -5,7 +5,8 @@ usage: mkcfg.py <base_yaml> <dataset_jsonl> <model> <concurrency> <report_dir> <
 
 Starts from mlcommons/endpoints examples/10_Agentic_Inference/qwen_agentic_benchmark.yaml
 and makes the same deviations as the DSv4.1 recipe (sampling params / thinking flags
-untouched): perf dataset only (no SWE-bench, no inline accuracy), 613 trajectories, salt +
+untouched): perf dataset only (no SWE-bench; inline accuracy with ACC_INLINE=1), a multiple of
+613 trajectories, salt +
 tool delay on, stop issuing at the first user completion, 30 min perf-issue cap.
 """
 
@@ -23,15 +24,26 @@ cfg["model_params"]["tokenizer_name"] = model
 
 perf = next(d for d in cfg["datasets"] if d.get("type") == "performance")
 perf["path"] = dataset
-perf.pop("accuracy_config", None)
+# ACC_INLINE=1 keeps the example's inline accuracy (agentic_inference_inline, scored from events.jsonl
+# when the run finalizes), which an official submission requires on every point; SWE-bench stays out.
+if os.environ.get("ACC_INLINE", "0") != "1":
+    perf.pop("accuracy_config", None)
 ai = perf["agentic_inference"]
 # trajectories: at least the dataset's 613, and TRAJ_X (default 4) per concurrency slot. The client
 # repeats conversations past 613 (<id>__repeat_N, each repeat with its own system-prompt salt), so
 # at c >= 613 the 30-minute cap still ends the point; with 613, every trajectory starts at once and
 # stop_issuing_on_first_user_complete ends it at the first completion (c2048: 4.4 min)
-ai["num_trajectories_to_issue"] = max(
-    613, int(os.environ.get("TRAJ_X", "4")) * int(conc)
-)
+# An official run issues a positive multiple of the dataset's 613 (README, Dataset Size): NUM_TRAJ
+# names the count outright, otherwise TRAJ_X * conc is rounded up to the next multiple.
+DATASET_TRAJ = 613
+if os.environ.get("NUM_TRAJ"):
+    n_traj = int(os.environ["NUM_TRAJ"])
+    if n_traj <= 0 or n_traj % DATASET_TRAJ:
+        sys.exit(f"NUM_TRAJ={n_traj} is not a positive multiple of {DATASET_TRAJ}")
+else:
+    want = max(DATASET_TRAJ, int(os.environ.get("TRAJ_X", "4")) * int(conc))
+    n_traj = -(-want // DATASET_TRAJ) * DATASET_TRAJ
+ai["num_trajectories_to_issue"] = n_traj
 # TURN_TIMEOUT (s): a turn still unanswered after it fails, and with it the rest of its trajectory.
 # Default: the benchmark's own 14400, as the DSv4.1 30-minute points use. A short one bounds the
 # drain after the cap but kills long turns at high concurrency (c2048 at 900 s: 22% of turns failed,
