@@ -1,6 +1,6 @@
-# Chat token logprobs (draft)
+# Chat token logprobs
 
-This draft connects target-model token probabilities to the Python Chat
+This change connects target-model token probabilities to the Python Chat
 Completions endpoint for ordinary and speculative decoding, including DSpark.
 It is separate from the frontend compatibility work in #2844.
 
@@ -36,14 +36,15 @@ to the acceptance algorithm. Probabilities travel with the same async batch as
 token IDs and are trimmed with max-token/stop boundaries. Offline scalar
 logprob arrays contain committed tokens only, not speculative placeholders.
 
-## Current draft boundaries
+## Supported combinations and limitations
 
 - ByteLevel tokenizers are supported; other decoder types return an explicit
   error rather than inventing UTF-8 bytes. The intended V4.1 tokenizer is ByteLevel.
 - Text and thinking output, streaming/non-streaming, and multiple choices are
-  included. Tools, multimodal input, and P/D KV transfer with logprobs are
-  explicitly rejected in this initial draft. Their existing behavior is retained
-  when logprobs is disabled. No image implementation is added.
+  included. Normal tool requests are supported; probability fields describe
+  visible content/reasoning, not tool arguments. Multimodal input and P/D KV
+  transfer with logprobs are rejected. Their existing behavior is retained when
+  logprobs is disabled. No image implementation is added.
 - Forced synthetic acceptance is rejected. It cannot validate target-model
   semantics or token probabilities.
 - This does not add logprob fields to Responses or Anthropic Messages.
