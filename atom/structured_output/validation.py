@@ -209,11 +209,11 @@ class WorkerGrammarPreflight:
     def __init__(self, engine, tokenizer, config):
         self.engine = engine
         self.tokenizer = tokenizer
-        hf = config.hf_config
-        self.vocab_size = (getattr(hf, "text_config", None) or hf).vocab_size
-        self.fingerprint = structured_output.tokenizer_fingerprint(
-            tokenizer, config.end_token_ids
-        )
+        # Constructed once with the engine; ordinary requests must not load
+        # grammar dependencies or serialize/hash the tokenizer.
+        self.config = config
+        self.vocab_size = None
+        self.fingerprint = None
         self.ready = OrderedDict()
         self.pending = {}
         self.lock = Lock()
@@ -224,6 +224,14 @@ class WorkerGrammarPreflight:
     def submit(self, schema, tool_format, reasoning_end=""):
         key = (schema, tool_format, reasoning_end)
         with self.lock:
+            if self.fingerprint is None:
+                hf = self.config.hf_config
+                vocab_size = (getattr(hf, "text_config", None) or hf).vocab_size
+                fingerprint = structured_output.tokenizer_fingerprint(
+                    self.tokenizer, self.config.end_token_ids
+                )
+                self.vocab_size = vocab_size
+                self.fingerprint = fingerprint
             if key in self.ready:
                 self.ready.move_to_end(key)
                 return self.ready[key]

@@ -4,7 +4,6 @@
 import importlib.util
 import itertools
 import logging
-import threading
 import time
 from collections import Counter
 from dataclasses import fields, replace
@@ -183,8 +182,9 @@ class LLMEngine:
             self.core_mgr = DisaggCoreManager(config)
         else:
             self.core_mgr = CoreManager(config)
-        self._structured_preflight = None
-        self._structured_lock = threading.Lock()
+        self._structured_preflight = WorkerGrammarPreflight(
+            self, self.tokenizer, config
+        )
         self.io_processor.structured_admission = self.prepare_structured_request
         self.core_mgr.structured_request_prepare = self.bind_structured_requests
         self._step_lock = None
@@ -221,12 +221,7 @@ class LLMEngine:
             multimodal=multimodal,
             relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
         )
-        with self._structured_lock:
-            if self._structured_preflight is None:
-                self._structured_preflight = WorkerGrammarPreflight(
-                    self, self.tokenizer, self.config
-                )
-            preflight = self._structured_preflight
+        preflight = self._structured_preflight
         key = (
             params.json_schema,
             params.structured_tool_format,

@@ -120,7 +120,10 @@ def frontend(rpc):
 def test_all_rank_success_is_cached_and_tool_format_is_part_of_key():
     rpc = Mock()
     preflight = frontend(rpc)
-    value = {"fingerprint": preflight.fingerprint, "vocab_size": 8}
+    value = {
+        "fingerprint": tokenizer_fingerprint(preflight.tokenizer, [2]),
+        "vocab_size": 8,
+    }
     rpc.return_value = [NS(ok=True, value=value), NS(ok=True, value=value)]
 
     async def run():
@@ -142,7 +145,10 @@ def test_all_rank_success_is_cached_and_tool_format_is_part_of_key():
 def test_failed_preparation_is_never_cached(kind):
     rpc = Mock()
     preflight = frontend(rpc)
-    value = {"fingerprint": preflight.fingerprint, "vocab_size": 8}
+    value = {
+        "fingerprint": tokenizer_fingerprint(preflight.tokenizer, [2]),
+        "vocab_size": 8,
+    }
     if kind == "one_rank_failed":
         rpc.return_value = [
             NS(ok=True, value=value),
@@ -220,7 +226,13 @@ def test_admission_uses_actual_channel_state(monkeypatch, opened):
     preflight = frontend(rpc)
     preflight.tokenizer.encode = lambda text, **kw: list(text.encode())
     rpc.return_value = [
-        NS(ok=True, value={"fingerprint": preflight.fingerprint, "vocab_size": 8})
+        NS(
+            ok=True,
+            value={
+                "fingerprint": tokenizer_fingerprint(preflight.tokenizer, [2]),
+                "vocab_size": 8,
+            },
+        )
     ]
     preflight.engine.prepare_structured_request = (
         lambda params, *args: preflight.submit(
@@ -277,7 +289,11 @@ def test_cached_schema_bypasses_unrelated_slow_compile():
 
     entered, release = Event(), Event()
     preflight = frontend(Mock())
-    ready = {"ready": True, "fingerprint": preflight.fingerprint, "vocab_size": 8}
+    ready = {
+        "ready": True,
+        "fingerprint": tokenizer_fingerprint(preflight.tokenizer, [2]),
+        "vocab_size": 8,
+    }
 
     def rpc(method, *, args, timeout):
         if args[0] == "slow":
@@ -619,3 +635,70 @@ def test_cleanup_failure_preserves_original_admission_error():
     mgr.broadcast_utility_command.assert_called_once_with(
         "release_structured_requests", request_ids=[19]
     )
+
+
+def test_preflight_construction_and_close_keep_optional_dependencies_unloaded():
+    code = """
+import sys
+from atom.structured_output.validation import WorkerGrammarPreflight
+
+# Deliberately opaque inputs: construction/close must not inspect tokenizer
+# or model configuration before any structured request arrives.
+preflight = WorkerGrammarPreflight(object(), object(), object())
+preflight.close()
+assert all(name not in sys.modules for name in ("torch", "llguidance", "jsonschema", "re2"))
+assert "atom.structured_output.manager" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    )
+
+
+def test_concurrent_first_requests_initialize_one_preflight_identity(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from atom import structured_output
+
+    fingerprint = Mock(return_value="identity")
+    monkeypatch.setattr(structured_output, "tokenizer_fingerprint", fingerprint)
+    rpc = Mock(
+        return_value=[NS(ok=True, value={"fingerprint": "identity", "vocab_size": 8})]
+    )
+    preflight = frontend(rpc)
+    gate = Barrier(8)
+
+    def submit():
+        gate.wait(timeout=3)
+        preflight.submit("{}", None).result(timeout=3)
+
+    try:
+        fingerprint.assert_not_called()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(lambda _: submit(), range(8)))
+        fingerprint.assert_called_once()
+        rpc.assert_called_once()
+    finally:
+        preflight.close()
+
+
+def test_failed_identity_initialization_can_retry(monkeypatch):
+    from atom import structured_output
+
+    fingerprint = Mock(side_effect=[ValueError("bad tokenizer"), "identity"])
+    monkeypatch.setattr(structured_output, "tokenizer_fingerprint", fingerprint)
+    rpc = Mock(
+        return_value=[NS(ok=True, value={"fingerprint": "identity", "vocab_size": 8})]
+    )
+    preflight = frontend(rpc)
+    try:
+        with pytest.raises(ValueError, match="bad tokenizer"):
+            preflight.submit("{}", None)
+        assert preflight.fingerprint is None
+        assert not preflight.pending
+        rpc.assert_not_called()
+        preflight.submit("{}", None).result(timeout=3)
+        assert preflight.fingerprint == "identity"
+        rpc.assert_called_once()
+    finally:
+        preflight.close()
