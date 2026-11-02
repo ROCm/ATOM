@@ -258,12 +258,12 @@ class _GridSpy:
     "sink", ["packed_ring", "bf16_ring", "prefill", "query", "query_fp8", "no_query"]
 )
 def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink):
-    """`ATOM_DSV41_ROPE_HEAD_BLOCK` against the default grid, byte for byte.
+    """The head-blocked query grid against a program a head, byte for byte.
 
     One program rotating a token's heads has to give the per-head programs'
     query and leave the KV half -- now slot 1, not slot `heads` -- writing the
     same rows. The launches are recorded, so a gate that never picks the
-    head-blocked grid fails here rather than comparing the default to itself.
+    head-blocked grid fails here rather than comparing a grid to itself.
     Six heads is no power of two, the MXFP8 query (`query_fp8`) is not the
     in-place rotation, and a query-less KV launch (`no_query`, a prefill whose
     queries rotate separately) has no heads: all three keep a program a head.
@@ -286,7 +286,7 @@ def test_fused_seam_head_block_matches_a_program_a_head(monkeypatch, heads, sink
     rows = start + (slot + 1) * ring * run_rows
     kv_half = sink != "query"
     head_block = sink in ("packed_ring", "bf16_ring", "prefill", "query") and (
-        heads & (heads - 1) == 0
+        (heads & (heads - 1)) == 0
     )
     expected_grid = (tokens, (1 if head_block else query_heads) + kv_half)
 

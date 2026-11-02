@@ -26,14 +26,14 @@ from atom.model_ops.blockscale_kernels.quantization import (
     ceil_pow2_code,
 )
 from atom.model_ops.v4_kernels.pool_index import window_row
-from atom.utils import envs
 
-# `ATOM_DSV41_ROPE_HEAD_BLOCK`: a token's query heads rotated by one program
-# rather than one each. The per-head programs each move one 64-element tail,
-# so a launch of hundreds of tokens is nearly all program scheduling; on
-# MI455X the whole launch at 576 tokens took 13.1 us one program a head and
-# 2.5 us one a token, with the same bytes out.
-_HEAD_BLOCK = envs.ATOM_DSV41_ROPE_HEAD_BLOCK
+# A token's query heads rotated by one program rather than one each. The
+# per-head programs each move one 64-element tail, so a launch of hundreds of
+# tokens is nearly all program scheduling; on MI455X the whole launch took
+# 2.00 -> 1.51 us at 32 tokens and 16.2 -> 2.2 us at 768, never slower from 1
+# token up, with the same bytes out. False only for the tests' per-head
+# reference.
+_HEAD_BLOCK = True
 
 
 @triton.jit
@@ -152,11 +152,13 @@ def _rope_window_kernel(
 ):
     """One program per (token, slot); the last slot of a token is its KV.
 
-    `HEADS` slots rotate a query head in place, slot `HEADS` runs the whole KV
-    chain. Splitting the grid this way rather than one program per token is
-    what keeps a decode bucket -- a few dozen rows -- wide enough to fill the
-    device; the two branches are otherwise independent. With `HEAD_BLOCK`
-    slot 0 rotates all of a token's heads and slot 1 is the KV.
+    With `HEAD_BLOCK` (the in-place BF16 query) slot 0 rotates all of a
+    token's heads and slot 1 runs the whole KV chain: one query program per
+    token. Otherwise (the MXFP8 query, odd shapes) `HEADS` slots each rotate
+    or quantize one query head and slot `HEADS` is the KV. Either way the KV
+    chain has its own program rather than sharing the token's, which keeps a
+    decode bucket -- a few dozen rows -- wide enough to fill the device; the
+    two branches are otherwise independent.
     """
     # The head-blocked query is the in-place BF16 rotation only; the host
     # keeps an MXFP8-emitting query on a program a head.
@@ -269,9 +271,9 @@ def rope_quant_window(
         _HEAD_BLOCK
         and query_fp8 is None
         and heads > 0
-        and heads & (heads - 1) == 0
+        and (heads & (heads - 1)) == 0
         and rope_dim >= 2
-        and rope_dim & (rope_dim - 1) == 0
+        and (rope_dim & (rope_dim - 1)) == 0
     )
     query_programs = 1 if head_block else heads
     _rope_window_kernel[(tokens, query_programs + kv_half)](
