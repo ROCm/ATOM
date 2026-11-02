@@ -6,18 +6,21 @@
   F1 ATOM_GDN_REPLAYSSM_FUSED_GATING       gating folded into ReplaySSM
 
 Each is off by default and, when on, must only apply where the fused output
-is exactly what the unfused path consumes. Numerics are in
-tests/test_replayssm_fused_gating.py (GPU).
+is exactly what the unfused path consumes. The modules under test import
+triton and aiter, so the CPU runner skips this file; the switch's default,
+override and documentation checks need neither and live in tests/test_envs.py.
+Numerics are in tests/test_replayssm_fused_gating.py (GPU, manual).
 """
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
 try:
     from atom.model_ops import attention_gdn
     from atom.model_ops.fla_ops import replayssm
-except Exception as e:  # noqa: BLE001 -- aiter / triton need a ROCm build to import
-    pytest.skip(f"needs an importable aiter: {e}", allow_module_level=True)
+except ImportError as _e:
+    skip_if_dependency_missing(_e, "the GDN modules import triton and aiter")
 
 SWITCHES = ("ATOM_GDN_REPLAYSSM_FUSED_GATING",)
 
@@ -26,26 +29,6 @@ SWITCHES = ("ATOM_GDN_REPLAYSSM_FUSED_GATING",)
 def _clean_env(monkeypatch):
     for name in SWITCHES:
         monkeypatch.delenv(name, raising=False)
-
-
-# --------------------------------------------------------------------------- #
-# defaults                                                                     #
-# --------------------------------------------------------------------------- #
-
-
-def test_all_switches_default_off():
-    from atom.utils import envs
-
-    assert envs.ATOM_GDN_REPLAYSSM_FUSED_GATING is False
-
-
-def test_switches_are_documented():
-    import pathlib
-
-    doc = (
-        pathlib.Path(__file__).parents[1] / "docs" / "environment_variables.md"
-    ).read_text()
-    assert [name for name in SWITCHES if f"**{name}**" not in doc] == []
 
 
 # --------------------------------------------------------------------------- #

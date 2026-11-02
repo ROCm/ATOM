@@ -10,35 +10,26 @@ checkpoint and cursor -- across the T1_TILED (T=1), serial (T=2, 4) and both
 launch configs (BV=16 small-batch on gfx950, BV=64), padded entries, the
 prefill sentinel, a flush step, and multi-step partial accepts.
 
-GPU (ROCm), or the Triton CPU interpreter (TRITON_INTERPRET=1).
+GPU-only, run manually: `pytest tests/test_replayssm_fused_gating.py` on a
+ROCm GPU. No CI job runs it -- the non-GPU unit runner has neither triton nor
+aiter, and TRITON_INTERPRET=1 does not help without a GPU because importing
+attention_gdn pulls in aiter's Triton utils, which probe the GPU arch at
+import. The switch's dispatch and entry-point argument handling run without a
+kernel in tests/test_qwen35_gdn_decode_fusion_switches.py.
 """
-
-import os
 
 import pytest
 import torch
 
-if torch.cuda.is_available() and torch.version.hip is not None:
-    DEV = "cuda"
-elif os.environ.get("TRITON_INTERPRET") == "1":
-    DEV = "cpu"
-else:
-    pytest.skip("ROCm GPU (or TRITON_INTERPRET=1) required", allow_module_level=True)
+if not (torch.cuda.is_available() and torch.version.hip is not None):
+    pytest.skip("GPU-only (ROCm), run manually; not in CI", allow_module_level=True)
 
 from atom.model_ops.attention_gdn import fused_gdn_gating
 from atom.model_ops.fla_ops import replayssm as rs
 
 CAP = 16
 STATE = ("ckpt", "buf_k", "buf_u", "buf_g", "write_pos")
-
-
-@pytest.fixture(autouse=True)
-def _interpreter_exp(monkeypatch):
-    if DEV == "cpu":
-        import triton.language as tl
-
-        # `exp` is bound from tl at import; the interpreter patches tl only.
-        monkeypatch.setattr(rs, "exp", lambda x: tl.exp(x))
+DEV = "cuda"
 
 
 def _case(bs, T, H, HV, K, V, seed):
@@ -111,8 +102,8 @@ def _fork(d):
     return {k: (v.clone() if k in STATE else v) for k, v in d.items()}
 
 
-BATCHES = [1, 2, 6] if DEV == "cpu" else [1, 2, 4, 6, 8, 16, 64]
-SHAPES = [(4, 16)] if DEV == "cpu" else [(4, 16), (8, 32)]  # (H, HV): TP4, TP2
+BATCHES = [1, 2, 4, 6, 8, 16, 64]
+SHAPES = [(4, 16), (8, 32)]  # (H, HV): TP4, TP2
 
 
 @pytest.mark.parametrize("gfx", ["gfx950", "gfx942"])  # BV=16 vs BV=64 config
@@ -136,7 +127,6 @@ def test_f1_in_kernel_gating_is_bit_identical(monkeypatch, bs, T, H, HV, gfx):
             rs.replayssm_commit(st["write_pos"], st["slot_idx"], accepted, T, CAP)
 
 
-@pytest.mark.skipif(DEV == "cpu", reason="slow in the interpreter")
 def test_f1_ut_route_falls_back_to_the_gating_kernel():
     T = 12
     base = _case(4, T, 4, 16, 128, 128, seed=5)
