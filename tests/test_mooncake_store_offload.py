@@ -2915,6 +2915,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
     for name, owner in (
         ("_dispatch_connector_only_batch", PPEngineCoreProc),
         ("_dispatch_idle_offload_work", PPEngineCoreProc),
+        ("_defer_prefill_hashes", PPEngineCoreProc),
         ("_advance_idle_kv_transfer", EngineCore),
     ):
         setattr(head, name, getattr(owner, name).__get__(head))

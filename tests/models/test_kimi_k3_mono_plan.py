@@ -109,6 +109,7 @@ def test_step_rows_accepts_a_uniform_spec_verify():
         {"num_accepted_tokens": None},
         {"num_actual_tokens": 7},  # disagrees with the rows
         {"spec_state_indices_tensor": torch.zeros(2, 4, dtype=torch.int64)},
+        {"has_state_fork": True},  # the layer's own branch moves the state
     ],
 )
 def test_step_rows_refuses_every_other_shape(over):
@@ -148,6 +149,7 @@ def test_step_rows_accepts_a_plain_decode_as_one_token_a_request():
         {"non_spec_state_indices_tensor": torch.arange(3, dtype=torch.int64)},
         # a strided slot table: K1 reads it at a stride of one
         {"non_spec_state_indices_tensor": torch.arange(6, dtype=torch.int32)[::2]},
+        {"has_state_fork": True},
     ],
 )
 def test_step_rows_refuses_every_other_plain_shape(over):

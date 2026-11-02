@@ -118,7 +118,7 @@ def test_output_capacity_follows_server_limit_and_warmup_floor(max_num_seqs):
         mock.patch.object(torch, "zeros") as zeros,
     ):
         processor = runner_module.tokenIDProcessor(
-            runner, 1024, use_spec=True, num_spec_tokens=5
+            runner, 1024, has_drafter=True, num_spec_tokens=5
         )
     request_capacity = max(max_num_seqs, 2)
     assert processor._draft_token_ids_queue.capacity == request_capacity * 5

@@ -1143,3 +1143,129 @@ def test_dynamic_pp_prefill_registers_prefix_hashes():
     assert seq.num_cached_tokens == prompt
     hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
     assert hit == prompt // bs - 1
+
+
+# --- _pp_checkpoint_hold: skipped while held, released when its batch files --
+
+
+def _held_after_first_chunk(prompt=400, bs=16):
+    """A PP seq with one middle chunk in flight, held as a rung would hold it."""
+    # Prefix caching on: the hold is only ever taken with it (`_partial_prefill_chunk`).
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=128,
+            kv_cache_block_size=bs,
+            enable_prefix_caching=True,
+        )
+    )
+    seq = _make_seq(prompt, block_size=bs)
+    sched.add(seq)
+    batch, seqs = sched.schedule()
+    assert seq.id in batch.req_ids and seq.is_partial_prefill
+    sched._pp_checkpoint_hold.add(seq.id)
+    return sched, seq, batch, seqs
+
+
+def _prefill_ids(sched):
+    res = sched.schedule()
+    if res is None:
+        return set()
+    batch, _ = res
+    return set(batch.req_ids[: batch.total_seqs_num_prefill])
+
+
+def test_held_seq_is_skipped_by_both_prefill_scans():
+    sched, seq, _, _ = _held_after_first_chunk()
+    pending, _ = sched._local_prefill_pending_work()
+    assert not pending, "the probe counted a held chunk as pending work"
+    assert seq.id not in _prefill_ids(sched)
+    assert seq.id in sched._pp_checkpoint_hold
+
+
+def test_hold_is_released_when_its_batch_files_its_hashes():
+    sched, seq, batch, seqs = _held_after_first_chunk()
+    assert sched.holds_checkpoint_hostage(batch)
+    sched.register_prefill_hashes(batch, seqs.values())
+    assert seq.id not in sched._pp_checkpoint_hold
+    assert not sched.holds_checkpoint_hostage(batch)
+    assert seq.id in _prefill_ids(sched)
+
+
+@pytest.mark.parametrize("acked", [False, True])
+def test_head_flushes_a_held_chunk_whether_or_not_it_is_acked(acked):
+    # Dynamic chunking acks middle chunks: that branch must flush a hold too,
+    # or the held seq never re-enters the prefill scan and stalls.
+    import queue
+
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    sched, seq, batch, seqs = _held_after_first_chunk()
+    batch.pp_completion_ack = acked
+    sched.mark_pp_inflight(batch)
+    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    core.scheduler = sched
+    core.pp_size = 1  # the in-flight chunk fills the window: schedule nothing
+    core._in_flight = deque([(batch, seqs, False)])
+    core._pending_prefix_hash = deque()
+    core._defer_prefix_hash = True
+    core.output_queue = queue.Queue()
+    core._poll_kv_transfer_progress = lambda: None
+    core._poll_dynamic_chunking_calibration = lambda: None
+    core.runner_mgr = types.SimpleNamespace(call_func=lambda *a, **k: None)
+    completions = deque([(batch.req_ids, None)] if acked else [])
+    core.pp_transport = types.SimpleNamespace(
+        recv_completion=lambda **k: completions.popleft() if completions else None
+    )
+    core._pp_head_step()
+    assert not core._in_flight and not core._pending_prefix_hash
+    assert seq.id not in sched._pp_checkpoint_hold
+    assert seq.id in _prefill_ids(sched)
+
+
+@pytest.mark.parametrize("filer", ["register_prefill_hashes", "postprocess"])
+def test_hold_is_released_even_if_the_seq_left_running(filer):
+    # Preempted, aborted or retired while its chunk was in flight: the batch
+    # still files, and the hold must go with it or the id is held forever.
+    import numpy as np
+
+    sched, seq, batch, _ = _held_after_first_chunk()
+    sched.running = deque(s for s in sched.running if s.id != seq.id)
+    if filer == "register_prefill_hashes":
+        sched.register_prefill_hashes(batch, [])
+    else:
+        n = len(batch.req_ids)
+        out = ScheduledBatchOutput(
+            req_ids=list(batch.req_ids),
+            token_ids=[(0,)] * n,
+            num_rejected=np.zeros(n, dtype=np.int32),
+            num_bonus=np.zeros(n, dtype=np.int32),
+            draft_token_ids=None,
+            is_deferred_out=False,
+        )
+        sched.postprocess([], out, batch=batch)
+    assert seq.id not in sched._pp_checkpoint_hold
+
+
+def test_hold_is_released_even_if_hashing_raises():
+    # The head loop logs a failed filing and carries on; the seqs after the
+    # one that raised must not stay out of the prefill scan forever.
+    sched = Scheduler(
+        _pp_config(
+            max_num_batched_tokens=512,
+            kv_cache_block_size=16,
+            enable_prefix_caching=True,
+        )
+    )
+    seqs = [_make_seq(400), _make_seq(400)]
+    for seq in seqs:
+        sched.add(seq)
+    batch, by_id = sched.schedule()
+    assert all(seq.id in batch.req_ids for seq in seqs)
+    sched._pp_checkpoint_hold.update(batch.req_ids)
+    sched.block_manager.hash_blocks = MagicMock(side_effect=RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="boom"):
+        sched.register_prefill_hashes(batch, by_id.values())
+    assert not sched._pp_checkpoint_hold

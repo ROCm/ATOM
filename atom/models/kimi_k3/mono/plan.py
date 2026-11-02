@@ -51,6 +51,11 @@ def step_shape(metadata, rows: int) -> tuple[int | None, str]:
         return None, "no KDA metadata"
     if metadata.num_prefills:
         return None, f"{metadata.num_prefills} prefills in the batch"
+    if getattr(metadata, "has_state_fork", False):
+        # A forked step reads one slot and writes another. `KimiKDAAttention`
+        # moves the state across before its kernels run; a mono step replaces
+        # that branch, so it would run on the unseeded write slot.
+        return None, "state fork (the layer's own branch moves the state)"
     if getattr(metadata, "spec_sequence_masks", None) is None:
         return _plain_decode_shape(metadata, rows)
     if metadata.num_decodes:
@@ -108,8 +113,7 @@ def state_slots(metadata, ones: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     A plain decode is that with one column and one accepted token: it reads and
     writes the request's one slot in place, as the production decode does. The
     production decode reads ``non_spec_state_indices_in_tensor`` instead where
-    a state fork makes the two differ, but forks happen only on prefill
-    (``GDNStateMixin.prepare_state_indices``), and a served step has none.
+    a state fork makes the two differ, but ``step_shape`` refuses a forked step.
     ``ones`` is int32, at least as long as the step has requests.
     """
     if getattr(metadata, "spec_sequence_masks", None) is not None:
