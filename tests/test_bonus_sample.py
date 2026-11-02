@@ -107,3 +107,34 @@ def test_no_rows_returns_an_empty_result():
         EPS,
     )
     assert out.shape == (0,) and out.dtype == torch.int32
+
+
+@in_the_interpreter
+def test_same_inputs_give_the_same_output():
+    # The draw is in `Sampler.forward`; the kernels carry no state of their own,
+    # so the same (logits, temps, noise) must give the same token every call.
+    vocab = 50000
+    gen = torch.Generator().manual_seed(3)
+    logits = (torch.randn(5, vocab, generator=gen) * 4).to(torch.bfloat16)
+    temps = torch.tensor([1.0, 0.7, 0.9, 1.2, 0.5])
+    noise = torch.empty(5, vocab).exponential_(1, generator=gen)
+    f = _bonus_sample().bonus_temperature_sample
+    first = f(logits, temps, noise, EPS, EPS)
+    assert torch.equal(first, f(logits, temps, noise, EPS, EPS))
+
+
+@in_the_interpreter
+def test_winner_in_a_late_tile_survives_the_reduction():
+    # One dominating race key in the final vocab tile must beat tile 0: the
+    # per-tile running max and the `(row,)` kernel's k * exp(m - mm) rescale
+    # have to reconstruct the global key across tiles.
+    vocab = 163840  # 40 tiles of 4096
+    gen = torch.Generator().manual_seed(5)
+    logits = (torch.randn(1, vocab, generator=gen) * 2).to(torch.bfloat16)
+    noise = torch.full((1, vocab), 10.0)
+    win = vocab - 3
+    logits[0, win] = 60.0
+    noise[0, win] = 1e-3  # huge key exp(0) / ~1e-3 against a flat field
+    temps = torch.tensor([1.0])
+    out = _bonus_sample().bonus_temperature_sample(logits, temps, noise, EPS, EPS)
+    assert int(out[0]) == win
