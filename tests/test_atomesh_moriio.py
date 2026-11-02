@@ -106,7 +106,11 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cells = generate_cells("DeepSeek-V3")
-        cls.cells = {cell["env"]["common"]["KV_CONNECTOR"]: cell for cell in cells}
+        cls.cells = {
+            cell["env"]["common"]["KV_CONNECTOR"]: cell
+            for cell in cells
+            if cell["topology"].startswith("1p1d_tp8_")
+        }
 
     def test_both_connectors_are_present(self):
         self.assertEqual(set(self.cells), {"mooncake", "moriio"})
@@ -151,6 +155,88 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
             self.assertTrue(cell["accuracy"]["apply_chat_template"])
             # V3 does not think, so gsm8k answers fit well inside this.
             self.assertEqual(cell["accuracy"]["max_gen_toks"], 512)
+
+
+# (model, topology): (nodes, nodes per worker, shared expert kept separate)
+LOW_LATENCY_DECODE_CELLS = {
+    ("DeepSeek-V3", "1p1d_dpa8_ep8_ll_moriio"): (2, 1, True),
+    ("DeepSeek-V3", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, True),
+    ("Kimi-K2.5-MXFP4", "1p1d_dpa8_ep8_ll_moriio"): (2, 1, False),
+    ("Kimi-K2.5-MXFP4", "1p1d_dpa16_ep16_ll_moriio"): (4, 2, False),
+}
+INTER_NODE_LL_GEOMETRY = {
+    "MORI_EP_BLOCK_NUM": "64",
+    "MORI_EP_RDMA_BLOCK_NUM": "32",
+    "MORI_EP_WARP_PER_BLOCK": "8",
+}
+
+
+class LowLatencyDecodeCellsTest(unittest.TestCase):
+    """DP attention + MoRI EP over MoRI IO, low latency on decode only."""
+
+    @classmethod
+    def setUpClass(cls):
+        models = {model for model, _ in LOW_LATENCY_DECODE_CELLS}
+        cells = {model: generate_cells(model) for model in models}
+        cls.cells = {
+            (model, topology): next(
+                cell for cell in cells[model] if cell["topology"] == topology
+            )
+            for model, topology in LOW_LATENCY_DECODE_CELLS
+        }
+
+    def each_cell(self):
+        for key, shape in LOW_LATENCY_DECODE_CELLS.items():
+            with self.subTest(cell=key):
+                yield self.cells[key], shape
+
+    def test_only_decode_runs_low_latency(self):
+        for cell, _ in self.each_cell():
+            prefill = cell["service"]["prefill"]["extra_args"]
+            decode = cell["service"]["decode"]["extra_args"]
+            for args in (prefill, decode):
+                self.assertIn("--enable-dp-attention --enable-expert-parallel", args)
+            self.assertNotIn("--all2all-backend", prefill)
+            self.assertIn("--all2all-backend low-latency", decode)
+            self.assertEqual(cell["env"]["decode"]["ATOM_MORI_V1_LL"], "1")
+            self.assertIsNone(cell["env"]["prefill"].get("ATOM_MORI_V1_LL"))
+
+    def test_cells_span_the_nodes_their_workers_need(self):
+        for cell, (nodes, per_worker, _) in self.each_cell():
+            self.assertEqual(cell["num_nodes"], nodes)
+            for role in ("prefill", "decode"):
+                service = cell["service"][role]
+                self.assertEqual(service.get("nodes_per_worker", 1), per_worker)
+
+    def test_only_cross_node_decode_sets_the_inter_node_ll_geometry(self):
+        for cell, (_, per_worker, _) in self.each_cell():
+            env = cell["env"]
+            for key in INTER_NODE_LL_GEOMETRY:
+                self.assertIsNone(env["prefill"].get(key))
+            if per_worker == 1:
+                for key in INTER_NODE_LL_GEOMETRY:
+                    self.assertIsNone(env["decode"].get(key))
+                continue
+            decode = {key: env["decode"].get(key) for key in INTER_NODE_LL_GEOMETRY}
+            self.assertEqual(decode, INTER_NODE_LL_GEOMETRY)
+            self.assertEqual(cell["server_args"]["gpu_memory_utilization"], 0.70)
+            for role in ("prefill", "decode"):
+                self.assertEqual(env[role]["MORI_ENABLE_HOST_PROXY"], "1")
+                self.assertEqual(env[role]["ATOM_DP_LM_HEAD_MODE"], "default")
+
+    def test_only_fp8_moe_keeps_the_shared_expert_separate(self):
+        for cell, (_, _, separate) in self.each_cell():
+            for role in ("prefill", "decode"):
+                fused = cell["env"][role].get("ATOM_FUSE_SHARED_EXPERT")
+                self.assertEqual(fused, "0" if separate else None)
+
+    def test_cells_are_moriio_gsm8k_runs(self):
+        for cell, _ in self.each_cell():
+            self.assertEqual(cell["env"]["common"]["KV_CONNECTOR"], "moriio")
+            self.assertEqual(cell["env"]["common"]["MORI_SHMEM_HEAP_SIZE"], "16G")
+            self.assertEqual(cell["server_args"]["max_num_batched_tokens"], 16384)
+            self.assertTrue(cell["eval_only"])
+            self.assertEqual(cell["accuracy"]["threshold"], 0.90)
 
 
 class KimiK3MoriIOCellTest(unittest.TestCase):
