@@ -108,24 +108,6 @@ def nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-def _tp_vocab_range(num_embeddings: int) -> tuple[int, int, int]:
-    """TP size and this rank's rows `[start, end)` of a vocab-sharded table."""
-    tp_size = get_tp_group().world_size
-    if num_embeddings % tp_size:
-        raise ValueError("PLE vocabulary size must be divisible by TP size")
-    rows = num_embeddings // tp_size
-    start = rows * get_tp_group().rank_in_group
-    return tp_size, start, start + rows
-
-
-def _check_global_scale(prefix: str, weight_scale: torch.Tensor) -> None:
-    scale = weight_scale.item()
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError(
-            f"{prefix}.weight_scale is missing or is not finite and positive"
-        )
-
-
 class _ShardsIntoWeight:
     """`load_shard` for a table in HBM: it is `weight`."""
 
@@ -162,10 +144,12 @@ class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, prefix: str):
         super().__init__()
         self.prefix = prefix
-        self.tp_size, self.vocab_start_idx, self.vocab_end_idx = _tp_vocab_range(
-            num_embeddings
-        )
-        rows = self.vocab_end_idx - self.vocab_start_idx
+        self.tp_size = get_tp_group().world_size
+        if num_embeddings % self.tp_size:
+            raise ValueError("PLE vocabulary size must be divisible by TP size")
+        rows = num_embeddings // self.tp_size
+        self.vocab_start_idx = rows * get_tp_group().rank_in_group
+        self.vocab_end_idx = self.vocab_start_idx + rows
         self.output_dtype = torch.get_default_dtype()
         self.weight = atom_parameter(
             torch.empty(rows, embedding_dim, dtype=torch.float8_e4m3fn)
@@ -182,7 +166,11 @@ class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
         param.data.copy_(loaded_weight.reshape_as(param))
 
     def process_weights_after_loading(self) -> None:
-        _check_global_scale(self.prefix, self.weight_scale)
+        scale = self.weight_scale.item()
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(
+                f"{self.prefix}.weight_scale is missing or is not finite and positive"
+            )
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         output = fp8_embedding_lookup(
@@ -244,9 +232,12 @@ class _Qwen4ExpHostEmbedding(HostTableHooks, nn.Module):
         super().__init__()
         self.prefix = prefix
         self.num_embeddings = num_embeddings
-        self.tp_size, self.vocab_start_idx, self.vocab_end_idx = _tp_vocab_range(
-            num_embeddings
-        )
+        self.tp_size = get_tp_group().world_size
+        if num_embeddings % self.tp_size:
+            raise ValueError("PLE vocabulary size must be divisible by TP size")
+        rows = num_embeddings // self.tp_size
+        self.vocab_start_idx = rows * get_tp_group().rank_in_group
+        self.vocab_end_idx = self.vocab_start_idx + rows
         self.embedding_dim = embedding_dim
         self.shard_rows = shard_rows
         self.fp8 = fp8
@@ -278,7 +269,7 @@ class _Qwen4ExpHostEmbedding(HostTableHooks, nn.Module):
 
     def process_weights_after_loading(self) -> None:
         if self.fp8:
-            _check_global_scale(self.prefix, self.weight_scale)
+            _Qwen4ExpFP8Embedding.process_weights_after_loading(self)
         self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
         if self.table.on_host:
             dp_ranks = (
