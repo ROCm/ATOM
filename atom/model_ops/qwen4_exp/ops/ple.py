@@ -9,8 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.qwen4_exp.ple_host_table import fp8_rows_fnuz
-
 
 @triton.jit
 def _advance_ngram_state_kernel(
@@ -345,6 +343,15 @@ def _sharded_table_lookup_kernel(
             values,
             mask=valid[:, None] & in_row[None, :],
         )
+
+
+def fp8_rows_fnuz(dtype: torch.dtype) -> bool:
+    """Which FP8 E4M3 encoding an FP8 table's rows are stored in, for the
+    kernel to read them as: `float8_e4m3fnuz` (True) or `float8_e4m3fn`. The
+    two encode the same byte as values a factor of two apart."""
+    if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        raise ValueError(f"not an FP8 E4M3 n-gram table: {dtype}")
+    return dtype == torch.float8_e4m3fnuz
 
 
 @functools.cache

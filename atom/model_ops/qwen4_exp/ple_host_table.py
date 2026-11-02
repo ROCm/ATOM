@@ -19,24 +19,6 @@ from atom.model_ops.engram import host_memory
 
 logger = logging.getLogger("atom")
 
-# Where the table is page-locked on the host by default: the archs the host
-# path has been validated on (bitwise lookups, GSM8K, page-locking ~100 GB),
-# MI355X and MI308X. Elsewhere it stays in HBM until it has been.
-VALIDATED_ARCHS = ("gfx950", "gfx942")
-
-
-def validated_arch(arch: str) -> bool:
-    return arch in VALIDATED_ARCHS
-
-
-def fp8_rows_fnuz(dtype: torch.dtype) -> bool:
-    """Which FP8 E4M3 encoding an FP8 table's rows are stored in, for the
-    kernel to read them as: `float8_e4m3fnuz` (True) or `float8_e4m3fn`. The
-    two encode the same byte as values a factor of two apart."""
-    if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        raise ValueError(f"not an FP8 E4M3 n-gram table: {dtype}")
-    return dtype == torch.float8_e4m3fnuz
-
 
 @functools.cache
 def _hip_device_pointer():

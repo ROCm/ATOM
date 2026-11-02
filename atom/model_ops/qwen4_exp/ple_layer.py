@@ -42,7 +42,7 @@ from atom.model_ops.qwen4_exp.ops.ple import (
     ple_gate,
     sharded_table_lookup,
 )
-from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable, validated_arch
+from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
 
@@ -194,6 +194,12 @@ class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
         return output
 
 
+# Where the table is page-locked on the host by default: the archs the host
+# path has been validated on (bitwise lookups, GSM8K, page-locking ~100 GB),
+# MI355X and MI308X. Elsewhere it stays in HBM until it has been.
+VALIDATED_ARCHS = ("gfx950", "gfx942")
+
+
 def _host_table_available() -> bool:
     """Whether the n-gram table goes to page-locked host memory instead of HBM.
 
@@ -208,7 +214,7 @@ def _host_table_available() -> bool:
         logger.info("PLE n-gram table: in HBM (ATOM_ENGRAM_UVA=0)")
         return False
     arch = get_gfx_runtime()
-    if not validated_arch(arch):
+    if arch not in VALIDATED_ARCHS:
         logger.info("PLE n-gram table: in HBM (host table not validated on %s)", arch)
         return False
     return True

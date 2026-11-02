@@ -322,9 +322,9 @@ class WeightUpdaterMixin:
         does hold its values. It raises rather than skip a weight it cannot
         take.
 
-        Such a module writes from the host (the PLE n-gram rows, page-locked
-        memory the device reads), so no stream orders the write after the
-        lookups of the step that just ended. The device is waited for once,
+        Such a module may write from the host (rows in page-locked memory the
+        device reads), so no stream orders the write after the reads of the
+        step that just ended. The device is waited for once,
         before the first module is asked in an update: nothing launches
         during one, and each of these writes is done when it returns, leaving
         nothing for a later wait to cover (unlike `_await_readers_of`'s).

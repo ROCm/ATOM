@@ -658,21 +658,11 @@ def test_fp8_rows_are_read_in_the_encoding_they_are_stored_in(fake_pin, dtype):
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(host.shard_bases(NUM_SHARDS), ids, 0, TABLE_ROWS, dtype)
     assert _bitwise_equal(got, table[ids])
-    assert ple_host_table.fp8_rows_fnuz(host.dtype) == (dtype == torch.float8_e4m3fnuz)
     other = (
         torch.float8_e4m3fnuz if dtype == torch.float8_e4m3fn else torch.float8_e4m3fn
     )
     finite = torch.isfinite(got.view(other).float()) & torch.isfinite(got.float())
     assert not torch.equal(got.view(other).float()[finite], got.float()[finite])
-    with pytest.raises(ValueError, match="not an FP8 E4M3"):
-        ple_host_table.fp8_rows_fnuz(torch.bfloat16)
-
-
-def test_the_host_table_is_on_by_default_only_where_validated():
-    for arch in ("gfx950", "gfx942"):
-        assert ple_host_table.validated_arch(arch)
-    for arch in ("gfx90a", "gfx1250", "unknown"):
-        assert not ple_host_table.validated_arch(arch)
 
 
 def test_addresses_and_syncs_wait_for_a_load_in_flight(fake_pin):
@@ -750,6 +740,14 @@ def _ops():
     from atom.model_ops.qwen4_exp.ops import ple
 
     return ple
+
+
+def test_the_kernel_reads_fp8_rows_in_the_tables_encoding():
+    ops = _ops()
+    assert ops.fp8_rows_fnuz(torch.float8_e4m3fnuz)
+    assert not ops.fp8_rows_fnuz(torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="not an FP8 E4M3"):
+        ops.fp8_rows_fnuz(torch.bfloat16)
 
 
 def _checkpoint_shards(table, directory):
@@ -1164,7 +1162,7 @@ def test_the_host_table_stays_off_where_not_validated(ngram_layer, monkeypatch):
     monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx90a")
     layer = ngram_layer(True)
     assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpEmbedding)
-    for arch in ple_host_table.VALIDATED_ARCHS:
+    for arch in ple_layer.VALIDATED_ARCHS:
         monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda arch=arch: arch)
         layer = ngram_layer(True)
         assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
