@@ -9,7 +9,7 @@ import threading
 import types
 from collections import deque
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -5736,12 +5736,20 @@ def _idle_engine(meta: LMCacheOffloadMetadata):
         is_offload=True,
         build_connector_meta=lambda: meta,
     )
-    return SimpleNamespace(
+    from atom.model_engine.engine_core import EngineCore
+
+    engine = SimpleNamespace(
         kv_transfer_enabled=True,
         scheduler=SimpleNamespace(kv_connector=connector),
         runner_mgr=_RecordingRunnerMgr(),
         pp_transport=_RecordingPPTransport(),
     )
+    # The idle dispatch zeros released checkpoint units first; with no block
+    # manager on this scheduler double there is nothing to zero.
+    engine._zero_released_units_before_loads = MethodType(
+        EngineCore._zero_released_units_before_loads, engine
+    )
+    return engine
 
 
 def test_idle_offload_dispatch_delivers_unpin_only_metadata():

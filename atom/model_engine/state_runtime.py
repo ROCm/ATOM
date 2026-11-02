@@ -19,6 +19,34 @@ NONE = "none"
 # (`BlockManager.replay_start`), writing none of what the cache holds there.
 REPLAY = "replay"
 
+# PAGE checkpoint layout id prefix of the Qwen GDN + MHA builder.
+GDN_PAGED_LAYOUT_PREFIX = "gdn-paged-state-"
+
+# The last PAGE unit zero enqueued in this process (`UnitZeroer.launch`), as
+# an event on the stream it ran on. Loads that write from their own streams
+# wait on it while it is pending (`pending_unit_zero`); zeros run in order on
+# one stream, so the last one done means every earlier one is too.
+_pending_unit_zero = None
+
+
+def note_unit_zero(event) -> None:
+    """Record the event of a PAGE unit zero just enqueued."""
+    global _pending_unit_zero
+    _pending_unit_zero = event
+
+
+def pending_unit_zero():
+    """The last unit zero's event if the GPU has not finished it, else None."""
+    global _pending_unit_zero
+    event = _pending_unit_zero
+    if event is None:
+        return None
+    if event.query():
+        if _pending_unit_zero is event:
+            _pending_unit_zero = None
+        return None
+    return event
+
 
 @dataclass(frozen=True)
 class StateTransfer:
@@ -187,6 +215,11 @@ class StateRuntime:
 
     transfer: StateTransfer = field(default_factory=StateTransfer.none)
     checkpoint_spec: PagedStateCheckpointSpec | None = None
+    #: The runner's builder has a PAGE unit zero (`zero_page_units`), so
+    #: released checkpoint units are zeroed before reuse
+    #: (ATOM_ZERO_EVICTED_BLOCKS). Set by the runner from the builder, not
+    #: derived from `layout_id`, so a renamed layout cannot turn it off.
+    zeroes_released_units: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.transfer, StateTransfer):
@@ -212,6 +245,10 @@ class StateRuntime:
             raise ValueError(
                 f"StateTransfer.{self.transfer.kind} cannot carry a PAGE checkpoint spec"
             )
+        if not isinstance(self.zeroes_released_units, bool):
+            raise TypeError("state runtime zeroes_released_units must be a bool")
+        if self.zeroes_released_units and self.checkpoint_spec is None:
+            raise ValueError("zeroes_released_units needs a PAGE checkpoint spec")
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -219,13 +256,14 @@ class StateRuntime:
             "checkpoint_spec": (
                 None if self.checkpoint_spec is None else self.checkpoint_spec.to_wire()
             ),
+            "zeroes_released_units": self.zeroes_released_units,
         }
 
     @classmethod
     def from_wire(cls, wire: object) -> "StateRuntime":
         if not isinstance(wire, Mapping):
             raise TypeError("state runtime must be a mapping")
-        expected = {"transfer", "checkpoint_spec"}
+        expected = {"transfer", "checkpoint_spec", "zeroes_released_units"}
         if set(wire) != expected:
             raise ValueError(
                 "invalid state runtime fields: "
@@ -240,6 +278,7 @@ class StateRuntime:
         return cls(
             transfer=StateTransfer.from_wire(wire["transfer"]),
             checkpoint_spec=checkpoint_spec,
+            zeroes_released_units=wire["zeroes_released_units"],
         )
 
 
@@ -253,11 +292,17 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
+    # PAGE ids a released state checkpoint held, to be zeroed before anything
+    # else in the batch (`BlockPool.take_released_units`).
+    zero_units: tuple[int, ...] = ()
 
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
+            or self.zero_units
         )
 
 

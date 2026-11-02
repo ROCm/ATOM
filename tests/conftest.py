@@ -32,7 +32,19 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
+from atom.utils import envs
 from atom.utils.region_graph import ReqGraph
+
+
+def kv_blocks(usable: int) -> int:
+    """KV pool size that leaves `usable` blocks to hand out.
+
+    With ATOM_ZERO_EVICTED_BLOCKS (default on) block 0 is the null page and
+    never handed out, so a test that sizes its pool by what it can allocate
+    asks for one more block.
+    """
+    return usable + (1 if envs.ATOM_ZERO_EVICTED_BLOCKS else 0)
+
 
 # ── 3. MockConfig ──────────────────────────────────────────────────────────
 

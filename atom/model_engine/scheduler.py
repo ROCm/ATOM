@@ -1361,7 +1361,7 @@ class Scheduler:
         BlockManager bookkeeping; cheap (no traversal of seq tables).
         """
         bm = self.block_manager
-        total = bm.kv.num_blocks
+        total = bm.kv.num_usable
         if total <= 0:
             return 0.0
         return bm.kv.num_used / total
@@ -1914,7 +1914,8 @@ class Scheduler:
                 f"{self.max_num_batched_tokens}. {remedy}"
             )
         bm = self.block_manager
-        total_blocks = bm.kv.num_blocks
+        # Usable blocks, so the null page (block 0) is not counted as room.
+        total_blocks = bm.kv.num_usable
         # `num_pool_blocks`, not `seq.num_blocks`: the latter counts global
         # blocks, while the pool is sized and drawn per-rank. Under dcp>1 the
         # two differ by `dcp_world_size`.
@@ -1925,7 +1926,7 @@ class Scheduler:
             )
             return (
                 f"needs {pool_blocks} KV blocks{scope} for {num_tokens} input "
-                f"tokens > total pool blocks={total_blocks}. Reduce prompt length "
+                f"tokens > usable pool blocks={total_blocks}. Reduce prompt length "
                 f"or raise --gpu-memory-utilization. (Per-req state cache lives in "
                 f"its own pre-allocated tensor and does not consume pool blocks.)"
             )

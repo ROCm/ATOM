@@ -271,6 +271,15 @@ class BlockManager:
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            # ATOM_ZERO_EVICTED_BLOCKS: block 0 stays the zero null page and
+            # released checkpoint units are zeroed before reuse (see BlockPool).
+            # Only queued when the runner's builder has the zero kernel
+            # (`StateRuntime.zeroes_released_units`): a drained id nobody
+            # zeroes would only look handled.
+            null_block=envs.ATOM_ZERO_EVICTED_BLOCKS,
+            scrub_released=(
+                envs.ATOM_ZERO_EVICTED_BLOCKS and state_runtime.zeroes_released_units
+            ),
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -558,10 +567,15 @@ class BlockManager:
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
+        # Drained after the checkpoint ops: a store begun above may have
+        # evicted another checkpoint, and its units must be zeroed in this
+        # batch, ahead of the copies that reuse them.
+        zero_units = self.kv.take_released_units()
         return StateMaintenanceOps(
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            zero_units=zero_units,
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:
@@ -773,7 +787,8 @@ class BlockManager:
         server needs it published because `num_kvcache_blocks` is measured in
         the engine subprocess and its own Config never learns the value.
         """
-        capacity = self.kv.num_blocks
+        # Usable blocks: block 0 is never handed out while it is the null page.
+        capacity = self.kv.num_usable
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.

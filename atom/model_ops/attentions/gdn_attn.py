@@ -14,7 +14,11 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
+from atom.model_engine.state_runtime import (
+    GDN_PAGED_LAYOUT_PREFIX,
+    StateTransfer,
+    midstep_checkpoint_targets,
+)
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
@@ -41,6 +45,7 @@ from .pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
+    zero_units_once,
 )
 from .pool_layout.pool_rows import PoolRowsMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
@@ -918,8 +923,9 @@ class GDNStateMixin(PoolRowsMixin):
 
         Slot 0 into the pool's first units. Both are real addresses, which is
         the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
+        A KV block is written before it is read and this runs before any block
+        has been handed out, so the only reader of these bytes is a masked lane
+        sent to block 0 -- which is why they are zeroed straight after.
         """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -935,6 +941,22 @@ class GDNStateMixin(PoolRowsMixin):
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        # The copy above put slot 0's bytes into units 0..n-1, and block 0 is
+        # the null page every masked lane reads. Zero them back whatever
+        # ATOM_ZERO_EVICTED_BLOCKS says, so the switch's off arm starts from
+        # the same all-zero pool. A builder with its own zero (Qwen's MHA
+        # pool) uses it, which also compiles it before the first request;
+        # Kimi's MLA pool shares this warmup but not `zero_page_units`, so it
+        # zeroes through its published unit regions instead.
+        units = list(range(spec.units_per_checkpoint))
+        if self.zeroes_page_units():
+            self.zero_page_units(units)
+        else:
+            zero_units_once(
+                self._page_unit_regions(),
+                units,
+                self._checkpoint_descriptor_device(),
+            )
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
@@ -1662,7 +1684,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # the one fact the shapes cannot say. ``spec`` changes the conv
         # window. ``tp`` is in the id because the heads are sharded.
         layout_id = (
-            "gdn-paged-state-v1"
+            f"{GDN_PAGED_LAYOUT_PREFIX}v1"
             f":layers={self.num_state_layers()}"
             f":conv={tuple(shape_k)},{dtype_k}"
             f":ssm={tuple(shape_v)},{dtype_v}"
@@ -1760,6 +1782,28 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             )
         self._page_unit_region_cache = (key, regions)
         return regions
+
+    def zero_page_units(self, unit_ids) -> None:
+        """Zero K, V and both scales of every layer for these PAGE ids.
+
+        The full published unit (`mha_page_unit_regions`, the same bytes a
+        checkpoint image is copied over), in one launch on the current stream.
+        """
+        if not len(unit_ids):
+            return
+        from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+            UnitZeroer,
+        )
+
+        regions = self._page_unit_regions()
+        zeroer = getattr(self, "_unit_zeroer", None)
+        if zeroer is None or zeroer.regions is not regions:
+            zeroer = self._unit_zeroer = UnitZeroer(
+                regions,
+                int(self.model_runner.config.num_kvcache_blocks),
+                self._checkpoint_descriptor_device(),
+            )
+        zeroer.launch(unit_ids)
 
     def _page_unit_bases(self, unit_ids):
         from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
