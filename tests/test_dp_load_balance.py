@@ -69,6 +69,7 @@ def _make_mgr(
     mgr._rank_reqs = [0] * n_ranks
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
+    mgr._seq_prefilling = set()
     mgr._lb_lock = Lock()
     return mgr
 
@@ -666,6 +667,34 @@ def test_prefix_spread_keeps_prefix_while_its_source_still_prefills():
     mgr._mark_seq_prefill_complete(2)
     (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
     assert rank != owner
+
+
+def test_prefix_spread_busy_source_survives_a_fully_cached_follower():
+    """A follower whose whole prompt is the prefix is charged 0 tokens but is
+    still prefilling. It becomes the prefix's source; a third request must
+    still see a busy source and stay, not move to a rank the tier cannot feed."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 98_304)])
+    mgr._rank_tokens[owner] += 200_000  # owner busy past the margin
+    follower = _chain_seq(2, 98_304)
+    assert _route(mgr, [follower]) == [owner]
+    assert mgr._seq_load[2][2] == 0  # fully cached: no prefill charge
+    (rank,) = _route(mgr, [_chain_seq(3, 98_304)])
+    assert rank == owner
+    assert mgr._dp_route_counters["prefix_source_busy_total"] == 2
+    for seq_id in (1, 2, 3):
+        mgr._mark_seq_prefill_complete(seq_id)
+    assert not mgr._seq_prefilling
+    (rank,) = _route(mgr, [_chain_seq(4, 110_000)])
+    assert rank != owner
+
+
+def test_prefill_tracking_is_released_with_the_load():
+    mgr = _make_spread_mgr()
+    _route(mgr, [_chain_seq(1, 50_000)])
+    assert 1 in mgr._seq_prefilling
+    mgr._release_seq_load(1)
+    assert 1 not in mgr._seq_prefilling
 
 
 class _SinkSocket:
