@@ -55,8 +55,12 @@ prefill output counts as a prompt step, as upstream's `ignored_seqs` does.
 
 On a global prefill, a rank without its own batch pauses decode and uses ATOM's
 existing dummy-prefill execution, **even without prefill token graphs**.
-ATOM executes a dummy tensor rather than DeepInfer's zero-request output;
-graph and TBO eligibility still follow ATOM's existing cross-rank metadata.
+DeepInfer represents this as an empty scheduler output, but its
+[worker also materializes a placeholder and executes the model](https://github.com/deepseek-ai/DeepInfer/blob/553741557a57df44a46fb3ab72b6aafeaf945337/deepinfer/worker/worker.py#L111-L117);
+the [placeholder has one query token](https://github.com/deepseek-ai/DeepInfer/blob/553741557a57df44a46fb3ab72b6aafeaf945337/deepinfer/worker/model_runner.py#L355-L371).
+An empty scheduler output must not be interpreted as skipping GPU execution.
+ATOM uses its own dummy tensors; graph and TBO eligibility still follow
+ATOM's existing cross-rank metadata.
 Consequently, enabling TBO does not guarantee it activates on dummy-heavy steps.
 
 This mode replaces PrefillDelayer; it does not layer on top of it:
