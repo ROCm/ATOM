@@ -347,16 +347,19 @@ ATOMESH_TORCH_PROFILE_ROLES="${ATOMESH_TORCH_PROFILE_ROLES:-prefill,decode}"
 PREFILL_KV_TRANSFER_CONFIG="${PREFILL_KV_TRANSFER_CONFIG:-}"
 DECODE_KV_TRANSFER_CONFIG="${DECODE_KV_TRANSFER_CONFIG:-}"
 
-default_profiler_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
+# Rank 0's online_quant_info_*.json dump for this run. It has its own variable
+# so that collecting it does not also hand the engine a profiler directory on
+# every launch; the profiler window below supplies one per worker instead.
+online_quant_dir="${RUN_DIR}/online_quant/rank-${NODE_RANK}"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
-  default_profiler_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
+  online_quant_dir="${RUN_DIR}/online_quant/${ATOMESH_EXECUTION_PHASE}/rank-${NODE_RANK}"
 fi
-export ATOM_TORCH_PROFILER_DIR="${ATOM_TORCH_PROFILER_DIR:-${default_profiler_dir}}"
+export ATOM_ONLINE_QUANT_INFO_DIR="${ATOM_ONLINE_QUANT_INFO_DIR:-${online_quant_dir}}"
 RUNTIME_LOG_DIR="${RUN_DIR}/logs"
 if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
   RUNTIME_LOG_DIR="${RUNTIME_LOG_DIR}/${ATOMESH_EXECUTION_PHASE}"
 fi
-mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
+mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_ONLINE_QUANT_INFO_DIR}"
 
 role_tp="${PREFILL_TP_SIZE}"
 if [[ "${AGGREGATED}" == "1" ]]; then
@@ -1942,10 +1945,10 @@ write_metadata() {
 EOF
 }
 
-# ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
-# passes its own torch_profiler_dir (None by default), which overrides the env
-# default in Config, so the profiler is off unless the flag is on the command.
-# One directory per worker keeps P/D ranks that share a node apart.
+# Put a profiler directory on the command line only while the window is on:
+# this script exports no ATOM_TORCH_PROFILER_DIR, so a launch that does not
+# profile carries none. One directory per worker keeps P/D ranks that share a
+# node apart; an explicit flag also outranks the environment default in Config.
 build_torch_profiler_args() {
   local log_name="$1"
   local -n out_args="$2"

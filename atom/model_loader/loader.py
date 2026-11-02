@@ -177,7 +177,9 @@ def _save_online_quant_info(
     """Save online quantization info to a JSON file (rank 0 only)."""
     if get_tp_group().rank_in_group != 0:
         return
-    output_dir = envs.ATOM_TORCH_PROFILER_DIR or os.getcwd()
+    # Its own knob (falling back to ATOM_TORCH_PROFILER_DIR), then the
+    # historical default.
+    output_dir = envs.ATOM_ONLINE_QUANT_INFO_DIR or os.getcwd()
     os.makedirs(output_dir, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     timestamp_ns = time.time_ns() % 1_000_000_000
