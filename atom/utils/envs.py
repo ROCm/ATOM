@@ -648,6 +648,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
+    # DSpark draft with a sliding window and a KV pool of its own (MiniMax-M3.1):
+    # keep the draft's KV only as far back as the window reads, in a pool of
+    # its own block ids (`atom/model_engine/draft_window.py`), instead of one
+    # draft block per target block. The draft's KV then grows with the running
+    # requests and the window rather than with the context, and a P/D transfer
+    # carries the window alone. Both sides of a P/D pair must agree.
+    "ATOM_DSPARK_DRAFT_KV_WINDOW": lambda: (
+        os.getenv("ATOM_DSPARK_DRAFT_KV_WINDOW", "0") == "1"
+    ),
+    # Windows' worth of draft blocks kept past the running requests', per
+    # `--max-num-seqs` slot, so a finished request's window is still there
+    # when its next turn hits the prefix cache. A hit whose window is gone
+    # recomputes up to one window instead.
+    "ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE": lambda: float(
+        os.getenv("ATOM_DSPARK_DRAFT_KV_WINDOW_CACHE", "1")
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),

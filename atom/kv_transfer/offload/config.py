@@ -324,6 +324,22 @@ def snapshot_kv_encoding(hf: object) -> str:
     return json.dumps(fields, sort_keys=True, default=str)
 
 
+def _draft_kv_window(config) -> int:
+    """The window a DSpark draft keeps its KV to under
+    `ATOM_DSPARK_DRAFT_KV_WINDOW` (`spec_decode/draft_kv.py`), 0 otherwise."""
+    from atom.utils import envs
+
+    spec = getattr(config, "speculative_config", None)
+    draft = getattr(spec, "draft_model_hf_config", None)
+    if (
+        not envs.ATOM_DSPARK_DRAFT_KV_WINDOW
+        or getattr(spec, "method", None) != "dspark"
+        or draft is None
+    ):
+        return 0
+    return int(getattr(draft, "sliding_window", 0) or 0)
+
+
 def build_page_namespace(
     config,
     cfg,
@@ -379,6 +395,13 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
+    # A DSpark draft that keeps only its window holds its rows in a pool of
+    # its own, so a PAGE unit carries none of them: different bytes from a
+    # unit that rides the draft along. Named only when set, so every other
+    # namespace is the one it was.
+    draft_window = _draft_kv_window(config)
+    if draft_window:
+        document["draft_kv_window"] = draft_window
     canonical = json.dumps(
         document,
         sort_keys=True,
