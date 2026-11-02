@@ -15,20 +15,21 @@ from atom.mono.device.ops import memrealtime, traced
 
 
 @traced
-def stamp_begin(on, tls, tid, points):
-    """Zero the LDS record, then point 0."""
+def stamp_begin(on, tls, tid, points, steady=False):
+    """Zero the LDS record, then point 0. ``steady``: the clock gfx1250 reads
+    (``memrealtime``)."""
     if const_expr(on):  # noqa: SIM102
         if tid < points:  # the stamping thread's wave: ordered
             fx.ptr_store(fx.Int64(0), tls + tid)
-    stamp(on, tls, tid, 0)
+    stamp(on, tls, tid, 0, steady)
 
 
 @traced
-def stamp(on, tls, tid, k):
+def stamp(on, tls, tid, k, steady=False):
     # compile-time gate outside, traced condition inside: they cannot be one `and`
     if const_expr(on):  # noqa: SIM102
         if tid == 0:
-            fx.ptr_store(memrealtime(), tls + k)
+            fx.ptr_store(memrealtime(steady), tls + k)
 
 
 @traced
