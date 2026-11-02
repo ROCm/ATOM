@@ -4,6 +4,7 @@
 """Target-model probabilities for committed ordinary/speculative output tokens."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
@@ -40,6 +41,36 @@ def capture_token_logits(logits, batch, metadata=None):
     return logits.index_select(0, rows), row_map
 
 
+def _score_rows(logits, rows, ids, k):
+    """Fuse row gathering, normalization and rank; keep scheduling outside.
+
+    Inputs have one flat token dimension, independent of draft width and
+    optional snapshots. Only compact probabilities/candidates leave scoring.
+    """
+    selected = logits[rows].float()
+    normalizer = torch.logsumexp(selected, dim=-1)
+    token_logits = selected.gather(-1, ids[:, None]).squeeze(-1)
+    ranks = (selected > token_logits[:, None]).sum(-1).to(torch.int32) + 1
+    values = (token_logits - normalizer)[:, None]
+    if k:
+        top_values, top_ids = torch.topk(selected, k, dim=-1)
+        values = torch.cat((values, top_values - normalizer[:, None]), dim=-1)
+        candidates = top_ids.to(torch.int32)
+    else:
+        candidates = torch.empty(
+            (rows.shape[0], 0), device=logits.device, dtype=torch.int32
+        )
+    return values, candidates, ranks
+
+
+@lru_cache(maxsize=1)
+def _compiled_scorer():
+    # Lazy: disabled requests and CPU callers neither compile nor warm kernels.
+    # Normal Dynamo fallback preserves correctness if an unusual workload
+    # exceeds the compilation cache; never raise from a fullgraph-only limit.
+    return torch.compile(_score_rows, dynamic=True)
+
+
 def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot=None):
     """Return (values, candidate IDs, ranks) for requesting sequences only.
 
@@ -58,8 +89,6 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot
     counts = getattr(batch, "top_logprobs", [0] * len(batch.return_logprobs))
     k = min(max((counts[i] for i in requested), default=0), logits.shape[-1])
     shape = (len(requested), width)
-    values = torch.empty((*shape, k + 1), device=device, dtype=torch.float32)
-    candidates = torch.empty((*shape, k), device=device, dtype=torch.int32)
     if metadata is None:
         rows = chosen[:, None]
     else:
@@ -78,21 +107,14 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot
             metadata.bonus_logits_indices.long()[chosen, None],
         )
     selected_ids = ids[chosen].clamp(min=0).long()
-    # No full log-softmax matrix: only the normalizer and selected/top logits
-    # survive this operation. These torch operations are correctness-first;
-    # reducing the gather/conversion workspace is a separate profiling task.
-    selected = (
-        logits[rows] if snapshot is None else snapshot[0][snapshot[1][rows]]
-    ).float()
-    normalizer = torch.logsumexp(selected, dim=-1)
-    token_logits = selected.gather(-1, selected_ids[..., None]).squeeze(-1)
-    values[:, :, 0] = token_logits - normalizer
-    ranks = (selected > token_logits[..., None]).sum(-1).to(torch.int32) + 1
-    if k:
-        top_values, top_ids = torch.topk(selected, k, dim=-1)
-        values[:, :, 1:] = top_values - normalizer[..., None]
-        candidates[:] = top_ids.to(torch.int32)
-    return values, candidates, ranks
+    if snapshot is not None:
+        rows = snapshot[1][rows]
+        logits = snapshot[0]
+    # Native topk is faster than the compiled variant on the tested ROCm path.
+    # Compile the no-candidates path, where gather/reductions can fully fuse.
+    score = _compiled_scorer() if logits.is_cuda and k == 0 else _score_rows
+    values, candidates, ranks = score(logits, rows.flatten(), selected_ids.flatten(), k)
+    return values.view(*shape, k + 1), candidates.view(*shape, k), ranks.view(shape)
 
 
 def unpack_token_logprobs(payload, req_ids, token_ids, requested=None):

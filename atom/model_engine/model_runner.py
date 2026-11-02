@@ -3323,8 +3323,11 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        # Compute logprobs if any sequence requested them
-        need_logprobs = any(batch.return_logprobs)
+        # AsyncIOProcManager returns forward outputs only from worker 0.
+        # Probabilities never feed sampling or the next draft; other workers
+        # need the agreed token IDs, not duplicated probability computation,
+        # broadcasts, D2H copies, or Python output records.
+        need_logprobs = any(batch.return_logprobs) and self.rank == 0
         logprob_snapshot = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
@@ -3436,12 +3439,6 @@ class ModelRunner:
                 spec_decode_metadata,
                 snapshot=logprob_snapshot,
             )
-            # No PCP broadcast: logprobs never feed the next forward and only
-            # worker 0's leave.
-            if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
-                sampled_logprobs = tuple(
-                    get_tp_group().broadcast(t, src=0) for t in sampled_logprobs
-                )
 
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.

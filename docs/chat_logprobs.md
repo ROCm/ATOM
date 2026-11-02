@@ -59,8 +59,20 @@ logprob arrays contain committed tokens only, not speculative placeholders.
 Disabled requests retain the original sampling path. In mixed batches, only
 requesting sequences have their vocabulary rows scored. Enabled requests add
 FP32 normalization, chosen-token ranking, optional top-K, and result serialization.
+Only worker 0, whose forward output the engine consumes, computes these results.
+Probabilities do not feed sampling or the next draft, so they are not broadcast
+to other TP workers; existing token-ID synchronization is unchanged.
+
+For `top_logprobs=0`, a lazily compiled tensor function fuses row gathering,
+normalization and ranking. It takes flat token rows, keeping optional snapshots
+and ragged scheduling outside the compilation boundary. The first enabled call
+can incur compilation latency; performance measurements must warm this path.
+Normal PyTorch compilation fallback remains available for unusual shape mixes.
+CPU execution and top-K requests use native PyTorch operations. Disabled
+requests do not compile or warm the scorer.
+
 The implementation avoids explicitly retaining a full log-softmax matrix, but
-the selected-logit gather/conversion still allocates vocabulary-sized workspace.
+the native selected-logit gather/conversion still allocates vocabulary-sized workspace.
 Padded positions within requesting sequences are safely masked at delivery;
 avoiding their computation is a later optimization opportunity.
 
@@ -70,6 +82,12 @@ spool until close; reading a source span does not consume or release its records
 The spool bounds its RAM buffer and spills to disk. This is not a zero-overhead
 claim; throughput, tail latency, temporary device memory, and CPU/SSE costs need
 on/off comparisons at representative loads.
+
+This follows the approach of [vLLM's logprob rank reduction](https://github.com/vllm-project/vllm/blob/0e5b2ba118cfb3763a3640942e02dd8d93e8ed6c/vllm/v1/sample/ops/logprobs.py)
+to fuse comparisons and reductions, and its
+[compact sampled/top-K output](https://github.com/vllm-project/vllm/blob/0e5b2ba118cfb3763a3640942e02dd8d93e8ed6c/vllm/v1/sample/sampler.py).
+ATOM retains its existing strictly-greater rank/tie semantics and raw-target
+probability definition. This is not a claim of equivalent vLLM throughput.
 
 ## Review follow-up: alignment and bounded transfer
 
