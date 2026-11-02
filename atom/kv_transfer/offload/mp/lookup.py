@@ -176,7 +176,7 @@ class _MPLookupClient:
         return True
 
     def _window_freed(self) -> None:
-        """An answered lookup left the window; let the driver send the next.
+        """A lookup left the window; let the driver send the next.
 
         The driver sleeps `_DRIVER_IDLE_S` when nothing is in flight, which
         includes a window full of answered, unconsumed lookups.
@@ -416,7 +416,10 @@ class _MPLookupClient:
         cannot be freed here and expire only with the L1 read TTL.
         """
         entry = self._async.pop(lookup_id, None)
-        return entry[2] if entry is not None else None
+        if entry is None:
+            return None
+        self._window_freed()
+        return entry[2]
 
     @_locked
     def has_orphans(self) -> bool:

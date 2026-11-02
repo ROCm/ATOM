@@ -108,6 +108,29 @@ def test_driver_keeps_answered_plus_in_flight_lookups_within_the_window():
         client.close()
 
 
+def test_a_failed_lookup_wakes_the_driver_for_pending_offers():
+    class _FailingStatus(_Client):
+        def query_prefetch_status(self, request_id):
+            raise RuntimeError("status query failed")
+
+    adapter = _Adapter(_FailingStatus(1))
+    client = _driven_client(adapter, window=1)
+    # Stop the thread so the only wake-up is the one under test.
+    client._driver.stop()
+    woken = []
+    client._driver.notify = lambda: woken.append(True)
+    try:
+        assert client.submit(list(range(8)), "bad")  # scheduler-side prefetch
+        with client._lock:
+            client._offered["next"] = lambda: list(range(8))
+        with pytest.raises(RuntimeError, match="status query failed"):
+            client.lookup(list(range(8)), "bad")
+        assert "bad" not in client._async
+        assert woken
+    finally:
+        client.close()
+
+
 def test_driver_skips_a_request_that_stopped_waiting_and_discard_drops_offers():
     fake = _PerRequestClient(chunks=1)
     adapter = _Adapter(fake)
