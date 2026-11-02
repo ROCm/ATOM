@@ -466,11 +466,11 @@ else
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
-  # CI 41409705072: g24 has occupied GPUs; g51 failed Store MR registration;
+  # C32 validation: g20/g24 have occupied GPUs; g51 failed Store registration;
   # g15 disabled rdma7 and repeatedly retried Store handshakes on that rail.
   # This validation branch keeps automatic placement across the other nodes.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd" ]]; then
-    SBATCH_CMD+=(--exclude pit2-p03-g15,pit2-p03-g24,pit2-p03-g51)
+    SBATCH_CMD+=(--exclude pit2-p03-g15,pit2-p03-g20,pit2-p03-g24,pit2-p03-g51)
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
