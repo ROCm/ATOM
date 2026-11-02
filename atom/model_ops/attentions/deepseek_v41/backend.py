@@ -17,9 +17,6 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
-    build_v41_pool_geometry,
-)
 from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 from atom.model_ops.engram.device.hashing import (
     EngramBatch,
@@ -40,6 +37,7 @@ from atom.models.deepseek_v41.bounded_replay import (
     tail_spans,
     tail_width,
 )
+from atom.models.deepseek_v41.pool_geometry import build_v41_pool_geometry
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 

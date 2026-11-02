@@ -156,9 +156,7 @@ def _build_v41_pool_geometry(
     duplication on this path fails loudly when it drifts; this one would not,
     so it gets a seam instead of a test comparing the two copies.
     """
-    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
-        build_v41_pool_geometry,
-    )
+    from atom.models.deepseek_v41.pool_geometry import build_v41_pool_geometry
 
     return build_v41_pool_geometry(
         hf_config,
