@@ -214,12 +214,14 @@ def warmup_unified_prefill_attention(model: nn.Module, dtype: torch.dtype) -> No
         n = warmup(dtype)
         logger.info(
             "prefix-hit prefill unified_attention warm-up: %d launches "
-            "(heads %d/%d, head_dim %d, <= %d new rows) in %.1f s",
+            "(heads %d/%d, head_dim %d, one request <= %d new rows, "
+            "several <= %d in total) in %.1f s",
             n,
             module.num_heads,
             module.num_kv_heads,
             module.head_dim,
             envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q,
+            envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL,
             time.perf_counter() - start,
         )
     if not found and not _warned_no_impl:

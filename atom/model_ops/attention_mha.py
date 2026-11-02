@@ -1134,8 +1134,10 @@ class PagedAttentionImpl(nn.Module):
             if not PagedAttentionImpl._unified_prefill_logged:
                 PagedAttentionImpl._unified_prefill_logged = True
                 logger.info(
-                    "prefix-hit prefill attention: unified_attention for <= %d new rows",
+                    "prefix-hit prefill attention: unified_attention for a single "
+                    "request of <= %d new rows, or several of <= %d new rows in total",
                     envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q,
+                    envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL,
                 )
             return self._unified_fp8_prefill_attention(q, k, v, fwd_ctx)
         if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
