@@ -858,7 +858,9 @@ def dspark_markov_sample(
         top_k:        [B]     int32, the request's top-k; 0 is off.
         top_p:        [B]     fp32, the request's top-p; 1.0 is off.
         seed:         [1]     int32 device scalar. Must hold the same value on
-                              every TP rank; see the module notes.
+                              every TP rank: each rank runs this op over the
+                              full vocab and must draw, and store, the same
+                              ids.
         noise_offset:         host int, the Philox counter base for this block
                               position. Static (position * max_B * V), so it
                               does not make the launch data-dependent.

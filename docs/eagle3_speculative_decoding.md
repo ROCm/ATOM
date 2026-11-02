@@ -69,7 +69,7 @@ hidden_for_logits, hidden_for_next_step = model(input_ids, positions, hidden_sta
   otherwise identical to `hidden_for_logits`. This is what the propose loop
   feeds back as `hidden_states` on the next speculative step.
 
-`EagleProposer.propose()` (`atom/spec_decode/eagle_proposer.py`) unpacks the
+`EagleProposer._propose()` (`atom/spec_decode/eagle_proposer.py`) unpacks the
 tuple via `isinstance(model_out, tuple)`, so legacy drafters returning a single
 tensor continue to work without changes.
 

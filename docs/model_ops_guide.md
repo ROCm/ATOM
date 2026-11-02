@@ -594,7 +594,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling; dispatches between the accept rules |
 | `ratio_verify.py` | `ratio_verify_scratch`, `warmup_ratio_verify` — the probability-ratio accept rule: target p, accept, densify and residual race |
-| `dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
+| `dspark_markov_sample.py` | `dspark_markov_argmax` / `dspark_markov_argmax_tp` — the default greedy DSpark draft (full-vocab and vocab-sharded head); `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
 | `sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |
 | `sparse_q_store.py` | `SparseQStore`, `RatioDraftQ` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
 | `sampling_filter.py` | `row_filters`, `filter_floor` — the ratio verify's top-k/top-p floor per row, found on the device (radix descent, or a count for a top-k of at most 256 alone) |
