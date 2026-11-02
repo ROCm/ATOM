@@ -1,15 +1,9 @@
-# Keep the release reproducible on the ROCm 7.2.4 / PyTorch 2.10 stack.
-# The digest prevents this historical tag from being moved underneath us.
-ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
+# Default: the pip-installed ROCm 7.14.1 SDK assembled by the rocm-sdk-base
+# stage below. The ROCm 10 line builds the same stage with its own
+# ROCM_SDK_VERSION / ROCM_INDEX_URL build-args.
+ARG BASE_IMAGE="rocm-sdk-base"
 ARG GPU_ARCH="gfx942;gfx950"
-# LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
-# LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
-# ROCm 10 flavor: pass --build-arg BASE_IMAGE=rocm10-base to build the whole
-# image on the pip-installed ROCm 10 SDK below instead of the rocm/pytorch
-# apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking
-# line only changes build-args (see ROCM_INDEX_URL / ROCM_SDK_VERSION).
-ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
+ARG BASE_IMAGE_ROCM_SDK="ubuntu:24.04"
 
 # ====================================================================
 # ATOM image: multi-stage parallel build
@@ -25,24 +19,30 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 # ====================================================================
 
 # --------------------------------------------------------------------
-# Stage -1: ROCm 10 base (pip SDK assembly on plain Ubuntu).
+# Stage -1: ROCm SDK base (pip SDK assembly on plain Ubuntu).
 #
-# Assemble the ROCm 10 stack from AMD's stable wheel channel instead of a
-# rocm/pytorch apt image (the TheRock distribution model: ROCm ships as pip
-# wheels, installed into site-packages rather than /opt/rocm). Ported from
-# sglang's docker/rocm.Dockerfile rocm1000-base stage.
+# Assemble the ROCm stack from AMD's wheel channels instead of a rocm/pytorch
+# apt image (the TheRock distribution model, which ROCm uses for every release
+# from 7.14 on: ROCm ships as pip wheels, installed into site-packages rather
+# than /opt/rocm). Ported from sglang's docker/rocm.Dockerfile rocm1000-base
+# stage.
 #
-# Version policy (ticket: ATOM v0.1.7 for ROCm 10.1, GA 2026-10-05):
-#   - Main line: stable channel 10.0.0 (the combination sglang validated).
+# Version policy:
+#   - Default (the rocm7 line, rocm/atom-dev:latest): ROCm 7.14.1 from
+#     repo.amd.com/rocm/whl-multi-arch, with torch 2.11.0. 7.14.1 publishes
+#     torch 2.10, 2.11 and 2.12, but 2.11 is the oldest with a gfx1250 device
+#     payload and is the torch the ROCm 10 line runs.
+#   - ROCm 10 line: stable channel 10.0.0 (the combination sglang validated),
+#     passed as build-args by docker-release.yaml.
 #   - 10.1 tracking line: nightly channel with 10.1.0a<date> versions
 #     (rc.repo.amd.com has no 10.1 artifacts yet). NOT a release artifact;
 #     it exists to surface 10.1 breaks early. Once 10.1 RC/GA lands on the
 #     stable channel, flip these ARGs and re-run the golden test.
 #
-# Python 3.12 (Ubuntu 24.04 default): the wheel channel publishes cp312 for
-# the whole stack; torch 2.11+rocm10.0.0 is the version sglang validated.
+# Python 3.12 (Ubuntu 24.04 default): the wheel channels publish cp312 for
+# the whole stack.
 # --------------------------------------------------------------------
-FROM ${BASE_IMAGE_ROCM10} AS rocm10-base
+FROM ${BASE_IMAGE_ROCM_SDK} AS rocm-sdk-base
 
 # Redeclare the global selector here so --build-arg GPU_ARCH lands in this
 # stage too; every device payload below is derived from it.
@@ -50,16 +50,18 @@ ARG GPU_ARCH
 
 # ROCM_TRITON_VERSION rather than TRITON_VERSION to leave room for a
 # stage-local TRITON_VERSION without a --build-arg landing on both.
-ARG ROCM_SDK_VERSION="10.0.0"
+ARG ROCM_SDK_VERSION="7.14.1"
 ARG ROCM_TORCH_VERSION="2.11.0"
 ARG ROCM_TORCHVISION_VERSION="0.26.0"
 ARG ROCM_TORCHAUDIO_VERSION="2.11.0"
 ARG ROCM_TRITON_VERSION="3.8.0+git4cff872c"
-ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
+ARG ROCM_INDEX_URL="https://repo.amd.com/rocm/whl-multi-arch/"
 # ENV (not just ARG) so downstream stages (base, atom_image, ...) can pass it
 # as --extra-index-url when resolving packages whose only home is the AMD
 # channel (e.g. torch's Requires-Dist: triton==<local rocm version>).
 ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
+# ENV so the final stack validation can assert the torch/Triton local version.
+ENV ROCM_SDK_VERSION=${ROCM_SDK_VERSION}
 # Every ROCm component above is an ARG, so a future ROCm line (10.1 and on)
 # is a set of --build-arg values -- a base version, an index URL -- and not a
 # new stage. The nightly channel prunes old date-stamped builds, so such a
@@ -189,7 +191,7 @@ RUN if [ -f /opt/rocm/share/amd_smi/setup.py ] || [ -f /opt/rocm/share/amd_smi/p
 
 # Keep pip from resolving the ROCm torch stack away to PyPI CUDA builds in any
 # later pip install (AITER requirements, MORI, ATOM deps, ...). The local
-# +rocm10.x version numbers lose to plain "torch==X" specs from PyPI unless
+# +rocm<version> version numbers lose to plain "torch==X" specs from PyPI unless
 # constrained. Deliberately shipped in the image (not just build-time) so user
 # pip installs stay on the ROCm stack too. Only the torch trio is named.
 ENV PIP_CONSTRAINT="/etc/atom/constraints/torch-rocm.txt"
@@ -207,8 +209,8 @@ ARG GPU_ARCH
 ARG BASE_IMAGE
 ENV GPU_ARCH_LIST=$GPU_ARCH
 ENV PYTORCH_ROCM_ARCH=$GPU_ARCH
-# Stamp the chosen base so later stages can branch on "is this the rocm10
-# flavor" without guessing from torch/HIP versions (10.0 and 10.1 both
+# Stamp the chosen base so later stages can branch on "is this the pip SDK
+# flavor" without guessing from torch/HIP versions (7.14, 10.0 and 10.1 all
 # report torch 2.11+ in some combinations).
 ENV ATOM_BASE_IMAGE=${BASE_IMAGE}
 
@@ -232,7 +234,7 @@ RUN pip install --upgrade pip "pybind11==3.0.4" && \
 # Newer rocm/pytorch images install ROCm libraries through Python wheels
 # instead of /opt/rocm. Register those directories so dpkg-shlibdeps can
 # resolve RCCL's dependencies while retaining compatibility with /opt/rocm.
-# Covers both the rocm10-base layout (SDK under /opt/venv, /opt/rocm symlink)
+# Covers both the rocm-sdk-base layout (SDK under /opt/venv, /opt/rocm symlink)
 # and any future rocm/pytorch image that moves to the same wheel layout.
 RUN ROCM_SDK_LIB_DIRS="$(python -c \
         'import glob, os; print("\n".join(sorted({os.path.dirname(p) for p in glob.glob("/opt/venv/lib/python*/site-packages/_rocm_sdk*/lib/*.so*")})))')" && \
@@ -242,14 +244,14 @@ RUN ROCM_SDK_LIB_DIRS="$(python -c \
         ldconfig; \
     fi
 
-# ROCm 10 flavor: the pip SDK's rocm_smi cmake config requires
+# pip SDK flavor: the SDK's rocm_smi cmake config requires
 # `pkg-config libdrm` (rocm_smi.h -> kfd_ioctl.h -> libdrm/drm.h), and the
 # SDK vendors the libdrm headers under lib/rocm_sysdeps/include without a
 # .pc file, so pkg-config cannot see them. Install Ubuntu's libdrm-dev +
 # pkg-config so RCCL's find_package(rocm_smi) resolves; without it the
 # config sets rocm_smi_FOUND=FALSE and RCCL's cmake dies at the
 # rocm_smi.h file(READ) fallback.
-RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm-sdk-base" ]; then \
         apt-get update && \
         apt-get install -y --no-install-recommends pkg-config libdrm-dev && \
         rm -rf /var/lib/apt/lists/* && \
@@ -257,91 +259,44 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         echo "libdrm for rocm_smi cmake: $(pkg-config --modversion libdrm)"; \
     fi
 
-# ROCm 10 torch stack tripwire: fail the build right here if any earlier step
-# let a PyPI CUDA torch replace the +rocm10.x stack, or if the venv carries
-# NVIDIA runtime packages. Only the rocm10 flavor asserts (the rocm/pytorch
+# pip SDK torch stack tripwire: fail the build right here if any earlier step
+# let a PyPI CUDA torch replace the +rocm<version> stack, or if the venv carries
+# NVIDIA runtime packages. Only the pip SDK flavor asserts (the rocm/pytorch
 # apt images ship their own, differently-versioned, stacks).
-RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm-sdk-base" ]; then \
         python -m pip check && \
-        python -c "import torch; assert torch.version.hip is not None, torch.__version__; print('rocm10 base torch:', torch.__version__, 'hip:', torch.version.hip)" && \
+        python -c "import torch; assert torch.version.hip is not None, torch.__version__; print('ROCm ${ROCM_SDK_VERSION} SDK base torch:', torch.__version__, 'hip:', torch.version.hip)" && \
         if pip list --format=freeze 2>/dev/null | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
-            echo "ERROR: NVIDIA CUDA runtime packages leaked into the ROCm 10 image"; \
+            echo "ERROR: NVIDIA CUDA runtime packages leaked into the ROCm ${ROCM_SDK_VERSION} SDK image"; \
             exit 1; \
         fi; \
     fi
 
-# Pin Triton to the perf-good ROCm build. The base rocm/pytorch image ships a
-# newer Triton (3.8.0) that regressed benchmark throughput; install the
-# AMD-published 3.7.0 wheel plus its matching triton_kernels from AMD's index,
-# here in the shared base so every downstream stage (the aiter build included)
-# links the same Triton. Empty TRITON_PIN_VERSION keeps the base image's Triton.
-# The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
-# installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
-# force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
-# rocm10-base flavor is excluded.
+# Pin Triton to the perf-good AMD build. The Triton torch pulls in (the
+# 3.8.0+git4cff872c SDK build here) regressed benchmark throughput; install the
+# AMD-published wheel plus its matching triton_kernels from AMD's index, here in
+# the shared base so every downstream stage (the aiter build included) links the
+# same Triton. The wheel is built with ROCm 7.2.0 but carries its own LLVM and
+# device libraries, links no ROCm library, and resolves the SDK's libamdhip64
+# through rocm_sdk at runtime. torch's metadata pins its own exact Triton, hence
+# --no-deps here and the one accepted conflict in the final pip check;
+# triton_kernels' declared deps are installed so pip check stays clean
+# otherwise. Empty TRITON_PIN_VERSION keeps torch's Triton. The ROCm 10 line
+# (ROCM_SDK_VERSION 10.*) keeps its SDK Triton, as it always has.
 ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
 ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
 ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
-RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
-        echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
-        pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
-            "triton==${TRITON_PIN_VERSION}" \
-            "triton_kernels==${TRITON_KERNELS_PIN_VERSION}" && \
-        python -c "import importlib.metadata as m; print('triton pinned ->', m.version('triton'))"; \
-    fi
-
-# ROCm 7.2.4 runtime backport used by vllm-project/vllm#55099.
-# Drop this stage once the official base image includes ordering-edge signals.
-FROM base AS build_rocm_runtime
-ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
-ARG ROCM_RUNTIME_COMMIT="b539bf7eebfd99ad0a69668caa1f4037034d501f"
-
-RUN mkdir -p /staging/lib && \
-    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then \
-        echo "Keeping the stock runtime for this non-7.2.4 base image"; exit 0; \
-    fi && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
-        git cmake ninja-build g++ pkg-config \
-        libelf-dev libdrm-dev libnuma-dev libdw-dev xxd && \
-    pip install --no-cache-dir CppHeaderParser==2.7.4 ply==3.11 && \
-    git init -q /src && cd /src && \
-    git remote add origin "${ROCM_SYSTEMS_REPO}" && \
-    git config remote.origin.promisor true && \
-    git config remote.origin.partialclonefilter blob:none && \
-    git sparse-checkout init --cone && \
-    git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake && \
-    git fetch --filter=blob:none --depth 1 origin "${ROCM_RUNTIME_COMMIT}" && \
-    git checkout -q FETCH_HEAD && \
-    mkdir -p /opt/rocm-cmake-shim && \
-    printf 'if(NOT TARGET clang)\n  add_executable(clang IMPORTED GLOBAL)\n  set_target_properties(clang PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/clang")\nendif()\nset(Clang_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/ClangConfig.cmake && \
-    printf 'if(NOT TARGET llvm-objcopy)\n  add_executable(llvm-objcopy IMPORTED GLOBAL)\n  set_target_properties(llvm-objcopy PROPERTIES IMPORTED_LOCATION "/opt/rocm/llvm/bin/llvm-objcopy")\nendif()\nset(LLVM_FOUND TRUE)\nset(LLVM_PACKAGE_VERSION "rocm-image-shim")\n' > /opt/rocm-cmake-shim/LLVMConfig.cmake && \
-    cmake -S /src/projects/rocr-runtime -B /src/build-rocr -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm \
-        -DCMAKE_INSTALL_PREFIX=/opt/rocm \
-        -DClang_DIR=/opt/rocm-cmake-shim -DLLVM_DIR=/opt/rocm-cmake-shim && \
-    cmake --build /src/build-rocr --parallel ${MAX_JOBS:-$(nproc)} && \
-    cmake --install /src/build-rocr && \
-    cmake --install /src/build-rocr --prefix /rocr-install --strip && \
-    cmake -S /src/projects/clr -B /src/build-clr -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release -DCLR_BUILD_HIP=ON -DCLR_BUILD_OCL=OFF \
-        -DHIP_COMMON_DIR=/src/projects/hip -DROCM_PATH=/opt/rocm \
-        -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_INSTALL_PREFIX=/opt/rocm \
-        -DLLVM_DIR=/opt/rocm-cmake-shim -DHIP_LLVM_ROOT=/opt/rocm/llvm && \
-    cmake --build /src/build-clr --parallel ${MAX_JOBS:-$(nproc)} && \
-    cmake --install /src/build-clr --prefix /clr-install --strip && \
-    cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ && \
-    cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ && \
-    mkdir -p /staging/.info && \
-    git rev-parse HEAD > /staging/.info/atom-rocm-runtime-commit && \
-    # Record the sonames this commit actually produced. The install step must
-    # not assume .so.1/.so.7: if a future ROCM_RUNTIME_COMMIT bumps a major the
-    # cp above succeeds under the new name while a hardcoded readlink resolves
-    # to the still-present stock symlink, and the fixup then hard-links stock
-    # onto stock and reports success.
-    ( cd /staging/lib && ls -1 libhsa-runtime64.so.* libamdhip64.so.* \
-        | grep -E '\.so\.[0-9]+$' ) > /staging/.info/atom-rocm-runtime-sonames && \
-    test -s /staging/.info/atom-rocm-runtime-sonames
+RUN case "${ROCM_SDK_VERSION}" in \
+      10.*) echo "ROCm ${ROCM_SDK_VERSION}: keeping the SDK's Triton" ;; \
+      *) if [ -n "${TRITON_PIN_VERSION}" ]; then \
+           echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
+           pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+               "triton==${TRITON_PIN_VERSION}" \
+               "triton_kernels==${TRITON_KERNELS_PIN_VERSION}" && \
+           pip install numpy pytest && \
+           python -c "import importlib.metadata as m; print('triton pinned ->', m.version('triton'))"; \
+         fi ;; \
+    esac
 
 # --------------------------------------------------------------------
 # Stage 1: RCCL — parallel
@@ -381,10 +336,11 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="HEAD"
 ARG PREBUILD_KERNELS=1
 ARG MAX_JOBS
-# Keep AITER compiled against the Triton the base image ships (the ROCm 10
-# SDK's 3.8.0 build). Without this, AITER's setup resolves its own Triton
+# Keep AITER compiled against the Triton the base stage settled on (the
+# perf-good pin, or the SDK's 3.8.0 build on the ROCm 10 line). Without this,
+# AITER's setup resolves its own Triton
 # from PyPI and the prebuilt kernels then mismatch the runtime Triton.
-# Only meaningful on the rocm10 flavor (the rocm/pytorch apt images carry a
+# Only meaningful on the pip SDK flavor (the rocm/pytorch apt images carry a
 # Triton AITER already agrees with), but harmless to set everywhere.
 ENV AITER_USE_SYSTEM_TRITON=1
 
@@ -398,18 +354,18 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
-# torch 2.11 (the ROCm 10 stack) Dynamo may pass a base torch.Stream where
+# torch 2.11 (the pip SDK stack) Dynamo may pass a base torch.Stream where
 # older torch passed torch.cuda.Stream; AITER's ctypes bridge then reads
 # .cuda_stream off a stream that does not carry it. Backport the torch.Stream
 # branch from ROCm/aiter#4817 until AITER_COMMIT contains it upstream.
-# The guard is inside the python (a no-op on non-rocm10 flavors) because a
+# The guard is inside the python (a no-op on the apt-image flavors) because a
 # Dockerfile heredoc cannot sit inside a shell if/then block.
 RUN python3 - <<'PY'
 import os
 from pathlib import Path
 
-if os.environ.get("ATOM_BASE_IMAGE") != "rocm10-base":
-    print("not the rocm10 flavor; skipping torch.Stream patch")
+if os.environ.get("ATOM_BASE_IMAGE") != "rocm-sdk-base":
+    print("not the pip SDK flavor; skipping torch.Stream patch")
 else:
     p = Path("/app/aiter-test/csrc/cpp_itfs/torch_utils.py")
     s = p.read_text()
@@ -433,9 +389,6 @@ else:
         print("torch_utils.py already carries the torch.Stream branch (upstream fix landed)")
 PY
 
-# The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
-FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
-
 # --------------------------------------------------------------------
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
@@ -449,14 +402,14 @@ RUN pip install lm-eval[api]
 # MORI: install the prebuilt nightly wheel directly (no source build needed).
 # The `amd-mori-nightly` PyPI package provides the `mori` Python module.
 # See: https://pypi.org/project/amd-mori-nightly/
-# On the rocm10 flavor the pip SDK vendors NUMA and libdrm under
+# On the pip SDK flavor the SDK vendors NUMA and libdrm under
 # _rocm_sdk_devel/lib/rocm_sysdeps, which is on none of the search paths the
 # MORI import path needs (rocm_smi.h reaches for <libdrm/drm.h>, mori_application
 # links -ldrm/-ldrm_amdgpu). Register it via ldconfig like sglang does for its
 # rocm1000 MORI build; every soname in there is librocm_sysdeps_*-prefixed, so
 # it shadows nothing system-wide.
 RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
-    if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
+    if [ "${ATOM_BASE_IMAGE}" = "rocm-sdk-base" ]; then \
         ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
         if [ -d "${ROCM_SYSDEPS}" ]; then \
             echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
@@ -664,70 +617,27 @@ RUN echo "========== Install atomesh binary ==========" && \
     cp target/release/atomesh /usr/local/bin/atomesh && \
     atomesh --version
 
-# ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
-# Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
-# pip cannot replace the preinstalled ROCm torch stack. The wheel comes from
-# LMCACHE_WHEEL_IMAGE, a FROM scratch image holding only the wheel, which
-# .github/workflows/lmcache-rocm-wheel.yaml pushes to Docker Hub; the same
-# workflow opens the PR that moves the pin. The expected lmcache.__version__
-# follows from the wheel name; the ABI suffix and wheel tag are the workflow's
-# ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
-# image's torch.
-ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
-# Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
-# backend predicate is overridden only in the validation process below.
-# Two install paths, because the published wheel targets one ABI: its filename
-# pins rocm7.2.4 / torch 2.10, which is what the apt base image ships but not
-# the pip SDK's (torch 2.11 on ROCm 10.0, 2.13 on the 10.1 nightly), and the
-# validation below asserts that exact version string. LMCache publishes no
-# ROCm 10 wheel today -- every rocm asset on their releases, up to v0.5.5rc7,
-# is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP c_ops
-# from source, which is how the images validated on gfx950 were built. ROCM_HOME
-# is set only by the rocm10-base stage and inherited through the image, so it
-# tells the two apart. Collapse this back to one path once a matching wheel
-# exists.
+# ========== LMCache for KV offload ==========
+# LMCache publishes no ROCm wheel for this torch (every rocm asset on their
+# releases is built for ROCm 7.2 / torch 2.10), so build the pinned commit here
+# against the image's torch, with the HIP recipe of LMCache's own
+# .github/scripts/build_rocm_torch210_wheel.sh. The commit must carry the ATOM
+# MP adapters (lmcache.integration.atom) that atom/kv_transfer/offload/mp runs
+# on; validate_lmcache_wheel_for_atom.py fails the build otherwise.
+# LMCACHE_VERSION is what setuptools-scm derives for LMCACHE_COMMIT from full
+# history (last stable tag + distance); the shallow fetch has no tags, so it is
+# passed explicitly and has to move with the commit. hipcc is on PATH via
+# /opt/rocm/bin. Docker builds do not expose a GPU, so the validator overrides
+# LMCache's torch.cuda.is_available() backend predicate.
+# The ROCm 10 line (ROCM_SDK_VERSION 10.*) stays on LMCACHE_TAG, building its
+# HIP c_ops from source, which is how the images validated on gfx950 were
+# built. That release predates the ATOM MP adapters, so its check covers only
+# the c_ops and the v1 engine imports.
+ARG LMCACHE_COMMIT=f22dec2832124ea4ffeb464553b819a6369d4a30
+ARG LMCACHE_VERSION=0.5.6.dev139+gf22dec28
 ARG LMCACHE_TAG=v0.4.5
-RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
-    if [ -z "${ROCM_HOME}" ]; then \
-      echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-          set -- /tmp/lmcache-wheel/*.whl && \
-          { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
-          lmcache_wheel="$1" && \
-          lmcache_version="$(basename "${lmcache_wheel}" | sed -nE \
-              's/^lmcache-([^-]+\.rocm7\.2\.4\.torch2\.10\.git3d3aa833\.cxx11abi1)-cp312-cp312-manylinux_2_39_x86_64\.whl$/\1/p')" && \
-          { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCache wheel ${lmcache_wheel}"; exit 1; }; } && \
-          echo "${LMCACHE_WHEEL_SHA256}  ${lmcache_wheel}" | sha256sum -c - && \
-          "${VENV_PYTHON}" -m pip install \
-              prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
-              blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
-              cachetools cryptography numba openai py-cpuinfo \
-              opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
-              opentelemetry-exporter-otlp==1.40.0 \
-              opentelemetry-exporter-prometheus==0.61b0 \
-              "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
-          "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
-          "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
-      from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
-      from lmcache.v1.memory_management import MemoryFormat; \
-      from lmcache.v1.lookup_client.factory import LookupClientFactory; \
-      from lmcache.v1.config import LMCacheEngineConfig; \
-      from lmcache.v1.metadata import LMCacheMetadata; \
-      from lmcache.integration.atom import AtomMPSchedulerAdapter, AtomMPTransferSpec, AtomMPWorkerAdapter; \
-      from lmcache.utils import EngineType; \
-      from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
-      from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
-      assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.__version__ == '${lmcache_version}', lmcache.__version__; \
-      assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
-      assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
-      assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \
-      assert EngineType.ATOM.value == 'atom'; \
-      assert DeviceMessagingFuture.__module__ == 'lmcache.v1.multiprocess.futures'; \
-      assert AtomMPTransferSpec.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-      assert AtomMPSchedulerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-      assert AtomMPWorkerAdapter.__module__ == 'lmcache.integration.atom.multi_process_adapter'; \
-      print('OK: lmcache', lmcache.__version__, 'HIP cuda_ops; torch', torch.__version__)" ; \
-    else \
+RUN case "${ROCM_SDK_VERSION}" in \
+    10.*) \
       echo "========== [ATOM] LMCache HIP c_ops (${LMCACHE_TAG}, arch=${PYTORCH_ROCM_ARCH}) ==========" && \
           git clone https://github.com/LMCache/LMCache.git /opt/LMCache && \
           cd /opt/LMCache && git checkout ${LMCACHE_TAG} && \
@@ -753,8 +663,30 @@ RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
       from lmcache.v1.metadata import LMCacheMetadata; \
       assert 'rocm' in torch.__version__, torch.__version__; \
       assert lmcache.c_ops.__file__.endswith('.so'), 'c_ops fell back to python backend!'; \
-      print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ; \
-    fi
+      print('OK: lmcache', lmcache.__version__, 'HIP c_ops; torch', torch.__version__)" ;; \
+    *) \
+      echo "========== [ATOM] LMCache ${LMCACHE_VERSION} HIP build (arch=${PYTORCH_ROCM_ARCH}) ==========" && \
+          git init -q /opt/LMCache && cd /opt/LMCache && \
+          git remote add origin https://github.com/LMCache/LMCache.git && \
+          git fetch --depth 1 origin "${LMCACHE_COMMIT}" && \
+          git checkout -q FETCH_HEAD && \
+          "${VENV_PYTHON}" -m pip install -r requirements/build.txt && \
+          PATH="${PATH}:/opt/rocm/bin" BUILD_WITH_HIP=1 CXX=hipcc \
+          SETUPTOOLS_SCM_PRETEND_VERSION="${LMCACHE_VERSION}" \
+            "${VENV_PYTHON}" -m pip wheel . --no-build-isolation --no-deps \
+                --wheel-dir /tmp/lmcache-dist && \
+          "${VENV_PYTHON}" -m pip install \
+              ${ROCM_INDEX_URL:+--extra-index-url "${ROCM_INDEX_URL}"} \
+              -r requirements/common.txt \
+              cupy-rocm-7-0 && \
+          "${VENV_PYTHON}" -m pip install --no-deps /tmp/lmcache-dist/lmcache-*.whl && \
+          # common.txt pins prometheus_client<=0.24.1, downgrading ATOM's required
+          # >=0.25; restore ATOM's pin (lmcache only uses it for optional metrics).
+          "${VENV_PYTHON}" -m pip install "prometheus_client==0.25.0" && \
+          cd / && rm -rf /opt/LMCache /tmp/lmcache-dist && \
+          "${VENV_PYTHON}" /app/ATOM/.github/scripts/validate_lmcache_wheel_for_atom.py \
+              --expected-version "${LMCACHE_VERSION}" ;; \
+    esac
 
 # ========== AgentX harness (agentic benchmark client) ==========
 # agentx-harness is the client InferenceX benchmarks with: every one of its
@@ -779,37 +711,66 @@ RUN if [ "${INSTALL_AGENTX_HARNESS}" = "1" ]; then \
         echo "========== Skipped agentx-harness (INSTALL_AGENTX_HARNESS=0) =========="; \
     fi
 
-# ========== Final ROCm 10 stack validation ==========
+# Guarantee the perf-good Triton survived every install above: anything that
+# resolves torch's dependencies (LMCache's common.txt lists torch) pulls torch's
+# own Triton back in, so re-pin if it drifted, then assert the exact version or
+# fail the build -- the image must never silently ship torch's Triton instead.
+# Same scope as the base-stage pin: not on the ROCm 10 line.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
+RUN case "${ROCM_SDK_VERSION}" in \
+      10.*) ;; \
+      *) if [ -n "${TRITON_PIN_VERSION}" ]; then \
+           cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
+           if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \
+               echo "[atom_image] Triton drifted to ${cur}; re-pinning ${TRITON_PIN_VERSION}"; \
+               "${VENV_PYTHON}" -m pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
+                   "triton==${TRITON_PIN_VERSION}" "triton_kernels==${TRITON_KERNELS_PIN_VERSION}"; \
+           fi; \
+           "${VENV_PYTHON}" -c "import importlib.metadata as m; v=m.version('triton'); k=m.version('triton_kernels'); \
+assert v == '${TRITON_PIN_VERSION}', 'Triton dist is '+v+', expected ${TRITON_PIN_VERSION}'; \
+assert k == '${TRITON_KERNELS_PIN_VERSION}', 'triton_kernels dist is '+k+', expected ${TRITON_KERNELS_PIN_VERSION}'; \
+print('[atom_image] final triton', v, '| triton_kernels', k)"; \
+         fi ;; \
+    esac
+
+# ========== Final pip SDK stack validation ==========
 # Last line of defense, after every component install has had its chance to
-# perturb the stack: the torch trio must still be the +rocm10.x builds, Triton
-# must still be the SDK's, no NVIDIA CUDA runtime package may be present, and
-# pip check must be clean (modulo one known cosmetic conflict). A failure here
-# means some component's requirements silently replaced the ROCm stack — the
-# exact failure mode PIP_CONSTRAINT exists to prevent, so treat it as a broken
-# image, not a warning.
-RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
-        echo "========== [ATOM] Final ROCm 10 stack validation =========="; \
-        # pip check, minus the one known conflict that cannot be satisfied
-        # by ANY version: atom wants prometheus_client>=0.25, lmcache 0.4.5
-        # caps <=0.24.1. The ROCm 7 nightly image ships the same conflict
-        # silently (it has no pip check at all); 0.25 works at runtime for
-        # both. Filter exactly that line, fail on anything else.
+# perturb the stack: the torch trio must still be the +rocm<ROCM_SDK_VERSION>
+# builds, Triton must still be the perf-good pin (the SDK's own on the ROCm 10
+# line or with an empty TRITON_PIN_VERSION), no NVIDIA CUDA runtime package may
+# be present, and pip check must be clean (modulo the known conflicts below). A
+# failure here means some component's requirements silently replaced the ROCm
+# stack — the exact failure mode PIP_CONSTRAINT exists to prevent, so treat it
+# as a broken image, not a warning.
+RUN if [ "${ATOM_BASE_IMAGE}" = "rocm-sdk-base" ]; then \
+        echo "========== [ATOM] Final ROCm ${ROCM_SDK_VERSION} SDK stack validation =========="; \
+        triton_pin=""; \
+        case "${ROCM_SDK_VERSION}" in 10.*) ;; *) triton_pin="${TRITON_PIN_VERSION}" ;; esac; \
+        # pip check, minus the known conflicts: atom wants
+        # prometheus_client>=0.25, lmcache caps <=0.24.1 (no version satisfies
+        # both; 0.25 works at runtime for both), and, while the Triton pin is
+        # active, torch's exact Triton requirement, which the pin overrides on
+        # purpose. Filter exactly those lines, fail on anything else.
+        known_conflicts() { \
+            grep -v "prometheus.client" | \
+            if [ -n "${triton_pin}" ]; then grep -vF "but you have triton ${triton_pin}."; else cat; fi; \
+        }; \
         if ! python -m pip check -q 2>/dev/null; then \
-            # pip check failed: allow only the known unsatisfiable\
-            # prometheus_client pin, fail on anything else.\
-            if python -m pip check 2>&1 | grep -v "prometheus.client" | grep -q "."; then \
+            if python -m pip check 2>&1 | known_conflicts | grep -q "."; then \
                 echo "pip check reported unexpected conflicts:"; \
-                python -m pip check 2>&1 | grep -v "prometheus.client"; \
+                python -m pip check 2>&1 | known_conflicts; \
                 exit 1; \
             fi; \
-            echo "pip check: only the known prometheus_client pin (atom>=0.25 / lmcache<=0.24.1)"; \
+            echo "pip check: only the known prometheus_client / Triton pin conflicts"; \
         else \
             echo "pip check clean"; \
         fi; \
         python -c "import torch, triton, torchvision, torchaudio; from importlib.metadata import version; \
 assert torch.version.hip is not None, torch.__version__; \
-assert '+rocm10' in torch.__version__, torch.__version__; \
-assert 'rocm10' in version('triton'), version('triton'); \
+assert torch.__version__.endswith('+rocm${ROCM_SDK_VERSION}'), torch.__version__; \
+assert (version('triton') == '${triton_pin}') if '${triton_pin}' else version('triton').endswith('.rocm${ROCM_SDK_VERSION}'), version('triton'); \
 print('final stack: torch', torch.__version__, '| triton', version('triton'), \
       '| torchvision', torchvision.__version__, '| torchaudio', torchaudio.__version__)" && \
         if pip list --format=freeze 2>/dev/null | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
@@ -822,66 +783,9 @@ print('final stack: torch', torch.__version__, '| triton', version('triton'), \
         # problem. aiter imports fine at runtime (the golden test covers it).
         # amdsmi is likewise optional: on the 10.1 nightly SDK neither the
         # SDK's share/amd_smi nor the ABI-incompatible PyPI wheel can import
-        # (see the rocm10-base amdsmi step); numa_utils degrades gracefully.
+        # (see the rocm-sdk-base amdsmi step); numa_utils degrades gracefully.
         python -c "import mori, atom; \
 print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi optional)')"; \
     fi
-
-# Guarantee the perf-good Triton survived every install above: re-pin if
-# something pulled a different one, then assert the exact version or fail the
-# build -- the image must never silently ship the base image's newer Triton.
-# The pin is for the rocm/pytorch (ROCm 7.x) line only: the ROCm 10 flavor
-# installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
-# force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
-# rocm10-base flavor is excluded.
-ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
-ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
-ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
-RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
-        cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
-        if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \
-            echo "[atom_image] Triton drifted to ${cur}; re-pinning ${TRITON_PIN_VERSION}"; \
-            "${VENV_PYTHON}" -m pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
-                "triton==${TRITON_PIN_VERSION}" "triton_kernels==${TRITON_KERNELS_PIN_VERSION}"; \
-        fi; \
-        "${VENV_PYTHON}" -c "import importlib.metadata as m; v=m.version('triton'); assert v == '${TRITON_PIN_VERSION}', 'Triton dist is '+v+', expected ${TRITON_PIN_VERSION}'; print('[atom_image] final triton', v)"; \
-    fi
-
-# Install the paired runtime after dependency installation. Preserve old image
-# tags for rollback; changing ROCM_RUNTIME_COMMIT selects a different backport.
-COPY --from=build_rocm_runtime /staging/ /opt/rocm/
-# Hard links rather than symlinks: ldconfig rewrites SONAME symlinks but cannot
-# re-point an inode, so absolute-path loads of the old versioned filenames have
-# to land on the new inode. This is upstream vLLM's replacement method.
-RUN set -eux; \
-    if ! grep -Eq '^7\.2\.4([+-]|$)' /opt/rocm/.info/version; then exit 0; fi; \
-    # The builder ran for this flavor, so its outputs have to be here. Failing
-    # closed is the point: publishing an image that silently carries the stock
-    # runtime is the failure this stage exists to prevent.
-    test -s /opt/rocm/.info/atom-rocm-runtime-commit; \
-    test -s /opt/rocm/.info/atom-rocm-runtime-sonames; \
-    cd /opt/rocm/lib; \
-    while read -r soname; do \
-        [ -n "$soname" ] || continue; \
-        # readlink -f exits 0 and prints the would-be path for a DANGLING link.
-        # Without this guard a COPY that did not deliver the target makes the
-        # touch below CREATE a 0-byte file, which the loop then hard-links over
-        # the real runtime. set -eux cannot see any of that.
-        if [ -L "$soname" ]; then [ -e "$soname" ]; fi; \
-        ours="$(readlink -f "$soname")"; \
-        [ -s "$ours" ]; \
-        # touch forces the overlayfs copy-up that lets the layer tar record the
-        # hard links below as aliases instead of as separate copies.
-        touch "$ours"; \
-        for f in "$soname".*; do \
-            [ -f "$f" ] && [ ! -L "$f" ] || continue; \
-            [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
-        done; \
-    done < /opt/rocm/.info/atom-rocm-runtime-sonames; \
-    ldconfig; \
-    # Prove the swap landed. Until this exists every failure path above ends in
-    # a successfully published image carrying the stock runtime.
-    hsa="$(grep -m1 '^libhsa-runtime64\.so\.' /opt/rocm/.info/atom-rocm-runtime-sonames)"; \
-    nm -D "/opt/rocm/lib/$hsa" | grep -q hsa_amd_signal_create_v2
 
 CMD ["/bin/bash"]
