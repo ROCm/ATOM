@@ -262,6 +262,9 @@ class KdaPreBuild:
     timeline: bool = field(default=False, metadata={"sym": "t"})
     # a block-write layer's block: the updated prefix stored there
     write_idx: int = field(default=-1, metadata={"sym": "wi"})
+    # the recurrent state pool is fp16, else fp32: widened on load, every state
+    # written back rounded to fp16 (``state_loads`` / ``store_states``)
+    state16: bool = field(default=False, metadata={"sym": "h"})
     # ReplaySSM (``fla_ops.replayssm``): the record buffer's length (its
     # ``cache_len``), 0 without. A request's state is its checkpoint plus the
     # (k, u, g) records committed since (``write_pos``), rebuilt here; each
@@ -1029,12 +1032,30 @@ def state_late(s: int) -> bool:
     return s >= 8
 
 
-def state_loads(k):
-    """A task's initial state rows ``k["rows"]`` into ``k["st"]``."""
-    k["st"] = [
-        fx.Vector(bo.buffer_load(rsrc(k["st_base"]), off, vec_width=4, dtype=T.f32))
-        for off in k["head_offs"]
-    ]
+def state_at(c, slot):
+    """Where ``slot``'s recurrent state starts: 4 B an element, 2 an fp16 pool's."""
+    a = c["args"]
+    return a["rstate"] + fx.Int64(slot) * fx.Int64(a["rs_seq"]) * (
+        2 if c["state16"] else 4
+    )
+
+
+def state_loads(c, k):
+    """A task's initial state rows ``k["rows"]`` into ``k["st"]``, fp32."""
+    if const_expr(c["state16"]):
+        k["st"] = [
+            fx.Vector(
+                bo.buffer_load(rsrc(k["st_base"]), off // 2, vec_width=2, dtype=T.i32)
+            )
+            .bitcast(fx.Float16)
+            .to(fx.Float32)
+            for off in k["head_offs"]
+        ]
+    else:
+        k["st"] = [
+            fx.Vector(bo.buffer_load(rsrc(k["st_base"]), off, vec_width=4, dtype=T.f32))
+            for off in k["head_offs"]
+        ]
 
 
 def fb_loads(c, k):
@@ -1097,11 +1118,9 @@ def kda_task_inputs(c, req, h, m0, channels, rows):
     k0 = (tid % 32) * 4
     k["rows"] = rows
     k["head_offs"] = [(h * HD + r) * HD + k0 for r in rows]
-    k["st_base"] = (
-        a["rstate"] + fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(a["rs_seq"]) * 4
-    )
+    k["st_base"] = state_at(c, fx.max(k["slot0"], 0))
     if const_expr(not state_late(c["S"])):
-        state_loads(k)
+        state_loads(c, k)
     # f_b: wave w's rows 16 w .. of head h, a lane 64 B of its row
     fr = h * HD + wave * 16 + lane % 16
     fb = (fr * HD + (lane // 16) * 32) // 2
@@ -1156,7 +1175,7 @@ def kda_gates(c, k, req, h):
     if const_expr(L > 1):
         fb_loads(c, k)
     if const_expr(state_late(c["S"])):
-        state_loads(k)
+        state_loads(c, k)
     if const_expr(not c["kda_head"]):
         gpu.barrier()
     gates_compute(c, k, h)
@@ -1257,12 +1276,14 @@ def kda_recur(c, k, req, h, ch):
 
 def store_states(c, k, slot, stv):
     """The task's state rows ``stv`` (a chunk's each) into ``slot``."""
-    a = c["args"]
-    dst = rsrc(a["rstate"] + fx.Int64(slot) * fx.Int64(a["rs_seq"]) * 4)
+    dst = rsrc(state_at(c, slot))
     for m in range_constexpr(len(stv)):
-        bo.buffer_store(
-            fx.Vector.from_elements(stv[m], fx.Float32), dst, k["head_offs"][m]
-        )
+        st = fx.Vector.from_elements(stv[m], fx.Float32)
+        if const_expr(c["state16"]):
+            st16 = st.to(fx.Float16).bitcast(fx.Int32)
+            bo.buffer_store(st16, dst, k["head_offs"][m] // 2)
+        else:
+            bo.buffer_store(st, dst, k["head_offs"][m])
 
 
 @traced
@@ -1731,6 +1752,7 @@ def build(key: KdaPreBuild):
             "lb": key.lower_bound,
             "kda0": key.kda0,
             "write_idx": key.write_idx,
+            "state16": key.state16,
             "put": mb.put,
             "poll": mb.poll,
             "red": lds.red.ptr,

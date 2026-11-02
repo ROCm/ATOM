@@ -27,11 +27,12 @@ closes each one:
 * **TP sharding** -- ``SUPPORTED_TP``; ``Dims`` refuses any size that does not
   divide every width.
 * **weight layouts** -- ``weights.py`` checks each tensor it binds.
-* **KV dtype** -- the conv state must be bf16 and the recurrent state fp32.
-  ``ATOM_GDN_SSM_DTYPE`` is checked here, but that is the *request*; the pools
-  that were actually allocated are checked in ``runner._conv_state`` and
-  ``runner._recurrent_state`` -- at build for the first mono layer, and again
-  where each step packs them.
+* **KV dtype** -- the conv state must be bf16 and the recurrent state fp32 or
+  fp16 (computed in fp32 either way: an fp16 pool is widened on load and each
+  state written back rounded to fp16). ``ATOM_GDN_SSM_DTYPE`` is checked here, but
+  that is the *request*; the pools that were actually allocated are checked in
+  ``runner._conv_state`` and ``runner._recurrent_state`` -- at build for every
+  mono layer, and again, against the build, where each step packs them.
 """
 
 from dataclasses import dataclass
@@ -249,10 +250,10 @@ def config_refusal(atom_config) -> str | None:
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
         + resident_grid_refusals(atom_config)
     ) + [
-        # the KDA recurrence reads and writes fp32 state in place; a narrower
-        # pool would be read as fp32 rather than converted
+        # the KDA recurrence reads and writes the state in place as fp32 or as
+        # fp16; any other pool would be reinterpreted rather than converted
         (
-            envs.ATOM_GDN_SSM_DTYPE == "fp32",
+            envs.ATOM_GDN_SSM_DTYPE in ("fp32", "fp16"),
             f"ATOM_GDN_SSM_DTYPE={envs.ATOM_GDN_SSM_DTYPE}",
         ),
         # the model's own widths, which the kernels bake
