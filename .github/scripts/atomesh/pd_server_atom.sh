@@ -495,7 +495,13 @@ apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 prepare_kv_connector || exit 2
 
 # Cross-node MoRI EP goes through the host proxy unless the cell says otherwise.
-if has_cli_flag "${PREFILL_SERVER_ARGS} ${DECODE_SERVER_ARGS}" "--enable-expert-parallel"; then
+# Only a worker spanning nodes has a cross-node leg: a one-node worker's EP runs
+# IntraNode, so it keeps MoRI's default.
+case "${NODE_ROLE:-}" in
+  prefill) role_nodes="${PREFILL_NODES_PER_WORKER:-1}" role_args="${PREFILL_SERVER_ARGS}" ;;
+  *) role_nodes="${DECODE_NODES_PER_WORKER:-1}" role_args="${DECODE_SERVER_ARGS}" ;;
+esac
+if (( role_nodes > 1 )) && has_cli_flag "${role_args}" "--enable-expert-parallel"; then
   export MORI_ENABLE_HOST_PROXY="${MORI_ENABLE_HOST_PROXY:-1}"
 fi
 
@@ -2992,6 +2998,11 @@ elif [[ "${NODE_ROLE}" == "prefill" ]]; then
   wait_router_closed
   cleanup_processes "${server_pid}"
 else
+  # Only the per-worker node layout sets needed_nodes; a node past them hosts no worker.
+  if [[ -n "${needed_nodes:-}" ]] && (( NODE_RANK >= needed_nodes )); then
+    echo "[server] rank=${NODE_RANK} idle: ${xP}P${yD}D at ${PREFILL_NODES_PER_WORKER}/${DECODE_NODES_PER_WORKER} node(s) per worker spans ${needed_nodes} node(s)"
+    exit 0
+  fi
   trap 'cleanup_processes ${server_pid:-}' EXIT
   start_decode
   wait_http "http://${NODE0_ADDR}:${ROUTER_PORT}/health" "router" "${WAIT_SERVER_TIMEOUT}" "${server_pid}"

@@ -285,35 +285,76 @@ class EndpointAndDpFlagTest(unittest.TestCase):
         self.assertIn("needs 4 nodes, got 3", result.stderr)
 
 
-class HostProxyDefaultTest(unittest.TestCase):
-    """MoRI EP starts on the host proxy unless the cell picks a transport."""
+EP_ARGS = "--enable-dp-attention --enable-expert-parallel"
 
-    def proxy(self, **env):
+
+class HostProxyDefaultTest(unittest.TestCase):
+    """MoRI EP across nodes starts on the host proxy unless the cell picks a transport."""
+
+    def proxy(self, role, **env):
         result = run_bash(
-            HAS_CLI_FLAG + HOST_PROXY + 'echo "${MORI_ENABLE_HOST_PROXY:-unset}"', **env
+            HAS_CLI_FLAG + HOST_PROXY + 'echo "${MORI_ENABLE_HOST_PROXY:-unset}"',
+            NODE_ROLE=role,
+            **env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
-    def test_expert_parallel_turns_it_on(self):
+    def test_a_spanning_ep_worker_turns_it_on(self):
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    self.proxy(
+                        role,
+                        PREFILL_SERVER_ARGS=EP_ARGS,
+                        DECODE_SERVER_ARGS=EP_ARGS,
+                        **TWO_BY_TWO,
+                    ),
+                    "1",
+                )
+
+    def test_a_one_node_ep_worker_leaves_it_alone(self):
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    self.proxy(
+                        role, PREFILL_SERVER_ARGS=EP_ARGS, DECODE_SERVER_ARGS=EP_ARGS
+                    ),
+                    "unset",
+                )
+
+    def test_only_the_role_whose_worker_spans_nodes_gets_it(self):
+        env = {
+            "DECODE_NODES_PER_WORKER": 2,
+            "PREFILL_SERVER_ARGS": EP_ARGS,
+            "DECODE_SERVER_ARGS": EP_ARGS,
+        }
+        self.assertEqual(self.proxy("prefill", **env), "unset")
+        self.assertEqual(self.proxy("decode", **env), "1")
+
+    def test_an_aggregated_server_follows_decode(self):
         self.assertEqual(
-            self.proxy(
-                DECODE_SERVER_ARGS="--enable-dp-attention --enable-expert-parallel"
-            ),
+            self.proxy("server", DECODE_NODES_PER_WORKER=2, DECODE_SERVER_ARGS=EP_ARGS),
             "1",
         )
 
     def test_the_cell_setting_wins(self):
         self.assertEqual(
             self.proxy(
-                PREFILL_SERVER_ARGS="--enable-expert-parallel", MORI_ENABLE_HOST_PROXY=0
+                "prefill",
+                PREFILL_SERVER_ARGS=EP_ARGS,
+                MORI_ENABLE_HOST_PROXY=0,
+                **TWO_BY_TWO,
             ),
             "0",
         )
 
     def test_no_expert_parallel_leaves_it_alone(self):
         self.assertEqual(
-            self.proxy(DECODE_SERVER_ARGS="--enable-dp-attention"), "unset"
+            self.proxy(
+                "decode", DECODE_SERVER_ARGS="--enable-dp-attention", **TWO_BY_TWO
+            ),
+            "unset",
         )
 
 
@@ -367,6 +408,23 @@ class MainFlowTest(unittest.TestCase):
                 "wait_router_closed",
             ],
         )
+
+    def test_nodes_past_the_layout_idle(self):
+        for env, nodes in ((TWO_BY_TWO, 5), ({}, 3)):
+            with self.subTest(nodes=nodes, **env):
+                result = run_bash(
+                    LAYOUT + ENDPOINTS + STUBS + MAIN_FLOW,
+                    NODE_RANK=nodes - 1,
+                    IPADDRS=ips(nodes),
+                    **env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("idle", result.stdout)
+                self.assertNotIn("start_", result.stdout)
+
+    def test_a_longer_node_list_leaves_the_layout_as_it_is(self):
+        self.assertEqual(self.flow(0, 5, **TWO_BY_TWO), self.flow(0, 4, **TWO_BY_TWO))
+        self.assertEqual(self.flow(3, 5, **TWO_BY_TWO), self.flow(3, 4, **TWO_BY_TWO))
 
     def test_a_one_node_aggregated_server_idles_the_other_nodes(self):
         result = run_bash(
