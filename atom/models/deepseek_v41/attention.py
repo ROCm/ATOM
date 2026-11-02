@@ -68,11 +68,16 @@ def _live_rows():
     return {**_live_step(), "queries": metadata.queries}
 
 
-def _log_woa_quant_path(fused: bool, why: str) -> None:
-    """One line per process. The loader calls the hook on every layer."""
-    if getattr(_log_woa_quant_path, "done", False):
+def _log_woa_quant_path(fused: bool, why: str, *, final: bool = True) -> None:
+    """Log the path once per process.
+
+    A module with no weight is not the decision `supported()` makes. That case
+    is logged once and does not hide a later module that does have weights.
+    """
+    state = getattr(_log_woa_quant_path, "state", None)
+    if state == "final" or (not final and state == "empty"):
         return
-    _log_woa_quant_path.done = True
+    _log_woa_quant_path.state = "final" if final else "empty"
     logger.info("dsv41 wo_a quant: %s (%s)", "fused" if fused else "unfused", why)
 
 
@@ -373,13 +378,9 @@ class Attention(nn.Module):
             return
         weight = getattr(self.wo_a, "weight", None)
         scale = getattr(self.wo_a, "weight_scale", None)
-        if (
-            weight is None
-            or scale is None
-            or weight.numel() == 0
-            or scale.numel() == 0
-        ):
+        if weight is None or scale is None or weight.numel() == 0 or scale.numel() == 0:
             self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "weight or scale empty", final=False)
             return
         wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
         k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
@@ -390,9 +391,7 @@ class Attention(nn.Module):
         )
         _log_woa_quant_path(
             self._fuse_woa_quant,
-            "gfx1250 mxfp8 epilogue"
-            if self._fuse_woa_quant
-            else "shape unsupported",
+            "mxfp8 epilogue" if self._fuse_woa_quant else "shape unsupported",
         )
 
     def _project_out(self, output, rope, positions):
