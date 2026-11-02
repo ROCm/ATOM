@@ -207,10 +207,15 @@ class EngineCore:
                     "prefill_token_graphs", wait_out=True
                 ),
             )
+            from atom.model_engine.prefill_delayer import admit_policy_from_env
+
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
-                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                and (
+                    envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                    or admit_policy_from_env() == "adaptive"
+                )
             ):
                 self._init_prefill_delayer(config)
 
@@ -245,7 +250,10 @@ class EngineCore:
             or self.scheduler is None
         ):
             return
-        from atom.model_engine.prefill_delayer import PrefillDelayer
+        from atom.model_engine.prefill_delayer import (
+            PrefillDelayer,
+            admit_policy_from_env,
+        )
 
         self.scheduler.set_prefill_delayer(
             PrefillDelayer(
@@ -262,6 +270,7 @@ class EngineCore:
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
+                admit_policy=admit_policy_from_env(),
             )
         )
 
@@ -535,7 +544,9 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    scheduled_batch.total_tokens_num_prefill
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
