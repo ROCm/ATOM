@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793552838676,
+  "lastUpdate": 1793638685529,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4660,6 +4660,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8923,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41324946066 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611011456 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1312 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Chaitanya Sri Krishna Lolla",
+            "username": "lcskrishna",
+            "email": "lollachaitanya@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "974414f16f85a26c0e051344b5093f300f25a59a",
+          "message": "[ATOMesh][DI][CI] Enable WideEP with MoRI V1LL with DSV3 & Kimi K2.5 MXFP4 (#2817)\n\n* Enable InternodeV1LL low latency and WideEP tests\n\nSigned-off-by: lcskrishna <lollachaitanya@gmail.com>\n\n* avoid multinode timeout for single node\n\nSigned-off-by: lcskrishna <lollachaitanya@gmail.com>\n\n* Idle ranks past the PD node layout; host proxy only for spanning EP workers\n\npd_server_atom.sh: in the per-worker node layout, a rank past the nodes the layout needs exits 0 as idle, as the aggregated branch does, instead of starting a decode server for a worker that does not exist. MORI_ENABLE_HOST_PROXY defaults to 1 only on a node whose role's worker spans nodes and runs expert parallel; a one-node worker's EP runs IntraNode and keeps MoRI's default. A cell's own setting still wins.\n\nSigned-off-by: lcskrishna <lollachaitanya@gmail.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nSigned-off-by: lcskrishna <lollachaitanya@gmail.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-11-02T12:42:59Z",
+          "url": "https://github.com/ROCm/ATOM/commit/974414f16f85a26c0e051344b5093f300f25a59a"
+        },
+        "date": 1793638684997,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.95,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41479235946 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611021458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9484 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8976,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41479235946 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611021458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1645 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
