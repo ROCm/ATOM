@@ -133,6 +133,12 @@ This ensures:
 
 ### Dummy batch execution
 
+For native colocated DP attention, `--dp-scheduler deepinfer` selects a
+two-vote ALL/ANY phase policy in place of PrefillDelayer. It requires idle
+ranks to dummy-prefill on a group prefill even without token graphs. See
+[DeepInfer DP scheduling](deepinfer_dp_scheduler.md) for configuration,
+counter semantics, ATOM adaptations and validation.
+
 When a DP rank has no real work but other ranks do, it executes dummy batches to participate in collective operations:
 
 - **`_execute_dummy_batch()`** — runs `ModelRunner.dummy_execution`, a one-sequence decode dummy through the model, triggering AllReduce and MORI collectives so other ranks are not blocked.

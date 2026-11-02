@@ -210,9 +210,12 @@ class EngineCore:
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
-                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                and (
+                    config.dp_scheduler == "deepinfer"
+                    or envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                )
             ):
-                self._init_prefill_delayer(config)
+                self._init_prefill_scheduler(config)
 
         self._dynamic_chunking_enabled = config.enable_dynamic_chunking
         self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
@@ -238,7 +241,26 @@ class EngineCore:
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
-    def _init_prefill_delayer(self, config: Config, cpu_group=None):
+    def _init_prefill_scheduler(self, config: Config, cpu_group=None):
+        if config.dp_scheduler == "deepinfer":
+            from atom.model_engine.deepinfer_scheduler import DeepInferDPPolicy
+
+            self.scheduler.set_dp_phase_policy(
+                DeepInferDPPolicy(
+                    dp_size=config.parallel_config.data_parallel_size,
+                    cpu_group=cpu_group,
+                    prefill_interval=config.deepinfer_prefill_interval,
+                    prefill_any_interval=config.deepinfer_prefill_any_interval,
+                )
+            )
+            logger.info(
+                "DeepInfer DP scheduler enabled: ALL=%d ANY=%d KV watermark=0.9; "
+                "PrefillDelayer, DP chunk-cost balancing and "
+                "ATOM_PREFILL_DECODE_INTERVAL are bypassed",
+                config.deepinfer_prefill_interval,
+                config.deepinfer_prefill_any_interval,
+            )
+            return
         if (
             not envs.ATOM_ENABLE_PREFILL_DELAYER
             or config.enable_rapidserve
@@ -880,7 +902,7 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        self._init_prefill_delayer(config, self.dp_group)
+        self._init_prefill_scheduler(config, self.dp_group)
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank

@@ -165,6 +165,9 @@ class EngineArgs:
     torch_profiler_dir: str | None = None
     enable_dp_attention: bool = False
     dp_load_balance: str = DP_LB_DEFAULT
+    dp_scheduler: str = "atom"
+    deepinfer_prefill_interval: int = 70
+    deepinfer_prefill_any_interval: int = 100
     enable_tbo: str | None = None
     all2all_backend: str | None = None
     moe_backend: str = "standard"
@@ -397,6 +400,25 @@ class EngineArgs:
             "the lowest combined in-flight token load (prompt tokens + "
             "per-request token-equivalent, tunable via ATOM_DP_LB_REQ_EQUIV). "
             "Has no effect when data_parallel_size == 1.",
+        )
+        parser.add_argument(
+            "--dp-scheduler",
+            choices=["atom", "deepinfer"],
+            default="atom",
+            help="Native colocated DP-attention phase scheduling. 'deepinfer' "
+            "uses ALL/ANY voting instead of PrefillDelayer and its decode interval.",
+        )
+        parser.add_argument(
+            "--deepinfer-prefill-interval",
+            type=int,
+            default=70,
+            help="Decode-step interval between DeepInfer ALL votes (default: 70).",
+        )
+        parser.add_argument(
+            "--deepinfer-prefill-any-interval",
+            type=int,
+            default=100,
+            help="Decode-step interval between DeepInfer ANY votes (default: 100).",
         )
         parser.add_argument(
             "--enable-tbo",
