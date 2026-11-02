@@ -14,7 +14,6 @@ Needs two ROCm devices; skipped otherwise.
 """
 
 import os
-import tempfile
 
 import pytest
 import torch
@@ -138,5 +137,8 @@ def _worker(rank, init):
 
 
 def test_routed_norm_under_torch_compile_at_16_and_4096_tokens():
-    with tempfile.TemporaryDirectory() as d:
-        mp.spawn(_worker, args=(f"file://{d}/store",), nprocs=WORLD, join=True)
+    from atom.utils import get_open_port
+
+    # TCP, not file://: aiter's custom all-reduce asserts a pure TCP store.
+    init = f"tcp://127.0.0.1:{get_open_port()}"
+    mp.spawn(_worker, args=(init,), nprocs=WORLD, join=True)
