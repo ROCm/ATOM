@@ -454,27 +454,21 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 from atom.kv_transfer.offload.mp.worker import LMCacheMPConnector
 
                 from .mp_worker_adapter import MPOffloadWorkerAdapter
-                from .page_ride import NULL_BLOCK_ID
 
                 # The PAGE-only worker, not the shell in `offload/mp/
                 # connector.py`: given V4.1's checkpoint spec the shell picks
                 # the native-state worker, which restores an image into an
                 # Active SLOT, while here the plugin restores it from the PAGE
-                # units a load fills. vLLM never hands out its null block, so
-                # the MP server's default `--null-block-id` of 0 marks a chunk
-                # that holds no image.
-                self._worker = MPOffloadWorkerAdapter(
-                    LMCacheMPConnector(self._config, null_block_id=NULL_BLOCK_ID)
-                )
+                # units a load fills. A chunk that holds no image names the
+                # server's `--null-block-id` (`lmcache.mp.null_block_id`), as
+                # native ATOM's does, so the two can share a server.
+                self._worker = MPOffloadWorkerAdapter(LMCacheMPConnector(self._config))
             else:
                 from atom.kv_transfer.offload.dense.connector import (
                     DenseOffloadConnector,
                 )
 
                 self._worker = DenseOffloadConnector(self._config)
-                # vLLM 0.31 refuses a flat block set for a model with more than
-                # one KV cache group, so failures also go out by request.
-                self._worker.track_load_error_reqs()
         else:
             if self._offload_backend == "mp":
                 # The shell in `offload/mp/connector.py` is bypassed on purpose:
@@ -488,8 +482,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # `DenseOffloadScheduler`, from `ChunkedOffloadSchedulerBase`,
                 # which is where every method this connector calls on the
                 # scheduler half is defined.
-                from atom.kv_transfer.offload.mp.scheduler import (
-                    LMCacheMPConnectorScheduler,
+                from atom.plugin.vllm.kv_transfer.plugin_schedulers import (
+                    PluginMPScheduler,
                 )
 
                 if self._state_rides_mp:
@@ -507,13 +501,13 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                         checkpoint_spec=v41_state_checkpoint_sizing(vllm_config).spec,
                     )
                 else:
-                    self._scheduler = LMCacheMPConnectorScheduler(self._config)
+                    self._scheduler = PluginMPScheduler(self._config)
             else:
-                from atom.kv_transfer.offload.dense.connector import (
-                    DenseOffloadScheduler,
+                from atom.plugin.vllm.kv_transfer.plugin_schedulers import (
+                    PluginDenseScheduler,
                 )
 
-                self._scheduler = DenseOffloadScheduler(self._config)
+                self._scheduler = PluginDenseScheduler(self._config)
             if self._mamba_groups:
                 self._kda_planner = KdaBoundaryPlanner.from_vllm_config(
                     vllm_config,
@@ -604,8 +598,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # tier hit would load a checkpoint no restore consumes.
             raise ValueError(
                 "ATOM offload connector: DeepSeek-V4.1 offload needs its state "
-                "checkpoints live (ATOM_V41_STATE_CHECKPOINTS=1 with "
-                "--enable-prefix-caching and --mamba-cache-mode align); the "
+                "checkpoints live (--enable-prefix-caching with "
+                "--mamba-cache-mode align); the "
                 "checkpoint is what carries the state with the PAGE bytes."
             )
         kv_transfer_config = getattr(
@@ -1483,14 +1477,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         sending, recving = self.get_finished(finished_req_ids)
-        # get_finished retained failures from the common terminal channel.
-        # MP has no take_load_error_reqs hook, and a withdrawn promise has no
-        # worker transfer at all. A PAGE failure may precede the STATE result:
-        # vLLM holds this flag until finished_recving reaches its rank quorum.
+        # get_finished retained failures from the common terminal channel
+        # (`failed_loading`) and withdrawn promises, which have no worker
+        # transfer at all. A PAGE failure may precede the STATE result: vLLM
+        # holds this flag until finished_recving reaches its rank quorum.
         failed, self._pending_failed_recving = self._pending_failed_recving, set()
-        drain = getattr(self._worker, "take_load_error_reqs", None)
-        if callable(drain):
-            failed.update(drain())
         if self._kda_error_reqs:
             failed |= self._kda_error_reqs
             self._kda_error_reqs = set()
@@ -1846,8 +1837,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         # After this step's saves: an operation built here is in the live set
-        # the deadline walks.
-        self._scheduler.enforce_transfer_deadlines()
+        # the deadline walks. Only MP bounds its transfers this way.
+        enforce = getattr(self._scheduler, "enforce_transfer_deadlines", None)
+        if enforce is not None:
+            enforce()
         return AtomOffloadMetadata(
             inner,
             preempted,
@@ -1983,10 +1976,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         timeout = offload_save_abandon_timeout_s()
         if timeout <= 0 or not self._deferred_frees:
             return
-        if not getattr(self._scheduler, "abandons_saves", True):
-            # MP gives a save's blocks back only on its report. Dropping the
-            # ranks' reports here would free nothing and leave the quorum
-            # unreachable; `enforce_transfer_deadlines` fail-stops instead.
+        waits = getattr(self._scheduler, "waits_for_transfer_report", None)
+        if waits is not None and waits(None):
+            # MP gives a save's blocks back only on its report, whatever the
+            # request. Dropping the ranks' reports here would free nothing and
+            # leave the quorum unreachable; `enforce_transfer_deadlines`
+            # fail-stops instead.
             return
         now = time.monotonic()
         if now < self._next_save_reconcile_at:
@@ -2121,7 +2116,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # instead is safe.
         return bool(
             scheduler is not None
-            and getattr(scheduler, "has_active_save_leases", None) is not None
             and scheduler.has_active_save_leases(max_age_s=self._PENDING_FREE_HORIZON_S)
         )
 
@@ -2161,7 +2155,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         if not self._promised_loads:
             return finished
         # Declined at dispatch this step: no later step will dispatch them.
-        declined = getattr(self._scheduler, "declined_loads", None) or set()
+        declined = self._scheduler.declined_loads
         for meta in getattr(inner, "requests", ()) or ():
             if (
                 getattr(meta, "load_operation", None) is None

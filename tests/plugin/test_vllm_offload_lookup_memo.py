@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.kv_transfer.offload import config as offcfg
-from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler
+from atom.plugin.vllm.kv_transfer.plugin_schedulers import PluginDenseScheduler
 from atom.plugin.vllm.kv_transfer.seq_view import SeqViewRegistry
 
 connector_mod = pytest.importorskip(
@@ -39,7 +39,7 @@ def _adapter(monkeypatch, calls, *, min_load):
         lambda _config=None: SimpleNamespace(chunk_size=CHUNK),
     )
     monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    scheduler = DenseOffloadScheduler(
+    scheduler = PluginDenseScheduler(
         SimpleNamespace(
             kv_transfer_config={"kv_role": "kv_consumer"},
             kv_cache_block_size=16,

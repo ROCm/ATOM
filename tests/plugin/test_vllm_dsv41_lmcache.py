@@ -211,6 +211,7 @@ def _v41_scheduler(cached):
             prepare_retrieve=lambda *_a: None, clear_lookup_status=lambda _sid: None
         ),
     )
+    s._init_plugin_state()
     s._mp_adapter = SimpleNamespace(end_session=lambda _session: None)
     s._scheduler_deadline_s = 3600.0
     s._transfer_seen_at = {}
@@ -601,13 +602,12 @@ def test_the_lookup_depth_is_one_budget_per_scheduling_pass(monkeypatch):
 def test_a_multi_group_failure_travels_by_request_and_stays_received():
     """0.31 refuses block ids on more than one group and needs the receive quorum."""
     c = object.__new__(AtomLMCacheOffloadConnector)
-    c._worker = SimpleNamespace(
-        take_load_error_blocks=lambda: {5}, take_load_error_reqs=lambda: {"r0"}
-    )
+    c._worker = SimpleNamespace(take_load_error_blocks=lambda: {5})
     c._kv_cache_config = SimpleNamespace(kv_cache_groups=(object(), object()))
     c._kda_error_blocks, c._kda_error_reqs = set(), set()
     c._abandoned_error_blocks, c._abandoned_loads = set(), set()
-    c._pending_failed_recving = set()
+    # What `get_finished` retained from the worker's `failed_loading`.
+    c._pending_failed_recving = {"r0"}
     c.get_finished = lambda ids: ((), {"r0", "r1"})
     assert c.get_block_ids_with_load_errors() == set()
     res = c.get_transfer_results(set())
@@ -980,7 +980,7 @@ def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):
     import types
 
     stub = types.ModuleType("atom.plugin.vllm.deepseek_v41_state_checkpoint")
-    stub.v41_state_checkpoints_requested = lambda: True
+    stub.v41_state_checkpoints_requested = lambda _config: True
     stub.register_deepseek_v41_state_checkpoint_layers = Mock()
     monkeypatch.setitem(sys.modules, stub.__name__, stub)
     patches = types.ModuleType("atom.plugin.vllm.scheduler")
@@ -1067,7 +1067,9 @@ def test_a_stalled_mp_save_keeps_its_rank_reports():
     c._deferred_frees, c._deferred_free_at = {"r0"}, {"r0": 0.0}
     c._next_save_reconcile_at = 0.0
     c._save_reports = {"r0": {0, 1}}
-    c._scheduler = SimpleNamespace(abandons_saves=False, abandon_save=Mock())
+    c._scheduler = SimpleNamespace(
+        waits_for_transfer_report=lambda seq: True, abandon_save=Mock()
+    )
     c._reconcile_stale_saves()
     c._scheduler.abandon_save.assert_not_called()
     assert c._save_reports == {"r0": {0, 1}}
@@ -1089,18 +1091,31 @@ def test_an_idle_streaming_session_does_not_drop_the_drafts():
     assert _kv_holding_request_will_prefill(scheduler)
 
 
-def test_the_v41_adapter_matches_only_with_the_switch_on(monkeypatch):
-    """Off, no checkpoint group exists for its hooks to size or place."""
+@pytest.mark.parametrize(
+    "prefix_caching, mode, on",
+    [(True, "align", True), (True, "none", False), (False, "align", False)],
+)
+def test_the_v41_checkpoints_are_on_with_prefix_caching_in_align_mode(
+    monkeypatch, prefix_caching, mode, on
+):
+    """Read off vLLM's own flags; off, no checkpoint group exists for the
+    adapter's hooks to size or place."""
     from atom.plugin.vllm import deepseek_v41_bridge
-    from atom.plugin.vllm.deepseek_v41_state_checkpoint import _V41_ADAPTER
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        _V41_ADAPTER,
+        v41_state_checkpoints_requested,
+    )
 
     monkeypatch.setattr(
         deepseek_v41_bridge, "is_deepseek_v41_vllm_config", lambda _config: True
     )
-    monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", "0")
-    assert not _V41_ADAPTER.matches(object())
-    monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", "1")
-    assert _V41_ADAPTER.matches(object())
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=prefix_caching, mamba_cache_mode=mode
+        )
+    )
+    assert v41_state_checkpoints_requested(config) is on
+    assert _V41_ADAPTER.matches(config) is on
 
 
 # -- review round 9 ----------------------------------------------------------
@@ -1223,3 +1238,42 @@ def test_a_one_token_tail_hit_is_asked_again_not_dropped(monkeypatch):
         False,
     )
     assert asked == [4095]
+
+
+def test_only_recent_save_leases_count_as_blocks_about_to_return():
+    """A lease is fresh while its blocks were leased, or a save of its request
+    was dispatched, within the horizon; an older one is a stuck save, which
+    must not stop preemption."""
+    import time
+
+    s, _, _ = _v41_scheduler({_HASHES[1]: (41, 42)})
+    seq = _prompt(1024)
+    s.update_state_after_alloc(seq)
+    s.activate_block_leases(seq, s.protected_block_ids(seq))
+    assert s.has_active_save_leases(max_age_s=10.0)
+    s._lease_fresh_at[id(seq)] = time.monotonic() - 60.0
+    assert not s.has_active_save_leases(max_age_s=10.0)
+    # Dispatching the request's save refreshes it.
+    [save] = s.build_connector_meta().requests
+    assert save.save_operation is not None
+    assert s.has_active_save_leases(max_age_s=10.0)
+    # Once the save lands the lease is gone, and so is its age.
+    _store_landed(s, save.save_operation)
+    assert not s.has_active_save_leases(max_age_s=10.0)
+    assert s._lease_fresh_at == {}
+
+
+def test_a_save_whose_source_vllm_took_back_is_retired():
+    """A preemption cleared the block table under a queued save: nothing is
+    sent, and a finished request's tracker and lease go rather than retry."""
+    s, _, _ = _v41_scheduler({_HASHES[1]: (41, 42)})
+    seq = _prompt(1024)
+    s.update_state_after_alloc(seq)
+    leased = s.protected_block_ids(seq)
+    s.activate_block_leases(seq, leased)
+    seq.block_table = []
+    seq._offload_finished_block_ids = []
+    assert s.build_connector_meta().requests == []
+    assert s.total_unbacked_saves == 1
+    assert "r0" not in s._save_tracker
+    assert s.take_source_safe_releases() == [frozenset(leased)]

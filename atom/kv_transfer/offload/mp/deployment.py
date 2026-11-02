@@ -183,6 +183,24 @@ def _config_has_own_pool_draft(config: Any) -> bool:
     return bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
 
 
+def _null_block_id(config: Any) -> int:
+    """The MP server's ``--null-block-id``, which marks a chunk with no image.
+
+    A native-state layout names it for every chunk before the one holding a
+    checkpoint image. It has to equal the server's: a value the server reads as
+    a real block makes a later hit restore whatever that block holds. No RPC
+    reports the server's value, so it is configured here
+    (``lmcache.mp.null_block_id``) and defaults to the ``-1`` the offload
+    README starts the server with; every frontend sharing a server fills the
+    same one.
+    """
+    return offcfg._strict_integer(
+        "lmcache.mp.null_block_id",
+        _extra_config(config).get("lmcache.mp.null_block_id", -1),
+        minimum=-1,
+    )
+
+
 def _tp_replication_factor(config: Any) -> int:
     """Return the PAGE rank-collapse factor selected before workers start.
 

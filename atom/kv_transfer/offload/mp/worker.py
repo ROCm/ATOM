@@ -7,19 +7,20 @@ Attention backends publish block-major tensor views through
 ``KVTransferTensors``. LMCache MP can attach several physical kernel groups to
 the same engine block-id space, so this connector registers those opaque views
 without knowing which model or attention implementation produced them.
+
+Transfers are submitted and polled on a drain thread (`drain.py`), wait on a
+step event from a reusable ring (`step_events.py`), and leave their finished
+futures to be destroyed on the step thread (`ipc_lifetime.py`).
 """
 
 from __future__ import annotations
 
 import logging
-import queue
-import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
-
-import torch
 
 from atom.kv_transfer.disaggregation.base import KVConnectorBase
 from atom.kv_transfer.disaggregation.types import (
@@ -38,16 +39,20 @@ from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReq
 from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
+    _null_block_id,
     _published_tp_replication_factor,
     _tp_replication_factor,
     _validate_mp_config,
 )
+from atom.kv_transfer.offload.mp.drain import TransferDrain
+from atom.kv_transfer.offload.mp.ipc_lifetime import OwnedFutures
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
     require_native_state_server,
     stores_state_images,
 )
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
+from atom.kv_transfer.offload.mp.step_events import PendingStepEvent, StepEventRing
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -63,128 +68,32 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
-# Finished futures the step thread may hold while its stream is busy; see
-# `LMCacheMPConnector._release_ipc_resources`.
-_OWNED_IPC_CAP = 8192
-# Past the cap with the stream still busy, the most destroyed in one step: a
-# stream that is never idle (async scheduling) pays them a batch at a time
-# rather than all at once.
-_BUSY_RELEASE_BATCH = 64
+# How long `get_finished` waits for a drain round to report a load that landed
+# during the forward. Bounded, so the step never waits out an IPC import or a
+# submit in progress: what misses it is reported on the next step.
+_LOAD_REPORT_WAIT_S = 0.001
+# How long `close` lets the drain finish its last round.
+_CLOSE_TIMEOUT_S = 30.0
 
 
-def _stream_idle() -> bool:
-    if not torch.cuda.is_available():
-        return True
-    return bool(torch.cuda.current_stream().query())
+def _req_id_of(completion: Any) -> str:
+    """The request id inside a completion id, which may be bare or structured."""
+    return str(getattr(completion, "req_id", completion))
 
 
-def _sole_owner_refcount() -> int:
-    """`sys.getrefcount` of an object only a local variable holds."""
-    entry = object()
-    return sys.getrefcount(entry)
+@dataclass(frozen=True)
+class _QueuedTransfer:
+    """One submit for the drain thread."""
 
-
-_SOLE_OWNER_REFCOUNT = _sole_owner_refcount()
-
-
-class _StepEventRing:
-    """Interprocess step events, re-recorded only once nothing waits on them.
-
-    The server waits on a step's event before it moves the step's bytes, and
-    re-recording an event it still waits on raises `HIP error: invalid
-    argument`. So an event is recorded again only once every transfer
-    submitted with it has reached a terminal state, and only if one was: an
-    event recorded and never exported is not reused. With TP rank collapse a
-    rank whose saves all settle without the server recorded its event step
-    after step and exported it only at its first load, and the server's wait
-    on it then failed in every such run; a fresh event per step did not
-    (`_PendingStepEvent` keeps such steps from recording at all). None is
-    destroyed while the connector lives: on ROCm 7.2.x every destroy
-    synchronises every stream of the device. Callers hold the connector's
-    `_lock` around `record_locked`, `hold` and `release`.
-    """
-
-    def __init__(self) -> None:
-        self._events: list[Any] = []
-        self._holds: list[int] = []
-        # Whether a transfer was submitted with the event since its last record.
-        self._exported: list[bool] = []
-
-    def __len__(self) -> int:
-        return len(self._events)
-
-    def record_locked(self) -> tuple[int, Any]:
-        index = next(
-            (
-                i
-                for i, (holds, exported) in enumerate(zip(self._holds, self._exported))
-                if exported and not holds
-            ),
-            None,
-        )
-        if index is None:
-            index = len(self._events)
-            self._events.append(torch.cuda.Event(interprocess=True))
-            self._holds.append(0)
-            self._exported.append(False)
-        self._exported[index] = False
-        event = self._events[index]
-        event.record(torch.cuda.current_stream())
-        return index, event
-
-    def record(self, lock: threading.Lock) -> tuple[int, Any]:
-        with lock:
-            return self.record_locked()
-
-    def hold(self, index: int) -> None:
-        """One transfer submitted with this event, which exports it."""
-        self._holds[index] += 1
-        self._exported[index] = True
-
-    def release(self, index: int) -> None:
-        self._holds[index] -= 1
-
-
-class _PendingStepEvent:
-    """This step's event, recorded when its first transfer reaches the server.
-
-    A step whose transfers all settle without the server -- a rank that does
-    not write under TP rank collapse, a save with nothing to store -- records
-    nothing. Taken on the step thread, at the same point of its stream as an
-    event recorded at the top of `start_load_kv`: no kernel is launched in
-    between.
-    """
-
-    __slots__ = ("_ring", "_taken")
-
-    def __init__(self, ring: _StepEventRing) -> None:
-        self._ring = ring
-        self._taken: tuple[int, Any] | None = None
-
-    def take_locked(self) -> tuple[int, Any]:
-        """The event and its ring index; the caller holds the connector's `_lock`."""
-        if self._taken is None:
-            self._taken = self._ring.record_locked()
-        return self._taken
-
-
-def _take_unshared(owned: deque[Any], limit: int | None = None) -> list[Any]:
-    """Remove and return up to `limit` entries nothing else holds any more.
-
-    Entries are checked until `limit` are taken: one held for good elsewhere
-    (a logged exception's traceback, say) goes to the back rather than keep
-    the ones behind it alive, and the unchecked rest stay queued in order.
-    """
-    unshared = []
-    for _ in range(len(owned)):
-        if limit is not None and len(unshared) >= limit:
-            break
-        entry = owned.popleft()
-        if sys.getrefcount(entry) <= _SOLE_OWNER_REFCOUNT:
-            unshared.append(entry)
-        else:
-            owned.append(entry)
-    return unshared
+    kind: str
+    operation_id: str
+    completion: Any
+    request_id: str
+    spec: Any
+    event: Any
+    start: int
+    end: int
+    queued_at: float
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -192,11 +101,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
     is_producer = False
 
-    def __init__(self, config: Any, *, null_block_id: int = -1) -> None:
-        """``null_block_id`` is the MP server's ``--null-block-id``, which a
-        native-state layout names for every chunk before the one holding its
-        image (`build_native_state_mp_layout`). Unused by a PAGE-only layout.
-        """
+    def __init__(self, config: Any) -> None:
         _validate_mp_config(config)
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -209,69 +114,33 @@ class LMCacheMPConnector(KVConnectorBase):
             minimum=1,
         )
         self.chunk_size: int | None = None
-        self._null_block_id = int(null_block_id)
+        # What a native-state layout names for every chunk before the one
+        # holding its image (`build_native_state_mp_layout`).
+        self._null_block_id = _null_block_id(config)
         # Set only when the backend publishes PAGE-backed checkpoint images
         # (`_register_native_state_layout`); every transfer then carries one.
         self._native_layout: Any = None
         self._adapter: Any = None
         self._is_kv_writer = True
+        self._lock = threading.Lock()
+        self._drain = TransferDrain(self._lock, self._perform_submit, self._poll_round)
+        self._step_events = StepEventRing()
+        # The ring index each queued or pending transfer holds.
+        self._step_event_of: dict[str, int] = {}
+        self._owned_futures = OwnedFutures(self._lock)
         self._pending_saves: dict[str, _PendingSave] = {}
-        # Submitting a transfer and polling it to completion are both HIP IPC
-        # calls (`export_event` / `from_ipc_handle`). On an idle GPU they
-        # cost microseconds, but under this rank's own kernel-launch
-        # pressure they cost milliseconds each -- and under rank collapse
-        # only the writer pays, so the whole TP group waits at the next
-        # collective. Both release the GIL, so a drain thread turns a hard
-        # per-step stall into a brief launch-latency tax instead.
-        #
-        # This holds for the load leg exactly as it does for the save leg, and
-        # a conc16 step probe prices it: on the step thread `submit_retrieve_
-        # request` costs 18.7 ms a call and a terminal load poll 13.8 ms, which
-        # over 8400 steps is 890 + 656 us of fixed cost on *every* step --
-        # against a measured 2.27 ms/step ITL gap to in-process. A pending
-        # (non-terminal) poll costs 0.2 us, so what is expensive is the IPC
-        # handle import, not waiting for the transfer.
-        #
-        # Both legs share one queue so that a request's load still reaches the
-        # server before its save, as it did when the step thread issued them.
-        self._transfer_queue: queue.Queue = queue.Queue()
-        self._drain_thread: threading.Thread | None = None
-        self._drain_stop = threading.Event()
-        # Demand-driven, not timer-driven. A fixed poll interval on this thread
-        # is a GIL tax on the step thread of every rank: a 2 ms cadence with
-        # loads outstanding measured ~1400 polls/s/rank and cost more
-        # end-to-end (ITL p50 23.1 -> 28.8 ms) than the step-thread work it
-        # moved off, even though it did move that work off (`start_load_kv`
-        # 1112 -> 16 us/step). The step signals instead, from `start_load_kv`
-        # -- so the IPC work lands while the step thread is inside the model
-        # forward with the GIL released, and `get_finished` later in the same
-        # step finds the results already settled.
-        self._drain_wake = threading.Event()
-        self._drain_rounds = 0
-        self._drained_done_save: set[SaveCompletionId] = set()
-        self._drained_completions: set[ConnectorCompletion] = set()
-        self._drained_done_load: set[LoadCompletionId] = set()
-        self._drained_failed_load: set[LoadCompletionId] = set()
-        # Deadline expiry is fail-stop, so it has to reach the step that
-        # calls `get_finished` rather than just killing the drain thread.
-        self._drain_error: BaseException | None = None
         self._pending_loads: dict[str, _PendingLoad] = {}
         self._submitting_saves: set[str] = set()
         self._submitting_loads: set[str] = set()
         # The request each queued or submitting operation reads or writes the
-        # blocks of. A preemption fence has to cover these too: they reach the
-        # server after the step that queued them.
+        # blocks of. `fence` covers these too: they reach the server after the
+        # step that queued them.
         self._submitting_owner: dict[str, str] = {}
-        # On ROCm 7.2.x destroying an interprocess event synchronises every
-        # stream of the device and blocks event creation on every other thread
-        # meanwhile. Step events are therefore reused rather than destroyed
-        # (`_StepEventRing`, and `_step_event_of` names the one each queued or
-        # pending transfer holds). Finished futures, whose response carries the
-        # server's imported event, come from the drain thread under `_lock`
-        # and are destroyed on the step thread (`_release_ipc_resources`).
-        self._step_events = _StepEventRing()
-        self._step_event_of: dict[str, int] = {}
-        self._owned_futures: deque[Any] = deque()
+        # What the drain thread settled since the last `get_finished`.
+        self._drained_done_save: set[SaveCompletionId] = set()
+        self._drained_completions: set[ConnectorCompletion] = set()
+        self._drained_done_load: set[LoadCompletionId] = set()
+        self._drained_failed_load: set[LoadCompletionId] = set()
         # Keep in-flight IDs in the unbounded pending/submitting collections.
         # Only completed IDs enter these bounded replay tombstones.
         self._completed_save_operations: set[str] = set()
@@ -285,11 +154,6 @@ class LMCacheMPConnector(KVConnectorBase):
         self._immediate_saves: dict[SaveCompletionId, tuple[int, int] | None] = {}
         self._transfer_deadline_s = _transfer_deadline_s(config)
         self._immediate_load_failures: set[LoadCompletionId] = set()
-        self._lock = threading.Lock()
-        self._drain_round_cv = threading.Condition(self._lock)
-        # Serialises load polling between the drain thread and the step
-        # thread's last look in `get_finished`, so no future is polled twice.
-        self._load_poll_lock = threading.Lock()
 
     def register_kv_caches(
         self,
@@ -472,24 +336,20 @@ class LMCacheMPConnector(KVConnectorBase):
         `AtomMPWorkerAdapter.shutdown` drains in-flight operations, stops the
         heartbeat and unregisters.
         """
-        self._drain_stop.set()
-        self._drain_wake.set()
-        drain, self._drain_thread = self._drain_thread, None
-        if drain is not None:
-            # Bounded: the loop waits at most its 50 ms wake timeout, then runs
-            # one last round that submits what is queued and polls once.
-            drain.join(timeout=30.0)
-            if drain.is_alive():
-                # A submit is still blocked (the client's own timeout is longer),
-                # and the client is not thread-safe: shutting it down under the
-                # drain thread, or handing that thread a None adapter, is worse
-                # than leaving the instance to the server's reaper.
-                logger.error(
-                    "LMCache MP transfer drain did not stop within 30 s; "
-                    "leaving its client to the server's reaper"
-                )
-                return
+        if not self._drain.close(timeout=_CLOSE_TIMEOUT_S):
+            # A submit is still blocked (the client's own timeout is longer),
+            # and the client is not thread-safe: shutting it down under the
+            # drain thread is worse than leaving the instance to the server's
+            # reaper. The drain refuses further work from here.
+            logger.error(
+                "LMCache MP transfer drain did not stop within %.0f s; "
+                "leaving its client to the server's reaper",
+                _CLOSE_TIMEOUT_S,
+            )
+            return
         adapter, self._adapter = self._adapter, None
+        with self._lock:
+            self._step_events.clear()
         if adapter is None:
             return
         try:
@@ -499,56 +359,54 @@ class LMCacheMPConnector(KVConnectorBase):
             logger.warning("LMCache MP worker shutdown failed", exc_info=True)
 
     def start_load_kv(self, metadata: Any) -> None:
-        return self._start_load_kv_inner(metadata)
-
-    def _start_load_kv_inner(self, metadata: Any) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
             return
         if self._adapter is None or self.chunk_size is None:
             raise RuntimeError("lmcache_mp KV caches are not registered")
 
         # Every step, so a backlog left when transfers stop still drains.
-        self._release_ipc_resources()
-        requests = [
-            req
-            for req in metadata.requests
-            if (req.load_spec is not None and self._do_load)
-            or (req.save_spec is not None and self._do_save)
-        ]
-        if not requests:
-            return
-        # Raised before the submits: the drain thread's useful window is the
-        # model forward that follows, where the step thread is in C with the
-        # GIL released. By `get_finished` the results are settled.
-        self._drain_wake.set()
-        event = _PendingStepEvent(self._step_events)
-        for req in requests:
+        self._owned_futures.release()
+        event = PendingStepEvent(self._step_events)
+        for req in metadata.requests:
             if req.load_spec is not None and self._do_load:
                 self._submit_load(req, event)
             if req.save_spec is not None and self._do_save:
                 self._submit_save(req, event)
 
-    def _hold_step_event(
-        self, operation_id: str, event: Any, event_index: int | None = None
-    ) -> Any:
-        """The step's event for a transfer the server will wait on, held.
+    def _queue_transfer(
+        self,
+        kind: str,
+        operation_id: str,
+        completion: Any,
+        req: LMCacheReqMeta,
+        spec: Any,
+        event: PendingStepEvent,
+        start: int = 0,
+        end: int = 0,
+    ) -> None:
+        """Queue one submit for the drain thread, holding the step's event.
 
-        `event` is this step's `_PendingStepEvent`, recorded now if this is
-        its first transfer, or an event a caller recorded itself. Called with
-        `_lock` held; `_release_step_event` gives it back.
+        The caller has already put `operation_id` in its submitting set; the
+        drain hands it to the pending map once the submit lands, so a duplicate
+        operation id is still refused while the submit is in flight.
         """
-        if isinstance(event, _PendingStepEvent):
-            event_index, event = event.take_locked()
-        if event_index is not None:
-            self._step_events.hold(event_index)
-            self._step_event_of[operation_id] = event_index
-        return event
-
-    def _queue_transfer(self, item: list, event: Any, event_index: int | None) -> None:
-        """Queue one submit for the drain thread, holding the step's event."""
         with self._lock:
-            item[5] = self._hold_step_event(item[1], event, event_index)
-        self._transfer_queue.put(tuple(item))
+            index, step_event = event.hold_locked()
+            self._step_event_of[operation_id] = index
+            self._submitting_owner[operation_id] = str(req.req_id)
+        self._drain.put(
+            _QueuedTransfer(
+                kind,
+                operation_id,
+                completion,
+                _mp_session_id(self._config, req.req_id),
+                spec,
+                step_event,
+                start,
+                end,
+                time.monotonic(),
+            )
+        )
 
     def _release_step_event(self, operation_id: str) -> None:
         """The transfer is terminal: the server no longer waits on its event.
@@ -558,33 +416,6 @@ class LMCacheMPConnector(KVConnectorBase):
         index = self._step_event_of.pop(operation_id, None)
         if index is not None:
             self._step_events.release(index)
-
-    def _release_ipc_resources(self) -> None:
-        """Destroy finished futures here, on the step thread.
-
-        Only while this thread's stream is idle -- under synchronous
-        scheduling, the start of a step -- so a destroy waits on nothing, and
-        only once nothing else holds them. LMCache keeps each future until
-        its next submission, and the drain thread's locals hold some between
-        rounds; letting go first would leave the destroy to whichever of them
-        lets go last, on the drain thread. Past `_OWNED_IPC_CAP` a busy stream
-        still releases, at most `_BUSY_RELEASE_BATCH` a step, so one that is
-        never idle can neither grow the backlog without bound nor pay it in
-        one step.
-        """
-        with self._lock:
-            owned = len(self._owned_futures)
-        if not owned:
-            return
-        idle = _stream_idle()
-        if owned < _OWNED_IPC_CAP and not idle:
-            return
-        limit = None if idle else _BUSY_RELEASE_BATCH
-        # The drain thread adds futures under `_lock`; the destroys run
-        # outside it.
-        with self._lock:
-            unshared = _take_unshared(self._owned_futures, limit)
-        del unshared
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
@@ -669,14 +500,11 @@ class LMCacheMPConnector(KVConnectorBase):
                 "transfer must not name one"
             )
 
-    def _submit_load(
-        self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
-    ) -> None:
+    def _submit_load(self, req: LMCacheReqMeta, event: PendingStepEvent) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         assert req.load_spec is not None
         completion = req.load_operation or req.req_id
-        request_id = _mp_session_id(self._config, req.req_id)
         operation_id = _transfer_operation_id("load", completion)
         with self._lock:
             if (
@@ -688,7 +516,6 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP load operation {operation_id!r}"
                 )
             self._submitting_loads.add(operation_id)
-            self._submitting_owner[operation_id] = str(req.req_id)
         start = int(req.load_spec.hbm_cached_tokens)
         end = (
             int(req.load_spec.lmcache_cached_tokens)
@@ -701,7 +528,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"load range [{start}, {end}) is not LMCache chunk aligned "
                     f"({self.chunk_size})"
                 )
-            op = AtomMPTransferSpec(
+            spec = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=True),
                 start=start,
@@ -715,7 +542,6 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             with self._lock:
                 self._submitting_loads.discard(operation_id)
-                self._submitting_owner.pop(operation_id, None)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_load_operations,
@@ -723,35 +549,13 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
                 self._immediate_load_failures.add(completion)
             return
-        # `_submitting_loads` still holds this slot: the drain thread hands it
-        # over to `_pending_loads` once the submit lands, so a duplicate
-        # operation id is still refused while the submit is in flight.
-        self._queue_transfer(
-            [
-                "load",
-                operation_id,
-                completion,
-                request_id,
-                op,
-                None,
-                0,
-                0,
-                time.monotonic(),
-            ],
-            event,
-            event_index,
-        )
-        self._ensure_drain_thread()
-        self._drain_wake.set()
+        self._queue_transfer("load", operation_id, completion, req, spec, event)
 
-    def _submit_save(
-        self, req: LMCacheReqMeta, event: Any, event_index: int | None = None
-    ) -> None:
+    def _submit_save(self, req: LMCacheReqMeta, event: PendingStepEvent) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
         assert req.save_spec is not None
         completion = req.save_operation or req.req_id
-        request_id = _mp_session_id(self._config, req.req_id)
         operation_id = _transfer_operation_id("save", completion)
         with self._lock:
             if (
@@ -763,15 +567,13 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP save operation {operation_id!r}"
                 )
             self._submitting_saves.add(operation_id)
-            self._submitting_owner[operation_id] = str(req.req_id)
         end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
         start = (
             int(req.save_spec.skip_leading_tokens) // self.chunk_size
         ) * self.chunk_size
-        if not self._is_kv_writer:
+        if not self._is_kv_writer or start >= end:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
-                self._submitting_owner.pop(operation_id, None)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_save_operations,
@@ -781,19 +583,8 @@ class LMCacheMPConnector(KVConnectorBase):
                     (start, end) if start < end else None
                 )
             return
-        if start >= end:
-            with self._lock:
-                self._submitting_saves.discard(operation_id)
-                self._submitting_owner.pop(operation_id, None)
-                _remember_operation_tombstone(
-                    operation_id,
-                    self._completed_save_operations,
-                    self._completed_save_operation_order,
-                )
-                self._immediate_saves[completion] = None
-            return
         try:
-            op = AtomMPTransferSpec(
+            spec = AtomMPTransferSpec(
                 token_ids=list(req.token_ids),
                 block_ids=self._transfer_block_ids(req, start, end, loading=False),
                 start=start,
@@ -807,171 +598,79 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             with self._lock:
                 self._submitting_saves.discard(operation_id)
-                self._submitting_owner.pop(operation_id, None)
                 self._pending_saves[operation_id] = _PendingSave(
                     completion=completion,
                     future=None,
                     start=start,
                     end=end,
                 )
-            # Nothing was queued, so start the drain thread explicitly: it is
-            # the only place this terminal entry is ever reported from.
-            self._ensure_drain_thread()
-            self._drain_wake.set()
+            # Nothing was queued: a round is the only place this terminal
+            # entry is ever reported from.
+            self._drain.ensure_running()
             return
-        # `_submitting_saves` still holds this slot: the drain thread hands it
-        # over to `_pending_saves` once the submit lands, so a duplicate
-        # operation id is still refused while the submit is in flight.
         self._queue_transfer(
-            [
-                "save",
-                operation_id,
-                completion,
-                request_id,
-                op,
-                None,
-                start,
-                end,
-                time.monotonic(),
-            ],
-            event,
-            event_index,
+            "save", operation_id, completion, req, spec, event, start, end
         )
-        self._ensure_drain_thread()
-        self._drain_wake.set()
 
-    def _ensure_drain_thread(self) -> None:
-        if self._drain_thread is not None:
-            return
-        self._drain_thread = threading.Thread(
-            target=self._drain_loop,
-            name="atom-lmcache-mp-transfer",
-            daemon=True,
-        )
-        self._drain_thread.start()
-
-    def _drain_loop(self) -> None:
-        while True:
-            # Read before the round, so the round that sees it is a whole one:
-            # what `close` finds queued is still submitted and polled once.
-            stopping = self._drain_stop.is_set()
-            try:
-                # The timeout is a backstop for teardown and for a rank that
-                # has stopped stepping, not the working cadence.
-                if not stopping:
-                    self._drain_wake.wait(timeout=0.05)
-                # Cleared before the work, so a wake raised while this round is
-                # running is kept for the next round rather than swallowed.
-                self._drain_wake.clear()
-                while True:
-                    try:
-                        item = self._transfer_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    kind, rest = item[0], item[1:]
-                    if kind == "load":
-                        self._perform_load_submit(*rest[:5], rest[7])
-                    else:
-                        self._perform_save_submit(*rest)
-                self._poll_pending_loads()
-                self._poll_pending_saves()
-                with self._drain_round_cv:
-                    self._drain_rounds += 1
-                    self._drain_round_cv.notify_all()
-                if stopping:
-                    return
-            except BaseException as exc:
-                # Deadline expiry and any unexpected failure are fail-stop, and
-                # this thread is not the one that can stop the engine.
-                if self._drain_error is None:
-                    self._drain_error = exc
-                logger.exception("LMCache MP transfer drain failed")
-                return
-
-    def _settle_transfers(self, timeout: float = 5.0) -> None:
-        """Block until every queued transfer has been submitted and polled once.
-
-        Both legs settle on `_drain_loop`, so a caller that needs the result of
-        a specific submit -- a test, or a teardown that wants the queue drained
-        before the adapter goes away -- needs a barrier rather than a sleep.
-        """
-        drain = self._drain_thread
-        if drain is None:
-            return
-        # `perf_counter`, not `monotonic`: the transfer deadline is expressed in
-        # `monotonic` and tests drive it from a fake clock, which must not also
-        # freeze this barrier's own timeout.
-        deadline = time.perf_counter() + timeout
-        while True:
-            if self._drain_error is not None:
-                raise self._drain_error
-            self._drain_wake.set()
-            with self._drain_round_cv:
-                # A round drains the whole queue, but a submit can be in flight
-                # when this one starts, so re-check the queue after waiting
-                # rather than assuming a fixed number of rounds.
-                target = self._drain_rounds + 2
-                while self._drain_rounds < target:
-                    if self._drain_error is not None or not drain.is_alive():
-                        break
-                    remaining = deadline - time.perf_counter()
-                    if remaining <= 0:
-                        raise TimeoutError("LMCache MP transfer drain did not settle")
-                    self._drain_round_cv.wait(min(remaining, 0.05))
-            if self._drain_error is not None:
-                raise self._drain_error
-            if not drain.is_alive() or self._transfer_queue.empty():
-                return
-
-    def _perform_load_submit(
-        self,
-        operation_id: str,
-        completion: LoadCompletionId,
-        request_id: str,
-        op: Any,
-        event: Any,
-        queued_at: float,
-    ) -> None:
+    def _perform_submit(self, item: _QueuedTransfer) -> None:
+        """Submit one queued transfer, on the drain thread."""
+        loading = item.kind == "load"
         try:
-            transfer = self._adapter.submit_retrieve_request(
-                request_id,
-                op,
-                event,
-            )
+            if loading:
+                submit = self._adapter.submit_retrieve_request
+            else:
+                submit = getattr(
+                    self._adapter,
+                    "submit_store_request_with_chunk_events",
+                    self._adapter.submit_store_request,
+                )
+            transfer = submit(item.request_id, item.spec, item.event)
         except Exception:
             # The server may have taken the request before the connection
-            # raised, and may still write the destination blocks, so the
-            # destination stays leased until a terminal report -- which the
-            # transfer deadline turns into a fail-stop if it never comes.
-            logger.exception("LMCache MP load submission unprovable for %s", request_id)
+            # raised, and may still read or write the blocks, so they stay
+            # leased until a terminal report -- which the transfer deadline
+            # turns into a fail-stop if it never comes.
+            logger.exception(
+                "LMCache MP %s submission unprovable for %s",
+                item.kind,
+                item.request_id,
+            )
             transfer = _UnprovableSubmission()
         with self._lock:
-            self._submitting_loads.discard(operation_id)
-            self._submitting_owner.pop(operation_id, None)
-            self._pending_loads[operation_id] = _PendingLoad(
-                completion=completion,
-                future=transfer,
-                started_at=queued_at,
-            )
+            self._submitting_owner.pop(item.operation_id, None)
+            if loading:
+                self._submitting_loads.discard(item.operation_id)
+                self._pending_loads[item.operation_id] = _PendingLoad(
+                    completion=item.completion,
+                    future=transfer,
+                    started_at=item.queued_at,
+                )
+            else:
+                self._submitting_saves.discard(item.operation_id)
+                self._pending_saves[item.operation_id] = _PendingSave(
+                    completion=item.completion,
+                    future=transfer,
+                    started_at=item.queued_at,
+                    start=item.start,
+                    end=item.end,
+                )
+
+    def _poll_round(self) -> None:
+        """Advance every pending transfer once, on the drain thread."""
+        self._poll_pending_loads()
+        self._poll_pending_saves()
 
     def _poll_pending_loads(self) -> None:
-        """Advance every pending load: each drain round, and once more from
-        `get_finished` while any is pending.
+        """Advance every pending load.
 
-        The save twin's reasoning applies unchanged: a terminal poll imports
-        the peer's IPC event and costs milliseconds, so it runs without `_lock`
-        held, and removal happens here alone (one caller at a time, under
-        `_load_poll_lock`) -- `start_load_kv` only ever adds -- so an entry the
-        snapshot missed is picked up on the next call.
+        The polls run without `_lock` held: a terminal poll imports the peer's
+        IPC event and costs milliseconds, and holding the lock across it would
+        just move the step's stall from the poll to the lock. Only this thread
+        removes entries, so an entry the snapshot missed is picked up next
+        round.
         """
-        with self._load_poll_lock:
-            self._poll_pending_loads_locked()
-
-    def _poll_pending_loads_locked(self) -> None:
         with self._lock:
             pending = list(self._pending_loads.items())
-        if not pending:
-            return
         terminal_ops: list[tuple[str, _PendingLoad, Any]] = []
         for operation_id, entry in pending:
             terminal, result = _terminal_future_result(entry.future)
@@ -987,8 +686,7 @@ class LMCacheMPConnector(KVConnectorBase):
             for operation_id, entry, result in terminal_ops:
                 self._pending_loads.pop(operation_id, None)
                 self._release_step_event(operation_id)
-                if entry.future is not None:
-                    self._owned_futures.append(entry.future)
+                self._owned_futures.add_locked(entry.future)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_load_operations,
@@ -999,55 +697,8 @@ class LMCacheMPConnector(KVConnectorBase):
                 else:
                     self._drained_done_load.add(entry.completion)
 
-    def _perform_save_submit(
-        self,
-        operation_id: str,
-        completion: SaveCompletionId,
-        request_id: str,
-        op: Any,
-        event: Any,
-        start: int,
-        end: int,
-        queued_at: float,
-    ) -> None:
-        try:
-            submit = getattr(
-                self._adapter,
-                "submit_store_request_with_chunk_events",
-                self._adapter.submit_store_request,
-            )
-            transfer = submit(
-                request_id,
-                op,
-                event,
-            )
-        except Exception:
-            # The server may have received the request before the connection
-            # raised: keep the source leased until a terminal report, which
-            # the transfer deadline turns into a fail-stop if it never comes.
-            logger.exception("LMCache MP save submission unprovable for %s", request_id)
-            transfer = _UnprovableSubmission()
-        with self._lock:
-            self._submitting_saves.discard(operation_id)
-            self._submitting_owner.pop(operation_id, None)
-            self._pending_saves[operation_id] = _PendingSave(
-                completion=completion,
-                future=transfer,
-                started_at=queued_at,
-                start=start,
-                end=end,
-            )
-
     def _poll_pending_saves(self) -> None:
-        """Advance every pending save, off the step thread.
-
-        The polls themselves run without `_lock` held: a terminal poll imports
-        the peer's IPC event and costs milliseconds, and holding the lock across
-        it would just move the step's stall from the poll to the lock.  The step
-        thread only ever *adds* to `_pending_saves` (the pre-submit failure
-        path); removal happens here alone, so an entry the snapshot missed is
-        simply picked up on the next round.
-        """
+        """Advance every pending save; see `_poll_pending_loads`."""
         with self._lock:
             pending = list(self._pending_saves.items())
         if not pending:
@@ -1077,8 +728,7 @@ class LMCacheMPConnector(KVConnectorBase):
             for operation_id, entry, result in terminal_ops:
                 self._pending_saves.pop(operation_id, None)
                 self._release_step_event(operation_id)
-                if entry.future is not None:
-                    self._owned_futures.append(entry.future)
+                self._owned_futures.add_locked(entry.future)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_save_operations,
@@ -1100,69 +750,101 @@ class LMCacheMPConnector(KVConnectorBase):
             self._drained_done_save |= done_save
             self._drained_completions |= completions
 
+    def _loads_in_flight(self) -> bool:
+        return bool(self._pending_loads)
+
+    def _transfers_in_flight_locked(self) -> bool:
+        return bool(
+            self._pending_loads or self._pending_saves or self._submitting_owner
+        )
+
+    def _outstanding_locked(self, wanted: set[str]) -> list[str]:
+        """Transfers that still read or write the blocks of the `wanted` requests.
+
+        Raises for one whose submit raised: the server may have the request
+        and write its blocks however long the caller waits.
+        """
+        outstanding = [
+            operation_id
+            for operation_id, owner in self._submitting_owner.items()
+            if owner in wanted
+        ]
+        for pending in (self._pending_saves, self._pending_loads):
+            for operation_id, entry in pending.items():
+                if _req_id_of(entry.completion) not in wanted:
+                    continue
+                if isinstance(entry.future, _UnprovableSubmission):
+                    raise RuntimeError(  # noqa: TRY004 - a state, not a bad argument
+                        f"LMCache MP: cannot release {sorted(wanted)}: the submit "
+                        f"of {operation_id} raised, so the server may have the "
+                        "request and still use its blocks"
+                    )
+                outstanding.append(operation_id)
+        return outstanding
+
+    def fence(self, req_ids) -> None:
+        """Block until no transfer for these requests still uses their blocks.
+
+        For a frontend that hands a preempted request's blocks to the next
+        allocation at once: a save still reading them would store the next
+        occupant's bytes under the preempted request's tokens. Waits on the
+        drain's rounds, up to the transfer deadline, and fail-stops past it.
+        The completions stay for `get_finished`, which releases their leases.
+        """
+        wanted = {str(req_id) for req_id in req_ids}
+        if not wanted:
+            return
+        self._drain.fence(
+            lambda: self._outstanding_locked(wanted),
+            self._transfer_deadline_s,
+            f"requests {sorted(wanted)}",
+        )
+
     def get_finished(self) -> KVConnectorOutput:
         if self._adapter is None:
             return KVConnectorOutput()
-        return self._get_finished_inner()
-
-    def _get_finished_inner(self) -> KVConnectorOutput:
-        done_load: set[LoadCompletionId] = set()
-        failed_load: set[LoadCompletionId] = set()
-        done_save: set[SaveCompletionId] = set()
-        connector_completions: set[ConnectorCompletion] = set()
-        if self._drain_error is not None:
-            # The save drain thread cannot stop the engine; the step can.
-            raise self._drain_error
-        if self._pending_loads:
-            # One last look before reporting. The drain round this step woke
-            # ran at `start_load_kv`, before the forward; a load that landed
-            # during the forward would otherwise wait a whole step in
-            # WAITING_FOR_REMOTE_KVS, which base, polling here, did not.
-            # Loads only: a save reported a step later delays no request.
-            self._poll_pending_loads()
+        # The drain thread cannot stop the engine; the step can.
+        self._drain.raise_if_failed()
+        if self._loads_in_flight():
+            # One last look before reporting: a load that landed during the
+            # forward would otherwise wait a whole step in
+            # WAITING_FOR_REMOTE_KVS. Loads only: a save reported a step later
+            # delays no request.
+            self._drain.wait_round(_LOAD_REPORT_WAIT_S)
+            self._drain.raise_if_failed()
+        output = KVConnectorOutput()
         with self._lock:
             # A step that queues nothing (an idle engine waiting on a load)
             # raises no wake of its own; without this the result waits for
-            # the drain thread's 50 ms backstop.
-            if self._pending_loads or self._pending_saves or self._submitting_owner:
-                self._drain_wake.set()
-            # The save side is advanced by `_drain_loop`; take whatever it
-            # has settled since the last step. Heartbeat health is a control-plane
-            # signal, not proof that GPU work has quiesced, so a save is only
-            # reported once its device event is terminal -- that check lives in
-            # `_poll_pending_saves`.
-            done_save |= self._drained_done_save
-            connector_completions |= self._drained_completions
+            # the drain thread's backstop.
+            if self._transfers_in_flight_locked():
+                self._drain.wake()
+            # Heartbeat health is a control-plane signal, not proof that GPU
+            # work has quiesced, so a save is only reported once its device
+            # event is terminal -- that check lives in `_poll_pending_saves`.
+            output.finished_saving |= self._drained_done_save
+            output.connector_completions |= self._drained_completions
+            output.finished_loading |= self._drained_done_load
+            output.failed_loading |= self._drained_failed_load
             self._drained_done_save = set()
             self._drained_completions = set()
-            # Loads are advanced by the same drain thread, for the same reason
-            # (see the queue's comment in `__init__`): the terminal poll's IPC
-            # handle import is what costs milliseconds, and it has no business
-            # on a thread the whole TP group waits for.
-            done_load |= self._drained_done_load
-            failed_load |= self._drained_failed_load
             self._drained_done_load = set()
             self._drained_failed_load = set()
-            done_save.update(self._immediate_saves)
+            output.finished_saving.update(self._immediate_saves)
             for completion, token_range in self._immediate_saves.items():
                 if isinstance(completion, SaveOperationId):
                     if token_range is not None:
-                        connector_completions |= _source_safe_completions(
+                        output.connector_completions |= _source_safe_completions(
                             completion,
                             _chunk_ranges(*token_range, int(self.chunk_size)),
                         )
-                    connector_completions.add(
+                    output.connector_completions.add(
                         ConnectorCompletion(DENSE_PAGE_STORE_CHANNEL, completion, True)
                     )
-            failed_load.update(self._immediate_load_failures)
+            output.failed_loading.update(self._immediate_load_failures)
             self._immediate_saves.clear()
             self._immediate_load_failures.clear()
-        return KVConnectorOutput(
-            finished_loading=done_load,
-            failed_loading=failed_load,
-            finished_saving=done_save,
-            connector_completions=connector_completions,
-        )
+        return output
 
 
 __all__ = ["LMCacheMPConnector"]

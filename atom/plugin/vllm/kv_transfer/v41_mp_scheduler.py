@@ -25,12 +25,12 @@ from typing import Any
 
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.metadata import LoadSpec, NativeStateTransfer
-from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
+from atom.plugin.vllm.kv_transfer.plugin_schedulers import PluginMPScheduler
 
 logger = logging.getLogger("atom")
 
 
-class V41StateMPScheduler(LMCacheMPConnectorScheduler):
+class V41StateMPScheduler(PluginMPScheduler):
     """LMCache MP scheduler whose transfers each carry a V4.1 checkpoint image."""
 
     def __init__(self, config: Any, *, checkpoint_spec: Any) -> None:
@@ -159,6 +159,10 @@ class V41StateMPScheduler(LMCacheMPConnectorScheduler):
     def _build_save_request(
         self, seq, saved, aligned, operation, block_ids, is_last_prefill
     ):
+        # Before a ride unit is taken for it: a save with no source to read
+        # must not pin a checkpoint either.
+        if not self._save_source_backed(seq, saved, aligned, block_ids):
+            return None
         # The end the worker derives from `token_ids`; equal to `aligned`,
         # which is a chunk edge, and computed rather than assumed so the two
         # cannot drift into a boundary mismatch the worker refuses.

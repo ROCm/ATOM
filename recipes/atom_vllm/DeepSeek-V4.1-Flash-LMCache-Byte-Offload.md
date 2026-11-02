@@ -13,7 +13,7 @@ MP server (start it first):
 
 ```bash
 HIP_VISIBLE_DEVICES=0,1,2,3 lmcache server --host localhost --port 5561 \
-  --chunk-size 256 --l1-size-gb 96 --eviction-policy LRU \
+  --chunk-size 256 --null-block-id -1 --l1-size-gb 96 --eviction-policy LRU \
   --supported-transfer-mode auto --shm-name dsv41mp_5561 \
   --no-l1-use-lazy --separate-object-groups --max-gpu-workers 4
 ```
@@ -24,7 +24,7 @@ Model:
 export MODEL=/data/amd_int/models/DeepSeek-V4.1-Flash
 export HIP_VISIBLE_DEVICES=0,1,2,3 AITER_LOG_LEVEL=WARNING
 export ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 VLLM_USE_BREAKABLE_CUDAGRAPH=1
-export ATOM_V41_STATE_CHECKPOINTS=1 ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS=256
+export ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS=256
 export OFFLOAD_MIN_LOAD_TOKENS=256 VLLM_WORKER_MULTIPROC_METHOD=spawn PYTHONHASHSEED=0
 
 vllm serve $MODEL --served-model-name DeepSeek-V4.1-Flash --port 8021 \
@@ -45,12 +45,13 @@ vllm serve $MODEL --served-model-name DeepSeek-V4.1-Flash --port 8021 \
 - `--chunk-size` must equal `ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS` (a
   multiple of 256) and the client's LMCache chunk size (`LMCACHE_CHUNK_SIZE`,
   default 256). `--separate-object-groups` and `--no-l1-use-lazy` are
-  required. `OFFLOAD_MIN_LOAD_TOKENS` (default 8192) is the shortest tier
+  required. `--null-block-id` must equal the client's `lmcache.mp.null_block_id`
+  (default `-1`, as the native ATOM recipes start the server), so native ATOM
+  and this frontend can share one server. `OFFLOAD_MIN_LOAD_TOKENS` (default 8192) is the shortest tier
   load worth making. Give the MP server the model's `HIP_VISIBLE_DEVICES`:
   its GPU workers open the model's buffers by local device index.
-- `ATOM_V41_STATE_CHECKPOINTS=1` with `--enable-prefix-caching` and
-  `--mamba-cache-mode align` registers the checkpoint groups. Without them the
-  connector refuses to start.
+- `--enable-prefix-caching` with `--mamba-cache-mode align` registers the
+  checkpoint groups. Without them the connector refuses to start.
 - `max_cudagraph_capture_size` 512: the vLLM default is 2 × `max-num-seqs`
   (64), so the step after a tier load (a prefill tail of a few hundred tokens
   plus the decode rows) would run eager.
@@ -61,8 +62,8 @@ vllm serve $MODEL --served-model-name DeepSeek-V4.1-Flash --port 8021 \
   cached, and the tier is asked only for the rest.
 - HBM-only prefix caching: the same command without `--kv-transfer-config`.
 - No prefix reuse (as on main): the same command without
-  `--kv-transfer-config`, with `--no-enable-prefix-caching`, without
-  `--mamba-cache-mode align`, and with `ATOM_V41_STATE_CHECKPOINTS=0`.
+  `--kv-transfer-config`, with `--no-enable-prefix-caching` and without
+  `--mamba-cache-mode align`.
 
 ## Accuracy
 

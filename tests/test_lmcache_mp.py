@@ -9,7 +9,6 @@ import types
 from collections import deque
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -38,16 +37,14 @@ from atom.kv_transfer.offload.metadata import (
     NativeStateTransfer,
     SaveSpec,
 )
-from atom.kv_transfer.offload.mp import deployment, page_views, transfer
+from atom.kv_transfer.offload.mp import deployment, ipc_lifetime, page_views, transfer
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp import step_events as mp_step_events
 from atom.kv_transfer.offload.mp import worker as mp_worker
-
-
-def _step_event():
-    """The step's recorded event, as `start_load_kv` hands to a submit."""
-
-    return object()
+from tests.lmcache_mp_support import close_workers, cpu_step_events  # noqa: F401
+from tests.lmcache_mp_support import settle as _settle
+from tests.lmcache_mp_support import step_event as _step_event
 
 
 def _config(
@@ -731,26 +728,8 @@ def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
     assert client.hit_tokens("req") == 8
 
 
-def _main_thread_clock(values):
-    """`time.monotonic` stepping through `values` on this thread only.
-
-    The patch is process-wide, and drain threads that earlier tests left
-    running call the clock too; they get the real time, so they cannot use up
-    the sequence this test drives.
-    """
-    ticks = iter(values)
-    real = transfer.time.monotonic
-
-    def clock():
-        if threading.current_thread() is threading.main_thread():
-            return next(ticks)
-        return real()
-
-    return clock
-
-
 def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
-    monkeypatch.setattr(transfer.time, "monotonic", _main_thread_clock([0.0, 0.0, 2.0]))
+    monkeypatch.setattr(transfer.time, "monotonic", iter([0.0, 0.0, 2.0]).__next__)
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
     client = mp_lookup._MPLookupClient(
@@ -770,7 +749,7 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
 
 
 def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
-    monkeypatch.setattr(transfer.time, "monotonic", _main_thread_clock([0.0, 0.0, 2.0]))
+    monkeypatch.setattr(transfer.time, "monotonic", iter([0.0, 0.0, 2.0]).__next__)
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
     client = mp_lookup._MPLookupClient(
@@ -901,9 +880,7 @@ def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
     held long enough to keep a dead tier from costing a timeout every step.
     """
 
-    monkeypatch.setattr(
-        transfer.time, "monotonic", _main_thread_clock([0.0, 0.0, 2.0, 0.0])
-    )
+    monkeypatch.setattr(transfer.time, "monotonic", iter([0.0, 0.0, 2.0, 0.0]).__next__)
     scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
     adapter = lookup._adapter
     adapter.results.clear()
@@ -1104,11 +1081,11 @@ def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
 
     def settling_submit_save(*args, **kwargs):
         submit_save(*args, **kwargs)
-        worker._settle_transfers()
+        _settle(worker)
 
     def settling_submit_load(*args, **kwargs):
         submit_load(*args, **kwargs)
-        worker._settle_transfers()
+        _settle(worker)
 
     worker._submit_save = settling_submit_save  # type: ignore[method-assign]
     worker._submit_load = settling_submit_load  # type: ignore[method-assign]
@@ -1159,7 +1136,7 @@ def _await_drain_stop(
     the engine, so it records the failure and exits; the next step is what
     raises. Loads are still submitted and polled inline and have no thread.
     """
-    drain = worker._drain_thread
+    drain = worker._drain._thread
     if drain is not None:
         drain.join(timeout=timeout)
 
@@ -1174,7 +1151,7 @@ def _finish_load(
     future.value = result
     future.ready = True
     # The drain thread is what notices; give it a round before the caller asks.
-    worker._settle_transfers()
+    _settle(worker)
 
 
 def _finish_save(
@@ -1187,7 +1164,7 @@ def _finish_save(
     future.value = result
     future.ready = True
     # The drain thread is what notices; give it a round before the caller asks.
-    worker._settle_transfers()
+    _settle(worker)
 
 
 def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
@@ -1224,7 +1201,7 @@ def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
 
     assert entered.wait(5.0), "the drain thread never picked the save up"
@@ -1233,7 +1210,7 @@ def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
     assert worker.get_finished().finished_saving == set()
 
     released.set()
-    worker._settle_transfers()
+    _settle(worker)
     assert set(worker._pending_saves) == {"save:77:1"}
     _finish_save(worker, "save:77:1")
     assert worker.get_finished().finished_saving == {operation}
@@ -1256,7 +1233,7 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
         load_operation=operation,
     )
 
-    worker._submit_load(request, _step_event())
+    worker._submit_load(request, _step_event(worker))
     assert adapter.loads[0][0] == "atom-offload-dp0:5"
     submitted = adapter.loads[0][1]
     assert submitted.start == 0
@@ -1285,8 +1262,8 @@ def test_a_load_landing_after_the_drain_round_is_reported_that_step(
         load_spec=LoadSpec(0, 8, can_load=True),
         load_operation=operation,
     )
-    worker._submit_load(request, _step_event())
-    worker._settle_transfers()
+    worker._submit_load(request, _step_event(worker))
+    _settle(worker)
     future = worker._pending_loads["load:7:1"].future
     future.value, future.ready = True, True
     # No drain round in between.
@@ -1304,7 +1281,7 @@ def test_worker_reports_failed_load_from_future(fake_lmcache_modules):
         load_spec=LoadSpec(0, 8, can_load=True),
         load_operation=operation,
     )
-    worker._submit_load(request, _step_event())
+    worker._submit_load(request, _step_event(worker))
     _finish_load(worker, "load:6:4", result=False)
 
     output = worker.get_finished()
@@ -1327,7 +1304,7 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1337,10 +1314,10 @@ def test_worker_future_query_exception_preserves_inflight_transfers(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
 
-    worker._settle_transfers()
+    _settle(worker)
     load_future = worker._pending_loads["load:10:1"].future
     save_future = worker._pending_saves["save:11:2"].future
     load_future.query_error = RuntimeError("load query failed")
@@ -1372,7 +1349,7 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1382,7 +1359,7 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
 
     adapter.is_healthy = False
@@ -1430,7 +1407,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1440,7 +1417,7 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
 
     output = worker.get_finished()
@@ -1494,10 +1471,10 @@ def test_worker_unprovable_submission_is_never_released_on_a_clock(
     worker = _worker(adapter)
     request = _unprovable_request(kind)
     if kind == "load":
-        worker._submit_load(request, _step_event())
+        worker._submit_load(request, _step_event(worker))
         pending = worker._pending_loads
     else:
-        worker._submit_save(request, _step_event())
+        worker._submit_save(request, _step_event(worker))
         pending = worker._pending_saves
 
     now[0] += worker._transfer_deadline_s - 1
@@ -1522,9 +1499,9 @@ def test_worker_failed_future_stops_immediately_without_releasing_lease(
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
-    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), _step_event())
+    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), _step_event(worker))
     # Submitted and polled once by the drain thread; not terminal yet.
-    worker._settle_transfers()
+    _settle(worker)
     operations = getattr(worker, f"_pending_{kind}s")
     [pending] = operations.values()
     pending.future.query_error = ConnectionError("IPC context torn down")
@@ -1549,8 +1526,8 @@ def test_worker_invalid_descriptor_fails_before_transport(
     worker = _worker(adapter)
     load = replace(_unprovable_request("load"), block_ids=[100])
     save = replace(_unprovable_request("save"), block_ids=[100])
-    worker._submit_load(load, _step_event())
-    worker._submit_save(save, _step_event())
+    worker._submit_load(load, _step_event(worker))
+    worker._submit_save(save, _step_event(worker))
 
     output = worker.get_finished()
     assert not adapter.loads and not adapter.saves
@@ -1590,8 +1567,8 @@ def test_worker_silent_future_is_bounded_without_remote_errors(
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     worker = _worker(_WorkerAdapter())
-    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), object())
-    worker._settle_transfers()
+    getattr(worker, f"_submit_{kind}")(_unprovable_request(kind), _step_event(worker))
+    _settle(worker)
     operations = getattr(worker, f"_pending_{kind}s")
     [pending] = operations.values()
     now[0] += 29
@@ -1607,8 +1584,8 @@ def test_worker_silent_future_is_bounded_without_remote_errors(
     if completes:
         worker.get_finished()
     else:
-        # A load's deadline is checked by `get_finished` itself, a save's by
-        # the drain round that call wakes.
+        # Both legs' deadlines are checked by the drain round that call wakes;
+        # the step raises what the drain recorded.
         with pytest.raises(transfer.LMCacheTransferUnprovable, match="30s"):
             worker.get_finished()
             _await_drain_stop(worker)
@@ -1630,7 +1607,7 @@ def test_worker_save_slices_chunk_blocks_and_preserves_operation(
         save_operation=operation,
     )
 
-    worker._submit_save(request, _step_event())
+    worker._submit_save(request, _step_event(worker))
     assert adapter.saves[0][0] == "atom-offload-dp0:8"
     submitted = adapter.saves[0][1]
     assert submitted.start == 8
@@ -1653,10 +1630,10 @@ def test_worker_reports_chunk_source_safe_before_store_terminal(fake_lmcache_mod
         save_operation=operation,
     )
 
-    worker._submit_save(request, _step_event())
+    worker._submit_save(request, _step_event(worker))
     future = worker._pending_saves["save:81:2"].future
     future.completed_ranges = [(8, 16)]
-    worker._settle_transfers()
+    _settle(worker)
     output = worker.get_finished()
 
     assert output.finished_saving == set()
@@ -1682,7 +1659,7 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
         save_operation=operation,
     )
 
-    worker._submit_save(request, _step_event())
+    worker._submit_save(request, _step_event(worker))
 
     assert adapter.saves == []
     output = worker.get_finished()
@@ -1693,7 +1670,7 @@ def test_non_writer_completes_save_without_submitting(fake_lmcache_modules):
         if completion.channel == DENSE_PAGE_SOURCE_SAFE_CHANNEL
     } == {((0, 8),)}
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
-        worker._submit_save(request, _step_event())
+        worker._submit_save(request, _step_event(worker))
 
 
 def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
@@ -1710,11 +1687,11 @@ def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
     writer = _worker(_WorkerAdapter())
     non_writer = _worker(_WorkerAdapter())
     non_writer._is_kv_writer = False
-    writer._submit_save(request, _step_event())
-    non_writer._submit_save(request, _step_event())
+    writer._submit_save(request, _step_event(writer))
+    non_writer._submit_save(request, _step_event(non_writer))
     writer_future = writer._pending_saves["save:91:1"].future
     writer_future.completed_ranges = [(0, 8)]
-    writer._settle_transfers()
+    _settle(writer)
 
     aggregator = KVOutputAggregator(world_size=2)
     first = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
@@ -1725,7 +1702,7 @@ def test_collapsed_tp_early_release_waits_only_for_the_single_writer_dma(
     } == {((0, 8),)}
 
     writer_future.completed_ranges = [(8, 16)]
-    writer._settle_transfers()
+    _settle(writer)
     second = aggregator.aggregate([writer.get_finished(), non_writer.get_finished()])
     assert {
         completion.operation_id.ranges
@@ -1752,7 +1729,7 @@ def test_worker_tracks_two_load_generations_for_one_raw_request(
                 load_spec=LoadSpec(0, 8, can_load=True),
                 load_operation=operation,
             ),
-            _step_event(),
+            _step_event(worker),
         )
 
     assert set(worker._pending_loads) == {"load:20:1", "load:20:2"}
@@ -1782,7 +1759,7 @@ def test_worker_tracks_two_save_generations_for_one_raw_request(
                 save_spec=SaveSpec(skip_leading_tokens=0),
                 save_operation=operation,
             ),
-            _step_event(),
+            _step_event(worker),
         )
 
     assert set(worker._pending_saves) == {"save:21:1", "save:21:2"}
@@ -1807,7 +1784,7 @@ def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules)
             load_spec=LoadSpec(0, 8, can_load=True),
             load_operation=load_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
     worker._submit_save(
         LMCacheReqMeta(
@@ -1817,7 +1794,7 @@ def test_worker_load_and_save_coexist_for_same_raw_request(fake_lmcache_modules)
             save_spec=SaveSpec(skip_leading_tokens=0),
             save_operation=save_operation,
         ),
-        _step_event(),
+        _step_event(worker),
     )
 
     assert set(worker._pending_loads) == {"load:22:4"}
@@ -1850,7 +1827,7 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
     submit = worker._submit_load if kind == "load" else worker._submit_save
     operation_id = f"{kind}:23:6"
 
-    submit(request, _step_event())
+    submit(request, _step_event(worker))
     completed = (
         worker._completed_load_operations
         if kind == "load"
@@ -1858,7 +1835,7 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
     )
     assert operation_id not in completed
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-        submit(request, _step_event())
+        submit(request, _step_event(worker))
 
     if kind == "load":
         _finish_load(worker, operation_id)
@@ -1866,7 +1843,7 @@ def test_worker_rejects_exact_operation_replay(fake_lmcache_modules, kind):
         _finish_save(worker, operation_id)
     worker.get_finished()
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-        submit(request, _step_event())
+        submit(request, _step_event(worker))
 
 
 @pytest.mark.parametrize("kind", ["load", "save"])
@@ -1899,12 +1876,12 @@ def test_worker_rejects_duplicate_while_operation_is_submitting(
 
     def submit_with_replay(*args):
         with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-            submit(request, _step_event())
+            submit(request, _step_event(worker))
         return original_adapter_submit(*args)
 
     monkeypatch.setattr(adapter, adapter_method_name, submit_with_replay)
 
-    submit(request, _step_event())
+    submit(request, _step_event(worker))
 
     submitting = (
         worker._submitting_loads if kind == "load" else worker._submitting_saves
@@ -1952,7 +1929,7 @@ def test_worker_terminal_operation_tombstones_are_bounded(
 
     submit = worker._submit_load if kind == "load" else worker._submit_save
     for generation in (1, 2, 3):
-        submit(request(generation), _step_event())
+        submit(request(generation), _step_event(worker))
         operation_id = f"{kind}:24:{generation}"
         if kind == "load":
             _finish_load(worker, operation_id)
@@ -1975,8 +1952,8 @@ def test_worker_terminal_operation_tombstones_are_bounded(
     assert list(order) == [f"{kind}:24:2", f"{kind}:24:3"]
 
     with pytest.raises(RuntimeError, match="duplicate LMCache MP"):
-        submit(request(3), _step_event())
-    submit(request(1), _step_event())
+        submit(request(3), _step_event(worker))
+    submit(request(1), _step_event(worker))
     pending = worker._pending_loads if kind == "load" else worker._pending_saves
     assert set(pending) == {f"{kind}:24:1"}
 
@@ -2004,8 +1981,8 @@ def test_worker_immediate_operation_tombstones_reject_replay(
         save_operation=save_operation,
     )
 
-    worker._submit_load(load_request, _step_event())
-    worker._submit_save(save_request, _step_event())
+    worker._submit_load(load_request, _step_event(worker))
+    worker._submit_save(save_request, _step_event(worker))
 
     assert worker._completed_load_operations == {"load:25:1"}
     assert list(worker._completed_load_operation_order) == ["load:25:1"]
@@ -2016,9 +1993,9 @@ def test_worker_immediate_operation_tombstones_reject_replay(
     assert output.finished_saving == {save_operation}
 
     with pytest.raises(RuntimeError, match="duplicate LMCache MP load"):
-        worker._submit_load(load_request, _step_event())
+        worker._submit_load(load_request, _step_event(worker))
     with pytest.raises(RuntimeError, match="duplicate LMCache MP save"):
-        worker._submit_save(save_request, _step_event())
+        worker._submit_save(save_request, _step_event(worker))
 
 
 def test_registers_multiple_layouts_as_views_of_one_engine_group(
@@ -2230,7 +2207,7 @@ def _checkpointed_transfer_tensors(*, num_blocks: int = 16) -> KVTransferTensors
     return transfer
 
 
-def _register_checkpointed(monkeypatch, *, null_block_id=0):
+def _register_checkpointed(monkeypatch, *, null_block_id=-1):
     """A base worker registered on a layout that publishes checkpoint images."""
     aiter = types.ModuleType("aiter")
     aiter.__path__ = []
@@ -2251,7 +2228,9 @@ def _register_checkpointed(monkeypatch, *, null_block_id=0):
 
     monkeypatch.setattr(mp_worker, "_make_worker_adapter", connect)
     monkeypatch.setattr(mp_worker, "require_native_state_server", lambda *_a: None)
-    worker = mp_worker.LMCacheMPConnector(_config(), null_block_id=null_block_id)
+    worker = mp_worker.LMCacheMPConnector(
+        _config(extra={"lmcache.mp.null_block_id": null_block_id})
+    )
     worker.register_kv_caches({}, _checkpointed_transfer_tensors(), 16)
     adapter.namespaces = namespaces
     return worker, adapter
@@ -2269,7 +2248,7 @@ def test_a_published_checkpoint_spec_registers_through_the_native_layout(
     worker, adapter = _register_checkpointed(monkeypatch)
     spec = worker._native_layout.checkpoint_spec
     assert adapter.namespaces == [{"checkpoint_spec": spec, "images": True}]
-    assert worker._native_layout.null_block_id == 0
+    assert worker._native_layout.null_block_id == -1
     assert worker.chunk_size == 8
     assert list(adapter.registered) == [f"native_state.{i}" for i in range(5)]
     assert [g.engine_group_id for g in adapter.groups] == [0, 1, 2]
@@ -2279,16 +2258,16 @@ def test_a_published_checkpoint_spec_registers_through_the_native_layout(
 
 
 def _settled(worker, submit, req):
-    submit(req, _step_event())
-    worker._settle_transfers()
+    submit(req, _step_event(worker))
+    _settle(worker)
 
 
 def test_the_base_worker_carries_a_checkpoint_image_with_its_page_kv(
     fake_lmcache_modules, monkeypatch
 ):
     """Only the boundary chunk names the image's units; every earlier chunk
-    names the server's null block, here 0. A load names the same lists as
-    the save that wrote them."""
+    names the server's null block, -1 by default. A load names the same lists
+    as the save that wrote them."""
     worker, adapter = _register_checkpointed(monkeypatch)
     _settled(
         worker,
@@ -2302,7 +2281,11 @@ def test_the_base_worker_carries_a_checkpoint_image_with_its_page_kv(
             native_state=NativeStateTransfer((7, 9), 24, 99),
         ),
     )
-    assert adapter.saves[0][1].block_ids == [[1, 2, 3, 4, 5, 6], [0, 0, 7], [0, 0, 9]]
+    assert adapter.saves[0][1].block_ids == [
+        [1, 2, 3, 4, 5, 6],
+        [-1, -1, 7],
+        [-1, -1, 9],
+    ]
 
     _settled(
         worker,
@@ -2318,7 +2301,11 @@ def test_the_base_worker_carries_a_checkpoint_image_with_its_page_kv(
             native_state=NativeStateTransfer((7, 9), 24, 99),
         ),
     )
-    assert adapter.loads[0][1].block_ids == [[1, 2, 3, 4, 5, 6], [0, 0, 7], [0, 0, 9]]
+    assert adapter.loads[0][1].block_ids == [
+        [1, 2, 3, 4, 5, 6],
+        [-1, -1, 7],
+        [-1, -1, 9],
+    ]
 
 
 def _checkpointed_load(state):
@@ -2344,7 +2331,7 @@ def _checkpointed_load(state):
         # An image from another boundary would not continue this KV.
         NativeStateTransfer((7, 9), 8, 99),
         # The null block cannot hold an image.
-        NativeStateTransfer((0, 9), 16, 99),
+        NativeStateTransfer((-1, 9), 16, 99),
         # Image units that are also KV blocks of the same transfer.
         NativeStateTransfer((3, 9), 16, 99),
     ],
@@ -2364,7 +2351,7 @@ def test_a_page_only_worker_refuses_an_image_transfer(fake_lmcache_modules):
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
     req = _checkpointed_load(NativeStateTransfer((7, 9), 16, 99))
-    worker._submit_load(req, _step_event())
+    worker._submit_load(req, _step_event(worker))
     assert adapter.loads == []
     assert worker.get_finished().failed_loading == {req.load_operation}
 
@@ -2392,14 +2379,7 @@ def test_a_rank_whose_saves_settle_without_the_server_records_no_event(
     at a later load failed the server's wait with `HIP error: invalid
     argument` on every such rank.
     """
-    created = []
-    monkeypatch.setattr(
-        mp_worker.torch.cuda,
-        "Event",
-        lambda **_kw: created.append(1) or SimpleNamespace(record=lambda _s: None),
-    )
-    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
-    monkeypatch.setattr(mp_worker, "_stream_idle", lambda: True)
+    monkeypatch.setattr(ipc_lifetime, "_stream_idle", lambda: True)
     worker = _worker(_WorkerAdapter())
     worker._is_kv_writer = False
     metadata = LMCacheOffloadMetadata()
@@ -2413,26 +2393,33 @@ def test_a_rank_whose_saves_settle_without_the_server_records_no_event(
         )
     )
     worker.start_load_kv(metadata)
-    assert created == [] and len(worker._step_events) == 0
+    assert len(worker._step_events) == 0
     worker.start_load_kv(_load_step(31))
-    assert created == [1]
+    assert len(worker._step_events) == 1
 
 
-def test_an_event_recorded_but_never_exported_is_not_reused(monkeypatch):
-    monkeypatch.setattr(
-        mp_worker.torch.cuda,
-        "Event",
-        lambda **_kw: SimpleNamespace(record=lambda _s: None),
-    )
-    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
-    lock = threading.Lock()
-    ring = mp_worker._StepEventRing()
-    first, _ = ring.record(lock)
-    second, _ = ring.record(lock)
-    assert second != first
-    ring.hold(second)
-    ring.release(second)
-    assert ring.record(lock)[0] == second
+def test_an_event_is_recorded_again_only_once_nothing_holds_it():
+    """A step's transfers share its event; another step takes a fresh one
+    while any of them is pending, and the event comes back after the last."""
+    ring = mp_step_events.StepEventRing()
+    step = mp_step_events.PendingStepEvent(ring)
+    first, _ = step.hold_locked()
+    assert step.hold_locked()[0] == first
+    ring.release(first)
+    assert mp_step_events.PendingStepEvent(ring).hold_locked()[0] != first
+    ring.release(first)
+    assert mp_step_events.PendingStepEvent(ring).hold_locked()[0] == first
+
+
+def test_a_step_event_released_before_its_sibling_is_held_is_not_reused():
+    """A step's first transfer can turn terminal before its second is held;
+    the second still waits on the event, so no other step records it."""
+    ring = mp_step_events.StepEventRing()
+    step = mp_step_events.PendingStepEvent(ring)
+    index, _ = step.hold_locked()
+    ring.release(index)
+    assert step.hold_locked()[0] == index
+    assert mp_step_events.PendingStepEvent(ring).hold_locked()[0] != index
 
 
 def test_a_step_event_is_reused_only_once_nothing_waits_on_it(
@@ -2444,90 +2431,58 @@ def test_a_step_event_is_reused_only_once_nothing_waits_on_it(
     argument` there, so a step whose earlier event has a pending transfer
     takes another; once every transfer on it is terminal it comes back.
     """
-    created = []
-
-    class _FakeEvent:
-        def __init__(self, interprocess=False):
-            self.records = 0
-            created.append(self)
-
-        def record(self, stream=None):
-            self.records += 1
-
-    monkeypatch.setattr(mp_worker.torch.cuda, "Event", _FakeEvent)
-    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
-    monkeypatch.setattr(mp_worker, "_stream_idle", lambda: True)
+    monkeypatch.setattr(ipc_lifetime, "_stream_idle", lambda: True)
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
 
     worker.start_load_kv(_load_step(20))
-    worker._settle_transfers()
+    _settle(worker)
     worker.start_load_kv(_load_step(21))
+    created = worker._step_events._events
     assert len(created) == 2, "an event with a pending transfer is not re-recorded"
 
     for _, _, _, future in adapter.loads:
         future.ready = True
-    worker._settle_transfers()
+    _settle(worker)
     worker.get_finished()
     worker.start_load_kv(_load_step(22))
     assert len(created) == 2, "a settled event comes back"
-    assert [event.records for event in created] == [2, 1]
+    assert sorted(event.records for event in created) == [1, 2]
 
 
-def test_preemption_fence_covers_queued_transfers_and_fails_stop(monkeypatch):
-    """A queued save reaches the server after the fence; it must hold it."""
-    import threading
+def test_the_fence_covers_queued_transfers_and_fails_stop(fake_lmcache_modules):
+    """A queued save reaches the server after the fence; it must hold it.
 
-    from atom.plugin.vllm.kv_transfer import mp_worker_adapter
-
-    # Bounded by the worker's own transfer deadline, not a constant of its own.
-    monkeypatch.setattr(mp_worker_adapter, "_FENCE_TIMEOUT_S", 3600.0)
-    inner = SimpleNamespace(
-        _lock=threading.Lock(),
-        _pending_saves={},
-        _pending_loads={},
-        _submitting_owner={"save:7:1": "7"},
-        _drain_wake=threading.Event(),
-        _drain_thread=SimpleNamespace(is_alive=lambda: True),
-        _drain_error=None,
-        _transfer_deadline_s=0.01,
-    )
-    fence = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
-    fence.wait_for_requests(["8"])  # someone else's transfer: no wait
+    Bounded by the worker's own transfer deadline.
+    """
+    worker = _worker(_WorkerAdapter())
+    worker._transfer_deadline_s = 0.05
+    worker._submitting_owner["save:7:1"] = "7"
+    worker._drain.ensure_running()
+    worker.fence(["8"])  # someone else's transfer: no wait
     with pytest.raises(RuntimeError, match="timed out after 0s, the transfer deadline"):
-        fence.wait_for_requests(["7"])
-    assert inner._drain_wake.is_set()
+        worker.fence(["7"])
 
 
-def test_the_preemption_fence_names_what_waiting_cannot_clear(monkeypatch):
+def test_the_fence_names_what_waiting_cannot_clear(fake_lmcache_modules):
     """A dead drain, its error, or an unprovable submit: raised at once."""
-    import threading
-
     from atom.kv_transfer.offload.mp.transfer import _UnprovableSubmission
-    from atom.plugin.vllm.kv_transfer import mp_worker_adapter
 
-    monkeypatch.setattr(mp_worker_adapter, "_FENCE_TIMEOUT_S", 3600.0)
-    inner = SimpleNamespace(
-        _lock=threading.Lock(),
-        _pending_saves={},
-        _pending_loads={},
-        _submitting_owner={"save:7:1": "7"},
-        _drain_wake=threading.Event(),
-        _drain_thread=None,
-        _drain_error=None,
-    )
-    fence = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
+    worker = _worker(_WorkerAdapter())
+    worker._submitting_owner["save:7:1"] = "7"
     with pytest.raises(RuntimeError, match="no drain thread"):
-        fence.wait_for_requests(["7"])
-    inner._drain_error = ConnectionError("server went away")
+        worker.fence(["7"])
+    worker._drain.ensure_running()
+    worker._drain.error = ConnectionError("server went away")
     with pytest.raises(RuntimeError, match="drain failed"):
-        fence.wait_for_requests(["7"])
-    inner._drain_error, inner._submitting_owner = None, {}
-    inner._pending_saves = {
-        "save:7:1": SimpleNamespace(completion="7", future=_UnprovableSubmission())
-    }
-    with pytest.raises(RuntimeError, match="submit raised"):
-        fence.wait_for_requests(["7"])
+        worker.fence(["7"])
+    worker._drain.error = None
+    worker._submitting_owner.clear()
+    worker._pending_saves["save:7:1"] = mp_worker._PendingSave(
+        completion="7", future=_UnprovableSubmission(), start=0, end=8
+    )
+    with pytest.raises(RuntimeError, match="submit of save:7:1 raised"):
+        worker.fence(["7"])
 
 
 def test_get_finished_wakes_the_drain_while_transfers_are_pending(
@@ -2535,14 +2490,14 @@ def test_get_finished_wakes_the_drain_while_transfers_are_pending(
 ):
     """An idle engine queues nothing, so only this call can wake the poll."""
     worker = _worker(_WorkerAdapter())
-    worker._drain_wake.clear()
+    worker._drain._wake.clear()
     worker.get_finished()
-    assert not worker._drain_wake.is_set()
+    assert not worker._drain._wake.is_set()
     worker._pending_loads["load:5:1"] = mp_worker._PendingLoad(
         completion=LoadOperationId(req_id=5, generation=1), future=_WorkerFuture()
     )
     worker.get_finished()
-    assert worker._drain_wake.is_set()
+    assert worker._drain._wake.is_set()
 
 
 def test_ipc_resources_are_destroyed_on_the_step_thread(
@@ -2596,10 +2551,15 @@ def test_ipc_resources_are_destroyed_on_the_step_thread(
             self.tracked.append(future)
             return future
 
-    monkeypatch.setattr(mp_worker.torch.cuda, "Event", _Event)
-    monkeypatch.setattr(mp_worker.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(
+        mp_step_events,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(Event=_Event, current_stream=lambda: None)
+        ),
+    )
     idle = [False]
-    monkeypatch.setattr(mp_worker, "_stream_idle", lambda: idle[0])
+    monkeypatch.setattr(ipc_lifetime, "_stream_idle", lambda: idle[0])
     monkeypatch.setattr(mp_worker, "_mp_session_id", lambda _c, rid: f"s:{rid}")
     worker = mp_worker.LMCacheMPConnector(_config())
     worker._adapter = _Adapter()
@@ -2607,7 +2567,7 @@ def test_ipc_resources_are_destroyed_on_the_step_thread(
 
     def step(metadata):
         worker.start_load_kv(metadata)
-        worker._settle_transfers()
+        _settle(worker)
         worker.get_finished()
 
     for req_id in range(1, 4):
@@ -2629,81 +2589,12 @@ def test_ipc_resources_are_destroyed_on_the_step_thread(
     worker.close()
 
 
-def test_only_recent_save_leases_count_as_blocks_about_to_return():
-    """A lease past the horizon is a stuck save, which must not stop preemption."""
-    import time
-
-    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
-
-    s = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
-    s._save_lease_blocks = {1: {10}}
-    s._save_lease_at = {1: time.monotonic() - 60.0}
-    assert s.has_active_save_leases()
-    assert not s.has_active_save_leases(max_age_s=10.0)
-    s._save_lease_blocks[2] = {11}
-    s._save_lease_at[2] = time.monotonic()
-    assert s.has_active_save_leases(max_age_s=10.0)
-
-
-def test_a_declined_save_retires_only_where_the_decline_is_permanent():
-    """NativeState declines while its pin budget is full: that clears."""
-    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
-    from atom.kv_transfer.offload.mp.native_state_scheduler import (
-        NativeStateLMCacheMPConnectorScheduler,
-    )
-
-    assert ChunkedOffloadSchedulerBase._unbuilt_save_is_final(None)
-    assert not NativeStateLMCacheMPConnectorScheduler._unbuilt_save_is_final(None)
-
-
-def test_a_failed_load_reports_only_the_blocks_it_writes():
-    """The HBM prefix below the load may be shared with a running request."""
-    from atom.plugin.vllm.kv_transfer import mp_worker_adapter
-
-    inner = SimpleNamespace(block_size=4, start_load_kv=lambda metadata: None)
-    adapter = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
-    metadata = LMCacheOffloadMetadata()
-    metadata.add_request(
-        LMCacheReqMeta(
-            req_id=7,
-            token_ids=list(range(16)),
-            block_ids=[100, 101, 102, 103],
-            load_spec=LoadSpec(8, 14, can_load=True),
-        )
-    )
-    adapter.start_load_kv(metadata)
-    assert adapter._load_blocks == {"7": {102, 103}}
-
-
-def test_the_v41_checkpoint_switch_parses_like_other_switches(monkeypatch):
-    from atom.utils import envs
-
-    for value, on in (("TRUE", True), ("1", True), ("true", True), ("0", False)):
-        monkeypatch.setenv("ATOM_V41_STATE_CHECKPOINTS", value)
-        assert envs.ATOM_V41_STATE_CHECKPOINTS is on
-    monkeypatch.delenv("ATOM_V41_STATE_CHECKPOINTS")
-    assert envs.ATOM_V41_STATE_CHECKPOINTS is False
-
-
 def test_a_busy_stream_past_the_cap_releases_a_batch_per_step():
     """Async scheduling rarely idles; the backlog is paid off, not dumped."""
     entries = deque(object() for _ in range(5))
-    first = mp_worker._take_unshared(entries, limit=2)
+    first = ipc_lifetime.take_unshared(entries, limit=2)
     assert len(first) == 2 and len(entries) == 3
-    assert len(mp_worker._take_unshared(entries)) == 3 and not entries
-
-
-def test_mp_bounds_a_stalled_save_by_its_deadline_not_by_abandoning_it():
-    """MP cannot release a save's blocks without its report, so the plugin
-    keeps the quorum and drives the deadline from its own per-step hook."""
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    assert sched.abandons_saves is False
-    called = []
-    sched._enforce_transfer_deadlines = lambda: called.append(True)
-    sched.enforce_transfer_deadlines()
-    assert called == [True]
+    assert len(ipc_lifetime.take_unshared(entries)) == 3 and not entries
 
 
 def test_the_release_cap_stops_scanning_once_it_is_met():
@@ -2711,44 +2602,40 @@ def test_the_release_cap_stops_scanning_once_it_is_met():
     held = object()
     entries = deque([held] + [object() for _ in range(4)])
     rest = [id(entry) for entry in list(entries)[3:]]
-    taken = mp_worker._take_unshared(entries, limit=2)
+    taken = ipc_lifetime.take_unshared(entries, limit=2)
     assert len(taken) == 2
     assert [id(entry) for entry in entries] == rest + [id(held)]
 
 
 def test_the_last_drain_round_submits_what_close_found_queued():
     """A save queued before `close` is submitted and polled, not dropped."""
-    import queue
+    from atom.kv_transfer.offload.mp.drain import TransferDrain
 
-    fake = SimpleNamespace(
-        _drain_stop=threading.Event(),
-        _drain_wake=threading.Event(),
-        _transfer_queue=queue.Queue(),
-        _perform_save_submit=Mock(),
-        _perform_load_submit=Mock(),
-        _poll_pending_loads=Mock(),
-        _poll_pending_saves=Mock(),
-        _drain_rounds=0,
-        _drain_error=None,
-    )
-    fake._drain_round_cv = threading.Condition(threading.Lock())
-    fake._transfer_queue.put(("save", "a", "b"))
-    fake._drain_stop.set()
-    mp_worker.LMCacheMPConnector._drain_loop(fake)
-    fake._perform_save_submit.assert_called_once_with("a", "b")
-    fake._poll_pending_saves.assert_called_once()
-    assert fake._drain_rounds == 1
+    submitted, polled = [], []
+    drain = TransferDrain(threading.Lock(), submitted.append, lambda: polled.append(1))
+    drain._queue.put("save")
+    assert drain.close(timeout=5.0)  # never started: nothing to join
+    drain._loop()  # what a running thread does after `close`
+    assert submitted == ["save"] and polled == [1]
+    assert drain._rounds_done == 1
 
 
-def test_close_leaves_a_stuck_drains_client_alone():
-    """The client is not thread-safe; a drain still in a submit keeps it."""
-    adapter = Mock()
-    fake = SimpleNamespace(
-        _drain_stop=threading.Event(),
-        _drain_wake=threading.Event(),
-        _drain_thread=SimpleNamespace(join=lambda timeout: None, is_alive=lambda: True),
-        _adapter=adapter,
-    )
-    mp_worker.LMCacheMPConnector.close(fake)
-    adapter.shutdown.assert_not_called()
-    assert fake._adapter is adapter
+def test_close_leaves_a_stuck_drains_client_alone(fake_lmcache_modules, monkeypatch):
+    """The client is not thread-safe; a drain still in a submit keeps it, and
+    no second drain thread starts to share it."""
+    adapter = _WorkerAdapter()
+    released = threading.Event()
+    adapter.submit_store_request = lambda *_a: released.wait(5.0)
+    worker = mp_worker.LMCacheMPConnector(_config())
+    worker._adapter = adapter
+    worker.chunk_size = 8
+    monkeypatch.setattr(mp_worker, "_CLOSE_TIMEOUT_S", 0.05)
+    worker._submit_save(_unprovable_request("save"), _step_event(worker))
+    worker.close()
+    assert not adapter.shutdown_called and worker._adapter is adapter
+    with pytest.raises(RuntimeError, match="drain is closed"):
+        worker._submit_save(
+            replace(_unprovable_request("save"), save_operation=SaveOperationId(16, 2)),
+            _step_event(worker),
+        )
+    released.set()

@@ -40,18 +40,6 @@ from typing import Any
 
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.kv_transfer.offload.mp.transfer import _UnprovableSubmission
-
-# The preemption fence waits as long as the worker's own transfer deadline
-# (`_transfer_deadline_s`): a transfer still running before that is healthy, so
-# preempting its request must not stop the engine sooner. Past it the fence
-# raises -- fail-stop, the verdict the worker reaches for the transfer itself.
-# This is the bound only for a worker that carries no deadline.
-_FENCE_TIMEOUT_S = 30.0
-# At most one drain wake per this long while the fence waits. The fence blocks
-# on the drain's round signal in between; a tighter cadence only has the two
-# threads contend for `_lock` and the GIL, slowing the transfer it waits on.
-_FENCE_POLL_S = 0.005
 
 
 def _req_id_of(completion: Any) -> str:
@@ -132,100 +120,13 @@ class MPOffloadWorkerAdapter:
         return blocks
 
     def wait_for_requests(self, req_ids) -> None:
-        """Block until no transfer for these requests is still reading blocks.
+        """Block until no transfer for these requests is still using blocks.
 
-        Reads the transport's pending maps rather than draining them: the
-        completions they carry belong to ``get_finished``, and consuming one
-        here would lose the block lease it releases. Waiting on the futures in
-        place leaves that report intact.
+        The worker's own fence (`LMCacheMPConnector.fence`): it waits on the
+        drain's rounds rather than draining the pending maps, so the
+        completions stay for ``get_finished``, which releases their leases.
         """
-        wanted = {str(req_id) for req_id in req_ids}
-        if not wanted:
-            return
-        inner = self._inner
-        lock = getattr(inner, "_lock", None)
-        if lock is None:
-            return
-
-        import time
-
-        bound_s = float(getattr(inner, "_transfer_deadline_s", _FENCE_TIMEOUT_S))
-        deadline = time.monotonic() + bound_s
-        while True:
-            with lock:
-                pending = [
-                    (operation_id, entry.future)
-                    for source in ("_pending_saves", "_pending_loads")
-                    for operation_id, entry in getattr(inner, source, {}).items()
-                    if _req_id_of(entry.completion) in wanted
-                ]
-                # Queued or mid-submit: no future yet, but the drain thread
-                # will hand it to the server, which then reads these blocks.
-                submitting = [
-                    operation_id
-                    for operation_id, owner in getattr(
-                        inner, "_submitting_owner", {}
-                    ).items()
-                    if owner in wanted
-                ]
-            # Not polled here: the drain thread polls these futures and drops
-            # terminal ones from the pending maps, and a second poller would
-            # race it on LMCache's future, which imports the server's event.
-            outstanding = submitting + [operation_id for operation_id, _ in pending]
-            if not outstanding:
-                return
-            # Causes that waiting cannot clear, named now rather than as a
-            # timeout: the server may still write these blocks either way.
-            error = getattr(inner, "_drain_error", None)
-            if error is not None:
-                raise RuntimeError(
-                    "ATOM LMCache MP: preemption fence found the transfer drain "
-                    f"failed with {len(outstanding)} transfer(s) in flight for "
-                    f"{sorted(wanted)}"
-                ) from error
-            unprovable = [
-                operation_id
-                for operation_id, future in pending
-                if isinstance(future, _UnprovableSubmission)
-            ]
-            if unprovable:
-                raise RuntimeError(
-                    "ATOM LMCache MP: preemption fence cannot release "
-                    f"{sorted(wanted)}: submit raised for {unprovable}, so the "
-                    "server may have the request and still write its blocks"
-                )
-            drain = getattr(inner, "_drain_thread", None)
-            if drain is None or not drain.is_alive():
-                raise RuntimeError(
-                    "ATOM LMCache MP: preemption fence found no drain thread to "
-                    f"submit or poll {outstanding} for {sorted(wanted)}"
-                )
-            if time.monotonic() >= deadline:
-                # Fail-stop: returning would let the forward overwrite blocks
-                # a transfer still reads, caching one wrong prefix silently.
-                raise RuntimeError(
-                    f"ATOM LMCache MP: preemption fence timed out after "
-                    f"{bound_s:.0f}s, the transfer deadline, with "
-                    f"{len(outstanding)} transfer(s) still in flight for "
-                    f"{sorted(wanted)}"
-                )
-            # The drain polls these futures and drops terminal ones; wake it
-            # once, then block until it finishes a round or the slot ends.
-            slot_end = time.monotonic() + _FENCE_POLL_S
-            wake = getattr(inner, "_drain_wake", None)
-            if wake is not None:
-                wake.set()
-            round_done = getattr(inner, "_drain_round_cv", None)
-            if round_done is not None:
-                with round_done:
-                    seen = getattr(inner, "_drain_rounds", 0)
-                    round_done.wait_for(
-                        lambda seen=seen: getattr(inner, "_drain_rounds", 0) != seen,
-                        timeout=_FENCE_POLL_S,
-                    )
-            remaining = slot_end - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
+        self._inner.fence(req_ids)
 
 
 __all__ = ["MPOffloadWorkerAdapter"]

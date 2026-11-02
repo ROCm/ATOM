@@ -141,8 +141,8 @@ def _build_v41_pool_geometry(
     block_size: int,
     *,
     kv_dtype: str,
-    speculative_tokens: int = 0,
-    index_fp4: bool = False,
+    speculative_tokens: int,
+    index_fp4: bool,
 ):
     """The CSA2 pool geometry, from core's single authority.
 
@@ -156,7 +156,7 @@ def _build_v41_pool_geometry(
     duplication on this path fails loudly when it drifts; this one would not,
     so it gets a seam instead of a test comparing the two copies.
     """
-    from atom.model_ops.attentions.deepseek_v41.backend import (
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
         build_v41_pool_geometry,
     )
 

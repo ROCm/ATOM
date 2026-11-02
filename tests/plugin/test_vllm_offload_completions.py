@@ -405,6 +405,7 @@ class _ParkScheduler:
         self._hit = hit
         self._park = park
         self.asked_park = 0
+        self.declined_loads: set[str] = set()
 
     def get_num_new_matched_tokens(self, seq):
         return self._hit, True

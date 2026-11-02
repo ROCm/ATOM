@@ -17,7 +17,9 @@ from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
-from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
+    build_v41_pool_geometry,
+)
 from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
 from atom.model_ops.engram.device.hashing import (
     EngramBatch,
@@ -38,7 +40,6 @@ from atom.models.deepseek_v41.bounded_replay import (
     tail_spans,
     tail_width,
 )
-from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
@@ -61,55 +62,6 @@ def _compress_plan_buffer_names(ratio):
         "write": f"v4_write_plan_{ratio}",
         "key_rope": f"v41_key_rope_positions_{ratio}",
     }
-
-
-def build_v41_pool_geometry(
-    hf_config,
-    block_size: int,
-    *,
-    kv_dtype: str,
-    speculative_tokens: int = 0,
-    index_fp4: bool = False,
-) -> V41PoolGeometry:
-    """The pool geometry a CSA2 configuration runs, from its text config alone.
-
-    The single authority for it. The pool is declared twice -- once by the
-    scheduler that sizes it and once by whoever hands the runtime its backing
-    store -- and the two only describe the same bytes if they derive the shape
-    the same way. A frontend that sizes its own pool sizes it from here and
-    the native builder below builds its cache from here, so a change to the
-    topology reaches both or neither.
-
-    ``kv_dtype`` is the main pool's format (native's ``kv_cache_dtype``: bf16,
-    fp4 or fp8), and ``speculative_tokens`` the draft width a verify step
-    retains; both move the geometry, so neither has a default that guesses.
-    """
-    topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
-    return V41PoolGeometry(
-        len(topology)
-        + (hf_config.num_nextn_predict_layers if speculative_tokens else 0),
-        tuple(
-            (spec.layer_id, spec.ratio)
-            for spec in topology
-            if spec.mode == AttentionMode.FULL
-        ),
-        block_size,
-        hf_config.sliding_window,
-        hf_config.head_dim,
-        hf_config.index_head_dim,
-        hf_config.engram_max_ngram_size - 1,
-        kv_dtype=kv_dtype,
-        speculative_tokens=speculative_tokens,
-        # Only the ratios the built layers run: a configuration with no
-        # window-only layer gets no buffer for one.
-        layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-        index_topk=hf_config.index_topk,
-        # Paged at the length candidates are picked in, which is what lets
-        # a candidate list be a block table. A GPU that cannot page that
-        # short refuses when asked, so there is nothing to pre-empt here.
-        index_block_rows=hf_config.candidate_block_size,
-        index_fp4=index_fp4,
-    )
 
 
 class DeepseekV41Backend(AttentionBackend):

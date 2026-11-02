@@ -294,9 +294,8 @@ def _refuse_v41_kv_transfer(vllm_config) -> None:
         # store nothing, and stop the engine on its first tier hit.
         msg = (
             "DeepSeek-V4.1 on the vLLM plugin runs AtomLMCacheOffloadConnector "
-            "only with its state checkpoints live: set "
-            "ATOM_V41_STATE_CHECKPOINTS=1, --enable-prefix-caching and "
-            "--mamba-cache-mode align, or run without --kv-transfer-config."
+            "only with its state checkpoints live: set --enable-prefix-caching "
+            "and --mamba-cache-mode align, or run without --kv-transfer-config."
         )
         logger.error(msg)
         raise ValueError(msg)
@@ -305,8 +304,8 @@ def _refuse_v41_kv_transfer(vllm_config) -> None:
         f"AtomLMCacheOffloadConnector, not {connector}: a request's window "
         "ring, compressor rings and Engram cursor live in the STATE region, "
         "and only that connector restores them with the PAGEs (it needs "
-        "ATOM_V41_STATE_CHECKPOINTS=1, prefix caching and --mamba-cache-mode "
-        "align). Configure it, or run without --kv-transfer-config."
+        "--enable-prefix-caching and --mamba-cache-mode align). Configure it, "
+        "or run without --kv-transfer-config."
     )
     logger.error(msg)
     raise ValueError(msg)
@@ -461,8 +460,8 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
     ):
         msg = (
             "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "
-            "with its state checkpoints (ATOM_V41_STATE_CHECKPOINTS=1 and "
-            "--mamba-cache-mode align); AtomLMCacheOffloadConnector needs them "
+            "with its state checkpoints, which --mamba-cache-mode align turns "
+            "on; AtomLMCacheOffloadConnector needs them "
             "too. A block-table hit restores the compressed pages but not the "
             "per-request window ring, compressor rings or Engram cursor that "
             "CSA2 attention reads alongside them, and a V4.1 forward cannot "

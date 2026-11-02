@@ -172,7 +172,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return super().load_failed(req_id)
 
     def waits_for_transfer_report(self, seq: Any) -> bool:
-        """MP releases memory only on a report; see `_enforce_transfer_deadlines`.
+        """MP releases memory only on a report; see `enforce_transfer_deadlines`.
 
         The engine's clock-based reclaim cannot prove the MP server stopped
         reading or writing, so it leaves MP requests alone instead of logging
@@ -202,17 +202,12 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         live.update(operation for _, operation in self._active_load_operations.values())
         return live
 
-    abandons_saves = False
-
     def enforce_transfer_deadlines(self) -> None:
-        # For a frontend that never calls `process_completions`.
-        self._enforce_transfer_deadlines()
-
-    def _enforce_transfer_deadlines(self) -> None:
         """Fail-stop when a dispatched transfer never reports.
 
         The worker bounds what it submitted; this catches what it cannot see,
-        such as a lost completion or a TP rank that never reports.
+        such as a lost completion or a TP rank that never reports. Run from
+        `process_completions`, and by a frontend that never calls it.
         """
         live = self._live_transfers()
         seen = self._transfer_seen_at
@@ -226,7 +221,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def process_completions(self, output: KVConnectorOutput) -> KVConnectorOutput:
         output = super().process_completions(output)
-        self._enforce_transfer_deadlines()
+        self.enforce_transfer_deadlines()
         return output
 
     def request_finished(self, seq: Any) -> None:

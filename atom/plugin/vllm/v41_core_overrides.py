@@ -328,20 +328,18 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         landed by the next call. Under async scheduling, which is where this
         frontend's deferred read reported state that was not stale, and
         during vLLM's warmup, the read blocks. A step that may restore a state
-        checkpoint (`_may_restore`) blocks too: a restore has to see this
-        step's cursors before the reset and the Engram staging, and the
-        deferred read judges them only on the next call.
-        `ATOM_V41_BLOCKING_STATE_PROBE=1` blocks every step.
+        checkpoint (`_may_restore`) restores first and then blocks too, so the
+        contract judges what the restore produced before the reset and the
+        Engram staging.
         """
         from atom.plugin.vllm.req_id_passthrough_patch import serving_synchronously
-        from atom.utils import envs
 
-        blocking = envs.ATOM_V41_BLOCKING_STATE_PROBE or not serving_synchronously()
-        if self.checkpoint_restore is not None:
-            # Tracked every step, so the previous step's rows are known when
-            # the switch lets a step go without the read.
-            may_restore = self._may_restore(step)
-            blocking = blocking or may_restore
+        blocking = not serving_synchronously()
+        # Tracked every step, so the previous step's rows are known when a
+        # step goes without the read.
+        if self.checkpoint_restore is not None and self._may_restore(step):
+            self._restore_stale_rows(step)
+            blocking = True
         histories = histories or blocking
         pending = self._probe_claim is not None and self._probe_done is not None
         if not histories and pending:
@@ -370,40 +368,43 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
             bool(above) and rid not in seen for rid, above in zip(ids, above_floor)
         )
 
-    def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
+    def _restore_stale_rows(self, step) -> None:
         """Restore checkpoints into the rows the contract is about to reject.
 
         Only those rows: restoring every row every step overwrites live state
         with a checkpoint nothing has written, measured as a prefill chunk
-        arriving at `computed=4096` with `cursor=0`. The filter is `~fresh`,
-        the same one the contract uses, so the two cannot drift apart. The
-        cursors are re-read afterwards, so the contract judges what the restore
-        produced: a row-order mistake hands over somebody else's state and
-        dies loudly there rather than answering from it.
+        arriving at `computed=4096` with `cursor=0`. Fresh rows and where each
+        state has to be are worked out as `prepare_state` does, so the two
+        cannot drift apart; core then reads the cursors again and judges what
+        the restore produced, so a row-order mistake hands over somebody
+        else's state and dies loudly there rather than answering from it.
         """
-        restore = self.checkpoint_restore
-        if restore is None:
-            return cursors
-        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
+        count = step.scheduled_bs
+        starts = step.request_positions[:count]
+        resumes = step.request_cached_until[:count]
+        fresh = (starts == step.request_floors[:count]) & (resumes == 0)
+        wanted = np.where(resumes > 0, resumes, starts)
+        cursors = torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
+        wrong = np.flatnonzero(~fresh & (cursors[:, 0] != wanted))
         if not wrong.size:
-            return cursors
+            return
         # The third element is the request id, not the row index: the checkpoint
         # block table is addressed in the batch's own row space, which is not
         # this step's. Handing over the step row read another request's block
         # ids (measured: a store wrote units 14..21 and the restore read
         # 192..185 for what should have been the same checkpoint).
         rows = [
-            (int(step.requests[int(i)].slot), int(starts[int(i)]), ids[int(i)])
+            (
+                int(step.requests[int(i)].slot),
+                int(wanted[int(i)]),
+                step.requests[int(i)].request_id,
+            )
             for i in wrong
         ]
         try:
-            restored = int(restore(rows))
+            self.checkpoint_restore(rows)
         except Exception:
             logger.warning("DeepSeek-V4.1 checkpoint restore failed", exc_info=True)
-            return cursors
-        if not restored:
-            return cursors
-        return torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
 
     def _report_stale_state(self, cursors, starts, requests, fresh):
         """The contract, with vLLM's synthetic warmup rows left out.

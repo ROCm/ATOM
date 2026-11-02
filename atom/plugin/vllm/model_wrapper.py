@@ -361,9 +361,10 @@ def _patch_required_act_dtype_post_load_hooks(
 
 
 def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
-    """Register V4.1's state-checkpoint layers when `ATOM_V41_STATE_CHECKPOINTS=1`.
+    """Register V4.1's state-checkpoint layers when prefix caching runs with
+    `--mamba-cache-mode align` (`v41_state_checkpoints_requested`).
 
-    Off by default: the layers make the pool hybrid, which changes how vLLM
+    Off otherwise: the layers make the pool hybrid, which changes how vLLM
     sizes and splits it. Prefix caching and LMCache offload need them on.
     """
     from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
@@ -371,14 +372,14 @@ def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
         v41_state_checkpoints_requested,
     )
 
-    if not v41_state_checkpoints_requested():
+    if not v41_state_checkpoints_requested(vllm_config):
         return
     from atom.plugin.vllm.scheduler import v41_scheduler_patches_missing
 
     missing = v41_scheduler_patches_missing()
     if missing:
         raise ValueError(
-            "DeepSeek-V4.1 state checkpoints (ATOM_V41_STATE_CHECKPOINTS) need "
+            "DeepSeek-V4.1 state checkpoints (prefix caching) need "
             f"ATOM's patch on vLLM's Scheduler.{', Scheduler.'.join(missing)}, "
             "which this vLLM does not carry; unpatched, local hits are not capped "
             "to a checkpoint and prefill chunks do not end on one"
@@ -391,8 +392,8 @@ def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
         # async speculative scheduling advances optimistically (as if every
         # draft were accepted), so they would land on unwritten boundaries.
         raise ValueError(
-            "DeepSeek-V4.1 state checkpoints (ATOM_V41_STATE_CHECKPOINTS=1) "
-            "with speculative decoding need --no-async-scheduling"
+            "DeepSeek-V4.1 prefix caching with speculative decoding needs "
+            "--no-async-scheduling"
         )
 
     register_deepseek_v41_state_checkpoint_layers(vllm_config)
@@ -409,6 +410,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         from atom.config import get_current_atom_config, use_custom_atom_config
 
         _set_framework_backbone("vllm")
+        # Before anything below can normalise `hf_config` for the model.
+        from atom.plugin.vllm.kv_transfer.offload_config import (
+            remember_page_geometry,
+        )
+
+        remember_page_geometry(vllm_config)
 
         self.cache_config = vllm_config.cache_config
         self.device_config = vllm_config.device_config

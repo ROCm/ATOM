@@ -206,6 +206,14 @@ class OffloadConfigShim:
                 "ATOM offload connector: vLLM reported no model_config.hf_config; "
                 "the LMCache namespace and layer count are derived from it"
             )
+        # What `build_page_namespace` hashes: the geometry before any model was
+        # built on this config (`remember_page_geometry`), as native ATOM
+        # snapshots it in `Config.__post_init__`.
+        from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+
+        self.offload_page_hf_geometry = getattr(
+            vllm_config, _PAGE_GEOMETRY_ATTR, None
+        ) or snapshot_page_hf_geometry(self.hf_config)
 
         self.parallel_config = parallel_config
         self.pipeline_parallel_size = int(
@@ -259,6 +267,37 @@ class OffloadConfigShim:
             f"{self.pipeline_parallel_size}, tp={self.tensor_parallel_size}, "
             f"dcp={self.decode_context_parallel_size})"
         )
+
+
+#: Where `remember_page_geometry` leaves its snapshot on a vLLM config.
+_PAGE_GEOMETRY_ATTR = "_atom_offload_page_hf_geometry"
+
+
+def remember_page_geometry(vllm_config: Any) -> None:
+    """Snapshot the HF geometry the PAGE namespace hashes, before a model build.
+
+    vLLM creates a worker's KV connector after the worker has built the model,
+    and an ATOM model may normalise `hf_config` while it does (Kimi-K3 derives
+    `head_dim`); the scheduler process builds none. Hashing the live config in
+    both gives two namespaces, and every scheduler lookup misses. Called where
+    the plugin first holds the config in a worker, before the model is built;
+    only when a KV connector is configured, and only once.
+    """
+    if getattr(vllm_config, "kv_transfer_config", None) is None:
+        return
+    if getattr(vllm_config, _PAGE_GEOMETRY_ATTR, None) is not None:
+        return
+    model_config = getattr(vllm_config, "model_config", None)
+    outer_hf = getattr(model_config, "hf_config", None)
+    if outer_hf is None:
+        return
+    from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+
+    view = _HFConfigView(getattr(model_config, "hf_text_config", None), outer_hf)
+    try:
+        setattr(vllm_config, _PAGE_GEOMETRY_ATTR, snapshot_page_hf_geometry(view))
+    except AttributeError:  # pragma: no cover - frozen config
+        pass
 
 
 def build_offload_config(vllm_config: Any) -> OffloadConfigShim:

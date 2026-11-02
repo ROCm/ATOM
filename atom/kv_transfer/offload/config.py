@@ -26,11 +26,7 @@ import torch
 # Version 3 adds the effective index-cache dtype to the PAGE identity. FP4 and
 # FP8 DSV4 indexers have different region counts and byte layouts, so they must
 # never reuse one another's objects even when the HF model config is identical.
-# Version 4 hashes `sliding_window` and `candidate_block_size`, a canonical
-# `head_dim`, and the speculative config without per-process or nested
-# model-config fields. That moves every model's digest, so objects stored under
-# version 3 are unreachable.
-PAGE_LAYOUT_VERSION = 4
+PAGE_LAYOUT_VERSION = 3
 _PAGE_FINGERPRINT_BYTES = 16
 _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
@@ -58,12 +54,12 @@ _HF_PAGE_FIELDS = (
     "compress_ratios",
     "indexer_dtype",
     "indexer_types",
-    # DeepSeek-V4.1: `sliding_window` sizes the per-request window ring and
-    # `candidate_block_size` pages the index plane, so either one moves the
-    # bytes a stored object holds while every field above stays put.
-    "sliding_window",
-    "candidate_block_size",
 )
+# Hashed for the `dsv41` layout only, so no other model's namespace moves:
+# `sliding_window` sizes V4.1's per-request window ring and
+# `candidate_block_size` pages its index plane, so either one moves the bytes
+# a stored object holds while every field above stays put.
+_DSV41_PAGE_FIELDS = ("sliding_window", "candidate_block_size")
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
@@ -298,42 +294,10 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
-def _canonical_head_dim(hf: object) -> int | None:
-    """Return the attention head dim every process agrees on.
-
-    ``head_dim`` is not a stable property of the checkpoint: for MLA models it
-    is absent from ``config.json`` and each process fills it in on its own.
-    A scheduler process can keep transformers' computed default
-    (``hidden_size // num_attention_heads``, 74 for Kimi K3) while the workers
-    that build the model end up with the MLA head dim (``qk_nope + qk_rope``,
-    192), as `Config.__post_init__` notes for ATOM's own.  Hashing the
-    attribute therefore splits the PAGE namespace in two: the workers publish
-    their layout under one name, every lookup asks for the other, and the tier
-    answers every lookup with a miss and no error.  Derive it from the fields
-    that do come from the checkpoint instead.
-    """
-
-    qk_nope = getattr(hf, "qk_nope_head_dim", None)
-    qk_rope = getattr(hf, "qk_rope_head_dim", None)
-    if qk_nope and qk_rope:
-        return int(qk_nope) + int(qk_rope)
-    head_dim = getattr(hf, "head_dim", None)
-    if head_dim:
-        return int(head_dim)
-    hidden_size = getattr(hf, "hidden_size", None)
-    num_heads = getattr(hf, "num_attention_heads", None)
-    if hidden_size and num_heads:
-        return int(hidden_size) // int(num_heads)
-    return None
-
-
 def _stable_hf_geometry(hf: object) -> dict[str, Any]:
     geometry: dict[str, Any] = {}
     for name in _HF_PAGE_FIELDS:
-        if name == "head_dim":
-            value = _canonical_head_dim(hf)
-        else:
-            value = getattr(hf, name, None)
+        value = getattr(hf, name, None)
         if value is not None and name in _HF_INTEGER_GEOMETRY_FIELDS:
             value = _strict_integer(f"PAGE {name}", value)
         elif value is not None and name == "compress_ratios":
@@ -416,6 +380,7 @@ def build_page_namespace(
     base_model_name = str(
         getattr(config, "model_tag", None) or getattr(config, "model", "atom-model")
     )
+    layout = select_offload_layout(config)
     document = {
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
@@ -424,7 +389,7 @@ def build_page_namespace(
             "hybrid": "dsv4-page-regions",
             "m3": "m3-page-regions",
             "dsv41": "dsv41-page-state",
-        }.get(select_offload_layout(config), "dense-opaque-block"),
+        }.get(layout, "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
@@ -455,6 +420,11 @@ def build_page_namespace(
         "speculative_config": getattr(config, "offload_speculative_config", None)
         or _stable_config_value(getattr(config, "speculative_config", None)),
     }
+    if layout == "dsv41":
+        document["dsv41_geometry"] = {
+            name: _strict_integer(f"PAGE {name}", getattr(hf, name))
+            for name in _DSV41_PAGE_FIELDS
+        }
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -792,9 +762,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
             minimum=1,
         )
         num_kv_heads_local = max(1, num_kv_heads // tp)
-        # Same derivation the PAGE namespace hashes, so the shape a worker
-        # publishes and the shape the scheduler looks up cannot drift apart.
-        raw_head_dim = _canonical_head_dim(hf) or 0
+        raw_head_dim = getattr(hf, "head_dim", 0)
         normalized_head_dim = (
             0
             if raw_head_dim is None

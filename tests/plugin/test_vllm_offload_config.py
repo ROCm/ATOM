@@ -175,3 +175,26 @@ def test_v41_resolves_auto_collapse_itself(given, resolved):
 def test_other_models_keep_auto_collapse_for_the_shared_rule():
     cfg = build_offload_config(_vllm_config(extra={}))
     assert "lmcache.mp.tp_rank_collapse" not in cfg.kv_transfer_config
+
+
+def test_a_worker_hashes_the_geometry_from_before_it_built_the_model():
+    """vLLM builds a worker's model before its KV connector, and an ATOM model
+    may normalise `hf_config` on the way (Kimi-K3 writes `head_dim`); the
+    scheduler builds none. The snapshot taken first keeps them on one
+    namespace."""
+    from atom.kv_transfer.offload import config as offcfg
+    from atom.plugin.vllm.kv_transfer.offload_config import remember_page_geometry
+
+    def namespace(vllm_config):
+        cfg = build_offload_config(vllm_config)
+        return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
+
+    scheduler, worker = _vllm_config(), _vllm_config()
+    remember_page_geometry(worker)
+    worker.model_config.hf_config.head_dim = 192
+    assert namespace(scheduler) == namespace(worker)
+
+    # Without the snapshot the live, normalised config splits the two.
+    unsnapshotted = _vllm_config()
+    unsnapshotted.model_config.hf_config.head_dim = 192
+    assert namespace(scheduler) != namespace(unsnapshotted)

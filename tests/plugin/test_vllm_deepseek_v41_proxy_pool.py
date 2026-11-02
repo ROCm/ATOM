@@ -481,10 +481,10 @@ def test_the_pool_is_sized_from_the_speculation_that_is_admitted():
     atom_platform_module().enforce_deepseek_v41_constraints(config)
 
 
-def test_the_connector_alone_does_not_admit_prefix_caching(monkeypatch):
+def test_the_connector_alone_does_not_admit_prefix_caching():
     """Prefix caching needs the state checkpoints, and so does the connector:
-    naming it without them is refused here, with that one requirement."""
-    monkeypatch.delenv("ATOM_V41_STATE_CHECKPOINTS", raising=False)
+    naming it without `--mamba-cache-mode align` is refused here, with that
+    one requirement."""
     config = _vllm_config()
     config.model_config.architectures = list(
         config.model_config.hf_config.architectures

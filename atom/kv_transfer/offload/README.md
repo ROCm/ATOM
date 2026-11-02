@@ -148,8 +148,12 @@ blocks before the remote store becomes terminal.
 ### Running the MP server
 
 The matching LMCache build must support the global `--null-block-id` setting
-and sparse null handling. Run the MP server on the same host, with GPU IPC
-access to the ATOM worker allocations:
+and sparse null handling. `--null-block-id` must equal the engine's
+`lmcache.mp.null_block_id` (default `-1`); native ATOM and the vLLM plugin
+read the same option, so one server can serve both. No RPC reports the
+server's value, so a mismatch is not caught: a chunk the engine marks empty
+would be read as a real block. Run the MP server on the same host, with GPU
+IPC access to the ATOM worker allocations:
 
 ```bash
 lmcache server --host 127.0.0.1 --port 5555 \

@@ -48,6 +48,12 @@ from atom.model_engine.arg_utils import (
 )
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
+from tests.lmcache_mp_support import (
+    close_workers,  # noqa: F401
+    cpu_step_events,  # noqa: F401
+    settle,
+    step_event,
+)
 
 
 @dataclass
@@ -135,6 +141,25 @@ def _make_worker(*, images=True):
     instance._adapter = SimpleNamespace(
         submit_store_request=submit, submit_retrieve_request=submit
     )
+    # Submits and polls run on the drain thread. These tests are about the
+    # bookkeeping around them, so each submit and each report waits for a
+    # round; the hand-off itself is covered by
+    # `test_native_transfers_are_submitted_and_polled_off_the_step_thread`.
+    for name in ("_submit_save", "_submit_load"):
+        submit_now = getattr(instance, name)
+
+        def settling(req, event, _submit=submit_now):
+            _submit(req, event)
+            settle(instance)
+
+        setattr(instance, name, settling)
+    get_finished_now = instance.get_finished
+
+    def settled_get_finished():
+        settle(instance)
+        return get_finished_now()
+
+    instance.get_finished = settled_get_finished
     return instance
 
 
@@ -164,7 +189,7 @@ def request(*, loading=False, units=(0, 25, 31), generation=1, hbm=0):
 
 def test_store_transmits_page_zero_as_real_native_unit(worker):
     req = request()
-    worker._submit_save(req, object())
+    worker._submit_save(req, step_event(worker))
     assert worker.submitted_request_ids == ["atom-offload-dp0:7"]
     assert worker.submitted[0].block_ids == [
         [1, 2, 3, 4],
@@ -216,7 +241,7 @@ def test_native_state_groups_share_one_presence_mask(worker):
     "units", [(0, -1, 31), (0, 31), (0, 0, 31), (0, 25, 32), (0, 2, 31)]
 )
 def test_invalid_native_source_fails_before_transport(worker, units):
-    worker._submit_save(request(units=units), object())
+    worker._submit_save(request(units=units), step_event(worker))
     assert not worker.submitted
     completions = worker.get_finished().connector_completions
     [terminal] = [
@@ -247,9 +272,9 @@ def test_unprovable_submission_retains_lease_until_the_deadline_stops_the_engine
         worker._adapter.submit_retrieve_request = unprovable
     pending = worker._native_loads if loading else worker._native_saves
     if loading:
-        worker._submit_load(request(loading=True), object())
+        worker._submit_load(request(loading=True), step_event(worker))
     else:
-        worker._submit_save(request(), object())
+        worker._submit_save(request(), step_event(worker))
     now[0] += worker._transfer_deadline_s - 1
     output = worker.get_finished()
     assert not output.connector_completions
@@ -268,7 +293,7 @@ def test_failed_retrieve_does_not_restore_or_report_success(worker, monkeypatch)
     )
     worker.future.value, worker.future.ready = False, True
     req = request(loading=True)
-    worker._submit_load(req, object())
+    worker._submit_load(req, step_event(worker))
     finished = worker.get_finished()
     assert finished.failed_loading == {req.load_operation}
     assert not finished.finished_loading
@@ -283,7 +308,7 @@ def _kv_only_load(hbm=8):
 
 def test_kv_only_load_reads_page_alone_under_the_request_session(page_worker):
     req = _kv_only_load()
-    page_worker._submit_load(req, object())
+    page_worker._submit_load(req, step_event(page_worker))
     # The lookup that reported the reach also locked it, under this session.
     assert page_worker.submitted_request_ids == ["atom-offload-dp0:7"]
     [spec] = page_worker.submitted
@@ -296,7 +321,7 @@ def test_page_only_save_stores_page_alone(page_worker):
     req = replace(
         request(), native_state=NativeStateTransfer((), 16, 998, None, kv_only=True)
     )
-    page_worker._submit_save(req, object())
+    page_worker._submit_save(req, step_event(page_worker))
     [spec] = page_worker.submitted
     assert spec.block_ids == [[1, 2, 3, 4]]
     assert spec.request_configs is None
@@ -316,7 +341,7 @@ def test_kv_only_load_restores_nothing(page_worker, monkeypatch):
         page_worker, "_begin_restore", lambda _: pytest.fail("no image to restore")
     )
     req = _kv_only_load()
-    page_worker._submit_load(req, object())
+    page_worker._submit_load(req, step_event(page_worker))
     page_worker.future.ready = True
     finished = page_worker.get_finished()
     assert finished.finished_loading == {req.load_operation}
@@ -331,12 +356,12 @@ def test_a_page_only_layout_registers_no_image_group(page_worker, worker):
 
 def test_page_alone_on_an_images_layout_fails_before_transport(worker):
     # The scheduler and this worker disagree about images: nothing is sent.
-    worker._submit_load(_kv_only_load(), object())
+    worker._submit_load(_kv_only_load(), step_event(worker))
     assert worker.submitted == []
 
 
 def test_an_image_on_a_page_only_layout_fails_before_transport(page_worker):
-    page_worker._submit_save(request(), object())
+    page_worker._submit_save(request(), step_event(page_worker))
     assert page_worker.submitted == []
 
 
@@ -412,7 +437,7 @@ def test_load_completion_waits_for_native_restore(worker, monkeypatch):
 
     monkeypatch.setattr(worker, "_begin_restore", restore)
     req = request(loading=True)
-    worker._submit_load(req, object())
+    worker._submit_load(req, step_event(worker))
     assert not worker.get_finished().finished_loading
     assert restored == []
     worker.future.ready = True
@@ -430,7 +455,7 @@ def test_query_exception_never_releases_dma_source(worker):
         raise RuntimeError("IPC event unavailable")
 
     worker.future.query = broken
-    worker._submit_save(request(), object())
+    worker._submit_save(request(), step_event(worker))
     with pytest.raises(LMCacheTransferUnprovable, match="IPC event unavailable"):
         worker.get_finished()
     assert worker._native_saves
@@ -438,8 +463,8 @@ def test_query_exception_never_releases_dma_source(worker):
 
 def test_worker_admission_bound_rejects_before_dma(worker):
     worker._max_pending_saves = 1
-    worker._submit_save(request(), object())
-    worker._submit_save(request(generation=2), object())
+    worker._submit_save(request(), step_event(worker))
+    worker._submit_save(request(generation=2), step_event(worker))
     assert len(worker.submitted) == 1
     completions = worker.get_finished().connector_completions
     [terminal] = [
@@ -453,10 +478,10 @@ def test_worker_admission_bound_rejects_before_dma(worker):
 
 def test_exact_completed_generation_cannot_replay(worker):
     worker.future.ready = True
-    worker._submit_save(request(), object())
+    worker._submit_save(request(), step_event(worker))
     worker.get_finished()
     with pytest.raises(RuntimeError, match="duplicate"):
-        worker._submit_save(request(), object())
+        worker._submit_save(request(), step_event(worker))
 
 
 def test_native_state_uses_same_tp_rank_collapse_as_page():
@@ -466,7 +491,7 @@ def test_native_state_uses_same_tp_rank_collapse_as_page():
 
 def test_incremental_load_transfers_only_page_suffix_but_full_native_image(worker):
     req = request(loading=True, hbm=8)
-    worker._submit_load(req, object())
+    worker._submit_load(req, step_event(worker))
     [submitted] = worker.submitted
     assert submitted.start == 8
     assert submitted.end == 16
@@ -479,7 +504,7 @@ def test_page_ranges_are_source_safe_before_terminal_but_state_is_not(worker):
     before the STORE terminal."""
     req = request()
     worker.future.source_ranges = [(0, 8)]
-    worker._submit_save(req, object())
+    worker._submit_save(req, step_event(worker))
 
     first = worker.get_finished()
     assert first.connector_completions == {
@@ -505,7 +530,7 @@ def test_page_ranges_are_source_safe_before_terminal_but_state_is_not(worker):
 def test_collapsed_tp_non_writer_skips_transport_and_reports_safe_success(worker):
     worker._is_kv_writer = False
     req = request()
-    worker._submit_save(req, object())
+    worker._submit_save(req, step_event(worker))
     assert worker.submitted == []
 
     completions = worker.get_finished().connector_completions
@@ -588,7 +613,7 @@ def test_restore_is_fenced_against_the_compute_stream_both_ways(worker, cuda):
     )
 
     req = request(loading=True)
-    worker._submit_load(req, object())
+    worker._submit_load(req, step_event(worker))
     pending = next(iter(worker._native_loads.values()))
     assert worker._begin_restore(pending)
     [event] = cuda.events
@@ -613,7 +638,7 @@ def test_native_restore_reports_success_and_returns_its_slot(worker, cuda):
     )
     worker.future.value, worker.future.ready = True, True
     req = request(loading=True)
-    worker._submit_load(req, object())
+    worker._submit_load(req, step_event(worker))
 
     first = worker.get_finished()
     assert not first.finished_loading and not first.failed_loading
@@ -705,7 +730,7 @@ def test_raising_restore_keeps_its_descriptor_slot_until_the_deadline(
     worker._restore_descriptor_slots = [3]
     worker.future.value, worker.future.ready = True, True
     req = request(loading=True)
-    worker._submit_load(req, object())
+    worker._submit_load(req, step_event(worker))
 
     first = worker.get_finished()
     assert not first.finished_loading and not first.failed_loading
@@ -764,18 +789,41 @@ def test_a_layout_without_images_has_a_namespace_of_its_own(monkeypatch):
     assert "::native-page-v1-" in page_alone
 
 
-def test_a_native_transfer_holds_its_step_event_until_terminal(worker, monkeypatch):
+def test_a_native_transfer_holds_its_step_event_until_terminal(worker):
     """The step's event is re-recorded only once the server no longer waits."""
-    # CPU-only torch has no constructible cuda.Event.
-    monkeypatch.setattr(
-        torch.cuda, "Event", lambda **_kw: SimpleNamespace(record=lambda _s: None)
-    )
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
-    index, _ = worker._step_events.record(worker._lock)
-    worker._submit_save(request(), object(), index)
+    worker._submit_save(request(), step_event(worker))
+    index = worker._step_event_of["save:7:1"]
     assert worker._step_events._holds[index] == 1
     assert not worker.get_finished().connector_completions
     assert worker._step_events._holds[index] == 1
     worker.future.ready = True
     worker.get_finished()
     assert worker._step_events._holds[index] == 0
+
+
+def test_native_transfers_are_submitted_and_polled_off_the_step_thread():
+    """Both are HIP IPC calls that cost milliseconds under launch pressure;
+    the step thread only restores, once a retrieve has landed."""
+    import threading
+
+    instance = _make_worker()
+    submit, query = [], []
+    future = instance.future
+    real_query = future.query
+
+    def recording_query():
+        query.append(threading.current_thread() is threading.main_thread())
+        return real_query()
+
+    future.query = recording_query
+
+    def recording_submit(request_id, op, event):
+        submit.append(threading.current_thread() is threading.main_thread())
+        return future
+
+    instance._adapter.submit_store_request = recording_submit
+    instance._submit_save(request(), step_event(instance))
+    future.ready = True
+    instance.get_finished()
+    assert submit == [False]
+    assert query and not any(query)
