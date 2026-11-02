@@ -112,11 +112,13 @@ def test_prefill_sized_fc_gather_stays_on_rccl(monkeypatch, module, cls_name):
     assert group.calls[0]["use_custom"] is False
 
 
-def test_qwen35_prefill_chunk_is_over_the_bound_and_decode_is_under():
+def test_qwen35_prefill_chunk_is_over_the_bound_and_decode_is_under(monkeypatch):
     """The shipped bound on the shapes it is meant to separate: Qwen3.5-397B
     (hidden 4096) bf16 fc output at TP4, a 16384-token prefill chunk vs a
     64-request x 6-row decode step."""
     from atom.models.utils import mtp_fc_gather_use_custom
+
+    monkeypatch.delenv("ATOM_USE_CUSTOM_ALL_GATHER", raising=False)
 
     cols = 4096 // 4
     prefill = torch.empty(16384, cols, dtype=torch.bfloat16, device="meta")
