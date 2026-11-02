@@ -410,7 +410,8 @@ _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
 def test_qwen38_runs_in_process_offload_of_quantized_caches(
     kv_transfer_config, kv_cache_dtype, index_cache_dtype
 ):
-    """The in-process codec carries the QSA scale planes (`extra_planes`)."""
+    """The in-process codec carries the QSA scale planes (`k_scale`, `v_scale`,
+    `extra_planes`)."""
     _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 

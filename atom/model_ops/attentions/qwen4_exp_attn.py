@@ -75,8 +75,8 @@ QSA_ROWS = "qsa"
 QSA_DRAFT_ROWS = "qsa_draft"
 
 
-# The QSA field rules. The arena, the layers binding its rows, the PAGE
-# namespace and `_check_kv_transfer` all read these.
+# The QSA field rules. The arena, the layers binding its rows and the PAGE
+# namespace all read these.
 
 
 def qsa_caches_quantized(config) -> bool:
@@ -634,34 +634,38 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             name += sfx
             return arena.view(name)[row] if name in names else None
 
-        key, value = optional("k"), optional("v")
+        key, value, k_scale, v_scale, raw, compressed, rope, compressed_scale = map(
+            optional,
+            (
+                "k",
+                "v",
+                "k_scale",
+                "v_scale",
+                "index_raw",
+                "index_compressed",
+                "rope_positions",
+                "index_compressed_scale",
+            ),
+        )
         module.bind_caches(
             key,
             value,
-            optional("index_raw"),
-            optional("index_compressed"),
-            optional("rope_positions"),
-            k_scale_cache=optional("k_scale"),
-            v_scale_cache=optional("v_scale"),
-            compressed_key_scale=optional("index_compressed_scale"),
+            raw,
+            compressed,
+            rope,
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
+            compressed_key_scale=compressed_scale,
         )
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
-            k_scale=optional("k_scale"),
-            v_scale=optional("v_scale"),
+            k_scale=k_scale,
+            v_scale=v_scale,
             extra_planes=tuple(
                 plane
-                for plane in map(
-                    optional,
-                    (
-                        "index_raw",
-                        "index_compressed",
-                        "rope_positions",
-                        "index_compressed_scale",
-                    ),
-                )
+                for plane in (raw, compressed, rope, compressed_scale)
                 if plane is not None
             ),
         )
