@@ -24,6 +24,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_DS_QKNORM_QUANT_FUSION",
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION",
     "ATOM_ENABLE_GLUON_FUSED_AR",
+    "ATOM_ENABLE_GLUON_GEMMA_RMSNORM",
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT",
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT",
@@ -110,6 +111,9 @@ class TestEnvsDefaults:
 
     def test_gluon_gemm_ar_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_GLUON_GEMM_AR is True
+
+    def test_gluon_gemma_rmsnorm_default_enabled(self):
+        assert _get_envs().ATOM_ENABLE_GLUON_GEMMA_RMSNORM is True
 
     def test_model_sensitive_rmsnorm_default_disabled(self):
         assert _get_envs().ATOM_USE_MODEL_SENSITIVE_RMSNORM is False

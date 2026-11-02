@@ -1085,6 +1085,33 @@ class GDNStateMixin(PoolRowsMixin):
         """
         return self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
 
+    def _zero_dead_conv_columns(self, num_prefills: int) -> None:
+        """Zero the conv window past `kernel - 1` in this prefill's write slots.
+
+        Those columns are the decode window's speculative tail (MTP). A prefill
+        neither reads nor writes them, and the first decode after it reads only
+        `[0, kernel - 1)` before rewriting the whole window, so whatever a
+        slot's previous use left there is dead. But a prompt-boundary
+        checkpoint copies the whole window into PAGE units: a stale NaN there
+        (dummy capture runs leave one in slot 0) travelled through every
+        restore and store, and once those units were reused as KV it poisoned
+        the attention tail tile of whichever request got them. Zeroed here, not
+        at the store: a decode-point checkpoint's tail columns are live.
+        """
+        k = getattr(self.model_runner, "mamba_k_cache", None)
+        live = self._conv_state_len()
+        if (
+            k is None
+            or k.dim() < 4
+            or k.shape[2] <= live
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        slots = self.non_spec_state_indices_tensor.np[:num_prefills]
+        slots = slots[slots >= 0]
+        if slots.size:
+            k[:, :, live:, :].index_fill_(1, self._staged_i64("conv_dead", slots), 0)
+
     def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
         """Checkpoints this step reaches, as device index tensors.
 
@@ -1326,6 +1353,8 @@ class GDNStateMixin(PoolRowsMixin):
             num_prefill_tokens = 0
 
         if num_prefills > 0:
+            if envs.ATOM_GDN_ZERO_DEAD_CONV:
+                self._zero_dead_conv_columns(num_prefills)
             # Tokens already folded into each request's state before this
             # forward: earlier prefill chunks, or a resumed state checkpoint.
             # It has to be the chunk's START offset — `attn_metadata`'s

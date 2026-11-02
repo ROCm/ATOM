@@ -206,6 +206,20 @@ def _mrope_qk_tiled_kernel(
     tl.store(k_out_ptr + out_offsets_k, out, mask=mask & ~is_q)
 
 
+def _mrope_rotary_supported(rotary_emb: nn.Module, head_size: int) -> bool:
+    """Whether the rotary embedding is the interleaved Qwen3.5 MRoPE these kernels take:
+    head 256, rotary 64, Neox."""
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
+    return (
+        mrope_section is not None
+        and len(mrope_section) >= 3
+        and getattr(rotary_emb, "mrope_interleaved", False)
+        and head_size == 256
+        and getattr(rotary_emb, "rotary_dim", None) == 64
+        and getattr(rotary_emb, "is_neox_style", False)
+    )
+
+
 def _mrope_qk_supported(
     rotary_emb: nn.Module,
     positions: torch.Tensor,
@@ -216,38 +230,33 @@ def _mrope_qk_supported(
     head_size: int,
 ) -> bool:
     """Whether q, k and the rotary embedding have the Qwen3.5 MRoPE shapes these kernels take."""
-    mrope_section = getattr(rotary_emb, "mrope_section", None)
-    return not (
-        positions.ndim != 2
-        or positions.shape[0] != 3
-        or positions.stride(1) != 1
-        or mrope_section is None
-        or len(mrope_section) < 3
-        or not getattr(rotary_emb, "mrope_interleaved", False)
-        or head_size != 256
-        or getattr(rotary_emb, "rotary_dim", None) != 64
-        or not getattr(rotary_emb, "is_neox_style", False)
-        or q.ndim != 2
-        or k.ndim != 2
-        or q.shape[0] != positions.shape[1]
-        or k.shape[0] != positions.shape[1]
-        or q.stride(1) != 1
-        or k.stride(1) != 1
-        or q.shape[1] != num_q_heads * head_size
-        or k.shape[1] != num_k_heads * head_size
+    return (
+        _mrope_rotary_supported(rotary_emb, head_size)
+        and positions.ndim == 2
+        and positions.shape[0] == 3
+        and positions.stride(1) == 1
+        and q.ndim == 2
+        and k.ndim == 2
+        and q.shape[0] == positions.shape[1]
+        and k.shape[0] == positions.shape[1]
+        and q.stride(1) == 1
+        and k.stride(1) == 1
+        and q.shape[1] == num_q_heads * head_size
+        and k.shape[1] == num_k_heads * head_size
     )
 
 
 @functools.cache
-def _gfx1250_fused_qk_norm_mrope():
-    """aiter's fused Q/K norm + MRoPE on gfx1250, or None (other arch, or an aiter without it)."""
+def _gfx1250_aiter_op(name: str):
+    """aiter's fused Q/K norm + MRoPE op ``name`` on gfx1250, or None (other arch, or an
+    aiter without it)."""
     if get_gfx() != "gfx1250":
         return None
     try:
-        from aiter.ops.triton.fusions.fused_qk_norm_mrope import fused_qk_norm_mrope
+        from aiter.ops.triton.fusions import fused_qk_norm_mrope
     except ImportError:
         return None
-    return fused_qk_norm_mrope
+    return getattr(fused_qk_norm_mrope, name, None)
 
 
 def try_fused_qk_norm_mrope(
@@ -267,7 +276,7 @@ def try_fused_qk_norm_mrope(
     """
     if torch.compiler.is_compiling():
         return None
-    fused_qk_norm_mrope = _gfx1250_fused_qk_norm_mrope()
+    fused_qk_norm_mrope = _gfx1250_aiter_op("fused_qk_norm_mrope")
     if (
         fused_qk_norm_mrope is None
         or not qk_norm.add_unit_offset
@@ -290,37 +299,16 @@ def try_fused_qk_norm_mrope(
     )
 
 
-@functools.cache
-def _gfx1250_fused_qk_norm_mrope_cache():
-    """aiter's fused Q/K norm + MRoPE + KV cache write on gfx1250, or None (other
-    arch, or an aiter without it)."""
-    if get_gfx() != "gfx1250":
-        return None
-    try:
-        from aiter.ops.triton.fusions.fused_qk_norm_mrope import (
-            fused_qk_norm_mrope_cache,
-        )
-    except ImportError:
-        return None
-    return fused_qk_norm_mrope_cache
-
-
 def gfx1250_fused_qk_norm_mrope_cache_applies(
     rotary_emb: nn.Module, head_size: int, kv_cache_dtype: str
 ) -> bool:
     """Whether ``try_fused_qk_norm_mrope_cache`` takes every batch of an attention:
     gfx1250 with the aiter kernel, the interleaved Qwen3.5 MRoPE (head 256, rotary
     64, Neox) and a cache that is not fp8."""
-    mrope_section = getattr(rotary_emb, "mrope_section", None)
     return (
-        _gfx1250_fused_qk_norm_mrope_cache() is not None
+        _gfx1250_aiter_op("fused_qk_norm_mrope_cache") is not None
         and not kv_cache_dtype.startswith("fp8")
-        and head_size == 256
-        and getattr(rotary_emb, "rotary_dim", None) == 64
-        and mrope_section is not None
-        and len(mrope_section) >= 3
-        and getattr(rotary_emb, "mrope_interleaved", False)
-        and getattr(rotary_emb, "is_neox_style", False)
+        and _mrope_rotary_supported(rotary_emb, head_size)
     )
 
 
@@ -347,7 +335,7 @@ def try_fused_qk_norm_mrope_cache(
     """
     if torch.compiler.is_compiling():
         return None
-    fused_qk_norm_mrope_cache = _gfx1250_fused_qk_norm_mrope_cache()
+    fused_qk_norm_mrope_cache = _gfx1250_aiter_op("fused_qk_norm_mrope_cache")
     if (
         fused_qk_norm_mrope_cache is None
         or k_cache.dtype != q.dtype

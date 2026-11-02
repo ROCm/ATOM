@@ -122,6 +122,23 @@ The engine-side counterpart of the state tier lives outside this directory:
 store/finished/failed hash sets that `hybrid/kimi_k3/state_tier.py` reports back,
 so a later prefix hit knows which checkpoints the CPU tier can actually serve.
 
+For embedded Qwen/Kimi-K3 state offload, `OFFLOAD_STATE_GPU_SIZE` optionally
+bounds GPU checkpoint storage in GiB per worker (default `0`, disabled).
+The budget accounts for physical PAGE padding. After batch completion it
+reclaims the oldest unpinned READY images whose completed CPU stores remain
+in `StateOffloadIndex`, preserving their KV blocks and CPU index entries.
+In-flight copies, restores, and checkpoints without a confirmed CPU copy can
+temporarily exceed this soft limit. A missing CPU image still follows the
+existing failed-load/recompute path. The budget requires both store and load
+capability; producer-only and consumer-only roles retain normal eviction.
+
+`OFFLOAD_STATE_CPU_SIZE` sets the state object's CPU budget (GiB per worker,
+default `32`), within the shared `LMCACHE_MAX_LOCAL_CPU_SIZE` allocation.
+Give the CPU state tier more capacity than the GPU checkpoint budget so it
+can retain images released from GPU memory. See the
+[gfx1250 Qwen3.5 recipe](../../../recipes/mlperf_endpoints_qwen35/README.lmcache.md)
+for the image-specific build and benchmark procedure.
+
 ## LMCache Multiprocess (`lmcache_mp`)
 
 The `lmcache_mp` connector selects one of two paths from capabilities published

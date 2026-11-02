@@ -396,6 +396,16 @@ def state_tier_cpu_bytes() -> int:
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
 
+def state_tier_gpu_bytes() -> int:
+    """Optional GPU checkpoint budget in GiB; zero preserves normal eviction."""
+    import math
+
+    size = float(os.environ.get("OFFLOAD_STATE_GPU_SIZE", "0"))
+    if not math.isfinite(size) or size < 0:
+        raise ValueError("OFFLOAD_STATE_GPU_SIZE must be finite and nonnegative")
+    return int(size * (1 << 30))
+
+
 def state_tier_chunk_tokens(config) -> int:
     """The LMCache chunk size in tokens for the joint KV leg, or 0.
 

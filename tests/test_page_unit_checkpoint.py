@@ -45,6 +45,77 @@ def ready(store, prefix_hash, src_slot=0):
     return checkpoint_id, op
 
 
+def test_offload_budget_releases_old_images_without_spending_cached_kv():
+    pool, store = make_store()
+    ready(store, 11)
+    ready(store, 22)
+    ready(store, 33)
+    before = pool.num_free
+    store.trim_offloaded(2, lambda h: True)
+    assert not store.contains(11)
+    assert store.contains(22) and store.contains(33)
+    assert pool.num_free == before + store.units_per_checkpoint
+    assert store.evictions == 1
+
+
+def test_offload_budget_preserves_unconfirmed_and_pinned_sources():
+    _pool, store = offload_store(num_units=40)
+    ready(store, 11)  # No successful CPU store yet.
+    ready(store, 22)
+    ready(store, 33)
+    ready(store, 44)
+    # A restore owns 22; an external reader owns 33.
+    assert store.begin_restore(22, 0)
+    op, _ = store.acquire_checkpoint_source(33)
+    store.trim_offloaded(1, lambda h: h != 11)
+    assert store.contains(11) and store.contains(22) and store.contains(33)
+    assert not store.contains(44)
+    store.release_offload_store_source(op)
+    store.settle_offload_store(op)
+    store.trim_offloaded(1, lambda h: h != 11)
+    assert not store.contains(33)
+    assert store.contains(22)
+
+
+def test_offload_budget_never_releases_an_inflight_gpu_writer():
+    _pool, store = make_store()
+    store.begin_store(11, 0)
+    store.begin_store(22, 0)
+    store.trim_offloaded(1, lambda h: True)
+    assert len(store.records) == 2
+    assert all(record.state == COPYING for record in store.records.values())
+
+
+def test_offload_gpu_budget_is_opt_in_and_counts_page_padding(monkeypatch):
+    from atom.model_engine.state_offload import StateOffloadIndex
+
+    monkeypatch.delenv("OFFLOAD_STATE_GPU_SIZE", raising=False)
+    c = TestTheTierVotes.coordinator(offload=StateOffloadIndex())
+    assert c._offload_gpu_max_entries == 0
+    # A 25-byte image needs 30 physical bytes: this permits two, not three.
+    monkeypatch.setenv("OFFLOAD_STATE_GPU_SIZE", str(80 / (1 << 30)))
+    c.attach_offload(StateOffloadIndex())
+    assert c._offload_gpu_max_entries == 2
+    for h in (11, 22, 33):
+        ready(c.store, h)
+        c.offload.note_stored(h)
+    c.complete_previous_batch()
+    assert not c.store.contains(11)
+    assert c.offload.could_serve(11)
+    # Removing the GPU image must not remove the tier's resumable boundary.
+    assert c.resumable_hit(TestTheTierVotes.seq(), 1, [11]) == 1
+
+
+@pytest.mark.parametrize("can_load,sink", [(False, True), (True, False)])
+def test_offload_gpu_budget_requires_both_tier_directions(monkeypatch, can_load, sink):
+    from atom.model_engine.state_offload import StateOffloadIndex
+
+    monkeypatch.setenv("OFFLOAD_STATE_GPU_SIZE", "1")
+    c = TestTheTierVotes.coordinator()
+    c.attach_offload(StateOffloadIndex(can_load=can_load), sink=sink)
+    assert c._offload_gpu_max_entries == 0
+
+
 def test_runtime_spec_derives_units_and_has_a_minimal_wire_form():
     spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
 

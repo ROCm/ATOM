@@ -232,6 +232,7 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 | **ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION** | bool | 1 (true) | If set to `1`, fuse allreduce with RMSNorm in tensor parallel mode. |
 | **ATOM_ENABLE_GLUON_FUSED_AR** | bool | 1 (true) | If set to `1`, ATOM sets `AITER_GLUON_FUSED_AR=1`, and aiter runs its Gluon all-reduce + residual add + RMSNorm for decode (fused calls up to 2 MiB) at TP4. aiter uses it on gfx1250 only. |
 | **ATOM_ENABLE_GLUON_GEMM_AR** | bool | 1 (true) | If set to `1`, the bf16 o_proj / out_proj of a Qwen3.5 layer and the all-reduce + residual add + RMSNorm after it run as one aiter Gluon kernel (`gemm_a16w16_all_reduce_rmsnorm`) up to 128 tokens, at TP4 on gfx1250. It needs an aiter with that op; other cases are not changed. |
+| **ATOM_ENABLE_GLUON_GEMMA_RMSNORM** | bool | 1 (true) | If set to `1`, `GemmaRMSNorm` (with or without the residual add) runs aiter's Gluon `fused_rmsnorm_add` (`gemma_norm=True`) in place of the HIP `fused_qk_rmsnorm_group_quant` kernel. gfx1250 only; ATOM keeps the HIP kernel on other GPUs and with an aiter that does not have the Gluon op. |
 
 ### DeepSeek-style
 
@@ -414,6 +415,8 @@ flag below. Details in the state-checkpoint section of the
 | **ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS** | int | — (the model's native interval) | vLLM plugin (DeepSeek-V4 state checkpoints): overrides the checkpoint interval in tokens, snapped down to a multiple of the block size. `>0` a rung every N tokens plus the prompt-end anchor and the demand rung; `-1` no rungs, anchor and demand only; `0` no state checkpoint is published, so there is no prefix hit at all (vLLM reports a hit only when every state checkpoint group is cached; the state checkpoint groups still allocate their working blocks). |
 | **ATOM_STATE_CHECKPOINT_CHECK_BLOCKS** | bool | 0 (false) | vLLM plugin (state checkpoints) diagnostic: after every schedule, raise if a request holds more than two blocks in any state checkpoint group. |
 | **ATOM_GDN_STATE_MIDSTEP** | bool | 0 (false) | Set to `1` to take Qwen3-Next / Qwen3.5 GDN state checkpoints inside a prefill forward, from the chunk kernel's per-64-token states, instead of cutting the prefill into several forwards that end on them. PAGE checkpoint path only. Checkpoint positions move back onto the forward's 64-token grid, so a resume recomputes up to 48 more tokens. |
+| **ATOM_ZERO_RELEASED_CHECKPOINT_UNITS** | bool | 1 (true) | Zero a PAGE state checkpoint's units when it is released back to the KV pool, before any request's KV can be written there. A checkpoint image is raw state bytes, and an attention tile reads a block's unwritten positions past the sequence end with zero weight: a NaN or Inf left there still poisons the output (`0 * Inf`). Costs one fill per K/V field on a step that releases units. |
+| **ATOM_GDN_ZERO_DEAD_CONV** | bool | 1 (true) | Qwen3-Next / Qwen3.5 with MTP: a prefill zeroes the conv window's speculative tail (columns past `kernel - 1`) in the slots it writes. The prefill neither reads nor writes those columns and the next decode reads only the history, but a prompt-boundary checkpoint copies the whole window into PAGE units, so stale bytes there (dummy runs leave NaN in slot 0) would otherwise travel through every restore and store. One fill per prefill step. |
 
 ### LMCache offload tier
 

@@ -476,6 +476,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # interior states instead of cutting prefill chunks onto them. PAGE path
     # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
     "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
+    # A PAGE checkpoint's units go back to the KV pool zeroed: their bytes are a
+    # state image, and the attention tail tile reads unwritten KV positions.
+    "ATOM_ZERO_RELEASED_CHECKPOINT_UNITS": lambda: (
+        os.getenv("ATOM_ZERO_RELEASED_CHECKPOINT_UNITS", "1") == "1"
+    ),
+    # A GDN prefill zeroes the speculative tail of its slots' conv window, which
+    # it neither reads nor writes, so no checkpoint image carries stale bytes.
+    "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -646,6 +654,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # norm after it, up to 128 tokens, at TP4 on gfx1250.
     "ATOM_ENABLE_GLUON_GEMM_AR": lambda: (
         os.getenv("ATOM_ENABLE_GLUON_GEMM_AR", "1") == "1"
+    ),
+    # aiter's Gluon RMSNorm (+ residual add) for GemmaRMSNorm in place of the
+    # HIP fused_qk_rmsnorm_group_quant kernel; on gfx1250 only.
+    "ATOM_ENABLE_GLUON_GEMMA_RMSNORM": lambda: (
+        os.getenv("ATOM_ENABLE_GLUON_GEMMA_RMSNORM", "1") == "1"
     ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
