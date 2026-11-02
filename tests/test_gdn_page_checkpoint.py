@@ -94,6 +94,7 @@ def _transfer(monkeypatch, **kwargs):
         num_state_layers=lambda: params["layers"],
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
+        _pool_state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
     for name in (
         "_decode_keep",
@@ -156,10 +157,12 @@ def test_decode_images_get_spare_slots_only_where_they_are_built(
         ),
         state_transfer=lambda: transfer,
         _state_shape_for_runner=lambda: ((3, 16), (2, 4, 4)),
-        _state_dtypes=lambda: (torch.bfloat16, torch.bfloat16),
+        _pool_state_dtypes=lambda: (torch.bfloat16, torch.bfloat16),
         num_state_layers=lambda: 2,
         _replayssm_bytes_per_slot=lambda: 0,
+        _leapquant_bytes_per_slot=lambda: 0,
         slots_per_req=lambda: 1,
+        state_transfer_slots=lambda: 0,
     )
     builder._checkpoint_interval = _builder_cls()._checkpoint_interval.__get__(builder)
     spec = _builder_cls().state_spec(builder)

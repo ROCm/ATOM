@@ -1303,6 +1303,8 @@ class ModelRunner:
                 "kv_cache",
                 "mamba_k_cache",
                 "mamba_v_cache",
+                "leapquant_scale",
+                "leapquant_comp",
                 "kpool_tail_cache",
             ):
                 if hasattr(self, attr):
