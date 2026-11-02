@@ -384,7 +384,7 @@ def build_page_namespace(
     from atom.utils.selector import Family, attn_family
 
     if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
-        from atom.model_ops.attentions.qwen4_exp_attn import qsa_page_segments
+        from atom.model_ops.qwen4_exp.qsa_cache_rules import qsa_page_segments
 
         document.update(qsa_page_segments(config))
     canonical = json.dumps(
@@ -473,12 +473,14 @@ def lmcache_engine_id(config) -> str:
     would both bind ``dp0`` and a scheduler would follow the other server's
     hits. ``data_parallel_base_port`` (the runners' TCPStore port, bound by
     ``CoreManager`` for the server's lifetime) tells servers apart; unresolved
-    (0), the DP rank alone is used. The id is not part of a chunk's key.
+    (0) or not a port, the DP rank alone is used. The id is not part of a
+    chunk's key.
     """
     parallel = getattr(config, "parallel_config", None)
     dp_rank = int(getattr(parallel, "data_parallel_rank", 0) or 0)
-    port = int(getattr(parallel, "data_parallel_base_port", 0) or 0)
-    if port:
+    port = getattr(parallel, "data_parallel_base_port", None)
+    # `type(...) is int`: a bool is an int, and True would name port 1.
+    if type(port) is int and port > 0:
         return f"atom-offload-r{port}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 
