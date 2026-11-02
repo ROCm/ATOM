@@ -74,8 +74,8 @@ def structured_tool_format(parser_cls, tools, tool_choice):
     """Describe the native tool alternative without accepting client grammars."""
     if not tools or tool_choice == "none":
         return None
-    from ..tool_parser.deepseekv4_tool_parser import DsmlParser
-    from ..tool_parser.tool_parser import qualified_tool_name
+    from atom.entrypoints.openai.tool_parser.deepseekv4_tool_parser import DsmlParser
+    from atom.entrypoints.openai.tool_parser.tool_parser import qualified_tool_name
 
     if parser_cls is None or not issubclass(parser_cls, DsmlParser):
         raise ValueError("Structured output with tools requires a DSML tool parser")
@@ -98,7 +98,7 @@ def structured_tool_format(parser_cls, tools, tool_choice):
 
 def structured_reasoning_marker(channel, tokenizer):
     """Only suspend the JSON grammar when generation starts inside reasoning."""
-    from ..reasoning_dialects import FALLBACK_DIALECT
+    from atom.entrypoints.openai.reasoning_dialects import FALLBACK_DIALECT
 
     dialect = channel.dialect or FALLBACK_DIALECT
     if dialect.content_framing or len(dialect.end_markers) != 1:

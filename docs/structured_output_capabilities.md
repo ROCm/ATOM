@@ -6,7 +6,7 @@ SGLang plugin's structured-output implementation.
 
 ## Code organization
 
-The engine implementation lives in `atom/structured_output/`, following the
+The structured-output implementation lives in `atom/structured_output/`, following the
 manager/backend separation used by vLLM's `vllm/v1/structured_output/` package.
 ATOM currently has one backend, so it does not introduce a backend registry or
 multi-backend interfaces.
@@ -19,20 +19,16 @@ multi-backend interfaces.
 | `schema_normalization.py` | Exact constraint lowering and shared expansion budgets. |
 | `mask.py` | Reusable packed mask buffers, H2D transfer and kernel dispatch. |
 | `transfer.py` | Owned token snapshots, pinned host buffers and asynchronous D2H events. |
-
-The OpenAI adapter has its own `atom/entrypoints/openai/structured_output/`
-package, separate from engine execution:
-
-| Module | Responsibility |
-| --- | --- |
 | `request_validation.py` | Chat/Responses format extraction, Schema checks, tool alternatives and reasoning activation. |
 | `response_validation.py` | Final JSON/Schema validation and Chat stream completion/error handling. |
 | `worker_preflight.py` | Admission-time worker RPC, deployment fingerprint checks and preparation cache. |
 
-The GPU kernel remains in
-`atom/model_ops/triton_structured_output.py`. The engine package does not depend
-on the HTTP layer, and importing its entry points does not load llguidance or
-allocate mask/transfer resources.
+API handlers and the model runner import from this single package. Protocol
+adapters import the existing tool/reasoning parsers and SSE helpers only inside
+the functions that use them; the execution manager and backend do not import the
+API adapters. Importing the package does not load llguidance or allocate
+mask/transfer resources. The GPU kernel remains in
+`atom/model_ops/triton_structured_output.py`.
 
 ## Request formats
 

@@ -17,9 +17,13 @@ assert callable(so.StructuredOutput)
 assert not any(n == "llguidance" or n.startswith("llguidance.") for n in sys.modules)
 assert all(
     "atom.structured_output." + n not in sys.modules
-    for n in ("backend_guidance", "mask", "transfer")
+    for n in (
+        "backend_guidance", "mask", "transfer", "request_validation",
+        "response_validation", "worker_preflight",
+    )
 )
 assert "atom.model_ops.triton_structured_output" not in sys.modules
+assert "atom.entrypoints.openai.api_server" not in sys.modules
 """
     subprocess.run(
         [sys.executable, "-c", code],

@@ -1787,11 +1787,11 @@ async def _configure_structured_output(
         raise ValueError(
             "Structured output does not support ignore_eos or custom stop strings"
         )
-    from .structured_output.request_validation import (
+    from atom.structured_output.request_validation import (
         structured_reasoning_marker,
         structured_tool_format,
     )
-    from .structured_output.worker_preflight import WorkerGrammarPreflight
+    from atom.structured_output.worker_preflight import WorkerGrammarPreflight
 
     marker = structured_reasoning_marker(channel, tokenizer)
     tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
@@ -1869,7 +1869,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
         )
 
-        from .structured_output.request_validation import schema_from_format
+        from atom.structured_output.request_validation import schema_from_format
 
         schema = schema_from_format(request.response_format)
 
@@ -1997,7 +1997,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     ),
                 )
             if schema is not None:
-                from .structured_output.response_validation import validate_chat_stream
+                from atom.structured_output.response_validation import (
+                    validate_chat_stream,
+                )
 
                 gen = validate_chat_stream(gen, schema)
             return StreamingResponse(
@@ -2106,7 +2108,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         if schema is not None:
-            from .structured_output.response_validation import validate_output
+            from atom.structured_output.response_validation import validate_output
 
             for choice in resp.choices:
                 validate_output(
@@ -2805,8 +2807,8 @@ async def responses_create(raw_request: Request):
             top_p=(request.top_p if request.top_p is not None else model_top_p),
         )
 
-        from .structured_output.request_validation import schema_from_format
-        from .structured_output.response_validation import validate_output
+        from atom.structured_output.request_validation import schema_from_format
+        from atom.structured_output.response_validation import validate_output
 
         text_config = getattr(request, "text", None)
         if text_config is not None and not isinstance(text_config, dict):

@@ -25,7 +25,7 @@ def validate_output(schema, text, finish_reason, *, tool_calls=False):
 
 
 async def validate_chat_stream(source, schema):
-    from ..sse import data_frame, iter_sse_data
+    from atom.entrypoints.openai.sse import data_frame, iter_sse_data
 
     texts = {}
     try:
