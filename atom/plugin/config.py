@@ -248,6 +248,26 @@ def _normalize_sglang_parallel_config(
     return tp_size, 1, 1, 0, tp_rank
 
 
+def _build_sglang_parallel_config(dp_size: int, dp_rank: int):
+    """Build the ATOM ParallelConfig for one SGLang scheduler process.
+
+    SGLang runs on a single node and starts one process per DP rank, so every
+    rank is local. At construction ParallelConfig reads data_parallel_rank as
+    the first global rank of this node's slice, so build it for the slice
+    starting at 0 and then assign this process's rank, as EngineCoreManager
+    does for native ATOM.
+    """
+    from atom.config import ParallelConfig
+
+    parallel_config = ParallelConfig(
+        data_parallel_size=dp_size,
+        data_parallel_size_local=dp_size,
+    )
+    parallel_config.data_parallel_rank = dp_rank
+    parallel_config.data_parallel_rank_local = dp_rank
+    return parallel_config
+
+
 def _build_atom_speculative_config_from_vllm(vllm_spec_config: Any):
     """Translate vLLM's SpeculativeConfig into ATOM's SpeculativeConfig.
 
@@ -503,7 +523,6 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.distributed.parallel_state import (
         get_attn_context_model_parallel_rank as get_attention_cp_rank,
     )
@@ -516,12 +535,13 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.distributed.parallel_state import (
         get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
     )
+    from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
         PortArgs,
     )
 
-    from atom.config import CompilationConfig, Config, ParallelConfig
+    from atom.config import CompilationConfig, Config
 
     # sglang's ModelRunner already parsed and stored ServerArgs globally
     # before OOT model loading, so we can retrieve it directly.
@@ -618,11 +638,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
     )
 
     # sglang uses the atom parallel config
-    sgl_parallel_config = ParallelConfig(
-        data_parallel_size=atom_data_parallel_size,
-        data_parallel_size_local=atom_data_parallel_size,
-        data_parallel_rank=atom_data_parallel_rank,
-        data_parallel_rank_local=atom_data_parallel_rank,
+    sgl_parallel_config = _build_sglang_parallel_config(
+        atom_data_parallel_size, atom_data_parallel_rank
     )
 
     # use sglang torch compile policy and cuda graph policy

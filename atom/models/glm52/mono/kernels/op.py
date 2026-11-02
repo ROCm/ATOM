@@ -46,6 +46,7 @@ from atom.mono.weights.packing import (
 )
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.weights.layer import LayerWeights, prepare_mxfp4_expert_storage
 
 __all__ = ["Glm5MonoKernel"]
@@ -324,7 +325,7 @@ class Glm5MonoKernel:
             # nobody is left holding a buffer the others do not have.
             local_error = None
             try:
-                self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
+                self.scratch = uncached_bytes(self.scr_layout["_bytes"], dev)
                 self.step = torch.zeros(1, dtype=torch.int32, device=dev)
             except Exception as error:
                 self.scratch = None
