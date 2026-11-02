@@ -519,6 +519,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the whole gathered q back to token-major; this removes both. Costs a
     # group-wide q GEMM + W_K bmm per prefill token. Off by default.
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
+    # DCP dense MLA cached-prefix prefill: prefetch the next MLA layer's context
+    # chunks' compressed-KV AllGathers on a high-priority side stream while this
+    # layer's attention runs (the first layer starts its own behind its
+    # new-token attention); steps with fewer than 8192 new tokens gather in place.
+    # Reorders communication only (the gathered KV is
+    # bit-identical). Off by default.
+    "ATOM_DCP_PREFILL_KV_AG_OVERLAP": lambda: (
+        os.getenv("ATOM_DCP_PREFILL_KV_AG_OVERLAP", "0") == "1"
+    ),
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
     "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
