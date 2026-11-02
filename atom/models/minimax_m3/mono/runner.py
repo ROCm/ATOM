@@ -84,6 +84,7 @@ from atom.mono.runtime.debug import (
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -290,8 +291,8 @@ class MonoDecodeRunner:
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
         dev = self.dev
-        self.scratch1 = torch.zeros(K1_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
-        self.scratch4 = torch.zeros(K4_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
+        self.scratch1 = uncached_bytes(K1_SCRATCH_BYTES, dev)
+        self.scratch4 = uncached_bytes(K4_SCRATCH_BYTES, dev)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
             sym_layout(self.npes)["_bytes"],

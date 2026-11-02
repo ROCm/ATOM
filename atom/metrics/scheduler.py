@@ -1,8 +1,8 @@
 """Scheduler-owned Prometheus observations.
 
-Only the scheduler owner updates these metrics. Request context gauges carry
-per-request labels. No GPU synchronization is needed, and scrapes never consume
-observations.
+Only the scheduler owner updates these metrics. Diagnostic request context
+gauges carry per-request labels and are opt-in. No GPU synchronization is
+needed, and scrapes never consume observations.
 """
 
 from __future__ import annotations
@@ -51,9 +51,18 @@ class RequestQueueTiming:
 
 
 class SchedulerMetrics:
-    def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
+    def __init__(
+        self,
+        dp_rank=0,
+        engine_role="default",
+        *,
+        request_context_enabled=False,
+        registry=None,
+    ):
         labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
         self._labels = labels
+        # Do not allocate request-label children
+        # by default: native multiprocess storage retains them after completion.
         self.queue_time = Histogram(
             "atom:request_queue_time_seconds",
             "Time from engine receipt to first real forward dispatch, including KV loading waits.",
@@ -96,11 +105,10 @@ class SchedulerMetrics:
             buckets=BATCH_CONTEXT_BUCKETS,
             registry=registry,
         ).labels(**labels)
-        self.prefill_request_context_tokens = Gauge(
+        self.prefill_request_context_tokens = self._request_context_gauge(
             "atom:prefill_request_context_tokens",
             "Full prompt length including cached prefixes at first real prefill dispatch, once per request sequence; retained until metrics storage is cleaned.",
-            [*labels, "request_id", "sequence_id", "started_at"],
-            multiprocess_mode="max",
+            enabled=request_context_enabled,
             registry=registry,
         )
         self.decode_context_tokens = Histogram(
@@ -110,16 +118,26 @@ class SchedulerMetrics:
             buckets=BATCH_CONTEXT_BUCKETS,
             registry=registry,
         ).labels(**labels)
-        self.decode_request_context_tokens = Gauge(
+        self.decode_request_context_tokens = self._request_context_gauge(
             "atom:decode_request_context_tokens",
             "Logical context length at first real decode dispatch, once per request sequence; retained until metrics storage is cleaned.",
-            [*labels, "request_id", "sequence_id", "started_at"],
-            multiprocess_mode="max",
+            enabled=request_context_enabled,
             registry=registry,
         )
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
+
+    def _request_context_gauge(self, name, description, *, enabled, registry):
+        if not enabled:
+            return None
+        return Gauge(
+            name,
+            description,
+            [*self._labels, "request_id", "sequence_id", "started_at"],
+            multiprocess_mode="max",
+            registry=registry,
+        )
 
     @staticmethod
     def enqueue(seq, *, received_at: float | None = None) -> None:
@@ -156,6 +174,8 @@ class SchedulerMetrics:
             self.pd_transfer.observe(now - started)
 
     def _record_request_context(self, metric, req_id, seq, tokens):
+        if metric is None:
+            return
         # Retain completed requests so a scrape can still see short requests.
         metric.labels(
             **self._labels,

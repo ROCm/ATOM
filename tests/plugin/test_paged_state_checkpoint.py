@@ -140,6 +140,8 @@ def test_generic_layer_imports_no_model_code():
             "atom.model_engine.page_unit_checkpoint",
             "atom.plugin.vllm.paged_state_checkpoint",
             "atom.plugin.vllm.req_id_passthrough_patch",
+            # Which runner classes exist; it names no model.
+            "atom.plugin.vllm.vllm_runtime",
             "atom.utils",
         )
         atom_mods = [m for m in mods if m.startswith("atom")]
@@ -361,6 +363,36 @@ def test_step_order_and_one_store_per_plan(fake, monkeypatch):
         worker, md2, capturing=True, plan=lambda: 1 / 0, reset_fn=reset, name="Fake"
     )
     assert len(copier.calls) == 2
+
+
+def test_model_runner_v2_releases_slots_where_it_drops_requests():
+    """V2 has no `_update_states`; it drops finished and preempted requests in
+    `finish_requests`, which is where the slots have to come back."""
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
+
+    G._apply_runner_patches()
+    assert getattr(V2Runner.finish_requests, "_atom_state_checkpoint_patched", False)
+    released = []
+    allocator = NS(release=lambda ids: released.append(set(ids)))
+    G.register_slot_allocator(allocator)
+    removed = []
+    runner = NS(
+        kv_cache_config=None,
+        pooling_runner=None,
+        _remove_request=removed.append,
+    )
+    output = NS(
+        finished_req_ids={"done"},
+        preempted_req_ids={"preempted"},
+        scheduled_cached_reqs=None,
+        kv_cache_block_copies=None,
+    )
+    try:
+        V2Runner.finish_requests(runner, output)
+    finally:
+        G._slot_allocators.remove(allocator)
+    assert released == [{"done", "preempted"}]
+    assert sorted(removed) == ["done", "preempted"]
 
 
 def test_stores_run_once_right_after_the_runner_forward(fake):
