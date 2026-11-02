@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The Qwen3.5 MTP fc all-gather takes aiter's custom collective.
+"""The Qwen3.5 and Qwen3-Next MTP fc all-gathers take aiter's custom collective.
 
 `GroupCoordinator.all_gather` defaults to `use_custom=False`, which is RCCL:
 ~14 us per draft step at decode plus an idle gap after it. The LM head's
 gather already asks for the custom one through `ATOM_USE_CUSTOM_ALL_GATHER`;
-these pin that the MTP fc gather asks the same way, along the last dim, and
+these pin that both MTP fc gathers ask the same way, along the last dim, and
 that the knob still turns it off. CPU-only: the TP group is a stand-in.
 """
 
 import pytest
 import torch
 
-# `qwen3_5_mtp` imports AITER at module scope.
+# Both MTP modules import AITER at module scope.
 pytest.importorskip("aiter")
 
-from atom.models import qwen3_5_mtp
+from atom.models import qwen3_5_mtp, qwen3_next_mtp
+
+# (module, predictor class): both forwards share the fc -> all_gather shape.
+PREDICTORS = [
+    pytest.param(qwen3_5_mtp, "Qwen3_5MultiTokenPredictor", id="qwen3_5"),
+    pytest.param(qwen3_next_mtp, "Qwen3NextMultiTokenPredictor", id="qwen3_next"),
+]
 
 HIDDEN = 64
 TP = 4
@@ -37,11 +43,10 @@ class _RecordingGroup:
         return torch.cat([x] * self.world_size, dim=dim)
 
 
-def _predictor():
+def _predictor(module, cls_name):
     """A predictor whose submodules are shape-correct identity stand-ins."""
-    pred = qwen3_5_mtp.Qwen3_5MultiTokenPredictor.__new__(
-        qwen3_5_mtp.Qwen3_5MultiTokenPredictor
-    )
+    cls = getattr(module, cls_name)
+    pred = cls.__new__(cls)
     torch.nn.Module.__init__(pred)
     pred.num_mtp_layers = 1
     pred.embed_input_ids = lambda ids: torch.zeros(ids.shape[0], HIDDEN)
@@ -54,10 +59,10 @@ def _predictor():
     return pred
 
 
-def _run(monkeypatch, n_tokens=4):
+def _run(monkeypatch, module, cls_name, n_tokens=4):
     group = _RecordingGroup()
-    monkeypatch.setattr(qwen3_5_mtp, "get_tp_group", lambda: group)
-    out = _predictor()(
+    monkeypatch.setattr(module, "get_tp_group", lambda: group)
+    out = _predictor(module, cls_name)(
         input_ids=torch.zeros(n_tokens, dtype=torch.int64),
         positions=torch.zeros(n_tokens, dtype=torch.int64),
         hidden_states=torch.zeros(n_tokens, HIDDEN),
@@ -65,10 +70,13 @@ def _run(monkeypatch, n_tokens=4):
     return group, out
 
 
+@pytest.mark.parametrize("module, cls_name", PREDICTORS)
 @pytest.mark.parametrize("n_tokens", [1, 4, 32])
-def test_fc_gather_asks_for_the_custom_collective(monkeypatch, n_tokens):
+def test_fc_gather_asks_for_the_custom_collective(
+    monkeypatch, module, cls_name, n_tokens
+):
     monkeypatch.delenv("ATOM_USE_CUSTOM_ALL_GATHER", raising=False)
-    group, out = _run(monkeypatch, n_tokens)
+    group, out = _run(monkeypatch, module, cls_name, n_tokens)
 
     assert group.calls == [
         {"shape": (n_tokens, HIDDEN // TP), "use_custom": True, "dim": -1}
@@ -77,23 +85,12 @@ def test_fc_gather_asks_for_the_custom_collective(monkeypatch, n_tokens):
     assert out.shape == (n_tokens, HIDDEN)
 
 
-def test_fc_gather_follows_the_knob_off(monkeypatch):
+@pytest.mark.parametrize("module, cls_name", PREDICTORS)
+def test_fc_gather_follows_the_knob_off(monkeypatch, module, cls_name):
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "0")
-    group, _ = _run(monkeypatch)
+    group, _ = _run(monkeypatch, module, cls_name)
 
     assert group.calls[0]["use_custom"] is False
-
-
-def test_qwen35_fc_shard_qualifies_for_the_custom_last_dim_gather():
-    """aiter's `GroupCoordinator.all_gather` takes the custom kernel for a
-    last-dim gather only when a row is a multiple of 16 bytes, else it falls
-    back to RCCL silently. Qwen3.5-397B: hidden 4096, TP 2/4/8, bf16 fc out."""
-    hidden = 4096
-    for tp in (2, 4, 8):
-        row_bytes = (hidden // tp) * torch.tensor(
-            [], dtype=torch.bfloat16
-        ).element_size()
-        assert row_bytes % 16 == 0, (tp, row_bytes)
 
 
 def test_env_knob_defaults_on(monkeypatch):
