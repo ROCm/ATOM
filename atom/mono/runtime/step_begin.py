@@ -20,6 +20,7 @@ import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
@@ -83,9 +84,16 @@ def _zero(base, nbytes, first, stride, cm=0):
         i = i + stride
 
 
+def _abort():
+    """A trap: the queue aborts and the HIP runtime ends the process, naming
+    this kernel, instead of the step hanging on a rank that never arrives."""
+    llvm.InlineAsmOp(None, [], "s_trap 2", "", has_side_effects=True)
+
+
 @traced
-def _wait_arrived(state, e, wave_size=64, steady=False, debug=False):
-    """Until every other CTA flagged epoch ``e`` (lane l: CTAs 4 l ..)."""
+def _wait_arrived(state, e, wave_size=64, steady=False, debug=False, trap=False):
+    """Until every other CTA flagged epoch ``e`` (lane l: CTAs 4 l ..). ``trap``
+    (with ``debug``'s bounded wait): give-up stops the queue."""
     lane = fx.thread_idx.x
     want = fx.Int32(e & 0xFFFFFFFF)
 
@@ -118,14 +126,17 @@ def _wait_arrived(state, e, wave_size=64, steady=False, debug=False):
             pending = late()
         if pending & (lane == 0):
             bo.buffer_store(_words(e), rsrc(state), MISSING * 2)
+        if const_expr(trap):  # noqa: SIM102
+            if pending:
+                _abort()
 
 
 @traced
-def _fence(peers, fence_off, rank, state, e, tp, debug, steady=False):
+def _fence(peers, fence_off, rank, state, e, tp, debug, steady=False, trap=False):
     """Epoch ``e`` into this rank's slot at every rank, then this rank's slots
     polled (lane p: source rank p's) until every one reaches it. A debug build
     gives up after DIAG_TICKS, a rank that never arrived leaving its last epoch
-    seen + 1 in its MISSING word."""
+    seen + 1 in its MISSING word; ``trap`` then stops the queue."""
     tid = fx.thread_idx.x
     cm = CM_SYS_GFX1250 if steady else CM_SYS
     if tid == 0:
@@ -155,6 +166,9 @@ def _fence(peers, fence_off, rank, state, e, tp, debug, steady=False):
             )
         if (tid < tp) & (seen < e):
             bo.buffer_store(_words(seen + 1), rsrc(state), (MISSING + tid) * 2)
+        if const_expr(trap):  # noqa: SIM102
+            if ballot(seen < e) != 0:
+                _abort()
 
 
 @dataclass(frozen=True)
@@ -162,17 +176,23 @@ class StepBeginBuild:
     tp: int
     debug: bool
     gfx1250: bool = False
+    # bounded waits that stop the queue on give-up (a gfx1250 build out of debug)
+    trap: bool = False
 
 
 @functools.cache
 def _build(key: StepBeginBuild):
-    tp, debug = key.tp, key.debug
+    tp, debug = key.tp, key.debug or key.trap
     threads, wave_size = (256, 32) if key.gfx1250 else (THREADS, 64)
     assert 1 <= tp <= FENCE_SLOTS
     keyed = key_tuple(key, source_digest("mono"))
 
     name = kernel_symbol(
-        "mono_step_begin", tp=tp, debug=int(debug), g1250=int(key.gfx1250)
+        "mono_step_begin",
+        tp=tp,
+        debug=int(key.debug),
+        g1250=int(key.gfx1250),
+        trap=int(key.trap),
     )
 
     @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
@@ -213,8 +233,8 @@ def _build(key: StepBeginBuild):
         # CTA 0's wave 0 fences (every lane polling: wave-uniform loops) while
         # the others zero the scratch, this rank's alone
         if (bid == 0) & (tid < wave_size):
-            _wait_arrived(state, e, wave_size, key.gfx1250, debug)
-            _fence(peers, fence_off, rank, state, e, tp, debug, key.gfx1250)
+            _wait_arrived(state, e, wave_size, key.gfx1250, debug, key.trap)
+            _fence(peers, fence_off, rank, state, e, tp, debug, key.gfx1250, key.trap)
         _zero(s0, n0, lane0, stride)
         _zero(s1, n1, lane0, stride)
 
@@ -252,10 +272,12 @@ def step_begin(
     for b in scratch:
         args += [b.data_ptr(), b.nbytes]
     args += [0, 0] * (MAX_SCRATCH - len(scratch))
-    if gfx1250 and not debug:
-        raise ValueError("gfx1250 step fence must be bounded")
+    # gfx1250's fence is bounded always: out of a debug build a give-up traps
+    key = StepBeginBuild(
+        peers.addresses.numel(), debug, gfx1250, trap=gfx1250 and not debug
+    )
     _run_compiled(
-        _build(StepBeginBuild(peers.addresses.numel(), debug, gfx1250)),
+        _build(key),
         *args,
         peers.addresses.data_ptr(),
         peers.bytes.nbytes,

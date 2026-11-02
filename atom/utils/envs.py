@@ -586,6 +586,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # token count saved under this path prefix (mono/timeline.py). Use with
     # --enforce-eager.
     "ATOM_MONO_TIMELINE": lambda: os.getenv("ATOM_MONO_TIMELINE"),
+    # Debug: the comma-separated timeline points a gfx1250 MiniMax-M3 layer
+    # kernel stamps (0 and its end always; all when empty): fewer stamps keep
+    # the timed kernel nearer the real one.
+    "ATOM_MONO_TL_POINTS": lambda: os.getenv("ATOM_MONO_TL_POINTS", ""),
+    # Debug: comma-separated gfx1250 MiniMax-M3 layer kernel stages built as
+    # no-ops (e.g. "moe,router"), for timing a kernel without them.
+    "ATOM_MONO_G1250_SKIP": lambda: os.getenv("ATOM_MONO_G1250_SKIP", ""),
     # Debug: the mono kernels bound every mailbox wait (10 s): a wait that gives up
     # records its region, pair and tags, and the runner raises with them at the end
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use

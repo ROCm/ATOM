@@ -225,8 +225,9 @@ class MonoDecodeRunner:
         heads = IndexHeads(TP, self.rank) if indexer_cp_enabled() else ONE_INDEX_HEAD
         self.index_heads = heads.count
         # bounded mailbox waits, their records raised after the step (finish_step)
-        # gfx1250's step fence is bounded (``StepMailboxes``); its kernels' waits
-        # only with ATOM_MONO_DEBUG, as on gfx950
+        # gfx1250's step fence is bounded always, a give-up trapping out of a
+        # debug build (``step_begin``); its kernels' waits only with
+        # ATOM_MONO_DEBUG, as on gfx950
         self.debug = envs.ATOM_MONO_DEBUG
         self.sparse = [
             SparseMoeLayer.from_layer(layers[i], i, heads)
@@ -340,7 +341,7 @@ class MonoDecodeRunner:
             self.peers,
             self.scratch1,
             self.scratch4,
-            debug=self.debug or self.gfx1250,
+            debug=self.debug,
             gfx1250=self.gfx1250,
         )
         bf16 = torch.bfloat16

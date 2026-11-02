@@ -19,7 +19,8 @@ from atom.mono.runtime.step_begin import MISSING, STATE_WORDS, step_begin
 class StepMailboxes:
     """``peers``' data region and this rank's ``scratch`` buffers, zeroed
     together by ``begin_step``. ``debug``: a bounded fence wait, a rank that
-    never arrived reported by ``missing_ranks``."""
+    never arrived reported by ``missing_ranks``; ``gfx1250`` bounds it out of
+    a debug build too, a give-up stopping the queue (``step_begin``)."""
 
     def __init__(
         self,
@@ -32,8 +33,6 @@ class StepMailboxes:
         self._scratch = scratch
         self._debug = debug
         self._gfx1250 = gfx1250
-        if gfx1250 and not debug:
-            raise ValueError("gfx1250 step mailboxes require bounded waits")
         self._state = torch.zeros(
             STATE_WORDS, dtype=torch.int64, device=peers.bytes.device
         )

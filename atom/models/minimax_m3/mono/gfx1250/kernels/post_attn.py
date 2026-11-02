@@ -7,7 +7,6 @@ is the gfx950 kernel's; the stages are the gfx1250 modules under ``stages`` and
 the LDS partial buffers are sized for 16 waves' WMMA accumulators.
 """
 
-import os
 from dataclasses import dataclass, field
 
 import flydsl.compiler as flyc
@@ -104,6 +103,7 @@ from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import first_task
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.debug import region_ids
+from atom.utils import envs
 
 __all__ = ["K4_ABI", "TL_POINTS", "TL_RECORD", "build_post_attn_kernel"]
 
@@ -114,9 +114,6 @@ TL_END = 16  # timeline point: the CTA's last stage done (free on gfx950's map)
 # moved the build's spills and schedule away from the real kernel's)
 TL_RECORD = TL_POINTS * WAVES
 assert TL_RECORD == THREADS
-# gfx950 makes both all-reduces RS + AG from 12 tokens; on gfx1250 the one-hop
-# push measured faster there (bs 3 x 4 verify rows: 9.29 -> 8.47 ms a step)
-AG_RS_FROM_G1250 = MAX_TOKENS + 1
 
 
 @dataclass(frozen=True)
@@ -139,7 +136,6 @@ class K4Build:
     debug: bool
     skip: str  # debug: stages replaced by no-ops (ATOM_MONO_G1250_SKIP)
     tl_points: str  # debug: the timeline's points stamped (ATOM_MONO_TL_POINTS)
-    ag_rs_from: int  # tokens from which the all-reduces are RS + AG
 
 
 def build_post_attn_kernel(
@@ -169,9 +165,7 @@ def build_post_attn_kernel(
         index_heads=heads.count, index_own=heads.own, index_topk=index_topk,
         x8_in=x8_in, timeline=timeline, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
         shared_weight=shared_weight, swiglu_limit=swiglu_limit, debug=debug,
-        skip=os.environ.get("ATOM_MONO_G1250_SKIP", ""),
-        tl_points=os.environ.get("ATOM_MONO_TL_POINTS", ""),
-        ag_rs_from=int(os.environ.get("ATOM_MONO_G1250_AGRS_FROM", AG_RS_FROM_G1250)),
+        skip=envs.ATOM_MONO_G1250_SKIP, tl_points=envs.ATOM_MONO_TL_POINTS,
     )  # fmt: skip
     SKIP = set(key.skip.split(",")) - {""}
     # a stamp stalls its wave on the clock read: fewer points, a timeline nearer
@@ -331,7 +325,10 @@ def build_post_attn_kernel(
             return (b & fx.Int32(-128)) | (127 - e)
 
         peer_dst = load_ptr64(peers, fx.min(wave, W - 1))
-        AG_RS = tokens >= key.ag_rs_from
+        # one-hop all-reduces at every width (gfx950 makes them RS + AG from 12
+        # tokens): measured faster (bs 3 x 4 verify rows: 9.29 -> 8.47 ms a
+        # step), and the next-layer prep reads only the one-hop o output
+        AG_RS = False
 
         def peer_addr(w):
             return load_ptr64(peers, w)
@@ -366,6 +363,8 @@ def build_post_attn_kernel(
 
         if const_expr(timeline):
             fx.ptr_store(fx.Int64(0), tls + tid)
+            # a thread zeroes its word, a wave stamps others'
+            lds_barrier()
         stamp(0)
 
         if const_expr(fuse_k1):
@@ -550,6 +549,9 @@ def build_post_attn_kernel(
 
         if const_expr(not WIDE):
             ffn_next_pre = None
+        # the next layer's buffers come with the fused K1's arguments
+        if const_expr(not fuse_k1):
+            ffn_next = ffn_next_pre = None
         k4ctx.update(locals())
         k4ctx.update(moe_common_defs(k4ctx))
         k4ctx.update(ffn_reduce_defs(k4ctx))
