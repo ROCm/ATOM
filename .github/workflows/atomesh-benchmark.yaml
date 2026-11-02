@@ -196,6 +196,7 @@ on:
           - pit2-p03-g24
           - pit2-p03-g25
           - pit2-p03-g27
+          - pit2-p03-g34
           - pit2-p03-g42
       atomesh_1p1d_nodes:
         description: 'Comma-separated nodes for 1P1D. auto lets Slurm select idle nodes; an explicit list pins those nodes. Spur MI350 auto still uses its fabric nodelist'
