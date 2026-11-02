@@ -61,8 +61,9 @@ every rank computes the SAME FIRE/HOLD from the reduced values:
   any_kv_low      = any prefillable rank below the low KV watermark
   any_partial     = any rank mid-chunked-prefill
   any_prefill_ran = any rank completed a prefill forward on the previous tick
+  any_prefill_only_ran = any such forward carried no decode rows
 
-  if any_prefill_ran:                              arm decode interval
+  if any_prefill_only_ran:                         arm decode interval
   if post-prefill decode interval is active and decode exists:
       stall = 0 if the group's work changed;      HOLD
   if n_prefillable == 0:                          FIRE   # nothing to do (vacuous)
@@ -411,7 +412,7 @@ class PrefillDelayer:
         #                                the step the decode-protection
         #                                interval answers; a mixed step decoded
         #                                beside its prefill and arms none)
-        #   slot 12 = prefill_budget     (SUM over prefillable ranks → what one
+        #   slot 12 = prefill_budget    (SUM over prefillable ranks → what one
         #                                step can admit; the fill target's
         #                                denominator. Below max_num_batched_tokens
         #                                when mixed batching reserves decode rows)
