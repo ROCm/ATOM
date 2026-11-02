@@ -366,11 +366,11 @@ class Attention(nn.Module):
     def process_weights_after_loading(self):
         """Turn on the fused wo_a quant epilogue when this shape supports it.
 
-        Bit-exact with the unfused bf16 GEMM plus `quantize_fp8`. The aiter
-        entry only exists for gfx1250 flydsl mxfp8_32, and an aiter build that
-        does not ship it leaves the symbols unset. Either case stays on the
-        unfused path. The loader calls this hook; it is not also invoked from
-        the parent block.
+        Bit-exact with the unfused bf16 GEMM plus `quantize_fp8`.
+        `batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported` decides
+        whether this shape can take the fused entry. An aiter build that does
+        not ship those symbols leaves them unset. Either case stays on the
+        unfused path. The loader calls this hook; the parent block does not.
         """
         if batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported is None:
             self._fuse_woa_quant = False
