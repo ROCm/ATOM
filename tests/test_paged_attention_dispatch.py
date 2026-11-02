@@ -2030,10 +2030,13 @@ class TestNoGluonFlyDSLRouting:
         )
 
 
-@pytest.mark.parametrize("num_seqs", [4096, 4097])
+@pytest.mark.parametrize("num_seqs", [4096, 4097, 32768])
 def test_plans_past_4096_set_max_batch_size(monkeypatch, num_seqs):
     """A refresh keeps max_batch_size, so a plan past 4096 must set it: sparse
-    prefill folds one row per token, up to --max-num-batched-tokens."""
+    prefill folds one row per token, up to --max-num-batched-tokens. It is the
+    planner's limit, not the row count, so the planner's power-of-two batch
+    buckets hold across prompt lengths."""
+    cap = 81792
     import aiter.ops.flydsl.pa_decode as fly
 
     from atom.model_ops import base_attention as ba
@@ -2046,6 +2049,7 @@ def test_plans_past_4096_set_max_batch_size(monkeypatch, num_seqs):
 
     monkeypatch.setattr(fly, "plan_pa_decode", plan_pa_decode)
     monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
+    monkeypatch.setattr(ba, "_flydsl_plan_max_batch", lambda: cap)
     monkeypatch.setattr(
         ba.torch.cuda,
         "current_stream",
@@ -2061,4 +2065,4 @@ def test_plans_past_4096_set_max_batch_size(monkeypatch, num_seqs):
         context_bound=2048,
         existing_plan=None,
     )
-    assert seen.get("max_batch_size") == (num_seqs if num_seqs > 4096 else None)
+    assert seen.get("max_batch_size") == (cap if num_seqs > 4096 else None)
