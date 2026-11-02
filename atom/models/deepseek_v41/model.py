@@ -113,6 +113,9 @@ class Block(nn.Module):
                 f"hc_{sublayer}_fn_packed",
                 pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
             )
+        # wo_a's shape is known now. Decide the fused quant epilogue here
+        # instead of mutating attention state on the first forward.
+        self.attn.process_weights_after_loading()
 
     def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""

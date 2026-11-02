@@ -36,7 +36,6 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.utils import envs
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region, forks, join_stream
 
@@ -288,9 +287,9 @@ class Attention(nn.Module):
             quant_config=native_quant_config(),
             reduce_results=True,
         )
-        # Resolved on the first `_project_out` (needs the loaded wo_a shape):
-        # whether to fuse the wo_a->wo_b quant into the wo_a GEMM epilogue.
-        self._fuse_woa_quant: bool | None = None
+        # Set in `process_weights_after_loading`, once wo_a's shape is known.
+        # Unsupported shapes stay on the unfused bf16 GEMM + quantize_fp8 path.
+        self._fuse_woa_quant = False
         self.compressor = (
             Compressor(
                 config.hidden_size, self.head_dim, spec.ratio, config.rms_norm_eps
@@ -339,6 +338,32 @@ class Attention(nn.Module):
             dim=-1,
         )
 
+    def process_weights_after_loading(self):
+        """Turn on the fused wo_a quant epilogue when this shape supports it.
+
+        Bit-exact with the unfused bf16 GEMM plus `quantize_fp8`. The aiter
+        entry only exists for gfx1250 flydsl mxfp8_32, so anything else stays
+        on the unfused path. Resolved here, after the weight exists, rather
+        than on the first forward.
+        """
+        weight = getattr(self.wo_a, "weight", None)
+        scale = getattr(self.wo_a, "weight_scale", None)
+        if (
+            weight is None
+            or scale is None
+            or weight.numel() == 0
+            or scale.numel() == 0
+        ):
+            self._fuse_woa_quant = False
+            return
+        wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
+        k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
+        self._fuse_woa_quant = (
+            batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
+                tuple(wo_a_ws.shape), self.o_rank, k
+            )
+        )
+
     def _project_out(self, output, rope, positions):
         """Inverse RoPE fused into the MXFP8 group quant, then the grouped FP8
         `wo_a` GEMM and `wo_b`. `positions` are the rows' positions, in the
@@ -355,24 +380,6 @@ class Attention(nn.Module):
         )
         wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
         wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
-        if self._fuse_woa_quant is None:
-            # Probe once, when the weight's shape is known: the fused-quant
-            # epilogue only exists for gfx1250 flydsl mxfp8_32.
-            self._fuse_woa_quant = envs.ATOM_V41_FUSE_WOA_QUANT and (
-                batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
-                    tuple(wo_a_ws.shape), self.o_rank, int(wo_a_w.shape[-1])
-                )
-            )
-            import sys as _sys
-
-            print(
-                f"[ATOM_V41_FUSE_WOA_QUANT] env={bool(envs.ATOM_V41_FUSE_WOA_QUANT)} "
-                f"resolved_fused={bool(self._fuse_woa_quant)} "
-                f"wo_a_ws={tuple(wo_a_ws.shape)} o_rank={self.o_rank} "
-                f"n={int(wo_a_w.shape[-1])}",
-                file=_sys.stderr,
-                flush=True,
-            )
         if self._fuse_woa_quant:
             # wo_a GEMM emits the (e4m3, e8m0) pair wo_b reads directly, so the
             # standalone quantize_fp8 between wo_a and wo_b is removed.
