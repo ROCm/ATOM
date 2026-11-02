@@ -465,7 +465,7 @@ def _as_bytes(t: torch.Tensor) -> torch.Tensor:
 
 
 def pin_rows(
-    sources: list[torch.Tensor], shared: bool = False
+    sources: list[torch.Tensor], shared: bool = False, copy: bool | None = None
 ) -> tuple[torch.Tensor, ...] | None:
     """`sources` (contiguous row ranges) as page-locked tensors of the same
     dtype and shape, owning their memory; all-or-nothing.
@@ -474,18 +474,25 @@ def pin_rows(
     page-locks too. Unless `ATOM_ENGRAM_UVA_COPY` says otherwise they are then
     registered in place (`copies`), and copied only if that is refused.
 
+    `copy` picks copying (True) or in-place registration (False) instead of
+    `ATOM_ENGRAM_UVA_COPY` and `shared`, with no fallback to the other -- not
+    even when there is no allocator to copy with.
+
     None, with everything taken released, on any failure -- no memory, a
     refused registration, no thread to copy on -- so the TP group can fall
     back as one.
     """
-    plan = ["copy"] if copies(shared) else ["register"]
-    if shared and _COPY_ENV not in os.environ:
-        plan.append("copy")
+    if copy is not None:
+        plan = ["copy"] if copy else ["register"]
+    else:
+        plan = ["copy"] if copies(shared) else ["register"]
+        if shared and _COPY_ENV not in os.environ:
+            plan.append("copy")
     for how in plan:
         allocator = _host_allocator() if how == "copy" else None
         if how == "copy" and allocator is None:
-            if "register" in plan:
-                break  # registering was refused already
+            if copy or "register" in plan:
+                break  # registering is not wanted, or was refused already
             how = "register"
         leases: list[_Lease] = []
         try:

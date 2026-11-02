@@ -1495,6 +1495,77 @@ def test_a_refused_shared_registration_falls_back_to_a_copy(monkeypatch):
     assert allocator.live == {}
 
 
+@pytest.mark.parametrize(
+    "env, shared, copy",
+    [
+        (None, True, True),  # the Qwen3.8 PLE table copies under DP attention too
+        ("0", False, True),
+        ("1", False, False),
+        (None, False, False),
+    ],
+)
+def test_an_explicit_copy_overrides_the_setting_and_shared(
+    monkeypatch, env, shared, copy
+):
+    import gc
+
+    from atom.model_ops.engram import host_memory
+
+    if env is not None:
+        monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", env)
+    allocator = FakeHostAllocator()
+    cudart = FakeCudart()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    rows = torch.arange(1 << 18, dtype=torch.float32)
+    pinned = host_memory.pin_rows([rows], shared=shared, copy=copy)
+    assert pinned is not None and torch.equal(pinned[0], rows)
+    assert (len(allocator.live), len(cudart.registered)) == ((1, 0) if copy else (0, 1))
+    del pinned
+    gc.collect()
+    assert allocator.live == {} and cudart.registered == []
+
+
+def test_an_explicit_copy_does_not_fall_back(monkeypatch):
+    """`copy=False` refused is a failure, not a copy -- even for a shared table,
+    which would otherwise fall back to one."""
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    cudart = FakeCudart(refuse_call=1)
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    rows = torch.ones(1 << 18)
+    assert host_memory.pin_rows([rows], shared=True, copy=False) is None
+    assert allocator.live == {} and cudart.registered == []
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_an_explicit_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
+    """`copy=True` with no page-locked allocator does not register the source
+    in place instead -- the Qwen3.8 PLE shards share their safetensors
+    mapping with other weights -- while `copy=None` still does."""
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    registered = []
+    register = host_memory._register
+
+    def spy(sources, leases):
+        registered.append(len(sources))
+        return register(sources, leases)
+
+    monkeypatch.setattr(host_memory, "_register", spy)
+    rows = torch.ones(1 << 18)
+    assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
+    assert registered == [] and cudart.registered == []
+
+    pinned = host_memory.pin_rows([rows], shared=shared)
+    assert pinned is not None and registered == [1]
+    assert pinned[0].data_ptr() == rows.data_ptr()
+
+
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
     """The shared mapping cannot be written, so it is registered read-only --
     and in place: the view is the page cache, the same pages for every rank."""
