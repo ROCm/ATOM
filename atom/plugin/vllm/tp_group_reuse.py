@@ -32,47 +32,35 @@ _ATOM_INSTALLED_GROUPS: dict[str, Any] = {}
 
 
 def _create_aiter_device_communicator(vllm_tp: Any) -> Any:
-    """Create AITER collectives without creating a duplicate PyNccl communicator."""
-    from aiter.dist.device_communicators.base_device_communicator import (
-        DeviceCommunicatorBase,
-    )
+    """Create AITER collectives without creating a duplicate PyNccl communicator.
+
+    aiter's own __init__ builds the communicator, so every collective it
+    defines (custom, quick, Gluon all-reduce) and every field its methods read
+    exist as aiter sets them. Only the PyNccl communicator it would create for
+    these ranks is vLLM's existing one: RCCL runs no second ncclCommInitRank.
+    """
+    from aiter.dist.device_communicators import communicator_pynccl
     from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
-    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
-    from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
-    from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
     pynccl_comm = getattr(vllm_tp.device_communicator, "pynccl_comm", None)
     if pynccl_comm is None:
         raise RuntimeError("vLLM TP group does not expose a PyNccl communicator")
 
-    class ReusedPyNcclCudaCommunicator(CudaCommunicator):
-        def __init__(self) -> None:
-            self._all2all_manager = None
-            self._all2all_manager_created = False
-            DeviceCommunicatorBase.__init__(
-                self,
-                cpu_group=vllm_tp.cpu_group,
-                device=vllm_tp.device,
-                device_group=vllm_tp.device_group,
-                unique_name="tp",
-            )
-
-            self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            self.use_torch_symm_mem = False
-            self.pynccl_comm = pynccl_comm
-            self.ca_comm = (
-                CustomAllreduce(group=self.cpu_group, device=self.device)
-                if self.use_custom_allreduce and self.world_size > 1
-                else None
-            )
-            self.qr_comm = (
-                QuickAllReduce(group=self.cpu_group, device=self.device)
-                if self.world_size > 1
-                else None
-            )
-            self.symm_mem_comm = None
-
-    return ReusedPyNcclCudaCommunicator()
+    # CudaCommunicator imports PyNcclCommunicator inside __init__.
+    build_pynccl = communicator_pynccl.PyNcclCommunicator
+    communicator_pynccl.PyNcclCommunicator = lambda *args, **kwargs: pynccl_comm
+    try:
+        communicator = CudaCommunicator(
+            cpu_group=vllm_tp.cpu_group,
+            device=vllm_tp.device,
+            device_group=vllm_tp.device_group,
+            unique_name="tp",
+        )
+    finally:
+        communicator_pynccl.PyNcclCommunicator = build_pynccl
+    if communicator.pynccl_comm is not pynccl_comm:
+        raise RuntimeError("aiter created its own PyNccl communicator for vLLM's TP")
+    return communicator
 
 
 def _create_aiter_tp_adapter_from_vllm() -> Any:
@@ -158,8 +146,7 @@ def shutdown_aiter_dist_from_vllm() -> bool:
     itself a few lines further on; destroying them here would be a double free.
     aiter's own `destroy()` is not usable for this either: `AiterTPAdapter`
     skips `GroupCoordinator.__init__`, so the `_owns_*` fields that `destroy()`
-    reads do not exist on it, and `CudaCommunicator.destroy()` gates every
-    close on an `_owns_comms` this communicator never sets.
+    reads do not exist on it.
 
     Deliberately without a barrier. Each rank frees only mappings it opened
     itself, and no collective is issued after this point. A barrier would be a

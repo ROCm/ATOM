@@ -351,23 +351,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
-    # MegaMoE stage 2 (gemm2-fused EP combine): the grouped gemm2 epilogue
-    # P2P-writes its weighted per-(token,k) results straight into the peers'
-    # combine staging, so combine only barriers + sums. Requires the mxfp4 weight
-    # path; ignored unless ATOM_MORI_V2 is on.
-    # This also selects the transport: 1 binds aiter's MegaMoEGfx1250, which owns
-    # the fused dispatch/combine pair, 0 binds mori's v2 op-layer running plain
-    # gather, i.e. the untouched upstream baseline. Formerly ATOM_MORI_V2_FUSED.
-    "ATOM_MEGA_STAGE2_FUSED": lambda: os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1",
+    # MegaMoE stage 2 (aiter stage2_fused), i.e. which combine aiter's
+    # MegaMoEGfx1250 runs. 1: the grouped gemm2 epilogue P2P-writes its weighted
+    # per-(token,k) results straight into the peers' combine staging, so combine
+    # only barriers + sums. 0: fused_moe returns its per-recv-token rows and
+    # mori's combine gathers them (bf16) or pushes them as MXFP4 (fp4 wire).
+    # MegaMoE runs the layer either way, so both need the mxfp4 weight path;
+    # ignored unless ATOM_MORI_V2 is on. Formerly ATOM_MORI_V2_FUSED.
+    "ATOM_MEGA_STAGE2_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1"),
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
-    # always combines in bf16. Ignored unless ATOM_MEGA_STAGE2_FUSED is on.
+    # combines in bf16 unless ATOM_MEGA_DECODE_COMBINE_QUANT is on. With
+    # ATOM_MEGA_STAGE2_FUSED=0 mori's combine has no fp8 wire, so only bf16 | fp4.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
-    # MegaMoE compact-plan stage 1 (aiter stage1_fused): routing/layout planning
-    # fused with a flydsl TDM dispatch that writes the grouped GEMM's per-expert
-    # rows directly. Needs ATOM_MEGA_STAGE2_FUSED and an fp8/fp4
-    # MEGA_DISPATCH_WIRE; a bf16 wire keeps the token-major path regardless of
-    # this flag.
-    "ATOM_MEGA_STAGE1_FUSED": lambda: os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1",
+    # Decode steps combine on ATOM_MEGA_COMBINE_WIRE too, rather than bf16. No
+    # effect on a bf16 ATOM_MEGA_COMBINE_WIRE, or on steps the Triton experts
+    # run (their combine is bf16 only).
+    "ATOM_MEGA_DECODE_COMBINE_QUANT": lambda: (
+        os.getenv("ATOM_MEGA_DECODE_COMBINE_QUANT", "0") == "1"
+    ),
+    # MegaMoE stage 1 (aiter stage1_fused), i.e. which dispatch MegaMoEGfx1250
+    # runs. 1: the compact plan -- routing/layout planning fused with a flydsl
+    # TDM dispatch that writes the grouped GEMM's per-expert rows directly.
+    # 0: mori's token-major dispatch. Needs ATOM_MEGA_STAGE2_FUSED=1 and an
+    # fp8/fp4 MEGA_DISPATCH_WIRE; otherwise it is ignored and dispatch runs on
+    # mori.
+    "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
@@ -386,7 +394,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",
-    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950 shapes, else Triton.
+    # V4.1 delayed mHC: HIP Mega-MHC on supported gfx950/gfx1250 shapes, else Triton.
     "ATOM_DSV41_MHC_BACKEND": lambda: os.getenv(
         "ATOM_DSV41_MHC_BACKEND", "auto"
     ).lower(),
@@ -488,6 +496,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lowering it saves memory but splits decode into more launches.
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
+    ),
+    # DeepSeek-V4 prefill indexer under plain TP: each TP rank scores and
+    # top-ks only every TP-th query row (each against the full key set) and the
+    # [rows, topk] results are all-gathered back over TP. The indexer is
+    # replicated across TP, so without this every rank repeats the same scoring.
+    # 0 restores the full per-rank scoring. This and the bound below must be the
+    # same on every rank: a split step's ranks gather together.
+    "ATOM_V4_INDEXER_QSPLIT": lambda: _flag_env("ATOM_V4_INDEXER_QSPLIT", "1"),
+    # The fewest index logits -- the keys a prefill step's rows see in all -- at
+    # which ATOM_V4_INDEXER_QSPLIT splits the step. The split saves index
+    # scoring, which grows with them, and on FP4 the logits bands a rank no
+    # longer launches; it pays a per-layer top-k gather, which grows with the
+    # rows. The default is a compromise measured on one setup (TP8 MI355X, FP4
+    # index, prefix hits).
+    "ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS": lambda: int(
+        os.getenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", str(1 << 26))
     ),
     # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
     # group's query heads locally, as decode does, instead of AllGather Q. The
@@ -1106,16 +1130,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS": lambda: int(
         os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
     ),
-    # Consecutive non-growing ticks after which the coalescer gives up waiting
-    # (burst ended, more won't come) and releases, including while some DP rank
-    # has no prefill.
+    # Consecutive ticks with no change in the group's work (pending did not
+    # grow, no rank turned (non-)prefillable, no arrival) after which the
+    # coalescer releases an underfilled or unaligned prefill.
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
         os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
     ),
     # With DP prefill cost balancing: also release while some DP rank has no
-    # prefill when the work expected to reach that rank in a held decode step
-    # can't pay for the requests it delays, or once they have waited as long
-    # as the decode stall of one unaligned prefill step.
+    # prefill and cannot align within the TTFT bound when the work expected
+    # to reach that rank in a held decode step can't pay for the requests it
+    # delays, or once they have waited as long as the decode stall of one
+    # unaligned prefill step.
     "ATOM_PREFILL_DELAYER_COST_GATE": lambda: (
         os.getenv("ATOM_PREFILL_DELAYER_COST_GATE", "1").lower() in ("1", "true")
     ),
@@ -1218,7 +1243,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pages from the process as it goes; 0 registers the checkpoint mapping in
     # place (one thread, under the HIP runtime lock). Either way the shard is
     # resident once. Copying needs the HIP runtime; elsewhere it registers in
-    # place regardless. `tools/engram/bench_uva_shard.py` measures both.
+    # place regardless. Unset, DP attention (every rank holds the whole table)
+    # registers in place -- the shared checkpoint mapping, pinned once per node
+    # rather than copied once per rank -- and copies only if that is refused.
+    # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for

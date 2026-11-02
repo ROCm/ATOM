@@ -640,23 +640,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ),
             )
 
+        # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
+        # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
+        # .all2all_manager, which would pin the default (v1) manager.
+        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_mori_v2_prepare_finalize,
+            )
+
+            return make_mori_v2_prepare_finalize(
+                moe,
+                ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
+            )
+
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
-            from atom.utils import envs as _atom_envs
-
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
-            if _atom_envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    make_mori_v2_prepare_finalize,
-                )
-
-                return make_mori_v2_prepare_finalize(moe, all2all_manager)
-
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will
@@ -789,9 +791,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # told the expert-GEMM recipe that only the layer + this quant method
             # know. Here is also the last point before any cudagraph capture, and
             # it allocates a cco arena and JIT-compiles its kernels.
-            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
-            if bind_mega is not None:
-                bind_mega(layer, self)
+            if mori_v2:
+                prepare_finalize.bind_mega_transport(layer, self)
+                assert (
+                    prepare_finalize.mega is not None
+                ), "MoriV2ModularKernel has no MegaMoE to run"
 
         comm_fused = getattr(layer, "_comm_fused_moe", None)
         if comm_fused is not None:

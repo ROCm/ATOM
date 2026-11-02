@@ -2889,29 +2889,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             out = torch.empty_like(q_3d, dtype=self.input_dtype)
             num_seqs = self.forward_metadata.kv_lens.shape[0]
-            query_group_size = 1 * (layer.tp_q_head_num // layer.tp_k_head_num)
             max_context_partition_num = get_recommended_splits(
                 num_seqs, layer.tp_k_head_num
             )
             context_partition_size = 256
-            intermediate_shape = (
-                num_seqs,
-                layer.tp_k_head_num,
-                max_context_partition_num,
-                query_group_size,
-            )
-            exp_sums = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            max_logits = torch.empty(
-                intermediate_shape, dtype=torch.float32, device=q.device
-            )
-            temporary_output = torch.empty(
-                *intermediate_shape,
-                layer.head_dim,
-                dtype=q.dtype,
-                device=q.device,
-            )
             run_pa_decode(
                 output=out,
                 q=q_3d,
@@ -2927,9 +2908,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 q_scale=None,
                 k_scale=None,
                 v_scale=None,
-                exp_sums=exp_sums,
-                max_logits=max_logits,
-                temporary_output=temporary_output,
                 alibi_slopes=None,
                 sinks=None,
                 sliding_window=-1,

@@ -153,6 +153,41 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
             self.assertEqual(cell["accuracy"]["max_gen_toks"], 512)
 
 
+class KimiK3MoriIOCellTest(unittest.TestCase):
+    """Kimi-K3's PD gsm8k cell, over MoRI IO, with nothing the connector refuses."""
+
+    @classmethod
+    def setUpClass(cls):
+        (cls.cell,) = generate_cells("Kimi-K3-MXFP4")
+
+    def test_it_runs_over_moriio_with_the_built_in_config(self):
+        env = self.cell["env"]
+        for role in ("common", "prefill", "decode"):
+            self.assertEqual(env[role]["KV_CONNECTOR"], "moriio")
+            self.assertEqual(env[role]["ATOM_MORIIO_MODE"], "write")
+        self.assertIsNone(env["prefill"].get("PREFILL_KV_TRANSFER_CONFIG"))
+        self.assertIsNone(env["decode"].get("DECODE_KV_TRANSFER_CONFIG"))
+
+    def test_nothing_the_connector_refuses_is_on(self):
+        for role in ("common", "prefill", "decode"):
+            self.assertEqual(self.cell["env"][role]["ATOM_ENABLE_REPLAYSSM"], "0")
+        server = self.cell["server_args"]
+        self.assertNotIn("num_speculative_tokens", server)
+        self.assertIs(server["enable_prefix_caching"], False)
+
+    def test_it_is_a_two_node_tp8_gsm8k_eval_with_thinking_off(self):
+        self.assertTrue(self.cell["eval_only"])
+        self.assertEqual(self.cell["num_nodes"], 2)
+        self.assertEqual(self.cell["service"]["prefill"]["tp"], 8)
+        self.assertEqual(self.cell["service"]["decode"]["tp"], 8)
+        self.assertEqual(self.cell["accuracy"]["task"], "gsm8k")
+        self.assertEqual(self.cell["accuracy"]["threshold"], 0.90)
+        self.assertIn(
+            '--default-chat-template-kwargs {"thinking":false}',
+            self.cell["server_args"]["extra_args"],
+        )
+
+
 class KvConnectorTest(unittest.TestCase):
     """KV_CONNECTOR picks the built-in config and guards role overrides."""
 

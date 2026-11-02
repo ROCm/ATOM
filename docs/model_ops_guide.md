@@ -14,7 +14,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Attention` | `base_attention.py` | `unified_attention_with_output_base` (custom op) | Unified attention entry |
 | MHA `Attention` | `attention_mha.py` | `flash_attn_varlen_func`, `pa_fwd_asm`, `pa_persistent_fwd`, `pa_decode_gluon` | Multi-head attention |
 | `MLAAttention` | `attention_mla.py` | `mla_decode_fwd`, `mla_prefill_fwd`, `concat_and_cache_mla`, `fused_qk_rope_concat_and_cache_mla` | Multi-head latent attention |
-| Shared DSA indexer scorer | `indexer/` | `deepgemm_fp8_paged_mqa_logits`, `fp8_mqa_logits`, `flydsl_pa_mqa_logits_fp4`, `pa_mqa_logits_mxfp4`, `top_k_per_row_decode`, `top_k_per_row_prefill` | Scoring and top-k for every DSA indexer (DeepSeek-V3.2 / GLM-5.x, GLM-5.3 kpool, DeepSeek-V4, V4.1): the attention builder publishes a step's rows once (`attn_metadata.index_rows`: `fp8_rows`, `fp4_rows`, `concat_rows`, a DCP rank's share by `DcpSplit`) cut to its logits plane (`LogitsWorkspace`), and a model calls `score_topk` against its cache (`IndexCache`) |
+| Shared DSA indexer scorer | `indexer/` | `deepgemm_fp8_paged_mqa_logits`, `fp8_mqa_logits`, `flydsl_pa_mqa_logits_fp4`, `pa_mqa_logits_mxfp4`, `top_k_per_row_decode`, `top_k_per_row_prefill` | Scoring and top-k for every DSA indexer (DeepSeek-V3.2 / GLM-5.x, GLM-5.3 kpool, DeepSeek-V4, V4.1): the attention builder publishes a step's rows once (`attn_metadata.index_rows`: `fp8_rows`, `fp4_rows`, `concat_rows`, a DCP or TP rank's share by `RowSplit`) cut to its logits plane (`LogitsWorkspace`), and a model calls `score_topk` against its cache (`IndexCache`) |
 | DSA FP4 index cache | `sparse_indexer_fp4.py` | `indexer_qk_rope_quant_and_cache` | FP4 (E2M1 + e8m0) index-cache geometry and the DSA FP4 predicate |
 | `Fp4MqaRaggedMetadata` | `fp4_mqa_ragged_metadata.py` | `make_fp4_mqa_plan` | FP4 MQA scoring's ragged rows (DeepSeek-V4, V4.1, V3.2 decode and its DCP shard): rows grouped into sequences (`query_start_loc`, `max_qlen`, block tables, `pages_per_block`), each row's bound, and their shape-only launch plan |
 | `FusedMoE` | `moe.py` | `aiter.fused_moe.fused_moe`, `asm_moe` | Mixture of experts |
@@ -26,6 +26,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
 
@@ -491,6 +492,34 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
+### Required channel (`required_channel.py`)
+
+Holds a request with a `RequiredChannel` (`atom/sampling_params.py`; today only
+Kimi-K3 under `tool_choice="required"`) to its tools channel by masking the
+target logits before any sampler reads them. Until the channel opens, the end
+ids (the format's own plus the engine's EOS and `stop_token_ids`) are `-inf`;
+once the output ends with `after` (K3: `<|close|>response<|sep|>`), each next
+row keeps only the forced id of `opening`. The channel is open once `opening`
+is written, or once the model writes `opening[:opens_at]` itself (K3:
+`<|open|>tools<|sep|>`); the state is then `UNCONSTRAINED` and the request
+costs nothing more.
+
+- `constrain_logits` masks a step's rows in place: plain decode and prefill
+  rows by the request's state, verification rows as if the drafts before them
+  were accepted, and the bonus row after every draft. A mismatching draft is
+  therefore rejected by the ordinary rejection sampler.
+- `advance_states` folds the step's emitted ids into each state on the GPU, so
+  a deferred-output step reads its predecessor's states through `decode_src`
+  before the host has seen those ids.
+
+`constrain_logits` runs `VOCAB_PROGRAMS` (16) programs per request, each
+writing every 16th 1,024-column block of a forced row without reading it;
+`advance_states` runs one per request. On MI355X over K3's vocabulary a step
+with no forced row costs what one program per request did (5-7 us for a
+DSpark7 verify step at bs 1-64), and one with all seven draft rows forced
+15-52 us. A batch with no unopened channel launches neither kernel. `constrain_logits_reference` / `advance_states_reference` are
+the pure-torch twins the tests hold the kernels to.
+
 ### `RejectionSampler` (`rejection_sampler.py`)
 
 Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
@@ -539,6 +568,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
+| `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 

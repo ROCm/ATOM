@@ -3,14 +3,19 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
+import inspect
 import sys
+import textwrap
 import types
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
+import numpy as np
 import pytest
 import torch
 
@@ -132,6 +137,7 @@ def _stub_v4_runtime_imports():
     aiter_dist.__path__ = []
     parallel_state = types.ModuleType("aiter.dist.parallel_state")
     parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+    parallel_state.get_tp_group = lambda: None
 
     pcp_utils = types.ModuleType("atom.distributed.pcp_utils")
     for name in (
@@ -176,7 +182,7 @@ def _stub_v4_runtime_imports():
     # The indexer's scorer needs aiter's kernels; the builder only names them.
     indexer = types.ModuleType("atom.model_ops.indexer")
     indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
-    for name in ("ConcatKeys", "IndexRows"):
+    for name in ("ConcatKeys", "RowSplit", "IndexRows"):
         setattr(indexer, name, type(name, (), {}))
     for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
         setattr(indexer, name, lambda *args, **kwargs: None)
@@ -946,3 +952,429 @@ def test_v4_sidecar_offload_rejects_pipeline_parallelism_before_registration(
         ),
     ):
         builder.get_kv_transfer_tensors()
+
+
+# ---- The prefill indexer's row split across TP, as the builder wires it -------
+
+
+class _RecordingSplit:
+    """Stands in for `RowSplit`: records how the builder asks for its split
+    and deals the rows round-robin, as `RowSplit.striped` does."""
+
+    calls: ClassVar[list] = []
+
+    @classmethod
+    def striped(cls, rows, rank, world, *, group):
+        cls.calls.append(((rows, rank, world), {"group": group}))
+        return SimpleNamespace(
+            rank=rank, world=world, end=len(range(rank, rows, world))
+        )
+
+
+def _rows_by_request(cu, first, stride, owned):
+    """`pcp_owned_rows_by_request`, by counting: the rows `first`,
+    `first + stride`, ... below each request's start, then `owned`."""
+    below = [len(range(first, start, stride)) for start in cu[:-1]]
+    return np.array([*below, owned], dtype=np.int32)
+
+
+def _split_builder(v4_builder_cls, monkeypatch, *, world, rank=3, fp4, bound=None):
+    """A builder as TP rank `rank` of `world`, splitting from `bound` index
+    logits (the default's, by default)."""
+    # The fixture loads the builder module off `sys.modules`; its globals are
+    # reachable through any of its functions.
+    module = v4_builder_cls._prefill_row_split.__globals__
+    _RecordingSplit.calls = []
+    monkeypatch.setitem(module, "RowSplit", _RecordingSplit)
+    monkeypatch.setitem(
+        module, "get_tp_group", lambda: SimpleNamespace(rank_in_group=rank)
+    )
+    monkeypatch.setitem(module, "visible_csa", lambda positions: positions)
+    if bound is None:
+        monkeypatch.delenv("ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS", raising=False)
+        bound = module["envs"].ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_qsplit_world = world
+    builder._indexer_qsplit_min_logits = bound
+    builder._indexer_fp4 = fp4
+    return builder, module
+
+
+def _prefill_step(builder, module, monkeypatch, positions, rows, n_committed):
+    """What `builder` hands on for a prefill step of `rows` new rows per
+    request: FP4's `_index_rows` arguments, or FP8's `concat_rows`'."""
+    handed = {}
+
+    def index_rows(metadata, row_ends, width, **kwargs):
+        handed.update(kwargs, row_ends=row_ends, width=width)
+
+    def concat(row_ends, keys, split):
+        handed.update(row_ends=row_ends, keys=keys, split=split)
+
+    builder._index_rows = index_rows
+    builder._stage = lambda name, values: torch.as_tensor(values)
+    monkeypatch.setitem(module, "concat_rows", concat)
+    monkeypatch.setitem(module, "ConcatKeys", lambda **kwargs: kwargs)
+    monkeypatch.setitem(module, "pcp_owned_rows_by_request", _rows_by_request)
+    metadata = SimpleNamespace(
+        n_committed_csa_per_seq_cpu=n_committed,
+        batch_id_per_q_token=_batch_ids(rows),
+        block_tables=None,
+    )
+    builder._build_v4_prefill_index_rows(
+        metadata,
+        positions,
+        rows.shape[0],
+        int(rows.sum()),
+        "the step's starts",
+        "",
+        rows,
+    )
+    return handed
+
+
+def _batch_ids(rows):
+    return torch.repeat_interleave(torch.arange(rows.shape[0]), torch.from_numpy(rows))
+
+
+@pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
+def test_split_prefill_rows_are_every_world_th_row(v4_builder_cls, monkeypatch, fp4):
+    """Split across TP, the prefill rows a rank publishes are every `world`-th
+    of the step's from its rank, each with its own bound and request: FP4
+    grouped by request (a rank may hold none of one), at most the most any
+    request has; FP8 each at its request's run of the gathered keys."""
+    world = 4
+    rows = np.array([5, 1, 9, 3], dtype=np.int32)
+    starts = np.array([100, 0, 37, 2000], dtype=np.int32)
+    n_committed = (starts + rows) // 4
+    cu = np.concatenate(([0], np.cumsum(rows)))
+    cu_committed = np.concatenate(([0], np.cumsum(n_committed)))
+    total = int(cu[-1])
+    positions = torch.cat([torch.arange(s, s + n) for s, n in zip(starts, rows)])
+    for rank in range(world):
+        builder, module = _split_builder(
+            v4_builder_cls, monkeypatch, world=world, rank=rank, fp4=fp4, bound=0
+        )
+        handed = _prefill_step(
+            builder, module, monkeypatch, positions, rows, n_committed
+        )
+        mine = slice(rank, total, world)
+        assert _RecordingSplit.calls == [((total, rank, world), {"group": "tp"})]
+        assert handed["row_ends"].tolist() == positions[mine].tolist()
+        batch_ids = _batch_ids(rows)[mine]
+        if fp4:
+            owned = [
+                len([i for i in range(cu[b], cu[b + 1]) if i % world == rank])
+                for b in range(rows.shape[0])
+            ]
+            assert handed["query_start_loc"].tolist() == [0, *np.cumsum(owned)]
+            assert handed["max_qlen"] == max(max(owned), 1)
+            assert handed["row_to_batch"].tolist() == batch_ids.tolist()
+        else:
+            row_starts = cu_committed[batch_ids.numpy()]
+            assert handed["keys"]["row_starts"].tolist() == row_starts.tolist()
+            assert handed["keys"]["total"] == cu_committed[-1]
+        assert handed["split"].rank == rank
+
+
+@pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
+def test_split_ranks_share_a_cold_chunk_s_scoring_evenly(
+    v4_builder_cls, monkeypatch, fp4
+):
+    """A prefill row scores the keys its position sees, so a cold chunk's last
+    rows cost the most: contiguous shares would leave the last of 8 ranks
+    1.9 times the mean. Every 8th row each, the ranks' keys are within 1%."""
+    world, total = 8, 1 << 13
+    rows = np.array([total], dtype=np.int32)
+    keys = []
+    for rank in range(world):
+        builder, module = _split_builder(
+            v4_builder_cls, monkeypatch, world=world, rank=rank, fp4=fp4, bound=0
+        )
+        handed = _prefill_step(
+            builder, module, monkeypatch, torch.arange(total), rows, rows // 4
+        )
+        keys.append(int(handed["row_ends"].sum()))
+    assert max(keys) / (sum(keys) / world) < 1.01
+
+
+@pytest.mark.parametrize("fp4", [True, False], ids=["fp4", "fp8"])
+def test_unsplit_prefill_rows_are_the_whole_step(v4_builder_cls, monkeypatch, fp4):
+    """Below the bound every rank publishes every row, as without a split:
+    FP4 grouped by the caller's starts at the step's longest request."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=fp4)
+    rows = np.array([3, 4], dtype=np.int32)
+    positions = torch.tensor([5, 6, 7, 0, 1, 2, 3])
+    handed = _prefill_step(
+        builder, module, monkeypatch, positions, rows, np.array([2, 1], np.int32)
+    )
+    assert _RecordingSplit.calls == []
+    assert handed["split"] is None
+    assert handed["row_ends"].tolist() == positions.tolist()
+    if fp4:
+        assert handed["query_start_loc"] == "the step's starts"
+        assert handed["max_qlen"] is None
+        assert handed["row_to_batch"].tolist() == [0, 0, 0, 1, 1, 1, 1]
+    else:
+        assert handed["keys"]["row_starts"].tolist() == [0, 0, 0, 2, 2, 2, 2]
+
+
+class _Metadata(SimpleNamespace):
+    """Stands in for the metadata `prepare_prefill` takes from its base and
+    promotes to V4's: a class of its own, so `__class__` can be reassigned."""
+
+
+def test_prepare_prefill_gates_the_split_by_each_request_s_new_rows(
+    v4_builder_cls, monkeypatch
+):
+    """`prepare_prefill` hands the split each scheduled request's new rows, not
+    its context: lost on the way, no prefill would ever split."""
+    builder, module = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    starts, rows = [8, 16, 0], [3, 5, 3]
+    cu = np.cumsum([0, *rows], dtype=np.int32)
+    context = np.add(starts, rows, dtype=np.int32)
+    positions = torch.cat([torch.arange(s, s + n) for s, n in zip(starts, rows)])
+    metadata = _Metadata(
+        block_tables=torch.zeros(3, 4, dtype=torch.int32),
+        cu_seqlens_q=torch.from_numpy(cu),
+        replay_start_cpu=None,
+        replay_end_cpu=None,
+        n_committed_csa_per_seq_cpu=context // 4,
+        batch_id_per_q_token=torch.zeros(11, dtype=torch.long),
+    )
+    monkeypatch.setitem(module, "AttentionMetaData_DSV4", _Metadata)
+    # `_stub_v4_runtime_imports` leaves the base builder an empty class.
+    monkeypatch.setattr(
+        v4_builder_cls.__mro__[1],
+        "prepare_prefill",
+        lambda self, batch, running_bs, running_tokens: (metadata, positions),
+        raising=False,
+    )
+    builder.model_runner = SimpleNamespace(
+        forward_vars={
+            "positions": SimpleNamespace(np=positions.numpy()),
+            "cu_seqlens_q": SimpleNamespace(np=cu),
+            "context_lens": SimpleNamespace(np=context),
+        }
+    )
+    builder.csa_layers = [0]
+    builder._populate_state_slot_mappings = lambda *args, **kwargs: (
+        None,
+        np.arange(3, dtype=np.int32),
+    )
+    for name in (
+        "_populate_state_slot_in",
+        "_build_compress_plans",
+        "_attach_v4_per_fwd_meta",
+        "_build_paged_prefill_meta",
+        "_attach_tbo_prefill_cpu_lens",
+        "_index_rows",
+    ):
+        setattr(builder, name, lambda *args, **kwargs: None)
+    asked = []
+    builder._prefill_row_split = lambda *args: asked.append(args)
+    batch = SimpleNamespace(
+        total_seqs_num_prefill=3, total_tokens_num_prefill=11, is_dummy_run=False
+    )
+
+    builder.prepare_prefill(batch, 3, 11)
+
+    [(tokens, new_rows, n_committed)] = asked
+    assert tokens == 11
+    assert new_rows.tolist() == rows
+    # Handed through only: the metadata above set it; its setter is stubbed.
+    assert n_committed.tolist() == (context // 4).tolist()
+
+
+@pytest.mark.parametrize("world, given", [(1, True), (8, False)])
+def test_unsplit_prefill_rows_carry_no_split(v4_builder_cls, monkeypatch, world, given):
+    """No split without a split world, or for a caller with no per-request rows
+    (PCP, TBO), however big the step."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=world, fp4=True)
+    big = np.array([1 << 14], dtype=np.int32)
+    split = builder._prefill_row_split(1 << 14, big if given else None, big)
+    assert split is None and _RecordingSplit.calls == []
+
+
+@pytest.mark.parametrize("over", [0, 1], ids=["at_bound", "under"])
+@pytest.mark.parametrize(
+    "rows, n_committed, logits",
+    [
+        (8, 126, 1000),
+        (1 << 14, 1 << 12, 1 << 25),
+        (1 << 10, (1 << 16) + (1 << 8), (1 << 26) + (1 << 17)),
+    ],
+    ids=["8_rows", "cold_16k_chunk", "prefix_hit"],
+)
+def test_a_step_splits_from_the_keys_its_rows_see(
+    v4_builder_cls, monkeypatch, rows, n_committed, logits, over
+):
+    """A step's logits are the keys its rows see: up to the committed keys,
+    one fewer every 4 rows back. 8 rows at 126 keys are 1000 logits, not
+    1008; a cold 16K chunk's rows see 2K keys on average, 2^25 logits, half
+    of rows times keys; 1K new rows past a 256K-token prefix hit see 2^26 +
+    2^17. A step splits from exactly its bound."""
+    builder, _ = _split_builder(
+        v4_builder_cls, monkeypatch, world=8, fp4=True, bound=logits + over
+    )
+    split = builder._prefill_row_split(
+        rows,
+        np.array([rows], dtype=np.int32),
+        np.array([n_committed], dtype=np.int32),
+    )
+    assert (split is not None) == (over == 0)
+
+
+def test_split_pairs_each_request_s_rows_with_its_own_keys(v4_builder_cls, monkeypatch):
+    """A step's logits count each request's rows at its own committed keys,
+    the scoring those rows do, not at the plane's width (the longest
+    request's): one row of a long request beside three of a fresh one is one
+    row's scoring."""
+    builder, _ = _split_builder(
+        v4_builder_cls, monkeypatch, world=8, fp4=True, bound=1000
+    )
+    rows = np.array([1, 3], dtype=np.int32)
+    n_committed = np.array([999, 0], dtype=np.int32)
+    assert builder._prefill_row_split(4, rows, n_committed) is None
+
+
+def test_split_logits_do_not_wrap_in_int32(v4_builder_cls, monkeypatch):
+    """16K rows of a 1M-token request are 2^32 logits, past int32 (the host
+    metadata's dtype): wrapped, the biggest steps would stay whole."""
+    builder, _ = _split_builder(v4_builder_cls, monkeypatch, world=8, fp4=True)
+    rows = np.array([1 << 14], dtype=np.int32)
+    n_committed = np.array([1 << 18], dtype=np.int32)
+    assert builder._prefill_row_split(1 << 14, rows, n_committed) is not None
+
+
+_MOONCAKE = {"kv_connector": "mooncake"}
+_OFFLOAD = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+_LOAD_ONLY = {"kv_connector": "lmcache_offload", "kv_role": "kv_consumer"}
+
+
+def _multi(*connectors):
+    return {"kv_connector": "multi", "connectors": list(connectors)}
+
+
+@pytest.mark.parametrize(
+    "enabled, tbo, kv, world",
+    [
+        ("1", False, {}, 8),
+        ("true", False, {}, 8),
+        ("1", False, {**_MOONCAKE, "kv_role": "kv_producer"}, 8),
+        ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_producer"}, _OFFLOAD), 8),
+        ("1", False, _LOAD_ONLY, 8),
+        ("1", False, _multi(_LOAD_ONLY), 8),
+        ("1", False, {**_multi(_MOONCAKE, _OFFLOAD), "kv_role": "kv_consumer"}, 8),
+        ("1", True, {}, 1),
+        ("1", False, {**_MOONCAKE, "kv_role": "kv_consumer"}, 1),
+        ("1", False, {"kv_connector": "moriio", "kv_role": "kv_consumer"}, 1),
+        ("1", False, _multi({**_MOONCAKE, "kv_role": "kv_consumer"}, _OFFLOAD), 1),
+        ("1", False, _multi(_OFFLOAD, {**_MOONCAKE, "kv_role": "kv_consumer"}), 1),
+        ("0", False, {}, 1),
+    ],
+    ids=[
+        "splits",
+        "flag_true",
+        "pd_prefill",
+        "multi_pd_prefill",
+        "offload_load_only",
+        "multi_offload_load_only",
+        "multi_top_level_role_only",
+        "prefill_tbo",
+        "pd_decode",
+        "moriio_pd_decode",
+        "multi_pd_decode",
+        "multi_pd_decode_offload_first",
+        "flag_off",
+    ],
+)
+def test_the_split_world_follows_the_run(
+    v4_builder_cls, monkeypatch, enabled, tbo, kv, world
+):
+    """With the flag on ("1" or "true"), plain TP8 splits, a P/D prefill
+    instance and a load-only offload node included; the flag off keeps the
+    rows whole, and so, for now, does prefill TBO, whose ubatches' rows do
+    not take the split yet, and so does a P/D decode instance, which only
+    recomputes prefills: under `multi` too, whose P/D sub-connector holds the
+    role, wherever it is listed (a role on `multi` alone reaches no
+    sub-connector, which runs as a producer). Reading the world is no collective: the
+    startup gather is the builder's `__init__`'s (`_warm_split_gather`)."""
+    module = v4_builder_cls._indexer_qsplit_world_size.__globals__
+    monkeypatch.setitem(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setitem(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3, device_group="tp"),
+    )
+    monkeypatch.setitem(module, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
+    gathers = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda out, mine, group: gathers.append((out, mine, group)),
+    )
+    monkeypatch.setenv("ATOM_V4_INDEXER_QSPLIT", enabled)
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder.indexer_layout = "fp8"
+    builder.device = "cpu"
+    config = SimpleNamespace(
+        enable_dp_attention=False,
+        enable_tbo=tbo,
+        enable_tbo_decode=False,
+        decode_context_parallel_size=1,
+        kv_transfer_config=kv,
+    )
+    assert builder._indexer_qsplit_world_size(config) == world
+    assert gathers == []
+
+
+@pytest.mark.parametrize("world, gathers", [(8, [8]), (1, [])])
+def test_a_run_that_splits_gathers_at_startup(v4_builder_cls, world, gathers):
+    """A run that splits gathers once at startup, before the memory profile;
+    one that does not never gathers."""
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder._indexer_qsplit_world_size = lambda config: world
+    warmed = []
+    builder._warm_split_gather = warmed.append
+    builder._init_indexer_qsplit(SimpleNamespace())
+    assert builder._indexer_qsplit_world == world
+    assert warmed == gathers
+
+
+def test_the_builder_inits_the_split(v4_builder_cls):
+    """`__init__` calls `_init_indexer_qsplit`: the builder is too heavy to
+    construct here, so its source is read. Without the call the startup
+    gather is gone and the split's state unset until a prefill reads it."""
+    init = ast.parse(textwrap.dedent(inspect.getsource(v4_builder_cls.__init__)))
+    calls = [
+        node.func.attr
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert calls.count("_init_indexer_qsplit") == 1
+
+
+def test_the_startup_gather_is_the_split_s(v4_builder_cls, monkeypatch):
+    """The startup gather runs on the TP group and from this rank's own slot,
+    as the split does, so what RCCL allocates on its first all-gather is
+    inside the memory profile."""
+    module = v4_builder_cls._warm_split_gather.__globals__
+    monkeypatch.setitem(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=3, device_group="tp"),
+    )
+    gathers = []
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        lambda out, mine, group: gathers.append((out, mine, group)),
+    )
+    builder = v4_builder_cls.__new__(v4_builder_cls)
+    builder.device = "cpu"
+    builder._warm_split_gather(8)
+    [(out, mine, group)] = gathers
+    assert group == "tp" and out.numel() == 8
+    assert mine.numel() == 1 and mine.data_ptr() == out[3:].data_ptr()

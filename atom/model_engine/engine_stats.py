@@ -44,6 +44,12 @@ class EngineStats:
           throughput: 0.3 tokens/s, Running: 6 reqs, Waiting: 0 reqs, GPU KV
           cache usage: 0.0%, Prefix cache hit rate: 0.0%
 
+      ...or every ``throughput_log_interval_steps`` forwards when that is set,
+      led by the cumulative forward count -- so consecutive lines read
+      ``step 40:``, ``step 80:``, not the interval repeated. The clock cannot
+      align two DP ranks: they read it at the same moment but at different
+      step numbers. A forward count can, see ``bump_step``.
+
     A disabled section's ``update_*`` / ``maybe_log_*`` entry points are
     no-ops, so callers need not guard on the feature flag.
     """
@@ -66,7 +72,10 @@ class EngineStats:
         "_spec_interval_distribution",
         "_spec_interval_draft_tokens",
         "_spec_log_interval",
+        "_throughput_idle_since",
         "_throughput_last_log_time",
+        "_throughput_steps",
+        "_throughput_total_steps",
         "block_manager",
         "cache_enabled",
         "distribution",
@@ -78,6 +87,7 @@ class EngineStats:
         "spec_enabled",
         "throughput_enabled",
         "throughput_log_interval_s",
+        "throughput_log_interval_steps",
         "total_cached_tokens",
         "total_compressed_tokens",
         "total_draft_tokens",
@@ -102,6 +112,7 @@ class EngineStats:
         cache_hit_rate_window: int = 1000,
         pool_pressure: Callable[[], dict[str, int]] | None = None,
         throughput_log_interval_s: float = 10.0,
+        throughput_log_interval_steps: int = 0,
     ):
         self.spec_enabled = use_spec
         self.cache_enabled = enable_prefix_caching
@@ -196,7 +207,16 @@ class EngineStats:
         # usually log to the same place. "" for the aggregated engine.
         self.label = label
         self.throughput_log_interval_s = throughput_log_interval_s
+        # 0 keeps the clock; positive counts forwards instead.
+        self.throughput_log_interval_steps = max(0, int(throughput_log_interval_steps))
         self._throughput_last_log_time = time.monotonic()
+        self._throughput_steps = 0
+        # Never reset: this is the number the line reports and the only one
+        # two ranks can be lined up by. `_throughput_steps` is the window's.
+        self._throughput_total_steps = 0
+        # Start of the current idle stretch, or None while forwards are
+        # running. See `note_idle`.
+        self._throughput_idle_since: float | None = None
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0
 
@@ -725,6 +745,84 @@ class EngineStats:
         self.num_prompt_tokens += num_prompt_tokens
         self.num_generation_tokens += num_generation_tokens
 
+    def bump_step(self) -> None:
+        """Count one executed forward, INCLUDING an idle DP rank's dummy.
+
+        That inclusion is the point: DP attention is lockstep, so forwards are
+        the one count every rank agrees on. Skipping the dummy would drift the
+        ranks apart exactly when load is unbalanced. Decode steps genuinely
+        differ per rank and no counter can align them.
+
+        Two counters, because they answer different questions: the window's
+        decides when to close, the total is what the line prints. Printing the
+        window's would print the interval on every line -- the same number
+        forever, which lines up nothing.
+
+        The total matches across ranks only while the DP collective is
+        healthy. `_sync_dp_state` falls back to local state once the all_reduce
+        raises, and from there the ranks can branch differently -- that is a
+        shutdown path, but it means the number is a comparison aid, not an
+        invariant to assert on.
+        """
+        if self.throughput_enabled:
+            self._throughput_steps += 1
+            self._throughput_total_steps += 1
+
+    def note_idle(self, now: float) -> None:
+        """Open an idle stretch; `note_busy` subtracts it from the window.
+
+        Step mode only. There the window closes on a forward count, so it can
+        span any amount of wall clock, while `elapsed` -- the divisor behind
+        both throughputs -- is still measured on the clock. Without this the
+        window's tokens are charged for time no forward ran. Time mode needs
+        none of it: the interval already bounds the window.
+
+        DP callers must pass *engine-wide* idleness. A locally idle rank still
+        runs dummies for its busy peers, and that is time its tokens earned.
+        """
+        if (
+            self.throughput_enabled
+            and self.throughput_log_interval_steps
+            and self._throughput_idle_since is None
+        ):
+            # Never behind the origin. The loop reads `now` before
+            # `heartbeat_throughput`, which may have opened a window at a
+            # later clock read; an anchor behind that origin would be
+            # subtracted from a span the window never contained, leaving the
+            # origin past `now` and the rate overstated. Mirror of the
+            # re-anchor in `_open_throughput_window`, for the other direction.
+            self._throughput_idle_since = max(now, self._throughput_last_log_time)
+
+    def note_busy(self, now: float) -> None:
+        """Close an idle stretch by moving the window origin past it.
+
+        Moving the origin rather than resetting it to `now` is what keeps a
+        half-filled window honest: the forwards already counted keep the time
+        they actually took, and only the dead span is dropped. Resetting would
+        divide their tokens by the shorter remainder and report a rate higher
+        than any the engine reached.
+
+        No mode check of its own: only `note_idle` opens a stretch, and it
+        already refuses outside step mode, so there is nothing to close.
+        """
+        if self._throughput_idle_since is None:
+            return
+        self._throughput_last_log_time += now - self._throughput_idle_since
+        self._throughput_idle_since = None
+
+    def _open_throughput_window(self, now: float) -> None:
+        """Start a fresh window at `now`, carrying the idle anchor with it.
+
+        A window does close while the engine is idle -- the loop's last
+        forwards fill it, and the close lands on a pass that is already idle.
+        An anchor left behind the new origin would then be subtracted from a
+        window that already skipped that span, putting the origin past `now`.
+        """
+        self._throughput_last_log_time = now
+        self._throughput_steps = 0
+        if self._throughput_idle_since is not None:
+            self._throughput_idle_since = now
+
     def window_expired(self, now: float) -> bool:
         """Whether the throughput window is due to close.
 
@@ -732,11 +830,15 @@ class EngineStats:
         queues or the KV pool. The busy loops call that on *every* pass, busy
         or idle, so this runs at loop frequency and says no all but once per
         interval; it takes the `now` the loop already read.
+
+        A positive `throughput_log_interval_steps` replaces the clock with
+        `bump_step`'s count.
         """
-        return (
-            self.throughput_enabled
-            and now - self._throughput_last_log_time >= self.throughput_log_interval_s
-        )
+        if not self.throughput_enabled:
+            return False
+        if self.throughput_log_interval_steps:
+            return self._throughput_steps >= self.throughput_log_interval_steps
+        return now - self._throughput_last_log_time >= self.throughput_log_interval_s
 
     def maybe_log_throughput(
         self,
@@ -748,19 +850,26 @@ class EngineStats:
             return
         now = time.monotonic()
         elapsed = now - self._throughput_last_log_time
-        # `elapsed <= 0` is unreachable while the interval holds the positive
-        # value `__init__` validated, but the interval is a public attribute
-        # and the division is two lines below; one compare keeps that division
-        # safe whatever the attribute has been set to since.
-        if elapsed < self.throughput_log_interval_s or elapsed <= 0:
+        # Same predicate `window_expired` answered, so a caller that skipped it
+        # cannot divide by an unopened window. `elapsed` is the divisor in
+        # either mode, hence the second check.
+        if not self.window_expired(now) or elapsed <= 0:
             return
         if (
-            self.num_prompt_tokens == 0
+            not self.throughput_log_interval_steps
+            and self.num_prompt_tokens == 0
             and self.num_generation_tokens == 0
             and num_running_reqs == 0
             and num_waiting_reqs == 0
         ):
-            self._throughput_last_log_time = now
+            # Time mode only. There an empty window means the engine is idle
+            # and the clock would emit one of these every interval forever.
+            # In step mode an empty window means the opposite -- the window
+            # closed, so `interval` forwards ran -- and it is a DP rank that
+            # spent all of them on dummies for its peers. Suppressing it is
+            # suppressing the line for exactly the rank whose absence of work
+            # is what the other rank's line is being compared against.
+            self._open_throughput_window(now)
             return
         prompt_throughput = self.num_prompt_tokens / elapsed
         generation_throughput = self.num_generation_tokens / elapsed
@@ -772,13 +881,21 @@ class EngineStats:
         prefix_cache_hit_rate = (
             self.recent_cache_hit_rate if self.cache_enabled else None
         )
+        # Leads the line: it is what two ranks are lined up by. Omitted in time
+        # mode, where the count agrees across ranks about nothing.
+        step_prefix = (
+            f"step {self._throughput_total_steps}: "
+            if self.throughput_log_interval_steps
+            else ""
+        )
         logger.info(
-            "%sEngine %03d: Avg prompt throughput: %.1f tokens/s, "
+            "%sEngine %03d: %sAvg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, Running: %d reqs, "
             "Waiting: %d reqs, GPU KV cache usage: %s, "
             "Prefix cache hit rate: %s",
             self.label,
             self.engine_index,
+            step_prefix,
             prompt_throughput,
             generation_throughput,
             num_running_reqs,
@@ -790,6 +907,6 @@ class EngineStats:
                 else f"{prefix_cache_hit_rate * 100:.1f}%"
             ),
         )
-        self._throughput_last_log_time = now
+        self._open_throughput_window(now)
         self.num_prompt_tokens = 0
         self.num_generation_tokens = 0

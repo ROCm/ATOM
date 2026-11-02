@@ -14,8 +14,9 @@ import types
 import pytest
 import torch
 
-from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, Dims
+from atom.models.kimi_k3.mono.config import EXPERTS, HEAD_DIM, HIDDEN, LATENT, Dims
 from atom.models.kimi_k3.mono.layouts import unshuffle_scale, unshuffle_weight
+from atom.mono.runtime.consensus import MonoUnsupported
 
 # (rows, packed columns) of the planes K3's bind actually undoes, and two small
 # shapes that exercise the tiling on its own
@@ -207,3 +208,102 @@ def test_the_bound_up_projection_band_owns_its_storage(monkeypatch):
     # the whole claim: the band carries its own 6.1 MiB, not the plane's 49
     assert bound.w_up.untyped_storage().nbytes() == dims.up_n * LATENT * 2
     assert bound.w_up.untyped_storage().nbytes() < plane.untyped_storage().nbytes()
+
+
+def _kda_layer(dims, o_norm_dtype):
+    """A decoder layer stubbed down to exactly what `bind_kda` reads."""
+    seam = types.SimpleNamespace(
+        norm=_norm(HIDDEN), proj=_norm(HIDDEN), out_norm=_norm(HIDDEN)
+    )
+    attn = types.SimpleNamespace(
+        _in_proj_fused=True,
+        num_local_heads=dims.heads,
+        head_dim=HEAD_DIM,
+        conv_kernel_size=4,
+        _kda_gate_lower_bound=-5.0,
+        in_proj=_lin(dims.fused, HIDDEN),
+        f_b_proj=_lin(dims.proj, HEAD_DIM),
+        conv_weight=torch.zeros(dims.qkv, 1, 4),
+        A_log=torch.zeros(dims.heads),
+        dt_bias=torch.zeros(dims.proj),
+        o_norm=types.SimpleNamespace(
+            weight=torch.ones(HEAD_DIM, dtype=o_norm_dtype), eps=1e-5
+        ),
+    )
+    return types.SimpleNamespace(
+        is_linear_attn=True,
+        self_attn=attn,
+        self_attention_attn_res=seam,
+    )
+
+
+def test_o_norm_binds_native_fp32_and_refuses_bf16():
+    """K1 reads `o_norm` with `ld_f32`; the model holds it in fp32
+    (`control_dtype`), so it is bound as the same tensor, not a converted copy,
+    and the old bf16 layout is refused rather than read as fp32 garbage."""
+    from atom.models.kimi_k3.mono import weights as w
+
+    dims = Dims(8)
+    layer = _kda_layer(dims, torch.float32)
+    bound = w.bind_kda(layer, 0, dims)
+    assert bound.on_w.dtype == torch.float32
+    assert bound.on_w.data_ptr() == layer.self_attn.o_norm.weight.data_ptr()
+
+    with pytest.raises(MonoUnsupported, match="o_norm"):
+        w.bind_kda(_kda_layer(dims, torch.bfloat16), 0, dims)
+
+
+def test_bf16_latent_projection_without_a_scale_binds_plain():
+    """A bf16 checkpoint's latent projections carry no `weight_scale`: they are
+    what the kernels read, so they pass through, never dequantized."""
+    from atom.models.kimi_k3.mono.weights import _mxfp4_to_bf16
+
+    module = _lin(HIDDEN, LATENT)
+    got = _mxfp4_to_bf16(module, "w_up", (HIDDEN, LATENT))
+    assert got.data_ptr() == module.weight.data_ptr()
+
+
+def test_bf16_latent_projection_refuses_a_malformed_layout():
+    from atom.models.kimi_k3.mono.weights import _mxfp4_to_bf16
+
+    with pytest.raises(MonoUnsupported, match="expected"):
+        _mxfp4_to_bf16(_lin(HIDDEN, LATENT + 8), "w_up", (HIDDEN, LATENT))
+
+    shuffled = _lin(HIDDEN, LATENT)
+    shuffled.weight = torch.nn.Parameter(shuffled.weight, requires_grad=False)
+    shuffled.weight.is_shuffled = True
+    with pytest.raises(MonoUnsupported, match="preshuffled"):
+        _mxfp4_to_bf16(shuffled, "w_up", (HIDDEN, LATENT))
+
+    # no scale and not bf16 is neither plain nor MXFP4 + scale: still refused
+    fp8 = types.SimpleNamespace(weight=torch.zeros(HIDDEN, LATENT, dtype=torch.int8))
+    with pytest.raises(MonoUnsupported, match="no weight_scale"):
+        _mxfp4_to_bf16(fp8, "w_up", (HIDDEN, LATENT))
+
+
+def test_bind_moe_binds_a_bf16_latent_checkpoint_without_dequantizing(monkeypatch):
+    """A bf16 checkpoint has no `weight_scale` on either latent projection. The
+    real `_mxfp4_to_bf16` runs here (only `_experts` is stubbed): the down
+    projection is bound as is and the up band is a copy that owns its storage."""
+    from atom.models.kimi_k3.mono import weights as w
+
+    dims = Dims(8)
+    rank = 1
+    torch.manual_seed(0)
+    up = _lin(HIDDEN, LATENT)
+    up.weight = torch.randn(HIDDEN, LATENT, dtype=torch.bfloat16)
+    down = _lin(LATENT, HIDDEN)
+    down.weight = torch.randn(LATENT, HIDDEN, dtype=torch.bfloat16)
+    stub = torch.zeros(1, dtype=torch.uint8)
+    monkeypatch.setattr(w, "_experts", lambda *a: (stub, stub, stub, stub))
+    layer = _moe_layer(dims, up)
+    layer.block_sparse_moe.routed_expert_down_proj = down
+
+    bound = w.bind_moe(layer, 1, dims, rank)
+
+    assert bound.w_ld.data_ptr() == down.weight.data_ptr()
+    assert torch.equal(bound.w_ld, down.weight)
+    band = up.weight[rank * dims.up_n : (rank + 1) * dims.up_n]
+    assert torch.equal(bound.w_up, band)
+    assert bound.w_up.data_ptr() != band.data_ptr()
+    assert bound.w_up.untyped_storage().nbytes() == dims.up_n * LATENT * 2

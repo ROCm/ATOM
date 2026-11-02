@@ -111,6 +111,72 @@ def test_plugin_forward_passes_fused_quant_into_capture_break(
     assert output is attention._project_out.return_value
 
 
+def test_plugin_forward_carries_mx_scale_across_the_break_as_bytes(
+    plugin_attention,
+):
+    """vLLM's weak-ref op refuses float8_e8m0fnu (ScalarType 44), so the MX
+    scale must reach the break as uint8 over the same storage."""
+    calls = []
+
+    class Attention:
+        heads = 2
+        head_dim = 16
+
+        def _atom_v41_attend_block(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    attention = Attention()
+    attention._project_out = Mock(return_value=object())
+    hidden = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    hidden_fp8 = torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, 2, 1, dtype=torch.float8_e8m0fnu)
+    cache = SimpleNamespace(rope_positions=Mock(return_value=object()))
+
+    plugin_attention._forward(
+        attention, hidden, scale, cache, object(), object(), None, hidden_fp8=hidden_fp8
+    )
+
+    ((args, kwargs),) = calls
+    crossed = args[2]  # self is bound, so args starts at attn_out
+    assert crossed.dtype == torch.uint8
+    assert crossed.data_ptr() == scale.data_ptr() and crossed.shape == scale.shape
+    assert args[7] is hidden_fp8
+    assert kwargs == {"hidden_scale_dtype": torch.float8_e8m0fnu}
+
+
+def test_plugin_attend_block_restores_the_mx_scale(plugin_attention):
+    class ReachedSelection(Exception):
+        pass
+
+    hidden = torch.empty(1, 2, 32, dtype=torch.bfloat16)
+    hidden_fp8 = torch.empty_like(hidden, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, 2, 1, dtype=torch.float8_e8m0fnu)
+    attention = SimpleNamespace(
+        _fork_compress=Mock(return_value=True),
+        project_qkv=Mock(return_value=(object(), object())),
+        qk_norm=Mock(return_value=(object(), object(), object())),
+        _fork_select=Mock(side_effect=ReachedSelection),
+    )
+    cache = SimpleNamespace(current_step=object())
+    with pytest.raises(ReachedSelection):
+        plugin_attention._attend_block(
+            attention,
+            None,
+            hidden,
+            scale.view(torch.uint8),
+            cache,
+            object(),
+            object(),
+            None,
+            hidden_fp8,
+            hidden_scale_dtype=torch.float8_e8m0fnu,
+        )
+    (qkv_input, restored), _ = attention.project_qkv.call_args
+    assert qkv_input is hidden_fp8
+    assert restored.dtype == torch.float8_e8m0fnu
+    assert restored.data_ptr() == scale.data_ptr()
+
+
 @pytest.mark.parametrize("fused_quant", [False, True])
 def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
     plugin_attention, fused_quant

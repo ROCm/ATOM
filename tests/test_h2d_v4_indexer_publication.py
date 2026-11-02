@@ -74,6 +74,7 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
     )
     builder._indexer_fp4 = False
     builder.indexer_layout = "fp8"
+    builder._indexer_qsplit_world = 1
     builder.pool_geometry = SimpleNamespace(slot_positions=4)
     builder._alloc_v4_metadata_buffers()
     runner.attn_metadata_builder = builder
