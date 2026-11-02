@@ -1067,6 +1067,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
     # instead of up to seven eager ones. Integer math, so the same result.
     "ATOM_MTP_FUSED_KV_INDPTR": lambda: _flag_env("ATOM_MTP_FUSED_KV_INDPTR", "0"),
+    # Qwen3.5 MTP: the draft token's embedding gather, both pre-fc Gemma norms
+    # and their concat in one launch writing the fc input (instead of gather +
+    # two norm launches + torch.cat, or gather + the dual norm of
+    # ATOM_MTP_DUAL_PRE_FC_NORM, which it supersedes): aiter's norm with its
+    # q_row_index gather where aiter has it, else a Triton kernel reproducing
+    # aiter's reduction order. Bitwise the same either way.
+    "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM": lambda: _flag_env(
+        "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM", "0"
+    ),
+    # GDN-hybrid MTP (Qwen3.5 / Next): EagleProposer's eager glue between its
+    # draft passes fused -- step 0's staging in one launch on a uniform verify
+    # batch, and each later pass's metadata advance + input staging + draft id
+    # export in one launch plus the kv_indices generation (57 launches a
+    # decode step at mtp_k=3 down to 6). Same metadata and inputs, bit for bit.
+    "ATOM_MTP_FUSED_DRAFT_GLUE": lambda: _flag_env("ATOM_MTP_FUSED_DRAFT_GLUE", "0"),
     # Debug: all-gather each step's draft ids over TP after propose and log any
     # rank disagreement. Syncs the host every decode step -- validation only.
     "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (

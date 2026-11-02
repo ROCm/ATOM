@@ -1702,6 +1702,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     # Inherited as True from the MHA builder, which made `EagleProposer` pass
     # `update_context_lens` / `positions_out` into a signature that has neither.
     fuse_mtp_decode_position_update = False
+    # `EagleProposer` may advance this builder's draft metadata with
+    # `atom.spec_decode.eagle_fused_glue.advance_draft_pass`
+    # (ATOM_MTP_FUSED_DRAFT_GLUE): the same writes as `prepare_mtp_decode`
+    # below, in one launch plus the `kv_indices` generation. Declared here and
+    # nowhere else: that function reproduces this builder's rebuild only.
+    supports_fused_mtp_glue = True
     # A prefill step pads to a token-graph bucket (`ForwardMode._pad_to_token_graph`,
     # `ModelRunner._record_tr_graphs`): `prepare_prefill` lays the step out at
     # `running_tokens`, the rows past the scheduled ones with slot -1 (written
@@ -2539,6 +2545,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             var["slot_mapping"].gpu[:running_bs],
             0 if dummy else bs,
         )
+        return result
+
+    def finish_mtp_decode(self, running_bs: int, slot_mapping: torch.Tensor) -> dict:
+        """`prepare_mtp_decode`'s workinfos once its device writes are done
+        elsewhere (`eagle_fused_glue.advance_draft_pass`): the persistent
+        worker buffers and FlyDSL plan it refreshes from the new lengths, and
+        the write slots already computed into ``slot_mapping``."""
+        result = {}
+        if self.block_size == 1024:
+            result = self.set_aiter_persistent_worker_buffers(running_bs)
+        result["flydsl_work_plan"] = self.refresh_flydsl_plan(
+            self.model_runner.forward_vars["context_lens"].gpu[:running_bs]
+        )
+        result["slot_mapping"] = slot_mapping
         return result
 
     def build_for_cudagraph_capture(self, bs: int):

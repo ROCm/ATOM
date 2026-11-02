@@ -19,6 +19,10 @@ from atom.model_ops.embed_head import (
 )
 from atom.model_ops.linear import ColumnParallelLinear, ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.mtp_pre_fc_norm import (
+    mtp_embed_pre_fc_norms,
+    mtp_embed_pre_fc_norms_supported,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_5 import (
     Qwen3_5DecoderLayer,
@@ -84,6 +88,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
         self.dual_pre_fc_norm = envs.ATOM_MTP_DUAL_PRE_FC_NORM
+        self.fused_embed_pre_fc_norm = envs.ATOM_MTP_FUSED_EMBED_PRE_FC_NORM
 
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
@@ -154,6 +159,37 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         )
         return out
 
+    def _local_embedding_weight(self) -> torch.Tensor | None:
+        """The embedding table when the lookup is a plain local gather (a
+        replicated table, or the whole vocab on one rank), else None: a
+        sharded lookup all-reduces partial rows, which a fused gather cannot."""
+        embed = self.embed_tokens
+        if isinstance(embed, ReplicatedEmbedding) or (
+            isinstance(embed, VocabParallelEmbedding) and embed.tp_size == 1
+        ):
+            return embed.weight
+        return None
+
+    def _embed_pre_fc_norms(
+        self, input_ids: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """The fc input from the ids in one launch
+        (ATOM_MTP_FUSED_EMBED_PRE_FC_NORM), or None where it does not apply."""
+        weight = self._local_embedding_weight()
+        if weight is None or not mtp_embed_pre_fc_norms_supported(
+            input_ids, weight, hidden_states
+        ):
+            return None
+        return mtp_embed_pre_fc_norms(
+            input_ids,
+            weight,
+            hidden_states,
+            self.pre_fc_norm_embedding.weight.data,
+            self.pre_fc_norm_embedding.variance_epsilon,
+            self.pre_fc_norm_hidden.weight.data,
+            self.pre_fc_norm_hidden.variance_epsilon,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -164,15 +200,23 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_input_ids(input_ids)
-        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-        if self.dual_pre_fc_norm and _dual_norm_inputs_ok(inputs_embeds, hidden_states):
-            hidden_states = self._pre_fc_norms(inputs_embeds, hidden_states)
+        fc_input = None
+        if inputs_embeds is None and self.fused_embed_pre_fc_norm:
+            fc_input = self._embed_pre_fc_norms(input_ids, hidden_states)
+        if fc_input is not None:
+            hidden_states = fc_input
         else:
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_input_ids(input_ids)
+            assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+            if self.dual_pre_fc_norm and _dual_norm_inputs_ok(
+                inputs_embeds, hidden_states
+            ):
+                hidden_states = self._pre_fc_norms(inputs_embeds, hidden_states)
+            else:
+                inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+                hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
         hidden_states = self._fc(hidden_states)
         residual = None
 
