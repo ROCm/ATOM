@@ -13,7 +13,7 @@ nothing on it.
 import pytest
 import torch
 
-from atom.model_ops.prefill_ar_route import prefill_ar_takes_split
+from atom.model_ops.prefill_ar_route import prefill_ar_takes_split, takes_gemma_norm
 from atom.utils import envs
 
 
@@ -46,6 +46,81 @@ def test_env_default_is_off(monkeypatch):
     assert envs.ATOM_PREFILL_AR_QR_MIN_TOKENS == 2048
 
 
+# aiter's rmsnorm2d_fwd_with_add before and after ROCm/aiter#3872: the seventh
+# parameter changed from use_model_sensitive_rmsnorm to gemma_norm.
+
+
+def _old_aiter_add_rmsnorm(
+    out,
+    input,
+    residual_in,
+    residual_out,
+    weight,
+    epsilon,
+    use_model_sensitive_rmsnorm=0,
+):
+    pass
+
+
+def _new_aiter_add_rmsnorm(
+    out,
+    input,
+    residual_in,
+    residual_out,
+    weight,
+    epsilon,
+    gemma_norm=False,
+    use_model_sensitive_rmsnorm=0,
+):
+    pass
+
+
+def _registered(schema):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(default=SimpleNamespace(_schema=schema))
+
+
+_OLD_SCHEMA = (
+    "aiter::rmsnorm2d_fwd_with_add(Tensor(a0!) out, Tensor input, "
+    "Tensor residual_in, Tensor(a3!) residual_out, Tensor weight, "
+    "float epsilon, SymInt use_model_sensitive_rmsnorm=0) -> ()"
+)
+_NEW_SCHEMA = (
+    "aiter::rmsnorm2d_fwd_with_add(Tensor(a0!) out, Tensor input, "
+    "Tensor residual_in, Tensor(a3!) residual_out, Tensor weight, "
+    "float epsilon, bool gemma_norm=False, "
+    "SymInt use_model_sensitive_rmsnorm=0) -> ()"
+)
+
+
+def _wrapper(*args, **kwargs):  # what aiter's torch_compile_guard returns
+    pass
+
+
+@pytest.mark.parametrize(
+    "op,fn,expect",
+    [
+        (None, _old_aiter_add_rmsnorm, False),
+        (None, _new_aiter_add_rmsnorm, True),
+        # registered op: the schema decides, the (*args, **kwargs) wrapper does not
+        (_registered(_OLD_SCHEMA), _wrapper, False),
+        (_registered(_NEW_SCHEMA), _wrapper, True),
+    ],
+)
+def test_gemma_norm_support_is_read_off_aiter(op, fn, expect):
+    assert takes_gemma_norm(op, fn) is expect
+
+
+def test_old_aiter_rejects_gemma_norm_by_keyword():
+    # Passed by keyword, the flag cannot land on use_model_sensitive_rmsnorm:
+    # an old aiter fails loudly instead of normalizing with x * w.
+    args = (None,) * 6
+    _new_aiter_add_rmsnorm(*args, gemma_norm=True)
+    with pytest.raises(TypeError):
+        _old_aiter_add_rmsnorm(*args, gemma_norm=True)
+
+
 # ---------------------------------------------------------------------------
 # GemmaRMSNorm wiring and op bodies (ROCm device needed to import aiter)
 # ---------------------------------------------------------------------------
@@ -62,6 +137,7 @@ def ln(monkeypatch):
     monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(layernorm, "fused_ar_gemma_per_group_supported", lambda: True)
     monkeypatch.setattr(layernorm, "fused_ar_gemma_per_token_supported", lambda: True)
+    monkeypatch.setattr(layernorm, "add_rmsnorm_gemma_supported", lambda: True)
     return layernorm
 
 
@@ -94,7 +170,9 @@ def seen(ln, monkeypatch):
             calls.append(("qr", x.shape[0], {}))
             return x.clone()
 
-    def add_rmsnorm(out, inp, residual, residual_out, weight, eps, gemma_norm):
+    # keyword-only: a positional seventh argument is use_model_sensitive_rmsnorm
+    # on older aiter
+    def add_rmsnorm(out, inp, residual, residual_out, weight, eps, *, gemma_norm):
         calls.append(("norm", inp.shape[0], {"gemma_norm": gemma_norm}))
 
     def hip_quant(quant_type):
@@ -196,5 +274,13 @@ def test_per_group_norm_is_never_routed(ln, seen, monkeypatch):
 def test_quick_reduce_off_falls_back_to_fused(ln, seen, monkeypatch):
     monkeypatch.setattr(ln, "_tp_quick_reduce", lambda: None)
     norm = _norm(ln, monkeypatch, 2048)
+    _run(norm, 4096)
+    assert [c[0] for c in seen] == ["fused"]
+
+
+def test_aiter_without_gemma_norm_keeps_the_fused_call(ln, seen, monkeypatch):
+    monkeypatch.setattr(ln, "add_rmsnorm_gemma_supported", lambda: False)
+    norm = _norm(ln, monkeypatch, 2048)
+    assert norm.ar_split_min_tokens == 0
     _run(norm, 4096)
     assert [c[0] for c in seen] == ["fused"]

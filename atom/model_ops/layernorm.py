@@ -3,6 +3,7 @@
 
 import functools
 import inspect
+import logging
 
 import aiter
 import torch
@@ -26,11 +27,13 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
-from atom.model_ops.prefill_ar_route import prefill_ar_takes_split
+from atom.model_ops.prefill_ar_route import prefill_ar_takes_split, takes_gemma_norm
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
+
+logger = logging.getLogger("atom")
 
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
@@ -810,6 +813,23 @@ def fused_ar_gemma_per_token_supported() -> bool:
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=1)
+def add_rmsnorm_gemma_supported() -> bool:
+    """Whether this aiter's `rmsnorm2d_fwd_with_add` takes `gemma_norm`
+    (see `takes_gemma_norm`)."""
+    op = getattr(torch.ops.aiter, "rmsnorm2d_fwd_with_add", None)
+    return takes_gemma_norm(op, rmsnorm2d_fwd_with_add)
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_split_norm_unsupported() -> None:
+    logger.warning(
+        "ATOM_PREFILL_AR_QR_MIN_TOKENS ignored: this aiter's "
+        "rmsnorm2d_fwd_with_add has no gemma_norm, so the split norm would "
+        "compute x * w; keeping the fused all-reduce + norm"
+    )
+
+
 def _tp_quick_reduce():
     """The TP group's quick-reduce communicator, or None when it is off."""
     from aiter.dist.parallel_state import get_tp_group
@@ -829,7 +849,9 @@ def _quick_reduce_split_norm(
     reduced = qr.quick_all_reduce(x)
     out = torch.empty_like(reduced)
     residual_out = torch.empty_like(residual)
-    rmsnorm2d_fwd_with_add(out, reduced, residual, residual_out, weight, eps, True)
+    rmsnorm2d_fwd_with_add(
+        out, reduced, residual, residual_out, weight, eps, gemma_norm=True
+    )
     return out, residual_out
 
 
@@ -975,6 +997,9 @@ class GemmaRMSNorm(nn.Module):
             and not (self.use_fused_quant and not self.per_token_quant)
             else 0
         )
+        if self.ar_split_min_tokens > 0 and not add_rmsnorm_gemma_supported():
+            _warn_split_norm_unsupported()
+            self.ar_split_min_tokens = 0
 
     @staticmethod
     def forward_static(
