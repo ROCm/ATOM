@@ -1186,8 +1186,8 @@ Image placeholder ids are the same for every picture, so every LMCache lookup,
 save and load keys its ids through `tier_token_ids(seq, end)`
 (`_offload_common.py`): the first 4 ids of a prompt with a `cache_seed` become
 digests of `(cache_seed, position, id)` with bit 31 set, off every vocabulary
-id. Text prompts key unchanged. mooncake_store seeds its chain hash the same
-way (`chain_seed`).
+id. Text prompts key unchanged. mooncake_store seeds its own chain hash with
+the same `cache_seed` (`chain_seed`).
 
 ### Invariants enforced in code
 

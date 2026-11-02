@@ -69,14 +69,15 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
 # layout (see `_is_minimax_m3` and offload/hybrid/m3/): its NSA index_cache is
 # delivered only through transfer_tensors.block_regions, so the dense codec --
 # which builds from per-layer KVCacheTensor K/V -- would silently drop it.
-# Qwen3.8; `qwen4_exp` is the wrapper name a native config flattens to.
-_QSA_GDN_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
-_GDN_LINEAR_MODEL_TYPES = _QSA_GDN_MODEL_TYPES | {
-    "qwen3_next",
-    "qwen3_next_mtp",
-    "qwen3_5_text",
-    "qwen3_5_moe_text",
-}
+_GDN_LINEAR_MODEL_TYPES = frozenset(
+    {
+        "qwen3_next",
+        "qwen3_next_mtp",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "qwen4_exp_text",
+    }
+)
 
 # Layouts that own a tier for a model's per-request *recurrent* state.
 # `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
@@ -380,8 +381,9 @@ def build_page_namespace(
         ),
     }
     from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, attn_family
 
-    if getattr(get_hf_text_config(hf), "model_type", None) in _QSA_GDN_MODEL_TYPES:
+    if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
         from atom.model_ops.attentions.qwen4_exp_attn import qsa_page_segments
 
         document.update(qsa_page_segments(config))
@@ -475,9 +477,8 @@ def lmcache_engine_id(config) -> str:
     """
     parallel = getattr(config, "parallel_config", None)
     dp_rank = int(getattr(parallel, "data_parallel_rank", 0) or 0)
-    port = getattr(parallel, "data_parallel_base_port", None)
-    # `type(...) is int`: a bool is an int, and True would name port 1.
-    if type(port) is int and port > 0:
+    port = int(getattr(parallel, "data_parallel_base_port", 0) or 0)
+    if port:
         return f"atom-offload-r{port}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 

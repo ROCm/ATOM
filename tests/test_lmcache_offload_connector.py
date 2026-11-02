@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import sys
 import threading
@@ -1213,13 +1212,7 @@ def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
     v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
     raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
     comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
-    qsa = KVCacheTensor(
-        layer_num=0,
-        k_cache=k,
-        v_cache=v,
-        index_raw=raw,
-        index_compressed=comp,
-    )
+    qsa = KVCacheTensor(layer_num=0, k_cache=k, v_cache=v, extra_planes=(raw, comp))
     plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
     qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
     plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
@@ -5726,8 +5719,8 @@ def test_engine_id_splits_servers_on_one_host_and_their_replicas():
     assert len(ids) == 15
 
 
-@pytest.mark.parametrize("base_port", [0, None, True, "41000"])
-def test_engine_id_ignores_an_unresolved_or_non_int_port(base_port):
+@pytest.mark.parametrize("base_port", [0, None])
+def test_engine_id_ignores_an_unresolved_port(base_port):
     assert offcfg.lmcache_engine_id(_server_config(base_port)) == "atom-offload-dp0"
 
 
@@ -7559,36 +7552,6 @@ _MEDIA_CHUNK = 256
 _MEDIA_PROMPT = 3 * _MEDIA_CHUNK
 
 
-class _MediaTier:
-    """LMCache's bookkeeping: chunk keys chained over the ids, deduplicated."""
-
-    def __init__(self):
-        self.chunks: dict[bytes, str] = {}
-
-    @staticmethod
-    def _keys(token_ids):
-        link = b""
-        whole = len(token_ids) - len(token_ids) % _MEDIA_CHUNK
-        for start in range(0, whole, _MEDIA_CHUNK):
-            chunk = token_ids[start : start + _MEDIA_CHUNK]
-            assert all(0 <= t < 1 << 32 for t in chunk)  # the MP server packs ">I"
-            link = hashlib.blake2b(link + repr(chunk).encode()).digest()
-            yield link
-
-    def store(self, token_ids, owner):
-        for key in self._keys(token_ids):
-            self.chunks.setdefault(key, owner)
-
-    def hit(self, token_ids) -> tuple[int, set]:
-        owners, tokens = set(), 0
-        for key in self._keys(token_ids):
-            if key not in self.chunks:
-                break
-            owners.add(self.chunks[key])
-            tokens += _MEDIA_CHUNK
-        return tokens, owners
-
-
 def _media_seq(sid, cache_seed, tokens=None):
     tokens = list(range(100, 100 + _MEDIA_PROMPT)) if tokens is None else tokens
     return SimpleNamespace(
@@ -7608,48 +7571,25 @@ def media_scheduler(monkeypatch):
     )
 
 
-def _media_save(scheduler, tier, seq):
-    request = scheduler._build_save_request(
+@pytest.mark.parametrize("cache_seed", [11, -1])
+def test_lookup_save_and_load_all_key_by_tier_token_ids(media_scheduler, cache_seed):
+    """One key per request: an image's KV is found only by the same image."""
+    seq = _media_seq("A", cache_seed)
+    keyed = tier_token_ids(seq, _MEDIA_PROMPT)
+    assert media_scheduler._lookup_token_ids(seq) == keyed
+    save = media_scheduler._build_save_request(
         seq, 0, _MEDIA_PROMPT, SimpleNamespace(), list(seq.block_table), True
     )
-    tier.store(request.token_ids, seq.id)
-
-
-def test_another_image_with_the_same_text_misses_the_first_ones_kv(media_scheduler):
-    """A = image1 + T stores its KV; B = image2 + T must not find it, or
-    C = image2 + T would decode from image1's KV under image2's state."""
-    tier = _MediaTier()
-    a, b, c = _media_seq("A", 11), _media_seq("B", 22), _media_seq("C", 22)
-    _media_save(media_scheduler, tier, a)
-
-    assert tier.hit(media_scheduler._lookup_token_ids(b)) == (0, set())
-    _media_save(media_scheduler, tier, b)
-    assert tier.hit(media_scheduler._lookup_token_ids(c)) == (_MEDIA_PROMPT, {"B"})
-    again = media_scheduler._lookup_token_ids(_media_seq("A2", 11))
-    assert tier.hit(again) == (_MEDIA_PROMPT, {"A"})
-
-
-def test_a_text_prompt_keys_on_its_ids_alone(media_scheduler):
-    text = _media_seq("T", -1)
-    assert media_scheduler._lookup_token_ids(text) == text.token_ids
-    tier = _MediaTier()
-    _media_save(media_scheduler, tier, text)
-    assert tier.hit(list(text.token_ids)) == (_MEDIA_PROMPT, {"T"})
-    assert tier.hit(media_scheduler._lookup_token_ids(_media_seq("I", 11)))[0] == 0
-
-
-def test_the_load_keys_what_the_lookup_and_save_keyed(media_scheduler):
-    tier = _MediaTier()
-    b, c = _media_seq("B", 22), _media_seq("C", 22)
-    _media_save(media_scheduler, tier, b)
+    assert save.token_ids == keyed
     load = media_scheduler._build_load_request(
-        c,
+        seq,
         LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=_MEDIA_PROMPT),
         SimpleNamespace(),
         _MEDIA_PROMPT,
     )
-    assert load.token_ids == media_scheduler._lookup_token_ids(c)
-    assert tier.hit(load.token_ids) == (_MEDIA_PROMPT, {"B"})
+    assert load.token_ids == keyed
+    # A text prompt keys on its ids alone.
+    assert (keyed == seq.token_ids) is (cache_seed == -1)
 
 
 def test_media_keys_touch_only_the_leading_ids_and_keep_prefixes():

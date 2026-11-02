@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -35,16 +35,6 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 _MAX_SAVE_ATTEMPTS = 3
-
-
-class _SaveFrontierMemo(NamedTuple):
-    """`_save_frontier`'s last answer for one request, and what it depended on."""
-
-    frontier: int
-    floor: int
-    saved: int
-    generation: int
-    found: int
 
 
 @dataclass
@@ -350,31 +340,31 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         if self._page_only:
             # No image to wait for: any computed chunk boundary will do.
             return frontier if frontier > floor else 0
-        sid = str(seq.id)
-        saved = int(self._save_tracker[sid][1]) if self._is_tracked(sid, seq) else 0
-        start = max(floor, saved)
+        # Every tracked request asks every step. The answer changes only when
+        # its frontier moves or one of ITS boundary checkpoints is published or
+        # dropped, so rescan only then -- not whenever any request's
+        # checkpoint traffic moves the store.
         store = self._checkpoints.store
         memo = getattr(seq, "_mp_save_frontier_memo", None)
-        if memo is not None and (memo.frontier, memo.floor, memo.saved) == (
-            frontier,
-            floor,
-            saved,
-        ):
-            changed = store.changed_since(memo.generation)
+        if memo is not None and memo[:2] == (frontier, floor):
+            changed = store.changed_since(memo[2])
             boundaries = getattr(seq, "_mp_boundary_by_hash", {})
             if changed is not None and not any(
-                start < boundaries.get(prefix_hash, 0) <= frontier
+                floor < boundaries.get(prefix_hash, 0) <= frontier
                 for prefix_hash in changed
             ):
-                seq._mp_save_frontier_memo = memo._replace(generation=store.generation)
-                return memo.found
+                seq._mp_save_frontier_memo = (
+                    frontier,
+                    floor,
+                    store.generation,
+                    memo[3],
+                )
+                return memo[3]
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
-        found = self._highest_image(seq, start, frontier, boundaries)
-        seq._mp_save_frontier_memo = _SaveFrontierMemo(
-            frontier, floor, saved, store.generation, found
-        )
+        found = self._highest_image(seq, floor, frontier, boundaries)
+        seq._mp_save_frontier_memo = (frontier, floor, store.generation, found)
         return found
 
     def _highest_image(

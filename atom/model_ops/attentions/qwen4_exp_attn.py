@@ -279,26 +279,24 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             activation_dtype=attention.dt_bias.dtype,
         )
 
+    @cached_property
     def _ssm_storage(self) -> str:
         """`vk` when FlyDSL decode keeps the SSM state transposed, else `kv`.
 
         Asked of a one-slot probe: the layout id is spelled before any state
         is allocated.
         """
-        storage = getattr(self, "_ssm_storage_order", None)
-        if storage is None:
-            _, shape_v = self._state_shape_for_runner()
-            _, dtype_v = self._state_dtypes()
-            probe = torch.empty((1, *shape_v), dtype=dtype_v, device=self.device)
-            transposed = {
-                self._gdn_flydsl_policy(module, probe).decode
-                for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
-                if hasattr(module, "base_linear_attention")
-            }
-            if len(transposed) > 1:
-                raise RuntimeError("GDN layers disagree on the SSM storage order")
-            storage = self._ssm_storage_order = "vk" if True in transposed else "kv"
-        return storage
+        _, shape_v = self._state_shape_for_runner()
+        _, dtype_v = self._state_dtypes()
+        probe = torch.empty((1, *shape_v), dtype=dtype_v, device=self.device)
+        transposed = {
+            self._gdn_flydsl_policy(module, probe).decode
+            for module in self.pool_rows.get(LINEAR_STATE_ROWS, {})
+            if hasattr(module, "base_linear_attention")
+        }
+        if len(transposed) > 1:
+            raise RuntimeError("GDN layers disagree on the SSM storage order")
+        return "vk" if True in transposed else "kv"
 
     def _build_gdn_cache_tensor(self, module):
         cache = super().build_kv_cache_tensor(module)
@@ -306,12 +304,12 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             attention = module.impl
             policy = self._gdn_flydsl_policy(module, cache.v_cache)
             if self._uses_paged_checkpoints() and policy.decode != (
-                self._ssm_storage() == "vk"
+                self._ssm_storage == "vk"
             ):
                 raise RuntimeError(
                     "GDN SSM state is bound "
                     f"{'VK' if policy.decode else 'KV'} but the checkpoint "
-                    f"layout id says ssm_storage={self._ssm_storage()}"
+                    f"layout id says ssm_storage={self._ssm_storage}"
                 )
             attention.gdn_flydsl_policy = policy
             self._flydsl_prefill_enabled = (
@@ -534,7 +532,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         planes = self._ple_planes
         layout_id = (
             transfer.paged_layout_id
-            + f":ssm_storage={self._ssm_storage()}"
+            + f":ssm_storage={self._ssm_storage}"
             + ":page="
             + ";".join(f"{f.name}={_shape_and_dtype(f)}" for f in self._qsa_fields())
             + "".join(f":ple_{p.tag}={_shape_and_dtype(p)}" for p in planes)
@@ -665,10 +663,12 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             v_cache=value,
             k_scale=None,
             v_scale=None,
-            index_raw=arena.view("index_raw")[row],
-            index_compressed=arena.view("index_compressed")[row],
-            rope_positions=(
-                arena.view("rope_positions")[row] if self.cache_rope_positions else None
+            extra_planes=tuple(
+                plane
+                for plane in map(
+                    optional, ("index_raw", "index_compressed", "rope_positions")
+                )
+                if plane is not None
             ),
         )
 

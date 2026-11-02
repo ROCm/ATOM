@@ -27,6 +27,7 @@ from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
     layer_major_page_unit_views,
     layer_major_published_page_bytes,
 )
+from tests.test_entry_arena import qsa_like_fields
 
 
 def _builder_cls():
@@ -132,16 +133,6 @@ def _pool(*, kv_dtype, layers=15, block_size=16):
     return pool
 
 
-def _qsa_fields(block=4):
-    """Shaped after Qwen3.8's QSA arena, scaled down."""
-    return [
-        EntryField("k", 2, (block, 2, 8), torch.bfloat16),
-        EntryField("v", 2, (block, 2, 8), torch.bfloat16),
-        EntryField("index_raw", 2, (block, 1, 4), torch.bfloat16),
-        EntryField("index_compressed", 2, (block // 4, 1, 4), torch.bfloat16),
-    ]
-
-
 class TestMhaRegionsMatchThePublishedPages:
     def test_bf16_published_bytes_are_the_whole_entry(self):
         pool = _pool(kv_dtype=torch.bfloat16)
@@ -174,21 +165,15 @@ class TestMhaRegionsMatchThePublishedPages:
         assert published == int(sizes.sum()) == arena.published_bytes
         assert published < arena.entry_bytes
 
-    def test_arena_regions_are_one_contiguous_block_each(self):
-        arena = LayerMajorArena(_qsa_fields(), entries=3, device="cpu")
-        assert arena.published_bytes <= arena.entry_bytes
+    def test_an_arena_block_round_trips_through_its_contiguous_regions(self):
+        arena = LayerMajorArena(qsa_like_fields(), entries=2, device="cpu")
         bases, sizes = layer_major_page_unit_regions([arena])
-        assert int(sizes.sum()) == arena.published_bytes
+        assert int(sizes.sum()) == arena.published_bytes <= arena.entry_bytes
         assert len(bases) == 8  # 4 fields * 2 layers
-        for _, tensor in arena.region_tensors():
-            assert tensor.is_contiguous()
-            assert tensor.shape[0] == 3
-
-    def test_one_arena_block_round_trips_through_page_views(self):
-        arena = LayerMajorArena(_qsa_fields(), entries=2, device="cpu")
         blob = torch.arange(arena.published_bytes, dtype=torch.uint8)
         at = 0
         for _, tensor in arena.region_tensors():
+            assert tensor.is_contiguous() and tensor.shape[0] == 2
             row = tensor[1].view(torch.uint8).reshape(-1)
             row.copy_(blob[at : at + row.numel()])
             at += row.numel()

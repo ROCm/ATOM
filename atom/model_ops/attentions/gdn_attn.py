@@ -1742,6 +1742,10 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         return layer_major_published_page_bytes(self._declare_kv_pools().values())
 
+    def _checkpoint_spec(self):
+        runtime = getattr(self.model_runner, "state_runtime", None)
+        return None if runtime is None else runtime.checkpoint_spec
+
     def _page_unit_regions(self) -> tuple[np.ndarray, np.ndarray]:
         """Where a scheduler block sits in the paged pool.
 
@@ -1767,8 +1771,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             return cached[1]
         key = tuple(pools)
         regions = layer_major_page_unit_regions(pools)
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
+        spec = self._checkpoint_spec()
         owned = int(regions[1].sum())
         if spec is not None and owned != spec.page_unit_bytes:
             raise RuntimeError(
@@ -1806,8 +1809,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         self._page_unit_regions()
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
+        spec = self._checkpoint_spec()
         image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
         return layer_major_page_unit_views(
             self._page_unit_pools(), unit_ids, image_bytes=image_bytes
@@ -1820,8 +1822,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             layer_major_page_unit_segments,
         )
 
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
+        spec = self._checkpoint_spec()
         if spec is None:
             # Untrimmed, the gather would carry padding and whatever follows
             # the image.
@@ -1847,8 +1848,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         if transfer is None or not self._uses_paged_checkpoints():
             return transfer
-        runtime = getattr(self.model_runner, "state_runtime", None)
-        spec = None if runtime is None else runtime.checkpoint_spec
+        spec = self._checkpoint_spec()
         if spec is None:
             return transfer
         bases, _ = self._page_unit_regions()

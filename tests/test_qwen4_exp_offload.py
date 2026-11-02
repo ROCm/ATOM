@@ -12,16 +12,7 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     LayerMajorArena,
     published_bytes_for,
 )
-
-
-def _fields():
-    block = 4
-    return [
-        EntryField("k", 2, (block, 2, 8), torch.bfloat16),
-        EntryField("v", 2, (block, 2, 8), torch.bfloat16),
-        EntryField("index_raw", 2, (block, 1, 4), torch.bfloat16),
-        EntryField("index_compressed", 2, (block // 4, 1, 4), torch.bfloat16),
-    ]
+from tests.test_entry_arena import qsa_like_fields
 
 
 def _builder():
@@ -32,8 +23,8 @@ def _builder():
     builder.num_spec = 1
     builder.ngram_context_len = 2
     builder.eos_token_id = 7
-    builder._ssm_storage = lambda: "kv"
-    builder._qsa_fields = lambda: _fields()[:2]
+    builder._ssm_storage = "kv"
+    builder._qsa_fields = lambda: qsa_like_fields()[:2]
     builder.num_state_layers = lambda: 2
     builder._state_shape_for_runner = lambda: ((3, 4), (2, 2))
     builder._state_dtypes = lambda: (torch.bfloat16, torch.float32)
@@ -69,6 +60,15 @@ def _builder():
     return builder, Qwen4ExpMetadataBuilder
 
 
+@pytest.fixture
+def one_tp_rank(monkeypatch):
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    monkeypatch.setattr(
+        "atom.model_ops.attentions.gdn_attn.get_tp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
+
+
 def test_ple_bytes_join_the_gdn_image():
     builder, cls = _builder()
     planes = cls._checkpoint_plane_shapes(builder)
@@ -83,12 +83,8 @@ def test_ple_bytes_join_the_gdn_image():
     assert sum(view.numel() * view.element_size() for view in views) == 80 + 320 + 24
 
 
-def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
+def test_layout_id_names_ple_and_forks_under_pipeline_parallel(one_tp_rank):
     builder, cls = _builder()
-    monkeypatch.setattr(
-        "atom.model_ops.attentions.gdn_attn.get_tp_group",
-        lambda: SimpleNamespace(world_size=1),
-    )
     layout = cls.state_transfer(builder).paged_layout_id
     assert layout.startswith("gdn-paged-state-v1:")
     assert layout.endswith(":ple_order=conv,ngram")
@@ -101,17 +97,13 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
     assert not cls.state_transfer(builder).copies
 
 
-def _layout_id(builder, cls, monkeypatch):
-    monkeypatch.setattr(
-        "atom.model_ops.attentions.gdn_attn.get_tp_group",
-        lambda: SimpleNamespace(world_size=1),
-    )
+def _layout_id(builder, cls):
     return cls.state_transfer(builder).paged_layout_id
 
 
-def test_layout_id_names_the_page_fields_and_the_ssm_storage(monkeypatch):
+def test_layout_id_names_the_page_fields_and_the_ssm_storage(one_tp_rank):
     builder, cls = _builder()
-    plain = _layout_id(builder, cls, monkeypatch)
+    plain = _layout_id(builder, cls)
     kv = "(4,2,8),torch.bfloat16"
     assert f":ssm_storage=kv:page=k={kv};v={kv}:ple_conv=" in plain
 
@@ -119,17 +111,17 @@ def test_layout_id_names_the_page_fields_and_the_ssm_storage(monkeypatch):
     builder._qsa_fields = lambda: [
         EntryField(n, 2, (4, 2, 8), torch.bfloat16) for n in names
     ]
-    draft = _layout_id(builder, cls, monkeypatch)
+    draft = _layout_id(builder, cls)
     assert f":page={';'.join(f'{n}={kv}' for n in names)}:" in draft
 
-    builder._ssm_storage = lambda: "vk"
-    transposed = _layout_id(builder, cls, monkeypatch)
+    builder._ssm_storage = "vk"
+    transposed = _layout_id(builder, cls)
     assert ":ssm_storage=vk:" in transposed
     assert len({plain, draft, transposed}) == 3
 
 
 def test_layout_id_tells_apart_fields_of_the_same_name_and_other_bytes(
-    monkeypatch,
+    one_tp_rank,
 ):
     """An FP8 and an FP4 index add fields of the same names."""
     builder, cls = _builder()
@@ -141,9 +133,9 @@ def test_layout_id_tells_apart_fields_of_the_same_name_and_other_bytes(
         ]
 
     builder._qsa_fields = lambda: index(4, torch.uint8, ())
-    fp8_like = _layout_id(builder, cls, monkeypatch)
+    fp8_like = _layout_id(builder, cls)
     builder._qsa_fields = lambda: index(2, torch.uint8, (1,))
-    fp4_like = _layout_id(builder, cls, monkeypatch)
+    fp4_like = _layout_id(builder, cls)
     assert fp8_like != fp4_like
     assert ":page=index_compressed=(1,1,2),torch.uint8;" in fp4_like
 
@@ -183,7 +175,9 @@ def _flydsl_builder(monkeypatch, *, replayssm=False):
         ({}, True, "kv"),
     ],
 )
-def test_ssm_storage_follows_the_decode_switches(monkeypatch, env, replayssm, storage):
+def test_ssm_storage_follows_the_decode_switches(
+    monkeypatch, one_tp_rank, env, replayssm, storage
+):
     pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
     from atom.model_ops.fla_ops import gdn_flydsl
 
@@ -191,8 +185,8 @@ def test_ssm_storage_follows_the_decode_switches(monkeypatch, env, replayssm, st
         monkeypatch.setenv(name, value)
     try:
         builder, cls, _ = _flydsl_builder(monkeypatch, replayssm=replayssm)
-        assert cls._ssm_storage(builder) == storage
-        layout = _layout_id(builder, cls, monkeypatch)
+        assert builder._ssm_storage == storage
+        layout = _layout_id(builder, cls)
         assert f":ssm_storage={storage}:" in layout
     finally:
         gdn_flydsl.backend.cache_clear()
@@ -213,7 +207,7 @@ def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
         )
         bound = cls._build_gdn_cache_tensor(builder, layer)
         assert bound.v_cache.stride() == state.transpose(-1, -2).stride()
-        builder._ssm_storage_order = "kv"
+        builder._ssm_storage = "kv"
         with pytest.raises(RuntimeError, match="ssm_storage=kv"):
             cls._build_gdn_cache_tensor(builder, layer)
     finally:
@@ -264,14 +258,10 @@ def _qwen4_exp_backend():
     ],
 )
 def test_lmcache_tiers_are_accepted_and_turn_page_checkpoints_on(
-    monkeypatch, kv_transfer_config, paged
+    one_tp_rank, kv_transfer_config, paged
 ):
     """A server without offload keeps main's fork slots."""
     builder, cls = _builder()
-    monkeypatch.setattr(
-        "atom.model_ops.attentions.gdn_attn.get_tp_group",
-        lambda: SimpleNamespace(world_size=1),
-    )
     builder.model_runner.config.kv_transfer_config = kv_transfer_config
     _qwen4_exp_backend().validate_config(builder.model_runner.config)
     assert cls._uses_paged_checkpoints(builder) is paged
@@ -361,42 +351,24 @@ def test_pipeline_parallel_and_rapidserve_refuse_offload(
 
 
 @pytest.mark.parametrize("reads", [True, False])
-def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(reads):
+def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, reads):
     """The knowledge lives on the registration, not in a Qwen3.8 list."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     builder, cls = _builder()
     name = "page_image_tier_under_test"
-    KVConnectorFactory.register(
-        name,
-        worker_module="unused",
-        worker_class="Unused",
-        scheduler_module="unused",
-        scheduler_class="Unused",
-        offload=True,
-        reads_page_images=reads,
-    )
-    try:
-        config = builder.model_runner.config
-        config.kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
-        if reads:
+    monkeypatch.setitem(KVConnectorFactory._registry, name, {})
+    monkeypatch.setitem(KVConnectorFactory._aliases, name, name)
+    monkeypatch.setitem(KVConnectorFactory._offload, name, True)
+    monkeypatch.setitem(KVConnectorFactory._reads_page_images, name, reads)
+    config = builder.model_runner.config
+    config.kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
+    if reads:
+        _qwen4_exp_backend().validate_config(config)
+    else:
+        with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
             _qwen4_exp_backend().validate_config(config)
-        else:
-            with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
-                _qwen4_exp_backend().validate_config(config)
-        assert cls._wants_paged_checkpoints(builder, config) is reads
-    finally:
-        for table in (
-            KVConnectorFactory._registry,
-            KVConnectorFactory._aliases,
-            KVConnectorFactory._requires_pd_staging,
-            KVConnectorFactory._reads_block_regions,
-            KVConnectorFactory._copies_whole_block_regions,
-            KVConnectorFactory._offload,
-            KVConnectorFactory._reads_page_images,
-        ):
-            table.pop(name, None)
-    assert KVConnectorFactory.page_image_readers() == ["lmcache_mp", "lmcache_offload"]
+    assert cls._wants_paged_checkpoints(builder, config) is reads
 
 
 _IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
@@ -461,23 +433,28 @@ def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
     _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 
+_MTP = SimpleNamespace(method="mtp")
+
+
 @pytest.mark.parametrize(
-    "kv_cache_dtype, index_cache_dtype",
+    "kv_cache_dtype, index_cache_dtype, draft_env, spec, draft",
     [
-        (kv, index)
-        for kv in ("bf16", "auto", "bfloat16", "fp8")
-        for index in (None, "bf16", "auto", "fp8", "fp4")
+        ("fp8", None, "1", _MTP, True),
+        ("bf16", "fp4", "1", _MTP, True),  # a quantized index cache alone
+        ("fp8", "fp8", "0", _MTP, False),
+        ("bf16", None, "1", _MTP, False),  # nothing to keep in BF16
+        ("auto", "bfloat16", "1", _MTP, False),
+        ("fp8", "fp8", "1", SimpleNamespace(method="eagle3"), False),
+        ("fp8", "fp8", "1", None, False),
     ],
 )
-@pytest.mark.parametrize("draft_env", ["0", "1"])
 def test_the_draft_rows_and_the_page_namespace_read_one_rule(
-    monkeypatch, kv_cache_dtype, index_cache_dtype, draft_env
+    monkeypatch, kv_cache_dtype, index_cache_dtype, draft_env, spec, draft
 ):
     pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
     from atom.model_ops.attentions.qwen4_exp_attn import (
         QSA_DRAFT_ROWS,
         QSA_ROWS,
-        qsa_cache_formats,
         qsa_page_segments,
         qsa_row_space,
     )
@@ -486,23 +463,23 @@ def test_the_draft_rows_and_the_page_namespace_read_one_rule(
     config = SimpleNamespace(
         kv_cache_dtype=kv_cache_dtype,
         index_cache_dtype=index_cache_dtype,
-        speculative_config=SimpleNamespace(method="mtp"),
+        speculative_config=spec,
     )
-    draft = draft_env == "1" and qsa_cache_formats(config) != ("bf16", "bf16")
-    assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
-    assert qsa_row_space(config, 39, 40) == QSA_ROWS
     assert qsa_page_segments(config)["draft_kv"] == ("bf16" if draft else "target")
+    if spec is _MTP:
+        assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
+    assert qsa_row_space(config, 39, 40) == QSA_ROWS
 
 
 def _paged_builder(blocks=3, *, spec=True):
     """A builder with a CPU QSA arena allocated the way the runner does."""
     builder, cls = _builder()
-    builder._qsa_fields = _fields
+    builder._qsa_fields = qsa_like_fields
     builder.device = torch.device("cpu")
     builder.kv_pools = {}
     builder._pool_rows = {}
     cls.allocate_kv_cache_tensors(builder, blocks=blocks, buf=None)
-    published = published_bytes_for(_fields())
+    published = published_bytes_for(qsa_like_fields())
     builder.model_runner.state_runtime = (
         SimpleNamespace(
             checkpoint_spec=SimpleNamespace(
@@ -551,12 +528,12 @@ def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
     for layer, row in ((target, 0), (draft, 1)):
         tensor = cls.build_kv_cache_tensor(builder, layer)
         caches, scales = layer.bound
-        handed = (tensor.k_cache, tensor.v_cache)
-        handed += (tensor.index_raw, tensor.index_compressed)
-        for name, bound, view in zip(names, caches, handed):
+        handed = (tensor.k_cache, tensor.v_cache, *tensor.extra_planes)
+        for name, bound, view in zip(names, caches, handed, strict=False):
             assert view.data_ptr() == arena.view(name)[row].data_ptr(), name
             assert view.data_ptr() == bound.data_ptr(), name
-        assert caches[4] is None and tensor.rope_positions is None
+        assert len(handed) == len(names)
+        assert caches[4] is None  # no rope positions without image input
         assert set(scales.values()) == {None}
         assert tensor.k_scale is None and tensor.v_scale is None
 
@@ -619,7 +596,7 @@ def test_page_unit_segments_refuse_without_a_spec_and_views_do_not():
             cls.page_unit_segments(builder, [1, 2])
         views = cls.page_unit_views(builder, [1, 2])
         assert sum(view.numel() * view.element_size() for view in views) == (
-            2 * published_bytes_for(_fields())
+            2 * published_bytes_for(qsa_like_fields())
         )
 
 
