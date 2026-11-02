@@ -391,6 +391,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_AITER_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_AITER_FP8_PREFILL_ATTN", "1") == "1"
     ),
+    # Largest new-row count of a prefix-cache-hit prefill whose FP8 attention runs
+    # on aiter's Gluon unified_attention (KV walk split across the device) instead
+    # of FMHA v3. Decided per step by its longest request (max_seqlen_q). Both read the same gathered, dequantized K/V. 0 (default) always
+    # uses FMHA v3; 4096 is the value measured on Qwen3.5-397B TP4.
+    "ATOM_PREFILL_UNIFIED_ATTN_MAX_Q": lambda: int(
+        os.getenv("ATOM_PREFILL_UNIFIED_ATTN_MAX_Q", "0")
+    ),
+    # Compile the unified_attention kernels of the path above at start-up
+    # (end of warmup_model) instead of on the first request that needs each one.
+    # Its memory is taken before KV sizing, so it comes out of the KV budget:
+    # ((sum ctx) * kv_heads + 3 * (sum new rows) * heads) * head_dim bytes for the
+    # largest launch, multi-request launches capped at 128 MiB, plus split scratch.
+    "ATOM_PREFILL_UNIFIED_ATTN_WARMUP": lambda: (
+        os.getenv("ATOM_PREFILL_UNIFIED_ATTN_WARMUP", "1") == "1"
+    ),
     # Pack mHC fn weights once after loading and use BF16 hi/lo computation.
     # Set to 0 before model loading to retain FP32 fn and FP32 mHC computation.
     "ATOM_MHC_USE_BF16": lambda: os.getenv("ATOM_MHC_USE_BF16", "1") == "1",

@@ -1401,6 +1401,16 @@ class ModelRunner:
         )
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
+        # Prefix-hit prefill only, so the dummy forward above never reaches it.
+        # Here, before KV sizing, so its scratch counts in the peak and comes out
+        # of the KV budget: per head geometry, the largest launch's tensors
+        # (unified_prefill_warmup_bytes, multi-request launches capped at
+        # 128 MiB) plus aiter's KV-split scratch.
+        from atom.model_ops.unified_prefill_warmup import (
+            warmup_unified_prefill_attention,
+        )
+
+        warmup_unified_prefill_attention(self.model, self.config.torch_dtype)
         torch.cuda.empty_cache()
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"

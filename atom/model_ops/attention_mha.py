@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
+import logging
 from functools import cache
 
 import aiter
@@ -28,6 +30,9 @@ from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
 from .attention_mla import MLAModules
+from .unified_prefill_warmup import token_block_table, unified_prefill_warmup_shapes
+
+logger = logging.getLogger("atom")
 
 
 @cache
@@ -43,6 +48,9 @@ class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
     """
+
+    # First use of the unified prefix-hit prefill path is logged once per process.
+    _unified_prefill_logged = False
 
     def __init__(
         self,
@@ -895,6 +903,25 @@ class PagedAttentionImpl(nn.Module):
 
             return output.view(batch_size * max_seqlen_q, self.num_heads, self.head_dim)
 
+    def _fp8_prefill_attention_supported(self) -> bool:
+        """The layer-static half of _can_use_fp8_prefill_attention."""
+        return (
+            envs.ATOM_AITER_FP8_PREFILL_ATTN
+            and get_gfx() == "gfx950"
+            and self.head_dim == 256
+            and self.kv_cache_dtype.startswith("fp8")
+            and self.sliding_window == -1
+            and self.sinks is None
+            and (self.logits_soft_cap is None or self.logits_soft_cap == 0.0)
+        )
+
+    def _unified_fp8_prefill_supported(self) -> bool:
+        """Whether this layer's prefix-hit prefill can take unified_attention."""
+        return (
+            envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q > 0
+            and self._fp8_prefill_attention_supported()
+        )
+
     def _can_use_fp8_prefill_attention(
         self,
         q: torch.Tensor,
@@ -907,17 +934,167 @@ class PagedAttentionImpl(nn.Module):
         # rows, so k can be longer than q, and the asm kernel's bottom-right
         # causal mask handles sq < sk through cu_seqlens_q / cu_seqlens_k.
         return (
-            envs.ATOM_AITER_FP8_PREFILL_ATTN
-            and get_gfx() == "gfx950"
-            and self.head_dim == 256
-            and self.kv_cache_dtype.startswith("fp8")
-            and self.sliding_window == -1
-            and self.sinks is None
-            and (self.logits_soft_cap is None or self.logits_soft_cap == 0.0)
+            self._fp8_prefill_attention_supported()
             and getattr(attn_metadata, "dropout_p", 0.0) == 0.0
             and k.shape[0] == v.shape[0]
             and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
         )
+
+    def _can_use_unified_fp8_prefill_attention(
+        self, q, k, v, fwd_ctx: ForwardContext
+    ) -> bool:
+        """A prefix-cache hit whose new rows are few enough for unified_attention.
+
+        The FMHA v3 asm kernel launches heads x ceil(Sq / 512) workgroups and
+        each walks the whole cached prefix: on Qwen3.5-397B TP4 (8 query heads)
+        a 367-token turn over a 100k prefix is 8 workgroups on 256 CUs, ~3.3 ms
+        per layer whatever Sq is up to a few thousand rows. aiter's Gluon
+        unified_attention splits the KV walk to fill the device, but only when
+        q has the K/V dtype -- with bf16 q it takes the Triton kernels, slower
+        than FMHA v3 above ~1k rows. It also carries one descale per tensor, so
+        it runs on the K/V gather_prefix_and_concat_kv already dequantized from
+        the per-token-scaled cache, requantized exactly as FMHA v3 gets them.
+        ATOM_PREFILL_UNIFIED_ATTN_MAX_Q is the largest Sq routed here.
+        """
+        attn_metadata = fwd_ctx.attn_metadata
+        return (
+            attn_metadata.has_cached
+            and 0 < attn_metadata.max_seqlen_q <= envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q
+            and self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx)
+        )
+
+    @staticmethod
+    def _token_block_table(attn_metadata, n_seqs: int) -> torch.Tensor:
+        """token_block_table for this step's requests.
+
+        Built once per step and shared by every layer: it depends only on
+        cu_seqlens_k, which is the same tensor in each layer of the step.
+        """
+        table = getattr(attn_metadata, "_unified_prefill_token_table", None)
+        if table is None:
+            table = token_block_table(
+                attn_metadata.cu_seqlens_k[:n_seqs],
+                attn_metadata.max_seqlen_k,
+                attn_metadata.total_kv,
+            )
+            attn_metadata._unified_prefill_token_table = table
+        return table
+
+    def _unified_fp8_attention(
+        self,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        seqused_k,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        block_table,
+        out_dtype: torch.dtype | None = None,
+    ):
+        """The unified_attention launch, shared by the forward and the warm-up
+        so that both compile exactly the same kernels. The output is out_dtype,
+        q's dtype by default; the warm-up passes FP8 q (the .to(fp8) below
+        leaves it as is) and the model dtype as out_dtype."""
+        scale = self.kv_scale.view(1)
+        fp8 = aiter.dtypes.fp8
+        o = torch.empty(q.shape, dtype=out_dtype or q.dtype, device=q.device)
+        unified_attention(
+            q.contiguous().to(fp8),
+            k.contiguous().to(fp8).unsqueeze(1),
+            v.contiguous().to(fp8).unsqueeze(1),
+            o,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=None,
+            window_size=(-1, -1),
+            block_table=block_table,
+            softcap=0,
+            q_descale=scale,
+            k_descale=scale,
+            v_descale=scale,
+            sinks=None,
+            shuffled_kv_cache=False,
+        )
+        return o
+
+    def _unified_fp8_prefill_attention(self, q, k, v, fwd_ctx: ForwardContext):
+        """Bottom-right causal attention of the new rows over the gathered K/V.
+
+        k / v are the cached + new rows gather_prefix_and_concat_kv packed per
+        request at cu_seqlens_k, read here as a block_size=1 cache (the same
+        trick the Triton-backend pure-prefill path uses).
+        """
+        attn_metadata = fwd_ctx.attn_metadata
+        # Requests this step scheduled; the prefill builder pads cu_seqlens_q
+        # and context_lens past them (as the Triton-backend prefill path notes).
+        n_seqs = fwd_ctx.context.scheduled_bs
+        return self._unified_fp8_attention(
+            q,
+            k,
+            v,
+            attn_metadata.cu_seqlens_q[: n_seqs + 1],
+            attn_metadata.context_lens[:n_seqs],
+            attn_metadata.max_seqlen_q,
+            attn_metadata.max_seqlen_k,
+            self._token_block_table(attn_metadata, n_seqs),
+        )
+
+    @torch.inference_mode()
+    def warmup_unified_fp8_prefill_attention(self, dtype: torch.dtype) -> int:
+        """Run _unified_fp8_attention once per unified_prefill_warmup_shapes
+        entry on synthetic tensors laid out as the prefix-hit path lays them
+        out (int32 metadata, gathered K/V packed per request, an output in the
+        model dtype). q and K/V are allocated in FP8 directly, which is what the
+        forward hands the kernel after its .to(fp8), so no extra copies are
+        made; K doubles as V. Returns the number of launches attempted."""
+        shapes = unified_prefill_warmup_shapes(
+            envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
+        dev = self.device
+        i32 = {"dtype": torch.int32, "device": dev}
+        fp8 = aiter.dtypes.fp8
+
+        def fp8_zeros(*shape):
+            # zero bytes are FP8 +0.0 in both e4m3 encodings
+            return torch.zeros(shape, dtype=torch.uint8, device=dev).view(fp8)
+
+        for q_lens, ctx_lens in shapes:
+            total_q, total_kv = sum(q_lens), sum(ctx_lens)
+            q = fp8_zeros(total_q, self.num_heads, self.head_dim)
+            k = fp8_zeros(total_kv, self.num_kv_heads, self.head_dim)
+            cu_q = torch.tensor([0, *itertools.accumulate(q_lens)], **i32)
+            cu_k = torch.tensor([0, *itertools.accumulate(ctx_lens)], **i32)
+            try:
+                self._unified_fp8_attention(
+                    q,
+                    k,
+                    k,
+                    cu_q,
+                    torch.tensor(ctx_lens, **i32),
+                    max(q_lens),
+                    max(ctx_lens),
+                    token_block_table(cu_k[: len(ctx_lens)], max(ctx_lens), total_kv),
+                    out_dtype=dtype,
+                )
+            except Exception as e:  # noqa: BLE001
+                # A shape the path cannot take is the request's problem when it
+                # comes, not a reason to refuse to start.
+                logger.warning(
+                    "unified_attention warm-up failed for new rows %s, context %s: %s",
+                    q_lens,
+                    ctx_lens,
+                    e,
+                )
+        torch.cuda.synchronize()
+        return len(shapes)
 
     @mark_trace(prefix="prefill_attention", torch_compile=False)
     def prefill_attention(
@@ -937,6 +1114,14 @@ class PagedAttentionImpl(nn.Module):
                     q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
                 )
             )
+        if self._can_use_unified_fp8_prefill_attention(q, k, v, fwd_ctx):
+            if not PagedAttentionImpl._unified_prefill_logged:
+                PagedAttentionImpl._unified_prefill_logged = True
+                logger.info(
+                    "prefix-hit prefill attention: unified_attention for <= %d new rows",
+                    envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q,
+                )
+            return self._unified_fp8_prefill_attention(q, k, v, fwd_ctx)
         if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
             output_dtype = q.dtype
             # On gfx950, kv_scale is 1.0; FMHA requires a 1-D per-tensor scale.
