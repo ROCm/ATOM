@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from time import monotonic
 from typing import Any
 
+from atom.kv_transfer.offload._offload_common import wait_load_fence
+
 logger = logging.getLogger(__name__)
 
 #: A load waiting longer than this for its lane is worth a line: it is time
@@ -120,15 +122,18 @@ class StateOffloadTier:
             self._store_submitted_at[op] = monotonic()
         self._register(self._store_executor.submit(self._do_store, op, unit_ids))
 
-    def submit_load(self, req_id: str, h: int, slot: int) -> None:
+    def submit_load(self, req_id: str, h: int, slot: int, ready_event=None) -> None:
         """Fetch `h` into pool slot `slot` for the parked request `req_id`.
 
         Its own lane, so a load is never behind a backlog of stores. What the
         two lanes still share is the staging-memory budget; see `__init__`.
         `_do_load` warns when that remaining wait crosses `_LOAD_WAIT_WARN_MS`.
+        `ready_event` (`record_load_fence`) is waited on before the write.
         """
         self._register(
-            self._load_executor.submit(self._do_load, req_id, h, slot, monotonic())
+            self._load_executor.submit(
+                self._do_load, req_id, h, slot, monotonic(), ready_event
+            )
         )
 
     def drain(self) -> None:
@@ -236,7 +241,9 @@ class StateOffloadTier:
             self._source_released.clear()
         return released
 
-    def _do_load(self, req_id: str, h: int, slot: int, submitted_at=None) -> None:
+    def _do_load(
+        self, req_id: str, h: int, slot: int, submitted_at=None, ready_event=None
+    ) -> None:
         # The bytes land in the committed slot, where the resuming request
         # reads them.
         #
@@ -246,6 +253,9 @@ class StateOffloadTier:
         # the report below.
         ok = False
         try:
+            # Before the write, and before taking a staging lane: a zero still
+            # queued on the compute stream for these units must land first.
+            wait_load_fence(ready_event)
             with self._staging_budget:
                 # Measure the wait *after* acquiring the lane, not before. The
                 # semaphore acquire is the lane contention this metric exists to

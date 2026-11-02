@@ -375,6 +375,164 @@ def test_engine_zeroes_queued_units_for_a_batch_without_ops():
     assert len(engine.runner_mgr.calls) == 1
 
 
+@pytest.mark.parametrize("switch, usable", [("1", 9), ("0", 10)])
+def test_capacity_checks_count_only_usable_blocks(
+    monkeypatch, seq_factory, switch, usable
+):
+    # 10 blocks of 4 tokens. With block 0 the null page only 9 can be handed
+    # out, so a 40-token prompt never fits; the frontend ceiling and the
+    # scheduler's drop must both say so, or it waits at the head of the queue
+    # forever and blocks everything behind it.
+    from atom.model_engine.scheduler import Scheduler
+
+    monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", switch)
+    sched = Scheduler(MockConfig(num_kvcache_blocks=10))
+    bm = sched.block_manager
+    assert bm.kv.num_usable == usable
+    assert bm.max_pool_tokens == usable * 4
+    fits = seq_factory(list(range(usable * 4)))
+    too_long = seq_factory(list(range(usable * 4 + 1)))
+    assert sched._unschedulable_reason(fits) is None
+    assert "usable pool blocks=" in sched._unschedulable_reason(too_long)
+    # A full pool reads as fully used.
+    for _ in range(usable):
+        bm.kv.allocate(bm.kv.pop())
+    assert sched._kv_usage() == 1.0
+
+
+# ------------------- loads wait for zeros queued before them ------------------ #
+class _FakeEvent:
+    """Records which stream it was recorded on and whether a thread waited."""
+
+    def __init__(self):
+        self.stream = None
+        self.synchronized = False
+
+    def record(self, stream):
+        self.stream = stream
+
+    def synchronize(self):
+        self.synchronized = True
+
+
+def _patch_cuda_events(monkeypatch):
+    from atom.kv_transfer.offload import _offload_common
+
+    made = []
+    stream = object()
+
+    def _event():
+        made.append(_FakeEvent())
+        return made[-1]
+
+    monkeypatch.setattr(_offload_common.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(_offload_common.torch.cuda, "Event", _event)
+    monkeypatch.setattr(_offload_common.torch.cuda, "current_stream", lambda: stream)
+    return made, stream
+
+
+def _dense_load_meta(n_loads):
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReqMeta
+
+    metadata = LMCacheOffloadMetadata()
+    metadata.lookup_requests_in_step = []
+    for i in range(n_loads):
+        metadata.add_request(
+            LMCacheReqMeta(
+                req_id=f"r{i}",
+                token_ids=list(range(8)),
+                block_ids=[1, 2],
+                load_spec=SimpleNamespace(hbm_cached_tokens=4, lmcache_cached_tokens=8),
+            )
+        )
+    return metadata
+
+
+@pytest.mark.parametrize("switch", ["1", "0"])
+def test_dense_loads_carry_one_fence_recorded_at_dispatch(monkeypatch, switch):
+    # Dense LMCache loads write from the load thread on their own streams. With
+    # zeroing on, every load of the step carries one event recorded on the
+    # dispatching stream, after the engine's zero; with it off, none.
+    from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
+
+    monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", switch)
+    made, stream = _patch_cuda_events(monkeypatch)
+    submitted = []
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
+    conn._do_load, conn._do_save = True, False
+    conn._engine = SimpleNamespace(lookup_unpin=lambda _id: None)
+    conn._load_executor = SimpleNamespace(submit=lambda *a, **kw: submitted.append(kw))
+    conn._track_job = lambda req_id, future: None
+    conn.start_load_kv(_dense_load_meta(2))
+
+    if switch == "1":
+        assert len(made) == 1 and made[0].stream is stream
+        assert [kw["ready_event"] for kw in submitted] == [made[0], made[0]]
+    else:
+        assert made == []
+        assert [kw["ready_event"] for kw in submitted] == [None, None]
+
+
+def test_dense_load_waits_on_the_fence_before_its_first_write():
+    from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
+
+    class _Stop(Exception):
+        pass
+
+    class _Fence:
+        def synchronize(self):
+            raise _Stop
+
+    retrieved = []
+    conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
+    conn.chunk_size = 4
+    conn._engine = SimpleNamespace(retrieve=lambda *a, **kw: retrieved.append(a))
+    req = _dense_load_meta(1).requests[0]
+    with pytest.raises(_Stop):
+        conn._do_load_req(req, ready_event=_Fence())
+    assert retrieved == []
+
+
+def test_state_load_writes_only_after_the_fence():
+    from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import StateOffloadTier
+
+    fence = _FakeEvent()
+    seen = []
+
+    class _Codec:
+        def get(self, h, slot):
+            seen.append(fence.synchronized)
+            return True
+
+    tier = StateOffloadTier(_Codec())
+    try:
+        tier.submit_load("ok", 7, 3, ready_event=fence)
+        # A fence that could not be recorded fails the load: it recomputes.
+        tier.submit_load("no-fence", 8, 4, ready_event=RuntimeError("hip"))
+        tier.drain()
+        assert seen == [True]
+        assert tier.get_finished() == ({"ok"}, {"no-fence"})
+    finally:
+        tier.shutdown()
+
+
+def test_k3_state_loads_carry_the_fence(monkeypatch):
+    from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+        KimiK3OffloadConnector,
+    )
+
+    monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", "1")
+    made, _ = _patch_cuda_events(monkeypatch)
+    calls = []
+    conn = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
+    conn._do_load = True
+    conn._state_tier = SimpleNamespace(
+        submit_load=lambda *a, **kw: calls.append(kw["ready_event"])
+    )
+    conn._start_state_loads(SimpleNamespace(state_loads=[("r0", 7, 3), ("r1", 8, 4)]))
+    assert len(made) == 1 and calls == [made[0], made[0]]
+
+
 def test_block_manager_switch_off_restores_old_pool(monkeypatch):
     monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", "0")
     bm = BlockManager(MockConfig(num_kvcache_blocks=50))

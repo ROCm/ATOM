@@ -52,8 +52,10 @@ from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
     pp_aware_rank_and_world,
+    record_load_fence,
     tokens_to_tensor,
     validated_kv_role,
+    wait_load_fence,
 )
 from atom.kv_transfer.offload.chunked_scheduler import (
     DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL,
@@ -199,6 +201,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._lookup_unpin(lookup_id)
         save_ready_event = None
         save_fence_failed = False
+        load_fence = record_load_fence() if load_requests else None
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -206,7 +209,11 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._track_job(
                     req.req_id,
                     self._load_executor.submit(
-                        self._guard, "load", self._do_load_req, req
+                        self._guard,
+                        "load",
+                        self._do_load_req,
+                        req,
+                        ready_event=load_fence,
                     ),
                 )
             if req.save_spec is not None and self._do_save:
@@ -306,7 +313,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 )
         self._record_store_terminal(req, False)
 
-    def _do_load_req(self, req: LMCacheReqMeta) -> None:
+    def _do_load_req(self, req: LMCacheReqMeta, *, ready_event=None) -> None:
         ls = req.load_spec
         assert ls is not None
         hbm = int(ls.hbm_cached_tokens)
@@ -336,6 +343,9 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask = torch.ones(len(toks), dtype=torch.bool)
         mask[:hbm] = False
 
+        # Before the first write: a pending zero of these blocks must land
+        # first (`record_load_fence`).
+        wait_load_fence(ready_event)
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(

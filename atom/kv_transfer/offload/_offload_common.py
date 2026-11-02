@@ -34,6 +34,45 @@ from atom.kv_transfer.offload import config as offcfg
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+
+def record_load_fence():
+    """Event on the dispatching stream that this step's loads wait on.
+
+    ATOM_ZERO_EVICTED_BLOCKS: released checkpoint units are zeroed on the
+    runner's current stream -- right before this dispatch
+    (`EngineCore._zero_released_units_before_loads`) or by an earlier batch's
+    `build()` the GPU may not have reached yet. Loads here write from a
+    transfer thread on their own streams, so without a fence a zero still in
+    flight can land after the restored bytes and erase them. None when the
+    switch is off (nothing is zeroed) or there is no GPU (nothing to order).
+    A failure to record is returned rather
+    than raised, so each load fails on its own thread and its request
+    recomputes, while the remaining loads and saves are still submitted.
+    """
+    if not envs.ATOM_ZERO_EVICTED_BLOCKS or not torch.cuda.is_available():
+        return None
+    try:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        return event
+    except Exception as exc:  # noqa: BLE001 -- re-raised per load by `wait_load_fence`
+        return exc
+
+
+def wait_load_fence(fence) -> None:
+    """Block the calling transfer thread until `record_load_fence`'s event is done.
+
+    Run before the load enqueues any write. Re-raises the error that kept the
+    fence from being recorded, which the caller's failure path turns into a
+    recompute.
+    """
+    if isinstance(fence, BaseException):
+        raise fence
+    if fence is not None:
+        fence.synchronize()
+
+
 _VALID_KV_ROLES = {"offload", "kv_both", "kv_producer", "kv_consumer"}
 
 
