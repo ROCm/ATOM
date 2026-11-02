@@ -482,7 +482,7 @@ def pin_rows(
     back as one.
     """
     plan = ["copy"] if copy or copies(shared) else ["register"]
-    if shared and not copy and _COPY_ENV not in os.environ:
+    if shared and _COPY_ENV not in os.environ:
         plan.append("copy")
     for how in plan:
         allocator = _host_allocator() if how == "copy" else None

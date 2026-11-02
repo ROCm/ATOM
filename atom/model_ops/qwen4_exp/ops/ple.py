@@ -2,12 +2,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """PLE tensor operators: n-gram state/hash, FP8 lookup, gate and convolution."""
 
-import functools
 import math
 
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -340,11 +340,6 @@ def _sharded_table_lookup_kernel(
         )
 
 
-@functools.cache
-def _compute_units(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def sharded_table_lookup(
     ids: torch.Tensor,
     bases: torch.Tensor,
@@ -363,7 +358,7 @@ def sharded_table_lookup(
     output = torch.empty((ids.numel(), dim), dtype=output_dtype, device=ids.device)
     if ids.numel() == 0:
         return output
-    units = _compute_units(ids.device.index)
+    units = get_cu_num()
     # Rows per program: spread a small batch over as many programs as there
     # are rows, up to a row per compute unit (bs 1 decode, 16 rows: 3.3 us at
     # 1, 5.1 us at 16 on MI355X), then up to 16 (from 4k rows, 2-16 are even).

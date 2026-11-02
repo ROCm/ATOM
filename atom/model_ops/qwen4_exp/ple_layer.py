@@ -42,7 +42,11 @@ from atom.model_ops.qwen4_exp.ops.ple import (
     ple_gate,
     sharded_table_lookup,
 )
-from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable
+from atom.model_ops.qwen4_exp.ple_host_table import (
+    HostTableHooks,
+    PleHostTable,
+    check_fp8_rows,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.utils import envs
 
@@ -104,6 +108,16 @@ def nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+def _tp_vocab_range(num_embeddings: int) -> tuple[int, int, int]:
+    """TP size and this rank's rows `[start, end)` of a vocab-sharded table."""
+    tp_size = get_tp_group().world_size
+    if num_embeddings % tp_size:
+        raise ValueError("PLE vocabulary size must be divisible by TP size")
+    rows = num_embeddings // tp_size
+    start = rows * get_tp_group().rank_in_group
+    return tp_size, start, start + rows
+
+
 def _check_global_scale(prefix: str, weight_scale: torch.Tensor) -> None:
     scale = weight_scale.item()
     if not math.isfinite(scale) or scale <= 0:
@@ -128,11 +142,7 @@ class _ShardsIntoWeight:
         if param_name != "weight":
             return False
         if shard_id is None:
-            if self.weight.dtype.itemsize < 2 and tensor.dtype != self.weight.dtype:
-                raise ValueError(
-                    f"{self.prefix}: expected {self.weight.dtype} n-gram rows, "
-                    f"got {tensor.dtype}"
-                )
+            check_fp8_rows(self.prefix, tensor, self.weight.dtype)
             return False
         self.weight.weight_loader(self.weight, tensor, shard_id)
         return True
@@ -152,12 +162,10 @@ class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
     def __init__(self, num_embeddings: int, embedding_dim: int, prefix: str):
         super().__init__()
         self.prefix = prefix
-        self.tp_size = get_tp_group().world_size
-        if num_embeddings % self.tp_size:
-            raise ValueError("PLE vocabulary size must be divisible by TP size")
-        rows = num_embeddings // self.tp_size
-        self.vocab_start_idx = rows * get_tp_group().rank_in_group
-        self.vocab_end_idx = self.vocab_start_idx + rows
+        self.tp_size, self.vocab_start_idx, self.vocab_end_idx = _tp_vocab_range(
+            num_embeddings
+        )
+        rows = self.vocab_end_idx - self.vocab_start_idx
         self.output_dtype = torch.get_default_dtype()
         self.weight = atom_parameter(
             torch.empty(rows, embedding_dim, dtype=torch.float8_e4m3fn)
@@ -208,13 +216,14 @@ def _host_table_available() -> bool:
     if arch not in VALIDATED_ARCHS:
         logger.info("PLE n-gram table: in HBM (host table not validated on %s)", arch)
         return False
-    return True
+    # A dummy load has nothing to page-lock; the loader fills the HBM embedding.
+    return not get_current_atom_config().load_dummy
 
 
-class _Qwen4ExpHostEmbedding(nn.Module):
+class _Qwen4ExpHostEmbedding(HostTableHooks, nn.Module):
     """Vocab-sharded PLE table in page-locked host memory, read over UVA.
 
-    The table is ~100 GB and a token reads `ngram_heads` rows of it, so it
+    The table is ~95 GiB and a token reads `ngram_heads` rows of it, so it
     does not earn its HBM. `sharded_table_lookup` reads the rows through
     `shard_bases`, which only move when the weights are released and resumed,
     so the lookup can be captured in a CUDA graph. If page-locking fails the
@@ -234,12 +243,10 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     ):
         super().__init__()
         self.prefix = prefix
-        self.tp_size = get_tp_group().world_size
-        if num_embeddings % self.tp_size:
-            raise ValueError("PLE vocabulary size must be divisible by TP size")
-        rows = num_embeddings // self.tp_size
-        self.vocab_start_idx = rows * get_tp_group().rank_in_group
-        self.vocab_end_idx = self.vocab_start_idx + rows
+        self.num_embeddings = num_embeddings
+        self.tp_size, self.vocab_start_idx, self.vocab_end_idx = _tp_vocab_range(
+            num_embeddings
+        )
         self.embedding_dim = embedding_dim
         self.shard_rows = shard_rows
         self.fp8 = fp8
@@ -269,59 +276,10 @@ class _Qwen4ExpHostEmbedding(nn.Module):
             prefix,
         )
 
-    def sync_weight(
-        self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
-    ) -> bool:
-        """`WeightUpdaterMixin`: the table or one checkpoint shard of it,
-        written in place. The whole table in HBM is `weight`, left to the
-        updater once it is known to fit."""
-        if param_name != "weight":
-            return False
-        if shard_id is None and not self.table.on_host:
-            self.table.check_resumed()
-            self.table.check_rows(tensor)
-            return False
-        num_rows = (self.vocab_end_idx - self.vocab_start_idx) * self.tp_size
-        first = 0 if shard_id is None else shard_id * self.shard_rows
-        expected = (
-            num_rows if shard_id is None else min(self.shard_rows, num_rows - first),
-            self.embedding_dim,
-        )
-        if not 0 <= first < num_rows or tuple(tensor.shape) != expected:
-            raise ValueError(
-                f"{self.prefix}: expected {expected} for n-gram "
-                f"{'table' if shard_id is None else f'shard {shard_id}'}, "
-                f"got {tuple(tensor.shape)}"
-            )
-        self.table.sync_rows(first, tensor)
-        return True
-
-    def load_shard(self, shard_index: int, row_start: int, rows: torch.Tensor) -> None:
-        self.table.load_rows(shard_index, row_start, rows)
-
-    def release_weight_memory(self) -> None:
-        """`MemoryManagerMixin` hook."""
-        self.table.release()
-
-    def resume_weight_memory(self) -> None:
-        """`MemoryManagerMixin` hook: the rows have moved."""
-        self.table.resume()
-        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
-
-    def _initialize_dummy(self) -> None:
-        """`--load_dummy` filled `weight` while it was still empty."""
-        mode = get_current_atom_config().load_dummy
-        if mode and mode != "empty":
-            # Deferred: the loader imports the model ops.
-            from atom.model_loader.loader import initialize_dummy_weights
-
-            initialize_dummy_weights(self, mode)
-
     def process_weights_after_loading(self) -> None:
         if self.fp8:
             _check_global_scale(self.prefix, self.weight_scale)
-        bases = self.table.shard_bases(self.shard_bases.numel(), self._initialize_dummy)
-        self.shard_bases.copy_(bases)
+        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
         if self.table.on_host:
             dp_ranks = (
                 get_current_atom_config().parallel_config.data_parallel_size_local

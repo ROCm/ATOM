@@ -52,10 +52,7 @@ def _one_update(method):
     @wraps(method)
     def update(self, *args, **kwargs):
         self._module_readers_awaited = False
-        try:
-            return method(self, *args, **kwargs)
-        finally:
-            self._module_readers_awaited = False
+        return method(self, *args, **kwargs)
 
     return update
 

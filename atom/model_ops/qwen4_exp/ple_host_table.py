@@ -9,13 +9,18 @@ is `ops.ple.sharded_table_lookup`.
 
 import logging
 import threading
-from collections.abc import Callable
 
 import torch
 
 from atom.model_ops.engram import host_memory
 
 logger = logging.getLogger("atom")
+
+
+def check_fp8_rows(prefix: str, rows: torch.Tensor, dtype: torch.dtype) -> None:
+    """An FP8 table's rows go with its scale: no conversion is right."""
+    if rows.dtype != dtype and dtype.itemsize < 2:
+        raise ValueError(f"{prefix}: expected {dtype} n-gram rows, got {rows.dtype}")
 
 
 class PleHostTable:
@@ -71,7 +76,12 @@ class PleHostTable:
 
     def load_rows(self, shard: int, row_start: int, rows: torch.Tensor) -> None:
         """Take this rank's rows of checkpoint shard `shard`, from global row
-        `row_start`."""
+        `row_start`; a shard already held (a weight sync) is written in place."""
+        with self._lock:
+            held = shard in self._rows or shard in self._released
+        if held:
+            self.sync_rows(row_start, rows)
+            return
         if not self._in_hbm:
             pinned = host_memory.pin_rows([rows.contiguous()], copy=True)
             with self._lock:
@@ -90,12 +100,6 @@ class PleHostTable:
         with self._lock:
             self._rows[shard] = (row_start, None)
 
-    def check_resumed(self) -> None:
-        """Raise if the table is released: a weight sync has to wait for the
-        resume."""
-        with self._lock:
-            self._check_resumed()
-
     def _check_resumed(self, use: str = "sync its rows") -> None:
         # In HBM, `weight` itself is released, with the other parameters.
         if self._released or (self._in_hbm and not self.weight.numel()):
@@ -111,11 +115,7 @@ class PleHostTable:
                 f"{self.prefix}: expected [rows, {self.dim}] n-gram rows, "
                 f"got {tuple(rows.shape)}"
             )
-        if rows.dtype != self.dtype and self.dtype.itemsize < 2:
-            # The FP8 table's rows go with its scale: no conversion is right.
-            raise ValueError(
-                f"{self.prefix}: expected {self.dtype} n-gram rows, got {rows.dtype}"
-            )
+        check_fp8_rows(self.prefix, rows, self.dtype)
 
     def sync_rows(self, first: int, rows: torch.Tensor) -> None:
         """Write this rank's part of global rows `[first, first + len(rows))`
@@ -188,26 +188,17 @@ class PleHostTable:
                     hbm.narrow(0, local, pinned.shape[0]).copy_(pinned)
                     self._rows[shard] = (row_start, None)
 
-    def shard_bases(
-        self, num_shards: int, initialize: Callable[[], None] | None = None
-    ) -> torch.Tensor:
+    def shard_bases(self, num_shards: int) -> torch.Tensor:
         """`[num_shards]` int64 on the CPU: the address of each local shard's
-        first global row (0 for other ranks'). Ask again after a resume. A
-        table that received nothing (a dummy load) moves to `weight` and is
-        filled by `initialize`."""
+        first global row (0 for other ranks'). Ask again after a resume."""
         with self._lock:
             self._check_resumed("take its addresses")
             missing = [shard for shard in self.shards if shard not in self._rows]
-            empty = len(missing) == len(self.shards)
-            if empty:
-                self._to_hbm()
-            elif missing:
+            if missing:
                 raise ValueError(
                     f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
                     "never loaded"
                 )
-        if empty and initialize is not None:
-            initialize()
         row_bytes = self.dim * self.dtype.itemsize
         bases = torch.zeros(num_shards, dtype=torch.int64, device="cpu")
         with self._lock:
@@ -221,3 +212,37 @@ class PleHostTable:
                     address = pinned.data_ptr() - (row_start - first) * row_bytes
                 bases[shard] = address
         return bases
+
+
+class HostTableHooks:
+    """The weight lifecycle hooks of a module whose rows are in a
+    `PleHostTable` (`table`, `num_embeddings` rows in all), read through
+    `shard_bases`."""
+
+    def load_shard(self, shard_index: int, row_start: int, rows: torch.Tensor) -> None:
+        self.table.load_rows(shard_index, row_start, rows)
+
+    def sync_weight(
+        self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
+    ) -> bool:
+        """`WeightUpdaterMixin`: written in place, a checkpoint shard through
+        the shard loader it was loaded with."""
+        if param_name != "weight":
+            return False
+        if shard_id is not None:
+            self.weight.weight_loader(self.weight, tensor, shard_id)
+        elif tensor.shape[0] != self.num_embeddings:
+            raise ValueError(
+                f"{self.prefix}: expected {self.num_embeddings} n-gram rows, "
+                f"got {tuple(tensor.shape)}"
+            )
+        else:
+            self.table.sync_rows(0, tensor)
+        return True
+
+    def release_weight_memory(self) -> None:
+        self.table.release()
+
+    def resume_weight_memory(self) -> None:
+        self.table.resume()
+        self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))

@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from atom.model_ops.engram import host_memory
-from atom.model_ops.qwen4_exp.ple_host_table import PleHostTable
+from atom.model_ops.qwen4_exp.ple_host_table import HostTableHooks, PleHostTable
 
 DIM = 160
 SHARD_ROWS = 37
@@ -165,73 +165,35 @@ def test_a_missing_shard_is_an_error(fake_pin):
         host.shard_bases(NUM_SHARDS)
 
 
-@pytest.mark.parametrize("fail_at", [None, 2])
-def test_only_an_empty_table_is_handed_to_initialize(fake_pin, fail_at):
-    """A dummy load's table is filled (`--load_dummy`'s mode) once it exists,
-    before its addresses are taken; a loaded one, host or HBM, is the
-    checkpoint's and is not."""
-    fake_pin.fail_at = fail_at
-    filled = []
+class _Embedding(HostTableHooks, torch.nn.Module):
+    """`_Qwen4ExpHostEmbedding` less the kernel, holding rows `[start, end)`;
+    its shard loader hands over each shard's overlap, as
+    `_embedding_shard_loader` does."""
 
-    def initialize(host):
-        assert host.weight.shape == (TABLE_ROWS, DIM)
-        host.weight.data.fill_(0.5)
-        filled.append(host)
-
-    dummy = _host()
-    bases = dummy.shard_bases(NUM_SHARDS, lambda: initialize(dummy))
-    assert filled == [dummy]
-    ids = _probe_ids(TABLE_ROWS)
-    got = _follow(bases, ids, 0, TABLE_ROWS, torch.bfloat16)
-    assert torch.equal(got, torch.full_like(got, 0.5))
-
-    table = _table()
-    loaded = _host()
-    _load(table, loaded)
-    bases = loaded.shard_bases(NUM_SHARDS, lambda: initialize(loaded))
-    assert filled == [dummy]
-    assert _bitwise_equal(_follow(bases, ids, 0, TABLE_ROWS, table.dtype), table[ids])
-
-
-class _Embedding(torch.nn.Module):
-    """`_Qwen4ExpHostEmbedding` as the weight lifecycle sees it: the
-    parameter, the table and the addresses the kernel reads."""
-
-    def __init__(self, device="cpu", dtype=torch.bfloat16):
+    def __init__(self, dtype=torch.bfloat16, start=0, end=TABLE_ROWS):
         super().__init__()
+        self.prefix, self.num_embeddings = "ple", TABLE_ROWS
         self.weight = _weight(dtype)
+        self.weight.weight_loader = self._shard_loader
         if dtype.itemsize == 1:
             self.weight_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)
         self.register_buffer(
-            "shard_bases",
-            torch.zeros(NUM_SHARDS, dtype=torch.int64, device=device),
-            persistent=False,
+            "shard_bases", torch.zeros(NUM_SHARDS, dtype=torch.int64), persistent=False
         )
         self.table = PleHostTable(
-            0, TABLE_ROWS, self.weight, SHARD_ROWS, torch.device(device), "ple"
+            start, end, self.weight, SHARD_ROWS, torch.device("cpu"), "ple"
         )
+
+    def _shard_loader(self, param, shard, index):
+        first = index * SHARD_ROWS
+        lo = max(first, self.table.vocab_start)
+        hi = min(first + shard.shape[0], self.table.vocab_end)
+        if lo < hi:
+            self.load_shard(index, lo, shard[lo - first : hi - first])
 
     def bind(self):
         """What `process_weights_after_loading` does with the addresses."""
         self.shard_bases.copy_(self.table.shard_bases(NUM_SHARDS))
-
-    def release_weight_memory(self):
-        self.table.release()
-
-    def resume_weight_memory(self):
-        self.table.resume()
-        self.bind()
-
-    def sync_weight(self, param_name, tensor, shard_id=None):
-        """`_Qwen4ExpHostEmbedding.sync_weight` at TP1, less its shape check."""
-        if param_name != "weight":
-            return False
-        if shard_id is None and not self.table.on_host:
-            self.table.check_resumed()
-            self.table.check_rows(tensor)
-            return False
-        self.table.sync_rows(0 if shard_id is None else shard_id * SHARD_ROWS, tensor)
-        return True
 
 
 def _runner(model, device="cpu"):
@@ -507,8 +469,11 @@ def test_a_sync_the_table_cannot_take_is_an_error(fake_pin):
     # Through the updater too: raised, not counted as skipped.
     model = _Model()
     _load(table, model.ple.ngram_embedding.table)
+    updater = _updater(model)
     with pytest.raises(ValueError, match="expected \\[rows, 160\\]"):
-        _updater(model).update_weights([("ple.ngram_embedding.weight", table[:, :8])])
+        updater.update_weights([("ple.ngram_embedding.weight", table[:, :8])])
+    with pytest.raises(ValueError, match=f"expected {TABLE_ROWS} n-gram rows"):
+        updater.update_weights([("ple.ngram_embedding.weight", table[:8])])
 
 
 def test_addresses_and_syncs_wait_for_a_load_in_flight(fake_pin):
@@ -544,29 +509,26 @@ def test_addresses_and_syncs_wait_for_a_load_in_flight(fake_pin):
     assert _bitwise_equal(got, table.neg()[ids])
 
 
+@pytest.mark.parametrize("start", [0, 100])
 @pytest.mark.parametrize("fail_at", [None, 1])
-def test_an_fp8_table_syncs_where_its_rows_are(fake_pin, monkeypatch, fail_at):
-    """On the host the module writes the rows ahead of the updater's FP8
-    branches; in HBM the table goes through them. BF16 rows raise on either."""
+def test_an_fp8_table_syncs_where_its_rows_are(fake_pin, fail_at, start):
+    """The whole FP8 table by its own name, on the host or in HBM, at TP1 or
+    as the second TP rank: the module writes this rank's rows, ahead of the
+    updater's FP8 branch (which would copy the whole table into them). BF16
+    rows raise."""
     fake_pin.fail_at = fail_at
     dtype = torch.float8_e4m3fn
     model = _Model()
-    emb = model.ple.ngram_embedding = _Embedding(dtype=dtype)
-    _load(_table(dtype), emb.table)
+    emb = model.ple.ngram_embedding = _Embedding(dtype, start)
+    _load(_table(dtype), emb.table, start)
     emb.bind()
-    asked = []
-    sync = emb.sync_weight
-    monkeypatch.setattr(
-        emb, "sync_weight", lambda *a: asked.append(sync(*a)) or asked[-1]
-    )
     new = _table().neg().to(dtype)
     updater = _updater(model)
     assert updater.update_weights([("ple.ngram_embedding.weight", new)]) == 1
-    assert asked == [fail_at is None]
     with pytest.raises(ValueError, match="expected torch.float8_e4m3fn n-gram rows"):
         updater.update_weights([("ple.ngram_embedding.weight", new.bfloat16())])
-    ids = _probe_ids(TABLE_ROWS)
-    got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, dtype)
+    ids = torch.arange(start, TABLE_ROWS)
+    got = _follow(emb.shard_bases, ids, start, TABLE_ROWS, dtype)
     assert _bitwise_equal(got, new[ids])
 
 
@@ -874,50 +836,10 @@ def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shard
 
 
 @_gpu
-@pytest.mark.parametrize("mode", ["zero", "xavier", "empty"])
-def test_dummy_load_fills_the_table_as_an_hbm_embedding(ngram_layer, monkeypatch, mode):
-    """`--load_dummy` fills the table the post-load hook allocates as the HBM
-    embedding's from the same RNG state; `empty` leaves it uninitialized."""
-    from atom.model_loader import loader
-    from atom.model_ops.qwen4_exp import ple_layer
-
-    monkeypatch.setattr(
-        ple_layer, "get_current_atom_config", lambda: SimpleNamespace(load_dummy=mode)
-    )
-    calls = []
-    initialize = loader.initialize_dummy_weights
-
-    def spy(model, init_mode):
-        calls.append(init_mode)
-        initialize(model, init_mode)
-
-    monkeypatch.setattr(loader, "initialize_dummy_weights", spy)
-    host_layer, hbm_layer = ngram_layer(True), ngram_layer(False)
-    embedding = host_layer.ngram_embedding
-    if mode != "empty":
-        loader.initialize_dummy_weights(host_layer, mode)
-    torch.manual_seed(7)
-    embedding.process_weights_after_loading()
-    assert not embedding.table.on_host
-    assert int(embedding.shard_bases[0]) == embedding.weight.data_ptr()
-    if mode == "empty":
-        assert calls == []
-        return
-    assert calls == [mode, mode]
-    torch.manual_seed(7)
-    loader.initialize_dummy_weights(hbm_layer, mode)
-    reference = hbm_layer.ngram_embedding.weight
-    assert reference.shape == embedding.weight.shape
-    assert _bitwise_equal(embedding.weight, reference)
-    assert torch.isfinite(embedding.weight).all()
-    assert (embedding.weight == 0).all() == (mode == "zero")
-    ids = torch.arange(0, host_layer.table_rows, 997, device="cuda")
-    assert _bitwise_equal(embedding(ids), reference[ids])
-
-
-@_gpu
-def test_the_host_table_stays_off_where_not_validated(ngram_layer, monkeypatch):
-    """gfx90a, for one: the table stays the HBM embedding it was."""
+def test_the_host_table_stays_off_where_not_validated_or_for_a_dummy_load(
+    ngram_layer, monkeypatch
+):
+    """gfx90a, for one, and `--load_dummy`: the table stays the HBM embedding."""
     from atom.model_ops.qwen4_exp import ple_layer
 
     monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda: "gfx90a")
@@ -927,6 +849,11 @@ def test_the_host_table_stays_off_where_not_validated(ngram_layer, monkeypatch):
         monkeypatch.setattr(ple_layer, "get_gfx_runtime", lambda arch=arch: arch)
         layer = ngram_layer(True)
         assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpHostEmbedding)
+    monkeypatch.setattr(
+        ple_layer, "get_current_atom_config", lambda: SimpleNamespace(load_dummy="zero")
+    )
+    layer = ngram_layer(True)
+    assert isinstance(layer.ngram_embedding, ple_layer._Qwen4ExpEmbedding)
 
 
 @_gpu
