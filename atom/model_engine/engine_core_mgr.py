@@ -12,6 +12,7 @@ import queue
 import time
 import uuid
 import weakref
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Lock, RLock, Thread, local
@@ -182,6 +183,11 @@ def _add_frame(seqs: list[Sequence]) -> bytes:
 
 
 class CoreManager:
+    # ATOM_DP_PLACE_BY_CONTEXT off unless _init_shared_state turns it on, so a
+    # router built without it (tests build the routing state by hand) keeps the
+    # request-count placement.
+    _dp_place_by_context = False
+
     def _init_shared_state(
         self,
         config: Config,
@@ -305,6 +311,20 @@ class CoreManager:
         # completion/release runs on the per-rank output threads.
         self._rank_reqs = [0] * self.global_engine_count
         self._rank_tokens = [0] * self.global_engine_count
+        # ATOM_DP_PLACE_BY_CONTEXT (see _select_new_session_rank_locked): per rank,
+        # the prefill attention cost of the requests it has not prefilled yet and
+        # the context its live sessions own.
+        self._dp_place_by_context = envs.ATOM_DP_PLACE_BY_CONTEXT
+        self._dp_place_token_weight = envs.ATOM_DP_PLACE_TOKEN_WEIGHT
+        self._dp_place_ctx_weight = envs.ATOM_DP_PLACE_CTX_WEIGHT
+        self._dp_place_idle_s = envs.ATOM_DP_PLACE_SESSION_IDLE_S
+        self._rank_prefill_cost = [0.0] * self.global_engine_count
+        self._rank_owned_ctx = [0] * self.global_engine_count
+        # seq id -> (rank, prefill cost), until the seq's prefill completes
+        self._seq_prefill_cost: dict = {}
+        # session -> (rank, context tokens, last seen), least recently seen first
+        self._live_sessions: OrderedDict = OrderedDict()
+        self._dp_place_count = 0
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
@@ -1156,10 +1176,22 @@ class CoreManager:
         best_rank = 0
         best_load = None
         best_hash = -1
+        if self._dp_place_by_context:
+            self._expire_idle_sessions_locked()
         for rank in range(self._routable_engine_count):
-            load = (
-                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
-            )
+            if self._dp_place_by_context:
+                # ATOM_DP_PLACE_BY_CONTEXT: the rank's attention load. A new
+                # session has no cache anywhere, so its own cost is the same on
+                # every rank and only the ranks' loads decide.
+                load = (
+                    self._rank_prefill_cost[rank]
+                    + self._dp_place_ctx_weight * self._rank_owned_ctx[rank]
+                )
+            else:
+                load = (
+                    self._rank_tokens[rank]
+                    + self._dp_lb_req_equiv * self._rank_reqs[rank]
+                )
             tie_hash = int.from_bytes(
                 hashlib.blake2b(
                     session_key + rank.to_bytes(4, "little"), digest_size=8
@@ -1174,7 +1206,30 @@ class CoreManager:
                 best_rank = rank
                 best_load = load
                 best_hash = tie_hash
+        if self._dp_place_by_context:
+            self._dp_place_count += 1
+            if self._dp_place_count % 200 == 0:
+                logger.info(
+                    "%s: DP placement by context: %d new sessions; owned context "
+                    "per rank (k tokens) %s, queued prefill cost (G) %s, live "
+                    "sessions %d",
+                    self.label,
+                    self._dp_place_count,
+                    [round(c / 1e3) for c in self._rank_owned_ctx],
+                    [round(c / 1e9, 2) for c in self._rank_prefill_cost],
+                    len(self._live_sessions),
+                )
         return best_rank
+
+    def _expire_idle_sessions_locked(self) -> None:
+        """Drop sessions not seen for SESSION_IDLE_S from the owned context."""
+        cutoff = time.monotonic() - self._dp_place_idle_s
+        while self._live_sessions:
+            _session_id, (rank, ctx, seen) = next(iter(self._live_sessions.items()))
+            if seen >= cutoff:
+                break
+            self._live_sessions.popitem(last=False)
+            self._rank_owned_ctx[rank] -= ctx
 
     def _record_dp_route_locked(self, decision: str, rank: int) -> int:
         """Account for one routing decision and return its target rank."""
@@ -1259,6 +1314,7 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
+        previous_prompt_tokens = None
         if self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
@@ -1270,6 +1326,21 @@ class CoreManager:
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
+        if self._dp_place_by_context:
+            cached = previous_prompt_tokens or 0
+            cost = tok_cost * (self._dp_place_token_weight + cached + tok_cost / 2)
+            self._rank_prefill_cost[dp_rank] += cost
+            self._seq_prefill_cost[seq.id] = (dp_rank, cost)
+            if self._dp_session_affinity_enabled and session_id:
+                old = self._live_sessions.pop(session_id, None)
+                if old is not None:
+                    self._rank_owned_ctx[old[0]] -= old[1]
+                self._live_sessions[session_id] = (
+                    dp_rank,
+                    prompt_tokens,
+                    time.monotonic(),
+                )
+                self._rank_owned_ctx[dp_rank] += prompt_tokens
 
     def _deliver_terminal_output(self, seq) -> bool:
         """Give an online client the terminal output for a seq that never streamed.
@@ -1325,6 +1396,15 @@ class CoreManager:
             dp_rank, req_cost, tok_cost = entry
             self._rank_reqs[dp_rank] -= req_cost
             self._rank_tokens[dp_rank] -= tok_cost
+            self._release_prefill_cost_locked(seq_id)
+
+    def _release_prefill_cost_locked(self, seq_id) -> None:
+        """Drop a seq's queued prefill cost (ATOM_DP_PLACE_BY_CONTEXT), once."""
+        if not self._dp_place_by_context:
+            return
+        cost_entry = self._seq_prefill_cost.pop(seq_id, None)
+        if cost_entry is not None:
+            self._rank_prefill_cost[cost_entry[0]] -= cost_entry[1]
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
@@ -1347,6 +1427,7 @@ class CoreManager:
                 return
             self._rank_tokens[dp_rank] -= tok_cost
             self._seq_load[seq_id] = (dp_rank, req_cost, 0)
+            self._release_prefill_cost_locked(seq_id)
 
     def reset_dp_router(self) -> None:
         """Reset all DP routing state (rotation cursor + in-flight load).
@@ -1376,6 +1457,11 @@ class CoreManager:
             self._seq_load.clear()
             self._dp_session_owners.clear()
             self._dp_session_prompt_tokens.clear()
+            if self._dp_place_by_context:
+                self._rank_prefill_cost = [0.0] * self._routable_engine_count
+                self._rank_owned_ctx = [0] * self._routable_engine_count
+                self._seq_prefill_cost.clear()
+                self._live_sessions.clear()
 
     def send_utility_command(self, cmd: str, dp_rank: int | None = None):
         self._refuse_unowned_weight_sync_cmd(cmd, None)

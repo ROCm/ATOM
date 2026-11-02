@@ -825,6 +825,9 @@ class Scheduler:
             if parallel_cfg is not None
             else None
         )
+        # The engine index the prefill-batch log line carries, so the four DP
+        # ranks' lines in one server log can be told apart.
+        self._log_dp_rank = dp_rank or 0
         self.engine_stats = EngineStats(
             engine_index=dp_rank or 0,
             label=self._ENGINE_LABEL,
@@ -2616,6 +2619,7 @@ class Scheduler:
                 seq.num_cached_tokens for seq in scheduled_seqs.values()
             ]
             logger.info(
+                f"[dp{getattr(self, '_log_dp_rank', 0)} t={time.time():.6f}] "
                 f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
                 f"{total_tokens_num_prefill} new tokens "
                 f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "

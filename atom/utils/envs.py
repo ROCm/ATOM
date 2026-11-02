@@ -213,6 +213,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),
+    # Place a new sticky session on the DP rank with the least attention load:
+    # its queued prefill cost, new * (TOKEN_WEIGHT + cached + new / 2) summed over
+    # the requests not yet prefilled, plus CTX_WEIGHT x the context its live
+    # sessions own (the cost of their next turns, and its decode attention). A
+    # session is live while it was seen in the last SESSION_IDLE_S seconds.
+    "ATOM_DP_PLACE_BY_CONTEXT": lambda: _flag_env("ATOM_DP_PLACE_BY_CONTEXT", "0"),
+    "ATOM_DP_PLACE_TOKEN_WEIGHT": lambda: float(
+        os.getenv("ATOM_DP_PLACE_TOKEN_WEIGHT", "53000")
+    ),
+    "ATOM_DP_PLACE_CTX_WEIGHT": lambda: float(
+        os.getenv("ATOM_DP_PLACE_CTX_WEIGHT", "564")
+    ),
+    "ATOM_DP_PLACE_SESSION_IDLE_S": lambda: float(
+        os.getenv("ATOM_DP_PLACE_SESSION_IDLE_S", "120")
+    ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank
