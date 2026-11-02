@@ -2320,7 +2320,7 @@ run_torch_profile_window() {
   # shared log mount come from clocks that disagree by more than a window lasts.
   local traces_before="${out_dir}/.torch_traces_before"
   find "${RUN_DIR}/torch_traces" -name '*.pt.trace.json.gz' -printf '%f\n' \
-    > "${traces_before}" 2>/dev/null
+    > "${traces_before}" 2>/dev/null || true
   echo "[profile] start_profile at $(date -Is)"
   for target in "${targets[@]}"; do
     curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
