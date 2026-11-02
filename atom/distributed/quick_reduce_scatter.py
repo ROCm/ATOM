@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""INT4 reduce-scatter for large SP4 tensors on gfx950.
+"""INT4 reduce-scatter for large MoE partial sums over a 4-rank PCP group on gfx950.
 
 The kernel uses QuickReduce's existing IPC allocation and device flag colors.
 Calls using one communicator must remain serialized on a single stream, just
@@ -65,8 +65,8 @@ def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
     if not _announced:
         _announced = True
         logger.info(
-            "AITER_QUICK_REDUCE_QUANTIZATION=INT4 also quantizes the SP MoE "
-            "reduce-scatter of tensors from %d MiB",
+            "AITER_QUICK_REDUCE_QUANTIZATION=INT4 also quantizes the MoE "
+            "reduce-scatter over the PCP group of tensors from %d MiB",
             QUICK_RS_MIN_BYTES >> 20,
         )
     out = x.new_empty((x.shape[0] // comm.world_size, *x.shape[1:]))

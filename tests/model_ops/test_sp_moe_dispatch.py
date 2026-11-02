@@ -56,15 +56,15 @@ def _layer(moe):
 
 
 @pytest.mark.parametrize("prequantize", [False, True])
-def test_sp_routes_owned_rows_then_gathers_them_once(
+def test_sp_gathers_every_pass_once_and_scatters_it_back(
     monkeypatch, sp_modules, prequantize
 ):
     moe = sp_modules.moe
     layer = _layer(moe)
+    layer.moe_parallel_config.pcp_merge = True
     method = layer.quant_method
     rows, world, hidden_size = 8, 4, 64
     hidden = torch.randn(rows, hidden_size, dtype=torch.bfloat16)
-    logits = torch.empty(rows, 4)
     weights = torch.rand(rows, 5)
     ids = torch.randint(0, 129, (rows, 5), dtype=torch.int32)
     # MXFP4 rows and their e8m0 scales, as bytes.
@@ -74,61 +74,45 @@ def test_sp_routes_owned_rows_then_gathers_them_once(
     method.routed_rows_wire = None
     method._fused_moe_prequantizes = Mock(return_value=prequantize)
     method._fp4_rows_wire = SimpleNamespace(quantize=Mock(return_value=(fp4, scale)))
-    method.select_experts = Mock(return_value=(weights, ids))
-    layer._run_experts = Mock(return_value=torch.empty(rows * world, hidden_size))
+    method.place_experts = Mock(side_effect=lambda layer, w, i, gathered: (w, i))
+    method.apply = Mock(return_value=torch.empty(rows * world, hidden_size))
     group = SimpleNamespace(world_size=world)
     gatherv = Mock(side_effect=lambda ts, sizes, g: [t.repeat(world, 1) for t in ts])
     scatter = Mock(side_effect=lambda value: value[:rows])
     reassign = Mock()
-    monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=1))
+    # A dummy pass that ordinary PCP would neither split nor reduce.
+    context = SimpleNamespace(is_dummy_run=True, pcp_split=False)
+    monkeypatch.setattr(
+        moe, "get_forward_context", lambda: SimpleNamespace(context=context)
+    )
     monkeypatch.setattr(moe, "sp_is_enabled", lambda: True)
-    monkeypatch.setattr(moe, "get_sp_group", lambda: group)
+    monkeypatch.setattr(moe, "get_pcp_group", lambda: group)
     monkeypatch.setattr(moe, "all_gatherv", gatherv)
     monkeypatch.setattr(moe, "reassign_gathered_shared_ids", reassign)
-    monkeypatch.setattr(moe, "sp_moe_reduce_scatter", scatter)
+    monkeypatch.setattr(moe, "pcp_reduce_scatter", scatter)
+    monkeypatch.setattr(moe, "tbo_active", lambda: False)
 
-    assert moe.FusedMoE.forward_impl(layer, hidden, logits).shape == hidden.shape
+    out = moe.FusedMoE._run_experts(layer, hidden, weights, ids)
 
-    # Routing runs on the owner's rows; one collective moves everything.
-    method.select_experts.assert_called_once_with(layer, hidden, logits)
+    assert out.shape == hidden.shape
+    # The wire is chosen for the gathered rows; one collective moves them.
     method._fused_moe_prequantizes.assert_called_once_with(
         layer, rows * world, torch.bfloat16
     )
     gatherv.assert_called_once()
     assert gatherv.call_args.args[1:] == ([rows] * world, group)
-    x, topk_weights, topk_ids, x_scale = layer._run_experts.call_args.args
-    assert layer._run_experts.call_args.kwargs == {"gathered": True}
-    assert torch.equal(topk_weights, weights.repeat(world, 1))
-    assert topk_ids.dtype == torch.int32
-    assert torch.equal(topk_ids, ids.repeat(world, 1))
-    reassign.assert_called_once_with(layer, topk_ids)
+    applied = method.apply.call_args.kwargs
+    assert method.place_experts.call_args.args[3] is True
+    assert applied["scheduled_tokens_gpu"] is None
+    assert torch.equal(applied["topk_weights"], weights.repeat(world, 1))
+    assert applied["topk_ids"].dtype == torch.int32
+    assert torch.equal(applied["topk_ids"], ids.repeat(world, 1))
+    reassign.assert_called_once_with(layer, applied["topk_ids"])
     if prequantize:
-        assert torch.equal(x, fp4.repeat(world, 1))
-        assert torch.equal(x_scale, scale.repeat(world, 1))
+        assert torch.equal(applied["x"], fp4.repeat(world, 1))
+        assert torch.equal(applied["x_scale"], scale.repeat(world, 1))
     else:
         method._fp4_rows_wire.quantize.assert_not_called()
-        assert torch.equal(x, hidden.repeat(world, 1))
-        assert x_scale is None
-    scatter.assert_called_once_with(layer._run_experts.return_value)
-
-
-def test_non_sp_skips_sp_gather(monkeypatch, sp_modules):
-    moe = sp_modules.moe
-    layer = _layer(moe)
-    hidden, logits = torch.empty(4, 2), torch.empty(4, 4)
-    weights, ids = object(), object()
-    layer.quant_method.select_experts = Mock(return_value=(weights, ids))
-    layer._run_experts = Mock(return_value=hidden)
-    gather, scatter = Mock(), Mock()
-    monkeypatch.setattr(moe, "get_dp_group", lambda: SimpleNamespace(world_size=1))
-    monkeypatch.setattr(moe, "sp_is_enabled", lambda: False)
-    monkeypatch.setattr(moe, "all_gatherv", gather)
-    monkeypatch.setattr(moe, "sp_moe_reduce_scatter", scatter)
-
-    assert moe.FusedMoE.forward_impl(layer, hidden, logits) is hidden
-
-    gather.assert_not_called()
-    scatter.assert_not_called()
-    layer._run_experts.assert_called_once_with(
-        hidden, weights, ids, None, gathered=False
-    )
+        assert torch.equal(applied["x"], hidden.repeat(world, 1))
+        assert applied["x_scale"] is None
+    scatter.assert_called_once_with(method.apply.return_value)

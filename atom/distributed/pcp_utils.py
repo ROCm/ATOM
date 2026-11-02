@@ -164,7 +164,11 @@ def pcp_reduce_scatter(
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    return reduce_scatter_tokens(input_, get_pcp_group())
+    from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
+
+    group = get_pcp_group()
+    out = try_quick_reduce_scatter(input_.contiguous(), group)
+    return out if out is not None else reduce_scatter_tokens(input_, group)
 
 
 def pcp_all_reduce(input_: torch.Tensor, pcp_size: int | None = None) -> torch.Tensor:

@@ -12,7 +12,6 @@ from aiter.jit.utils import chip_info
 
 from atom import config
 from atom.distributed import fp8_head_exchange, token_transport
-from atom.model_ops import gemma_norm_fp8
 from atom.plugin import prepare
 
 
@@ -23,7 +22,6 @@ def supported(monkeypatch):
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(fp8_head_exchange.dtypes, "fp8", torch.float8_e4m3fn)
-    monkeypatch.setattr(gemma_norm_fp8, "_fused_per_token_quant", lambda *a, **k: None)
     monkeypatch.setattr(token_transport, "_head_exchange_kernel", lambda: object())
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     with config.use_custom_atom_config(settings):
@@ -45,8 +43,6 @@ def _head_input(**overrides):
 
 def test_validated_layout_selects_fp8_without_opt_in(supported):
     assert fp8_head_exchange.token_fp8_supported()
-    assert gemma_norm_fp8.gemma_rms_norm_fp8_supported(6144)
-    assert not gemma_norm_fp8.gemma_rms_norm_fp8_supported(8193)
 
 
 @pytest.mark.parametrize("case", ["cpu", "dtype", "gfx", "plugin"])
@@ -106,15 +102,19 @@ class _Norm:
         return hidden_states, residual
 
 
-def test_norm_quant_fuses_only_when_asked(monkeypatch):
+def test_fp32_norm_quant_only_when_asked(monkeypatch):
     """Plain TP keeps the BF16-rounded quantization that mono matches."""
+    from aiter.utility import dtypes
+
     from atom.model_ops import layernorm  # its Triton import needs a GPU
 
     calls = []
     monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(layernorm, "gemma_rms_norm_fp8_supported", lambda width: True)
+    monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
     monkeypatch.setattr(
-        layernorm, "gemma_rms_norm_fp8", lambda *args: calls.append("fused")
+        layernorm,
+        "fused_qk_rmsnorm_per_token_quant",
+        lambda *args, **kwargs: calls.append("fp32"),
     )
 
     def quant(x, **kwargs):
@@ -123,7 +123,7 @@ def test_norm_quant_fuses_only_when_asked(monkeypatch):
 
     monkeypatch.setattr(aiter, "get_hip_quant", lambda quant_type: quant)
     x = torch.ones(2, 8, dtype=torch.bfloat16)
-    for fused in (False, True):
-        layernorm.gemma_rms_norm_quant(x, x, _Norm(), fused=fused)
-        layernorm.fused_allreduce_gemma_rms_norm_quant(x, x, _Norm(), fused=fused)
-    assert calls == ["bf16", "bf16", "fused", "fused"]
+    layernorm.fused_allreduce_gemma_rms_norm_quant(x, x, _Norm())
+    layernorm.gemma_rms_norm_quant(x, x, _Norm())
+    layernorm.gemma_rms_norm_quant(x, x, _Norm(), quantize_fp32_norm=True)
+    assert calls == ["bf16", "bf16", "fp32"]

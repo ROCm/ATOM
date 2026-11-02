@@ -912,6 +912,9 @@ class ModelRunner:
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
+        # SP attention ops are recorded inline in token graphs
+        # (`fp8_head_exchange.sp_attention_fp8`): only decode buckets may hold them.
+        assert not (sp_is_enabled() and self.attn_metadata_builder.supports_token_graph)
         # Sub-pool sizing needs a memory profile, so it cannot run until after
         # warmup. Install the empty plan now: `warmup_model` below drives the
         # builder through paths that ask for their entry counts, and those must
@@ -3315,13 +3318,7 @@ class ModelRunner:
                 if sp_is_enabled():
                     self.sp_graph_input_ids(running_tokens)
                 logits = self.req_graph.replay(key=graph_key)
-                if sp_is_enabled():
-                    local = sp_local_len(running_tokens)
-                    hidden_states = sp_gather_tokens(
-                        self.forward_vars["outputs"][:local], running_tokens
-                    )[:scheduled_tokens]
-                else:
-                    hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
+                hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 if logits is not None:
@@ -4203,8 +4200,7 @@ class ModelRunner:
                 "TBO decode has no token graph: under TR_HYBRID a decode step "
                 "split into microbatches runs eagerly."
             )
-        # SP gathers hidden states before the LM head.
-        logits_in_graph = self.world_size == 1 and not sp_is_enabled()
+        logits_in_graph = self.world_size == 1
 
         # start capture profiler
         self.start_capture_profiler()
@@ -4358,18 +4354,17 @@ class ModelRunner:
                         else positions[:running_tokens]
                     )
                     # Ulysses runs the model on this rank's token chunk while
-                    # positions stay whole, so the graph is captured at the
-                    # local width and writes that many output rows.
-                    local_tokens = sp_local_len(running_tokens)
+                    # positions stay whole; the graph gathers the chunks back.
                     model_ids = (
                         self.sp_graph_input_ids(running_tokens)
                         if sp_is_enabled()
                         else input_ids[:running_tokens]
                     )
-                    model_output = self.model(model_ids, model_positions)
-                    outputs[:local_tokens] = model_output
+                    outputs[:running_tokens] = sp_gather_tokens(
+                        self.model(model_ids, model_positions), running_tokens
+                    )
                     if logits_in_graph:
-                        self.model.compute_logits(outputs[:local_tokens])
+                        self.model.compute_logits(outputs[:running_tokens])
 
                     if tr_hybrid:
                         # TR_HYBRID: no manual whole-forward graph. The model's
@@ -4397,9 +4392,9 @@ class ModelRunner:
                         # The drafter's aux capture hook runs inside the
                         # forward and writes its own buffers (in-graph).
                         def full_forward(
-                            n=local_tokens, ids=model_ids, pos=model_positions
+                            n=running_tokens, ids=model_ids, pos=model_positions
                         ):
-                            outputs[:n] = self.model(ids, pos)
+                            outputs[:n] = sp_gather_tokens(self.model(ids, pos), n)
                             if logits_in_graph:
                                 return self.model.compute_logits(outputs[:n])
                             return None
@@ -4494,8 +4489,6 @@ class ModelRunner:
         if self.config.disagg_is_decode:
             return
         if self.attn_metadata_builder.supports_token_graph:
-            # Their attention ops are recorded inline, so a prefill token graph
-            # would replay the synthetic prompt's attention on real prompts.
             self._record_tr_graphs()
         self._record_prefill_req_graphs()
         reset_forward_context()

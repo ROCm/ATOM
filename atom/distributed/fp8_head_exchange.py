@@ -45,9 +45,7 @@ def token_fp8_supported() -> bool:
 
 
 @triton.jit
-def _head_amax_kernel(
-    X, AMAX, WIDTH: tl.constexpr, STRIDE: tl.constexpr, BLOCK: tl.constexpr
-):
+def _head_amax_kernel(X, AMAX, STRIDE, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, BLOCK)
     x = tl.load(X + row * STRIDE + col, col < WIDTH, other=0).to(tl.float32)
@@ -57,17 +55,18 @@ def _head_amax_kernel(
     tl.store(AMAX + row, amax)
 
 
-@triton.jit
+# One build for every rank.
+@triton.jit(do_not_specialize=["RANK"])
 def _quantize_global_amax_kernel(
     X,
     AMAX,
     Q,
     SCALE,
     TOKENS,
+    STRIDE,
+    RANK,
     WIDTH: tl.constexpr,
-    STRIDE: tl.constexpr,
     WORLD: tl.constexpr,
-    RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -105,7 +104,7 @@ def head_amax(x: torch.Tensor) -> torch.Tensor:
     assert x.ndim == 2 and x.dtype == torch.bfloat16 and x.stride(1) == 1
     amax = torch.empty((x.shape[0], 1), device=x.device, dtype=torch.bfloat16)
     _head_amax_kernel[(x.shape[0],)](
-        x, amax, x.shape[1], x.stride(0), triton.next_power_of_2(x.shape[1])
+        x, amax, x.stride(0), x.shape[1], triton.next_power_of_2(x.shape[1])
     )
     return amax
 
@@ -131,10 +130,10 @@ def quantize_with_gathered_amax(
         q,
         scale,
         x.shape[0],
-        x.shape[1],
         x.stride(0),
-        world,
         rank,
+        x.shape[1],
+        world,
         triton.next_power_of_2(x.shape[1]),
     )
     return q, scale
@@ -194,9 +193,10 @@ def _attention_fp8_fake(
 
 
 # Not an eager_region: TR_HYBRID records it inline in the decode token graphs,
-# which is valid only while a token bucket is one (bs, q=1) request bucket
-# (Config refuses spec decoding; ModelRunner._record_prefill_graphs refuses
-# prefill token graphs).
+# which is valid only while a token bucket is one (bs, q=1) request bucket.
+# Config refuses spec decoding under SP, and prefill token graphs are recorded
+# only for a builder with `supports_token_graph` (DeepSeek-V4.1's, an attention
+# SP refuses); ModelRunner asserts that no such builder runs under SP.
 @mark_spliting_op(is_custom=True, gen_fake=_attention_fp8_fake, mutates_args=[])
 def sp_attention_fp8(
     q: torch.Tensor,

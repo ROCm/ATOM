@@ -32,11 +32,7 @@ from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_reduce_scatter,
 )
-from atom.distributed.ulysses_sp import (
-    get_sp_group,
-    sp_is_enabled,
-    sp_moe_reduce_scatter,
-)
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
 from atom.model_ops.eplb import (
@@ -327,11 +323,9 @@ class FusedMoEParallelConfig:
         )
 
         pcp_size = get_prefill_context_model_parallel_world_size()
-        # SP always shards MoE weights over the PCP rank dimension, but reduces
-        # its gathered rows itself; ordinary PCP makes the fold optional.
-        sp_fold = pcp_size > 1 and sp_is_enabled()
-        pcp_merge = pcp_size > 1 and envs.ATOM_PCP_MOE_MERGE and not sp_fold
-        if pcp_merge or sp_fold:
+        # SP always folds its group, which shares the PCP rank dimension.
+        pcp_merge = pcp_size > 1 and (envs.ATOM_PCP_MOE_MERGE or sp_is_enabled())
+        if pcp_merge:
             pcp_rank = get_prefill_context_model_parallel_rank()
             tp_rank = pcp_rank * tp_size + tp_rank
             tp_size = pcp_size * tp_size
@@ -454,18 +448,6 @@ def all_gatherv(
 
 def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
     return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
-
-
-def gather_routed_rows(layer, rows: tuple[torch.Tensor, ...], group):
-    """`pack_routed_rows` output, one height on every rank of `group`, gathered
-    rank-major in one grouped collective: hidden states, top-k weights and
-    ids, and their scales (None when unquantized)."""
-    heights = [rows[0].shape[0]] * group.world_size
-    hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-        lambda ts: all_gatherv(ts, heights, group), rows
-    )
-    reassign_gathered_shared_ids(layer, topk_ids)
-    return hidden_states, topk_weights, topk_ids, scale[0] if scale else None
 
 
 def dp_gather_routed_rows(
@@ -3607,8 +3589,6 @@ class FusedMoE(torch.nn.Module):
 
     # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
     shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
-    # The SPMegaMoE backend, set when it runs this layer's FFN region.
-    sp_mega_moe = None
 
     def __init__(
         self,
@@ -3673,6 +3653,8 @@ class FusedMoE(torch.nn.Module):
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size, dp_size, atom_config
         )
+        # SP MegaMoE attaches its backend to these layers after loading.
+        self.enable_comm_fused = enable_comm_fused
         self._comm_fused_moe = None
         if enable_comm_fused:
             from atom.model_ops.fused_moe.comm_fused_moe import (
@@ -5495,18 +5477,24 @@ class FusedMoE(torch.nn.Module):
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
         physical ones (`place_experts`) after every gather. `gathered`: a DP
-        gather made them the group's. Where ATOM_PCP_MOE_MERGE folds the PCP
-        group into the expert sharding, every PCP rank runs them over the same
-        rows: a split pass gathers its rows rank-major first, in that wire,
-        and reduce-scatters the partial sums back; any other real pass already
+        gather made them the group's. Where ATOM_PCP_MOE_MERGE or SP folds the
+        PCP group into the expert sharding, every PCP rank runs them over the
+        same rows: a split pass (every SP pass) gathers its rows rank-major
+        first, in the wire fused_moe takes for the gathered rows, and
+        reduce-scatters the partial sums back; any other real pass already
         holds the same rows on every PCP rank and all-reduces. Only rows no
         gather moved are counted (`pass_scheduled_tokens_gpu`)."""
         context = get_forward_context().context
-        pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
-        split = pcp and context.pcp_split
+        # SP ranks hold token shards in every pass, captured and dummy ones too.
+        sp = sp_is_enabled()
+        pcp = self.moe_parallel_config.pcp_merge and (sp or not context.is_dummy_run)
+        split = pcp and (sp or context.pcp_split)
         if split:
+            pcp_group = get_pcp_group()
             rows = pack_routed_rows(
-                self.quant_method.routed_rows_wire,
+                self.quant_method.gathered_rows_wire(
+                    self, hidden_states.shape[0] * pcp_group.world_size
+                ),
                 hidden_states,
                 topk_weights,
                 topk_ids,
@@ -5515,9 +5503,13 @@ class FusedMoE(torch.nn.Module):
             tbo = tbo_active()
             if tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            hidden_states, topk_weights, topk_ids, x_scale = gather_routed_rows(
-                self, rows, get_pcp_group()
+            # One grouped collective, rank-major: every PCP shard is one height.
+            heights = [hidden_states.shape[0]] * pcp_group.world_size
+            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
+                lambda ts: all_gatherv(ts, heights, pcp_group), rows
             )
+            x_scale = scale[0] if scale else None
+            reassign_gathered_shared_ids(self, topk_ids)
             if tbo:
                 tbo_switch_to_compute_sync()
         gathered = gathered or split
@@ -5645,54 +5637,28 @@ class FusedMoE(torch.nn.Module):
         if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
 
-        # Route the SP token shards on their owners, gather the routed rows for
-        # local expert computation, then sum partials back to each owner.
-        sp_moe = sp_is_enabled()
-        topk_weights, topk_ids = self.quant_method.select_experts(
-            self, hidden_states, router_logits
-        )
-        x_scale = None
-        dp_repeat = self.moe_parallel_config.dp_logical_ratio
-        if sp_moe:
-            group = get_sp_group()
-            # Chosen for the rows fused_moe sees, after the stand-in repeat below.
-            gathered_rows = hidden_states.shape[0] * group.world_size * dp_repeat
-            rows = pack_routed_rows(
-                self.quant_method.gathered_rows_wire(self, gathered_rows),
-                hidden_states,
-                topk_weights,
-                topk_ids,
-            )
-            hidden_states, topk_weights, topk_ids, x_scale = gather_routed_rows(
-                self, rows, group
-            )
-
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
         # forward_impl_graph. Dropped again below.
+        topk_weights, topk_ids = self.quant_method.select_experts(
+            self, hidden_states, router_logits
+        )
+        dp_repeat = self.moe_parallel_config.dp_logical_ratio
         local_rows = hidden_states.shape[0]
         if dp_repeat > 1:
             hidden_states, topk_weights, topk_ids = (
                 repeat_rows(t, dp_repeat)
                 for t in (hidden_states, topk_weights, topk_ids)
             )
-            if x_scale is not None:
-                x_scale = repeat_rows(x_scale, dp_repeat)
 
-        # The SP gather and the stand-in copies both make the rows the group's.
+        # The stand-in copies make the rows the logical group's, as a gather
+        # would.
         final_hidden_states = self._run_experts(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            x_scale,
-            gathered=sp_moe or dp_repeat > 1,
+            hidden_states, topk_weights, topk_ids, gathered=dp_repeat > 1
         )
 
         if dp_repeat > 1:
             final_hidden_states = final_hidden_states[:local_rows]
-
-        if sp_moe:
-            final_hidden_states = sp_moe_reduce_scatter(final_hidden_states)
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

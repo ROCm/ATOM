@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""CPU checks of SP MegaMoE tiling, native fallback and fused-block ownership."""
+"""CPU checks of SP MegaMoE tiling, native fallback and setup agreement."""
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -11,24 +11,8 @@ from test_comm_fused_moe import atom_modules  # noqa: F401
 from test_sp_moe_dispatch import _layer
 from test_sp_moe_dispatch import sp_modules as _sp_modules
 
-from atom.config import use_custom_atom_config
 from atom.model_ops import sp_mega_moe as fusion
 from atom.model_ops.sp_mega_moe import SPMegaMoE, local_token_tile
-
-
-@pytest.fixture(autouse=True)
-def mock_device_ops(monkeypatch):
-    from atom.model_ops import sp_mega_moe
-
-    # Replace only the GPU copy and router GEMM boundaries for CPU orchestration
-    # tests. The real copies, routing and launch counts are covered on GPU.
-    def copy(source, source_scale, out, out_scale):
-        out.view(torch.uint8).copy_(source.view(torch.uint8))
-        if source_scale is not None:
-            out_scale.view(-1).copy_(source_scale)
-
-    monkeypatch.setattr(sp_mega_moe, "copy_tail", copy)
-    monkeypatch.setattr(sp_mega_moe, "_router_logits", torch.nn.functional.linear)
 
 
 @pytest.fixture
@@ -51,36 +35,16 @@ def test_small_batches_keep_the_native_moe(monkeypatch, sp_modules, rows, use_me
         resolver,
         raising=False,
     )
-    runtime = SimpleNamespace(
-        cfg=SimpleNamespace(world_size=4, tail_eps=1e-6), forward=Mock()
-    )
+    runtime = SimpleNamespace(cfg=SimpleNamespace(world_size=4), forward=Mock())
     backend = SPMegaMoE(runtime, layer, 1, None)
-    assert backend.supports(rows) is use_mega
+    assert backend.runs(rows) is use_mega
     assert resolver.call_args.kwargs["M"] == rows * 4
     if use_mega:
         return
-
-    eps_used = []
-
-    def norm(x, residual, weight, eps, fp8):
-        eps_used.append(eps)
-        return x + residual, torch.ones(x.shape[0], 1), x + residual
-
-    monkeypatch.setattr(fusion, "_norm_input", norm)
-    layer.forward_impl = Mock(side_effect=lambda x, logits: x * 2)
-    attention = torch.ones(rows, 8, dtype=torch.bfloat16)
-    gate = torch.zeros(128, 8, dtype=torch.bfloat16)
-    weight = torch.ones(8, dtype=torch.bfloat16)
-    normalized, _, residual = backend.forward_block(
-        layer, attention, attention * 3, weight, gate, weight, 1e-5, 1e-6, False
-    )
-    # Each norm uses its own eps, never the runtime's tail eps.
-    assert eps_used == [1e-5, 1e-6]
-    x, logits = layer.forward_impl.call_args.args
-    torch.testing.assert_close(x, attention * 4)
-    assert logits.shape == (rows, 128)
-    torch.testing.assert_close(normalized, attention * 12)
-    torch.testing.assert_close(residual, attention * 12)
+    layer.forward_impl = Mock(return_value="native")
+    x, logits = torch.ones(rows, 8), torch.zeros(rows, 128)
+    assert backend.forward_impl(layer, x, logits) == "native"
+    layer.forward_impl.assert_called_once_with(x, logits)
     runtime.forward.assert_not_called()
 
 
@@ -92,99 +56,41 @@ def test_tile_covers_the_largest_local_shard(budget, world_size, tile):
     assert local_token_tile(budget, world_size) == tile
 
 
-@pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("rows", [0, 8, 16, 65])
-def test_full_op_preserves_rank_rows_residual_and_output_ownership(
-    monkeypatch, sp_modules, fp8, rows
-):
-    from aiter import dtypes
+@pytest.mark.parametrize("rows", [8, 65])
+def test_large_batches_run_in_local_tiles_into_a_fresh_output(rows):
+    launches = []
 
-    # Real custom-op implementation and backend orchestration; only the device
-    # boundaries are replaced. Shared scratch is overwritten on every launch.
-    x = (torch.arange(rows) % 8).bfloat16()[:, None].expand(rows, 8).contiguous()
-    residual = torch.ones_like(x)
-    expected_residual = (x + residual) * 2 + (x + residual)
-    scratch = torch.empty((4 * 32, 8), dtype=torch.bfloat16)
-    tail_calls, plain_calls = [], []
-
-    def norm(x, residual, weight, eps, fp8):
-        r = x + residual
-        return r.to(dtypes.fp8 if fp8 else r.dtype), torch.ones(r.shape[0], 1), r
-
-    monkeypatch.setattr(fusion, "_norm_input", norm)
-
-    def route(layer, hidden, router):
-        return (
-            torch.ones(hidden.shape[0], 5),
-            hidden[:, :1].int().expand(-1, 5).contiguous(),
-        )
-
-    def launch(hidden, weights, ids, *, tail=None, bf16=False):
+    def launch(hidden, weights, ids, *, out):
+        # Every tile keeps its own rows' routing.
         torch.testing.assert_close(ids[:, :1].bfloat16(), hidden[:, :1])
-        y = hidden * 2
-        if tail is None:
-            plain_calls.append(hidden.shape[0])
-            return y
-        tail_calls.append(hidden.shape[0])
-        res_in, res_out, _nw = tail
-        res_out.copy_(y + res_in)
-        m = hidden.shape[0]
-        # Non-owning rows contain poison; selecting global row 0 would fail.
-        scratch.fill_(-42)
-        scratch[2 * m : 3 * m].copy_(res_out)
-        q = scratch.to(dtypes.fp8).view(torch.uint8)
-        result = (y, q, torch.ones(m * 4))
-        return (*result, scratch) if bf16 else result
+        launches.append(hidden.shape[0])
+        out.copy_(hidden * 2)
 
-    backend = fusion.SPMegaMoE(
-        SimpleNamespace(
-            cfg=SimpleNamespace(rank=2, world_size=4, tail_eps=1e-6),
-            max_local_tokens=32,
-            set_weights=Mock(),
-            forward=launch,
-            tail_ok=lambda m: m >= 16,
-        ),
-        None,
-        1,
-        None,
+    runtime = SimpleNamespace(max_local_tokens=32, set_weights=Mock(), forward=launch)
+    backend = SPMegaMoE(runtime, None, 1, None)
+    backend.runs = lambda rows: True
+    backend._route = lambda layer, hidden, logits: (
+        torch.ones(hidden.shape[0], 5),
+        hidden[:, :1].int().expand(-1, 5),
     )
-    backend.supports = lambda rows: True
-    backend._route = route
     layer = SimpleNamespace(
-        sp_mega_moe=backend,
         w13_weight=object(),
         w13_weight_scale=object(),
         w2_weight=object(),
         w2_weight_scale=object(),
     )
-    config = SimpleNamespace(
-        compilation_config=SimpleNamespace(static_forward_context={"e": layer})
+    x = (torch.arange(rows) % 8).bfloat16()[:, None].expand(rows, 8).contiguous()
+    before = x.clone()
+    out = backend.forward_impl(layer, x, torch.empty(rows, 128))
+    torch.testing.assert_close(out, before * 2)
+    torch.testing.assert_close(x, before)
+    assert launches == ([32, 32, 1] if rows == 65 else [8])
+    runtime.set_weights.assert_called_once_with(
+        w1=layer.w13_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2=layer.w2_weight,
+        w2_scale=layer.w2_weight_scale,
     )
-    weight = torch.ones(8, dtype=torch.bfloat16)
-    gate = torch.zeros(128, 8, dtype=torch.bfloat16)
-    before_x, before_res = x.clone(), residual.clone()
-    with use_custom_atom_config(config):
-        first = fusion.sp_mega_moe_block(
-            x, residual, weight, gate, weight, "e", 1e-6, 1e-6, fp8
-        )
-        second = fusion.sp_mega_moe_block(
-            x, residual, weight, gate, weight, "e", 1e-6, 1e-6, fp8
-        )
-    second[0].zero_()
-    second[2].zero_()
-    expected_normalized = expected_residual.to(dtypes.fp8) if fp8 else expected_residual
-    torch.testing.assert_close(first[0].float(), expected_normalized.float())
-    torch.testing.assert_close(first[2], expected_residual)
-    torch.testing.assert_close(x, before_x)
-    torch.testing.assert_close(residual, before_res)
-    assert first[1].shape == (rows, 1)
-    assert first[0].dtype == (dtypes.fp8 if fp8 else torch.bfloat16)
-    if rows == 65:
-        assert plain_calls == [1, 1]
-        assert tail_calls == [32, 32, 32, 32]
-    elif rows == 8:
-        # One untailed launch returns the norm outputs as they are.
-        assert plain_calls == [8, 8]
 
 
 def _servable_layer(moe):
@@ -219,7 +125,12 @@ def _servable_layer(moe):
         value = torch.empty(shape, dtype=torch.uint8)
         value.is_shuffled = True
         setattr(layer, name, value)
+    layer.enable_comm_fused = True
     return layer
+
+
+def _model(layer):
+    return SimpleNamespace(modules=lambda: [torch.nn.Identity(), layer])
 
 
 def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
@@ -238,12 +149,11 @@ def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
         ulysses_sp, "get_sp_group", lambda: SimpleNamespace(cpu_group=None)
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
-    monkeypatch.setattr(fusion, "_model_layers", lambda model, config: ([layer], 1e-6))
     config = SimpleNamespace(sp_mega_moe_enabled=True)
-    assert fusion.initialize_sp_mega_moe(object(), config) is None
+    assert fusion.initialize_sp_mega_moe(_model(layer), config) is None
     # The compile hash reads the flag; native graphs must not reuse mega ones.
     assert config.sp_mega_moe_enabled is False
-    assert getattr(layer, "sp_mega_moe", None) is None
+    assert getattr(layer, "_comm_fused_moe", None) is None
 
 
 def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, **stubs):
@@ -255,9 +165,7 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, **stubs):
     mega.MegaMoeTP = runtime
     comm = ModuleType("aiter.ops.communication")
     comm._mori = stubs.get("mori", Mock())
-    norm = ModuleType("atom.model_ops.gemma_norm_fp8")
-    norm.gemma_rms_norm_fp8_supported = stubs.get("norm_supported", lambda h: True)
-    for module in (mega, comm, norm):
+    for module in (mega, comm):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(ulysses_sp, "get_sp_world_size", lambda: 4)
     monkeypatch.setattr(
@@ -266,9 +174,8 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, **stubs):
         lambda: SimpleNamespace(world_size=4, rank_in_group=0, cpu_group=None),
     )
     monkeypatch.setattr(fusion, "_unsupported_config", lambda config: None)
-    monkeypatch.setattr(fusion, "_model_layers", lambda model, config: ([layer], 1e-6))
     config = SimpleNamespace(sp_mega_moe_enabled=True, max_num_batched_tokens=mnbt)
-    return config, layer, lambda: fusion.initialize_sp_mega_moe(object(), config)
+    return config, layer, lambda: fusion.initialize_sp_mega_moe(_model(layer), config)
 
 
 @pytest.mark.parametrize(
@@ -295,23 +202,25 @@ def test_runtime_setup_failure_keeps_the_native_moe(
     assert initialize() is None
     assert config.sp_mega_moe_enabled is False
     assert runtime.call_args.args[0]["max_local_tokens"] == 256
-    assert getattr(layer, "sp_mega_moe", None) is None
+    assert getattr(layer, "_comm_fused_moe", None) is None
 
 
-@pytest.mark.parametrize(
-    "stubs,vote",
-    [
-        ({"mori": Mock(side_effect=ImportError("no MORI"))}, False),
-        ({"norm_supported": lambda hidden: False}, False),
-        # This rank could serve it; a peer cannot.
-        ({}, True),
-    ],
-)
-def test_any_rank_refusing_keeps_every_rank_native(
-    monkeypatch, sp_modules, stubs, vote
-):
+def test_agreed_prepare_failure_closes_the_runtime(monkeypatch, sp_modules):
+    runtime = Mock(max_local_tokens=256, bigm_m=0)
+    runtime.prepare.side_effect = RuntimeError(
+        "MegaMoeTP.prepare: warmup launches timed out"
+    )
+    config, _, initialize = _initialize(
+        monkeypatch, sp_modules, Mock(return_value=runtime)
+    )
+    assert initialize() is None
+    assert config.sp_mega_moe_enabled is False
+    runtime.close.assert_called_once_with()
+
+
+def test_a_refusing_peer_keeps_every_rank_native(monkeypatch, sp_modules):
     runtime = Mock()
-    config, _, initialize = _initialize(monkeypatch, sp_modules, runtime, **stubs)
+    config, _, initialize = _initialize(monkeypatch, sp_modules, runtime)
     votes = []
 
     def peer_refuses(ok, group):
@@ -320,28 +229,55 @@ def test_any_rank_refusing_keeps_every_rank_native(
 
     monkeypatch.setattr(fusion, "group_agree", peer_refuses)
     assert initialize() is None
-    assert votes == [vote]
+    # This rank could serve it.
+    assert votes == [True]
     assert config.sp_mega_moe_enabled is False
     runtime.assert_not_called()
+
+
+# A 256-row tile: big-M is unreachable, reachable, or past the tile.
+@pytest.mark.parametrize("bigm_m,probed", [(0, False), (128, True), (512, False)])
+def test_mori_is_required_only_where_big_m_runs(
+    monkeypatch, sp_modules, bigm_m, probed
+):
+    mori = Mock(side_effect=ImportError("no MORI"))
+    runtime = Mock(max_local_tokens=256, bigm_m=bigm_m)
+    runtime.poll_errors.return_value = 0
+    runtime.launch_config.side_effect = lambda rows: rows > 64
+    config, layer, initialize = _initialize(
+        monkeypatch, sp_modules, Mock(return_value=runtime), mori=mori
+    )
+    backend = initialize()
+    assert mori.called is probed
+    if probed:
+        assert backend is None
+        assert config.sp_mega_moe_enabled is False
+        runtime.close.assert_called_once_with()
+        runtime.prepare.assert_not_called()
+    else:
+        assert layer._comm_fused_moe is backend
+        runtime.prepare.assert_called_once_with([1, 65])
 
 
 def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modules):
     # 65536 tokens over SP4 are 16384 local rows: eight 2048-row launches.
     runtime = Mock(
-        return_value=Mock(max_local_tokens=2048, **{"poll_errors.return_value": 0})
+        return_value=Mock(
+            max_local_tokens=2048, bigm_m=0, **{"poll_errors.return_value": 0}
+        )
     )
     _, layer, initialize = _initialize(monkeypatch, sp_modules, runtime, mnbt=65536)
     backend = initialize()
     assert runtime.call_args.args[0]["max_local_tokens"] == 8192
-    assert layer.sp_mega_moe is backend
-    backend.supports = lambda rows: True
+    assert layer._comm_fused_moe is backend
+    backend.runs = lambda rows: True
     backend.count_step(16384)
     assert backend.launches == 8
 
 
 def test_warmup_timeout_on_any_rank_keeps_the_native_moe(monkeypatch, sp_modules):
     # The big-M warmup raises nothing: a timed-out wait is only in the bits.
-    runtime = Mock(max_local_tokens=256, **{"poll_errors.return_value": 0})
+    runtime = Mock(max_local_tokens=256, bigm_m=0, **{"poll_errors.return_value": 0})
     config, layer, initialize = _initialize(
         monkeypatch, sp_modules, Mock(return_value=runtime)
     )
@@ -349,7 +285,7 @@ def test_warmup_timeout_on_any_rank_keeps_the_native_moe(monkeypatch, sp_modules
     assert initialize() is None
     assert config.sp_mega_moe_enabled is False
     runtime.close.assert_called_once_with()
-    assert getattr(layer, "sp_mega_moe", None) is None
+    assert getattr(layer, "_comm_fused_moe", None) is None
 
 
 @pytest.fixture
@@ -364,7 +300,7 @@ def host_copies(monkeypatch):
 def _counted(runtime, layers=1):
     backend = SPMegaMoE(runtime, None, layers, None)
     # Single-row steps are decode, which keeps the native MoE.
-    backend.supports = lambda rows: rows > 1
+    backend.runs = lambda rows: rows > 1
     return backend
 
 

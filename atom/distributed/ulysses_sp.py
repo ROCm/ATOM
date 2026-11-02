@@ -16,7 +16,6 @@ from atom.distributed.token_transport import (
     gather_heads,
     gather_tokens,
     prefer_custom_gather,
-    reduce_scatter_tokens,
 )
 
 # Keep GPU imports lazy for CPU-only metadata consumers. Set by ModelRunner.
@@ -149,18 +148,6 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     owner = rows.long() // local
     gathered = gather_tokens(picked, get_sp_group())
     return gathered[owner * n + torch.arange(n, device=x.device)]
-
-
-def sp_moe_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
-    """Sum expert contributions, honoring the communicator's reduction policy."""
-    if _SP_WORLD_SIZE <= 1:
-        return x
-    x = x.contiguous()
-    group = get_sp_group()
-    from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
-
-    out = try_quick_reduce_scatter(x, group)
-    return out if out is not None else reduce_scatter_tokens(x, group)
 
 
 _SCATTER = 0  # zero means one head shard per rank

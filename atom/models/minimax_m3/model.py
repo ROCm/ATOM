@@ -20,7 +20,7 @@ from transformers import PretrainedConfig
 from atom.config import Config, QuantizationConfig
 from atom.distributed.fp8_head_exchange import token_fp8_supported
 from atom.distributed.indexer_cp import indexer_cp_enabled
-from atom.distributed.ulysses_sp import sp_is_enabled
+from atom.distributed.ulysses_sp import attn_head_shard_size, sp_is_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
@@ -105,8 +105,7 @@ def _validate_sparse_flydsl_config(
             "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
             "explicit-plan API (#5809) because there is no gluon fallback"
         )
-    tp_size = get_tensor_model_parallel_world_size()
-    local_kv_heads = max(1, int(config.num_key_value_heads) // tp_size)
+    local_kv_heads = max(1, int(config.num_key_value_heads) // attn_head_shard_size())
     max_tokens = int(atom_config.max_num_batched_tokens)
     max_rows = max_tokens * local_kv_heads
     plan_limit = _flydsl_plan_max_batch()
@@ -360,6 +359,7 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
+            enable_comm_fused=True,
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full
@@ -385,10 +385,11 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
+        routed_output, complete = self.experts.forward_maybe_comm_fused(
+            hidden_states, router_logits, None
         )
+        if complete:
+            return routed_output.view(orig_shape)
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
@@ -636,36 +637,29 @@ class MiniMaxM3SparseAttention(nn.Module):
         return _minimax_m3_attend_and_project(self, q, k, v, positions, qkv)
 
 
-def _minimax_m3_norm(norm, hidden_states, residual, *, quant, fused):
+def _minimax_m3_norm(norm, hidden_states, residual, *, quant, quantize_fp32_norm):
     """Gemma RMSNorm of `hidden_states + residual`, all-reducing the increment
-    first when there is a residual and quantizing per token when `quant` (in
-    one kernel when `fused`).
+    first when there is a residual and quantizing per token when `quant`.
 
     Returns ``(hidden_states, scale, residual)``; scale is None without `quant`.
     """
     if quant:
-        fn = (
-            gemma_rms_norm_quant
-            if residual is None
-            else fused_allreduce_gemma_rms_norm_quant
-        )
-        return fn(hidden_states, residual, norm, fused=fused)
+        # SP rows, the only ones that quantize the FP32 norm, have no
+        # all-reduce pending.
+        if residual is None or quantize_fp32_norm:
+            return gemma_rms_norm_quant(
+                hidden_states,
+                residual,
+                norm,
+                quantize_fp32_norm=quantize_fp32_norm,
+            )
+        return fused_allreduce_gemma_rms_norm_quant(hidden_states, residual, norm)
     if residual is None:
         return norm(hidden_states), None, hidden_states
     hidden_states, residual = fused_allreduce_gemma_rms_norm(
         hidden_states, residual, norm
     )
     return hidden_states, None, residual
-
-
-def _minimax_m3_input_norm(layer, hidden_states, residual):
-    return _minimax_m3_norm(
-        layer.input_layernorm,
-        hidden_states,
-        residual,
-        quant=_linear_consumes_per_token_fp8(layer.self_attn.qkv_proj),
-        fused=layer._fused_norm_quant,
-    )
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -716,33 +710,27 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # Whole-token rows; plain TP keeps main's BF16-rounded quantization,
-        # which mono matches.
-        self._fused_norm_quant = sp_is_enabled()
+        # SP rows are whole tokens on TP 1; plain TP keeps the BF16-rounded
+        # quantization that mono matches.
+        self._quantize_fp32_norm = sp_is_enabled()
 
-    @property
-    def uses_sp_mega_moe(self) -> bool:
-        """Whether the model runs this layer's FFN region, through the next
-        layer's input norm, as one SP MegaMoE block."""
-        return (
-            self.is_moe_layer and self.block_sparse_moe.experts.sp_mega_moe is not None
-        )
-
-    def attend(
+    def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         capture_aux: bool = False,
-        *,
-        input_normalized: bool = False,
-        hidden_states_scale: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """The input norm and attention: ``(attention, residual, aux)``."""
-        if not input_normalized:
-            hidden_states, hidden_states_scale, residual = _minimax_m3_input_norm(
-                self, hidden_states, residual
-            )
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
+        hidden_states, hidden_states_scale, residual = _minimax_m3_norm(
+            self.input_layernorm,
+            hidden_states,
+            residual,
+            quant=_linear_consumes_per_token_fp8(self.self_attn.qkv_proj),
+            quantize_fp32_norm=self._quantize_fp32_norm,
+        )
 
         # Eagle3 aux hidden state = the all-reduced residual stream entering this
         # layer (post input-norm). Captured here, not as `hidden_states + residual`
@@ -755,36 +743,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             hidden_states_scale=hidden_states_scale,
         )
-        return hidden_states, residual, aux_hidden_state
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        capture_aux: bool = False,
-        *,
-        input_normalized: bool = False,
-        hidden_states_scale: torch.Tensor | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor | None]
-        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]
-    ):
-        hidden_states, residual, aux_hidden_state = self.attend(
-            positions,
-            hidden_states,
-            residual,
-            capture_aux,
-            input_normalized=input_normalized,
-            hidden_states_scale=hidden_states_scale,
-        )
         hidden_states, hidden_states_scale, residual = _minimax_m3_norm(
             self.post_attention_layernorm,
             hidden_states,
             residual,
             quant=not self.is_moe_layer
             and _linear_consumes_per_token_fp8(self.mlp.gate_up_proj),
-            fused=self._fused_norm_quant,
+            quantize_fp32_norm=self._quantize_fp32_norm,
         )
         if self.is_moe_layer:
             hidden_states = self.block_sparse_moe(hidden_states)
@@ -886,67 +851,25 @@ class MiniMaxM3Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states: list[torch.Tensor] = []
-        # Set after an SP MegaMoE block, which also runs the next input norm.
-        input_normalized = False
-        hidden_states_scale = None
         for idx in range(self.start_layer, self.end_layer):
-            layer = self.layers[idx]
-            capture_aux = idx in self.aux_hidden_state_layers
-            kwargs = {
-                "input_normalized": input_normalized,
-                "hidden_states_scale": hidden_states_scale,
-            }
-            if layer.uses_sp_mega_moe:
-                hidden_states, residual, aux_hidden_state = layer.attend(
-                    positions, hidden_states, residual, capture_aux, **kwargs
+            if idx in self.aux_hidden_state_layers:
+                hidden_states, residual, aux_hidden_state = self.layers[idx](
+                    positions, hidden_states, residual, capture_aux=True
                 )
-                next_layer = self.layers[idx + 1] if idx + 1 < self.end_layer else None
-                next_norm = (
-                    next_layer.input_layernorm if next_layer is not None else self.norm
-                )
-                next_fp8 = next_layer is not None and _linear_consumes_per_token_fp8(
-                    next_layer.self_attn.qkv_proj
-                )
-                hidden_states, hidden_states_scale, residual = (
-                    torch.ops.aiter.sp_mega_moe_block(
-                        hidden_states,
-                        residual,
-                        layer.post_attention_layernorm.weight,
-                        layer.block_sparse_moe.gate.weight,
-                        next_norm.weight,
-                        layer.block_sparse_moe.experts.layer_name,
-                        layer.post_attention_layernorm.variance_epsilon,
-                        next_norm.variance_epsilon,
-                        next_fp8,
-                    )
-                )
-                if not next_fp8:
-                    hidden_states_scale = None
-                input_normalized = True
-            else:
-                # A dense layer after an MoE block takes the normalized input;
-                # its FFN still leaves an increment for the next norm.
-                output = layer(
-                    positions, hidden_states, residual, capture_aux, **kwargs
-                )
-                hidden_states, residual = output[:2]
-                aux_hidden_state = output[2] if capture_aux else None
-                input_normalized = False
-                hidden_states_scale = None
-            if capture_aux:
                 aux_hidden_states.append(aux_hidden_state)
+            else:
+                hidden_states, residual = self.layers[idx](
+                    positions, hidden_states, residual
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        # After an SP MegaMoE tail the final Gemma norm already ran, with BF16
-        # output.
-        if not input_normalized:
-            hidden_states, _ = fused_allreduce_gemma_rms_norm(
-                hidden_states, residual, self.norm
-            )
+        hidden_states, _ = fused_allreduce_gemma_rms_norm(
+            hidden_states, residual, self.norm
+        )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -956,20 +879,6 @@ class MiniMaxM3Model(nn.Module):
         return make_minimax_m3_expert_params_mapping(
             self.config.num_local_experts + num_fused_shared
         )
-
-
-def sp_mega_moe_layers(model: nn.Module):
-    """The MoE layers SP MegaMoE may run (`MiniMaxM3Model.forward` threads
-    each block's next input norm), and the eps all M3 GemmaRMSNorms share."""
-    decoders = [
-        module
-        for module in model.modules()
-        if isinstance(module, MiniMaxM3DecoderLayer) and module.is_moe_layer
-    ]
-    if not decoders:
-        return [], None
-    eps = decoders[0].post_attention_layernorm.variance_epsilon
-    return [decoder.block_sparse_moe.experts for decoder in decoders], eps
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):

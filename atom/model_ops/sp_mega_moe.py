@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Ulysses SP integration for AITER's MegaMoeTP ag_rs kernel.
 
-The MoE tail also fuses the next input norm; the residual add, norm and router
-before the MoE run the native kernels. One runtime is shared by the sequential
+It is the comm-fused backend (`FusedMoE.forward_maybe_comm_fused`) of every MoE
+layer built with `enable_comm_fused`. One runtime is shared by the sequential
 MoE layers; its collective buffers and launch epochs must survive layer/graph
 boundaries.
 Large token shards are tiled locally, with the same tiles on every SP rank.
@@ -17,16 +17,8 @@ import torch
 
 from atom.distributed.group_agreement import group_agree, group_max
 from atom.utils import envs
-from atom.utils.custom_register import direct_register_custom_op
 
 logger = logging.getLogger("atom")
-
-
-def copy_tail(source, source_scale, out, out_scale):
-    # Keep dispatch and settings importable without the GPU kernel dependencies.
-    from atom.model_ops.sp_mega_buffers import copy_tail as copy
-
-    copy(source, source_scale, out, out_scale)
 
 
 # AITER's largest big-M tier, in local tokens.
@@ -70,14 +62,11 @@ def _unsupported_layer(layer):
     ):
         return "needs MXFP4 FlyDSL experts without Triton MoE, GU interleave or padding"
     if (
-        layer.use_ep
-        or layer.reduce_results
-        or layer.moe_parallel_config.use_all2all_kernels
-        or layer.moe_parallel_config.dp_logical_ratio != 1
+        layer.reduce_results
         or layer.expert_layout.uses_dispatch_remap
         or layer.expert_layout.shared_is_routed
     ):
-        return "needs unreduced experts without EP, all2all or dispatch remapping"
+        return "needs unreduced experts without dispatch remapping"
     # AITER counts the last expert apart, as the one shared expert.
     if (
         layer.num_fused_shared_experts != 1
@@ -107,13 +96,6 @@ def _unsupported_layer(layer):
         ):
             return f"{name} has an incompatible layout"
     return None
-
-
-def _router_logits(hidden, gate_weight):
-    # The native gate's GEMM (ReplicatedLinear), so both paths pick the same top-k.
-    from aiter.tuned_gemm import tgemm
-
-    return tgemm.mm(hidden, gate_weight, None, otype=hidden.dtype)
 
 
 class SPMegaMoE:
@@ -167,7 +149,7 @@ class SPMegaMoE:
         keeps the native MoE (decode) launches nothing and adds no copy.
         """
         self._raise_on_timeout()
-        if not self.supports(rows):
+        if not self.runs(rows):
             return
         self._uncopied = True
         self.launches += self.num_layers * math.ceil(
@@ -182,7 +164,7 @@ class SPMegaMoE:
             self.runtime.reset()
             self.launches = 0
 
-    def supports(self, rows):
+    def runs(self, rows):
         """Keep the native path whenever MegaMoE would change activation precision.
 
         Use the padded global row count, exactly as the native SP gather does.
@@ -201,212 +183,76 @@ class SPMegaMoE:
         weights, ids = method.select_experts(layer, hidden_states, router_logits)
         return method.place_experts(layer, weights, ids)
 
-    def forward_block(
+    def supports(self, tokens):
+        """Every row count: it is symbolic while compiling, so `forward_impl`
+        picks the path at run time."""
+        return True
+
+    def forward(
         self,
         layer,
-        attention,
-        residual,
-        post_weight,
-        gate_weight,
-        next_weight,
-        post_eps,
-        next_eps,
-        fp8_output,
+        hidden_states,
+        router_logits,
+        shared_partial,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
+        stage2_stream=None,
     ):
-        """Complete SP-local FFN region, returning the NEXT normalized input.
-
-        Attention is already reduced and token-sharded; the MoE's intermediate
-        shards communicate over SP4. Tail rows are replicated scratch in AITER:
-        copy only this rank's rows before another tile/layer reuses them. No
-        returned tensor aliases an input.
-        """
-        from aiter import dtypes
-
-        rows = attention.shape[0]
-        hidden, _, post_res = _norm_input(
-            attention, residual, post_weight, post_eps, False
+        if shared_partial is not None or not (
+            before_stage2_for_rows is None
+            and before_shared_add is None
+            and stage2_stream is None
+        ):
+            raise ValueError(
+                "SP MegaMoE runs the shared expert among the routed ones and "
+                "takes no hooks"
+            )
+        return torch.ops.aiter.comm_fused_moe_forward(
+            hidden_states, router_logits, None, layer.layer_name
         )
-        logits = _router_logits(hidden, gate_weight)
-        if not self.supports(rows):
+
+    def forward_impl(self, layer, hidden_states, router_logits, shared_partial=None):
+        rows = hidden_states.shape[0]
+        if not self.runs(rows):
             # Small batches (decode) keep the native A16W4 MoE.
-            output = layer.forward_impl(hidden, logits)
-            return _norm_input(output, post_res, next_weight, next_eps, fp8_output)
-        weights, ids = self._route(layer, hidden, logits)
-
-        def tailed(m):
-            return self.runtime.tail_ok(m) and next_eps == self.runtime.cfg.tail_eps
-
-        tile = self.runtime.max_local_tokens
+            return layer.forward_impl(hidden_states, router_logits)
+        weights, ids = self._route(layer, hidden_states, router_logits)
         self.runtime.set_weights(**_weights(layer))
-        if 0 < rows <= tile and not tailed(rows):
-            # One untailed launch: its norm outputs are already fresh.
-            y = self.runtime.forward(hidden, weights, ids)
-            return _norm_input(y, post_res, next_weight, next_eps, fp8_output)
-        normalized = torch.empty(
-            hidden.shape,
-            dtype=dtypes.fp8 if fp8_output else hidden.dtype,
-            device=hidden.device,
-        )
-        scale = torch.empty((rows, 1), dtype=torch.float32, device=hidden.device)
-        next_res = torch.empty_like(post_res)
+        out = torch.empty_like(hidden_states)
+        tile = self.runtime.max_local_tokens
         for start in range(0, rows, tile):
-            end = min(start + tile, rows)
-            sl = slice(start, end)
-            m = end - start
-            if tailed(m):
-                result = self.runtime.forward(
-                    hidden[sl],
-                    weights[sl],
-                    ids[sl],
-                    tail=(post_res[sl], next_res[sl], next_weight),
-                    bf16=not fp8_output,
-                )
-                own = slice(self.runtime.cfg.rank * m, (self.runtime.cfg.rank + 1) * m)
-                copy_tail(
-                    result[1 if fp8_output else 3][own],
-                    result[2][own] if fp8_output else None,
-                    normalized[sl],
-                    scale[sl],
-                )
-            else:
-                # Dynamic schedule / unsupported tail eps: same output
-                # contract, with the ordinary fused residual+norm kernel.
-                y = self.runtime.forward(hidden[sl], weights[sl], ids[sl])
-                x, s, r = _norm_input(
-                    y, post_res[sl], next_weight, next_eps, fp8_output
-                )
-                normalized[sl].copy_(x)
-                next_res[sl].copy_(r)
-                if fp8_output:
-                    scale[sl].copy_(s)
-        return normalized, scale, next_res
-
-
-def _norm_input(x, residual, weight, eps, fp8):
-    if fp8:
-        from atom.model_ops.gemma_norm_fp8 import gemma_rms_norm_fp8
-
-        return gemma_rms_norm_fp8(x, weight, eps, residual)
-    # GemmaRMSNorm's own kernel, so these tiles match the native next layer.
-    from atom.model_ops.layernorm import gemma_rms_norm_unquantized
-
-    out, res_out = gemma_rms_norm_unquantized(x, weight, eps, residual)
-    return (
-        out,
-        torch.empty((x.shape[0], 1), device=x.device, dtype=torch.float32),
-        res_out,
-    )
-
-
-def _block_fake(
-    attention: torch.Tensor,
-    residual: torch.Tensor,
-    post_weight: torch.Tensor,
-    gate_weight: torch.Tensor,
-    next_weight: torch.Tensor,
-    layer_name: str,
-    post_eps: float,
-    next_eps: float,
-    fp8_output: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter import dtypes
-
-    return (
-        torch.empty_like(
-            attention, dtype=dtypes.fp8 if fp8_output else attention.dtype
-        ),
-        torch.empty(
-            (attention.shape[0], 1), device=attention.device, dtype=torch.float32
-        ),
-        torch.empty_like(residual),
-    )
-
-
-def sp_mega_moe_block(
-    attention: torch.Tensor,
-    residual: torch.Tensor,
-    post_weight: torch.Tensor,
-    gate_weight: torch.Tensor,
-    next_weight: torch.Tensor,
-    layer_name: str,
-    post_eps: float,
-    next_eps: float,
-    fp8_output: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from atom.config import get_current_atom_config
-
-    layer = get_current_atom_config().compilation_config.static_forward_context[
-        layer_name
-    ]
-    return layer.sp_mega_moe.forward_block(
-        layer,
-        attention,
-        residual,
-        post_weight,
-        gate_weight,
-        next_weight,
-        post_eps,
-        next_eps,
-        fp8_output,
-    )
-
-
-# Keep the whole FFN region in one capturable opaque op. Dynamic row decisions
-# and shared runtime state must not escape into torch.compile's traced graph.
-direct_register_custom_op(
-    op_name="sp_mega_moe_block",
-    op_func=sp_mega_moe_block,
-    mutates_args=[],
-    fake_impl=_block_fake,
-)
+            sl = slice(start, min(start + tile, rows))
+            self.runtime.forward(hidden_states[sl], weights[sl], ids[sl], out=out[sl])
+        return out
 
 
 def _unsupported_config(config):
-    from aiter.dist.parallel_state import get_dp_group, get_tp_group
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    from atom.plugin.prepare import is_plugin_mode
-
-    if (
-        get_tp_group().world_size != 1
-        or get_dp_group().world_size != 1
-        or config.pipeline_parallel_size != 1
-        or config.moe_backend != "standard"
-        or config.enable_tbo
-        or config.enable_tbo_decode
-        or config.enable_rapidserve
-        or config.enable_expert_parallel
-        or config.eplb_enable
-        or config.fake_eplb
-        or config.speculative_config is not None
-        or config.torch_dtype != torch.bfloat16
-        or is_plugin_mode()
-    ):
-        return (
-            "needs native BF16 SP with TP1/DP1/PP1, without TBO, RapidServe, "
-            "speculative decoding, EP or EPLB"
-        )
+    # Config._init_sequence_parallel refuses the rest.
+    if config.eplb_enable or config.fake_eplb:
+        return "needs static expert placement, without EPLB"
+    if config.torch_dtype != torch.bfloat16:
+        return "needs BF16 activations"
     if get_gfx_runtime() != "gfx950":
         return "needs gfx950"
-    # Forward hooks on the decoder layers and their MoE never see a fused block.
+    # The dump hooks FusedMoE.forward, which comm-fused dispatch bypasses.
     if envs.ATOM_FWD_DUMP_DIR:
         return "ATOM_FWD_DUMP_DIR hooks every layer's forward"
     return None
 
 
-def _model_layers(model, config):
-    """The registered `(layers, norm_eps)` of the model, or None.
+def _model_layers(model):
+    """The MoE layers whose model dispatches through `forward_maybe_comm_fused`.
 
-    The model runs each layer's FFN region through `sp_mega_moe_block`: the
-    post-attention GemmaRMSNorm, the router, the experts, and the next layer's
-    input GemmaRMSNorm, each with its own eps. The fused tail is built for
-    `norm_eps`; a next norm with another eps runs unfused.
+    Not `isinstance(module, FusedMoE)`: that name is the plugin-mode lazy
+    wrapper, a subclass the built layers are not instances of.
     """
-    from atom.models.registry import sp_mega_moe_layers
-    from atom.utils import resolve_obj_by_qualname
-
-    find = sp_mega_moe_layers.get(config.hf_config.architectures[0])
-    return None if find is None else resolve_obj_by_qualname(find)(model)
+    return [
+        module
+        for module in model.modules()
+        if getattr(module, "enable_comm_fused", False)
+    ]
 
 
 # MegaMoeTP setup failures that AITER gathers and raises on every rank.
@@ -440,20 +286,22 @@ def _plan(config, layers):
     }
     if len(shapes) != 1:
         return "the shared runtime needs one expert shape across layers"
-    shape = shapes.pop()
-    from atom.model_ops.gemma_norm_fp8 import gemma_rms_norm_fp8_supported
+    try:
+        from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP  # noqa: F401
+    except ImportError as exc:
+        return f"MegaMoeTP unavailable: {exc}"
+    return shapes.pop()
 
-    # Rows the fused tail does not cover are normalized with the same rule.
-    if not gemma_rms_norm_fp8_supported(shape[0]):
-        return f"no fused Gemma RMSNorm FP8 kernel for hidden size {shape[0]}"
+
+def _probe_mori():
+    """Why MORI cannot be imported, or None."""
     try:
         from aiter.ops.communication import _mori
-        from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP  # noqa: F401
 
         _mori()
     except ImportError as exc:
-        return f"MegaMoeTP unavailable: {exc}"
-    return shape
+        return f"MORI unavailable for the big-M kernel: {exc}"
+    return None
 
 
 def initialize_sp_mega_moe(model, config):
@@ -472,10 +320,9 @@ def initialize_sp_mega_moe(model, config):
         config.sp_mega_moe_enabled = False
         log("SP MegaMoE disabled, native MoE kept on every layer: %s", reason)
 
-    found = _model_layers(model, config)
-    if not found or not found[0]:
+    layers = _model_layers(model)
+    if not layers:
         return skip("the model has no MoE layers it can run through it", logger.info)
-    layers, tail_eps = found
     group = get_sp_group()
     plan = _plan(config, layers)
     # A rank-local verdict (an import, a layout) must not split the ranks before
@@ -488,6 +335,7 @@ def initialize_sp_mega_moe(model, config):
     max_local_rows = local_token_tile(config.max_num_batched_tokens, group.world_size)
     # Prefill needs larger row tiles than AITER's default.
     lb_mt = "6"
+    runtime = None
     try:
         runtime = MegaMoeTP(
             MegaMoeTPConfig(
@@ -503,7 +351,6 @@ def initialize_sp_mega_moe(model, config):
                 comm_mode="ag_rs",
                 comm_dtype="fp8",
                 lb_mt=lb_mt,
-                tail_eps=tail_eps,
                 fit_max_local=True,
             ),
             **_weights(layers[0]),
@@ -511,20 +358,26 @@ def initialize_sp_mega_moe(model, config):
             device=layers[0].w13_weight.device,
         )
         tile = runtime.max_local_tokens
+        # MORI's SDMA queues serve the big-M kernel only.
+        if 0 < runtime.bigm_m <= tile:
+            mori = _probe_mori()
+            if not group_agree(mori is None, group.cpu_group):
+                runtime.close()
+                return skip(mori or "another SP rank cannot import MORI")
         # Prepare each distinct launch variant once. Cover every possible
         # remainder of a local tile so an unseen graph bucket cannot compile
         # during capture.
         representatives = {}
         for rows in range(1, tile + 1):
-            # Tail eligibility can change inside a launch bucket (TN_MAX).
-            key = (runtime.launch_config(rows), runtime.tail_ok(rows))
-            representatives.setdefault(key, rows)
-        runtime.prepare(sorted(representatives.values()), tail=True, tail_bf16=True)
+            representatives.setdefault(runtime.launch_config(rows), rows)
+        runtime.prepare(sorted(representatives.values()))
     except RuntimeError as exc:
         # Any other failure (OOM, a compile error) may hit one rank while its
         # peers wait in a collective; falling back there alone desyncs them.
         if not str(exc).startswith(_AGREED_SETUP_FAILURES):
             raise
+        if runtime is not None:
+            runtime.close()
         return skip(f"MegaMoeTP setup failed on every rank: {exc}")
     # The big-M warmup leaves a timed-out wait in the sticky bits only.
     bits = group_max(runtime.poll_errors(), group.cpu_group)
@@ -533,10 +386,10 @@ def initialize_sp_mega_moe(model, config):
         return skip(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
     backend = SPMegaMoE(runtime, layers[0], len(layers), group.cpu_group)
     for layer in layers:
-        layer.sp_mega_moe = backend
+        layer._comm_fused_moe = backend
     logger.info(
         "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens, "
-        "lb_mt=%s. Each tail supplies the next GemmaNorm/FP8 (final layer BF16).",
+        "lb_mt=%s.",
         len(layers),
         tile,
         lb_mt,
