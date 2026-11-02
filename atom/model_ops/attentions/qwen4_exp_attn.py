@@ -75,16 +75,13 @@ QSA_ROWS = "qsa"
 QSA_DRAFT_ROWS = "qsa_draft"
 
 
-# The QSA field rules. The arena, the layers binding its rows, the PAGE
-# namespace and `_check_kv_transfer` all read these.
-
-
-def qsa_caches_quantized(config) -> bool:
-    return qsa_cache_formats(config) != ("bf16", "bf16")
+# The QSA field rules. The arena, the layers binding its rows and the PAGE
+# namespace all read these.
 
 
 def qsa_draft_rows(config) -> bool:
-    return bool(envs.ATOM_QSA_DRAFT_KV_BF16) and qsa_caches_quantized(config)
+    quantized = qsa_cache_formats(config) != ("bf16", "bf16")
+    return bool(envs.ATOM_QSA_DRAFT_KV_BF16) and quantized
 
 
 def qsa_row_space(config, layer_num: int, num_target_layers: int) -> str:
@@ -119,8 +116,7 @@ def _kv_transfer_leaves(config) -> list[str]:
 def _check_kv_transfer(config) -> None:
     """Qwen3.8's GDN and PLE state ride the PAGE checkpoint image, so only an
     offload tier registered with `reads_page_images` may run."""
-    leaves = _kv_transfer_leaves(config)
-    for name in leaves:
+    for name in _kv_transfer_leaves(config):
         if not KVConnectorFactory.is_offload_backend(name):
             # A P/D connector moves the QSA pages alone, and decode would
             # continue from a zero recurrent state: wrong output, no error.
@@ -138,17 +134,6 @@ def _check_kv_transfer(config) -> None:
                 f"kv_connector={name!r} does not read the QSA/GDN/PLE PAGE "
                 "checkpoint image."
             )
-    if "lmcache_offload" in leaves and qsa_caches_quantized(config):
-        # The in-process codec copies what `build_kv_cache_tensor` hands it:
-        # no scale planes, so a CPU hit restores rows under stale scales.
-        raise ValueError(
-            "Qwen3.8 lmcache_offload does not carry the scale planes of a "
-            "quantized QSA cache yet (kv_cache_dtype="
-            f"{getattr(config, 'kv_cache_dtype', None)!r}, index_cache_dtype="
-            f"{getattr(config, 'index_cache_dtype', None)!r}). Use "
-            "--kv-cache-dtype bf16 --index-cache-dtype bf16, or lmcache_mp, "
-            "which stores every QSA field; ROCm/ATOM#2655 lifts this."
-        )
 
 
 class _PlePlane(NamedTuple):
@@ -661,12 +646,18 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
-            k_scale=None,
-            v_scale=None,
+            k_scale=optional("k_scale"),
+            v_scale=optional("v_scale"),
             extra_planes=tuple(
                 plane
                 for plane in map(
-                    optional, ("index_raw", "index_compressed", "rope_positions")
+                    optional,
+                    (
+                        "index_raw",
+                        "index_compressed",
+                        "rope_positions",
+                        "index_compressed_scale",
+                    ),
                 )
                 if plane is not None
             ),

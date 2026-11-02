@@ -87,9 +87,8 @@ and draft share the embedding and output head.
 - Only native MTP speculation is supported. Pipeline parallelism, context
   parallelism, DP attention, and TBO are not supported.
 - LMCache offload (`lmcache_offload`, `lmcache_mp`) stores the QSA pages plus
-  a checkpoint of the GDN and PLE state. Until ROCm/ATOM#2655,
-  `lmcache_offload` needs `--kv-cache-dtype bf16 --index-cache-dtype bf16`.
-  P/D connectors are rejected: they would move the pages without the state.
+  a checkpoint of the GDN and PLE state. P/D connectors are rejected: they
+  would move the pages without the state.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
 - Video inference and long-context accuracy have not been validated.

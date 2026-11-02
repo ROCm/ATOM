@@ -371,68 +371,6 @@ def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, re
     assert cls._wants_paged_checkpoints(builder, config) is reads
 
 
-_IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
-_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
-
-
-def _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    from atom.model_ops.attentions.qwen4_exp_attn import _check_kv_transfer
-
-    _check_kv_transfer(
-        SimpleNamespace(
-            kv_transfer_config=kv_transfer_config,
-            kv_cache_dtype=kv_cache_dtype,
-            index_cache_dtype=index_cache_dtype,
-        )
-    )
-
-
-@pytest.mark.parametrize(
-    "kv_cache_dtype, index_cache_dtype",
-    [
-        ("fp8", None),  # the index cache follows the KV cache
-        ("fp8", "fp8"),
-        ("fp8", "bf16"),
-        ("bf16", "fp8"),
-        ("bf16", "fp4"),
-        ("auto", "fp4"),
-    ],
-)
-@pytest.mark.parametrize(
-    "kv_transfer_config",
-    [
-        _IN_PROCESS,
-        {"kv_connector": "multi", "connectors": [_MP, _IN_PROCESS]},
-    ],
-)
-def test_qwen38_refuses_in_process_offload_of_quantized_caches(
-    kv_transfer_config, kv_cache_dtype, index_cache_dtype
-):
-    """The in-process codec has no field for the QSA scale planes."""
-    with pytest.raises(ValueError, match="lmcache_offload.*#2655"):
-        _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
-
-
-@pytest.mark.parametrize(
-    "kv_transfer_config, kv_cache_dtype, index_cache_dtype",
-    [
-        (_IN_PROCESS, "bf16", "bf16"),
-        (_IN_PROCESS, "bf16", None),
-        (_IN_PROCESS, "auto", "bfloat16"),
-        (_IN_PROCESS, None, None),
-        (_MP, "fp8", None),
-        (_MP, "fp8", "fp4"),
-        (_MP, "bf16", "fp8"),
-        (None, "fp8", "fp8"),
-    ],
-)
-def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
-    kv_transfer_config, kv_cache_dtype, index_cache_dtype
-):
-    _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
-
-
 _MTP = SimpleNamespace(method="mtp")
 
 
