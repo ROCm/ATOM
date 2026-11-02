@@ -33,6 +33,7 @@ from atom.models.qwen3_5 import (
     get_fused_expert_mapping,
     load_fused_expert_weights,
 )
+from atom.models.qwen3_5_gdn_in_proj import _apply_merged_in_proj_mapping
 from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.attention_backend.attention_gdn import (
     SGLangGDNForwardContext,
@@ -59,14 +60,6 @@ _PACKED_MODULES_MAPPING = {
     "in_proj_a": ("in_proj_ba", 1),
     ".gate.": (".gate.", 0),
     "shared_expert_gate": ("gate", 1),
-}
-
-
-_BF16_IN_PROJ_MAPPING = {
-    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvzba", 3),
-    "in_proj_b": ("in_proj_qkvzba", 4),
-    "in_proj_a": ("in_proj_qkvzba", 5),
 }
 
 
@@ -137,14 +130,9 @@ def _validate_qwen35_runtime_contract(
 
 
 def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Any) -> dict:
-    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
-        return mapping
-
-    mapping.pop("in_proj_qkvz", None)
-    mapping.pop("in_proj_ba", None)
-    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
-    mapping.update(_BF16_IN_PROJ_MAPPING)
-    return mapping
+    # Not only BF16: the same decision the ATOM layer construction makes (also
+    # per-token FP8), so the mapping always names the modules that exist.
+    return _apply_merged_in_proj_mapping(mapping, atom_config)
 
 
 def _make_qwen35_hf_mapper(language_model_prefix: str) -> WeightsMapper:

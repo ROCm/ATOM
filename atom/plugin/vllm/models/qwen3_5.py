@@ -17,6 +17,7 @@ from atom.models.qwen3_5 import (
     load_fused_expert_weights,
     maybe_prefix,
 )
+from atom.models.qwen3_5_gdn_in_proj import gdn_in_proj_is_merged
 from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -151,10 +152,9 @@ class Qwen3_5ForConditionalGeneration_(vLLMQwen3_5):
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.atom_config = atom_config
-        if (
-            self.atom_config.quant_config.global_quant_config.quant_dtype
-            == torch.bfloat16
-        ):
+        # The decision the ATOM layer construction makes (BF16, or per-token
+        # FP8), so the mapping names the modules that exist.
+        if gdn_in_proj_is_merged(self.atom_config):
             self.packed_modules_mapping.pop("in_proj_qkv")
             self.packed_modules_mapping.pop("in_proj_b")
             self.packed_modules_mapping.pop("in_proj_a")
@@ -235,10 +235,9 @@ class Qwen3_5MoeForConditionalGeneration_(vLLMQwen3_5Moe):
         config: Qwen3_5MoeConfig = atom_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
-        if (
-            self.atom_config.quant_config.global_quant_config.quant_dtype
-            == torch.bfloat16
-        ):
+        # The decision the ATOM layer construction makes (BF16, or per-token
+        # FP8), so the mapping names the modules that exist.
+        if gdn_in_proj_is_merged(self.atom_config):
             self.packed_modules_mapping.pop("in_proj_qkv")
             self.packed_modules_mapping.pop("in_proj_b")
             self.packed_modules_mapping.pop("in_proj_a")
