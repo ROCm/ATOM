@@ -9,6 +9,7 @@ import torch
 rows_module = pytest.importorskip("atom.model_ops.indexer.rows", exc_type=ImportError)
 
 
+@pytest.mark.parametrize("is_decode", [False, True], ids=["prefill", "decode"])
 @pytest.mark.parametrize(
     "heads,max_qlen,pages_per_block",
     [
@@ -16,14 +17,16 @@ rows_module = pytest.importorskip("atom.model_ops.indexer.rows", exc_type=Import
         (64, 4, 1),
         (64, 6, 1),
         (64, 8, 1),
+        (64, 9, 1),
         (64, 20, 1),
+        (64, 8192, 1),
         (32, 3, 1),
         (32, 3, 16),
         (32, 20, 32),
     ],
 )
 def test_opus_bands_keep_sequence_mapping_and_schedule_identity(
-    monkeypatch, heads, max_qlen, pages_per_block
+    monkeypatch, heads, max_qlen, pages_per_block, is_decode
 ):
     calls = []
 
@@ -65,6 +68,7 @@ def test_opus_bands_keep_sequence_mapping_and_schedule_identity(
             heads=heads,
             page_size=8 if heads == 32 else 64,
             layout=rows_module.NATURAL,
+            is_decode=is_decode,
             bands=((0, 3), (3, 6)),
             storage=storages[ubatch],
         ).fp4_bands
@@ -80,7 +84,7 @@ def test_opus_bands_keep_sequence_mapping_and_schedule_identity(
     assert (
         first[1]["query_start_loc"].data_ptr() != other[1]["query_start_loc"].data_ptr()
     )
-    if heads == 64 and max_qlen <= 8:
+    if is_decode and heads == 64 and max_qlen <= 8:
         assert len(calls) == 6
         assert calls[0][3] is calls[2][3]
         assert calls[0][3] is not calls[4][3]
@@ -200,6 +204,7 @@ def test_gfx950_query_layout_logits_and_graph_replay(qlen):
             heads=64,
             page_size=64,
             layout=rows_module.MFMA,
+            is_decode=True,
             storage=storage,
             bands=((0, qlen + 1), (qlen + 1, count)),
         )

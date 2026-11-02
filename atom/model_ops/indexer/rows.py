@@ -26,6 +26,10 @@ NATURAL = "natural"
 # gfx950 OPUS: MFMA-permuted scales, distinct from FlyDSL's preshuffle.
 MFMA = "mfma"
 
+# ATOM shares a TABLE schedule across V4 layers only for short decode groups.
+# Longer groups keep the config-selected mode; this is not a prefill detector.
+_V4_SHARED_SCHEDULE_MAX_QLEN = 8
+
 
 class IndexCache(NamedTuple):
     """A layer's index keys: FP8 `values` with their scales inline, or FP4
@@ -247,6 +251,7 @@ def fp4_rows(
     heads: int,
     page_size: int,
     layout: str = PRESHUFFLE,
+    is_decode: bool = False,
     row_tables: torch.Tensor | None = None,
     row_starts: torch.Tensor | None = None,
     bands: tuple[tuple[int, int], ...] | None = None,
@@ -256,7 +261,8 @@ def fp4_rows(
 ) -> IndexRows:
     """FP4 rows, a sequence's together (`sequences`), each band's launch
     prepared here, once: the row-group plan (preshuffle) or the OPUS config
-    (natural/MFMA), with a shared schedule for V4 decode.
+    (natural/MFMA). `is_decode` enables a shared schedule for short V4 decode
+    groups; prefill (including short chunks) and V4.1 keep the config's mode.
     `page_size` is the cache's index rows a block. Without `sequences` each
     row is a sequence of its own on its own `row_tables` row, a band's
     starting at `row_starts` (`[rows + 1]`, 0 .. rows). Rows a graph records
@@ -298,7 +304,11 @@ def fp4_rows(
             # V4 amortizes one decode schedule across its indexer layers.
             # Prefill and V4.1 use the config-selected schedule-free mode.
             schedule = None
-            if heads == 64 and band.max_qlen <= 8:
+            if (
+                is_decode
+                and heads == 64
+                and band.max_qlen <= _V4_SHARED_SCHEDULE_MAX_QLEN
+            ):
                 schedule = mqa_logits_mxfp4_schedule(
                     cfg,
                     band.query_start_loc,

@@ -1079,15 +1079,23 @@ def _batch_ids(rows):
     return torch.repeat_interleave(torch.arange(rows.shape[0]), torch.from_numpy(rows))
 
 
+@pytest.mark.parametrize("state", ["DECODE", "PREFILL_NATIVE", "PREFILL_PREFIX"])
 @pytest.mark.parametrize("layout", ["fp4-gfx950-opus", "fp4-gfx1250-natural"])
 def test_opus_index_rows_keep_request_starts_and_split(
-    v4_builder_cls, monkeypatch, layout
+    v4_builder_cls, monkeypatch, layout, state
 ):
     rows = pytest.importorskip("atom.model_ops.indexer.rows", exc_type=ImportError)
     module = v4_builder_cls._index_rows.__globals__
     monkeypatch.setitem(module, "fp4_rows", rows.fp4_rows)
     monkeypatch.setitem(module, "Fp4MqaRaggedMetadata", rows.Fp4MqaRaggedMetadata)
-    cfg, schedule = SimpleNamespace(block_table_width=2), object()
+
+    class Config:
+        block_table_width = 2
+
+        def schedule_buffers(self):
+            return object()
+
+    cfg, schedule = Config(), object()
     monkeypatch.setattr(rows, "mqa_logits_mxfp4_config", lambda *a, **kw: cfg)
     monkeypatch.setattr(rows, "mqa_logits_mxfp4_schedule", lambda *a, **kw: schedule)
     builder = v4_builder_cls.__new__(v4_builder_cls)
@@ -1096,21 +1104,31 @@ def test_opus_index_rows_keep_request_starts_and_split(
     builder.index_logits_workspace = None
     builder.index_n_heads = 64
     builder.csa_rows_per_block = 64
+    builder._fp4_launches = rows.Fp4LaunchStorages("cpu", 3, 2)
     metadata = SimpleNamespace(
-        max_seqlen_q=9, block_tables=torch.tensor([[2], [5]], dtype=torch.int32)
+        max_seqlen_q=9,
+        block_tables=torch.tensor([[2], [5]], dtype=torch.int32),
+        state=module["AttnState"][state],
     )
     starts = torch.tensor([0, 1, 3], dtype=torch.int32)
     ends = torch.tensor([65, 7, 8], dtype=torch.int32)
     split = rows.RowSplit.striped(13, 2, 4)
 
     result = builder._index_rows(
-        metadata, ends, 128, query_start_loc=starts, max_qlen=2, split=split
+        metadata,
+        ends,
+        128,
+        query_start_loc=starts,
+        max_qlen=2,
+        split=split,
+        recorded_as="" if state == "DECODE" else None,
     )
 
     assert result.split is split
     assert result.bands == ((0, 3),)
     [launch] = result.fp4_bands
-    assert launch["cfg"] is cfg and launch["schedule"] is schedule
+    assert launch["cfg"] is cfg
+    assert launch["schedule"] is (schedule if state == "DECODE" else None)
     assert launch["query_start_loc"].tolist() == starts.tolist()
     assert launch["row_ends"].tolist() == ends.tolist()
     assert launch["block_tables"].tolist() == [[2, 0], [5, 0]]

@@ -2313,6 +2313,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ),
             split=split,
             storage=storage,
+            is_decode=attn_metadata.state is AttnState.DECODE,
         )
 
     def prepare_mtp_decode(
