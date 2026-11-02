@@ -281,6 +281,98 @@ class AlwaysHitShapeEnv:
         return ""
 
 
+_managed_compiler_cache_dirs: dict[str, str] = {}
+
+
+def _is_default_compiler_cache(name: str, path: str, default_root: str) -> bool:
+    """Recognize PyTorch's temporary defaults, not arbitrary user temp paths."""
+    root = default_root
+    path = os.path.abspath(path)
+    if name == "TORCHINDUCTOR_CACHE_DIR":
+        return path == root
+    triton_root = os.path.join(root, "triton")
+    try:
+        return os.path.commonpath((path, triton_root)) == triton_root
+    except ValueError:
+        return False
+
+
+def _initialize_inductor_cache_dirs(
+    base_cache_dir: str, *, preserve_user_paths: bool = False
+) -> None:
+    """Redirect future compiler work; preserve standalone caller-owned caches.
+
+    Standalone may inherit defaults installed by PyTorch before the backend
+    runs. Redirect those defaults, unset values, and paths we set ourselves.
+    Respect other existing values (e.g. atomesh deployment configuration).
+    When only Inductor has a caller-owned root, automatically selected Triton
+    storage follows its ``triton`` child so a single persistent mount suffices.
+    The regular adaptor retains its historical unconditional redirection.
+    Earlier artifacts are not migrated. Level-0 execution bypasses this
+    backend and should configure its cache environment at process startup.
+    """
+    names = (
+        ("TORCHINDUCTOR_CACHE_DIR", "inductor_cache"),
+        ("TRITON_CACHE_DIR", "triton_cache"),
+    )
+    # Classify both variables against one pre-mutation snapshot. Do not let
+    # selecting the Inductor destination change how Triton's old value is read.
+    previous = {name: os.environ.get(name) for name, _ in names}
+    caller_owned: set[str] = set()
+    if preserve_user_paths:
+        from torch._inductor.runtime.runtime_utils import default_cache_dir
+
+        default_root = os.path.abspath(default_cache_dir())
+        for name, value in previous.items():
+            if (
+                value is not None
+                and value != _managed_compiler_cache_dirs.get(name)
+                and not _is_default_compiler_cache(name, value, default_root)
+            ):
+                caller_owned.add(name)
+
+    for name, subdir in names:
+        if name in caller_owned:
+            continue
+        selected = os.path.join(base_cache_dir, subdir)
+        # If the deployment mounts only its explicit Inductor root, keep an
+        # automatically selected Triton cache under that same persistent mount.
+        # An explicit Triton path always wins. An explicitly empty Inductor
+        # value is preserved, but is not treated as a usable parent directory.
+        if (
+            name == "TRITON_CACHE_DIR"
+            and "TORCHINDUCTOR_CACHE_DIR" in caller_owned
+            and previous["TORCHINDUCTOR_CACHE_DIR"]
+        ):
+            selected = os.path.join(previous["TORCHINDUCTOR_CACHE_DIR"], "triton")
+        os.makedirs(selected, exist_ok=True)
+        os.environ[name] = selected
+        _managed_compiler_cache_dirs[name] = selected
+    logger.info(
+        "Compiler cache directories: Inductor=%s, Triton=%s",
+        os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
+        os.environ.get("TRITON_CACHE_DIR"),
+    )
+
+
+def _initialize_inductor_cache(
+    adaptor,
+    cache_dir: str,
+    disable_cache: bool,
+    prefix: str,
+    *,
+    preserve_user_paths: bool = False,
+) -> None:
+    """Initialize shared ownership metadata before redirecting compilers."""
+    adaptor.cache_dir = cache_dir
+    adaptor.prefix = prefix
+    adaptor.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
+    if not disable_cache:
+        _initialize_inductor_cache_dirs(
+            adaptor.base_cache_dir, preserve_user_paths=preserve_user_paths
+        )
+
+
 def get_inductor_factors() -> list[Any]:
     factors: list[Any] = []
     # summarize system state
@@ -331,21 +423,7 @@ class InductorAdaptor(CompilerInterface):
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ):
-        self.cache_dir = cache_dir
-        self.prefix = prefix
-        self.base_cache_dir = cache_dir[: -len(prefix)] if prefix else cache_dir
-        if disable_cache:
-            return
-        # redirect the cache directory to a sub-directory
-        # set flags so that Inductor and Triton store their cache
-        # in the cache_dir, then users only need to copy the cache_dir
-        # to another machine to reuse the cache.
-        inductor_cache = os.path.join(self.base_cache_dir, "inductor_cache")
-        os.makedirs(inductor_cache, exist_ok=True)
-        os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
-        triton_cache = os.path.join(self.base_cache_dir, "triton_cache")
-        os.makedirs(triton_cache, exist_ok=True)
-        os.environ["TRITON_CACHE_DIR"] = triton_cache
+        _initialize_inductor_cache(self, cache_dir, disable_cache, prefix)
 
     def compile(
         self,
@@ -675,7 +753,9 @@ class InductorStandaloneAdaptor(CompilerInterface):
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
     ):
-        self.cache_dir = cache_dir
+        _initialize_inductor_cache(
+            self, cache_dir, disable_cache, prefix, preserve_user_paths=True
+        )
 
     def compile(
         self,
