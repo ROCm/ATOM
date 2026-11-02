@@ -2134,3 +2134,14 @@ def test_incremental_tokens_restart_from_zero_resets_worker_cache():
     sched._shipped_tokens.clear()  # the drop has not reached the worker
     assert _ship_save(sched, worker, seq, 256).token_ids == list(range(256))
     assert _ship_save(sched, worker, seq, 800).token_ids == list(range(800))
+
+
+def test_token_cache_drops_alone_are_dispatchable_work():
+    """A drop must reach the workers even when no transfer runs this step."""
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
+
+    meta = LMCacheOffloadMetadata()
+    assert not connector_metadata_has_work(meta)
+    meta.token_cache_drops = [7]
+    assert connector_metadata_has_work(meta)
