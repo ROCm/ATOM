@@ -281,6 +281,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # Pad the unquantized MoE router weight's rows to a multiple of 16 and run
+    # its decode-M GEMM on the tuned FlyDSL hgemm in atom/model_ops/router_gemm.py
+    # (Qwen3-Next / Qwen3.5 merged router + shared_expert_gate). 0 keeps
+    # tgemm.mm on the unpadded weight (hipBLASLt for N=513).
+    "ATOM_ROUTER_FLYDSL_GEMM": lambda: (
+        os.getenv("ATOM_ROUTER_FLYDSL_GEMM", "1") == "1"
+    ),
+    # Qwen3-Next / Qwen3.5 MoE router logits in fp32 instead of bf16. With
+    # ATOM_ROUTER_FLYDSL_GEMM the split-K partials then meet in fp32 atomics
+    # (one final rounding, to fp32) rather than bf16 ones.
+    "ATOM_ROUTER_LOGITS_FP32": lambda: (
+        os.getenv("ATOM_ROUTER_LOGITS_FP32", "1") == "1"
+    ),
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
         os.getenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", "0") == "1"
     ),
@@ -975,6 +988,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
+    ),
+    # Softmax top-k + sigmoid fused-shared routing (Qwen3-Next / Qwen3.5) runs
+    # the Triton router up to this many tokens, AITER topk_softmax above it;
+    # 0 always uses AITER.
+    "ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS", "128")
     ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (

@@ -8,6 +8,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
+from atom.model_ops.router_gemm import use_triton_topk_softmax
 from atom.model_ops.utils import _has_module
 from atom.quant_spec import fuses_mxfp8_shared_into_mxfp4
 from atom.utils import envs
@@ -201,6 +202,27 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
+@lru_cache(maxsize=1)
+def _triton_topk_softmax_max_tokens() -> int:
+    return envs.ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS
+
+
+def _use_triton_topk_softmax(
+    gating_output: torch.Tensor,
+    num_fused_shared_experts: int,
+    fused_shared_experts_scoring_func: str,
+    num_valid_rows: torch.Tensor | None = None,
+) -> bool:
+    """See ``router_gemm.use_triton_topk_softmax``."""
+    return use_triton_topk_softmax(
+        gating_output,
+        num_fused_shared_experts,
+        fused_shared_experts_scoring_func,
+        num_valid_rows,
+        _triton_topk_softmax_max_tokens(),
+    )
+
+
 def rocm_aiter_topk_softmax_impl(
     gating_output: torch.Tensor,
     topk: int,
@@ -222,24 +244,41 @@ def rocm_aiter_topk_softmax_impl(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
-    token_expert_indicies = torch.empty(
-        gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
-    )
     if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
-    topk_softmax(
-        topk_weights,
-        topk_ids,
-        token_expert_indicies,
+    if _use_triton_topk_softmax(
         gating_output,
-        renormalize,
-        fused_shared_experts_for_kernel,
+        num_fused_shared_experts,
         fused_shared_experts_scoring_func,
         num_valid_rows,
-    )
+    ):
+        from atom.model_ops.triton_topk_softmax import triton_topk_softmax_op
+
+        triton_topk_softmax_op(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            topk,
+            renormalize,
+            fused_shared_experts_for_kernel,
+        )
+    else:
+        token_expert_indicies = torch.empty(
+            token, topk, dtype=torch.int32, device=gating_output.device
+        )
+        topk_softmax(
+            topk_weights,
+            topk_ids,
+            token_expert_indicies,
+            gating_output,
+            renormalize,
+            fused_shared_experts_for_kernel,
+            fused_shared_experts_scoring_func,
+            num_valid_rows,
+        )
     if num_fused_shared_experts > 0:
         return total_topk_weights, total_topk_ids
     return topk_weights, topk_ids

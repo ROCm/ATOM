@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import itertools
 import logging
 from collections.abc import Callable
@@ -29,6 +30,12 @@ from torch import nn
 
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.router_gemm import (
+    padded_router_rows,
+    router_flydsl_params,
+    router_kernel_table,
+    select_router_kernel,
+)
 from atom.model_ops.utils import (
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -2760,3 +2767,116 @@ class MergedReplicatedLinear(ReplicatedLinear):
             shard_size = self.output_sizes[loaded_shard_id]
         param_data = param_data.narrow(0, shard_offset, shard_size)
         param.weight_loader_process(param_data, loaded_weight)
+
+
+@functools.cache
+def _router_kernel_table(padded_rows: int, k: int):
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+    return router_kernel_table(get_gfx(), get_cu_num(), padded_rows, k)
+
+
+def _padded_router_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], weight.shape[0], dtype=out_dtype, device=x.device)
+
+
+@torch_compile_guard(gen_fake=_padded_router_gemm_fake, mutates_args=[])
+def padded_router_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    """``x[M, K] @ weight[N_pad, K]^T`` (bf16 in, ``out_dtype`` out) for a
+    row-padded router weight.
+
+    M is only known here, inside the op, so the M-bucketed choice
+    (``atom/model_ops/router_gemm.py``) is made per call: the tuned FlyDSL
+    hgemm for M the table covers, ``tgemm.mm`` above it. With an fp32
+    ``out_dtype`` the split-K partials meet in fp32 atomics instead of bf16.
+    """
+    table = _router_kernel_table(weight.shape[0], weight.shape[1])
+    kernel_name = select_router_kernel(table, x.shape[0]) if table else None
+    if kernel_name is None:
+        return tgemm.mm(x, weight, None, otype=out_dtype)
+    from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
+
+    p = router_flydsl_params(kernel_name)
+    return flydsl_hgemm(
+        x,
+        weight,
+        block_m=p["block_m"],
+        block_n=p["block_n"],
+        block_k=p["block_k"],
+        split_k=p["split_k"],
+        m_waves=p["m_waves"],
+        n_waves=p["n_waves"],
+        k_waves=p["k_waves"],
+        stages=p["stages"],
+        group_m=p["group_m"],
+        policy=("ht" if p["use_half_tile_interleaved"] else "ft"),
+        out_dtype=out_dtype,
+    )
+
+
+class MergedReplicatedRouterLinear(MergedReplicatedLinear):
+    """An unquantized bf16 MoE router whose decode GEMM runs on a tuned kernel.
+
+    After loading, the weight's rows are zero-padded to a multiple of 16 and
+    the forward runs ``padded_router_gemm`` on the padded weight, returning
+    the first ``output_size`` columns (a view with the padded row stride) in
+    ``otype`` (bf16 or fp32). Only a shape ``router_gemm.py`` has a kernel
+    table for is converted; any other shape, a quantized or biased router, and
+    ``ATOM_ROUTER_FLYDSL_GEMM=0`` keep ``MergedReplicatedLinear``'s
+    ``tgemm.mm`` path unchanged.
+    """
+
+    uses_router_gemm = False
+
+    def process_weights_after_loading(self):
+        super().process_weights_after_loading()
+        if not envs.ATOM_ROUTER_FLYDSL_GEMM:
+            return
+        if (
+            self.quant_type.value != QuantType.No.value
+            or self.bias is not None
+            or self.weight.dtype != torch.bfloat16
+            or self.weight.dim() != 2
+        ):
+            return
+        rows, k = self.weight.shape
+        padded_rows = padded_router_rows(rows)
+        table = _router_kernel_table(padded_rows, k)
+        if not table:
+            return
+        unknown = [n for _, n in table if router_flydsl_params(n) is None]
+        if unknown:
+            # The installed aiter's FlyDSL catalog no longer parses a name the
+            # table was tuned with, or FlyDSL is not installed; the old path is
+            # still correct.
+            logger.warning(
+                "%s: router FlyDSL kernels %s unavailable in this aiter; "
+                "keeping the tgemm path",
+                self.prefix,
+                unknown,
+            )
+            return
+        if padded_rows != rows:
+            self.weight.data = torch.nn.functional.pad(
+                self.weight.data, (0, 0, 0, padded_rows - rows)
+            )
+        self.uses_router_gemm = True
+
+    @mark_trace
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+        otype=dtypes.bf16,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.uses_router_gemm:
+            return super().forward(x, x_scale=x_scale, otype=otype, out=out)
+        assert x_scale is None and out is None and x.dtype == torch.bfloat16
+        assert otype in (torch.bfloat16, torch.float32), otype
+        y = padded_router_gemm(x.reshape(-1, x.shape[-1]), self.weight, otype)
+        return y.view(*x.shape[:-1], y.shape[-1])[..., : self.output_size]
