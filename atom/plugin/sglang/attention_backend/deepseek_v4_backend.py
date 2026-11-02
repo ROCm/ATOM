@@ -64,8 +64,16 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
             self.forward_metadata = forward_batch
 
         if not (in_capture or hasattr(forward_batch, "actual_forward_mode")):
-            self.atom_v4_graph_metadata = None
-            return
+            # Eagle draft replay calls this with the live batch and no
+            # ``actual_forward_mode``. Skipping it left the captured state-slot
+            # buffer on the capture dummy (slot 0) while the request's SWA ring
+            # lives on the allocator slot. Rebuild decode so the replay reads
+            # the same ring the prefill wrote.
+            mode = getattr(forward_batch, "forward_mode", None)
+            is_decode = bool(mode is not None and mode.is_decode_or_idle())
+            if not is_decode:
+                self.atom_v4_graph_metadata = None
+                return
         from atom.plugin.sglang.deepseek_v4_bridge import (
             build_atom_v4_attention_metadata_from_sglang,
             build_atom_v4_decode_graph_metadata_from_sglang,
