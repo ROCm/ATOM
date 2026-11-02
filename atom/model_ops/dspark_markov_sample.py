@@ -385,8 +385,7 @@ def _fused_is_supported(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
 ) -> bool:
-    num_rows, vocab_size = base_logits.shape
-    rank = markov_w2.shape[1]
+    num_rows = base_logits.shape[0]
     if not base_logits.is_cuda:
         return False
     # tl.dot wants one dtype for both operands, and bf16/fp16 are the only ones
@@ -402,12 +401,10 @@ def _fused_is_supported(
         return False
     if markov_w2.stride(1) != 1:
         return False
+    # base, W1 and W2 are addressed in int64; only these two are not.
     largest_offset = max(
-        (num_rows - 1) * base_logits.stride(0) + vocab_size,
         (num_rows - 1) * prev_ids.stride(0) + 1,
         (num_rows - 1) * out.stride(0) + 1,
-        (vocab_size - 1) * markov_w1.stride(0) + rank,
-        (vocab_size - 1) * markov_w2.stride(0) + rank,
     )
     return largest_offset <= _MAX_INT32
 
