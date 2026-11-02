@@ -8,7 +8,7 @@ passes still live with the flavor; only the machine is here.
 """
 
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -132,13 +132,6 @@ class DraftGraph:
         }
         return self
 
-    def _assert_declared(self, roles: Iterable[str]) -> None:
-        undeclared = sorted(set(roles) - self._buffers.keys())
-        assert not undeclared, (
-            f"{self.name} has no staged input {', '.join(map(repr, undeclared))}; "
-            f"declared roles are {sorted(self._buffers)}"
-        )
-
     def _batch_of(self, role: str, src: torch.Tensor) -> int:
         return src.shape[-1] if self.inputs[role].batch_last else src.shape[0]
 
@@ -168,7 +161,11 @@ class DraftGraph:
         How many rows are real comes from the sources, never from the caller: a
         count that cannot disagree with the tensor it describes.
         """
-        self._assert_declared(srcs)
+        undeclared = sorted(srcs.keys() - self._buffers.keys())
+        assert not undeclared, (
+            f"{self.name} has no staged inputs {undeclared}; "
+            f"declared roles are {sorted(self._buffers)}"
+        )
         counts = {self._batch_of(role, t) for role, t in srcs.items()}
         assert len(counts) <= 1, (
             f"{self.name} was handed batches of {sorted(counts)}; they "
@@ -185,7 +182,10 @@ class DraftGraph:
         The caller must not mutate this view between that stage and the pass
         consuming it.
         """
-        self._assert_declared((role,))
+        assert role in self._buffers, (
+            f"{self.name} has no staged input {role!r}; "
+            f"declared roles are {sorted(self._buffers)}"
+        )
         assert not self.inputs[role].batch_last, (
             f"{self.name} stages {role!r} batch-last, whose view at one batch is "
             f"not the front of a wider one; hand it to stage instead"
@@ -224,8 +224,8 @@ class DraftGraph:
         )
         assert src.ndim == out.ndim, (
             f"draft input '{role}' of {self.name} arrived as {tuple(src.shape)}, "
-            f"but this pass stages {shape} per sequence "
-            f"with the batch axis {'last' if batch_last else 'leading'}"
+            f"whose {'last' if batch_last else 'leading'} axis is not the batch; "
+            f"this pass stages {shape} per sequence"
         )
         scheduled_bs = self._batch_of(role, src)
         dst = out[..., :scheduled_bs] if batch_last else out[:scheduled_bs]

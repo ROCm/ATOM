@@ -160,7 +160,7 @@ def test_fixed_storage_accessor_checks_role_and_capacity():
 def test_staging_an_undeclared_role_names_it():
     g = _graph()
     with pytest.raises(
-        AssertionError, match=r"'missing'; declared roles are \['row'\]"
+        AssertionError, match=r"\['missing'\]; declared roles are \['row'\]"
     ):
         g.stage(1, {"missing": torch.zeros(1, dtype=torch.int32)})
 
@@ -179,10 +179,15 @@ def test_staging_a_wrong_dtype_fails_loudly():
 
 
 def test_staging_a_source_whose_leading_axis_is_not_the_batch_fails_loudly():
-    """A source whose batch axis is not where its StagedInput says fails here,
-    not as a `copy_` size error two frames down."""
+    """Every leading-batch source is indexed as `[rows, *StagedInput.shape]`.
+
+    MRoPE positions are the live case: they keep the token axis LAST (`[3, N]`),
+    so a drafter must declare them `batch_last`. Without this the mismatch
+    surfaced as a `copy_` size error two frames down, which reads like a
+    batch-size bug rather than a layout one.
+    """
     g = _graph()
-    with pytest.raises(AssertionError, match="batch axis leading"):
+    with pytest.raises(AssertionError, match="leading axis is not the batch"):
         g._stage_one("row", 8, torch.zeros(3, 8, dtype=torch.int32))
 
 
@@ -232,6 +237,9 @@ def test_sources_that_disagree_on_the_batch_are_refused():
                 "b": torch.zeros(5, dtype=torch.int32),
             },
         )
+
+
+def test_batch_last_sources_must_agree_with_leading_ones():
     with pytest.raises(AssertionError, match="batches of"):
         _mrope_graph().stage(
             4,
