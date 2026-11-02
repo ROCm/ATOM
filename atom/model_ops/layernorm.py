@@ -26,6 +26,13 @@ from torch import Tensor, nn
 from torch.overrides import handle_torch_function, has_torch_function_unary
 
 from atom.config import QuantizationConfig
+from atom.model_ops.moe_tail_norm import (
+    MoEGatedSum,
+    can_fuse_moe_tail,
+    gated_sum,
+    moe_tail_rmsnorm,
+    moe_tail_rmsnorm_rows,
+)
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
@@ -1056,11 +1063,52 @@ class GemmaRMSNorm(nn.Module):
             gemma_norm=True,
         )
 
+    @property
+    def takes_moe_gated_sum(self) -> bool:
+        """Whether `forward` / `forward_moe_tail` fold a `MoEGatedSum` input
+        into the norm's kernel (ATOM_FUSED_MOE_TAIL_NORM): the plain add +
+        norm path, not the all-reduce or the FP8-quantizing one."""
+        return not self.fused_allreduce and not self.use_fused_quant
+
+    def forward_moe_tail(
+        self,
+        moe: MoEGatedSum,
+        residual: torch.Tensor,
+        rows: torch.Tensor | None = None,
+        write_residual: bool = True,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """`self(routed + sigmoid(gate) * shared, residual)` in one launch.
+
+        `write_residual=False` (a final norm, whose new residual nobody reads)
+        returns the normed rows alone, and only rows `rows` when given
+        (`out[i]` is row `rows[i]`); otherwise `(normed, new_residual)`.
+        """
+        assert self.takes_moe_gated_sum, "this norm cannot take a MoEGatedSum"
+        if not can_fuse_moe_tail(moe, residual, self.weight, rows):
+            out = self.forward_cuda(gated_sum(moe), residual)
+            if write_residual:
+                return out
+            out = out[0]
+            return out if rows is None else torch.index_select(out, 0, rows)
+        routed, shared, gate = moe
+        if write_residual:
+            assert rows is None, "a row subset has no new residual to return"
+            return moe_tail_rmsnorm(
+                routed, shared, gate, residual, self.weight, self.variance_epsilon
+            )
+        return moe_tail_rmsnorm_rows(
+            routed, shared, gate, residual, self.weight, self.variance_epsilon, rows
+        )
+
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor | MoEGatedSum,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(x, MoEGatedSum):
+            # A MoE block that deferred its gated shared-expert add to us.
+            assert residual is not None, "a MoEGatedSum comes with a residual"
+            return self.forward_moe_tail(x, residual)
         if self.fused_allreduce:
             assert residual is not None, "fused all-reduce norm needs a residual"
             return self._forward_fused_allreduce(x, residual)

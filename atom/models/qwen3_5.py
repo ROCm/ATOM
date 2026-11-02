@@ -41,6 +41,7 @@ from atom.models.qwen3_next import (
     Qwen3NextMLP,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
+    defer_moe_gated_sums,
 )
 from atom.models.utils import (
     IntermediateTensors,
@@ -593,6 +594,7 @@ class Qwen3_5Model(Qwen3NextModel):
             eps=config.rms_norm_eps,
             fused_allreduce=fuse_allreduce_norm,
         )
+        defer_moe_gated_sums(self.layers, self.norm)
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {

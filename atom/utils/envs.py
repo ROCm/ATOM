@@ -427,6 +427,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
+    # Qwen3-Next / Qwen3.5: the MoE block leaves `routed + sigmoid(gate) *
+    # shared` to the norm that reads it (the next layer's input norm, the final
+    # norm, the MTP drafter's final norm), which adds it, adds the residual and
+    # normalizes in one Triton launch (atom/model_ops/moe_tail_norm.py). The MTP
+    # drafter's final norm then also covers only the rows its LM head reads (one
+    # a sequence), which replaces the row gather. TP1 only (DP attention / EP,
+    # or one GPU); the new residual is bitwise the unfused one, the normed
+    # output within one bf16 ulp. Off by default.
+    "ATOM_FUSED_MOE_TAIL_NORM": lambda: (
+        os.getenv("ATOM_FUSED_MOE_TAIL_NORM", "0") == "1"
+    ),
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
     # loses at prefill sizes while saving launches at decode sizes (crossover

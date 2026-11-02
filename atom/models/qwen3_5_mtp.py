@@ -19,6 +19,7 @@ from atom.model_ops.embed_head import (
 )
 from atom.model_ops.linear import ColumnParallelLinear, ReplicatedLinear
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe_tail_norm import MoEGatedSum
 from atom.model_ops.mtp_pre_fc_norm import (
     mtp_embed_pre_fc_norms,
     mtp_embed_pre_fc_norms_supported,
@@ -29,6 +30,7 @@ from atom.models.qwen3_5 import (
     Qwen3_5RMSNorm,
     get_qwen3_5_text_config,
 )
+from atom.models.qwen3_next import defer_moe_gated_sums
 from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
@@ -110,6 +112,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         self.pre_fc_norm_embedding = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # One MTP layer a step, each read by the final norm (mtp_num_hidden_layers
+        # is 1 for every Qwen3.5 checkpoint; with more, each still feeds `norm`).
+        for layer in self.layers:
+            defer_moe_gated_sums([layer], self.norm)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -198,8 +204,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        select_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-
+        """The final-normed hidden states, of rows `select_rows` only when
+        given (`out[i]` is row `select_rows[i]`, as `index_select` picks them)."""
         fc_input = None
         if inputs_embeds is None and self.fused_embed_pre_fc_norm:
             fc_input = self._embed_pre_fc_norms(input_ids, hidden_states)
@@ -227,7 +235,16 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             residual=residual,
         )
 
+        if isinstance(hidden_states, MoEGatedSum):
+            # ATOM_FUSED_MOE_TAIL_NORM: the layer's gated shared-expert add, its
+            # residual add and this norm in one launch, over the selected rows
+            # only, and no residual store (nothing reads it).
+            return self.norm.forward_moe_tail(
+                hidden_states, residual, rows=select_rows, write_residual=False
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if select_rows is not None:
+            hidden_states = torch.index_select(hidden_states, 0, select_rows)
         return hidden_states
 
 
@@ -295,6 +312,9 @@ class Qwen3_5MTP(nn.Module):
         self.model = Qwen3_5MultiTokenPredictor(
             atom_config=mtp_atom_config, prefix=maybe_prefix(prefix, "mtp")
         )
+        # ATOM_FUSED_MOE_TAIL_NORM: the proposer hands `forward` the rows its
+        # head reads (`select_rows`), and the final norm covers only those.
+        self.forward_selects_rows = envs.ATOM_FUSED_MOE_TAIL_NORM
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -346,7 +366,12 @@ class Qwen3_5MTP(nn.Module):
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            select_rows=kwargs.get("select_rows"),
         )
         return hidden_states
 

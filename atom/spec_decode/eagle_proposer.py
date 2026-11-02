@@ -223,12 +223,25 @@ class EagleProposer(Drafter):
             input_ids=input_ids.reshape(-1),
             positions=positions,
             hidden_states=hidden_states.reshape(-1, *hidden_states.shape[2:]),
+            **self._select_rows_kwargs(last_token_indices),
         )
+
+    def _select_rows_kwargs(self, rows: torch.Tensor) -> dict:
+        """`select_rows=rows` for a draft model whose forward returns only the
+        rows its head reads (`forward_selects_rows`, e.g. Qwen3.5 MTP with
+        ATOM_FUSED_MOE_TAIL_NORM: its final norm then covers those rows alone),
+        else nothing and the caller gathers them."""
+        if getattr(self.model, "forward_selects_rows", False):
+            return {"select_rows": rows}
+        return {}
 
     def _step0_head(self, fwd_out, running_bs, *, last_token_indices, **_):
         """Each sequence's accepted row and the draft id it makes, as step 1 reads
         them."""
-        hidden = torch.index_select(fwd_out, 0, last_token_indices)
+        if getattr(self.model, "forward_selects_rows", False):
+            hidden = fwd_out  # already those rows (`_step0_forward`)
+        else:
+            hidden = torch.index_select(fwd_out, 0, last_token_indices)
         ids = empty_token_ids(hidden)
         return hidden, self.model.compute_draft_ids(hidden, out=ids)
 
@@ -935,6 +948,14 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
+                # An eager step 0 reads one row a sequence; a model that can
+                # returns only those (not under PCP, which all-gathers every row
+                # back first).
+                step0_rows = (
+                    self._select_rows_kwargs(last_token_indices)
+                    if i == 0 and not step0_graphed and not pcp_draft_prefill
+                    else {}
+                )
                 if i == 0 and step0_graphed:
                     # The target replayed its verify graph, so step 0 runs at
                     # that recorded shape too; the head hands back each
@@ -974,6 +995,7 @@ class EagleProposer(Drafter):
                         input_ids=d_input_ids,
                         positions=d_positions,
                         hidden_states=d_hidden,
+                        **step0_rows,
                     )
                     graphed_ids = None
                 if pcp_draft_prefill:
@@ -995,10 +1017,18 @@ class EagleProposer(Drafter):
                         if self._reuse_step_buffers
                         else None
                     )
-                    # out=None is index_select's own default: it allocates.
-                    sample_hidden_states = torch.index_select(
-                        ret_hidden_states, 0, last_token_indices, out=hidden_out
-                    )
+                    if step0_rows:
+                        # The forward returned exactly those rows.
+                        sample_hidden_states = (
+                            ret_hidden_states
+                            if hidden_out is None
+                            else hidden_out.copy_(ret_hidden_states)
+                        )
+                    else:
+                        # out=None is index_select's own default: it allocates.
+                        sample_hidden_states = torch.index_select(
+                            ret_hidden_states, 0, last_token_indices, out=hidden_out
+                        )
                 else:
                     sample_hidden_states = ret_hidden_states[:scheduled_bs]
                 # This step's row is owned storage -- the assembled matrix's
