@@ -21,6 +21,7 @@ from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_plane import (
+    FP4_MFMA,
     IndexUnits,
     fp4_index_layout_for_arch,
 )
@@ -36,7 +37,7 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_scatter_rows_reference,
     swa_write,
 )
-from atom.utils import CpuGpuBuffer, upload_numpy
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 
 from .indices import (
     build_indices,
@@ -80,6 +81,28 @@ class PagedAttentionCache:
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
+        index_layout = (
+            fp4_index_layout_for_arch(get_gfx(), backend=envs.ATOM_V4_UNIFIED_MQA)
+            if geometry.index_fp4
+            else "fp8"
+        )
+        if index_layout == FP4_MFMA and (
+            geometry.index_dim != 128
+            or any(geometry.rows_per_page(ratio) % 64 for _, ratio in geometry.owners)
+        ):
+            raise ValueError(
+                "gfx950 OPUS FP4 index cache requires dim=128 and complete "
+                "64-row groups in every PAGE (block_size multiple of 128 "
+                "for ratio-2 owners)"
+            )
+        if index_layout == FP4_MFMA and any(
+            pages * geometry.rows_per_page(ratio) * 64 > (1 << 32)
+            for _, ratio in geometry.owners
+        ):
+            raise ValueError(
+                "gfx950 OPUS supports at most 4 GiB per FP4 index values plane; "
+                "reduce gpu_memory_utilization or select ATOM_V4_UNIFIED_MQA=flydsl"
+            )
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
@@ -120,11 +143,7 @@ class PagedAttentionCache:
                     plane.view(-1, geometry.index_block_rows, plane.shape[-1])
                     for plane in planes
                 ),
-                layout=(
-                    fp4_index_layout_for_arch(get_gfx())
-                    if geometry.index_fp4
-                    else "fp8"
-                ),
+                layout=index_layout,
             )
             for owner, planes in self.index_planes.items()
         }

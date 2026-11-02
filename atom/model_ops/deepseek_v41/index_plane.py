@@ -7,7 +7,10 @@ their fp32 scales (`fp8_indexer_block_fields`).
 FP4: the official arithmetic (E2M1, one E8M0 per 32 dims, `quantize_fp4`'s
 group-32 grid), values and scales in two planes, a page per candidate block.
 gfx1250's OPUS scorer reads natural [page, row, byte/group] order. gfx950's
-FlyDSL scorer reads the page-8 layout below. Key `t` of a page, its K tile `kt`, its
+OPUS scorer reads 64-row groups: values [group, chunk, row, 16 bytes],
+scales [group, chunk % 2, row % 32, chunk // 2, row // 32]. Its logical
+8-row page p is rows (p % 8) * 8 through +7 of group p // 8. gfx950
+FlyDSL reads the page-8 layout below. Key `t` of a page, its K tile `kt`, its
 32-dim chunk `c` and that chunk's byte `b` (two E2M1 values) sit at
 
     values  [kt][t % 4][c][t // 4][b]      (16 bytes a chunk)
@@ -21,11 +24,19 @@ from typing import NamedTuple
 
 import torch
 
+from atom.model_ops.indexer.layout import MFMA as FP4_MFMA
 from atom.model_ops.indexer.layout import NATURAL as FP4_OPUS
 from atom.model_ops.indexer.layout import PRESHUFFLE as FP4_FLYDSL
 
 
-def fp4_index_layout_for_arch(arch):
+def fp4_index_layout_for_arch(arch, *, backend="flydsl"):
+    if arch == "gfx950":
+        if backend not in ("opus", "flydsl"):
+            raise ValueError(
+                f"ATOM_V4_UNIFIED_MQA must be opus or flydsl, got {backend!r}"
+            )
+        if backend == "opus":
+            return FP4_MFMA
     return FP4_OPUS if arch == "gfx1250" else FP4_FLYDSL
 
 
@@ -42,8 +53,10 @@ class IndexUnits(NamedTuple):
 
     values: torch.Tensor
     scales: torch.Tensor | None = None
-    # Both FP4 layouts have the same shape and byte count. Keep the layout
-    # with the plane so the writer, query quantizer and scorer agree.
+    # FP4 layouts have the same logical shape and byte count. MFMA stores
+    # eight logical pages together as one 64-row group; a whole PAGE still
+    # contains complete groups, so PAGE copies preserve the byte layout.
+    # Keep the layout with the plane so its writer and readers agree.
     layout: str = FP4_FLYDSL
 
     @property

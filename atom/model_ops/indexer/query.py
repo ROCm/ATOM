@@ -55,9 +55,11 @@ def quantize_query(
         return values, scales.view(rows, heads, 1)
     values = torch.empty(rows, heads, dim // 2, dtype=torch.uint8, device=query.device)
     if layout == MFMA:
-        if heads != 64 or dim != 128:
-            raise ValueError("gfx950 OPUS queries require heads=64, dim=128")
-        scales = torch.empty(rows, 2, 32, 4, dtype=torch.uint8, device=query.device)
+        if heads not in (32, 64) or dim != 128:
+            raise ValueError("gfx950 OPUS queries require heads=32 or 64, dim=128")
+        scales = torch.empty(
+            rows, 2, 32, heads // 16, dtype=torch.uint8, device=query.device
+        )
     elif layout == NATURAL:
         scales = torch.empty(
             rows, heads, dim // 32, dtype=torch.uint8, device=query.device

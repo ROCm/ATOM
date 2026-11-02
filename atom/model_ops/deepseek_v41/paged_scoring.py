@@ -34,7 +34,7 @@ from atom.model_ops.indexer import (
 )
 
 from .candidate_table import lift_candidate_selection
-from .index_plane import FP4_FLYDSL
+from .index_plane import FP4_FLYDSL, FP4_MFMA
 from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
 
 __all__ = [
@@ -134,9 +134,13 @@ def score_topk_quantized(
     # also scored inside someone else's would have two meanings for a column.
     assert not (candidate_count and candidates is not None)
     tile = units.values.shape[1]
-    cache = IndexCache(
-        units.values, units.scales if units.fp4 else None, tile, units.layout
-    )
+    values, scales = units.values, units.scales
+    if units.layout == FP4_MFMA:
+        # Table entries still name 8-row pages; OPUS reads the same bytes as
+        # 64-row physical groups, including when a PAGE contains two groups.
+        values = values.view(-1, 4, 64, 16)
+        scales = scales.view(-1, 2, 32, 4)
+    cache = IndexCache(values, scales, tile, units.layout)
     if candidates is not None:
         # One number reached by two paths: the geometry pages the plane at
         # `candidate_block_size`, and this is where they have to agree.
