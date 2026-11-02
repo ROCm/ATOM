@@ -54,12 +54,11 @@ class IPCEventReclaimer:
         self._reaper = _Reaper() if background else None
 
     def acquire_ready_event(self, factory: Any) -> Any:
-        # A fresh event every time. Re-recording an exported event is unsafe:
-        # until the device executes the new record, a peer that imported it
-        # still sees the previous completion, so the MP server can copy source
-        # blocks the forward has not finished writing (DSv4.1: a loaded prefix
-        # whose deep layers were stale). An event whose transfers have all
-        # completed is retired here and destroyed at the next safe point.
+        # A fresh event every time. Reusing an exported (IPC) event across
+        # batches was unsafe in our setup, so each batch records its own and
+        # nothing re-records one a peer may have imported. An event whose
+        # transfers have all completed is retired here and destroyed at the
+        # next safe point.
         keep = []
         for entry in self._ready_events:
             if entry.reusable():
