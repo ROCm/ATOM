@@ -44,6 +44,11 @@ _UNIFIED_WARMUP_NUM_SEQS = (
 # no long prefix; they just have to be prefix hits (context > new rows).
 _UNIFIED_WARMUP_SHORT_CTX = 16
 
+# Default of ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL: the most new rows, summed over
+# the step's requests, that a multi-request prefix-hit step may have and still
+# take unified_attention (see unified_prefill_step_qualifies).
+_UNIFIED_DEFAULT_MAX_TOTAL = 2048
+
 # Byte cap on one multi-request warm-up launch's q, output and K/V tensors,
 # taken before KV sizing (see unified_prefill_warmup_bytes).
 _UNIFIED_WARMUP_BYTES = 128 << 20
@@ -61,6 +66,25 @@ def token_block_table(
     n_cols = -(-max_seqlen_k // _TOKEN_TABLE_COL_ALIGN) * _TOKEN_TABLE_COL_ALIGN
     cols = torch.arange(n_cols, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device)
     return (cu_seqlens_k[:, None] + cols).clamp_(max=total_kv - 1)
+
+
+def unified_prefill_step_qualifies(
+    num_seqs: int, total_rows: int, max_rows: int, max_q: int, max_total: int
+) -> bool:
+    """Whether a prefix-hit prefill step takes unified_attention (vs FMHA v3).
+
+    A single request qualifies up to max_q new rows. A step with several
+    requests qualifies only while its total new rows stay within max_total
+    (and each request within max_q): once the step has a few thousand rows,
+    FMHA v3 has enough workgroups to fill the device and unified_attention is
+    slower. Measured on Qwen3.5-397B TP4 at a 128k prefix (step GPU ms,
+    FMHA v3 -> unified): 1 x 2032 rows 136 -> 97, 4 x 496 144 -> 106, but
+    8 x 496 194 -> 231 and 4 x 2032 270 -> 346. max_total <= 0 keeps every
+    multi-request step on FMHA v3.
+    """
+    if not 0 < max_rows <= max_q:
+        return False
+    return num_seqs == 1 or (max_total > 0 and total_rows <= max_total)
 
 
 def unified_prefill_warmup_bytes(
@@ -81,6 +105,7 @@ def unified_prefill_warmup_shapes(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    max_total: int = _UNIFIED_DEFAULT_MAX_TOTAL,
     prefix: int = _UNIFIED_WARMUP_PREFIX,
     max_bytes: int = _UNIFIED_WARMUP_BYTES,
 ) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
@@ -97,18 +122,24 @@ def unified_prefill_warmup_shapes(
     short contexts reach the split counts that the context length, not the
     program count, caps.
 
+    Only steps unified_prefill_step_qualifies admits are warmed: single
+    requests up to max_q rows, multi-request steps up to max_total rows in all.
     The first request carries the longest context; the others get a short one
     (selection reads only the maximum). In a multi-request launch the other
-    requests' new rows are trimmed, if needed, so that
-    unified_prefill_warmup_bytes stays within max_bytes for this head geometry;
-    a trimmed launch is still a real step, just one with fewer new rows.
-    Single-request launches are never trimmed: a real step of that size
-    allocates as much on its own.
+    requests' new rows are trimmed, if needed, so that the launch stays within
+    max_total rows and unified_prefill_warmup_bytes within max_bytes for this
+    head geometry; a trimmed launch is still a real step, just one with fewer
+    new rows. A multi-request launch that cannot fit (the first request alone
+    leaves no row per other request) is dropped: no step of that shape takes
+    the path. Single-request launches are never trimmed: a real step of that
+    size allocates as much on its own.
     """
     per_row = (num_kv_heads + 3 * num_heads) * head_dim
 
     def launch(q, n_others, rows, ctx):
         if n_others:
+            if max_total <= 0 or q + n_others > max_total:
+                return []
             fixed = unified_prefill_warmup_bytes(
                 (q,),
                 (ctx + n_others * _UNIFIED_WARMUP_SHORT_CTX,),
@@ -116,11 +147,14 @@ def unified_prefill_warmup_shapes(
                 num_kv_heads,
                 head_dim,
             )
+            rows = min(rows, (max_total - q) // n_others)
             rows = max(1, min(rows, (max_bytes - fixed) // (n_others * per_row)))
-        return (
-            (q,) + (rows,) * n_others,
-            (ctx,) + (rows + _UNIFIED_WARMUP_SHORT_CTX,) * n_others,
-        )
+        return [
+            (
+                (q,) + (rows,) * n_others,
+                (ctx,) + (rows + _UNIFIED_WARMUP_SHORT_CTX,) * n_others,
+            )
+        ]
 
     shapes = []
     big = []
@@ -132,18 +166,18 @@ def unified_prefill_warmup_shapes(
         big.append(max_q)
     for q in sorted(set(big)):
         shapes += [
-            launch(q, 0, 0, q + prefix),
-            launch(q, 1, q, q + prefix),
-            launch(q, 1, 2, q + prefix),
-            launch(q, 15, q, q + prefix),
+            *launch(q, 0, 0, q + prefix),
+            *launch(q, 1, q, q + prefix),
+            *launch(q, 1, 2, q + prefix),
+            *launch(q, 15, q, q + prefix),
         ]
     for q in (1, 2, 4, 8, 16, 32):
         if q > max_q:
             continue
         for n in _UNIFIED_WARMUP_NUM_SEQS:
-            shapes.append(launch(q, n - 1, q, q + prefix))
+            shapes += launch(q, n - 1, q, q + prefix)
         for ctx in (320, 960, 1984):
-            shapes += [launch(q, 0, 0, ctx), launch(q, 1, q, ctx)]
+            shapes += [*launch(q, 0, 0, ctx), *launch(q, 1, q, ctx)]
     return shapes
 
 

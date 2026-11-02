@@ -390,6 +390,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_UNIFIED_ATTN_MAX_Q": lambda: int(
         os.getenv("ATOM_PREFILL_UNIFIED_ATTN_MAX_Q", "0")
     ),
+    # With ATOM_PREFILL_UNIFIED_ATTN_MAX_Q > 0: the most new rows, summed over the
+    # step's requests, a multi-request prefix-hit prefill may have and still take
+    # unified_attention (a single request only needs MAX_Q). Above it FMHA v3 fills
+    # the device and is faster. 0 keeps every multi-request step on FMHA v3.
+    "ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL": lambda: int(
+        os.getenv("ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL", "2048")
+    ),
     # Compile the unified_attention kernels of the path above at start-up
     # (end of warmup_model) instead of on the first request that needs each one.
     # Its memory is taken before KV sizing, so it comes out of the KV budget:

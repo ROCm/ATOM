@@ -86,7 +86,11 @@ class TestWarmupShapes:
                 "one" if n == 1 else "x16" if n % 16 == 0 else "few"
             )
         assert kinds
-        assert all(k == {"one", "few", "x16"} for k in kinds.values()), kinds
+        total = upw._UNIFIED_DEFAULT_MAX_TOTAL
+        for rows, k in kinds.items():
+            # a multi-request step needs room for one row per other request
+            want = {"one", "few", "x16"} if rows + 15 <= total else {"one"}
+            assert k == want, (rows, k)
 
     def test_request_counts_double_at_most_up_to_256(self):
         """The KV split follows the program count in powers of two, so each
@@ -106,7 +110,7 @@ class TestWarmupShapes:
 
     def test_sixteen_request_launches_are_real_sixteen_request_steps(self):
         """Every request carries new rows: the program count is a 16-request
-        step's, not a single request's. Untrimmed up to the byte cap."""
+        step's, not a single request's. Untrimmed while 16 x q fits the total."""
         x16 = [
             q
             for q, _ in upw.unified_prefill_warmup_shapes(4096, *QWEN35_TP4)
@@ -114,7 +118,7 @@ class TestWarmupShapes:
         ]
         assert x16
         assert all(min(q) > 2 for q in x16)
-        assert all(q == (q[0],) * 16 for q in x16 if q[0] <= 1024)
+        assert all(q == (q[0],) * 16 for q in x16 if 16 * q[0] <= 2048)
 
     @pytest.mark.parametrize("geometry", GEOMETRIES)
     def test_warmup_bytes_stay_within_the_cap(self, geometry):
@@ -140,6 +144,48 @@ class TestWarmupShapes:
                 c == q + upw._UNIFIED_WARMUP_SHORT_CTX
                 for q, c in zip(q_lens[1:], ctx_lens[1:])
             )
+
+
+class TestStepGate:
+    """unified_prefill_step_qualifies at MAX_Q 4096, MAX_TOTAL 2048."""
+
+    @pytest.mark.parametrize(
+        "num_seqs, total, longest, expect",
+        [
+            (1, 1, 1, True),
+            (1, 4096, 4096, True),  # a single request needs only MAX_Q
+            (1, 4097, 4097, False),
+            (1, 0, 0, False),
+            (2, 2048, 1024, True),
+            (4, 2048, 512, True),  # 4 x 496 measured faster
+            (2, 2049, 1025, False),
+            (8, 4096, 512, False),  # 8 x 496 measured slower
+            (4, 8192, 2048, False),  # 4 x 2032 measured slower
+            (264, 2048, 32, True),
+        ],
+    )
+    def test_boundaries(self, num_seqs, total, longest, expect):
+        assert (
+            upw.unified_prefill_step_qualifies(num_seqs, total, longest, 4096, 2048)
+            is expect
+        )
+
+    def test_max_total_zero_keeps_multi_request_steps_on_fmha(self):
+        assert upw.unified_prefill_step_qualifies(1, 300, 300, 4096, 0)
+        assert not upw.unified_prefill_step_qualifies(2, 4, 2, 4096, 0)
+
+    @pytest.mark.parametrize("max_total", [0, 512, 2048, 8192])
+    def test_warmup_only_launches_steps_the_gate_admits(self, max_total):
+        shapes = upw.unified_prefill_warmup_shapes(
+            4096, *QWEN35_TP4, max_total=max_total
+        )
+        assert shapes
+        for q_lens, _ in shapes:
+            assert upw.unified_prefill_step_qualifies(
+                len(q_lens), sum(q_lens), max(q_lens), 4096, max_total
+            ), q_lens
+        if max_total == 0:
+            assert all(len(q) == 1 for q, _ in shapes)
 
 
 class _Impl(nn.Module):

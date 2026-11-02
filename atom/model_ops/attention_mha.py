@@ -30,7 +30,11 @@ from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
 from .attention_mla import MLAModules
-from .unified_prefill_warmup import token_block_table, unified_prefill_warmup_shapes
+from .unified_prefill_warmup import (
+    token_block_table,
+    unified_prefill_step_qualifies,
+    unified_prefill_warmup_shapes,
+)
 
 logger = logging.getLogger("atom")
 
@@ -954,12 +958,23 @@ class PagedAttentionImpl(nn.Module):
         than FMHA v3 above ~1k rows. It also carries one descale per tensor, so
         it runs on the K/V gather_prefix_and_concat_kv already dequantized from
         the per-token-scaled cache, requantized exactly as FMHA v3 gets them.
-        ATOM_PREFILL_UNIFIED_ATTN_MAX_Q is the largest Sq routed here.
+        With several requests in the step FMHA v3 fills the device itself, so
+        unified_prefill_step_qualifies admits a single request up to
+        ATOM_PREFILL_UNIFIED_ATTN_MAX_Q new rows but a multi-request step only
+        up to ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL rows in all. Both counts are
+        host ints the step already carries (scheduled_bs, scheduled_tokens).
         """
         attn_metadata = fwd_ctx.attn_metadata
+        context = fwd_ctx.context
         return (
             attn_metadata.has_cached
-            and 0 < attn_metadata.max_seqlen_q <= envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q
+            and unified_prefill_step_qualifies(
+                context.scheduled_bs,
+                context.scheduled_tokens,
+                attn_metadata.max_seqlen_q,
+                envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q,
+                envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL,
+            )
             and self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx)
         )
 
@@ -1057,6 +1072,7 @@ class PagedAttentionImpl(nn.Module):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+            max_total=envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_TOTAL,
         )
         dev = self.device
         i32 = {"dtype": torch.int32, "device": dev}
