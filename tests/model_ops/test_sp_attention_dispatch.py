@@ -147,8 +147,18 @@ def test_empty_rows_launch_no_norm_kernel(monkeypatch, rows):
         "fused_qk_rmsnorm_per_token_quant",
         lambda *args, **kwargs: calls.append("fp8"),
     )
+
+    def quant(x, **kwargs):
+        calls.append("quant")
+        return x, x[:, :1]
+
+    monkeypatch.setattr(aiter, "get_hip_quant", lambda quant_type: quant)
     x = torch.ones(rows, 8, dtype=torch.bfloat16)
     out, res = layernorm.GemmaRMSNorm(8).forward_cuda(x, x)
     assert out.shape == res.shape == x.shape
-    layernorm.gemma_rms_norm_quant(x, x, _Norm(), quantize_fp32_norm=True)
-    assert calls == (["bf16", "fp8"] if rows else [])
+    for fp32 in (True, False):
+        out, scale, res = layernorm.gemma_rms_norm_quant(
+            x, x, _Norm(), quantize_fp32_norm=fp32
+        )
+        assert out.shape == res.shape == x.shape and scale.shape == (rows, 1)
+    assert calls == (["bf16", "fp8", "quant"] if rows else [])

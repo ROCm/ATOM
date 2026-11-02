@@ -1024,6 +1024,13 @@ def gemma_rms_norm_quant(
     from aiter.utility.dtypes import fp8
 
     x = hidden_states
+    # An empty grid leaves a launch error for the next kernel to report.
+    if not x.numel():
+        return (
+            torch.empty(x.shape, dtype=fp8, device=x.device),
+            torch.empty((*x.shape[:-1], 1), dtype=torch.float32, device=x.device),
+            x if residual is None else torch.empty_like(x),
+        )
     if (
         quantize_fp32_norm
         and fused_qk_rmsnorm_per_token_quant is not None
@@ -1037,18 +1044,16 @@ def gemma_rms_norm_quant(
         out = torch.empty(x.shape, dtype=fp8, device=x.device)
         scale = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
         residual_out = x if residual is None else torch.empty_like(x)
-        # An empty grid leaves a launch error for the next kernel to report.
-        if x.shape[0]:
-            fused_qk_rmsnorm_per_token_quant(
-                out,
-                scale,
-                x,
-                norm.weight,
-                norm.variance_epsilon,
-                q_res_out=None if residual is None else residual_out,
-                q_residual=residual,
-                gemma_norm=True,
-            )
+        fused_qk_rmsnorm_per_token_quant(
+            out,
+            scale,
+            x,
+            norm.weight,
+            norm.variance_epsilon,
+            q_res_out=None if residual is None else residual_out,
+            q_residual=residual,
+            gemma_norm=True,
+        )
         return out, scale, residual_out
     if residual is None:
         normed, residual_out = norm(x), x
