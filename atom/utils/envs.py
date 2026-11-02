@@ -236,7 +236,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when it runs more than this many requests over the lightest rank, so
     # decode stays balanced across the lockstep DP ranks. -1 disables.
     "ATOM_DP_PREFIX_MAX_REQ_GAP": lambda: int(
-        os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP", "-1")
+        os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP", "4")
     ),
     # Prefix-spread rule: "margin" (above) or "cost". "cost" places each
     # request on the rank minimizing its estimated time to first token (the
