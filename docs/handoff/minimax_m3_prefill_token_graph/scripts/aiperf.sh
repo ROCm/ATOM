@@ -17,11 +17,11 @@ export AIPERF_FAILED_REQUEST_THRESHOLD=0.10
 export AIPERF_LIVE_FAILED_REQUEST_THRESHOLD=0.10
 export AIPERF_WARMUP_REQUESTS_PER_LANE=10
 export AIPERF_BENCHMARK_GRACE_PERIOD=30
-export AIPERF_SERVER_METRICS_URLS="http://localhost:8890/metrics"
+export AIPERF_SERVER_METRICS_URLS="http://localhost:${API_PORT:-8890}/metrics"
 export AIPERF_REQUIRED_SERVER_METRIC_PREFIX="atom:"
 
 aiperf profile --scenario inferencex-agentx-mvp \
-  --url http://localhost:8890 --endpoint /v1/chat/completions \
+  --url http://localhost:${API_PORT:-8890} --endpoint /v1/chat/completions \
   --endpoint-type chat --streaming \
   --model "$MODEL" --tokenizer "$MODEL" \
   --tokenizer-trust-remote-code \
@@ -33,6 +33,6 @@ aiperf profile --scenario inferencex-agentx-mvp \
   --agentic-warmup-grace-period 1800 \
   --use-server-token-count --no-gpu-telemetry \
   --num-dataset-entries 393 --slice-duration 1.0 \
-  --server-metrics http://localhost:8890/metrics \
+  --server-metrics http://localhost:${API_PORT:-8890}/metrics \
   --public-dataset semianalysis_cc_traces_weka_062126 \
   --output-artifact-dir "$ART" ${AIPERF_EXTRA:-}

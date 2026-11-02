@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")" && . ./config.env
 mkdir -p "$WORK/logs"
-for d in "$ATOM_DIR" "$AITER_DIR" "$MODEL_HOST_DIR/$MODEL" "$MODEL_HOST_DIR/$DRAFT"; do
+for d in "$ATOM_DIR" "$AITER_DIR" "$MODEL_PATH" "$DRAFT_PATH"; do
   [ -d "$d" ] || { echo "missing $d (config.env)" >&2; exit 1; }
 done
 if ! docker inspect "$CONTAINER" > /dev/null 2>&1; then
@@ -14,7 +14,7 @@ if ! docker inspect "$CONTAINER" > /dev/null 2>&1; then
     --security-opt seccomp=unconfined --security-opt label=disable \
     --device /dev/kfd --device /dev/dri --shm-size 64g \
     -e PYTHONPATH=/app/aiter:/app/ATOM \
-    -v "$MODEL_HOST_DIR":/models:ro -v "$WORK/logs":/logs -v "$PWD":/ep:ro \
+    -v "$MODEL_PATH":"/models/$MODEL":ro -v "$DRAFT_PATH":"/models/$DRAFT":ro -v "$WORK/logs":/logs -v "$PWD":/ep:ro \
     -v "$ATOM_DIR":/app/ATOM -v "$AITER_DIR":/app/aiter $EXTRA_DOCKER_ARGS \
     -w /app/ATOM --entrypoint sleep "$IMAGE" infinity > /dev/null
   echo "created $CONTAINER from $IMAGE"

@@ -23,7 +23,7 @@ fi
 cat << YAML
 model_params:
   name: "/models/$MODEL"
-  tokenizer_name: "$MODEL_HOST_DIR/$MODEL"
+  tokenizer_name: "$MODEL_PATH"
   temperature: 1.0
   top_p: 1.0
   max_new_tokens: 8192

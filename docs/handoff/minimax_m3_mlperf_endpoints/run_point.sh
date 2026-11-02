@@ -2,17 +2,18 @@
 # run_point.sh [<concurrency> ...]: benchmark MiniMax-M3 with MLPerf Endpoints at each concurrency (default 10), in the
 # order given. Run it on the host, detached, e.g.
 #   setsid nohup ./run_point.sh 10 >> "$CLIENT/results/run.log" 2>&1 < /dev/null &
-# Each point: wait until the node has no GPU processes; start a fresh server (server.sh in $CONTAINER); wait for
+# Each point: wait until the GPUs it uses (config.env GPUS) are idle; start a fresh server (server.sh in $CONTAINER); wait for
 # /health; run gate.py; run a warmup with other seeds; run the measured pass; print its summary line (also appended to
 # $CLIENT/results/m3-sweep-<tag>.txt); stop the server. Stops at the first failure and leaves the GPUs free.
 # Environment:
 #   CAP        the measured run's issue cap in a unit the client parses (ms, s or m: 30m, 1800s; not h), or none for a
 #              whole pass; default 30m
-#   IDLE_WAIT  seconds to wait for an idle node before each point; default 43200
+#   IDLE_WAIT  seconds to wait for idle GPUs before each point; default 43200
 #   TG         1 = MiniMax-M3 prefill token graphs (ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH); default 0. TG_SIZES: buckets
+#   GPUS MONO  as config.env (8-GPU MI355X: GPUS=0,1,4,5 by default)
 #   MAX_SEQS GPU_MEM KV   passed to server.sh (defaults 2 x C, 0.95, fp8)
 set -uo pipefail
-cd "$(dirname "$0")" && . ./config.env
+cd "$(dirname "$0")" && . ./config.env && . ./lib.sh
 [ $# -gt 0 ] || set -- 10
 for C in "$@"; do [[ "$C" =~ ^[1-9][0-9]*$ ]] || { echo "not a concurrency: $C" >&2; exit 2; }; done
 CAP=${CAP:-30m}
@@ -28,15 +29,14 @@ API=http://127.0.0.1:$API_PORT
 mkdir -p "$RES" "$WORK/logs"
 
 say() { echo "[$(date '+%F %T')] $*"; }
-idle() { [ -d /sys/class/kfd/kfd/proc ] && [ -z "$(ls /sys/class/kfd/kfd/proc)" ]; }
 
-# Idle twice in a row, a minute apart, within <seconds>.
+# The run's GPUs idle twice in a row, a minute apart, within <seconds>.
 wait_idle() {
   local deadline=$(($(date +%s) + $1))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if idle; then
+    if gpus_idle; then
       sleep 60
-      idle && return 0
+      gpus_idle && return 0
     fi
     sleep 120
   done
@@ -127,7 +127,7 @@ run_client() {
   wait "$pid"
 }
 
-say "m3 sweep $TAG: concurrencies $*, issue cap $CAP, TG=$TG; summary in $SUMMARY"
+say "m3 sweep $TAG: $(gpu_arch), GPUS=${GPUS:-all}, concurrencies $*, issue cap $CAP, TG=$TG; summary in $SUMMARY"
 for C in "$@"; do
   if [ "$CAP" = none ]; then MN=m3-c$C-full-$TAG YCAP=- BUDGET=86400; else MN=m3-c$C-cap$CAP-$TAG YCAP=$CAP BUDGET=$(($(cap_seconds "$CAP") + 2700)); fi
   WN=m3-c$C-warmup-$TAG
@@ -141,11 +141,12 @@ for C in "$@"; do
       || { say "invalid $RES/$y.yaml"; say "STOPPED"; exit 1; }
   done
 
-  say "c$C: waiting for an idle node"
-  wait_idle "$IDLE_WAIT" || { say "node not idle within $IDLE_WAIT s"; say "STOPPED"; exit 1; }
+  say "c$C: waiting for GPUs ${GPUS:-all} to be idle"
+  wait_idle "$IDLE_WAIT" || { say "GPUs ${GPUS:-all} not idle within $IDLE_WAIT s"; say "STOPPED"; exit 1; }
   say "c$C: starting the server, log $WORK/logs/$SLOG"
-  docker exec -e CONC="$C" -e API_PORT="$API_PORT" -e MODEL="$MODEL" -e DRAFT="$DRAFT" -e TG="$TG" \
-    -e TG_SIZES="${TG_SIZES:-}" -e MAX_SEQS="${MAX_SEQS:-$((2 * C))}" -e GPU_MEM="${GPU_MEM:-0.95}" -e KV="${KV:-fp8}" \
+  docker exec -e CONC="$C" -e API_PORT="$API_PORT" -e ENGINE_PORT="$ENGINE_PORT" -e MODEL="$MODEL" -e DRAFT="$DRAFT" -e TG="$TG" \
+    -e TG_SIZES="${TG_SIZES:-}" -e GPUS="$GPUS" -e MONO="$MONO" -e MAX_SEQS="${MAX_SEQS:-$((2 * C))}" \
+    -e GPU_MEM="${GPU_MEM:-0.95}" -e KV="${KV:-fp8}" \
     "$CONTAINER" bash /ep/server.sh "/logs/$SLOG" || fail "server.sh c$C"
   wait_healthy "$SLOG" || fail "c$C server did not come up ($(errors "$SLOG") error lines)"
   say "c$C: healthy"

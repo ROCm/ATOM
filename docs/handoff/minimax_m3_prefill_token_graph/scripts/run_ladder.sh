@@ -1,11 +1,12 @@
 #!/bin/bash
-# Host driver. Waits until no other process holds a GPU, then:
+# Host driver. Waits until no other process holds the GPUs it uses (GPUS, default all), then:
 #   1. accuracy: agentic server config (CONC=$ACC_CONC point) with real EAGLE3 acceptance, GSM8K 5-shot full;
 #      the perf ladder only runs if flexible-extract >= $ACC_MIN.
 #   2. perf: one server launch + one 3600 s aiperf replay per concurrency point, fixed acceptance 0.5933.
 # Usage: TAG=flydsl_fp8 bash run_ladder.sh [conc ...]   (default: 2 10 24 40)
-# Env: KV (fp8) FLY (1) QR (INT4) OFFLOAD (1) to server.sh; DURATION (3600) to aiperf.sh;
-#      ACC_FIRST (1) ACC_CONC (10) ACC_MIN (0.92).
+# Env: KV (fp8) FLY (1) QR (INT4) OFFLOAD (1) TG TG_SIZES GPUS MONO to server.sh; DURATION (3600) to aiperf.sh;
+#      API_PORT (8890) ENGINE_PORT (8896) to both; ACC_FIRST (1) ACC_CONC (10) ACC_MIN (0.92).
+#      8-GPU MI355X: GPUS=0,1,4,5 (the recipe's NUMA split, required with OFFLOAD=1).
 set -u
 C=${C:-ruili_m3_flydsl}
 TAG=${TAG:-flydsl_fp8}
@@ -18,7 +19,7 @@ OUT=/logs/agentic/$TAG
 MODEL=/models/MiniMax-M3-MXFP4
 mkdir -p $HOST_DIR
 log() { echo "$(date '+%F %T') $*" | tee -a $HOST_DIR/ladder.log; }
-health() { curl -s -m 5 localhost:8890/health -o /dev/null -w '%{http_code}'; }
+health() { curl -s -m 5 localhost:${API_PORT:-8890}/health -o /dev/null -w '%{http_code}'; }
 CID=$(docker inspect -f '{{.Id}}' $C)
 
 stop_all() {
@@ -30,9 +31,24 @@ stop_all() {
   sleep 20
 }
 
-busy_gpus() {  # KFD processes that are not ours
-  rocm-smi --showpids 2>/dev/null | awk '/^[0-9]+/{print $1}' | while read p; do
-    grep -q "$CID" /proc/$p/cgroup 2>/dev/null || echo $p
+# KFD gpu_ids of the GPUs this run uses: GPUS as ROCR_VISIBLE_DEVICES indices, every GPU when it is empty.
+our_gpu_ids() {
+  local i=0 n
+  for n in $(ls /sys/class/kfd/kfd/topology/nodes | sort -n); do
+    grep -q '^simd_count [1-9]' /sys/class/kfd/kfd/topology/nodes/$n/properties 2>/dev/null || continue
+    if [ -z "${GPUS:-}" ] || [[ ",$GPUS," == *",$i,"* ]]; then cat /sys/class/kfd/kfd/topology/nodes/$n/gpu_id; fi
+    i=$((i + 1))
+  done
+}
+
+busy_gpus() {  # processes, not ours, holding over 1 GiB on a GPU this run uses; the node's other GPUs do not count
+  local ids p id
+  ids=$(our_gpu_ids)
+  for p in $(ls /sys/class/kfd/kfd/proc 2>/dev/null); do
+    grep -q "$CID" /proc/$p/cgroup 2>/dev/null && continue
+    for id in $ids; do
+      [ "$(cat /sys/class/kfd/kfd/proc/$p/vram_$id 2>/dev/null || echo 0)" -gt 1073741824 ] && { echo $p; break; }
+    done
   done
 }
 
@@ -47,7 +63,8 @@ wait_gpus() {
 
 start_server() {  # $1 conc, $2 acc(0/1), $3 server log (container path); returns 0 when healthy
   docker exec -e CONC=$1 -e ACC=$2 -e GPU_MEM=${GPU_MEM:-0.95} -e KV=${KV:-fp8} -e FLY=${FLY:-1} -e QR=${QR:-INT4} -e OFFLOAD=${OFFLOAD:-1} \
-    -e TG=${TG:-0} -e TG_SIZES=${TG_SIZES:-} \
+    -e TG=${TG:-0} -e TG_SIZES=${TG_SIZES:-} -e GPUS=${GPUS:-} -e MONO=${MONO:-} \
+    -e API_PORT=${API_PORT:-8890} -e ENGINE_PORT=${ENGINE_PORT:-8896} \
     $C bash /scripts/agentic/server.sh $3
   log "c$1 acc=$2 server starting, log ${3/#\/logs/$ROOT/logs}"
   for i in $(seq 1 360); do
@@ -60,7 +77,7 @@ start_server() {  # $1 conc, $2 acc(0/1), $3 server log (container path); return
   done
   [ "$(health)" = 200 ] || { log "c$1 ABORT server not healthy after 1 h"; return 1; }
   local ans
-  ans=$(curl -s -m 600 localhost:8890/v1/chat/completions -H "Content-Type: application/json" \
+  ans=$(curl -s -m 600 localhost:${API_PORT:-8890}/v1/chat/completions -H "Content-Type: application/json" \
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 17 * 23? Answer briefly.\"}],\"max_tokens\":1024,\"temperature\":0}" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'][-80:])" 2>&1 | tr '\n' ' ')
   log "c$1 smoke: $ans"
@@ -82,7 +99,7 @@ if [ "${ACC_FIRST:-1}" = 1 ]; then
   SLOG=$OUT/server_acc_c$AC.log
   start_server $AC 1 $SLOG || { stop_all; log "STOP: accuracy server failed"; exit 1; }
   docker exec -w /logs $C lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn \
-    --model_args model=$MODEL,base_url=http://localhost:8890/v1/chat/completions,num_concurrent=16,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True \
+    --model_args model=$MODEL,base_url=http://localhost:${API_PORT:-8890}/v1/chat/completions,num_concurrent=16,max_retries=3,max_gen_toks=16384,tokenized_requests=False,trust_remote_code=True \
     --tasks gsm8k --num_fewshot 5 --log_samples --output_path $OUT/gsm8k_acc > $HOST_DIR/gsm8k_acc.log 2>&1
   flex=$(grep -E 'flexible' $HOST_DIR/gsm8k_acc.log | tail -1 | awk -F'|' '{print $8}' | tr -d ' ')
   strict=$(grep -E 'strict' $HOST_DIR/gsm8k_acc.log | tail -1 | awk -F'|' '{print $8}' | tr -d ' ')
@@ -100,7 +117,7 @@ for CONC in $CONCS; do
   SLOG=$OUT/server_c${CONC}.log
   start_server $CONC 0 $SLOG || continue
   log "c$CONC aiperf start, artifacts ${ART/#\/logs/$ROOT/logs}"
-  docker exec -e CONC=$CONC -e DURATION=${DURATION:-3600} $C bash /scripts/agentic/aiperf.sh $ART \
+  docker exec -e CONC=$CONC -e DURATION=${DURATION:-3600} -e API_PORT=${API_PORT:-8890} $C bash /scripts/agentic/aiperf.sh $ART \
     > $HOST_DIR/aiperf_c${CONC}.log 2>&1
   log "c$CONC aiperf rc=$?"
   docker exec $C python3 /scripts/agentic/summarize.py $ART 2>&1 | tail -n 1 | tee -a $HOST_DIR/ladder.log

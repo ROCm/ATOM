@@ -7,6 +7,7 @@
 - 方案第 0–2 步已完成：代码基线、attention builder 改动、单测。单测在 gfx1250 上全部通过。
 - 第 3–6 步没做：起服务、smoke、GSM8K、TTFT / AgentX 性能对比。原因是当时卡被占用。
 - 开关是 `ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH=1`，默认关闭。关闭时走的代码路径和基线完全一样，所以随时可以用 `TG=0` 做同机对照。
+- 剩下的验证在两种机器上都能做：4 卡 MI455X（gfx1250），或 8 卡 MI355X（gfx950）的其中 4 张卡。MI355X 的不同点见第 1 节最后一小节。单测目前只在 gfx1250 上跑过。
 
 ## 1. 代码
 
@@ -48,6 +49,26 @@ docker exec -e SKIP_LMCACHE=1 $C bash /scripts/agentic/setup_container.sh       
 ```
 
 模型需要在 `/models/MiniMax-M3-MXFP4`，EAGLE3 draft 在 `/models/MiniMax-M3-EAGLE3-GQA`。
+
+### MI355X（gfx950）
+
+步骤和上面一样，不同点如下：
+- **镜像：** 用 gfx950 的 ATOM 镜像，比如 `rocm/atom-dev:latest` 或某个 `rocm/atom-dev:nightly_*`。`server.sh` 和 `setup_container.sh` 会用 rocminfo 自动识别架构；gfx1250 专用的环境变量在 gfx950 上不会设。
+- **权重：** MI355X 集群上，模型和 draft 不在同一个父目录下。把上面的 `-v /data/models:/models` 换成分别挂载：
+  ```bash
+  -v /shared_nfs/huggingface_models/amd/MiniMax-M3-MXFP4:/models/MiniMax-M3-MXFP4 \
+  -v /shared_nfs/huggingface_models/Inferact/MiniMax-M3-EAGLE3-GQA:/models/MiniMax-M3-EAGLE3-GQA \
+  ```
+- **选卡：** 8 卡机器上，后面所有起服务和跑脚本的命令都要带 `GPUS=0,1,4,5`。
+  - `server.sh` 会把它设成 `ROCR_VISIBLE_DEVICES`；`run_ladder.sh` / `acc_only.sh` 把它透传给 server，并且只等这 4 张卡空闲。
+  - 0–3 号卡在 NUMA 0，4–7 号卡在 NUMA 1。recipe 要求每个 NUMA 节点用两张。`OFFLOAD=1`（CPU 卸载）时不这样分，server 起不来。
+  - 0,1,4,5 被别人占着时，可以用 `GPUS=2,3,6,7`。
+- **端口：** 同一台机器上别人也在跑 ATOM 时，8890 / 8896 可能被占。
+  - 用 `API_PORT` / `ENGINE_PORT` 换掉。8896 是 ATOM 的 `--port`，也就是 TP 组的 `MASTER_PORT`。
+  - `prefill_graph_smoke.py` 和 `replay_matched.py` 用 `--url` 指定新端口。
+- **mono：**
+  - gfx950 上 decode 默认走 mono megakernel（`ATOM_MONO_ENABLE` 默认是 1）。它只管 decode，和 prefill 入图互不影响。
+  - A/B 对照时两边都不设 `MONO`。
 
 ## 2. 方案
 
@@ -115,13 +136,20 @@ docker exec -e HIP_VISIBLE_DEVICES=0 $C bash -c 'cd /app/ATOM && python3 -m pyte
 
 lint：`black --check`、`ruff check`、`git diff --check` 都干净。
 
+MI355X 上还没跑过单测，要在 gfx950 容器里用同样的命令重跑。
+- 已有失败的清单会和上面不同，比如 mono 和 asm PA 的测试在 gfx950 上应该能跑。
+- 判断有没有引入新失败，以同一台机器上干净的 `588e9553b` 为准。
+
 ## 5. 待做的验证（按顺序）
 
-`scripts/` 是原机器 `~/code/m3_fp8kv/scripts/agentic` 的拷贝，只加了 `TG` / `TG_SIZES` 两个开关：
-- `server.sh`：`TG=1` 打开本功能，`TG_SIZES` 覆盖 bucket 列表。
-- `run_ladder.sh` / `acc_only.sh`：把这两个变量透传给 `server.sh`。
+`scripts/` 是原机器 `~/code/m3_fp8kv/scripts/agentic` 的拷贝，改了这几处：
+- `server.sh`：`TG=1` 打开本功能，`TG_SIZES` 覆盖 bucket 列表；`API_PORT` / `ENGINE_PORT` 可以改端口。`ARCH`、`GPUS`、`MONO` 原来就支持。
+- `run_ladder.sh` / `acc_only.sh`：
+  - 把 `TG`、`TG_SIZES`、`GPUS`、`MONO` 和两个端口透传给 `server.sh`；
+  - 只等本次要用的卡（`GPUS`）空闲。判断方法是读 KFD sysfs 里每张卡的显存占用，超过 1 GiB 算被占，所以 8 卡机器另一半卡上的进程不影响。
+- `aiperf.sh`：端口用 `API_PORT`。
 
-容器内路径是 `/scripts/agentic/`。
+容器内路径是 `/scripts/agentic/`。MI355X 上，下面每条起服务的命令都加 `-e GPUS=0,1,4,5`，每条 `run_ladder.sh` / `acc_only.sh` 前面都加 `GPUS=0,1,4,5`。
 
 ### 5.1 起服务（第 3 步）
 
@@ -178,7 +206,7 @@ C=$C TAG=m3tg_acc_eager ROOT=$R TG=0 bash acc_only.sh
    C=$C TAG=m3tg_tg ROOT=$R ATOM_DIR=$R/ATOM AITER_DIR=$R/aiter OFFLOAD=0 ACC_FIRST=0 TG=1 bash run_ladder.sh 2 10
    C=$C TAG=m3tg_eager ROOT=$R ATOM_DIR=$R/ATOM AITER_DIR=$R/aiter OFFLOAD=0 ACC_FIRST=0 TG=0 bash run_ladder.sh 2 10
    ```
-   `run_ladder.sh` 会等到没有别人的 GPU 进程才开始。结果在 `$R/logs/agentic/<TAG>/ladder.log` 末尾的 summary 表里。
+   `run_ladder.sh` 会等到本次要用的卡上没有别人的进程才开始。结果在 `$R/logs/agentic/<TAG>/ladder.log` 末尾的 summary 表里。
 
 ## 6. 预期收益和基线
 
@@ -205,6 +233,14 @@ C=$C TAG=m3tg_acc_eager ROOT=$R TG=0 bash acc_only.sh
 - 吞吐 +0.5–1%。
 - 显存每卡 +1–2 GB。
 
+MI355X：
+- **基线：** 还没有同栈的基线，要在同一台机器上自己跑 `TG=0`。
+- **recipe 的参考值：** 可以用 `recipes/MiniMax-M3-Agentic-InferenceX.md` 的 Measured 表（MI355X，3600 s，AgentX）判断基线是否正常：
+  - c2：5,485 tok/s/chip，interactivity p90 274.9；
+  - c10：16,458 tok/s/chip，interactivity p90 206.6。
+  - 这张表没有 TTFT，用的 ATOM / aiter 也不是本分支，只能做量级参考。
+- **收益：** 上面的估算来自 MI455X。省下的时间来自 host 开销和层间 gap，这个来源在两种机器上一样；但 MI355X 的 kernel 时间和 host 开销比例不同，具体能省多少要实测。
+
 ## 7. 风险和排查
 
 - **EAGLE3：**
@@ -220,6 +256,10 @@ C=$C TAG=m3tg_acc_eager ROOT=$R TG=0 bash acc_only.sh
   - LMCache offload：`CONC>=40`。
   - `ATOM_USE_UNIFIED_ATTN=1`：会走 TritonMHA 子类 builder，同样会开启本功能。
   - 有问题就在 `minimax_m3_prefill_token_graph_refusal` 里加拒绝条件，并在 `tests/test_indexer_cp_gate.py` 的矩阵里补一行。
+- **gfx950 特有的：**
+  - MoE 的 pad 行：#7085 / #7222 改的是 sort 和 routing，这部分代码不分架构。但 gfx950 上 MXFP4 MoE 用的 kernel 和 gfx1250 不同，expert -1 在 gfx950 上没测过，主要看 smoke 和 GSM8K。
+  - aiter 分支：M3 TP4 调参那个提交只针对 gfx1250，gfx950 用 aiter 自带的配置。FlyDSL PA planner 的三个提交两种机器都会用到，因为都设了 `ATOM_PA_FLYDSL=1`。在 gfx950 上遇到 aiter 的问题，先在 `TG=0` 下复现，确认和本功能无关。
+  - mono：decode 走 mono megakernel。`TG=1` 下 decode 出问题时，用 `MONO=0` 排除它。
 - **长 prefill 收益：** 超过 3072 的 prefill 仍走 eager。可以试 `TG_SIZES=256,512,1024,2048,3072,4096,8192`，覆盖约 85% 的步，代价是显存。录制时每个 bucket 的激活要单独估。
 - **回滚：** `TG=0`（环境变量不设）就是基线行为。
 

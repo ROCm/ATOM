@@ -4,6 +4,7 @@
 # Usage (in container): CONC=10 bash /scripts/agentic/server.sh <log>
 #   ARCH=gfx950|gfx1250  (auto from rocminfo)   GPUS=0,1,4,5  (ROCR_VISIBLE_DEVICES; 8-GPU MI355X nodes)
 #   MONO=0|1  (ATOM_MONO_ENABLE, gfx950 only; unset = ATOM default)   MAX_SEQS (default 2*CONC)   GPU_MEM (0.95)
+#   API_PORT (8890)   ENGINE_PORT (8896, ATOM --port: the TP group's MASTER_PORT; a second server on the node needs others)
 set -u
 CONC=${CONC:?set CONC}
 LOG=${1:-/logs/agentic/server_c${CONC}.log}
@@ -60,7 +61,7 @@ fi
 echo "ARCH=$ARCH CONC=$CONC KV=$KV ACC=${ACC:-0} TG=${TG:-0} env: ${envs[*]}" > "$LOG"
 nohup env "${envs[@]}" python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL" --served-model-name "$MODEL" \
-  --host 0.0.0.0 --port 8896 --server-port 8890 \
+  --host 0.0.0.0 --port "${ENGINE_PORT:-8896}" --server-port "${API_PORT:-8890}" \
   --tensor-parallel-size 4 \
   --trust-remote-code \
   --kv_cache_dtype "$KV" \
