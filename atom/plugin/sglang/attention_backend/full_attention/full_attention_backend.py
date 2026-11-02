@@ -724,36 +724,31 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             run_graph=False,
         )
 
-    def _init_draft_extend_v2_mha(self, bs, forward_batch):
+    def _init_draft_extend_v2_mha(self, _bs, forward_batch):
         spec_info = forward_batch.spec_info
         if spec_info is None:
             raise RuntimeError("MHA draft_extend_v2 requires speculative metadata")
-        if forward_batch.extend_prefix_lens is None:
-            raise RuntimeError("MHA draft_extend_v2 requires extend_prefix_lens")
-        self.indices_updater_prefill.update(
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.seq_lens_sum,
-            prefix_lens=forward_batch.extend_prefix_lens,
-            encoder_lens=forward_batch.encoder_lens,
-            spec_info=None,
+        # AiterIndicesUpdaterPrefill.update ignores plan when spec_info is
+        # None and scans req_to_token. 0.5.22's MHA draft-extend path asks the
+        # spec metadata to place KV through the parent's translator instead.
+        kv_indices, kv_indptr, qo_indptr, _ = spec_info.generate_attn_arg_prefill(
+            req_pool_indices=forward_batch.req_pool_indices,
+            paged_kernel_lens=forward_batch.seq_lens,
+            paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+            translator=self.kv_index_translator,
+            plan=forward_batch.kv_loc_plan,
         )
-        max_q_len = self._max_len(
-            forward_batch.extend_seq_lens_cpu,
-            forward_batch.extend_seq_lens,
-        )
+        max_q_len = spec_info.num_tokens_per_req
         max_kv_len = self._max_len(forward_batch.seq_lens_cpu, forward_batch.seq_lens)
         self.forward_metadata = ForwardMetadata(
-            self.indices_updater_prefill.kv_indptr,
-            self.indices_updater_prefill.kv_indices,
-            self.qo_indptr[: bs + 1],
+            kv_indptr,
+            kv_indices,
+            qo_indptr,
             None,
             max_q_len,
             max_kv_len,
             None,
             None,
-            custom_mask=None,
-            mask_indptr=None,
             max_extend_len=max_q_len,
         )
 
@@ -883,6 +878,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.extend_seq_lens.max().item(),
             forward_batch.seq_lens.max().item(),
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
 
         max_q_len = self.mla_indices_updater_prefill.max_q_len
@@ -962,6 +958,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             forward_batch.extend_prefix_lens,
             encoder_lens=forward_batch.encoder_lens,
             spec_info=None,
+            plan=getattr(forward_batch, "kv_loc_plan", None),
         )
         self.forward_metadata = ForwardMetadata(
             self.indices_updater_prefill.kv_indptr,

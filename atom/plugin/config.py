@@ -518,7 +518,6 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from sglang.srt.configs.modelopt_config import ModelOptConfig
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
     from sglang.srt.distributed.parallel_state import (
         get_attn_context_model_parallel_rank as get_attention_cp_rank,
     )
@@ -531,6 +530,7 @@ def _generate_atom_config_from_sglang_config(config: Any):
     from sglang.srt.distributed.parallel_state import (
         get_attn_tensor_model_parallel_world_size as get_attention_tp_size,
     )
+    from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
     from sglang.srt.server_args import (
         ZMQ_TCP_PORT_DELTA,
         PortArgs,

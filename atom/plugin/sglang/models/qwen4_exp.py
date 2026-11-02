@@ -16,7 +16,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig as SGLangQuantizationConfig,
@@ -25,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
 )
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
@@ -251,7 +251,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
                 f"got {logger_name}. Do not route Qwen4Exp through Qwen3_5*."
             )
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = atom_lm.config
         self.atom_config = atom_lm.atom_config
         self.quant_config = quant_config or atom_lm.atom_config.quant_config

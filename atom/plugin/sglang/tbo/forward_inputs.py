@@ -53,13 +53,13 @@ def _sync_atom_tbo_adapter_gate(
     if not dist.is_available() or not dist.is_initialized():
         return local_ready, tuple(ubatch_token_counts) if local_ready else None
 
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
     # Keep the parameter in this adapter API because the caller's topology is
     # still useful context and older integrations pass it explicitly. The gate
     # itself must cover the full model-parallel group in either mode.
     _ = enable_expert_parallel
-    sync_group = get_tp_group()
+    sync_group = get_parallel().tp_group
     world_size = sync_group.world_size
     if world_size <= 1:
         return local_ready, tuple(ubatch_token_counts) if local_ready else None

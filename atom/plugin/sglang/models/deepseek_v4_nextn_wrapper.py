@@ -10,10 +10,10 @@ import logging
 from collections.abc import Iterable
 
 import torch
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_parallel
 from torch import nn
 
 from atom.config import QuantizationConfig as AtomQuantizationConfig
@@ -117,7 +117,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
 
         logger.info("Initializing ATOM backend for %s", self.__class__.__name__)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.config = config
         self.vocab_size = config.vocab_size
