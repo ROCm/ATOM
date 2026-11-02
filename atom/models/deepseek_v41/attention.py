@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """CSA2 model projections; cache storage and sparse kernels have separate owners."""
 
+import logging
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
@@ -50,6 +52,8 @@ from atom.utils.region_graph import eager_region, forks, join_stream
 from .config import AttentionMode
 from .layers import native_quant_config
 
+logger = logging.getLogger("atom")
+
 
 def _live_step():
     """The step a replayed region serves: the live forward's, not the one
@@ -62,6 +66,14 @@ def _live_rows():
     """`_live_step` plus bounded replay's query rows."""
     metadata = forward_context.get_forward_context().attn_metadata
     return {**_live_step(), "queries": metadata.queries}
+
+
+def _log_woa_quant_path(fused: bool, why: str) -> None:
+    """One line per process. The loader calls the hook on every layer."""
+    if getattr(_log_woa_quant_path, "done", False):
+        return
+    _log_woa_quant_path.done = True
+    logger.info("dsv41 wo_a quant: %s (%s)", "fused" if fused else "unfused", why)
 
 
 class Indexer(nn.Module):
@@ -357,6 +369,7 @@ class Attention(nn.Module):
         """
         if batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported is None:
             self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "aiter has no fused epilogue")
             return
         weight = getattr(self.wo_a, "weight", None)
         scale = getattr(self.wo_a, "weight_scale", None)
@@ -374,6 +387,12 @@ class Attention(nn.Module):
             batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
                 tuple(wo_a_ws.shape), self.o_rank, k
             )
+        )
+        _log_woa_quant_path(
+            self._fuse_woa_quant,
+            "gfx1250 mxfp8 epilogue"
+            if self._fuse_woa_quant
+            else "shape unsupported",
         )
 
     def _project_out(self, output, rope, positions):
