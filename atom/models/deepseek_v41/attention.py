@@ -3,11 +3,19 @@
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from aiter.ops.batched_gemm_op_a8w8 import (
-    batched_gemm_a8w8_mxscale_bpreshuffle,
-    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant,
-    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported,
-)
+from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+
+try:
+    from aiter.ops.batched_gemm_op_a8w8 import (
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant,
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported,
+    )
+except ImportError:
+    # An aiter without the fused epilogue must still import. supported()
+    # cannot run in that case, so the unfused bf16 GEMM + quantize_fp8 path
+    # stays selected.
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant = None
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported = None
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
@@ -342,10 +350,14 @@ class Attention(nn.Module):
         """Turn on the fused wo_a quant epilogue when this shape supports it.
 
         Bit-exact with the unfused bf16 GEMM plus `quantize_fp8`. The aiter
-        entry only exists for gfx1250 flydsl mxfp8_32, so anything else stays
-        on the unfused path. Resolved here, after the weight exists, rather
-        than on the first forward.
+        entry only exists for gfx1250 flydsl mxfp8_32, and an aiter build that
+        does not ship it leaves the symbols unset. Either case stays on the
+        unfused path. The loader calls this hook; it is not also invoked from
+        the parent block.
         """
+        if batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported is None:
+            self._fuse_woa_quant = False
+            return
         weight = getattr(self.wo_a, "weight", None)
         scale = getattr(self.wo_a, "weight_scale", None)
         if (
