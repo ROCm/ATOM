@@ -494,8 +494,10 @@ class BlockPool:
         drain is the last step of building a batch, after admission (where
         transfers reserve) and after the connector metadata, so a drained zero
         belongs to a batch the runner receives before any later connector
-        dispatch, and that dispatch's loads wait on an event recorded on the
-        stream the zero was enqueued on.
+        dispatch, and that dispatch's loads wait for the zero: on the event
+        the zero recorded while it is still pending (`pending_zero_fence`), or
+        for the mp worker on an event recorded on the same stream at
+        `start_load_kv`.
         """
         drop = self._unscrubbed_set.intersection(unit_ids)
         if drop:

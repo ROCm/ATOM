@@ -3582,7 +3582,9 @@ class ModelRunner:
         `build()` does this for a batch's `zero_units`; the engine calls it
         directly before dispatching connector loads, which must be ordered
         after the zero (`EngineCore._zero_released_units_before_loads`). Runs
-        on the current stream, the one `start_load_kv` records its event on.
+        on the current stream and records an event after it
+        (`UnitZeroer.launch`); offload loads wait on that event only while it
+        is pending (`pending_zero_fence`).
         """
         self.attn_metadata_builder.zero_page_units(unit_ids)
 

@@ -596,10 +596,13 @@ class EngineCore:
         ATOM_ZERO_EVICTED_BLOCKS. A load dispatched now may target a block
         whose zero is still pending: in `batch`'s `zero_units`, or still in the
         pool's queue when no batch drained it (an idle tick, or a decode pass
-        that scheduled no sequence and so carries no maintenance ops). Both
-        calls go to the runner in order and run on its current stream, which
-        is the stream `start_load_kv` records the event the load waits on, so
-        the zero lands before the loaded bytes. The batch's ids are dropped so
+        that scheduled no sequence and so carries no maintenance ops). The
+        zero goes to the runner before the dispatch and is enqueued on its
+        current stream; each zero records an event there (`UnitZeroer.launch`),
+        and a load waits on the last one while it is still pending
+        (`pending_zero_fence`; the mp worker instead records its own event on
+        that stream at `start_load_kv`), so the zero lands before the loaded
+        bytes. The batch's ids are dropped so
         `build()` does not zero the loaded bytes again. Zeros drained by an
         earlier batch were enqueued by that batch's `build()`, which the
         runner executed before this dispatch.
