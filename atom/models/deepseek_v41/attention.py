@@ -1,9 +1,23 @@
 # SPDX-License-Identifier: MIT
 """CSA2 model projections; cache storage and sparse kernels have separate owners."""
 
+import logging
+
 import torch
 from aiter.dist.parallel_state import get_tp_group
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
+
+try:
+    from aiter.ops.batched_gemm_op_a8w8 import (
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant,
+        batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported,
+    )
+except ImportError:
+    # An aiter without the fused epilogue must still import. supported()
+    # cannot run in that case, so the unfused bf16 GEMM + quantize_fp8 path
+    # stays selected.
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant = None
+    batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported = None
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
@@ -38,6 +52,8 @@ from atom.utils.region_graph import eager_region, forks, join_stream
 from .config import AttentionMode
 from .layers import native_quant_config
 
+logger = logging.getLogger("atom")
+
 
 def _live_step():
     """The step a replayed region serves: the live forward's, not the one
@@ -50,6 +66,19 @@ def _live_rows():
     """`_live_step` plus bounded replay's query rows."""
     metadata = forward_context.get_forward_context().attn_metadata
     return {**_live_step(), "queries": metadata.queries}
+
+
+def _log_woa_quant_path(fused: bool, why: str, *, final: bool = True) -> None:
+    """Log the path once per process.
+
+    A module with no weight is not the decision `supported()` makes. That case
+    is logged once and does not hide a later module that does have weights.
+    """
+    state = getattr(_log_woa_quant_path, "state", None)
+    if state == "final" or (not final and state == "empty"):
+        return
+    _log_woa_quant_path.state = "final" if final else "empty"
+    logger.info("dsv41 wo_a quant: %s (%s)", "fused" if fused else "unfused", why)
 
 
 class Indexer(nn.Module):
@@ -283,6 +312,9 @@ class Attention(nn.Module):
             quant_config=native_quant_config(),
             reduce_results=True,
         )
+        # Set in `process_weights_after_loading`, once wo_a's shape is known.
+        # Unsupported shapes stay on the unfused bf16 GEMM + quantize_fp8 path.
+        self._fuse_woa_quant = False
         self.compressor = (
             Compressor(
                 config.hidden_size, self.head_dim, spec.ratio, config.rms_norm_eps
@@ -331,6 +363,37 @@ class Attention(nn.Module):
             dim=-1,
         )
 
+    def process_weights_after_loading(self):
+        """Turn on the fused wo_a quant epilogue when this shape supports it.
+
+        Bit-exact with the unfused bf16 GEMM plus `quantize_fp8`.
+        `batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported` decides
+        whether this shape can take the fused entry. An aiter build that does
+        not ship those symbols leaves them unset. Either case stays on the
+        unfused path. The loader calls this hook; the parent block does not.
+        """
+        if batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported is None:
+            self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "aiter has no fused epilogue")
+            return
+        weight = getattr(self.wo_a, "weight", None)
+        scale = getattr(self.wo_a, "weight_scale", None)
+        if weight is None or scale is None or weight.numel() == 0 or scale.numel() == 0:
+            self._fuse_woa_quant = False
+            _log_woa_quant_path(False, "weight or scale empty", final=False)
+            return
+        wo_a_ws = scale.view(self.groups, self.o_rank // 32, -1)
+        k = int(weight.view(self.groups, self.o_rank, -1).shape[-1])
+        self._fuse_woa_quant = (
+            batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
+                tuple(wo_a_ws.shape), self.o_rank, k
+            )
+        )
+        _log_woa_quant_path(
+            self._fuse_woa_quant,
+            "mxfp8 epilogue" if self._fuse_woa_quant else "shape unsupported",
+        )
+
     def _project_out(self, output, rope, positions):
         """Inverse RoPE fused into the MXFP8 group quant, then the grouped FP8
         `wo_a` GEMM and `wo_b`. `positions` are the rows' positions, in the
@@ -345,11 +408,23 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
+        wo_a_w = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+        wo_a_ws = self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1)
+        if self._fuse_woa_quant:
+            # wo_a GEMM emits the (e4m3, e8m0) pair wo_b reads directly, so the
+            # standalone quantize_fp8 between wo_a and wo_b is removed.
+            y8, y_scale = batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
+                x_fp8, wo_a_w, x_scale, wo_a_ws
+            )
+            return self.wo_b(
+                y8.view(*output.shape[:-2], -1),
+                x_scale=y_scale.view(*output.shape[:-2], -1),
+            )
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
-            self.wo_a.weight.view(self.groups, self.o_rank, -1),
+            wo_a_w,
             x_scale,
-            self.wo_a.weight_scale.view(self.groups, self.o_rank // 32, -1),
+            wo_a_ws,
             dtype=output.dtype,
         )
         return self.wo_b(y.view(*output.shape[:-2], -1))
