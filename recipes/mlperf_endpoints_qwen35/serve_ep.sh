@@ -60,6 +60,13 @@ if [ "$MODE" = dp ]; then
   export ATOM_DP_PREFILL_GRAPH=${ATOM_DP_PREFILL_GRAPH:-1}
   export ATOM_GDN_GRAPH_MAX_SEQS=${ATOM_GDN_GRAPH_MAX_SEQS:-16}
   export ATOM_TOKEN_GRAPH_SIZES=${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,1536,2048,3072,4096,6144,8192,12288,16384}
+  # GDN layers stay eager inside those graphs. With them recorded too, c2048 turns some requests
+  # that resume a prefix checkpoint into garbage (they decode to the output cap at ~1% MTP
+  # acceptance, one rank at a time): 1-15 such requests within 1-8 min on every run, none in
+  # 10 min with the GDN layers eager, at the same throughput. Draining the stream before a step's
+  # state copies, or turning off the cached launch paths above, also clears it: a race that needs
+  # the host far ahead of the GPU, still open.
+  export ATOM_GDN_PREFILL_IN_GRAPH=${ATOM_GDN_PREFILL_IN_GRAPH:-0}
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server

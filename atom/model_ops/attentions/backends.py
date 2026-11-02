@@ -1106,6 +1106,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        if envs.ATOM_STATE_OPS_DRAIN and (
+            state_ops.relocations
+            or state_ops.checkpoint_stores
+            or state_ops.checkpoint_restores
+        ):
+            # Let the GPU finish the forwards already queued before this step's
+            # state copies and the metadata built after them. With the host far
+            # ahead (graphed prefill steps, cached launch paths), c2048 DP turns
+            # some requests that resume a prefix checkpoint into garbage; this
+            # drain clears it. The race it closes is not yet identified.
+            torch.cuda.current_stream().synchronize()
         # First: a store below may take some of these units again for its image.
         if state_ops.zero_blocks:
             self.zero_kv_blocks(state_ops.zero_blocks)
