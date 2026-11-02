@@ -18,6 +18,7 @@ import pytest
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import ChatMessage
 from atom.entrypoints.openai.reasoning import separate_reasoning
+from atom.entrypoints.openai.reasoning_controls import apply_reasoning_controls
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     AnthropicMessagesRequest,
@@ -542,7 +543,9 @@ class TestAnthropicMessagesRequest:
         assert len(req.tools) == 1
 
     @pytest.mark.parametrize("value", [-5, -1, 0])
-    def test_non_positive_max_tokens_returns_invalid_request(self, value):
+    def test_non_positive_max_tokens_returns_invalid_request(self, value, monkeypatch):
+        # Use a served model so the request reaches max_tokens validation.
+        monkeypatch.setattr(api_server, "model_name", "test")
         request = AnthropicMessagesRequest(
             model="test",
             messages=[AnthropicMessage(role="user", content="Hi")],
@@ -949,26 +952,25 @@ class TestAnEffortIsNotAnOptIn:
     def test_only_an_explicit_statement_resolves(self, req, expected):
         assert resolve_thinking(req)[0] is expected
 
-    def test_the_toggle_is_written_only_when_stated(self):
-        """Read off the syntax tree, not grepped: the guard has to be on the
-        resolved value, not on the toggle merely existing."""
-        tree = ast.parse(pathlib.Path(api_server.__file__).read_text())
-        writes = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Subscript)
-            and isinstance(n.ctx, ast.Store)
-            and getattr(n.value, "id", None) == "merged_kwargs"
-            and isinstance(n.slice, ast.Name)
-        ]
-        assert writes, "no name-keyed write to merged_kwargs; matcher is stale"
-        guarded = [
-            n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.If)
-            and "_th_enabled is not None" in ast.unparse(n.test)
-        ]
-        assert guarded, "the toggle is written without asking whether it was stated"
+    @pytest.mark.parametrize("default", [False, True])
+    @pytest.mark.parametrize("effort", [None, "high", 37])
+    def test_the_toggle_is_written_only_when_stated(self, default, effort):
+        defaults = {"enable_thinking": default}
+        actual = apply_reasoning_controls(
+            defaults,
+            ("enable_thinking", False, True),
+            resolve_thinking(self.Req(reasoning_effort=effort)),
+        )
+        assert actual["enable_thinking"] is default
+        assert defaults == {"enable_thinking": default}
+        explicit = apply_reasoning_controls(
+            defaults,
+            ("enable_thinking", False, True),
+            resolve_thinking(
+                self.Req(thinking={"type": "disabled"}, reasoning_effort=effort)
+            ),
+        )
+        assert explicit["enable_thinking"] is False
 
 
 class TestTheEndpointAsksForTheOrder:
