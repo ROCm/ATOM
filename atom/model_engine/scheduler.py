@@ -1141,9 +1141,15 @@ class Scheduler:
         if (
             seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
             or not self._connector_flag("is_offload")
-            or self._still_loading(seq)
             or len(seq.block_table) == 0
         ):
+            return None
+        if self._has_req_id(self.failed_recving_kv_req_ids, seq.id):
+            # A failed load recomputes past its local hit: only that is cached.
+            # `offload_loaded_tokens` still holds the planned boundary until
+            # failure recovery runs at admission.
+            return seq.num_cached_tokens
+        if not self._has_req_id(self.finished_recving_kv_req_ids, seq.id):
             return None
         loaded = getattr(seq, "offload_loaded_tokens", None)
         return max(seq.num_cached_tokens, loaded or 0)
@@ -1254,9 +1260,7 @@ class Scheduler:
                 break
             finished_load = self._finished_load_tokens(seq)
             if finished_load is not None or self._is_offload_prefill_resume(seq):
-                resume = (
-                    seq.num_cached_tokens if finished_load is None else finished_load
-                )
+                resume = self._offload_prefill_start(seq, finished_load)
                 start = self.block_manager.replay_start(
                     seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
