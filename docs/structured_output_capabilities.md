@@ -20,9 +20,16 @@ multi-backend interfaces.
 | `mask.py` | Reusable packed mask buffers, H2D transfer and kernel dispatch. |
 | `transfer.py` | Owned token snapshots, pinned host buffers and asynchronous D2H events. |
 
-HTTP parameter extraction and final response validation remain in
-`atom/entrypoints/openai/structured_output.py`; API admission orchestration stays
-in `structured_preflight.py` alongside it. The GPU kernel remains in
+The OpenAI adapter has its own `atom/entrypoints/openai/structured_output/`
+package, separate from engine execution:
+
+| Module | Responsibility |
+| --- | --- |
+| `request_validation.py` | Chat/Responses format extraction, Schema checks, tool alternatives and reasoning activation. |
+| `response_validation.py` | Final JSON/Schema validation and Chat stream completion/error handling. |
+| `worker_preflight.py` | Admission-time worker RPC, deployment fingerprint checks and preparation cache. |
+
+The GPU kernel remains in
 `atom/model_ops/triton_structured_output.py`. The engine package does not depend
 on the HTTP layer, and importing its entry points does not load llguidance or
 allocate mask/transfer resources.
