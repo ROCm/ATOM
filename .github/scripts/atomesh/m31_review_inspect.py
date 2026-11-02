@@ -1,10 +1,12 @@
 """Read only this validation's queue records and bounded shared-log excerpts."""
 import datetime
 import json
+import re
 import subprocess
+from collections import deque
 from pathlib import Path
 
-RUNS = (41415572765, 41423516489, 41425998224)
+RUNS = (41431079593, 41423516489, 41425998224)
 PREFIX = 'minimax-m3.1-flash-quark-mxfp4-minimax-m31-flash-mxfp4-1p1d-pp4-tp4-dspark7-nvfp4-mcstore-agentx'
 LOG_ROOT = Path('/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG')
 OUT = Path('m31-review-inspection')
@@ -47,8 +49,21 @@ for run in RUNS:
             target = OUT / str(run) / root.name / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b'=== FIRST 8 KiB ===\n' + head + b'\n=== LAST 32 KiB ===\n' + tail)
-            entry['files'].append({'path': str(relative), 'bytes': stat.st_size,
-                                   'mtime_utc': datetime.datetime.fromtimestamp(stat.st_mtime, datetime.timezone.utc).isoformat()})
+            info = {'path': str(relative), 'bytes': stat.st_size,
+                    'mtime_utc': datetime.datetime.fromtimestamp(stat.st_mtime, datetime.timezone.utc).isoformat()}
+            if path.name in ('prefill-rank-0.log', 'decode-rank-0.log', 'container.log'):
+                selected = deque(maxlen=12)
+                disabled, handshakes = 0, 0
+                with path.open(errors='replace') as source:
+                    for line in source:
+                        disabled += 'Disable device ' in line
+                        handshakes += 'Active handshake RPC failed' in line
+                        if re.search(r'Profiling|Warmup|WARMUP|Benchmark Duration|benchmark.*(?:start|finish)|profiling.*(?:start|finish)', line):
+                            selected.append(re.sub(r'\x1b\[[0-9;]*m', '', line).strip()[:500])
+                info.update(disabled_device_records=disabled,
+                            failed_handshake_records=handshakes,
+                            phase_records=list(selected))
+            entry['files'].append(info)
         entries.append(entry)
     summary['runs'][str(run)] = entries
 
