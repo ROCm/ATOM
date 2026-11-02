@@ -185,6 +185,19 @@ class TestMhaRegionsMatchThePublishedPages:
         ]
         assert published == list(zip(bases.tolist(), sizes.tolist(), strict=True))
 
+    @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.int8])
+    def test_region_layout_names_the_published_regions(self, kv_dtype):
+        """The GDN transfer check compares the published regions with this."""
+        pool = _pool(kv_dtype=kv_dtype)
+        published = [
+            (region.base_addr, region.unit_bytes)
+            for region in (
+                page_region(tensor, semantic_role=role).region
+                for role, tensor in pool.region_tensors()
+            )
+        ]
+        assert published == pool.region_layout()
+
     def test_a_scheduler_entry_is_one_unit_even_when_it_holds_many_blocks(self):
         """Kernel blocks are packed into the entry ``page_pool`` charges.
         A checkpoint unit is that entry, so block id 2 is two entries down."""

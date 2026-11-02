@@ -6062,33 +6062,28 @@ def _text_wrapped(model_type: str, text_type: str):
 
 
 @pytest.mark.parametrize(
-    "hf_config,scheduler_cls",
+    "hf_config",
     [
         pytest.param(
             SimpleNamespace(model_type="qwen3_next"),
-            QwenOffloadScheduler,
             id="qwen3-next",
         ),
         pytest.param(
             _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
-            QwenOffloadScheduler,
             id="qwen3.5",
         ),
         pytest.param(
             _text_wrapped("qwen4_exp", "qwen4_exp_text"),
-            QwenOffloadScheduler,
             id="qwen3.8",
         ),
     ],
 )
-def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
-    monkeypatch, hf_config, scheduler_cls
-):
+def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(monkeypatch, hf_config):
     """A chunk-aligned prompt resent whole with HBM empty. Withholding the last
     token would floor the KV leg to 512, under the 704 rung the prompt kept,
     so the hit stays whole when a boundary lands in that last chunk."""
     sched = _offload_scheduler(monkeypatch, hf_config, chunk=256)
-    assert type(sched) is scheduler_cls
+    assert type(sched) is QwenOffloadScheduler
     sched._min_load_tokens = 0
     sched._lookup_client = _LookupClient(hit=768)
     asked = []

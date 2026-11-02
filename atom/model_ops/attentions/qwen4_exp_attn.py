@@ -97,8 +97,8 @@ def qsa_row_space(config, layer_num: int, num_target_layers: int) -> str:
 def qsa_caches_rope_positions(config) -> bool:
     # Image/video requests give mRoPE three genuinely different position rows,
     # and then a compressed key's group position cannot be recomputed
-    # arithmetically. Cached only when the engine can actually be handed an
-    # image: it costs ~1.4 GB of the paged budget.
+    # arithmetically. Cache the per-token axes only when the engine can
+    # actually be handed an image -- it costs ~1.4 GB of the paged budget.
     return getattr(config, "multimodal_config", None) is not None
 
 
@@ -394,9 +394,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         if not getattr(hf, "ple_layer_ids", None):
             return []
         state_len = (int(hf.ple_conv_kernel_size) - 1) * int(hf.ngram_size)
+        channels = int(hf.hidden_size) * int(hf.hc_count)
         # The PLE convolution is NOT tensor-parallel: every rank runs the full
         # hc_count * hidden width, matching the reference's tp_world_size=1.
-        channels = int(hf.hidden_size) * int(hf.hc_count)
         return [
             _PlePlane(
                 "ple_conv_state",
@@ -603,7 +603,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
                 page_region(tensor, semantic_role=role)
                 for role, tensor in arena.region_tensors()
             ],
-            tp_replication_factor=1,
         )
         return self._with_paged_state_contract(transfer)
 
