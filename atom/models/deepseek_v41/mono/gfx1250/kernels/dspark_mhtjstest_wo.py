@@ -1,6 +1,9 @@
 """M16 N64 WO-B, native fragments, full-row TP1 publication."""
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_wo import *
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_projection import _weight_step
+from atom.mono.device.sync import _noted
+from atom.mono.device.ops import bf16_pair, rsrc
+from aiter.ops.flydsl.kernels import buffer_ops as bo
 
 @traced
 def matrix(c,block,n):
@@ -32,23 +35,46 @@ def matrix(c,block,n):
         for j in range_constexpr(8):fx.ptr_store(v[j],c['red']+(wave*16+lane%16)*16+half*8+j)
     gpu.barrier()
 
+# TP1 partials travel as 16-byte groups: three bf16-pair words and one tag.
+# 64 columns (32 pairs) are 10 groups of three pairs and one of two. Block-major
+# layout keeps one CTA's 16 tokens x 11 groups a contiguous, 256 B aligned run,
+# so peer writes stay whole aligned chunks (W24b).
+ATTN_GROUPS = 11
+ATTN_BLOCKS = 80
+
+
+def attn_group_word(src, t, s, block, g):
+    return ((fx.Int32(src) * ATTN_BLOCKS + block) * s + t) * (ATTN_GROUPS * 4) + g * 4
+
+
 @traced
-def push(c,block,t0,n):
-    tid=c['tid'];d=c['d']
-    for begin in range_constexpr(0,16*64//2,THREADS):
-        at=tid+begin;t=at//32;pair=at%32
-        if t<n:
-            group=pair//8;cc=2*(pair%8)
-            vals=[]
-            for j in range_constexpr(2):
-                x=fx.ptr_load(c['red']+((2*group)*16+t)*16+cc+j)
-                x=x+fx.ptr_load(c['red']+((2*group+1)*16+t)*16+cc+j)
-                vals.append(x)
-            tg=t0+t;col=block*64+pair*2
+def push(c, block, t0, n):
+    tid = c['tid']
+    mb = c['put'].__self__
+    red = c['red']
+    for begin in range_constexpr(0, 16 * ATTN_GROUPS, THREADS):
+        at = tid + begin
+        t = at // ATTN_GROUPS
+        g = at % ATTN_GROUPS
+        if (at < 16 * ATTN_GROUPS) & (t < n):
+            words = []
+            for k in range_constexpr(3):
+                pair = fx.min(g * 3 + k, 31)
+                group = pair // 8
+                cc = 2 * (pair % 8)
+                vals = []
+                for j in range_constexpr(2):
+                    x = fx.ptr_load(red + ((2 * group) * 16 + t) * 16 + cc + j)
+                    x = x + fx.ptr_load(red + ((2 * group + 1) * 16 + t) * 16 + cc + j)
+                    vals.append(x)
+                words.append(bf16_pair(vals[0], vals[1]).bitcast(fx.Int32))
+            words.append(fx.Int32(mb.tag))
+            vec = fx.Vector.from_elements(words, fx.Int32)
+            index = attn_group_word(c['rank'], t0 + t, c['S'], block, g)
             for p in range_constexpr(4):
-                dst=preg(c['peer_addr'](p),c['peer']['attn'],'attn')
-                address=attn_region_pair(c['rank'],tg,c['S'],col)
-                c['put_bf'](dst,2*address,vals)
+                dst = preg(c['peer_addr'](p), c['peer']['attn'], 'attn')
+                bo.buffer_store(vec, rsrc(_noted(dst, 'put')), index,
+                                cache_modifier=mb.scope_cm[dst.space])
     gpu.barrier()
 
 @traced

@@ -74,15 +74,18 @@ def make_input_job(c,kind,t0,group=0):
     return atom,src
 
 
+# Each of the eight waves issues one TDM for its 1/8 of the K128 slabs.
+WAVES_IN = 8
+
+
 @traced
 def load_input(c,kind,t0,group,job):
     d=c['d'];tid=c['tid']
     if const_expr(kind=='woa'):
         inner=d.group_k;stride=d.heads*HEAD_DIM//32;off=group*inner//32
         offset=RAW_XOS_OFFSET
+        xstride=d.xo_words;xoff=group*inner//4;xoffset=RAW_XO_OFFSET
         flag=sreg(raw_address(c,0),RAW_XO_READY_OFFSET,'xo')
-        # At TP4 the single 16-head IRQ producer tile contains both 8-head
-        # WOA groups. Every dc is needed by either group, so no new wait edge.
         assert d.head_tiles.count==1 and d.groups==2
         assert c['S']==48
         per=GROUPS//4
@@ -90,20 +93,31 @@ def load_input(c,kind,t0,group,job):
         participants=16*per
     else:
         inner=d.wob_k;stride=d.o_rows//32;off=0;offset=RAW_XBS_OFFSET
+        xstride=d.yb_words;xoff=0;xoffset=RAW_XB_OFFSET
         flag=sreg(raw_address(c,0),RAW_XB_READY_OFFSET,'x8b')
         assert d.woa_tasks==64
         indices=[(t0//16)*d.woa_tasks+tid]
         participants=d.woa_tasks
     if tid<participants:c['poll']([(flag,index,1) for index in indices])
     gpu.barrier()
-    if c['wave']==0:
-        atom,src=job
-        fx.copy(atom,src,tensor(c['xl'],(inner//128,16,32),(16*36,36,1)))
-        ready(0)
-    groups=inner//32
-    for begin in range_constexpr(0,16*groups,THREADS):
-        at=tid+begin;row=at//groups;col=at%groups
-        value=bo.buffer_load(rsrc(raw_address(c,offset)),
-                            (t0+row)*stride+off+col,vec_width=1,dtype=T.i32,cache_modifier=CM_DEV)
-        fx.ptr_store(fx.Int32(value),c['xsl']+row*lds_row(groups)+col)
+    slabs=inner//128
+    assert slabs%WAVES_IN==0
+    per_wave=slabs//WAVES_IN
+    w=c['wave']
+    ptr=fx.inttoptr(fx.PointerType.get(fx.Int32.ir_type,fx.AddressSpace.Global,16),
+                   raw_address(c,xoffset)+(fx.Int64(t0)*xstride+fx.Int64(xoff)+fx.Int64(w)*(per_wave*32))*4)
+    src=tensor(ptr,(per_wave,16,32),(32,xstride,1))
+    atom=fx.rocdl.make_tdm_atom(src,[per_wave,16,32],strides=[32,xstride,None],
+                              num_warps=1,pad_interval=32,pad_amount=4,
+                              cache_modifier=CM_DEV)
+    fx.copy(atom,src,tensor(c['xl']+w*(per_wave*16*36),(per_wave,16,32),(16*36,36,1)))
+    groups=inner//32;vecs=groups//4
+    assert (16*vecs)%THREADS==0
+    for begin in range_constexpr(0,16*vecs,THREADS):
+        at=tid+begin;row=at//vecs;col=(at%vecs)*4
+        v=fx.Vector(bo.buffer_load(rsrc(raw_address(c,offset)),
+                    (t0+row)*stride+off+col,vec_width=4,dtype=T.i32,cache_modifier=CM_DEV))
+        for j in range_constexpr(4):
+            fx.ptr_store(v[j],c['xsl']+row*lds_row(groups)+col+j)
+    ready(0)
     gpu.barrier()

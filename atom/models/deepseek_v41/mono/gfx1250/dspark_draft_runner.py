@@ -88,6 +88,15 @@ class DraftMonoRunner(V41MonoDecodeRunner):
         self.positions = torch.empty(
             self.max_rows, device=self.scratch.device, dtype=torch.int64
         )
+        # The block's real requests (``set_live_requests``): a padded graph's
+        # pad requests carry slot 0, a real request's, and must not write or
+        # read its ring.
+        self.live_requests = torch.full(
+            (1,), MAX_REQUESTS, device=self.scratch.device, dtype=torch.int32
+        )
+        self._request_ids = torch.arange(
+            MAX_REQUESTS, device=self.scratch.device, dtype=torch.int32
+        )
 
     def _layer_keys(self, s: int) -> list:
         # stage 0 starts from the block's embeddings: no owed post to fold
@@ -121,7 +130,8 @@ class DraftMonoRunner(V41MonoDecodeRunner):
             self.ug_groups = ug
 
     def _timeline_ptr(self, kernel, layer_id) -> int:
-        if self._wide_step and kernel in ("k1", "k2"):
+        from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as diag
+        if (self._wide_step or diag.ENABLED) and kernel in ("k1", "k2"):
             return self.mhc_sq.data_ptr()
         timeline = self.timelines.get(kernel)
         return timeline.ptr(layer_id) if timeline is not None else 0
@@ -132,6 +142,11 @@ class DraftMonoRunner(V41MonoDecodeRunner):
 
     def _rope_positions(self, cache, step) -> torch.Tensor:
         return self.positions
+
+    def set_live_requests(self, requests: int) -> None:
+        """The next block's real requests, the rest graph padding. Called by
+        the proposer outside the graph (``DSparkDraftModel.prepare_block``)."""
+        self.live_requests.fill_(requests)
 
     def backbone(self, anchor_ids, anchor_positions):
         """``DSparkDraftModel.block_backbone`` of ``anchor_ids``' requests at the
@@ -170,9 +185,17 @@ class DraftMonoRunner(V41MonoDecodeRunner):
 
             residual, pre_mix = replicate(residual), replicate(pre_mix)
         state = SinglePassHCState(residual, pre_mix)
+        # A pad request's slot past the pool: it writes and reads no key
+        # (``write_draft_step_meta``). Read on the GPU, so a replay sees the
+        # count ``set_live_requests`` staged for its step.
+        slots = torch.where(
+            self._request_ids[:requests] < self.live_requests,
+            metadata.state_slot_out[:requests],
+            cache.num_slots,
+        )
         write_draft_step_meta(
             anchor_positions,
-            metadata.state_slot_out,
+            slots,
             cache.num_slots,
             cache.geometry,
             cache.geometry.window(0, cache.num_pages),

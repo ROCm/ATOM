@@ -302,3 +302,23 @@ def test_wrong_model_topology_stays_native(runners):
         dispatch.install_mono_decode(model, atom_config(), NS(model=Draft())) is model
     )
     assert not runners
+
+
+def test_draft_prepare_block_stages_live_requests():
+    """A padded draft graph's pad requests must not reach the mono ring."""
+    calls = []
+
+    class Draft2(Draft):
+        def prepare_block(self, *args):
+            calls.append(("native", args))
+
+    class Runner:
+        def set_live_requests(self, n):
+            calls.append(("mono", n))
+
+    wrapped = dispatch.MonoDraftModel(Draft2())
+    wrapped.prepare_block(None, 5, 3, 8)
+    assert calls == [("native", (None, 5, 3, 8))]
+    wrapped._mono.runner = Runner()
+    wrapped.prepare_block(None, 5, 6, 8)
+    assert calls[-2:] == [("mono", 6), ("native", (None, 5, 6, 8))]

@@ -28,7 +28,20 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_round_column
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_round_column_down import weight_words
 from atom.mono.runtime.abi import KernelAbi
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_state import STATE_WORDS
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as diag
+
+
+@traced
+def k2_stamp(c, slot, picks):
+    if const_expr(diag.ENABLED):
+        diag.stamp(c['stamps'], c['tid'], slot)
+import os
 ABI = KernelAbi((*ABI.names, 'mhtjstest_state'))
+# Routed UG/down as expert K128 slice units (``dspark_slice_moe``); its FP32
+# partials follow the state words in the runner's workspace.
+SLICE_MOE = os.environ.get('ATOM_DSV41_GFX1250_SLICE_MOE', '0') == '1'
+if SLICE_MOE:
+    from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_slice_moe import run_slice_moe, K_SLICES, STAMP_WORDS
 @lru_cache(None)
 def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False, gates=False, front=False, shared_debug=False, union=False, ug=False, ug_debug=False, down=False, down_debug=False):
     assert key.tp==4 and key.ep==key.moe_tp==1
@@ -43,7 +56,7 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
     offsets=stage_lds(s,rs)["offsets"]
     layout=scratch_layout(key)
     sizes=lds_words(PER_THREAD)
-    name=kernel_symbol('ct1_p1a_k2',fs=P1A.S,s=s,n=key.index_bound_max,tpar=int(key.tok_par),db=int(debug),ar=int(reduce),se=int(seam),ga=int(gates),fr=int(front),e=key.experts,k=key.topk,sd=int(shared_debug),un=int(union),ug=int(ug),ud=int(ug_debug),dn=int(down),dd=int(down_debug))
+    name=kernel_symbol('ct1_p1a_k2',fs=P1A.S,s=s,n=key.index_bound_max,tpar=int(key.tok_par),db=int(debug),ar=int(reduce),se=int(seam),ga=int(gates),fr=int(front),e=key.experts,k=key.topk,sd=int(shared_debug),un=int(union),ug=int(ug),ud=int(ug_debug),dn=int(down),dd=int(down_debug),**({'sl':1} if SLICE_MOE and down else {}),**({'ks':1} if diag.ENABLED else {}))
     @fx.struct
     class IndexSmem:
         keys:fx.Array[fx.Int32,sizes['keys'],16]
@@ -120,6 +133,8 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
     @fx.struct
     class Smem:
         late_meta:fx.Array[fx.Int32,272 + (3*s+2 if s > 24 else 0),16]
+        if diag.ENABLED:
+            stamps:fx.Array[fx.Int64,diag.SLOTS,16]
     @flyc.kernel(name=name,known_block_size=[THREADS,1,1])
     def index(iact: Int32, iq: Int64, iw: Int64, plane: Int64, iqs: Int64, pscale: Int64, iplan: Int64, itab: Int64, itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64, lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32, ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64, q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64, rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32, ring_slots: Int32, sink: Int64, qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64, wob: Int64, wob_s: Int64, res_in: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64, hc_fn: Int64, hc_scale: Int64, hc_base: Int64, ffn_w: Int64, res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64, normed: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64, w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32, moe_layer: Int32, tl: Int64, mhtjstest_state: Int64):
         tid,bid=fx.thread_idx.x,fx.block_idx.x
@@ -228,8 +243,13 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
                peer_addr=lambda p:late_pointer(dict(late_meta=mem.late_meta.ptr),112+2*p),peer=peer_offsets(s,dims),
                sel_lds=dict(keys=ix.keys.ptr,hist=ix.hist.ptr,buf=ix.buf.ptr),
                score_red=fx.recast_iter(fx.PointerType.get(fx.Float32.ir_type,fx.AddressSpace.Shared,4),ix.keys.ptr))
+        if const_expr(diag.ENABLED):
+            c['stamps'] = mem.stamps.ptr
+            diag.begin(c['stamps'], tid)
+        k2_stamp(c,0,rs.picks)
         if const_expr(key.index_bound_max>0):
             if iact!=0:run_indexer(c,s,bid,key.index_bound_max)
+        k2_stamp(c,1,rs.picks)
         # Original per-CTA union handover, before score task placement.
         gpu.barrier()
         c['index_bound_max']=key.index_bound_max
@@ -240,6 +260,7 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
             ca=attention_context(c,'score')
             ca['p1a']=dict(kv=fu.kv.ptr,red=fu.red.ptr,p=fu.p.ptr,mx=fu.mx.ptr,ls=fu.ls.ptr)
             P1A.stage_fused(ca,task)
+        k2_stamp(c,9,rs.picks)
         groups=pv_groups(s,dims.head_tiles.count)
         for task in range(first_task(bid,IRQ0),s*dims.head_tiles.count*GROUPS//groups,BLOCKS):
             ca=attention_context(c,'pv')
@@ -248,12 +269,14 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
                                            fx.AddressSpace.Global,2),late_pointer(c,152))
             P1A.stage_irq_p1a(ca,task,groups)
         gpu.barrier()
+        k2_stamp(c,2,rs.picks)
         c.update(red=gm.red.ptr,xl=gm.xl.ptr,xsl=gm.xsl.ptr,pend_lds=gm.pend.ptr,
                  debug=debug,put_bf=mb.put_bf)
         if const_expr(debug):
             c['debug_woa']=fx.inttoptr(fx.PointerType.get(fx.BFloat16.ir_type,fx.AddressSpace.Global,2),late_pointer(c,180))
         c.update(wo_x=nm.x.ptr,wo_s=nm.xs.ptr,wo_ring=nm.ring.ptr,wo_red=nm.red.ptr)
         run_wo(c,key,bid)
+        k2_stamp(c,3,rs.picks)
         if const_expr(reduce):
             cr=wo_context(c,'reduce')
             if const_expr(key.tok_par):cr=dict(cr,S=s//4)
@@ -271,21 +294,26 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
             gpu.barrier()
             c.update(rl=sl.rl.ptr,fl=sl.fl.ptr,red=sl.red.ptr,pend_lds=sl.pend.ptr,split_x=sl.split_x.ptr)
             run_seam(c,key,bid)
+            k2_stamp(c,4,rs.picks)
             # This standalone probe stops after XG and optionally checks gates.
             # Full MoE will own gather placement and the before_ug callback.
             gpu.barrier()
             if const_expr(front):
                 c.update(front_red=mf.red.ptr,front_pair=mf.pair.ptr,front_xl=mf.stage.ptr+offsets['x8l'],front_xsl=mf.stage.ptr+offsets['x8sl'],front_tab=mf.tab.ptr,front_stage=mf.stage.ptr,shared_debug=shared_debug,ug_debug=ug_debug,down_debug=down_debug)
                 run_moe_front(c,key,bid)
+                k2_stamp(c,5,rs.picks)
             else:run_gather(c,key,bid)
             if const_expr(gates):
                 gpu.barrier()
                 run_seam_gates(c,key,bid)
+                k2_stamp(c,6,rs.picks)
         if const_expr(ug):
             assert seam and front and gates
             gpu.barrier()
             c.update(native_x=nm.x.ptr,native_s=nm.xs.ptr,native_ring=nm.ring.ptr,native_sdl=nm.sdl.ptr)
-            cu=run_ug(c,key,bid)
+            if const_expr(not (SLICE_MOE and down)):
+                cu=run_ug(c,key,bid)
+            k2_stamp(c,7,rs.picks)
         if const_expr(union):
             assert seam and front and gates
             gpu.barrier()
@@ -303,8 +331,18 @@ def build_dspark_down(key: LayerPostBuild, debug=False, reduce=False, seam=False
             assert not (debug or reduce or union or shared_debug or ug_debug)
             gpu.barrier()
             c.update(column_contrib=cd.contrib.ptr,column_weights=cd.weights.ptr)
-            run_down(c,key,bid)
+            if const_expr(SLICE_MOE):
+                c['slice_partial']=late_pointer(c,220)+fx.Int64(P1A.P1A_STATE_WORDS*4)
+                run_slice_moe(c,key,bid)
+            else:
+                run_down(c,key,bid)
+            k2_stamp(c,8,rs.picks)
         if const_expr(key.tok_par and key.index_bound_max>0):await_candidates(c,s,bid)
+        if const_expr(diag.ENABLED):
+            diag.stamp(c['stamps'], tid, 10)
+            extra = rs.picks * K_SLICES * 5120 + STAMP_WORDS if SLICE_MOE else 0
+            stamp_base = late_pointer(c, 220) + fx.Int64((P1A.P1A_STATE_WORDS + extra + diag.WORDS) * 4)
+            diag.flush(c['stamps'], stamp_base, tid, bid, layer, s)
     @launcher(name)
     def launch(iact: Int32, iq: Int64, iw: Int64, plane: Int64, iqs: Int64, pscale: Int64, iplan: Int64, itab: Int64, itab_stride: Int32, itab_len: Int32, ibatch: Int64, ishift: Int32, ibound: Int64, ilog: Int64, lstride: Int32, isel: Int64, icand: Int64, ilift: Int32, iprod: Int32, ibmax: Int64, bstride: Int32, icout: Int64, irow: Int64, sbound: Int64, q: Int64, pool: Int64, sel: Int64, topk: Int32, kmeta: Int64, table: Int64, rows_per_page: Int32, page_rows: Int32, main_off: Int32, ring_off: Int32, ring_slots: Int32, sink: Int64, qk_scale: Int32, pos: Int64, cos: Int64, sin: Int64, woa: Int64, woa_s: Int64, wob: Int64, wob_s: Int64, res_in: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64, hc_fn: Int64, hc_scale: Int64, hc_base: Int64, ffn_w: Int64, res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64, normed: Int64, gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64, w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64, scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32, moe_layer: Int32, tl: Int64, mhtjstest_state: Int64, stream:fx.Stream):
         index(iact, iq, iw, plane, iqs, pscale, iplan, itab, itab_stride, itab_len, ibatch, ishift, ibound, ilog, lstride, isel, icand, ilift, iprod, ibmax, bstride, icout, irow, sbound, q, pool, sel, topk, kmeta, table, rows_per_page, page_rows, main_off, ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob, wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w, res_out, post_out, comb_out, pre_out, normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, scratch, sym, peers, rank, layer, moe_layer, tl, mhtjstest_state).launch(grid=(BLOCKS,),block=(THREADS,),stream=stream)

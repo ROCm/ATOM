@@ -186,12 +186,37 @@ class V41MonoDecodeRunner:
             # CT1-P1A: split-K attention partials/ready pairs after the original state (offsets unchanged)
             from atom.models.deepseek_v41.mono.gfx1250.kernels.p1a_attention import P1A_STATE_WORDS as STATE_WORDS
             sq_words = self.max_rows * 160 * 2
+            from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_mhtjstest_native_k2 as k2n
+            from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as diag
+            # Diagnostics use two bounded records, independent of slice partials.
+            k1_words = diag.WORDS if diag.ENABLED else 0
+            k2_words = diag.WORDS if diag.ENABLED else 0
+            slice_words = 0
+            if k2n.SLICE_MOE:
+                from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_slice_moe import K_SLICES, HIDDEN, STAMP_WORDS
+                slice_words = self.max_rows * self.topk * K_SLICES * HIDDEN + STAMP_WORDS
+            if diag.ENABLED:
+                assert self.max_rows == diag.MAX_ROWS
+                assert not k2n.SLICE_MOE, "W0 records and the frozen slice experiment are separate builds"
             self.mhtjstest_workspace = torch.zeros(
-                sq_words + STATE_WORDS, dtype=torch.int32, device=self.scratch.device
+                sq_words + k1_words + STATE_WORDS + slice_words + k2_words,
+                dtype=torch.int32, device=self.scratch.device,
             )
             self.mhc_sq = self.mhtjstest_workspace[:sq_words]
-            self.mhtjstest_state = self.mhtjstest_workspace[sq_words:]
-            scratch += (self.mhtjstest_workspace,)
+            state_start = sq_words
+            self.mhtjstest_state = self.mhtjstest_workspace[state_start:]
+            # Written diagnostics/partials are not part of per-step clearing.
+            if diag.ENABLED:
+                scratch += (self.mhtjstest_workspace[:sq_words + STATE_WORDS],)
+            elif k2n.SLICE_MOE:
+                scratch += (self.mhtjstest_workspace[:sq_words + STATE_WORDS],)
+            else:
+                scratch += (self.mhtjstest_workspace,)
+            if diag.ENABLED:
+                self.diagnostic_stamps = {
+                    "k1": self.mhtjstest_workspace[diag.k1_offset_words():diag.k2_offset_words()],
+                    "k2": self.mhtjstest_workspace[-k2_words:],
+                }
         self.mailboxes = StepMailboxes(self.peers, *scratch, debug=self.debug)
         self.widths = WidthBuilds(
             self._rows_build, self._row_kernels, group, "V4.1 mono"

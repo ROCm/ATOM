@@ -102,26 +102,42 @@ def run_ug(root, key, bid):
     c['wave'] = uniform(c['tid'] >> 5)
     load_route(c, c['tab'])
     tiles=c['rs'].tile_first(c['tab'], c['rs'].n_union(c['tab'], c['S']))
-    total=mplan.ug_tasks(tiles, c['rs'].ug_parts)
-    task=first_task(bid, c['rs'].ug0)
-    if task < total:
+    assert c['rs'].ug_parts == 9
+    groups_per_tile = 5
+    total_groups = tiles * groups_per_tile
+    total = mplan.ug_tasks(tiles, c['rs'].ug_parts)
+    group_task=first_task(bid, c['rs'].ug0)
+    task=(group_task // groups_per_tile) * 9 + (group_task % groups_per_tile) * 2
+    reuse_input=fx.Int32(0)
+    if group_task < total_groups:
         # CT1-M3-A1 (from tp4-mono/ct1-m3-ugfront): the first task's weights are primed
         # before the loop; every later task's by the previous iteration, before its epilogue.
         e0, part00, _, _ = ug_tile_task(c, task)
         _, tile0, ks0, _ = ug_wave_pair(c, part00)
         prime(c, jobs(c, c['args']['w13'], c['args']['w13_s'], local_expert(c, e0), tile0,
                       HIDDEN, 2 * c['d'].inter, HIDDEN // 32), ks0)
-    while task < total:
+    while group_task < total_groups:
         e, part0, first, count = ug_tile_task(c, task)
         _, tile, ks, _ = ug_wave_pair(c, part0)
         job = jobs(c, c['args']['w13'], c['args']['w13_s'], local_expert(c, e), tile,
                    HIDDEN, 2 * c['d'].inter, HIDDEN // 32)
-        gather(c, first, count)
+        if reuse_input == 0:
+            gather(c, first, count)
+        else:
+            # Preserve the original gather's full primed-weight wait and CTA
+            # rendezvous. Only omit repeated A/SA loads and readiness poll.
+            ready(0)
+            gpu.barrier()
         acc=pipeline(c, job, HIDDEN // 256, fx.min(c['lane'] % 16, count - 1), HIDDEN, ks)
         # take the next task now and start its weight stream into the retired ring
         # before this task's epilogue
-        nxt=(total > BLOCKS).select(take_ug_task(c) + BLOCKS, total)
-        if nxt < total:
+        reuse_next = (task % 9 % 2 == 0) & (task % 9 < 8)
+        next_group = group_task
+        nxt = task + 1
+        if reuse_next == 0:
+            next_group=(total_groups > BLOCKS).select(take_ug_task(c) + BLOCKS, total_groups)
+            nxt=(next_group // groups_per_tile) * 9 + (next_group % groups_per_tile) * 2
+        if next_group < total_groups:
             e1, part01, _, _ = ug_tile_task(c, nxt)
             _, tile1, ks1, _ = ug_wave_pair(c, part01)
             retire_reads()
@@ -130,4 +146,6 @@ def run_ug(root, key, bid):
         epilogue(c, part0, first, count, acc)
         publish(c['put'], c['ugf'], task, 1, c['tid'] == 0)
         task=nxt
+        group_task=next_group
+        reuse_input=fx.Int32(reuse_next)
     return c

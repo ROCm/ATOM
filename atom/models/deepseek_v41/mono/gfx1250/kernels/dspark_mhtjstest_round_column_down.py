@@ -12,6 +12,8 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_suppo
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_support import ready
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_support import retire_reads
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import publish_plain as publish
+from atom.mono.device.sync import _noted, _spin, preg
+from atom.mono.device.ops import bf2_f32, bf16_pair, rsrc
 
 
 def weight_words(inter):
@@ -54,7 +56,32 @@ def operands(n):
 
 
 @traced
-def load_operands(c, tasks, first, count, step, out, slot, slots):
+def load_tile_scales(c, first, count):
+    steps = c['d'].inter // 128
+    row = first + fx.min(c['lane'] % 16, count - 1)
+    packed = fx.make_rmem_tensor(steps, fx.Int32)
+    packed.store(fx.full(steps, 0, fx.Int32))
+    for group in range_constexpr(4):
+        codes = []
+        for begin in range_constexpr(0, steps, 4):
+            width = min(4, steps - begin)
+            values = bo.buffer_load(rsrc(c['mids'].value),
+                row * (4 * steps) + group * steps + begin,
+                vec_width=width, dtype=T.i32, cache_modifier=CM_DEV)
+            if const_expr(width == 1):
+                codes.append(fx.Int32(values))
+            else:
+                vec = fx.Vector(values)
+                for j in range_constexpr(width):
+                    codes.append(vec[j])
+        old = packed.load()
+        packed.store(fx.Vector.from_elements([
+            old[i] | (codes[i] << (8 * group)) for i in range_constexpr(steps)], fx.Int32))
+    return packed
+
+
+@traced
+def load_operands(c, tasks, first, count, step, out, slot, slots, scale_code):
     lane, d = c['lane'], c['d']
     row = first + fx.min(lane % 16, count - 1)
     chunks = [fx.Vector(bo.buffer_load(rsrc(c['mid'].value),
@@ -62,13 +89,7 @@ def load_operands(c, tasks, first, count, step, out, slot, slots):
                   vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)) for h in range(4)]
     out['x'].store(fx.Vector.from_elements(
         [chunks[h][q] for h in range(4) for q in range(4)], fx.Int32))
-    sx = fx.Int32(0)
-    for group in range_constexpr(4):
-        code = fx.Int32(bo.buffer_load(rsrc(c['mids'].value),
-            mid_code_index(d, row, step * 4 + group), vec_width=1,
-            dtype=T.i32, cache_modifier=CM_DEV))
-        sx = sx | (code << (8 * group))
-    out['sx'].store(fx.Vector.from_elements([sx], fx.Int32))
+    out['sx'].store(fx.Vector.from_elements([scale_code], fx.Int32))
     steps = d.inter // 128
     base = c['column_weights'] + c['wave'] * (2 * steps * (256 + 16))
     at = lane // 16 * 64 + lane % 16 * 4
@@ -92,10 +113,11 @@ def matrix_tile(c, tasks, first, count, slot, slots):
     for pair in acc:
         for a in pair:
             a.store(fx.full(8, 0., fx.Float32))
+    scale_codes = load_tile_scales(c, first, count)
     cur, nxt = operands(len(tasks)), operands(len(tasks))
-    load_operands(c, tasks, first, count, fx.Int32(0), cur, slot, slots)
+    load_operands(c, tasks, first, count, fx.Int32(0), cur, slot, slots, scale_codes.load()[0])
     for step in range_constexpr(c['d'].inter // 128 - 1):
-        load_operands(c, tasks, first, count, step + 1, nxt, slot, slots)
+        load_operands(c, tasks, first, count, step + 1, nxt, slot, slots, scale_codes.load()[step + 1])
         sx, sw = cur['sx'].load()[0], cur['sw'].load()
         for j in range_constexpr(len(tasks)):
             fx.gemm(atom, acc[j][step % 2], cur['w'][j], cur['x'], acc[j][step % 2],
@@ -177,40 +199,103 @@ def run_down(root, key, bid):
     flag = sreg(late_pointer(root, 24), root['scratch_layout']['dnf'][0], 'dnf')
     publish(c['put'], flag, bid, 1, c['tid'] == 0)
     for t in range(first_task(fresh(bid), RED0), RED_TASKS, BLOCKS):
-        stage_reduce(c, t)
+        stage_reduce_packed(c, t)
+
+
+# TP2 partials travel as 16-byte groups (three bf16-pair words and one tag):
+# a 16-column owner task's 48 tokens x 3 groups are one contiguous 2304 B,
+# 256 B aligned run per rank (W28), instead of 64 B tagged-pair fragments.
+FFN_GROUPS = 3
+FFN_TASKS = 320
+
+
+def ffn_group_word(src, task16, t, s, g):
+    return ((fx.Int32(src) * FFN_TASKS + task16) * s + t) * (FFN_GROUPS * 4) + g * 4
 
 
 @traced
 def bulk_finish(c, tasks):
-    """All 48 rows/owned columns together, original top-k order and TP ABI.
-
-    Source is the owner's LDS contribution, already complete at the preceding
-    CTA barrier. There is no per-M16 pair arena or intermediate handoff. Issue
-    all routed words together, sum two BF16 values, then directly publish the
-    same tagged BF16 pair used by the established P7 finish.
-    """
-    per_task = c['S'] * 8
+    mb = c['put'].__self__
+    per_task = c['S'] * FFN_GROUPS
     for begin in range_constexpr(0, len(tasks) * per_task, THREADS):
         idx = c['tid'] + begin
         if idx < len(tasks) * per_task:
             j, rem = idx // per_task, idx % per_task
-            t, rp = rem // 8, rem % 8
+            t, g = rem // FFN_GROUPS, rem % FFN_GROUPS
             task = tasks[0]
             if const_expr(len(tasks) == 2):
                 task = (j == 0).select(tasks[0], tasks[1])
-            words = [fx.ptr_load(c['contrib'] + j * c['rs'].picks * 8
-                       + (t * c['rs'].topk + k) * 8 + rp)
-                     for k in range(c['rs'].topk)]
-            r0, r1 = fx.Float32(0.), fx.Float32(0.)
-            for k in range_constexpr(c['rs'].topk):
-                r0 = r0 + bf_lo(words[k])
-                r1 = r1 + bf_hi(words[k])
-            at = (j * c['S'] + t) * ROWS + 2 * rp
-            sh0 = fx.ptr_load(c['sdl'] + at).bitcast(fx.Float32)
-            sh1 = fx.ptr_load(c['sdl'] + at + 1).bitcast(fx.Float32)
-            v0, v1 = bf16_round(r0 + sh0), bf16_round(r1 + sh1)
-            col = task * ROWS + 2 * rp
+            words = []
+            for k in range_constexpr(3):
+                rp = fx.min(g * 3 + k, 7)
+                ws = [fx.ptr_load(c['contrib'] + j * c['rs'].picks * 8
+                       + (t * c['rs'].topk + q) * 8 + rp) for q in range(c['rs'].topk)]
+                r0, r1 = fx.Float32(0.), fx.Float32(0.)
+                for q in range_constexpr(c['rs'].topk):
+                    r0 = r0 + bf_lo(ws[q])
+                    r1 = r1 + bf_hi(ws[q])
+                at = (j * c['S'] + t) * ROWS + 2 * rp
+                sh0 = fx.ptr_load(c['sdl'] + at).bitcast(fx.Float32)
+                sh1 = fx.ptr_load(c['sdl'] + at + 1).bitcast(fx.Float32)
+                v0, v1 = bf16_round(r0 + sh0), bf16_round(r1 + sh1)
+                words.append(bf16_pair(v0, v1).bitcast(fx.Int32))
+            words.append(fx.Int32(mb.tag))
+            vec = fx.Vector.from_elements(words, fx.Int32)
+            index = ffn_group_word(c['rank'], task, t, c['S'], g)
             for p in range_constexpr(c['d'].ranks):
                 dst = preg(c['peer_addr'](p), c['peer']['ffn'], 'ffn')
-                c['put_bf'](dst, 2 * region_pair(c['rank'], t, c['S'], col), [v0, v1])
+                bo.buffer_store(vec, rsrc(_noted(dst, 'put')), index,
+                                cache_modifier=mb.scope_cm[dst.space])
     gpu.barrier()
+
+
+@traced
+def reduce_pair_packed(c, task, idx):
+    s, tp = c['S'], c['d'].ranks
+    a = c['args']
+    if idx < s * RED_COLS // 2:
+        t = idx // (RED_COLS // 2)
+        col = task * RED_COLS + 2 * (idx % (RED_COLS // 2))
+        own = preg(c['sym'], c['peer']['ffn'], 'ffn')
+        mb = c['poll'].__self__
+        cm = mb.scope_cm[own.space]
+        base = _noted(own, 'poll')
+        task16 = col // 16
+        rp = (col % 16) // 2
+        g = fx.min(rp // 3, FFN_GROUPS - 1)
+        k = rp - g * 3
+        tag = fx.Int32(mb.tag)
+
+        def load_all():
+            words = []
+            for src in range_constexpr(tp):
+                w = fx.Vector(bo.buffer_load(rsrc(base), ffn_group_word(src, task16, t, s, g),
+                                             vec_width=4, dtype=T.i32, cache_modifier=cm))
+                words += [w[e] for e in range(4)]
+            return fx.Vector.from_elements(words, fx.Int32)
+
+        def pending(v):
+            bad = v[3] != tag
+            for src in range_constexpr(1, tp):
+                bad = bad | (v[4 * src + 3] != tag)
+            return bad
+
+        v = _spin(load_all, pending)
+        acc0, acc1 = fx.Float32(0.), fx.Float32(0.)
+        for src in range_constexpr(tp):
+            w = (k == 0).select(v[4 * src], (k == 1).select(v[4 * src + 1], v[4 * src + 2]))
+            lo, hi = bf2_f32(fx.Int32(w))
+            if const_expr(src == 0):
+                acc0, acc1 = lo, hi
+            else:
+                acc0 = acc0 + lo
+                acc1 = acc1 + hi
+        bo.buffer_store(acc0.to(fx.BFloat16), rsrc(a['out']), t * HIDDEN + col)
+        bo.buffer_store(acc1.to(fx.BFloat16), rsrc(a['out']), t * HIDDEN + col + 1)
+
+
+@traced
+def stage_reduce_packed(c, task):
+    """``stage_reduce`` over the packed TP2 layout written by ``bulk_finish``."""
+    for pas in range_constexpr(0, c["S"] * RED_COLS // 2, THREADS):
+        reduce_pair_packed(c, task, pas + c["tid"])

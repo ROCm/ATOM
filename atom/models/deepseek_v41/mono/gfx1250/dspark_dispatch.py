@@ -93,6 +93,15 @@ class MonoDraftModel(nn.Module):
             lambda: DraftMonoRunner(model), "V4.1 gfx1250 mono draft"
         )
 
+    def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
+        """Before each block, replayed or not: its pad requests (slot 0, a
+        real request's) must not touch a real request's draft ring."""
+        if self._mono.runner is not None:
+            self._mono.runner.set_live_requests(scheduled_bs)
+        return self.model.prepare_block(
+            metadata_builder, num_draft, scheduled_bs, running_bs
+        )
+
     def block_backbone(self, input_ids, positions, num_draft):
         width = self.model.block_size if num_draft is None else num_draft
         rows = input_ids.numel() * width

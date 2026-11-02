@@ -22,6 +22,7 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import scalar_
 from atom.mono.device.ops import bf2_f32, row_shr, lane_gather
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import CM_NT_GFX1250
 from flydsl.expr.typing import T
+from atom.models.deepseek_v41.mono.gfx1250.kernels import dspark_stamps as diag
 
 THREADS = 256
 # Eight K streams are unchanged; physical waves are 32 lanes.
@@ -556,7 +557,7 @@ def build_dspark_k1(key: AttnPreBuild):
         red: fx.Array[fx.Float32, WAVES * 2 * 64 * 4, 16]
         qxl: fx.Array[fx.Int32, rows * lds_row(QX8_WORDS), 16]
         qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
-        tls: fx.Array[fx.Int64, TL_POINTS if key.timeline else 1, 16]
+        tls: fx.Array[fx.Int64, diag.SLOTS if diag.ENABLED else (TL_POINTS if key.timeline else 1), 16]
 
     @fx.struct
     class SliceLds:
@@ -590,6 +591,7 @@ def build_dspark_k1(key: AttnPreBuild):
         a=int(key.aux),
         tl=int(key.timeline),
         tpar=int(key.tok_par),
+        **({"st": 1} if diag.ENABLED else {}),
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -669,17 +671,21 @@ def build_dspark_k1(key: AttnPreBuild):
         timeline = key.timeline
         tls = lds.tls.ptr
         stamp_begin(timeline, tls, tid, TL_POINTS)
+        diag.begin(tls, tid)
+        diag.stamp(tls, tid, 0)
         enter_stage("k1.slice")
         for unit in range(first_task(bid, 0), SLICES*((s+15)//16), BLOCKS):
             task, rowbase = unit % SLICES, (unit // SLICES)*16
             stage_tile(row_view(co, rowbase), task)
         stamp(timeline, tls, tid, 1)
+        diag.stamp(tls, tid, 1)
         # the gate's outputs are the next seam's: it runs after the stages
         # this launch waits on that its CTAs may also hold (norm, wqkv_a)
         enter_stage("k1.norm")
         for t in range(first_task(bid, NORM0), own_n, BLOCKS):
             stage_norm(co, t)
         stamp(timeline, tls, tid, 2)
+        diag.stamp(tls, tid, 2)
         enter_stage("k1.wqkv_a")
         # a CTA's wqkv task (at most one): its weights in flight before the
         # normed row's wait
@@ -711,10 +717,12 @@ def build_dspark_k1(key: AttnPreBuild):
                 if wqkv_tasks[k] < WQKV_TASKS:
                     stage_wqkv(co, wqkv_tasks[k], wqkv_ops[k], t0, n)
         stamp(timeline, tls, tid, 3)
+        diag.stamp(tls, tid, 3)
         enter_stage("k1.gate")
         for t in range(first_task(bid, GATE0), own_n, BLOCKS):
             stage_gate(co, t)
         stamp(timeline, tls, tid, 4)
+        diag.stamp(tls, tid, 4)
         enter_stage("k1.qkv")
         for t in range(first_task(bid, QKV0), own_n, BLOCKS):
             stage_qkv(co, t)
@@ -723,6 +731,7 @@ def build_dspark_k1(key: AttnPreBuild):
             c["qx8"] = preg(sym, pl["qg"], "qg")
             c["qx8s"] = preg(sym, pl["qgs"], "qgs")
         stamp(timeline, tls, tid, 5)
+        diag.stamp(tls, tid, 5)
         enter_stage("k1.wq_b")
         # every CTA's wq_b tasks (and an indexer layer's wq task), two at a
         # time: the first two's weights in flight before the q latent's wait;
@@ -769,6 +778,7 @@ def build_dspark_k1(key: AttnPreBuild):
             if const_expr(key.feeds_index):
                 stage_iq(c, iq_task, iq_ops, t0, n, iq_ropes)
         stamp(timeline, tls, tid, 6)
+        diag.stamp(tls, tid, 6)
         if const_expr(key.feeds_index):
             enter_stage("k1.index_w")
 
@@ -793,6 +803,7 @@ def build_dspark_k1(key: AttnPreBuild):
                 else:
                     stage_iquant(c, task)
         stamp(timeline, tls, tid, TL_POINTS - 1)
+        diag.stamp(tls, tid, 7)
         if const_expr(key.tok_par):
             kg = preg(sym, pl["kg"], "kg")
             for t in range(first_task(bid, QKV0), s, BLOCKS):
@@ -803,6 +814,9 @@ def build_dspark_k1(key: AttnPreBuild):
                 for t in range(first_task(bid, NORM0), s, BLOCKS):
                     normed_row_from(c, nbg, t, own_n)
         stamp_flush(timeline, tls, tl, tid, bid, TL_POINTS)
+        if const_expr(diag.ENABLED):
+            diag.stamp(tls, tid, 8)
+            diag.flush(tls, tl + fx.Int64(diag.k1_offset_words() * 4), tid, bid, layer, s)
         _ = keyed
 
     @launcher(name)
