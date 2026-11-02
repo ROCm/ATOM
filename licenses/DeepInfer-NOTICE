@@ -1,0 +1,12 @@
+The file atom/model_engine/deepinfer_scheduler.py is a Python port of the
+NORMAL-engine phase selection in deepseek-ai/DeepInfer:
+https://github.com/deepseek-ai/DeepInfer/blob/553741557a57df44a46fb3ab72b6aafeaf945337/csrc/engine/scheduler.hpp
+
+Upstream project: DeepInfer, deepseek-ai.
+Upstream license: Apache License, Version 2.0 (see DeepInfer-LICENSE).
+
+Modifications: extracted the ALL/ANY phase policy into Python, used ATOM's CPU
+DP process group, and exposed separate admission and confirmation calls for
+ATOM's existing request/KV allocator. Single-rank execution skips collectives.
+
+This attribution does not change the license of unrelated ATOM source files.
