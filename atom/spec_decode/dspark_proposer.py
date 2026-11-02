@@ -15,7 +15,6 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample_unsupported,
 )
 from atom.model_ops.ratio_verify import (
-    ratio_count_scratch_bytes,
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
@@ -169,6 +168,8 @@ class DSparkProposer(Drafter):
         t = self.draft_tokens_per_seq
         vocab = int(self.model.vocab_size)
         self._verify_scratch = ratio_verify_scratch(max_bs, t, vocab, self.device)
+        # Set by `warmup_lossless_verify`; checked against every verify's logits.
+        self._verify_logits_dtype = None
         self.draft_sampling, self._staging = self._build_lossless_sampling()
         self.model.bind_draft_sampling(self.draft_sampling)
         if self.runner.rank == 0:
@@ -177,8 +178,7 @@ class DSparkProposer(Drafter):
             logger.info(
                 "Lossless speculative sampling armed: draft q store %d slots x "
                 "[%d, top %d of %d] (%.1f MiB) + %.1f MiB draft scores + %.1f "
-                "MiB draft scratch + %.1f MiB verify scratch (%.1f MiB of it "
-                "the counted top-k's run maxima)",
+                "MiB draft scratch + %.1f MiB verify scratch",
                 q_rows // t,
                 t,
                 q_width,
@@ -187,7 +187,6 @@ class DSparkProposer(Drafter):
                 self.draft_sampling.s_scratch.numel() * 4 / 2**20,
                 _scratch_mib(self.draft_sampling.scratch),
                 _scratch_mib(self._verify_scratch),
-                ratio_count_scratch_bytes(max_bs * t, vocab) / 2**20,
             )
 
     def _lossless_unsupported_reason(self) -> str | None:
@@ -369,7 +368,7 @@ class DSparkProposer(Drafter):
             return
         self._staging.consume(self.runner.forward_step)
 
-    def lossless_verify_inputs(self, bs: int):
+    def lossless_verify_inputs(self, bs: int, logits_dtype: torch.dtype | None = None):
         """The verify step's ``(draft_q, q_row_base, ratio_scratch)``.
 
         All None keeps exact-match verification; anything else selects the
@@ -384,6 +383,14 @@ class DSparkProposer(Drafter):
         """
         if self.draft_sampling is None:
             return None, None, None
+        warmed = self._verify_logits_dtype
+        if logits_dtype is not None and warmed is not None and logits_dtype != warmed:
+            # The kernels were compiled for another logits dtype; this verify
+            # would JIT them mid-serving while the TP/DP peers wait.
+            raise RuntimeError(
+                f"ratio verify was warmed up for {warmed} "
+                f"logits but the LM head emits {logits_dtype}"
+            )
         return (
             RatioDraftQ(self.draft_sampling.q_store, self.draft_sampling.s_scratch),
             self.metadata_buffers["verify_q_row_base"].gpu[:bs],
@@ -395,6 +402,7 @@ class DSparkProposer(Drafter):
         the vocab's and ``mtp_k`` drafts (`warmup_ratio_verify`)."""
         if self.draft_sampling is None:
             return
+        self._verify_logits_dtype = logits_dtype
         warmup_ratio_verify(
             self.mtp_k,
             self.draft_sampling.s_scratch.shape[1],

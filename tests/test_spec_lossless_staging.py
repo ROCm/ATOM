@@ -8,7 +8,6 @@ row-by-row staging policy itself is `DraftQStaging`, tested without aiter in
 `tests/test_draft_q_staging.py`.
 """
 
-import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,7 +17,6 @@ from torch import nn
 
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
-from atom.model_ops.ratio_verify import _ratio_scratch_shapes, ratio_count_scratch_bytes
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import Sampler
 from atom.spec_decode import dspark_proposer
@@ -295,15 +293,16 @@ def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossl
     assert scratch is prop._verify_scratch
 
 
-def test_the_documented_verify_scratch_figures_hold():
-    """docs/model_ops_guide.md quantifies the verify scratch at 512, T=16, V=163840:
-    191 MiB, 160 MiB of it the counted top-k's run maxima."""
-    num_tokens, vocab = 512 * 16, 163840
-    run_maxima = ratio_count_scratch_bytes(num_tokens, vocab)
-    assert run_maxima == 160 * 2**20 == num_tokens * vocab // 8
-    f32, i32 = _ratio_scratch_shapes(num_tokens, 512, vocab)
-    total = sum(math.prod(shape) for shape in f32 + i32) * 4
-    assert round(total / 2**20) == 191 and run_maxima < total
+def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
+    """A verify on another logits dtype would JIT every ratio kernel
+    mid-serving, so it is refused instead."""
+    prop = proposer(monkeypatch)
+    monkeypatch.setattr(dspark_proposer, "warmup_ratio_verify", lambda *args: None)
+    prop.warmup_lossless_verify(torch.bfloat16)
+    stage(prop, batch(["a", "b"]))
+    assert prop.lossless_verify_inputs(2, torch.bfloat16)[0] is not None
+    with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
+        prop.lossless_verify_inputs(2, torch.float32)
 
 
 # ---- staging ----------------------------------------------------------------

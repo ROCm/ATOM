@@ -428,10 +428,11 @@ class Drafter(abc.ABC):
         publication, which is what carries them to the device."""
         return
 
-    def lossless_verify_inputs(self, bs: int):
+    def lossless_verify_inputs(self, bs: int, logits_dtype: torch.dtype | None = None):
         """``(draft_q, q_row_base, ratio_scratch)`` for the ratio accept
         rule (``draft_q`` a `sparse_q_store.RatioDraftQ`), or all None
-        for exact match."""
+        for exact match. ``logits_dtype`` is the verify's target logits
+        dtype, which must be the one `warmup_lossless_verify` compiled for."""
         return None, None, None
 
     def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:

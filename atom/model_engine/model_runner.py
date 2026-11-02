@@ -928,7 +928,8 @@ class ModelRunner:
         if getattr(self, "drafter", None) is not None:
             # No warmup or capture forward verifies, so the ratio verify is
             # compiled here, before the memory profile. Its logits are the LM
-            # head's, which keeps the hidden states' dtype.
+            # head's, which keeps the hidden states' dtype; the verify refuses
+            # logits of any other dtype rather than JIT mid-serving.
             self.drafter.warmup_lossless_verify(config.torch_dtype)
         self._maybe_warmup()
 
@@ -3413,7 +3414,9 @@ class ModelRunner:
             # runner's) touches neither. Keep the two on one stream.
             draft_q = q_row_base = ratio_scratch = None
             if drafter is not None and not all_greedy:
-                draft_q, q_row_base, ratio_scratch = drafter.lossless_verify_inputs(bs)
+                draft_q, q_row_base, ratio_scratch = drafter.lossless_verify_inputs(
+                    bs, target_logits.dtype
+                )
             target_token_ids = None
             if RejectionSampler.needs_target_draw(all_greedy, draft_q):
                 target_token_ids = self.sampler.sample_verification_tokens(
