@@ -506,7 +506,7 @@ def _select_logical(
     router_logits: torch.Tensor,
     num_routing_experts: int,
     num_fused_shared_experts: int,
-    triton_max_rows: int | None,
+    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The layer's routing over `num_routing_experts` logical experts,
     `num_fused_shared_experts` shared columns widened in."""
@@ -2072,18 +2072,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         """The base routing over the layer's logical experts, its prefilled
         shared column widened in where the legacy layout fuses one."""
         layout = layer.expert_layout
-        in_dispatch = layout.uses_all2all_fusion
         return _select_logical(
             layer,
             x,
             router_logits,
             layout.num_routed,
-            0 if in_dispatch else layer.num_fused_shared_experts,
+            0 if layout.uses_all2all_fusion else layer.num_fused_shared_experts,
             # Left to the dispatch, a scored shared expert keeps its logit in
             # `router_logits`: not the width the layer's cutoff was set for.
             (
                 None
-                if in_dispatch and layer.shared_expert_scoring_func is not None
+                if layout.uses_all2all_fusion
+                and layer.shared_expert_scoring_func is not None
                 else layer.triton_topk_softmax_max_rows
             ),
         )

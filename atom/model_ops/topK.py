@@ -272,6 +272,9 @@ def rocm_aiter_topk_softmax_impl(
     else:
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+    token_expert_indicies = torch.empty(
+        gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
+    )
     if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
@@ -291,9 +294,6 @@ def rocm_aiter_topk_softmax_impl(
             num_valid_rows,
         )
     else:
-        token_expert_indicies = torch.empty(
-            gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
-        )
         topk_softmax(
             topk_weights,
             topk_ids,
