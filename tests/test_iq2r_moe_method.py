@@ -249,8 +249,7 @@ def test_iq2r_glm53_packed_apply_runs_the_glm53_moe(aiter_iq2r, monkeypatch):
         num_fused_shared_experts=1,
         routed_scaling_factor=2.5,
         triton_topk_softmax_max_rows=None,
-        # Routed width, unlike `global_num_experts` below, which a dispatch
-        # space with redundant experts would grow.
+        # Routed width; redundant experts grow `global_num_experts`.
         expert_layout=SimpleNamespace(num_routed=255),
         w13_weight=torch.empty((257, 3), dtype=torch.uint8),
         w13_weight_scale=torch.empty((257, 5), dtype=torch.uint8),

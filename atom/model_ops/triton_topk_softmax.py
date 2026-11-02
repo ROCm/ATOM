@@ -1,16 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Renormalized softmax top-k routing, one Triton program per token.
-
-Bit-identical to AITER's `topk_softmax` with `need_renorm` (ids, tie order,
-weights, the sigmoid-scored shared-expert slots it appends, and the pad rows
-of its optional `num_valid_rows` count), also on rows with fewer than k finite
-logits. Rows with NaN logits are the exception; see `triton_topk_softmax`.
-On MI355X at 512 experts it takes about 4 us per call where the HIP
-kernel takes 9-11 us; past a few thousand rows the HIP kernel is faster, and
-`topk_softmax_dispatch.py` picks it there. Each selection is a single int64
-max over (value, -index).
-"""
+"""Renormalized softmax top-k routing, one Triton program per token,
+bit-identical to AITER's `topk_softmax` except on rows with NaN logits."""
 
 import torch
 import triton
@@ -85,38 +76,18 @@ def triton_topk_softmax(
     num_shared_experts: int = 0,
     num_valid_rows: torch.Tensor | None = None,
 ) -> None:
-    """Fill `topk_weights[:, :k]` / `topk_ids[:, :k]` like AITER's
-    `topk_softmax(..., need_renorm=True, ...)` (k = `topk_ids.shape[1]`), and
-    `topk_weights[:, k + s]` with sigmoid(shared logit s) for each of the
-    `num_shared_experts` trailing logits.
+    """`topk_softmax(topk_weights, topk_ids, _, gating_output, True,
+    num_shared_experts, "sigmoid", num_valid_rows)` as in AITER, with
+    k = `topk_ids.shape[1]` and the shared columns sigmoid-scored.
 
-    As in AITER, once a row's finite logits run out, the rest of its k picks
-    get weight 0 and repeat the lowest expert id whose logit is -inf or
-    already picked: expert 0 when the others are -inf. A row with no finite
-    logit gets NaN for every routed weight; all -inf or all NaN, it picks
-    expert 0 throughout, as in AITER. A NaN logit is picked only when every
-    logit in its row is NaN. AITER agrees unless a NaN is the first element
-    of one of its per-thread vector loads (16 bf16 below 512 experts, 32 at
-    512; expert 0 always is): there it may pick it, making every weight NaN,
-    or misorder the row, so rows with NaNs are not bit-identical. Probed
-    against ROCm/aiter@836b336ed.
-
-    `num_valid_rows`, as in AITER (ROCm/aiter#6916): an optional int32 device
-    tensor whose first element is the count of real rows. Rows at or past it
-    are padding: their routed ids are written -1 and their weights 0; shared
-    columns are written as for any row. Read on device, so a replayed CUDA
-    graph follows each step's count."""
+    A NaN logit is picked only from a row of NaNs. AITER can also pick a NaN
+    that is the first element of one of its vector loads (every 16th expert,
+    32nd at 512 experts), so rows with NaNs may differ from it."""
     tokens, width = gating_output.shape
     k = topk_ids.shape[1]
     assert (
         gating_output.stride(-1) == topk_weights.stride(-1) == topk_ids.stride(-1) == 1
     ), "the logits and both outputs must have a unit last stride"
-    if num_valid_rows is not None:
-        assert (
-            num_valid_rows.dtype == torch.int32 and num_valid_rows.numel() >= 1
-        ), "num_valid_rows must be an int32 tensor of at least one element"
-    if not tokens:
-        return
     _topk_softmax_kernel[(tokens,)](
         gating_output,
         topk_weights,

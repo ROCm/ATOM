@@ -4,6 +4,7 @@
 from functools import lru_cache
 
 import torch
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
@@ -202,6 +203,53 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
+# Rows per CU up to which `triton_topk_softmax` is faster than AITER's
+# `topk_softmax`, measured per architecture; others run AITER.
+TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
+
+
+def triton_topk_softmax_rows(
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    num_fused_shared_experts: int = 0,
+    fused_shared_experts_scoring_func: str | None = None,
+    cu_masked: bool = False,
+) -> int | None:
+    """The most rows a launch of this routing runs `triton_topk_softmax` for;
+    None: always AITER. The shapes are those of AITER's fused
+    `topkGatingSoftmax`. `cu_masked`: count the CUs of RapidServe's smallest
+    CU-masked stream. `get_cu_num()` ignores an `HSA_CU_MASK` set outside
+    ATOM; set `CU_NUM` then."""
+    if fused_shared_experts_scoring_func is None:
+        num_shared, scoring_func = 0, ""
+    else:
+        num_shared = num_fused_shared_experts
+        scoring_func = fused_shared_experts_scoring_func
+    if not (
+        renormalize
+        and scoring_func in ("", "sigmoid")
+        and 32 <= num_experts <= 512
+        and num_experts & (num_experts - 1) == 0
+        and 0 < topk <= 32
+        and num_shared in (0, 1, 2, 4, 8)
+    ):
+        return None
+    per_cu = TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU.get(get_gfx_runtime())
+    if per_cu is None:
+        return None
+    cus = get_cu_num()
+    if cu_masked:
+        # model_runner imports this module. To move to atom/config.py:
+        # https://github.com/ROCm/ATOM/issues/2863
+        from atom.model_engine.model_runner import RapidServeModelRunner
+
+        # A prefill stream gets fraction f of the CUs, its decode stream the rest.
+        fractions = RapidServeModelRunner._CU_POOL_FRACTIONS
+        cus = round(cus * min(min(f, 1 - f) for f in fractions))
+    return per_cu * cus
+
+
 def rocm_aiter_topk_softmax_impl(
     gating_output: torch.Tensor,
     topk: int,
@@ -212,12 +260,8 @@ def rocm_aiter_topk_softmax_impl(
     num_valid_rows: torch.Tensor | None = None,
     triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`triton_max_rows`: the layer's `triton_topk_softmax_rows` for these
-    arguments; launches of up to that many rows run `triton_topk_softmax`,
-    the rest (all of them when None) AITER's `topk_softmax`. The cutoff was
-    decided for this routing, so a Triton launch that is not renormalized or
-    whose logits are not `num_routing_experts` wide plus the scored shared
-    columns is a mismatched caller, and fails."""
+    """`triton_max_rows`: the layer's `triton_topk_softmax_rows`; launches of
+    up to that many rows run `triton_topk_softmax`, the rest AITER's."""
     from aiter import topk_softmax
 
     token = gating_output.shape[0]

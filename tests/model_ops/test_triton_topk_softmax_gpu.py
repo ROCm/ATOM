@@ -1,17 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The Triton routing kernel must reproduce AITER's `topk_softmax` exactly.
-
-`rocm_aiter_topk_softmax_impl` runs it, eager and captured alike, for the
-shapes it supports up to `triton_topk_softmax_max_rows()` rows, and AITER
-for longer launches, the other shapes or with `ATOM_TRITON_TOPK_SOFTMAX=0`
--- as the layer decided when it was built (`triton_topk_softmax_rows`).
-Any difference -- an expert id, the order of tied experts, or the last bit
-of a weight -- would route a token differently in a long prefill than in a
-short pass, or make that switch change outputs, hence bit-exactness rather
-than a tolerance.
-"""
+"""`triton_topk_softmax` must match AITER's `topk_softmax` bit for bit: a
+launch takes one kernel or the other by its row count, so any difference
+would route a token differently in a long prefill than in a short pass."""
 
 import functools
 import inspect
@@ -24,388 +16,39 @@ if not torch.cuda.is_available():
 
 aiter = pytest.importorskip("aiter")
 
-from atom.model_ops import topk_softmax_dispatch
-from atom.model_ops.topk_softmax_dispatch import (
-    triton_topk_softmax_max_rows,
-    triton_topk_softmax_rows,
-    triton_topk_softmax_supported,
-)
-from atom.model_ops.triton_topk_softmax import triton_topk_softmax
-from atom.utils import envs
+from conftest import atom_config_double
 
-# The kernel comparisons run on any GPU; the dispatch tests need this GPU to
-# have a measured Triton cutoff.
-needs_cutoff = pytest.mark.skipif(
-    triton_topk_softmax_max_rows() is None,
-    reason="no measured Triton top-k softmax cutoff on this GPU architecture",
-)
+from atom import config
+from atom.model_engine.model_runner import RapidServeModelRunner
+from atom.model_ops import moe, topK
+from atom.model_ops.triton_topk_softmax import triton_topk_softmax
+from atom.utils import forward_context as fc
 
 EXPERTS, TOPK = 512, 10
+MI355X_CUS = 256
+AITER_HAS_NUM_VALID_ROWS = (
+    "num_valid_rows" in inspect.signature(aiter.topk_softmax).parameters
+)
 
 
-def _logits(rows, width, scale, ties):
+@pytest.fixture
+def gpu(monkeypatch):
+    """Set the architecture and CU count the cutoff reads."""
+
+    def set_gpu(arch="gfx950", cus=MI355X_CUS):
+        monkeypatch.setattr(topK, "get_gfx_runtime", lambda: arch)
+        monkeypatch.setattr(topK, "get_cu_num", lambda: cus)
+
+    set_gpu()
+    return set_gpu
+
+
+def _logits(rows, width, scale=2.0, ties=False, dtype=torch.bfloat16):
     x = torch.randn(rows, width, device="cuda") * scale
     if ties:
         # Coarse values: many equal logits, including +0.0 and -0.0.
         x = (x * 4).round() / 4
-    return x.to(torch.bfloat16)
-
-
-def _supported(logits, k, renormalize, shared):
-    """`triton_topk_softmax_supported` for a routing of these logits, the
-    last `shared` of them sigmoid-scored shared experts."""
-    experts = logits.shape[1] - shared
-    return triton_topk_softmax_supported(
-        experts, k, renormalize, shared, "sigmoid" if shared else ""
-    )
-
-
-def _layer_rows(experts, k, shared):
-    """What a layer routing `experts` / top-`k` with `shared` sigmoid-scored
-    fused shared experts decides when it is built."""
-    return triton_topk_softmax_rows(
-        experts, k, True, shared, "sigmoid" if shared else None
-    )
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("rows", [1, 4, 33, 1024])
-@pytest.mark.parametrize("scale,ties", [(2.0, False), (0.05, True), (8.0, False)])
-def test_matches_aiter_bit_for_bit(shared, rows, scale, ties):
-    torch.manual_seed(rows * 7 + shared)
-    logits = _logits(rows, EXPERTS + shared, scale, ties)
-    assert _supported(logits, TOPK, True, shared)
-
-    # The fused-shared layout: one [rows, k + shared] buffer per output, the
-    # kernels write the routed columns through a [:, :k] view.
-    w_ref = torch.full((rows, TOPK + shared), -1.0, device="cuda")
-    ids_ref = torch.full(
-        (rows, TOPK + shared), EXPERTS, dtype=torch.int32, device="cuda"
-    )
-    w_new, ids_new = w_ref.clone(), ids_ref.clone()
-    scratch = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
-
-    aiter.topk_softmax(
-        w_ref, ids_ref[:, :TOPK], scratch, logits, True, shared,
-        "sigmoid" if shared else "",
-    )  # fmt: skip
-    triton_topk_softmax(w_new, ids_new[:, :TOPK], logits, shared)
-
-    assert torch.equal(ids_new, ids_ref)
-    assert torch.equal(w_new, w_ref)
-
-
-def _aiter_and_triton(logits, k, shared):
-    """Both kernels on the fused-shared layout, from the same poisoned
-    buffers: ((w_aiter, ids_aiter), (w_triton, ids_triton))."""
-    rows = logits.shape[0]
-    w_ref = torch.full((rows, k + shared), -1.0, device="cuda")
-    ids_ref = torch.full((rows, k + shared), 12345, dtype=torch.int32, device="cuda")
-    w_new, ids_new = w_ref.clone(), ids_ref.clone()
-    scratch = torch.empty(rows, k, dtype=torch.int32, device="cuda")
-    aiter.topk_softmax(
-        w_ref, ids_ref[:, :k], scratch, logits, True, shared,
-        "sigmoid" if shared else "",
-    )  # fmt: skip
-    triton_topk_softmax(w_new, ids_new[:, :k], logits, shared)
-    return (w_ref, ids_ref), (w_new, ids_new)
-
-
-# Every shape `triton_topk_softmax_supported` accepts, so a shape where AITER
-# takes another code path (as 1024 experts does) cannot be accepted unseen.
-SUPPORTED_EXPERTS = (32, 64, 128, 256, 512)
-SUPPORTED_TOPK = (1, 8, 10, 32)
-SUPPORTED_SHARED = (0, 1, 2, 4, 8)
-
-
-@pytest.mark.parametrize("shared", SUPPORTED_SHARED)
-@pytest.mark.parametrize("k", SUPPORTED_TOPK)
-@pytest.mark.parametrize("experts", SUPPORTED_EXPERTS)
-def test_every_supported_shape_matches_aiter(experts, k, shared):
-    torch.manual_seed(experts + 3 * k + shared)
-    width = experts + shared
-    logits = torch.cat(
-        [
-            _logits(24, width, 2.0, False),
-            _logits(24, width, 0.05, True),
-            _logits(16, width, 8.0, False),
-        ]
-    )
-    assert _supported(logits, k, True, shared)
-    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, k, shared)
-    assert torch.equal(ids_new, ids_ref)
-    assert torch.equal(_bits(w_new), _bits(w_ref))
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("k", [10, 32])
-@pytest.mark.parametrize("experts", [32, 128, 512])
-def test_rows_short_of_finite_logits_match_aiter(experts, k, shared):
-    """Row r keeps 1 + r % (k + 1) finite logits (at random places), the rest
-    are -inf. Once the finite ones run out AITER picks expert 0 again, with
-    weight 0."""
-    rows = 64
-    torch.manual_seed(experts + k + shared)
-    logits = _logits(rows, experts + shared, 2.0, False)
-    finite = 1 + torch.arange(rows, device="cuda") % (k + 1)
-    rank = torch.rand(rows, experts, device="cuda").argsort(1).argsort(1)
-    logits[:, :experts][rank >= finite[:, None]] = float("-inf")
-    # As in review: only experts 0..4 finite.
-    logits[0, :experts] = _logits(1, experts, 2.0, False)[0]
-    logits[0, 5:experts] = float("-inf")
-    # No finite logit at all: every weight is NaN in both.
-    logits[1, :experts] = float("-inf")
-
-    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, k, shared)
-    assert torch.equal(ids_new, ids_ref)
-    finite_rows = torch.arange(rows, device="cuda") != 1
-    assert torch.equal(_bits(w_new[finite_rows]), _bits(w_ref[finite_rows]))
-    assert bool((ids_new[0, 5:k] == 0).all())
-    assert bool((_bits(w_new[0, 5:k]) == 0).all())
-    assert bool(w_new[1, :k].isnan().all()) and bool(w_ref[1, :k].isnan().all())
-    assert torch.equal(_bits(w_new[1, k:]), _bits(w_ref[1, k:]))
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("experts", [32, 128, 512])
-def test_nan_logits_are_never_picked(experts, shared):
-    """NaNs off the first slot of AITER's per-thread vector loads (16 bf16
-    below 512 experts, 32 at 512), which its `>` never picks either."""
-    rows = 64
-    torch.manual_seed(experts + 17 * shared)
-    logits = _logits(rows, experts + shared, 2.0, False)
-    nan = torch.rand(rows, experts, device="cuda") < 0.3
-    nan[:, ::16] = False
-    nan[1] = True  # all NaN but the vector-load first slots
-    nan[1, ::16] = False
-    logits[:, :experts][nan] = float("nan")
-
-    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, TOPK, shared)
-    assert torch.equal(ids_new, ids_ref)
-    assert torch.equal(_bits(w_new), _bits(w_ref))
-    assert not bool(nan.gather(1, ids_new[:, :TOPK].long()).any())
-
-
-def _vector_load_first_slots(experts):
-    """AITER's per-thread vector loads start every 16 bf16 below 512 experts,
-    every 32 at 512; a NaN there is where the two kernels may differ."""
-    first = torch.zeros(experts, dtype=torch.bool, device="cuda")
-    first[:: 32 if experts == 512 else 16] = True
-    return first
-
-
-def _route_one(logits, k, shared):
-    w = torch.full((logits.shape[0], k + shared), -1.0, device="cuda")
-    ids = torch.full(w.shape, 12345, dtype=torch.int32, device="cuda")
-    triton_topk_softmax(w, ids[:, :k], logits, shared)
-    return w, ids
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("experts", [32, 128, 512])
-def test_rows_without_finite_logits_pick_expert_0(experts, shared):
-    """All NaN, all -inf, or -inf on AITER's vector-load first slots and NaN
-    or -inf elsewhere: no finite logit, so both kernels pick expert 0 every
-    time, and every routed weight is NaN."""
-    rows = 64
-    torch.manual_seed(experts + 29 * shared)
-    logits = _logits(rows, experts + shared, 2.0, False)
-    nan = torch.rand(rows, experts, device="cuda") < 0.5
-    nan[:, _vector_load_first_slots(experts)] = False
-    nan[0] = True
-    nan[1] = False
-    routed = logits[:, :experts]
-    routed[nan] = float("nan")
-    routed[~nan] = float("-inf")
-
-    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, TOPK, shared)
-    assert torch.equal(ids_new, ids_ref)
-    assert bool((ids_new[:, :TOPK] == 0).all())
-    assert bool(w_new[:, :TOPK].isnan().all()) and bool(w_ref[:, :TOPK].isnan().all())
-    assert torch.equal(_bits(w_new[:, TOPK:]), _bits(w_ref[:, TOPK:]))
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("experts", [32, 128, 512])
-def test_rows_short_of_finite_logits_among_nans(experts, shared):
-    """Each of AITER's vector-load first slots finite or -inf, NaN elsewhere,
-    fewer finite logits than k: once they run out both kernels repeat expert
-    0, with weight 0."""
-    rows, k = 64, 32
-    torch.manual_seed(experts + 31 * shared)
-    logits = _logits(rows, experts + shared, 2.0, False)
-    routed = logits[:, :experts]
-    first = _vector_load_first_slots(experts)
-    finite = first & (torch.rand(rows, experts, device="cuda") < 0.5)
-    finite[0] = False  # no finite logit at all
-    routed[:, ~first] = float("nan")
-    routed[first & ~finite] = float("-inf")
-    count = finite.sum(1)
-    assert bool((count < k).all())
-
-    (w_ref, ids_ref), (w_new, ids_new) = _aiter_and_triton(logits, k, shared)
-    assert torch.equal(ids_new, ids_ref)
-    some = count > 0
-    assert torch.equal(_bits(w_new[some]), _bits(w_ref[some]))
-    assert bool(w_new[~some, :k].isnan().all()) and bool(w_ref[~some, :k].isnan().all())
-    assert bool(some[1:].any())
-    for r in range(rows):
-        n = int(count[r])
-        assert bool((ids_new[r, n:k] == 0).all())
-        if n:
-            assert bool((_bits(w_new[r, n:k]) == 0).all())
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("experts", [32, 128, 512])
-def test_a_nan_expert_0_is_skipped_for_the_lowest_cleared_or_neg_inf(experts, shared):
-    """Expert 0 NaN, which AITER's vector loads may pick (no bit-identity
-    there): the Triton kernel repeats the lowest expert already picked, or
-    the lowest -inf one, and picks a NaN only from a row of NaNs."""
-    k = 10
-    logits = torch.full((3, experts + shared), float("nan"), device="cuda")
-    logits[0, 7] = 1.0  # one finite logit
-    logits[1, 5] = float("-inf")  # no finite logit, one -inf
-    logits[1, 9] = float("-inf")
-    logits[:, experts:] = 0.5
-    w, ids = _route_one(logits.to(torch.bfloat16), k, shared)
-    assert bool((ids[0, :k] == 7).all())
-    assert w[0, 0].item() == 1.0 and bool((_bits(w[0, 1:k]) == 0).all())
-    assert bool((ids[1, :k] == 5).all()) and bool(w[1, :k].isnan().all())
-    assert bool((ids[2, :k] == 0).all()) and bool(w[2, :k].isnan().all())
-
-
-def test_unsupported_shapes_fall_back():
-    logits = torch.zeros(4, 513, dtype=torch.bfloat16, device="cuda")
-    assert not _supported(logits, TOPK, False, 1)
-    assert not _supported(logits, TOPK, True, 0)  # 513 experts
-    # AITER's fused kernel stops at 512 experts; 1024 takes its
-    # softmax-then-top-k path, which rounds the weights differently.
-    wide = torch.zeros(4, 1024 + 1, dtype=torch.bfloat16, device="cuda")
-    assert not _supported(wide, TOPK, True, 1)
-    assert not _supported(wide[:, :1024], TOPK, True, 0)
-    assert not _supported(logits[:, :16], 1, True, 0)
-    assert not _supported(logits[:, :512], 33, True, 0)
-    assert not _supported(wide[:, :515], TOPK, True, 3)
-
-
-def test_launcher_needs_a_unit_last_stride():
-    """The Triton kernel loads and stores along a unit last stride. The impl's
-    outputs always have one (fresh buffers, or column views of the shared
-    `aiter_topK_meta_data` rows), as do router logits (a gate's output, or a
-    column slice of it); the launcher refuses anything else."""
-    rows, shared = 8, 1
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-    w = torch.empty(rows, TOPK + shared, device="cuda")
-    ids = torch.empty(rows, TOPK + shared, dtype=torch.int32, device="cuda")
-    w_t = torch.empty(TOPK + shared, rows, device="cuda").t()
-    ids_t = torch.empty(TOPK + shared, rows, dtype=torch.int32, device="cuda").t()
-    wide = _logits(rows, 2 * (EXPERTS + shared), 2.0, False)
-    for out_w, out_ids, gating in (
-        (w_t, ids[:, :TOPK], logits),
-        (w, ids_t[:, :TOPK], logits),
-        (w, ids[:, :TOPK], wide[:, ::2]),
-    ):
-        with pytest.raises(AssertionError, match="unit last stride"):
-            triton_topk_softmax(out_w, out_ids, gating, shared)
-
-
-@needs_cutoff
-@pytest.mark.parametrize("shared", [0, 1])
-def test_mismatched_triton_launches_fail(shared, monkeypatch):
-    """The Triton kernel always renormalizes and takes the routed experts from
-    the logits' width. An unnormalized layer gets no cutoff and runs AITER's
-    unnormalized top-k; a launch handed a cutoff that is unnormalized, or
-    whose `num_routing_experts` is not its logits' routed width, fails."""
-    from atom.model_ops import topK
-
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
-    rows = 16
-    scoring = "sigmoid" if shared else None
-    assert triton_topk_softmax_rows(EXPERTS, TOPK, False, shared, scoring) is None
-    cutoff = _layer_rows(EXPERTS, TOPK, shared)
-    assert rows <= cutoff
-    torch.manual_seed(43 + shared)
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-    w_ref = torch.full((rows, TOPK + shared), -1.0, device="cuda")
-    ids_ref = torch.full(
-        (rows, TOPK + shared), EXPERTS, dtype=torch.int32, device="cuda"
-    )
-    scratch = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
-    aiter.topk_softmax(
-        w_ref, ids_ref[:, :TOPK], scratch, logits, False, shared, scoring or ""
-    )
-    used = _record_kernels(monkeypatch, topK)
-    monkeypatch.setattr(topK, "aiter_topK_meta_data", _outputs(rows, shared))
-
-    def route(renormalize, routed, max_rows):
-        return topK.rocm_aiter_topk_softmax_impl(
-            logits, TOPK, renormalize, shared, routed, scoring,
-            triton_max_rows=max_rows,
-        )  # fmt: skip
-
-    w, ids = route(False, EXPERTS, None)
-    assert torch.equal(ids[:, :TOPK], ids_ref[:, :TOPK])
-    assert torch.equal(_bits(w[:, :TOPK]), _bits(w_ref[:, :TOPK]))
-    assert not torch.allclose(w_ref[:, :TOPK].sum(1), torch.ones(rows, device="cuda"))
-    with pytest.raises(AssertionError, match="always renormalizes"):
-        route(False, EXPERTS, cutoff)
-    for routed in (0, EXPERTS + 1, EXPERTS // 2):
-        with pytest.raises(AssertionError, match="routed experts"):
-            route(True, routed, cutoff)
-    route(True, EXPERTS, cutoff)
-    assert used == ["aiter", "triton"]
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-def test_1024_experts_route_through_aiter(shared, monkeypatch):
-    """Past AITER's fused kernel, eager and captured passes both run AITER."""
-    from atom.model_ops import topK
-
-    def no_triton(*args, **kwargs):
-        raise AssertionError("1024 experts must not take the Triton kernel")
-
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
-    monkeypatch.setattr(topK, "triton_topk_softmax", no_triton)
-    rows, experts, k = 64, 1024, TOPK
-    torch.manual_seed(5 + shared)
-    logits = _logits(rows, experts + shared, 2.0, False)
-    if shared:
-        meta_w, meta_ids = _outputs(rows, shared)
-        monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
-    max_rows = _layer_rows(experts, k, shared)
-    assert max_rows is None
-
-    def route():
-        return topK.rocm_aiter_topk_softmax_impl(
-            logits, k, True, shared, experts, "sigmoid" if shared else None,
-            triton_max_rows=max_rows,
-        )  # fmt: skip
-
-    w_eager, ids_eager = (t.clone() for t in route())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        w_graph, ids_graph = route()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(ids_graph[:, :k], ids_eager[:, :k])
-    assert torch.equal(_bits(w_graph), _bits(w_eager))
-
-
-# num_valid_rows (ROCm/aiter#6916): rows at or past the device count are
-# padding, routed to id -1 with weight 0; shared columns are written as usual.
-AITER_HAS_NUM_VALID_ROWS = (
-    "num_valid_rows" in inspect.signature(aiter.topk_softmax).parameters
-)
-needs_aiter_num_valid_rows = pytest.mark.skipif(
-    not AITER_HAS_NUM_VALID_ROWS, reason="AITER predates ROCm/aiter#6916"
-)
-
-
-def _outputs(rows, shared):
-    w = torch.full((rows, TOPK + shared), float("nan"), device="cuda")
-    ids = torch.full((rows, TOPK + shared), EXPERTS, dtype=torch.int32, device="cuda")
-    return w, ids
+    return x.to(dtype)
 
 
 def _bits(w):
@@ -413,373 +56,117 @@ def _bits(w):
     return w.view(torch.int32)
 
 
-def _check_pad_rows(w, ids, w_full, ids_full, n):
-    """Rows below `n` match the unmasked launch bit for bit; rows at or past
-    it carry id -1 and weight +0.0; shared columns match on every row."""
-    assert torch.equal(ids[:n], ids_full[:n])
-    assert torch.equal(_bits(w[:n]), _bits(w_full[:n]))
-    assert bool((ids[n:, :TOPK] == -1).all())
-    assert bool((_bits(w[n:, :TOPK]) == 0).all())
-    assert torch.equal(ids[:, TOPK:], ids_full[:, TOPK:])
-    assert torch.equal(_bits(w[:, TOPK:]), _bits(w_full[:, TOPK:]))
+def _outputs(rows, k, shared):
+    # The fused-shared layout: the shared columns' ids are prefilled.
+    w = torch.full((rows, k + shared), float("nan"), device="cuda")
+    ids = torch.full((rows, k + shared), 12345, dtype=torch.int32, device="cuda")
+    return w, ids
 
 
-@pytest.mark.parametrize("shared", [0, 1])
-@pytest.mark.parametrize("rows", [1, 33, 256])
-@pytest.mark.parametrize("count", [None, "zero", "some", "all", "over"])
-def test_num_valid_rows_pads_rows(shared, rows, count):
-    torch.manual_seed(rows * 5 + shared)
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-    n = {None: rows, "zero": 0, "some": rows // 3, "all": rows, "over": rows + 7}
-    n = n[count]
-    num_valid_rows = (
-        None
-        if count is None
-        else torch.tensor([n, 12345], dtype=torch.int32, device="cuda")
+def _aiter(logits, k, shared, num_valid_rows=None, renormalize=True):
+    w, ids = _outputs(logits.shape[0], k, shared)
+    kwargs = {} if num_valid_rows is None else {"num_valid_rows": num_valid_rows}
+    scratch = torch.empty(logits.shape[0], k, dtype=torch.int32, device="cuda")
+    aiter.topk_softmax(
+        w, ids[:, :k], scratch, logits, renormalize, shared,
+        "sigmoid" if shared else "", **kwargs,
+    )  # fmt: skip
+    return w, ids
+
+
+def _triton(logits, k, shared, num_valid_rows=None):
+    w, ids = _outputs(logits.shape[0], k, shared)
+    triton_topk_softmax(w, ids[:, :k], logits, shared, num_valid_rows)
+    return w, ids
+
+
+def _layer_rows(experts, k, shared, **kwargs):
+    return topK.triton_topk_softmax_rows(
+        experts, k, True, shared, "sigmoid" if shared else None, **kwargs
     )
 
-    w_full, ids_full = _outputs(rows, shared)
-    triton_topk_softmax(w_full, ids_full[:, :TOPK], logits, shared)
-    w, ids = _outputs(rows, shared)
-    triton_topk_softmax(w, ids[:, :TOPK], logits, shared, num_valid_rows)
-    _check_pad_rows(w, ids, w_full, ids_full, n)
 
-    if AITER_HAS_NUM_VALID_ROWS:
-        w_ref, ids_ref = _outputs(rows, shared)
-        scratch = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
-        aiter.topk_softmax(
-            w_ref, ids_ref[:, :TOPK], scratch, logits, True, shared,
-            "sigmoid" if shared else "", num_valid_rows=num_valid_rows,
-        )  # fmt: skip
-        assert torch.equal(ids, ids_ref)
-        assert torch.equal(_bits(w), _bits(w_ref))
-
-
-@pytest.mark.parametrize("shared", [0, 1])
-def test_num_valid_rows_follows_graph_replay(shared):
-    rows = 64
-    torch.manual_seed(11 + shared)
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-    w_full, ids_full = _outputs(rows, shared)
-    triton_topk_softmax(w_full, ids_full[:, :TOPK], logits, shared)
-
-    num_valid_rows = torch.tensor([rows], dtype=torch.int32, device="cuda")
-    w, ids = _outputs(rows, shared)
-    triton_topk_softmax(w, ids[:, :TOPK], logits, shared, num_valid_rows)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        triton_topk_softmax(w, ids[:, :TOPK], logits, shared, num_valid_rows)
-
-    for n in (rows, 0, 17, rows // 2, 1, rows):
-        w.fill_(float("nan"))
-        ids[:, :TOPK] = 7
-        num_valid_rows.fill_(n)
-        graph.replay()
-        torch.cuda.synchronize()
-        _check_pad_rows(w, ids, w_full, ids_full, n)
-
-
-def _record_kernels(monkeypatch, topK):
-    """The kernel each later `rocm_aiter_topk_softmax_impl` call launches."""
-    used = []
-    triton_fn, aiter_fn = topK.triton_topk_softmax, aiter.topk_softmax
-
-    @functools.wraps(triton_fn)
-    def via_triton(*args, **kwargs):
-        used.append("triton")
-        return triton_fn(*args, **kwargs)
-
-    @functools.wraps(aiter_fn)
-    def via_aiter(*args, **kwargs):
-        used.append("aiter")
-        return aiter_fn(*args, **kwargs)
-
-    monkeypatch.setattr(topK, "triton_topk_softmax", via_triton)
-    monkeypatch.setattr(aiter, "topk_softmax", via_aiter)
-    return used
-
-
-# With the switch on, eager and captured passes both run Triton; off, both
-# run AITER. Either way both get the count.
-SWITCH = pytest.mark.parametrize("switch,kernel", [("1", "triton"), ("0", "aiter")])
-
-
-@needs_cutoff
-@needs_aiter_num_valid_rows
-@SWITCH
-@pytest.mark.parametrize("shared", [0, 1])
-def test_impl_passes_num_valid_rows_to_both_paths(shared, switch, kernel, monkeypatch):
-    """Eager and captured calls run the same kernel, both get the count and
-    agree bit for bit on every replay."""
-    from atom.model_ops import topK
-
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", switch)
-    used = _record_kernels(monkeypatch, topK)
-    rows, max_rows = 48, 64
-    torch.manual_seed(23 + shared)
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-    if shared:
-        meta_w, meta_ids = _outputs(max_rows, shared)
-        monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
-    num_valid_rows = torch.tensor([rows], dtype=torch.int32, device="cuda")
-    max_rows = _layer_rows(EXPERTS, TOPK, shared)
-
-    def route():
-        w, ids = topK.rocm_aiter_topk_softmax_impl(
-            logits, TOPK, True, shared, EXPERTS,
-            "sigmoid" if shared else None, num_valid_rows=num_valid_rows,
-            triton_max_rows=max_rows,
-        )  # fmt: skip
-        return w[:rows], ids[:rows]
-
-    route()  # eager: compiles the Triton kernel, when on, outside the capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        w_graph, ids_graph = route()
-
-    for n in (rows, 0, 29):
-        num_valid_rows.fill_(n)
-        w_eager, ids_eager = (t.clone() for t in route())
-        graph.replay()
-        torch.cuda.synchronize()
-        assert bool((ids_eager[n:, :TOPK] == -1).all())
-        assert torch.equal(ids_graph, ids_eager)
-        assert torch.equal(_bits(w_graph), _bits(w_eager))
-    assert used == [kernel] * (2 + 3)
-
-
-@needs_cutoff
-@needs_aiter_num_valid_rows
-@SWITCH
-@pytest.mark.parametrize("shared,offset", [(0, 0), (1, 0), (1, 32)])
-def test_select_experts_counts_the_pass_rows(
-    shared, offset, switch, kernel, monkeypatch
-):
-    """Through `FusedMoE.select_experts`, which takes the pass's real row count
-    from the forward context (`scheduled_tokens_gpu`): the captured route
-    follows the count on every replay, bit for bit with the eager one (same
-    kernel), and with a fused shared expert writes the rows `topk_meta_rows`
-    gives this (TBO micro-)batch at its offset."""
-    from atom.model_ops import topK
-    from atom.model_ops.moe import FusedMoE
-    from atom.utils import forward_context as fc
-
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", switch)
-    used = _record_kernels(monkeypatch, topK)
-    rows, max_rows = 48, 128
-    torch.manual_seed(31 + shared + offset)
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-    count = torch.tensor([rows], dtype=torch.int32, device="cuda")
-    context = fc.Context(
-        positions=torch.zeros(rows, dtype=torch.int64, device="cuda"),
-        running_tokens=rows,
-        ubatch_token_offset=offset,
-        scheduled_tokens_gpu=count,
-    )
-    monkeypatch.setattr(fc, "_forward_context", fc.ForwardContext(context=context))
-    if shared:
-        meta_w, meta_ids = _outputs(max_rows, shared)
-        monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
-    triton_max_rows = _layer_rows(EXPERTS, TOPK, shared)
-
-    def route():
-        return FusedMoE.select_experts(
-            hidden_states=None,
-            router_logits=logits,
-            top_k=TOPK,
-            use_grouped_topk=False,
-            renormalize=True,
-            num_routing_experts=EXPERTS,
-            num_fused_shared_experts=shared,
-            fused_shared_experts_scoring_func="sigmoid" if shared else None,
-            triton_max_rows=triton_max_rows,
-        )
-
-    route()  # eager: compiles the Triton kernel, when on, outside the capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        w_graph, ids_graph = route()
-    if shared:
-        assert w_graph.data_ptr() == meta_w[offset].data_ptr()
-        assert ids_graph.data_ptr() == meta_ids[offset].data_ptr()
-
-    for n in (rows, 0, 29, rows):
-        count.fill_(n)
-        w_eager, ids_eager = (t.clone() for t in route())
-        graph.replay()
-        torch.cuda.synchronize()
-        assert bool((ids_eager[n:, :TOPK] == -1).all())
-        assert bool((_bits(w_eager[n:, :TOPK]) == 0).all())
-        assert bool((ids_eager[:n, :TOPK] >= 0).all())
-        assert torch.equal(ids_graph, ids_eager)
-        assert torch.equal(_bits(w_graph), _bits(w_eager))
-    assert used == [kernel] * (2 + 4)
-    if shared:
-        # Rows outside this batch's slice are never written.
-        outside = torch.ones(max_rows, dtype=torch.bool, device="cuda")
-        outside[offset : offset + rows] = False
-        assert bool(meta_w[outside].isnan().all())
-        assert bool((meta_ids[outside] == EXPERTS).all())
-
-
-@needs_cutoff
-@pytest.mark.parametrize("count", [None, "some"])
-@pytest.mark.parametrize("past_cutoff", [False, True])
-@pytest.mark.parametrize("experts,k,shared", [(512, 10, 1), (256, 8, 1), (128, 8, 0)])
-def test_impl_matches_aiter_on_both_sides_of_the_row_cutoff(
-    experts, k, shared, past_cutoff, count, monkeypatch
-):
-    """At `triton_topk_softmax_max_rows()` rows the impl runs the Triton
-    kernel, one row more AITER's; on both sides, eager and replayed, with or
-    without a row count, it matches AITER's kernel bit for bit, and so does
-    the other kernel run directly on the same launch."""
-    from atom.model_ops import topK
-
-    if count and not AITER_HAS_NUM_VALID_ROWS:
-        pytest.skip("AITER predates ROCm/aiter#6916")
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "1")
-    cutoff = triton_topk_softmax_max_rows()
-    assert cutoff > 0, "no launch would take the Triton kernel"
-    rows = cutoff + past_cutoff
-    torch.manual_seed(rows + experts + shared)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("shared", [0, 1, 2, 4, 8])
+@pytest.mark.parametrize("k", [1, 8, 10, 32])
+@pytest.mark.parametrize("experts", [32, 64, 128, 256, 512])
+def test_every_supported_shape_matches_aiter(experts, k, shared, dtype, gpu):
+    assert _layer_rows(experts, k, shared) is not None
+    torch.manual_seed(experts + 3 * k + shared)
     width = experts + shared
     logits = torch.cat(
         [
-            _logits(rows // 2, width, 2.0, False),
-            _logits(rows - rows // 2, width, 0.05, True),
+            _logits(24, width, 2.0, dtype=dtype),
+            _logits(24, width, 0.05, ties=True, dtype=dtype),
+            _logits(16, width, 8.0, dtype=dtype),
         ]
     )
-    num_valid_rows = (
-        None
-        if count is None
-        else torch.tensor([rows * 2 // 3], dtype=torch.int32, device="cuda")
-    )
-    scoring_func = "sigmoid" if shared else ""
-
-    def outputs():
-        # The shared columns' ids are prefilled (`init_aiter_topK_meta_data`).
-        w = torch.full((rows, k + shared), float("nan"), device="cuda")
-        ids = torch.full((rows, k + shared), experts, dtype=torch.int32, device="cuda")
-        return w, ids
-
-    w_ref, ids_ref = outputs()
-    scratch = torch.empty(rows, k, dtype=torch.int32, device="cuda")
-    kwargs = {} if num_valid_rows is None else {"num_valid_rows": num_valid_rows}
-    aiter.topk_softmax(
-        w_ref, ids_ref[:, :k], scratch, logits, True, shared, scoring_func, **kwargs
-    )
-    w_tri, ids_tri = outputs()
-    triton_topk_softmax(w_tri, ids_tri[:, :k], logits, shared, num_valid_rows)
-
-    if shared:
-        monkeypatch.setattr(topK, "aiter_topK_meta_data", outputs())
-    used = _record_kernels(monkeypatch, topK)
-
-    max_rows = _layer_rows(experts, k, shared)
-    assert max_rows == cutoff
-
-    def route():
-        return topK.rocm_aiter_topk_softmax_impl(
-            logits, k, True, shared, experts, scoring_func or None,
-            num_valid_rows=num_valid_rows, triton_max_rows=max_rows,
-        )  # fmt: skip
-
-    w_eager, ids_eager = (t.clone() for t in route())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        w_graph, ids_graph = route()
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert used == ["aiter" if past_cutoff else "triton"] * 2
-    for w, ids in ((w_eager, ids_eager), (w_graph, ids_graph), (w_tri, ids_tri)):
-        assert torch.equal(ids, ids_ref)
-        assert torch.equal(_bits(w), _bits(w_ref))
-    if num_valid_rows is not None:
-        assert bool((ids_ref[rows * 2 // 3 :, :k] == -1).all())
+    w_ref, ids_ref = _aiter(logits, k, shared)
+    w, ids = _triton(logits, k, shared)
+    assert torch.equal(ids, ids_ref)
+    assert torch.equal(_bits(w), _bits(w_ref))
 
 
-@needs_cutoff
-@SWITCH
-def test_launches_only_compare_the_row_count(switch, kernel, monkeypatch):
-    """Launches, direct or through `FusedMoE.select_experts`, read neither the
-    switch nor the CU count and run no shape check: the layer decided once,
-    when it was built, and flipping the switch afterwards does not move it."""
-    from atom.model_ops import moe, topK
-    from atom.model_ops.moe import FusedMoE
-
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", switch)
-    shared, rows = 1, 64
-    max_rows = _layer_rows(EXPERTS, TOPK, shared)
-    assert (max_rows is not None) == (kernel == "triton")
-
-    calls = []
-    get_env = envs.__getattr__
-
-    def counting_getattr(name):
-        if name == "ATOM_TRITON_TOPK_SOFTMAX":
-            calls.append(name)
-        return get_env(name)
-
-    monkeypatch.setattr(envs, "__getattr__", counting_getattr)
-    for module, name in (
-        (topk_softmax_dispatch, "_cu_num"),
-        (topk_softmax_dispatch, "_gfx"),
-        (topk_softmax_dispatch, "_masked_cu_fraction"),
-        (topk_softmax_dispatch, "triton_topk_softmax_max_rows"),
-        (topk_softmax_dispatch, "triton_topk_softmax_supported"),
-        (topk_softmax_dispatch, "triton_topk_softmax_rows"),
-        (moe, "triton_topk_softmax_rows"),
-    ):
-        fn = getattr(module, name)
-
-        def counted(*args, _fn=fn, _name=name, **kwargs):
-            calls.append(_name)
-            return _fn(*args, **kwargs)
-
-        monkeypatch.setattr(module, name, counted)
-    monkeypatch.setenv("ATOM_TRITON_TOPK_SOFTMAX", "0" if switch == "1" else "1")
-    used = _record_kernels(monkeypatch, topK)
-    monkeypatch.setattr(topK, "aiter_topK_meta_data", _outputs(rows, shared))
-    torch.manual_seed(41)
-    logits = _logits(rows, EXPERTS + shared, 2.0, False)
-
-    for _ in range(3):
-        topK.rocm_aiter_topk_softmax_impl(
-            logits, TOPK, True, shared, EXPERTS, "sigmoid", triton_max_rows=max_rows
-        )
-        FusedMoE.select_experts(
-            hidden_states=None,
-            router_logits=logits,
-            top_k=TOPK,
-            use_grouped_topk=False,
-            renormalize=True,
-            num_routing_experts=EXPERTS,
-            num_fused_shared_experts=shared,
-            fused_shared_experts_scoring_func="sigmoid",
-            mask_pad_rows=False,
-            triton_max_rows=max_rows,
-        )
-    torch.cuda.synchronize()
-    assert used == [kernel] * 6
-    assert calls == []
+@pytest.mark.parametrize(
+    "experts,k,shared,scoring,renormalize",
+    [
+        (1024, 8, 0, None, True),  # AITER: moeSoftmax + moeTopK
+        (1024, 10, 1, "sigmoid", True),
+        (8, 2, 0, None, True),  # Mixtral
+        (16, 4, 0, None, True),
+        (160, 8, 0, None, True),  # Qwen3-Coder-480B
+        (513, 10, 0, None, True),
+        (512, 33, 0, None, True),
+        (512, 0, 0, None, True),
+        (512, 10, 3, "sigmoid", True),
+        (512, 10, 1, "softplus", True),
+        (512, 10, 1, "sigmoid", False),
+    ],
+)
+def test_other_layers_stay_on_aiter(experts, k, shared, scoring, renormalize, gpu):
+    rows = topK.triton_topk_softmax_rows(experts, k, renormalize, shared, scoring)
+    assert rows is None
 
 
-@pytest.mark.parametrize("fractions", [None, [0.75], [0.3, 0.5]])
-def test_cu_masked_cutoff_counts_the_fewest_cus_a_stream_gets(fractions, monkeypatch):
-    """RapidServe's prefill stream for fraction f gets CUs [0, f * total), its
-    decode stream the rest; the masked cutoff counts the smaller of all."""
-    from atom.model_engine.model_runner import RapidServeModelRunner as Runner
+def test_unscored_shared_experts_route_like_none(gpu):
+    # Without a scoring func the shared columns are prefilled, not routed.
+    assert topK.triton_topk_softmax_rows(512, 10, True, 3, None) == 5120
 
+
+@pytest.mark.parametrize(
+    "arch,cus,fractions,max_rows",
+    [
+        ("gfx950", 256, None, 5120),
+        ("gfx950", 128, None, 2560),
+        ("gfx950", 256, [0.5], 2560),
+        ("gfx950", 256, [0.75], 1280),
+        ("gfx950", 80, [0.3, 0.5], 480),
+        ("gfx942", 304, None, None),
+        ("gfx942", 304, [0.5], None),
+        ("gfx1250", 256, None, None),
+    ],
+)
+def test_cutoff_counts_the_cus_a_launch_gets(
+    arch, cus, fractions, max_rows, gpu, monkeypatch
+):
+    gpu(arch, cus)
     if fractions is not None:
-        monkeypatch.setattr(Runner, "_CU_POOL_FRACTIONS", fractions)
-    cus = min(
-        sum(word.bit_count() for word in Runner._cu_mask_for_fraction(f, upper))
-        for f in Runner._CU_POOL_FRACTIONS
-        for upper in (False, True)
-    )
+        monkeypatch.setattr(RapidServeModelRunner, "_CU_POOL_FRACTIONS", fractions)
+    assert _layer_rows(512, 10, 1, cu_masked=fractions is not None) == max_rows
+
+
+@pytest.mark.parametrize("fractions", [[0.5], [0.75], [0.3, 0.5]])
+def test_cu_masked_cutoff_matches_the_streams_masks(fractions, gpu, monkeypatch):
+    """The fewest CUs any of RapidServe's CU-masked streams gets."""
     total = torch.cuda.get_device_properties(0).multi_processor_count
-    assert round(total * topk_softmax_dispatch._masked_cu_fraction()) == cus
+    gpu("gfx950", total)
+    monkeypatch.setattr(RapidServeModelRunner, "_CU_POOL_FRACTIONS", fractions)
+    cus = min(
+        sum(w.bit_count() for w in RapidServeModelRunner._cu_mask_for_fraction(f, up))
+        for f in fractions
+        for up in (False, True)
+    )
+    assert _layer_rows(512, 10, 1, cu_masked=True) == 20 * cus
 
 
 @pytest.mark.parametrize(
@@ -789,13 +176,6 @@ def test_cu_masked_cutoff_counts_the_fewest_cus_a_stream_gets(fractions, monkeyp
 def test_layers_count_masked_cus_only_on_cu_masked_streams(
     rapidserve, constrained, monkeypatch
 ):
-    """Only `--enable-rapidserve --disagg-constrained` runs layers on CU-masked
-    streams. The layer's decision is all this builds: it stops there."""
-    from conftest import atom_config_double
-
-    from atom import config
-    from atom.model_ops import moe
-
     class Decided(Exception):
         pass
 
@@ -822,3 +202,280 @@ def test_layers_count_masked_cus_only_on_cu_masked_streams(
             prefix=f"cu_masked_{rapidserve}_{constrained}.experts",
         )
     assert e.value.args == (rapidserve and constrained,)
+
+
+def _first_load_slots(experts):
+    # AITER's per-thread vector loads start every 16 bf16, every 32 at 512.
+    first = torch.zeros(experts, dtype=torch.bool, device="cuda")
+    first[:: 32 if experts == 512 else 16] = True
+    return first
+
+
+def _edge_logits(pattern, rows, experts, shared, k):
+    """Rows with -inf and NaN logits, no NaN where AITER's vector loads start
+    (there AITER may pick it)."""
+    logits = _logits(rows, experts + shared)
+    routed = logits[:, :experts]
+    rand = torch.rand(rows, experts, device="cuda")
+    first = _first_load_slots(experts)
+    if pattern == "neg_inf":
+        # Row r keeps 1 + r % (k + 1) finite logits; row 1 none.
+        finite = 1 + torch.arange(rows, device="cuda") % (k + 1)
+        routed[rand.argsort(1).argsort(1) >= finite[:, None]] = float("-inf")
+        routed[1] = float("-inf")
+    elif pattern == "nan":
+        nan = (rand < 0.3) & ~first
+        nan[1] = ~first
+        routed[nan] = float("nan")
+    elif pattern == "nan_and_neg_inf":
+        # No finite logit; row 0 is NaN but for the -inf first slots.
+        nan = (rand < 0.5) & ~first
+        nan[0] = ~first
+        routed[nan] = float("nan")
+        routed[~nan] = float("-inf")
+    else:  # "nan_short": fewer finite logits than k, among NaNs
+        finite = first & (rand < 0.5)
+        finite[0] = False
+        routed[:, ~first] = float("nan")
+        routed[first & ~finite] = float("-inf")
+    return logits
+
+
+@pytest.mark.parametrize("pattern", ["neg_inf", "nan", "nan_and_neg_inf", "nan_short"])
+@pytest.mark.parametrize("k", [10, 32])
+@pytest.mark.parametrize("shared", [0, 1])
+@pytest.mark.parametrize("experts", [32, 128, 512])
+def test_rows_short_of_finite_logits_match_aiter(experts, shared, k, pattern):
+    """Once a row's finite logits run out, both kernels pick expert 0 again
+    with weight 0; a row with none gets NaN routed weights. A NaN is never
+    picked."""
+    torch.manual_seed(experts + k + shared)
+    logits = _edge_logits(pattern, 64, experts, shared, k)
+    routed = logits[:, :experts].float()
+    w_ref, ids_ref = _aiter(logits, k, shared)
+    w, ids = _triton(logits, k, shared)
+
+    assert torch.equal(ids, ids_ref)
+    count = routed.isfinite().sum(1)
+    some = count > 0
+    assert torch.equal(_bits(w[some]), _bits(w_ref[some]))
+    assert bool(w[~some, :k].isnan().all()) and bool(w_ref[~some, :k].isnan().all())
+    assert torch.equal(_bits(w[:, k:]), _bits(w_ref[:, k:]))
+    assert not bool(routed.isnan().gather(1, ids[:, :k].long()).any())
+    for r in range(64):
+        n = min(int(count[r]), k)
+        assert bool((ids[r, n:k] == 0).all())
+        if n:
+            assert bool((_bits(w[r, n:k]) == 0).all())
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+@pytest.mark.parametrize("experts", [32, 128, 512])
+def test_a_nan_expert_0_is_skipped_for_the_lowest_cleared_or_neg_inf(experts, shared):
+    # AITER's first vector load may pick a NaN expert 0; Triton never does.
+    k = 10
+    logits = torch.full((3, experts + shared), float("nan"), device="cuda")
+    logits[0, 7] = 1.0
+    logits[1, 5] = float("-inf")
+    logits[1, 9] = float("-inf")
+    logits[:, experts:] = 0.5
+    w, ids = _triton(logits.to(torch.bfloat16), k, shared)
+    assert bool((ids[0, :k] == 7).all())
+    assert w[0, 0].item() == 1.0 and bool((_bits(w[0, 1:k]) == 0).all())
+    assert bool((ids[1, :k] == 5).all()) and bool(w[1, :k].isnan().all())
+    assert bool((ids[2, :k] == 0).all()) and bool(w[2, :k].isnan().all())
+
+
+def test_launcher_needs_a_unit_last_stride():
+    rows, shared = 8, 1
+    logits = _logits(rows, EXPERTS + shared)
+    w, ids = _outputs(rows, TOPK, shared)
+    w_t = torch.empty(TOPK + shared, rows, device="cuda").t()
+    ids_t = torch.empty(TOPK + shared, rows, dtype=torch.int32, device="cuda").t()
+    wide = _logits(rows, 2 * (EXPERTS + shared))
+    for out_w, out_ids, gating in (
+        (w_t, ids[:, :TOPK], logits),
+        (w, ids_t[:, :TOPK], logits),
+        (w, ids[:, :TOPK], wide[:, ::2]),
+    ):
+        with pytest.raises(AssertionError, match="unit last stride"):
+            triton_topk_softmax(out_w, out_ids, gating, shared)
+
+
+def test_no_rows_launch_nothing():
+    w, ids = _triton(_logits(0, EXPERTS + 1), TOPK, 1)
+    assert w.shape == ids.shape == (0, TOPK + 1)
+
+
+def _record_kernels(monkeypatch):
+    """The kernel each later `rocm_aiter_topk_softmax_impl` call launches."""
+    used = []
+
+    def recorded(name, fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            used.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        topK, "triton_topk_softmax", recorded("triton", topK.triton_topk_softmax)
+    )
+    monkeypatch.setattr(aiter, "topk_softmax", recorded("aiter", aiter.topk_softmax))
+    return used
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+def test_mismatched_triton_launches_fail(shared, gpu, monkeypatch):
+    rows = 16
+    scoring = "sigmoid" if shared else None
+    torch.manual_seed(43 + shared)
+    logits = _logits(rows, EXPERTS + shared)
+    monkeypatch.setattr(topK, "aiter_topK_meta_data", _outputs(rows, TOPK, shared))
+    used = _record_kernels(monkeypatch)
+
+    def route(renormalize, routed, max_rows):
+        return topK.rocm_aiter_topk_softmax_impl(
+            logits, TOPK, renormalize, shared, routed, scoring,
+            triton_max_rows=max_rows,
+        )  # fmt: skip
+
+    cutoff = _layer_rows(EXPERTS, TOPK, shared)
+    with pytest.raises(AssertionError, match="always renormalizes"):
+        route(False, EXPERTS, cutoff)
+    for routed in (0, EXPERTS + 1, EXPERTS // 2):
+        with pytest.raises(AssertionError, match="routed experts"):
+            route(True, routed, cutoff)
+    route(True, EXPERTS, cutoff)
+    assert used == ["triton"]
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+@pytest.mark.parametrize("rows", [1, 33, 256])
+@pytest.mark.parametrize("count", ["zero", "some", "all", "over"])
+def test_num_valid_rows_pads_rows(shared, rows, count):
+    """Rows at or past the count (ROCm/aiter#6916) get id -1 and weight 0;
+    shared columns are written on every row."""
+    torch.manual_seed(rows * 5 + shared)
+    logits = _logits(rows, EXPERTS + shared)
+    n = {"zero": 0, "some": rows // 3, "all": rows, "over": rows + 7}[count]
+    num_valid_rows = torch.tensor([n, 12345], dtype=torch.int32, device="cuda")
+    w_full, ids_full = _triton(logits, TOPK, shared)
+    w, ids = _triton(logits, TOPK, shared, num_valid_rows)
+
+    assert torch.equal(ids[:n], ids_full[:n])
+    assert torch.equal(_bits(w[:n]), _bits(w_full[:n]))
+    assert bool((ids[n:, :TOPK] == -1).all())
+    assert bool((_bits(w[n:, :TOPK]) == 0).all())
+    assert torch.equal(_bits(w[:, TOPK:]), _bits(w_full[:, TOPK:]))
+    if AITER_HAS_NUM_VALID_ROWS:
+        w_ref, ids_ref = _aiter(logits, TOPK, shared, num_valid_rows)
+        assert torch.equal(ids, ids_ref)
+        assert torch.equal(_bits(w), _bits(w_ref))
+
+
+@pytest.mark.parametrize("shared,offset", [(0, 0), (1, 0), (1, 32)])
+def test_select_experts_counts_the_pass_rows(shared, offset, gpu, monkeypatch):
+    """Through `FusedMoE.select_experts`, which reads the pass's row count from
+    the forward context: the captured route follows it on every replay, bit
+    for bit with the eager one, and with a fused shared expert writes this
+    (TBO micro-)batch's `topk_meta_rows` only."""
+    used = _record_kernels(monkeypatch)
+    rows, max_rows = 48, 128
+    torch.manual_seed(31 + shared + offset)
+    logits = _logits(rows, EXPERTS + shared)
+    count = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    context = fc.Context(
+        positions=torch.zeros(rows, dtype=torch.int64, device="cuda"),
+        running_tokens=rows,
+        ubatch_token_offset=offset,
+        scheduled_tokens_gpu=count,
+    )
+    monkeypatch.setattr(fc, "_forward_context", fc.ForwardContext(context=context))
+    meta_w, meta_ids = _outputs(max_rows, TOPK, shared)
+    monkeypatch.setattr(topK, "aiter_topK_meta_data", (meta_w, meta_ids))
+
+    def route():
+        return moe.FusedMoE.select_experts(
+            hidden_states=None,
+            router_logits=logits,
+            top_k=TOPK,
+            use_grouped_topk=False,
+            renormalize=True,
+            num_routing_experts=EXPERTS,
+            num_fused_shared_experts=shared,
+            fused_shared_experts_scoring_func="sigmoid" if shared else None,
+            triton_max_rows=_layer_rows(EXPERTS, TOPK, shared),
+        )
+
+    route()  # compiles the Triton kernel outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w_graph, ids_graph = route()
+    if shared:
+        assert w_graph.data_ptr() == meta_w[offset].data_ptr()
+
+    for n in (rows, 0, 29, rows):
+        count.fill_(n)
+        w_eager, ids_eager = (t.clone() for t in route())
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool((ids_eager[n:, :TOPK] == -1).all())
+        assert bool((ids_eager[:n, :TOPK] >= 0).all())
+        assert torch.equal(ids_graph, ids_eager)
+        assert torch.equal(_bits(w_graph), _bits(w_eager))
+    assert used == ["triton"] * (2 + 4)
+    if shared:
+        outside = torch.ones(max_rows, dtype=torch.bool, device="cuda")
+        outside[offset : offset + rows] = False
+        assert bool(meta_w[outside].isnan().all())
+
+
+@pytest.mark.parametrize("count", [False, True])
+@pytest.mark.parametrize("past_cutoff", [False, True])
+@pytest.mark.parametrize("experts,k,shared", [(512, 10, 1), (256, 8, 1), (128, 8, 0)])
+def test_impl_matches_aiter_on_both_sides_of_the_row_cutoff(
+    experts, k, shared, past_cutoff, count, gpu, monkeypatch
+):
+    """At the cutoff the impl runs Triton, one row past it AITER; eager and
+    replayed, both match AITER's kernel bit for bit."""
+    if count and not AITER_HAS_NUM_VALID_ROWS:
+        pytest.skip("AITER predates ROCm/aiter#6916")
+    max_rows = _layer_rows(experts, k, shared)
+    rows = max_rows + past_cutoff
+    torch.manual_seed(rows + experts + shared)
+    width = experts + shared
+    logits = torch.cat(
+        [
+            _logits(rows // 2, width),
+            _logits(rows - rows // 2, width, 0.05, ties=True),
+        ]
+    )
+    num_valid_rows = (
+        torch.tensor([rows * 2 // 3], dtype=torch.int32, device="cuda")
+        if count
+        else None
+    )
+    w_ref, ids_ref = _aiter(logits, k, shared, num_valid_rows)
+    if shared:
+        monkeypatch.setattr(topK, "aiter_topK_meta_data", _outputs(rows, k, shared))
+    used = _record_kernels(monkeypatch)
+
+    def route():
+        return topK.rocm_aiter_topk_softmax_impl(
+            logits, k, True, shared, experts, "sigmoid" if shared else None,
+            num_valid_rows=num_valid_rows, triton_max_rows=max_rows,
+        )  # fmt: skip
+
+    w_eager, ids_eager = (t.clone() for t in route())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w_graph, ids_graph = route()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert used == ["aiter" if past_cutoff else "triton"] * 2
+    for w, ids in ((w_eager, ids_eager), (w_graph, ids_graph)):
+        assert torch.equal(ids, ids_ref)
+        assert torch.equal(_bits(w), _bits(w_ref))

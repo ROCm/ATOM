@@ -124,8 +124,7 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
     [
         (False, "sigmoid", 5120),
         (False, None, 5120),
-        # The dispatch carries the shared expert; its scored logit is still
-        # in the router logits, a width the layer did not decide for.
+        # Left to the dispatch, the scored shared logit widens the logits.
         (True, "sigmoid", None),
         (True, None, 5120),
     ],
@@ -159,8 +158,7 @@ def test_select_experts_passes_the_layer_kernel_choice(
         object(), layer, torch.empty(1, 4), torch.empty(1, 9)
     )
     assert captured["triton_max_rows"] == 5120
-    # The routed width the Triton launch checks its logits against, not the
-    # dispatch space (`global_num_experts`, 10 here).
+    # The routed width, not the dispatch space (`global_num_experts`, 10).
     assert captured["num_routing_experts"] == 8
 
 
