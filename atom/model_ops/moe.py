@@ -524,7 +524,7 @@ def _select_logical(
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
         # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
-        # found, pure TP routes and runs its pad rows like real ones.
+        # found, pure TP routes its pad rows like real ones.
         mask_pad_rows=layer.use_ep,
     )
 
@@ -5405,9 +5405,7 @@ class FusedMoE(torch.nn.Module):
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
             scheduled_tokens_gpu=(
-                None
-                if gathered or not self.use_ep
-                else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+                None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
         )
         if split:
