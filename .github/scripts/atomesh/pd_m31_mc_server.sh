@@ -38,6 +38,10 @@ m31_checkout() {  # URL SHA DIR [--blobless]: exact commit; blobless keeps the t
 m31_prepare() {
   local wheel="${ATOMESH_SCRIPT_DIR}/mooncake-dist/${ATOMESH_M31_MOONCAKE_WHEEL}"
   local digest image_vllm egg build_log="${RUNTIME_LOG_DIR}/m31-aiter-build-rank-${NODE_RANK}.log"
+  [[ -f "${MODEL_PATH}/config.json" && -f "${MODEL_PATH}/dspark/config.json" ]] || {
+    echo "ERROR: ${MODEL_PATH} is not a complete MiniMax-M3.1-Flash snapshot" >&2
+    return 2
+  }
   rm -rf "${M31_ROOT}" && mkdir -p "${M31_ROOT}" || return 2
 
   # The image's Mooncake 0.3.13.post1 lacks multi-protocol support and sends every GPU segment to HipTransport.

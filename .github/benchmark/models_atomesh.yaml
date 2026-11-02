@@ -16443,7 +16443,8 @@ models:
   # because max-num-seqs and the decode cudagraph size scale with it.
   MiniMax-M3.1-Flash-vLLM-MC-RDMA:
     backend: vllm
-    model_path: "${ATOMESH_MODEL_ROOT}/amd/MiniMax-M3.1-Flash-Quark-MXFP4"
+    # amd/MiniMax-M3.1-Flash-Quark-MXFP4 at the revision of the local copy, cached on the cluster NFS.
+    model_path: /share_nfs/models/amd/.hf-vllm-m31/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/1442d09d4926cb286fa2dc6646c83c4af2b3898c
     precision: MXFP4
     image: vllm/vllm-openai-rocm:nightly-76c6f3f2a95f6049657db1e513133b824a5c8175@sha256:4c92e167b9b4739e9c7181ae384fafc2b8e6da0de9ddef7c4829ce0d581b12eb
     vllm:
