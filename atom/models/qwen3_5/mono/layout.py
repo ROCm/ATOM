@@ -56,16 +56,13 @@ def dn_tile(S: int, hidden: int) -> int:
     return 32 if S == 1 else max(16, -(-(hidden // BLOCKS) // 16) * 16)
 
 
-# ATOM's FlyDSL decode plan at head_dim 256 (``base_attention.flydsl_plan_shape``; the runner refuses
-# ATOM_PA_FLYDSL when it differs): at most 64 partitions a sequence, a 256-workgroup budget
+# ATOM's FlyDSL plan shape at head_dim 256 (``flydsl_plan_shape``; checked by the runner)
 FLYDSL_MAX_PARTS = 64
 FLYDSL_BUDGET = 256
 
 
 def flydsl_capacity(seqs: int) -> int:
-    """Plan slots of baseline ATOM's FlyDSL decode attention for ``seqs`` sequences (one KV head a rank,
-    aiter's ``plan_pa_decode`` capacity). A sequence's partition count depends on it, so the kernel plans
-    with the same."""
+    """``plan_pa_decode``'s slot capacity for ``seqs`` sequences."""
     return min(FLYDSL_MAX_PARTS * seqs, max(seqs, FLYDSL_BUDGET))
 
 
@@ -219,7 +216,6 @@ def layout(
     """Byte offsets of the per-rank scratch and of the symmetric buffer. Every mailbox holds
     ``(value, tag)`` int32 pairs (8 bytes); bf16 mailboxes pack two elements per pair.
     """
-    # the split partials: a split of a row (gluon), or a plan slot of a request's rows (FlyDSL)
     parts = (
         flydsl_capacity(S // tokens_per_seq) * tokens_per_seq
         if pa_flydsl
@@ -361,7 +357,7 @@ def stage_tasks(
     tokens_per_seq=1,
 ):
     """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence;
-    ``pa_flydsl``: a split task per FlyDSL plan slot, the idle ones past a step's live slots skipped).
+    ``pa_flydsl``: a split task per FlyDSL plan slot).
     """
     xin = [("xin", S)] if xin_stage(S, weights) else []
     if full:

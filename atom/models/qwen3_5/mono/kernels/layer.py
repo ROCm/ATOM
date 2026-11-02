@@ -69,18 +69,6 @@ from atom.mono.runtime.debug import region_ids
 _CURRENT_STREAM = fx.Stream(None)
 
 
-# Codegen-only LLVM options a width's build is retried with when the build needs scratch (``codegen``, an
-# index): at some widths LLVM's SGPR allocator leaves a dead spill slot, a frame that gives the kernel scratch,
-# which mono refuses. Each changes only the schedule / allocation, never what is computed
-CODEGEN_VARIANTS = (
-    {},
-    {"amdgpu-use-amdgpu-trackers": True},
-    {"amdgpu-sched-strategy": "max-ilp"},
-    {"amdgpu-disable-unclustered-high-rp-reschedule": True},
-    {"misched-cluster": False},
-)
-
-
 def build_qwen35_kernel(
     S: int,
     npes: int,
@@ -103,7 +91,6 @@ def build_qwen35_kernel(
     pa_flydsl=False,
     tokens_per_seq=1,
     replay_cap=0,
-    codegen=0,
     debug=False,
     timeline=False,
 ):
@@ -242,8 +229,7 @@ def build_qwen35_kernel(
             else 0
         ),
         flydsl_lds_words(T_SEQ, HD) if PA_FLYDSL else 0,
-    )  # split (gluon): scores | P' bytes | Q bytes | per-head factors | this launch's K / V bytes, scales;
-    # under ATOM_PA_FLYDSL attn_flydsl's (flydsl_lds_words)
+    )  # split: scores | P' bytes | Q bytes | per-head factors | this launch's K / V bytes, scales
     ON = max(
         # MXFP4: the expert down's routed tile and, after it, the shared expert's
         S * max(ROW_TILE, PROJ_TILE * PROJ_GROUPS, DN_TILE * (2 if MX else 1)),
@@ -487,6 +473,6 @@ def build_qwen35_kernel(
             tl,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
-    return flyc.compile[
-        {"llvm_options": {"disable-vector-combine": True, **CODEGEN_VARIANTS[codegen]}}
-    ](launch_qwen35)
+    return flyc.compile[{"llvm_options": {"disable-vector-combine": True}}](
+        launch_qwen35
+    )

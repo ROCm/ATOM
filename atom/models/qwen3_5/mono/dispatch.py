@@ -69,6 +69,8 @@ _FIXED = {
     "hidden_act": ("silu", None),
     "attn_output_gate": (True, None),
     "attention_bias": (False, False),
+    # Qwen3NextAttention's q / k / v projection bias
+    "qkv_bias": (False, False),
     # the router renormalizes its top-k (qwen3_next's default)
     "norm_topk_prob": (True, True),
     # a MoE block every layer

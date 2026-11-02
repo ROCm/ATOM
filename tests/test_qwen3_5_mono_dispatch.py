@@ -163,6 +163,7 @@ def test_unsupported_deployment_is_refused(native, overrides, reason):
         ("hidden_act", "gelu"),
         ("attn_output_gate", False),
         ("attention_bias", True),
+        ("qkv_bias", True),
         ("norm_topk_prob", False),
         ("mlp_only_layers", [0]),
         ("decoder_sparse_step", 2),

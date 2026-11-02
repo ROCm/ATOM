@@ -343,9 +343,8 @@ def attn_stages(ctx):
                 XPP + (H + tid // (CPS // 4)) * SPP + tid % (CPS // 4),
                 fx.Float32(0.0),
             )
-        # this launch's keys, for every split with a tile (their V scales enter the tile's vmax, their
-        # P' = 0 products the split's sums): K / V codes (exact FP8 values) back to bytes, a word a
-        # thread, in rounds of the block (past 4 tokens a request the words outnumber the threads)
+        # this launch's keys, for every split with a tile: K / V codes back to bytes, a word a thread
+        # (in rounds: past 4 tokens a request the words outnumber the threads)
         NKW = T_SEQ * 2 * HD // 4
         for rnd in range_constexpr(-(-NKW // THREADS)):
             wk = tid if rnd == 0 else tid + rnd * THREADS

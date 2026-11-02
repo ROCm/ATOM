@@ -1,30 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: B023  (traced stage closures read the loop's values on purpose: the tracer unrolls)
-"""Stages 3-4 of the full-attention mixer under ``ATOM_PA_FLYDSL=1``: baseline ATOM's decode attention is
-then aiter's FlyDSL paged decode (``aiter.ops.flydsl.pa_decode``: its work planner, tile kernel and
-reduce), which this follows rounding point for rounding point (aiter 59fae2078: kernels/pa_decode_plan.py,
-kernels/pa_decode/{traits,op_lds,op_gemm,op_softmax,op_epilog,pipeline}.py, kernels/pa_decode_reduce.py).
-
-The plan: each request's context is cut into 256-key tiles, and the request gets ``cnt`` partitions (runs
-of whole tiles), a share of the plan's ``capacity`` slots proportional to its tile count, at most 64. It
-is integer math on the step's ``context_lens``, so every task recomputes it. A split task is one plan slot:
-all ``T_SEQ x 8`` query rows of its request over its tiles, in order, with an online softmax; it publishes
-each row's bf16 partial output and its (max, exp sum). The merge reduces a row's partials as aiter's reduce
-does.
-
-One tile, as FlyDSL's 4-warp CTA computes it (its warp w is this CTA's waves 2w, 2w + 1):
-  Q: per row, ``q8 = fp8(q * rcp(max(absmax * 1/448, 1e-20)))``, the row's scale kept;
-  QK: 8 chained FP8 MFMAs a 16-key chunk, A = K, B = Q, pack p holding head dims
-      ``(4 (p // 2) + g) * 16 + 8 (p % 2) + [0, 8)`` (lane group g);
-  score ``fl(fl(dot * k_scale) * scale_r)`` in log2 units, -inf past the causal bound; the tile max over
-      the rows' keys, ``P = exp2(fl(score - m))``, ``corr = exp2(fl(m_prev - m))``;
-  ``P' = fp8(fl(fl(P * v_scale) * rcp(fma(vmax, 1/448, 1e-8/448))))``, vmax the tile's largest V scale;
-  the exp sum of the unquantized P in FlyDSL's order (4 keys, 4 chunks, xor 16 / 32, 4 warps);
-  PV: 8 chained FP8 MFMAs a 16-dim group, A = V, B = P', pack i holding keys ``64 g + 8 i + [0, 8)``;
-      ``o = fma(o, corr, fl(pv * fl(vmax * 1/448)))``, ``l = fma(l, corr, sum)``.
-This launch's keys come from ``kvnew`` (other CTAs may not see their cache stores yet), spliced into the
-MFMA operands; scales past the context are 0 and V bytes past it are 0 (FlyDSL's ``mask_unowned_kv``).
+"""Full-attention stages 3-4 (split, merge) under ``ATOM_PA_FLYDSL=1``: aiter's FlyDSL paged decode
+(work plan, tile, reduce; aiter 59fae2078 ``kernels/pa_decode*``), bit for bit. A split task is one plan
+slot covering all of its request's rows.
 """
 
 import flydsl.expr as fx
@@ -64,7 +43,7 @@ LN2 = 1.0 / 1.4426950408889634  # f32 0x3F317218
 
 
 def flydsl_lds_words(T_SEQ: int, HD: int) -> int:
-    """LDS words the split and merge stages use (the layer sizes its ``x`` buffer to at least this)."""
+    """LDS words the split and merge stages use."""
     MTR = 16 * (-(-(8 * T_SEQ) // 16))
     split = (
         MTR * (2 * (HD // 4 + 2) + 1)  # Q bytes, P' bytes, row scales
@@ -84,9 +63,8 @@ def flydsl_lds_words(T_SEQ: int, HD: int) -> int:
 
 
 def plan(context_lens, Q, CAP):
-    """aiter's ``pa_decode_plan`` (sliding window 0, one KV head, at most 64 partitions a request) on the
-    first ``Q`` context lengths, wave-uniform: per request (its tile count, its first slot, its slot
-    count)."""
+    """aiter's ``pa_decode_plan`` on the first ``Q`` context lengths: per request (lens, tiles, first slot,
+    slots)."""
     lens = [uniform(g32(context_lens, i)) for i in range(Q)]
     tiles = [(fx.max(L_, 0) + TILE - 1) // TILE for L_ in lens]
     tot = tiles[0]
@@ -119,13 +97,13 @@ def pick(i, vals):
 
 
 def g32(base, i):
-    """The i32 at element ``i`` of the global buffer at 64-bit address ``base``."""
+    """i32 ``i`` of the global buffer at ``base``."""
     return fx.Int32(global_load(base + fx.Int64(i) * 4))
 
 
 @traced
 def flydsl_split_merge(ctx):
-    """Stages ``split`` (a task a plan slot) and ``merge`` (a task a row and head)."""
+    """Stages ``split`` (a task a plan slot) and ``merge`` (a task a row, head)."""
     G = ctx["G"]
     H = ctx["H"]
     HD = ctx["HD"]
@@ -147,11 +125,9 @@ def flydsl_split_merge(ctx):
     v_cache = ctx["v_cache"]
     wave = ctx["wave"]
     xs = ctx["xs"]
-    # the block table, the scale pools and context_lens by 64-bit address (global_load), not buffer
-    # descriptors: four SGPRs each, live across the tile loop, push the small widths past the SGPR file
+    # by 64-bit address, not buffer descriptors (SGPR pressure)
     block_tables, context_lens = ctx["block_tables"], ctx["context_lens"]
     k_scale, v_scale = ctx["k_scale"], ctx["v_scale"]
-    # ATOM's torch.sigmoid (accurate expf), or under QKF its Triton kernel's tl.sigmoid
     sig = sigmoid if const_expr(QKF_O) else sigmoid_precise
 
     Q = S // T_SEQ  # requests
@@ -161,11 +137,9 @@ def flydsl_split_merge(ctx):
     CAP = flydsl_capacity(Q)
     KVB = HD * BS
     assert H == 8 and HD == 256 and BS == 16 and WAVES == 8 and THREADS == 512
-    # FlyDSL's head-256 FP8 pipe: up to 32 rows, one K128 scaled MFMA (unit scales) a 4 packs; past it 4
-    # chained K32 MFMAs. The same operand bytes either way (aiter op_gemm.py, traits.py d256_pipe)
+    # FlyDSL's d256 pipe: K128 scaled MFMA up to 32 rows, K32 past it (same operand bytes)
     K128 = R <= 32
-    # LDS (words): Q bytes and P' bytes [row][64 + 2 pad], row scales, this launch's K / V bytes and
-    # scales, the tile's k / v scales, per-wave row maxima, the warp halves' exp-sum hand-off, warp sums
+    # LDS layout (words)
     SQ = HD // 4 + 2
     XQ8 = 0
     XP8 = XQ8 + MTR * SQ
@@ -178,23 +152,20 @@ def flydsl_split_merge(ctx):
     XMX = XVS + TILE
     XLX = XMX + WAVES * MTR
     XW = XLX + 4 * MT * 64
-    # this launch's V bytes by head dim: [HD][2 words], key i at byte i
     XVT = XW + 4 * MTR
     XBT = XVT + 2 * HD  # block ids of three tiles, by tile % 3
-    # the task's scalars, read back in the tile loop: LDS loads are VGPRs, held there instead of across
-    # the tile loops in SGPRs (the small widths are at the SGPR file's end)
+    # the task's scalars, re-read in the tile loop (VGPRs, not SGPRs)
     XSC = XBT + 3 * TILE // BS
-    # T_SEQ <= 7: the V splice shifts vt64 arithmetically, so its byte 7 (a key past this launch's) stays 0
+    # T_SEQ <= 7: the V splice's arithmetic shift needs byte 7 of vt64 zero
     assert XSC + 4 <= flydsl_lds_words(T_SEQ, HD) and T_SEQ <= 7
-    # softmax_scale * log2(e), f32 0x3DB8AA3B at head_dim 256
     LOG2E_SCALE = ctx["SCALE"] * LOG2E
     g = lane // 16
     n = lane % 16
     fw = wave // 2  # FlyDSL's warp
-    half = wave % 2  # its chunks 2 half, 2 half + 1
+    half = wave % 2  # which half of the warp's chunks
 
     def mfma_chain(a_packs, b_packs, acc):
-        """acc += A x B over 8 packs (i64 of 8 FP8 each, a lane's K slots), as FlyDSL issues it."""
+        """acc += A x B over 8 FP8 packs, as FlyDSL issues it."""
         if const_expr(K128):
             for inst in range_constexpr(2):
                 a = fx.Vector.from_elements(
@@ -216,13 +187,10 @@ def flydsl_split_merge(ctx):
         )
 
     def kv_vec4(pool, blk, byte):
-        """Four words at ``byte`` of cache block ``blk`` of ``pool``: a 64-bit address (no buffer
-        descriptor: its four SGPRs a block push the build past the SGPR file into scratch).
-        """
+        """Four words at ``byte`` of cache block ``blk`` of ``pool``."""
         return fx.Vector(global_load(pool + fx.Int64(blk) * KVB + fx.Int64(byte), 4))
 
-    # ================================ 3. split: a task a live plan slot (the slots past them stay idle)
-    # (only the live total crosses the loop; a task replans: the plan held across it costs SGPRs)
+    # ================================ 3. split: a task a live plan slot (each task replans: SGPRs)
     _, _, starts, cnts = plan(context_lens, Q, CAP)
     n_live = starts[Q - 1] + cnts[Q - 1]
     for tt in range(start("split"), n_live, G):
@@ -242,8 +210,7 @@ def flydsl_split_merge(ctx):
         pos0 = L - T_SEQ  # this launch's keys: pos0 .. L - 1
         last_blk = fx.max(fx.min((L - 1) // BS, bt_stride - 1), 0)
 
-        # Q -> FP8 with a per-row scale; padded rows (>= R) zero. A wave a row a round (MT * 2 rounds), 4
-        # dims a lane; this launch's K / V codes back to bytes (a word a thread a round). One poll each
+        # Q -> FP8 with a per-row scale (padded rows zero); this launch's K / V codes -> bytes
         NKW = T_SEQ * 2 * HD // 4
         NKR = -(-NKW // THREADS)
         if tid == 0:
@@ -318,7 +285,7 @@ def flydsl_split_merge(ctx):
             )
             lds_st(xs, XSN + tid, sc2[0][0].bitcast(fx.Float32))
         gpu.barrier()
-        # the V bytes again by head dim (a thread a dim): the PV operand's 4-key words splice from them
+        # this launch's V bytes by head dim, for the PV operand splice
         if tid < HD:
             vt = [fx.Int32(0), fx.Int32(0)]
             for i_ in range_constexpr(T_SEQ):
@@ -334,22 +301,22 @@ def flydsl_split_merge(ctx):
         NS = 2 * MT + 2 * MT * 4  # carried softmax state: m, l, o
 
         def sc_(i):
-            """The task's scalar ``i`` (context length, last block, block-table row, end tile)."""
+            """Task scalar ``i``: context length, last block, block-table row, end tile."""
             return lds_ld(xs, XSC + i).bitcast(fx.Int32)
 
         def ids_of(tl):
-            """Tile ``tl``'s block ids, a thread a block (tid % NB); past the context the last block."""
+            """Tile ``tl``'s block ids, a thread a block."""
             return g32(
                 block_tables,
                 sc_(2) + fx.min(fx.max(tl * NB + tid % NB, 0), sc_(1)),
             )
 
         def bid(tl, i):
-            """Block ``i`` of tile ``tl``, from the 3-slot ring in LDS (tiles t .. t + 2 at tile t)."""
+            """Block ``i`` of tile ``tl`` (3-slot ring)."""
             return lds_ld(xs, XBT + (tl % 3) * NB + i).bitcast(fx.Int32)
 
         def load_k(tl):
-            """This wave's two 16-key chunks of K (a cache block each): [chunk][dim group q][word]."""
+            """This wave's two 16-key K chunks."""
             kw = []
             for c in range_constexpr(2):
                 blk = uniform(bid(tl, 2 * wave + c))
@@ -359,7 +326,7 @@ def flydsl_split_merge(ctx):
             return kw
 
         def load_v(tl):
-            """This wave's two 16-dim groups of V (four blocks a lane group): [group][block][word]."""
+            """This wave's two 16-dim V groups."""
             vw = []
             for j in range_constexpr(2):
                 for kq in range_constexpr(4):
@@ -370,7 +337,7 @@ def flydsl_split_merge(ctx):
             return vw
 
         def load_s(tl):
-            """The k and v scale of key tid % TILE of tile ``tl``."""
+            """k / v scale of key ``tid % TILE``."""
             blk = bid(tl, (tid % TILE) // BS)
             return [
                 g32(k_scale, blk * BS + tid % BS).bitcast(fx.Float32),
@@ -378,10 +345,8 @@ def flydsl_split_merge(ctx):
             ]
 
         def tile_body(t, carry, patch):
-            """Tile ``t``: carry = m[MT] + l[MT] + o[2 groups][MT][4], then tile t's K words, V words and the
-            thread's (k, v) scale, loaded during tile t - 1 -> the same for t + 1. ``patch``: the tile may
-            hold this launch's keys or keys past the context (FlyDSL's last tiles), spliced in here.
-            """
+            """One tile; carry = (m, l, o, this tile's prefetched K, V, scales). ``patch``: the tile may hold
+            this launch's keys or keys past the context."""
             m_p = carry[:MT]
             l_p = carry[MT : 2 * MT]
             o_p = carry[2 * MT : NS]
@@ -391,7 +356,6 @@ def flydsl_split_merge(ctx):
             kbase = t * TILE
             L = sc_(0)
             pos0 = L - T_SEQ
-            # the next tile (the last one re-reads itself: cache hits)
             tn = fx.min(t + 1, sc_(3) - 1)
             idn = ids_of(t + 2)  # into the ring at the tile's end
             if const_expr(patch):
@@ -409,18 +373,16 @@ def flydsl_split_merge(ctx):
                             kw[(c * 4 + q) * 4 + e] = new.select(
                                 kn[e], fx.Int32(kw[(c * 4 + q) * 4 + e])
                             )
-                # V: keys < pos0 cached, pos0 .. L - 1 this launch's (bytes of vt64), >= L zero
+                # V: keys < pos0 cached, pos0 .. L - 1 from vt64, >= L zero
                 for j in range_constexpr(2):
                     vt64 = lds_i64(xs, XVT + 2 * ((2 * wave + j) * 16 + n))
                     for kq in range_constexpr(4):
                         for e in range_constexpr(4):
                             key0 = kbase + 64 * g + 16 * kq + 4 * e
-                            # this word's cached keys
                             nc = fx.min(fx.max(pos0 - key0, 0), 4)
                             keep = (nc >= 4).select(
                                 fx.Int32(-1), (fx.Int32(1) << nc * 8) - 1
                             )
-                            # this launch's key at byte 0 (negative: past byte 0)
                             rel = key0 - pos0
                             up = fx.Int32(fx.min(fx.max(rel, 0), 7) * 8)
                             dn = fx.Int32(fx.min(fx.max(-rel, 0), 3) * 8)
@@ -430,7 +392,6 @@ def flydsl_split_merge(ctx):
                             )
                             i_ = (j * 4 + kq) * 4 + e
                             vw[i_] = (fx.Int32(vw[i_]) & keep) | (nw & ~keep)
-                # scales: this launch's, zero past the context
                 key = kbase + tid % TILE
                 i_ = fx.min(fx.max(key - pos0, 0), T_SEQ - 1)
                 ks_ = (key >= pos0).select(lds_ld(xs, XSN + 2 * i_), ks_)
@@ -441,7 +402,7 @@ def flydsl_split_merge(ctx):
                 lds_st(xs, XKS + tid, ks_)
                 lds_st(xs, XVS + tid, vs_)
             gpu.barrier()
-            # --- QK and the masked scores; this wave's row maxima
+            # --- QK, masked scores, row maxima
             vmax = wave_max(
                 fx.max(
                     fx.max(lds_ld(xs, XVS + 4 * lane), lds_ld(xs, XVS + 4 * lane + 1)),
@@ -494,7 +455,7 @@ def flydsl_split_merge(ctx):
                     lds_st(xs, XMX + wave * MTR + row, mx)
             kw_n = load_k(tn)  # the next tile's K, in K's registers
             gpu.barrier()
-            # --- the tile max, P, P' -> LDS, the first half of a warp's exp sum
+            # --- tile max, P, P', exp sum (first half)
             nrm = hw_rcp(fmath.fma(vmax, fx.Float32(INV_FP8), fx.Float32(NRM_EPS)))
             vms = vmax * INV_FP8
             m_n, corr, rs = [], [], []
@@ -522,7 +483,7 @@ def flydsl_split_merge(ctx):
                 if half == 0:
                     lds_st(xs, XLX + (fw * MT + m) * 64 + lane, rc[0] + rc[1])
             gpu.barrier()
-            # --- the warp's exp sum (its second half), PV
+            # --- exp sum (second half), PV
             for m in range_constexpr(MT):
                 if half == 1:
                     ls = (lds_ld(xs, XLX + (fw * MT + m) * 64 + lane) + rs[m][0]) + rs[
@@ -559,7 +520,6 @@ def flydsl_split_merge(ctx):
             if tid < NB:
                 lds_st(xs, XBT + ((t + 2) % 3) * NB + tid, idn.bitcast(fx.Float32))
             gpu.barrier()
-            # --- l: the 4 warps' sums in order
             l_n = []
             for m in range_constexpr(MT):
                 row = 16 * m + n
@@ -576,7 +536,6 @@ def flydsl_split_merge(ctx):
                 + [fx.Float32(x) for x in carry[NS + 64 :]]
             )
 
-        # the ring's first two tiles, then tile tb's loads
         if tid < 2 * NB:
             tl = tb + tid // NB
             lds_st(xs, XBT + (tl % 3) * NB + tid % NB, ids_of(tl).bitcast(fx.Float32))
@@ -587,7 +546,7 @@ def flydsl_split_merge(ctx):
             + [fx.Float32(0.0)] * (2 * MT * 4)
         )
         init += load_k(tb) + load_v(tb) + load_s(tb)
-        # tiles wholly before this launch's keys, then the rest (this launch's keys, the context's end)
+        # tiles before this launch's keys, then the patched rest
         ta = fx.max(fx.min(pos0 // TILE, te), tb)
         for ti, carry in range(tb, ta, fx.Int32(1), init=init):
             res = yield tile_body(fx.Int32(ti), wrap(carry), False)
@@ -595,7 +554,6 @@ def flydsl_split_merge(ctx):
         for ti, carry in range(ta, te, fx.Int32(1), init=mid):
             res2 = yield tile_body(fx.Int32(ti), wrap(carry), True)
         fin = [fx.Float32(x) for x in res2[:NS]]
-        # --- the partition's rows: bf16 o / l, (max in natural log units, l)
         for m in range_constexpr(MT):
             row = 16 * m + n
             lm = fin[MT + m]
@@ -608,7 +566,7 @@ def flydsl_split_merge(ctx):
             if (wave == 0) & (g == 0) & (row < R):
                 put2(mb("sp_ml"), (slot * R + row) * 2, fin[m] * LN2, lm)
 
-    # ================================ 4. merge a row's partitions (aiter's reduce), output gate -> gated
+    # ================================ 4. merge (aiter's reduce), output gate -> gated
     for tt in range(start("merge"), S * H, G):
         tt = fx.Int32(tt)
         s = tt // H
@@ -619,8 +577,7 @@ def flydsl_split_merge(ctx):
         _, _, starts, cnts = plan(context_lens, Q, CAP)
         first = pick(req, starts)
         cnt = pick(req, cnts)
-        # every wave reduces the (at most 64) partitions alike; wave 0 stores the weights. A request
-        # without partitions (a padded one, context 0) polls a pair every launch writes instead
+        # a request without partitions (padded) polls a pair every launch writes instead
         pin = lane < cnt
         has = cnt > 0
         src = Addr("sp_ml", Space.SCRATCH, has.select(mb("sp_ml").value, mb("q").value))
@@ -641,9 +598,7 @@ def flydsl_split_merge(ctx):
         if wave == 0:
             lds_st(misc, lane, pin.select(wj, fx.Float32(0.0)))  # w = 0 past cnt
         gpu.barrier()
-        # the partitions' bf16 outputs: a thread a dim pair and a quarter of the (at most 64) partitions,
-        # one poll, into LDS; then a thread a dim pair sums them in order. Past cnt the last partition's value
-        # times w = 0 is added: exact no-ops for its finite values, as aiter's reducer pads
+        # partition outputs -> LDS (one poll), then summed in order; past cnt w = 0, as aiter pads
         tq = tid % (HD // 2)
         pq4 = tid // (HD // 2)
         at = [
@@ -659,8 +614,9 @@ def flydsl_split_merge(ctx):
         )
         parts = poll([(src, a_, 1) for a_ in at], batch=MAX_PARTS // 4)
         for i in range_constexpr(MAX_PARTS // 4):
-            # (no partitions: q's words were polled, 0 instead: their bf16 halves may be inf / nan)
-            word = has.select(parts[i][0], fx.Int32(0))
+            word = has.select(
+                parts[i][0], fx.Int32(0)
+            )  # padded: not q's words (inf / nan halves)
             lds_st(xs, (pq4 * 16 + i) * (HD // 2) + tq, word.bitcast(fx.Float32))
         gpu.barrier()
         o0 = fx.Float32(0.0)

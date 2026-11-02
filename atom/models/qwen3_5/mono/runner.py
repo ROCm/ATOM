@@ -19,6 +19,7 @@ and buffers (scratch, peer memory) are built on its first step (``WidthBuilds``)
 kind (GDN, full attention) share them.
 """
 
+import inspect
 import logging
 
 import torch
@@ -42,11 +43,11 @@ from atom.models.qwen3_5.mono.op import (
     Qwen35MonoKernel,
     Qwen35Variant,
     StepInputError,
-    zero_abi,
 )
 from atom.models.qwen3_5.mono.packing import pack_bf16
 from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
 from atom.mono.plan.execution import BLOCKS
+from atom.mono.runtime.abi import KernelAbi
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import raise_if_given_up
 from atom.mono.runtime.lifecycle import owned_peer_buffer
@@ -57,6 +58,14 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+def _zero_abi(launcher) -> KernelAbi:
+    """A launcher's parameters but ``stream``: what a compile-only call zeroes."""
+    fn = getattr(launcher, "func", None) or launcher._func
+    params = tuple(inspect.signature(fn).parameters)
+    assert params[-1] == "stream", params
+    return KernelAbi(params[:-1])
 
 
 def baseline_refusal(experts, rows: int = 16) -> str | None:
@@ -92,16 +101,13 @@ def baseline_refusal(experts, rows: int = 16) -> str | None:
 
 
 def flydsl_refusal(cfg) -> str | None:
-    """Under ATOM_PA_FLYDSL, why the original decode attention is not the FlyDSL paged decode the kernel
-    follows (kernels/attn_flydsl.py), or None: ATOM runs gluon instead where aiter predates the explicit
-    work plan or the GPU has no FlyDSL decode, plans otherwise than the kernel, or aiter's head-256 decode
-    is not the one copied (its K128 pipe up to 32 rows, aiter 59fae2078)."""
+    """Why the original decode attention under ATOM_PA_FLYDSL is not the FlyDSL decode the kernel follows."""
     import importlib
 
     from atom.model_ops import base_attention as ba
 
     try:
-        # the module before ATOM's probe of it: until then aiter.ops.flydsl.pa_decode names the function
+        # before ATOM's probe: until imported, aiter.ops.flydsl.pa_decode names the function
         importlib.import_module("aiter.ops.flydsl.pa_decode")
         from aiter.ops.flydsl.kernels.pa_decode import traits
     except ImportError:
@@ -185,10 +191,8 @@ def check_splits(md, requests: int, T: int = 1, flydsl: bool = False) -> None:
     """The original decode attention splits each sequence by the count of its metadata's
     ``context_lens`` (ATOM's ``dense_decode_splits``), and each split is a rounding point: a step
     whose metadata counts other than its ``requests`` rows (a graph's padded batch around an eager
-    draft) would split differently, so it raises ``StepInputError``. Under ATOM_PA_FLYDSL the split is
-    FlyDSL's work plan on the first ``rows // max_seqlen_q`` sequences, which ATOM takes only while
-    they divide and fit its metadata (``_flydsl_pa_decode_num_seqs``; else gluon): the kernel plans
-    ``requests`` sequences of ``T`` rows, so the two must agree."""
+    draft) would split differently, so it raises ``StepInputError``. Under ATOM_PA_FLYDSL it follows
+    ``_flydsl_pa_decode_num_seqs``."""
     seqs = md.context_lens.shape[0]
     if flydsl:
         qlen = int(md.max_seqlen_q)
@@ -594,7 +598,7 @@ class Qwen35MonoDecodeRunner:
     def _width_kernels(built: dict) -> list:
         out = []
         for var in built["variants"].values():
-            out.append((var.launch, zero_abi(var.launch)))
+            out.append((var.launch, _zero_abi(var.launch)))
         return out
 
     def launch_width(self, rows: int) -> int | None:
