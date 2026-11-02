@@ -133,7 +133,8 @@ verdict lands. An image only another backend (LocalDisk) still holds is
 present but outside the hot cache: the touch cannot refresh it, reports that on
 `k3_state_touch_refresh`, and it is counted in
 `state_offload_touches_unrefreshed` (0 when every touch refreshed the LRU); the
-next store of it puts it back into the CPU tier. A gone verdict from a touch
+next store of it puts it back into the CPU tier. A touch that raises keeps the
+image indexed and is counted there too (one traceback per worker). A gone verdict from a touch
 sent before the image's latest store is ignored as stale. An admission about to
 load an image not confirmed recently is held for a pass (at most `OFFLOAD_LOOKUP_DEFER_S`) while that verdict comes
 back, so it plans a lower boundary instead of parking on a miss and

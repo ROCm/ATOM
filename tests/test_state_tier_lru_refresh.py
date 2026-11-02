@@ -103,8 +103,8 @@ class _LocalCPU:
 
     def __init__(self, refuse_all: bool = False) -> None:
         self.hot: OrderedDict = OrderedDict()
-        # A second backend (LocalDisk): read by `get`, which promotes a hit
-        # back into the hot cache, and answered by `contains`.
+        # A second backend (LocalDisk) for presence only: `contains` answers
+        # from it, `get` does not read it (no test loads a disk-only image).
         self.disk: dict = {}
         self.refuse_all = refuse_all
         self.fail_put = False
@@ -669,6 +669,7 @@ def _k3_worker(tier):
     c = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     c._state_tier = tier
     c._touch_verdicts = {}
+    c._touch_failures = 0
     return c
 
 
@@ -705,7 +706,24 @@ class TestConnectorTouches:
 
         worker = _k3_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
         worker._touch_states(SimpleNamespace(state_touches=[StateTouchId(1, 0)]))
-        assert worker._touch_verdicts == {StateTouchId(1, 0): (True, True)}
+        assert worker._touch_verdicts[StateTouchId(1, 0)][0] is True
+
+    def test_a_failing_touch_counts_unrefreshed_and_logs_once(self, caplog):
+        """A drifted LMCache raises on every touch: that must show up in
+        `touches_unrefreshed`, not as healthy refreshes, and not as one
+        traceback per touch."""
+
+        def touch(h):
+            raise RuntimeError("backend hiccup")
+
+        worker = _k3_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
+        ids = [StateTouchId(1, 0), StateTouchId(2, 1), StateTouchId(1, 2)]
+        with caplog.at_level(logging.WARNING, logger="atom"):
+            worker._touch_states(SimpleNamespace(state_touches=ids[:2]))
+            worker._touch_states(SimpleNamespace(state_touches=ids[2:]))
+        assert worker._touch_verdicts == {i: (True, False) for i in ids}
+        assert worker._touch_failures == 3
+        assert [r.exc_info is not None for r in caplog.records] == [True]
 
     def _scheduler(self, monkeypatch):
         from atom.kv_transfer.offload.dense.connector import DenseOffloadScheduler

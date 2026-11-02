@@ -26,8 +26,10 @@ class TouchResult(enum.IntEnum):
     """What a touch found. Truthy when the image can still be read."""
 
     GONE = 0
-    #: Outside LocalCPU's hot cache but held by another backend (`get` reads
-    #: it and promotes it back): present, its eviction order not refreshed.
+    #: Outside LocalCPU's hot cache but held by another backend: present, its
+    #: eviction order not refreshed. `get` still reads it, through LMCache's
+    #: `StorageManager.get`, which writes a hit from another backend back into
+    #: LocalCPU (`LocalCPUBackend.submit_put_task`); nothing in ATOM does.
     PRESENT = 1
     REFRESHED = 2
 

@@ -134,6 +134,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
         # Touch verdicts since the last `get_finished`: (resident, refreshed).
         self._touch_verdicts: dict[StateTouchId, tuple[bool, bool]] = {}
+        # Touches whose codec call raised; only the first is logged.
+        self._touch_failures = 0
 
     def close(self) -> None:
         """Drain then join the state tier before the base executors.
@@ -331,13 +333,19 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             try:
                 result = tier.codec.touch(int(touch_id.prefix_hash))
             except Exception:
-                # Says nothing about the bytes; do not let it erase the index.
-                logger.warning(
-                    "kimi_k3 offload: touch of state hash %d failed",
-                    touch_id.prefix_hash,
-                    exc_info=True,
-                )
-                result = TouchResult.REFRESHED
+                # Says nothing about the bytes, so the index keeps the image;
+                # nothing was refreshed either. One traceback: a drifted
+                # LMCache raises on every touch.
+                self._touch_failures += 1
+                if self._touch_failures == 1:
+                    logger.warning(
+                        "kimi_k3 offload: touch of state hash %d failed; failed "
+                        "touches keep the image indexed and are counted in "
+                        "state_offload_touches_unrefreshed",
+                        touch_id.prefix_hash,
+                        exc_info=True,
+                    )
+                result = TouchResult.PRESENT
             self._touch_verdicts[touch_id] = (
                 bool(result),
                 result is not TouchResult.PRESENT,
