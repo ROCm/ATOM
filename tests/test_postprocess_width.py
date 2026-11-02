@@ -41,6 +41,7 @@ def _batch(seqs):
 def _runner(seen):
     """A ModelRunner carrying only what the no-spec branch of postprocess reads."""
     runner = object.__new__(mod.ModelRunner)
+    runner.rank = 0
 
     def _sampler(logits, temperatures, top_ks, top_ps, all_greedy, **kw):
         seen["logits_rows"] = logits.shape[0]
@@ -120,7 +121,8 @@ def test_a_step_that_padded_nothing_is_unaffected(monkeypatch):
     assert seen["logits_rows"] == bs
 
 
-def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
+@pytest.mark.parametrize("rank", [0, 1])
+def test_the_logprob_gather_reads_the_cut_logits(monkeypatch, rank):
     """`log_probs.gather` indexes with the sampled ids, which are per-request.
 
     Left on the padded logits it is `[running_bs, V]` gathered by `[scheduled_bs,
@@ -142,6 +144,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     batch.return_logprobs = [True] * scheduled_bs
     captured = {}
     runner = _runner(seen)
+    runner.rank = rank
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
         captured.update(logprobs=lp) or ({}, {})
     )
@@ -155,6 +158,11 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
         all_greedy=False,
         hidden_states=None,
     )
+
+    assert seen["logits_rows"] == seen["temperature_rows"] == scheduled_bs
+    if rank != 0:
+        assert captured["logprobs"] is None
+        return
 
     values, candidates, ranks = captured["logprobs"]
     assert values.shape == (scheduled_bs, 1, 1)
