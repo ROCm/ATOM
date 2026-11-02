@@ -184,7 +184,7 @@ class TestUndeferredSpecPlaceholders:
                 num_kvcache_blocks=64,
             )
         )
-        assert not sched.is_deferred_out and sched.spec_decode_local
+        assert not sched.is_deferred_out and sched.use_spec
         return sched
 
     def _step(self, sched, seq, tokens, num_rejected, stream_queue=None):

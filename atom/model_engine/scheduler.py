@@ -755,10 +755,7 @@ class Scheduler:
         self.drafter_needs_next_token = has_spec and not (
             config.speculative_config.use_dspark()
         )
-        # True when this engine both drafts and verifies. Under PP the last
-        # stage drafts and returns rows on `draft_token_ids` for the head.
         pp_size = getattr(config, "pipeline_parallel_size", 1)
-        self.spec_decode_local = self.use_spec
         # Positions past `len(seq)` each forward's draft round writes KV to.
         # Allocated before the forward, with the step's own blocks: see
         # `draft_kv_lookahead` for the arithmetic and what an unallocated one
@@ -1496,7 +1493,7 @@ class Scheduler:
         """Decode steps until the first running decode reaches max_tokens if
         every step accepts all its draft tokens; None without decode. EOS can
         come sooner, rejected drafts make it later. Only an engine that
-        verifies drafts (`spec_decode_local`) gains more than a token a step."""
+        verifies drafts (`use_spec`) gains more than a token a step."""
         fewest = None
         for seq in self.running:
             if seq.is_partial_prefill:
@@ -1506,7 +1503,7 @@ class Scheduler:
                 fewest = left
         if fewest is None:
             return None
-        tokens_per_step = 1 + (self.mtp_k if self.spec_decode_local else 0)
+        tokens_per_step = 1 + (self.mtp_k if self.use_spec else 0)
         return -(-fewest // tokens_per_step)
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
@@ -2789,7 +2786,7 @@ class Scheduler:
         num_seqs_decode = 0
         num_decode_tokens = 0
         # anchor + drafts if verifying locally, anchor alone otherwise.
-        spec_width = self.mtp_k if self.spec_decode_local else 0
+        spec_width = self.mtp_k if self.use_spec else 0
         tokens_per_decode_seq = spec_width + 1
         num_new_tokens = spec_width + 1
         remote_kv_blocks: set[int] = set()
@@ -2826,7 +2823,7 @@ class Scheduler:
             if blocked_by_pinned_save:
                 break
             if not preempted_current:
-                if self.spec_decode_local and seq.spec_token_ids.size > 0:
+                if self.use_spec and seq.spec_token_ids.size > 0:
                     scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                 num_seqs_decode += 1
                 num_decode_tokens += num_new_tokens
@@ -2907,7 +2904,7 @@ class Scheduler:
             total_seqs_num_prefill=num_seqs_prefill,
             total_seqs_num_decode=num_seqs_decode,
             connector_meta_output=connector_meta_output,
-            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            num_spec_step=self.mtp_k if self.use_spec else 0,
             is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             remote_kv_block_ids=sorted(remote_kv_blocks) if remote_kv_blocks else [],
@@ -4218,13 +4215,11 @@ class Scheduler:
         stream_outputs = []
         num_new_generation_tokens = 0
 
-        need_placeholder = is_deferred_out or self.spec_decode_local
+        need_placeholder = is_deferred_out or self.use_spec
         # Drafts occupy trailing slots only on an engine that verifies them; a
         # drafting-only engine's tokens are all real. Undeferred, `num_rejected`
         # alone names the tail.
-        num_placeholder_width = (
-            self.mtp_k if (self.spec_decode_local and is_deferred_out) else 0
-        )
+        num_placeholder_width = self.mtp_k if (self.use_spec and is_deferred_out) else 0
         # Up to `mtp_k` accepted drafts plus one bonus (or, deferred without
         # spec, the one-step lag slot).
         num_placeholder = self.mtp_k + 1
@@ -4310,9 +4305,7 @@ class Scheduler:
                 token_logprob = token_logprobs.get(seq.id)
 
             # In-place overwrite only when placeholders already exist.
-            if is_deferred_out or (
-                self.spec_decode_local and seq.num_placeholder_tokens > 0
-            ):
+            if is_deferred_out or (self.use_spec and seq.num_placeholder_tokens > 0):
                 # int() casts strip the np.int32 wrapper coming out of
                 # fwd_output's np.ndarray indexing. Without these, the values
                 # propagate into seq.num_rejected / seq.num_bonus_tokens, then
@@ -5166,7 +5159,6 @@ class PrefillScheduler:
         self.running: deque[Sequence] = deque()
         # spec decode not used on prefill side
         self.use_spec = False
-        self.spec_decode_local = False
         self.mtp_k = 0
         # Only the throughput section applies to the prefill side: it does not
         # speculate, and it has no BlockManager to source prefix-cache hits.
@@ -5553,7 +5545,7 @@ class DecodeScheduler(Scheduler):
                         self.preempt(seq)
                         break
                 else:
-                    if self.spec_decode_local and seq.spec_token_ids.size > 0:
+                    if self.use_spec and seq.spec_token_ids.size > 0:
                         scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                     num_new_tokens = self.mtp_k + 1
                     self.block_manager.may_append(
@@ -5591,7 +5583,7 @@ class DecodeScheduler(Scheduler):
             total_tokens_num_decode=total_tokens_num_decode,
             total_seqs_num=len(scheduled_seqs),
             total_seqs_num_decode=len(scheduled_seqs),
-            num_spec_step=self.mtp_k if self.spec_decode_local else 0,
+            num_spec_step=self.mtp_k if self.use_spec else 0,
             is_deferred_out=self.is_deferred_out,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             cu_stream_fraction=self.cu_fraction,

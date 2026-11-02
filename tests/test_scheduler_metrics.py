@@ -568,7 +568,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
         _partial_prefill_count=1,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
@@ -638,7 +638,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     owner = SimpleNamespace(
         _is_preemptable=lambda seq: True,
         total_preemptions=0,
-        spec_decode_local=False,
+        use_spec=False,
         _connector_release_stalled_save=lambda seq: None,
         block_manager=SimpleNamespace(deallocate=lambda seq: None),
         waiting=deque(),
