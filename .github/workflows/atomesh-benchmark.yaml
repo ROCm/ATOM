@@ -279,8 +279,25 @@ permissions:
   contents: write
 
 jobs:
+  m31-review-inspect:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.case_names == 'm31-review-ci-inspect' && !inputs.run_model_benchmark }}
+    name: Read-only M31 validation status
+    runs-on: atomesh-cicd
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Inspect this validation's queue and bounded logs
+        run: python3 .github/scripts/atomesh/m31_review_inspect.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m31-review-ci-inspection
+          path: m31-review-inspection/
+          retention-days: 7
   load-config:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ inputs.case_names != 'm31-review-ci-inspect' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: Load ATOMesh benchmark config
     runs-on: ubuntu-latest
     outputs:
