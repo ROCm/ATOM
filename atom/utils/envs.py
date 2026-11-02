@@ -768,6 +768,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # always accumulates in fp32.  fp16 over bf16 when narrowing: the state is
     # O(1), so bf16's range buys nothing and its short mantissa costs accuracy.
     "ATOM_GDN_SSM_DTYPE": lambda: os.getenv("ATOM_GDN_SSM_DTYPE", "fp32").lower(),
+    # --- LeapQuant (linear-attention state, arXiv:2609.38166) ---
+    # Store the GDN state between record-buffer flushes as int8 plus fp16
+    # compensator tokens and per-row/per-column scales (~1.19 B per element
+    # instead of 4), re-quantised once per window.  Built on ReplaySSM, which
+    # it turns on.  Non-speculative GDN decode only, without prefix caching.
+    # See atom/model_ops/fla_ops/leapquant.py.
+    "ATOM_ENABLE_LEAPQUANT": lambda: (
+        os.getenv("ATOM_ENABLE_LEAPQUANT", "0").lower() == "1"
+    ),
+    # Compensator tokens per head (r).
+    "ATOM_LEAPQUANT_RANK": lambda: int(os.getenv("ATOM_LEAPQUANT_RANK", "4")),
+    # Tokens per quantisation window (p); the record buffer holds p + 1, and
+    # this replaces ATOM_REPLAYSSM_CACHE_LEN.
+    "ATOM_LEAPQUANT_WINDOW": lambda: int(os.getenv("ATOM_LEAPQUANT_WINDOW", "16")),
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT", "1") == "1"
     ),

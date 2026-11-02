@@ -377,6 +377,7 @@ def test_qwen_replay_uses_shared_record_dtype_and_preserves_state_dtype(monkeypa
     )
     qwen = object.__new__(Qwen4ExpMetadataBuilder)
     qwen.model_runner = SimpleNamespace(config=config)
+    qwen.leapquant = False
     qwen._state_shape_for_runner = lambda: ((3, 32), (2, 4, 4))
     qwen._replayssm_buffer_shapes = lambda: ((2, 16, 4), (2, 16, 4), (2, 16))
     qwen.num_state_layers = lambda: 2
