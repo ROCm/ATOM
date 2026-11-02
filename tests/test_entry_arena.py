@@ -219,6 +219,47 @@ class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
             LayerMajorArena(fields, 3, device="cpu", buf=buf)
 
 
+# Shaped after Qwen3.8's QSA arena, scaled down.
+QSA_LIKE = [
+    EntryField("k", 2, (4, 2, 8), torch.bfloat16),
+    EntryField("v", 2, (4, 2, 8), torch.bfloat16),
+    EntryField("index_raw", 2, (4, 1, 4), torch.bfloat16),
+    EntryField("index_compressed", 2, (1, 1, 4), torch.bfloat16),
+]
+
+
+class TestALayerMajorArenaPublishesOneRegionPerFieldLayer:
+    """The walk `MhaKvPool`, `MlaKvPool` and Qwen3.8's QSA arena share."""
+
+    def test_the_region_layout_matches_its_views(self):
+        arena = LayerMajorArena(QSA_LIKE, entries=5, device="cpu")
+        expected = [
+            (view[layer].data_ptr(), view[layer].stride(0) * view.element_size())
+            for field in arena.fields
+            for view in (arena.view(field.name),)
+            for layer in range(field.layers)
+        ]
+        assert arena.region_layout() == expected
+
+    def test_region_tensors_name_each_field_layer_and_match_the_layout(self):
+        """Role names and order as the MHA pool always published them, and the
+        views sit where the declared offsets say."""
+        arena = LayerMajorArena(QSA_LIKE, entries=5, device="cpu")
+        regions = arena.region_tensors()
+        assert [role for role, _ in regions] == [
+            f"{field.name}.layer_{layer}"
+            for field in arena.fields
+            for layer in range(field.layers)
+        ]
+        assert [
+            (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
+            for _, tensor in regions
+        ] == arena.region_layout()
+        again = arena.region_tensors()
+        assert again is not regions
+        assert all(a is b for (_, a), (_, b) in zip(regions, again, strict=True))
+
+
 class TestMixedDtypes:
 
     def test_fields_may_differ_in_dtype(self):

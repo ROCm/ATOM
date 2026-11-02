@@ -259,13 +259,8 @@ def entry_bytes_for(fields: list[EntryField]) -> int:
 
 
 def published_bytes_for(fields: list[EntryField]) -> int:
-    """Bytes one entry publishes as transfer regions, alignment gaps excluded.
-
-    `entry_bytes_for` also bills the padding between fields. A layer-major
-    pool publishes one region per field per layer (`region_tensors`), so those
-    gaps are not a region, and `lmcache_mp` requires a PAGE checkpoint unit to
-    equal the published sum.
-    """
+    """Bytes one entry publishes as transfer regions: `entry_bytes_for`
+    without the alignment gaps between fields."""
     return sum(field.bytes_per_entry for field in fields)
 
 
@@ -597,12 +592,8 @@ class LayerMajorArena:
         )
 
     def region_layout(self) -> list[tuple[int, int]]:
-        """`(base address, bytes per entry)` of each field's layers, in field order.
-
-        Byte arithmetic on the declared offsets rather than `view`, so a
-        caller comparing it with the views a transfer publishes catches either
-        side drifting from the arena's actual layout.
-        """
+        """`(base address, bytes per entry)` of each field's layers, from the
+        declared offsets rather than `view`."""
         base = self.buf.data_ptr()
         regions: list[tuple[int, int]] = []
         for field in self.fields:
@@ -615,14 +606,8 @@ class LayerMajorArena:
         return regions
 
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
-        """One `(role, tensor)` per (field, layer), in field order.
-
-        A tensor is `view(name)[layer]`, `[entries, *shape]`, so a row is one
-        entry and `stride(0)` its bytes. This is the granularity a transfer
-        registers: an entry's bytes are `entries` apart, so no coarser range
-        is one entry. Built on first use and kept, since the buffer never
-        moves; each call returns a new list over the same tensors.
-        """
+        """One `(role, view(name)[layer])` per (field, layer), in field order.
+        Built once: the buffer never moves."""
         if self._regions is None:
             self._regions = [
                 (f"{field.name}.layer_{layer}", view[layer])

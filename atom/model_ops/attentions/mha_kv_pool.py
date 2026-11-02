@@ -154,8 +154,6 @@ class MhaKvPool:
         # is empty rather than absent, which keeps the positions fixed.
         self.field_groups = [self.cache_fields, self.scale_fields, self.extra_fields]
         self.entry_bytes = sum(entry_bytes_for(g) for g in self.field_groups)
-        # What `region_tensors` publishes per entry: the fields without the
-        # alignment gaps `entry_bytes` bills between them.
         self.published_bytes = sum(published_bytes_for(g) for g in self.field_groups)
         self.cache: LayerMajorArena | None = None
         self.scale: LayerMajorArena | None = None
@@ -301,8 +299,8 @@ class MhaKvPool:
         ]
 
     def region_layout(self) -> list[tuple[int, int]]:
-        """`region_tensors`' `(base address, bytes per entry)`, from the arenas'
-        declared offsets rather than the views (`LayerMajorArena.region_layout`)."""
+        """`region_tensors`' `(base address, bytes per entry)`, from the
+        declared offsets (`LayerMajorArena.region_layout`)."""
         return [
             region
             for arena in (self.cache, self.scale, self.extra)

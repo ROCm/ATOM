@@ -1571,25 +1571,23 @@ class TestPagedCopyCheckpoint:
         # The KV leg has real work: the walk stopped well below the boundary.
         assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
 
-    def test_a_chunk_aligned_prompt_resent_whole_reaches_its_last_rung(self):
-        """The KV leg's ceiling decides which rungs are in reach.
-
-        A prompt of whole chunks keeps its rungs at its end and one block
-        before it, and only the second is lookup-able. A ceiling withheld by
-        one token and floored lands a whole chunk below that rung, so nothing
-        forms and the tier copy is never read. Left whole, the covering chunk
-        is the prompt's last one and the boundary is the rung.
-        """
-        tokens = list(range(48))  # 12 blocks, 3 chunks
-        chunk = 4 * BLOCK
-        bm = self._joint_bm(chunk=chunk)
-        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
-        victim = first.block_table[0]
+    def _only_the_tier_keeps(self, bm, first, h, *, evict_from=0):
+        """Evict `first`'s KV from block `evict_from` on, and rung `h` from HBM;
+        the tier keeps the rung."""
+        victim = first.block_table[evict_from]
         bm.deallocate(first)
         self._break_the_kv_chain_at(bm, victim)
         bm.paged_state_checkpoints.unindex(h)
         self._with_tier(bm, h)
         self._reset_joint_counters(bm)
+
+    def test_a_chunk_aligned_prompt_resent_whole_reaches_its_last_rung(self):
+        """Its rungs sit at its end and one block before; a KV ceiling withheld
+        by one token and floored lands a whole chunk below the second."""
+        tokens = list(range(48))  # 12 blocks, 3 chunks
+        chunk = 4 * BLOCK
+        bm = self._joint_bm(chunk=chunk)
+        self._only_the_tier_keeps(bm, *self._prompt_with_a_rung_at(bm, 11, tokens))
 
         withheld = stateful_seq(tokens)
         withheld.offload_joint.kv_prefix_tokens = (len(tokens) - 1) // chunk * chunk
@@ -1605,9 +1603,7 @@ class TestPagedCopyCheckpoint:
         assert whole.offload_joint.kv_tokens == len(tokens)
 
     def test_the_joint_probe_names_the_boundary_a_full_hit_lands_on(self):
-        """What a hybrid connector asks before reporting a full-prompt hit
-        whole: the rung in the last chunk while only the tier can bring it
-        back, and 0 when HBM already resumes there or the hit is withheld."""
+        """0 while HBM already resumes there, or for a withheld hit."""
         tokens = list(range(48))
         chunk = 4 * BLOCK
         bm = self._joint_bm(chunk=chunk)
@@ -1615,11 +1611,7 @@ class TestPagedCopyCheckpoint:
         self._with_tier(bm, h)
         assert bm.joint_boundary_tokens(stateful_seq(tokens), len(tokens)) == 0
 
-        victim = first.block_table[0]
-        bm.deallocate(first)
-        self._break_the_kv_chain_at(bm, victim)
-        bm.paged_state_checkpoints.unindex(h)
-        self._reset_joint_counters(bm)
+        self._only_the_tier_keeps(bm, first, h)
         seq = stateful_seq(tokens)
         assert bm.joint_boundary_tokens(seq, len(tokens)) == 11 * BLOCK
         assert bm.joint_boundary_tokens(seq, 2 * chunk) == 0
@@ -1629,9 +1621,7 @@ class TestPagedCopyCheckpoint:
 
     def test_the_joint_probe_measures_the_hit_a_replay_widens(self):
         """HBM holds the KV to block 8 and a rung at 4, the tier the rung at 11.
-        A bounded replay has admission hold the whole HBM hit, 8, rather than
-        the rung; the probe asks the same hit, so it names the boundary the
-        admission then commits."""
+        A bounded replay has admission hold the HBM hit, 8; the probe agrees."""
         tokens = list(range(48))
         bm = self._joint_bm(chunk=4 * BLOCK)
         first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
@@ -1639,13 +1629,8 @@ class TestPagedCopyCheckpoint:
         bm.paged_state_checkpoints.checkpoint(first, 4, low)
         bm.take_state_maintenance_ops()
         bm.complete_previous_state_batch()
-        victim = first.block_table[8]
-        bm.deallocate(first)
-        self._break_the_kv_chain_at(bm, victim)
-        bm.paged_state_checkpoints.unindex(h)
-        self._with_tier(bm, h)
+        self._only_the_tier_keeps(bm, first, h, evict_from=8)
         bm.state_replay_tokens = BLOCK
-        self._reset_joint_counters(bm)
 
         seq = stateful_seq(tokens)
         probed = bm.joint_boundary_tokens(seq, len(tokens))
@@ -1658,16 +1643,9 @@ class TestPagedCopyCheckpoint:
     def test_a_waiting_request_probes_without_walking_its_prompt_again(
         self, monkeypatch
     ):
-        """The probe runs on every scheduling pass a request waits; the walk
-        behind it is the memoised one, re-done only once the index moved."""
         tokens = list(range(48))
         bm = self._joint_bm(chunk=4 * BLOCK)
-        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
-        victim = first.block_table[0]
-        bm.deallocate(first)
-        self._break_the_kv_chain_at(bm, victim)
-        bm.paged_state_checkpoints.unindex(h)
-        self._with_tier(bm, h)
+        self._only_the_tier_keeps(bm, *self._prompt_with_a_rung_at(bm, 11, tokens))
         bm.walk_memo = True
         walks = []
         walk = bm._walk_prefix
@@ -3252,11 +3230,8 @@ class TestPromptEndAnchor:
                 assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
 
     def test_an_aligned_anchor_is_the_hash_anchor_floored_to_the_tier_grid(self):
-        """LMCache MP stores a state image only at a chunk boundary, so an
-        anchor off that grid stays in HBM and the next turn finds nothing in
-        the tier. Aligned, it moves left by less than one grid and stays a
-        position the cut and the keep agree on. Swept for the same reason as
-        the test above."""
+        """Floored, it moves left by less than one grid and stays a position
+        the cut and the keep agree on. Swept for the same reason as above."""
         grid = 2 * BLOCK
         for n in range(BLOCK, 80):
             tokens = list(range(1000 * n, 1000 * n + n))
@@ -3278,9 +3253,6 @@ class TestPromptEndAnchor:
                 assert anchor in keeps, n
 
     def test_a_prompt_short_of_the_tier_grid_keeps_its_hash_block_anchor(self):
-        """A grid coarser than the prompt's anchor floors it to 0. Recording
-        nothing would drop the HBM resume point the next turn uses (the tier
-        never had it), so the hash-block anchor stays."""
         n = 40
         tokens = list(range(1000 * n, 1000 * n + n))
         plain = make_block_manager(demand_config())
@@ -3311,9 +3283,8 @@ class TestPromptEndAnchor:
         return bm
 
     def test_a_hit_on_the_tier_grid_keeps_the_anchor_past_it(self):
-        """Chunk 256, block 64: a turn that hits 8192 with an 8300-token
-        prompt. The grid floors its anchor 8256 onto the hit, where no forward
-        of this turn reaches it, so the hash-block anchor stays and is kept."""
+        """Chunk 256, block 64: floored, the anchor 8256 would sit on the 8192
+        hit, where no forward of this turn reaches it."""
         bm = self._tier_grid_manager()
         run_prompt_on_the_ladder(
             bm, Sequence(list(range(8200)), 64, has_per_req_cache=True)
@@ -3326,11 +3297,9 @@ class TestPromptEndAnchor:
         assert forward_on_the_ladder(bm, seq) == [8256]
         assert bm.checkpointers_at(seq, 8256)
 
-    def test_an_lmcache_mp_load_on_the_tier_grid_keeps_the_anchor_past_it(self):
-        """LMCache MP is no state tier, so no joint re-records the anchor: the
-        load point the lookup reported is where this turn resumes. HBM evicted,
-        the prompt resent: an anchor floored onto 8192 would sit at the load
-        point, where no forward of this turn reaches it."""
+    def test_a_tier_load_on_the_tier_grid_keeps_the_anchor_past_it(self):
+        """No joint re-records the anchor: the reported load point is where
+        this turn resumes."""
         bm = self._tier_grid_manager()
         seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
         seq.offload_joint.kv_prefix_tokens = 8192
@@ -3340,8 +3309,8 @@ class TestPromptEndAnchor:
     def test_a_joint_boundary_on_the_tier_grid_keeps_the_anchor_past_it(
         self, monkeypatch
     ):
-        """The same frontier reached by a tier load: `can_allocate` saw no
-        HBM hit and aligned the anchor to 8192, where the joint then lands."""
+        """`can_allocate` saw no HBM hit and floored the anchor to 8192, where
+        the joint then lands."""
         bm = self._tier_grid_manager()
         seq = Sequence(list(range(8300)), 64, has_per_req_cache=True)
         probe = AdmissionProbe()

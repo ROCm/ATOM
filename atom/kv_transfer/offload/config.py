@@ -60,31 +60,23 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. The types `attn_family` resolves to
-# `Family.GDN` (Qwen3-Next, Qwen3.5) plus Qwen3.8's, which it resolves to
-# `Family.QSA_GDN` (`qwen4_exp_text`; `qwen4_exp` is the wrapper name a native
-# config flattens to). `_layout_from_model` matches it against the text
-# config's `model_type` (`get_hf_text_config`), the attribute `attn_family`
-# reads, so a wrapped config such as Qwen3.5's multimodal one resolves to its
-# text type here and in the backend selector alike.
+# `kimi_linear` family `kimi_k3` owns: what `attn_family` resolves to
+# `Family.GDN` or `Family.QSA_GDN`. Matched against the text config's
+# `model_type`, the attribute `attn_family` reads.
 # MiniMax-M3 is not here either: it is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
 # state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
 # layout (see `_is_minimax_m3` and offload/hybrid/m3/): its NSA index_cache is
 # delivered only through transfer_tensors.block_regions, so the dense codec --
 # which builds from per-layer KVCacheTensor K/V -- would silently drop it.
-_GDN_LINEAR_MODEL_TYPES = frozenset(
-    {
-        "qwen3_next",
-        "qwen3_next_mtp",
-        "qwen3_5_text",
-        "qwen3_5_moe_text",
-        # Qwen3.8 publishes its QSA arena as the PAGE image and appends PLE
-        # to the same GDN checkpoint. The tier is still `qwen`.
-        "qwen4_exp",
-        "qwen4_exp_text",
-    }
-)
+# Qwen3.8; `qwen4_exp` is the wrapper name a native config flattens to.
+_QSA_GDN_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+_GDN_LINEAR_MODEL_TYPES = _QSA_GDN_MODEL_TYPES | {
+    "qwen3_next",
+    "qwen3_next_mtp",
+    "qwen3_5_text",
+    "qwen3_5_moe_text",
+}
 
 # Layouts that own a tier for a model's per-request *recurrent* state.
 # `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
@@ -387,14 +379,12 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
-    from atom.model_ops.attentions.qwen4_exp_qsa_fields import qsa_page_segments
+    from atom.utils import get_hf_text_config
 
-    qsa_segments = qsa_page_segments(config)
-    if qsa_segments is not None:
-        # Same checkpoint, another segment set: the QSA arena's field rules
-        # decide it. Keyed only where the segment set depends on them; every
-        # other namespace is unchanged.
-        document.update(qsa_segments)
+    if getattr(get_hf_text_config(hf), "model_type", None) in _QSA_GDN_MODEL_TYPES:
+        from atom.model_ops.attentions.qwen4_exp_attn import qsa_page_segments
+
+        document.update(qsa_page_segments(config))
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -477,27 +467,11 @@ def lmcache_engine_id(config) -> str:
     ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
     ``tensor_parallel_size == 1``.
 
-    The DP rank alone only separates replicas of one server. The socket lives
-    under a fixed host directory (``/tmp/vllm_rpc`` without vLLM), so two
-    servers on one host -- one per GPU is the usual way to serve a TP1 model --
-    both bind ``dp0``; each bind takes the path over, and a scheduler connects
-    to whichever server bound last. Its loads then follow another server's
-    hits.
-
-    ``parallel_config.data_parallel_base_port`` tells servers apart. It is the
-    port of the model runners' TCPStore, which ``CoreManager`` binds before it
-    spawns any engine (port 0 asks the OS for a free one) and holds for the
-    server's lifetime, then writes back into the config every engine and
-    worker is spawned with. So two live servers on one host never share it,
-    and every process of one server -- every DP replica, PP stage and TP rank
-    -- reads the same value. ``config.port`` (``--port``, default 8006) is not
-    a substitute: the usual launch never sets it, and only ``MASTER_PORT``,
-    which nothing reads, is derived from it. An unresolved port (0, as before
-    ``CoreManager`` runs) falls back to the DP rank alone.
-
-    The id names only these sockets and LMCache's in-process engine; it is not
-    part of a stored chunk's key, so a restart on a new port still finds what
-    an earlier server stored.
+    The socket lives under a fixed host directory, so two servers on one host
+    would both bind ``dp0`` and a scheduler would follow the other server's
+    hits. ``data_parallel_base_port`` (the runners' TCPStore port, bound by
+    ``CoreManager`` for the server's lifetime) tells servers apart; unresolved
+    (0), the DP rank alone is used. The id is not part of a chunk's key.
     """
     parallel = getattr(config, "parallel_config", None)
     dp_rank = int(getattr(parallel, "data_parallel_rank", 0) or 0)

@@ -7,17 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from atom.config import KVCacheTensor
-from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
-    entry_bytes_for,
     published_bytes_for,
-)
-from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
-    layer_major_page_unit_regions,
-    layer_major_page_unit_views,
 )
 
 
@@ -29,51 +22,6 @@ def _fields():
         EntryField("index_raw", 2, (block, 1, 4), torch.bfloat16),
         EntryField("index_compressed", 2, (block // 4, 1, 4), torch.bfloat16),
     ]
-
-
-def test_qsa_regions_are_one_contiguous_block_each():
-    arena = LayerMajorArena(_fields(), entries=3, device="cpu")
-    published = published_bytes_for(_fields())
-    assert published <= entry_bytes_for(_fields())
-    bases, sizes = layer_major_page_unit_regions([arena])
-    assert int(sizes.sum()) == published
-    assert len(bases) == 8  # 4 fields * 2 layers
-    for _, tensor in arena.region_tensors():
-        assert tensor.is_contiguous()
-        assert tensor.shape[0] == 3
-
-
-def test_one_qsa_block_round_trips_through_page_views():
-    arena = LayerMajorArena(_fields(), entries=2, device="cpu")
-    blob = torch.arange(published_bytes_for(_fields()), dtype=torch.uint8)
-    at = 0
-    for _, tensor in arena.region_tensors():
-        row = tensor[1].view(torch.uint8).reshape(-1)
-        row.copy_(blob[at : at + row.numel()])
-        at += row.numel()
-    views = layer_major_page_unit_views([arena], [1])
-    packed = torch.cat([view.view(torch.uint8).reshape(-1) for view in views])
-    assert torch.equal(packed, blob)
-
-
-def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
-    blocks = 4
-    k = torch.zeros(blocks, 8, dtype=torch.bfloat16)
-    v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
-    raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
-    comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
-    qsa = KVCacheTensor(
-        layer_num=0,
-        k_cache=k,
-        v_cache=v,
-        index_raw=raw,
-        index_compressed=comp,
-    )
-    plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
-    qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
-    plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
-    assert qsa_codec.bytes_per_block == (8 + 8 + 4 + 2) * 2
-    assert plain_codec.bytes_per_block == (8 + 8) * 2
 
 
 def _builder():
@@ -162,8 +110,6 @@ def _layout_id(builder, cls, monkeypatch):
 
 
 def test_layout_id_names_the_page_fields_and_the_ssm_storage(monkeypatch):
-    """BF16 draft rows add `*_draft` fields and FlyDSL decode stores the SSM
-    transposed; neither shows in the parent's shapes, so both are spelled."""
     builder, cls = _builder()
     plain = _layout_id(builder, cls, monkeypatch)
     kv = "(4,2,8),torch.bfloat16"
@@ -185,8 +131,7 @@ def test_layout_id_names_the_page_fields_and_the_ssm_storage(monkeypatch):
 def test_layout_id_tells_apart_fields_of_the_same_name_and_other_bytes(
     monkeypatch,
 ):
-    """With BF16 KV, an FP8 and an FP4 index both add `index_compressed` and
-    `index_compressed_scale`; the id alone must keep their images apart."""
+    """An FP8 and an FP4 index add fields of the same names."""
     builder, cls = _builder()
 
     def index(dim, dtype, scale):
@@ -275,36 +220,30 @@ def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
         gdn_flydsl.backend.cache_clear()
 
 
-def test_ple_layout_id_and_checkpoint_planes_match_the_allocated_state(monkeypatch):
-    """The layout id, checkpoint plane sizes and slot size all come from the
-    tensors `allocate_per_req_cache` really creates, so none can drift."""
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    import re
-
+def test_allocated_ple_state_is_what_the_layout_id_spells(monkeypatch):
+    builder, cls = _builder()
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.attentions.qwen4_exp_attn import PLE_STATE_SLOT_CLASS
 
     if not torch.cuda.is_available():
         pytest.skip("allocates the PLE state on the GPU")
-    builder, cls = _builder()
     builder.slots_per_req = lambda: 1
     monkeypatch.setattr(
         GDNAttentionMetadataBuilder, "allocate_per_req_cache", lambda self, e: {}
     )
     caches = cls.allocate_per_req_cache(builder, {PLE_STATE_SLOT_CLASS: 4})
-    states = [caches["ple_conv_state"], caches["ple_ngram_state"]]
-    assert int(states[1][0, 0]) == builder.eos_token_id
+    conv, ngram = caches["ple_conv_state"], caches["ple_ngram_state"]
+    # `:ple_conv=(16,10),torch.bfloat16:ple_ngram=(3,),torch.int64`.
+    assert (tuple(conv.shape), conv.dtype) == ((4, 16, 10), torch.bfloat16)
+    assert (tuple(ngram.shape), ngram.dtype) == ((4, 3), torch.int64)
+    assert bool((ngram == builder.eos_token_id).all())
+    assert cls._ple_state_spec(builder).entry_bytes == conv[0].nbytes + ngram[0].nbytes
 
-    fragment = cls._ple_layout_fragment(builder)
-    declared = re.findall(r":ple_(\w+)=\(([\d,]+)\),(torch\.\w+)", fragment)
-    assert [tag for tag, _, _ in declared] == ["conv", "ngram"]
-    assert fragment.endswith(":ple_order=conv,ngram")
-    for (_, dims, dtype), state in zip(declared, states):
-        assert tuple(int(d) for d in dims.split(",") if d) == tuple(state.shape[1:])
-        assert dtype == str(state.dtype)
-    slot_bytes = [state[0].numel() * state.element_size() for state in states]
-    assert cls._ple_checkpoint_planes(builder) == [(n, 1) for n in slot_bytes]
-    assert cls._ple_state_spec(builder).entry_bytes == sum(slot_bytes)
+
+def _qwen4_exp_backend():
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
+
+    return Qwen4ExpBackend
 
 
 @pytest.mark.parametrize(
@@ -313,29 +252,28 @@ def test_ple_layout_id_and_checkpoint_planes_match_the_allocated_state(monkeypat
         (None, False),
         ({}, False),
         ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, True),
-        ({"kv_connector": "lmcache_mp", "kv_role": "offload"}, True),
+        ({"kv_connector": " LMCache_MP", "kv_role": "offload"}, True),
+        ({"kv_connector": "LMCacheMPConnector", "kv_role": "offload"}, True),
         (
             {
                 "kv_connector": "multi",
-                "connectors": [
-                    {"kv_connector": "lmcache_offload", "kv_role": "offload"}
-                ],
+                "connectors": [{"kv_connector": "LMCacheOffloadConnector"}],
             },
             True,
         ),
     ],
 )
-def test_page_checkpoints_follow_an_offload_connector(
+def test_lmcache_tiers_are_accepted_and_turn_page_checkpoints_on(
     monkeypatch, kv_transfer_config, paged
 ):
-    """A server without offload keeps main's fork slots; only a tier that reads
-    the PAGE image moves Qwen3.8 onto it."""
+    """A server without offload keeps main's fork slots."""
     builder, cls = _builder()
     monkeypatch.setattr(
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=1),
     )
     builder.model_runner.config.kv_transfer_config = kv_transfer_config
+    _qwen4_exp_backend().validate_config(builder.model_runner.config)
     assert cls._uses_paged_checkpoints(builder) is paged
     assert bool(cls.state_transfer(builder).copies) is paged
     if not paged:
@@ -343,40 +281,9 @@ def test_page_checkpoints_follow_an_offload_connector(
 
 
 def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
-    """Only `Qwen4ExpBackend` builds this builder; a flattened or renamed text
-    type must not turn the state tier off after validation accepted offload."""
     builder, cls = _builder()
     builder.model_runner.config.hf_config.model_type = "qwen4_exp_flattened"
     assert cls._uses_paged_checkpoints(builder)
-
-
-def test_validate_config_allows_offload_and_rejects_rapidserve():
-    builder, _ = _builder()
-    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
-
-    Qwen4ExpBackend.validate_config(builder.model_runner.config)
-    builder.model_runner.config.enable_rapidserve = True
-    with pytest.raises(ValueError, match="fork slots"):
-        Qwen4ExpBackend.validate_config(builder.model_runner.config)
-
-
-@pytest.mark.parametrize(
-    "kv_transfer_config",
-    [
-        {"kv_connector": "lmcache_offload", "kv_role": "offload"},
-        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
-        {
-            "kv_connector": "multi",
-            "connectors": [{"kv_connector": "lmcache_offload", "kv_role": "offload"}],
-        },
-    ],
-)
-def test_validate_config_allows_offload_connectors(kv_transfer_config):
-    builder, _ = _builder()
-    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
-
-    builder.model_runner.config.kv_transfer_config = kv_transfer_config
-    Qwen4ExpBackend.validate_config(builder.model_runner.config)
 
 
 @pytest.mark.parametrize(
@@ -390,144 +297,55 @@ def test_validate_config_allows_offload_connectors(kv_transfer_config):
             {
                 "kv_connector": "multi",
                 "connectors": [
-                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
-                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
-                ],
-            },
-            "mooncake",
-        ),
-        # The connector is built from the canonical name, so the check is too.
-        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake"),
-        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio"),
-        ({"kv_connector": " moriio", "kv_role": "kv_consumer"}, "moriio"),
-        # An offload backend that does not read the Qwen3.8 PAGE image.
-        ({"kv_connector": "mooncake_store", "kv_role": "offload"}, "mooncake_store"),
-    ],
-)
-def test_validate_config_rejects_pd_connectors(kv_transfer_config, backend):
-    """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
-    builder, _ = _builder()
-    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
-
-    builder.model_runner.config.kv_transfer_config = kv_transfer_config
-    with pytest.raises(ValueError, match=f"kv_connector={backend!r}"):
-        Qwen4ExpBackend.validate_config(builder.model_runner.config)
-
-
-@pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
-def test_validate_config_names_an_unsupported_connector_before_the_deployment(
-    switch,
-):
-    """Under PP or RapidServe a P/D connector is still refused for being one."""
-    builder, _ = _builder()
-    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
-
-    config = builder.model_runner.config
-    setattr(config, switch, 2 if switch == "pipeline_parallel_size" else True)
-    config.kv_transfer_config = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
-    with pytest.raises(ValueError, match="disaggregated serving is not supported"):
-        Qwen4ExpBackend.validate_config(config)
-
-
-def test_the_deployment_gate_is_the_parents_and_only_the_model_gate_is_qwens():
-    _, cls = _builder()
-    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
-
-    assert "_uses_paged_checkpoints" not in vars(cls)
-    assert "_wants_paged_checkpoints" in vars(cls)
-    assert "_uses_paged_checkpoints" in vars(GDNAttentionMetadataBuilder)
-
-
-def test_the_ple_planes_are_declared_once():
-    builder, _ = _builder()
-    planes = builder._ple_planes
-    assert [plane.name for plane in planes] == ["ple_conv_state", "ple_ngram_state"]
-    builder.model_runner.config.hf_config = None  # no second read
-    assert builder._ple_planes is planes
-
-
-def _transfer_config(kv_transfer_config):
-    return SimpleNamespace(kv_transfer_config=kv_transfer_config)
-
-
-@pytest.mark.parametrize(
-    "kv_transfer_config, backend",
-    [
-        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "mooncake"),
-        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake"),
-        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio"),
-        ({"kv_connector": " moriio", "kv_role": "kv_consumer"}, "moriio"),
-        ({"kv_role": "kv_producer"}, "moriio"),
-        (
-            {
-                "kv_connector": "multi",
-                "connectors": [
                     {"kv_connector": "lmcache_offload", "kv_role": "offload"},
                     {"kv_connector": " MOONCAKE ", "kv_role": "kv_producer"},
                 ],
             },
             "mooncake",
         ),
+        # Checked by the canonical name the connector is built from.
+        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake"),
+        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio"),
+        # An offload backend that does not read the PAGE image.
+        ({"kv_connector": "Mooncake_Store", "kv_role": "offload"}, "mooncake_store"),
     ],
 )
-def test_qwen38_refuses_every_pd_spelling(kv_transfer_config, backend):
-    """A raw-string check let `"Mooncake"` past while the factory built the
-    mooncake connector from its canonical name; the GDN/PLE state then never
-    reached decode."""
-    from atom.model_ops.attentions.qwen4_exp_transfer import check_qwen38_kv_transfer
-
-    with pytest.raises(ValueError, match=f"disaggregated.*kv_connector={backend!r}"):
-        check_qwen38_kv_transfer(_transfer_config(kv_transfer_config))
-
-
-def test_qwen38_refuses_an_offload_backend_that_skips_its_image():
-    """mooncake_store is an offload tier, but its layout check is Qwen3-Next's:
-    refused at validation, not after PAGE checkpoints resized the KV budget."""
-    from atom.model_ops.attentions.qwen4_exp_transfer import (
-        check_qwen38_kv_transfer,
-        qwen38_offload_configured,
-    )
-
-    config = _transfer_config({"kv_connector": "Mooncake_Store", "kv_role": "offload"})
-    with pytest.raises(ValueError, match="kv_connector='mooncake_store' does not read"):
-        check_qwen38_kv_transfer(config)
-    assert not qwen38_offload_configured(config)
+def test_validate_config_refuses_connectors_that_drop_the_state(
+    kv_transfer_config, backend
+):
+    """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
+    builder, _ = _builder()
+    builder.model_runner.config.kv_transfer_config = kv_transfer_config
+    with pytest.raises(ValueError, match=f"kv_connector={backend!r}"):
+        _qwen4_exp_backend().validate_config(builder.model_runner.config)
 
 
+@pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
 @pytest.mark.parametrize(
-    "kv_transfer_config",
+    "kv_transfer_config, error",
     [
-        None,
-        {},
-        {"kv_connector": "lmcache_offload", "kv_role": "offload"},
-        {"kv_connector": " LMCache_MP", "kv_role": "offload"},
-        {"kv_connector": "LMCacheMPConnector", "kv_role": "offload"},
-        {
-            "kv_connector": "multi",
-            "connectors": [{"kv_connector": "LMCacheOffloadConnector"}],
-        },
+        ({"kv_connector": "lmcache_offload", "kv_role": "offload"}, "fork slots"),
+        # A P/D connector is refused for being one, not for the deployment.
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "disaggregated"),
     ],
 )
-def test_qwen38_accepts_the_lmcache_tiers(kv_transfer_config):
-    from atom.model_ops.attentions.qwen4_exp_transfer import (
-        check_qwen38_kv_transfer,
-        qwen38_offload_configured,
-    )
-
-    config = _transfer_config(kv_transfer_config)
-    check_qwen38_kv_transfer(config)
-    assert qwen38_offload_configured(config) is bool(kv_transfer_config)
+def test_pipeline_parallel_and_rapidserve_refuse_offload(
+    switch, kv_transfer_config, error
+):
+    builder, _ = _builder()
+    config = builder.model_runner.config
+    setattr(config, switch, 2 if switch == "pipeline_parallel_size" else True)
+    config.kv_transfer_config = kv_transfer_config
+    with pytest.raises(ValueError, match=error):
+        _qwen4_exp_backend().validate_config(config)
 
 
 @pytest.mark.parametrize("reads", [True, False])
 def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(reads):
     """The knowledge lives on the registration, not in a Qwen3.8 list."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-    from atom.model_ops.attentions.qwen4_exp_transfer import (
-        check_qwen38_kv_transfer,
-        qwen38_offload_configured,
-    )
 
+    builder, cls = _builder()
     name = "page_image_tier_under_test"
     KVConnectorFactory.register(
         name,
@@ -539,13 +357,14 @@ def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(reads):
         reads_page_images=reads,
     )
     try:
-        config = _transfer_config({"kv_connector": name, "kv_role": "offload"})
+        config = builder.model_runner.config
+        config.kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
         if reads:
-            check_qwen38_kv_transfer(config)
+            _qwen4_exp_backend().validate_config(config)
         else:
             with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
-                check_qwen38_kv_transfer(config)
-        assert qwen38_offload_configured(config) is reads
+                _qwen4_exp_backend().validate_config(config)
+        assert cls._wants_paged_checkpoints(builder, config) is reads
     finally:
         for table in (
             KVConnectorFactory._registry,
@@ -562,6 +381,19 @@ def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(reads):
 
 _IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
 _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+
+
+def _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype):
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.attentions.qwen4_exp_attn import _check_kv_transfer
+
+    _check_kv_transfer(
+        SimpleNamespace(
+            kv_transfer_config=kv_transfer_config,
+            kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype=index_cache_dtype,
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -585,18 +417,9 @@ _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
 def test_qwen38_refuses_in_process_offload_of_quantized_caches(
     kv_transfer_config, kv_cache_dtype, index_cache_dtype
 ):
-    """The in-process codec has no field for the QSA scale planes: a CPU hit
-    would restore FP8 rows under the scales of the blocks' previous owners.
-    Refused until ROCm/ATOM#2655 lands."""
-    from atom.model_ops.attentions.qwen4_exp_transfer import check_qwen38_kv_transfer
-
-    config = SimpleNamespace(
-        kv_transfer_config=kv_transfer_config,
-        kv_cache_dtype=kv_cache_dtype,
-        index_cache_dtype=index_cache_dtype,
-    )
+    """The in-process codec has no field for the QSA scale planes."""
     with pytest.raises(ValueError, match="lmcache_offload.*#2655"):
-        check_qwen38_kv_transfer(config)
+        _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 
 @pytest.mark.parametrize(
@@ -615,17 +438,7 @@ def test_qwen38_refuses_in_process_offload_of_quantized_caches(
 def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
     kv_transfer_config, kv_cache_dtype, index_cache_dtype
 ):
-    """lmcache_mp publishes every arena field, scales and `*_draft` rows
-    included; without offload nothing is transferred."""
-    from atom.model_ops.attentions.qwen4_exp_transfer import check_qwen38_kv_transfer
-
-    check_qwen38_kv_transfer(
-        SimpleNamespace(
-            kv_transfer_config=kv_transfer_config,
-            kv_cache_dtype=kv_cache_dtype,
-            index_cache_dtype=index_cache_dtype,
-        )
-    )
+    _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 
 @pytest.mark.parametrize(
@@ -640,9 +453,8 @@ def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
 def test_the_draft_rows_and_the_page_namespace_read_one_rule(
     monkeypatch, kv_cache_dtype, index_cache_dtype, draft_env
 ):
-    """The layer's row space and the namespace's `draft_kv` come from the
-    same field rules (`qwen4_exp_qsa_fields`), so they cannot drift apart."""
-    from atom.model_ops.attentions.qwen4_exp_qsa_fields import (
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.attentions.qwen4_exp_attn import (
         QSA_DRAFT_ROWS,
         QSA_ROWS,
         qsa_cache_formats,
@@ -655,20 +467,11 @@ def test_the_draft_rows_and_the_page_namespace_read_one_rule(
         kv_cache_dtype=kv_cache_dtype,
         index_cache_dtype=index_cache_dtype,
         speculative_config=SimpleNamespace(method="mtp"),
-        hf_config=SimpleNamespace(model_type="qwen4_exp_text"),
     )
     draft = draft_env == "1" and qsa_cache_formats(config) != ("bf16", "bf16")
     assert qsa_row_space(config, 40, 40) == (QSA_DRAFT_ROWS if draft else QSA_ROWS)
     assert qsa_row_space(config, 39, 40) == QSA_ROWS
     assert qsa_page_segments(config)["draft_kv"] == ("bf16" if draft else "target")
-
-
-def test_the_kernels_serve_the_formats_the_field_rules_resolve():
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    from atom.model_ops.attentions import qwen4_exp_qsa_fields
-    from atom.model_ops.qwen4_exp.ops import qsa
-
-    assert qsa.qsa_cache_formats is qwen4_exp_qsa_fields.qsa_cache_formats
 
 
 def _paged_builder(blocks=3, *, spec=True):
@@ -707,11 +510,8 @@ class _QSALayer:
 
 
 def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
-    """`*_draft` rows exist only under quantized target caches with
-    ATOM_QSA_DRAFT_KV_BF16 (`QSAAttention.qsa_row_space`), which
-    lmcache_offload refuses until #2655. With BF16 caches the MTP layer is
-    one more row of the target's fields, and the in-process codec is handed
-    exactly the rows that layer binds."""
+    """With BF16 caches the MTP layer is one more row of the target's fields,
+    and the in-process codec is handed exactly the rows that layer binds."""
     builder, cls = _builder()
     del builder._qsa_fields  # the real declaration, not `_builder`'s stand-in
     hf = builder.model_runner.config.hf_config
@@ -741,28 +541,8 @@ def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
         assert tensor.k_scale is None and tensor.v_scale is None
 
 
-def test_qsa_builder_inherits_the_page_contract_through_hooks():
-    """One PAGE contract: the QSA builder overrides only the pool hooks."""
-    _, cls = _builder()
-    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
-
-    for name in (
-        "_page_unit_regions",
-        "page_unit_views",
-        "page_unit_segments",
-        "checkpoint_page_unit_bytes",
-        "_with_paged_state_contract",
-    ):
-        assert name not in vars(cls), name
-        assert name in vars(GDNAttentionMetadataBuilder), name
-    for name in ("_page_unit_pools", "_published_page_unit_bytes"):
-        assert name in vars(cls), name
-    assert not hasattr(GDNAttentionMetadataBuilder, "_page_unit_arenas")
-
-
 def test_qsa_regions_are_built_once_per_allocation(monkeypatch):
-    """The PAGE copy and the store thread read the image through the arena's
-    regions every step; building them is fields x layers `as_strided` views."""
+    """Read every step; building them is fields x layers `as_strided` views."""
     builder, cls = _paged_builder()
     arena = cls._page_unit_pools(builder)[0]
     assert arena is builder.qsa_arena
@@ -784,9 +564,7 @@ def test_qsa_regions_are_built_once_per_allocation(monkeypatch):
 
 
 def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
-    """Called several times a step: the key is the pool objects, not a walk
-    over every region tensor, and a release drops it before the addresses
-    change."""
+    """Keyed on the pool objects; a release drops it before addresses change."""
     from atom.model_ops.attentions.pool_layout import layer_major_page_geometry
 
     builder, cls = _paged_builder()
@@ -814,10 +592,6 @@ def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
 
 
 def test_page_unit_segments_refuse_without_a_spec_and_views_do_not():
-    """The store's gather must trim to the image, so with no spec it fails at
-    once rather than gather a whole unit (padding and whatever follows). Only
-    `page_unit_views` keeps the untrimmed path, for callers ahead of the
-    runtime."""
     for runtime in (None, SimpleNamespace(checkpoint_spec=None)):
         builder, cls = _paged_builder(spec=False)
         builder.model_runner.state_runtime = runtime
@@ -829,18 +603,13 @@ def test_page_unit_segments_refuse_without_a_spec_and_views_do_not():
         )
 
 
-def test_page_unit_segments_name_the_bytes_page_unit_views_name():
+def test_page_unit_segments_name_the_view_bytes_trimmed_to_the_image():
     builder, cls = _paged_builder()
     ptrs, sizes = cls.page_unit_segments(builder, [1, 2])
     views = cls.page_unit_views(builder, [1, 2])
     assert ptrs.tolist() == [view.data_ptr() for view in views]
     assert sizes.tolist() == [view.numel() * view.element_size() for view in views]
-
-
-def test_page_unit_segments_trim_to_the_image():
-    builder, cls = _paged_builder()
     image = builder.model_runner.state_runtime.checkpoint_spec.image_bytes
-    _, sizes = cls.page_unit_segments(builder, [0, 2])
     assert int(sizes.sum()) == image
 
 
@@ -857,8 +626,6 @@ def test_transfer_contract_matches_the_arena_byte_layout():
 
 
 def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
-    """Published views and the copy's regions read the same pool, so the check
-    compares them with the arena's own offsets: a reorder there is caught."""
     builder, cls = _paged_builder()
     builder.qsa_arena.region_tensors()
     rows = builder.qsa_arena._regions
@@ -869,9 +636,6 @@ def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
 
 
 def test_transfer_contract_catches_a_missing_field():
-    """`rope_positions` (or any field) absent from the published set fails
-    closed. The unit-size check sees it first; a reorder, which keeps the
-    size, is what needs the arena comparison (the test above)."""
     builder, cls = _paged_builder()
     builder.qsa_arena._regions = [
         row
@@ -881,34 +645,3 @@ def test_transfer_contract_catches_a_missing_field():
     builder._page_unit_region_cache = None
     with pytest.raises(RuntimeError, match="PAGE unit is 592 B"):
         cls.get_kv_transfer_tensors(builder)
-
-
-def test_arena_region_layout_matches_its_views():
-    arena = LayerMajorArena(_fields(), entries=5, device="cpu")
-    expected = [
-        (view[layer].data_ptr(), view[layer].stride(0) * view.element_size())
-        for field in arena.fields
-        for view in (arena.view(field.name),)
-        for layer in range(field.layers)
-    ]
-    assert arena.region_layout() == expected
-
-
-def test_arena_region_tensors_name_each_field_layer_and_match_the_layout():
-    """The walk `MhaKvPool` / `MlaKvPool` / Qwen3.8 share: role names and order
-    as the MHA pool always published them, and the views sit where the
-    declared offsets say."""
-    arena = LayerMajorArena(_fields(), entries=5, device="cpu")
-    regions = arena.region_tensors()
-    assert [role for role, _ in regions] == [
-        f"{field.name}.layer_{layer}"
-        for field in arena.fields
-        for layer in range(field.layers)
-    ]
-    assert [
-        (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
-        for _, tensor in regions
-    ] == arena.region_layout()
-    again = arena.region_tensors()
-    assert again is not regions
-    assert all(a is b for (_, a), (_, b) in zip(regions, again, strict=True))

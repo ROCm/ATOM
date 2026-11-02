@@ -39,7 +39,7 @@ import torch
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
-from atom.model_ops.attentions.qwen4_exp_qsa_fields import (
+from atom.model_ops.attentions.qwen4_exp_attn import (
     QSA_DRAFT_ROWS,
     QSA_ROWS,
     qsa_row_space,

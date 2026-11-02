@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import sys
 import threading
@@ -49,7 +50,10 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload import _block_gpu_connector
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
-from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.kv_transfer.offload._offload_common import (
+    OffloadSchedulerMixin,
+    tier_token_ids,
+)
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
     DenseOffloadScheduler,
@@ -84,6 +88,7 @@ from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
+    LoadSpec,
     SlotLoadSpec,
     SlotSaveSpec,
 )
@@ -1194,6 +1199,32 @@ def test_dense_codec_fp8_indexer_layout_is_unchanged():
     assert codec.bytes_per_block == (
         layer.k_cache.numel() // 4 + layer.index_cache.numel() // 4
     )
+
+
+def test_dense_codec_keeps_qsa_side_caches_and_ignores_absent_ones():
+    import torch
+
+    if not hasattr(torch, "arange"):
+        pytest.skip("real torch is unavailable")
+    from atom.config import KVCacheTensor
+
+    blocks = 4
+    k = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    v = torch.zeros(blocks, 8, dtype=torch.bfloat16)
+    raw = torch.zeros(blocks, 4, dtype=torch.bfloat16)
+    comp = torch.zeros(blocks, 2, dtype=torch.bfloat16)
+    qsa = KVCacheTensor(
+        layer_num=0,
+        k_cache=k,
+        v_cache=v,
+        index_raw=raw,
+        index_compressed=comp,
+    )
+    plain = KVCacheTensor(layer_num=1, k_cache=k, v_cache=v)
+    qsa_codec = DenseKVByteCodec({"qsa": qsa}, num_blocks=blocks)
+    plain_codec = DenseKVByteCodec({"mha": plain}, num_blocks=blocks)
+    assert qsa_codec.bytes_per_block == (8 + 8 + 4 + 2) * 2
+    assert plain_codec.bytes_per_block == (8 + 8) * 2
 
 
 def test_lmcache_connector_maps_dcp_ranges_on_virtual_block_grid():
@@ -5680,15 +5711,8 @@ def _server_config(base_port, dp_rank: int = 0, **kw):
     return cfg
 
 
-def test_engine_id_is_distinct_per_server_on_one_host():
-    # One TP1 server per GPU: every one is DP rank 0, and the lookup socket
-    # sits under one host directory. Without the port, the eight schedulers
-    # would connect to whichever server bound the shared path last.
-    ids = [offcfg.lmcache_engine_id(_server_config(41000 + gpu)) for gpu in range(8)]
-    assert len(set(ids)) == 8
-
-
-def test_engine_id_with_port_still_pairs_one_replica_and_splits_replicas():
+def test_engine_id_splits_servers_on_one_host_and_their_replicas():
+    # One TP1 server per GPU: every one is DP rank 0 under one host directory.
     same = {
         offcfg.lmcache_engine_id(
             _server_config(41000, 3, pp_size=2, tp_size=4, pp_rank=pp)
@@ -5696,8 +5720,10 @@ def test_engine_id_with_port_still_pairs_one_replica_and_splits_replicas():
         for pp in range(2)
     }
     assert same == {"atom-offload-r41000-dp3"}
-    ids = [offcfg.lmcache_engine_id(_server_config(41000, rank)) for rank in range(8)]
-    assert len(set(ids)) == 8
+    servers = [_server_config(41000 + gpu) for gpu in range(8)]
+    replicas = [_server_config(41000, rank) for rank in range(1, 8)]
+    ids = {offcfg.lmcache_engine_id(cfg) for cfg in servers + replicas}
+    assert len(ids) == 15
 
 
 @pytest.mark.parametrize("base_port", [0, None, True, "41000"])
@@ -5706,13 +5732,8 @@ def test_engine_id_ignores_an_unresolved_or_non_int_port(base_port):
 
 
 def test_two_default_tp1_servers_on_one_host_get_distinct_engine_ids(monkeypatch):
-    """Two servers launched the usual way: no --port, no --data-parallel-base-port.
-
-    Each `CoreManager` binds its runners' TCPStore on port 0 before spawning
-    and writes the resolved port into the config its engines are deep-copied
-    from, so the scheduler and every worker of one server agree on the id and
-    the two servers differ.
-    """
+    """No --port, no --data-parallel-base-port: each `CoreManager` resolves a
+    port before spawning, and every process of one server copies it."""
     import copy
 
     from atom.config import ParallelConfig
@@ -6019,6 +6040,27 @@ def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
     assert ls.lmcache_cached_tokens == 1024
 
 
+def _offload_scheduler(monkeypatch, hf_config, *, chunk):
+    """The in-process scheduler the layout selection builds for `hf_config`."""
+    from atom.kv_transfer.offload.connector import _build_scheduler
+
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(chunk_size=chunk),
+    )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
+    return _build_scheduler(
+        SimpleNamespace(
+            hf_config=hf_config,
+            kv_transfer_config={"kv_role": "offload"},
+            kv_cache_block_size=64,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+
+
 def _text_wrapped(model_type: str, text_type: str):
     return SimpleNamespace(
         model_type=model_type,
@@ -6054,34 +6096,10 @@ def _text_wrapped(model_type: str, text_type: str):
 def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
     monkeypatch, hf_config, scheduler_cls
 ):
-    """A chunk-aligned prompt resent whole, with HBM empty and the tier holding
-    all of it. Withholding the last token would floor the KV leg's ceiling to
-    512, under the 704 rung that prompt kept, and no joint boundary could form.
-    A hybrid claims the joint boundary instead, so the hit stays whole when
-    the block manager lands a boundary in that last chunk, and is withheld
-    when none does: a whole hit nothing backs would hold a parked slot for a
-    load `_decide_load_after_alloc` refuses.
-
-    Every state-owning family takes this path, so each is built through the
-    layout selection a server runs; what keeps the forward from skipping the
-    whole prompt is `_decide_load_after_alloc` loading only at a boundary."""
-    from atom.kv_transfer.offload.connector import _build_scheduler
-
-    monkeypatch.setattr(
-        offcfg,
-        "build_lmcache_config",
-        lambda _config=None: SimpleNamespace(chunk_size=256),
-    )
-    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
-    sched = _build_scheduler(
-        SimpleNamespace(
-            hf_config=hf_config,
-            kv_transfer_config={"kv_role": "offload"},
-            kv_cache_block_size=64,
-            decode_context_parallel_size=1,
-            tensor_parallel_size=1,
-        )
-    )
+    """A chunk-aligned prompt resent whole with HBM empty. Withholding the last
+    token would floor the KV leg to 512, under the 704 rung the prompt kept,
+    so the hit stays whole when a boundary lands in that last chunk."""
+    sched = _offload_scheduler(monkeypatch, hf_config, chunk=256)
     assert type(sched) is scheduler_cls
     sched._min_load_tokens = 0
     sched._lookup_client = _LookupClient(hit=768)
@@ -7533,3 +7551,140 @@ class TestStateLoadsAndStoresRunInSeparateLanes:
             assert tier.take_store_reports() == (set(), {op})
         finally:
             tier.shutdown()
+
+
+# -- multimodal prompts: LMCache chunk keys carry the media identity ---------
+
+_MEDIA_CHUNK = 256
+_MEDIA_PROMPT = 3 * _MEDIA_CHUNK
+
+
+class _MediaTier:
+    """LMCache's bookkeeping: chunk keys chained over the ids, deduplicated."""
+
+    def __init__(self):
+        self.chunks: dict[bytes, str] = {}
+
+    @staticmethod
+    def _keys(token_ids):
+        link = b""
+        whole = len(token_ids) - len(token_ids) % _MEDIA_CHUNK
+        for start in range(0, whole, _MEDIA_CHUNK):
+            chunk = token_ids[start : start + _MEDIA_CHUNK]
+            assert all(0 <= t < 1 << 32 for t in chunk)  # the MP server packs ">I"
+            link = hashlib.blake2b(link + repr(chunk).encode()).digest()
+            yield link
+
+    def store(self, token_ids, owner):
+        for key in self._keys(token_ids):
+            self.chunks.setdefault(key, owner)
+
+    def hit(self, token_ids) -> tuple[int, set]:
+        owners, tokens = set(), 0
+        for key in self._keys(token_ids):
+            if key not in self.chunks:
+                break
+            owners.add(self.chunks[key])
+            tokens += _MEDIA_CHUNK
+        return tokens, owners
+
+
+def _media_seq(sid, cache_seed, tokens=None):
+    tokens = list(range(100, 100 + _MEDIA_PROMPT)) if tokens is None else tokens
+    return SimpleNamespace(
+        id=sid,
+        token_ids=tokens,
+        num_prompt_tokens=len(tokens),
+        num_tokens=len(tokens),
+        cache_seed=cache_seed,
+        block_table=list(range(len(tokens) // 64)),
+    )
+
+
+@pytest.fixture
+def media_scheduler(monkeypatch):
+    return _offload_scheduler(
+        monkeypatch, _text_wrapped("qwen4_exp", "qwen4_exp_text"), chunk=_MEDIA_CHUNK
+    )
+
+
+def _media_save(scheduler, tier, seq):
+    request = scheduler._build_save_request(
+        seq, 0, _MEDIA_PROMPT, SimpleNamespace(), list(seq.block_table), True
+    )
+    tier.store(request.token_ids, seq.id)
+
+
+def test_another_image_with_the_same_text_misses_the_first_ones_kv(media_scheduler):
+    """A = image1 + T stores its KV; B = image2 + T must not find it, or
+    C = image2 + T would decode from image1's KV under image2's state."""
+    tier = _MediaTier()
+    a, b, c = _media_seq("A", 11), _media_seq("B", 22), _media_seq("C", 22)
+    _media_save(media_scheduler, tier, a)
+
+    assert tier.hit(media_scheduler._lookup_token_ids(b)) == (0, set())
+    _media_save(media_scheduler, tier, b)
+    assert tier.hit(media_scheduler._lookup_token_ids(c)) == (_MEDIA_PROMPT, {"B"})
+    again = media_scheduler._lookup_token_ids(_media_seq("A2", 11))
+    assert tier.hit(again) == (_MEDIA_PROMPT, {"A"})
+    text = _media_seq("T", -1)
+    assert media_scheduler._lookup_token_ids(text) == text.token_ids
+
+
+def test_the_load_keys_what_the_lookup_and_save_keyed(media_scheduler):
+    tier = _MediaTier()
+    b, c = _media_seq("B", 22), _media_seq("C", 22)
+    _media_save(media_scheduler, tier, b)
+    load = media_scheduler._build_load_request(
+        c,
+        LoadSpec(hbm_cached_tokens=0, lmcache_cached_tokens=_MEDIA_PROMPT),
+        SimpleNamespace(),
+        _MEDIA_PROMPT,
+    )
+    assert load.token_ids == media_scheduler._lookup_token_ids(c)
+    assert tier.hit(load.token_ids) == (_MEDIA_PROMPT, {"B"})
+
+
+def test_media_keys_touch_only_the_leading_ids_and_keep_prefixes():
+    seq = _media_seq("A", 11)
+    keyed = tier_token_ids(seq, _MEDIA_PROMPT)
+    assert keyed[4:] == seq.token_ids[4:]
+    assert all(1 << 31 <= t < 1 << 32 for t in keyed[:4])
+    for end in (1, 3, 4, _MEDIA_CHUNK, _MEDIA_PROMPT - 1):
+        assert tier_token_ids(seq, end) == keyed[:end]
+    assert tier_token_ids(_media_seq("B", 22), _MEDIA_PROMPT)[:4] != keyed[:4]
+    other_text = _media_seq("A", 11, [7] + seq.token_ids[1:])
+    assert tier_token_ids(other_text, _MEDIA_PROMPT)[0] != keyed[0]
+    assert seq.token_ids[0] == 100  # the request's own ids are untouched
+
+
+def test_lmcache_mp_native_state_lookup_is_keyed_the_same_way():
+    from atom.kv_transfer.offload.mp.native_state_scheduler import (
+        NativeStateLMCacheMPConnectorScheduler,
+    )
+
+    lookup = NativeStateLMCacheMPConnectorScheduler._lookup_token_ids
+    stub = SimpleNamespace(_chunk_floor=lambda t: t // _MEDIA_CHUNK * _MEDIA_CHUNK)
+    end = _MEDIA_PROMPT - _MEDIA_CHUNK
+    for seed in (11, -1):
+        seq = _media_seq("A", seed)
+        assert lookup(stub, seq) == tier_token_ids(seq, end)
+    assert lookup(stub, seq) == seq.token_ids[:end]
+
+
+def test_dsv4_lookup_is_keyed_the_same_way():
+    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
+
+    asked = []
+    stub = SimpleNamespace(
+        _lookup_in_step=[],
+        _lookup_client=SimpleNamespace(
+            lookup=lambda ids, lookup_id: asked.append(ids) or _MEDIA_PROMPT
+        ),
+        _remember_tier_hit=lambda *_args: None,
+    )
+    for seed in (11, -1):
+        seq = _media_seq("A", seed)
+        assert DSV4OffloadScheduler._fresh_tier_lookup(stub, seq, "A") == _MEDIA_PROMPT
+        assert asked[-1] == tier_token_ids(seq, _MEDIA_PROMPT)
+    assert asked[-1] == list(seq.token_ids)

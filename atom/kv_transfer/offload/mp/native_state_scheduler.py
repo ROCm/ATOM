@@ -154,10 +154,9 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 self._replay_tokens,
             )
         else:
-            # An image is saved only at a chunk boundary (`_save_frontier`), so
-            # a prompt-end anchor off the chunk grid never reaches LMCache and
-            # the next turn resumes from the ladder, 8192 tokens apart by
-            # default, or from nothing.
+            # Images are saved only at a chunk boundary, so an anchor off the
+            # chunk grid never reaches LMCache and the next turn resumes from
+            # the ladder (8192 tokens apart by default) or from nothing.
             block_manager.align_checkpoint_anchor(self.chunk_size)
         # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
         # its answer until admission weighs it. The lookup keeps the PAGE KV
@@ -383,11 +382,8 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     ) -> int:
         """Highest chunk boundary in `(low, high]` holding a checkpoint, or 0.
 
-        The image a save stores: a rung at the prompt's end, which a
-        continuation loads, and otherwise the prompt-end anchor
-        (`align_checkpoint_anchor`), which a resend loads. One per save, as
-        HBM holds them when it is issued; storing every rung would hold
-        `should_defer_free` and the state budget for a whole ladder per prompt.
+        One image per save: storing every rung would hold `should_defer_free`
+        and the state budget for a whole ladder per prompt.
         """
         for boundary in range(self._chunk_floor(high), low, -self.chunk_size):
             prefix_hash = self._boundary_hash(seq, boundary)

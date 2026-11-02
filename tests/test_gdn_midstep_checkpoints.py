@@ -336,10 +336,8 @@ class TestPagedMidstep:
         assert bm.can_allocate(stateful_seq(PROMPT)) == 32 // BLOCK
 
     def test_a_tier_anchor_grid_ends_the_chunk_on_the_anchor(self):
-        """LMCache MP stores images only on its chunk grid. A forward that
-        would snapshot the anchor at 40 elsewhere (at 32 from 0, at 36 from 4)
-        ends on it instead and reads it exactly; one whose own grid reaches 40
-        is left alone, and without a tier grid nothing changes."""
+        """A forward that would snapshot the anchor at 40 elsewhere (at 32
+        from 0, at 36 from 4) ends on it instead."""
         bm = self.bm()
         bm.align_checkpoint_anchor(2 * BLOCK)
         seq = admitted(bm)

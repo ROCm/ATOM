@@ -65,10 +65,8 @@ def tokens_to_tensor(tokens: list[int]) -> torch.Tensor:
     return torch.from_numpy(np.asarray(tokens, dtype=np.int64))
 
 
-# How many leading ids of a multimodal prompt carry its media identity
-# (`tier_token_ids`): 4 x 31 bits covers the 64-bit `cache_seed`. The high bit
-# keeps a keyed id off every vocabulary id, and 32 bits is what the LMCache MP
-# server packs one id into.
+# 4 x 31 bits covers the 64-bit `cache_seed`. The high bit keeps a keyed id off
+# every vocabulary id; the LMCache MP server packs an id into 32 bits.
 _MEDIA_KEY_TOKENS = 4
 _MEDIA_KEY_BIT = 1 << 31
 _MEDIA_KEY_PERSON = b"atom-lmc-media"
@@ -77,14 +75,9 @@ _MEDIA_KEY_PERSON = b"atom-lmc-media"
 def tier_token_ids(seq, end: int) -> list[int]:
     """``seq``'s first ``end`` token ids, as LMCache keys them.
 
-    LMCache keys a chunk on the ids up to its end. A multimodal prompt's
-    placeholder ids are the same for every image, so two prompts that differ
-    only in their pictures would share every KV chunk, while a hybrid's state
-    images are filed under ``BlockManager`` hashes seeded with
-    ``Sequence.cache_seed`` and do not. Folding the media identity into the
-    first ids seeds every chunk key with it, as ``chain_seed`` seeds
-    mooncake_store's. A text prompt (``cache_seed == -1``) keys exactly as
-    before. Each keyed id depends on its own position and id only, so a
+    Image placeholder ids are the same for every image, so the media identity
+    (``Sequence.cache_seed``, which also seeds the state images' hashes) is
+    folded into the first ids. A text prompt keys exactly as before, and a
     prefix's keys are those of the whole prompt.
     """
     tokens = list(seq.token_ids[:end])
@@ -721,13 +714,9 @@ class OffloadSchedulerMixin(ABC):
         return (max(0, int(tokens)) // chunk) * chunk
 
     def _withholds_last_prompt_token(self, seq) -> bool:
-        """Whether a full-prompt hit gives back its last token (`_loadable_hit`).
-
-        It must wherever the request claims what it loads: a load that ends at
-        the prompt's end leaves the forward nothing to compute. A layout whose
-        claim stops short of the load on its own overrides this. Asked only of
-        a hit covering the whole prompt.
-        """
+        """Whether a full-prompt hit gives back its last token (`_loadable_hit`):
+        a load that ends at the prompt's end leaves nothing to compute, unless
+        the layout's claim stops short of the load on its own."""
         del seq
         return True
 

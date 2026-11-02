@@ -1559,9 +1559,8 @@ class GDNStateMixin(PoolRowsMixin):
 
 # ``GDNAttentionMetadataBuilder`` is shared, so the model name is the gate.
 # Turning PAGE copies on for every subclass would aim the image at MHA
-# regions. Qwen4Exp is not in this set: its builder opts in on its own and
-# aims the image at the QSA arena. The set is only the hybrids whose full
-# attention is ordinary MHA: Qwen3-Next and Qwen3.5.
+# regions. Qwen4Exp answers `_wants_paged_checkpoints` itself. The set is only
+# the hybrids whose full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
 #
 # These are text-config ``model_type`` values. A Qwen3.5 wrapper may report
 # ``qwen3_5_moe``; ``get_hf_text_config`` peels that to ``qwen3_5_moe_text``
@@ -1573,14 +1572,10 @@ GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
 
 
 def paged_checkpoints_deployable(config) -> bool:
-    """Whether a deployment can keep PAGE checkpoints: one stage, no RapidServe.
-
-    ``get_num_blocks`` raises when a copying transfer meets pipeline
-    parallelism or RapidServe, and answering yes there would turn "this model
-    keeps fork-slot checkpoints" into "this model does not start". Kimi's
-    ``_uses_paged_checkpoints`` is the same two switches and no model gate,
-    because that builder is Kimi-only.
-    """
+    """Off under pipeline parallelism and RapidServe. ``get_num_blocks``
+    raises when a copying transfer meets either, and answering yes there
+    would turn "this model keeps fork-slot checkpoints" into "this model
+    does not start"."""
 
     if int(getattr(config, "pipeline_parallel_size", 1) or 1) > 1:
         return False
@@ -1640,11 +1635,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     fuse_mtp_decode_position_update = False
 
     def _uses_paged_checkpoints(self) -> bool:
-        """PAGE image where the deployment allows it and the model wants it.
-
-        The deployment half is ``paged_checkpoints_deployable`` and is not
-        overridden; a subclass answers only ``_wants_paged_checkpoints``.
-        """
+        """PAGE image where the deployment allows it and the model wants it."""
 
         config = self.model_runner.config
         return paged_checkpoints_deployable(config) and self._wants_paged_checkpoints(
@@ -1662,11 +1653,6 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def state_transfer(self) -> StateTransfer:
         """PAGE image when ``_uses_paged_checkpoints`` says so; fork otherwise.
 
-        That hook decides who gets the image: here the Qwen3-Next / Qwen3.5
-        model types, and ``Qwen4ExpMetadataBuilder``'s own answer for Qwen3.8.
-        Qwen3.8 builds this same ``gdn-paged-state-v1`` id through ``super()``
-        and appends what its QSA pages and PLE state add. Where the image's
-        bytes live is ``_page_unit_pools``' business, not this method's.
         Pipeline parallelism and RapidServe stay on fork so sizing does not
         refuse to start.
         """
@@ -1705,16 +1691,14 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
     def checkpoint_page_unit_bytes(self) -> int | None:
-        """Bytes of one page that a transfer actually publishes.
+        """Bytes of one page (``_page_unit_pools``) a transfer actually publishes.
 
-        The page is whatever ``_page_unit_pools`` holds: the MHA pool here,
-        the QSA arena for Qwen3.8 (``_published_page_unit_bytes`` sums the
-        declared fields either way). ``ModelRunner`` sizes the checkpoint unit
-        from the paged pool's ``entry_bytes`` unless a backend returns a
-        number here. ``None`` keeps that charged size. Kimi's MLA pool needs no
-        override: its charged entry is exactly the rows the page geometry walks.
+        ``ModelRunner`` sizes the checkpoint unit from the paged pool's
+        ``entry_bytes`` unless a backend returns a number here. ``None`` keeps
+        that charged size. Kimi's MLA pool needs no override: its charged
+        entry is exactly the rows the page geometry walks.
 
-        Qwen3-Next / Qwen3.5's ``MhaKvPool`` does not work that way. The pool is one
+        Qwen's ``MhaKvPool`` does not work that way. The pool is one
         allocation ATOM lays out itself. Each field (K, V, scale) is rounded
         up to 256 bytes so a kernel sees aligned rows, and ``entry_bytes``
         bills those gaps. ``region_tensors()`` publishes only the real fields,
@@ -1739,32 +1723,19 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             raise RuntimeError("GDN PAGE checkpoint has no published page bytes")
         return published
 
-    # -- PAGE pools: the one thing a subclass with another pool overrides --
-
     def _page_unit_pools(self) -> list:
-        """Pools holding the image, in published order.
-
-        Each has ``region_tensors()`` (the views a transfer publishes and the
-        copy addresses), ``region_layout()`` (the same regions from the
-        declared offsets) and ``published_bytes``. Everything below reads the
-        PAGE image through this, so a builder that keeps its pages elsewhere
-        overrides it, and ``_published_page_unit_bytes`` with it: sizing asks
-        for the bytes before any pool is allocated.
-        """
+        """Pools holding the PAGE image, in published order. A builder that
+        keeps its pages elsewhere overrides this and
+        ``_published_page_unit_bytes``."""
         return list(self.kv_pools.values())
 
     def release_kv_pools(self) -> None:
-        # `_page_unit_regions` is keyed on the pool objects, and the regions
-        # cached under them name this allocation's addresses.
+        # The region cache is keyed on the pool objects.
         self._page_unit_region_cache = None
         super().release_kv_pools()
 
     def _published_page_unit_bytes(self) -> int:
-        """Bytes one block publishes, from the declared pools.
-
-        ``checkpoint_page_unit_bytes`` asks at sizing, before
-        ``_page_unit_pools`` holds anything.
-        """
+        """Bytes one block publishes; asked at sizing, before any pool exists."""
         from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
             layer_major_published_page_bytes,
         )
@@ -1784,12 +1755,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         pools = self._page_unit_pools()
-        # Keyed on the pool objects: a pool's regions do not move while it is
-        # allocated, and walking ~120 region tensors per call cost more than
-        # the step's copy bookkeeping. Every allocation declares new pools
-        # (`_allocate_kv_pools`, a new QSA arena), which moves the key. A
-        # release keeps the released pools until then, so `release_kv_pools`
-        # drops this: its views would name, and keep alive, freed memory.
+        # Keyed on the pool objects, whose regions do not move while they are
+        # allocated: walking ~120 region tensors per call cost more than the
+        # step's copy bookkeeping.
         cached = getattr(self, "_page_unit_region_cache", None)
         if (
             cached is not None
@@ -1825,8 +1793,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return layer_major_page_unit_stream_sizes(self._page_unit_regions(), units)
 
     def page_unit_views(self, unit_ids):
-        """Views of one checkpoint image over ``_page_unit_pools``, for the
-        in-process state tier.
+        """Views of one checkpoint image, for the in-process state tier.
 
         The tier packs these bytes and unpacks them into ``state_entry_views``.
         The copy plan already wrote the slot stream across these regions, so
@@ -1839,19 +1806,12 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         self._page_unit_regions()
-        return layer_major_page_unit_views(
-            self._page_unit_pools(), unit_ids, image_bytes=self._image_bytes()
-        )
-
-    def _image_bytes(self) -> int:
-        """The checkpoint image's size, or 0 (no trim) before the spec exists.
-
-        Only for ``page_unit_views``, which may be asked before the runtime
-        has a spec; ``page_unit_segments`` refuses instead.
-        """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
-        return int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
+        image_bytes = int(getattr(spec, "image_bytes", 0) or 0) if spec else 0
+        return layer_major_page_unit_views(
+            self._page_unit_pools(), unit_ids, image_bytes=image_bytes
+        )
 
     def page_unit_segments(self, unit_ids):
         """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
@@ -1863,9 +1823,8 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
         if spec is None:
-            # The store gathers a published image. Without the spec there is
-            # no image size to trim to, and the untrimmed unit would carry
-            # padding and whatever follows the image.
+            # Untrimmed, the gather would carry padding and whatever follows
+            # the image.
             raise RuntimeError("page_unit_segments called without a checkpoint spec")
         regions = self._page_unit_regions()
         first_region = self._page_unit_pools()[0].region_tensors()[0][1]
@@ -1882,13 +1841,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return self._with_paged_state_contract(super().get_kv_transfer_tensors())
 
     def _with_paged_state_contract(self, transfer):
-        """Attach the native checkpoint contract to the published PAGE regions.
-
-        The regions a unit spans are checked against the pools' declared byte
-        offsets (``region_layout``), not against ``_page_unit_regions``: both
-        of those read the same ``region_tensors`` views and would move
-        together.
-        """
+        """Attach the native checkpoint contract to the published PAGE regions,
+        checked against the pools' declared offsets (``region_layout``): the
+        published views and ``_page_unit_regions`` would move together."""
 
         if transfer is None or not self._uses_paged_checkpoints():
             return transfer
