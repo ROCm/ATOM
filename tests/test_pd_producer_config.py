@@ -138,6 +138,10 @@ def test_kv_staging_slots_are_capped_by_pool_bytes():
     assert staging_slot_count(4, 12 << 20) == 2
     assert staging_slot_count(1, 12 << 20) == 0
     assert staging_slot_count(128, (256 << 20) + 64) == 0
+    # Registration must obey the actual reservation, even if the worker
+    # configuration would ordinarily reserve a larger pool.
+    assert staging_slot_count(16, slot, reserve_bytes=slot) == 1
+    assert staging_slot_count(16, slot, reserve_bytes=slot - 4) == 0
 
 
 def _mla_producer_config(workers, **overrides):

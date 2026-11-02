@@ -122,16 +122,19 @@ def staging_pool_bytes(num_send_workers: int) -> int:
     return min(num_send_workers * STAGING_SLOT_BYTES, STAGING_POOL_BYTES)
 
 
-def staging_slot_count(num_send_workers: int, slot_bytes: int) -> int:
+def staging_slot_count(
+    num_send_workers: int, slot_bytes: int, *, reserve_bytes: int | None = None
+) -> int:
     """KV staging slots for one producer: one per send worker, within its reserve.
 
-    ``slot_bytes`` follows the physical layout and exceeds ``STAGING_SLOT_BYTES``
-    when one block is wider. The pool then gets fewer slots, or none (the
-    producer keeps per-token sends), rather than outgrow what
-    ``mla_staging_reserve_bytes`` held back from the KV cache.
+    ``reserve_bytes`` is the connector's actual KV budget reservation; callers
+    without an allocation use the configured worker-count budget. Wider slots
+    get fewer slots, or none, rather than outgrow the reserved memory.
     """
 
-    return min(num_send_workers, staging_pool_bytes(num_send_workers) // slot_bytes)
+    if reserve_bytes is None:
+        reserve_bytes = staging_pool_bytes(num_send_workers)
+    return min(num_send_workers, reserve_bytes // slot_bytes)
 
 
 def plain_mla_model(config) -> bool:
