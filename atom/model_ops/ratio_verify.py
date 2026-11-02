@@ -93,14 +93,6 @@ def _count_run_cells(num_tokens: int, vocab_size: int) -> int:
     return num_tokens * triton.cdiv(vocab_size, _RATIO_BLOCK_V) * _FILTER_COUNT_GROUPS
 
 
-def ratio_count_scratch_bytes(num_tokens: int, vocab_size: int) -> int:
-    """Bytes of `ratio_verify_scratch` at ``num_tokens`` draft rows that the
-    counted top-k's run maxima and their ids take, reserved whether or not a
-    request filters: about ``num_tokens * V / 8``, 160 MiB at
-    ``max_num_seqs=512``, T=16, V=163840."""
-    return 2 * _count_run_cells(num_tokens, vocab_size) * 4
-
-
 def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
     """fp32 and int32 shapes one ratio verify needs, in `_ratio_sample` order."""
     tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
