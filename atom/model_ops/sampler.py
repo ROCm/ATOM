@@ -9,6 +9,8 @@ from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
+from atom.utils import envs
+
 # Try to import aiter top-k/top-p sampling ops
 try:
     import aiter.ops.sampling  # noqa: F401
@@ -65,6 +67,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.eps = SAMPLER_EPS
+        # `ATOM_SPEC_BONUS_FUSED`: read once, so it must be set before the
+        # server starts. None keeps the aiter spelling in `forward`.
+        self._fused_temperature_sample = None
+        if envs.ATOM_SPEC_BONUS_FUSED:
+            from atom.model_ops.bonus_sample import bonus_temperature_sample
+
+            self._fused_temperature_sample = bonus_temperature_sample
 
     def sample_verification_tokens(
         self,
@@ -144,6 +153,16 @@ class Sampler(nn.Module):
 
         # No Top-K Top-P parameters, perform temperature-based sampling
         if not self._needs_filtering(top_ks, top_ps):
+            if self._fused_temperature_sample is not None and needs_independent_noise:
+                # The same noise draw as `_temperature_sample`, then the race
+                # and the greedy override in two vocab-tiled launches.
+                num_tokens, vocab_size = logits.shape
+                exponential = torch.empty(
+                    (num_tokens, vocab_size), dtype=torch.float, device=logits.device
+                ).exponential_(1)
+                return self._fused_temperature_sample(
+                    logits, temperatures, exponential, self.eps, SAMPLER_EPS
+                )
             sampled = self._temperature_sample(
                 logits, temperatures, needs_independent_noise=needs_independent_noise
             )

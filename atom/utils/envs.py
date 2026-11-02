@@ -1015,6 +1015,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
     ),
+    # "1": an unfiltered, per-row-noise draw (the speculative bonus token, and
+    # every draft-conditioned verification row of a non-greedy batch) runs as
+    # two vocab-tiled Triton launches (`model_ops/bonus_sample.py`) instead of
+    # `mixed_sample_outer_exponential` + `topk_select` + `<=` + `where` (five
+    # launches, the first with one program per row). It draws the same
+    # `exponential_` noise and runs the same race, argmax_i p_i / (E_i + eps),
+    # so the sample has the same distribution; greedy rows (temperature at or
+    # below the sampler's epsilon) are bit-identical, lowest id on ties.
+    # Sampling rows can differ from the aiter kernel only when the two best
+    # race keys sit within ~1e-7 relative of each other (fp32 rounding order).
+    # Rows with top-k/top-p, and batches without per-row noise, keep the aiter
+    # path. Read when the `Sampler` is built, so it must be set before the
+    # server starts.
+    "ATOM_SPEC_BONUS_FUSED": lambda: os.getenv("ATOM_SPEC_BONUS_FUSED", "0") == "1",
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
