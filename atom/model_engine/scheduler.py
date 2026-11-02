@@ -1065,9 +1065,7 @@ class Scheduler:
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
-            finished_load = (
-                None if offload_resume else self._finished_load_tokens(seq)
-            )
+            finished_load = None if offload_resume else self._finished_load_tokens(seq)
             if offload_resume or finished_load is not None:
                 offload_resume = True
                 resume = self._offload_prefill_start(seq, finished_load)
