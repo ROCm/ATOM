@@ -285,8 +285,14 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
     assert cls._uses_paged_checkpoints(builder)
 
 
-def _check(kv_transfer_config):
-    _check_kv_transfer(SimpleNamespace(kv_transfer_config=kv_transfer_config))
+def _check(kv_transfer_config, kv_cache_dtype="bf16", index_cache_dtype=None):
+    _check_kv_transfer(
+        SimpleNamespace(
+            kv_transfer_config=kv_transfer_config,
+            kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype=index_cache_dtype,
+        )
+    )
 
 
 _PD = "disaggregated.*kv_connector={!r}"
@@ -379,6 +385,54 @@ def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, re
             _check(kv_transfer_config)
 
 
+_IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
+_MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype, index_cache_dtype",
+    [
+        ("fp8", None),  # the index cache follows the KV cache
+        ("fp8", "fp8"),
+        ("fp8", "bf16"),
+        ("bf16", "fp8"),
+        ("bf16", "fp4"),
+        ("auto", "fp4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        _IN_PROCESS,
+        {"kv_connector": "multi", "connectors": [_MP, _IN_PROCESS]},
+    ],
+)
+def test_qwen38_runs_in_process_offload_of_quantized_caches(
+    kv_transfer_config, kv_cache_dtype, index_cache_dtype
+):
+    """The in-process codec carries the QSA scale planes (`extra_planes`)."""
+    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config, kv_cache_dtype, index_cache_dtype",
+    [
+        (_IN_PROCESS, "bf16", "bf16"),
+        (_IN_PROCESS, "bf16", None),
+        (_IN_PROCESS, "auto", "bfloat16"),
+        (_IN_PROCESS, None, None),
+        (_MP, "fp8", None),
+        (_MP, "fp8", "fp4"),
+        (_MP, "bf16", "fp8"),
+        (None, "fp8", "fp8"),
+    ],
+)
+def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
+    kv_transfer_config, kv_cache_dtype, index_cache_dtype
+):
+    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
+
+
 _MTP = SimpleNamespace(method="mtp")
 
 
@@ -444,6 +498,38 @@ class _QSALayer:
         self.bound = (caches, scales)
 
 
+def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
+    """With BF16 caches the MTP layer is one more row of the target's fields,
+    and the in-process codec is handed exactly the rows that layer binds."""
+    builder, cls = _builder()
+    del builder._qsa_fields  # the real declaration, not `_builder`'s stand-in
+    hf = builder.model_runner.config.hf_config
+    hf.head_dim, hf.indexer_head_dim = 8, 4
+    builder.model_runner._get_num_kv_heads = lambda: 2
+    builder.block_size = 4
+    builder.cache_rope_positions = False
+    builder.device = torch.device("cpu")
+    builder.kv_pools = {}
+    target, draft = _QSALayer(0), _QSALayer(1)
+    builder._pool_rows = {"qsa": {target: 0, draft: 1}}
+
+    names = [field.name for field in cls._qsa_fields(builder)]
+    assert names == ["k", "v", "index_raw", "index_compressed"]
+    cls.allocate_kv_cache_tensors(builder, blocks=2, buf=None)
+    arena = builder.qsa_arena
+    for layer, row in ((target, 0), (draft, 1)):
+        tensor = cls.build_kv_cache_tensor(builder, layer)
+        caches, scales = layer.bound
+        handed = (tensor.k_cache, tensor.v_cache, *tensor.extra_planes)
+        for name, bound, view in zip(names, caches, handed, strict=False):
+            assert view.data_ptr() == arena.view(name)[row].data_ptr(), name
+            assert view.data_ptr() == bound.data_ptr(), name
+        assert len(handed) == len(names)
+        assert caches[4] is None  # no rope positions without image input
+        assert set(scales.values()) == {None}
+        assert tensor.k_scale is None and tensor.v_scale is None
+
+
 # `DenseKVByteCodec` reads these in this order; a reorder misreads every stored
 # chunk, so a new plane goes last.
 _STORED_ORDER = (
@@ -461,14 +547,13 @@ _STORED_ORDER = (
 @pytest.mark.parametrize(
     "kv_cache_dtype, index_cache_dtype, draft_space",
     [
-        ("bf16", None, "qsa"),
         ("fp8", "bf16", "qsa_draft"),
         ("fp8", "fp8", "qsa_draft"),
         ("fp8", "fp4", "qsa_draft"),
         ("fp8", "fp8", "qsa"),  # ATOM_QSA_DRAFT_KV_BF16=0
     ],
 )
-def test_every_qsa_layer_hands_the_codec_the_rows_it_binds(
+def test_every_quantized_qsa_layer_hands_the_codec_the_rows_it_binds(
     kv_cache_dtype, index_cache_dtype, draft_space
 ):
     """The in-process codec moves exactly what a layer registers: every field
