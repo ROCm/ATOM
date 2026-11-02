@@ -7188,172 +7188,6 @@ class TestStateStoreCompletionsCarryAGeneration:
 # ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
 
 
-class TestStateLoadsAndStoresRunInSeparateLanes:
-    """A load is on the TTFT critical path and a store is not, but one serial
-    executor made that ordering unenforceable: a load submitted in a later step
-    sat behind every store already queued, and a stuck store blocked all of
-    them. Putting same-step loads first cannot overtake queued work."""
-
-    class _BlockingCodec:
-        """A codec whose stores hang until released; loads always land."""
-
-        def __init__(self):
-            self.gate = threading.Event()
-            self.loaded = threading.Event()
-
-        def put(self, h, unit_ids, on_source_released=None):
-            self.gate.wait(timeout=5)
-            if on_source_released is not None:
-                on_source_released()
-            return True
-
-        def get(self, h, slot):
-            self.loaded.set()
-            return True
-
-    def _tier(self, codec, **kw):
-        from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
-            StateOffloadTier,
-        )
-
-        return StateOffloadTier(codec, **kw)
-
-    def test_a_load_lands_while_a_store_is_still_stuck(self):
-        codec = self._BlockingCodec()
-        tier = self._tier(codec)
-        try:
-            for gen in range(4):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
-            tier.submit_load("r1", 77, 0)
-            assert codec.loaded.wait(
-                timeout=5
-            ), "the load waited behind the store backlog"
-            done, failed = tier.get_finished()
-            assert done == {"r1"}
-            assert failed == set()
-        finally:
-            codec.gate.set()
-            tier.shutdown()
-
-    def test_one_lane_serialises_the_load_behind_the_inflight_store(self):
-        """`staging_lanes=1` serialises the two lanes: a load waits out the
-        single in-flight store, but still not the backlog behind it. It does
-        *not* change standing HBM -- the staging buffer is per-thread and both
-        executors are `max_workers=1`, so HBM is two buffers either way; this
-        knob only gates load/store concurrency, which is what this asserts."""
-        codec = self._BlockingCodec()
-        tier = self._tier(codec, staging_lanes=1)
-        try:
-            for gen in range(3):
-                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
-            tier.submit_load("r1", 77, 0)
-            assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
-            codec.gate.set()
-            assert codec.loaded.wait(timeout=5)
-        finally:
-            codec.gate.set()
-            tier.shutdown()
-
-    def test_the_oldest_store_age_is_visible_while_it_hangs(self):
-        codec = self._BlockingCodec()
-        tier = self._tier(codec)
-        try:
-            assert tier.oldest_store_age_s() == 0.0
-            tier.submit_store(StateStoreOperationId(1, 1), (0,))
-            assert tier.oldest_store_age_s() >= 0.0
-            assert len(tier._store_submitted_at) == 1
-        finally:
-            codec.gate.set()
-            tier.drain()
-            assert tier.oldest_store_age_s() == 0.0
-            tier.shutdown()
-
-    class _EarlyReleaseCodec:
-        """`put` releases the source (D2H drained) and then stalls in the CPU
-        `batched_put`, so a drain can observe the early release *before* the
-        store completes -- exactly the window the source/store split exists
-        for."""
-
-        def __init__(self):
-            self.released = threading.Event()
-            self.gate = threading.Event()
-
-        def put(self, h, unit_ids, on_source_released=None):
-            if on_source_released is not None:
-                on_source_released()  # D2H is done here, CPU put is not
-            self.released.set()
-            self.gate.wait(timeout=5)
-            return True
-
-        def get(self, h, slot):
-            return True
-
-    def test_source_release_is_emitted_once_early_not_again_at_store_end(self):
-        """The release must land the instant the D2H drains (before the CPU
-        put), and must not be re-emitted when `_do_store` returns. A second
-        emission across two engine drains double-unpins the same record."""
-        codec = self._EarlyReleaseCodec()
-        tier = self._tier(codec)
-        op = StateStoreOperationId(1, 1)
-        try:
-            tier.submit_store(op, (0,))
-            assert codec.released.wait(timeout=5), "the D2H callback never fired"
-            # Early: units handed back while the CPU put is still running.
-            assert tier.take_source_releases() == {op}
-            # Finish the store; the end-of-store backstop must stay silent.
-            codec.gate.set()
-            tier.drain()
-            assert tier.take_source_releases() == set(), "source release re-emitted"
-            assert tier.take_store_reports() == ({op}, set())
-        finally:
-            codec.gate.set()
-            tier.shutdown()
-
-    def test_a_refused_store_still_releases_its_units(self):
-        """A refused allocation never fires the D2H callback and never read the
-        units, so the backstop must release them -- withholding it would hold an
-        image out of the KV pool until the stale reclaimer noticed."""
-
-        class _RefuseCodec:
-            def put(self, h, unit_ids, on_source_released=None):
-                return False  # allocation refused; callback never reached
-
-            def get(self, h, slot):
-                return True
-
-        tier = self._tier(_RefuseCodec())
-        op = StateStoreOperationId(2, 1)
-        try:
-            tier.submit_store(op, (0,))
-            tier.drain()
-            assert tier.take_source_releases() == {op}
-            assert tier.take_store_reports() == (set(), {op})
-        finally:
-            tier.shutdown()
-
-    def test_a_throwing_store_still_releases_its_units(self):
-        """A throwing `pack` drains the device before it propagates, so the GPU
-        has stopped reading the units by the time control returns -- the backstop
-        releases them and the store is reported failed, not lost."""
-
-        class _ThrowCodec:
-            def put(self, h, unit_ids, on_source_released=None):
-                raise RuntimeError("pack blew up")
-
-            def get(self, h, slot):
-                return True
-
-        tier = self._tier(_ThrowCodec())
-        op = StateStoreOperationId(3, 1)
-        try:
-            tier.submit_store(op, (0,))
-            tier.drain()
-            assert tier.take_source_releases() == {op}
-            assert tier.take_store_reports() == (set(), {op})
-        finally:
-            tier.shutdown()
-
-
 class _Obj:
     """A MemoryObj's reference count, and nothing else."""
 
@@ -7771,3 +7605,169 @@ class TestConnectorTouches:
             "load_requests": 3,
             "state_touches_unrefreshed": 1,
         }
+
+
+class TestStateLoadsAndStoresRunInSeparateLanes:
+    """A load is on the TTFT critical path and a store is not, but one serial
+    executor made that ordering unenforceable: a load submitted in a later step
+    sat behind every store already queued, and a stuck store blocked all of
+    them. Putting same-step loads first cannot overtake queued work."""
+
+    class _BlockingCodec:
+        """A codec whose stores hang until released; loads always land."""
+
+        def __init__(self):
+            self.gate = threading.Event()
+            self.loaded = threading.Event()
+
+        def put(self, h, unit_ids, on_source_released=None):
+            self.gate.wait(timeout=5)
+            if on_source_released is not None:
+                on_source_released()
+            return True
+
+        def get(self, h, slot):
+            self.loaded.set()
+            return True
+
+    def _tier(self, codec, **kw):
+        from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
+            StateOffloadTier,
+        )
+
+        return StateOffloadTier(codec, **kw)
+
+    def test_a_load_lands_while_a_store_is_still_stuck(self):
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            for gen in range(4):
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            tier.submit_load("r1", 77, 0)
+            assert codec.loaded.wait(
+                timeout=5
+            ), "the load waited behind the store backlog"
+            done, failed = tier.get_finished()
+            assert done == {"r1"}
+            assert failed == set()
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_one_lane_serialises_the_load_behind_the_inflight_store(self):
+        """`staging_lanes=1` serialises the two lanes: a load waits out the
+        single in-flight store, but still not the backlog behind it. It does
+        *not* change standing HBM -- the staging buffer is per-thread and both
+        executors are `max_workers=1`, so HBM is two buffers either way; this
+        knob only gates load/store concurrency, which is what this asserts."""
+        codec = self._BlockingCodec()
+        tier = self._tier(codec, staging_lanes=1)
+        try:
+            for gen in range(3):
+                tier.submit_store(StateStoreOperationId(gen, gen + 1), (0,))
+            tier.submit_load("r1", 77, 0)
+            assert not codec.loaded.wait(timeout=0.2), "held by the in-flight store"
+            codec.gate.set()
+            assert codec.loaded.wait(timeout=5)
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_the_oldest_store_age_is_visible_while_it_hangs(self):
+        codec = self._BlockingCodec()
+        tier = self._tier(codec)
+        try:
+            assert tier.oldest_store_age_s() == 0.0
+            tier.submit_store(StateStoreOperationId(1, 1), (0,))
+            assert tier.oldest_store_age_s() >= 0.0
+            assert len(tier._store_submitted_at) == 1
+        finally:
+            codec.gate.set()
+            tier.drain()
+            assert tier.oldest_store_age_s() == 0.0
+            tier.shutdown()
+
+    class _EarlyReleaseCodec:
+        """`put` releases the source (D2H drained) and then stalls in the CPU
+        `batched_put`, so a drain can observe the early release *before* the
+        store completes -- exactly the window the source/store split exists
+        for."""
+
+        def __init__(self):
+            self.released = threading.Event()
+            self.gate = threading.Event()
+
+        def put(self, h, unit_ids, on_source_released=None):
+            if on_source_released is not None:
+                on_source_released()  # D2H is done here, CPU put is not
+            self.released.set()
+            self.gate.wait(timeout=5)
+            return True
+
+        def get(self, h, slot):
+            return True
+
+    def test_source_release_is_emitted_once_early_not_again_at_store_end(self):
+        """The release must land the instant the D2H drains (before the CPU
+        put), and must not be re-emitted when `_do_store` returns. A second
+        emission across two engine drains double-unpins the same record."""
+        codec = self._EarlyReleaseCodec()
+        tier = self._tier(codec)
+        op = StateStoreOperationId(1, 1)
+        try:
+            tier.submit_store(op, (0,))
+            assert codec.released.wait(timeout=5), "the D2H callback never fired"
+            # Early: units handed back while the CPU put is still running.
+            assert tier.take_source_releases() == {op}
+            # Finish the store; the end-of-store backstop must stay silent.
+            codec.gate.set()
+            tier.drain()
+            assert tier.take_source_releases() == set(), "source release re-emitted"
+            assert tier.take_store_reports() == ({op}, set())
+        finally:
+            codec.gate.set()
+            tier.shutdown()
+
+    def test_a_refused_store_still_releases_its_units(self):
+        """A refused allocation never fires the D2H callback and never read the
+        units, so the backstop must release them -- withholding it would hold an
+        image out of the KV pool until the stale reclaimer noticed."""
+
+        class _RefuseCodec:
+            def put(self, h, unit_ids, on_source_released=None):
+                return False  # allocation refused; callback never reached
+
+            def get(self, h, slot):
+                return True
+
+        tier = self._tier(_RefuseCodec())
+        op = StateStoreOperationId(2, 1)
+        try:
+            tier.submit_store(op, (0,))
+            tier.drain()
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
+
+    def test_a_throwing_store_still_releases_its_units(self):
+        """A throwing `pack` drains the device before it propagates, so the GPU
+        has stopped reading the units by the time control returns -- the backstop
+        releases them and the store is reported failed, not lost."""
+
+        class _ThrowCodec:
+            def put(self, h, unit_ids, on_source_released=None):
+                raise RuntimeError("pack blew up")
+
+            def get(self, h, slot):
+                return True
+
+        tier = self._tier(_ThrowCodec())
+        op = StateStoreOperationId(3, 1)
+        try:
+            tier.submit_store(op, (0,))
+            tier.drain()
+            assert tier.take_source_releases() == {op}
+            assert tier.take_store_reports() == (set(), {op})
+        finally:
+            tier.shutdown()
