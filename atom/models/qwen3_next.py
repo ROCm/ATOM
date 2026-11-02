@@ -295,6 +295,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            # The MXFP4 default pads each rank's experts to 256 columns: at TP4
+            # (512 / 4 = 128) half of every expert the grouped GEMMs stream is zeros.
+            pad_align=(
+                128
+                if envs.ATOM_QWEN_MOE_PAD_ALIGN_128
+                and (config.moe_intermediate_size // self.tp_size) % 128 == 0
+                else None
+            ),
         )
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
