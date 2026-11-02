@@ -106,7 +106,6 @@ class StateByteCodec:
         )
         if self._max_entries is not None and self._max_entries < 1:
             raise ValueError("state CPU budget must fit at least one checkpoint")
-        # The cap's LRU, kept in LMCache's order (`get`, `touch`, a re-store).
         self._cache_keys: OrderedDict[Any, None] = OrderedDict()
         self._cache_lock = threading.Lock()
         self._store_lock = threading.Lock()
@@ -164,8 +163,7 @@ class StateByteCodec:
         # unpacking, so removing its cache entry cannot free live bytes.
         if self._storage is None:
             return False
-        key = self.key(h)
-        if self._touch_key(key) is TouchResult.REFRESHED:
+        if self._touch_key(self.key(h)) is TouchResult.REFRESHED:
             # Same key, same bytes, already hot: a re-store is a D2H LocalCPU
             # refuses as a duplicate. One held only by disk is stored again.
             if on_source_released is not None:
@@ -173,6 +171,7 @@ class StateByteCodec:
             return True
         if self._max_entries is None:
             return self._put(h, unit_ids, on_source_released)
+        key = self.key(h)
         with self._store_lock:
             with self._cache_lock:
                 if key not in self._cache_keys:
@@ -309,11 +308,8 @@ class StateByteCodec:
         """
         if self._storage is None:
             return False
-        key = self.key(h)
-        obj = self._storage.get(key)
+        obj = self._storage.get(self.key(h))
         if obj is None:
-            with self._cache_lock:
-                self._cache_keys.pop(key, None)
             return False
         size = self._object_bytes(obj)
         if size is not None and size != self.entry_bytes:
@@ -338,7 +334,7 @@ class StateByteCodec:
         finally:
             obj.ref_count_down()
         # `get_blocking` does not refresh LMCache's LRU; a resume is a use.
-        self._touch_key(key)
+        self._touch_key(self.key(h))
         return True
 
     @staticmethod

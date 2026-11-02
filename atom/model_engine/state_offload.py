@@ -35,15 +35,15 @@ _TIER_TOUCH_INTERVAL_S = 0.5
 class StateOffloadIndex:
     """What is believed to be in LMCache, and what is being fetched back.
 
-    `hashes` answers the membership half of the tier's vote. LMCache's own LRU
-    can drop bytes at any time, so on its own a hash here means "was stored
-    once", never "is still there".
+    `hashes` answers the membership half of the tier's vote. It is deliberately
+    optimistic: LMCache's own LRU can drop bytes at any time, so a hash here
+    means "was stored once", never "is still there". The false positive costs
+    one lookup and a park/unpark, and is handled by the `failed_loading` path
+    (`fail_load` -> `forget`).
 
     With a `verified_for_s` window, every voted hit is also touched: the worker
     refreshes the image in LMCache's LRU, as a KV lookup does for its chunks,
-    and reports whether it was still there (`apply_touch_verdict`). A false
-    positive that slips through still costs one park/unpark and is handled by
-    the `failed_loading` path (`fail_load` -> `forget`).
+    and reports whether it was still there (`apply_touch_verdict`).
     """
 
     def __init__(
@@ -147,7 +147,7 @@ class StateOffloadIndex:
             self.hashes_evicted += 1
 
     def forget(self, h: int) -> None:
-        """Drop a hash whose image is gone, so the next request does not retry."""
+        """Drop a hash whose load failed, so the next request does not retry."""
         self.hashes.discard(h)
         self._hash_lru.pop(h, None)
         self._drop_touch_state(h)
@@ -169,8 +169,7 @@ class StateOffloadIndex:
 
     def could_serve(self, h: int) -> bool:
         """Whether a load for `h` could be offered at all: this tier can load
-        AND believes it holds `h`. Pure: a voter registers its hit with
-        `want_touch`.
+        AND believes it holds `h`.
 
         The membership+capability half of `request_load`'s guard (minus its
         per-request in-flight check), factored out so the admission-path voters
@@ -567,8 +566,7 @@ def state_tier_capability(config) -> StateTierCapability:
 
 def state_tier_cpu_bytes() -> int:
     """CPU bytes the state tier may keep per worker (`OFFLOAD_STATE_CPU_SIZE`,
-    GiB, default 32): a cap on the images in the paged-KV LMCache pool they
-    share, not a reservation -- images and KV chunks compete in one LRU.
+    GiB, default 32), carved from the paged-KV LMCache pool it shares.
 
     One reader for both halves: the worker's `StateByteCodec` evicts against
     it and the engine's `StateOffloadIndex` mirrors the resulting entry bound.
@@ -600,27 +598,6 @@ def state_tier_budget_warning(state_gib: float, pool_gib: float) -> str | None:
     return None
 
 
-def _lmcache_engine_config(config):
-    """The `LMCacheEngineConfig` this engine's offload connector builds.
-
-    Raises when LMCache or its config cannot be read; the callers decide what
-    that costs.
-    """
-    from atom.kv_transfer.offload.config import build_lmcache_config
-
-    kvcfg = getattr(config, "kv_transfer_config", None) or {}
-    # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
-    # the offload SUB-connector, not the composite. Passing the raw
-    # composite here read a zero chunk grid. Unwrap the sub the same way
-    # `state_tier_capability` does, so the gate's chunk size and the tier
-    # the capability check builds stay consistent.
-    if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
-        sub, _why = _offload_subconfig(kvcfg)
-        if sub is not None:
-            kvcfg = sub
-    return build_lmcache_config(kvcfg)
-
-
 def state_tier_chunk_tokens(config) -> int:
     """The LMCache chunk size in tokens for the joint KV leg, or 0.
 
@@ -639,7 +616,19 @@ def state_tier_chunk_tokens(config) -> int:
     disable the joint KV load.
     """
     try:
-        return int(_lmcache_engine_config(config).chunk_size)
+        from atom.kv_transfer.offload.config import build_lmcache_config
+
+        kvcfg = getattr(config, "kv_transfer_config", None) or {}
+        # Under `multi` the lmcache.* keys (chunk_size, offload_layout) live on
+        # the offload SUB-connector, not the composite. Passing the raw
+        # composite here read a zero chunk grid. Unwrap the sub the same way
+        # `state_tier_capability` does, so the gate's chunk size and the tier
+        # the capability check builds stay consistent.
+        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+            sub, _why = _offload_subconfig(kvcfg)
+            if sub is not None:
+                kvcfg = sub
+        return int(build_lmcache_config(kvcfg).chunk_size)
     except Exception:
         # Blind on purpose: this runs at model load, the import reaches a
         # third-party package that may be absent entirely, and the only
@@ -658,7 +647,15 @@ def state_tier_verified_for_s(config) -> float:
     when it cannot be read. Like `state_tier_chunk_tokens`, call it only when
     a tier is hosted."""
     try:
-        pool_gib = float(_lmcache_engine_config(config).max_local_cpu_size)
+        from atom.kv_transfer.offload.config import build_lmcache_config
+
+        kvcfg = getattr(config, "kv_transfer_config", None) or {}
+        # The offload sub-connector's keys, as in `state_tier_chunk_tokens`.
+        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "multi":
+            sub, _why = _offload_subconfig(kvcfg)
+            if sub is not None:
+                kvcfg = sub
+        pool_gib = float(build_lmcache_config(kvcfg).max_local_cpu_size)
     except Exception:  # noqa: BLE001 - `state_tier_chunk_tokens` logged why
         logger.warning(
             "state offload: LMCache's CPU pool size is unknown; a confirmed "

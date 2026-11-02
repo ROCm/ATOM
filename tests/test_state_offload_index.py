@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""StateOffloadIndex must stop advertising images the worker codec dropped,
-and keeps state images as warm in LMCache's LRU as the KV they belong to
-(hit touches, their verdicts, and the admission hold)."""
+"""StateOffloadIndex must stop advertising images the worker codec dropped."""
 
 from types import SimpleNamespace
 
 import pytest
-from conftest import OFFLOAD_STALE_S as STALE
 
 from atom.model_engine import state_offload as so
 from atom.model_engine.state_offload import (
@@ -64,6 +61,18 @@ def test_state_tier_cpu_bytes_reads_gib(monkeypatch):
 
 
 # ── the index: votes queue touches, verdicts keep it in step ───────────────
+
+
+#: Past every confirmation window `tier_verified_for_s` can give.
+STALE = so._TIER_VERIFIED_MAX_S + 1
+
+
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
 
 
 def _index(*hashes, verified_for_s=so._TIER_VERIFIED_MIN_S, **kw):

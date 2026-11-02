@@ -6162,22 +6162,11 @@ def test_no_more_saves_go_out_than_the_pool_can_afford_to_pin():
 # ── the state key: build safety and namespace separation ──────────────────
 
 
-class _LRUPolicy:
-    """LMCache's `LRUCachePolicy.update_on_hit`."""
-
-    def update_on_hit(self, key, cache) -> None:
-        cache.move_to_end(key)
-
-
 class _FakeStorage:
-    """The `storage_manager` calls the codec makes, over a plain dict, with
-    the LocalCPU LRU internals `bind_storage_manager` requires."""
+    """The two `storage_manager` calls the codec makes, over a plain dict."""
 
     def __init__(self) -> None:
-        self.objects: OrderedDict = OrderedDict()
-        self.local_cpu_backend = SimpleNamespace(
-            cpu_lock=threading.Lock(), hot_cache=self.objects, cache_policy=_LRUPolicy()
-        )
+        self.objects: dict = {}
 
     def batched_put(self, keys, objs) -> None:
         for k, o in zip(keys, objs, strict=True):
@@ -7185,9 +7174,6 @@ class TestStateStoreCompletionsCarryAGeneration:
         assert failed == set()
 
 
-# ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
-
-
 class _Obj:
     """A MemoryObj's reference count, and nothing else."""
 
@@ -7207,6 +7193,13 @@ class _Obj:
 
     def get_size(self) -> int:
         return self.size
+
+
+class _LRUPolicy:
+    """LMCache's `LRUCachePolicy.update_on_hit`."""
+
+    def update_on_hit(self, key, cache) -> None:
+        cache.move_to_end(key)
 
 
 class _LocalCPU:
@@ -7341,14 +7334,6 @@ class TestCodecRefresh:
         assert codec.get(1, 0)
         assert objs[0].refs == 1, "the load's reference is discharged"
         assert pool.evict_oldest() == "kv-chunk"
-
-    def test_a_missed_get_leaves_the_cap_lru(self, lmcache_key):
-        pool = _LocalCPU()
-        codec, _ = _lru_codec(pool, max_entries=2)
-        assert codec.put(1, [])
-        pool.evict_oldest()
-        assert not codec.get(1, 0)
-        assert codec._cache_keys == OrderedDict()
 
     def test_a_resident_image_is_refreshed_not_stored_twice(self, lmcache_key):
         pool = _LocalCPU()
@@ -7605,6 +7590,9 @@ class TestConnectorTouches:
             "load_requests": 3,
             "state_touches_unrefreshed": 1,
         }
+
+
+# ── kimi_k3: loads must not queue behind a backlog of stores ───────────────
 
 
 class TestStateLoadsAndStoresRunInSeparateLanes:

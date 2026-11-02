@@ -249,7 +249,6 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             staging_buffer_bytes=entry_bytes,
             release_after_transfer=gpu_connector.release_gpu_staging_after_transfer,
         )
-        state_bytes = state_tier_cpu_bytes()
         codec = StateByteCodec(
             backend,
             staged,
@@ -258,13 +257,15 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             world_size=world,
             worker_id=rank,
             layout_id=layout_id,
-            max_cache_bytes=state_bytes,
+            max_cache_bytes=state_tier_cpu_bytes(),
         )
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
         pool_gib = float(getattr(cfg, "max_local_cpu_size", 0) or 0)
-        budget_warning = state_tier_budget_warning(state_bytes / (1 << 30), pool_gib)
+        budget_warning = state_tier_budget_warning(
+            state_tier_cpu_bytes() / (1 << 30), pool_gib
+        )
         if budget_warning:
             logger.warning("kimi_k3 offload: %s", budget_warning)
         # No index here: StateOffloadIndex lives in the engine process; both

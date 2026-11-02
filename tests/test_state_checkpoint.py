@@ -17,7 +17,6 @@ from math import inf, isinf
 from types import SimpleNamespace
 
 import pytest
-from conftest import OFFLOAD_STALE_S as STALE
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import (
@@ -35,7 +34,7 @@ from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_offload import StateOffloadIndex
+from atom.model_engine.state_offload import _TIER_VERIFIED_MAX_S, StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -4567,6 +4566,18 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 # ── state tier hit refresh: the admission hold and the voters ──────────────
 
 
+#: Past every confirmation window `tier_verified_for_s` can give.
+STALE = _TIER_VERIFIED_MAX_S + 1
+
+
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
+
+
 def _paged_bm():
     bm = make_block_manager(
         ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
@@ -4747,19 +4758,7 @@ class TestVotersRegisterTouches:
 
 
 class TestResumeHash:
-    """`allocate` and the admission hold pick the state to resume from with
-    one helper, `_state_resume_hash`."""
-
-    def test_the_joint_boundary_wins_then_a_replay_then_the_hit(self, monkeypatch):
-        bm = _paged_bm()
-        seq = _seq()
-        assert bm._state_resume_hash(seq, 77, 2) == 77
-        assert bm._state_resume_hash(seq, -1, 2) == 2
-        assert bm._state_resume_hash(seq, -1, -1) == -1
-        monkeypatch.setattr(bm, "state_replay_tokens", 8)
-        seq.replays_hit = True
-        assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
-        assert bm._state_resume_hash(seq, 77, 2) == 77
+    """The admission hold judges the hash `allocate` then restores."""
 
     def test_the_hold_judges_the_hash_allocate_then_loads(
         self, offload_clock, monkeypatch

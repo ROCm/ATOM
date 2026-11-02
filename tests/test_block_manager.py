@@ -1381,9 +1381,8 @@ class TestStateTierVerifyWindow:
         self, monkeypatch
     ):
         monkeypatch.setattr(
-            so,
-            "_lmcache_engine_config",
-            lambda config: SimpleNamespace(chunk_size=256, max_local_cpu_size=100),
+            "atom.kv_transfer.offload.config.build_lmcache_config",
+            lambda kvcfg: SimpleNamespace(chunk_size=256, max_local_cpu_size=100),
         )
         bm = _bm_with_state_tier(monkeypatch, _OFFLOAD_KVC)
         assert bm._joint_chunk_tokens == 256

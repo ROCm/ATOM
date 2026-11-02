@@ -426,7 +426,7 @@ class StateOffloadFace(ABC):
     `QwenOffloadScheduler` inherits that, so
     `isinstance(impl, StateOffloadFace)` is the honest predicate.
 
-    Narrow on purpose -- only the tier methods. Other impl attributes the
+    Narrow on purpose -- only the four tier methods. Other impl attributes the
     scheduler reads (e.g. `max_pending_saves`) stay plain shell forwards rather
     than joining this face, which is exclusively the KDA state-tier contract.
     """
@@ -439,10 +439,6 @@ class StateOffloadFace(ABC):
     def take_state_reports(self) -> tuple[set[int], set[int]]: ...
     @abstractmethod
     def take_state_source_releases(self) -> set: ...
-    @abstractmethod
-    def enqueue_state_touches(self, hashes) -> bool: ...
-    @abstractmethod
-    def take_state_touch_verdicts(self) -> dict[int, bool]: ...
 
 
 class OffloadSchedulerMixin(ABC):
