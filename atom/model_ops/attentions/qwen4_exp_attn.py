@@ -615,7 +615,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             torch._foreach_copy_(destinations, sources)
 
     def build_kv_cache_tensor(self, module):
-        """Bind the three caches a QSA layer owns; defer everything else."""
+        """Bind a QSA layer's row of every arena field and register the same
+        views for transfer; a GDN layer goes to the parent."""
         if not getattr(module, "is_qsa_attention", False):
             return self._build_gdn_cache_tensor(module)
 
@@ -631,34 +632,38 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             name += sfx
             return arena.view(name)[row] if name in names else None
 
-        key, value = optional("k"), optional("v")
+        key, value, k_scale, v_scale, raw, compressed, rope, compressed_scale = map(
+            optional,
+            (
+                "k",
+                "v",
+                "k_scale",
+                "v_scale",
+                "index_raw",
+                "index_compressed",
+                "rope_positions",
+                "index_compressed_scale",
+            ),
+        )
         module.bind_caches(
             key,
             value,
-            optional("index_raw"),
-            optional("index_compressed"),
-            optional("rope_positions"),
-            k_scale_cache=optional("k_scale"),
-            v_scale_cache=optional("v_scale"),
-            compressed_key_scale=optional("index_compressed_scale"),
+            raw,
+            compressed,
+            rope,
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
+            compressed_key_scale=compressed_scale,
         )
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
-            k_scale=optional("k_scale"),
-            v_scale=optional("v_scale"),
+            k_scale=k_scale,
+            v_scale=v_scale,
             extra_planes=tuple(
                 plane
-                for plane in map(
-                    optional,
-                    (
-                        "index_raw",
-                        "index_compressed",
-                        "rope_positions",
-                        "index_compressed_scale",
-                    ),
-                )
+                for plane in (raw, compressed, rope, compressed_scale)
                 if plane is not None
             ),
         )
