@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from atom.model_ops.engram import host_memory
 from atom.model_ops.engram.tables import HostEmbeddingTable
 from atom.utils import CpuGpuBuffer, envs
 
@@ -438,6 +439,11 @@ class EngramHost:
             logger.info("engram: using the host path")
             self._release_shard()
             return False
+        # Only now that the group keeps the shard: a fallback above must not
+        # leave the layers registered so far locked.
+        host_memory.mlock_in_place(
+            t for table in self._pinned_tables for t in table.shard_tensors()
+        )
         logger.info(
             "engram: UVA device lookup active -- heads [%d, %d) of %d, "
             "%.1f GiB page-locked on this rank%s",

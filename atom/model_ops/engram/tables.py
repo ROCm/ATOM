@@ -159,6 +159,10 @@ class HostEmbeddingTable:
         self._shard = ()
         self._uva = None
 
+    def shard_tensors(self) -> tuple[torch.Tensor, ...]:
+        """The page-locked rows (values, then scales); empty without a range."""
+        return self._shard
+
     def registered_shard(self):
         """`(weight, scales, row_start, row_end)` as the UVA kernel addresses them.
 

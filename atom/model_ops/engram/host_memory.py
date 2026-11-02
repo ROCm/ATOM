@@ -598,6 +598,18 @@ class _PageRuns:
                         _clear_hip_error()
                         logger.warning("engram: cudaHostUnregister failed")
 
+    def covers(self, lo: int, hi: int) -> bool:
+        """Whether registered runs cover all of `[lo, hi)`."""
+        with self._lock:
+            cursor = lo
+            for base in sorted(
+                b for b, (e, _) in self._runs.items() if b < hi and e > lo
+            ):
+                if base > cursor:
+                    return False
+                cursor = max(cursor, self._runs[base][0])
+            return cursor >= hi
+
     def __len__(self) -> int:
         return len(self._runs)
 
@@ -631,8 +643,9 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
-def _mlock(ranges) -> None:
-    """Lock the in-place registered `[lo, hi)` ranges in RAM.
+def mlock_in_place(tensors) -> None:
+    """Lock in RAM the tensors `pin_rows` registered in place; copies (their
+    `hipHostMalloc` memory is locked already) are skipped.
 
     An in-place registration pins page-cache pages through a KFD userptr BO,
     which the kernel does not treat as locked: under memory pressure kswapd
@@ -640,11 +653,27 @@ def _mlock(ranges) -> None:
     notifier evicts all of the process's GPU queues until the BO is
     revalidated (stalls of seconds, or a hang). `mlock` keeps reclaim off
     these pages; set `vm.compact_unevictable_allowed=0` to keep compaction
-    off them as well. Best effort: a refusal (RLIMIT_MEMLOCK without
-    CAP_IPC_LOCK) warns once and the registration stands. Not undone on
-    release -- ranges that share a page would unlock each other; the lock
-    goes with the mapping.
+    off them as well.
+
+    Called once the shard is final (the TP group agreed to keep it), so a
+    fallback never leaves pages locked. Best effort: a refusal
+    (RLIMIT_MEMLOCK without CAP_IPC_LOCK) warns once and the registration
+    stands. Not undone on release -- ranges that share a page would unlock
+    each other; the lock goes with the mapping.
     """
+    ranges = []
+    for t in tensors:
+        base = t.data_ptr()
+        lo = base - (base % _PAGE)
+        hi = -(-(base + t.numel() * t.element_size()) // _PAGE) * _PAGE
+        if hi > lo and _PAGE_RUNS.covers(lo, hi):
+            ranges.append((lo, hi))
+    if ranges:
+        _mlock(ranges)
+
+
+def _mlock(ranges) -> None:
+    """`mlock` each `[lo, hi)`; one warning for all that are refused."""
     libc = ctypes.CDLL(None, use_errno=True)
     libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     refused, errno = 0, 0
@@ -671,7 +700,6 @@ def _register(sources, leases):
     rt = torch.cuda.cudart()
 
     out = []
-    locked = []
     for src in sources:
         base = src.data_ptr()
         nbytes = src.numel() * src.element_size()
@@ -694,8 +722,4 @@ def _register(sources, leases):
         leases.append(lease)
         view = _owning_bytes(lease, base - lo, nbytes)
         out.append(view.view(src.dtype).view(src.shape))
-        locked.append((lo, hi))
-    # Only once every range is registered: a refused one falls back to the
-    # host path, which must not leave the earlier ranges locked.
-    _mlock(locked)
     return tuple(out)

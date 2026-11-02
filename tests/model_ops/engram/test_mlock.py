@@ -1,6 +1,6 @@
 """In-place UVA registrations are `mlock`ed: `_mlock` locks a shared read-only
 file mapping (what an in-place registration pins) and only warns when the
-kernel refuses; `_register` locks only once every range is registered."""
+kernel refuses; `mlock_in_place` locks only what is registered in place."""
 
 import ctypes
 import logging
@@ -75,36 +75,19 @@ def test_mlock_refusal_only_warns(tmp_path, caplog):
     assert len(warnings) == 1 and "mlock" in warnings[0].getMessage()
 
 
-class _FakeRuns:
-    """`_PAGE_RUNS` stand-in that refuses the `refuse_at`-th range."""
-
-    def __init__(self, refuse_at=None):
-        self.refuse_at = refuse_at
-        self.calls = 0
-
-    def acquire(self, rt, lo, hi, flags=0):
-        self.calls += 1
-        return None if self.calls == self.refuse_at else [lo]
-
-    def release(self, rt, runs):
-        pass
-
-
-@pytest.mark.parametrize("refuse_at", [None, 2])
-def test_register_locks_only_a_complete_registration(monkeypatch, refuse_at):
-    monkeypatch.setattr(host_memory.torch.cuda, "cudart", lambda: None)
-    monkeypatch.setattr(host_memory, "_read_only", lambda lo, hi: False)
-    monkeypatch.setattr(host_memory, "_PAGE_RUNS", _FakeRuns(refuse_at))
+def test_mlock_in_place_skips_what_is_not_registered(monkeypatch):
+    """Only ranges `_PAGE_RUNS` holds (in place) are locked; a copy's memory
+    is locked by `hipHostMalloc` already."""
+    page = host_memory._PAGE
+    runs = host_memory._PageRuns()
+    monkeypatch.setattr(host_memory, "_PAGE_RUNS", runs)
     locked = []
     monkeypatch.setattr(host_memory, "_mlock", lambda ranges: locked.extend(ranges))
-    sources = [torch.ones(3 * host_memory._PAGE, dtype=torch.uint8) for _ in range(3)]
-    leases = []
-    out = host_memory._register(sources, leases)
-    if refuse_at is None:
-        assert out is not None and len(locked) == len(sources)
-        for (lo, hi), src in zip(locked, sources):
-            assert lo <= src.data_ptr() and src.data_ptr() + src.numel() <= hi
-    else:
-        assert out is None and locked == []
-    for lease in leases:
-        lease.release()
+    registered = torch.ones(3 * page, dtype=torch.uint8)
+    copied = torch.ones(3 * page, dtype=torch.uint8)
+    base = registered.data_ptr()
+    lo = base - base % page
+    hi = -(-(base + registered.numel()) // page) * page
+    runs._runs[lo] = [hi, 1]
+    host_memory.mlock_in_place([registered, copied])
+    assert locked == [(lo, hi)]
