@@ -68,6 +68,43 @@ def test_another_arch_is_refused(native, monkeypatch):
     assert dispatch._config_refusal(_atom_config()) == "arch gfx942"
 
 
+def test_gfx1250_scratch_keeps_the_measured_cached_allocation(monkeypatch):
+    dev = torch.device("cuda", 3)
+    cached = object()
+    calls = []
+
+    def zeros(nbytes, *, dtype, device):
+        calls.append((nbytes, dtype, device))
+        return cached
+
+    monkeypatch.setattr(runner.torch, "zeros", zeros)
+    monkeypatch.setattr(
+        runner,
+        "uncached_bytes",
+        lambda *_args: pytest.fail("gfx1250 scratch must stay cached"),
+    )
+    assert runner._scratch_bytes(123, dev, gfx1250=True) is cached
+    assert calls == [(123, torch.uint8, dev)]
+
+
+def test_other_mono_arches_keep_uncached_scratch(monkeypatch):
+    dev = torch.device("cuda", 2)
+    uncached = object()
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "uncached_bytes",
+        lambda nbytes, device: calls.append((nbytes, device)) or uncached,
+    )
+    monkeypatch.setattr(
+        runner.torch,
+        "zeros",
+        lambda *_args, **_kwargs: pytest.fail("non-gfx1250 scratch must stay uncached"),
+    )
+    assert runner._scratch_bytes(456, dev, gfx1250=False) is uncached
+    assert calls == [(456, dev)]
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [

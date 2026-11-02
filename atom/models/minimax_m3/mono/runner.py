@@ -113,6 +113,13 @@ _KERNEL_ABI = {
 }
 
 
+def _scratch_bytes(nbytes: int, dev: torch.device, gfx1250: bool) -> torch.Tensor:
+    """M3's scratch with the cache policy its architecture was measured with."""
+    if gfx1250:
+        return torch.zeros(nbytes, dtype=torch.uint8, device=dev)
+    return uncached_bytes(nbytes, dev)
+
+
 def _ptr(t: torch.Tensor) -> int:
     return t.data_ptr()
 
@@ -326,8 +333,8 @@ class MonoDecodeRunner:
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
         dev = self.dev
-        self.scratch1 = uncached_bytes(K1_SCRATCH_BYTES, dev)
-        self.scratch4 = uncached_bytes(K4_SCRATCH_BYTES, dev)
+        self.scratch1 = _scratch_bytes(K1_SCRATCH_BYTES, dev, self.gfx1250)
+        self.scratch4 = _scratch_bytes(K4_SCRATCH_BYTES, dev, self.gfx1250)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
             sym_layout(self.npes)["_bytes"],
