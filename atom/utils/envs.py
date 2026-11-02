@@ -222,10 +222,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
-    # Place a new agent session on the lightest DP rank, then keep every later
-    # request on that immutable cache owner. Existing sessions never spill;
-    # child correlation ids are independently load-placed rather than
-    # inheriting their parent's owner.
     # Prefix-spread DP routing (replaces sticky sessions when set): every
     # request goes to the least-loaded rank (`least_tokens` score), except that
     # the rank which last ran its longest prompt prefix -- found through the
@@ -234,6 +230,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # placed away from its prefix is queued first on its rank, so the tier
     # (LMCache) load of that prefix starts on arrival.
     "ATOM_DP_PREFIX_SPREAD": lambda: os.getenv("ATOM_DP_PREFIX_SPREAD", "0") == "1",
+    # Load tokens by which the prefix's rank may
+    # exceed the lightest rank and still keep the request.
     "ATOM_DP_PREFIX_OWNER_MARGIN": lambda: int(
         os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN", "65536")
     ),
@@ -260,6 +258,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFIX_LOAD_TOKENS_PER_S": lambda: float(
         os.getenv("ATOM_DP_PREFIX_LOAD_TOKENS_PER_S", "2e6")
     ),
+    # Place a new agent session on the lightest DP rank, then keep every later
+    # request on that immutable cache owner. Existing sessions never spill;
+    # child correlation ids are independently load-placed rather than
+    # inheriting their parent's owner.
     "ATOM_DP_SESSION_AFFINITY": lambda: (
         os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
     ),
@@ -1227,6 +1229,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
+    # `lmcache_mp`: ship only the tokens a worker does not yet hold with each
+    # transfer instead of the whole prefix. "0" ships whole prefixes.
+    "ATOM_MP_INCREMENTAL_TOKENS": lambda: (
+        os.getenv("ATOM_MP_INCREMENTAL_TOKENS", "1") == "1"
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.
