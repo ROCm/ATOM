@@ -8,7 +8,10 @@ import subprocess
 
 RUN = os.environ.get("OBSERVE_RUN_ID", "41430932776")
 assert RUN.isdigit(), "An existing numeric GitHub run ID is required"
-CASE = "m31-stack-mxfp4-pp4-index-freq4-equal-gsm8k20"
+CASES = (
+    "m31-stack-mxfp4-pp4-index-freq4-equal-gsm8k20",
+    "m31-stack-mxfp4-pp4-index-freq4-aligned-gsm8k20",
+)
 print("Observed at", datetime.now(timezone.utc).isoformat(), flush=True)
 
 
@@ -25,13 +28,14 @@ def query(args):
 
 
 queue = query(["squeue", "--noheader", "--format=%A|%256j|%T|%M|%R"])
-matches = [line for line in queue.splitlines() if RUN in line and CASE in line]
+matches = [line for line in queue.splitlines()
+           if RUN in line and any(case in line for case in CASES)]
 print("Matching queue entries:", *matches, sep="\n", flush=True)
 
 roots = [Path("/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"), Path("/it-share/ATOMESH_LOG")]
 seen = set()
 for root in roots:
-    for case_dir in sorted(root.glob(f"*{CASE}*-{RUN}-*")):
+    for case_dir in sorted(p for case in CASES for p in root.glob(f"*{case}*-{RUN}-*")):
         resolved = case_dir.resolve()
         if resolved in seen:
             continue
