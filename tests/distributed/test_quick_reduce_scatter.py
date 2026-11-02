@@ -9,6 +9,7 @@ from unittest.mock import Mock, sentinel
 
 import pytest
 import torch
+from import_guard import skip_if_dependency_missing
 
 from atom.distributed import quick_reduce_scatter as quick_rs
 
@@ -100,7 +101,10 @@ def test_the_int4_reduce_scatter_is_logged_once(runtime, caplog):
 
 @pytest.mark.parametrize("sp", [False, True])
 def test_pcp_merge_alone_keeps_the_exact_reduce_scatter(monkeypatch, sp):
-    from atom.distributed import pcp_utils
+    try:
+        from atom.distributed import pcp_utils
+    except ImportError as e:
+        skip_if_dependency_missing(e, "pcp_utils imports aiter")
 
     quick = Mock(return_value=sentinel.int4)
     exact = Mock(return_value=sentinel.exact)
