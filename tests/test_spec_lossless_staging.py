@@ -115,11 +115,11 @@ def stage(prop, b, *, verifiable=True):
 
 
 def dest(prop):
-    return prop._draft_row_base_buf.np.tolist()
+    return prop.metadata_buffers["draft_q_row_base"].np.tolist()
 
 
 def verify(prop):
-    return prop._verify_row_base_buf.np.tolist()
+    return prop.metadata_buffers["verify_q_row_base"].np.tolist()
 
 
 # ---- arming -----------------------------------------------------------------
@@ -130,15 +130,15 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
     for name in LOSSLESS:
         assert prop.metadata_buffers[name].publication_group == "sampling", name
     sampling = prop.model.bound
-    assert sampling.q_row_base is prop._draft_row_base_buf.gpu
-    assert sampling.top_k is prop._draft_top_k_buf.gpu
-    assert sampling.top_p is prop._draft_top_p_buf.gpu
+    assert sampling.q_row_base is prop.metadata_buffers["draft_q_row_base"].gpu
+    assert sampling.top_k is prop.metadata_buffers["draft_top_k"].gpu
+    assert sampling.top_p is prop.metadata_buffers["draft_top_p"].gpu
     # Unpublished rows are harmless from the start: no destination, T=1, no
     # filter.
     assert dest(prop) == [-1] * MAX_BS and verify(prop) == [-1] * MAX_BS
-    assert prop._draft_temps_buf.np.tolist() == [1.0] * MAX_BS
-    assert prop._draft_top_k_buf.gpu.tolist() == [0] * MAX_BS
-    assert prop._draft_top_p_buf.gpu.tolist() == [1.0] * MAX_BS
+    assert prop.metadata_buffers["draft_temperatures"].np.tolist() == [1.0] * MAX_BS
+    assert prop.metadata_buffers["draft_top_k"].gpu.tolist() == [0] * MAX_BS
+    assert prop.metadata_buffers["draft_top_p"].gpu.tolist() == [1.0] * MAX_BS
 
 
 @pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
@@ -176,7 +176,7 @@ def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk,
 )
 def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
-    assert prop.draft_sampling is None and prop._q_store is None
+    assert prop.draft_sampling is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert prop.lossless_verify_inputs(2) == (None, None, None)
     # Staging is a no-op rather than an error.
@@ -192,7 +192,7 @@ def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, cap
     model.window_size = T - 1
     with caplog.at_level("WARNING", logger="atom"):
         prop = proposer(monkeypatch, model=model)
-    assert prop.draft_sampling is None and prop._q_store is None
+    assert prop.draft_sampling is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert f"draft_tokens_per_seq={T - 1}, mtp_k={T}" in caplog.text
     # A window at least as wide as the block arms.
@@ -270,8 +270,8 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     """Next to the q store, before the KV cache is sized: the profiling run
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
-    assert prop.draft_sampling.scratch is prop._draft_scratch
-    assert prop._draft_scratch.f32.numel() and prop._verify_scratch.f32.numel()
+    assert prop.draft_sampling.scratch.f32.numel()
+    assert prop._verify_scratch.f32.numel()
 
 
 @pytest.mark.parametrize("lossless", [True, False], ids=["armed", "not-armed"])
@@ -292,7 +292,7 @@ def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossl
     assert (steps, vocab, width, dtype) == (
         T,
         VOCAB,
-        prop._q_store.ids.shape[1],
+        prop.draft_sampling.q_store.ids.shape[1],
         torch.bfloat16,
     )
     assert scratch is prop._verify_scratch
@@ -360,8 +360,8 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     seen = {}
 
     def base_warmup(self, build_context, end_trace=None):
-        seen["np"] = self._draft_row_base_buf.np.tolist()
-        seen["gpu"] = self._draft_row_base_buf.gpu.tolist()
+        seen["np"] = self.metadata_buffers["draft_q_row_base"].np.tolist()
+        seen["gpu"] = self.metadata_buffers["draft_q_row_base"].gpu.tolist()
 
     monkeypatch.setattr(dspark_proposer.Drafter, "_warmup_draft_graphs", base_warmup)
     prop.warmup_draft_graphs(None)
@@ -383,8 +383,8 @@ def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     seen = {}
 
     def retire():
-        seen["np"] = mono._draft_row_base_buf.np.tolist()
-        seen["gpu"] = mono._draft_row_base_buf.gpu.tolist()
+        seen["np"] = mono.metadata_buffers["draft_q_row_base"].np.tolist()
+        seen["gpu"] = mono.metadata_buffers["draft_q_row_base"].gpu.tolist()
 
     mono._mono_session = SimpleNamespace(
         retire_draft_captures_for_startup=retire,
@@ -400,10 +400,12 @@ def test_each_rows_filters_ride_the_publication(monkeypatch):
     prop = proposer(monkeypatch)
     counts = stage(prop, batch(["a", "b"], top_ks=[-1, 7], top_ps=[0.8, 1.0]))
     assert counts["draft_top_k"] == counts["draft_top_p"] == 2
-    assert prop._draft_top_k_buf.np[:2].tolist() == [0, 7]
-    np.testing.assert_array_equal(prop._draft_top_p_buf.np[:2], np.float32([0.8, 1]))
+    assert prop.metadata_buffers["draft_top_k"].np[:2].tolist() == [0, 7]
+    np.testing.assert_array_equal(
+        prop.metadata_buffers["draft_top_p"].np[:2], np.float32([0.8, 1])
+    )
     # Neither row drafts greedily for a filter.
-    assert prop._draft_greedy_buf.np[:2].tolist() == [0, 0]
+    assert prop.metadata_buffers["draft_greedy_mask"].np[:2].tolist() == [0, 0]
 
 
 def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
@@ -425,7 +427,8 @@ def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     q, base, scratch = prop.lossless_verify_inputs(2)
     # The sparse store itself, and the draft's score scratch to spread a
     # rejecting request's row into: one dense row per batch row, V wide.
-    assert q.store is prop._q_store and q.dense is prop._s_scratch
+    assert q.store is prop.draft_sampling.q_store
+    assert q.dense is prop.draft_sampling.s_scratch
     assert q.dense.shape == (MAX_BS, VOCAB)
     assert base.shape == (2,) and scratch is prop._verify_scratch
 
