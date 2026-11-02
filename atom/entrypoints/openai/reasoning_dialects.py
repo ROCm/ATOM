@@ -100,6 +100,25 @@ class ReasoningDialect:
     # `reasoning_content` with an empty `content`, while the non-streaming
     # split read it correctly.
     extra_end_markers: tuple[str, ...] = ()
+    # Markers that close the *answer*. Met inside the reasoning channel before
+    # any of `end_markers`, one proves the channel was never used: the model
+    # skipped it and wrote its reply straight into the opened think section,
+    # so everything ahead of the marker is the answer, not reasoning. Kimi-K3
+    # does this on ~1M-token prompts -- measured on BEAM (1M) under the Kimi
+    # Vendor Verifier, about one reply in five came back as `<reply>
+    # <|close|>response<|sep|><|close|>message<|sep|>` with neither
+    # `<|close|>think<|sep|>` nor `<|open|>response<|sep|>`, and was delivered
+    # as `reasoning_content` with `content` empty. SGLang reads it the same way
+    # (sgl-project/sglang#37743). Each must also be `content_framing`: the
+    # streaming filter drops the marker itself, so the split has to as well.
+    answer_end_markers: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        stray = set(self.answer_end_markers) - set(self.content_framing)
+        if stray:
+            raise ValueError(
+                f"answer_end_markers {sorted(stray)} must also be content_framing"
+            )
 
     @property
     def end_markers(self) -> tuple[str, ...]:
@@ -124,10 +143,20 @@ class ReasoningDialect:
 # filter cannot be told different things; adding a marker in
 # one place alone used to change only the streamed path.
 _CHANNEL_END_MARKERS = (CHANNEL_THINK_END, CHANNEL_RESPONSE_START, k3.TOOLS_START)
+# The answer's own closer, which the trained format only ever writes after
+# `<|open|>response<|sep|>`. Seen before every entry above, it means the think
+# channel was skipped -- see `ReasoningDialect.answer_end_markers`. Listed once
+# here, read by `_split_channel` and by the dialect, for the reason above.
+_CHANNEL_ANSWER_END_MARKERS = (CHANNEL_RESPONSE_END,)
 
 
 def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | None:
     """One rule: the reasoning channel ends at whichever closer comes first.
+
+    Unless the first closer is the *answer's* (`_CHANNEL_ANSWER_END_MARKERS`).
+    Then the channel was skipped and nothing in it was reasoning: the whole
+    text is content, the marker included -- `separate_reasoning` strips it as
+    framing, and a tools section after it stays in place for the tool parser.
 
     This was three branches, and the middle one -- `<|open|>response<|sep|>`
     with no `<|close|>think<|sep|>` immediately before it -- returned
@@ -178,6 +207,9 @@ def _split_channel(text: str, starts_thinking: bool = False) -> SplitResult | No
         at = text.find(marker)
         if 0 <= at < best_at:
             best_at, best = at, marker
+    if any(0 <= text.find(m) < best_at for m in _CHANNEL_ANSWER_END_MARKERS):
+        # Skipped think channel: the reply was written where reasoning goes.
+        return (None, before + text)
     if best is None:
         # Never closed. Seeded, that is a trace cut off at `max_tokens` and
         # `separate_reasoning`'s fallback says so; self-opened, the channel's
@@ -337,6 +369,7 @@ _CHANNEL_DIALECT = ReasoningDialect(
     # with empty `content`, on both delivery paths, and on `/v1/messages`
     # where reasoning is dropped by default the client gets nothing at all.
     extra_end_markers=tuple(m for m in _CHANNEL_END_MARKERS if m != CHANNEL_THINK_END),
+    answer_end_markers=_CHANNEL_ANSWER_END_MARKERS,
     split=_split_channel,
     template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
     template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),

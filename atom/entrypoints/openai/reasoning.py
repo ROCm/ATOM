@@ -224,7 +224,13 @@ class ReasoningFilter:
         self.dialect = dialect
         speaking = dialect or FALLBACK_DIALECT
         self._end_markers = frozenset(speaking.end_markers)
+        self._answer_end_markers = frozenset(speaking.answer_end_markers)
         self._framing = frozenset(speaking.content_framing)
+        # What state 1 has released, kept only while it might turn out to have
+        # been the answer -- see the `_answer_end_markers` branch in `process`.
+        # Empty for a dialect with no answer-end markers, and dropped the
+        # moment the channel closes the ordinary way.
+        self._released_in_channel: list[str] = []
         self._open_markers = frozenset(
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
@@ -252,7 +258,7 @@ class ReasoningFilter:
             # by chunk and not by marker count.
             watched |= self._open_markers | self._end_markers
         elif state == 1:
-            watched |= self._end_markers
+            watched |= self._end_markers | self._answer_end_markers
         return MarkerScanner(tuple(sorted(watched))) if watched else None
 
     @property
@@ -273,8 +279,33 @@ class ReasoningFilter:
                 out.append((self._field, scan.released))
                 if self.state == 0:
                     self._at_offset_zero = False
+                elif self.state == 1 and self._answer_end_markers:
+                    self._released_in_channel.append(scan.released)
             if scan.hit is None:
                 return out
+            if self.state == 1 and scan.hit in self._answer_end_markers:
+                # The answer's closer inside the reasoning channel: the model
+                # skipped the channel and everything it held was the reply.
+                # Above the framing branch, which would otherwise drop the
+                # marker as framing and leave the reply in reasoning.
+                #
+                # What already went out as `reasoning_content` cannot be
+                # recalled, so it is sent again as `content`. The answer then
+                # agrees with `separate_reasoning` on every chunking; the
+                # reasoning field keeps a copy the split does not have. That
+                # is the one divergence, and the alternative -- holding state
+                # 1 back until the channel is decided -- withholds every byte
+                # of an ordinary chain of thought, the stall that long
+                # reasoning turns into a client timeout. SGLang makes the same
+                # trade (sgl-project/sglang#37743).
+                replay = "".join(self._released_in_channel)
+                self._released_in_channel = []
+                if replay:
+                    out.append(("content", replay))
+                self.state = 2
+                self._scanner = self._scanner_for(self.state)
+                text = scan.rest
+                continue
             if scan.hit in self._framing and not (
                 self.state == 1 and scan.hit in self._end_markers
             ):
@@ -301,6 +332,7 @@ class ReasoningFilter:
             # no opener to see, so it starts in state 1 and only ever takes
             # the second of these.
             self.state = 1 if self.state == 0 else 2
+            self._released_in_channel = []
             self._scanner = self._scanner_for(self.state)
             text = scan.rest
 
