@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import partial as functools_partial
@@ -32,6 +33,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as triton_mla_decode_fwd
 from aiter.ops.triton.fusions.fused_kv_cache import (
@@ -498,6 +500,35 @@ try:
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_FP8_MHA_AVAILABLE = False
 
+# The gfx1250 counterpart: the a8w8 FMHA. Builds whose entry takes no Q/K/V
+# descales cannot serve prequantized inputs, so they count as unavailable.
+try:
+    from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+        flash_attn_a8w8_m32x8_supported,
+        flash_attn_varlen_a8w8_m32x8,
+    )
+
+    _FLYDSL_FP8_MHA_GFX1250_AVAILABLE = (
+        "q_descale" in inspect.signature(flash_attn_varlen_a8w8_m32x8).parameters
+    )
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    _FLYDSL_FP8_MHA_GFX1250_AVAILABLE = False
+
+
+def _flydsl_fp8_mha_gfx1250_supported(
+    num_heads: int, num_kv_heads: int, head_dim: int, head_dim_v: int
+) -> bool:
+    # The predicate reads only shapes and dtypes, so meta tensors stand in for Q/K/V.
+    def probe(heads: int, dim: int) -> torch.Tensor:
+        return torch.empty((1, heads, dim), dtype=torch.float8_e4m3fn, device="meta")
+
+    return flash_attn_a8w8_m32x8_supported(
+        "varlen",
+        probe(num_heads, head_dim),
+        probe(num_kv_heads, head_dim),
+        probe(num_kv_heads, head_dim_v),
+    )
+
 
 # MLA Specific Arguments
 @dataclass
@@ -594,6 +625,7 @@ class MLAAttention(nn.Module):
         super().__init__()
         self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
         self._flydsl_fp8_mha_ok: bool | None = None
+        self._flydsl_fp8_mha_gfx1250 = False
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = float(scale)
@@ -1077,15 +1109,22 @@ class MLAAttention(nn.Module):
             self._flydsl_fp8_mha_ok = False
             return
         head_dim = self.qk_nope_head_dim if self.rope_is_zero_pad else q.shape[-1]
+        self._flydsl_fp8_mha_gfx1250 = (
+            _FLYDSL_FP8_MHA_GFX1250_AVAILABLE and get_gfx_runtime() == "gfx1250"
+        )
+        if self._flydsl_fp8_mha_gfx1250:
+            supported = _flydsl_fp8_mha_gfx1250_supported
+        elif _FLYDSL_FP8_MHA_AVAILABLE:
+            supported = functools_partial(flydsl_flash_attn_fp8_supported, q.device)
+        else:
+            supported = None
         self._flydsl_fp8_mha_ok = (
-            _FLYDSL_FP8_MHA_AVAILABLE
+            supported is not None
             and q.dtype == torch.bfloat16
             # Cached FP8 gather currently retains the synthetic RoPE padding.
             # Until that tuple is trimmed too, NoPE models use the BF16 path.
             and not self.rope_is_zero_pad
-            and flydsl_flash_attn_fp8_supported(
-                q.device, q.shape[-2], self.num_heads, head_dim, self.v_head_dim
-            )
+            and supported(q.shape[-2], self.num_heads, head_dim, self.v_head_dim)
         )
         if not self._flydsl_fp8_mha_ok and not getattr(
             MLAAttention, "_fp8_prefill_fallback_logged", False
@@ -1165,6 +1204,22 @@ class MLAAttention(nn.Module):
                 k8, v8, k_descale, v_descale = kv_fp8
             # Empty per-sequence cached chunks require the FMHA kernel's
             # masked-row handling: zero output and -inf LSE for the merge.
+            if self._flydsl_fp8_mha_gfx1250:
+                return flash_attn_varlen_a8w8_m32x8(
+                    q8,
+                    k8,
+                    v8,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=causal,
+                    return_lse=return_lse,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
             return flydsl_flash_attn_fp8_func(
                 q8,
                 k8,
