@@ -83,13 +83,11 @@ def prepare_worker_grammar(runner, schema, tool_format, fingerprint, vocab_size)
 
 class StructuredOutput:
     def __init__(self, tokenizer, vocab_size, stop_token_ids):
-        from llguidance.hf import from_tokenizer
-
         from . import backend_guidance as grammar
 
         self.xgr = grammar
         self.stop_ids = list(stop_token_ids)
-        info = from_tokenizer(tokenizer, n_vocab=vocab_size, eos_token=self.stop_ids)
+        info = grammar.grammar_tokenizer(tokenizer, vocab_size, self.stop_ids)
         self.compiler = grammar.GrammarCompiler(info)
         self.compile = lru_cache(maxsize=128)(self.compiler.compile_json_schema)
         self.vocab_size = vocab_size

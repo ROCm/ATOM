@@ -120,7 +120,12 @@ bridges deferred output delivery and reconstructs grammar state from committed
 history on replay. No target-model forward or AITER operator is added.
 
 Once the answer grammar is active, inline reasoning markers inside JSON strings
-remain literal answer text. Tool-only Responses results skip answer validation
+remain literal answer text. The grammar tokenizer also preserves HF added tokens
+marked `special=False` as visible bytes: llguidance 1.9.1 otherwise classifies
+tokens such as `<think>` as specials and can disagree between masking and token
+consumption. This adapter preserves model token IDs and EOS and is built once
+when a worker first initializes structured output; the API/model tokenizer is
+unchanged. Tool-only Responses results skip answer validation
 after conversion to `function_call`, `custom_tool_call`, or `tool_search_call`;
 any accompanying visible answer is still validated. Structured requests are
 rejected at both API and worker admission when `ATOM_ENABLE_RELAXED_MTP=1`, since

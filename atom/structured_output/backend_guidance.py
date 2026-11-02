@@ -8,6 +8,46 @@ import json
 import torch
 
 
+class _VisibleAddedTokenAdapter:
+    """Keep HF's visible added tokens as literal bytes in the grammar trie."""
+
+    def __init__(self, tokenizer, source, vocab_size, visible):
+        self.source = source
+        self.eos_token_id = tokenizer.eos_token_id
+        self.bos_token_id = tokenizer.bos_token_id
+        self.tokens = [source.decode_bytes([i]) for i in range(vocab_size)]
+        self.special_token_ids = [
+            i
+            for i in range(vocab_size)
+            if source.is_special_token(i) and i not in visible
+        ]
+
+    def __call__(self, value):
+        return self.source.tokenize_bytes(value)
+
+
+def grammar_tokenizer(tokenizer, vocab_size, stop_ids):
+    from llguidance import LLTokenizer, TokenizerWrapper
+    from llguidance.hf import from_tokenizer
+
+    source = from_tokenizer(tokenizer, n_vocab=vocab_size, eos_token=stop_ids)
+    # llguidance 1.9.1 classifies HF added tokens as grammar specials even
+    # when HF marks them special=False. Its mask can then allow <think> as
+    # literal JSON text, but consume_token sees a special-token sentinel and
+    # rejects it. Preserve the model IDs/bytes and HF's visible-token contract.
+    visible = {
+        i
+        for i, token in tokenizer.backend_tokenizer.get_added_tokens_decoder().items()
+        if i < vocab_size and not token.special and source.is_special_token(i)
+    }
+    if not visible:
+        return source
+    adapter = _VisibleAddedTokenAdapter(tokenizer, source, vocab_size, visible)
+    return LLTokenizer(
+        TokenizerWrapper(adapter), n_vocab=vocab_size, eos_token=stop_ids
+    )
+
+
 class GrammarMatcher:
     def __init__(self, compiled):
         self.matcher = compiled.deep_copy()
