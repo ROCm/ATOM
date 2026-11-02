@@ -1,23 +1,31 @@
 name: Observe M3 PP4 experiment
 on:
   workflow_dispatch:
+    inputs:
+      experiment_run:
+        description: Existing M3 PP4 experiment run ID to observe
+        type: string
+        required: true
+        default: '41430932776'
 permissions:
   contents: read
 jobs:
   observe:
-    name: Read-only status for run 41430932776
+    name: Read-only status for run ${{ inputs.experiment_run }}
     runs-on: atomesh-cicd
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
       - name: Read matching Slurm status and shared logs
+        env:
+          OBSERVE_RUN_ID: ${{ inputs.experiment_run }}
         run: |
           export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
           python3 .github/scripts/observe_m31_pp.py | tee pp-observation.txt
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: pp-observation-41430932776
+          name: pp-observation-${{ inputs.experiment_run }}
           path: |
             pp-observation.txt
             observed-logs/

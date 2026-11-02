@@ -1,11 +1,13 @@
 """Read only the status and logs belonging to one existing PP experiment."""
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
 
-RUN = "41430932776"
+RUN = os.environ.get("OBSERVE_RUN_ID", "41430932776")
+assert RUN.isdigit(), "An existing numeric GitHub run ID is required"
 CASE = "m31-stack-mxfp4-pp4-index-freq4-equal-gsm8k20"
 print("Observed at", datetime.now(timezone.utc).isoformat(), flush=True)
 
