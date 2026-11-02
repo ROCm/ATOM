@@ -33,13 +33,10 @@ from atom.models.minimax_m3.mono.gfx1250.layout import (
     N_DN,
     N_ROUTER,
     SCORE_COPIES,
-    UG_PER_SLOT,
-    UG_ROWS,
     XN8_ROW,
     XSC_ROW,
 )
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
-    S13_BYTES,
     W2_BYTES,
     W13_BYTES,
     W13_ROWS,
@@ -57,11 +54,8 @@ from atom.mono.device.gfx1250 import (
     lds_addr,
     lds_barrier,
     lds_reads_done,
-    n32k4_word,
-    publish,
     release_stores,
     rows_to_lds_async,
-    shuffled_rows,
     wait_async,
     wmma_a8w4,
     xshfl,
@@ -94,8 +88,6 @@ def moe_wide_defs(k4ctx):
     MID_ROWS = k4ctx["MID_ROWS"]
     MID_ROW_WORDS = k4ctx["MID_ROW_WORDS"]
     ROUTE_ITERS = k4ctx["ROUTE_ITERS"]
-    UGW_ITERS = k4ctx["UGW_ITERS"]
-    UG_CPW = k4ctx["UG_CPW"]
     UG_PAIRS = k4ctx["UG_PAIRS"]
     U_MAX = k4ctx["U_MAX"]
     W_MIDSC = k4ctx["W_MIDSC"]
@@ -140,7 +132,6 @@ def moe_wide_defs(k4ctx):
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
-    SKIP = k4ctx["SKIP"]
     UGR = k4ctx["UGR"]
     UG_RING = k4ctx["UG_RING"]
     upart = k4ctx["upart"]
@@ -183,93 +174,9 @@ def moe_wide_defs(k4ctx):
                 fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + tot)
         lds_barrier()
 
-    def wug_load(t, has):
-        """Up / gate weights and scales of task t = (distinct expert t / 48, mid
-        rows 16 (t % 48) ..): [row group 2 cg + h][chunk]."""
-        u = t // UG_PER_SLOT
-        cg = t % UG_PER_SLOT
-        e_u = fx.max(fx.min(uniform(fx.ptr_load(uexp + u)), SHARED_EXPERT), 0)
-        r_w = rsrc(
-            w13 + fx.Int64(e_u) * W13_BYTES,
-            has.select(fx.Int32(W13_BYTES), fx.Int32(0)),
-        )
-        r_s = rsrc(s13, has.select(fx.Int32(S13_BYTES), fx.Int32(0)))
-        wts, scs = [], []
-        for h in range_constexpr(2):
-            rg = 2 * cg + h
-            wts.append([])
-            scs.append([])
-            for i in range_constexpr(UG_CPW):
-                kc = wave * UG_CPW + i
-                wts[h].append(shuffled_rows(r_w, rg, HIDDEN // 2, kc, lane, 64, CM_NT))
-                scs[h].append(
-                    n32k4_word(r_s, e_u * W13_ROWS + 16 * rg + l16, kc, HIDDEN)
-                )
-        return wts, scs
-
-    def wug_y(wts, scs):
-        """A task's up / gate GEMV for every token -> swiglu: thread (mid row r,
-        token k)'s value."""
-        col = fx.min(l16, tokens - 1)
-        acc = [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(2)]
-        sbs = [
-            lds_scale4(XSC_LDS + col * XSC_ROW + (wave * UG_CPW + i) * 4)
-            for i in range(UG_CPW)
-        ]
-        for i in range_constexpr(UG_CPW):
-            kc = wave * UG_CPW + i
-            xb = lds_b8(col * XN8_ROW + kc * 32)
-            for h in range_constexpr(2):
-                acc[h] = wmma_a8w4(wts[h][i], xb, acc[h], scs[h][i], sbs[i])
-        fx.ptr_store(acc[0], red + (wave * WAVE + lane) * 8)
-        fx.ptr_store(acc[1], fpool + (W_UPP + (wave * WAVE + lane) * 8))
-        lds_barrier()
-        r = tid % UG_ROWS
-        k = fx.min(tid // UG_ROWS, tokens - 1)
-        p = r % 8
-        first = r < 8
-        g = first.select(
-            acc_row_sum(red, 2 * p, k), acc_row_sum(fpool + W_UPP, 2 * p, k)
-        )
-        u = first.select(
-            acc_row_sum(red, 2 * p + 1, k), acc_row_sum(fpool + W_UPP, 2 * p + 1, k)
-        )
-        lds_barrier()
-        return swiglu_mul_batch([g], [u], fx.Float32(-swiglu_limit))[0]
-
     def fp8_lanes4(q):
         lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q, xshfl(q, 1), fx.Int32(0), False))
         return lo | (xshfl(lo, 2) << 16)
-
-    def wug_publish(pr, y_lo, y_hi):
-        u = pr // UG_PAIRS
-        blk_ = pr % UG_PAIRS
-        r = tid % UG_ROWS
-        k = fx.min(tid // UG_ROWS, tokens - 1)
-        lo = bf16_round(y_lo)
-        hi = bf16_round(y_hi)
-        sc, inv = mx8_scale([lo, hi], (1, 2, 4, 8))
-        words = [fp8_lanes4(mx8_q(v, inv)) for v in (lo, hi)]
-        e_u = fx.Int32(fx.ptr_load(uexp + u))
-        m_u = fx.Int32(fx.ptr_load(umask + u))
-        row = k * MOE_SLOTS + slot_of(k, e_u)
-        if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):
-            if r % 4 == 0:
-                for h in range_constexpr(2):
-                    bo.buffer_store(
-                        words[h],
-                        rsrc(mb("mid8p")),
-                        row * MID_ROW_WORDS + blk_ * 8 + h * 4 + r // 4,
-                        cache_modifier=CM_DEV,
-                    )
-            if r == 0:
-                bo.buffer_store(
-                    sc,
-                    rsrc(mb("midsp")),
-                    row * MIDSC_ROW_WORDS + blk_,
-                    cache_modifier=CM_DEV,
-                )
-        publish(mb_put, mr("ugdone"), pr, fx.Int32(1), tid == 0)
 
     def down_tables():
         """Distinct expert u's (mid row, route weight) of column k at entry
@@ -354,7 +261,7 @@ def moe_wide_defs(k4ctx):
         """Round r's block: the quarters summed in order, swiglu, the down stage's
         MXFP8 rows (thread (token tid / 32, block mid row lane): a wave is one
         token's 32 rows, the MXFP8 block; mid row m is pair m % 8 of row group
-        m // 8), as ``wug_publish`` writes them."""
+        m // 8)."""
         has, prc, u, e_u, _, _, _ = rounds[r]
         k = tid // WAVE
         m = lane
@@ -489,15 +396,7 @@ def moe_wide_defs(k4ctx):
             )
         n_pairs = (uniform(fx.ptr_load(uexp + NU_AT)) + 1) * UG_PAIRS
 
-        def task(it):
-            pr = fx.Int32(bid + it // 2 * G)
-            return fx.min(pr, n_pairs - 1) * 2 + it % 2, pr < n_pairs
-
-        if const_expr("ugold" in SKIP):
-            t0, h0 = task(0)
-            cur = wug_load(t0, h0)
-        else:
-            ug_state = wide_ug(n_pairs)  # the first chunks' loads out
+        ug_state = wide_ug(n_pairs)  # the first chunks' loads out
         down_tables()
         stamp(7)
         n_rt = N_ROUTER * tokens
@@ -516,28 +415,11 @@ def moe_wide_defs(k4ctx):
         ):
             rows_to_lds_async(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         lds_barrier()
-        if const_expr("ugold" in SKIP):
-            y_lo = fx.Float32(0.0)
-            for it in range_constexpr(UGW_ITERS):
-                t, has_t = task(it)
-                if const_expr(it + 1 < UGW_ITERS):
-                    tn, hn = task(it + 1)
-                    nxt = wug_load(tn, hn)
-                if has_t:
-                    y = wug_y(cur[0], cur[1])
-                    if const_expr(it % 2 == 0):
-                        y_lo = y
-                    else:
-                        wug_publish(t // 2, y_lo, y)
-                if const_expr(it + 1 < UGW_ITERS):
-                    cur = nxt
-        else:
-            wide_ug_run(ug_state)
+        wide_ug_run(ug_state)
         stamp(8)
-        if const_expr("wdown" not in SKIP):  # noqa: SIM102
-            if has_dn:
-                wide_down(td)
-                stamp(11)
+        if has_dn:
+            wide_down(td)
+            stamp(11)
 
     def wide_down(td):
         """Row group td * 2 + wave // 8's down GEMV over every distinct expert
@@ -720,10 +602,7 @@ def moe_wide_defs(k4ctx):
     return {
         "slot_of": slot_of,
         "build_experts": build_experts,
-        "wug_load": wug_load,
-        "wug_y": wug_y,
         "fp8_lanes4": fp8_lanes4,
-        "wug_publish": wug_publish,
         "down_tables": down_tables,
         "stage_moe_wide": stage_moe_wide,
         "wide_down": wide_down,

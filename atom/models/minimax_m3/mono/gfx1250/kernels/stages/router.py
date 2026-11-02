@@ -37,7 +37,6 @@ from atom.mono.device.ops import (
     rsrc,
     traced,
 )
-from atom.mono.device.sync import preg
 
 XN_SLICE = HIDDEN // N_ROUTER  # normalized-input elements a router task publishes
 EPL = N_ROUTED // WAVE  # experts a lane routes
@@ -48,22 +47,18 @@ GATE_ROUNDS = GATE_HALF // (WAVE * 8)  # 8 bf16 a lane a round
 @traced
 def router_defs(k4ctx):
     """``kernels.stages.router.router_defs`` on gfx1250."""
-    AG_RS = k4ctx["AG_RS"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
-    SY = k4ctx["SY"]
     WIDE = k4ctx["WIDE"]
     XN8_WORDS = k4ctx["XN8_WORDS"]
     XSC_WORDS = k4ctx["XSC_WORDS"]
     acquire = k4ctx["acquire"]
     bias = k4ctx["bias"]
     eps = k4ctx["eps"]
-    fuse_k1 = k4ctx["fuse_k1"]
     x8_in = k4ctx["x8_in"]
     g4 = k4ctx["g4"]
     g_post = k4ctx["g_post"]
     h_in = k4ctx["h_in"]
-    h_mid = k4ctx["h_mid"]
     k1_poll = k4ctx["k1_poll"]
     lane = k4ctx["lane"]
     mb = k4ctx["mb"]
@@ -81,7 +76,6 @@ def router_defs(k4ctx):
     shared_weight = k4ctx["shared_weight"]
     stamp = k4ctx["stamp"]
     start = k4ctx["start"]
-    sym = k4ctx["sym"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
     w_gate = k4ctx["w_gate"]
@@ -187,13 +181,13 @@ def router_defs(k4ctx):
             ]
             gp = ld_bf16x12(r_g, rw0)
             # x8_in: h_in is the previous launch's
-            if const_expr(fuse_k1 and not x8_in):
+            if const_expr(not x8_in):
                 if wave == 0:
                     k1_poll([(rdone_mb, k, 1)])
                 lds_barrier()
                 acquire()
             hres = ld_bf16x12(rsrc(h_in), k * (HIDDEN // 2) + rw0, CM_K1)
-            a_src = preg(sym, SY["a_ag"], "a_ag") if AG_RS else mr("a")
+            a_src = mr("a")
             arow = mb_poll(
                 [
                     (a_src, (k * HIDDEN + tid * RE) // 2 + 2 * h, 2)
@@ -207,24 +201,6 @@ def router_defs(k4ctx):
                 for qq in range(2)
                 for i, f in enumerate(bf2_f32(arow[h][qq]))
             ]
-            if const_expr(AG_RS):  # noqa: SIM102
-                if tid // (XN_SLICE // RE) == t:
-                    hw = (k * HIDDEN + tid * RE) // 2
-                    hi = (
-                        fx.Vector.from_elements(v, fx.Float32)
-                        .to(fx.BFloat16)
-                        .bitcast(fx.Int32)
-                    )
-                    bo.buffer_store(
-                        fx.Vector.from_elements([hi[e] for e in range(4)], fx.Int32),
-                        rsrc(h_mid),
-                        hw,
-                    )
-                    bo.buffer_store(
-                        fx.Vector.from_elements([hi[4], hi[5]], fx.Int32),
-                        rsrc(h_mid),
-                        hw + 4,
-                    )
             ssw = fx.Float32(0.0)
             for e in range_constexpr(RE):
                 ssw = fmath.fma(v[e], v[e], ssw)

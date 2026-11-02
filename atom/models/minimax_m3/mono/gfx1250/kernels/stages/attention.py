@@ -81,7 +81,6 @@ def split_defs(k4ctx):
     G = k4ctx["G"]
     acquire = k4ctx["acquire"]
     blk = k4ctx["blk"]
-    fuse_k1 = k4ctx["fuse_k1"]
     g4 = k4ctx["g4"]
     hdone_mb = k4ctx["hdone_mb"]
     hst = k4ctx["hst"]
@@ -121,23 +120,22 @@ def split_defs(k4ctx):
             t = ts % N_SPLIT
             task_blocks(tok, t)
             stamp(17)
-            if const_expr(fuse_k1):
-                # this token's q heads (lanes < H) and every token's new K / V
-                if wave == 0:
-                    k1_poll(
-                        [
-                            (
-                                hdone_mb,
-                                (lane < H).select(
-                                    tok * K1_HEAD_TASKS + lane, kv_task(lane - H)
-                                ),
-                                1,
+            # this token's q heads (lanes < H) and every token's new K / V
+            if wave == 0:
+                k1_poll(
+                    [
+                        (
+                            hdone_mb,
+                            (lane < H).select(
+                                tok * K1_HEAD_TASKS + lane, kv_task(lane - H)
                             ),
-                            (hdone_mb, kv_task(lane + WAVE - H), 1),
-                        ]
-                    )
-                lds_barrier()
-                acquire()
+                            1,
+                        ),
+                        (hdone_mb, kv_task(lane + WAVE - H), 1),
+                    ]
+                )
+            lds_barrier()
+            acquire()
             n_ctx = uniform(fx.ptr_load(blk + 16))
             pages = [uniform(fx.ptr_load(blk + j)) for j in range(PAGES)]
             page = pages[0]
@@ -412,13 +410,11 @@ def merge_defs(k4ctx):
 def o_defs(k4ctx):
     """``kernels.stages.attention.o_defs`` on gfx1250: a 16-row group's GEMV on 8
     waves, each two 16x16x128 FP8 WMMAs."""
-    AG_RS = k4ctx["AG_RS"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
     SY = k4ctx["SY"]
     W = k4ctx["W"]
     acquire = k4ctx["acquire"]
-    fuse_k1 = k4ctx["fuse_k1"]
     x8_in = k4ctx["x8_in"]
     g4 = k4ctx["g4"]
     h_in = k4ctx["h_in"]
@@ -432,9 +428,7 @@ def o_defs(k4ctx):
     merge_token = k4ctx["merge_token"]
     misc = k4ctx["misc"]
     mr = k4ctx["mr"]
-    peer_addr = k4ctx["peer_addr"]
     push_rows = k4ctx["push_rows"]
-    rank = k4ctx["rank"]
     rdone_mb = k4ctx["rdone_mb"]
     red = k4ctx["red"]
     s_o = k4ctx["s_o"]
@@ -502,61 +496,41 @@ def o_defs(k4ctx):
                 tot = acc_row_sum(red, rr, tk, [grp * GW + w for w in range(GW)])
                 fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
             lds_barrier()
-            push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None)
+            push_rows("attn", t * O_ROWS, O_ROWS)
             lds_barrier()
-            if const_expr(AG_RS):  # noqa: SIM102
-                if (t % W == rank) & (tid < O_ROWS // 2 * tokens):
-                    ptk = tid // (O_ROWS // 2)
-                    row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
-                    own = preg(sym, SY["attn"], "attn")
-                    t0, t1 = sum_partials(
-                        mb_poll,
-                        own,
-                        lambda src, k=ptk, r=row: (
-                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
-                        ),
-                        W,
+            if tid < O_ROWS // 2 * tokens:
+                ptk = tid // (O_ROWS // 2)
+                row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
+                # x8_in: h_in is the previous launch's
+                if const_expr(not x8_in):
+                    k1_poll([(rdone_mb, ptk, 1)])
+                    acquire()
+                hr = fx.Int32(
+                    bo.buffer_load(
+                        rsrc(h_in),
+                        (ptk * HIDDEN + row) // 2,
+                        vec_width=1,
+                        dtype=T.i32,
+                        cache_modifier=CM_K1,
                     )
-                    for w in range_constexpr(W):
-                        mb_put_bf(
-                            preg(peer_addr(w), SY["a_ag"], "a_ag"),
-                            ptk * HIDDEN + row,
-                            [t0, t1],
-                        )
-            if const_expr(not AG_RS):  # noqa: SIM102
-                if tid < O_ROWS // 2 * tokens:
-                    ptk = tid // (O_ROWS // 2)
-                    row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
-                    # x8_in: h_in is the previous launch's
-                    if const_expr(fuse_k1 and not x8_in):
-                        k1_poll([(rdone_mb, ptk, 1)])
-                        acquire()
-                    hr = fx.Int32(
-                        bo.buffer_load(
-                            rsrc(h_in),
-                            (ptk * HIDDEN + row) // 2,
-                            vec_width=1,
-                            dtype=T.i32,
-                            cache_modifier=CM_K1,
-                        )
-                    )
-                    own = preg(sym, SY["attn"], "attn")
-                    t0, t1 = sum_partials(
-                        mb_poll,
-                        own,
-                        lambda src, k=ptk, r=row: (
-                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
-                        ),
-                        W,
-                    )
-                    r0, r1 = bf2_f32(hr)
-                    a0 = bf16_round(t0) + r0
-                    a1 = bf16_round(t1) + r1
-                    mb_put_bf(mr("a"), ptk * HIDDEN + row, [t0, t1])
-                    bo.buffer_store(
-                        fx.Vector.from_elements([a0, a1], fx.Float32).to(fx.BFloat16),
-                        rsrc(h_mid),
-                        ptk * HIDDEN + row,
-                    )
+                )
+                own = preg(sym, SY["attn"], "attn")
+                t0, t1 = sum_partials(
+                    mb_poll,
+                    own,
+                    lambda src, k=ptk, r=row: (
+                        ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                    ),
+                    W,
+                )
+                r0, r1 = bf2_f32(hr)
+                a0 = bf16_round(t0) + r0
+                a1 = bf16_round(t1) + r1
+                mb_put_bf(mr("a"), ptk * HIDDEN + row, [t0, t1])
+                bo.buffer_store(
+                    fx.Vector.from_elements([a0, a1], fx.Float32).to(fx.BFloat16),
+                    rsrc(h_mid),
+                    ptk * HIDDEN + row,
+                )
 
     return {"stage_o": stage_o}

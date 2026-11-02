@@ -103,7 +103,6 @@ from atom.mono.plan.build_key import key_tuple, symbol_params
 from atom.mono.plan.execution import first_task
 from atom.mono.plan.trace import enter_stage
 from atom.mono.runtime.debug import region_ids
-from atom.utils import envs
 
 __all__ = ["K4_ABI", "TL_POINTS", "TL_RECORD", "build_post_attn_kernel"]
 
@@ -127,15 +126,12 @@ class K4Build:
     index_topk: bool = field(metadata={"sym": "it"})
     x8_in: bool = field(metadata={"sym": "xi"})
     timeline: bool = field(metadata={"sym": "tl"})
-    fuse_k1: bool
     sm_scale: float
     eps: float
     route_scale: float
     shared_weight: float
     swiglu_limit: float
     debug: bool
-    skip: str  # debug: stages replaced by no-ops (ATOM_MONO_G1250_SKIP)
-    tl_points: str  # debug: the timeline's points stamped (ATOM_MONO_TL_POINTS)
 
 
 def build_post_attn_kernel(
@@ -149,38 +145,33 @@ def build_post_attn_kernel(
     local_blocks: int,
     tokens: int = 1,
     timeline: bool = False,
-    fuse_k1: bool = False,
+    fuse_k1: bool = True,
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
     x8_in: bool = False,
 ):
-    """``kernels.post_attn.build_post_attn_kernel`` on gfx1250. ``x8_in``: K1 takes
-    the MXFP8 rows the previous layer's FFN finish made (every sparse layer but
-    the first); every layer's FFN finish makes them for the next."""
-    assert not x8_in or fuse_k1
+    """``kernels.post_attn.build_post_attn_kernel`` on gfx1250, K1 fused only (the
+    build the runner launches). ``x8_in``: K1 takes the MXFP8 rows the previous
+    layer's FFN finish made (every sparse layer but the first); every layer's FFN
+    finish makes them for the next."""
+    assert fuse_k1, "gfx1250 builds K4 with K1 fused only"
     assert 1 <= tokens <= MAX_TOKENS
     key = K4Build(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, index_topk=index_topk,
-        x8_in=x8_in, timeline=timeline, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
+        x8_in=x8_in, timeline=timeline, sm_scale=sm_scale, eps=eps, route_scale=route_scale,
         shared_weight=shared_weight, swiglu_limit=swiglu_limit, debug=debug,
-        skip=envs.ATOM_MONO_G1250_SKIP, tl_points=envs.ATOM_MONO_TL_POINTS,
     )  # fmt: skip
-    SKIP = set(key.skip.split(",")) - {""}
-    # a stamp stalls its wave on the clock read: fewer points, a timeline nearer
-    # the real kernel's (0 and TL_END always)
-    TL_SET = {int(p) for p in key.tl_points.split(",") if p} | {0, TL_END}
-    TL_ALL = not key.tl_points
     build_key = key_tuple(key, SOURCES)
     REGION_IDS = region_ids(
-        d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk)
+        d.name for d in mailbox_regions(tokens, heads.count, True, index_topk)
     )
     W = npes
     G = BLOCKS
     BASE = stage_bases(tokens)
     SY = sym_layout(W)
-    CM_K1 = 16 if fuse_k1 else 0  # SCOPE_DEV: K1's outputs are read device-coherent
+    CM_K1 = 16  # SCOPE_DEV: K1's outputs are read device-coherent
     WIDE = wide_moe(tokens)
     POOL = pool_words(tokens)
     U_MAX = TOP_K * tokens + 1
@@ -220,14 +211,12 @@ def build_post_attn_kernel(
         qs: fx.Array[fx.Float32, HEAD_DIM // 2 * tokens if heads.count == 1 else 1, 16]
 
     kernel_name = kernel_symbol(
-        "minimax_m3_mono_layer_g1250" if fuse_k1 else "minimax_m3_post_attn_g1250",
+        "minimax_m3_mono_layer_g1250",
         **symbol_params(key),
     )
     ih_count, ih_own = heads.count, heads.own
     QS_CP = tokens * HIDDEN // 4
-    assert not (fuse_k1 and heads.count > 1) or (
-        QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
-    )
+    assert heads.count == 1 or (QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL)
     assert POOL >= tokens * HIDDEN // 4  # K1's x8 rows
 
     _bc = dict(locals())
@@ -327,7 +316,8 @@ def build_post_attn_kernel(
         peer_dst = load_ptr64(peers, fx.min(wave, W - 1))
         # one-hop all-reduces at every width (gfx950 makes them RS + AG from 12
         # tokens): measured faster (bs 3 x 4 verify rows: 9.29 -> 8.47 ms a
-        # step), and the next-layer prep reads only the one-hop o output
+        # step), and the next-layer prep reads only the one-hop o output; the
+        # shared FFN reduce reads AG_RS (``ffn_reduce_defs``)
         AG_RS = False
 
         def peer_addr(w):
@@ -338,7 +328,7 @@ def build_post_attn_kernel(
 
         def stamp(k):
             """``timeline``: this wave passing point k (steady clock)."""
-            if const_expr(timeline and (TL_ALL or k in TL_SET)):
+            if const_expr(timeline):
                 fx.ptr_store(memrealtime(True), tls + (k * WAVES + wave))
 
         def block_max(v):
@@ -367,57 +357,52 @@ def build_post_attn_kernel(
             lds_barrier()
         stamp(0)
 
-        if const_expr(fuse_k1):
+        def k1_stamp(k):
+            """K1's points 1-4 and 6 on K4's free stamps 27-31."""
+            if const_expr(k in K1_STAMPS):
+                stamp(K1_STAMPS[k])
 
-            def k1_stamp(k):
-                """K1's points 1-4 and 6 on K4's free stamps 27-31."""
-                if const_expr(k in K1_STAMPS):
-                    stamp(K1_STAMPS[k])
-
+        (
+            ar_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, index_cache,
+            iq_out, scratch1, x8_prev, x8s_prev, ss_prev, h_next, x8_next,
+            x8s_next, ss_next, g_next,
+        ) = [load_ptr64(k1_args, i) for i in range(len(K1_ARGS_G1250))]  # fmt: skip
+        qs_k1 = lds.qs.ptr
+        if const_expr(ih_count > 1):
+            qs_k1 = fpool + QS_CP
+        emit_k1(
+            tid, bid, lane, wave, xs, red, qs_k1, k1_stamp, layer,
+            eps, index_scale_log2e(sm_scale), tokens, q_len, init_blocks,
+            local_blocks, IndexHeads(ih_count, ih_own),
             (
-                ar_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, index_cache,
-                iq_out, scratch1, x8_prev, x8s_prev, ss_prev, h_next, x8_next,
-                x8s_next, ss_next, g_next,
-            ) = [load_ptr64(k1_args, i) for i in range(len(K1_ARGS_G1250))]  # fmt: skip
-            qs_k1 = lds.qs.ptr
-            if const_expr(ih_count > 1):
-                qs_k1 = fpool + QS_CP
-            emit_k1(
-                tid, bid, lane, wave, xs, red, qs_k1, k1_stamp, layer,
-                eps, index_scale_log2e(sm_scale), tokens, q_len, init_blocks,
-                local_blocks, IndexHeads(ih_count, ih_own),
+                ar_in, res, h_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin,
+                positions, slot_mapping, k_cache, v_cache, k_scale, v_scale,
+                index_cache, q, iq_out, block_table, seq_lens, mb("iscore"), scratch1,
+            ),
+            bt_width,
+            True,
+            diag,
+            REGION_IDS,
+            index_topk,
+            x8_in=(
                 (
-                    ar_in, res, h_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin,
-                    positions, slot_mapping, k_cache, v_cache, k_scale, v_scale,
-                    index_cache, q, iq_out, block_table, seq_lens, mb("iscore"), scratch1,
-                ),
-                bt_width,
-                True,
-                diag,
-                REGION_IDS,
-                index_topk,
-                x8_in=(
-                    (
-                        x8_prev,
-                        x8s_prev,
-                        ss_prev,
-                        lds.ugring.ptr if WIDE else lds.k1xsc.ptr,
-                        lds.k1rst.ptr,
-                    )
-                    if x8_in
-                    else None
-                ),
-            )  # fmt: skip
-            lds_barrier()
-            k1_mbox = Mailbox(
-                layer, diag, REGION_IDS, gfx1250=True, steady=diag is not None
-            )
-            k1_poll = k1_mbox.poll
-            hdone_mb = sreg(scratch1, K1_SCRATCH_HDONE, "k1.hdone")
-            rdone_mb = sreg(scratch1, K1_SCRATCH_RDONE, "k1.rdone")
-        else:
-            k1_poll = hdone_mb = rdone_mb = None
-
+                    x8_prev,
+                    x8s_prev,
+                    ss_prev,
+                    lds.ugring.ptr if WIDE else lds.k1xsc.ptr,
+                    lds.k1rst.ptr,
+                )
+                if x8_in
+                else None
+            ),
+        )  # fmt: skip
+        lds_barrier()
+        k1_mbox = Mailbox(
+            layer, diag, REGION_IDS, gfx1250=True, steady=diag is not None
+        )
+        k1_poll = k1_mbox.poll
+        hdone_mb = sreg(scratch1, K1_SCRATCH_HDONE, "k1.hdone")
+        rdone_mb = sreg(scratch1, K1_SCRATCH_RDONE, "k1.rdone")
         seq_lens_k, n_blks, long_rows = step_rows(
             seq_lens, tokens, q_len, IndexHeads(ih_count, ih_own)
         )
@@ -436,23 +421,20 @@ def build_post_attn_kernel(
             enter_stage("select_long")
             stage_select_long()
         enter_stage("split")
-        if const_expr("split" not in SKIP):
-            stage_split()
+        stage_split()
         stamp(1)
 
         k4ctx.update(locals())
         k4ctx.update(merge_defs(k4ctx))
         stage_merge = k4ctx["stage_merge"]
         enter_stage("merge")
-        if const_expr("merge" not in SKIP):
-            stage_merge()
+        stage_merge()
 
         k4ctx.update(locals())
         k4ctx.update(o_defs(k4ctx))
         stage_o = k4ctx["stage_o"]
         enter_stage("o")
-        if const_expr("o" not in SKIP):
-            stage_o()
+        stage_o()
         stamp(4)
 
         XN8_WORDS = HIDDEN // 4
@@ -468,8 +450,7 @@ def build_post_attn_kernel(
         k4ctx.update(router_defs(k4ctx))
         stage_router = k4ctx["stage_router"]
         enter_stage("router")
-        if const_expr("router" not in SKIP):
-            stage_router()
+        stage_router()
         stamp(5)
 
         UG_KC = HIDDEN // 128
@@ -549,9 +530,6 @@ def build_post_attn_kernel(
 
         if const_expr(not WIDE):
             ffn_next_pre = None
-        # the next layer's buffers come with the fused K1's arguments
-        if const_expr(not fuse_k1):
-            ffn_next = ffn_next_pre = None
         k4ctx.update(locals())
         k4ctx.update(moe_common_defs(k4ctx))
         k4ctx.update(ffn_reduce_defs(k4ctx))
@@ -563,7 +541,6 @@ def build_post_attn_kernel(
         MIDSC_ROW_WORDS = INTER // 32
         W_MIDSC = (MID_ROWS + 1) * MID_ROW
         UG_PAIRS = UG_PER_SLOT // 2
-        UGW_ITERS = 2 * ((U_MAX * UG_PAIRS + G - 1) // G)
         assert DN_KC <= DN_GW
         ROUTE_ITERS = (tokens + WAVES - 1) // WAVES
 
@@ -576,8 +553,7 @@ def build_post_attn_kernel(
         stage_moe = k4ctx["stage_moe"]
 
         enter_stage("ug")
-        if const_expr("moe" not in SKIP):
-            (stage_moe_wide if WIDE else stage_moe)()
+        (stage_moe_wide if WIDE else stage_moe)()
         stamp(TL_END)
         if const_expr(timeline):
             lds_barrier()

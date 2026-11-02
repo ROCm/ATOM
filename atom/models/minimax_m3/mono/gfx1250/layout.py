@@ -10,7 +10,6 @@ halves (``kernels.stages.attention``).
 
 from atom.models.minimax_m3.mono.config import MOE_SLOTS, N_ROUTED
 from atom.models.minimax_m3.mono.layout import (  # noqa: F401
-    AG_RS_FROM,
     DN_ROWS,
     MID_ROW,
     MIDSC_ROW,

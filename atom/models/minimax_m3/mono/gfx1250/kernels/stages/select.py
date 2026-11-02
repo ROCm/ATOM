@@ -48,7 +48,6 @@ def select_defs(k4ctx):
     blk = k4ctx["blk"]
     block_table = k4ctx["block_table"]
     bt_width = k4ctx["bt_width"]
-    fuse_k1 = k4ctx["fuse_k1"]
     ih_count = k4ctx["ih_count"]
     ih_own = k4ctx["ih_own"]
     init_blocks = k4ctx["init_blocks"]
@@ -138,18 +137,12 @@ def select_defs(k4ctx):
         )
         # a pinned block's slot holds no score (index_key forces its key); past
         # n_blk the key is never read
-        if const_expr(fuse_k1):
-            # the scorers are CTAs of this launch: poll (a pinned block's slot
-            # polls a scored block's)
-            slot = fx.min(fx.max(b, init_blocks), n_blk - 1 - local_blocks)
-            word = fx.Int32(0)
-            if scored_k:
-                word = mb_poll([(iscore, slot, 1)])[0][0]
-        else:
-            # K1 (or a harness's scorer) wrote every score before this launch
-            word = fx.Int32(
-                bo.buffer_load(rsrc(iscore.value), 2 * b, vec_width=1, dtype=T.i32)
-            )
+        # the scorers are CTAs of this launch: poll (a pinned block's slot polls a
+        # scored block's)
+        slot = fx.min(fx.max(b, init_blocks), n_blk - 1 - local_blocks)
+        word = fx.Int32(0)
+        if scored_k:
+            word = mb_poll([(iscore, slot, 1)])[0][0]
         key = scored_k.select(index_key(b, word, n_blk), -b)
         live = b < n_blk
         (rank,) = rank_in_cta([(key, b, live)], n_blk)
@@ -294,15 +287,7 @@ def select_defs(k4ctx):
             ]
             out, out_slot = mr("sel_long"), part
             got_from = out
-        if const_expr(fuse_k1):
-            words = [w[0] for w in mb_poll([(src, sl, 1) for sl in slots])]
-        else:
-            words = [
-                fx.Int32(
-                    bo.buffer_load(rsrc(src.value), 2 * sl, vec_width=1, dtype=T.i32)
-                )
-                for sl in slots
-            ]
+        words = [w[0] for w in mb_poll([(src, sl, 1) for sl in slots])]
         # the share's entry tid + THREADS i is its block i of this thread's
         hs = [index_key(b, w, n_blk) for b, w in zip(blocks, words)]
         cnts = rank_in_cta(list(zip(hs, blocks, live)), hi - lo)
