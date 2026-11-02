@@ -35,7 +35,8 @@ from atom.distributed.dcp_utils import get_dcp_group
 from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
-from .rows import MFMA, NATURAL, IndexCache, IndexRows
+from .layout import MFMA, NATURAL
+from .rows import IndexCache, IndexRows
 
 # gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
 # included); it reads the same packed preshuffled pages as the Triton kernel

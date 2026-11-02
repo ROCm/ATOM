@@ -16,7 +16,7 @@ from aiter.ops.quant import dynamic_per_token_scaled_quant
 
 from atom.model_ops.v4_kernels import scale_indexer_weights
 
-from .rows import MFMA, NATURAL, PRESHUFFLE
+from .layout import MFMA, NATURAL, PRESHUFFLE
 
 
 def quantize_query(

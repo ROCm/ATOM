@@ -21,8 +21,8 @@ from typing import NamedTuple
 
 import torch
 
-FP4_FLYDSL = "preshuffle"
-FP4_OPUS = "natural"
+from atom.model_ops.indexer.layout import NATURAL as FP4_OPUS
+from atom.model_ops.indexer.layout import PRESHUFFLE as FP4_FLYDSL
 
 
 def fp4_index_layout_for_arch(arch):

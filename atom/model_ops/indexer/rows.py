@@ -20,11 +20,7 @@ from atom.model_ops.sparse_indexer_chunk import (
     qsplit_rows,
 )
 
-PRESHUFFLE = "preshuffle"
-# gfx1250: FP4 rows in natural order, scored by the OPUS kernels.
-NATURAL = "natural"
-# gfx950 OPUS: MFMA-permuted scales, distinct from FlyDSL's preshuffle.
-MFMA = "mfma"
+from .layout import MFMA, NATURAL, PRESHUFFLE
 
 # ATOM shares a TABLE schedule across V4 layers only for short decode groups.
 # Longer groups keep the config-selected mode; this is not a prefill detector.
