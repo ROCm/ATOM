@@ -186,6 +186,7 @@ class LLMEngine:
         self._structured_preflight = None
         self._structured_lock = threading.Lock()
         self.io_processor.structured_admission = self.prepare_structured_request
+        self.core_mgr.structured_request_prepare = self.bind_structured_requests
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -237,6 +238,17 @@ class LLMEngine:
             preflight.prepare_requests(key, request_ids)
         else:
             preflight.submit(*key).result()
+
+    def bind_structured_requests(self, seqs):
+        # Called by CoreManager only after frontend context validation, at the
+        # actual submission boundary. No worker matcher belongs to preprocessing.
+        for seq in seqs:
+            key = (
+                seq.json_schema,
+                seq.structured_tool_format,
+                seq.structured_reasoning_end,
+            )
+            self._structured_preflight.prepare_requests(key, (seq.id,))
 
     def add_request(
         self,
@@ -992,13 +1004,6 @@ class InputOutputProcessor:
             seq.arrive_time = time.time()
             seqs.append(seq)
 
-        if sampling_params.json_schema is not None:
-            self.structured_admission(
-                sampling_params,
-                kv_transfer_params,
-                multimodal_data is not None,
-                tuple(seq.id for seq in seqs),
-            )
         for seq in seqs:
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:

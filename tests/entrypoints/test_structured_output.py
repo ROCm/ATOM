@@ -287,3 +287,79 @@ def test_relaxed_mtp_rejected_on_execution_worker(monkeypatch):
     monkeypatch.setattr(envs, "ATOM_ENABLE_RELAXED_MTP", True)
     with pytest.raises(ValueError, match="relaxed MTP"):
         _compile_worker_grammar(NS(), "{}", None, "", "fingerprint", 10)
+
+
+@pytest.mark.parametrize("text", ['{"answer":42}', ""])
+@pytest.mark.parametrize("multi", [False, True])
+def test_chat_rejects_raw_grammar_error_before_success_normalization(text, multi):
+    from atom.entrypoints.openai.serving_chat import (
+        build_chat_response,
+        build_chat_response_multi,
+    )
+
+    output = {
+        "text": text,
+        "finish_reason": "structured_output_error",
+        "num_tokens_input": 1,
+        "num_tokens_output": 1,
+    }
+    with pytest.raises(RuntimeError, match="Structured decoding failed"):
+        if multi:
+            build_chat_response_multi(
+                "id", "model", [dict(output, finish_reason="stop"), output]
+            )
+        else:
+            build_chat_response("id", "model", text, output)
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_chat_stream_grammar_error_never_emits_success_even_after_valid_json(multi):
+    from atom.entrypoints.openai.serving_chat import (
+        stream_chat_response,
+        stream_chat_response_fanout,
+    )
+    from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
+
+    async def run():
+        collector = StreamOutputCollector("id")
+        cleaned = []
+        good = {"text": '{"answer":42}', "token_ids": [1], "finished": False}
+        error = {
+            "text": "",
+            "token_ids": [],
+            "finished": True,
+            "finish_reason": "structured_output_error",
+        }
+        if multi:
+            collector.put_nowait((0, good))
+            collector.put_nowait((1, error))
+            source = stream_chat_response_fanout(
+                "id",
+                "model",
+                collector,
+                [1, 2],
+                1,
+                lambda sid, **kw: cleaned.append(sid),
+                lambda *a: None,
+            )
+        else:
+            collector.put_nowait(good)
+            collector.put_nowait(error)
+            source = stream_chat_response(
+                "id",
+                "model",
+                collector,
+                1,
+                1,
+                lambda sid, **kw: cleaned.append(sid),
+                lambda *a: None,
+            )
+        frames = [f async for f in validate_chat_stream(source, '{"type":"object"}')]
+        assert set(cleaned) == ({1, 2} if multi else {1})
+        raw = "".join(frames)
+        assert "structured_output_error" in raw
+        assert '"finish_reason": "stop"' not in raw
+        assert '"finish_reason": "tool_calls"' not in raw
+        assert raw.count("[DONE]") == 1
+
+    asyncio.run(run())

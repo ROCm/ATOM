@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import json
+from collections import OrderedDict
 from types import SimpleNamespace as NS
 from typing import ClassVar
 
@@ -543,7 +544,7 @@ def test_admitted_matcher_survives_compilation_cache_eviction(controller):
     schema = '{"const":{"x":1}}'
     controller.fingerprint = "test-fingerprint"
     controller.compile(schema)
-    runner = NS(structured_output=controller)
+    runner = NS(structured_output=controller, structured_compilations=OrderedDict())
     assert prepare_worker_grammar(
         runner, schema, None, "", "test-fingerprint", 128, (11,)
     )["ready"]

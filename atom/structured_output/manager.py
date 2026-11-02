@@ -84,10 +84,22 @@ def _compile_worker_grammar(
     return result
 
 
+def _prune_compilations(runner):
+    # Remove completed records even if an older compilation is still running.
+    # Active futures remain owned until completion; cache hits must prune too.
+    records = runner.structured_compilations
+    for key, future in list(records.items()):
+        if len(records) <= 128:
+            break
+        if future.done():
+            records.pop(key)
+
+
 def prepare_worker_grammar(
     runner, schema, tool_format, reasoning_end, fingerprint, vocab_size, request_ids=()
 ):
     """Poll background compilation without blocking the worker's forward loop."""
+    _prune_compilations(runner)
     structured = getattr(runner, "structured_output", None)
     if (
         structured is not None
@@ -138,11 +150,7 @@ def prepare_worker_grammar(
         }
         structured.states.update(states)
     runner.structured_compilations.move_to_end(key)
-    while len(runner.structured_compilations) > 128:
-        oldest = next(iter(runner.structured_compilations))
-        if not runner.structured_compilations[oldest].done():
-            break
-        runner.structured_compilations.pop(oldest)
+    _prune_compilations(runner)
     return {"ready": True, "fingerprint": fingerprint, "vocab_size": vocab_size}
 
 

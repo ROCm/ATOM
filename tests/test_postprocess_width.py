@@ -188,7 +188,7 @@ def test_a_masked_row_still_reports_the_models_logprob(monkeypatch, with_schema)
             return {}
 
         runner.structured_output = types.SimpleNamespace(
-            vocab_size=8, apply=mask_schema_rows
+            vocab_size=8, apply=mask_schema_rows, errors={}
         )
 
     def force_column_zero(_batch, logits, *_args):

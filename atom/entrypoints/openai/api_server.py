@@ -818,6 +818,28 @@ def _send_stream_chunk_tagged(
     )
 
 
+async def _submit_engine_requests(seqs):
+    if not any(getattr(seq, "json_schema", None) is not None for seq in seqs):
+        engine.core_mgr.add_request(seqs)
+        return
+    # Admission RPCs must not block the API event loop. If the client cancels,
+    # settle the in-flight submission before aborting so it cannot enqueue later.
+    submission = asyncio.create_task(
+        asyncio.to_thread(engine.core_mgr.add_request, seqs)
+    )
+    try:
+        await asyncio.shield(submission)
+    except BaseException:
+        try:
+            await submission
+        finally:
+            for seq in seqs:
+                engine.core_mgr.abort_request(seq.id)
+                engine.io_processor.requests.pop(seq.id, None)
+                _seq_id_to_request_id.pop(seq.id, None)
+        raise
+
+
 async def generate_async(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -883,7 +905,7 @@ async def generate_async(
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
-    engine.core_mgr.add_request([seq])
+    await _submit_engine_requests([seq])
 
     _finished_ok = False
     try:
@@ -1006,7 +1028,7 @@ async def generate_async_multimodal(
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
-    engine.core_mgr.add_request([seq])
+    await _submit_engine_requests([seq])
 
     _finished_ok = False
     try:
@@ -1134,7 +1156,7 @@ async def generate_async_fanout(
         for seq in seqs:
             engine.io_processor.requests.pop(seq.id, None)
         raise
-    engine.core_mgr.add_request(seqs)
+    await _submit_engine_requests(seqs)
     num_tokens_input = seqs[0].num_prompt_tokens
 
     _all_finished = False
@@ -1349,7 +1371,7 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
-    engine.core_mgr.add_request([seq])
+    await _submit_engine_requests([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1567,7 +1589,7 @@ async def setup_streaming_request_fanout(
     logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
-    engine.core_mgr.add_request(seqs)
+    await _submit_engine_requests(seqs)
     return seq_ids, shared_collector, seqs[0].num_prompt_tokens
 
 

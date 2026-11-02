@@ -66,6 +66,16 @@ does not imply zero interference. Repeated schema/tool/reasoning configurations
 use bounded compilation caches. Ordinary requests do not
 initialize this path or perform these RPCs.
 
+Compilation-only preflight does not allocate request matchers. Binding happens at
+submission after the API has validated the tokenized context budget. Admission,
+completion, cancellation and failed submission share request ownership in the
+core manager. Cleanup reaches every DP replica used by collective preparation,
+including replicas that did not generate the request. Completion cleanup uses a
+fire-and-forget utility command so output receiver threads never wait for their
+own RPC replies. A cancelled API submission is settled before aborting its IDs,
+preventing an executor task from enqueueing after cancellation cleanup.
+
+
 Only local references are allowed, including references reached transitively
 through a local pointer into an otherwise literal `const` or `enum` value.
 Every runtime validator also disables external resource retrieval. Schema regexes

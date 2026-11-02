@@ -372,3 +372,111 @@ assert all(name not in sys.modules for name in ("torch", "llguidance", "jsonsche
     subprocess.run(
         [sys.executable, "-c", code], check=True, capture_output=True, text=True
     )
+
+
+def test_cleanup_method_is_allowed_by_collective_rpc():
+    from atom.model_engine.collective_rpc import COLLECTIVE_RPC_METHODS
+
+    assert "release_structured_requests" in COLLECTIVE_RPC_METHODS
+
+
+def test_cold_compile_cache_hit_prunes_completed_futures_without_losing_active_work():
+    from collections import OrderedDict
+    from concurrent.futures import Future
+
+    active = Future()
+    records = OrderedDict([(0, active)])
+    controller = NS(
+        fingerprint="fp", vocab_size=8, grammars={("{}", None, ""): object()}, states={}
+    )
+    runner = NS(structured_output=controller, structured_compilations=records)
+    for i in range(1, 300):
+        done = Future()
+        done.set_result(None)
+        records[i] = done
+        assert so.prepare_worker_grammar(runner, "{}", None, "", "fp", 8)["ready"]
+        assert len(records) <= 128
+        assert records[0] is active
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_submission_owns_matchers_and_releases_all_replicas(failure):
+    import threading
+
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    mgr = CoreManager.__new__(CoreManager)
+    mgr._structured_request_ids = set()
+    mgr._structured_request_lock = threading.Lock()
+    replicas = [{}, {}]
+    events = []
+    seq = NS(id=77, json_schema="{}", leave_reason="stop")
+
+    def prepare(seqs):
+        events.append("prepare")
+        for replica in replicas:
+            replica[77] = object()
+        if failure:
+            raise ValueError("one rank failed")
+
+    mgr.structured_request_prepare = prepare
+    mgr._add_prepared_requests = lambda seqs: events.append("enqueue")
+
+    def broadcast(cmd, **kw):
+        assert cmd == "release_structured_requests"
+        for replica in replicas:
+            for i in kw["request_ids"]:
+                replica.pop(i, None)
+
+    mgr.broadcast_utility_command = broadcast
+    mgr._seq_id_to_callback = {}
+    if failure:
+        with pytest.raises(ValueError):
+            mgr.add_request([seq])
+        assert events == ["prepare"]
+    else:
+        mgr.add_request([seq])
+        assert events == ["prepare", "enqueue"]
+        assert all(77 in r for r in replicas)
+        mgr._deliver_terminal_output(seq)
+        mgr._deliver_terminal_output(seq)  # completion cleanup is idempotent
+    assert not mgr._structured_request_ids
+    assert all(not replica for replica in replicas)
+
+
+def test_api_cancel_waits_for_submission_before_aborting(monkeypatch):
+    import threading
+
+    from atom.entrypoints.openai import api_server
+
+    entered, release = threading.Event(), threading.Event()
+    events = []
+    seq = NS(id=77, json_schema="{}")
+
+    def submit(seqs):
+        entered.set()
+        assert release.wait(3)
+        events.append("enqueued")
+
+    engine = NS(
+        core_mgr=NS(
+            add_request=submit, abort_request=lambda i: events.append("aborted")
+        ),
+        io_processor=NS(requests={77: seq}),
+    )
+    monkeypatch.setattr(api_server, "engine", engine)
+
+    async def run():
+        task = asyncio.create_task(api_server._submit_engine_requests([seq]))
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert events == ["enqueued", "aborted"]
+    assert not engine.io_processor.requests

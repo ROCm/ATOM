@@ -96,9 +96,13 @@ def structured_response_channel(channel, schema):
     return replace(channel, literal_answer=True) if schema is not None else channel
 
 
-def validate_output(schema, text, finish_reason, *, tool_calls=False):
-    if schema is not None and finish_reason == "structured_output_error":
+def raise_for_structured_error(finish_reason):
+    if finish_reason == "structured_output_error":
         raise RuntimeError("Structured decoding failed for this request")
+
+
+def validate_output(schema, text, finish_reason, *, tool_calls=False):
+    raise_for_structured_error(finish_reason)
     if schema is None or finish_reason in {"length", "max_tokens", "max_new_tokens"}:
         return
     if tool_calls and not text.strip():
