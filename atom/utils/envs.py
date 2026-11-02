@@ -936,6 +936,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
+    # Opt-in VMM exchange for a same-node gfx1250 DP4 BF16 decode head.
+    # The runner allocates the pool before capture; unsupported heads fall back.
+    "ATOM_DP_LOGITS_PEER_EXCHANGE": lambda: (
+        os.getenv("ATOM_DP_LOGITS_PEER_EXCHANGE", "0") == "1"
+    ),
     # Pure-DP LM head strategy (only active when the model TP group is size 1 and
     # the DP group is size > 1, i.e. pure DP attention on decode; every other
     # case — TP>1, DP off, prefill, ragged/draft rows — auto-falls back to the

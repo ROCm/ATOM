@@ -640,3 +640,24 @@ Set on the decode side; the prefill side follows what each write request offers 
 | **ATOM_MORIIO_VERIFY** | bool | 0 | Debugging. Digest each layer's destination blocks before and after every receive and log, per request, the layers the transfer left unchanged. Costs a device sync per request, and allocates an int64 weight per destination byte (about 150 MB for a 32k-token MLA fp8 prompt) on the worker loop, so it is not meant for runs under load. |
 
 A failed receive, in either mode, holds its blocks `ATOM_PD_FAILED_WRITE_HOLD_S` before the failure is reported: MoRI marks a batch failed on its first failed work request while the rest of it may still be in flight.
+
+### DP logits peer exchange
+
+`ATOM_DP_LOGITS_PEER_EXCHANGE=1` enables an experimental, same-node gfx1250
+DP4 BF16 decode-head exchange with `ATOM_DP_LM_HEAD_MODE=allgather`.
+The default is `0`. Each rank reads only its own request rows from the four
+vocabulary shards, writing directly to the sampler layout. The GEMM and
+sampling rules are unchanged; logits are transported as raw 64-bit words.
+
+The runner allocates a fixed VMM pool before graph capture and reuses the
+existing AITER communicator for stream-ordered publish and reuse barriers.
+The communicator itself may use either IPC or VMM transport. Every rank must
+use the same setting. TBO decode is rejected because concurrent streams cannot
+share this pool. Unsupported heads and rows outside the reserved capacity
+retain the original exchange. Prefill and draft heads retain their existing
+paths. Eager-only runs do not prepare the pool.
+
+The pool reserves `4 * max_rows * vocab_shard * 2` bytes per rank, where
+`max_rows` is the largest reachable decode graph batch times the maximum
+verification query length. For 384 rows and a 32,320-column vocabulary shard,
+this is approximately 94.7 MiB per rank, excluding output buffers.
