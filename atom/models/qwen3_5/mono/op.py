@@ -9,6 +9,7 @@ from typing import ClassVar
 
 import torch
 
+from atom.models.qwen3_5.mono.config import StepInputError
 from atom.models.qwen3_5.mono.kernels.layer import build_qwen35_kernel
 from atom.models.qwen3_5.mono.layout import layout, mailbox_regions, shape_dims
 from atom.models.qwen3_5.mono.weights import LayerWeights
@@ -125,10 +126,6 @@ class Qwen35Variant:
             self.mailboxes is not None
         ), "a runner's variant: the runner begins its steps"
         self.mailboxes.begin_step()
-
-
-class StepInputError(ValueError):
-    """A step's tensors are not what the kernel addresses: the step keeps the original path."""
 
 
 class Qwen35MonoKernel:

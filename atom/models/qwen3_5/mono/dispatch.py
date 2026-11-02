@@ -30,9 +30,9 @@ from atom.models.qwen3_5.mono.config import (
     MAX_TOKENS,
     MAX_VERIFY_TOKENS,
     Q35Config,
+    StepInputError,
 )
 from atom.models.qwen3_5.mono.layout import BS
-from atom.models.qwen3_5.mono.op import StepInputError
 from atom.mono.plan.shard import Shard, ShardError
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import common_refusals, first_refusal

@@ -43,6 +43,10 @@ GLUON_VERIFY_TOKENS = 4
 MAX_VERIFY_TOKENS = 6
 
 
+class StepInputError(ValueError):
+    """A step's tensors are not what the kernel addresses: the step keeps the original path."""
+
+
 def is_full_attention(layer_id: int) -> bool:
     return (layer_id + 1) % FULL_ATTENTION_INTERVAL == 0
 
