@@ -37,6 +37,14 @@ on:
         required: false
         default: 'rocm/atom-dev:latest'
         type: string
+      aiter_source:
+        description: 'Where aiter comes from: the aiter main nightly wheel, or the build already in atom_base_image. The nightly wheel links the libtorch it was built against, so a base image with a different torch needs "image".'
+        required: false
+        default: 'nightly-wheel'
+        type: choice
+        options:
+          - nightly-wheel
+          - image
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
@@ -111,7 +119,7 @@ jobs:
           CHECK_SIGNAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
   download_aiter_wheel:
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' && inputs.aiter_source != 'image' }}
     needs: [ci-gate, check-signal]
     name: Download aiter wheel
     runs-on: ubuntu-latest
@@ -263,7 +271,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
+    if: ${{ !cancelled() && needs.ci-gate.outputs.should_run == 'true' && (needs.download_aiter_wheel.result == 'success' || (inputs.aiter_source == 'image' && needs.download_aiter_wheel.result == 'skipped')) && needs.load-test-models.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     permissions:
       actions: read
@@ -456,6 +464,7 @@ jobs:
           EOF
 
       - name: Download aiter wheel
+        if: ${{ inputs.aiter_source != 'image' }}
         timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -498,6 +507,7 @@ jobs:
         run: bash .github/scripts/collect_gpu_info.sh "$CONTAINER_NAME" docker "${{ matrix.runner }}"
 
       - name: Install aiter from wheel
+        if: ${{ inputs.aiter_source != 'image' }}
         run: bash .github/scripts/install_aiter_wheel.sh
 
       - name: Install ATOM and dependencies
