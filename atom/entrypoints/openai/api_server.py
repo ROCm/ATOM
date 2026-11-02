@@ -1693,8 +1693,9 @@ async def _forward_to_frontend_hub(request: Request, call_next):
         )
     try:
         return await _relay_to_hub(request)
-    except aiohttp.ClientConnectionError:
-        # Workers serve before the hub binds its socket, and after it exits.
+    except aiohttp.ClientError:
+        # Workers serve before the hub binds its socket and after it exits,
+        # and the hub can go away mid-reply.
         return JSONResponse({"detail": "Engine hub is not serving"}, status_code=503)
 
 
