@@ -222,12 +222,22 @@ Engine memory under an MP transfer (PAGE sources, restore destinations,
 checkpoint pins, descriptor slots) is released only on a terminal report from
 the server. A timeout cannot prove that a remote DMA stopped, so no clock ever
 frees it. Instead, a transfer that is still not terminal after
-`lmcache.mp.transfer_deadline_s` (default 1200 s) is fatal: the worker, or the
-scheduler for a report that never arrives, raises `LMCacheTransferUnprovable`
-and the engine stops. This covers a submission that raised, a future whose
-poll keeps raising, a restore whose event cannot be queried, and a lost or
-never-aggregated completion. The engine-wide stalled-save reclaim leaves MP
-leases alone for the same reason.
+`lmcache.mp.transfer_deadline_s` (default 30 s) is fatal: the worker raises
+`LMCacheTransferUnprovable` and the engine stops. This is a per-transfer deadline
+from submission, including time queued at the MP server, not a model request
+timeout or a heartbeat timeout. It also catches a live server whose ZMQ handler
+failed without replying; no LMCache transport changes are required. The scheduler
+independently watches dispatched operations with an additional 10 s margin for
+lost or never-aggregated completion reports. These checks run when the respective
+worker/scheduler polls completions; they are not an independent watchdog for a
+blocked process. A future query/result exception stops the engine immediately.
+The engine-wide stalled-save reclaim leaves MP leases alone for the same reason.
+
+Set `"lmcache.mp.transfer_deadline_s": 180` in `kv_connector_extra_config`, for
+example, if measured normal transfer/queue latency on a slower storage tier
+requires a longer deadline. The value must be finite and positive. The default
+is a failure-detection policy, not a guarantee that every overloaded deployment
+can complete transfers within 30 s.
 
 The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the
