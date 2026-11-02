@@ -57,6 +57,7 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: Any | None = None
     metadata: dict | None = None
+    output_config: dict | None = None
     thinking: dict | None = None  # {"type":"enabled","budget_tokens":N}
     kv_transfer_params: dict | None = None  # PD handoff metadata, as on chat
 

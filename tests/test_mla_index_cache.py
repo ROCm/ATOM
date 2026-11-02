@@ -198,8 +198,10 @@ def _builder(
             hf_config=hf_config,
             kv_cache_dtype="fp8",
             speculative_config=SimpleNamespace(
+                # an MTP draft of a sparse target: the target's indexer fields
                 draft_model_hf_config=SimpleNamespace(
                     num_nextn_predict_layers=1,
+                    index_topk=2048,
                 ),
                 use_dspark_with_draft=lambda: False,
             ),

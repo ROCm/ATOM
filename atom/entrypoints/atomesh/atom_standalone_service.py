@@ -59,7 +59,9 @@ from atom.entrypoints.openai.serving_completion import (
 from atom.entrypoints.openai.sse import data_frame
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.registry import (
+    channel_for_request,
     forbids_tool_calls,
+    required_call_channel,
     resolve_tool_call_parser,
 )
 from atom.model_engine.sequence import new_token_ids
@@ -1198,6 +1200,10 @@ class AtomStandaloneService:
         self.tool_parser_cls = resolve_tool_call_parser(
             tool_call_parser, tokenizer, self.custom_message_encoder, model=model_name
         )
+        # What `tool_choice="required"` holds output to, derived once with it.
+        self.required_tool_channel = required_call_channel(
+            self.tool_parser_cls, tokenizer
+        )
 
         self.engine_service = AtomEngineService(engine, tokenizer)
 
@@ -1263,7 +1269,9 @@ class AtomStandaloneService:
                 request_data.get("n"),
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
-            sampling_params = self._build_sampling_params(request_data, effective_n)
+            sampling_params = self._build_sampling_params(
+                request_data, effective_n, chat=True
+            )
             data_parallel_rank = self._get_data_parallel_rank(request_data)
             request_id = f"chatcmpl-{uuid.uuid4().hex}"
             if effective_n > 1:
@@ -1480,7 +1488,9 @@ class AtomStandaloneService:
                 request_data.get("n"),
                 request_data.get("temperature", DEFAULT_TEMPERATURE),
             )
-            sampling_params = self._build_sampling_params(request_data, effective_n)
+            sampling_params = self._build_sampling_params(
+                request_data, effective_n, chat=True
+            )
             request_id = f"chatcmpl-{uuid.uuid4().hex}"
             stream_queue = self.engine_service.start_stream(
                 prompt,
@@ -1670,7 +1680,20 @@ class AtomStandaloneService:
         self,
         request: dict[str, Any] | CompletionRequest,
         effective_n: int,
+        *,
+        chat: bool = False,
     ) -> SamplingParams:
+        # Only a chat request can be held to the tools channel, as on the
+        # OpenAI server: a completion's prompt is not in the chat format.
+        required_channel = (
+            channel_for_request(
+                self.required_tool_channel,
+                self._request_field(request, "tool_choice"),
+                self._request_field(request, "tools"),
+            )
+            if chat
+            else None
+        )
         return _build_sampling_params(
             temperature=self._request_field(
                 request, "temperature", DEFAULT_TEMPERATURE
@@ -1683,6 +1706,7 @@ class AtomStandaloneService:
             top_k=self._request_field(request, "top_k", DEFAULT_TOP_K),
             top_p=self._request_field(request, "top_p", DEFAULT_TOP_P),
             n=effective_n,
+            required_channel=required_channel,
         )
 
     @staticmethod
