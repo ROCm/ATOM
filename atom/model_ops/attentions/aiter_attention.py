@@ -11,7 +11,10 @@ import triton
 import triton.language as tl
 from aiter.dist.parallel_state import get_tp_group
 
-from atom.config import _is_minimax_m3_config
+from atom.config import (
+    _is_minimax_m3_config,
+    minimax_m3_prefill_token_graph_refusal,
+)
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mha import PagedAttentionImpl, use_pa_decode_bf16_asm
 from atom.utils import CpuGpuBuffer, envs, pack_rows, upload_numpy
@@ -189,6 +192,23 @@ class AiterBackend(AttentionBackend):
         )
 
 
+def _m3_prefill_token_graph_enabled(has_sparse_attention: bool, config) -> bool:
+    """Whether a MiniMax-M3 builder records and replays prefill token graphs:
+    only when asked for (`ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH`) and the
+    deployment is one `minimax_m3_prefill_token_graph_refusal` admits."""
+    if not (has_sparse_attention and envs.ATOM_MINIMAX_M3_PREFILL_TOKEN_GRAPH):
+        return False
+    refusal = minimax_m3_prefill_token_graph_refusal(config)
+    if refusal is not None:
+        logger.warning("MiniMax-M3 prefill token graphs refused: %s", refusal)
+        return False
+    logger.info(
+        "MiniMax-M3 prefill token graphs enabled for buckets %s",
+        envs.ATOM_TOKEN_GRAPH_SIZES,
+    )
+    return True
+
+
 class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     # Whose kernels this builder feeds. Read for `attn_block_size` below, so a
     # subclass that names another backend gets that backend's rule -- naming
@@ -213,6 +233,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         sparse_cfg = getattr(text_config, "sparse_attention_config", None)
         self._has_sparse_attention = bool(sparse_cfg) and _is_minimax_m3_config(
             hf_config
+        )
+        self._m3_prefill_token_graph = _m3_prefill_token_graph_enabled(
+            self._has_sparse_attention, model_runner.config
         )
         # The backend's own, from the one rule `make_kv_pool` also reads, so a
         # draft resolving here gets it from its own config the same way.
@@ -1522,6 +1545,45 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
             )
         return attn
+
+    # MiniMax-M3 sizes every launch outside its attention regions by the token
+    # count alone, so its prefill may pad to a recorded token-graph bucket. The
+    # other models this builder and its subclasses serve (plain MHA, GDN,
+    # Qwen4Exp) keep eager prefills.
+    @property
+    def supports_token_graph(self) -> bool:
+        return getattr(self, "_m3_prefill_token_graph", False)
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        if (
+            self.supports_token_graph
+            and batch.total_tokens_num_prefill > 0
+            and getattr(batch, "multimodal_data", None)
+        ):
+            return True
+        return super().step_needs_eager(batch)
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A request-less prefill of ``tokens`` rows for recording that
+        token-graph bucket. A dummy step: attention hands back its output
+        shape and writes no KV or index cache -- a replay runs it on the live
+        step."""
+        if not 0 < tokens <= self.model_runner.config.max_num_batched_tokens:
+            raise ValueError(
+                f"token-graph bucket {tokens} exceeds max_num_batched_tokens"
+            )
+        positions = self.model_runner.forward_vars["positions"].gpu[:tokens]
+        positions.zero_()
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
+        return AttentionMetaData(max_seqlen_q=tokens, max_seqlen_k=tokens), context
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
