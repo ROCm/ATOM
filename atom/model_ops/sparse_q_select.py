@@ -311,8 +311,9 @@ def _dspark_q_finalize(
         probs = tl.load(q_probs_ptr + base + slots, mask=mask, other=0.0) * inv_total
         tl.store(q_probs_ptr + base + slots, probs, mask=mask)
         ids = tl.load(q_ids_ptr + base + slots, mask=mask, other=0)
-        # The verify's race and tie rule (`softmax_tiles`). Stored ids are in
-        # slot order, not id order, so chunks merge on the id below.
+        # The verify's race and tie rule (`softmax_tiles`). Stored ids ascend
+        # with slot (compaction order), so a later chunk wins only on a
+        # strictly larger key, as the lowest-id tie rule requires.
         key = race_key(probs, seed, noise_base, ids, mask)
         chunk_best, chunk_id = argmax_lowest_id(key, ids, mask, 2147483647)
         chunk_slot = tl.min(
