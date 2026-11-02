@@ -632,7 +632,15 @@ def weight_is_stored_preshuffled(
     side backwards.
     """
     if native_group_rows is not None:
-        if native_group_rows != 32 or params_dtype != dtypes.fp8:
+        if params_dtype != dtypes.fp8:
+            return False
+        if native_group_rows == 1:
+            # 1x32 (MXFP8): AITER's preshuffled group32 GEMM reads it on gfx950
+            # (FlyDSL MXFP8 bmm / mxpsh, picked by its mxscale tuned table).
+            from aiter.jit.utils.chip_info import get_gfx
+
+            return envs.ATOM_MXFP8_1X32_PRESHUFFLE and get_gfx() == "gfx950"
+        if native_group_rows != 32:
             return False
         if needs_preshuffled_weight:
             return True
