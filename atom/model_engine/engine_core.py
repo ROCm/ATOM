@@ -31,7 +31,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
-from atom.observability import tracing
+from atom.observability import timeline, tracing
 from atom.utils import (
     engine_process_name,
     envs,
@@ -73,6 +73,8 @@ class EngineCore:
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
+        # Sequences whose first stream output went out (ATOM_REQ_TIMELINE only).
+        self._timeline_streamed: set[int] = set()
         self.stream_output_queue = (
             queue.Queue()
         )  # Queue for streaming intermediate outputs
@@ -475,6 +477,7 @@ class EngineCore:
             self.runner_mgr.call_func("release_multimodal_requests", request_ids)
 
     def _process_engine_step_inner(self):
+        step_t0 = time.time()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -507,6 +510,15 @@ class EngineCore:
 
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
+        step_key = None
+        if has_seqs and timeline.enabled():
+            self._timeline_step = getattr(self, "_timeline_step", 0) + 1
+            kind = "P" if scheduled_batch.total_seqs_num_prefill else "D"
+            step_key = (
+                f"e{self._timeline_step}:{kind}{scheduled_batch.total_tokens_num}"
+            )
+            timeline.mark(step_key, "step_start", step_t0)
+            timeline.mark(step_key, "scheduled")
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             tracing.record_forward(scheduled_batch, seqs)
@@ -514,6 +526,8 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if step_key is not None:
+                timeline.mark(step_key, "forwarded")
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -531,6 +545,8 @@ class EngineCore:
             return False
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
+        if step_key is not None:
+            timeline.mark(step_key, "postprocessed")
         return True
 
     def _postprocess(self, seqs, fwd_out, batch):
@@ -775,6 +791,10 @@ class EngineCore:
                     if request_type == EngineCoreRequestType.ADD:
                         attach_shipped_chains(reqs, *chains)
                         tracing.enqueue_many(reqs, received_at=received_at)
+                        if timeline.enabled():
+                            now = time.time()
+                            for req in reqs:
+                                timeline.mark(req.id, "eng_recv", now)
                         for req in reqs:
                             SchedulerMetrics.enqueue(req, received_at=received_at)
                         req_ids = [req.id for req in reqs]
@@ -809,6 +829,13 @@ class EngineCore:
                     stream_outputs = item[1]
                     obj = pickle.dumps((EngineCoreRequestType.STREAM, stream_outputs))
                     socket.send(obj)
+                    if timeline.enabled():
+                        for seq_id, request_output in stream_outputs:
+                            if seq_id not in self._timeline_streamed:
+                                self._timeline_streamed.add(seq_id)
+                                timeline.mark(seq_id, "stream_sent")
+                            if request_output.finished:
+                                self._timeline_streamed.discard(seq_id)
                     continue
 
                 if isinstance(item, tuple) and item[0] == "READY":

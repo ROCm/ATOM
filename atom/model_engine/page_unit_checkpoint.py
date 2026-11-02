@@ -14,10 +14,17 @@ from time import monotonic
 from atom.kv_transfer.disaggregation.types import StateStoreOperationId
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.sequence import Sequence
+from atom.utils import envs
 
 _CHANGE_LOG_LIMIT = 4096
 
 logger = logging.getLogger("atom")
+
+
+def _release_any(_prefix_hash: int) -> bool:
+    """A GPU-only image budget may release any eligible image."""
+    return True
+
 
 #: How many reclaimed store operations to remember. Only has to outlive a
 #: report already on the wire, which is one step, so this is generous.
@@ -129,6 +136,13 @@ class CheckpointRecord:
     unit_ids: tuple[int, ...]
     state: str = COPYING
     pin_count: int = 0
+    # A later image of the same conversation exists: the seq that wrote this
+    # one filed a later boundary, or the next turn resumed from it and filed
+    # its own. A budget trim releases these first (`trim_to_budget`).
+    superseded: bool = False
+    # Restores served. More than one means several conversations resume here
+    # (a shared prefix), so nothing supersedes it.
+    restores: int = 0
 
 
 @dataclass(frozen=True)
@@ -193,6 +207,9 @@ class PageUnitCheckpointStore:
         self._inflight_restores: list[int] = []
         self._next_checkpoint_id = 0
         self.evictions = 0
+        # Diagnostics (ATOM_STATE_CHECKPOINT_DIAG): told of every image released,
+        # with whether `unindex` (its prefix left the KV index) released it.
+        self.on_evict: Callable[[CheckpointRecord, bool], None] | None = None
         # Checkpoints that reached READY and have not been offered to the CPU
         # tier yet. Candidates only: NOT pinned, so one still counts as free
         # space and `_next_victim` may spend it. The pin is taken later, in
@@ -378,27 +395,52 @@ class PageUnitCheckpointStore:
             layout_id=self.spec.layout_id,
         )
 
-    def trim_offloaded(
-        self, max_entries: int, can_serve: Callable[[int], bool]
+    def trim_to_budget(
+        self, max_entries: int, can_release: Callable[[int], bool]
     ) -> None:
-        """Release old GPU images backed by the tier, without touching live DMA.
+        """Release the oldest GPU images past `max_entries`, never live DMA.
 
         The pool's free list includes cached KV. Waiting for it to empty lets
-        checkpoint images displace reusable KV even after those images were
-        stored on CPU. This optional soft budget spends only unpinned READY
-        images whose successful store is still advertised by the tier. Copies,
+        checkpoint images displace reusable KV. This soft budget spends only
+        unpinned READY images, least recently used first, and of those only
+        the ones `can_release` allows: with the CPU tier, those whose
+        successful store the tier still advertises; without it, any. Copies,
         restores and unconfirmed stores may temporarily exceed the budget.
-        A later CPU eviction is handled by the existing failed-load/recompute
-        path; tier membership is optimistic, just as for ordinary eviction.
+        A released image a later prefix would have resumed from costs that
+        prefix a recompute from an earlier boundary, as ordinary eviction does
+        (and, with the tier, a load when it still holds the image).
         """
         if max_entries <= 0 or len(self.records) <= max_entries:
             return
-        for checkpoint_id in list(self._lru):
-            if len(self.records) <= max_entries:
-                break
-            record = self.records[checkpoint_id]
-            if self._is_evictable(checkpoint_id) and can_serve(record.prefix_hash):
-                self._evict(checkpoint_id)
+        # Superseded images first, then the rest; least recently used first in
+        # each. The images a live conversation will resume from are its chain's
+        # root and tip, which nothing has superseded, so age alone does not
+        # release them while older generations of other conversations remain.
+        for superseded_only in (True, False):
+            for checkpoint_id in list(self._lru):
+                if len(self.records) <= max_entries:
+                    return
+                record = self.records.get(checkpoint_id)
+                if record is None or (superseded_only and not record.superseded):
+                    continue
+                if self._is_evictable(checkpoint_id) and can_release(
+                    record.prefix_hash
+                ):
+                    self._evict(checkpoint_id)
+
+    def mark_superseded(self, prefix_hash: int, max_restores: int = 1) -> None:
+        """Mark the image at `prefix_hash` as no longer a resume point.
+
+        Unless more than `max_restores` requests resumed from it: a shared
+        prefix's image (the system prompt, say) stays an ordinary LRU candidate.
+        A later restore clears the mark (`begin_restore`).
+        """
+        checkpoint_id = self.lookup(prefix_hash)
+        if checkpoint_id < 0:
+            return
+        record = self.records[checkpoint_id]
+        if record.restores <= max_restores:
+            record.superseded = True
 
     def restore_queued_for(self, dst_slot: int) -> bool:
         """Whether a queued restore will write `dst_slot` on the next batch."""
@@ -412,6 +454,8 @@ class PageUnitCheckpointStore:
             return None
         record = self.records[checkpoint_id]
         record.pin_count += 1
+        record.restores += 1
+        record.superseded = False  # resumed from, so still a resume point
         self._lru.move_to_end(checkpoint_id)
         op = CheckpointRestoreOp(
             dst_slot=dst_slot,
@@ -864,6 +908,8 @@ class PageUnitCheckpointStore:
         record = self.records.get(checkpoint_id)
         if record is None:
             return False
+        if self.on_evict is not None and record.state == READY:
+            self.on_evict(record, True)
         record.state = EVICTING
         self._lru.pop(checkpoint_id, None)
         # Keep units alive while a queued GPU writer can still access them.
@@ -887,6 +933,8 @@ class PageUnitCheckpointStore:
         record = self.records[checkpoint_id]
         if record.state != READY or record.pin_count:
             raise AssertionError("only an unpinned READY checkpoint is evictable")
+        if self.on_evict is not None:
+            self.on_evict(record, False)
         self._note_change(record.prefix_hash)
         if self.hash_to_checkpoint.get(record.prefix_hash) == checkpoint_id:
             del self.hash_to_checkpoint[record.prefix_hash]
@@ -967,9 +1015,67 @@ class PagedStateCheckpointCoordinator:
         # `resumable_hit` (the vote) and `take_offload_stores` (the sink).
         self.offload = offload
         self._offload_gpu_max_entries = 0
+        # Per live seq (by id): the last boundary it filed, the image it
+        # resumed from, and whether that image already had a successor (the seq
+        # branched back rather than extending its conversation's newest image).
+        # Dropped with the seq's slot (`forget_pending`).
+        self._seq_last_image: dict[int, int] = {}
+        self._seq_resumed_from: dict[int, int] = {}
+        self._seq_branched: dict[int, bool] = {}
+        # Image chains. A chain is one conversation's run of strict extensions,
+        # each request resuming from the previous one's prompt-end image; only
+        # prompt-end images are members, and earlier boundaries stay standalone
+        # (see `checkpoint`). The
+        # newest image (the tip) is where the next request resumes. The first
+        # (the root) is kept too: a chat template that drops earlier reasoning
+        # once the next user message arrives (Qwen3.5's) rewrites every turn
+        # after the root, sending the conversation back to it. A request that
+        # resumes from an image which already has a successor has branched
+        # back; it roots a new chain, and the old root and tip are superseded.
+        # Everything in between is superseded as the chain extends.
+        self._has_child: set[int] = set()
+        self._chain_of: dict[int, int] = {}  # image -> its chain's root
+        self._chain_tip: dict[int, int] = {}  # root -> the chain's newest image
+        # Decode-time boundaries filed but maybe not stored yet; marked
+        # superseded once their image exists (`complete_previous_batch`).
+        self._release_first: set[int] = set()
         self.store = PageUnitCheckpointStore(
             pool, spec, offload_sink=offload is not None
         )
+        # ATOM_STATE_CHECKPOINT_DIAG: what kind of image each release was, and
+        # for a resume that fell short of its KV frontier, the kind of the
+        # nearest released image that would have served it ("never" when no
+        # image ever existed between the two).
+        self.diag = envs.ATOM_STATE_CHECKPOINT_DIAG and enabled
+        self._decode_hashes: set[int] = set()
+        self._released_kind: OrderedDict[int, tuple[str, float]] = OrderedDict()
+        self._trimming = False
+        self.diag_released: dict[str, int] = {}
+        self.diag_short: dict[str, list[int]] = {}
+        self.store.on_evict = self._on_release
+        # GPU-only budget for the images (ATOM_STATE_CHECKPOINT_GPU_SIZE): past
+        # it, `complete_previous_batch` releases the least recently used ones
+        # rather than letting them displace the prefix cache. Superseded images
+        # go first (see the image chains above); a shared prefix's image stays
+        # recent by being hit.
+        self._gpu_max_entries = 0
+        budget = envs.ATOM_STATE_CHECKPOINT_GPU_SIZE
+        if enabled and budget:
+            if not 0 < budget < float("inf"):
+                raise ValueError(
+                    "ATOM_STATE_CHECKPOINT_GPU_SIZE must be finite and nonnegative"
+                )
+            entry_bytes = self.store.units_per_checkpoint * spec.page_unit_bytes
+            self._gpu_max_entries = int(budget * (1 << 30)) // entry_bytes
+            if self._gpu_max_entries < 1:
+                raise ValueError(
+                    "ATOM_STATE_CHECKPOINT_GPU_SIZE must fit one checkpoint"
+                )
+            logger.info(
+                "state checkpoints: GPU image budget %.2f GiB (%d images)",
+                budget,
+                self._gpu_max_entries,
+            )
         # Keyed by `(seq id, prefix hash)` rather than by seq: two boundaries of
         # one prompt are two checkpoints, and keying by seq alone let the later
         # one overwrite the earlier before either was stored. Re-reaching the
@@ -1134,10 +1240,86 @@ class PagedStateCheckpointCoordinator:
         the bytes allow: the newer boundary is the one the slot actually holds,
         so it wins and the older is dropped rather than mis-stored.
         """
-        del boundary_blocks
         if self.applies(seq) and seq.state_slot >= 0:
             self._supersede(id(seq))
             self._pending[(id(seq), h)] = (seq, h)
+            pos = boundary_blocks * getattr(seq, "block_size", 0)
+            if pos <= getattr(seq, "num_prompt_tokens", pos):
+                # A prompt boundary: the next turn resumes at this prompt's end.
+                prev = self._seq_last_image.get(id(seq))
+                if prev is None:
+                    self._link(id(seq), h)
+                elif prev != h:
+                    # This seq's own earlier prompt boundary, a rung or demand
+                    # boundary that other prefixes may share (a long system
+                    # prompt's): left standalone, an ordinary LRU candidate.
+                    # h takes its place in the chain.
+                    root = self._chain_of.pop(prev, None)
+                    if root is not None:
+                        if root == prev:
+                            self._chain_tip.pop(prev, None)
+                            root = h
+                        self._chain_of[h] = root
+                        self._chain_tip[root] = h
+                self._seq_last_image[id(seq)] = h
+            else:
+                # A decode-time boundary supersedes nothing and goes first under
+                # a budget: generated tokens reach a later prompt only when the
+                # client sends this output back verbatim and the template
+                # renders it unchanged, and a client replaying recorded turns
+                # never does.
+                self._release_first.add(h)
+                if self.diag:
+                    self._decode_hashes.add(h)
+
+    def _link(self, seq_id: int, h: int) -> None:
+        """Place a seq's first prompt boundary `h` in its conversation's chain."""
+        parent = self._seq_resumed_from.pop(seq_id, None)
+        branched = self._seq_branched.pop(seq_id, True)
+        if parent == h:
+            # Resumed exactly where it files (a replay of the same prompt).
+            return
+        root = self._chain_of.get(parent) if parent is not None else None
+        if root is not None and not branched:
+            # Extends its chain: the parent was the tip, and h replaces it.
+            if parent != root:
+                self.store.mark_superseded(parent)
+            self._has_child.add(parent)
+            self._chain_of[h] = root
+            self._chain_tip[root] = h
+            return
+        if root is not None:
+            # Branched back into its own chain (with Qwen3.5's template, the
+            # next user message). The parent was resumed from twice when it is
+            # the old root: by the chain's second request and by this one.
+            self.store.mark_superseded(parent, max_restores=2)
+            for older in (root, self._chain_tip.get(root)):
+                if older is not None and older not in (h, parent):
+                    self.store.mark_superseded(older)
+        # A cold start, a branch-back, or a resume from a standalone image (a
+        # rung or demand boundary, which other prefixes may share and which is
+        # therefore never superseded): h roots a new chain.
+        self._chain_of[h] = h
+        self._chain_tip[h] = h
+
+    def _on_release(self, record: CheckpointRecord, unindexed: bool) -> None:
+        h = record.prefix_hash
+        self._has_child.discard(h)
+        root = self._chain_of.pop(h, None)
+        if root is not None and self._chain_tip.get(root) == h:
+            del self._chain_tip[root]
+        if self.diag:
+            self._note_release(record, unindexed)
+
+    def _prune_chains(self) -> None:
+        """Drop chain entries for boundaries that were filed but never stored."""
+        if len(self._chain_of) <= 4 * len(self.store.records) + 4096:
+            return
+        live = {r.prefix_hash for r in self.store.records.values()}
+        live.update(h for _sid, h in self._pending)
+        self._chain_of = {h: r for h, r in self._chain_of.items() if h in live}
+        self._chain_tip = {r: t for r, t in self._chain_tip.items() if t in live}
+        self._has_child &= live
 
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
@@ -1160,6 +1342,9 @@ class PagedStateCheckpointCoordinator:
         seq_id = id(seq)
         for key in [k for k in self._pending if k[0] == seq_id]:
             del self._pending[key]
+        self._seq_last_image.pop(seq_id, None)
+        self._seq_resumed_from.pop(seq_id, None)
+        self._seq_branched.pop(seq_id, None)
         self.store.cancel_queued_restore(seq.state_slot)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -1170,8 +1355,12 @@ class PagedStateCheckpointCoordinator:
         """
         return self.store.restore_queued_for(dst_slot)
 
-    def begin_restore(self, h: int, dst_slot: int) -> bool:
-        return self.store.begin_restore(h, dst_slot) is not None
+    def begin_restore(self, h: int, dst_slot: int, seq: Sequence | None = None) -> bool:
+        queued = self.store.begin_restore(h, dst_slot) is not None
+        if queued and seq is not None:
+            self._seq_resumed_from[id(seq)] = h
+            self._seq_branched[id(seq)] = h in self._has_child
+        return queued
 
     def take_checkpoint_ops(
         self,
@@ -1198,12 +1387,77 @@ class PagedStateCheckpointCoordinator:
         stores, self._store_ops = self._store_ops, []
         return tuple(stores), restores
 
+    def _note_release(self, record: CheckpointRecord, unindexed: bool) -> None:
+        h = record.prefix_hash
+        if h in self._decode_hashes:
+            kind = "decode"
+            self._decode_hashes.discard(h)
+        elif record.superseded:
+            kind = "superseded"
+        elif record.restores > 1:
+            kind = "shared"
+        elif record.restores:
+            kind = "restored"
+        else:
+            kind = "unread"
+        source = "unindex" if unindexed else "budget" if self._trimming else "pressure"
+        key = f"{source}:{kind}"
+        self.diag_released[key] = self.diag_released.get(key, 0) + 1
+        self._released_kind[h] = (key, monotonic())
+        self._released_kind.move_to_end(h)
+        if len(self._released_kind) > 1 << 17:
+            self._released_kind.popitem(last=False)
+
+    def classify_shortfall(self, block_hashes: list[int], hit: int, wanted: int) -> str:
+        """How the image nearest below boundary `wanted`, above `hit`, went,
+        and how long before this resume it was released."""
+        for b in range(min(wanted, len(block_hashes)), hit, -1):
+            released = self._released_kind.get(block_hashes[b - 1])
+            if released is not None:
+                key, at = released
+                age = monotonic() - at
+                bucket = next(
+                    (f"<{t}s" for t in (10, 30, 60, 120, 300) if age < t), ">300s"
+                )
+                return f"{key}@{bucket}"
+        return "never"
+
+    def note_shortfall(self, kind: str, tokens: int) -> None:
+        n = self.diag_short.setdefault(kind, [0, 0])
+        n[0] += 1
+        n[1] += tokens
+
+    def diag_line(self) -> str:
+        records = self.store.records.values()
+        superseded = sum(r.superseded for r in records)
+        shared = sum(r.restores > 1 for r in records)
+        released = ", ".join(f"{k} {v}" for k, v in sorted(self.diag_released.items()))
+        short = ", ".join(
+            f"{k} {n}/{t}" for k, (n, t) in sorted(self.diag_short.items())
+        )
+        return (
+            f"images {len(self.store.records)} (superseded {superseded}, "
+            f"shared {shared}) | released: {released} | "
+            f"short resumes (reqs/tokens): {short}"
+        )
+
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
+        self._prune_chains()
+        for h in list(self._release_first):
+            if self.store.contains(h):
+                self.store.mark_superseded(h)
+                self._release_first.discard(h)
+            elif not self.store.contains_or_pending(h):
+                self._release_first.discard(h)
         if self._offload_gpu_max_entries and self.offload is not None:
-            self.store.trim_offloaded(
+            self.store.trim_to_budget(
                 self._offload_gpu_max_entries, self.offload.could_serve
             )
+        elif self._gpu_max_entries:
+            self._trimming = True
+            self.store.trim_to_budget(self._gpu_max_entries, _release_any)
+            self._trimming = False
         # The batch that carried these stores has been issued.
         issued, self._scratch_issued = self._scratch_issued, []
         for slot in issued:

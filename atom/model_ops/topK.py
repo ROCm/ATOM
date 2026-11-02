@@ -211,6 +211,67 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
     topk_ids[:, top_k:] = total_topk_ids[:rows, top_k:]
 
 
+def _triton_topk_eligible(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_fused_shared_experts: int,
+) -> bool:
+    """Whether aiter's Triton top-8 (`fused_topk_dispatch`, one program a row)
+    can stand in for `topk_softmax`: the same ids and weights on bf16 [T, 256]
+    logits with renormalized top-8 and no shared columns, in about 2.5 us
+    instead of 4 on gfx1250 (ATOM_MOE_TRITON_TOPK)."""
+    return (
+        envs.ATOM_MOE_TRITON_TOPK
+        and topk == 8
+        and renormalize
+        and num_fused_shared_experts == 0
+        and gating_output.dim() == 2
+        and gating_output.shape[0] > 0
+        and gating_output.shape[1] == 256
+        and gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and _is_gfx1250()
+    )
+
+
+@lru_cache(maxsize=1)
+def _is_gfx1250() -> bool:
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() == "gfx1250"
+
+
+def _triton_topk_softmax(
+    gating_output: torch.Tensor, num_valid_rows: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`topk_softmax(need_renorm=True)`'s ids and weights from the Triton top-8.
+    Rows at or past `num_valid_rows` get ids -1 (their weights are not zeroed:
+    a -1 route is dropped before its weight is read)."""
+    from aiter.ops.triton.moe.fused_topk_dispatch import fused_topk_dispatch
+
+    n, device = gating_output.shape[0], gating_output.device
+    weights = torch.empty((n, 8), dtype=torch.float32, device=device)
+    ids = torch.empty((n, 8), dtype=torch.int32, device=device)
+    pad = torch.empty(n, dtype=torch.bool, device=device)
+    recv = torch.empty(1, dtype=torch.int32, device=device)
+    fused_topk_dispatch(
+        gating_output,
+        weights,
+        ids,
+        None,
+        None,
+        pad,
+        recv,
+        batch_size=1,
+        is_draft=False,
+        write_requests=False,
+        no_padding=num_valid_rows is None,
+        num_valid_rows=num_valid_rows,
+    )
+    return weights, ids
+
+
 def rocm_aiter_topk_softmax_impl(
     gating_output: torch.Tensor,
     topk: int,
@@ -224,6 +285,10 @@ def rocm_aiter_topk_softmax_impl(
 
     token = gating_output.shape[0]
     device = gating_output.device
+    if _triton_topk_eligible(
+        gating_output, topk, renormalize, num_fused_shared_experts
+    ):
+        return _triton_topk_softmax(gating_output, num_valid_rows)
     if num_fused_shared_experts > 0:
         total_topk_weights, total_topk_ids = topk_meta_rows(token)
         # The kernel scores the shared columns too when given a scoring func.

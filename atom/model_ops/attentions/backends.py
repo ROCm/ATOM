@@ -29,14 +29,16 @@ from atom.model_ops.attention_mla import MLAModules
 from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
+from atom.model_ops.attentions.pool_layout.zero_spans import SpanZeroer
 from atom.model_ops.attentions.token_layout.batch_ids import (
     build_batch_ids,
     build_batch_ids_device,
+    build_batch_ids_from_cu,
 )
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.model_ops.attentions.token_layout.slots import slot_mapping
 from atom.model_ops.dcp_ops import dcp_prefill_slot_mapping
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, AttnState, ForwardMode
 from atom.utils.h2d import h2d_producer
@@ -333,12 +335,47 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         pools = getattr(self, "kv_pools", None)
         if not pools or not blocks:
             return
+        if envs.ATOM_FUSED_ZERO_FILL:
+            views = [
+                view
+                for pool in pools.values()
+                for view in getattr(pool, "_views", {}).values()
+            ]
+            if views and self._zero_spans(views, blocks):
+                return
         idx = torch.tensor(list(blocks), dtype=torch.int64).to(
             self.device, non_blocking=True
         )
         for pool in pools.values():
             for view in getattr(pool, "_views", {}).values():
                 view.index_fill_(1, idx, 0)
+
+    def _zero_spans(self, views: Sequence["torch.Tensor"], entries) -> bool:
+        """`view.index_fill_(1, entries, 0)` for every view in one launch.
+
+        `ATOM_FUSED_ZERO_FILL`: what the fills write is one contiguous chunk per
+        (view, layer, entry), so `SpanZeroer` zeroes all of them at once from a
+        single pinned upload. False -- leaving the caller's own fills to run --
+        when the views cannot be described that way (a strided trailing dim,
+        storage not 16 B aligned, not on a GPU); said once per builder.
+        """
+        zeroer = getattr(self, "_span_zeroer", None)
+        if zeroer is None:
+            zeroer = self._span_zeroer = SpanZeroer()
+        if zeroer is False or not views[0].is_cuda:
+            return False
+        try:
+            zeroer.plan(views)
+        except ValueError as exc:
+            logger.warning(
+                "%s: fused zeroing unavailable (%s); keeping index_fill_",
+                type(self).__name__,
+                exc,
+            )
+            self._span_zeroer = False
+            return False
+        zeroer(views, entries)
+        return True
 
     def relocate_state_slots(self, pairs: Sequence[tuple[int, int]]) -> None:
         """Move live state between contiguous Active Slots."""
@@ -971,9 +1008,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             # geometry is then `cached + all_new` per request -- the request
             # range `split_attn_metadata` already slices out of this -- so the
             # only way to get that slice wrong is to have nothing to slice.
-            ctx["batch_id_per_k_token"] = build_batch_ids_device(
-                ctx["context_lens"], total=total_kv
-            )
+            if envs.ATOM_FAST_PREFILL_BATCH_IDS:
+                # The same ids from the prefix sum already on the device: the
+                # padded tail of `cu_seqlens_k` repeats its last value, so those
+                # rows are empty here exactly as their zero length is above.
+                ctx["batch_id_per_k_token"] = build_batch_ids_from_cu(
+                    ctx["cu_seqlens_k"], total=total_kv, max_seqlen=max_seqlen_k
+                )
+            else:
+                ctx["batch_id_per_k_token"] = build_batch_ids_device(
+                    ctx["context_lens"], total=total_kv
+                )
         attn_metadata = AttentionMetaData(
             # Cast to python int — numpy.int32 leaks in via batch.context_lens
             # (numpy array) and breaks downstream Triton kernel constexpr
@@ -1061,6 +1106,17 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self._ubatch_split_bs = ubatch_split_bs
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        if envs.ATOM_STATE_OPS_DRAIN and (
+            state_ops.relocations
+            or state_ops.checkpoint_stores
+            or state_ops.checkpoint_restores
+        ):
+            # Let the GPU finish the forwards already queued before this step's
+            # state copies and the metadata built after them. With the host far
+            # ahead (graphed prefill steps, cached launch paths), c2048 DP turns
+            # some requests that resume a prefix checkpoint into garbage; this
+            # drain clears it. The race it closes is not yet identified.
+            torch.cuda.current_stream().synchronize()
         # First: a store below may take some of these units again for its image.
         if state_ops.zero_blocks:
             self.zero_kv_blocks(state_ops.zero_blocks)

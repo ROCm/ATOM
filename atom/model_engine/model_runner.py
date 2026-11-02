@@ -81,6 +81,7 @@ from atom.model_ops.eplb import (
 from atom.model_ops.presence_penalty import PresencePenaltyState, PresencePenaltyStep
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler, sample_topk_candidates
+from atom.observability import timeline
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.status import SpecStatusQueue
@@ -3756,6 +3757,13 @@ class ModelRunner:
         # buffers. Excluding them here leaves no event between a dummy and the
         # following real forward, allowing that real forward's CPU writes to
         # race the dummy's still-pending H2D copies.
+        # ATOM_REQ_TIMELINE: rank 0's host time at each phase of the forward.
+        step_key = None
+        if timeline.enabled() and self.rank == 0 and not batch.is_dummy_run:
+            self._timeline_step = getattr(self, "_timeline_step", 0) + 1
+            kind = "P" if batch.total_seqs_num_prefill else "D"
+            step_key = f"r{self._timeline_step}:{kind}{batch.total_tokens_num}"
+            timeline.mark(step_key, "fwd_start")
         self._advance_forward_vars()
         self._gate_staging_reuse()
         (
@@ -3767,12 +3775,16 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if step_key is not None:
+            timeline.mark(step_key, "prepared")
         logits, hidden_states = self.run_model(
             input_ids,
             batch,
             greedy_ids=self._greedy_ids_step(batch, all_greedy),
             topk_cands=self._topk_candidates_step(batch, all_greedy, top_ks),
         )
+        if step_key is not None:
+            timeline.mark(step_key, "model_launched")
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3799,6 +3811,8 @@ class ModelRunner:
                 hidden_states,
                 batch.next_token_ids,
             )
+            if step_key is not None:
+                timeline.mark(step_key, "draft_kv_launched")
         if pp_non_last or self._is_pure_middle_chunk(batch):
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.
@@ -3840,6 +3854,8 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+        if step_key is not None:
+            timeline.mark(step_key, "postprocessed")
 
         reset_forward_context()
         self._record_forward_vars_event()

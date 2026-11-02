@@ -51,7 +51,7 @@ def test_offload_budget_releases_old_images_without_spending_cached_kv():
     ready(store, 22)
     ready(store, 33)
     before = pool.num_free
-    store.trim_offloaded(2, lambda h: True)
+    store.trim_to_budget(2, lambda h: True)
     assert not store.contains(11)
     assert store.contains(22) and store.contains(33)
     assert pool.num_free == before + store.units_per_checkpoint
@@ -67,12 +67,12 @@ def test_offload_budget_preserves_unconfirmed_and_pinned_sources():
     # A restore owns 22; an external reader owns 33.
     assert store.begin_restore(22, 0)
     op, _ = store.acquire_checkpoint_source(33)
-    store.trim_offloaded(1, lambda h: h != 11)
+    store.trim_to_budget(1, lambda h: h != 11)
     assert store.contains(11) and store.contains(22) and store.contains(33)
     assert not store.contains(44)
     store.release_offload_store_source(op)
     store.settle_offload_store(op)
-    store.trim_offloaded(1, lambda h: h != 11)
+    store.trim_to_budget(1, lambda h: h != 11)
     assert not store.contains(33)
     assert store.contains(22)
 
@@ -81,7 +81,7 @@ def test_offload_budget_never_releases_an_inflight_gpu_writer():
     _pool, store = make_store()
     store.begin_store(11, 0)
     store.begin_store(22, 0)
-    store.trim_offloaded(1, lambda h: True)
+    store.trim_to_budget(1, lambda h: True)
     assert len(store.records) == 2
     assert all(record.state == COPYING for record in store.records.values())
 
@@ -104,6 +104,195 @@ def test_offload_gpu_budget_is_opt_in_and_counts_page_padding(monkeypatch):
     assert c.offload.could_serve(11)
     # Removing the GPU image must not remove the tier's resumable boundary.
     assert c.resumable_hit(TestTheTierVotes.seq(), 1, [11]) == 1
+
+
+def test_gpu_image_budget_is_opt_in_and_needs_no_tier(monkeypatch):
+    monkeypatch.delenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", raising=False)
+    c = TestTheTierVotes.coordinator()
+    assert c._gpu_max_entries == 0
+    # A 25-byte image needs 30 physical bytes: 80 bytes permit two, not three.
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    assert c._gpu_max_entries == 2
+    assert c.offload is None
+    for h in (11, 22, 33):
+        ready(c.store, h)
+    c.complete_previous_batch()
+    # the least recently used image goes; the two newest stay on the GPU
+    assert not c.store.contains(11)
+    assert c.store.contains(22) and c.store.contains(33)
+
+
+def test_gpu_image_budget_keeps_a_hit_image(monkeypatch):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    for h in (11, 22):
+        ready(c.store, h)
+    # a restore from 11 makes it the most recently used; once it lands, its pin
+    # is gone, so recency alone keeps it
+    assert c.store.begin_restore(11, 0)
+    c.store.take_restore_ops()
+    c.store.complete_inflight()
+    rid = next(cid for cid, r in c.store.records.items() if r.prefix_hash == 11)
+    assert c.store.records[rid].pin_count == 0
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    assert c.store.contains(11) and c.store.contains(33)
+    assert not c.store.contains(22)
+
+
+def _image_seq(slot=0):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(has_per_req_cache=True, state_slot=slot)
+
+
+def test_budget_releases_superseded_images_before_older_live_ones(monkeypatch):
+    # room for three images (25 bytes each in 30 physical)
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(100 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    ready(c.store, 11)  # conversation A's newest image, the oldest overall
+    _turn(c, 22, slot=1)  # conversation B's root
+    _turn(c, 33, resumed_from=22, slot=1)
+    _turn(c, 44, resumed_from=33, slot=1)  # B moves on: its 33 is superseded
+    c.complete_previous_batch()
+    # plain LRU would drop 11; the superseded 33 goes instead
+    assert c.store.contains(11) and c.store.contains(22) and c.store.contains(44)
+    assert not c.store.contains(33)
+
+
+def _superseded(c, h):
+    return next(r.superseded for r in c.store.records.values() if r.prefix_hash == h)
+
+
+def _turn(c, h, resumed_from=None, slot=0):
+    """One request: resume from `resumed_from` (if any), file its prompt end `h`."""
+    s = _image_seq(slot)
+    if resumed_from is not None:
+        assert c.begin_restore(resumed_from, s.state_slot, seq=s)
+        c.store.take_restore_ops()
+        c.store.complete_inflight()
+    c.checkpoint(s, 1, h)
+    if not c.store.contains(h):
+        ready(c.store, h)
+    c.forget_pending(s)
+
+
+def test_a_chain_keeps_its_root_and_tip_and_supersedes_between():
+    c = TestTheTierVotes.coordinator(num_units=80)
+    _turn(c, 11)  # a cold start roots the chain
+    _turn(c, 22, resumed_from=11)
+    _turn(c, 33, resumed_from=22)
+    # 22 lies between root and tip; with preserve_thinking nothing resumes there
+    assert _superseded(c, 22)
+    assert not _superseded(c, 11) and not _superseded(c, 33)
+
+
+def test_branching_back_to_the_root_starts_a_new_chain():
+    # Qwen3.5's template drops reasoning at the next user message, so that
+    # turn resumes at the root, not at the tip
+    c = TestTheTierVotes.coordinator(num_units=80)
+    _turn(c, 11)
+    _turn(c, 22, resumed_from=11)
+    _turn(c, 33, resumed_from=22)
+    _turn(c, 44, resumed_from=11)
+    assert _superseded(c, 11) and _superseded(c, 33)
+    assert not _superseded(c, 44)
+    _turn(c, 55, resumed_from=44)  # the new chain extends; its root stays
+    assert not _superseded(c, 44)
+
+
+def test_a_replayed_prompt_supersedes_nothing():
+    c = TestTheTierVotes.coordinator(num_units=80)
+    _turn(c, 11)
+    _turn(c, 22, resumed_from=11)
+    _turn(c, 22, resumed_from=22)  # a replica resumes exactly where it files
+    assert not _superseded(c, 22) and not _superseded(c, 11)
+
+
+def test_the_root_survives_a_budget_that_releases_the_middle(monkeypatch):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    _turn(c, 11)
+    _turn(c, 22, resumed_from=11)
+    _turn(c, 33, resumed_from=22)
+    c.complete_previous_batch()
+    assert c.store.contains(11) and c.store.contains(33)
+    assert not c.store.contains(22)
+
+
+def test_mid_prompt_boundaries_stay_standalone_and_start_their_own_chains():
+    c = TestTheTierVotes.coordinator(num_units=80)
+    a = _image_seq(0)
+    c.checkpoint(a, 1, 11)  # a rung inside a shared system prompt
+    ready(c.store, 11)
+    c.checkpoint(a, 2, 22)  # conversation A's prompt end
+    ready(c.store, 22)
+    c.forget_pending(a)
+    assert not _superseded(c, 11) and 11 not in c._chain_of
+    _turn(c, 33, resumed_from=22)  # A's next tool step
+    _turn(c, 44, resumed_from=11)  # conversation B starts from the shared rung
+    _turn(c, 55, resumed_from=44)
+    _turn(c, 66, resumed_from=44)  # B branches back to its root
+    assert _superseded(c, 44) and _superseded(c, 55)
+    assert not _superseded(c, 11)  # the shared rung
+    assert not _superseded(c, 22) and not _superseded(c, 33)  # A untouched
+
+
+def test_released_images_leave_the_chain_bookkeeping():
+    c = TestTheTierVotes.coordinator(num_units=80)
+    _turn(c, 11)
+    _turn(c, 22, resumed_from=11)
+    assert 11 in c._has_child and c._chain_of[22] == 11
+    c.store.unindex(22)
+    assert 22 not in c._chain_of and 11 not in c._chain_tip
+
+
+def test_a_decode_time_image_supersedes_nothing_and_goes_first(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    c = TestTheTierVotes.coordinator()
+    s = SimpleNamespace(
+        has_per_req_cache=True, state_slot=0, block_size=1, num_prompt_tokens=10
+    )
+    ready(c.store, 11)  # another conversation's newest, the oldest overall
+    c.checkpoint(s, 10, 22)  # this turn's prompt-end image: where its next turn resumes
+    ready(c.store, 22)
+    c.checkpoint(s, 15, 33)  # a decode-time image
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    # the decode-time image goes, not the prompt-end one nor the oldest
+    assert c.store.contains(11) and c.store.contains(22)
+    assert not c.store.contains(33)
+
+
+def test_a_shared_image_is_never_superseded():
+    _pool, store = make_store(num_units=40)
+    ready(store, 11)
+    for slot in (0, 1):  # two conversations resume from the same prefix
+        assert store.begin_restore(11, slot)
+    store.take_restore_ops()
+    store.complete_inflight()
+    store.mark_superseded(11)
+    rid = next(cid for cid, r in store.records.items() if r.prefix_hash == 11)
+    assert not store.records[rid].superseded
+
+
+def test_forgetting_a_seq_drops_its_image_bookkeeping():
+    c = TestTheTierVotes.coordinator()
+    s = _image_seq(0)
+    c.checkpoint(s, 1, 22)
+    assert id(s) in c._seq_last_image
+    c.forget_pending(s)
+    assert id(s) not in c._seq_last_image and id(s) not in c._seq_resumed_from
+    assert id(s) not in c._seq_branched
+
+
+def test_gpu_image_budget_must_fit_one_image(monkeypatch):
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(10 / (1 << 30)))
+    with pytest.raises(ValueError, match="must fit one checkpoint"):
+        TestTheTierVotes.coordinator()
 
 
 @pytest.mark.parametrize("can_load,sink", [(False, True), (True, False)])
@@ -771,3 +960,36 @@ class TestTheTierVotes:
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 2
         index.hashes.discard(77)  # what `fail_load` -> `forget` does
         assert c.resumable_hit(self.seq(), 3, [11, 77, 99]) == 0
+
+
+def test_diag_names_the_released_image_a_short_resume_needed(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", str(80 / (1 << 30)))
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_DIAG", "1")
+    c = TestTheTierVotes.coordinator()
+    s = SimpleNamespace(
+        has_per_req_cache=True, state_slot=0, block_size=1, num_prompt_tokens=10
+    )
+    ready(c.store, 11)
+    c.checkpoint(s, 10, 22)  # prompt-end image
+    ready(c.store, 22)
+    c.checkpoint(s, 15, 33)  # decode-time image, released first
+    ready(c.store, 33)
+    c.complete_previous_batch()
+    assert c.diag_released == {"budget:decode": 1}
+    # a resume found image 22 at boundary 2 but its KV ran to boundary 4,
+    # where the released 33 sat; boundary 3's hash was never imaged
+    assert c.classify_shortfall([11, 22, 44, 33, 55], 2, 4) == "budget:decode@<10s"
+    assert c.classify_shortfall([11, 22, 44, 66, 55], 2, 4) == "never"
+    c.note_shortfall("budget:decode", 128)
+    assert "budget:decode 1/128" in c.diag_line()
+    assert "budget:decode 1 |" in c.diag_line()
+
+
+def test_diag_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("ATOM_STATE_CHECKPOINT_DIAG", raising=False)
+    c = TestTheTierVotes.coordinator()
+    _turn(c, 11)
+    c.store.unindex(11)
+    assert not c.diag and not c.diag_released

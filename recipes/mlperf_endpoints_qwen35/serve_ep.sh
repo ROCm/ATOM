@@ -60,6 +60,13 @@ if [ "$MODE" = dp ]; then
   export ATOM_DP_PREFILL_GRAPH=${ATOM_DP_PREFILL_GRAPH:-1}
   export ATOM_GDN_GRAPH_MAX_SEQS=${ATOM_GDN_GRAPH_MAX_SEQS:-16}
   export ATOM_TOKEN_GRAPH_SIZES=${ATOM_TOKEN_GRAPH_SIZES:-256,512,1024,1536,2048,3072,4096,6144,8192,12288,16384}
+  # GDN layers stay eager inside those graphs. With them recorded too, c2048 turns some requests
+  # that resume a prefix checkpoint into garbage (they decode to the output cap at ~1% MTP
+  # acceptance, one rank at a time): 1-15 such requests within 1-8 min on every run, none in
+  # 10 min with the GDN layers eager, at the same throughput. Draining the stream before a step's
+  # state copies, or turning off the cached launch paths above, also clears it: a race that needs
+  # the host far ahead of the GPU, still open.
+  export ATOM_GDN_PREFILL_IN_GRAPH=${ATOM_GDN_PREFILL_IN_GRAPH:-0}
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server
@@ -89,7 +96,7 @@ case $MODE in
   # logits with uneven DP token counts) + the DSv4.1 DEP recipe's session affinity: a conversation's
   # turns stay on the DP rank that holds its prefix cache
   dp) MAXSEQ=${MAXSEQ:-16}
-      export ATOM_MORI_V2=1 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 ATOM_DP_LM_HEAD_MODE=allgather
+      export ATOM_MORI_V2=1 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 ATOM_DP_LM_HEAD_MODE=${ATOM_DP_LM_HEAD_MODE:-allgather}
       export MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27
       export ATOM_DP_SESSION_AFFINITY=1 AITER_CUSTOM_AR_MAX_SIZE=0
       # after any rank prefills, every rank runs 8 decode-only passes before new prefill: without it, once

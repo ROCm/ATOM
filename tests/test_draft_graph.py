@@ -338,6 +338,21 @@ def test_the_eager_path_hands_back_what_it_allocated():
     assert g.run(2, **g.stage(2, {"row": torch.zeros(2, dtype=torch.int32)})) is made
 
 
+def test_a_borrowing_caller_gets_the_recordings_own_storage(req_graph_recordings):
+    """`borrow=True` is the opt-out of the copy above, for a caller whose next
+    stream work consumes the outputs before any replay (the fused MTP glue):
+    the replay's own tensors, no clone launched."""
+    ids = torch.full((4, 3), 9, dtype=torch.int32)
+    conf = torch.zeros(4, 3)
+    g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
+    req_graph_recordings.add(4, (ids, conf))
+    staged = g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
+    got_ids, got_conf = g.run(4, borrow=True, **staged)
+    assert got_ids is ids and got_conf is conf
+    owned_ids, _ = g.run(4, **staged)
+    assert owned_ids is not ids and owned_ids.tolist() == ids.tolist()
+
+
 def test_a_dummy_replays_in_lockstep_with_the_real_ranks(req_graph_recordings):
     """`is_dummy_run` is per-rank, so no decision that feeds a collective may
     read it.

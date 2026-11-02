@@ -104,3 +104,17 @@ def test_writes_into_a_caller_buffer_without_reaching_past_it():
     assert np.shares_memory(got, dst)
     assert got.tolist() == [0, 0, 0, 1, 1, -1, -1, -1]
     assert (dst[8:] == -7).all(), "wrote past the requested width"
+
+
+def test_from_cu_returns_an_empty_int32_axis_without_a_launch():
+    """`build_batch_ids_from_cu` (ATOM_FAST_PREFILL_BATCH_IDS) on an empty step:
+    nothing to write, so nothing is launched -- also where no GPU exists. Its
+    equality with `build_batch_ids_device` needs a GPU, so it is checked
+    outside this suite."""
+    import torch
+
+    for cu in ([0], [0, 0, 0]):
+        out = _mod.build_batch_ids_from_cu(
+            torch.tensor(cu, dtype=torch.int32), total=0, max_seqlen=0
+        )
+        assert out.dtype == torch.int32 and out.shape == (0,)

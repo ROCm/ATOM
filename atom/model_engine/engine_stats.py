@@ -562,8 +562,13 @@ class EngineStats:
                 f"free {occ['free']} ({occ['free'] / total:.0%}), "
                 f"retained-cache {occ['retained']}, "
                 f"evicted this interval {evicted_iv} "
-                f"(total {occ['evicted_total']})"
+                f"(total {occ['evicted_total']}), "
+                f"state images {occ.get('images', 0)} "
+                f"({occ.get('image_units', 0)} units)"
             )
+            psc = getattr(self.block_manager, "paged_state_checkpoints", None)
+            if psc is not None and getattr(psc, "diag", False):
+                logger.info(f"[Image Diag] {psc.diag_line()}")
             # Rejected chains are rehashed on the scheduler thread.
             bm = self.block_manager
             logger.info(

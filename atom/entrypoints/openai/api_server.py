@@ -43,6 +43,7 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
+from atom.observability import timeline
 from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
@@ -85,6 +86,7 @@ from .reasoning import (
 from .reasoning_dialects import resolve_dialect
 from .request_timing import (
     RequestTimingMiddleware,
+    current_request_timing,
     get_stream_timing,
     has_generated_output,
     record_nonstream_first_token,
@@ -1221,13 +1223,27 @@ async def setup_streaming_request(
     stream_loop = asyncio.get_running_loop()
     _stream_loops[request_id] = stream_loop
     _request_start_times[request_id] = time.time()
+    if timeline.enabled():
+        timeline.mark(request_id, "ttft_start", _request_start_times[request_id])
+        timing = current_request_timing()
+        if timing is not None:
+            timing.timeline_key = request_id
+            timeline.mark(
+                request_id,
+                "http",
+                time.time() - (time.perf_counter() - timing.started_at),
+            )
 
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
     detokenizer = _stream_batch_dispatcher.new_state()
+    first_callback = [True]
 
     def stream_callback(request_output: RequestOutput) -> None:
+        if first_callback[0]:
+            first_callback[0] = False
+            timeline.mark(request_id, "first_cb")
         _send_stream_chunk_direct(
             request_output, request_id, stream_collector, stream_loop, detokenizer
         )
@@ -1235,6 +1251,7 @@ async def setup_streaming_request(
     executor_loop = asyncio.get_event_loop()
 
     def do_preprocess():
+        timeline.mark(request_id, "prep_start")
         seq = engine.io_processor.preprocess(
             prompt_or_tokens,
             sampling_params,
@@ -1246,6 +1263,8 @@ async def setup_streaming_request(
             dp_parent_session_id=dp_parent_session_id,
         )
         _seq_id_to_request_id[seq.id] = request_id
+        timeline.mark(request_id, "prep_end")
+        timeline.mark(request_id, f"map:{seq.id}")
         return seq
 
     seq = None
@@ -1271,6 +1290,7 @@ async def setup_streaming_request(
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
     engine.core_mgr.add_request([seq])
+    timeline.mark(request_id, "add_sent")
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 

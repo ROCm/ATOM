@@ -60,7 +60,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
-from atom.observability import tracing
+from atom.observability import timeline, tracing
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -1448,6 +1448,32 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    def _partial_tails_skip_hold(self) -> bool:
+        """Whether a delayer hold still lets this step finish the mid-chunked-
+        prefill seqs (`ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS`): on a TP-local
+        delayer, when every partial has at most that many tokens left. A state
+        checkpoint cuts nearly every prompt one block short of its end, and the
+        few tokens after the cut otherwise wait out the decode interval before
+        the request's first token; fresh prefills still wait for the delayer."""
+        limit = envs.ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS
+        if (
+            limit <= 0
+            or self._partial_prefill_count == 0
+            or self.prefill_delayer is None
+            or not self.prefill_delayer.is_local
+        ):
+            return False
+        seen = 0
+        for seq in self.running:
+            if not seq.is_partial_prefill:
+                continue
+            if seq.num_tokens - seq.num_cached_tokens > limit:
+                return False
+            seen += 1
+            if seen >= self._partial_prefill_count:
+                break
+        return True
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -2060,7 +2086,8 @@ class Scheduler:
         # Phase 2 in lockstep. Inside that, skip the running-queue scan entirely
         # when no seq is mid-prefill — the common steady-state decode case —
         # using the counter maintained by postprocess / preempt / finished-removal.
-        if delayer_allows and self._partial_prefill_count > 0:
+        resume_partials = delayer_allows or self._partial_tails_skip_hold()
+        if resume_partials and self._partial_prefill_count > 0:
             for seq in self.running:
                 if num_seqs_prefill >= self.max_num_seqs:
                     break
@@ -3566,6 +3593,11 @@ class Scheduler:
             )
             hbm_cached_tokens = min(cached_tokens, wanted_tokens)
             offload_tokens = cached_tokens - hbm_cached_tokens
+            psc = self.block_manager.paged_state_checkpoints
+            kind = getattr(seq, "short_resume_kind", None)
+            lost = wanted_tokens - hbm_cached_tokens
+            if psc is not None and psc.diag and kind is not None and lost > 0:
+                psc.note_shortfall(kind, lost)
             self.engine_stats.update_cache(
                 hbm_cached_tokens,
                 seq.num_tokens,
@@ -4060,6 +4092,7 @@ class Scheduler:
                     pp_middle_chunk_ids.add(req_id)
                 elif i >= batch.total_seqs_num_decode:
                     tracing.prefill_complete(seq)
+                    timeline.mark(seq.id, "prefill_done")
         elif batch is not None:
             for i, req_id in enumerate(batch.req_ids):
                 seq = running_by_id.get(req_id)
@@ -4096,6 +4129,7 @@ class Scheduler:
                     seq.is_partial_prefill = now_partial
                 if not now_partial:
                     tracing.prefill_complete(seq)
+                    timeline.mark(seq.id, "prefill_done")
 
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
@@ -4383,6 +4417,7 @@ class Scheduler:
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
                 tracing.first_token(seq)
+                timeline.mark(seq.id, "first_tok", seq.first_token_time)
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's
