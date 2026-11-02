@@ -669,3 +669,69 @@ def test_shared_expert_mlp_uses_the_gated_gemm(monkeypatch, gated):
         assert seen == [w] and torch.equal(out, (x[:, :4] + 1) * 2)
     else:
         assert seen == [] and torch.allclose(out, mlp.act_fn(x @ w.T) * 2)
+
+
+# ---------------------------------------------------------------------------
+# ATOM_MTP_SELECT_ROWS_BEFORE_MOE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("nrows", [0, 3])
+def test_mtp_layer_selects_rows_before_its_moe(monkeypatch, flag, nrows):
+    """With the flag the MTP layer gets the rows (and its MLP sees only them);
+    the final norm then covers its whole input. Without it, or for an empty
+    selection, the layer runs every row and the norm selects."""
+    mtp = _mtp()
+    monkeypatch.setenv("ATOM_MTP_SELECT_ROWS_BEFORE_MOE", "1" if flag else "0")
+    calls = []
+    _fake_kernels(monkeypatch, calls)
+    t = _inputs(8)
+    seen = {}
+
+    class _Layer(nn.Module):
+        def forward(self, positions, hidden_states, residual, select_rows=None):
+            seen["rows"] = select_rows
+            moe = mt.MoEGatedSum(t.routed, t.shared, t.gate)
+            if select_rows is None:
+                return moe, t.residual
+            pick = lambda v: v.index_select(0, select_rows)
+            return mt.MoEGatedSum(*(pick(v) for v in moe)), pick(t.residual)
+
+    pred = _predictor(mtp, t, None)
+    pred.layers = nn.ModuleList([_Layer()])
+    rows = torch.tensor([6, 1, 4])[:nrows]
+    zeros = torch.zeros(8, HIDDEN, dtype=torch.bfloat16)
+    out = pred.forward(
+        None, torch.zeros(8), zeros, inputs_embeds=zeros, select_rows=rows
+    )
+    ref, _ = kernel_math(t.routed, t.shared, t.gate, t.residual, t.weight, EPS)
+    assert torch.equal(out, ref[rows])
+    assert (seen["rows"] is rows) == (flag and nrows > 0)
+
+
+def test_decoder_layer_select_rows_keeps_them_for_the_mlp():
+    qn = _qwen3_next()
+    layer = object.__new__(qn.Qwen3NextDecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_type = "linear_attention"
+    layer.layer_scale = False
+    layer.linear_attn = (
+        lambda hidden_states, x_fp8=None, x_scale=None: hidden_states * 2
+    )
+    layer.input_layernorm = SimpleNamespace(use_fused_quant=False)
+    layer.input_layernorm = type(
+        "Norm", (), {"use_fused_quant": False, "__call__": lambda self, h, r=None: h}
+    )()
+    layer.post_attention_layernorm = lambda h, r: (h + r, h + r)
+    seen = {}
+    layer.mlp = lambda h: (seen.setdefault("rows", h.shape[0]), h + 1)[1]
+    x = torch.randn(6, 4)
+    rows = torch.tensor([5, 0])
+    h, r = layer.forward(None, x, None, select_rows=rows)
+    full_h, full_r = layer.forward(None, x, None)
+    assert (
+        seen["rows"] == 2
+        and torch.equal(h, full_h[rows])
+        and torch.equal(r, full_r[rows])
+    )

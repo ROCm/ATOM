@@ -1069,7 +1069,11 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        select_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`select_rows`: after the attention (which every row needs: it writes
+        their KV), keep only these rows for the MLP; the layer then returns
+        `len(select_rows)` rows (the MTP drafter's step 0)."""
         # Self Attention
         if self.input_layernorm.use_fused_quant:
             if residual is None:
@@ -1130,6 +1134,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states, residual
             )
 
+        if select_rows is not None:
+            hidden_states = torch.index_select(hidden_states, 0, select_rows)
+            residual = torch.index_select(residual, 0, select_rows)
         if getattr(self.mlp, "combine_tail_norm", None) is not None:
             # The MoE combine runs the next norm too (ATOM_MEGA_COMBINE_TAIL).
             hidden_states = self.mlp(hidden_states, residual)

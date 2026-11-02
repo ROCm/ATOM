@@ -231,11 +231,26 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
+        # ATOM_MTP_SELECT_ROWS_BEFORE_MOE: the layer keeps the selected rows
+        # right after its attention, so its MoE (router, EP dispatch, experts,
+        # combine, shared expert) and the final norm run on one row a sequence.
+        # Not for an empty selection: the MoE would then run on zero rows (a
+        # zero-sized GEMM grid); every rank still runs it on its full rows.
+        layer_rows = (
+            select_rows
+            if envs.ATOM_MTP_SELECT_ROWS_BEFORE_MOE
+            and select_rows is not None
+            and select_rows.shape[0] > 0
+            else None
+        )
         hidden_states, residual = self.layers[current_step_idx](
             positions=positions,
             hidden_states=hidden_states,
             residual=residual,
+            **({"select_rows": layer_rows} if layer_rows is not None else {}),
         )
+        if layer_rows is not None:
+            select_rows = None  # already selected
 
         if isinstance(hidden_states, MoEGatedSum):
             # ATOM_FUSED_MOE_TAIL_NORM: the layer's gated shared-expert add, its

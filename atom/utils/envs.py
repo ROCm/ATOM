@@ -453,6 +453,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen3-Next / Qwen3.5 shared expert (bf16, gfx1250): its gate_up GEMM and
     # SiLU-and-mul in one aiter gluon GEMM with a gated epilogue; gate_up's
     # weight rows are interleaved gate / up in place at load. Off by default.
+    # With ATOM_FUSED_MOE_TAIL_NORM (which hands the MTP drafter its step-0
+    # rows): the MTP layer keeps those rows right after its attention, so its
+    # MoE and final norm run on one row a sequence instead of the whole token
+    # stream (4 x bs at decode, the prefill chunk at prefill). Each EP rank then
+    # dispatches its own row count; every rank still runs the layer. Off by
+    # default.
+    "ATOM_MTP_SELECT_ROWS_BEFORE_MOE": lambda: (
+        os.getenv("ATOM_MTP_SELECT_ROWS_BEFORE_MOE", "0") == "1"
+    ),
     "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
         os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
     ),
