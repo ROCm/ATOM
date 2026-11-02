@@ -82,9 +82,9 @@ def test_reclamation_does_not_accumulate_completed_events():
 
 
 def test_ready_event_is_never_rerecorded():
-    """An exported event is never re-recorded: a peer that imported it would
-    see its previous completion until the device runs the new record. Once
-    every transfer that used it completed, it is retired for destruction."""
+    """Each batch gets a fresh event; an exported one is never re-recorded
+    (reusing them was unsafe in our setup). Once every transfer that used an
+    event completed, it is retired for destruction."""
 
     class Future:
         ready = False
