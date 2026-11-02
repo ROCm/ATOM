@@ -1248,6 +1248,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rather than copied once per rank -- and copies only if that is refused.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # mlock the ranges the UVA path registers in place, so reclaim cannot touch
+    # the pinned page cache (each touch evicts the GPU queues). Off by default.
+    "ATOM_ENGRAM_MLOCK": lambda: os.getenv("ATOM_ENGRAM_MLOCK", "0") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

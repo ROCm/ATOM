@@ -631,6 +631,29 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
+def _mlock(lo: int, hi: int) -> None:
+    """Lock `[lo, hi)` in RAM (`ATOM_ENGRAM_MLOCK`).
+
+    An in-place registration pins page-cache pages through a KFD userptr BO,
+    which the kernel does not treat as locked: under memory pressure kswapd
+    reclaim or kcompactd migration still touches them, and every such MMU
+    notifier evicts all of the process's GPU queues until the BO is
+    revalidated (stalls of seconds, or a hang). `mlock` keeps reclaim off
+    these pages; set `vm.compact_unevictable_allowed=0` to keep compaction
+    off them as well. Best effort: a refusal (RLIMIT_MEMLOCK) only warns.
+    Not undone on release -- ranges that share a page would unlock each
+    other; the lock goes with the mapping.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    if libc.mlock(lo, hi - lo) != 0:
+        logger.warning(
+            "engram: mlock of %d bytes failed (errno %d); raise RLIMIT_MEMLOCK",
+            hi - lo,
+            ctypes.get_errno(),
+        )
+
+
 def _register(sources, leases):
     """Register the mapping in place; each range is widened to page
     boundaries, which registration requires (the extra bytes are neighbouring
@@ -649,6 +672,8 @@ def _register(sources, leases):
         flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
         if flags:
             _populate(lo, hi)
+        if envs.ATOM_ENGRAM_MLOCK:
+            _mlock(lo, hi)
         runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
         if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
