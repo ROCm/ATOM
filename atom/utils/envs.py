@@ -314,6 +314,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Qwen3.8-Flash-Next eager prefill on SGLang-ATOM: run QSA sparse attention
+    # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
+    # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel. On by
+    # default; 0 / false / off disables. Needs aiter with ROCm/aiter#6576.
+    "ATOM_QSA_FLYDSL_ATTN": lambda: _flag_env("ATOM_QSA_FLYDSL_ATTN", "1"),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
@@ -921,6 +926,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
+    # Qwen3.8-Flash-Next under TP: forwards with at least this many tokens
+    # (eager prefill) keep the hyper-connection residual streams token-sharded
+    # across the TP ranks (reduce-scatter + all-gather instead of all-reduce),
+    # so the replicated HC norm/GEMM work is split TP ways. The target model
+    # additionally never shards forwards of at most HC_QUANT_ROWS_MAX (1024)
+    # tokens, so they keep the fused HC FP8 quant; the MTP drafter (no fused
+    # quant) follows this value alone. 0 disables.
+    "ATOM_QWEN4_EXP_SP_MIN_TOKENS": lambda: _nonnegative_int_env(
+        "ATOM_QWEN4_EXP_SP_MIN_TOKENS", 1024
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"

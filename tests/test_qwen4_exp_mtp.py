@@ -16,6 +16,9 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compressed_slots,
     qsa_draft_decode_metadata,
+    qsa_expand_block_indices,
+    qsa_paged_mqa_logits,
+    qsa_select_paged_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
@@ -596,3 +599,180 @@ def test_qsa_verification_is_causal_and_matches_individual_queries(k, start):
         torch.testing.assert_close(
             batched[row : row + 1], reference, rtol=0.001, atol=0.001
         )
+
+
+def _qsa_index_batch(prefixes, query_lens, seed, block=64, ratio=4):
+    """Index queries and a paged compressed-key cache for prefill chunks with
+    the given prefixes, on non-consecutive pages."""
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(seed)
+    seq_lens = [p + q for p, q in zip(prefixes, query_lens)]
+    pages_per_req = [-(-s // block) for s in seq_lens]
+    width = max(pages_per_req)
+    pool = torch.randperm(sum(pages_per_req) + width, device=device, generator=gen)
+    tables = pool[: len(seq_lens) * width].view(len(seq_lens), width).to(torch.int32)
+    positions = torch.cat(
+        [torch.arange(p, p + q, device=device) for p, q in zip(prefixes, query_lens)]
+    )
+    requests = torch.cat(
+        [
+            torch.full((q,), r, dtype=torch.int32, device=device)
+            for r, q in enumerate(query_lens)
+        ]
+    )
+    lengths = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    index_q = torch.randn(
+        positions.numel(), 4, 128, dtype=torch.bfloat16, device=device, generator=gen
+    )
+    compressed = torch.randn(
+        pool.numel(),
+        block // ratio,
+        1,
+        128,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=gen,
+    )
+    return index_q, compressed, tables, requests, positions, lengths, max(seq_lens)
+
+
+def _require_flydsl_scorer(allow_flydsl):
+    if not allow_flydsl:
+        return
+    pytest.importorskip("flydsl")
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx942":
+        pytest.skip("the FlyDSL index scorer is built for gfx942")
+
+
+_QSA_BATCHES = {
+    # A prefixed chunk and a fresh request; 2503 rows do not split evenly.
+    "2503-rows": ((5000, 0), (1500, 1003)),
+    # The smallest sharded forward (> HC_QUANT_ROWS_MAX): TP4 gives 257-row
+    # shards, TP8 129-row shards.
+    "1025-rows": ((6000,), (1025,)),
+}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("calls", ["shard", "half-shard", "200-rows"])
+@pytest.mark.parametrize("allow_flydsl", [False, True], ids=["triton", "flydsl"])
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("batch", list(_QSA_BATCHES))
+def test_qsa_row_sharded_selection_matches_whole_batch(batch, tp, allow_flydsl, calls):
+    """Sequence-parallel prefill selects each rank's rows and gathers the
+    groups before expanding. The whole batch is scored in one call, which
+    takes the >256-row scorer (FlyDSL in serving prefill, else Triton MFMA).
+    The shards take that scorer too when they exceed 256 rows: in one call
+    ("shard") or chunked in two ("half-shard": TP2 / TP4 at 2503 rows and
+    TP2 at 1025 rows stay above 256 per call). Smaller calls ("200-rows",
+    129-row TP8 shards, other half shards) take the stacked <=256-row scorer. The scorers' logits differ in the last FP32 bits only (see
+    `test_qsa_index_scorers_agree_on_visible_logits`), so the selection is
+    expected to match unless a top-k boundary is tied that closely."""
+    _require_flydsl_scorer(allow_flydsl)
+    ratio, budget = 4, 2048
+    index_q, compressed, tables, requests, positions, lengths, max_seq = (
+        _qsa_index_batch(*_QSA_BATCHES[batch], seed=7)
+    )
+    rows = positions.numel()
+    common = {
+        "token_topk": budget,
+        "compress_ratio": ratio,
+        "max_seq_len": max_seq,
+        "allow_flydsl": allow_flydsl,
+    }
+    whole = qsa_select_paged_tokens(
+        index_q, compressed, tables, requests, positions, lengths, **common
+    )
+
+    # The scored width, as `qsa_select_paged_groups` bounds it.
+    columns = min(
+        tables.shape[1] * compressed.shape[1],
+        1 << ((max_seq + ratio - 1) // ratio - 1).bit_length(),
+    )
+    chunk = -(-rows // tp)
+    rows_per_call = {"shard": None, "half-shard": -(-chunk // 2), "200-rows": 200}
+    per_call = rows_per_call[calls]
+    workspace = (
+        {} if per_call is None else {"logits_workspace_bytes": per_call * columns * 4}
+    )
+    shards = []
+    for rank in range(tp):
+        local = slice(rank * chunk, min((rank + 1) * chunk, rows))
+        groups, output_width = qsa_select_paged_groups(
+            index_q[local],
+            compressed,
+            tables,
+            requests[local],
+            positions[local],
+            lengths,
+            **workspace,
+            **common,
+        )
+        shards.append(
+            torch.nn.functional.pad(groups, (0, 0, 0, chunk - groups.shape[0]))
+        )
+    gathered = torch.cat(shards)[:rows]
+    sharded = qsa_expand_block_indices(
+        gathered,
+        positions,
+        lengths,
+        requests,
+        ratio,
+        budget,
+        output_width=output_width,
+    )
+    assert sharded.shape == whole.shape
+    assert torch.equal(sharded, whole)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("allow_flydsl", [False, True], ids=["triton", "flydsl"])
+def test_qsa_index_scorers_agree_on_visible_logits(allow_flydsl):
+    """Which scorer a row gets depends on the row count of its call (stacked
+    up to 256 rows, FlyDSL / Triton MFMA above), so row sharding can move a
+    row across that boundary. The scorers must agree on every visible logit
+    up to FP32 rounding; only a top-k tie that close can then select
+    differently."""
+    _require_flydsl_scorer(allow_flydsl)
+    ratio = 4
+    index_q, compressed, tables, requests, positions, lengths, max_seq = (
+        _qsa_index_batch(*_QSA_BATCHES["2503-rows"], seed=11)
+    )
+    rows = positions.numel()
+    columns = min(
+        tables.shape[1] * compressed.shape[1],
+        1 << ((max_seq + ratio - 1) // ratio - 1).bit_length(),
+    )
+
+    def score(rows_per_call):
+        logits, visible = [], []
+        for start in range(0, rows, rows_per_call):
+            part = slice(start, min(start + rows_per_call, rows))
+            starts = torch.empty(
+                part.stop - start, dtype=torch.int32, device=index_q.device
+            )
+            out, ends = qsa_paged_mqa_logits(
+                index_q[part],
+                compressed,
+                tables,
+                requests[part],
+                positions[part],
+                lengths,
+                ratio,
+                max_columns=columns,
+                row_starts=starts,
+                allow_flydsl=allow_flydsl,
+            )
+            col = torch.arange(out.shape[1], device=out.device)[None]
+            logits.append(out)
+            visible.append((col >= starts[:, None]) & (col < ends[:, None]))
+        return torch.cat(logits), torch.cat(visible)
+
+    large, large_visible = score(rows)  # FlyDSL or Triton MFMA
+    stacked, stacked_visible = score(256)
+    assert torch.equal(large_visible, stacked_visible)
+    torch.testing.assert_close(
+        stacked[stacked_visible], large[large_visible], rtol=0, atol=1e-5
+    )
