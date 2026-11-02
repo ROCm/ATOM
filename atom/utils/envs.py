@@ -824,6 +824,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # across requests (`segment_tokenizer.SegmentTokenizer`): segment ids and
     # stored prompts together, counted by the bytes they retain. 0 turns it off.
     "ATOM_TOKENIZE_CACHE_MB": lambda: int(os.getenv("ATOM_TOKENIZE_CACHE_MB", "512")),
+    # Worker processes the API server tokenizes prompts in
+    # (`entrypoints/openai/tokenize_pool.py`). 0 tokenizes in the server's own
+    # preprocessing threads, which cannot encode in parallel.
+    "ATOM_TOKENIZE_PROCESSES": lambda: int(os.getenv("ATOM_TOKENIZE_PROCESSES", "0")),
     # Keep the prompt block-hash chain (frontend prefix hashing) with each
     # tokenizer-cached prefix and extend it on the next turn instead of
     # rehashing the whole prompt. Content hashes only: KV residency is still

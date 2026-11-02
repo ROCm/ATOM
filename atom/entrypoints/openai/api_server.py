@@ -19,6 +19,7 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -161,6 +162,8 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
+# `tokenize_pool.TokenizePool` when ATOM_TOKENIZE_PROCESSES > 0.
+_tokenize_pool = None
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -183,6 +186,60 @@ custom_message_encoder: Any | None = None
 _seq_id_to_request_id: dict[int, str] = {}
 _stream_loops: dict[str, AbstractEventLoop] = {}
 _request_start_times: dict[str, float] = {}
+
+# ATOM_PRE_ENGINE_TIMING=1: time each streaming request from ASGI arrival to the engine add, in three segments
+# (arrival -> handler: body read + parse + validation; handler -> preprocess: chat template; preprocess: executor
+# queue + tokenization), and log one summary every 10 s. Off by default; a per-request log line would stall the
+# event loop under load.
+_PRE_ENGINE_TIMING = os.environ.get("ATOM_PRE_ENGINE_TIMING", "0") == "1"
+_t_http_arrival: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_t_http_arrival", default=None
+)
+_t_handler_entry: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_t_handler_entry", default=None
+)
+_pre_engine_samples: list[tuple[float, float, float]] = []
+_pre_engine_last_log = [time.monotonic()]
+
+
+def _note_pre_engine(t_preprocess: float) -> None:
+    now = time.monotonic()
+    t_arrival, t_handler = _t_http_arrival.get(), _t_handler_entry.get()
+    if t_arrival is None or t_handler is None:
+        return
+    _pre_engine_samples.append(
+        (t_handler - t_arrival, t_preprocess - t_handler, now - t_preprocess)
+    )
+    if now - _pre_engine_last_log[0] < 10.0:
+        return
+    _pre_engine_last_log[0] = now
+    parts = []
+    for i, name in enumerate(
+        ("arrival->handler", "handler->preprocess", "preprocess+add")
+    ):
+        v = sorted(x[i] for x in _pre_engine_samples)
+        parts.append(
+            f"{name} mean {sum(v) / len(v) * 1e3:.1f} p50 {v[len(v) // 2] * 1e3:.1f} "
+            f"p90 {v[int(0.9 * len(v))] * 1e3:.1f} max {v[-1] * 1e3:.1f} ms"
+        )
+    logger.warning(
+        "[pre-engine] %d requests: %s", len(_pre_engine_samples), " | ".join(parts)
+    )
+    _pre_engine_samples.clear()
+
+
+class _ArrivalTimeMiddleware:
+    """Stamp the ASGI arrival time of each HTTP request for ATOM_PRE_ENGINE_TIMING."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            _t_http_arrival.set(time.monotonic())
+        await self.app(scope, receive, send)
+
+
 _request_logger: logging.Logger | None = None
 _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 # `SYNTHETIC_TOKEN_TEXT` while a run's own text is meaningless, None otherwise.
@@ -823,6 +880,7 @@ async def generate_async(
             dp_parent_session_id=dp_parent_session_id,
         )
 
+    prompt_or_tokens = await _pool_tokenized(prompt_or_tokens)
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
         _validate_sequence_context_length(seq)
@@ -1198,6 +1256,19 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
     return response
 
 
+async def _pool_tokenized(prompt_or_tokens, multimodal_data=None):
+    """The prompt as ids from the tokenize pool, when one is running; else as is."""
+    pool = _tokenize_pool
+    if (
+        pool is None
+        or not pool.enabled
+        or multimodal_data is not None
+        or not isinstance(prompt_or_tokens, str)
+    ):
+        return prompt_or_tokens
+    return await pool.encode(prompt_or_tokens)
+
+
 async def setup_streaming_request(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -1247,7 +1318,9 @@ async def setup_streaming_request(
         return seq
 
     seq = None
+    t_preprocess = time.monotonic()
     try:
+        prompt_or_tokens = await _pool_tokenized(prompt_or_tokens, multimodal_data)
         seq = await executor_loop.run_in_executor(None, do_preprocess)
         _validate_sequence_context_length(seq)
     except Exception:
@@ -1269,6 +1342,8 @@ async def setup_streaming_request(
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
     engine.core_mgr.add_request([seq])
+    if _PRE_ENGINE_TIMING:
+        _note_pre_engine(t_preprocess)
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1577,6 +1652,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
+if _PRE_ENGINE_TIMING:
+    app.add_middleware(_ArrivalTimeMiddleware)
 app.add_middleware(
     RequestTimingMiddleware,
     observe_ttft=_request_metrics.observe_time_to_first_token,
@@ -1623,6 +1700,8 @@ async def general_error_handler(request: Request, exc: Exception):
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
 
+    if _PRE_ENGINE_TIMING:
+        _t_handler_entry.set(time.monotonic())
     validate_model(request.model)
 
     try:
@@ -2869,7 +2948,7 @@ def main():
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
-    global custom_message_encoder, _stream_batch_dispatcher
+    global custom_message_encoder, _stream_batch_dispatcher, _tokenize_pool
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3018,6 +3097,15 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    if envs.ATOM_TOKENIZE_PROCESSES > 0:
+        from atom.entrypoints.openai.tokenize_pool import TokenizePool
+
+        _tokenize_pool = TokenizePool(
+            args.model, args.trust_remote_code, envs.ATOM_TOKENIZE_PROCESSES, tokenizer
+        )
+        logger.info(
+            "Tokenizing prompts in %d worker processes", envs.ATOM_TOKENIZE_PROCESSES
+        )
     # Responses go out through per-request callbacks; nothing here reads
     # `get_output()`.
     engine.core_mgr.keep_finished_outputs = False
