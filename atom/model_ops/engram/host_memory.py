@@ -631,8 +631,8 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
-def _mlock(lo: int, hi: int) -> None:
-    """Lock `[lo, hi)` in RAM (`ATOM_ENGRAM_MLOCK`).
+def _mlock(ranges) -> None:
+    """Lock the in-place registered `[lo, hi)` ranges in RAM.
 
     An in-place registration pins page-cache pages through a KFD userptr BO,
     which the kernel does not treat as locked: under memory pressure kswapd
@@ -640,17 +640,24 @@ def _mlock(lo: int, hi: int) -> None:
     notifier evicts all of the process's GPU queues until the BO is
     revalidated (stalls of seconds, or a hang). `mlock` keeps reclaim off
     these pages; set `vm.compact_unevictable_allowed=0` to keep compaction
-    off them as well. Best effort: a refusal (RLIMIT_MEMLOCK) only warns.
-    Not undone on release -- ranges that share a page would unlock each
-    other; the lock goes with the mapping.
+    off them as well. Best effort: a refusal (RLIMIT_MEMLOCK without
+    CAP_IPC_LOCK) warns once and the registration stands. Not undone on
+    release -- ranges that share a page would unlock each other; the lock
+    goes with the mapping.
     """
     libc = ctypes.CDLL(None, use_errno=True)
     libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    if libc.mlock(lo, hi - lo) != 0:
+    refused, errno = 0, 0
+    for lo, hi in ranges:
+        if libc.mlock(lo, hi - lo) != 0:
+            refused += hi - lo
+            errno = ctypes.get_errno()
+    if refused:
         logger.warning(
-            "engram: mlock of %d bytes failed (errno %d); raise RLIMIT_MEMLOCK",
-            hi - lo,
-            ctypes.get_errno(),
+            "engram: mlock of %d bytes failed (errno %d); reclaim may stall the "
+            "GPU queues under host memory pressure, raise RLIMIT_MEMLOCK",
+            refused,
+            errno,
         )
 
 
@@ -664,6 +671,7 @@ def _register(sources, leases):
     rt = torch.cuda.cudart()
 
     out = []
+    locked = []
     for src in sources:
         base = src.data_ptr()
         nbytes = src.numel() * src.element_size()
@@ -672,8 +680,6 @@ def _register(sources, leases):
         flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
         if flags:
             _populate(lo, hi)
-        if envs.ATOM_ENGRAM_MLOCK:
-            _mlock(lo, hi)
         runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
         if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
@@ -688,4 +694,8 @@ def _register(sources, leases):
         leases.append(lease)
         view = _owning_bytes(lease, base - lo, nbytes)
         out.append(view.view(src.dtype).view(src.shape))
+        locked.append((lo, hi))
+    # Only once every range is registered: a refused one falls back to the
+    # host path, which must not leave the earlier ranges locked.
+    _mlock(locked)
     return tuple(out)
