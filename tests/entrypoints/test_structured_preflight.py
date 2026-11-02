@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from atom.structured_output import tokenizer_fingerprint
-from atom.structured_output.worker_preflight import (
+from atom.structured_output.validation import (
     WorkerGrammarPreflight,
 )
 

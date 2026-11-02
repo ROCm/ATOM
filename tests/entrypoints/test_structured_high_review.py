@@ -9,8 +9,10 @@ from unittest.mock import Mock
 import pytest
 
 from atom.entrypoints.openai.reasoning import ReasoningChannel
-from atom.structured_output.request_validation import structured_response_channel
-from atom.structured_output.response_validation import validate_responses_output
+from atom.structured_output.validation import (
+    structured_response_channel,
+    validate_responses_output,
+)
 
 
 @pytest.mark.parametrize(

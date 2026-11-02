@@ -1789,11 +1789,11 @@ async def _configure_structured_output(
         raise ValueError(
             "Structured output does not support ignore_eos or custom stop strings"
         )
-    from atom.structured_output.request_validation import (
+    from atom.structured_output.validation import (
+        WorkerGrammarPreflight,
         structured_reasoning_marker,
         structured_tool_format,
     )
-    from atom.structured_output.worker_preflight import WorkerGrammarPreflight
 
     marker = structured_reasoning_marker(channel, tokenizer)
     tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
@@ -1871,7 +1871,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
         )
 
-        from atom.structured_output.request_validation import schema_from_format
+        from atom.structured_output.validation import schema_from_format
 
         schema = schema_from_format(request.response_format)
 
@@ -1937,7 +1937,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
-        from atom.structured_output.request_validation import (
+        from atom.structured_output.validation import (
             structured_response_channel,
         )
 
@@ -2004,7 +2004,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     ),
                 )
             if schema is not None:
-                from atom.structured_output.response_validation import (
+                from atom.structured_output.validation import (
                     validate_chat_stream,
                 )
 
@@ -2115,7 +2115,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         if schema is not None:
-            from atom.structured_output.response_validation import validate_output
+            from atom.structured_output.validation import validate_output
 
             for choice in resp.choices:
                 validate_output(
@@ -2814,8 +2814,10 @@ async def responses_create(raw_request: Request):
             top_p=(request.top_p if request.top_p is not None else model_top_p),
         )
 
-        from atom.structured_output.request_validation import schema_from_format
-        from atom.structured_output.response_validation import validate_output
+        from atom.structured_output.validation import (
+            schema_from_format,
+            validate_output,
+        )
 
         text_config = getattr(request, "text", None)
         if text_config is not None and not isinstance(text_config, dict):
@@ -2866,7 +2868,7 @@ async def responses_create(raw_request: Request):
             tool_choice=request.tool_choice,
             kv_transfer=kv_transfer_params,
         )
-        from atom.structured_output.request_validation import (
+        from atom.structured_output.validation import (
             structured_response_channel,
         )
 
@@ -3022,7 +3024,7 @@ async def responses_create(raw_request: Request):
             finish_reason=final_output.get("finish_reason"),
         )
         if schema is not None:
-            from atom.structured_output.response_validation import (
+            from atom.structured_output.validation import (
                 validate_responses_output,
             )
 

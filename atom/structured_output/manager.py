@@ -110,7 +110,7 @@ class StructuredOutput:
             return
         import torch
 
-        from .transfer import AsyncTokenCopy
+        from .utils import AsyncTokenCopy
 
         # Host mirrors are consumed here, while this step owns the staging slot.
         # Copy row numbers into Python, never retain a reusable NumPy view.
@@ -213,7 +213,7 @@ class StructuredOutput:
                 drafts = self.draft_copy.wait().tolist()
         self.draft_plan = None
         if getattr(self, "mask_buffer", None) is None:
-            from .mask import StructuredOutputMask
+            from .utils import StructuredOutputMask
 
             self.mask_buffer = StructuredOutputMask(self.vocab_size)
         mask_count = (
@@ -309,7 +309,7 @@ class StructuredOutput:
         if sampled.device.type == "cuda":
             import torch
 
-            from .transfer import AsyncTokenCopy
+            from .utils import AsyncTokenCopy
 
             if getattr(self, "commit_copy", None) is None:
                 self.commit_copy = AsyncTokenCopy(sampled.device)

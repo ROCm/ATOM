@@ -7,11 +7,9 @@ import pytest
 pytest.importorskip("jsonschema")
 
 from atom.entrypoints.openai.sse import data_frame
-from atom.structured_output.request_validation import (
+from atom.structured_output.validation import (
     schema_from_format,
     structured_reasoning_marker,
-)
-from atom.structured_output.response_validation import (
     validate_chat_stream,
     validate_output,
 )
@@ -87,7 +85,7 @@ def test_namespaced_tools_keep_dispatch_identity(choice):
     from atom.entrypoints.openai.tool_parser.deepseekv41_tool_parser import (
         DsmlV41Parser,
     )
-    from atom.structured_output.request_validation import (
+    from atom.structured_output.validation import (
         structured_tool_format,
     )
 
@@ -167,7 +165,7 @@ def test_tool_format_matches_the_selected_parser_and_tool_name():
     from atom.entrypoints.openai.tool_parser.deepseekv41_tool_parser import (
         DsmlV41Parser,
     )
-    from atom.structured_output.request_validation import (
+    from atom.structured_output.validation import (
         structured_tool_format,
     )
 

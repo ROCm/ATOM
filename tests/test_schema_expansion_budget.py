@@ -6,8 +6,8 @@ import json
 import pytest
 from jsonschema import Draft202012Validator
 
-from atom.structured_output import schema_normalization as normalization
-from atom.structured_output.schema_normalization import (
+from atom.structured_output import schema as normalization
+from atom.structured_output.schema import (
     SchemaExpansionLimit,
     normalize_schema,
 )

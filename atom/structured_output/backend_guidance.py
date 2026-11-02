@@ -80,8 +80,7 @@ class GrammarCompiler:
     def compile_json_schema(self, schema, tool_format=None):
         from llguidance import LLMatcher
 
-        from .schema_normalization import normalize_schema
-        from .schema_validation import check_schema_safety
+        from .schema import check_schema_safety, normalize_schema
 
         value = json.loads(schema)
         check_schema_safety(value)

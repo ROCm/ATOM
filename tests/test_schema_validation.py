@@ -7,13 +7,12 @@ import sys
 
 import pytest
 
-from atom.structured_output.request_validation import schema_from_format
-from atom.structured_output.response_validation import validate_output
-from atom.structured_output.schema_normalization import normalize_schema
-from atom.structured_output.schema_validation import (
+from atom.structured_output.schema import (
     check_schema_safety,
+    normalize_schema,
     schema_validator,
 )
+from atom.structured_output.validation import schema_from_format, validate_output
 
 
 def test_reference_into_literal_cannot_reach_network(monkeypatch):
@@ -73,9 +72,9 @@ def test_literal_reference_text_without_schema_reference_is_data():
 def test_regex_paths_finish_under_enforced_test_deadline(keyword):
     # The subprocess timeout would stop a regression using Python's backtracking re.
     code = f"""
-from atom.structured_output.schema_validation import schema_validator
-from atom.structured_output.schema_normalization import normalize_schema
-from atom.structured_output.response_validation import validate_output
+from atom.structured_output.schema import schema_validator
+from atom.structured_output.schema import normalize_schema
+from atom.structured_output.validation import validate_output
 import json
 bad = "a" * 40 + "!"
 pattern = "^(a+)+$"
@@ -99,7 +98,7 @@ else:
 
 def test_nested_dialect_cannot_restore_backtracking_validator():
     code = """
-from atom.structured_output.schema_validation import schema_validator
+from atom.structured_output.schema import schema_validator
 schema = {
         "properties": {
             "x": {
@@ -120,7 +119,7 @@ def test_registry_blocks_retrieval_even_without_admission_guard(monkeypatch):
 
     from referencing.exceptions import Unresolvable
 
-    from atom.structured_output import schema_validation
+    from atom.structured_output import schema as schema_validation
 
     monkeypatch.setattr(schema_validation, "check_schema_safety", lambda schema: None)
     monkeypatch.setattr(

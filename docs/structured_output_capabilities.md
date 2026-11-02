@@ -16,13 +16,9 @@ multi-backend interfaces.
 | `__init__.py` | Lightweight entry points used by the API preflight and model runner. |
 | `manager.py` | Worker admission, cached compilation, committed and speculative grammar state, and prepare/apply/commit ordering. |
 | `backend_guidance.py` | llguidance compiler and matcher adapter. |
-| `schema_normalization.py` | Exact constraint lowering and shared expansion budgets. |
-| `schema_validation.py` | Offline reference resolution and bounded RE2 validation shared by normalization and final answer checks. |
-| `mask.py` | Reusable packed mask buffers, H2D transfer and kernel dispatch. |
-| `transfer.py` | Owned token snapshots, pinned host buffers and asynchronous D2H events. |
-| `request_validation.py` | Chat/Responses format extraction, Schema checks, tool alternatives and reasoning activation. |
-| `response_validation.py` | Final JSON/Schema validation and Chat stream completion/error handling. |
-| `worker_preflight.py` | Admission-time worker RPC, deployment fingerprint checks and preparation cache. |
+| `schema.py` | Offline reference resolution, bounded RE2 validation, exact constraint lowering and shared expansion budgets. |
+| `validation.py` | Chat/Responses format and final answer validation, tool/reasoning adapters, and admission-time worker RPC/cache. |
+| `utils.py` | Reusable packed mask buffers, H2D kernel dispatch, and owned asynchronous token D2H snapshots. |
 
 API handlers and the model runner import from this single package. Protocol
 adapters import the existing tool/reasoning parsers and SSE helpers only inside
