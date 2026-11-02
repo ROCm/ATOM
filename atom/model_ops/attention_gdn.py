@@ -537,6 +537,16 @@ class GatedDeltaNet(nn.Module):
         gate_fused = False
         if gdn_metadata.num_prefills > 0:
             ckpt = gdn_metadata.ssm_checkpoints
+            # Interior checkpoints come out of the state kernel itself, as the
+            # exact fp32 state stored into their slots (`checkpoint_slots`),
+            # where the builder supplied the per-chunk slot table. Otherwise
+            # they are copied from the per-chunk `h`, which is rounded to bf16.
+            exact_ckpt = (
+                ckpt is not None
+                and ckpt.get("chunk_slots") is not None
+                and ssm_state.stride(-2) != 1
+            )
+            ckpt_slots = (ssm_state, ckpt["chunk_slots"]) if exact_ckpt else None
             flydsl_metadata = getattr(gdn_metadata, "flydsl_prefill_metadata", None)
             use_flydsl_prefill = False
             if (
@@ -560,8 +570,10 @@ class GatedDeltaNet(nn.Module):
             plan = getattr(gdn_metadata, "varlen_plan", None)
             if plan is not None:
                 # Bucket-shaped launches; the recurrence reads and writes the
-                # state pool by slot (`fla_ops.varlen_plan`). No checkpoints
-                # on this path: the builder keeps those steps eager.
+                # state pool by slot (`fla_ops.varlen_plan`). Checkpoints ride
+                # along: the state kernel stores interior ones, the copy below
+                # the conv windows and the end-of-sequence states, all from
+                # fixed-address tables the builder fills every step.
                 wrote_core_attn_out = spec_sequence_masks is None
                 gate_fused = wrote_core_attn_out and z is not None
                 core_attn_out_non_spec, last_recurrent_state = chunk_gated_delta_rule(
@@ -580,8 +592,9 @@ class GatedDeltaNet(nn.Module):
                         if wrote_core_attn_out
                         else None
                     ),
-                    keep_intermediate_states=False,
+                    keep_intermediate_states=ckpt is not None and not exact_ckpt,
                     plan=plan,
+                    checkpoint_slots=ckpt_slots,
                     output_gate=(
                         self._output_gate(z[:num_actual_tokens]) if gate_fused else None
                     ),
@@ -634,7 +647,8 @@ class GatedDeltaNet(nn.Module):
                     ),
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=ckpt is not None and not exact_ckpt,
+                    checkpoint_slots=ckpt_slots,
                     state_slots=(
                         gdn_metadata.non_spec_state_indices_in_i64,
                         gdn_metadata.non_spec_state_indices_i64,
@@ -675,7 +689,12 @@ class GatedDeltaNet(nn.Module):
                     write_state_checkpoints,
                 )
 
-                h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
+                from_h = use_flydsl_prefill or not exact_ckpt
+                h = (
+                    (flydsl_h if use_flydsl_prefill else pop_last_intermediate_states())
+                    if from_h
+                    else ssm_state
+                )
                 # Raise rather than skip: the scheduler publishes every target
                 # after this forward, written or not.
                 if h is None:
@@ -701,6 +720,7 @@ class GatedDeltaNet(nn.Module):
                     non_spec_query_start_loc,
                     CHUNK_SIZE,
                     gdn_metadata.ssm_conv_state_len,
+                    ssm_from_h=from_h,
                 )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
