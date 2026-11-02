@@ -52,7 +52,10 @@ Key entry points:
   loops) over `atom/distributed/pp_transport.py`; dynamic chunked PP prefill in
   `atom/model_engine/dynamic_chunking.py` (latency model, pure) and
   `dynamic_chunking_worker.py` (startup sweep and runtime timing in the runner),
-  sized by `Scheduler._dynamic_chunk_limit`
+  sized by `Scheduler._dynamic_chunk_limit`. What crosses a stage boundary is
+  `atom/distributed/pp_comm.py:_PP_PROXY_KEYS` (incl. `block_residual` and
+  `PP_AUX_KEY` = `pp_aux`); `atom/spec_decode/pp_aux_relay.py` relays a drafter's
+  target aux hidden states from earlier stages to the last (the drafter's) stage
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),

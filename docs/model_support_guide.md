@@ -156,6 +156,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
 - **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3/image_processing.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
+- **Pipeline parallel:** pp2 x tp4 runs with or without the DSpark drafter (`--enforce-eager`: PP decode has no CUDA graphs yet). The drafter sits on the last stage; `PPAuxRelay` (`atom/spec_decode/pp_aux_relay.py`) brings it the aux hidden states captured on earlier stages.
 
 ### DeepSeek-V4.1 (`DeepseekV41ForCausalLM`)
 
