@@ -17,6 +17,7 @@ multi-backend interfaces.
 | `manager.py` | Worker admission, cached compilation, committed and speculative grammar state, and prepare/apply/commit ordering. |
 | `backend_guidance.py` | llguidance compiler and matcher adapter. |
 | `schema_normalization.py` | Exact constraint lowering and shared expansion budgets. |
+| `schema_validation.py` | Offline reference resolution and bounded RE2 validation shared by normalization and final answer checks. |
 | `mask.py` | Reusable packed mask buffers, H2D transfer and kernel dispatch. |
 | `transfer.py` | Owned token snapshots, pinned host buffers and asynchronous D2H events. |
 | `request_validation.py` | Chat/Responses format extraction, Schema checks, tool alternatives and reasoning activation. |
@@ -65,8 +66,17 @@ rejected at admission. Cold compilation pauses scheduling on the affected ranks;
 repeated schema/tool-format pairs use bounded caches. Ordinary requests do not
 initialize this path or perform these RPCs.
 
-Only local
-references are allowed. Unsupported grammar constructs cause a request error;
+Only local references are allowed, including references reached transitively
+through a local pointer into an otherwise literal `const` or `enum` value.
+Every runtime validator also disables external resource retrieval. Schema regexes
+use the non-backtracking RE2 evaluator from the optional `google-re2` dependency
+for candidate filtering and final validation, including property-name matching.
+Each compiled regex has a 2 MiB memory limit; patterns are limited to 262,144
+characters and the cache retains at most 32 compiled expressions. Unsupported
+RE2 syntax, such as backreferences or lookarounds, is rejected before enqueue.
+Nested dialect declarations cannot switch validation back to Python's
+backtracking regex engine. Only JSON Schema draft 2020-12 is accepted.
+Unsupported grammar constructs cause a request error;
 compilation is not a claim of complete JSON Schema vocabulary support. A final
 JSON Schema validator additionally checks the visible answer before a successful
 completion is returned. A validation failure becomes an error, never a successful
@@ -108,6 +118,14 @@ decoding each verification row uses the grammar state after its proposed draft
 prefix; rejected drafts never advance the committed state. The implementation
 bridges deferred output delivery and reconstructs grammar state from committed
 history on replay. No target-model forward or AITER operator is added.
+
+Once the answer grammar is active, inline reasoning markers inside JSON strings
+remain literal answer text. Tool-only Responses results skip answer validation
+after conversion to `function_call`, `custom_tool_call`, or `tool_search_call`;
+any accompanying visible answer is still validated. Structured requests are
+rejected at both API and worker admission when `ATOM_ENABLE_RELAXED_MTP=1`, since
+relaxed acceptance can otherwise accept a draft with zero grammar-masked target
+probability. Unconstrained requests retain their existing behavior.
 
 This change preserves the existing non-speculative engine's scalar logprob
 semantics: normalization uses the raw model distribution before grammar and

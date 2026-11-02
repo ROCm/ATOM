@@ -325,14 +325,26 @@ class ReasoningChannel:
 
     dialect: ReasoningDialect | None = None
     starts_open: bool = False
+    literal_answer: bool = False
 
     def split(self, text: str) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``."""
+        if self.literal_answer:
+            reader = self.stream()
+            events = [*reader.process(text), *reader.flush()]
+            reasoning = "".join(v for k, v in events if k == "reasoning_content")
+            content = "".join(v for k, v in events if k == "content")
+            return reasoning or None, content
         return separate_reasoning(text, self.starts_open, self.dialect)
 
     def stream(self) -> ReasoningFilter:
         """A filter over the same output arriving in chunks."""
-        return ReasoningFilter(starts_thinking=self.starts_open, dialect=self.dialect)
+        reader = ReasoningFilter(starts_thinking=self.starts_open, dialect=self.dialect)
+        if self.literal_answer and not self.starts_open:
+            # The answer grammar is active already; markers inside JSON are data.
+            reader.state = 2
+            reader._scanner = None
+        return reader
 
 
 # For a caller with no model behind it -- tests, and the completions endpoint,

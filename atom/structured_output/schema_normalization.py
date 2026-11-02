@@ -8,7 +8,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from jsonschema import Draft202012Validator
+from .schema_validation import schema_validator
 
 _TYPES = ["null", "boolean", "number", "string", "array", "object"]
 _LIMIT = 256
@@ -62,7 +62,7 @@ def _finite(schema, budget):
     else:
         return None
     budget.consume(candidates=len(values))
-    validator = Draft202012Validator(schema)
+    validator = schema_validator(schema)
     return [value for value in values if validator.is_valid(value)]
 
 
@@ -239,7 +239,7 @@ def _conditional(schema, budget):
         raise ValueError("Conditional schema expansion exceeds 256 branches")
     budget.consume(branches=math.prod(map(len, domains)) * (3 + len(names)))
     branches = []
-    validator = Draft202012Validator(guard)
+    validator = schema_validator(guard)
     for values in itertools.product(*domains):
         instance = {n: v for n, v in zip(names, values) if v is not _MISSING}
         properties = {
@@ -270,7 +270,7 @@ def _unique(schema, budget):
     distinct = []
     for value in values:
         if not any(
-            Draft202012Validator({"const": old}).is_valid(value) for old in distinct
+            schema_validator({"const": old}).is_valid(value) for old in distinct
         ):
             distinct.append(value)
     lo = schema.get("minItems", 0)
@@ -281,7 +281,7 @@ def _unique(schema, budget):
         if count > _LIMIT:
             raise ValueError("uniqueItems expansion exceeds 256 arrays")
     budget.consume(branches=count + 2)
-    validator = Draft202012Validator(schema)
+    validator = schema_validator(schema)
     arrays = [
         list(p) for n in range(lo, hi + 1) for p in itertools.permutations(distinct, n)
     ]
@@ -317,9 +317,7 @@ def _normalize_schema(schema, budget):
         finite = _finite(result, budget)
         if finite is not None:
             budget.consume(branches=len(finite))
-            values = [
-                v for v in finite if not Draft202012Validator(predicate).is_valid(v)
-            ]
+            values = [v for v in finite if not schema_validator(predicate).is_valid(v)]
             additions.append({"enum": values} if values else False)
         else:
             additions.append(_negate(predicate, budget))

@@ -227,6 +227,9 @@ class ScheduledBatch:
                     else seq.json_schema
                 ),
                 seq.structured_reasoning_end,
+                # TODO(#2864): replace full per-step history copies with a
+                # serialization-safe committed-history cursor; preserve the
+                # deferred-output bridge during replay and batch reordering.
                 list(
                     seq.output_tokens[
                         : len(seq.output_tokens) - seq.num_placeholder_tokens

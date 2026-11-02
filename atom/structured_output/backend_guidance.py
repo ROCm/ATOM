@@ -41,8 +41,11 @@ class GrammarCompiler:
         from llguidance import LLMatcher
 
         from .schema_normalization import normalize_schema
+        from .schema_validation import check_schema_safety
 
-        value = normalize_schema(json.loads(schema))
+        value = json.loads(schema)
+        check_schema_safety(value)
+        value = normalize_schema(value)
         if isinstance(value, dict):
             # This is an API JSON Schema, not a backend configuration object.
             # In particular, clients must not enable lenient/coerce_one_of or

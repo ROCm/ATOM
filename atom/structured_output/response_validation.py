@@ -11,17 +11,37 @@ def validate_output(schema, text, finish_reason, *, tool_calls=False):
         return
     if tool_calls and not text.strip():
         return  # A function-only turn has no response text to constrain.
-    from jsonschema import Draft202012Validator
+    from .schema_validation import schema_validator
 
     try:
         value = json.loads(
             text, parse_constant=lambda x: (_ for _ in ()).throw(ValueError(x))
         )
-        Draft202012Validator(json.loads(schema)).validate(value)
+        schema_validator(json.loads(schema)).validate(value)
     except Exception as exc:
         raise RuntimeError(
             "Generated output did not satisfy the requested JSON Schema"
         ) from exc
+
+
+def validate_responses_output(schema, response, finish_reason):
+    visible = "".join(
+        part.get("text", "")
+        for item in response.get("output", [])
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+        if part.get("type") == "output_text"
+    )
+    validate_output(
+        schema,
+        visible,
+        finish_reason,
+        tool_calls=any(
+            item.get("type")
+            in {"function_call", "custom_tool_call", "tool_search_call"}
+            for item in response.get("output", [])
+        ),
+    )
 
 
 async def validate_chat_stream(source, schema):

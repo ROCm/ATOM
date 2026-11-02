@@ -42,6 +42,10 @@ def prepare_worker_grammar(runner, schema, tool_format, fingerprint, vocab_size)
     The RPC dispatcher catches failures without terminating the worker loop.
     No GPU operation or inter-rank collective is performed here.
     """
+    from atom.utils import envs
+
+    if envs.ATOM_ENABLE_RELAXED_MTP:
+        raise ValueError("Structured output cannot use relaxed MTP verification")
     structured = getattr(runner, "structured_output", None)
     if structured is None:
         from atom.model_engine.llm_engine import _load_tokenizer

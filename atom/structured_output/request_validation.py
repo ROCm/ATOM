@@ -28,45 +28,14 @@ def schema_from_format(fmt, *, responses=False):
     from jsonschema import Draft202012Validator, SchemaError
 
     try:
-        Draft202012Validator.check_schema(schema)
+        # Regex syntax is checked by the bounded RE2 compiler below, not re.compile.
+        Draft202012Validator.check_schema(schema, format_checker=None)
     except SchemaError as exc:
         raise ValueError(f"Invalid JSON Schema: {exc.message}") from exc
 
-    # Resolve only document-local references. Never fetch schemas from URLs.
-    def check(value):
-        if not isinstance(value, dict):
-            return
-        for key in ("$ref", "$dynamicRef"):
-            if key in value and not value[key].startswith("#"):
-                raise ValueError("Only local JSON Schema references are supported")
-        # Names in these maps are user data, not schema keywords.
-        for key in (
-            "properties",
-            "patternProperties",
-            "$defs",
-            "definitions",
-            "dependentSchemas",
-        ):
-            for child in value.get(key, {}).values():
-                check(child)
-        for key in (
-            "items",
-            "additionalProperties",
-            "contains",
-            "propertyNames",
-            "unevaluatedProperties",
-            "unevaluatedItems",
-            "not",
-            "if",
-            "then",
-            "else",
-        ):
-            check(value.get(key))
-        for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
-            for child in value.get(key, []):
-                check(child)
+    from .schema_validation import check_schema_safety
 
-    check(schema)
+    check_schema_safety(schema)
     return json.dumps(schema, ensure_ascii=False)
 
 
@@ -114,3 +83,9 @@ def structured_reasoning_marker(channel, tokenizer):
             "Structured thinking requires an explicit reasoning end marker"
         )
     return tokens
+
+
+def structured_response_channel(channel, schema):
+    from dataclasses import replace
+
+    return replace(channel, literal_answer=True) if schema is not None else channel

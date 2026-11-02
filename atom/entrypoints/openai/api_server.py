@@ -1775,6 +1775,8 @@ async def _configure_structured_output(
 ):
     if schema is None:
         return
+    if envs.ATOM_ENABLE_RELAXED_MTP:
+        raise ValueError("Structured output cannot use relaxed MTP verification")
     if kv_transfer or multimodal:
         raise ValueError("Structured output currently requires text without P/D")
     config = _get_engine_config()
@@ -1935,6 +1937,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
+        from atom.structured_output.request_validation import (
+            structured_response_channel,
+        )
+
+        _reasoning = structured_response_channel(_reasoning, schema)
 
         # Streaming
         if request.stream:
@@ -2848,16 +2855,22 @@ async def responses_create(raw_request: Request):
             input_tokens = max_input
 
         created_at = int(time.time())
+        _reasoning = reasoning_channel(
+            prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
+        )
         await _configure_structured_output(
             sampling_params,
             schema,
-            reasoning_channel(
-                prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
-            ),
+            _reasoning,
             tools=openai_tools,
             tool_choice=request.tool_choice,
             kv_transfer=kv_transfer_params,
         )
+        from atom.structured_output.request_validation import (
+            structured_response_channel,
+        )
+
+        _reasoning = structured_response_channel(_reasoning, schema)
 
         if request.stream:
             seq_id, stream_collector, _num_prompt_tokens = (
@@ -2870,10 +2883,7 @@ async def responses_create(raw_request: Request):
             )
 
             async def generate_responses_stream():
-                reasoning_filter = reasoning_channel(
-                    prompt_starts_in_reasoning(prompt),
-                    template_kwargs=merged_kwargs,
-                ).stream()
+                reasoning_filter = _reasoning.stream()
                 tool_parser = ToolCallStreamParser(
                     parser_cls=tool_call_parser_cls,
                     suppress_calls=forbids_tool_calls(request.tool_choice),
@@ -2991,10 +3001,7 @@ async def responses_create(raw_request: Request):
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
-            reasoning_channel(
-                prompt_starts_in_reasoning(prompt),
-                template_kwargs=merged_kwargs,
-            ),
+            _reasoning,
             tool_call_parser_cls,
             raw_text,
             openai_tools,
@@ -3015,21 +3022,12 @@ async def responses_create(raw_request: Request):
             finish_reason=final_output.get("finish_reason"),
         )
         if schema is not None:
-            visible = "".join(
-                part.get("text", "")
-                for item in response.get("output", [])
-                if item.get("type") == "message"
-                for part in item.get("content", [])
-                if part.get("type") == "output_text"
+            from atom.structured_output.response_validation import (
+                validate_responses_output,
             )
-            validate_output(
-                schema,
-                visible,
-                final_output.get("finish_reason"),
-                tool_calls=any(
-                    item.get("type") == "function_call"
-                    for item in response.get("output", [])
-                ),
+
+            validate_responses_output(
+                schema, response, final_output.get("finish_reason")
             )
         return _with_kv_transfer_params(response, final_output)
 

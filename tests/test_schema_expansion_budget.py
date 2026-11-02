@@ -79,7 +79,7 @@ def test_finite_candidate_budget_precedes_validation(monkeypatch):
     def forbidden(*_args):
         raise AssertionError("candidate validation must not start")
 
-    monkeypatch.setattr(normalization, "Draft202012Validator", forbidden)
+    monkeypatch.setattr(normalization, "schema_validator", forbidden)
     with pytest.raises(SchemaExpansionLimit):
         normalize_schema({"enum": list(range(5000)), "not": {"const": 1}})
 
