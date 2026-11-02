@@ -37,28 +37,6 @@ def _stage_anchors_kernel(
     tl.store(positions_out + i, tl.load(positions + tl.load(rows + src)))
 
 
-def build_aux_capture_spec(config) -> AuxCaptureSpec | None:
-    """Default DSpark aux-capture spec, derived from config alone (None if no DSpark).
-
-    Lets drafterless PP stages arm capture (`PPAuxRelay`); `DSparkProposer` uses
-    it too so the two cannot drift.
-    """
-    spec_cfg = getattr(config, "speculative_config", None)
-    if spec_cfg is None or not spec_cfg.use_dspark():
-        return None
-    draft_cfg = spec_cfg.draft_model_hf_config
-    layer_ids = tuple(
-        int(i) for i in (getattr(draft_cfg, "dspark_target_layer_ids", None) or ())
-    )
-    if not layer_ids:
-        raise ValueError("DSpark requires dspark_target_layer_ids on the draft config.")
-    return AuxCaptureSpec(
-        layer_ids=layer_ids,
-        hidden_size=config.hf_config.hidden_size,
-        extract=DSparkProposer._extract_layer_hidden,
-    )
-
-
 class DSparkProposer(Drafter):
     """DSpark block-parallel drafter (sibling of ``EagleProposer``).
 
@@ -531,11 +509,31 @@ class DSparkProposer(Drafter):
         return self._verify_scheduler
 
     # ---- aux-hidden-state ownership (declarative; base owns the hook machinery) ----
+    @classmethod
+    def aux_capture_spec(cls, config) -> AuxCaptureSpec | None:
+        """Default DSpark aux-capture spec, from config alone (None if no DSpark)."""
+        spec_cfg = getattr(config, "speculative_config", None)
+        if spec_cfg is None or not spec_cfg.use_dspark():
+            return None
+        draft_cfg = spec_cfg.draft_model_hf_config
+        layer_ids = tuple(
+            int(i) for i in (getattr(draft_cfg, "dspark_target_layer_ids", None) or ())
+        )
+        if not layer_ids:
+            raise ValueError(
+                "DSpark requires dspark_target_layer_ids on the draft config."
+            )
+        return AuxCaptureSpec(
+            layer_ids=layer_ids,
+            hidden_size=config.hf_config.hidden_size,
+            extract=cls._extract_layer_hidden,
+        )
+
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
         """Resolve the draft's feature contract; the base owns capture buffers."""
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is None:
-            return build_aux_capture_spec(self.config)
+            return self.aux_capture_spec(self.config)
         if int(getattr(self.config, "pipeline_parallel_size", 1) or 1) > 1:
             # Drafterless PP stages can only rebuild the default spec; relaying
             # it to a draft with its own contract would be silently wrong.

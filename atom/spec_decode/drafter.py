@@ -120,6 +120,71 @@ def _identity_extract(output: Any, _module: nn.Module) -> torch.Tensor:
     return output[0] if isinstance(output, tuple) else output
 
 
+def _aux_hook(extract, write):
+    """A target-layer forward hook handing ``write(tensor, row_offset)`` the
+    tap's aux tensor, on target forwards only."""
+
+    def _hook(module, _inputs, output):
+        ctx = get_forward_context().context
+        # Target forwards only. The `-1` tap sits on the embedding, which the
+        # draft model shares — its forward_spec would otherwise clobber these
+        # rows with noise-token embeddings.
+        if ctx.is_draft:
+            return
+        tensor = extract(output, module)
+        if tensor is None:
+            return
+        # The offset is 0 except under TBO, where this hook fires once per
+        # micro-batch on a disjoint token slice — writing at row 0
+        # unconditionally would make the ubatches overwrite each other.
+        write(tensor, ctx.ubatch_token_offset)
+
+    return _hook
+
+
+def install_aux_taps(
+    target_model: nn.Module, spec: AuxCaptureSpec, layer_ids, make_hook
+):
+    """Hook each of ``layer_ids`` (a subset of ``spec.layer_ids``) on the target
+    with ``make_hook(lid, extract)``.
+
+    Reference convention (deepspec validate_target_layer_ids): ``spec``'s ids
+    must be strictly increasing and each in {-1} U [0, n_layers). Each id
+    resolves to a (module, extract) tap: -1 taps the embedding output
+    (hidden_states[0], taken verbatim); k taps decoder layer k through
+    ``spec.extract``.
+    """
+    layers = _resolve_decoder_layers(target_model)
+    n_layers = len(layers)
+    prev = None
+    for lid in spec.layer_ids:
+        if not (lid == -1 or 0 <= lid < n_layers):
+            raise ValueError(
+                f"aux capture layer id {lid} out of range {{-1}} U [0,{n_layers})."
+            )
+        if prev is not None and lid <= prev:
+            raise ValueError(
+                "aux capture layer ids must be strictly increasing, got "
+                f"{spec.layer_ids}."
+            )
+        prev = lid
+    for lid in layer_ids:
+        module, extract = (
+            (_resolve_embedding(target_model), _identity_extract)
+            if lid == -1
+            else (layers[lid], spec.extract)
+        )
+        hook = make_hook(lid, extract)
+        if lid != -1 and spec.capture == "input":
+
+            def pre_hook(module, inputs, hook=hook):
+                hook(module, (), inputs)
+
+            module.register_forward_pre_hook(pre_hook)
+        else:
+            module.register_forward_hook(hook)
+
+
 # Draft-model architecture registry: maps a draft checkpoint's architecture
 # string to the ATOM wrapper class. Covers all drafter flavors (serial MTP,
 # EAGLE3, DSpark), so it lives on the shared base rather than a per-flavor file.
@@ -320,11 +385,17 @@ class Drafter(abc.ABC):
         the target config; ``EagleProposer`` overrides for the eagle3 arch."""
         return model_class(self.config)
 
+    @classmethod
+    def aux_capture_spec(cls, config: Config) -> AuxCaptureSpec | None:
+        """The aux capture this drafter class makes, from config alone (None:
+        no capture). What a drafterless PP stage taps and relays on."""
+        return None
+
     def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec | None:
         """Declare which target layers to tap for aux hidden states and how to
-        extract them. Default: no capture. Hook-based drafters (DSpark) override
-        this; the base ``arm_aux_capture`` turns the spec into forward hooks."""
-        return None
+        extract them. Default: the config-only ``aux_capture_spec``. The base
+        ``arm_aux_capture`` turns the spec into forward hooks."""
+        return self.aux_capture_spec(self.config)
 
     @abc.abstractmethod
     def propose(
@@ -387,39 +458,14 @@ class Drafter(abc.ABC):
             )
             for _ in spec.layer_ids
         ]
-        layers = _resolve_decoder_layers(target_model)
-        n_layers = len(layers)
-        # Reference convention (deepspec validate_target_layer_ids): ids must be
-        # strictly increasing and each in {-1} U [0, n_layers). Each id resolves to
-        # a (module, extract) tap funneled through the SAME hook: -1 taps the
-        # embedding output (hidden_states[0], taken verbatim); k taps decoder
-        # layer k's output through the drafter's mHC extract.
-        prev = None
-        for buf_idx, lid in enumerate(spec.layer_ids):
-            if not (lid == -1 or 0 <= lid < n_layers):
-                raise ValueError(
-                    f"aux capture layer id {lid} out of range {{-1}} U [0,{n_layers})."
-                )
-            if prev is not None and lid <= prev:
-                raise ValueError(
-                    "aux capture layer ids must be strictly increasing, got "
-                    f"{spec.layer_ids}."
-                )
-            prev = lid
-            module, extract = (
-                (_resolve_embedding(target_model), _identity_extract)
-                if lid == -1
-                else (layers[lid], spec.extract)
-            )
-            hook = self._make_aux_hook(buf_idx, extract)
-            if lid != -1 and spec.capture == "input":
-
-                def pre_hook(module, inputs, hook=hook):
-                    hook(module, (), inputs)
-
-                module.register_forward_pre_hook(pre_hook)
-            else:
-                module.register_forward_hook(hook)
+        install_aux_taps(
+            target_model,
+            spec,
+            spec.layer_ids,
+            lambda lid, extract: self._make_aux_hook(
+                spec.layer_ids.index(lid), extract
+            ),
+        )
         self._captures_aux = True
         # A target that runs some layers on a subset of rows (V4.1 bounded
         # replay) moves those layers' captures to their forward rows itself.
@@ -437,24 +483,11 @@ class Drafter(abc.ABC):
     def _make_aux_hook(self, buf_idx: int, extract):
         buffer = self._aux_buffers[buf_idx]
 
-        def _hook(module, _inputs, output):
-            ctx = get_forward_context().context
-            # Target forwards only. The `-1` tap sits on the embedding, which the
-            # draft model shares — its forward_spec would otherwise clobber these
-            # rows with noise-token embeddings.
-            if ctx.is_draft:
-                return
-            tensor = extract(output, module)
-            if tensor is None:
-                return
-            # In-place write into the fixed buffer (cudagraph-safe). Offset is 0
-            # except under TBO, where this hook fires once per micro-batch on a
-            # disjoint token slice — writing at row 0 unconditionally would make
-            # the ubatches overwrite each other.
-            off = ctx.ubatch_token_offset
+        def write(tensor, off):
+            # In-place write into the fixed buffer (cudagraph-safe).
             buffer[off : off + tensor.shape[0]].copy_(tensor)
 
-        return _hook
+        return _aux_hook(extract, write)
 
     def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:
         """The target aux hidden states captured during the last forward,
