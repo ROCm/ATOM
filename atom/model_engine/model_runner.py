@@ -80,7 +80,13 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.presence_penalty import PresencePenaltyState, PresencePenaltyStep
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler, sample_topk_candidates
+from atom.model_ops.sampler import (
+    SAMPLER_EPS,
+    Sampler,
+    fused_topk_topp_applicable,
+    fused_topk_topp_sample,
+    sample_topk_candidates,
+)
 from atom.observability import timeline
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
@@ -3457,6 +3463,23 @@ class ModelRunner:
         filters as the two calls, independent noise per row as both had."""
         rows = target_logits_indices.numel()
         device = target_logits_indices.device
+        if isinstance(logits, torch.Tensor) and fused_topk_topp_applicable(
+            logits, top_ks, top_ps
+        ):
+            # The verify and bonus rows read in place, each row's request
+            # found in the kernel (ATOM_FUSED_TOPK_TOPP_SAMPLE).
+            tokens = fused_topk_topp_sample(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                verify_rows=target_logits_indices,
+                bonus_rows=bonus_logits_indices,
+                cu_num_draft_tokens=cu_num_draft_tokens,
+            )
+            if get_tp_group().world_size > 1:
+                tokens = broadcast_from_rank0(tokens, get_tp_group())
+            return tokens[:rows], tokens[rows:]
         per_row = torch.cat(
             [
                 torch.searchsorted(
