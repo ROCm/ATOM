@@ -12,6 +12,7 @@ AITER build, and `loader.py` imports AITER at module level.
 
 import concurrent.futures
 import contextlib
+import ctypes
 import json
 import logging
 import os
@@ -86,6 +87,13 @@ def verify_shard_files_present(model_name_or_path: str) -> None:
         "Re-download the checkpoint -- an interrupted `hf download` is the "
         "usual cause, and re-running it resumes the missing files."
     )
+
+
+def _one_omp_thread() -> None:
+    """A loader thread's own OpenMP team: one thread (``omp_set_num_threads``
+    sets the calling thread's count only; torch's OpenMP runtime is loaded,
+    so the process resolves it)."""
+    ctypes.CDLL(None).omp_set_num_threads(1)
 
 
 def load_weights_into_model(
@@ -197,8 +205,17 @@ def load_weights_into_model(
     if online_quant_streamer is not None:
         num_threads = online_quant_streamer.resolve_num_threads(num_threads)
         online_quant_streamer.setup_online_quant_pool()
+    # Each loader thread copies one tensor at a time. Left at torch's default,
+    # every one of them gets its own OpenMP team the size of the machine: 16
+    # threads x 8 TP ranks became ~17k OS threads on 256 cores, and the
+    # scheduling cost, not the copies, set the load time. OpenMP's thread count
+    # is the calling thread's own; ``torch.set_num_threads`` here would also
+    # set the default every thread started during the load inherits (the
+    # online-quant pool, the checkpoint prefetch).
     if num_threads > 1:
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=num_threads, initializer=_one_omp_thread
+        )
     else:
         executor = None
     futures = []
