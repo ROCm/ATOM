@@ -226,21 +226,9 @@ class GDNStateMixin(PoolRowsMixin):
                 lin.get("short_conv_kernel_size", 4),
             )
 
-        self.num_spec = 0
-        spec_config = getattr(model_runner.config, "speculative_config", None)
-        if hasattr(model_runner, "drafter"):
-            self.num_spec = model_runner.drafter.mtp_k
-        elif spec_config is not None:
-            # Under PP only the last stage has a drafter, but every stage runs the
-            # verify window over its own recurrent state; sized for one token it
-            # would advance state across rejected drafts with no rollback.
-            self.num_spec = int(spec_config.num_speculative_tokens or 0)
-            if self.num_spec == 0:
-                raise ValueError(
-                    "Speculative decoding is configured but "
-                    "num_speculative_tokens is unset, so a pipeline stage with "
-                    "no drafter cannot size its verify window."
-                )
+        # Not the drafter's: under PP only the last stage has one, but every
+        # stage runs the verify window over its own recurrent state.
+        self.num_spec = model_runner.num_spec_tokens
         self.use_spec_decode = self.num_spec > 0
 
         # --- ReplaySSM ------------------------------------------------------

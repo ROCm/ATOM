@@ -66,7 +66,8 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
-from atom.utils import envs
+from atom.utils import envs, get_hf_text_config
+from atom.utils.selector import attn_family
 
 if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer
@@ -74,6 +75,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger("atom")
 
 _DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
+
+
+def defers_output(config, family=None) -> bool:
+    """Whether each step's sampled ids reach the host a step late, read on
+    device by the next forward. The scheduler and the runner's
+    `tokenIDProcessor` both take it from here: the two modes leave different
+    trailing placeholder counts, so they must agree.
+
+    Not under PP, where the ids cross stages on the host. Not for a P/D
+    producer with recurrent state either: it hands off prompt-end state plus
+    the first sampled token, and deferring makes it decode once more to surface
+    that token, so the consumer applies T0 to a state that already has it. A
+    paged write lands at T0's own position, so only a recurrent state notices.
+    `family` is the config's `attn_family`, resolved here when not given.
+    """
+    if getattr(config, "pipeline_parallel_size", 1) > 1:
+        return False
+    if not kv_config_has_producer(getattr(config, "kv_transfer_config", {}) or {}):
+        return True
+    if family is None:
+        family = attn_family(get_hf_text_config(config.hf_config))
+    return not family.has_recurrent_state
 
 
 class ChunkKind(enum.Enum):
@@ -762,11 +785,7 @@ class Scheduler:
         # costs.
         self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
         self.block_manager.draft_lookahead = self.draft_lookahead
-        # Matches `tokenID_processor.is_deferred_out` under speculation, the
-        # only time it is read (a P/D producer is also undeferred, but never
-        # speculates). Scheduling needs it early because the modes leave
-        # different trailing placeholder counts.
-        self.is_deferred_out = pp_size == 1
+        self.is_deferred_out = defers_output(config)
         if self.use_spec and pp_size > 1:
             logger.info(
                 "Speculative decoding: verifying locally under pipeline "

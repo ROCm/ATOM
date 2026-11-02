@@ -53,7 +53,11 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
-from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.model_engine.scheduler import (
+    ScheduledBatch,
+    ScheduledBatchOutput,
+    defers_output,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -190,17 +194,7 @@ class tokenIDProcessor:
         # The scheduler never speculates for a P/D producer, though the runner
         # keeps its drafter loaded: every decode it runs is q=1.
         self.is_pd_producer = _kv_config_has_producer(kv_cfg)
-        # P/D hands off prompt-end state plus the first sampled token. Deferred
-        # output makes the producer decode once more to surface that token, so
-        # the consumer applies T0 to a state that already has it. Only a
-        # recurrent state notices -- a paged write lands at T0's own position,
-        # so repeating it is idempotent.
-        hands_off_recurrent_state = (
-            self.is_pd_producer and runner.attn_family.has_recurrent_state
-        )
-        self.is_deferred_out = (
-            not self.is_pipeline_parallel and not hands_off_recurrent_state
-        )
+        self.is_deferred_out = defers_output(runner.config, runner.attn_family)
 
         self.runner = runner
         device = runner.device
