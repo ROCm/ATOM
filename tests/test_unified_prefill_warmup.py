@@ -88,6 +88,22 @@ class TestWarmupShapes:
         assert kinds
         assert all(k == {"one", "few", "x16"} for k in kinds.values()), kinds
 
+    def test_request_counts_double_at_most_up_to_256(self):
+        """The KV split follows the program count in powers of two, so each
+        multi-request kind must step by <= 2x to reach every split count; a
+        31-request, 16-row step missed one when "neither" stopped at 12."""
+        shapes = upw.unified_prefill_warmup_shapes(4096, *QWEN35_TP4)
+        for q in (1, 2, 4, 8, 16, 32):
+            counts = {len(rows) for rows, _ in shapes if max(rows) == q}
+            for kind in (
+                sorted(n for n in counts if n > 1 and n % 16),
+                sorted(n for n in counts if n % 16 == 0),
+            ):
+                assert kind[-1] >= 256
+                assert all(b <= 2 * a for a, b in itertools.pairwise(kind))
+        rows31 = [rows for rows, _ in shapes if rows == (16,) * len(rows)]
+        assert any(len(r) > 31 and len(r) % 16 for r in rows31)
+
     def test_sixteen_request_launches_are_real_sixteen_request_steps(self):
         """Every request carries new rows: the program count is a 16-request
         step's, not a single request's. Untrimmed up to the byte cap."""

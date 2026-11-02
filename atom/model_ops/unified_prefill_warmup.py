@@ -28,10 +28,16 @@ _TOKEN_TABLE_COL_ALIGN = 16
 _UNIFIED_WARMUP_PREFIX = 16384
 
 # Requests per step the small-row warm-up launches use. The request count is a
-# kernel argument too, so besides 1 (its own specialization) and the counts that
-# set the KV split, 16 and 32 compile the "multiple of 16" specialization that
-# steps with 16, 32, ... prefix-hit requests take.
-_UNIFIED_WARMUP_NUM_SEQS = (1, 2, 3, 4, 6, 8, 12, 16, 32)
+# kernel argument with its own Triton specializations (1, a multiple of 16, or
+# neither), and with the new rows it sets the program count, which picks the KV
+# split: each doubling of the programs halves the split. So both multi-request
+# kinds step by <= 2x up to 256+ requests, reaching every split count down to
+# the unsplit grid for the row counts below. ("Neither" stopped at 12 before,
+# so a 31-request, 16-row step compiled a new split on first use.)
+_UNIFIED_WARMUP_NUM_SEQS = (
+    *(1, 2, 3, 4, 6, 8, 12, 24, 40, 72, 136, 264),  # 1 and "neither"
+    *(16, 32, 64, 128, 256),  # multiples of 16
+)
 
 # Context of every request but the first in a multi-request launch. Kernel
 # selection reads only the longest context (max_seqlen_k), so the others need
