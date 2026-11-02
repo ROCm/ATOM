@@ -908,11 +908,13 @@ def test_chat_template_renders_off_the_event_loop(monkeypatch):
     assert seen["kwargs"] == {"thinking": True}
 
 
-def test_online_server_does_not_keep_finished_sequences():
-    # Only offline callers read CoreManager.outputs_queue; the server clears
-    # the flag so finished Sequences are not kept for the process lifetime.
+def test_online_servers_do_not_keep_finished_sequences():
+    # Only offline callers read CoreManager.outputs_queue; both online front
+    # ends clear the flag (the queue behaviour itself is tested in
+    # test_engine_core_mgr_shared_state.py).
+    from atom.entrypoints.atomesh import server as atomesh_server
     from atom.model_engine.engine_core_mgr import CoreManager
 
     assert CoreManager.consumes_outputs_queue is True
-    src = inspect.getsource(api_server.main)
-    assert "consumes_outputs_queue = False" in src
+    for fn in (api_server.main, atomesh_server.initialize_engine):
+        assert "consumes_outputs_queue = False" in inspect.getsource(fn)

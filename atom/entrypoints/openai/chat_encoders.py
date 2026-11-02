@@ -10,14 +10,12 @@ that the request handler calls — it transparently routes to the custom encoder
 when one was found, or to ``tokenizer.apply_chat_template`` otherwise.
 """
 
-import functools
 import glob
 import importlib.util
 import json
 import logging
 import os
 import pathlib
-import threading
 from typing import Any
 
 from jinja2 import TemplateError
@@ -31,34 +29,6 @@ from .chat_encoder_adapters import (
 from .protocol import ChatMessage
 
 logger = logging.getLogger("atom")
-
-
-def _memoize_last_user_index(mod) -> None:
-    """Cache ``mod.find_last_user_index`` per messages list.
-
-    DeepSeek's ``encoding.py`` calls it from ``render_message`` once for every
-    message, and each call scans the list backwards past the assistant and tool
-    turns, so one render costs O(n^2) in the number of messages (~135 in a long
-    agentic conversation). The answer only changes with the list, so it is
-    computed once per (list, length) and reused, per thread since renders run
-    on a thread pool.
-    """
-    orig = getattr(mod, "find_last_user_index", None)
-    if not callable(orig) or getattr(orig, "_atom_memoized", False):
-        return
-    local = threading.local()
-
-    @functools.wraps(orig)
-    def find_last_user_index(messages):
-        cached = getattr(local, "cached", None)
-        if cached is not None and cached[0] is messages and cached[1] == len(messages):
-            return cached[2]
-        result = orig(messages)
-        local.cached = (messages, len(messages), result)
-        return result
-
-    find_last_user_index._atom_memoized = True
-    mod.find_last_user_index = find_last_user_index
 
 
 def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
@@ -93,7 +63,6 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         raw = mod.encode_messages
-        _memoize_last_user_index(mod)
     except Exception:
         # Broad on purpose: this executes a file the operator supplied, so the
         # failure can be anything that module raises, and a bad encoder must

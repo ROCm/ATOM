@@ -130,6 +130,34 @@ class OutputThreadStateTest(unittest.TestCase):
         finally:
             sender.close(linger=0)
 
+    def test_finished_sequences_reach_the_outputs_queue_only_if_consumed(self):
+        # Online front ends deliver through the callbacks and clear the flag;
+        # otherwise every finished Sequence would stay queued for the life of
+        # the process.
+        for consumes in (True, False):
+            mgr = _bare_manager(CoreManager)
+            self.addCleanup(mgr.ctx.term)
+            mgr.consumes_outputs_queue = consumes
+            mgr._deliver_terminal_output = lambda seq: False
+            mgr._release_seq_load = lambda seq_id: None
+            mgr._shutdown_engine_core_rank = lambda rank: None
+            url = f"inproc://outputs-{uuid.uuid4().hex}"
+            receiver = mgr.ctx.socket(zmq.PULL)
+            receiver.bind(url)
+            sender = mgr.ctx.socket(zmq.PUSH)
+            sender.connect(url)
+            thread = mgr._create_output_thread(0, receiver, url + "-shutdown")
+            thread.start()
+            try:
+                seqs = [SimpleNamespace(id=7)]
+                sender.send(pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+                sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
+                thread.join(timeout=3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(mgr.outputs_queue.qsize(), 1 if consumes else 0)
+            finally:
+                sender.close(linger=0)
+
     def _terminate(self):
         for mgr in self.managers:
             mgr.ctx.term()
