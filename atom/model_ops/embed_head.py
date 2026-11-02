@@ -7,13 +7,12 @@ import triton
 import triton.language as tl
 from aiter import topk_select
 from aiter.dist.communication_op import tensor_model_parallel_all_gather
-from aiter.dist.parallel_state import get_dp_group, get_tp_group
+from aiter.dist.parallel_state import get_dp_group, get_pcp_group, get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.distributed.ulysses_sp import (
-    get_sp_group,
     get_sp_world_size,
     sp_gather_rows,
     sp_is_enabled,
@@ -365,7 +364,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         """Every Ulysses SP rank (TP1) holds the same rows here: project them
         onto this rank's vocab slice and gather the slices, rather than have
         every rank read the whole LM head."""
-        group = get_sp_group()
+        group = get_pcp_group()
         shard = self._vocab_shard_logits(x, group.rank_in_group, group.world_size)
         use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
         return group.all_gather(shard, dim=-1, use_custom=use_custom)

@@ -429,7 +429,7 @@ class CommFusedMoeBackend:
 def comm_fused_moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
-    shared_partial: torch.Tensor | None,
+    shared_partial: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
     layer = get_current_atom_config().compilation_config.static_forward_context[
@@ -443,7 +443,7 @@ def comm_fused_moe_forward(
 def _comm_fused_moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
-    shared_partial: torch.Tensor | None,
+    shared_partial: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)

@@ -2072,7 +2072,6 @@ class Config:
     # Ulysses shards tokens and exchanges them for heads around attention.
     # Its workers use the PCP rank dimension.
     sequence_parallel_size: int = 1
-    sp_mega_moe_enabled: bool = field(init=False, default=False)
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2355,6 +2354,12 @@ class Config:
             )
         if self.enable_tbo or self.enable_tbo_decode:
             raise ValueError("Ulysses SP does not support TBO token slicing.")
+        # Each rank reads its token shard from the shared input buffer.
+        if self.max_num_batched_tokens % sp:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} must divide "
+                f"--max-num-batched-tokens ({self.max_num_batched_tokens})."
+            )
         # Also keeps each TR_HYBRID decode token bucket one (bs, q=1) request
         # bucket, which the inline-recorded sp_attention_fp8 relies on.
         if self.speculative_config is not None:
@@ -2595,9 +2600,6 @@ class Config:
                 "--enable-rapidserve hands KV over by TP rank only; it does not "
                 "support -pcp or -sp."
             )
-        self.sp_mega_moe_enabled = (
-            envs.ATOM_SP_MOE_MEGA and self.sequence_parallel_size > 1
-        )
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
@@ -3005,10 +3007,6 @@ class Config:
         if self.sequence_parallel_size > 1:
             # SP and PCP use the same rank dimension but different head shapes.
             factors.append(("sp", self.sequence_parallel_size))
-        if self.sp_mega_moe_enabled:
-            # This changes the decoder graph, including the next input norm
-            # and final norm. Never load a native SP artifact for this region.
-            factors.append("sp_mega_moe_full_fusion_v1")
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the

@@ -24,7 +24,6 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_world_size,
 )
 
-from atom.distributed.token_transport import reduce_scatter_tokens
 from atom.distributed.ulysses_sp import sp_is_enabled
 
 
@@ -166,13 +165,14 @@ def pcp_reduce_scatter(
     if pcp_size <= 1:
         return input_
     group = get_pcp_group()
+    input_ = input_.contiguous()
     if sp_is_enabled():
         from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
 
-        out = try_quick_reduce_scatter(input_.contiguous(), group)
+        out = try_quick_reduce_scatter(input_, group)
         if out is not None:
             return out
-    return reduce_scatter_tokens(input_, group)
+    return group.reduce_scatter(input_, dim=0)
 
 
 def pcp_all_reduce(input_: torch.Tensor, pcp_size: int | None = None) -> torch.Tensor:

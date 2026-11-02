@@ -25,8 +25,8 @@ import torch
 import torch.distributed as dist
 
 from atom.config import get_current_atom_config
+from atom.distributed.token_transport import custom_gather_ok
 from atom.plugin.prepare import is_plugin_mode
-from atom.utils import envs
 
 
 def indexer_cp_enabled() -> bool:
@@ -149,14 +149,7 @@ def _can_all_gather(keys: torch.Tensor, group) -> bool:
     the rest is availability. When availability says no, the all-to-all is
     correct at every size -- just with the bubble documented above.
     """
-    if keys.numel() * keys.element_size() > _ALLGATHER_MAX_PAYLOAD_BYTES:
-        return False
-    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
-        return False
-    ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    if ca_comm is None or ca_comm.disabled:
-        return False
-    return bool(ca_comm.should_custom_ag(keys.view(torch.int32)))
+    return custom_gather_ok(keys.view(torch.int32), group, _ALLGATHER_MAX_PAYLOAD_BYTES)
 
 
 def _exchange_via_all_gather(keys: torch.Tensor, group) -> torch.Tensor:

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Ulysses SP integration for AITER's MegaMoeTP ag_rs kernel.
 
-It is the comm-fused backend (`FusedMoE.forward_maybe_comm_fused`) of every MoE
-layer built with `enable_comm_fused`. One runtime is shared by the sequential
-MoE layers; its collective buffers and launch epochs must survive layer/graph
+`FusedMoE.forward_impl` hands it the row counts it serves, on every MoE layer
+built with `allow_sp_mega_moe`. One runtime is shared by the sequential MoE
+layers; its collective buffers and launch epochs must survive layer/graph
 boundaries.
 Large token shards are tiled locally, with the same tiles on every SP rank.
 """
@@ -16,6 +16,7 @@ import math
 import torch
 
 from atom.distributed.group_agreement import group_agree, group_max
+from atom.distributed.ulysses_sp import get_sp_world_size
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -113,6 +114,7 @@ class SPMegaMoE:
         self._errors = self._errors_copied = None
         # A copy not read yet; launches enqueued after the last copy.
         self._copy_pending = self._uncopied = False
+        self._runs = {}
 
     def _timed_out(self, bits):
         raise RuntimeError(
@@ -146,7 +148,8 @@ class SPMegaMoE:
         """Count a model step's launches up front, so graph replays count too.
 
         ``rows`` is this rank's share of the step's padded tokens. A step that
-        keeps the native MoE (decode) launches nothing and adds no copy.
+        keeps the native MoE launches nothing and adds no copy. Decode graphs
+        from 256 global rows up replay MegaMoE launches without running Python.
         """
         self._raise_on_timeout()
         if not self.runs(rows):
@@ -168,14 +171,18 @@ class SPMegaMoE:
         """Keep the native path whenever MegaMoE would change activation precision.
 
         Use the padded global row count, exactly as the native SP gather does.
-        Decode typically uses BF16 activations, which this MegaMoE kernel
+        Small decode batches use BF16 activations, which this MegaMoE kernel
         cannot produce. All ranks make the same shape decision.
         """
-        from aiter import dtypes
+        runs = self._runs.get(rows)
+        if runs is None:
+            from aiter import dtypes
 
-        method = self.layer.quant_method
-        tokens = rows * self.runtime.cfg.world_size
-        return method.activation_dtype(self.layer, tokens) == dtypes.fp4x2
+            method = self.layer.quant_method
+            tokens = rows * self.runtime.cfg.world_size
+            runs = method.activation_dtype(self.layer, tokens) == dtypes.fp4x2
+            self._runs[rows] = runs
+        return runs
 
     @staticmethod
     def _route(layer, hidden_states, router_logits):
@@ -183,39 +190,9 @@ class SPMegaMoE:
         weights, ids = method.select_experts(layer, hidden_states, router_logits)
         return method.place_experts(layer, weights, ids)
 
-    def supports(self, tokens):
-        """Every row count: it is symbolic while compiling, so `forward_impl`
-        picks the path at run time."""
-        return True
-
-    def forward(
-        self,
-        layer,
-        hidden_states,
-        router_logits,
-        shared_partial,
-        before_stage2_for_rows=None,
-        before_shared_add=None,
-        stage2_stream=None,
-    ):
-        if shared_partial is not None or not (
-            before_stage2_for_rows is None
-            and before_shared_add is None
-            and stage2_stream is None
-        ):
-            raise ValueError(
-                "SP MegaMoE runs the shared expert among the routed ones and "
-                "takes no hooks"
-            )
-        return torch.ops.aiter.comm_fused_moe_forward(
-            hidden_states, router_logits, None, layer.layer_name
-        )
-
-    def forward_impl(self, layer, hidden_states, router_logits, shared_partial=None):
+    def forward(self, layer, hidden_states, router_logits):
+        """The layer's output, shared expert included, for rows `runs` takes."""
         rows = hidden_states.shape[0]
-        if not self.runs(rows):
-            # Small batches (decode) keep the native A16W4 MoE.
-            return layer.forward_impl(hidden_states, router_logits)
         weights, ids = self._route(layer, hidden_states, router_logits)
         self.runtime.set_weights(**_weights(layer))
         out = torch.empty_like(hidden_states)
@@ -236,14 +213,11 @@ def _unsupported_config(config):
         return "needs BF16 activations"
     if get_gfx_runtime() != "gfx950":
         return "needs gfx950"
-    # The dump hooks FusedMoE.forward, which comm-fused dispatch bypasses.
-    if envs.ATOM_FWD_DUMP_DIR:
-        return "ATOM_FWD_DUMP_DIR hooks every layer's forward"
     return None
 
 
 def _model_layers(model):
-    """The MoE layers whose model dispatches through `forward_maybe_comm_fused`.
+    """The MoE layers their model allows SP MegaMoE on.
 
     Not `isinstance(module, FusedMoE)`: that name is the plugin-mode lazy
     wrapper, a subclass the built layers are not instances of.
@@ -251,7 +225,7 @@ def _model_layers(model):
     return [
         module
         for module in model.modules()
-        if getattr(module, "enable_comm_fused", False)
+        if getattr(module, "allow_sp_mega_moe", False)
     ]
 
 
@@ -310,20 +284,18 @@ def initialize_sp_mega_moe(model, config):
     Returns the shared backend, or None when the native MoE is kept. It is
     all or nothing: one layer it cannot serve keeps every layer native.
     """
-    from atom.distributed.ulysses_sp import get_sp_group, get_sp_world_size
+    from aiter.dist.parallel_state import get_pcp_group
 
-    if config is None or not config.sp_mega_moe_enabled or get_sp_world_size() < 2:
+    if not envs.ATOM_SP_MOE_MEGA or get_sp_world_size() < 2:
         return
 
     def skip(reason, log=logger.warning):
-        # The compile hash reads this flag; native graphs must not share it.
-        config.sp_mega_moe_enabled = False
         log("SP MegaMoE disabled, native MoE kept on every layer: %s", reason)
 
     layers = _model_layers(model)
     if not layers:
         return skip("the model has no MoE layers it can run through it", logger.info)
-    group = get_sp_group()
+    group = get_pcp_group()
     plan = _plan(config, layers)
     # A rank-local verdict (an import, a layout) must not split the ranks before
     # the collective MegaMoeTP setup.
@@ -386,7 +358,7 @@ def initialize_sp_mega_moe(model, config):
         return skip(f"a MegaMoeTP warmup wait timed out (error bits {bits:#x})")
     backend = SPMegaMoE(runtime, layers[0], len(layers), group.cpu_group)
     for layer in layers:
-        layer._comm_fused_moe = backend
+        layer.sp_mega_moe = backend
     logger.info(
         "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens, "
         "lb_mt=%s.",

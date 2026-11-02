@@ -11,16 +11,16 @@ import torch
 import triton
 import triton.language as tl
 from aiter import dtypes
+from aiter.dist.parallel_state import get_pcp_group
 
 from atom.config import get_current_atom_config
 from atom.distributed.token_transport import (
     HEAD_EXCHANGE_MIN_LOCAL_ROWS,
-    exchange_heads,
     gather_heads,
     gather_tokens,
     head_exchange_communicator,
 )
-from atom.distributed.ulysses_sp import get_sp_group, ulysses_attention
+from atom.distributed.ulysses_sp import ulysses_attention
 from atom.utils import mark_spliting_op
 
 
@@ -157,11 +157,9 @@ def gather_heads_fp8(x: torch.Tensor, group) -> tuple[torch.Tensor, torch.Tensor
 
         return per_token_quant_hip(gather_heads(x, group), quant_dtype=dtypes.fp8)
     amax = gather_tokens(head_amax(x), group)
-    from atom.distributed.sp_registered_buffer import registered_input_view
-
     # The FP8 payload has half the row bytes of x; the exchange needs 16B rows.
     ca = head_exchange_communicator(x, group) if x.shape[1] % 16 == 0 else None
-    scratch = registered_input_view(ca, x.shape, dtypes.fp8) if ca is not None else None
+    scratch = ca.registered_input_view(x.shape, dtypes.fp8) if ca is not None else None
     q, scale = quantize_with_gathered_amax(
         x,
         amax,
@@ -171,7 +169,7 @@ def gather_heads_fp8(x: torch.Tensor, group) -> tuple[torch.Tensor, torch.Tensor
     )
     payload = q.view(torch.bfloat16)
     output = (
-        exchange_heads(payload, ca, registered=True)
+        ca.head_exchange(payload, registered=True)
         if scratch is not None
         else gather_heads(payload, group)
     )
@@ -209,7 +207,7 @@ def sp_attention_fp8(
     attn = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    group = get_sp_group()
+    group = get_pcp_group()
     return ulysses_attention(
         attn,
         q,

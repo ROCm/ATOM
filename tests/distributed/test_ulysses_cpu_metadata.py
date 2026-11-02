@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 """SP token sharding, row gathers and the vocab-sharded LM head, on CPU."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -9,37 +10,39 @@ import torch
 from atom.distributed import ulysses_sp as sp
 
 
+def _on_each_rank(monkeypatch, world, fn):
+    parallel_state = ModuleType("aiter.dist.parallel_state")
+    monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
+    out = []
+    for rank in range(world):
+        group = SimpleNamespace(rank_in_group=rank)
+        parallel_state.get_pcp_group = lambda g=group: g
+        out.append(fn(rank))
+    return out
+
+
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("total", [1, 3, 5, 17])
-def test_shards_keep_token_order_and_pad_the_tail(monkeypatch, world, total):
+def test_rank_ranges_tile_the_sequence_in_order(monkeypatch, world, total):
     monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
-    tokens = torch.arange(1, total + 1)
-    shards = []
-    for rank in range(world):
-        monkeypatch.setattr(sp, "get_sp_rank", lambda rank=rank: rank)
-        shards.append(sp.sp_split_tokens(tokens))
-    padded = torch.cat(shards)
-    assert padded.numel() == sp.sp_pad_len(total)
-    assert torch.equal(padded[:total], tokens) and not padded[total:].any()
+    ranges = _on_each_rank(monkeypatch, world, lambda _: sp.sp_local_slice(total))
+    rows = [row for r in ranges for row in range(r.start, r.stop)]
+    assert rows == list(range(len(rows))) and total <= len(rows) < total + world
 
 
 @pytest.mark.parametrize("world", [2, 4])
 def test_gather_rows_matches_full_gather(monkeypatch, world):
     # Last rows of prompts of 1, 3, 3, 1, 2 and 3 tokens: they land on every
-    # rank, on a shard's first and last row, and next to the padded tail.
-    hidden, rows = torch.randn(13, 8), torch.tensor([0, 3, 6, 7, 9, 12])
+    # rank, on a range's first and last row, and next to the rows past the end.
+    buffer, rows = torch.randn(16, 8), torch.tensor([0, 3, 6, 7, 9, 12])
+    hidden = buffer[:13]
     monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
 
     def on_each_rank(fn):
-        out = []
-        for rank in range(world):
-            monkeypatch.setattr(sp, "get_sp_rank", lambda rank=rank: rank)
-            out.append(fn(rank))
-        return out
+        return _on_each_rank(monkeypatch, world, fn)
 
-    shards = on_each_rank(lambda _: sp.sp_split_tokens(hidden))
+    shards = on_each_rank(lambda _: buffer[sp.sp_local_slice(13)])
     sent = []
-    monkeypatch.setattr(sp, "get_sp_group", lambda: None)
     monkeypatch.setattr(
         sp, "gather_tokens", lambda x, group: sent.append(x) or x.repeat(world, 1)
     )
@@ -66,7 +69,7 @@ def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, world):
             group = SimpleNamespace(
                 world_size=world, rank_in_group=rank, all_gather=all_gather
             )
-            monkeypatch.setattr(embed_head, "get_sp_group", lambda g=group: g)
+            monkeypatch.setattr(embed_head, "get_pcp_group", lambda g=group: g)
             out.append(head._sp_sharded_logits(x))
         return out
 

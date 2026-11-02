@@ -37,7 +37,7 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
         ]
 
     monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", world)
-    monkeypatch.setattr(ulysses_sp, "prefer_custom_gather", lambda x, group: True)
+    monkeypatch.setattr(ulysses_sp, "custom_gather_ok", lambda x, group, limit: True)
     for rank in range(world):
         queries = range(rank * q_heads // world, (rank + 1) * q_heads // world)
         kv = sorted({h // (q_heads // kv_heads) for h in queries})
@@ -52,6 +52,5 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
         )
         assert torch.equal(packed[rank], expected)
         group = SimpleNamespace(rank_in_group=rank, custom_all_gather=lambda x: x)
-        monkeypatch.setattr(ulysses_sp, "get_sp_group", lambda group=group: group)
-        gathered = ulysses_sp._exchange_columns(source, spec, SimpleNamespace())
+        gathered = ulysses_sp._exchange_columns(source, spec, SimpleNamespace(), group)
         assert torch.equal(gathered, expected)

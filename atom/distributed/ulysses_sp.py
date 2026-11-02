@@ -13,12 +13,14 @@ from functools import partial
 import torch
 
 from atom.distributed.token_transport import (
+    ALLGATHER_MAX_PAYLOAD_BYTES,
+    custom_gather_ok,
     gather_heads,
     gather_tokens,
-    prefer_custom_gather,
 )
 
-# Keep GPU imports lazy for CPU-only metadata consumers. Set by ModelRunner.
+# AITER is imported where used: `forward_context` imports this module on CPU.
+# Set by ModelRunner.
 _SP_WORLD_SIZE: int = 1
 
 
@@ -34,37 +36,6 @@ def get_sp_world_size() -> int:
 
 def sp_is_enabled() -> bool:
     return _SP_WORLD_SIZE > 1
-
-
-def get_sp_rank() -> int:
-    if _SP_WORLD_SIZE <= 1:
-        return 0
-    from aiter.dist.parallel_state import get_prefill_context_model_parallel_rank
-
-    return get_prefill_context_model_parallel_rank()
-
-
-def get_sp_group():
-    from aiter.dist.parallel_state import get_pcp_group
-
-    return get_pcp_group()
-
-
-def sp_graph_capture(capture_context):
-    """Register SP collective inputs along with the enclosing device graph.
-
-    AITER's global capture context does not include the PCP group used by SP.
-    Reuse its stream, and avoid flushing an already active communicator.
-    """
-    from contextlib import nullcontext
-
-    if not sp_is_enabled():
-        return nullcontext()
-    group = get_sp_group()
-    ca_comm = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    if ca_comm is None or ca_comm.disabled or getattr(ca_comm, "_IS_CAPTURING", False):
-        return nullcontext()
-    return group.graph_capture(capture_context)
 
 
 def attn_head_shard_size() -> int:
@@ -92,48 +63,28 @@ def check_sp_attention_layer(sp, name, sinks, alibi_slopes, rotary_emb, index_he
         )
 
 
-def sp_pad_len(total_tokens: int, sp_size: int | None = None) -> int:
-    """Token count rounded up so the sequence splits evenly across the group."""
-    if sp_size is None:
-        sp_size = _SP_WORLD_SIZE
-    if sp_size <= 1:
-        return total_tokens
-    rem = total_tokens % sp_size
-    return total_tokens if rem == 0 else total_tokens + (sp_size - rem)
-
-
 def sp_local_len(total_tokens: int) -> int:
-    """Rows of a ``total_tokens`` sequence this rank owns."""
-    return sp_pad_len(total_tokens) // _SP_WORLD_SIZE
+    """Rows of a ``total_tokens`` sequence each rank owns."""
+    return -(-total_tokens // _SP_WORLD_SIZE)
 
 
 def sp_local_slice(total_tokens: int) -> slice:
-    """This rank's contiguous token range within a padded sequence."""
+    """This rank's contiguous token range. The last rank's may run past
+    ``total_tokens``; attention and the final gather drop those rows."""
+    from aiter.dist.parallel_state import get_pcp_group
+
     local = sp_local_len(total_tokens)
-    start = get_sp_rank() * local
+    start = get_pcp_group().rank_in_group * local
     return slice(start, start + local)
 
 
-def sp_split_tokens(x: torch.Tensor) -> torch.Tensor:
-    """Take this rank's contiguous chunk, padding with zeros along dim 0.
-
-    Attention and the final gather discard padding before returning results.
-    """
-    if _SP_WORLD_SIZE <= 1:
-        return x
-    total = x.shape[0]
-    padded = sp_pad_len(total)
-    if padded != total:
-        pad = x.new_zeros(padded - total, *x.shape[1:])
-        x = torch.cat([x, pad], dim=0)
-    return x[sp_local_slice(total)].contiguous()
-
-
 def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
-    """Inverse of `sp_split_tokens`: all-gather the chunks and drop the pad."""
+    """All-gather every rank's token range and drop the rows past the sequence."""
+    from aiter.dist.parallel_state import get_pcp_group
+
     if _SP_WORLD_SIZE <= 1:
         return x
-    return gather_tokens(x, get_sp_group())[:total_tokens]
+    return gather_tokens(x, get_pcp_group())[:total_tokens]
 
 
 def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -141,12 +92,15 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
 
     Every rank sends one row per index, and the copy from its owner is kept.
     """
+    from aiter.dist.parallel_state import get_pcp_group
+
     if _SP_WORLD_SIZE <= 1:
         return x[rows].contiguous()
+    group = get_pcp_group()
     local, n = x.shape[0], rows.numel()
-    picked = x[(rows - get_sp_rank() * local).clamp(0, local - 1)]
+    picked = x[(rows - group.rank_in_group * local).clamp(0, local - 1)]
     owner = rows.long() // local
-    gathered = gather_tokens(picked, get_sp_group())
+    gathered = gather_tokens(picked, group)
     return gathered[owner * n + torch.arange(n, device=x.device)]
 
 
@@ -156,20 +110,19 @@ _REPLICATE = 1  # one shard, replicated on every rank
 # with fewer KV heads than ranks, consecutive query-head owners share a shard.
 
 
-def _exchange(send):
+def _exchange(send, group):
     """All-to-all a ``[W, S/W, width]`` send buffer into global token order."""
     from atom.distributed.sp_kernels import all_to_all_into
 
     recv = torch.empty_like(send)
-    all_to_all_into(recv, send, get_sp_group())
+    all_to_all_into(recv, send, group)
     # Rank-major receive order is global token order for contiguous shards.
     return recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
 
 
-def _exchange_tensors(tensors, shards=None):
+def _exchange_tensors(tensors, shards, group):
     """Exchange separate fields into one packed tensor with all sequence rows."""
     w = _SP_WORLD_SIZE
-    shards = shards or [w] * len(tensors)
     widths = [t.shape[-1] // n for t, n in zip(tensors, shards)]
     proto = tensors[0]
     # Copy directly into the send buffer, replicating shared KV head shards.
@@ -181,17 +134,16 @@ def _exchange_tensors(tensors, shards=None):
             field[:, None]
         )
         col += width
-    return _exchange(send)
+    return _exchange(send, group)
 
 
-def _exchange_columns(source, spec, owner):
+def _exchange_columns(source, spec, owner, group):
     """Exchange fused fields described by (column offset, width, head shards)."""
     w = _SP_WORLD_SIZE
-    group = get_sp_group()
-    if not prefer_custom_gather(source, group):
+    if not custom_gather_ok(source, group, ALLGATHER_MAX_PAYLOAD_BYTES):
         from atom.distributed.sp_kernels import pack_fields
 
-        return _exchange(pack_fields(source, tuple(spec), w))
+        return _exchange(pack_fields(source, tuple(spec), w), group)
     columns = getattr(owner, "_sp_send_columns", None)
     if columns is None or columns.device != source.device:
         # Device aranges also support first use during graph capture.
@@ -216,10 +168,15 @@ def ulysses_attention(
     Called inside the attention custom op, keeping collectives and padding
     slices opaque to Dynamo.
     """
+    from aiter.dist.parallel_state import get_pcp_group
+
     w = _SP_WORLD_SIZE
+    group = get_pcp_group()
     kv_shards = min(w, key.shape[-1] // attn.head_dim)
     if qkv is None:
-        packed = _exchange_tensors([query, key, value], [w, kv_shards, kv_shards])
+        packed = _exchange_tensors(
+            [query, key, value], [w, kv_shards, kv_shards], group
+        )
     else:
         # Fused kernels may also read indexer fields by column offset.
         q_size, kv_size = query.shape[-1], key.shape[-1]
@@ -250,7 +207,7 @@ def ulysses_attention(
             index_shards = min(w, index_q_width // idx_dim)
             spec.append((index_q_start, index_q_width, index_shards))
             spec.append((index_q_start + index_q_width, idx_dim, _REPLICATE))
-        packed = _exchange_columns(qkv, spec, attn)
+        packed = _exchange_columns(qkv, spec, attn, group)
 
     # Global positions and attention metadata exclude the divisibility pad.
     real_tokens = positions.shape[-1]
@@ -277,4 +234,4 @@ def ulysses_attention(
         )
     if output_transform is not None:
         return output_transform(out)
-    return gather_heads(out, get_sp_group())
+    return gather_heads(out, group)

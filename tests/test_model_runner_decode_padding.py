@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-pytest.importorskip("aiter")
+parallel_state = pytest.importorskip("aiter.dist.parallel_state")
 
 from atom.distributed import ulysses_sp
 from atom.model_engine import model_runner as runner_module
@@ -44,7 +44,8 @@ def test_runner_model_height_and_sampling_rows(
     token_graph,
 ):
     monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1 if sp_rank is None else 4)
-    monkeypatch.setattr(ulysses_sp, "get_sp_rank", lambda: sp_rank or 0)
+    group = SimpleNamespace(rank_in_group=sp_rank)
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.sp_mega_moe = Mock()
@@ -57,7 +58,6 @@ def test_runner_model_height_and_sampling_rows(
     pos = torch.full((32,), -99, dtype=torch.int64)
     pos[:scheduled] = torch.arange(11, scheduled + 11)
     runner.forward_vars = {
-        "sp_input_ids": torch.empty(8, dtype=ids.dtype),
         "input_ids": SimpleNamespace(gpu=ids),
         "positions": SimpleNamespace(gpu=pos),
         "mrope_positions": SimpleNamespace(gpu=torch.full((96,), -99)),
@@ -114,16 +114,27 @@ def test_runner_model_height_and_sampling_rows(
     expected_rows = running if unified and not prefill else scheduled
     sp_prefill = sp_rank is not None and prefill
 
+    # SP runs on its range of the global ids, the address its graphs capture;
+    # the last range may run past the step into rows whose outputs are dropped.
+    rows = (
+        slice(0, expected_rows)
+        if sp_rank is None
+        else ulysses_sp.sp_local_slice(expected_rows)
+    )
+
     def global_ids():
         full = torch.zeros(expected_rows, dtype=ids.dtype)
         full[:scheduled] = torch.arange(1, scheduled + 1)
         return full
 
+    def local_rows():
+        return ids[rows][:, None].float()
+
     class Model:
         def __call__(self, input_ids, model_positions):
-            torch.testing.assert_close(
-                input_ids, ulysses_sp.sp_split_tokens(global_ids())
-            )
+            torch.testing.assert_close(ids[:expected_rows], global_ids())
+            assert input_ids.data_ptr() == ids[rows].data_ptr()
+            assert input_ids.shape[0] == rows.stop - rows.start
             assert model_positions.shape[-1] == expected_rows
             if expected_rows > scheduled:
                 assert torch.all(model_positions[..., scheduled:] == 0)
@@ -132,9 +143,8 @@ def test_runner_model_height_and_sampling_rows(
         def compute_logits(self, hidden):
             if sp_prefill:
                 # The LM head picks each prompt's last row from the local shard.
-                full = global_ids()[:, None].float()
-                torch.testing.assert_close(hidden, ulysses_sp.sp_split_tokens(full))
-                hidden = full[:scheduled]
+                torch.testing.assert_close(hidden, local_rows())
+                hidden = global_ids()[:scheduled, None].float()
             assert hidden.shape[0] == scheduled
             return hidden + 1
 
@@ -142,9 +152,8 @@ def test_runner_model_height_and_sampling_rows(
 
         def gather_shards(local, total_tokens):
             assert total_tokens == expected_rows
-            full = global_ids()[:, None].float()
-            torch.testing.assert_close(local, ulysses_sp.sp_split_tokens(full))
-            return full
+            torch.testing.assert_close(local, local_rows())
+            return global_ids()[:, None].float()
 
         monkeypatch.setattr(runner_module, "sp_gather_tokens", gather_shards)
 

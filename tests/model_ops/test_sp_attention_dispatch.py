@@ -22,7 +22,6 @@ def supported(monkeypatch):
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "atom")
     monkeypatch.setattr(fp8_head_exchange.dtypes, "fp8", torch.float8_e4m3fn)
-    monkeypatch.setattr(token_transport, "_head_exchange_kernel", lambda: object())
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     with config.use_custom_atom_config(settings):
         yield settings
@@ -63,7 +62,11 @@ def test_unsupported_runtime_keeps_existing_kernels(monkeypatch, supported, case
 
 
 def test_head_exchange_requires_usable_collective(supported):
-    ca = SimpleNamespace(disabled=False, _pool={}, should_custom_ag=lambda x: True)
+    ca = SimpleNamespace(
+        disabled=False,
+        should_custom_ag=lambda x: True,
+        should_head_exchange=lambda x: True,
+    )
     group = SimpleNamespace(
         world_size=4, device_communicator=SimpleNamespace(ca_comm=ca)
     )
@@ -74,24 +77,19 @@ def test_head_exchange_requires_usable_collective(supported):
         )
 
     assert communicator() is ca
-    assert communicator(shape=(8192, 1024)) is ca
     for overrides in (
         {"is_cuda": False},
         {"shape": (4, 2048)},
-        {"shape": (8193, 2048)},
-        {"shape": (8192, 4)},
         {"dtype": torch.float16},
-        {"is_contiguous": lambda: False},
     ):
         assert communicator(**overrides) is None
     ca.disabled = True
     assert communicator() is None
     ca.disabled = False
-    ca.should_custom_ag = lambda x: False
-    assert communicator() is None
-    ca.should_custom_ag = lambda x: True
-    group.world_size = 2
-    assert communicator() is None
+    for check in ("should_custom_ag", "should_head_exchange"):
+        setattr(ca, check, lambda x: False)
+        assert communicator() is None
+        setattr(ca, check, lambda x: True)
 
 
 class _Norm:
@@ -104,6 +102,7 @@ class _Norm:
 
 def test_fp32_norm_quant_only_when_asked(monkeypatch):
     """Plain TP keeps the BF16-rounded quantization that mono matches."""
+    from aiter.ops import fused_qk_rmsnorm_group_quant as norm_ops
     from aiter.utility import dtypes
 
     from atom.model_ops import layernorm  # its Triton import needs a GPU
@@ -112,7 +111,7 @@ def test_fp32_norm_quant_only_when_asked(monkeypatch):
     monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
     monkeypatch.setattr(
-        layernorm,
+        norm_ops,
         "fused_qk_rmsnorm_per_token_quant",
         lambda *args, **kwargs: calls.append("fp32"),
     )
@@ -127,6 +126,11 @@ def test_fp32_norm_quant_only_when_asked(monkeypatch):
     layernorm.gemma_rms_norm_quant(x, x, _Norm())
     layernorm.gemma_rms_norm_quant(x, x, _Norm(), quantize_fp32_norm=True)
     assert calls == ["bf16", "bf16", "fp32"]
+    # No silent fallback to the BF16-rounded quantization.
+    with pytest.raises(ValueError, match="quantize_fp32_norm"):
+        layernorm.gemma_rms_norm_quant(
+            x.float(), None, _Norm(), quantize_fp32_norm=True
+        )
 
 
 @pytest.mark.parametrize("rows", [0, 2])
@@ -143,7 +147,7 @@ def test_empty_rows_launch_no_norm_kernel(monkeypatch, rows):
         norm_ops, "fused_qk_rmsnorm_group_quant", lambda **kw: calls.append("bf16")
     )
     monkeypatch.setattr(
-        layernorm,
+        norm_ops,
         "fused_qk_rmsnorm_per_token_quant",
         lambda *args, **kwargs: calls.append("fp8"),
     )

@@ -106,15 +106,8 @@ def test_sp_indexer_heads_shard_or_replicate(index_heads, world, ok):
         )
 
 
-def test_layouts_that_change_the_graph_do_not_share_compiled_artifacts():
+def test_sp_does_not_share_compiled_artifacts():
     config = atom_config_double()
-    keys = [Config.compute_hash(config)]
-    for name, value in (
-        ("sequence_parallel_size", 4),
-        ("sp_mega_moe_enabled", True),
-    ):
-        setattr(config, name, value)
-        key = Config.compute_hash(config)
-        assert key == Config.compute_hash(config)
-        keys.append(key)
-    assert len(set(keys)) == len(keys)
+    native = Config.compute_hash(config)
+    config.sequence_parallel_size = 4
+    assert Config.compute_hash(config) == Config.compute_hash(config) != native

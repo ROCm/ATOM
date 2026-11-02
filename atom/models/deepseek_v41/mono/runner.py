@@ -28,6 +28,7 @@ from aiter.dist.parallel_state import (
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
+from atom.distributed.token_transport import custom_gather_ok
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
@@ -305,12 +306,6 @@ class V41MonoDecodeRunner:
         """Whether the widest step's ``_gather_rows`` takes aiter's custom
         all-gather (``ATOM_USE_CUSTOM_ALL_GATHER``, the group's ``ca_comm`` and
         its size limit): the same on every rank."""
-        if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
-            return False
-        group = get_tp_group()
-        ca = getattr(group.device_communicator, "ca_comm", None)
-        if ca is None or ca.disabled:
-            return False
         rows = self.max_rows // self.tp
         widest = torch.empty(
             rows,
@@ -319,7 +314,7 @@ class V41MonoDecodeRunner:
             dtype=torch.bfloat16,
             device="meta",
         )
-        return bool(ca.should_custom_ag(widest))
+        return custom_gather_ok(widest, get_tp_group())
 
     def _tok_par(self, s: int) -> bool:
         """Whether an s-row step runs token parallel (``tok_par_from``); never

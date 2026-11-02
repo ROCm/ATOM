@@ -44,14 +44,13 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import (
+    attn_head_shard_size,
     get_sp_world_size,
     set_sp_world_size,
     sp_gather_tokens,
-    sp_graph_capture,
     sp_is_enabled,
     sp_local_len,
     sp_local_slice,
-    sp_split_tokens,
 )
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
@@ -757,12 +756,10 @@ class ModelRunner:
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
         # world_size: the logical TP width, i.e. how many shards each weight is
-        # cut into. tp_world_size: how many of those shards have a process;
-        # they differ only under simulated TP. kv_head_shards: how many the
-        # attention heads are cut into, which SP splits too -- what the
-        # KV-head math below divides by.
+        # cut into -- what the KV-head math below divides by.
+        # tp_world_size: how many of those shards have a process.
+        # They differ only under simulated TP.
         self.world_size = config.tensor_parallel_size
-        self.kv_head_shards = self.world_size * config.sequence_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -1500,13 +1497,6 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
-        if sp_is_enabled():
-            # Each graph captures a fixed address for this rank's token shard.
-            self.forward_vars["sp_input_ids"] = torch.empty(
-                sp_local_len(self.max_num_batched_tokens),
-                dtype=self.tokenID_processor.input_ids.gpu.dtype,
-                device=self.device,
-            )
         if self.use_mrope:
             self.forward_vars["mrope_positions"] = CpuGpuBuffer(
                 3,
@@ -1716,25 +1706,20 @@ class ModelRunner:
             self.h2d_owner.fail()
             raise
 
-    def sp_graph_input_ids(self, num_tokens: int) -> torch.Tensor:
-        """Stage this rank's padded token shard at the graph's fixed address."""
-        local = sp_local_len(num_tokens)
-        buf = self.forward_vars["sp_input_ids"][:local]
-        src = self.forward_vars["input_ids"].gpu[:num_tokens]
-        shard = src[sp_local_slice(num_tokens)]
-        buf[: shard.numel()].copy_(shard)
-        # Pad the local buffer: the global buffer may end at num_tokens.
-        buf[shard.numel() :].zero_()
-        return buf
+    def sp_input_ids(self, num_tokens: int) -> torch.Tensor:
+        """This rank's token range, a view of the global ids, which graphs
+        capture at a fixed address (`max_num_batched_tokens` divides by SP)."""
+        return self.forward_vars["input_ids"].gpu[sp_local_slice(num_tokens)]
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
         hf_config = self.config.hf_config
-        if hf_config.num_key_value_heads >= self.kv_head_shards:
-            assert hf_config.num_key_value_heads % self.kv_head_shards == 0
-            return hf_config.num_key_value_heads // self.kv_head_shards
+        shards = attn_head_shard_size()
+        if hf_config.num_key_value_heads >= shards:
+            assert hf_config.num_key_value_heads % shards == 0
+            return hf_config.num_key_value_heads // shards
         else:
-            assert self.kv_head_shards % hf_config.num_key_value_heads == 0
+            assert shards % hf_config.num_key_value_heads == 0
             return 1
 
     def _mrope_positions_view(self, running_tokens: int) -> torch.Tensor:
@@ -2238,11 +2223,12 @@ class ModelRunner:
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
         hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.kv_head_shards:
-            assert hf_config.num_key_value_heads % self.kv_head_shards == 0
-            num_kv_heads = hf_config.num_key_value_heads // self.kv_head_shards
+        shards = attn_head_shard_size()
+        if hf_config.num_key_value_heads >= shards:
+            assert hf_config.num_key_value_heads % shards == 0
+            num_kv_heads = hf_config.num_key_value_heads // shards
         else:
-            assert self.kv_head_shards % hf_config.num_key_value_heads == 0
+            assert shards % hf_config.num_key_value_heads == 0
             num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
@@ -3159,7 +3145,8 @@ class ModelRunner:
                 # Pad globally before SP shards the input; attention retains
                 # global positions to identify real sequence rows.
                 sp_total_tokens = input_ids.shape[0]
-                input_ids = sp_split_tokens(input_ids)
+                if sp_is_enabled():
+                    input_ids = self.sp_input_ids(sp_total_tokens)
                 # The multimodal runtime owns request leases and span scatter.
                 # Only the first PP stage embeds tokens; later stages receive
                 # hidden states.
@@ -3293,7 +3280,7 @@ class ModelRunner:
                     # (`ForwardContext.tr_graph`).
                     _ids, _pos = self._padded_inputs(forward_mode)
                     if sp_is_enabled():
-                        _ids = self.sp_graph_input_ids(running_tokens)
+                        _ids = self.sp_input_ids(running_tokens)
                     model_output = self.model(_ids, _pos)
                     model_output = sp_gather_tokens(model_output, running_tokens)
                     # model_output is always a plain Tensor; drafter aux capture
@@ -3315,8 +3302,6 @@ class ModelRunner:
                 graph_key = request_bucket(
                     running_bs, forward_context.attn_metadata.max_seqlen_q
                 )
-                if sp_is_enabled():
-                    self.sp_graph_input_ids(running_tokens)
                 logits = self.req_graph.replay(key=graph_key)
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
@@ -4279,8 +4264,7 @@ class ModelRunner:
 
         with (
             pause_gc(),
-            graph_capture() as capture_ctx,
-            sp_graph_capture(capture_ctx),
+            graph_capture(),
             self.capture_profiler as prof,
         ):
             for max_q_len in q_buckets:
@@ -4356,7 +4340,7 @@ class ModelRunner:
                     # Ulysses runs the model on this rank's token chunk while
                     # positions stay whole; the graph gathers the chunks back.
                     model_ids = (
-                        self.sp_graph_input_ids(running_tokens)
+                        self.sp_input_ids(running_tokens)
                         if sp_is_enabled()
                         else input_ids[:running_tokens]
                     )

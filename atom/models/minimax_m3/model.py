@@ -359,7 +359,7 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_experts",
-            enable_comm_fused=True,
+            allow_sp_mega_moe=True,
         )
         if hasattr(self.experts.quant_method, "intermediate_pad"):
             # MiniMax-M3 pads expert weights at load time; computing the full
@@ -385,11 +385,10 @@ class MiniMaxM3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
 
-        routed_output, complete = self.experts.forward_maybe_comm_fused(
-            hidden_states, router_logits, None
+        routed_output = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
         )
-        if complete:
-            return routed_output.view(orig_shape)
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
@@ -638,14 +637,13 @@ class MiniMaxM3SparseAttention(nn.Module):
 
 
 def _minimax_m3_norm(norm, hidden_states, residual, *, quant, quantize_fp32_norm):
-    """Gemma RMSNorm of `hidden_states + residual`, all-reducing the increment
-    first when there is a residual and quantizing per token when `quant`.
+    """Gemma RMSNorm of `hidden_states + residual`, quantized per token when
+    `quant`. A residual's increment is all-reduced first, except under
+    `quantize_fp32_norm`, which runs on TP 1 with no all-reduce pending.
 
     Returns ``(hidden_states, scale, residual)``; scale is None without `quant`.
     """
     if quant:
-        # SP rows, the only ones that quantize the FP32 norm, have no
-        # all-reduce pending.
         if residual is None or quantize_fp32_norm:
             return gemma_rms_norm_quant(
                 hidden_states,
@@ -713,6 +711,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # SP rows are whole tokens on TP 1; plain TP keeps the BF16-rounded
         # quantization that mono matches.
         self._quantize_fp32_norm = sp_is_enabled()
+        assert (
+            not self._quantize_fp32_norm or get_tensor_model_parallel_world_size() == 1
+        )
 
     def forward(
         self,

@@ -31,11 +31,6 @@ from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
-try:
-    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_per_token_quant
-except ImportError:  # older AITER
-    fused_qk_rmsnorm_per_token_quant = None
-
 
 def silu(input: Tensor, inplace: bool = False) -> Tensor:
     r"""Apply the Sigmoid Linear Unit (SiLU) function, element-wise.
@@ -1018,9 +1013,10 @@ def gemma_rms_norm_quant(
 
     By default the norm is rounded to BF16 before quantization, as on the TP
     all-reduce path. `quantize_fp32_norm` quantizes the FP32 norm instead, in
-    one AITER kernel, where that kernel takes these rows.
+    one AITER kernel, and raises on rows that kernel cannot take.
     """
     from aiter import get_hip_quant
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_per_token_quant
     from aiter.utility.dtypes import fp8
 
     x = hidden_states
@@ -1031,16 +1027,20 @@ def gemma_rms_norm_quant(
             torch.empty((*x.shape[:-1], 1), dtype=torch.float32, device=x.device),
             x if residual is None else torch.empty_like(x),
         )
-    if (
-        quantize_fp32_norm
-        and fused_qk_rmsnorm_per_token_quant is not None
-        and fp8 == torch.float8_e4m3fn
-        and x.dtype == norm.weight.dtype == torch.bfloat16
-        and x.ndim == 2
-        and x.stride(1) == 1
-        # the kernel keeps one row in registers
-        and x.shape[1] <= 8192
-    ):
+    if quantize_fp32_norm:
+        if not (
+            fp8 == torch.float8_e4m3fn
+            and x.dtype == norm.weight.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x.stride(1) == 1
+            # the kernel keeps one row in registers
+            and x.shape[1] <= 8192
+        ):
+            raise ValueError(
+                "quantize_fp32_norm needs unit-stride 2-D BF16 rows of at most "
+                f"8192 columns and FP8 e4m3fn; got {tuple(x.shape)} {x.dtype} "
+                f"(weight {norm.weight.dtype}) to {fp8}."
+            )
         out = torch.empty(x.shape, dtype=fp8, device=x.device)
         scale = torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device)
         residual_out = x if residual is None else torch.empty_like(x)
