@@ -400,6 +400,18 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             batch.num_scheduled_tokens, batch.context_lens
         )
 
+    def decoder_needs_eager(self, batch):
+        """`DecoderGraph` cannot replay: images, or the tail (each finishing
+        request's last window rows) overflows one score band. The encoder's
+        rows do not count: the recording scores only the tail."""
+        if batch.total_tokens_num_prefill > 0 and batch.multimodal_data:
+            return True
+        finals = np.asarray(batch.num_scheduled_tokens) > 0
+        if batch.is_final_chunk is not None:
+            finals &= np.asarray(batch.is_final_chunk, dtype=bool)
+        rows = np.where(finals, self.geometry.window_size, 0)
+        return not self.score_workspace.fits(rows, batch.context_lens)
+
     def state_transfer(self):
         # Encoder SWA bounded replay: a hit rebuilds the state from the PAGE
         # below it instead of restoring a checkpoint (`BlockManager.

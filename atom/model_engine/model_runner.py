@@ -2728,6 +2728,13 @@ class ModelRunner:
             dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
             enforce_eager=self.enforce_eager,
             step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch),
+            # Prefill only: decode steps skip the cost.
+            decoder_needs_eager=(
+                self.attn_metadata_builder.decoder_needs_eager(batch)
+                if batch.total_tokens_num_prefill > 0
+                and envs.ATOM_V41_DECODER_GRAPH_ON_EAGER
+                else None
+            ),
             capture_sizes=self.capture_sizes_np,
             is_block_drafter=(
                 hasattr(self, "drafter") and self.drafter.is_block_drafter
