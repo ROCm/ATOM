@@ -82,8 +82,14 @@ from atom.model_ops.eplb import (
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.required_channel import (
+    DeviceChannel,
+    advance_states,
+    constrain_logits,
+)
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
+from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.status import SpecStatusQueue
@@ -319,6 +325,13 @@ class tokenIDProcessor:
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
+        # `prev_batch`'s required-channel states after its output, beside its
+        # ids and for the same reason: the host has not seen that output yet.
+        # None when `prev_batch` had no channel.
+        self.prev_channel_states: torch.Tensor | None = None
+        # Whether this step carries requests over from `prev_batch` on the
+        # GPU, so that its `decode_src` holds the row each one held there.
+        self.carries_over = False
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
@@ -373,6 +386,7 @@ class tokenIDProcessor:
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
+        channel_states: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -424,6 +438,7 @@ class tokenIDProcessor:
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
+        self.prev_channel_states = channel_states
         token_id_dict[-1] = 1
         return token_id_dict, logprobs_map
 
@@ -506,6 +521,7 @@ class tokenIDProcessor:
             bs * self.draft_tokens_per_seq,
         )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
+        self.carries_over = locs is not None
         # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
         # before postprocess when the batch produces no output (every prefill in
@@ -838,6 +854,8 @@ class ModelRunner:
             is_spec_run,
         )
         self.sampler = Sampler()
+        # Each `RequiredChannel` a batch has carried, as the kernels read it.
+        self._device_channels: dict[RequiredChannel, DeviceChannel] = {}
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -1467,6 +1485,9 @@ class ModelRunner:
             ),
             "top_ps": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **f32_kwargs
+            ),
+            "required_channel_states": CpuGpuBuffer(
+                self.max_bs, publication_group="sampling", **i32_kwargs
             ),
             # Keep enough space for MTP decode (max_q_len > 1).
             # `extra_output_dims` lets a model insert dims between N and dim
@@ -2792,6 +2813,14 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
+        # Read back by `postprocess` through `_constrain_required_channel`.
+        channel_count = None
+        if batch.required_channel is not None:
+            self.forward_vars["required_channel_states"].np[
+                :bs
+            ] = batch.required_channel_states
+            channel_count = bs
+
         group = (
             self.h2d_groups["sampling"]
             if publication_group is None
@@ -2801,6 +2830,7 @@ class ModelRunner:
         counts[group.indices["temperatures"]] = bs
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
+        counts[group.indices["required_channel_states"]] = channel_count
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -3040,13 +3070,7 @@ class ModelRunner:
             spec = build_aux_capture_spec(self.config)
         if spec is None:
             return
-        relay = PPAuxRelay(
-            spec,
-            self.model,
-            self.config.max_num_batched_tokens,
-            self.device,
-            self.config.torch_dtype,
-        )
+        relay = PPAuxRelay(spec, self.model)
         if not relay.incoming_ids and not relay.outgoing_ids:
             return
         relay.arm(self.model, lambda: get_forward_context().context.is_draft)
@@ -3392,6 +3416,46 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
+    def _constrain_required_channel(
+        self,
+        batch: ScheduledBatch,
+        last_logits: torch.Tensor,
+        spec_decode_metadata=None,
+        target_logits: torch.Tensor | None = None,
+    ) -> tuple[DeviceChannel, torch.Tensor] | None:
+        """Mask the step's target rows of the requests that must open a
+        channel (see `atom.model_ops.required_channel`).
+
+        Returns the channel and each request's state at the start of the step,
+        which the caller advances over the step's output; None when no request
+        in the batch has one, which costs nothing.
+        """
+        channel = batch.required_channel
+        if channel is None:
+            return None
+        device_channel = self._device_channels.get(channel)
+        if device_channel is None:
+            device_channel = DeviceChannel.of(channel, self.device)
+            self._device_channels[channel] = device_channel
+        tp = self.tokenID_processor
+        bs = batch.total_seqs_num
+        # Without states from the previous forward no carried request had a
+        # channel then, so it has none now and the host's -1 is right.
+        carried = tp.carries_over and tp.prev_channel_states is not None
+        md = spec_decode_metadata
+        base = constrain_logits(
+            device_channel,
+            self.forward_vars["required_channel_states"].gpu[:bs],
+            last_logits,
+            carried_from=tp.decode_src.gpu[:bs] if carried else None,
+            carried_states=tp.prev_channel_states if carried else None,
+            target_logits=target_logits,
+            cu_num_draft_tokens=None if md is None else md.cu_num_draft_tokens,
+            input_ids=None if md is None else md.input_ids,
+            target_logits_indices=None if md is None else md.target_logits_indices,
+        )
+        return device_channel, base
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3407,6 +3471,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # Compute logprobs if any sequence requested them
+        need_logprobs = any(batch.return_logprobs)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3417,6 +3483,20 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
+            # `_constrain_required_channel` below masks `logits` in place, so
+            # each row's logsumexp is taken BEFORE it. Logprobs report the
+            # model's own distribution, as they do for a request without a
+            # channel and on the verification path, which masks copies. The
+            # mask never moves a logit that can still be sampled (an end id it
+            # bans cannot be, a forced id keeps its value), so the sampled
+            # token's logprob is its masked logit minus that logsumexp: a
+            # forced token's is its real logprob, not the masked row's 0.0.
+            # (A forced id the model itself gave -inf is written as 0, so it
+            # reports `-logsumexp` rather than -inf.)
+            premask_lse = None
+            if need_logprobs and batch.required_channel is not None:
+                premask_lse = torch.logsumexp(logits.float(), dim=-1)
+            channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
@@ -3440,6 +3520,10 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            premask_lse = None
+            channel = self._constrain_required_channel(
+                batch, bonus_logits, spec_decode_metadata, target_logits
+            )
             target_token_ids = None
             if not all_greedy:
                 target_token_ids = self.sampler.sample_verification_tokens(
@@ -3490,15 +3574,23 @@ class ModelRunner:
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
-        # Compute logprobs if any sequence requested them
-        need_logprobs = any(batch.return_logprobs)
+        # From the ids every rank now agrees on. Only a deferred step needs
+        # it: otherwise the host has these ids before the next forward.
+        channel_states = None
+        if channel is not None and self.tokenID_processor.is_deferred_out:
+            channel_states = advance_states(*channel, sampled_tokens)
+
         sampled_logprobs = None
         if need_logprobs:
-            logits_fp32 = logits.float()
-            log_probs = torch.log_softmax(logits_fp32, dim=-1)
-            sampled_logprobs = log_probs.gather(
-                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
-            ).squeeze(-1)
+            sampled_ids = sampled_tokens.to(torch.long).unsqueeze(-1)
+            if premask_lse is not None:
+                sampled_logprobs = (
+                    logits.gather(-1, sampled_ids).squeeze(-1).float() - premask_lse
+                )
+            else:
+                logits_fp32 = logits.float()
+                log_probs = torch.log_softmax(logits_fp32, dim=-1)
+                sampled_logprobs = log_probs.gather(-1, sampled_ids).squeeze(-1)
             # No PCP broadcast: logprobs never feed the next forward and only
             # worker 0's leave.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
@@ -3508,7 +3600,11 @@ class ModelRunner:
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
+            batch,
+            sampled_tokens,
+            self.forward_done_event,
+            sampled_logprobs,
+            channel_states=channel_states,
         )
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
@@ -5082,7 +5178,11 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
-            # Sample the first generated token from each sequence's last logit
+            # Sample the first generated token from each sequence's last logit.
+            # Masked in place with no pre-mask copy, unlike `postprocess`: this
+            # path returns token ids only and computes no logprobs, so nothing
+            # reads the unmasked row.
+            self._constrain_required_channel(batch, logits)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()

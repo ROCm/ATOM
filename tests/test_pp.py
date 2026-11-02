@@ -1191,6 +1191,41 @@ def test_hold_is_released_when_its_batch_files_its_hashes():
     assert seq.id in _prefill_ids(sched)
 
 
+@pytest.mark.parametrize("acked", [False, True])
+def test_head_flushes_a_held_chunk_whether_or_not_it_is_acked(acked):
+    # Dynamic chunking acks middle chunks: that branch must flush a hold too,
+    # or the held seq never re-enters the prefill scan and stalls.
+    import queue
+
+    from aiter_stub import stubbed_aiter
+
+    with stubbed_aiter():
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
+
+    sched, seq, batch, seqs = _held_after_first_chunk()
+    batch.pp_completion_ack = acked
+    sched.mark_pp_inflight(batch)
+    core = PPEngineCoreProc.__new__(PPEngineCoreProc)
+    core.scheduler = sched
+    # The in-flight chunk fills the window: schedule nothing.
+    core.pp_size = core.pp_max_inflight = 1
+    core._in_flight = deque([(batch, seqs, False)])
+    core._pending_prefix_hash = deque()
+    core._defer_prefix_hash = True
+    core.output_queue = queue.Queue()
+    core._poll_kv_transfer_progress = lambda: None
+    core._poll_dynamic_chunking_calibration = lambda: None
+    core.runner_mgr = types.SimpleNamespace(call_func=lambda *a, **k: None)
+    completions = deque([(batch.req_ids, None)] if acked else [])
+    core.pp_transport = types.SimpleNamespace(
+        recv_completion=lambda **k: completions.popleft() if completions else None
+    )
+    core._pp_head_step()
+    assert not core._in_flight and not core._pending_prefix_hash
+    assert seq.id not in sched._pp_checkpoint_hold
+    assert seq.id in _prefill_ids(sched)
+
+
 @pytest.mark.parametrize("filer", ["register_prefill_hashes", "postprocess"])
 def test_hold_is_released_even_if_the_seq_left_running(filer):
     # Preempted, aborted or retired while its chunk was in flight: the batch

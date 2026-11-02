@@ -7,8 +7,9 @@ tuple) its launcher's closures capture; an object in a closure is not keyed, and
 a parameter used only by build-time Python (a placement table, a layout) is in no
 closure at all. Two builds differing only there would share one binary -- every
 TP rank ran rank 3's kernel once that way. So a build's parameters are one frozen
-dataclass of scalars, ``key_tuple`` turns it into one (name, value) tuple, and the
-launcher references that tuple: every field is keyed, whatever the body uses.
+dataclass of scalars (or of such dataclasses), ``key_tuple`` turns it into one
+(name, value) tuple, and the launcher references that tuple: every field is
+keyed, whatever the body uses.
 
 The tuple also carries the model's kernel sources (``source_digest``): FlyDSL
 keys a helper's source only when its walk reaches it, and it does not reach a
@@ -20,7 +21,7 @@ kernel's directory -- an edit there kept the old binary.
 import enum
 import functools
 import hashlib
-from dataclasses import fields
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 _SCALARS = (int, float, bool, str, enum.Enum)
@@ -46,18 +47,27 @@ def source_digest(*paths: str) -> str:
 
 def key_tuple(key, sources: str) -> tuple:
     """``key``'s (field name, value) pairs, every value a scalar, then
-    ("sources", ``sources``): the model's ``source_digest``."""
+    ("sources", ``sources``): the model's ``source_digest``. A field that is
+    itself a dataclass of scalars (a layer's shape) is spread as
+    ``field.name`` pairs."""
+    return (*_scalar_fields(key, ""), ("sources", sources))
+
+
+def _scalar_fields(key, prefix: str) -> list:
     out = []
     for f in fields(key):
         value = getattr(key, f.name)
+        name = prefix + f.name
+        if is_dataclass(value):
+            out.extend(_scalar_fields(value, name + "."))
+            continue
         if not isinstance(value, _SCALARS):
             raise TypeError(
                 f"{type(key).__name__}.{f.name} = {value!r}: a build parameter must be"
                 " a scalar to reach the JIT cache key"
             )
-        out.append((f.name, value))
-    out.append(("sources", sources))
-    return tuple(out)
+        out.append((name, value))
+    return out
 
 
 def symbol_params(key) -> dict:
