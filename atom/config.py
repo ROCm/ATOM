@@ -2578,6 +2578,7 @@ class Config:
             # builds the model.
             self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
         self._resolve_dynamic_chunking()
+        self._check_pp_support()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2788,6 +2789,43 @@ class Config:
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _check_pp_support(self) -> None:
+        """Refuse what PP does not wire yet: P/D consumers, and speculation
+        beyond Kimi-K3 with DSpark.
+
+        Only Kimi-K3 with DSpark relays the target's aux taps across stages;
+        anything else fails mid-serving or drafts from zero buffers.
+        """
+        if self.pipeline_parallel_size <= 1:
+            return
+        from atom.kv_transfer.disaggregation.pd_producer import (
+            disaggregated_kv_role,
+        )
+
+        # A consumer's first decode leaves T0 plus mtp_k placeholders, not the
+        # mtp_k + 1 the PP verify window assumes, and the PP loop has no
+        # remote-KV path at all.
+        if disaggregated_kv_role(self) == "kv_consumer":
+            raise ValueError(
+                "A P/D kv_consumer is not supported with pipeline_parallel_size > 1."
+            )
+        if self.speculative_config is None:
+            return
+        archs = getattr(self.hf_config, "architectures", None) or ()
+        if "KimiK3ForConditionalGeneration" not in archs or not (
+            self.speculative_config.use_dspark()
+        ):
+            raise ValueError(
+                "pipeline_parallel_size > 1 with speculative decoding supports "
+                f"only Kimi-K3 with DSpark, got architectures={list(archs)}, "
+                f"method={self.speculative_config.method!r}."
+            )
+        if self.dspark.confidence_schedule:
+            raise ValueError(
+                "The DSpark confidence scheduler (confidence_schedule) is not "
+                "supported with pipeline_parallel_size > 1."
+            )
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
