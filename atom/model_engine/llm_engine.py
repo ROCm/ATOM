@@ -211,9 +211,7 @@ class LLMEngine:
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
 
-    def prepare_structured_request(
-        self, params, kv_transfer=None, multimodal=False, request_ids=()
-    ):
+    def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
         if params.json_schema is None:
             return
         validate_execution_options(
@@ -234,21 +232,21 @@ class LLMEngine:
             params.structured_tool_format,
             params.structured_reasoning_end,
         )
-        if request_ids:
-            preflight.prepare_requests(key, request_ids)
-        else:
-            preflight.submit(*key).result()
+        preflight.submit(*key).result()
 
     def bind_structured_requests(self, seqs):
         # Called by CoreManager only after frontend context validation, at the
         # actual submission boundary. No worker matcher belongs to preprocessing.
+        groups = {}
         for seq in seqs:
             key = (
                 seq.json_schema,
                 seq.structured_tool_format,
                 seq.structured_reasoning_end,
             )
-            self._structured_preflight.prepare_requests(key, (seq.id,))
+            groups.setdefault(key, []).append(seq.id)
+        for key, request_ids in groups.items():
+            self._structured_preflight.prepare_requests(key, tuple(request_ids))
 
     def add_request(
         self,

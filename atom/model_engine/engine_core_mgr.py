@@ -1536,7 +1536,16 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
-        self._release_structured_requests([seq.id])
+        try:
+            self._release_structured_requests([seq.id])
+        except Exception as e:
+            logger.warning(
+                "%s: structured cleanup for sequence %s failed: %s",
+                self.label,
+                seq.id,
+                e,
+                exc_info=True,
+            )
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False

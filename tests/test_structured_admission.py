@@ -517,3 +517,64 @@ def test_pipeline_schema_rejected_before_api_preflight(pp_size):
             with pytest.raises(ValueError, match="pipeline parallelism"):
                 asyncio.run(request)
     engine.prepare_structured_request.assert_not_called()
+
+
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_cleanup_send_failure_does_not_stop_terminal_deliveries(with_callback):
+    import threading
+
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.label = "test"
+    mgr._structured_request_ids = {77, 78}
+    mgr._structured_request_lock = threading.Lock()
+    first, second = Mock(), Mock()
+    mgr._seq_id_to_callback = {78: second}
+    if with_callback:
+        mgr._seq_id_to_callback[77] = first
+    mgr.broadcast_utility_command = Mock(
+        side_effect=[RuntimeError("socket closed"), None, None]
+    )
+    assert mgr._deliver_terminal_output(NS(id=77, leave_reason="stop")) == with_callback
+    assert mgr._deliver_terminal_output(NS(id=78, leave_reason="stop"))
+    assert first.call_count == int(with_callback)
+    second.assert_called_once()
+    assert second.call_args.args[0].finished
+    assert mgr._structured_request_ids == {77}
+    mgr._release_structured_requests([77])
+    assert not mgr._structured_request_ids
+    assert not mgr._seq_id_to_callback
+
+
+def test_bind_groups_matching_grammars_without_merging_request_states():
+    from atom.model_engine.llm_engine import LLMEngine
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine._structured_preflight = Mock()
+
+    def seq(i, schema="{}", tool=None, reasoning=""):
+        return NS(
+            id=i,
+            json_schema=schema,
+            structured_tool_format=tool,
+            structured_reasoning_end=reasoning,
+        )
+
+    engine.bind_structured_requests(
+        [
+            seq(1),
+            seq(2, schema='{"type":"object"}'),
+            seq(3),
+            seq(4, tool="tool"),
+            seq(5, reasoning="</think>"),
+            seq(6),
+        ]
+    )
+    calls = engine._structured_preflight.prepare_requests.call_args_list
+    assert [c.args for c in calls] == [
+        (("{}", None, ""), (1, 3, 6)),
+        (('{"type":"object"}', None, ""), (2,)),
+        (("{}", "tool", ""), (4,)),
+        (("{}", None, "</think>"), (5,)),
+    ]
