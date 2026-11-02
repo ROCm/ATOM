@@ -81,7 +81,11 @@ def test_reclamation_does_not_accumulate_completed_events():
     assert not reclaimer._retired
 
 
-def test_ready_event_is_not_rerecorded_before_all_dma_completes():
+def test_ready_event_is_never_rerecorded():
+    """An exported event is never re-recorded: a peer that imported it would
+    see its previous completion until the device runs the new record. Once
+    every transfer that used it completed, it is retired for destruction."""
+
     class Future:
         ready = False
 
@@ -97,8 +101,10 @@ def test_ready_event_is_not_rerecorded_before_all_dma_completes():
     other = reclaimer.acquire_ready_event(object)
     assert other is not original
     second.ready = True
-    assert reclaimer.acquire_ready_event(object) is original
-    assert len(reclaimer._ready_events) == 2
+    third = reclaimer.acquire_ready_event(object)
+    assert third is not original and third is not other
+    assert original in reclaimer._retired
+    assert all(e.event is not original for e in reclaimer._ready_events)
 
 
 def test_unprovable_submission_keeps_its_ready_event():
@@ -125,9 +131,11 @@ def test_pre_submit_rejection_keeps_other_event_owners():
     event = reclaimer.acquire_ready_event(object)
     reclaimer.track_ready_event(event, owner)
     reclaimer.track_ready_event(event, None)
-    assert reclaimer.acquire_ready_event(object) is not event
+    reclaimer.acquire_ready_event(object)
+    assert event not in reclaimer._retired  # its submitted owner still runs
     owner.ready = True
-    assert reclaimer.acquire_ready_event(object) is event
+    reclaimer.acquire_ready_event(object)
+    assert event in reclaimer._retired
 
 
 class PendingEvent(Event):
