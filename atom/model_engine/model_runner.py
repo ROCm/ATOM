@@ -1287,9 +1287,12 @@ class ModelRunner:
     def dummy_execution(self, prefill: bool = False):
         """A one-sequence dummy step that keeps an idle rank in its DP group's
         collectives: a decode, or with ``prefill`` -- the group's prefill step
-        (`Scheduler.dummy_prefill`) -- a request-less prefill of the smallest
-        token-graph bucket's tokens, which `ForwardMode._pad_to_token_graph`
-        raises to the bucket every rank of the group replays.
+        (`Scheduler.dummy_prefill`) -- a request-less prefill. With token
+        graphs it starts at the smallest bucket, which
+        `ForwardMode._pad_to_token_graph` raises to the group's replay bucket.
+        Without prefill graphs, one token keeps the rank in the same phase
+        and follows the normal eager prefill path. DeepInfer's ANY vote can
+        select that path even when this rank has no requests.
 
         Two mechanisms lean on the fabricated id being -1: this pass flushes
         the previous real step's tokens (`prepare_sampled_ids` reports the
@@ -1298,7 +1301,8 @@ class ModelRunner:
         `get_token_locations`.
         """
         if prefill:
-            mtp_k, tokens = 0, TokenGraph.captured_sizes("prefill")[0]
+            prefill_sizes = TokenGraph.captured_sizes("prefill")
+            mtp_k, tokens = 0, prefill_sizes[0] if prefill_sizes else 1
         else:
             # The scheduler's spec width, not the drafter's. On a P/D producer
             # the real decodes are q=1, and under DP an idle rank's dummy is

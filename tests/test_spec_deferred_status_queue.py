@@ -274,6 +274,40 @@ def test_a_dp_dummy_runs_at_the_schedulers_query_width(is_pd_producer, expected_
     assert batch.num_spec_step == expected_q - 1
 
 
+@pytest.mark.parametrize("prefill_sizes", [(), (128, 256)])
+@pytest.mark.parametrize("has_drafter", [False, True])
+def test_dummy_prefill_without_graphs_keeps_the_prefill_phase(
+    prefill_sizes, has_drafter
+):
+    """DeepInfer ANY admits sparse prefill even without prefill token graphs.
+
+    The idle rank must participate as prefill, with no speculative columns;
+    sizing it from the decode drafter would change the collective phase.
+    """
+    runner = ModelRunner.__new__(ModelRunner)
+    if has_drafter:
+        runner.drafter = SimpleNamespace(mtp_k=7)
+    runner.block_size = 16
+    seen = []
+    runner.forward = seen.append
+    with mock.patch(
+        "atom.model_engine.model_runner.TokenGraph.captured_sizes",
+        return_value=prefill_sizes,
+    ):
+        ModelRunner.dummy_execution(runner, prefill=True)
+
+    (batch,) = seen
+    expected_tokens = prefill_sizes[0] if prefill_sizes else 1
+    assert batch.is_dummy_run
+    assert batch.total_tokens_num_prefill == expected_tokens
+    assert batch.total_tokens_num_decode == 0
+    assert batch.total_seqs_num_prefill == 1
+    assert batch.total_seqs_num_decode == 0
+    assert batch.num_spec_step == 0
+    assert list(batch.req_ids) == [-1]
+    assert batch.total_tokens_num == expected_tokens
+
+
 def _graph_runner(*, is_pd_producer: bool, drafter: bool = True) -> ModelRunner:
     runner = ModelRunner.__new__(ModelRunner)
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
