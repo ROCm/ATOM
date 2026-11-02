@@ -401,13 +401,9 @@ def test_cold_compile_cache_hit_prunes_completed_futures_without_losing_active_w
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_submission_owns_matchers_and_releases_all_replicas(failure):
-    import threading
-
     from atom.model_engine.engine_core_mgr import CoreManager
 
     mgr = CoreManager.__new__(CoreManager)
-    mgr._structured_request_ids = set()
-    mgr._structured_request_lock = threading.Lock()
     replicas = [{}, {}]
     events = []
     seq = NS(id=77, json_schema="{}", leave_reason="stop")
@@ -440,7 +436,6 @@ def test_submission_owns_matchers_and_releases_all_replicas(failure):
         assert all(77 in r for r in replicas)
         mgr._deliver_terminal_output(seq)
         mgr._deliver_terminal_output(seq)  # completion cleanup is idempotent
-    assert not mgr._structured_request_ids
     assert all(not replica for replica in replicas)
 
 
@@ -521,14 +516,10 @@ def test_pipeline_schema_rejected_before_api_preflight(pp_size):
 
 @pytest.mark.parametrize("with_callback", [False, True])
 def test_cleanup_send_failure_does_not_stop_terminal_deliveries(with_callback):
-    import threading
-
     from atom.model_engine.engine_core_mgr import CoreManager
 
     mgr = CoreManager.__new__(CoreManager)
     mgr.label = "test"
-    mgr._structured_request_ids = {77, 78}
-    mgr._structured_request_lock = threading.Lock()
     first, second = Mock(), Mock()
     mgr._seq_id_to_callback = {78: second}
     if with_callback:
@@ -536,14 +527,17 @@ def test_cleanup_send_failure_does_not_stop_terminal_deliveries(with_callback):
     mgr.broadcast_utility_command = Mock(
         side_effect=[RuntimeError("socket closed"), None, None]
     )
-    assert mgr._deliver_terminal_output(NS(id=77, leave_reason="stop")) == with_callback
-    assert mgr._deliver_terminal_output(NS(id=78, leave_reason="stop"))
+    assert (
+        mgr._deliver_terminal_output(NS(id=77, leave_reason="stop", json_schema="{}"))
+        == with_callback
+    )
+    assert mgr._deliver_terminal_output(
+        NS(id=78, leave_reason="stop", json_schema="{}")
+    )
     assert first.call_count == int(with_callback)
     second.assert_called_once()
     assert second.call_args.args[0].finished
-    assert mgr._structured_request_ids == {77}
-    mgr._release_structured_requests([77])
-    assert not mgr._structured_request_ids
+    mgr._release_structured_requests([NS(id=77, json_schema="{}")])
     assert not mgr._seq_id_to_callback
 
 
@@ -578,3 +572,50 @@ def test_bind_groups_matching_grammars_without_merging_request_states():
         (("{}", "tool", ""), (4,)),
         (("{}", None, "</think>"), (5,)),
     ]
+
+
+@pytest.mark.parametrize("schema", [None, "{}"])
+@pytest.mark.parametrize("pending", [False, True])
+def test_cancellation_cleanup_follows_terminal_sequence(schema, pending):
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.label = "test"
+    seq = NS(id=19, json_schema=schema, leave_reason="aborted")
+    callback = Mock()
+    mgr._seq_id_to_callback = {19: callback}
+    mgr._release_seq_load = Mock()
+    mgr._bp_take_pending = Mock(return_value=seq if pending else None)
+    mgr.broadcast_utility_command = Mock()
+    mgr.abort_request(19)
+    if not pending:
+        mgr.broadcast_utility_command.assert_called_once_with(
+            "abort_request", req_id=19
+        )
+        callback.assert_not_called()
+        mgr._deliver_terminal_output(seq)
+    callback.assert_called_once()
+    releases = [
+        c
+        for c in mgr.broadcast_utility_command.call_args_list
+        if c.args[0] == "release_structured_requests"
+    ]
+    assert len(releases) == int(schema is not None)
+    if releases:
+        assert releases[0].kwargs == {"request_ids": [19]}
+
+
+def test_cleanup_failure_preserves_original_admission_error():
+    from atom.model_engine.engine_core_mgr import CoreManager
+
+    mgr = CoreManager.__new__(CoreManager)
+    mgr.label = "test"
+    mgr.structured_request_prepare = Mock(side_effect=ValueError("compile failed"))
+    mgr.broadcast_utility_command = Mock(side_effect=RuntimeError("socket closed"))
+    mgr._add_prepared_requests = Mock()
+    with pytest.raises(ValueError, match="compile failed"):
+        mgr.add_request([NS(id=19, json_schema="{}")])
+    mgr._add_prepared_requests.assert_not_called()
+    mgr.broadcast_utility_command.assert_called_once_with(
+        "release_structured_requests", request_ids=[19]
+    )

@@ -161,6 +161,14 @@ multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
 
+Cleanup follows request ownership rather than a shared frontend ID registry.
+Finished sequences carry their Schema metadata, so the output path releases
+request state on every replica. Waiting/running cancellations use that same
+terminal path; a submission failure releases its locally held sequence list.
+Worker release is idempotent, and ordinary requests send no grammar-cleanup
+message. There is no additional request-registry lock; the existing transport
+synchronization remains in place.
+
 Committed grammar states live until request completion, rejection, or cancellation,
 including across interleaved prefills and ordinary batches. The scheduler sends
 schema configuration once and then only newly acknowledged output tokens, excluding

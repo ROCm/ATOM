@@ -236,8 +236,6 @@ class CoreManager:
         # the next caller's answer.
         self._rpc_router = RpcResponseRouter()
         self.structured_request_prepare = None
-        self._structured_request_ids = set()
-        self._structured_request_lock = Lock()
         # Held across every bucket plus FINISH/abort. RLock lets the sender's
         # outer session call the same synchronous command method per bucket.
         self._weight_sync_lock = RLock()
@@ -1005,36 +1003,32 @@ class CoreManager:
             seq for seq in seqs if getattr(seq, "json_schema", None) is not None
         ]
         if structured:
-            ids = [seq.id for seq in structured]
-            # Register before preparation so a partial multi-request failure
-            # releases every ID that may have been installed on any replica.
-            with self._structured_request_lock:
-                self._structured_request_ids.update(ids)
             try:
                 if self.structured_request_prepare is None:
                     raise ValueError("Structured output requires engine admission")
                 self.structured_request_prepare(structured)
                 self._add_prepared_requests(seqs)
             except BaseException:
-                self._release_structured_requests(ids)
+                self._release_structured_requests(structured)
                 raise
         else:
             self._add_prepared_requests(seqs)
 
-    def _release_structured_requests(self, request_ids):
-        owned = getattr(self, "_structured_request_ids", None)
-        if not owned:
+    def _release_structured_requests(self, seqs):
+        # The submitted/finished sequences own the cleanup information. There
+        # is no cross-thread registry: workers tolerate repeated releases.
+        ids = [seq.id for seq in seqs if getattr(seq, "json_schema", None) is not None]
+        if not ids:
             return
-        with self._structured_request_lock:
-            ids = [req for req in request_ids if req in owned]
-            if not ids:
-                return
-            # A fire-and-forget command is safe on the output receiver thread;
-            # waiting for an RPC reply here would deadlock that same receiver.
+        try:
+            # Never wait for an RPC reply on the output receiver thread.
             self.broadcast_utility_command(
                 "release_structured_requests", request_ids=ids
             )
-            owned.difference_update(ids)
+        except Exception:
+            # Cleanup must neither interrupt terminal delivery nor hide the
+            # original admission failure. Worker teardown also frees state.
+            logger.exception("%s: structured cleanup failed for %s", self.label, ids)
 
     def _add_prepared_requests(self, seqs: list[Sequence]):
         tracing.bind_sequences(seqs)
@@ -1536,16 +1530,7 @@ class CoreManager:
         and normal completions have had theirs popped by the STREAM that
         delivered them, so both answer False and keep their existing path.
         """
-        try:
-            self._release_structured_requests([seq.id])
-        except Exception as e:
-            logger.warning(
-                "%s: structured cleanup for sequence %s failed: %s",
-                self.label,
-                seq.id,
-                e,
-                exc_info=True,
-            )
+        self._release_structured_requests([seq])
         callback = self._seq_id_to_callback.pop(seq.id, None)
         if callback is None:
             return False
@@ -1739,7 +1724,8 @@ class CoreManager:
             return
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
-            self._release_structured_requests([req_id])
+            # Waiting/running cancellations return a finished Sequence through
+            # the ordinary output path, which releases grammar on every rank.
         except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
