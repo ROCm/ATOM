@@ -955,7 +955,12 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
-        self._build_pp_aux_relay()
+        from atom.spec_decode.pp_aux_relay import PPAuxRelay
+
+        self.pp_aux_relay = PPAuxRelay.build(
+            self.config, self.model, getattr(self, "drafter", None)
+        )
+        self._pp_recv_aux = None
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
@@ -2970,31 +2975,6 @@ class ModelRunner:
             outs.append(seg[: grp.tok_end - grp.tok_start])  # crop per-group pad
             off += local_len
         return torch.cat(outs)
-
-    def _build_pp_aux_relay(self):
-        """Build the PP relay for drafter aux hidden states owned by other stages.
-
-        Runs on every stage; drafterless stages derive the spec from config.
-        """
-        self.pp_aux_relay = None
-        self._pp_recv_aux = None
-        if get_pp_group().world_size <= 1 or self.config.speculative_config is None:
-            return
-        from atom.spec_decode.dspark_proposer import build_aux_capture_spec
-        from atom.spec_decode.pp_aux_relay import PPAuxRelay
-
-        drafter = getattr(self, "drafter", None)
-        if drafter is not None:
-            spec = drafter._aux_capture_spec(self.model)
-        else:
-            spec = build_aux_capture_spec(self.config)
-        if spec is None:
-            return
-        relay = PPAuxRelay(spec, self.model)
-        if not relay.incoming_ids and not relay.outgoing_ids:
-            return
-        relay.arm(self.model, lambda: get_forward_context().context.is_draft)
-        self.pp_aux_relay = relay
 
     def _setup_pp_shared_indexer(self):
         """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary

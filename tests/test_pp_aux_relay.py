@@ -163,3 +163,21 @@ def test_relay_a_skipped_first_tap_is_caught_not_written_around():
     target.layers[2](torch.zeros(3, 8))
     with pytest.raises(AssertionError, match=r"\[-1\] not captured"):
         relay.pack(None, 3)
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+def test_build_takes_the_drafters_spec_and_arms_only_under_pp(world_size):
+    target = _FakeTarget(8, (0, 4), with_embed=True)
+    spec = AuxCaptureSpec(layer_ids=(-1, 2), hidden_size=8, extract=lambda o, m: o)
+    drafter = types.SimpleNamespace(_aux_capture_spec=lambda model: spec)
+    config = types.SimpleNamespace(speculative_config=object())
+    group = types.SimpleNamespace(
+        world_size=world_size, is_first_rank=True, is_last_rank=False
+    )
+    with mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group):
+        relay = PPAuxRelay.build(config, target, drafter)
+    if world_size == 1:
+        assert relay is None
+        return
+    assert relay.spec is spec and relay.own_ids == (-1, 2)
+    assert target.embed_tokens._forward_hooks, "build must arm the relay"

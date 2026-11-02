@@ -24,6 +24,7 @@ from atom.spec_decode.drafter import (
     _resolve_decoder_layers,
     _resolve_embedding,
 )
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -77,6 +78,28 @@ class PPAuxRelay:
         self._col = {lid: col for col, lid in enumerate(self.outgoing_ids)}
 
         self._armed = False
+
+    @classmethod
+    def build(cls, config, target_model, drafter) -> "PPAuxRelay | None":
+        """This stage's armed relay, or None when no tap crosses a PP boundary.
+
+        Runs on every stage; drafterless stages derive the spec from config.
+        """
+        if get_pp_group().world_size <= 1 or config.speculative_config is None:
+            return None
+        from atom.spec_decode.dspark_proposer import build_aux_capture_spec
+
+        if drafter is not None:
+            spec = drafter._aux_capture_spec(target_model)
+        else:
+            spec = build_aux_capture_spec(config)
+        if spec is None:
+            return None
+        relay = cls(spec, target_model)
+        if not relay.incoming_ids and not relay.outgoing_ids:
+            return None
+        relay.arm(target_model, lambda: get_forward_context().context.is_draft)
+        return relay
 
     def arm(self, target_model: torch.nn.Module, is_draft_forward) -> None:
         """Install capture hooks for this stage's taps (no-op on the last stage).
