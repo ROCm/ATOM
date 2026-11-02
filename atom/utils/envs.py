@@ -976,6 +976,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Run the model runner on a High-priority stream. HIP pools hardware queues
+    # per priority and a graph's parallel streams are always Normal, so they can
+    # never share the queue the graph is launched from.
+    "ATOM_HIGH_PRIORITY_COMPUTE_STREAM": lambda: _flag_env(
+        "ATOM_HIGH_PRIORITY_COMPUTE_STREAM"
+    ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
