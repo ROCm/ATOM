@@ -208,20 +208,21 @@ def reassign_gathered_shared_ids(layer, topk_ids: torch.Tensor) -> None:
 TRITON_TOPK_SOFTMAX_MAX_ROWS_PER_CU = {"gfx950": 20}
 
 
+@lru_cache
 def triton_topk_softmax_rows(
     num_experts: int,
     topk: int,
     renormalize: bool,
     num_fused_shared_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
-    cu_masked: bool = False,
 ) -> int | None:
-    """The most rows a launch of this routing runs `triton_topk_softmax` for;
-    None: always AITER. The shapes are those of AITER's fused
-    `topkGatingSoftmax` from top-4 up (at top-1 / top-2 Triton is slower near
-    the cutoff). `cu_masked`: count the CUs of RapidServe's smallest CU-masked
-    stream. `get_cu_num()` ignores an `HSA_CU_MASK` set outside ATOM; set
-    `CU_NUM` then."""
+    """The most rows a `rocm_aiter_topk_softmax` launch of this routing runs
+    `triton_topk_softmax` for; None: always AITER. The shapes are those of
+    AITER's fused `topkGatingSoftmax` from top-4 up (at top-1 / top-2 Triton is
+    slower near the cutoff) and from 32 experts, the fewest measured for speed.
+    Under RapidServe's CU masks it counts the smallest stream's CUs.
+    `get_cu_num()` ignores an `HSA_CU_MASK` set outside ATOM; set `CU_NUM`
+    then."""
     scoring_func = fused_shared_experts_scoring_func
     num_shared = 0 if scoring_func is None else num_fused_shared_experts
     if not (
@@ -237,7 +238,8 @@ def triton_topk_softmax_rows(
     if per_cu is None:
         return None
     cus = get_cu_num()
-    if cu_masked:
+    config = get_current_atom_config()
+    if config.enable_rapidserve and config.disagg_constrained:
         # model_runner imports this module. To move to atom/config.py:
         # https://github.com/ROCm/ATOM/issues/2863
         from atom.model_engine.model_runner import RapidServeModelRunner
@@ -256,10 +258,7 @@ def rocm_aiter_topk_softmax_impl(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
-    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`triton_max_rows`: the layer's `triton_topk_softmax_rows`; launches of
-    up to that many rows run `triton_topk_softmax`, the rest AITER's."""
     from aiter import topk_softmax
 
     token = gating_output.shape[0]
@@ -275,17 +274,22 @@ def rocm_aiter_topk_softmax_impl(
     token_expert_indicies = torch.empty(
         gating_output.shape[0], topk, dtype=torch.int32, device=gating_output.device
     )
+    num_scored_shared = (
+        0 if fused_shared_experts_scoring_func is None else num_fused_shared_experts
+    )
+    triton_max_rows = triton_topk_softmax_rows(
+        gating_output.shape[1] - num_scored_shared,
+        topk,
+        renormalize,
+        num_scored_shared,
+        fused_shared_experts_scoring_func,
+    )
     if fused_shared_experts_scoring_func is None:
         fused_shared_experts_scoring_func = ""
         fused_shared_experts_for_kernel = 0
     else:
         fused_shared_experts_for_kernel = num_fused_shared_experts
     if triton_max_rows is not None and token <= triton_max_rows:
-        assert renormalize, "triton_topk_softmax always renormalizes"
-        assert (
-            num_routing_experts
-            == gating_output.shape[1] - fused_shared_experts_for_kernel
-        ), "the logits must be the routed experts' and then the scored shared ones'"
         triton_topk_softmax(
             topk_weights,
             topk_ids,
@@ -493,7 +497,6 @@ def rocm_aiter_topk_softmax(
     num_routing_experts: int = 0,
     fused_shared_experts_scoring_func: str | None = None,
     num_valid_rows: torch.Tensor | None = None,
-    triton_max_rows: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     return rocm_aiter_topk_softmax_impl(
         gating_output,
@@ -503,7 +506,6 @@ def rocm_aiter_topk_softmax(
         num_routing_experts,
         fused_shared_experts_scoring_func,
         num_valid_rows,
-        triton_max_rows,
     )
 
 

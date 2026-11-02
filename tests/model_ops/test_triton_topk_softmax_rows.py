@@ -6,6 +6,7 @@ GPU-less CI (through `test_comm_fused_moe`'s AITER / Triton stubs)."""
 
 import importlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 from test_comm_fused_moe import _stubbed_external_kernel_modules
@@ -26,12 +27,17 @@ def topK():
 
 @pytest.fixture
 def gpu(topK, monkeypatch):
+    cfg = SimpleNamespace(enable_rapidserve=False, disagg_constrained=False)
+    monkeypatch.setattr(topK, "get_current_atom_config", lambda: cfg)
+
     def set_gpu(arch="gfx950", cus=256):
         monkeypatch.setattr(topK, "get_gfx_runtime", lambda: arch)
         monkeypatch.setattr(topK, "get_cu_num", lambda: cus)
+        topK.triton_topk_softmax_rows.cache_clear()
 
     set_gpu()
-    return set_gpu
+    yield set_gpu
+    topK.triton_topk_softmax_rows.cache_clear()
 
 
 @pytest.mark.parametrize(
