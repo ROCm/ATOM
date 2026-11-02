@@ -516,10 +516,7 @@ class BlockManager:
                     if checkpoint_spec is not None
                     else None
                 ),
-                # Off again (`stop_refreshing`) if the connector turns out not
-                # to carry state touches.
                 refresh_hits=True,
-                # How long a confirmed image is trusted.
                 verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is
@@ -1582,12 +1579,8 @@ class BlockManager:
         block_hashes: list[int],
         decision: JointBoundaryDecision,
     ) -> int:
-        """The hash `allocate` would restore this seq's state from when HBM
-        does not hold its state, or -1 (no state, HBM holds it, or a replay).
-
-        The hash `allocate` will hand `_attach_state_slots`
-        (`_state_resume_hash`), so a hold judges what will be loaded.
-        """
+        """The `_state_resume_hash` `allocate` would restore from, when HBM
+        does not hold it; -1 for no state, an HBM-held one, or a replay."""
         if not seq.has_per_req_cache:
             return -1
         joint = decision.skip_reason is None
@@ -1602,10 +1595,12 @@ class BlockManager:
             seq, decision.boundary_hash if joint else -1, hit_hash
         )
         if h != -1 and not joint:
-            if self.paged_state_checkpoints is not None:
-                if self.paged_state_checkpoints.contains(h):
-                    return -1
-            elif self.state.lookup(h) >= 0:
+            in_hbm = (
+                self.paged_state_checkpoints.contains(h)
+                if self.paged_state_checkpoints is not None
+                else self.state.lookup(h) >= 0
+            )
+            if in_hbm:
                 return -1
         return h
 
@@ -1614,9 +1609,7 @@ class BlockManager:
 
         The joint boundary when there is one (above the HBM hit by
         construction), else the HBM hit's last block. A replay rebuilds the
-        state instead of restoring it, so it resumes from none. `allocate`
-        hands this to `_attach_state_slots`, and `_resume_hash_off_hbm` reports
-        it, so the admission hold judges the hash that will be loaded.
+        state instead of restoring it, so it resumes from none.
         """
         if joint_hash != -1:
             return joint_hash

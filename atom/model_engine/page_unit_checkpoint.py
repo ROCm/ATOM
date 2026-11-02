@@ -1072,9 +1072,7 @@ class PagedStateCheckpointCoordinator:
         `hashes` from its own stores but cannot load them back, and voting a hit
         it would then refuse strands the scan at the tier rung -- skipping a
         still-resident HBM rung -- and forfeits the checkpoint to a recompute.
-
-        A tier hit accepted here is a vote, so it is registered for a touch
-        (`want_touch`).
+        A tier hit accepted here is a vote (`want_touch`).
         """
         if self.store.contains(h):
             return True

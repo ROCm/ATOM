@@ -68,14 +68,12 @@ STATE_SOURCE_CHANNEL = "k3_state_source"
 #: rather than leaving a partially-reported key pending forever.
 STATE_LOAD_DISPOSITION_CHANNEL = "k3_state_load_disposition"
 
-#: One verdict per `StateTouchId`: the worker refreshed the image in LMCache's
-#: LRU (`succeeded=True`) or found it gone (`succeeded=False`). Failure-dominant
-#: across TP, like a joint load: one missing shard means the load would miss.
+#: One verdict per `StateTouchId`: `succeeded` is whether the image is still
+#: resident. Failure-dominant across TP: one missing shard and a load misses.
 STATE_TOUCH_CHANNEL = "k3_state_touch"
 
-#: Alongside each `STATE_TOUCH_CHANNEL` verdict, same id: `succeeded=False` when
-#: the image was present but outside LocalCPU's hot cache, so the touch did not
-#: refresh its eviction order. Failure-dominant: any such shard counts.
+#: Same id: `succeeded=False` when the image was present but not refreshed
+#: (outside LocalCPU's hot cache).
 STATE_TOUCH_REFRESH_CHANNEL = "k3_state_touch_refresh"
 
 #: The connector's standalone stall clock, used only when reclamation is
@@ -267,7 +265,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         codec.bind_storage_manager(self._engine.storage_manager)
         pool_gib = float(getattr(cfg, "max_local_cpu_size", 0) or 0)
         budget_warning = state_tier_budget_warning(
-            state_bytes, int(pool_gib * (1 << 30)), entry_bytes
+            state_bytes, int(pool_gib * (1 << 30))
         )
         if budget_warning:
             logger.warning("kimi_k3 offload: %s", budget_warning)
@@ -314,14 +312,10 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             super().start_load_kv(metadata)
 
     def _touch_states(self, metadata) -> None:
-        """Refresh the state images the engine voted a hit for, and record
-        whether each is still there.
-
-        Inline on this thread, not on the tier's executors: a touch is one
-        dict move under LocalCPU's lock, and it must not queue behind an
-        image-sized store. With no tier every image is gone by definition, so
-        the engine's index drops what it still advertises.
-        """
+        """Refresh the voted state images and record whether each is still
+        there. Inline, not on the tier's executors: a touch is one dict move
+        and must not queue behind an image-sized store. With no tier every
+        image is gone."""
         touches = getattr(metadata, "state_touches", None)
         if not touches:
             return
@@ -333,9 +327,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             try:
                 result = tier.codec.touch(int(touch_id.prefix_hash))
             except Exception:
-                # Says nothing about the bytes, so the index keeps the image;
-                # nothing was refreshed either. One traceback: a drifted
-                # LMCache raises on every touch.
+                # Says nothing about the bytes: kept, not refreshed. One
+                # traceback, since a drifted LMCache raises on every touch.
                 self._touch_failures += 1
                 if self._touch_failures == 1:
                     logger.warning(
@@ -682,13 +675,9 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         # block ids, no chunking -- only the park/report lifecycle.
         self._pending_state_loads: list[tuple] = []
         self._pending_state_stores: list[tuple] = []
-        # Hit refresh: touches waiting for the next metadata, the round
-        # counter that keeps each one a distinct aggregator identity, and the
-        # verdicts drained by the engine (`take_state_touch_verdicts`).
         self._pending_state_touches: list[StateTouchId] = []
         self._touch_round = 0
         self._state_touch_verdicts: dict[int, bool] = {}
-        # Touches that only confirmed presence (`take_state_touches_unrefreshed`).
         self._state_touches_unrefreshed = 0
         # A finished request whose save is queued keeps its blocks pinned
         # (`should_defer_free`), so the queue depth is also how much of the pool
@@ -728,13 +717,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return True
 
     def enqueue_state_touches(self, hashes) -> bool:
-        """Queue LRU touches for state images the engine just voted a hit for.
-
-        Each gets its own round, so a hash touched again is a new aggregator
-        identity rather than a tombstoned duplicate.
-        """
-        if not hashes:
-            return False
+        """Queue touches for the next metadata, each under its own round."""
         for h in hashes:
             self._pending_state_touches.append(StateTouchId(int(h), self._touch_round))
             self._touch_round += 1
@@ -747,8 +730,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return verdicts
 
     def take_state_touches_unrefreshed(self) -> int:
-        """Touches since the last call that found an image present but could
-        not refresh it in LocalCPU's LRU."""
+        """Touches since the last call that only confirmed presence."""
         n = self._state_touches_unrefreshed
         self._state_touches_unrefreshed = 0
         return n

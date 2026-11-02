@@ -656,23 +656,15 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return bool(c.enqueue_state_stores(stores))
 
     def enqueue_state_touches(self, hashes) -> bool:
-        """LRU touches for voted state images, to the one sub hosting the
-        tier; False if none does (the engine then stops sending them).
-
-        Select by `has_state_tier`, not method presence -- see
-        `_state_tier_sub`.
-        """
+        """State touches to the sub hosting the tier (`_state_tier_sub`);
+        False if none does."""
         c = self._state_tier_sub()
         if c is None:
             return False
         return bool(c.enqueue_state_touches(hashes))
 
     def take_state_touch_verdicts(self) -> dict:
-        """`{hash: resident}` from the tier sub; empty if none.
-
-        Select by `has_state_tier`, not method presence -- see
-        `_state_tier_sub`.
-        """
+        """`{hash: resident}` from the tier sub; empty if none."""
         c = self._state_tier_sub()
         if c is None:
             return {}

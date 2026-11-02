@@ -2382,10 +2382,9 @@ class Scheduler:
             if not self.block_manager.record_allocation(
                 seq, hbm_probe, defer_unverified=True
             ):
-                # The state offload holds it a pass (the state it would load
-                # is unconfirmed, and its check is out). Held like an
-                # in-flight prefix: an image found gone is forgotten when the
-                # verdict lands, and the retry plans without it.
+                # Held a pass for the state offload's verdict on the image it
+                # would load; a gone image is forgotten and the retry plans
+                # without it.
                 prefix_waiters.append(seq)
                 continue
             if not self.block_manager.allocate(seq, num_cached_blocks):
@@ -4918,7 +4917,7 @@ class Scheduler:
         bm = getattr(self, "block_manager", None)
         offload = getattr(bm, "state_offload", None)
         if offload is not None:
-            # Before the next admission pass, which reads what they decide.
+            # Before the next admission pass reads them.
             offload.collect_touch_verdicts(self.kv_connector)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:

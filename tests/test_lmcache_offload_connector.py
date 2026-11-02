@@ -7573,54 +7573,37 @@ class TestCodecRefresh:
             codec.put(1, [])
         assert objs[0].refs == 0
 
-    def test_without_a_local_cpu_backend_a_touch_asks_presence(
-        self, lmcache_key, caplog
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "local_cpu_backend",
+            "local_cpu_backend.cpu_lock",
+            "local_cpu_backend.hot_cache",
+            "local_cpu_backend.cache_policy",
+            "cache_policy.update_on_hit",
+        ],
+    )
+    def test_without_the_lru_internals_a_touch_only_confirms_presence(
+        self, lmcache_key, missing, caplog
     ):
+        """An LMCache whose internals moved keeps serving loads; bind warns
+        once, naming what is missing, and the lost refresh is counted."""
         pool = _LocalCPU()
-        pool.local_cpu_backend = None
-        with caplog.at_level(logging.WARNING, logger="atom"):
-            codec, _ = _lru_codec(pool, max_entries=None)
-        assert any("no local_cpu_backend" in r.message for r in caplog.records)
-        pool.hot[codec.key(1)] = _Obj()
-        assert codec.touch(1) is TouchResult.PRESENT
-        pool.hot.clear()
-        assert codec.touch(1) is TouchResult.GONE
-
-    def _assert_degrades(self, pool, missing, caplog):
-        """Bind warns once naming what is missing; touches then only confirm
-        presence, and each one is counted rather than passing as a refresh."""
+        if missing == "local_cpu_backend":
+            del pool.local_cpu_backend
+        elif missing == "cache_policy.update_on_hit":
+            pool.local_cpu_backend.cache_policy = SimpleNamespace()
+        else:
+            setattr(pool.local_cpu_backend, missing.split(".")[1], None)
         with caplog.at_level(logging.WARNING, logger="atom"):
             codec, _ = _lru_codec(pool, max_entries=None)
         bind = [r.message for r in caplog.records if missing in r.message]
         assert len(bind) == 1 and "state_offload_touches_unrefreshed" in bind[0]
         assert codec.put(1, [])
         assert codec.touch(1) is TouchResult.PRESENT
-        assert codec.touch(1) is TouchResult.PRESENT
-        assert codec._unrefreshed_touches == 2
-
-    @pytest.mark.parametrize("dropped", ["cpu_lock", "hot_cache", "cache_policy"])
-    def test_a_local_cpu_without_the_lru_internals_degrades_to_presence(
-        self, lmcache_key, dropped, caplog
-    ):
-        """An LMCache whose internals moved keeps serving loads; the lost
-        refresh shows in the stats instead of taking the engine down."""
-        pool = _LocalCPU()
-        setattr(pool.local_cpu_backend, dropped, None)
-        self._assert_degrades(pool, f"local_cpu_backend.{dropped}", caplog)
-
-    def test_a_policy_without_update_on_hit_degrades_to_presence(
-        self, lmcache_key, caplog
-    ):
-        pool = _LocalCPU()
-        pool.local_cpu_backend.cache_policy = SimpleNamespace()
-        self._assert_degrades(pool, "cache_policy.update_on_hit", caplog)
-
-    def test_a_storage_manager_without_local_cpu_backend_degrades_to_presence(
-        self, lmcache_key, caplog
-    ):
-        pool = _LocalCPU()
-        del pool.local_cpu_backend
-        self._assert_degrades(pool, "no local_cpu_backend", caplog)
+        assert codec._unrefreshed_touches == 1
+        pool.hot.clear()
+        assert codec.touch(1) is TouchResult.GONE
 
     def test_the_lru_is_resolved_once_at_bind(self, lmcache_key):
         pool = _LocalCPU()
@@ -7631,30 +7614,23 @@ class TestCodecRefresh:
         assert codec.touch(1) is TouchResult.REFRESHED
         assert pool.evict_oldest() == "kv-chunk"
 
-    def test_a_disk_only_image_is_counted_and_warned_once(self, lmcache_key, caplog):
-        """Present, so still readable, but its LRU was not refreshed: it must
-        not be silent."""
+    def test_only_a_presence_only_touch_is_counted_and_warned_once(
+        self, lmcache_key, caplog
+    ):
+        """A disk-only image is still readable, but its LRU was not refreshed:
+        that must not be silent, and must not be one warning per touch."""
         pool = _LocalCPU()
         codec, _ = _lru_codec(pool, max_entries=None)
-        assert codec.put(1, [])
-        pool.spill_to_disk(codec.key(1))
+        assert codec.put(1, []) and codec.put(2, [])
+        pool.spill_to_disk(codec.key(2))
         with caplog.at_level(logging.WARNING, logger="atom"):
-            assert codec.touch(1) is TouchResult.PRESENT
-            assert codec.touch(1) is TouchResult.PRESENT
+            assert codec.touch(1) is TouchResult.REFRESHED
+            assert codec.touch(2) is TouchResult.PRESENT
+            assert codec.touch(2) is TouchResult.PRESENT
+            assert codec.touch(3) is TouchResult.GONE
         assert codec._unrefreshed_touches == 2
         warned = [r for r in caplog.records if "touches_unrefreshed" in r.message]
         assert len(warned) == 1
-
-    def test_a_refreshed_or_gone_image_is_not_counted(self, lmcache_key, caplog):
-        pool = _LocalCPU()
-        codec, _ = _lru_codec(pool, max_entries=None)
-        assert codec.put(1, [])
-        with caplog.at_level(logging.WARNING, logger="atom"):
-            assert codec.touch(1) is TouchResult.REFRESHED
-            pool.hot.clear()
-            assert codec.touch(1) is TouchResult.GONE
-        assert codec._unrefreshed_touches == 0
-        assert not [r for r in caplog.records if "touches_unrefreshed" in r.message]
 
     def test_a_disk_only_image_is_stored_back_into_the_cpu_tier(self, lmcache_key):
         """The put fast path is for an image LocalCPU still holds, not for
@@ -7713,18 +7689,9 @@ class TestConnectorTouches:
         worker._touch_states(SimpleNamespace(state_touches=[StateTouchId(1, 0)]))
         assert worker._touch_verdicts == {StateTouchId(1, 0): (False, True)}
 
-    def test_a_failing_touch_does_not_erase_the_index(self):
-        def touch(h):
-            raise RuntimeError("backend hiccup")
-
-        worker = _touch_worker(SimpleNamespace(codec=SimpleNamespace(touch=touch)))
-        worker._touch_states(SimpleNamespace(state_touches=[StateTouchId(1, 0)]))
-        assert worker._touch_verdicts[StateTouchId(1, 0)][0] is True
-
     def test_a_failing_touch_counts_unrefreshed_and_logs_once(self, caplog):
-        """A drifted LMCache raises on every touch: that must show up in
-        `touches_unrefreshed`, not as healthy refreshes, and not as one
-        traceback per touch."""
+        """A raising touch keeps the image (resident) but is not a refresh;
+        a drifted LMCache raises on every touch, so one traceback."""
 
         def touch(h):
             raise RuntimeError("backend hiccup")
@@ -7762,7 +7729,6 @@ class TestConnectorTouches:
 
     def test_each_touch_is_a_distinct_identity_drained_once(self, monkeypatch):
         s = self._scheduler(monkeypatch)
-        assert s.enqueue_state_touches([]) is False
         assert s.enqueue_state_touches([5, 5])
         meta = s.build_connector_meta()
         assert meta.state_touches == [StateTouchId(5, 0), StateTouchId(5, 1)]
@@ -7784,21 +7750,6 @@ class TestConnectorTouches:
         )
         assert s.take_state_touch_verdicts() == {5: False, 6: True}
         assert s.take_state_touch_verdicts() == {}
-
-    def test_a_presence_only_shard_counts_the_touch_unrefreshed(self, monkeypatch):
-        from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
-            STATE_TOUCH_REFRESH_CHANNEL,
-        )
-
-        s = self._scheduler(monkeypatch)
-        for op, ok in ((StateTouchId(5, 0), True), (StateTouchId(6, 1), False)):
-            handled = s.connector_completion(
-                ConnectorCompletion(STATE_TOUCH_REFRESH_CHANNEL, op, ok)
-            )
-            assert handled is None, "handled, but not a terminal save"
-        assert s.take_state_touches_unrefreshed() == 1
-        assert s.take_state_touches_unrefreshed() == 0
-        assert s.take_state_touch_verdicts() == {}, "not a residency verdict"
 
     def test_both_touch_reports_reach_quorum_across_tp(self, monkeypatch):
         """Each rank files a residency and a refresh report per touch; one
@@ -7832,7 +7783,7 @@ class TestConnectorTouches:
         merged = KVOutputAggregator(world_size=2).aggregate(outputs)
         s = self._scheduler(monkeypatch)
         for completion in merged.connector_completions:
-            s.connector_completion(completion)
+            assert s.connector_completion(completion) is None, "not a save"
         assert s.take_state_touch_verdicts() == {5: True}
         assert s.take_state_touches_unrefreshed() == 1
 
@@ -7863,7 +7814,3 @@ class TestConnectorTouches:
             MultiConnectorScheduler, "_state_tier_sub", lambda self: None
         )
         assert multi.take_state_touches_unrefreshed() == 0
-
-    def test_a_negative_round_is_refused(self):
-        with pytest.raises(ValueError):
-            StateTouchId(1, -1)

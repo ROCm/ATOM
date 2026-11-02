@@ -157,9 +157,8 @@ class KVOutputAggregator:
             terminal_tombstone_limit,
             lambda key: isinstance(key, LoadOperationId),
         )
-        # A state touch has a fresh round in every identity, so it is never
-        # reported twice; tombstoning touches (one per voted hash per 0.5 s)
-        # would only push the store / source tombstones out of the ring.
+        # Touch ids are never reused (fresh round), and tombstoning them would
+        # push the store / source tombstones out of the ring.
         self._connector_completions = _TPCompletionGroup[ConnectorCompletionKey](
             world_size,
             terminal_tombstone_limit,

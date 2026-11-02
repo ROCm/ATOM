@@ -19,8 +19,11 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
-from atom.model_engine import state_offload as so
-from atom.model_engine.block_manager import AdmissionProbe, BlockManager
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    JointBoundaryDecision,
+)
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.page_unit_checkpoint import (
@@ -31,7 +34,7 @@ from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_offload import StateOffloadIndex
+from atom.model_engine.state_offload import _TIER_VERIFIED_MAX_S, StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -4567,12 +4570,12 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 def clock(monkeypatch):
     """`state_offload`'s monotonic clock, advanced by hand."""
     now = [1000.0]
-    monkeypatch.setattr(so, "monotonic", lambda: now[0])
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
     return now
 
 
 #: Past every confirmation window `tier_verified_for_s` can give.
-STALE = so._TIER_VERIFIED_MAX_S + 1
+STALE = _TIER_VERIFIED_MAX_S + 1
 
 
 def _paged_bm():
@@ -4593,8 +4596,6 @@ class TestAdmissionHold:
     would load an unconfirmed image, and commits nothing while it does."""
 
     def _joint(self, bm, monkeypatch, *, h=77, from_hbm=False):
-        from atom.model_engine.block_manager import JointBoundaryDecision
-
         decision = JointBoundaryDecision(
             boundary_tokens=16,
             boundary_hash=h,
@@ -4668,28 +4669,42 @@ class TestAdmissionHold:
         clock[0] += STALE
         assert bm.record_allocation(_seq(), AdmissionProbe(2, [1, 2]))
 
-    def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(self, clock, monkeypatch):
-        from atom.model_engine.block_manager import JointBoundaryDecision
-
-        bm = _paged_bm()
+    def _hbm_hit(self, bm, monkeypatch, resident):
+        """No joint; the HBM hit's state (hash 2) is stale on the tier and in
+        HBM while `resident` holds it."""
         monkeypatch.setattr(
             bm,
             "_joint_kv_boundary",
             lambda *a: JointBoundaryDecision(skip_reason="no_kv_reach"),
         )
         monkeypatch.setattr(bm, "_commit_joint_boundary", lambda seq, d: None)
-        bm.state_offload.note_stored(2)
-        clock[0] += STALE
-        resident = {2}
         monkeypatch.setattr(
             bm.paged_state_checkpoints, "contains", lambda h: h in resident
         )
+        bm.state_offload.note_stored(2)
+
+    def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(self, clock, monkeypatch):
+        bm = _paged_bm()
+        resident = {2}
+        self._hbm_hit(bm, monkeypatch, resident)
+        clock[0] += STALE
         assert bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
         resident.clear()
         assert not bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
+        )
+
+    def test_a_replayed_hit_is_not_held(self, clock, monkeypatch):
+        bm = _paged_bm()
+        self._hbm_hit(bm, monkeypatch, set())
+        monkeypatch.setattr(bm, "state_replay_tokens", 8)
+        clock[0] += STALE
+        seq = _seq()
+        seq.replays_hit = True
+        assert bm.record_allocation(
+            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
 
     def test_the_hold_judges_the_joint_fit_kept(self, clock, monkeypatch):
@@ -4758,26 +4773,6 @@ class TestResumeHash:
         seq.replays_hit = True
         assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
         assert bm._state_resume_hash(seq, 77, 2) == 77
-
-    def test_a_replayed_hit_is_not_held(self, clock, monkeypatch):
-        from atom.model_engine.block_manager import JointBoundaryDecision
-
-        bm = _paged_bm()
-        monkeypatch.setattr(
-            bm,
-            "_joint_kv_boundary",
-            lambda *a: JointBoundaryDecision(skip_reason="no_kv_reach"),
-        )
-        monkeypatch.setattr(bm, "_commit_joint_boundary", lambda seq, d: None)
-        monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: False)
-        monkeypatch.setattr(bm, "state_replay_tokens", 8)
-        bm.state_offload.note_stored(2)
-        clock[0] += STALE
-        seq = _seq()
-        seq.replays_hit = True
-        assert bm.record_allocation(
-            seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
-        )
 
     def test_the_hold_judges_the_hash_allocate_then_loads(self, clock, monkeypatch):
         bm = _paged_bm()

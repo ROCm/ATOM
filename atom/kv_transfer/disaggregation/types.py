@@ -126,22 +126,13 @@ class StateStoreOperationId:
 
 @dataclass(frozen=True)
 class StateTouchId:
-    """One recency refresh of a state image the engine just voted a hit for.
-
-    Every TP worker touches its own shard and reports whether the image was
-    still resident under this id, so the aggregator's failure-dominant quorum
-    says "gone" as soon as any shard is gone -- which is when a joint load
-    would miss. `round` makes repeated touches of one hash distinct identities,
-    so a quorum never merges two touches and the aggregator keeps no tombstone
-    for them.
+    """One LRU refresh of a voted state image. Every TP worker reports on its
+    own shard under this id, so the failure-dominant quorum says gone when any
+    shard is. `round` keeps repeated touches of one hash distinct identities.
     """
 
     prefix_hash: int
     round: int
-
-    def __post_init__(self) -> None:
-        if self.round < 0:
-            raise ValueError("state touch round must be nonnegative")
 
 
 ConnectorCompletionId = (

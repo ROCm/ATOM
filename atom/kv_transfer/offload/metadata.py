@@ -216,10 +216,8 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         # generation) is what the source-release and index reports carry back to
         # settle the pin and index the hash.
         self.state_stores: list[tuple] = []
-        # StateTouchId per state image the engine voted a hit for: each worker
-        # refreshes the image in LMCache's LRU and reports whether it is still
-        # there. Work in its own right -- an admission can be waiting on the
-        # verdict.
+        # StateTouchId per voted state image, refreshed and reported by each
+        # worker.
         self.state_touches: list = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:

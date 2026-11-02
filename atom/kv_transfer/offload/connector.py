@@ -336,20 +336,17 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return bool(callback(stores)) if callback is not None else False
 
     def enqueue_state_touches(self, hashes) -> bool:
-        """LRU touches for voted state images. False when the impl carries
-        none, which tells the engine to stop asking (and to stop holding
-        admissions for verdicts)."""
+        """State touches for the impl; False when it carries none."""
         callback = getattr(self._impl, "enqueue_state_touches", None)
         return bool(callback(hashes)) if callback is not None else False
 
     def take_state_touch_verdicts(self) -> dict:
-        """`{hash: resident}` for touches that reached quorum; empty when the
-        impl carries none."""
+        """`{hash: resident}` for touches that reached quorum."""
         callback = getattr(self._impl, "take_state_touch_verdicts", None)
         return callback() if callback is not None else {}
 
     def take_state_touches_unrefreshed(self) -> int:
-        """Touches that only confirmed presence; 0 when the impl carries none."""
+        """Touches that only confirmed presence."""
         callback = getattr(self._impl, "take_state_touches_unrefreshed", None)
         return int(callback()) if callback is not None else 0
 
