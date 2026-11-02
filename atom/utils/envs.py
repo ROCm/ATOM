@@ -141,6 +141,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.
     "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
+    # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
+    # does not serve): pages per producer slot that repacks MLA KV for a DCP
+    # consumer below a page of interleave. The slots are allocated whatever the
+    # decode runs, so this is opt-in; 0 writes each token run in place.
+    "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 0
+    ),
+    # Priority of those slots' gather streams (torch.cuda.Stream priority;
+    # negative is higher), so a repack need not queue behind the forward.
+    "ATOM_PD_MLA_STAGING_STREAM_PRIORITY": lambda: _int_env(
+        "ATOM_PD_MLA_STAGING_STREAM_PRIORITY", 0
+    ),
     # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
     # GPU landing pool, first come, first served (see mla_landing.py). A stage
     # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
@@ -1227,6 +1239,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Output batches the PP head keeps in flight before it waits for the oldest
+    # to come back. Equal to the stage count, one slow batch stalls the head
+    # while the stages ahead of it drain. 0 means pipeline_parallel_size.
+    "ATOM_PP_MAX_INFLIGHT": lambda: _int_env("ATOM_PP_MAX_INFLIGHT", 0),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the

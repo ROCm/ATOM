@@ -49,7 +49,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     producer_endpoint,
 )
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.llm_engine import InputOutputProcessor, _load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
@@ -1215,6 +1215,17 @@ def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
         raise HTTPException(
             status_code=400,
             detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
+        )
+    # Not checkable at startup: chunked transfer is P's setting, and P learns
+    # D's DCP only from a request.
+    if (
+        cfg.decode_context_parallel_size > 1
+        and cfg.hf_config.model_type
+        in InputOutputProcessor._per_req_cache_model_types()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Chunked P/D does not send per-request state to a DCP decode",
         )
 
 

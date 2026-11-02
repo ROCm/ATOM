@@ -418,6 +418,11 @@ class Sequence:
         # `1 + accepted` puts it, and there the grid is unreachable — see
         # `BlockManager.checkpointers_at`, which measures spacing from here.
         self.last_checkpoint_pos = 0
+        # The furthest prompt position whose checkpoint was decided when its
+        # chunk was scheduled (`BlockManager.checkpoint_when_scheduled`) rather
+        # than when it retired. Retire files nothing at or before it: with
+        # forwards in flight the slot has moved on by then.
+        self.scheduled_checkpoint_pos = 0
         self.prefix_cache_hit_tokens = 0
         # True iff this seq is mid-prefill (chunked prefill produced KV for
         # some prompt tokens but not all). Maintained by the scheduler:

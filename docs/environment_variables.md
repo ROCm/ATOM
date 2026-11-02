@@ -35,6 +35,12 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
 
+## Pipeline parallelism
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PP_MAX_INFLIGHT** | int | 0 | Output batches (decode batches and final prefill chunks) the PP head keeps in flight before it waits for the oldest to return. A middle prefill chunk retires once launched and does not count. `0` uses `pipeline_parallel_size`. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. |
+
 ## Prefill delayer (TP/DCP and DP attention)
 
 Coalesces waiting prefills while decode continues. DP attention enables it by
@@ -619,6 +625,8 @@ rank configuration, deployment requirements, and registration lifetime.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_PD_MLA_STAGING_CHUNK_PAGES** | int | 0 | Prefill only, for models with per-request state such as Kimi-K3, which `ATOM_PD_MLA_STAGING` does not serve. Destination pages per producer staging slot when a producer without DCP pushes MLA KV to a DCP consumer interleaved below a page (e.g. a PP×TP1 prefill to a TP8/DCP8 decode). The producer gathers each consumer rank's tokens into whole pages on the GPU and writes one RDMA descriptor per page instead of one per token run per layer. One slot per send worker (`num_worker_threads`, default 16), allocated at KV registration on every such producer whatever its decode runs, and not held back from the KV cache budget, so it is opt-in: set it (128 is what the Kimi-K3 PP8 → TP8/DCP8 CI cells use) only on a prefill whose decode runs DCP. `0` writes token runs in place. |
+| **ATOM_PD_MLA_STAGING_STREAM_PRIORITY** | int | 0 | Prefill only. Priority of the `ATOM_PD_MLA_STAGING_CHUNK_PAGES` slots' gather streams, as in `torch.cuda.Stream` (lower is higher; out-of-range values clamp). Every slot has its own stream, so a push waits only for its own gathers; a higher priority keeps them from queueing behind the forward's kernels. |
 | **ATOM_PD_MLA_STAGING** | bool | 1 | Prefill (`kv_producer`, plain `mooncake` connector) only. When the decode side runs DCP, gather the MLA tokens each decode rank owns into a GPU staging slot laid out as its destination pages, then RDMA one descriptor per run of adjacent destination pages instead of one per 576-byte token. Destination bytes are identical. The pool holds one 8 MiB slot per send worker (`num_worker_threads`, default 16), capped at 256 MiB per producer GPU, and is held back from the KV cache budget. A prefill learns the decode's DCP size only per request, so every Mooncake producer of a plain MLA model (not DeepSeek-V4 or an MLA hybrid such as Kimi) without producer DCP reserves the pool while this is on; set 0 where no decode runs DCP. 0 restores the per-token path. |
 | **ATOM_PD_FAILED_WRITE_HOLD_S** | float | 60 | Mooncake P/D. Mooncake gives up on a sync RDMA write at `MC_TRANSFER_TIMEOUT` without cancelling the work it posted, so a failed write may still land afterwards; a prefill therefore never retries one. A decode holds a failed receive's KV pages (and its staging row) this many seconds before reporting the failure; the scheduler then aborts the request and frees its pages, which no late write can reach any more. A prefill keeps a landing slot whose write failed out of use for as long. 60 s covers a write Mooncake keeps re-posting while the network is down (each of its 9 tries waits at most a 5 s connect); behind a decode whose handshake hangs it can take about 10 minutes. 0 releases at once. MoRIIO P/D holds a failed receive's blocks the same way; a MoRIIO decode in write mode refuses 0, since the hold is also what lets a push started just before its deadline finish. |
 

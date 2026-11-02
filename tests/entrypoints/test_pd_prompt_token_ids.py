@@ -400,6 +400,24 @@ def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
         }
 
 
+def _decode_engine(tp, pp=1, dcp=1, model_type="deepseek_v3"):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            decode_context_parallel_size=dcp,
+            hf_config=SimpleNamespace(model_type=model_type),
+        )
+    )
+
+
+CHUNKED_RECEIVE = {
+    "chunked_transfer": True,
+    "do_remote_prefill": True,
+    "remote_tp_size": 8,
+}
+
+
 class TestChunkedAdmissionTopology:
     @pytest.mark.parametrize(
         "endpoint", ["chat/completions", "completions", "messages", "responses"]
@@ -411,16 +429,7 @@ class TestChunkedAdmissionTopology:
     def test_incompatible_pair_is_http_400_before_enqueue(
         self, monkeypatch, server, endpoint, stream, p_tp, d_tp, d_pp
     ):
-        monkeypatch.setattr(
-            api_server,
-            "engine",
-            SimpleNamespace(
-                config=SimpleNamespace(
-                    tensor_parallel_size=d_tp,
-                    pipeline_parallel_size=d_pp,
-                )
-            ),
-        )
+        monkeypatch.setattr(api_server, "engine", _decode_engine(d_tp, d_pp))
 
         async def unexpected_enqueue(*_args, **_kwargs):
             pytest.fail("incompatible D request must be rejected before enqueue")
@@ -459,16 +468,7 @@ class TestChunkedAdmissionTopology:
 
     @pytest.mark.parametrize("p_tp,d_tp", [(1, 1), (1, 4), (2, 4), (4, 4)])
     def test_supported_receive_keeps_admission_path(self, monkeypatch, p_tp, d_tp):
-        monkeypatch.setattr(
-            api_server,
-            "engine",
-            SimpleNamespace(
-                config=SimpleNamespace(
-                    tensor_parallel_size=d_tp,
-                    pipeline_parallel_size=1,
-                )
-            ),
-        )
+        monkeypatch.setattr(api_server, "engine", _decode_engine(d_tp))
         api_server._validate_chunked_receive(
             {
                 "chunked_transfer": True,
@@ -476,6 +476,26 @@ class TestChunkedAdmissionTopology:
                 "remote_tp_size": p_tp,
             }
         )
+
+    def test_a_dcp_decode_of_a_stateful_model_is_refused(self, monkeypatch):
+        monkeypatch.setattr(
+            api_server, "engine", _decode_engine(8, dcp=8, model_type="kimi_linear")
+        )
+
+        with pytest.raises(fastapi.HTTPException) as refused:
+            api_server._validate_chunked_receive(CHUNKED_RECEIVE)
+
+        assert refused.value.status_code == 400
+        assert "per-request state to a DCP decode" in refused.value.detail
+
+    @pytest.mark.parametrize("dcp,model_type", [(8, "deepseek_v3"), (1, "kimi_linear")])
+    def test_dcp_or_state_alone_keeps_admission_path(
+        self, monkeypatch, dcp, model_type
+    ):
+        monkeypatch.setattr(
+            api_server, "engine", _decode_engine(8, dcp=dcp, model_type=model_type)
+        )
+        api_server._validate_chunked_receive(CHUNKED_RECEIVE)
 
     @pytest.mark.parametrize(
         "params",
