@@ -625,6 +625,7 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
         )
         assert config.parallel_config.data_parallel_master_port == 27123
         validated.append(config.parallel_config)
+        return SimpleNamespace()
 
     monkeypatch.setattr(engine_module, "CoreManager", start_core)
     monkeypatch.setattr(
