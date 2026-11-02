@@ -385,7 +385,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Largest new-row count of a prefix-cache-hit prefill whose FP8 attention runs
     # on aiter's Gluon unified_attention (KV walk split across the device) instead
-    # of FMHA v3. Both read the same gathered, dequantized K/V. 0 (default) always
+    # of FMHA v3. Decided per step by its longest request (max_seqlen_q). Both read the same gathered, dequantized K/V. 0 (default) always
     # uses FMHA v3; 4096 is the value measured on Qwen3.5-397B TP4.
     "ATOM_PREFILL_UNIFIED_ATTN_MAX_Q": lambda: int(
         os.getenv("ATOM_PREFILL_UNIFIED_ATTN_MAX_Q", "0")

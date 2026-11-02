@@ -1372,9 +1372,12 @@ class ModelRunner:
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
         # Prefix-hit prefill only, so the dummy forward above never reaches it.
-        # Here, before KV sizing, so its scratch (~245 MB at Qwen3.5 TP4)
-        # counts in the peak.
-        from atom.model_ops.attention_mha import warmup_unified_prefill_attention
+        # Here, before KV sizing, so its scratch counts in the peak: ~245 MB
+        # measured at Qwen3.5 TP4 with <= 12 requests per launch; the
+        # 32-request launches gather 2.7x the K/V rows, ~0.6 GB estimated.
+        from atom.model_ops.unified_prefill_warmup import (
+            warmup_unified_prefill_attention,
+        )
 
         warmup_unified_prefill_attention(self.model, self.config.torch_dtype)
         torch.cuda.empty_cache()
