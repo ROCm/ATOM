@@ -112,7 +112,8 @@ class StateStoreOperationId:
     an eviction or a load miss, and `KVOutputAggregator` tombstones the
     `(channel, operation_id)` of every store it has taken quorum on, so a
     second store under a bare hash is dropped as a duplicate: its pin is never
-    settled and its bytes are never re-indexed. `generation` is what separates the attempts.
+    settled and its bytes are never re-indexed. `generation` is what separates
+    the attempts.
     """
 
     prefix_hash: int

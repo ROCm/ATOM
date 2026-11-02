@@ -1080,12 +1080,7 @@ class PagedStateCheckpointCoordinator:
             return True
         if self.offload is None or not self.offload.could_serve(h):
             return False
-        # `getattr`, as for `stats`: `attach_offload` accepts anything that
-        # answers `could_serve`, and one without touches loses the LRU refresh,
-        # not the hit.
-        want_touch = getattr(self.offload, "want_touch", None)
-        if callable(want_touch):
-            want_touch(h)
+        self.offload.want_touch(h)
         return True
 
     def checkpoint(self, seq: Sequence, boundary_blocks: int, h: int) -> None:

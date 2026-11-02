@@ -1552,11 +1552,9 @@ class BlockManager:
         """Commit the fit probe before any allocation changes the pool.
 
         With `defer_unverified`, returns False and commits nothing when the
-        state this admission would load from the CPU tier has not been
-        confirmed there lately (`StateOffloadIndex.needs_verify`). The
-        caller holds the request for a pass while that image's touch comes
-        back, rather than parking a joint load that may miss and recompute the
-        whole prompt.
+        state offload asks to hold the admission over the state it would
+        restore from outside HBM (`StateOffloadIndex.hold_admission`). The
+        caller retries the request a pass later.
         """
         if not self.enable_prefix_caching:
             return True
@@ -1564,34 +1562,37 @@ class BlockManager:
             seq, probe.num_cached_blocks, probe.block_hashes
         )
         decision = self._fit_joint(decision, probe)
-        if defer_unverified and self._tier_state_unverified(
-            seq, probe.num_cached_blocks, probe.block_hashes, decision
+        if (
+            defer_unverified
+            and self.state_offload is not None
+            and self.state_offload.hold_admission(
+                self._resume_hash_off_hbm(
+                    seq, probe.num_cached_blocks, probe.block_hashes, decision
+                )
+            )
         ):
-            self.state_offload.loads_deferred_for_verify += 1
             return False
         self._commit_joint_boundary(seq, decision)
         return True
 
-    def _tier_state_unverified(
+    def _resume_hash_off_hbm(
         self,
         seq: Sequence,
         num_cached_blocks: int,
         block_hashes: list[int],
         decision: JointBoundaryDecision,
-    ) -> bool:
-        """Whether `allocate` would load this seq's state from the CPU tier
-        under a hash not confirmed resident recently.
+    ) -> int:
+        """The hash `allocate` would restore this seq's state from when HBM
+        does not hold its state, or -1 (no state, HBM holds it, or a replay).
 
-        Judges the hash `allocate` will hand `_attach_state_slots`
-        (`_state_resume_hash`), which the tier only serves when HBM does not
-        hold it.
+        The hash `allocate` will hand `_attach_state_slots`
+        (`_state_resume_hash`), so a hold judges what will be loaded.
         """
-        offload = self.state_offload
-        if offload is None or not offload.refresh_hits or not seq.has_per_req_cache:
-            return False
+        if not seq.has_per_req_cache:
+            return -1
         joint = decision.skip_reason is None
         if joint and decision.state_from_hbm:
-            return False
+            return -1
         hit_hash = (
             block_hashes[num_cached_blocks - 1]
             if 0 < num_cached_blocks <= len(block_hashes)
@@ -1600,15 +1601,13 @@ class BlockManager:
         h = self._state_resume_hash(
             seq, decision.boundary_hash if joint else -1, hit_hash
         )
-        if h == -1:
-            return False
-        if not joint:
+        if h != -1 and not joint:
             if self.paged_state_checkpoints is not None:
                 if self.paged_state_checkpoints.contains(h):
-                    return False
+                    return -1
             elif self.state.lookup(h) >= 0:
-                return False
-        return offload.needs_verify(h)
+                return -1
+        return h
 
     def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
         """The hash whose state `seq` resumes from, or -1 for none.
@@ -1616,8 +1615,8 @@ class BlockManager:
         The joint boundary when there is one (above the HBM hit by
         construction), else the HBM hit's last block. A replay rebuilds the
         state instead of restoring it, so it resumes from none. `allocate`
-        hands this to `_attach_state_slots`, and `_tier_state_unverified` asks
-        about it, so the admission hold judges the hash that will be loaded.
+        hands this to `_attach_state_slots`, and `_resume_hash_off_hbm` reports
+        it, so the admission hold judges the hash that will be loaded.
         """
         if joint_hash != -1:
             return joint_hash
@@ -2116,7 +2115,6 @@ class BlockManager:
             return False
         if not self.state_offload.request_load(seq.id, hit_hash):
             return False
-        self.state_offload.want_touch(hit_hash)
         seq.offload_joint.load_hash = hit_hash
         self._state_loads.append((seq.id, hit_hash, seq.state_slot))
         return True

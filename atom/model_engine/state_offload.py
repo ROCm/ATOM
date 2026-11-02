@@ -215,8 +215,8 @@ class StateOffloadIndex:
         """A voter counted `h` as a hit: under `refresh_hits`, queue it for
         `take_touches`.
 
-        Called by every voter on the hits it votes for (the resumable scan and
-        `BlockManager._request_state_load`), so a prefix whose state is voted
+        Called on every hit voted for (the resumable scan, and `request_load`
+        for the load it offers), so a prefix whose state is voted
         for on every pass stays as warm in LMCache as its KV chunks, which the
         KV lookup refreshes on every pass.
         """
@@ -274,6 +274,43 @@ class StateOffloadIndex:
         self._hold_started_at.clear()
         self._hold_expired.clear()
 
+    def publish_touches(self, connector) -> None:
+        """Hand this pass's touches to `connector`, which refreshes the images
+        in LMCache's LRU and reports whether each is still there
+        (`collect_touch_verdicts`).
+
+        A connector that will not carry them turns the refresh off for good:
+        otherwise every admission that waits for a verdict would wait out
+        `defer_s` for nothing.
+        """
+        if not self.refresh_hits:
+            return
+        hashes = self.take_touches()
+        if not hashes:
+            return
+        enqueue = getattr(connector, "enqueue_state_touches", None)
+        if enqueue is not None and enqueue(hashes):
+            return
+        logger.warning(
+            "state offload: %s does not carry state touches; state images "
+            "will not be refreshed in LMCache's LRU, and an image LMCache "
+            "evicts is only noticed when a load misses.",
+            type(connector).__name__,
+        )
+        self.stop_refreshing()
+
+    def collect_touch_verdicts(self, connector) -> None:
+        """Apply the touch verdicts `connector` reached TP quorum on, and add
+        its presence-only touches to `touches_unrefreshed`."""
+        take = getattr(connector, "take_state_touch_verdicts", None)
+        if take is None:
+            return
+        for h, resident in take().items():
+            self.apply_touch_verdict(h, resident)
+        unrefreshed = getattr(connector, "take_state_touches_unrefreshed", None)
+        if unrefreshed is not None:
+            self.touches_unrefreshed += int(unrefreshed())
+
     def needs_verify(self, h: int) -> bool:
         """Whether an admission about to load `h` should wait a pass for a
         touch verdict instead of parking on it now.
@@ -321,13 +358,23 @@ class StateOffloadIndex:
         self._touch_wanted.add(h)
         return True
 
+    def hold_admission(self, h: int) -> bool:
+        """Whether an admission that would restore its state from `h` (-1:
+        from nothing outside HBM) waits a pass for `h`'s touch verdict
+        (`needs_verify`). Counted in `loads_deferred_for_verify`."""
+        if h == -1 or not self.needs_verify(h):
+            return False
+        self.loads_deferred_for_verify += 1
+        return True
+
     # -------------------------------- loads -------------------------------- #
     def request_load(self, req_id, h: int) -> bool:
         """Offer to fetch `h` back for `req_id`. False if this tier cannot.
 
         The guard between believing and delivering: a load is resolved only by
         a worker report, so offering one for a hash never stored would park the
-        request against bytes no `get` can produce.
+        request against bytes no `get` can produce. An offered load is a hit,
+        so it is registered for a touch (`want_touch`).
         """
         if not self.could_serve(h):
             # A store-only role (can_load False) or a hash never stored. Voting
@@ -347,6 +394,7 @@ class StateOffloadIndex:
             return False
         self.pending_loads[req_id] = int(h)
         self.loads_attempted += 1
+        self.want_touch(h)
         return True
 
     def complete_load(self, req_id) -> None:
