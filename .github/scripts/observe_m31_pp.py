@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 RUN = "41430932776"
@@ -48,6 +49,9 @@ for root in roots:
         for path in selected:
             if not path.is_file():
                 continue
+            saved = Path("observed-logs") / path.relative_to(case_dir)
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, saved)
             lines = path.read_text(errors="replace").splitlines()
             print("\nLOG", path, "lines", len(lines), "mtime",
                   datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat())

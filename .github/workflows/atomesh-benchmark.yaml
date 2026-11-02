@@ -18,4 +18,6 @@ jobs:
         if: always()
         with:
           name: pp-observation-41430932776
-          path: pp-observation.txt
+          path: |
+            pp-observation.txt
+            observed-logs/
