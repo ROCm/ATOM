@@ -39,6 +39,11 @@ import torch
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.model_ops.attentions.qwen4_exp_attn import (
+    QSA_DRAFT_ROWS,
+    QSA_ROWS,
+    qsa_row_space,
+)
 from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm
 from atom.model_ops.linear import (
     QKVGParallelLinear,
@@ -52,18 +57,13 @@ from atom.model_ops.qwen4_exp.ops.gated import (
 )
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
+    qsa_cache_formats,
     qsa_cache_row_layout,
     qsa_compress_groups,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_quantized_rows,
     qsa_store_rows,
-)
-from atom.model_ops.qwen4_exp.qsa_cache_rules import (
-    QSA_DRAFT_ROWS,
-    QSA_ROWS,
-    qsa_cache_formats,
-    qsa_row_space,
 )
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils.forward_context import get_forward_context
