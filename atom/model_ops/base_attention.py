@@ -173,12 +173,9 @@ def run_pa_fwd_asm(
     )
 
 
-# Copies of aiter's own limits, pinned against its source by a test. Mirroring
-# them lets the gate decline an unsupported call before entering aiter; a copy
-# that drifts either over-rejects or stops protecting.
-_FLYDSL_PA_MAX_PARTITIONS = 256
-_FLYDSL_PA_TILE = 256
-_FLYDSL_PA_BLOCK_SIZES = (16, 64, 128)
+# The GPUs aiter's FlyDSL paged decode builds for, pinned against its source by
+# a test. Only the MiniMax-M3 startup check reads it; per-call acceptance is
+# aiter's can_use_flydsl_pa_decode.
 _FLYDSL_PA_ARCHS = ("gfx942", "gfx950", "gfx1250")
 _flydsl_pa_routed: set[tuple] = set()
 _flydsl_plan_refused: set[tuple] = set()
@@ -252,6 +249,30 @@ def _flydsl_explicit_plan_api() -> bool:
     return ok
 
 
+def _flydsl_pa_decode_can_use():
+    """aiter's ``can_use_flydsl_pa_decode``; raise if this aiter lacks it.
+
+    FlyDSL paged decode is opt-in (ATOM_PA_FLYDSL=1), and ATOM no longer keeps
+    its own copy of the kernel's acceptance rules, so an aiter without the
+    predicate cannot be routed safely.
+    """
+    try:
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    except ImportError as exc:
+        raise RuntimeError(
+            "ATOM_PA_FLYDSL=1 needs aiter's FlyDSL paged decode, which this "
+            "aiter cannot import; unset ATOM_PA_FLYDSL or install a newer aiter"
+        ) from exc
+    can_use = getattr(mod, "can_use_flydsl_pa_decode", None)
+    if can_use is None:
+        raise RuntimeError(
+            "ATOM_PA_FLYDSL=1 needs aiter.ops.flydsl.pa_decode."
+            "can_use_flydsl_pa_decode (ROCm/aiter#7206), which this aiter "
+            "predates; unset ATOM_PA_FLYDSL or install a newer aiter"
+        )
+    return can_use
+
+
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -261,20 +282,24 @@ def _flydsl_pa_decode_num_seqs(
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     max_seqlen_q: int,
-    max_context_partition_num: int,
     context_partition_size: int,
     compute_type: torch.dtype,
     q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
     alibi_slopes: torch.Tensor | None,
     sinks: torch.Tensor | None,
     sliding_window: int,
     ps: bool,
+    max_context_length: int | None = None,
 ) -> int | None:
     """Sequence count to run aiter's FlyDSL paged decode with, or None to decline.
 
-    Mirrors the kernel's own validation, so an unsupported call is rejected
-    before entering aiter. The caller uses gluon where available and raises
-    otherwise. Every clause below is a hard reject there, not a preference.
+    Whether the kernel takes the call is aiter's decision
+    (``can_use_flydsl_pa_decode``), asked with the exact arguments
+    ``run_pa_decode`` then passes to ``pa_decode``. ATOM decides only two
+    things here: which calls it routes to FlyDSL at all, and how many
+    sequences the call covers.
 
     Why a count rather than a bool: FlyDSL demands
     ``q.shape[0] == context_lens.shape[0] * query_length`` exactly, but ATOM
@@ -288,66 +313,12 @@ def _flydsl_pa_decode_num_seqs(
     headroom over gluon lives, it runs ``num_spec + 1``, and FlyDSL tunes that
     shape (it has a query_length==4 MTP4 grid split).
     """
-    import aiter
-
-    if alibi_slopes is not None or sinks is not None or q_scale is not None:
+    # ATOM's routing, not kernel limits: sliding-window, sink and
+    # non-persistent calls stay on gluon, and so does BF16 KV where gluon
+    # exists.
+    if sinks is not None or sliding_window > 0 or not ps:
         return None
-    if sliding_window > 0 or not ps:
-        return None
-    # Native BF16 KV uses 8-element vectors and no scales; FP8 uses 16.
-    is_bf16_kv = compute_type is torch.bfloat16 and k_cache.dtype is torch.bfloat16
-    is_fp8_kv = compute_type is aiter.dtypes.fp8 and k_cache.dtype is aiter.dtypes.fp8
-    if not (is_fp8_kv or is_bf16_kv):
-        return None
-    # BF16 KV stays on gluon where gluon exists.
-    if is_bf16_kv and pa_decode_gluon_supports_arch():
-        return None
-    x = 8 if is_bf16_kv else 16
-    if k_cache.dim() != 5 or k_cache.shape[-1] != x:
-        return None
-    # block_size is dim -2 of the page-16 cache. --block-size 256/1024 reaches
-    # this site whenever use_triton_attn is set, which the published recipe does.
-    if k_cache.shape[-2] not in _FLYDSL_PA_BLOCK_SIZES:
-        return None
-    if not _flydsl_arch_supported():
-        return None
-    if not _flydsl_explicit_plan_api():
-        return None
-    if context_partition_size != _FLYDSL_PA_TILE:
-        return None
-    if not 1 <= max_context_partition_num <= _FLYDSL_PA_MAX_PARTITIONS:
-        return None
-    head_dim = q.shape[-1]
-    if not (head_dim == 64 or (head_dim % 128 == 0 and head_dim <= 1024)):
-        return None
-    # The cache encodes head_dim as num_hgroups * x; aiter rejects a q whose
-    # own head_dim disagrees, and nothing upstream forces the two to match.
-    if k_cache.shape[2] * x != head_dim:
-        return None
-    if q.dtype not in (torch.bfloat16, torch.float16):
-        return None
-    if output.dtype is not q.dtype or output.shape != q.shape:
-        return None
-    # aiter checks both head_dim axes (pa_decode.py:443,448); output is
-    # whatever the caller handed down, not necessarily contiguous.
-    if q.stride(2) != 1 or output.stride(2) != 1:
-        return None
-    if q.shape[-2] % k_cache.shape[1] != 0:
-        return None
-    if v_cache.dtype is not k_cache.dtype:
-        return None
-    if block_tables.dtype is not torch.int32 or context_lens.dtype is not torch.int32:
-        return None
-    # aiter requires all four contiguous (pa_decode.py:464-470). No in-tree
-    # path produces a non-contiguous one -- the cache views come from
-    # `.view()`, which would raise first -- but the SGLang bridge's pool is
-    # not this tree's to promise, and ATOM_PA_FLYDSL routes it too.
-    if not (
-        k_cache.is_contiguous()
-        and v_cache.is_contiguous()
-        and block_tables.is_contiguous()
-        and context_lens.is_contiguous()
-    ):
+    if k_cache.dtype is torch.bfloat16 and pa_decode_gluon_supports_arch():
         return None
     # The rectangle, recovered the way gluon recovers it. See the docstring.
     if max_seqlen_q < 1:
@@ -356,6 +327,27 @@ def _flydsl_pa_decode_num_seqs(
     if remainder or not 1 <= num_seqs <= context_lens.shape[0]:
         return None
     if num_seqs > block_tables.shape[0]:
+        return None
+    if not _flydsl_pa_decode_can_use()(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        context_lens[:num_seqs],
+        block_tables[:num_seqs],
+        max_seqlen_q,
+        context_partition_size=context_partition_size,
+        compute_type=compute_type,
+        query_scale=q_scale,
+        key_scale=k_scale,
+        value_scale=v_scale,
+        alibi_slopes=alibi_slopes,
+        sinks=sinks,
+        sliding_window=0,
+        max_context_length=_flydsl_context_bound(
+            max_context_length, block_tables, k_cache
+        ),
+    ):
         return None
     return num_seqs
 
@@ -602,7 +594,9 @@ def flydsl_decode_seqs(*, max_context_length=None, **kwargs):
 
     False when FlyDSL is off, None when the call is outside FlyDSL's domain.
     """
-    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(**kwargs)
+    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
+        max_context_length=max_context_length, **kwargs
+    )
     # aiter's planner rejects more sequences than one plan holds.
     if flydsl_seqs and flydsl_seqs > _flydsl_plan_max_batch():
         flydsl_seqs = None
@@ -644,6 +638,7 @@ def run_pa_decode(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
+    require_flydsl: bool = False,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -652,13 +647,20 @@ def run_pa_decode(
     sites -- including the vLLM and SGLang bridges -- import it.
 
     gluon unless ``ATOM_PA_FLYDSL=1``, and then only where FlyDSL's
-    domain covers the call: ``_flydsl_pa_decode_num_seqs`` mirrors the kernel's
-    own validation. Unsupported shapes fall back on GPUs with gluon support;
+    domain covers the call, which aiter's ``can_use_flydsl_pa_decode`` decides
+    (see ``_flydsl_pa_decode_num_seqs``). Unsupported shapes fall back on GPUs
+    with gluon support;
     a GPU without gluon raises an explicit error.
 
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
+
+    ``require_flydsl``: the caller already decided this call runs on FlyDSL
+    (``PagedAttentionImpl._flydsl_takes_decode``); if FlyDSL declines it on a
+    gluon GPU, raise before any plan or scratch is built rather than fall back
+    to gluon, which may be outside its query-length envelope. A GPU without
+    gluon raises below as it always has.
     """
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
@@ -668,16 +670,23 @@ def run_pa_decode(
         block_tables=block_tables,
         context_lens=context_lens,
         max_seqlen_q=max_seqlen_q,
-        max_context_partition_num=max_context_partition_num,
         context_partition_size=context_partition_size,
         compute_type=compute_type,
         q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
         alibi_slopes=alibi_slopes,
         sinks=sinks,
         sliding_window=sliding_window,
         ps=ps,
         max_context_length=max_context_length,
     )
+    if require_flydsl and not flydsl_seqs and pa_decode_gluon_supports_arch():
+        raise NotImplementedError(
+            "pa_decode: the caller routed this call to FlyDSL, which declined it "
+            f"(rows={q.shape[0]}, max_seqlen_q={max_seqlen_q}, "
+            f"padded_seqs={context_lens.shape[0]}, q dtype {q.dtype})"
+        )
     # Inside the guard, not before it: this runs 63 times per decode step and
     # attention is an eager region of the token graphs, so replay does not
     # elide it. A deployment that never enables FlyDSL should pay nothing here.
