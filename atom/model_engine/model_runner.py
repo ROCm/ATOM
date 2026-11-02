@@ -1372,9 +1372,10 @@ class ModelRunner:
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
         # Prefix-hit prefill only, so the dummy forward above never reaches it.
-        # Here, before KV sizing, so its scratch counts in the peak: ~245 MB
-        # measured at Qwen3.5 TP4 with <= 12 requests per launch; the
-        # 32-request launches gather 2.7x the K/V rows, ~0.6 GB estimated.
+        # Here, before KV sizing, so its scratch counts in the peak and comes out
+        # of the KV budget: per head geometry, the largest launch's tensors
+        # (unified_prefill_warmup_bytes, multi-request launches capped at
+        # 128 MiB) plus aiter's KV-split scratch.
         from atom.model_ops.unified_prefill_warmup import (
             warmup_unified_prefill_attention,
         )

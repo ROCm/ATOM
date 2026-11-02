@@ -990,12 +990,15 @@ class PagedAttentionImpl(nn.Module):
         max_seqlen_q: int,
         max_seqlen_k: int,
         block_table,
+        out_dtype: torch.dtype | None = None,
     ):
         """The unified_attention launch, shared by the forward and the warm-up
-        so that both compile exactly the same kernels."""
+        so that both compile exactly the same kernels. The output is out_dtype,
+        q's dtype by default; the warm-up passes FP8 q (the .to(fp8) below
+        leaves it as is) and the model dtype as out_dtype."""
         scale = self.kv_scale.view(1)
         fp8 = aiter.dtypes.fp8
-        o = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        o = torch.empty(q.shape, dtype=out_dtype or q.dtype, device=q.device)
         unified_attention(
             q.contiguous().to(fp8),
             k.contiguous().to(fp8).unsqueeze(1),
@@ -1045,19 +1048,28 @@ class PagedAttentionImpl(nn.Module):
     def warmup_unified_fp8_prefill_attention(self, dtype: torch.dtype) -> int:
         """Run _unified_fp8_attention once per unified_prefill_warmup_shapes
         entry on synthetic tensors laid out as the prefix-hit path lays them
-        out (the same dtypes, int32 metadata, gathered K/V packed per request).
-        Returns the number of launches attempted."""
-        shapes = unified_prefill_warmup_shapes(envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q)
+        out (int32 metadata, gathered K/V packed per request, an output in the
+        model dtype). q and K/V are allocated in FP8 directly, which is what the
+        forward hands the kernel after its .to(fp8), so no extra copies are
+        made; K doubles as V. Returns the number of launches attempted."""
+        shapes = unified_prefill_warmup_shapes(
+            envs.ATOM_PREFILL_UNIFIED_ATTN_MAX_Q,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+        )
         dev = self.device
         i32 = {"dtype": torch.int32, "device": dev}
+        fp8 = aiter.dtypes.fp8
+
+        def fp8_zeros(*shape):
+            # zero bytes are FP8 +0.0 in both e4m3 encodings
+            return torch.zeros(shape, dtype=torch.uint8, device=dev).view(fp8)
+
         for q_lens, ctx_lens in shapes:
             total_q, total_kv = sum(q_lens), sum(ctx_lens)
-            q = torch.zeros(
-                total_q, self.num_heads, self.head_dim, dtype=dtype, device=dev
-            )
-            k = torch.zeros(
-                total_kv, self.num_kv_heads, self.head_dim, dtype=dtype, device=dev
-            )
+            q = fp8_zeros(total_q, self.num_heads, self.head_dim)
+            k = fp8_zeros(total_kv, self.num_kv_heads, self.head_dim)
             cu_q = torch.tensor([0, *itertools.accumulate(q_lens)], **i32)
             cu_k = torch.tensor([0, *itertools.accumulate(ctx_lens)], **i32)
             try:
@@ -1070,6 +1082,7 @@ class PagedAttentionImpl(nn.Module):
                     max(q_lens),
                     max(ctx_lens),
                     token_block_table(cu_k[: len(ctx_lens)], max(ctx_lens), total_kv),
+                    out_dtype=dtype,
                 )
             except Exception as e:  # noqa: BLE001
                 # A shape the path cannot take is the request's problem when it

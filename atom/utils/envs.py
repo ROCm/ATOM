@@ -392,6 +392,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Compile the unified_attention kernels of the path above at start-up
     # (end of warmup_model) instead of on the first request that needs each one.
+    # Its memory is taken before KV sizing, so it comes out of the KV budget:
+    # ((sum ctx) * kv_heads + 3 * (sum new rows) * heads) * head_dim bytes for the
+    # largest launch, multi-request launches capped at 128 MiB, plus split scratch.
     "ATOM_PREFILL_UNIFIED_ATTN_WARMUP": lambda: (
         os.getenv("ATOM_PREFILL_UNIFIED_ATTN_WARMUP", "1") == "1"
     ),
