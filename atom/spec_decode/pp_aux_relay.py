@@ -6,10 +6,10 @@
 The drafter lives only on the last PP stage, so hooks on taps owned by earlier
 stages land on ``PPMissingLayer`` and never fire, leaving zero aux buffers and
 garbage drafts. Earlier stages capture their own taps and forward them in the
-intermediate-tensor payload, concatenated along the hidden axis in ascending
-tap order (-1, the embedding, first). Stages own contiguous ascending layer
-ranges, so every stage derives the same order from ``layer_ids`` alone,
-whatever order the drafter lists them in.
+intermediate-tensor payload, concatenated along the hidden axis in the
+spec's ``layer_ids`` order, which ``install_aux_taps`` requires strictly
+increasing (-1, the embedding, first). Stages own contiguous ascending layer
+ranges, so every stage derives the same columns from ``layer_ids`` alone.
 """
 
 import logging
