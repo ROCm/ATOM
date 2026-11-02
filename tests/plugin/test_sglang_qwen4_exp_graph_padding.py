@@ -775,6 +775,70 @@ def test_ple_state_pool_slots_uses_mamba_pool_size():
     assert _ple_state_pool_slots(fb, idx) >= 64
 
 
+def test_ple_state_pool_slots_ignores_kv_token_budget(monkeypatch):
+    """`--max-total-tokens` sizes the KV cache, not the mamba pool; as a PLE
+    row floor it allocated one 184 KB row per KV token."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            max_mamba_cache_size=330, max_total_tokens=65536, max_running_requests=4
+        ),
+    )
+    fb = SimpleNamespace(
+        batch_size=4,
+        attn_backend=None,
+        req_to_token_pool=SimpleNamespace(size=64, req_to_token=torch.zeros(64, 8)),
+        token_to_kv_pool=None,
+    )
+    idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    slots = _ple_state_pool_slots(fb, idx)
+    assert 330 <= slots < 65536
+
+
+def _batch_with_mamba_pool(slots_axis: int, num_layers: int = 3):
+    """A batch whose mamba pool tensors are [num_layers, size + 1, ...]."""
+    cache = SimpleNamespace(
+        conv=[torch.zeros(num_layers, slots_axis, 2, 3)],
+        temporal=torch.zeros(num_layers, slots_axis, 2, 2),
+    )
+    pool = SimpleNamespace(
+        size=8,
+        req_to_token=torch.zeros(8, 8),
+        mamba_pool=SimpleNamespace(mamba_cache=cache),
+    )
+    return SimpleNamespace(
+        batch_size=4, attn_backend=None, req_to_token_pool=pool, token_to_kv_pool=None
+    )
+
+
+@pytest.mark.parametrize(
+    "max_mamba_cache_size,max_running_requests",
+    [(1024, 4), (330, 64)],
+)
+def test_ple_state_pool_slots_follow_physical_slot_axis(
+    monkeypatch, max_mamba_cache_size, max_running_requests
+):
+    """Axis 1 of the full pool counts slots (reserved row included); axis 0
+    counts layers. A resolved pool sizes PLE exactly: covering slot `size`,
+    without the running-requests floor that overallocated 12x at 64/330."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            max_mamba_cache_size=max_mamba_cache_size,
+            max_running_requests=max_running_requests,
+        ),
+    )
+    fb = _batch_with_mamba_pool(max_mamba_cache_size + 1)
+    idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    assert _ple_state_pool_slots(fb, idx) == max_mamba_cache_size + 1
+
+
 def test_plugin_ple_metadata_is_native():
     """Plugin PLE metadata is Native Qwen4ExpPLEMetadata, including num_accepted_tokens."""
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata

@@ -35,7 +35,11 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
-from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
+from atom.model_engine.block_manager import (
+    AdmissionProbe,
+    BlockManager,
+    draft_kv_lookahead,
+)
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -61,6 +65,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.observability import tracing
+from atom.sampling_params import RequiredChannel
 from atom.utils import envs
 
 if TYPE_CHECKING:
@@ -286,6 +291,28 @@ class ScheduledBatch:
         self.needs_independent_noise = np.asarray(
             [getattr(seq, "needs_independent_noise", False) for seq in seqs.values()],
             dtype=bool,
+        )
+        # The channel the batch's requests must still open, when any row has
+        # one left to open (a request whose channel is open is
+        # `UNCONSTRAINED`), and then each row's committed state towards it.
+        # A batch with none stages no states and runs no channel kernels. One
+        # per engine: `InputOutputProcessor` refuses a request naming another
+        # at admission, so the engine loop never meets two.
+        channels = {
+            seq.required_channel
+            for seq in seqs.values()
+            if seq.required_channel_state >= 0
+        }
+        assert len(channels) <= 1, f"one batch holds {len(channels)} channels"
+        self.required_channel: RequiredChannel | None = (
+            channels.pop() if channels else None
+        )
+        self.required_channel_states = (
+            None
+            if self.required_channel is None
+            else np.asarray(
+                [seq.required_channel_state for seq in seqs.values()], dtype=np.int32
+            )
         )
 
         self.is_first_decode_without_local_prefill = [
@@ -662,6 +689,9 @@ class Scheduler:
             * getattr(config, "pipeline_parallel_size", 1)
             + getattr(pc, "pipeline_parallel_rank", 0),
             self._METRICS_ROLE or "default",
+            request_context_enabled=getattr(
+                config, "enable_request_context_metrics", False
+            ),
         )
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
@@ -829,6 +859,7 @@ class Scheduler:
             enable_prefix_caching=config.enable_prefix_caching,
             enable_log_stats=config.enable_log_stats,
             throughput_log_interval_s=config.throughput_log_interval,
+            throughput_log_interval_steps=config.throughput_log_interval_steps,
             cache_hit_rate_window=config.cache_hit_rate_window,
             pool_pressure=self.block_manager.pool_pressure,
         )
@@ -1444,6 +1475,23 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    def _next_decode_completion_steps(self) -> int | None:
+        """Decode steps until the first running decode reaches max_tokens if
+        every step accepts all its draft tokens; None without decode. EOS can
+        come sooner, rejected drafts make it later. Only an engine that
+        verifies drafts (`spec_decode_local`) gains more than a token a step."""
+        fewest = None
+        for seq in self.running:
+            if seq.is_partial_prefill:
+                continue
+            left = seq.max_tokens - seq.num_completion_tokens
+            if fewest is None or left < fewest:
+                fewest = left
+        if fewest is None:
+            return None
+        tokens_per_step = 1 + (self.mtp_k if self.spec_decode_local else 0)
+        return -(-fewest // tokens_per_step)
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -1502,6 +1550,7 @@ class Scheduler:
         tracing.enqueue(seq)
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
+        self._register_connector_admission(seq)
         self.waiting.append(seq)
         self._arrived_requests += 1
 
@@ -1510,8 +1559,16 @@ class Scheduler:
         for seq in seqs:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
+            self._register_connector_admission(seq)
         self.waiting.extend(seqs)
         self._arrived_requests += len(seqs)
+
+    def _register_connector_admission(self, seq: Sequence) -> None:
+        # Register every logical P request, including those behind a capacity
+        # blocked head. Workers must not expire their D metadata as orphaned.
+        admission_ready = getattr(self.kv_connector, "admission_ready", None)
+        if callable(admission_ready) and self._unschedulable_reason(seq) is None:
+            admission_ready(seq)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
@@ -1612,6 +1669,14 @@ class Scheduler:
         callback = getattr(self.kv_connector, "send_finished", None)
         if callable(callback):
             callback(req_id)
+
+    def _connector_abort_send(self, seq: Sequence) -> None:
+        """Let the send owner decide whether cancellation can retire its claim."""
+        callback = getattr(self.kv_connector, "abort_send", None)
+        if callable(callback):
+            callback(seq)
+        else:
+            self._connector_send_finished(seq.id)
 
     def _connector_source_blocks_released(self, seq: Sequence) -> None:
         """Tell the connector its source blocks are back in the pool.
@@ -2014,6 +2079,7 @@ class Scheduler:
                 if self.cost_balance and prefillable
                 else 0.0
             )
+            waiting_requests = len(self.waiting) + self._partial_prefill_count
             decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
@@ -2030,8 +2096,14 @@ class Scheduler:
                     else 0.0
                 ),
                 prefill_cost=prefill_cost,
-                waiting_requests=len(self.waiting) + self._partial_prefill_count,
+                waiting_requests=waiting_requests,
                 arrived_requests=self._arrived_requests,
+                # read only by a rank with no prefill and nothing waiting
+                next_completion_steps=(
+                    self._next_decode_completion_steps()
+                    if not prefillable and not waiting_requests
+                    else None
+                ),
             )
         else:
             decision = PrefillDecision(allow=True, prefillable_ranks=0)
@@ -2139,6 +2211,13 @@ class Scheduler:
             if len(self.running) >= self.max_num_seqs:
                 self.waiting.appendleft(seq)
                 break
+
+            admission_ready = getattr(self.kv_connector, "admission_ready", None)
+            if callable(admission_ready) and not admission_ready(seq):
+                # D may reserve a later request first. Unready P requests own no
+                # source blocks and must not block those that already have D space.
+                skipped_waiting_requests.append(seq)
+                continue
 
             remote_ready_for_decode = self._resolve_waiting_remote_kv(
                 seq, skipped_waiting_requests
@@ -2291,7 +2370,7 @@ class Scheduler:
                 and self._tier_hit(seq) != probed_tier_kv
             ):
                 hbm_probe = self._probe_hbm_prefix(seq)
-            num_cached_blocks, block_hashes = hbm_probe
+            num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
@@ -2351,7 +2430,7 @@ class Scheduler:
             ):
                 self.waiting.appendleft(seq)
                 break
-            self.block_manager.record_allocation(seq, num_cached_blocks, block_hashes)
+            self.block_manager.record_allocation(seq, hbm_probe)
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
                 # risking a shared decoding sequence's blocks (finding #2).
@@ -2386,7 +2465,17 @@ class Scheduler:
             # Guard: PD decode consumer inherits hit from prefill node;
             # don't clobber with the local hit (always 0 on consumer).
             if not seq.prefix_cache_hit_tokens:
-                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
+                # The gated HBM hit, not the chunk floor `allocate` may have
+                # lowered `num_cached_tokens` to. `[floor, hbm)` is refilled
+                # from CPU but was already resident; recording the floor makes
+                # that slice look like a CPU-tier load.
+                recorded = seq.num_cached_tokens
+                if (
+                    seq.offload_joint.boundary_tokens
+                    and seq.offload_joint.hbm_hit_tokens > recorded
+                ):
+                    recorded = seq.offload_joint.hbm_hit_tokens
+                seq.prefix_cache_hit_tokens = recorded
 
             self._lookup_detach_declined.discard(seq.id)
             self._notify_connector_after_prefill_alloc(seq)
@@ -2425,31 +2514,42 @@ class Scheduler:
 
             if seq.offload_joint.boundary_tokens:
                 # The KV leg was refused after the state leg was aimed at the
-                # joint boundary, so the state claims a prefix whose KV nobody
-                # will fetch. Disown it; `_decide_load_after_alloc` logs why.
-                logger.debug(
-                    "[JOINT-DISOWN] seq %s: KV leg refused at boundary %d; "
-                    "recomputing from %d",
-                    seq.id,
-                    seq.offload_joint.boundary_tokens,
-                    seq.num_cached_tokens,
-                )
-                # Privatise the claimed prefix (finding #2) so recompute-from-0
-                # cannot tear a shared decode. cancel_state_load does it when a
-                # CPU state load was pending; otherwise disown directly.
-                if seq.offload_joint.load_hash != -1:
-                    disowned = self.block_manager.cancel_state_load(seq)
+                # joint boundary. An unaligned joint resumes at the HBM hit
+                # when that hit is still recoverable; otherwise disown to 0.
+                # `_decide_load_after_alloc` logs why the leg was refused.
+                if self.block_manager.retreat_joint_to_hbm(seq):
+                    logger.debug(
+                        "[JOINT-RETREAT] seq %s: KV leg refused; resuming at %d",
+                        seq.id,
+                        seq.num_cached_tokens,
+                    )
                 else:
-                    disowned = self.block_manager.disown_claimed_prefix(seq)
-                if not disowned:
-                    self.block_manager.deallocate(seq)
-                    self.waiting.appendleft(seq)
-                    break
-                seq.num_cached_tokens = 0
-                # Partial reset by design: the KV/claim spans are left as-is,
-                # matching the pre-record code -- not a full `reset_joint`.
-                seq.offload_joint.boundary_tokens = 0
-                seq.offload_joint.boundary_hash = -1
+                    logger.debug(
+                        "[JOINT-DISOWN] seq %s: KV leg refused at boundary %d; "
+                        "recomputing from %d",
+                        seq.id,
+                        seq.offload_joint.boundary_tokens,
+                        seq.num_cached_tokens,
+                    )
+                    # Privatise the claimed prefix (finding #2) so
+                    # recompute-from-0 cannot tear a shared decode.
+                    # cancel_state_load does it when a CPU state load was
+                    # pending; otherwise disown directly.
+                    if seq.offload_joint.load_hash != -1:
+                        disowned = self.block_manager.cancel_state_load(seq)
+                    else:
+                        disowned = self.block_manager.disown_claimed_prefix(seq)
+                    if not disowned:
+                        self.block_manager.deallocate(seq)
+                        self.waiting.appendleft(seq)
+                        break
+                    seq.num_cached_tokens = 0
+                    # Partial reset by design: the KV/claim spans are left
+                    # as-is, matching the pre-record code -- not a full
+                    # `reset_joint`.
+                    seq.offload_joint.boundary_tokens = 0
+                    seq.offload_joint.boundary_hash = -1
+                    seq.offload_joint.hbm_hit_tokens = 0
 
             if seq.offload_joint.load_hash != -1:
                 # The kept state boundary is in LMCache, not HBM. It parks
@@ -2864,24 +2964,35 @@ class Scheduler:
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
-            # The state never arrived, so the boundary is not this request's
-            # history. Disown it exactly as `BlockManager.allocate` does at
-            # admission, otherwise the resume runs with `num_cached_tokens > 0`
-            # over a group nobody filled -- `has_initial_state` reads that as
-            # "the recurrence continues". Before `offload_loaded_tokens` is set
-            # below, so that field records the disowned figure. Privatise the
+            # The state or the joint KV never arrived. An unaligned joint
+            # resumes at the HBM hit when that hit is still recoverable.
+            # Otherwise disown exactly as `BlockManager.allocate` does:
+            # `num_cached_tokens > 0` would tell `has_initial_state` the
+            # recurrence continues over a group nobody filled. Privatise the
             # claimed prefix (finding #2): the offload resume path reuses this
-            # exact block_table without re-allocating, so recompute-from-0 would
-            # otherwise tear a shared decode.
+            # block_table, so recompute-from-0 would tear a shared decode.
+            if self.block_manager.retreat_joint_to_hbm(seq):
+                seq.offload_loaded = False
+                seq.offload_loaded_tokens = seq.num_cached_tokens
+                seq.offload_load_start_tokens = None
+                if seq.offload_joint.load_hash != -1:
+                    # The hit's own state is a tier load. Stay parked for it;
+                    # this failure was the joint, not that load.
+                    seq.offload_load_failed = False
+                    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    return False
+                # The HBM hit's blocks are already in the table. Mark the
+                # load failed so admission resumes that prefill instead of
+                # calling allocate on a non-empty block table.
+                seq.offload_load_failed = True
+                return True
             disowned = self.block_manager.disown_claimed_prefix(seq)
             seq.num_cached_tokens = 0
             seq.offload_joint.load_hash = -1
-            # A joint boundary that failed on either leg is not this request's
-            # history any more than a state-only one is, and leaving it set
-            # would let the connector clamp a later lookup to it. Partial reset
-            # by design: the KV/claim spans are left as-is, as before.
+            # Partial reset by design: the KV/claim spans are left as-is.
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
+            seq.offload_joint.hbm_hit_tokens = 0
             if not disowned:
                 # Cannot back private copies; drop the whole table so the
                 # re-admission rebuilds a clean one via can_allocate/allocate
@@ -2940,13 +3051,12 @@ class Scheduler:
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
 
-        A decode does not prefill a P/D request itself: it is sized and
-        compiled for decode, and the request's block table is still the one
-        the transfer was writing, which re-admission cannot allocate over. The
-        connector reports a failure only once no producer write can still land
-        in those blocks (``ATOM_PD_FAILED_WRITE_HOLD_S``), so they are freed at
-        once. Offload load failures (``failed_loading``) still resume their
-        prefill on this node.
+        Decode is sized and compiled for decode, so a failed P/D transfer must
+        not turn into a potentially unbounded local prefill. This also applies
+        to chunked admission timeouts. The connector reports failure only after
+        all expected writers finish and the failed-write safety hold elapses
+        (``ATOM_PD_FAILED_WRITE_HOLD_S``), so the reservation can now be freed.
+        Offload load failures (``failed_loading``) still resume local prefill.
         """
         seq = next(
             (
@@ -2980,9 +3090,7 @@ class Scheduler:
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
-        # As in `_reject_aborted_waiting`: an abort never sends, so the
-        # scheduler retires the send claim rather than waiting for a report.
-        self._connector_send_finished(seq.id)
+        self._connector_abort_send(seq)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -3065,21 +3173,20 @@ class Scheduler:
             or (seq.kv_transfer_params or {}).get("do_remote_prefill")
         )
 
-    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+    def _probe_hbm_prefix(self, seq: Sequence) -> AdmissionProbe:
         """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
-        request does not fit) and the hash chain it walked.
+        request does not fit), the hash chain it walked and the demand its fit
+        passed, which `record_allocation` commits.
 
         Done once per admission attempt; the result is shared by the detach
         decision and the admission itself, which run in the same pass with no
         pool change in between.
         """
-        block_hashes: list[int] = []
-        num_cached_blocks = self.block_manager.can_allocate(
-            seq,
-            record=False,
-            block_hashes=block_hashes,
+        probe = AdmissionProbe()
+        probe.num_cached_blocks = self.block_manager.can_allocate(
+            seq, record=False, probe=probe
         )
-        return num_cached_blocks, block_hashes
+        return probe
 
     @staticmethod
     def _tier_hit(seq: Sequence) -> tuple[int, int]:
@@ -3091,9 +3198,7 @@ class Scheduler:
             int(getattr(joint, "kv_only_tokens", 0) or 0),
         )
 
-    def _can_detach_tier_lookup(
-        self, seq: Sequence, hbm_probe: tuple[int, list[int]]
-    ) -> bool:
+    def _can_detach_tier_lookup(self, seq: Sequence, hbm_probe: AdmissionProbe) -> bool:
         """Whether admission may proceed without waiting for `seq`'s lookup.
 
         Side-effect free. Requires an HBM hit and the connector's consent
@@ -3101,7 +3206,7 @@ class Scheduler:
         probe is the one admission uses, so it sees the HBM prefix
         `_decide_load_after_alloc` will see.
         """
-        hit_blocks = hbm_probe[0]
+        hit_blocks = hbm_probe.num_cached_blocks
         if hit_blocks <= 0:
             return False
         num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
@@ -3150,6 +3255,10 @@ class Scheduler:
         if first_token_id is not None:
             seq.append_token(first_token_id)
             seq._injected_t0 = first_token_id
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.step(
+                    seq.required_channel_state, first_token_id
+                )
             if self.mtp_k > 0:
                 drafts = list(
                     (seq.kv_transfer_params or {}).get("draft_token_ids") or []
@@ -4148,6 +4257,12 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            # Over the forward's own tokens only: a P/D consumer's T0 joins
+            # `new_tokens` below but was counted when it was appended.
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.advance(
+                    seq.required_channel_state, token_ids
+                )
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
@@ -4510,8 +4625,7 @@ class Scheduler:
             if callable(callback):
                 callback(seq)
             if reason == "aborted":
-                # No peer will report a send for a cancelled request.
-                self._connector_send_finished(seq.id)
+                self._connector_abort_send(seq)
         seq.num_tokens = num_tokens
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
@@ -4749,6 +4863,9 @@ class Scheduler:
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
 
+        process_pd = getattr(self.kv_connector, "process_pd_completions", None)
+        if callable(process_pd):
+            kv_connector_output = process_pd(kv_connector_output)
         process_completions = getattr(self.kv_connector, "process_completions", None)
         if callable(process_completions):
             kv_connector_output = process_completions(kv_connector_output)
@@ -4988,6 +5105,9 @@ class PrefillScheduler:
             * getattr(config, "pipeline_parallel_size", 1)
             + getattr(pc, "pipeline_parallel_rank", 0),
             self._METRICS_ROLE or "default",
+            request_context_enabled=getattr(
+                config, "enable_request_context_metrics", False
+            ),
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -5010,6 +5130,7 @@ class PrefillScheduler:
             label="Prefill ",
             enable_log_stats=config.enable_log_stats,
             throughput_log_interval_s=config.throughput_log_interval,
+            throughput_log_interval_steps=config.throughput_log_interval_steps,
         )
         self.total_prompt_tokens = 0
         self.total_generation_tokens = 0
@@ -5307,6 +5428,10 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            if seq.required_channel is not None:
+                seq.required_channel_state = seq.required_channel.step(
+                    seq.required_channel_state, sampled_token_id
+                )
             seq.is_first_decode = True
             # Decode schedules a full target verification window.  The remote
             # prefill producer normally sends only T0, so pad the missing draft

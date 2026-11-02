@@ -6,12 +6,12 @@ K3's registered class (``KimiK3ForConditionalGeneration``) is an uncompiled
 wrapper, but the routing still cannot sit in its forward without editing a file
 whose layer stack is ``@support_torch_compile``-decorated. So the installer
 wraps the loaded model after load, the way V4.1's does
-(``model_runner.mono_decode_installers``), and every other attribute passes
+(``models.registry.mono_decode_installers``), and every other attribute passes
 through to it. Nothing in ``atom/models/kimi_k3/model.py`` changes.
 
 The configuration is checked once (``config.config_refusal``). A step is then
-routed only when it is a pure, uniform speculative verify of at most
-``MAX_ROWS`` rows (``runner.step_rows``). Every per-step input read here is
+routed only when it is a pure, uniform speculative verify or plain decode of at
+most ``MAX_ROWS`` rows (``plan.step_shape``). Every per-step input read here is
 TP-uniform: the kernels wait in-kernel on every peer rank, so ranks that
 disagreed would wait on each other for ever (a per-rank flag such as
 ``is_dummy_run`` must never gate this).
@@ -34,7 +34,7 @@ logger = logging.getLogger("atom")
 class MonoDecodeModel(nn.Module):
     """The loaded K3 model, with its supported steps routed to mono."""
 
-    def __init__(self, model: nn.Module, drafter=None) -> None:
+    def __init__(self, model: nn.Module, drafter=None, metadata_builder=None) -> None:
         super().__init__()
         self.model = model
 
@@ -61,7 +61,7 @@ class MonoDecodeModel(nn.Module):
             except ImportError as error:
                 raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
 
-            return K3MonoDecodeRunner(model, drafter)
+            return K3MonoDecodeRunner(model, drafter, metadata_builder)
 
         self._mono = LazyRunner(_build_runner, "Kimi-K3 mono decode")
         self._declines: set[str] = set()
@@ -125,4 +125,4 @@ def install_mono_decode(
         logger.info("Kimi-K3 mono decode off: %s", why)
         return model
     logger.info("Kimi-K3 mono decode armed (TP%d)", atom_config.tensor_parallel_size)
-    return MonoDecodeModel(model, drafter)
+    return MonoDecodeModel(model, drafter, metadata_builder)

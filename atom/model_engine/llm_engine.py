@@ -6,7 +6,7 @@ import itertools
 import logging
 import time
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
@@ -17,7 +17,7 @@ from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
-from atom.sampling_params import SamplingParams
+from atom.sampling_params import RequiredChannel, SamplingParams
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -157,6 +157,19 @@ class LLMEngine:
                 logger.warning(
                     "ATOM_TBO_PREFILL_TOKEN_SPLIT is ignored under PCP: TBO "
                     "prefill uses request-boundary balanced grouping."
+                )
+            # TBO stripes positions per request group, the draft prefill split
+            # the batch as one sequence: their shards disagree. Keyed on config,
+            # so runs that would never reach TBO are refused too.
+            if config.enable_tbo and config.speculative_config is not None:
+                raise ValueError(
+                    "prefill_context_parallel_size > 1 (-pcp) with speculative "
+                    "decoding is not supported under TBO: TBO's PCP prefill "
+                    "splits per request group, which the draft model's global "
+                    "round-robin query split does not match. Drop --enable-tbo, "
+                    "or run without a draft model. Note -tp > 1 already "
+                    "disables TBO under PCP (see above), so this only affects "
+                    "-tp 1 (e.g. -tp 1 -pcp 8)."
                 )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
@@ -301,7 +314,10 @@ class LLMEngine:
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        # Backpressure admission is offline-only. The flag covers this add,
+        # not the collect loop; refills of the pool do not consult it.
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -321,11 +337,12 @@ class LLMEngine:
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
         self.core_mgr.reset_dp_router()
-        self.add_request(
-            token_ids_list,
-            sampling_params,
-            multimodal_data_list=multimodal_data_list,
-        )
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(
+                token_ids_list,
+                sampling_params,
+                multimodal_data_list=multimodal_data_list,
+            )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -692,6 +709,11 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
+        # The one channel `tool_choice="required"` holds this engine's requests
+        # to (`_engine_channel`): as the server's format named it, and as built
+        # from that once with every id this engine stops on held back.
+        self._format_channel: RequiredChannel | None = None
+        self._required_channel: RequiredChannel | None = None
         self.segment_tokenizer = SegmentTokenizer.maybe_create(
             tokenizer, envs.ATOM_TOKENIZE_CACHE_MB << 20
         )
@@ -783,6 +805,33 @@ class InputOutputProcessor:
         )
         return seqs[0]
 
+    def _engine_channel(self, channel: RequiredChannel) -> RequiredChannel:
+        """The channel a required request is held to on this engine.
+
+        Hold its opening against every single id this engine ends a sequence
+        on (`Scheduler.postprocess` stops on EOS and on `stop_token_ids`), not
+        just the ones the tool-call format named. The third way a sequence
+        ends, the request's own `stop` strings, is left to end it: the client
+        asked for that stop, and a multi-token match is not one logits row's
+        mask.
+
+        Built once, from the first required request, and shared by every
+        later one. A request naming a different channel is refused here, at
+        admission, where it fails alone; the engine loop batches every
+        request together and holds one channel.
+        """
+        if self._required_channel is None:
+            held = channel.ending_on(
+                (self.config.eos_token_id, *self.config.stop_token_ids)
+            )
+            self._format_channel, self._required_channel = channel, held
+        elif channel != self._format_channel and channel != self._required_channel:
+            raise ValueError(
+                'this engine already holds tool_choice="required" requests to '
+                "another channel; a server resolves one tool-call format"
+            )
+        return self._required_channel
+
     def preprocess_fanout(
         self,
         prompt_or_tokens: str | list[int],
@@ -860,6 +909,12 @@ class InputOutputProcessor:
                 stop_tokens = self.tokenizer.encode(stop_str, add_special_tokens=False)
                 if stop_tokens:
                     stop_token_sequences.append(stop_tokens)
+
+        if sampling_params.required_channel is not None:
+            sampling_params = replace(
+                sampling_params,
+                required_channel=self._engine_channel(sampling_params.required_channel),
+            )
 
         if stream_callbacks is not None and len(stream_callbacks) != n:
             raise ValueError(

@@ -294,6 +294,7 @@ def build_layer_post(key: LayerPostBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
+        qoff: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         moe_layer: Int32, tl: Int64,
     ):  # fmt: skip
@@ -323,8 +324,9 @@ def build_layer_post(key: LayerPostBuild):
             res_out, post_out, comb_out, pre_out, normed_a,
         )  # fmt: skip
         args_b = moe_args(
-            normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out
-        )
+            normed, gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
+            qoff,
+        )  # fmt: skip
         ca = attn_post_context(
             key_a, s, lds_a, mailbox(layer, scratch, key.diag_off, layout),
             bases_a, layout_a, scratch,
@@ -381,6 +383,7 @@ def build_layer_post(key: LayerPostBuild):
         normed: Int64,
         gate_w: Int64, bias: Int64, w13: Int64, w13_s: Int64, w2: Int64,
         w2_s: Int64, sgu: Int64, sgu_s: Int64, sw2: Int64, sw2_s: Int64, out: Int64,
+        qoff: Int64,
         scratch: Int64, sym: Int64, peers: Int64, rank: Int32, layer: Int32,
         moe_layer: Int32, tl: Int64, stream: fx.Stream = _CURRENT_STREAM,
     ):  # fmt: skip
@@ -393,7 +396,7 @@ def build_layer_post(key: LayerPostBuild):
             ring_off, ring_slots, sink, qk_scale, pos, cos, sin, woa, woa_s, wob,
             wob_s, res_in, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, ffn_w,
             res_out, post_out, comb_out, pre_out, normed,
-            gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out,
+            gate_w, bias, w13, w13_s, w2, w2_s, sgu, sgu_s, sw2, sw2_s, out, qoff,
             scratch, sym, peers, rank, layer, moe_layer, tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
 

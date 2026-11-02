@@ -71,7 +71,7 @@ support_model_arch_dict = {
 
 ### Model Reuse Relationships
 
-One model file often serves multiple HuggingFace `model_type`s when their architecture is identical or a strict subset. The mapping lives in `atom/model_engine/model_runner.py:support_model_arch_dict` — that's the authoritative source. Common patterns:
+One model file often serves multiple HuggingFace `model_type`s when their architecture is identical or a strict subset. The mapping lives in `atom/models/registry.py:support_model_arch_dict` — that's the authoritative source. Common patterns:
 
 - A shared base file covers a family of closely-related releases (e.g. DeepSeek V3 / V3.2 / GLM-5 all dispatch to one `deepseek_v2.py`).
 - A standalone file when the architecture diverges enough that sharing causes branching everywhere (e.g. DeepSeek V4's hot-cold sparse attention + FP4 MoE).
@@ -90,7 +90,7 @@ MoE pattern: FusedMoE + shared_experts both use `reduce_results=False`, parent d
 ### Adding a Model (file co-change pattern)
 
 1. `atom/models/new_model.py` — Model implementation
-2. `atom/model_engine/model_runner.py` — Register in `support_model_arch_dict`
+2. `atom/models/registry.py` — Register in `support_model_arch_dict`
 3. `atom/config.py` — Add to `_CONFIG_REGISTRY` if config schema differs
 4. `.github/benchmark/models_accuracy.json` — CI accuracy test entry
 5. `recipes/` — Usage recipe

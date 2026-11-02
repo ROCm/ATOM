@@ -493,10 +493,8 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         # q.shape[0] == num_decodes * max_query_len for MTP (one row per decode
         # token, query_len > 1). For non-MTP it equals num_decodes (query_len = 1).
         # pa_decode_gluon handles multi-token causal masking internally when
-        # `query_length > 1` is passed; intermediate buffers must be sized
-        # `num_decodes` (not q.shape[0]) and `query_group_size` must include
-        # the max_qlen multiplier — mirroring server-mode `paged_attention_triton`.
-        _, num_q_heads_total, head_size = q.shape
+        # `query_length > 1` is passed.
+        _, num_q_heads_total, _ = q.shape
         _, num_kv_heads, _, _, _ = k_cache.shape
         # Only reached through _dispatch_decode_backend, which asserts
         # decode_metadata is present and reads the same field to pick this
@@ -508,7 +506,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
         seq_lens = attn_metadata.seq_lens[:num_decodes]
         block_tables = attn_metadata.block_table[:num_decodes]
 
-        query_group_size = max_qlen * (num_q_heads_total // num_kv_heads)
         context_partition_size = 256
 
         use_ps = True
@@ -523,26 +520,10 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             max_context_partition_num = 1
             context_partition_size = 128
 
-        intermediate_shape = (
-            num_decodes,
-            num_kv_heads,
-            max_context_partition_num,
-            query_group_size,
-        )
         compute_type = (
             aiter.dtypes.fp8
             if self.kv_cache_dtype.startswith("fp8")
             else torch.bfloat16
-        )
-        exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
-        max_logits = torch.empty(
-            intermediate_shape, dtype=torch.float32, device=q.device
-        )
-        temporary_output = torch.empty(
-            *intermediate_shape,
-            head_size,
-            dtype=q.dtype,
-            device=q.device,
         )
 
         if k_scale is not None and k_scale.numel() > 1:
@@ -550,9 +531,9 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             v_scale = v_scale.unsqueeze(-1)
 
         # Kernel takes natural q layout [batch * query_length, num_q_heads, head_size].
-        # Internally it derives batch_size = q.shape[0] // query_length and reshapes
-        # to [batch, query_length, num_kv_heads, group, head_size]. See
-        # aiter/aiter/ops/triton/gluon/pa_decode_gluon.py:5371-5377 and 5542-5544.
+        # aiter's pa_decode_gluon derives batch_size = q.shape[0] // query_length,
+        # reshapes to [batch, query_length, num_kv_heads, group, head_size], and
+        # sizes the scratch it allocates from that batch and query_length * group.
         run_pa_decode(
             output=out,
             q=q,
@@ -568,9 +549,6 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             q_scale=None,
             k_scale=k_scale if self.kv_cache_dtype.startswith("fp8") else None,
             v_scale=v_scale if self.kv_cache_dtype.startswith("fp8") else None,
-            exp_sums=exp_sums,
-            max_logits=max_logits,
-            temporary_output=temporary_output,
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,

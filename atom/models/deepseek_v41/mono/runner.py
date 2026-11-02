@@ -25,6 +25,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
@@ -55,6 +56,7 @@ from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_
 from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.mono.device import queue
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -62,6 +64,7 @@ from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_u
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
 from atom.mono.runtime.timeline import LayerTimeline
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -494,7 +497,7 @@ class V41MonoDecodeRunner:
         if self.debug:
             self.diag_off = nbytes
             nbytes += DIAG_BYTES
-        self.scratch = torch.zeros(nbytes, device=dev, dtype=torch.uint8)
+        self.scratch = uncached_bytes(nbytes, dev)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -641,7 +644,7 @@ class V41MonoDecodeRunner:
         })  # fmt: skip
         # the caller's stream: a FlyDSL launcher left to its default submits on the
         # NULL stream, outside a graph capture
-        self.build.launchers[key](*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.launchers[key], *args, torch.cuda.current_stream())
         return res_out, (pre, post, comb)
 
     def _index_projection_args(self, key, weights) -> dict:
@@ -666,9 +669,10 @@ class V41MonoDecodeRunner:
             **self._moe_args(weights),
             **self._peer_args(),
             "layer": POST_TAG0 + layer_id, "moe_layer": MOE_TAG0 + layer_id,
+            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
             "tl": self._timeline_ptr("k2", layer_id),
         })  # fmt: skip
-        self.build.layer_post(*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.layer_post, *args, torch.cuda.current_stream())
 
     def _attn_post(self, spec, block, weights, residual, gates, step, cache, rope):
         """K2a: the decode sparse attention over this layer's keys (its class's
@@ -683,7 +687,7 @@ class V41MonoDecodeRunner:
             "layer": POST_TAG0 + layer_id,
             "tl": self._timeline_ptr("k2a", layer_id),
         })  # fmt: skip
-        self.build.attn_post(*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.attn_post, *args, torch.cuda.current_stream())
 
     def _peer_args(self) -> dict:
         p = torch.Tensor.data_ptr
@@ -738,11 +742,12 @@ class V41MonoDecodeRunner:
         args = k2b.ABI.pack({
             "x": self.ffn_normed.data_ptr(), **self._moe_args(weights),
             **self._peer_args(), "layer": MOE_TAG0 + layer_id,
+            "qoff": queue.tag_offset(MOE_TAG0 + layer_id),
             "tl": self._timeline_ptr("k2b", layer_id),
             # where the merged launch's layout puts K2b's regions
             "scratch": self.scratch.data_ptr() + k2.moe_base(key_a),
         })  # fmt: skip
-        self.build.moe(*args, stream=torch.cuda.current_stream())
+        _run_compiled(self.build.moe, *args, torch.cuda.current_stream())
 
     def _moe_args(self, weights) -> dict:
         """K2b's own arguments but its input."""
