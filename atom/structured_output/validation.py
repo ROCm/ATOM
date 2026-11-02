@@ -181,6 +181,8 @@ def validate_execution_options(
     relaxed_mtp=False,
     synthetic=False,
 ):
+    if getattr(config, "pipeline_parallel_size", 1) > 1:
+        raise ValueError("Structured output does not support pipeline parallelism")
     if relaxed_mtp:
         raise ValueError("Structured output cannot use relaxed MTP verification")
     if (

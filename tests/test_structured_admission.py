@@ -480,3 +480,40 @@ def test_api_cancel_waits_for_submission_before_aborting(monkeypatch):
         release.set()
     assert events == ["enqueued", "aborted"]
     assert not engine.io_processor.requests
+
+
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_pipeline_schema_rejected_before_engine_preflight(pp_size):
+    from atom.model_engine.llm_engine import LLMEngine
+    from atom.sampling_params import SamplingParams
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.config = NS(pipeline_parallel_size=pp_size)
+    engine.core_mgr = NS(collective_rpc=Mock())
+    with pytest.raises(ValueError, match="pipeline parallelism"):
+        engine.prepare_structured_request(SamplingParams(json_schema="{}"))
+    engine.prepare_structured_request(SamplingParams())
+    engine.core_mgr.collective_rpc.assert_not_called()
+
+
+@pytest.mark.parametrize("pp_size", [2, 4])
+def test_pipeline_schema_rejected_before_api_preflight(pp_size):
+    from atom.sampling_params import SamplingParams
+    from atom.structured_output.validation import configure_request
+
+    engine = NS(prepare_structured_request=Mock())
+    for schema in ("{}", None):
+        request = configure_request(
+            engine,
+            None,
+            NS(pipeline_parallel_size=pp_size),
+            SamplingParams(),
+            schema,
+            None,
+        )
+        if schema is None:
+            asyncio.run(request)
+        else:
+            with pytest.raises(ValueError, match="pipeline parallelism"):
+                asyncio.run(request)
+    engine.prepare_structured_request.assert_not_called()

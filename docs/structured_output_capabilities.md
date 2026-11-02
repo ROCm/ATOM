@@ -156,7 +156,7 @@ or Responses `text.format`. The grammar admits the parser's canonical function
 envelope or a schema-conforming answer. Required/named choices select the tool
 branch; `tool_choice="none"` selects JSON text. Function-only turns have no
 response text to validate; subsequent text answers remain constrained. This is
-not beta strict-tool argument validation. Other tool parser formats, P/D handoff,
+not beta strict-tool argument validation. Other tool parser formats, pipeline parallelism, P/D handoff,
 multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
