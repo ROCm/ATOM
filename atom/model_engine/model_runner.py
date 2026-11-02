@@ -3030,10 +3030,16 @@ class ModelRunner:
         if pp.world_size <= 1:
             return
         # Unwrap to the module exposing the PP layer range (make_layers sets
-        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap it).
+        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap
+        # it with .model, and conditional-generation models use .language_model).
         inner = self.model
-        while not hasattr(inner, "start_layer") and hasattr(inner, "model"):
-            inner = inner.model
+        while not hasattr(inner, "start_layer"):
+            if hasattr(inner, "model"):
+                inner = inner.model
+            elif hasattr(inner, "language_model"):
+                inner = inner.language_model
+            else:
+                break
         if not hasattr(inner, "start_layer"):
             return
 

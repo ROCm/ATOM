@@ -45,7 +45,7 @@ def config(**overrides):
     )
 
 
-def runner(start, end, cfg, *, mla=False):
+def runner(start, end, cfg, *, mla=False, wrappers=()):
     md = SimpleNamespace()
     ns = {
         "get_pp_group": lambda: SimpleNamespace(
@@ -67,7 +67,13 @@ def runner(start, end, cfg, *, mla=False):
     obj = cls()
     obj.config = SimpleNamespace(hf_config=cfg)
     obj.has_mla_indexer = mla
-    obj.model = SimpleNamespace(start_layer=start, end_layer=end)
+    obj._test_layer_range = range(start, end)
+    obj.model = torch.nn.Module()
+    obj.model.start_layer, obj.model.end_layer = start, end
+    for name in reversed(wrappers):
+        wrapper = torch.nn.Module()
+        wrapper.add_module(name, obj.model)
+        obj.model = wrapper
     obj.attn_metadata_builder = SimpleNamespace(
         _sparse_kv_indices_gpu=torch.zeros(64, dtype=torch.int32),
         index_topk_out=4,
@@ -94,11 +100,11 @@ def stage(obj, md, cfg, schedule, incoming, layout, mode, seed=0):
     obj._load_pp_shared_indexer(incoming)
     traces = {}
     for layer in sorted(schedule._sparse_attention_layer_ids(cfg)):
-        if not obj.model.start_layer <= layer < obj.model.end_layer:
+        if layer not in obj._test_layer_range:
             continue
         reuse, _ = schedule._should_skip_minimax_m3_index_topk(cfg, layer)
         impl = memo(layer, reuse)
-        key = (mode, obj.model.start_layer)  # Device/key belongs to this stage.
+        key = (mode, obj._test_layer_range.start)  # Key belongs to this stage.
         value = impl._load_cached_topk(md, key)
         if value is None:
             assert not reuse, f"layer {layer} missed its incoming top-k"
@@ -143,6 +149,21 @@ def test_partition_preserves_all_cached_values(model_schedule, mode, layout, par
                 torch.testing.assert_close(actual, want, rtol=0, atol=0)
         start += size
     assert set(incoming.tensors) == {"hidden_states"}
+
+
+@pytest.mark.parametrize(
+    "wrappers",
+    [("model",), ("language_model", "model"), ("model", "language_model", "model")],
+)
+def test_wrapped_model_transfers_topk_at_each_equal_boundary(model_schedule, wrappers):
+    # CausalLM, the M3.1 conditional-generation wrapper, and UBatchWrapper.
+    cfg = config()
+    incoming = None
+    for start in range(0, 60, 15):
+        obj, md = runner(start, start + 15, cfg, wrappers=wrappers)
+        assert obj._pp_recv_needs_sparse == (start != 0)
+        assert obj._pp_send_needs_sparse == (start != 45)
+        incoming, _ = stage(obj, md, cfg, model_schedule, incoming, "mxfp4", "prefill")
 
 
 @pytest.mark.parametrize(
