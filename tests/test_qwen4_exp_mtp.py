@@ -19,6 +19,7 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+from atom.spec_decode.draft_graph import StagedInput
 
 
 def test_qwen_mtp_does_not_import_deepseek_when_pcp_disabled(monkeypatch):
@@ -291,9 +292,9 @@ def test_decode_mrope_storage_matches_padded_graph_stride(monkeypatch, k):
 
 
 @pytest.mark.parametrize("opted_in", [True, False])
-def test_mrope_draft_graph_stages_positions_batch_last(opted_in):
-    """Qwen3.8's MTP head records steps 1+ on `[3, bs]` positions; an MRoPE
-    draft model that has not opted in still declares no pass."""
+def test_mrope_draft_graph_declares_positions_batch_last(opted_in):
+    """Qwen3.8's MTP head declares its steps 1+ with `[3, bs]` positions; an
+    MRoPE draft model that has not opted in still declares no pass."""
     from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
     from atom.spec_decode.eagle_proposer import EagleProposer
 
@@ -314,13 +315,11 @@ def test_mrope_draft_graph_stages_positions_batch_last(opted_in):
         assert graphs == () and proposer.step is None
         return
     (graph,) = graphs
+    assert graph.inputs["positions"] == StagedInput(
+        shape=(3,), dtype=torch.int64, batch_last=True
+    )
     assert graph.inputs["hidden_states"].shape == (2, 8)
     assert proposer._reuse_step_buffers
-    graph.bind(SimpleNamespace(max_num_seqs=8), "cpu")
-    positions = torch.arange(6, dtype=torch.int64).view(3, 2)
-    staged = graph.stage(4, {"positions": positions})["positions"]
-    assert staged.shape == (3, 4) and staged.is_contiguous()
-    assert staged.tolist() == [[0, 1, 1, 1], [2, 3, 3, 3], [4, 5, 5, 5]]
 
 
 def test_draft_qsa_view_drops_only_graph_padding():

@@ -121,11 +121,10 @@ class EagleProposer(Drafter):
         per sequence. That rewrite is what ``warmup_inputs`` replays, so the two
         go through the same code rather than a copy that can drift.
 
-        MRoPE positions are ``[3, N]``, batch axis last. A draft model that
-        sets ``draft_graph_supports_mrope`` stages them batch-last; any other
-        MRoPE model declares nothing, by the same rule Kimi-K3 does. Declaring
-        one-dimensional positions instead used to warm and capture a shape
-        serving never runs -- graphs nobody replays, paid for at every startup.
+        MRoPE positions are ``[3, N]``: a draft model that sets
+        ``draft_graph_supports_mrope`` stages them batch-last, and any other MRoPE
+        model declares nothing, as Kimi-K3 does -- one-dimensional positions
+        would warm and capture a shape serving never runs.
         """
         self.step = None
         mrope = self.runner.use_mrope
