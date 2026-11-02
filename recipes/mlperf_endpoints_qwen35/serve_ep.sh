@@ -89,7 +89,7 @@ case $MODE in
   # logits with uneven DP token counts) + the DSv4.1 DEP recipe's session affinity: a conversation's
   # turns stay on the DP rank that holds its prefix cache
   dp) MAXSEQ=${MAXSEQ:-16}
-      export ATOM_MORI_V2=1 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 ATOM_DP_LM_HEAD_MODE=allgather
+      export ATOM_MORI_V2=1 MEGA_DISPATCH=mori MORI_GPU_ARCHS=gfx1250 ATOM_DP_LM_HEAD_MODE=${ATOM_DP_LM_HEAD_MODE:-allgather}
       export MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27
       export ATOM_DP_SESSION_AFFINITY=1 AITER_CUSTOM_AR_MAX_SIZE=0
       # after any rank prefills, every rank runs 8 decode-only passes before new prefill: without it, once
