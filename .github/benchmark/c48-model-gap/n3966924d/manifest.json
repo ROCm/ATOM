@@ -65,8 +65,8 @@
       "relative_path": "distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py",
       "ported_from_sha256": "5b702ae788d982993a93fa6b9fbde30d3403fdd72630850814f9c214a8227fe2",
       "base_sha256": "0c32467e42ff05749b992c25e56a6ccf3d9659a263c2272d31427cf4c768015f",
-      "patched_sha256": "f22bc178085c69c5bb8e6c49bbd57c57a06bd4ddf8d17eae24bbc3d8a00aa349",
-      "note": "Upstream omits the layout after a peer acks layout_id; the DCP fields are D-static and small, so _build_pull_metadata sends them on every pull. Asymmetric DCP keeps its own block order; _normalize_paired_block_order applies to the symmetric path. KpoolTailSpec no longer exists."
+      "patched_sha256": "443ba0cf97f90b99c98029a761916279b3165ee6018c7692971ec355cabf03f4",
+      "note": "Upstream omits the layout after a peer acks layout_id; the DCP fields are D-static and small, so _build_pull_metadata sends them on every pull. Asymmetric DCP keeps its own block order; _normalize_paired_block_order applies to the symmetric path. KpoolTailSpec no longer exists. Asymmetric DCP pairs only the final Mamba state (P's position-indexed row at cdiv(tokens, P block) - 1, D's unhashed list at -1 - num_speculative_blocks) because P and D Mamba block sizes differ, and a pull P answered with an error counts as settled (D never retries it), so P frees its blocks instead of waiting for the abort timeout."
     },
     {
       "mount_source": "pp-mooncake/dcp_transfer.py",

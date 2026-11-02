@@ -1849,10 +1849,8 @@ class MooncakeConnectorWorker:
 
             for d_req_id, send_meta in ready_reqs:
                 send_meta.sending -= 1
-
-                if d_req_id in err_req_set:
-                    continue
-
+                # D never retries a failed pull, so it settles like a sent one;
+                # otherwise P pins the blocks until the abort timeout.
                 send_meta.sent += 1
                 if (
                     send_meta.sent == send_meta.need_send
@@ -1973,6 +1971,24 @@ class MooncakeConnectorWorker:
                     group_specs[group_index].kv_cache_spec,
                     MambaSpec,
                 )
+                if is_mamba_group and asymmetric_dcp and remote_group:
+                    # Block sizes differ, so only the state after the pulled
+                    # prefix maps across. P's align-mode row is position-indexed;
+                    # D lists its unhashed states [CoW?, final, speculative...].
+                    spec = group_specs[group_index].kv_cache_spec
+                    num_tokens = agent_meta.req_num_tokens.get(d_req_id, 0)
+                    final = cdiv(num_tokens, spec.block_size) - 1
+                    destination = len(remote_group) - 1 - spec.num_speculative_blocks
+                    if (
+                        not 0 <= final < len(local_group)
+                        or local_group[final] == NULL_BLOCK_ID
+                        or destination < 0
+                    ):
+                        has_block_error = True
+                        err_msg = "Asymmetric DCP lacks the final Mamba state"
+                        break
+                    local_group = [local_group[final]]
+                    remote_group = [remote_group[destination]]
                 if is_mamba_group:
                     # Mamba/GDN prefix caching can use null blocks only as
                     # align-mode placeholders. They do not carry transferable
@@ -1990,11 +2006,6 @@ class MooncakeConnectorWorker:
 
                 n_local = len(local_group)
                 n_remote = len(remote_group)
-                if asymmetric_dcp and is_mamba_group and n_remote > 1:
-                    # Intermediate checkpoint positions can differ with HMA pages.
-                    has_block_error = True
-                    err_msg = "Asymmetric DCP supports one final Mamba state per group"
-                    break
                 if asymmetric_dcp and not is_mamba_group:
                     # D's suffix spans striped tokens across the full P prefix.
                     local_block_ids_by_group.append(local_group)
