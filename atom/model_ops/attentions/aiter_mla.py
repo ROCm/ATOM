@@ -45,7 +45,6 @@ from atom.kv_transfer.disaggregation.pd_producer import mooncake_pd_producer_con
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import (
-    _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
     mla_dcp_kernel_num_heads,
@@ -73,6 +72,7 @@ from atom.model_ops.indexer import (
     fp8_rows,
 )
 from atom.model_ops.indexer.schedule import any_layer_skips_index_topk
+from atom.model_ops.mla_decode_heads import mla_decode_min_heads
 from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
@@ -465,8 +465,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
         self.is_sparse = model_runner.has_mla_indexer
+        self.padded_num_attention_heads = max(
+            self.num_attention_heads,
+            mla_decode_min_heads(
+                config.kv_cache_dtype, self.is_sparse, get_dcp_world_size()
+            ),
+        )
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         # GLM-5.3's pooled indexer selects `index_topk // index_kpool` POOLS --
         # index_topk tokens -- and then appends the trailing incomplete pool,

@@ -295,6 +295,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
+    # MLA decode query-head floor: 16 (default) or 12. 12 lets a model with 12
+    # heads a rank (Kimi-K3 at TP8) skip the zero padding to 16 on a non-sparse,
+    # no-DCP decode over an FP8 KV cache; see `mla_decode_min_heads`.
+    "ATOM_MLA_MIN_HEADS": lambda: int(os.getenv("ATOM_MLA_MIN_HEADS", "16")),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
     # ATOM_USE_TRITON_MLA=1.
