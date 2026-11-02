@@ -3479,8 +3479,6 @@ class FusedMoE(torch.nn.Module):
 
     # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
     shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
-    # Set in __init__ (`triton_topk_softmax_rows`).
-    triton_topk_softmax_max_rows: int | None = None
 
     def __init__(
         self,

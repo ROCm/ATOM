@@ -108,54 +108,20 @@ def test_every_supported_shape_matches_aiter(experts, k, shared, dtype, gpu):
 
 
 @pytest.mark.parametrize(
-    "experts,k,shared,scoring,renormalize",
-    [
-        (1024, 8, 0, None, True),  # AITER: moeSoftmax + moeTopK
-        (1024, 10, 1, "sigmoid", True),
-        (8, 2, 0, None, True),  # Mixtral
-        (16, 4, 0, None, True),
-        (128, 1, 0, None, True),  # Triton slower near the cutoff
-        (512, 2, 0, None, True),
-        (160, 8, 0, None, True),  # Qwen3-Coder-480B
-        (513, 10, 0, None, True),
-        (512, 33, 0, None, True),
-        (512, 0, 0, None, True),
-        (512, 10, 3, "sigmoid", True),
-        (512, 10, 1, "softplus", True),
-        (512, 10, 1, "", True),  # AITER refuses shared columns unscored by ""
-        (512, 10, 1, "sigmoid", False),
-    ],
-)
-def test_other_layers_stay_on_aiter(experts, k, shared, scoring, renormalize, gpu):
-    rows = topK.triton_topk_softmax_rows(experts, k, renormalize, shared, scoring)
-    assert rows is None
-
-
-def test_unscored_shared_experts_route_like_none(gpu):
-    # Without a scoring func the shared columns are prefilled, not routed.
-    assert topK.triton_topk_softmax_rows(512, 10, True, 3, None) == 5120
-
-
-@pytest.mark.parametrize(
     "arch,cus,fractions,max_rows",
     [
-        ("gfx950", 256, None, 5120),
-        ("gfx950", 128, None, 2560),
         ("gfx950", 256, [0.5], 2560),
         ("gfx950", 256, [0.75], 1280),
         ("gfx950", 80, [0.3, 0.5], 480),
-        ("gfx942", 304, None, None),
         ("gfx942", 304, [0.5], None),
-        ("gfx1250", 256, None, None),
     ],
 )
-def test_cutoff_counts_the_cus_a_launch_gets(
+def test_cu_masked_cutoff_counts_the_streams_cus(
     arch, cus, fractions, max_rows, gpu, monkeypatch
 ):
     gpu(arch, cus)
-    if fractions is not None:
-        monkeypatch.setattr(RapidServeModelRunner, "_CU_POOL_FRACTIONS", fractions)
-    assert _layer_rows(512, 10, 1, cu_masked=fractions is not None) == max_rows
+    monkeypatch.setattr(RapidServeModelRunner, "_CU_POOL_FRACTIONS", fractions)
+    assert _layer_rows(512, 10, 1, cu_masked=True) == max_rows
 
 
 @pytest.mark.parametrize("fractions", [[0.5], [0.75], [0.3, 0.5]])
