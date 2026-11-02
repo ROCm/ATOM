@@ -20,12 +20,78 @@ assumed width reads 4x the rows it should. SGLang is exactly that bridge today,
 which is why it must keep answering False.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from atom.config import indexer_cp_unsupported_reason
+from atom.config import (
+    indexer_cp_unsupported_reason,
+    minimax_m3_prefill_token_graph_refusal,
+)
 
 M3 = ["MiniMaxM3SparseForCausalLM"]
+
+
+# ───────────────────────────── native prefill token-graph capability gate ──
+
+
+def _prefill_graph_config(**overrides):
+    values = {
+        "hf_config": SimpleNamespace(
+            model_type="minimax_m3",
+            architectures=M3,
+            sparse_attention_config={"sparse_block_size": 128},
+        ),
+        "plugin_config": None,
+        "parallel_config": SimpleNamespace(data_parallel_size=1),
+        "pipeline_parallel_size": 1,
+        "prefill_context_parallel_size": 1,
+        "enable_expert_parallel": False,
+        "enable_tbo": False,
+        "enable_tbo_decode": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, None),
+        (
+            {"hf_config": SimpleNamespace(model_type="llama", architectures=[])},
+            "not MiniMax-M3",
+        ),
+        (
+            {
+                "hf_config": SimpleNamespace(
+                    model_type="minimax_m3_vl",
+                    architectures=["MiniMaxM3SparseForConditionalGeneration"],
+                    vision_config=SimpleNamespace(),
+                    sparse_attention_config={"sparse_block_size": 128},
+                )
+            },
+            None,
+        ),
+        ({"plugin_config": SimpleNamespace(is_vllm=True)}, "plugin mode"),
+        (
+            {"parallel_config": SimpleNamespace(data_parallel_size=2)},
+            "data_parallel_size",
+        ),
+        ({"pipeline_parallel_size": 2}, "pipeline_parallel_size"),
+        ({"prefill_context_parallel_size": 2}, "prefill_context_parallel_size"),
+        ({"enable_expert_parallel": True}, "expert parallelism"),
+        ({"enable_tbo": True}, "TBO"),
+        ({"enable_tbo_decode": True}, "TBO"),
+    ],
+)
+def test_prefill_token_graph_capability_matrix(overrides, expected):
+    reason = minimax_m3_prefill_token_graph_refusal(_prefill_graph_config(**overrides))
+    if expected is None:
+        assert reason is None
+    else:
+        assert reason is not None and expected in reason
 
 
 # ─────────────────────────────────────────────────────── topology gate ──

@@ -20,6 +20,8 @@ from atom.utils.region_graph import (
     _weak,
     eager_region,
     join_stream,
+    on_scheduled_rows,
+    padded_prefill_rows,
     token_graph,
 )
 
@@ -425,3 +427,74 @@ def test_a_region_argument_keeps_its_named_tuple_type():
     assert type(weak) is Pair and weak.width == 64
     assert weak.values.data_ptr() == value.values.data_ptr()
     assert type(_weak((value.values, 1))) is tuple
+
+
+class PaddedPrefillUnit(torch.nn.Module):
+    """A unit whose region attends a prefill's scheduled rows alone: its
+    launch follows the step (a cumulative sum over the rows), as attention's
+    and a recurrence's do."""
+
+    def __init__(self, dim=64):
+        super().__init__()
+        self.a = torch.nn.Linear(dim, dim, device="cuda")
+        self.b = torch.nn.Linear(dim, dim, device="cuda")
+
+    @eager_region()
+    def attend(self, x: torch.Tensor):
+        return on_scheduled_rows(
+            lambda h: h.cumsum(0), padded_prefill_rows(x.shape[0]), x
+        )
+
+    def forward(self, x):
+        return self.b(self.attend(torch.relu(self.a(x))))
+
+
+PaddedPrefillGraph = token_graph(PaddedPrefillUnit)
+
+
+@torch.inference_mode()
+def test_a_padded_prefill_region_attends_its_scheduled_rows(context):
+    torch.manual_seed(5)
+    unit = PaddedPrefillGraph()
+    bucket, scheduled = 32, 20
+    # Recorded on a step of the bucket's own rows, as the runner records it.
+    context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=bucket)
+    unit(torch.randn(bucket, 64, device="cuda"))  # warmup
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        context.main_stream = stream
+        context.in_hipgraph, context.tr_graph = True, "record"
+        unit(torch.randn(bucket, 64, device="cuda"))
+        context.in_hipgraph, context.tr_graph = False, None
+    torch.cuda.current_stream().wait_stream(stream)
+    context.main_stream = torch.cuda.current_stream()
+
+    # Replayed on a prefill of fewer rows, padded with junk to the bucket.
+    x = torch.randn(scheduled, 64, device="cuda")
+    padded = torch.cat([x, torch.randn(bucket - scheduled, 64, device="cuda")])
+    context.context = SimpleNamespace(is_prefill=True, scheduled_tokens=scheduled)
+    context.tr_graph = "replay"
+    got = unit(padded).clone()
+    context.tr_graph = None
+
+    # The scheduled rows are the eager step's: no padded row reached the
+    # region's cumulative sum. The padded rows leave it as zeros.
+    torch.testing.assert_close(got[:scheduled], unit(x), rtol=1e-5, atol=1e-5)
+    bias = unit.b.bias.expand(bucket - scheduled, -1)
+    torch.testing.assert_close(got[scheduled:], bias, rtol=0, atol=0)
+    unit.__dict__["_token_graph"].release_graphs()
+
+
+def test_padded_prefill_rows_only_for_a_prefill_taller_than_its_schedule(
+    monkeypatch,
+):
+    def rows(height, **step):
+        ctx = SimpleNamespace(context=SimpleNamespace(**step) if step else None)
+        monkeypatch.setattr(forward_context, "_forward_context", ctx)
+        return padded_prefill_rows(height)
+
+    assert rows(32, is_prefill=True, scheduled_tokens=20) == 20
+    assert rows(20, is_prefill=True, scheduled_tokens=20) is None
+    assert rows(32, is_prefill=False, scheduled_tokens=20) is None
+    assert rows(32) is None
