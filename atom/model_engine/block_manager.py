@@ -516,7 +516,6 @@ class BlockManager:
                     if checkpoint_spec is not None
                     else None
                 ),
-                refresh_hits=True,
                 verified_for_s=state_tier_verified_for_s(config),
             )
             # Attached rather than passed at construction: the coordinator is
@@ -1613,11 +1612,7 @@ class BlockManager:
         """
         if joint_hash != -1:
             return joint_hash
-        if self.state.transfer.replays or (
-            self.state_replay_tokens and seq.replays_hit
-        ):
-            return -1
-        return hit_hash
+        return -1 if self.tier_resume_replays(seq) else hit_hash
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.

@@ -128,11 +128,12 @@ class StateStoreOperationId:
 class StateTouchId:
     """One LRU refresh of a voted state image. Every TP worker reports on its
     own shard under this id, so the failure-dominant quorum says gone when any
-    shard is. `round` keeps repeated touches of one hash distinct identities.
+    shard is. `generation` keeps repeated touches of one hash distinct
+    identities.
     """
 
     prefix_hash: int
-    round: int
+    generation: int
 
 
 ConnectorCompletionId = (

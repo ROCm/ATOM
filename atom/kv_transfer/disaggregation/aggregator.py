@@ -157,7 +157,7 @@ class KVOutputAggregator:
             terminal_tombstone_limit,
             lambda key: isinstance(key, LoadOperationId),
         )
-        # Touch ids are never reused (fresh round), and tombstoning them would
+        # Touch ids are never reused (fresh generation), and tombstoning them would
         # push the store / source tombstones out of the ring.
         self._connector_completions = _TPCompletionGroup[ConnectorCompletionKey](
             world_size,

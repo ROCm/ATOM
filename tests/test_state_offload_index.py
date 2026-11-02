@@ -6,6 +6,7 @@ and keeps state images as warm in LMCache's LRU as the KV they belong to
 from types import SimpleNamespace
 
 import pytest
+from conftest import OFFLOAD_STALE_S as STALE
 
 from atom.model_engine import state_offload as so
 from atom.model_engine.state_offload import (
@@ -62,51 +63,42 @@ def test_state_tier_cpu_bytes_reads_gib(monkeypatch):
     assert state_tier_cpu_bytes() == 96 << 30
 
 
-@pytest.fixture
-def clock(monkeypatch):
-    """`state_offload`'s monotonic clock, advanced by hand."""
-    now = [1000.0]
-    monkeypatch.setattr(so, "monotonic", lambda: now[0])
-    return now
-
-
 # ── the index: votes queue touches, verdicts keep it in step ───────────────
 
 
-#: Past every confirmation window `tier_verified_for_s` can give.
-STALE = so._TIER_VERIFIED_MAX_S + 1
-
-
-def _index(*hashes, refresh=True, **kw):
-    idx = StateOffloadIndex(refresh_hits=refresh, **kw)
+def _index(*hashes, verified_for_s=so._TIER_VERIFIED_MIN_S, **kw):
+    idx = StateOffloadIndex(verified_for_s=verified_for_s, **kw)
     for h in hashes:
         idx.note_stored(h)
     return idx
 
 
 class TestIndexTouches:
-    def test_only_a_registered_hit_queues_a_touch(self, clock):
+    def test_only_a_registered_hit_queues_a_touch(self, offload_clock):
         idx = _index(7)
         assert idx.could_serve(7)
         assert idx.take_touches() == [], "could_serve is pure"
+        assert idx.request_load("r", 7)
+        assert idx.take_touches() == [], "a load is its own verdict"
         idx.want_touch(7)
         idx.want_touch(8)  # not indexed: nothing to touch
         assert idx.take_touches() == [7]
         assert idx.take_touches() == []
 
-    def test_no_touches_without_refresh(self, clock):
-        idx = _index(7, refresh=False)
+    def test_no_touches_without_refresh(self, offload_clock):
+        idx = _index(7, verified_for_s=None)
         idx.want_touch(7)
         assert idx.take_touches() == []
+        assert idx._verified_at == {}, "nothing reads it"
 
-    def test_a_hash_voted_every_pass_is_touched_at_an_interval(self, clock):
+    def test_a_hash_voted_every_pass_is_touched_at_an_interval(self, offload_clock):
         idx = _index(7)
         idx.want_touch(7)
         assert idx.take_touches() == [7]
-        clock[0] += so._TIER_TOUCH_INTERVAL_S / 2
+        offload_clock[0] += so._TIER_TOUCH_INTERVAL_S / 2
         idx.want_touch(7)
         assert idx.take_touches() == []
-        clock[0] += so._TIER_TOUCH_INTERVAL_S
+        offload_clock[0] += so._TIER_TOUCH_INTERVAL_S
         idx.want_touch(7)
         assert idx.take_touches() == [7]
         assert idx.touches_sent == 2
@@ -122,130 +114,144 @@ class TestIndexTouches:
         ids=["gone", "stored-since", "restored-since", "stored-before"],
     )
     def test_a_gone_verdict_drops_the_hash_unless_a_store_landed_since(
-        self, clock, before_touch, after_touch, dropped
+        self, offload_clock, before_touch, after_touch, dropped
     ):
         idx = _index(7)
         for op in before_touch:
-            clock[0] += 1
+            offload_clock[0] += 1
             getattr(idx, op)(7)
-        clock[0] += 1
+        offload_clock[0] += 1
         idx.want_touch(7)
         assert idx.take_touches() == [7]
         for op in after_touch:
-            clock[0] += 0.01
+            offload_clock[0] += 0.01
             getattr(idx, op)(7)
         idx.apply_touch_verdict(7, False)
         assert idx.could_serve(7) is not dropped
         assert idx.stats()["touch_misses"] == int(dropped)
 
-    def test_a_resident_verdict_refreshes_the_cap_order(self, clock):
-        idx = StateOffloadIndex(max_cpu_entries=19, refresh_hits=True)  # cap 3
-        for h in (1, 2, 3):
-            idx.note_stored(h)
+    def test_a_resident_verdict_refreshes_the_cap_order(self, offload_clock):
+        idx = _index(1, 2, 3, max_cpu_entries=19)  # cap 3
         idx.apply_touch_verdict(1, True)
         idx.note_stored(4)
         assert idx.could_serve(1) and not idx.could_serve(2)
 
-    def test_a_verdict_for_a_forgotten_hash_is_ignored(self, clock):
+    def test_a_verdict_for_a_forgotten_hash_is_ignored(self, offload_clock):
         idx = _index(7)
         idx.forget(7)
         idx.apply_touch_verdict(7, True)
         assert not idx.could_serve(7)
 
+    def test_touch_state_leaves_with_its_hash(self, offload_clock):
+        idx = _index(1, 2, 3, max_cpu_entries=19)  # cap 3
+        for h in (1, 2, 3):
+            idx.want_touch(h)
+        idx.take_touches()
+        for h in (1, 2, 3):
+            idx.want_touch(h)
+        offload_clock[0] += STALE
+        assert idx.hold_admission(3)
+        idx.note_stored(4)
+        idx.note_stored(5)  # evicts 1 and 2
+        idx.forget(3)
+        for table in (
+            idx._touch_wanted,
+            idx._touch_sent_at,
+            idx._verified_at,
+            idx._hold_started_at,
+        ):
+            assert set(table) <= idx.hashes
 
-class TestNeedsVerify:
-    def test_a_fresh_store_needs_no_verdict(self, clock):
-        assert not _index(7).needs_verify(7)
 
-    def test_a_store_only_role_holds_nothing(self, clock):
+class TestHoldAdmission:
+    def test_a_fresh_store_needs_no_verdict(self, offload_clock):
+        assert not _index(7).hold_admission(7)
+
+    def test_a_store_only_role_holds_nothing(self, offload_clock):
         """A `kv_producer` indexes its own stores but never loads them."""
         idx = _index(7, can_load=False)
-        clock[0] += STALE
-        assert not idx.needs_verify(7)
+        offload_clock[0] += STALE
+        assert not idx.hold_admission(7)
         assert idx.take_touches() == []
 
-    def test_a_stale_hash_waits_for_its_touch(self, clock):
+    def test_a_stale_hash_waits_for_its_touch(self, offload_clock):
         idx = _index(7)
-        clock[0] += STALE
-        assert idx.needs_verify(7)
+        offload_clock[0] += STALE
+        assert not idx.hold_admission(-1), "nothing to load"
+        assert idx.hold_admission(7)
         assert idx.take_touches() == [7], "the hold asks for its own touch"
-        assert idx.needs_verify(7), "still out"
+        assert idx.hold_admission(7), "still out"
+        assert idx.stats()["loads_deferred_for_verify"] == 2
         idx.apply_touch_verdict(7, True)
-        assert not idx.needs_verify(7)
+        assert not idx.hold_admission(7)
 
-    def test_a_gone_verdict_ends_the_hold_by_dropping_the_hash(self, clock):
+    def test_a_gone_verdict_ends_the_hold_by_dropping_the_hash(self, offload_clock):
         idx = _index(7)
-        clock[0] += STALE
-        assert idx.needs_verify(7)
+        offload_clock[0] += STALE
+        assert idx.hold_admission(7)
         idx.take_touches()
         idx.apply_touch_verdict(7, False)
-        assert not idx.needs_verify(7) and not idx.could_serve(7)
+        assert not idx.hold_admission(7) and not idx.could_serve(7)
 
-    def test_a_lost_verdict_holds_no_longer_than_the_lookup_defer(self, clock):
+    def test_a_lost_verdict_holds_no_longer_than_the_lookup_defer(self, offload_clock):
         idx = _index(7)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         # Re-probed every pass, re-touched every interval, never answered:
         # the re-sends must not extend the hold.
         held_for, step = 0.0, 0.05
-        while idx.needs_verify(7):
+        while idx.hold_admission(7):
             assert held_for <= idx.defer_s + 1e-6
             idx.take_touches()
-            clock[0] += step
+            offload_clock[0] += step
             held_for += step
         assert held_for >= idx.defer_s
         assert idx.touches_sent > 1, "the touch was re-sent while held"
-        assert not idx.needs_verify(7), "later admissions are not held again"
+        assert not idx.hold_admission(7), "later admissions are not held again"
         assert idx.stats()["verify_holds_expired"] == 1
 
-    def test_evidence_after_an_expired_hold_rearms_it(self, clock):
+    def test_evidence_after_an_expired_hold_rearms_it(self, offload_clock):
         idx = _index(7)
-        clock[0] += STALE
-        assert idx.needs_verify(7)
-        clock[0] += idx.defer_s + 1
-        assert not idx.needs_verify(7)
+        offload_clock[0] += STALE
+        assert idx.hold_admission(7)
+        offload_clock[0] += idx.defer_s + 1
+        assert not idx.hold_admission(7)
         idx.apply_touch_verdict(7, True)
-        clock[0] += STALE
-        assert idx.needs_verify(7), "a fresh hold, timed from now"
-        clock[0] += idx.defer_s / 2
-        assert idx.needs_verify(7)
+        offload_clock[0] += STALE
+        assert idx.hold_admission(7), "a fresh hold, timed from now"
+        offload_clock[0] += idx.defer_s / 2
+        assert idx.hold_admission(7)
 
-    def test_a_verdict_ends_the_hold_timer(self, clock):
+    def test_a_verdict_ends_the_hold_timer(self, offload_clock):
         idx = _index(7)
-        clock[0] += STALE
-        assert idx.needs_verify(7)
-        clock[0] += idx.defer_s * 0.75
+        offload_clock[0] += STALE
+        assert idx.hold_admission(7)
+        offload_clock[0] += idx.defer_s * 0.75
         idx.apply_touch_verdict(7, True)
-        clock[0] += STALE
-        assert idx.needs_verify(7)
-        clock[0] += idx.defer_s * 0.75
-        assert idx.needs_verify(7), "the earlier wait does not count"
+        offload_clock[0] += STALE
+        assert idx.hold_admission(7)
+        offload_clock[0] += idx.defer_s * 0.75
+        assert idx.hold_admission(7), "the earlier wait does not count"
 
-    def test_the_lookup_defer_is_read_once_at_construction(self, clock, monkeypatch):
+    def test_the_lookup_defer_is_read_once_at_construction(
+        self, offload_clock, monkeypatch
+    ):
         monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "0")
         idx = _index(7)
-        clock[0] += STALE
-        assert not idx.needs_verify(7), "0 disables the hold"
+        offload_clock[0] += STALE
+        assert not idx.hold_admission(7), "0 disables the hold"
         monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "2")
-        assert not idx.needs_verify(7), "not re-read on the admission path"
+        assert not idx.hold_admission(7), "not re-read on the admission path"
 
     def test_an_index_without_refresh_never_reads_the_defer(self, monkeypatch):
         monkeypatch.setenv("OFFLOAD_LOOKUP_DEFER_S", "not-a-number")
         assert StateOffloadIndex().defer_s == 0
 
-    def test_a_completed_load_counts_as_verified(self, clock):
+    def test_a_completed_load_counts_as_verified(self, offload_clock):
         idx = _index(7)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         assert idx.request_load("r", 7)
         idx.complete_load("r")
-        assert not idx.needs_verify(7)
-
-    def test_a_hold_is_counted(self, clock):
-        idx = _index(7)
-        assert not idx.hold_admission(-1), "nothing to load"
-        assert not idx.hold_admission(7), "confirmed by its store"
-        clock[0] += STALE
-        assert idx.hold_admission(7)
-        assert idx.stats()["loads_deferred_for_verify"] == 1
+        assert not idx.hold_admission(7)
 
 
 @pytest.mark.parametrize(
@@ -255,19 +261,19 @@ def test_the_verified_window_scales_with_the_pool_within_bounds(pool_gib, window
     assert so.tier_verified_for_s(pool_gib) == pytest.approx(window)
 
 
-def test_the_index_holds_by_its_own_window(clock):
+def test_the_index_holds_by_its_own_window(offload_clock):
     idx = _index(7, verified_for_s=8.0)
-    clock[0] += 7.5
-    assert not idx.needs_verify(7)
-    clock[0] += 1
-    assert idx.needs_verify(7)
+    offload_clock[0] += 7.5
+    assert not idx.hold_admission(7)
+    offload_clock[0] += 1
+    assert idx.hold_admission(7)
 
 
 class TestTouchPlumbing:
     """The scheduler's two calls a pass: `publish_touches` before the metadata
     is built, `collect_touch_verdicts` before the next admission."""
 
-    def test_voted_hashes_reach_the_connector(self, clock):
+    def test_voted_hashes_reach_the_connector(self, offload_clock):
         idx = _index(7)
         idx.want_touch(7)
         sent = []
@@ -276,44 +282,37 @@ class TestTouchPlumbing:
         )
         assert sent == [7] and idx.refresh_hits
 
-    def test_a_connector_without_touches_turns_the_refresh_off(self, clock):
+    def test_a_connector_without_touches_turns_the_refresh_off(self, offload_clock):
         idx = _index(7)
         idx.want_touch(7)
         idx.publish_touches(SimpleNamespace())
         idx.want_touch(7)
         assert idx.take_touches() == []
-        clock[0] += STALE
-        assert not idx.needs_verify(7), "nothing would ever answer the hold"
+        offload_clock[0] += STALE
+        assert not idx.hold_admission(7), "nothing would ever answer the hold"
 
-    def test_verdicts_and_presence_only_touches_are_collected(self, clock):
+    def test_verdicts_are_collected(self, offload_clock):
         idx = _index(7, 8)
-        clock[0] += 1
+        offload_clock[0] += 1
         idx.want_touch(7)
         idx.want_touch(8)
         assert sorted(idx.take_touches()) == [7, 8]
-        connector = SimpleNamespace(
-            take_state_touch_verdicts=lambda: {7: False, 8: True},
-            take_state_touches_unrefreshed=lambda: 3,
+        idx.collect_touch_verdicts(
+            SimpleNamespace(take_state_touch_verdicts=lambda: {7: False, 8: True})
         )
-        idx.collect_touch_verdicts(connector)
-        idx.collect_touch_verdicts(connector)
         assert not idx.could_serve(7) and idx.could_serve(8)
-        assert idx.stats()["touches_unrefreshed"] == 6
-
-
-GIB = 1 << 30
 
 
 @pytest.mark.parametrize(
-    "state, pool, says",
+    "state_gib, pool_gib, says",
     [
         (59, 208, None),
         (32, 32, "bounds nothing"),  # #2562's accuracy run: the default cap
         (40, 64, "more than half"),
+        (32, 64, None),
         (32, 0, None),
-        (0, 32, None),
     ],
 )
-def test_the_state_cap_is_judged_against_the_pool(state, pool, says):
-    msg = state_tier_budget_warning(state * GIB, pool * GIB)
+def test_the_state_cap_is_judged_against_the_pool(state_gib, pool_gib, says):
+    msg = state_tier_budget_warning(state_gib, pool_gib)
     assert msg is None if says is None else says in msg

@@ -21,6 +21,7 @@ from atom.kv_transfer.disaggregation.types import (
     LoadOperationId,
     ReqId,
     SaveOperationId,
+    StateTouchId,
 )
 
 
@@ -218,7 +219,7 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         self.state_stores: list[tuple] = []
         # StateTouchId per voted state image, refreshed and reported by each
         # worker.
-        self.state_touches: list = []
+        self.state_touches: list[StateTouchId] = []
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)

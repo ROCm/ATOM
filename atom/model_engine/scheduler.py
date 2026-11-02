@@ -3779,8 +3779,8 @@ class Scheduler:
             self.block_manager.settle_state_store(op, ok=False, attempted=False)
 
     def _publish_state_loads(self) -> None:
-        """Hand this pass's state-tier loads to the connector, before it builds
-        its metadata.
+        """Hand this pass's state-tier loads, and the touches the admission
+        pass registered, to the connector before it builds its metadata.
 
         Drained here rather than at the park, because the connector publishes
         once per pass and a load handed over twice would write the same entry
@@ -3791,10 +3791,11 @@ class Scheduler:
         # Guarded like the `_settle_state_load` / `_publish_state_stores`
         # siblings: a scheduler built without a block manager (the connector
         # test doubles) would otherwise AttributeError on the bare deref.
-        offload = getattr(getattr(self, "block_manager", None), "state_offload", None)
+        bm = getattr(self, "block_manager", None)
+        offload = getattr(bm, "state_offload", None)
         if offload is not None:
             offload.publish_touches(self.kv_connector)
-        take = getattr(getattr(self, "block_manager", None), "take_state_loads", None)
+        take = getattr(bm, "take_state_loads", None)
         if take is None:
             return
         loads = take()
@@ -4906,6 +4907,11 @@ class Scheduler:
         # offload leg.
         self._drain_source_safe_releases()
 
+        bm = getattr(self, "block_manager", None)
+        offload = getattr(bm, "state_offload", None)
+        if offload is not None:
+            # Touch verdicts, before the next admission pass reads them.
+            offload.collect_touch_verdicts(self.kv_connector)
         # The state-offload store reports, not keyed by request: by the time a
         # store lands its owner is long gone and only the hash remains. They
         # ride the connector's completion channels, so they are drained from the
@@ -4914,11 +4920,6 @@ class Scheduler:
         # Indexed only on the report, never at submission: a hash advertised
         # before its bytes exist parks the next request over that prefix
         # against a `get` that must miss.
-        bm = getattr(self, "block_manager", None)
-        offload = getattr(bm, "state_offload", None)
-        if offload is not None:
-            # Before the next admission pass reads them.
-            offload.collect_touch_verdicts(self.kv_connector)
         take = getattr(self.kv_connector, "take_state_reports", None)
         if offload is not None and take is not None:
             indexed, failed = take()

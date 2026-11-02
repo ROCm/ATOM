@@ -132,8 +132,8 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         self._store_failed_no_tier: set[StateStoreOperationId] = set()
         # Touch verdicts since the last `get_finished`: (resident, refreshed).
         self._touch_verdicts: dict[StateTouchId, tuple[bool, bool]] = {}
-        # Touches whose codec call raised; only the first is logged.
-        self._touch_failures = 0
+        # Only the first touch whose codec call raised is logged.
+        self._warned_touch_failure = False
 
     def close(self) -> None:
         """Drain then join the state tier before the base executors.
@@ -264,9 +264,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
         pool_gib = float(getattr(cfg, "max_local_cpu_size", 0) or 0)
-        budget_warning = state_tier_budget_warning(
-            state_bytes, int(pool_gib * (1 << 30))
-        )
+        budget_warning = state_tier_budget_warning(state_bytes / (1 << 30), pool_gib)
         if budget_warning:
             logger.warning("kimi_k3 offload: %s", budget_warning)
         # No index here: StateOffloadIndex lives in the engine process; both
@@ -329,12 +327,12 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             except Exception:
                 # Says nothing about the bytes: kept, not refreshed. One
                 # traceback, since a drifted LMCache raises on every touch.
-                self._touch_failures += 1
-                if self._touch_failures == 1:
+                if not self._warned_touch_failure:
+                    self._warned_touch_failure = True
                     logger.warning(
                         "kimi_k3 offload: touch of state hash %d failed; failed "
                         "touches keep the image indexed and are counted in "
-                        "state_offload_touches_unrefreshed",
+                        "state_touches_unrefreshed",
                         touch_id.prefix_hash,
                         exc_info=True,
                     )
@@ -676,7 +674,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._pending_state_loads: list[tuple] = []
         self._pending_state_stores: list[tuple] = []
         self._pending_state_touches: list[StateTouchId] = []
-        self._touch_round = 0
+        self._touch_generation = 0
         self._state_touch_verdicts: dict[int, bool] = {}
         self._state_touches_unrefreshed = 0
         # A finished request whose save is queued keeps its blocks pinned
@@ -717,10 +715,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         return True
 
     def enqueue_state_touches(self, hashes) -> bool:
-        """Queue touches for the next metadata, each under its own round."""
+        """Queue touches for the next metadata, each under its own generation."""
         for h in hashes:
-            self._pending_state_touches.append(StateTouchId(int(h), self._touch_round))
-            self._touch_round += 1
+            self._pending_state_touches.append(
+                StateTouchId(int(h), self._touch_generation)
+            )
+            self._touch_generation += 1
         return True
 
     def take_state_touch_verdicts(self) -> dict[int, bool]:
@@ -729,11 +729,12 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._state_touch_verdicts = {}
         return verdicts
 
-    def take_state_touches_unrefreshed(self) -> int:
-        """Touches since the last call that only confirmed presence."""
-        n = self._state_touches_unrefreshed
-        self._state_touches_unrefreshed = 0
-        return n
+    def get_statistics(self) -> dict[str, int]:
+        # Touches that only confirmed presence, without refreshing the LRU.
+        return {
+            **super().get_statistics(),
+            "state_touches_unrefreshed": self._state_touches_unrefreshed,
+        }
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         self._refresh_save_stall()

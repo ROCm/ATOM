@@ -31,6 +31,7 @@ from atom.config import Config
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.state_offload import _TIER_VERIFIED_MAX_S
 from atom.sampling_params import SamplingParams
 from atom.utils.region_graph import ReqGraph
 
@@ -245,6 +246,18 @@ def keep_envs_lazy():
     for name in list(vars(envs)):
         if name in envs.environment_variables:
             delattr(envs, name)
+
+
+#: Past every confirmation window `tier_verified_for_s` can give.
+OFFLOAD_STALE_S = _TIER_VERIFIED_MAX_S + 1
+
+
+@pytest.fixture
+def offload_clock(monkeypatch):
+    """`state_offload`'s monotonic clock, advanced by hand."""
+    now = [1000.0]
+    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
+    return now
 
 
 @pytest.fixture

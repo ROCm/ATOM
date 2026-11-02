@@ -54,7 +54,7 @@ def _local_cpu_lru(storage_manager):
     logger.warning(
         "state offload: LMCache's storage manager has no %s, so state touches "
         "only confirm presence and refresh no eviction order (every touch is "
-        "counted in state_offload_touches_unrefreshed)",
+        "counted in state_touches_unrefreshed)",
         ", ".join(missing),
     )
     return None
@@ -96,7 +96,7 @@ class StateByteCodec:
         self._worker_id = int(worker_id)
         self._layout_id = layout_id
         self._misfit_reads = 0
-        self._unrefreshed_touches = 0
+        self._warned_unrefreshed = False
         self._storage = None
         self._local_cpu = None
         self._max_entries = (
@@ -191,23 +191,23 @@ class StateByteCodec:
         """Refresh `h`'s image in LMCache's LRU, as a KV lookup does for its
         chunks; falsy (`GONE`) when it is gone. A state hit is answered by
         `StateOffloadIndex`, so otherwise LMCache never sees the image used.
-
-        `update_on_hit` under `cpu_lock`, not `contains(pin=True)` +
-        `touch_cache()`: a pin needs an unpin, and `keys_in_request` belongs
-        to the concurrent KV lookup.
         """
         if self._storage is None:
             return TouchResult.GONE
         result = self._touch_key(self.key(h))
-        if result is TouchResult.PRESENT:
-            self._unrefreshed_touches += 1
-            if self._unrefreshed_touches == 1:
-                logger.warning(
-                    "state offload: a touched state image is outside "
-                    "LocalCPU's hot cache, so the touch only confirmed it is "
-                    "present and did not refresh its eviction order (counted "
-                    "as state_offload_touches_unrefreshed)"
-                )
+        # Without LocalCPU's internals `_local_cpu_lru` already warned.
+        if (
+            result is TouchResult.PRESENT
+            and self._local_cpu is not None
+            and not self._warned_unrefreshed
+        ):
+            self._warned_unrefreshed = True
+            logger.warning(
+                "state offload: a touched state image is outside "
+                "LocalCPU's hot cache, so the touch only confirmed it is "
+                "present and did not refresh its eviction order (counted "
+                "as state_touches_unrefreshed)"
+            )
         return result
 
     def _touch_key(self, key) -> TouchResult:

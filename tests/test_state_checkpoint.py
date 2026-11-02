@@ -17,6 +17,7 @@ from math import inf, isinf
 from types import SimpleNamespace
 
 import pytest
+from conftest import OFFLOAD_STALE_S as STALE
 from conftest import MockConfig
 
 from atom.model_engine.block_manager import (
@@ -34,7 +35,7 @@ from atom.model_engine.prefix_hash import full_prompt_blocks
 from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
 from atom.model_engine.sequence import Sequence, SequenceType
 from atom.model_engine.state_cache import StateCache
-from atom.model_engine.state_offload import _TIER_VERIFIED_MAX_S, StateOffloadIndex
+from atom.model_engine.state_offload import StateOffloadIndex
 from atom.model_engine.state_pool import StateSlotPool
 from atom.model_engine.state_runtime import (
     StateRuntime,
@@ -4566,24 +4567,12 @@ class TestPagedAllocateAimsTheStateLegAtTheJointBoundary:
 # ── state tier hit refresh: the admission hold and the voters ──────────────
 
 
-@pytest.fixture
-def clock(monkeypatch):
-    """`state_offload`'s monotonic clock, advanced by hand."""
-    now = [1000.0]
-    monkeypatch.setattr("atom.model_engine.state_offload.monotonic", lambda: now[0])
-    return now
-
-
-#: Past every confirmation window `tier_verified_for_s` can give.
-STALE = _TIER_VERIFIED_MAX_S + 1
-
-
 def _paged_bm():
     bm = make_block_manager(
         ckpt_config(num_kvcache_blocks=160, pool_entries={"state": 8}),
         state_runtime=PAGED_COPY_RUNTIME,
     )
-    bm.state_offload = StateOffloadIndex(refresh_hits=True)
+    bm.state_offload = StateOffloadIndex(verified_for_s=5.0)
     return bm
 
 
@@ -4611,11 +4600,11 @@ class TestAdmissionHold:
         )
         return commits
 
-    def test_an_unconfirmed_joint_image_is_held(self, clock, monkeypatch):
+    def test_an_unconfirmed_joint_image_is_held(self, offload_clock, monkeypatch):
         bm = _paged_bm()
         commits = self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         seq = _seq()
 
         assert not bm.record_allocation(
@@ -4630,13 +4619,13 @@ class TestAdmissionHold:
         )
         assert len(commits) == 1
 
-    def test_a_gone_image_is_not_parked_on(self, clock, monkeypatch):
+    def test_a_gone_image_is_not_parked_on(self, offload_clock, monkeypatch):
         """The verdict drops the hash; the retry's boundary search no longer
         sees the tier rung (`could_serve` is False), so it plans a lower one."""
         bm = _paged_bm()
         self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         assert not bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
@@ -4644,7 +4633,9 @@ class TestAdmissionHold:
         bm.state_offload.apply_touch_verdict(77, False)
         assert not bm._tier_can_serve(77)
 
-    def test_a_recently_confirmed_image_goes_straight_through(self, clock, monkeypatch):
+    def test_a_recently_confirmed_image_goes_straight_through(
+        self, offload_clock, monkeypatch
+    ):
         bm = _paged_bm()
         commits = self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
@@ -4653,20 +4644,20 @@ class TestAdmissionHold:
         )
         assert len(commits) == 1
 
-    def test_a_state_resident_in_hbm_is_never_held(self, clock, monkeypatch):
+    def test_a_state_resident_in_hbm_is_never_held(self, offload_clock, monkeypatch):
         bm = _paged_bm()
         self._joint(bm, monkeypatch, from_hbm=True)
         bm.state_offload.note_stored(77)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         assert bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
 
-    def test_the_fit_probe_path_never_holds(self, clock, monkeypatch):
+    def test_the_fit_probe_path_never_holds(self, offload_clock, monkeypatch):
         bm = _paged_bm()
         self._joint(bm, monkeypatch)
         bm.state_offload.note_stored(77)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         assert bm.record_allocation(_seq(), AdmissionProbe(2, [1, 2]))
 
     def _hbm_hit(self, bm, monkeypatch, resident):
@@ -4683,11 +4674,13 @@ class TestAdmissionHold:
         )
         bm.state_offload.note_stored(2)
 
-    def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(self, clock, monkeypatch):
+    def test_an_hbm_hit_holds_only_for_a_tier_sourced_state(
+        self, offload_clock, monkeypatch
+    ):
         bm = _paged_bm()
         resident = {2}
         self._hbm_hit(bm, monkeypatch, resident)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         assert bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
@@ -4696,18 +4689,18 @@ class TestAdmissionHold:
             _seq(), AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
 
-    def test_a_replayed_hit_is_not_held(self, clock, monkeypatch):
+    def test_a_replayed_hit_is_not_held(self, offload_clock, monkeypatch):
         bm = _paged_bm()
         self._hbm_hit(bm, monkeypatch, set())
         monkeypatch.setattr(bm, "state_replay_tokens", 8)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         seq = _seq()
         seq.replays_hit = True
         assert bm.record_allocation(
             seq, AdmissionProbe(2, [1, 2]), defer_unverified=True
         )
 
-    def test_the_hold_judges_the_joint_fit_kept(self, clock, monkeypatch):
+    def test_the_hold_judges_the_joint_fit_kept(self, offload_clock, monkeypatch):
         """A joint `_fit_joint` drops is not loaded, so its stale image must not
         hold an admission that resumes at an HBM-resident hit."""
         bm = _paged_bm()
@@ -4717,7 +4710,7 @@ class TestAdmissionHold:
         )
         monkeypatch.setattr(bm.paged_state_checkpoints, "contains", lambda h: h == 2)
         bm.state_offload.note_stored(77)
-        clock[0] += STALE
+        offload_clock[0] += STALE
         assert bm.record_allocation(
             _seq(), AdmissionProbe(2, [1, 2], 1), defer_unverified=True
         )
@@ -4734,12 +4727,12 @@ class TestVotersRegisterTouches:
         bm.state_offload.note_stored(77)
         return bm
 
-    def test_the_resumable_scan_registers_a_tier_hit(self, clock):
+    def test_the_resumable_scan_registers_a_tier_hit(self, offload_clock):
         bm = self._bm()
         assert bm.paged_state_checkpoints._reachable(77)
         assert bm.state_offload.take_touches() == [77]
 
-    def test_an_hbm_hit_is_not_a_tier_vote(self, clock, monkeypatch):
+    def test_an_hbm_hit_is_not_a_tier_vote(self, offload_clock, monkeypatch):
         bm = self._bm()
         monkeypatch.setattr(
             bm.paged_state_checkpoints.store, "contains", lambda h: True
@@ -4747,16 +4740,10 @@ class TestVotersRegisterTouches:
         assert bm.paged_state_checkpoints._reachable(77)
         assert bm.state_offload.take_touches() == []
 
-    def test_asking_whether_the_tier_can_serve_registers_nothing(self, clock):
+    def test_asking_whether_the_tier_can_serve_registers_nothing(self, offload_clock):
         bm = self._bm()
         assert bm._tier_can_serve(77)
         assert bm.state_offload.take_touches() == []
-
-    def test_an_offered_load_registers_its_hash(self, clock):
-        bm = self._bm()
-        seq = _seq()
-        assert bm._request_state_load(seq, 77)
-        assert bm.state_offload.take_touches() == [77]
 
 
 class TestResumeHash:
@@ -4774,7 +4761,9 @@ class TestResumeHash:
         assert bm._state_resume_hash(seq, -1, 2) == -1, "a replay restores none"
         assert bm._state_resume_hash(seq, 77, 2) == 77
 
-    def test_the_hold_judges_the_hash_allocate_then_loads(self, clock, monkeypatch):
+    def test_the_hold_judges_the_hash_allocate_then_loads(
+        self, offload_clock, monkeypatch
+    ):
         bm = _paged_bm()
         offload = bm.state_offload
         bm.paged_state_checkpoints.attach_offload(offload)
@@ -4787,12 +4776,12 @@ class TestResumeHash:
         # The image left HBM; only the tier has it, and not confirmed lately.
         bm.paged_state_checkpoints.unindex(h)
         offload.note_stored(h)
-        clock[0] += STALE
+        offload_clock[0] += STALE
 
         asked, attached = [], []
-        verify, attach = offload.needs_verify, bm._attach_state_slots
+        hold, attach = offload.hold_admission, bm._attach_state_slots
         monkeypatch.setattr(
-            offload, "needs_verify", lambda x: asked.append(x) or verify(x)
+            offload, "hold_admission", lambda x: asked.append(x) or hold(x)
         )
         monkeypatch.setattr(
             bm, "_attach_state_slots", lambda s, x: attached.append(x) or attach(s, x)
@@ -4832,8 +4821,8 @@ def test_the_scheduler_retries_a_held_admission(monkeypatch):
     assert seq.id in scheduled and not sched.waiting
 
 
-def test_the_scheduler_publishes_touches_with_the_state_loads(clock):
-    idx = StateOffloadIndex(refresh_hits=True)
+def test_the_scheduler_publishes_touches_with_the_state_loads(offload_clock):
+    idx = StateOffloadIndex(verified_for_s=5.0)
     idx.note_stored(7)
     idx.want_touch(7)
     sent = []
