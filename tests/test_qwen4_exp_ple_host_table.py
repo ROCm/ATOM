@@ -294,6 +294,9 @@ def test_releasing_the_weights_releases_the_table(fake_pin, monkeypatch, fail_at
     pinned = [weakref.ref(p) for _, p in emb.table._rows.values() if p is not None]
     assert len(pinned) == (NUM_SHARDS if fail_at is None else 0)
     pins = fake_pin.calls
+    # The released HBM table, one block the heap could hand back as it was,
+    # stays held, so the resumed one cannot come back where it was.
+    held = emb.weight.data
 
     runner.release_memory(tags=["weights"])
     assert emb.weight.numel() == 0
@@ -317,7 +320,7 @@ def test_releasing_the_weights_releases_the_table(fake_pin, monkeypatch, fail_at
     assert not torch.equal(emb.shard_bases, before)
     new = table.neg()
     assert _updater(model).update_weights(_sync_tensors(new, torch.ones(4, 4), True))
-    del squatters
+    del squatters, held
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
     assert _bitwise_equal(got, new[ids])
