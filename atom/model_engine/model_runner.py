@@ -389,7 +389,9 @@ class tokenIDProcessor:
                 if sampled_logprobs is not None
                 else None
             )
-            logprobs_map = unpack_token_logprobs(payload, req_ids, ret)
+            logprobs_map = unpack_token_logprobs(
+                payload, req_ids, ret, batch.return_logprobs
+            )
             return ret, logprobs_map
 
         token_ids = self.recv_async_output(self.token_ids_cpu)
@@ -417,7 +419,10 @@ class tokenIDProcessor:
                 from atom.model_engine.token_logprobs import unpack_token_logprobs
 
                 logprobs_map = unpack_token_logprobs(
-                    logprobs, self.prev_req_ids, token_id_dict
+                    logprobs,
+                    self.prev_req_ids,
+                    token_id_dict,
+                    self.prev_batch.return_logprobs,
                 )
         else:
             # first time, no previous tokens

@@ -41,13 +41,14 @@ def capture_token_logits(logits, batch, metadata=None):
 
 
 def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot=None):
-    """Return (values, candidate IDs, ranks), retaining the sampled-ID layout.
+    """Return (values, candidate IDs, ranks) for requesting sequences only.
 
     Values slot 0 holds the sampled token; remaining slots hold top candidates.
     The vocabulary distribution is the raw target distribution, before sampling
     filters. Fixed-width output keeps async token/probability copies aligned.
     Padding positions are computed safely and discarded with their token IDs.
-    Only requesting sequences are selected; the disabled path never calls here.
+    Rows retain requesting-sequence order and each sampled-ID token width.
+    The disabled path never calls here.
     """
     requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
     width = sampled_ids.shape[1] if sampled_ids.ndim == 2 else 1
@@ -56,9 +57,9 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot
     chosen = torch.tensor(requested, device=device, dtype=torch.long)
     counts = getattr(batch, "top_logprobs", [0] * len(batch.return_logprobs))
     k = min(max((counts[i] for i in requested), default=0), logits.shape[-1])
-    values = torch.zeros((*ids.shape, k + 1), device=device, dtype=torch.float32)
-    candidates = torch.zeros((*ids.shape, k), device=device, dtype=torch.int32)
-    ranks = torch.zeros(ids.shape, device=device, dtype=torch.int32)
+    shape = (len(requested), width)
+    values = torch.empty((*shape, k + 1), device=device, dtype=torch.float32)
+    candidates = torch.empty((*shape, k), device=device, dtype=torch.int32)
     if metadata is None:
         rows = chosen[:, None]
     else:
@@ -85,20 +86,24 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot
     ).float()
     normalizer = torch.logsumexp(selected, dim=-1)
     token_logits = selected.gather(-1, selected_ids[..., None]).squeeze(-1)
-    values[chosen, :, 0] = token_logits - normalizer
-    ranks[chosen] = (selected > token_logits[..., None]).sum(-1).to(torch.int32) + 1
+    values[:, :, 0] = token_logits - normalizer
+    ranks = (selected > token_logits[..., None]).sum(-1).to(torch.int32) + 1
     if k:
         top_values, top_ids = torch.topk(selected, k, dim=-1)
-        values[chosen, :, 1:] = top_values - normalizer[..., None]
-        candidates[chosen] = top_ids.to(torch.int32)
+        values[:, :, 1:] = top_values - normalizer[..., None]
+        candidates[:] = top_ids.to(torch.int32)
     return values, candidates, ranks
 
 
-def unpack_token_logprobs(payload, req_ids, token_ids):
+def unpack_token_logprobs(payload, req_ids, token_ids, requested=None):
     """Decode the matching CPU batch, never the next scheduled batch."""
     if payload is None:
         return None
     values, candidates, ranks = payload
+    if requested is not None:
+        req_ids = [rid for rid, enabled in zip(req_ids, requested) if enabled]
+    if len(values) != len(req_ids):
+        raise ValueError("Token/logprob batch identity mismatch")
     return {
         req_id: [
             TokenLogprob(float(v[0]), int(rank), tuple(zip(c, v[1:])))

@@ -3,10 +3,12 @@
 
 """Keep generated token probabilities aligned with visible Chat byte spans."""
 
+import codecs
 import json
 from functools import lru_cache
 
-from .sse import data_frame, iter_sse_data
+from .logprob_store import LogprobStore
+from .source_text import SourceText
 
 
 class TokenBytes:
@@ -61,82 +63,76 @@ def token_bytes(tokenizer):
 class LogprobTracker:
     def __init__(self, codec, top_k=0):
         self.codec = codec
-        self.top_k = top_k
-        self.raw = bytearray()
-        self.spans = []
-        self.cursor = 0
-        self.emitted = 0
+        self.store = LogprobStore(top_k)
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self.source_end = 0
 
-    def feed(self, token_ids, records):
-        if records is None or len(token_ids) != len(records):
+    def feed(self, token_ids, records, *, finished=False):
+        if token_ids and (records is None or len(token_ids) != len(records)):
             raise RuntimeError("Missing or misaligned engine token logprobs")
-        for token_id, record in zip(token_ids, records):
+        pending = self.decoder.getstate()[0]
+        start = self.source_end - len(pending)
+        pieces = []
+        for token_id, record in zip(token_ids, records or ()):
             if int(token_id) in self.codec.special:
-                continue  # Mirrors skip_special_tokens in the text decoder.
-            start = len(self.raw)
-            self.raw.extend(self.codec.raw(token_id))
-            self.spans.append((start, len(self.raw), token_id, record))
+                continue
+            raw = self.codec.raw(token_id)
+            end = self.source_end + len(raw)
+            self.store.append(self.source_end, end, token_id, record)
+            self.source_end = end
+            pieces.append(raw)
+        raw = b"".join(pieces)
+        text = self.decoder.decode(raw, final=finished)
+        remaining = len(self.decoder.getstate()[0])
+        data = pending + raw
+        if remaining:
+            data = data[:-remaining]
+        parts = []
+        # Usually one exact UTF-8 span. For malformed/truncated bytes, map each
+        # replacement character to the original bytes, not its three-byte encoding.
+        while data:
+            try:
+                decoded = data.decode("utf-8")
+            except UnicodeDecodeError as error:
+                if error.start:
+                    parts.append(
+                        (
+                            data[: error.start].decode("utf-8"),
+                            start,
+                            start + error.start,
+                        )
+                    )
+                parts.append(("\ufffd", start + error.start, start + error.end))
+                start += error.end
+                data = data[error.end :]
+            else:
+                parts.append((decoded, start, start + len(data)))
+                break
+        sourced = SourceText(parts, self)
+        if sourced != text:
+            raise RuntimeError("Token-byte decoder lost source alignment")
+        return sourced
 
     def take(self, text):
         if not text:
             return []
-        visible = text.encode("utf-8")
-        start = self.raw.find(visible, self.cursor)
-        end = start + len(visible)
-        if start < 0 and "\ufffd" in text:
-            # A token cap may leave incomplete UTF-8. Match the text decoder's
-            # replacement behavior while retaining the original token bytes.
-            prefix = text.split("\ufffd", 1)[0].encode("utf-8")
-            starts = (
-                [self.raw.find(prefix, self.cursor)]
-                if prefix
-                else [self.cursor] + [lo for lo, *_ in self.spans if lo >= self.cursor]
-            )
-            for lo in starts:
-                if lo < 0:
-                    continue
-                for _, hi, *_ in self.spans:
-                    if (
-                        hi > lo
-                        and self.raw[lo:hi].decode("utf-8", errors="replace") == text
-                    ):
-                        start, end = lo, hi
-                        break
-                if start >= 0:
-                    break
-        if start < 0:
-            raise RuntimeError(
-                "Visible text cannot be aligned to generated token bytes"
-            )
+        if not isinstance(text, SourceText) or text.owner is not self:
+            raise RuntimeError("Visible text has no token-byte source spans")
         result = []
-        while self.emitted < len(self.spans):
-            _lo, hi, token_id, record = self.spans[self.emitted]
-            if hi > end:
-                break  # A parser may split a token across two text deltas.
-            self.emitted += 1
-            if hi <= start:
-                continue  # Reasoning/tool delimiters removed by the parsers.
-            entry = self.codec.candidate(
-                token_id, record.logprob if record.rank <= 20 else -9999.0
-            )
-            entry["top_logprobs"] = [
-                self.codec.candidate(t, p) for t, p in record.top[: self.top_k]
-            ]
-            result.append(entry)
-        self.cursor = end
-        # Streaming requests retain only unconsumed parser/UTF-8 fragments.
-        # Top-K records for the entire response must not accumulate here.
-        self.spans = self.spans[self.emitted :]
-        self.emitted = 0
-        cut = min(self.cursor, self.spans[0][0]) if self.spans else self.cursor
-        if cut:
-            del self.raw[:cut]
-            self.cursor -= cut
-            self.spans = [
-                (lo - cut, hi - cut, token, record)
-                for lo, hi, token, record in self.spans
-            ]
+        for start, end in text.source_ranges:
+            for record in self.store.within(start, end):
+                _, _, token, logprob, rank, *top = record
+                entry = self.codec.candidate(token, logprob if rank <= 20 else -9999.0)
+                entry["top_logprobs"] = [
+                    self.codec.candidate(t, p)
+                    for t, p in zip(top[::2], top[1::2])
+                    if t >= 0
+                ]
+                result.append(entry)
         return result
+
+    def close(self):
+        self.store.close()
 
 
 class LogprobCollector:
@@ -149,39 +145,63 @@ class LogprobCollector:
     async def get(self):
         payload = await self.source.get()
         index, chunk = payload if isinstance(payload, tuple) else (0, payload)
-        if chunk.get("token_ids"):
-            self.trackers[index].feed(chunk["token_ids"], chunk.get("logprobs"))
+        chunk["text"] = self.trackers[index].feed(
+            chunk.get("token_ids", []),
+            chunk.get("logprobs"),
+            finished=bool(chunk.get("finished")),
+        )
         return payload
 
 
 async def stream_logprobs(source, trackers):
+    # create_chat_chunk attaches probabilities before serialization, while source
+    # spans still exist. Never search rendered SSE text or re-encode its frames.
     try:
         async for frame in source:
-            for data in iter_sse_data(frame):
-                if data == "[DONE]":
-                    yield "data: [DONE]\n\n"
-                    continue
-                chunk = json.loads(data)
-                for choice in chunk.get("choices", []):
-                    tracker = trackers[choice["index"]]
-                    values = {}
-                    for field in ("reasoning_content", "content"):
-                        if text := choice.get("delta", {}).get(field):
-                            values[field] = tracker.take(text)
-                    if values:
-                        choice["logprobs"] = values
-                yield data_frame(chunk)
+            yield frame
     finally:
-        await source.aclose()
+        try:
+            await source.aclose()
+        finally:
+            for tracker in trackers:
+                tracker.close()
 
 
-def response_logprobs(response, outputs, codec, top_k):
+def response_logprobs(
+    response,
+    outputs,
+    codec,
+    top_k,
+    *,
+    reasoning,
+    tools=None,
+    tool_choice=None,
+    tool_parser_cls=None
+):
+    from .serving_chat import _tool_parser_for_request
+    from .tool_parser import parse_tool_calls
+    from .tool_parser.registry import forbids_tool_calls
+
     for choice, output in zip(response.choices, outputs):
         tracker = LogprobTracker(codec, top_k)
-        tracker.feed(output["token_ids"], output.get("logprobs"))
-        values = {"content": []}
-        for field in ("reasoning_content", "content"):
-            if text := choice["message"].get(field):
-                values[field] = tracker.take(text)
-        choice["logprobs"] = values
-    return response
+        try:
+            source = tracker.feed(
+                output["token_ids"], output.get("logprobs"), finished=True
+            )
+            thought, answer = reasoning.split(source)
+            content, _ = parse_tool_calls(
+                answer,
+                tools,
+                parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
+                suppress_calls=forbids_tool_calls(tool_choice),
+            )
+            # Consume spans independently; reasoning and content can be interleaved
+            # in source order, then joined into separate non-streaming fields.
+            values = {"content": tracker.take(content)}
+            choice["message"]["content"] = str(content)
+            if thought is not None:
+                choice["message"]["reasoning_content"] = str(thought)
+                values["reasoning_content"] = tracker.take(thought)
+            choice["logprobs"] = values
+        finally:
+            tracker.close()

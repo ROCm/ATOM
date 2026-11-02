@@ -13,7 +13,7 @@ from atom.entrypoints.openai.chat_logprobs import (
     TokenBytes,
     stream_logprobs,
 )
-from atom.entrypoints.openai.sse import data_frame, iter_sse_data
+from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.model_engine.token_logprobs import TokenLogprob
 
@@ -51,8 +51,8 @@ def rec(rank=1):
 
 def test_bytes_across_chinese_tokens_and_special_eos():
     tracker = LogprobTracker(codec(), 1)
-    tracker.feed([2, 3, 4, 7], [rec()] * 4)
-    rows = tracker.take("中")
+    text = tracker.feed([2, 3, 4, 7], [rec()] * 4, finished=True)
+    rows = tracker.take(text)
     assert len(rows) == 3
     assert bytes(b for row in rows for b in row["bytes"]) == "中".encode()
     assert rows[0]["bytes"] == [0xE4]
@@ -61,17 +61,17 @@ def test_bytes_across_chinese_tokens_and_special_eos():
 
 def test_reasoning_delimiter_and_rank_sentinel():
     tracker = LogprobTracker(codec(), 0)
-    tracker.feed([0, 5, 6], [rec(), rec(), rec(21)])
-    assert tracker.take("hello")[0]["logprob"] == -0.25
-    rows = tracker.take("40")
+    text = tracker.feed([0, 5, 6], [rec(), rec(), rec(21)], finished=True)
+    assert tracker.take(text[:5])[0]["logprob"] == -0.25
+    rows = tracker.take(text[-2:])
     assert len(rows) == 1 and rows[0]["logprob"] == -9999.0
     assert rows[0]["top_logprobs"] == []
 
 
 def test_truncated_utf8_keeps_original_token_bytes():
     tracker = LogprobTracker(codec())
-    tracker.feed([2], [rec()])
-    rows = tracker.take("\ufffd")
+    text = tracker.feed([2], [rec()], finished=True)
+    rows = tracker.take(text)
     assert rows[0]["bytes"] == [0xE4]
     assert rows[0]["logprob"] == -0.25
 
@@ -94,19 +94,17 @@ def test_coalescing_keeps_probabilities_and_choice_identity():
         wrapper = LogprobCollector(source, codec(), 2, n=2)
         index, chunk = await wrapper.get()
         assert index == 1 and len(chunk["logprobs"]) == 2
-        assert wrapper.trackers[0].spans == []
+        assert wrapper.trackers[0].store.count == 0
 
         async def frames():
-            yield data_frame(
-                {
-                    "choices": [
-                        {
-                            "index": 1,
-                            "delta": {"content": "hello world"},
-                            "logprobs": None,
-                        }
-                    ]
-                }
+            from atom.entrypoints.openai.serving_chat import create_chat_chunk
+
+            yield create_chat_chunk(
+                "req",
+                "model",
+                delta={"content": chunk["text"]},
+                index=1,
+                with_logprobs=True,
             )
             yield "data: [DONE]\n\n"
 
@@ -129,10 +127,11 @@ def test_missing_probability_does_not_succeed_silently():
 def test_stream_tracker_releases_consumed_records_and_preserves_partial_tokens():
     tracker = LogprobTracker(codec())
     for _ in range(100):
-        tracker.feed([0], [rec()])
-        assert tracker.take("hell") == []
-        assert len(tracker.take("o")) == 1
-        assert not tracker.raw and not tracker.spans
+        text = tracker.feed([0], [rec()])
+        assert tracker.take(text[:4]) == []
+        assert len(tracker.take(text[4:])) == 1
+    tracker.close()
+    assert tracker.store.file.closed
 
 
 def test_non_bytelevel_tokenizer_is_explicitly_rejected():

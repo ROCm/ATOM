@@ -194,6 +194,7 @@ def create_chat_chunk(
     *,
     include_usage: bool = False,
     kv_transfer_params: dict | None = None,
+    with_logprobs: bool = False,
 ) -> str:
     """Create a chat completion chunk in SSE format.
 
@@ -214,6 +215,22 @@ def create_chat_chunk(
             }
         ],
     }
+    if with_logprobs and delta:
+        from .source_text import SourceText
+
+        probabilities = {
+            field: text.owner.take(text)
+            for field, text in delta.items()
+            if field in ("content", "reasoning_content")
+            and isinstance(text, SourceText)
+            and text
+        }
+        if probabilities:
+            chunk["choices"][0]["logprobs"] = probabilities
+        chunk["choices"][0]["delta"] = {
+            field: str(text) if isinstance(text, SourceText) else text
+            for field, text in delta.items()
+        }
     if usage is not None or include_usage:
         chunk["usage"] = usage
     if kv_transfer_params is not None:
@@ -292,6 +309,8 @@ async def stream_chat_response(
         if usage_on_finish and include_usage
         else create_chat_chunk
     )
+    if getattr(stream_collector, "trackers", None) is not None:
+        make_chunk = partial(make_chunk, with_logprobs=True)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
@@ -601,6 +620,8 @@ async def stream_chat_response_fanout(
         if usage_on_finish and include_usage
         else create_chat_chunk
     )
+    if getattr(shared_collector, "trackers", None) is not None:
+        make_chunk = partial(make_chunk, with_logprobs=True)
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     # Every sibling answers the same prompt, so they start in the same state.

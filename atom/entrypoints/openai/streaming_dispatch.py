@@ -115,6 +115,8 @@ class IncrementalStreamDetokenizer:
     # it. Maintained whether or not reuse is on, so the two paths never diverge
     # in state -- only in whether they pay for the decode.
     last_delta: str = ""
+    # None preserves the tokenizer's configured policy for ordinary requests.
+    clean_up_tokenization_spaces: bool | None = None
 
     def update(self, token_ids: list[int], finished: bool) -> str:
         """The text this stream has not been given yet, from its next tokens.
@@ -155,6 +157,11 @@ class IncrementalStreamDetokenizer:
         at sixty-four, on DeepSeek-V4-Pro.
         """
         self.tokens.extend(token_ids)
+        decode_kwargs = (
+            {}
+            if self.clean_up_tokenization_spaces is None
+            else {"clean_up_tokenization_spaces": self.clean_up_tokenization_spaces}
+        )
         reuse = _DELTA_REUSE
         if reuse.enabled and not reuse.should_audit():
             prefix_text = self.last_delta
@@ -162,6 +169,7 @@ class IncrementalStreamDetokenizer:
             prefix_text = self.tokenizer.decode(
                 self.tokens[self.prefix_offset : self.read_offset],
                 skip_special_tokens=True,
+                **decode_kwargs,
             )
             if reuse.enabled:
                 if prefix_text:
@@ -171,6 +179,7 @@ class IncrementalStreamDetokenizer:
         new_text = self.tokenizer.decode(
             self.tokens[self.prefix_offset :],
             skip_special_tokens=True,
+            **decode_kwargs,
         )
 
         if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):

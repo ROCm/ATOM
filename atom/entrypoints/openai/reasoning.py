@@ -328,6 +328,15 @@ class ReasoningChannel:
 
     def split(self, text: str) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``."""
+        from .source_text import SourceText, join_text
+
+        if isinstance(text, SourceText):
+            reader = self.stream()
+            segments = reader.process(text) + reader.flush()
+            return (
+                join_text(t for f, t in segments if f == "reasoning_content") or None,
+                join_text(t for f, t in segments if f == "content"),
+            )
         return separate_reasoning(text, self.starts_open, self.dialect)
 
     def stream(self) -> ReasoningFilter:

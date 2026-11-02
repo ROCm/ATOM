@@ -66,3 +66,22 @@ Only selected probabilities and candidate IDs/scores are copied to the host,
 not full vocabularies. Streaming byte trackers release consumed records. This
 is not a zero-overhead claim; throughput, tail latency, temporary device memory,
 and CPU/SSE costs need on/off comparisons at representative loads.
+
+## Review follow-up: alignment and bounded transfer
+
+Logprob-enabled requests explicitly disable tokenizer whitespace cleanup. Parsing
+keeps the original byte ranges through reasoning and tool regions, so visible
+text joined across hidden regions retains the correct token probabilities even
+when the same text also occurs inside tool arguments. SSE attaches probabilities
+before serialization; it does not search or reparse serialized text.
+
+Unclassified tool-like regions may become visible text at end of stream. Their
+fixed-width probability records are kept in a request-owned spool with a 64 KiB
+in-memory limit, spilling to a temporary file beyond that limit. The file is
+closed on completion or cancellation. This bounds retained probability RAM but
+adds file I/O for long enabled requests; it is not a zero-overhead feature.
+
+Mixed batches compact probability payloads to requesting sequences before CPU
+transfer and Python conversion. Deferred delivery uses the previous batch's
+request IDs and logprob mask, preserving token/probability alignment. Ordinary
+requests do not create source trackers or probability spools.

@@ -64,8 +64,15 @@ def test_mixed_requests_do_not_score_disabled_rows():
         logits, torch.tensor([1, 2]), batch
     )
     assert torch.isfinite(values).all()
-    assert values[0].count_nonzero() == 0
-    assert ranks[1, 0] == 2
+    assert values.shape == (1, 1, 3)
+    assert ranks[0, 0] == 2
+    records = unpack_token_logprobs(
+        (values.tolist(), _candidates.tolist(), ranks.tolist()),
+        [12, 7],
+        {12: (1,), 7: (2,)},
+        [False, True],
+    )
+    assert set(records) == {7}
 
 
 def test_zero_draft_step_uses_bonus_row():

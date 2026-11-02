@@ -18,6 +18,7 @@ compares them, but no second implementation to compare against.
 import logging
 
 from ..marker_scanner import MarkerScanner
+from ..source_text import join_text
 from .schema import ParamTypes, build_param_types
 from .tool_parser import (
     RegionParse,
@@ -90,7 +91,7 @@ class Region:
         literal that could close the region has actually arrived.
         """
         if len(self._parts) > 1:
-            self._parts = ["".join(self._parts)]
+            self._parts = [join_text(self._parts)]
         return self._parts[0] if self._parts else ""
 
     def take(self) -> str:
@@ -783,4 +784,4 @@ def flatten_tool_events(events: list) -> tuple[str, list[ToolCall]]:
                 )
             )
             pending = None
-    return "".join(content), calls
+    return join_text(content), calls

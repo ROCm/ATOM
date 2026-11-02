@@ -893,7 +893,13 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = (
+        tokenizer.decode(
+            all_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        if sampling_params.logprobs
+        else delivered_text(all_token_ids)
+    )
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -1164,7 +1170,15 @@ async def generate_async_fanout(
         )
         outputs.append(
             {
-                "text": delivered_text(per_tokens[i]),
+                "text": (
+                    tokenizer.decode(
+                        per_tokens[i],
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    if sampling_params.logprobs
+                    else delivered_text(per_tokens[i])
+                ),
                 "token_ids": per_tokens[i],
                 "logprobs": per_logprobs[i] if per_logprobs is not None else None,
                 "finish_reason": per_finish_reason[i],
@@ -1288,6 +1302,8 @@ async def setup_streaming_request(
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
     detokenizer = _stream_batch_dispatcher.new_state()
+    if sampling_params.logprobs:
+        detokenizer.detokenizer.clean_up_tokenization_spaces = False
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1499,6 +1515,8 @@ async def setup_streaming_request_fanout(
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
         detokenizer = _stream_batch_dispatcher.new_state()
+        if sampling_params.logprobs:
+            detokenizer.detokenizer.clean_up_tokenization_spaces = False
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -2069,6 +2087,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 outputs if effective_n > 1 else [final_output],
                 logprob_codec,
                 request.top_logprobs or 0,
+                reasoning=_reasoning,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
