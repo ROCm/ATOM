@@ -45,14 +45,16 @@ def config(**overrides):
     )
 
 
-def runner(start, end, cfg, *, mla=False, wrappers=()):
+def runner(start, end, cfg, *, mla=False, wrappers=(), dummy=False):
     md = SimpleNamespace()
+    context = SimpleNamespace(is_dummy_run=dummy)
     ns = {
         "get_pp_group": lambda: SimpleNamespace(
             world_size=4, is_first_rank=start == 0, is_last_rank=end == 60
         ),
         "get_forward_context": lambda: SimpleNamespace(
-            attn_metadata=SimpleNamespace(sparse_attention_metadata=md)
+            attn_metadata=SimpleNamespace(sparse_attention_metadata=md),
+            context=context,
         ),
         "_is_minimax_m3_config": _is_minimax_m3_config,
         "logger": logging.getLogger(__name__),
@@ -67,6 +69,7 @@ def runner(start, end, cfg, *, mla=False, wrappers=()):
     obj = cls()
     obj.config = SimpleNamespace(hf_config=cfg)
     obj.has_mla_indexer = mla
+    obj._test_context = context
     obj._test_layer_range = range(start, end)
     obj.model = torch.nn.Module()
     obj.model.start_layer, obj.model.end_layer = start, end
@@ -164,6 +167,30 @@ def test_wrapped_model_transfers_topk_at_each_equal_boundary(model_schedule, wra
         assert obj._pp_recv_needs_sparse == (start != 0)
         assert obj._pp_send_needs_sparse == (start != 45)
         incoming, _ = stage(obj, md, cfg, model_schedule, incoming, "mxfp4", "prefill")
+
+
+def test_dummy_forward_relays_empty_values_then_real_forward_refreshes(model_schedule):
+    cfg = config()
+    stages = [runner(i, i + 15, cfg, dummy=True) for i in range(0, 60, 15)]
+    incoming = None
+    for obj, md in stages:
+        obj._load_pp_shared_indexer(incoming)
+        # Attention deliberately skips dummy forwards, leaving the memo empty.
+        incoming = IntermediateTensors({"hidden_states": torch.zeros(6, 8)})
+        obj._store_pp_shared_indexer(incoming)
+        if obj._pp_send_needs_sparse:
+            assert tuple(incoming.tensors[k] for k in obj._pp_rank_local_keys) == (
+                None,
+                None,
+                None,
+            )
+    incoming = None
+    for obj, md in stages:
+        obj._test_context.is_dummy_run = False
+        incoming, traces = stage(
+            obj, md, cfg, model_schedule, incoming, "mxfp4", "prefill"
+        )
+        assert all(value[0] is not None for value in traces.values())
 
 
 @pytest.mark.parametrize(

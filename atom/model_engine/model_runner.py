@@ -3150,9 +3150,14 @@ class ModelRunner:
         if not self._pp_send_needs_sparse:
             return
         if self._pp_rank_local_keys:
-            md = get_forward_context().attn_metadata.sparse_attention_metadata
-            state = md._index_topk_cache_state
-            value = state["topk"]["value"] if "topk" in state else state["pp_topk"]
+            fwd_ctx = get_forward_context()
+            if fwd_ctx.context.is_dummy_run:
+                # Dummy forwards skip attention and produce no top-k memo.
+                value = (None,) * len(self._pp_rank_local_keys)
+            else:
+                md = fwd_ctx.attn_metadata.sparse_attention_metadata
+                state = md._index_topk_cache_state
+                value = state["topk"]["value"] if "topk" in state else state["pp_topk"]
             model_output.tensors.update(zip(self._pp_rank_local_keys, value))
         else:
             # Use the physical producer row width and the PCP-local token count.
