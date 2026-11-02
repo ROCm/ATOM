@@ -124,7 +124,7 @@ def test_missing_probability_does_not_succeed_silently():
         tracker.feed([0], None)
 
 
-def test_stream_tracker_releases_consumed_records_and_preserves_partial_tokens():
+def test_stream_tracker_preserves_partial_tokens_and_closes_store():
     tracker = LogprobTracker(codec())
     for _ in range(100):
         text = tracker.feed([0], [rec()])
@@ -228,3 +228,24 @@ def test_top_logprobs_dependency_is_rejected_before_work(server, stream):
     assert response.status_code == 400
     assert "logprobs=true" in response.json()["error"]["message"]
     assert not server.generations and not server.templates
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_rapidserve_logprobs_rejected_before_generation(server, stream, enabled):
+    api_server.engine.config.enable_rapidserve = True
+    response = post(
+        "/v1/chat/completions",
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": enabled,
+            "stream": stream,
+        },
+    )
+    if enabled:
+        assert response.status_code == 400
+        assert "RapidServe" in response.json()["error"]["message"]
+        assert not server.generations and not server.templates
+    else:
+        assert response.status_code == 200, response.text
+        assert server.generations

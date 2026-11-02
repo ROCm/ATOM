@@ -44,7 +44,9 @@ logprob arrays contain committed tokens only, not speculative placeholders.
   included. Normal tool requests are supported; probability fields describe
   visible content/reasoning, not tool arguments. Multimodal input and P/D KV
   transfer with logprobs are rejected. Their existing behavior is retained when
-  logprobs is disabled. No image implementation is added.
+  logprobs is disabled. RapidServe requests with logprobs are also rejected before
+  inference: its prefill handoff transfers the first token without its probability.
+  No image implementation is added.
 - Forced synthetic acceptance is rejected. It cannot validate target-model
   semantics or token probabilities.
 - This does not add logprob fields to Responses or Anthropic Messages.
@@ -63,9 +65,11 @@ Padded positions within requesting sequences are safely masked at delivery;
 avoiding their computation is a later optimization opportunity.
 
 Only selected probabilities and candidate IDs/scores are copied to the host,
-not full vocabularies. Streaming byte trackers release consumed records. This
-is not a zero-overhead claim; throughput, tail latency, temporary device memory,
-and CPU/SSE costs need on/off comparisons at representative loads.
+not full vocabularies. Streaming probability records remain in the request-owned
+spool until close; reading a source span does not consume or release its records.
+The spool bounds its RAM buffer and spills to disk. This is not a zero-overhead
+claim; throughput, tail latency, temporary device memory, and CPU/SSE costs need
+on/off comparisons at representative loads.
 
 ## Review follow-up: alignment and bounded transfer
 

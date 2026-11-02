@@ -128,3 +128,21 @@ class TestPreprocessFanout:
             stream_callback=cb,
         )
         assert all(s.stream_callback is cb for s in seqs)
+
+
+@pytest.mark.parametrize("n", [1, 2])
+@pytest.mark.parametrize("rapidserve", [False, True])
+@pytest.mark.parametrize("logprobs", [False, True])
+def test_rapidserve_logprob_admission(n, rapidserve, logprobs):
+    proc = _make_processor()
+    proc.config.enable_rapidserve = rapidserve
+    params = SamplingParams(n=n, logprobs=logprobs)
+    if rapidserve and logprobs:
+        with pytest.raises(ValueError, match="RapidServe"):
+            proc.preprocess_fanout("hello", params)
+        proc.tokenizer.encode.assert_not_called()
+        assert not proc.requests
+    else:
+        seqs = proc.preprocess_fanout("hello", params)
+        assert len(seqs) == n
+        assert all(s.return_logprobs == logprobs for s in seqs)

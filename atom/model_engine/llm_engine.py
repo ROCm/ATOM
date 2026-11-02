@@ -861,6 +861,12 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        # RapidServe PrefillDone carries the first token without probabilities.
+        # Reject before tokenization/registration instead of misaligning output.
+        if getattr(sampling_params, "logprobs", False) and getattr(
+            self.config, "enable_rapidserve", False
+        ):
+            raise ValueError("logprobs is unavailable with RapidServe")
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(

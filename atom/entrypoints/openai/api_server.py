@@ -1786,6 +1786,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         if request.logprobs:
             from .chat_logprobs import token_bytes
 
+            if getattr(engine.config, "enable_rapidserve", False):
+                raise ValueError("logprobs is unavailable with RapidServe")
             spec = getattr(engine.config, "speculative_config", None)
             if (
                 synthetic_token_text is not None
