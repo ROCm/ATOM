@@ -638,7 +638,6 @@ def run_pa_decode(
     plan_step_owner=None,
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
-    require_flydsl: bool = False,
     flydsl_seqs: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
@@ -656,12 +655,6 @@ def run_pa_decode(
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
-
-    ``require_flydsl``: the caller already decided this call runs on FlyDSL
-    (``PagedAttentionImpl._flydsl_takes_decode``); if FlyDSL declines it on a
-    gluon GPU, raise before any plan or scratch is built rather than fall back
-    to gluon, which may be outside its query-length envelope. A GPU without
-    gluon raises below as it always has.
 
     ``flydsl_seqs``: the sequence count the caller already got from
     ``flydsl_decode_seqs`` for these exact arguments
@@ -687,12 +680,6 @@ def run_pa_decode(
             sliding_window=sliding_window,
             ps=ps,
             max_context_length=max_context_length,
-        )
-    if require_flydsl and not flydsl_seqs and pa_decode_gluon_supports_arch():
-        raise NotImplementedError(
-            "pa_decode: the caller routed this call to FlyDSL, which declined it "
-            f"(rows={q.shape[0]}, max_seqlen_q={max_seqlen_q}, "
-            f"padded_seqs={context_lens.shape[0]}, q dtype {q.dtype})"
         )
     # Inside the guard, not before it: this runs 63 times per decode step and
     # attention is an eager region of the token graphs, so replay does not

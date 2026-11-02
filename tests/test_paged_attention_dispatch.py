@@ -408,7 +408,7 @@ class TestFlyDSLPastGluon:
     fp8 KV with per-token scales, qlen 6 -> 48 rows. _dispatch_decode still
     sends it to paged_attention_unified; the FlyDSL decision is made there on
     the call's own tensors (the same check run_pa_decode applies) and passed
-    down as require_flydsl.
+    down as flydsl_seqs.
     """
 
     HEADS, KV_HEADS, HEAD_DIM, BLOCK = 8, 1, 256, 16
@@ -575,52 +575,61 @@ class TestFlyDSLPastGluon:
         assert hit.value.args == (4,)
         assert len(asked) == 1
 
-    def test_flydsl_off_hints_once_and_skips_the_gate(self, monkeypatch, caplog):
-        """A default user past the gluon envelope gets one line naming the
-        opt-in; aiter's predicate is never asked."""
+    @pytest.mark.parametrize("per_token", [False, True])
+    def test_flydsl_off_names_the_opt_in_once(self, monkeypatch, caplog, per_token):
+        """A default user past the gluon envelope is told about ATOM_PA_FLYDSL
+        once, and aiter's predicate is never asked. Per-token FP8 KV: unified
+        refuses those scales, so the refusal carries the hint and no info line
+        claims the call runs on unified."""
         import logging
+
+        import torch
 
         from atom.model_ops import attention_mha as mha
 
         calls = self._flydsl_on(monkeypatch, on=False)
         monkeypatch.setattr(mha, "_flydsl_off_hint_logged", False)
+        monkeypatch.setattr(mha, "unified_attention", lambda *a, **k: None)
+        layer = self._layer(scale=1.0, kv_scale=None)
         q, kc, vc, md = self._call(6)
+        md.cu_seqlens_q = md.max_seqlen_k = None
+        scale = (
+            torch.empty(64, self.KV_HEADS, self.BLOCK, device="meta")
+            if per_token
+            else None
+        )
+        args = (layer, q, None, None, kc, vc, scale, scale)
+        ctx = SimpleNamespace(attn_metadata=md)
         with caplog.at_level(logging.INFO, logger="atom"):
             for _ in range(3):
-                assert not self._layer()._flydsl_takes_decode(q, kc, vc, None, None, md)
+                if per_token:
+                    with pytest.raises(NotImplementedError, match="ATOM_PA_FLYDSL=1"):
+                        mha.PagedAttentionImpl.paged_attention_unified(*args, ctx)
+                else:
+                    mha.PagedAttentionImpl.paged_attention_unified(*args, ctx)
         hints = [r for r in caplog.records if "ATOM_PA_FLYDSL=1" in r.getMessage()]
-        assert len(hints) == 1
-        assert "max_seqlen_q=6 x 8" in hints[0].getMessage()
+        assert len(hints) == (0 if per_token else 1)
+        if not per_token:
+            assert "max_seqlen_q=6 x 8" in hints[0].getMessage()
         assert not calls
 
-    @pytest.mark.parametrize("gluon", [True, False])
-    def test_a_required_flydsl_call_never_reaches_gluon_or_a_plan(
-        self, monkeypatch, gluon
-    ):
-        """Feasibility first: no plan or scratch is built on the refusal, and a
-        GPU without gluon keeps its own error."""
+    def test_no_hint_inside_the_gluon_envelope(self, monkeypatch):
+        """MTP-3 (qlen 4) keeps gluon; the refusal names no opt-in."""
         import torch
 
-        from atom.model_ops import base_attention as ba
+        from atom.model_ops import attention_mha as mha
 
-        monkeypatch.setattr(ba, "pa_decode_gluon_supports_arch", lambda: gluon)
-        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
-        monkeypatch.setattr(ba, "flydsl_decode_seqs", lambda **kw: None)
-
-        def boom(*a, **k):
-            raise AssertionError("built a plan or scratch before refusing")
-
-        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", boom)
-        monkeypatch.setattr(ba, "_flydsl_plan_scratch", boom)
-        monkeypatch.setattr(torch.ops.aiter, "pa_decode_gluon", boom, raising=False)
-        q, kc, vc, md = self._call(6)
-        err = NotImplementedError if gluon else RuntimeError
-        with pytest.raises(err, match="declined" if gluon else "no gluon fallback"):
-            ba.run_pa_decode(
-                *(q, q, kc, vc, md.context_lens, md.block_tables, 1.0, 6, 8, 256),
-                *(_FP8, None, None, None),
-                require_flydsl=True,
+        self._flydsl_on(monkeypatch, on=False)
+        layer = self._layer()
+        q, kc, vc, md = self._call(4)
+        assert not layer._flydsl_route_open(md)
+        scale = torch.empty(64, self.KV_HEADS, self.BLOCK, device="meta")
+        with pytest.raises(NotImplementedError) as err:
+            mha.PagedAttentionImpl.paged_attention_unified(
+                *(layer, q, None, None, kc, vc, scale, scale),
+                SimpleNamespace(attn_metadata=md),
             )
+        assert "ATOM_PA_FLYDSL" not in str(err.value)
 
 
 def _gpu_flydsl_arch():
@@ -638,7 +647,7 @@ def _gpu_flydsl_arch():
 def test_qwen35_mtp5_shape_is_accepted_by_real_aiter(monkeypatch, qlen):
     """No monkeypatched probe: ATOM's gate accepts the Qwen3.5 MTP-5 call and
     aiter's own pa_decode validation and kernel then take it, with per-token
-    fp8 KV scales and require_flydsl=True (a decline would raise)."""
+    fp8 KV scales and the count the gate returned passed as flydsl_seqs."""
     import torch
 
     from atom.model_ops import base_attention as ba
@@ -690,7 +699,7 @@ def test_qwen35_mtp5_shape_is_accepted_by_real_aiter(monkeypatch, qlen):
         k_scale=k_scale,
         v_scale=v_scale,
         max_context_partition_num=splits,
-        require_flydsl=True,
+        flydsl_seqs=seqs,
         **common,
     )
     torch.cuda.synchronize()

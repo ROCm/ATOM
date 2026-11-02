@@ -188,16 +188,23 @@ class PagedAttentionImpl(nn.Module):
             return False
         return q.shape[1] % k.shape[1] == 0
 
-    def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
+    @staticmethod
+    def _per_token_kv(k_scale, v_scale) -> bool:
+        return (k_scale is not None and k_scale.numel() > 1) or (
+            v_scale is not None and v_scale.numel() > 1
+        )
+
+    def _reject_per_token_scales_on_unified(
+        self, k_scale, v_scale, phase: str, flydsl_would_take: bool = False
+    ):
         """unified_attention carries one descale for the whole tensor.
 
         Feeding it a per-token cache is not an error downstream, just wrong
         numbers, so it has to be refused here. Both phases route into unified on
-        the same conditions, so both check.
+        the same conditions, so both check. ``flydsl_would_take``: the decode
+        is one ATOM_PA_FLYDSL=1 would offer to FlyDSL, so the error says so.
         """
-        if (k_scale is not None and k_scale.numel() > 1) or (
-            v_scale is not None and v_scale.numel() > 1
-        ):
+        if self._per_token_kv(k_scale, v_scale):
             if phase == "decode" and not pa_decode_gluon_supports_arch():
                 reason = (
                     "set ATOM_PA_FLYDSL=1"
@@ -209,9 +216,15 @@ class PagedAttentionImpl(nn.Module):
                     f"cache on this GPU: {reason}, unified_attention cannot "
                     "carry per-token KV scales, and there is no gluon fallback"
                 )
+            hint = (
+                "; ATOM_PA_FLYDSL=1 lets aiter's FlyDSL pa_decode take it "
+                "(needs aiter with ROCm/aiter#7206)"
+                if flydsl_would_take
+                else ""
+            )
             raise NotImplementedError(
                 f"layer {self.layer_num} takes unified_attention for {phase}, "
-                "which cannot carry its per-token KV scales"
+                f"which cannot carry its per-token KV scales{hint}"
             )
 
     def forward_impl(
@@ -623,6 +636,20 @@ class PagedAttentionImpl(nn.Module):
             return k_scale.unsqueeze(-1), v_scale.unsqueeze(-1)
         return k_scale, v_scale
 
+    def _flydsl_route_open(self, attn_metadata) -> bool:
+        """Whether this unified-bound decode is one ATOM_PA_FLYDSL offers to
+        FlyDSL: not forced to unified, paged layout, no window, and on a gluon
+        GPU past the gluon envelope (inside it the gluon route is kept)."""
+        if (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or self.use_flash_layout
+            or self.sliding_window > 0
+        ):
+            return False
+        return not pa_decode_gluon_supports_arch() or gluon_decode_over_limit(
+            attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
+        )
+
     def _flydsl_takes_decode(
         self, q, k_cache, v_cache, k_scale, v_scale, attn_metadata
     ):
@@ -637,36 +664,15 @@ class PagedAttentionImpl(nn.Module):
         the count is passed down as ``flydsl_seqs``, so aiter's predicate is
         asked once per call and the two cannot disagree.
 
-        With ATOM_PA_FLYDSL unset, such a call stays on unified and one info
-        line per process says that the flag would route it to FlyDSL.
+        With ATOM_PA_FLYDSL unset such a call stays on unified;
+        ``paged_attention_unified`` says what the flag would change.
 
         ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
 
         gfx1250 with per-token FP8 KV past qlen 4 is decided by the same check;
         it is not exercised by this path's tests or runs (out of scope here).
         """
-        if (
-            envs.ATOM_USE_UNIFIED_ATTN
-            or self.use_flash_layout
-            or self.sliding_window > 0
-        ):
-            return False
-        if pa_decode_gluon_supports_arch() and not gluon_decode_over_limit(
-            attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
-        ):
-            return False
-        if not envs.ATOM_PA_FLYDSL:
-            global _flydsl_off_hint_logged
-            if not _flydsl_off_hint_logged:
-                _flydsl_off_hint_logged = True
-                logger.info(
-                    "decode with max_seqlen_q=%d x %d q heads per kv head runs on "
-                    "unified_attention because ATOM_PA_FLYDSL is unset; "
-                    "ATOM_PA_FLYDSL=1 lets aiter's FlyDSL pa_decode take it "
-                    "(needs aiter with ROCm/aiter#7206)",
-                    attn_metadata.max_seqlen_q,
-                    self.num_heads // self.num_kv_heads,
-                )
+        if not envs.ATOM_PA_FLYDSL or not self._flydsl_route_open(attn_metadata):
             return False
         k_scale, v_scale = self._pa_decode_kv_scales(k_scale, v_scale)
         return (
@@ -721,7 +727,25 @@ class PagedAttentionImpl(nn.Module):
                 fwd_ctx,
                 flydsl_seqs=flydsl_seqs,
             )
-        self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
+        # A default user gets the opt-in named once: in the per-token FP8 KV
+        # refusal (unified cannot carry those scales), else in one info line.
+        flydsl_would_take = not envs.ATOM_PA_FLYDSL and self._flydsl_route_open(
+            attn_metadata
+        )
+        self._reject_per_token_scales_on_unified(
+            k_scale, v_scale, "decode", flydsl_would_take
+        )
+        global _flydsl_off_hint_logged
+        if flydsl_would_take and not _flydsl_off_hint_logged:
+            _flydsl_off_hint_logged = True
+            logger.info(
+                "decode with max_seqlen_q=%d x %d q heads per kv head runs on "
+                "unified_attention because ATOM_PA_FLYDSL is unset; "
+                "ATOM_PA_FLYDSL=1 lets aiter's FlyDSL pa_decode take it "
+                "(needs aiter with ROCm/aiter#7206)",
+                attn_metadata.max_seqlen_q,
+                self.num_heads // self.num_kv_heads,
+            )
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
