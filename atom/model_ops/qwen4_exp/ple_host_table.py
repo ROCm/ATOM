@@ -7,8 +7,6 @@ so a CPU-only machine can import and test it. The kernel that reads the rows
 is `ops.ple.sharded_table_lookup`.
 """
 
-import ctypes
-import functools
 import logging
 import threading
 from collections.abc import Callable
@@ -20,67 +18,21 @@ from atom.model_ops.engram import host_memory
 logger = logging.getLogger("atom")
 
 
-@functools.cache
-def _hip_device_pointer():
-    # The runtime `host_memory` page-locks with: another one does not know
-    # its allocations.
-    hip = host_memory._hip_runtime()
-    if hip is None:
-        return None
-    try:
-        fn = hip.hipHostGetDevicePointer
-    except AttributeError:
-        return None
-    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
-    return fn
-
-
-def device_address(host_address: int) -> int:
-    """Where the device reaches page-locked host memory at `host_address`.
-
-    Not always the host address: memory registered in place
-    (`hipHostRegister`) is mapped at a different device address, and a kernel
-    handed the host one faults. Identity where there is no HIP runtime.
-    """
-    fn = _hip_device_pointer()
-    if fn is None:
-        return host_address
-    out = ctypes.c_void_p()
-    if fn(ctypes.byref(out), host_address, 0) != 0 or not out.value:
-        raise RuntimeError(f"no device address for host memory at {host_address:#x}")
-    return out.value
-
-
 class PleHostTable:
     """One rank's rows `[vocab_start, vocab_end)` of a table loaded shard by shard.
 
-    Each checkpoint shard is copied into page-locked memory as it arrives
-    (`host_memory.pin_rows`), so the table is never whole anywhere and never
-    in HBM. `shard_bases` then gives, per shard, the address of its first
-    global row for the device to read over UVA.
+    Each checkpoint shard is copied into page-locked memory as it arrives, so
+    the table is never whole anywhere and never in HBM; `shard_bases` gives the
+    device the address of each shard's first global row. Always copied: the
+    shards share safetensors files with other weights, and registering part of
+    a file mapping in place makes host-to-device copies from the rest of it
+    fail.
 
-    Always copied, whatever `ATOM_ENGRAM_UVA_COPY` says: the shards share
-    safetensors files with other weights, and registering part of a file
-    mapping in place makes ordinary host-to-device copies from the rest of
-    that mapping fail (`hipErrorInvalidValue`, or a GPU memory fault). The
-    registered pages would also be private copies (the mapping is
-    `MAP_PRIVATE`), so registering would not share them across processes.
-    And the kernel reads a shard from one base address, while in-place
-    registrations of adjacent, unaligned shards share their boundary pages
-    (`host_memory._PageRuns`): a shard then spans device ranges that are
-    mapped apart.
+    One shard that cannot be page-locked moves the table to `device`, as the
+    data of `weight`, so it is released and resumed with the parameters.
 
-    One shard that cannot be page-locked moves the table to `device` -- the
-    rows already pinned are copied over -- and the addresses point there
-    instead. There it is the data of `weight`, the module's parameter, so
-    releasing and resuming the weights frees and reallocates it as they would
-    an HBM embedding; `shard_bases` then has to be asked again. Page-locked
-    rows are freed and reallocated the same way (`release` / `resume`).
-
-    Loader threads may call `load_rows` concurrently. Each page-locks its rows
-    outside `_lock` -- the copy is most of the load, and under the lock the
-    threads would take turns -- and records them under it, as everything
-    reading or changing `_rows` and `_in_hbm` does.
+    Loader threads may call `load_rows` concurrently: the copy runs outside
+    `_lock` (it is most of the load), and `_rows` / `_in_hbm` change under it.
     """
 
     def __init__(
@@ -120,22 +72,19 @@ class PleHostTable:
     def load_rows(self, shard: int, row_start: int, rows: torch.Tensor) -> None:
         """Take this rank's rows of checkpoint shard `shard`, from global row
         `row_start`."""
-        if shard not in self.shards or not (
-            self.vocab_start <= row_start
-            and row_start + rows.shape[0] <= self.vocab_end
-        ):
-            raise ValueError(
-                f"{self.prefix}: rows [{row_start}, {row_start + rows.shape[0]}) "
-                f"of shard {shard} are outside [{self.vocab_start}, "
-                f"{self.vocab_end})"
-            )
         if not self._in_hbm:
             pinned = host_memory.pin_rows([rows.contiguous()], copy=True)
             with self._lock:
                 if pinned is not None and not self._in_hbm:
                     self._rows[shard] = (row_start, pinned[0])
                     return
-                self._to_hbm(pin_failed=True)
+                if not self._in_hbm:
+                    logger.warning(
+                        "%s: page-locking the n-gram table on the host failed; "
+                        "falling back to HBM",
+                        self.prefix,
+                    )
+                self._to_hbm()
         local = row_start - self.vocab_start
         self.weight.data.narrow(0, local, rows.shape[0]).copy_(rows)
         with self._lock:
@@ -169,13 +118,9 @@ class PleHostTable:
             )
 
     def sync_rows(self, first: int, rows: torch.Tensor) -> None:
-        """A weight sync's global rows `[first, first + len(rows))`: this
-        rank's part is written in place, over the page-locked rows or into
-        `weight` in HBM. Nothing is allocated or page-locked again, so
-        `shard_bases`, and the graphs that captured it, stay valid.
-
-        The caller makes sure no lookup is still reading the rows.
-        """
+        """Write this rank's part of global rows `[first, first + len(rows))`
+        in place, so `shard_bases` and the graphs that captured it stay valid.
+        The caller makes sure no lookup is still reading the rows."""
         self.check_rows(rows)
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
@@ -202,55 +147,33 @@ class PleHostTable:
                 "so they cannot be synced"
             )
 
-    def release(self) -> int:
-        """Free the page-locked rows, as releasing the weights frees the
-        parameters; the bytes freed. In HBM the table is `weight`, released
-        with them, and there is nothing else to free.
-
-        Nothing may read the rows any more: the graphs that captured
-        `shard_bases` are released first, and `hipHostFree` waits for the
-        device.
-        """
+    def release(self) -> None:
+        """Free the page-locked rows (in HBM, `weight` is released with the
+        parameters). The graphs that captured `shard_bases` are released
+        first, and `hipHostFree` waits for the device."""
         with self._lock:
             if self._in_hbm or self._released:
-                return 0
-            freed = sum(pinned.nbytes for _, pinned in self._rows.values())
+                return
             self._released = {
                 shard: (row_start, pinned.shape[0])
                 for shard, (row_start, pinned) in self._rows.items()
             }
             self._rows = {}
-        return freed
 
     def resume(self) -> None:
-        """Page-lock the rows `release` freed again, at new addresses, so
-        `shard_bases` has to be asked again. Their values are whatever the
-        memory held, as for the parameters `MemoryManagerMixin` reallocates:
-        the weight sync that follows a resume writes them. A shard that cannot
-        be page-locked moves the table to HBM, as at load."""
+        """Page-lock the released rows again, at new addresses and with
+        undefined values, as the parameters are reallocated; the weight sync
+        after a resume writes them."""
         with self._lock:
             released, self._released = self._released, {}
         for shard, (row_start, num_rows) in released.items():
             rows = torch.empty(num_rows, self.dim, dtype=self.dtype, device="cpu")
             self.load_rows(shard, row_start, rows)
 
-    def _to_hbm(self, pin_failed: bool) -> None:
-        """Make `weight` the table on `device`, holding every row pinned so
-        far; under `_lock`. Either page-locking a shard failed, or nothing
-        was loaded (a dummy load), which is expected and not warned about."""
+    def _to_hbm(self) -> None:
+        """Make `weight` the table on `device`, with the rows pinned so far;
+        under `_lock`."""
         if not self._in_hbm:
-            if pin_failed:
-                logger.warning(
-                    "%s: page-locking the n-gram table on the host failed; "
-                    "falling back to HBM",
-                    self.prefix,
-                )
-            else:
-                logger.info(
-                    "%s: no n-gram rows loaded (dummy load); the table is "
-                    "allocated in HBM",
-                    self.prefix,
-                )
             hbm = torch.empty(
                 self.vocab_end - self.vocab_start,
                 self.dim,
@@ -269,20 +192,15 @@ class PleHostTable:
         self, num_shards: int, initialize: Callable[[], None] | None = None
     ) -> torch.Tensor:
         """`[num_shards]` int64 on the CPU: the address of each local shard's
-        first global row (0 for another rank's shards).
-
-        Call once loading is done, and again whenever `weight` has been
-        reallocated or the rows resumed. A table that received nothing (a
-        dummy load) is allocated in `weight`, as an HBM embedding would be,
-        and filled by `initialize` -- left uninitialized without one; one
-        missing only some shards is an error.
-        """
+        first global row (0 for other ranks'). Ask again after a resume. A
+        table that received nothing (a dummy load) moves to `weight` and is
+        filled by `initialize`."""
         with self._lock:
             self._check_resumed("take its addresses")
             missing = [shard for shard in self.shards if shard not in self._rows]
             empty = len(missing) == len(self.shards)
             if empty:
-                self._to_hbm(pin_failed=False)
+                self._to_hbm()
             elif missing:
                 raise ValueError(
                     f"{self.prefix}: n-gram checkpoint shards {missing[:8]} were "
@@ -300,7 +218,6 @@ class PleHostTable:
                     address += (first - self.vocab_start) * row_bytes
                 else:
                     row_start, pinned = self._rows[shard]
-                    address = device_address(pinned.data_ptr())
-                    address -= (row_start - first) * row_bytes
+                    address = pinned.data_ptr() - (row_start - first) * row_bytes
                 bases[shard] = address
         return bases

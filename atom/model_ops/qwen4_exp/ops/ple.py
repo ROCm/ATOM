@@ -304,15 +304,10 @@ def _sharded_table_lookup_kernel(
     FP8: tl.constexpr,
     FNUZ: tl.constexpr,
 ):
-    """Gather rows of a table held as separately allocated shards.
-
-    `Bases[s]` is the address of global row `s * SHARD_ROWS`, wherever shard
-    `s` lives -- page-locked host memory read over UVA, or HBM. Rows outside
-    `[START, END)` (another rank's, or a placeholder id) store zeros. The grid
-    is persistent: over the bus the cost is latency, and fewer programs keep
-    more of their address translations warm. FP8 rows are E4M3, `FNUZ` or not
-    as stored.
-    """
+    """Gather rows of a table held as shards; `Bases[s]` is the address (host
+    over UVA, or HBM) of global row `s * SHARD_ROWS`. Rows outside
+    `[START, END)` are zeros. The grid is persistent: over the bus the cost is
+    latency, and fewer programs keep more address translations warm."""
     cols = tl.arange(0, BLOCK_D)
     in_row = cols < DIM
     out_dtype = Output.dtype.element_ty
@@ -345,15 +340,6 @@ def _sharded_table_lookup_kernel(
         )
 
 
-def fp8_rows_fnuz(dtype: torch.dtype) -> bool:
-    """Which FP8 E4M3 encoding an FP8 table's rows are stored in, for the
-    kernel to read them as: `float8_e4m3fnuz` (True) or `float8_e4m3fn`. The
-    two encode the same byte as values a factor of two apart."""
-    if dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-        raise ValueError(f"not an FP8 E4M3 n-gram table: {dtype}")
-    return dtype == torch.float8_e4m3fnuz
-
-
 @functools.cache
 def _compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -370,15 +356,9 @@ def sharded_table_lookup(
     output_dtype: torch.dtype,
     table_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Rows `ids` of a sharded table (`_sharded_table_lookup_kernel`), `[N, dim]`.
-
-    `scale` set means FP8 rows of `table_dtype` (E4M3FN or E4M3FNUZ),
-    dequantized like `fp8_embedding_lookup`; otherwise the rows are copied in
-    `output_dtype`, which is `table_dtype`.
-    """
-    fnuz = scale is not None and fp8_rows_fnuz(table_dtype)
-    if scale is None and table_dtype != output_dtype:
-        raise ValueError(f"{table_dtype} rows need a scale to read as {output_dtype}")
+    """Rows `ids` of a sharded table, `[N, dim]`. With `scale` the rows are FP8
+    E4M3 (FN or FNUZ, per `table_dtype`), dequantized like
+    `fp8_embedding_lookup`; otherwise they are copied as they are."""
     ids = ids.reshape(-1)
     output = torch.empty((ids.numel(), dim), dtype=output_dtype, device=ids.device)
     if ids.numel() == 0:
@@ -402,7 +382,7 @@ def sharded_table_lookup(
         triton.next_power_of_2(dim),
         block_rows,
         scale is not None,
-        fnuz,
+        table_dtype == torch.float8_e4m3fnuz,
     )
     return output
 

@@ -312,22 +312,13 @@ class WeightUpdaterMixin:
         tensor: torch.Tensor,
         shard_id=None,
     ) -> bool:
-        """Whether the module wrote this weight itself (``sync_weight``).
+        """Whether the module wrote this weight itself (``sync_weight``), for
+        a parameter that is only a placeholder for where the values live; it
+        is asked before the FP8 branches, which would leave such a weight
+        unchanged and count it as updated.
 
-        For a module whose parameter is not where the values live, only a
-        placeholder: the writers here would copy into that, or (the FP8
-        branches) warn and count the weight as updated with the values left
-        as they were. So it is asked before them -- after the expert buffers,
-        which it never defines -- and answers False for every parameter that
-        does hold its values. It raises rather than skip a weight it cannot
-        take.
-
-        Such a module may write from the host (rows in page-locked memory the
-        device reads), so no stream orders the write after the reads of the
-        step that just ended. The device is waited for once,
-        before the first module is asked in an update: nothing launches
-        during one, and each of these writes is done when it returns, leaving
-        nothing for a later wait to cover (unlike `_await_readers_of`'s).
+        The module may write from the host, which no stream orders after the
+        last step's reads, so the device is waited for once per update.
         """
         sync = getattr(module, "sync_weight", None)
         if not callable(sync):

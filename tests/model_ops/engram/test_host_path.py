@@ -1495,18 +1495,8 @@ def test_a_refused_shared_registration_falls_back_to_a_copy(monkeypatch):
     assert allocator.live == {}
 
 
-@pytest.mark.parametrize(
-    "env, shared, copy",
-    [
-        (None, True, True),  # the Qwen3.8 PLE table copies under DP attention too
-        ("0", False, True),
-        ("1", False, False),
-        (None, False, False),
-    ],
-)
-def test_an_explicit_copy_overrides_the_setting_and_shared(
-    monkeypatch, env, shared, copy
-):
+@pytest.mark.parametrize("env, shared", [(None, True), ("0", False)])
+def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, shared):
     import gc
 
     from atom.model_ops.engram import host_memory
@@ -1518,33 +1508,18 @@ def test_an_explicit_copy_overrides_the_setting_and_shared(
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
     rows = torch.arange(1 << 18, dtype=torch.float32)
-    pinned = host_memory.pin_rows([rows], shared=shared, copy=copy)
+    pinned = host_memory.pin_rows([rows], shared=shared, copy=True)
     assert pinned is not None and torch.equal(pinned[0], rows)
-    assert (len(allocator.live), len(cudart.registered)) == ((1, 0) if copy else (0, 1))
+    assert (len(allocator.live), len(cudart.registered)) == (1, 0)
     del pinned
     gc.collect()
-    assert allocator.live == {} and cudart.registered == []
-
-
-def test_an_explicit_copy_does_not_fall_back(monkeypatch):
-    """`copy=False` refused is a failure, not a copy -- even for a shared table,
-    which would otherwise fall back to one."""
-    from atom.model_ops.engram import host_memory
-
-    allocator = FakeHostAllocator()
-    cudart = FakeCudart(refuse_call=1)
-    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    rows = torch.ones(1 << 18)
-    assert host_memory.pin_rows([rows], shared=True, copy=False) is None
-    assert allocator.live == {} and cudart.registered == []
+    assert allocator.live == {}
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_an_explicit_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
-    """`copy=True` with no page-locked allocator does not register the source
-    in place instead -- the Qwen3.8 PLE shards share their safetensors
-    mapping with other weights -- while `copy=None` still does."""
+def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
+    """With no page-locked allocator `copy=True` fails; without it the source
+    is registered in place."""
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart()

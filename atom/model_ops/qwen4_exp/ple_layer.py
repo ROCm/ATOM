@@ -122,13 +122,9 @@ class _ShardsIntoWeight:
     def sync_weight(
         self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
     ) -> bool:
-        """`WeightUpdaterMixin`: checkpoint shard `shard_id` of `weight`,
-        through the shard loader the checkpoint went through (it checks the
-        shard, its shape and dtype), in place. The updater would otherwise
-        hand the shard to the module's own `weight_loader`, which takes the
-        whole table, or have none and skip it. The whole table is `weight`,
-        the updater's to sync, unless its rows cannot go into an FP8 table
-        as they are."""
+        """`WeightUpdaterMixin`: a checkpoint shard goes through the shard
+        loader, which checks it; the whole table is left to the updater unless
+        its rows cannot go into an FP8 table as they are."""
         if param_name != "weight":
             return False
         if shard_id is None:
@@ -194,20 +190,15 @@ class _Qwen4ExpFP8Embedding(_ShardsIntoWeight, nn.Module):
         return output
 
 
-# Where the table is page-locked on the host by default: the archs the host
-# path has been validated on (bitwise lookups, GSM8K, page-locking ~100 GB),
-# MI355X and MI308X. Elsewhere it stays in HBM until it has been.
+# The archs the host table has been validated on (bitwise lookups, GSM8K);
+# elsewhere the table stays in HBM.
 VALIDATED_ARCHS = ("gfx950", "gfx942")
 
 
 def _host_table_available() -> bool:
-    """Whether the n-gram table goes to page-locked host memory instead of HBM.
-
-    Only where it would otherwise be allocated on a ROCm device: the kernel
-    reads it through HIP's unified addressing. And only on an architecture
-    the host path has been validated on (`VALIDATED_ARCHS`). `ATOM_ENGRAM_UVA=0`
-    keeps it in HBM, as it does the Engram tables.
-    """
+    """Whether the n-gram table goes to page-locked host memory instead of
+    a ROCm device's HBM (the kernel reads it through HIP's unified
+    addressing)."""
     if torch.version.hip is None or torch.empty(0).device.type != "cuda":
         return False
     if not envs.ATOM_ENGRAM_UVA:
@@ -224,21 +215,13 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     """Vocab-sharded PLE table in page-locked host memory, read over UVA.
 
     The table is ~100 GB and a token reads `ngram_heads` rows of it, so it
-    does not earn its HBM. `PleHostTable` page-locks each checkpoint shard as
-    it loads, and `sharded_table_lookup` reads the rows a step names across the
-    bus through `shard_bases`. Those addresses only move when the weights are
-    released and resumed, so the lookup can be captured in a CUDA graph; a
-    weight sync writes the rows in place (`sync_weight`). If page-locking
-    fails the table moves to HBM and the same kernel reads it there; either
-    way the rows returned are the checkpoint's, bit for bit. In HBM the table
-    is `weight`, released and resumed with the other weights; on the host its
-    rows are freed and page-locked again alongside them. Either way the
-    addresses follow (`resume_weight_memory`; resuming recaptures the graphs).
+    does not earn its HBM. `sharded_table_lookup` reads the rows through
+    `shard_bases`, which only move when the weights are released and resumed,
+    so the lookup can be captured in a CUDA graph. If page-locking fails the
+    same kernel reads the table from HBM.
 
-    Each data-parallel rank is its own model and page-locks its own copy of
-    the table (split across its TP ranks): N ranks on a node hold N copies,
-    ~95 GiB each for the BF16 table. Sharing one copy across them:
-    https://github.com/ROCm/ATOM/issues/2861
+    Each data-parallel rank page-locks its own copy (sharing one:
+    https://github.com/ROCm/ATOM/issues/2861).
     """
 
     def __init__(
@@ -262,9 +245,8 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         self.fp8 = fp8
         self.output_dtype = torch.get_default_dtype()
         dtype = torch.float8_e4m3fn if fp8 else self.output_dtype
-        # The loader's handle on the table: the dtype the shard loader checks
-        # and the `weight_loader`, holding no rows -- unless the table falls
-        # back to HBM, where it holds them all (`PleHostTable`).
+        # No rows, only the dtype and `weight_loader` for the shard loader,
+        # unless the table falls back to HBM.
         self.weight = atom_parameter(
             torch.empty(0, embedding_dim, dtype=dtype, device="cpu")
         )
@@ -290,17 +272,9 @@ class _Qwen4ExpHostEmbedding(nn.Module):
     def sync_weight(
         self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
     ) -> bool:
-        """`WeightUpdaterMixin`: `weight` -- the whole table, or checkpoint
-        shard `shard_id` of it -- written in place (`PleHostTable.sync_rows`).
-        False for other parameters, and for the whole table in HBM: that is
-        `weight` itself, which the updater syncs as any other parameter --
-        unless it is released or the rows are not the table's dtype (BF16
-        rows for an FP8 table), which raise as a shard would rather than
-        reach the updater as a shape mismatch or an FP8 requantization.
-
-        The last lookups of the step that just ended may still be reading the
-        rows over the bus; the updater has waited for them, once per update.
-        """
+        """`WeightUpdaterMixin`: the table or one checkpoint shard of it,
+        written in place. The whole table in HBM is `weight`, left to the
+        updater once it is known to fit."""
         if param_name != "weight":
             return False
         if shard_id is None and not self.table.on_host:
@@ -326,26 +300,16 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         self.table.load_rows(shard_index, row_start, rows)
 
     def release_weight_memory(self) -> None:
-        """`MemoryManagerMixin` released the weights: free the page-locked
-        rows too."""
-        freed = self.table.release()
-        if freed:
-            logger.info(
-                "%s: released %.1f GiB of page-locked n-gram rows",
-                self.prefix,
-                freed / 1024**3,
-            )
+        """`MemoryManagerMixin` hook."""
+        self.table.release()
 
     def resume_weight_memory(self) -> None:
-        """`MemoryManagerMixin` resumed the weights: page-lock the rows
-        again, or, for a table that fell back to HBM, take `weight`'s new
-        allocation; either way the addresses have moved."""
+        """`MemoryManagerMixin` hook: the rows have moved."""
         self.table.resume()
         self.shard_bases.copy_(self.table.shard_bases(self.shard_bases.numel()))
 
     def _initialize_dummy(self) -> None:
-        """`--load_dummy` filled the parameters while `weight` was still the
-        `[0, dim]` placeholder; the table it has become gets the same fill."""
+        """`--load_dummy` filled `weight` while it was still empty."""
         mode = get_current_atom_config().load_dummy
         if mode and mode != "empty":
             # Deferred: the loader imports the model ops.
@@ -364,10 +328,9 @@ class _Qwen4ExpHostEmbedding(nn.Module):
             )
             table_bytes = self.table.pinned_bytes * self.tp_size
             logger.info(
-                "%s: n-gram table in page-locked host memory, %.1f GiB on this "
-                "rank read over UVA, none in HBM; every data-parallel rank "
-                "page-locks its own %.1f GiB copy, %.1f GiB for the %d on this "
-                "node",
+                "%s: n-gram table page-locked on the host, %.1f GiB on this "
+                "rank; each data-parallel rank holds a %.1f GiB copy, %.1f GiB "
+                "for the %d on this node",
                 self.prefix,
                 self.table.pinned_bytes / 1024**3,
                 table_bytes / 1024**3,

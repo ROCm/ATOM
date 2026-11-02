@@ -163,23 +163,14 @@ class MemoryManagerMixin:
       - self.capture_cudagraph() — method
       - self.get_num_blocks() — method
 
-    A model module may also hold weight memory outside its parameters, or
-    hand its kernels their addresses rather than the tensors. It then defines
-    ``release_weight_memory()``, called once the parameters are discarded,
-    and ``resume_weight_memory()``, called once they are reallocated and
-    before the graphs are recaptured.
+    A model module holding weight memory outside its parameters, or handing
+    its kernels their addresses, defines ``release_weight_memory()`` and
+    ``resume_weight_memory()``, called after the parameters are discarded and
+    reallocated (before the graphs are recaptured).
     """
 
-    def _weight_memory_modules(self) -> list:
-        """The modules defining ``resume_weight_memory``; found once per model."""
-        if getattr(self, "_weight_memory_modules_of", None) is not self.model:
-            self._weight_memory_module_list = [
-                module
-                for module in self.model.modules()
-                if callable(getattr(module, "resume_weight_memory", None))
-            ]
-            self._weight_memory_modules_of = self.model
-        return self._weight_memory_module_list
+    def _weight_memory_modules(self):
+        return (m for m in self.model.modules() if hasattr(m, "resume_weight_memory"))
 
     def clear_kv_cache(self) -> bool:
         kv = self.kv_cache
