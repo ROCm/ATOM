@@ -205,11 +205,14 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
         "lookup_requests_in_step",
         "state_loads",
         "state_stores",
+        "token_cache_drops",
     )
 
     def __init__(self) -> None:
         super().__init__()
         self.requests: list[LMCacheReqMeta] = []
+        # LMCache MP: req_ids whose worker-held token prefix can be dropped.
+        self.token_cache_drops: list = []
         # req_ids whose worker-side lookup pin can be released this step.
         self.lookup_requests_in_step: list[str] = []
         # (req_id, state_hash, target_group) for the K3 state tier. A separate

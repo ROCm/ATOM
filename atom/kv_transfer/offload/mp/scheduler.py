@@ -318,9 +318,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             extended = self.__dict__.get("_step_extended", set())
             self._step_extended = set()
         drops = self.__dict__.get("_shipped_drops")
-        if drops and metadata.requests:
-            # Only metadata with requests is sure to reach the workers; an
-            # empty snapshot may be dropped, so the drops wait for one.
+        if drops:
+            # A work field of its own: metadata carrying only drops still
+            # reaches the workers, so a finished prefix is not held until the
+            # next transfer.
             metadata.token_cache_drops = drops
             self._shipped_drops = []
         for req in metadata.requests:
