@@ -98,6 +98,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     CSA_INDEXER_SCALE,
     FP4_GFX950_OPUS,
+    FP4_GFX950_PRESHUFFLE,
     FP4_GFX1250_NATURAL,
     MAIN_KV_NOPE,
     fp4_indexer_block_fields,
@@ -1826,8 +1827,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = idx_kv
                 if self._indexer_fp4:
                     # FP4 path: bind the matching uint8 e8m0 scale pool.
-                    # `fused_compress_attn(quant_mode="fp4")` writes both in
-                    # the architecture-selected preshuffle/natural layout.
+                    # The explicit writer mode below selects the same layout
+                    # for the packed values and scales.
                     module.cache_scale = runner.v4_csa_idx_kv_scale[pos]
                 else:
                     # FP8 quant path: bind a strided fp32 view of the block's
@@ -1858,12 +1859,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         stride=(block_fp32_stride, 1),
                         storage_offset=idx_kv_f32.storage_offset() + scale_fp32_offset,
                     )
-                # Indexer-inner cache is always fp8 (independent of
-                # kv_cache_dtype); it has no separate rope pool.
+                # Indexer-inner cache follows index_cache_dtype independently
+                # of kv_cache_dtype; it has no separate rope pool.
                 module.quant_mode = (
                     "fp4_gfx950_opus"
                     if self.indexer_layout == FP4_GFX950_OPUS
-                    else "fp4" if self._indexer_fp4 else "per_row_fp8"
+                    else (
+                        "fp4_gfx950_flydsl"
+                        if self.indexer_layout == FP4_GFX950_PRESHUFFLE
+                        else "fp4" if self._indexer_fp4 else "per_row_fp8"
+                    )
                 )
                 module.kv_cache_rope = None
             elif ratio in (CSA_RATIO, HCA_RATIO):

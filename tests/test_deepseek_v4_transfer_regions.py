@@ -632,6 +632,48 @@ def test_fp4_indexer_without_transfer_keeps_single_node_behavior(v4_builder_cls)
 
 
 @pytest.mark.parametrize(
+    "layout,expected",
+    [
+        ("fp4-gfx950-preshuffle", "fp4_gfx950_flydsl"),
+        ("fp4-gfx950-opus", "fp4_gfx950_opus"),
+        ("fp4-gfx1250-natural", "fp4"),
+        ("fp8", "per_row_fp8"),
+    ],
+)
+def test_cache_binding_preserves_indexer_writer_layout(
+    v4_builder_cls, monkeypatch, layout, expected
+):
+    model = types.ModuleType("atom.models.deepseek_v4")
+    for name in ("Compressor", "DeepseekV4Attention", "Indexer"):
+        setattr(model, name, type(name, (), {}))
+    monkeypatch.setitem(sys.modules, model.__name__, model)
+    builder, *_ = _transfer_builder(
+        v4_builder_cls, kv_dtype="fp8", indexer_fp4=layout != "fp8"
+    )
+    builder.indexer_layout = layout
+    builder.layer_id_to_csa_pos = {0: 0, 2: 1}
+    runner = builder.model_runner
+    runner.v4_csa_idx_kv_state = [object(), object()]
+    runner.v4_csa_idx_score_state = [object(), object()]
+    if builder._indexer_fp4:
+        data, scale = fp4_indexer_block_fields(64, 128, layout)
+        runner.v4_csa_idx_kv = torch.empty(2, 3, *data.shape, dtype=data.dtype)
+        runner.v4_csa_idx_kv_scale = torch.empty(2, 3, *scale.shape, dtype=scale.dtype)
+    module = model.Compressor()
+    module.prefix = "layers.2.attn.indexer.compressor"
+    module.compress_ratio = 4
+    module.quant_mode = "none"
+
+    builder.build_kv_cache_tensor(module)
+
+    assert module.quant_mode == expected
+    assert module.kv_cache.data_ptr() == runner.v4_csa_idx_kv[1].data_ptr()
+    if builder._indexer_fp4:
+        assert module.cache_scale.data_ptr() == runner.v4_csa_idx_kv_scale[1].data_ptr()
+    assert module.kv_cache_rope is None
+
+
+@pytest.mark.parametrize(
     ("transfer_config", "expected"),
     [
         (None, False),

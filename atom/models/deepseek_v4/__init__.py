@@ -1455,9 +1455,8 @@ class Indexer(nn.Module):
         self._indexer_fp4 = fp4_indexer_enabled(
             get_current_atom_config().index_cache_dtype
         )
-        # `quant_mode` says how values are quantized; `indexer_layout` says how
-        # those values are physically stored and therefore which scorer ABI
-        # consumes them. Query scales and cache writes must select it together.
+        # The writer's `quant_mode` must match the scorer's `indexer_layout`:
+        # AITER's generic "fp4" writes natural rows, regardless of preshuffle.
         self.indexer_layout = (
             fp4_indexer_layout_for_arch(
                 get_gfx_runtime(), backend=envs.ATOM_V4_UNIFIED_MQA
@@ -1473,7 +1472,11 @@ class Indexer(nn.Module):
         self.quant_mode = (
             "fp4_gfx950_opus"
             if self._layout == MFMA
-            else "fp4" if self._indexer_fp4 else "fp8_per_row"
+            else (
+                "fp4_gfx950_flydsl"
+                if self._indexer_fp4 and self._layout == PRESHUFFLE
+                else "fp4" if self._indexer_fp4 else "fp8_per_row"
+            )
         )
         self.compressor = Compressor(
             args,
