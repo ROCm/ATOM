@@ -162,6 +162,8 @@ DEFAULT_PORT = 8000
 # ============================================================================
 
 engine = None
+# `tokenize_pool.TokenizePool` when ATOM_TOKENIZE_PROCESSES > 0.
+_tokenize_pool = None
 tokenizer: AutoTokenizer | None = None
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
@@ -878,6 +880,7 @@ async def generate_async(
             dp_parent_session_id=dp_parent_session_id,
         )
 
+    prompt_or_tokens = await _pool_tokenized(prompt_or_tokens)
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
         _validate_sequence_context_length(seq)
@@ -1253,6 +1256,19 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
     return response
 
 
+async def _pool_tokenized(prompt_or_tokens, multimodal_data=None):
+    """The prompt as ids from the tokenize pool, when one is running; else as is."""
+    pool = _tokenize_pool
+    if (
+        pool is None
+        or not pool.enabled
+        or multimodal_data is not None
+        or not isinstance(prompt_or_tokens, str)
+    ):
+        return prompt_or_tokens
+    return await pool.encode(prompt_or_tokens)
+
+
 async def setup_streaming_request(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -1304,6 +1320,7 @@ async def setup_streaming_request(
     seq = None
     t_preprocess = time.monotonic()
     try:
+        prompt_or_tokens = await _pool_tokenized(prompt_or_tokens, multimodal_data)
         seq = await executor_loop.run_in_executor(None, do_preprocess)
         _validate_sequence_context_length(seq)
     except Exception:
@@ -2931,7 +2948,7 @@ def main():
     global engine, tokenizer, model_name, default_chat_template_kwargs, _request_logger
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
-    global custom_message_encoder, _stream_batch_dispatcher
+    global custom_message_encoder, _stream_batch_dispatcher, _tokenize_pool
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -3080,6 +3097,15 @@ def main():
     )
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    if envs.ATOM_TOKENIZE_PROCESSES > 0:
+        from atom.entrypoints.openai.tokenize_pool import TokenizePool
+
+        _tokenize_pool = TokenizePool(
+            args.model, args.trust_remote_code, envs.ATOM_TOKENIZE_PROCESSES, tokenizer
+        )
+        logger.info(
+            "Tokenizing prompts in %d worker processes", envs.ATOM_TOKENIZE_PROCESSES
+        )
     # Responses go out through per-request callbacks; nothing here reads
     # `get_output()`.
     engine.core_mgr.keep_finished_outputs = False
