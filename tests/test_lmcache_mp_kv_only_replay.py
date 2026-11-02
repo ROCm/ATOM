@@ -383,16 +383,20 @@ def test_a_replay_stores_no_images(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=0)
     assert scheduler._page_only
     assert adapter.images is False
-    # PAGE alone is saved at any chunk boundary, so the anchor can stay put.
-    assert scheduler._block_manager.anchor_grids == []
 
 
 def test_no_replay_keeps_the_images(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=0, replay=0)
     assert not scheduler._page_only
     assert adapter.images is True
-    # An image is stored only at a chunk boundary: the anchor is put on one.
-    assert scheduler._block_manager.anchor_grids == [scheduler.chunk_size]
+
+
+def test_images_put_the_prompt_end_anchor_on_the_chunk_grid(monkeypatch):
+    """An image is stored only at a chunk boundary; PAGE alone at any."""
+    replays, _, _, _ = _scheduler(monkeypatch, chunks=0)
+    assert replays._block_manager.anchor_grids == []
+    images, _, _, _ = _scheduler(monkeypatch, chunks=0, replay=0)
+    assert images._block_manager.anchor_grids == [images.chunk_size]
 
 
 def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):

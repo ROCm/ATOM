@@ -1048,8 +1048,8 @@ class BlockManager:
             return self._no_joint("no_chunk_size")
         # Floored to the grid everything below compares against, so the
         # covering-chunk check becomes true by construction rather than by
-        # luck. (A full-prompt hit that withholds its last token, see
-        # `_withholds_last_prompt_token`, is off the grid.)
+        # luck. (`get_num_new_matched_tokens` withholds one token on a
+        # full-prompt hit, which takes the lookup off the grid.)
         lmc_tokens = (lmc_tokens // chunk) * chunk
         hbm_tokens = hbm_boundary * hbs
         if lmc_tokens <= hbm_tokens:

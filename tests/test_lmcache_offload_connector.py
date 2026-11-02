@@ -6062,38 +6062,28 @@ def _text_wrapped(model_type: str, text_type: str):
 
 
 @pytest.mark.parametrize(
-    "hf_config,scheduler_cls",
+    "hf_config",
     [
         pytest.param(
-            SimpleNamespace(model_type="kimi_linear"),
-            KimiK3OffloadScheduler,
-            id="kimi-k3",
-        ),
-        pytest.param(
             SimpleNamespace(model_type="qwen3_next"),
-            QwenOffloadScheduler,
             id="qwen3-next",
         ),
         pytest.param(
             _text_wrapped("qwen3_5_moe", "qwen3_5_moe_text"),
-            QwenOffloadScheduler,
             id="qwen3.5",
         ),
         pytest.param(
             _text_wrapped("qwen4_exp", "qwen4_exp_text"),
-            QwenOffloadScheduler,
             id="qwen3.8",
         ),
     ],
 )
-def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(
-    monkeypatch, hf_config, scheduler_cls
-):
+def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(monkeypatch, hf_config):
     """A chunk-aligned prompt resent whole with HBM empty. Withholding the last
     token would floor the KV leg to 512, under the 704 rung the prompt kept,
     so the hit stays whole when a boundary lands in that last chunk."""
     sched = _offload_scheduler(monkeypatch, hf_config, chunk=256)
-    assert type(sched) is scheduler_cls
+    assert type(sched) is QwenOffloadScheduler
     sched._min_load_tokens = 0
     sched._lookup_client = _LookupClient(hit=768)
     asked = []
@@ -7617,21 +7607,3 @@ def test_lmcache_mp_native_state_lookup_is_keyed_the_same_way():
         seq = _media_seq("A", seed)
         assert lookup(stub, seq) == tier_token_ids(seq, end)
     assert lookup(stub, seq) == seq.token_ids[:end]
-
-
-def test_dsv4_lookup_is_keyed_the_same_way():
-    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
-
-    asked = []
-    stub = SimpleNamespace(
-        _lookup_in_step=[],
-        _lookup_client=SimpleNamespace(
-            lookup=lambda ids, lookup_id: asked.append(ids) or _MEDIA_PROMPT
-        ),
-        _remember_tier_hit=lambda *_args: None,
-    )
-    for seed in (11, -1):
-        seq = _media_seq("A", seed)
-        assert DSV4OffloadScheduler._fresh_tier_lookup(stub, seq, "A") == _MEDIA_PROMPT
-        assert asked[-1] == tier_token_ids(seq, _MEDIA_PROMPT)
-    assert asked[-1] == list(seq.token_ids)

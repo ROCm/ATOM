@@ -133,8 +133,7 @@ class MlaKvPool:
         `block_ratio` applied. Named for `MhaKvPool.region_tensors`' reason.
         """
         return [
-            region
-            for arena in (self.cache, self.index)
-            if arena is not None
-            for region in arena.region_tensors()
+            (f"{name}.layer_{layer}", view[layer])
+            for name, view in self._views.items()
+            for layer in range(len(view))
         ]

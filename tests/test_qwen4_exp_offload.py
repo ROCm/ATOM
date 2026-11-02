@@ -25,7 +25,16 @@ from atom.model_ops.attentions.qwen4_exp_attn import (
     qsa_page_segments,
     qsa_row_space,
 )
-from tests.test_entry_arena import qsa_like_fields
+
+
+def qsa_like_fields(block=4):
+    """Shaped after Qwen3.8's QSA arena, scaled down."""
+    return [
+        EntryField("k", 2, (block, 2, 8), torch.bfloat16),
+        EntryField("v", 2, (block, 2, 8), torch.bfloat16),
+        EntryField("index_raw", 2, (block, 1, 4), torch.bfloat16),
+        EntryField("index_compressed", 2, (block // 4, 1, 4), torch.bfloat16),
+    ]
 
 
 def _builder():
@@ -525,20 +534,18 @@ def test_qsa_regions_are_built_once_per_allocation(monkeypatch):
 
 def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
     """Keyed on the pool objects; a release drops it before addresses change."""
-    from atom.model_ops.attentions.pool_layout import layer_major_page_geometry
+    from atom.model_ops.attentions.pool_layout import mha_page_unit_geometry
 
     builder, cls = _paged_builder()
     first = cls._page_unit_regions(builder)
-    real = layer_major_page_geometry.layer_major_page_unit_regions
+    real = mha_page_unit_geometry.mha_page_unit_regions
     walks = []
 
     def counted(pools):
         walks.append(len(pools))
         return real(pools)
 
-    monkeypatch.setattr(
-        layer_major_page_geometry, "layer_major_page_unit_regions", counted
-    )
+    monkeypatch.setattr(mha_page_unit_geometry, "mha_page_unit_regions", counted)
     for _ in range(3):
         assert cls._page_unit_regions(builder) is first
     assert walks == []
@@ -549,18 +556,6 @@ def test_page_unit_regions_are_cached_per_pool_until_release(monkeypatch):
     bases, _ = cls._page_unit_regions(builder)
     assert walks == [1]
     assert bases.tolist() == [base for base, _ in builder.qsa_arena.region_layout()]
-
-
-def test_page_unit_segments_refuse_without_a_spec_and_views_do_not():
-    for runtime in (None, SimpleNamespace(checkpoint_spec=None)):
-        builder, cls = _paged_builder(spec=False)
-        builder.model_runner.state_runtime = runtime
-        with pytest.raises(RuntimeError, match="without a checkpoint spec"):
-            cls.page_unit_segments(builder, [1, 2])
-        views = cls.page_unit_views(builder, [1, 2])
-        assert sum(view.numel() * view.element_size() for view in views) == (
-            2 * published_bytes_for(qsa_like_fields())
-        )
 
 
 def test_page_unit_segments_name_the_view_bytes_trimmed_to_the_image():
@@ -591,7 +586,7 @@ def test_transfer_contract_catches_published_regions_drifting(monkeypatch):
     rows = builder.qsa_arena._regions
     rows[0], rows[2] = rows[2], rows[0]  # k.0 <-> v.0
     builder._page_unit_region_cache = None
-    with pytest.raises(RuntimeError, match="do not match the checkpoint PAGE unit"):
+    with pytest.raises(RuntimeError, match="do not match its checkpoint PAGE unit"):
         cls.get_kv_transfer_tensors(builder)
 
 

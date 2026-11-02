@@ -1182,12 +1182,13 @@ reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
 ### Multimodal prompts: seeded keys
 
-Image placeholder ids are the same for every picture, so every LMCache lookup,
-save and load keys its ids through `tier_token_ids(seq, end)`
-(`_offload_common.py`): the first 4 ids of a prompt with a `cache_seed` become
-digests of `(cache_seed, position, id)` with bit 31 set, off every vocabulary
-id. Text prompts key unchanged. mooncake_store seeds its own chain hash with
-the same `cache_seed` (`chain_seed`).
+Image placeholder ids are the same for every picture, so the lookup, save and
+load requests `ChunkedOffloadSchedulerBase` builds (in-process
+`lmcache_offload` and `lmcache_mp`, including the native-state lookup) key
+their ids through `tier_token_ids(seq, end)` (`_offload_common.py`): the first
+4 ids of a prompt with a `cache_seed` become digests of
+`(cache_seed, position, id)` with bit 31 set, off every vocabulary id. Text
+prompts key unchanged.
 
 ### Invariants enforced in code
 
