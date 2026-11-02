@@ -1591,7 +1591,7 @@ jobs:
 
       # kvcache-ai/Mooncake PR 4657 ROCm wheel; pd_c48_server.sh checks the case's pinned SHA256.
       - name: Download pinned ROCm Mooncake wheel
-        if: ${{ endsWith(matrix.env.common.ATOMESH_C48_CASE, '-MC') }}
+        if: ${{ endsWith(matrix.env.common.ATOMESH_C48_CASE, '-MC') || matrix.env.common.ATOMESH_M31_MC == '1' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

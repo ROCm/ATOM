@@ -354,7 +354,7 @@ EOF
   if [[ "${rank}" -eq 0 && "${BACKEND}" == "atom" ]]; then
     mesh_binary="$(bash "${REPO_ROOT}/.github/scripts/atomesh/setup_mesh.sh" \
       "${REPO_ROOT}" "${RUN_DIR}" "${DOCKER_IMAGE}" "${env_file}" "${JOB_ID}")" || return $?
-  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" ]]; then
+  elif [[ "${rank}" -eq 0 && "${BACKEND}" == "vllm" && "${ATOMESH_ENV_ATOMESH_M31_MC:-}" != 1 ]]; then
     router_container="${container}-router"
     if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-MC ]]; then
       # The Mooncake router reads P's bootstrap server once at startup, so the

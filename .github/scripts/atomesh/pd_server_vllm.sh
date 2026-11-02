@@ -327,6 +327,8 @@ start_router() {
 
 if [[ -n "${ATOMESH_C48_CASE:-}" ]]; then
   source "${ATOMESH_SCRIPT_DIR}/pd_c48_server.sh"
+elif [[ "${ATOMESH_M31_MC:-}" == 1 ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/pd_m31_mc_server.sh"
 else
   apply_vllm_fork_overlay
 fi
