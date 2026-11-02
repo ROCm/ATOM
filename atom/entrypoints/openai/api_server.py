@@ -539,6 +539,7 @@ def _build_sampling_params(
     top_k: int = -1,
     top_p: float = 1.0,
     n: int = 1,
+    presence_penalty: float | None = None,
 ) -> SamplingParams:
     return SamplingParams(
         temperature=temperature,
@@ -548,6 +549,7 @@ def _build_sampling_params(
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
         n=n,
+        presence_penalty=presence_penalty or 0.0,
     )
 
 
@@ -1688,6 +1690,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            presence_penalty=getattr(request, "presence_penalty", None),
         )
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1931,6 +1934,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            presence_penalty=getattr(request, "presence_penalty", None),
         )
         # Prefer pre-tokenized IDs; otherwise pass text to preprocessing.
         prompt_or_tokens = request.get_prompt_or_tokens()
