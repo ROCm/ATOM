@@ -625,6 +625,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_CTX_KV": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_CTX_KV", "1") == "1"
     ),
+    # Token count from which a fused all-reduce + Gemma RMSNorm (`GemmaRMSNorm`
+    # with `fused_allreduce`) splits into aiter's quick-reduce all-reduce and a
+    # separate norm. aiter keeps the one-kernel fused path, a bf16
+    # reduce-scatter capped at 80 workgroups, for every input under 64 MiB
+    # (8192 tokens at hidden 4096) and only switches to quick-reduce above
+    # that; with INT4 quick-reduce the split is ~3x faster per token from
+    # ~2k tokens. Applies only when quick-reduce is on and takes the tensor;
+    # otherwise the fused path runs as before. 0 (default) = off.
+    "ATOM_PREFILL_AR_QR_MIN_TOKENS": lambda: int(
+        os.getenv("ATOM_PREFILL_AR_QR_MIN_TOKENS", "0")
+    ),
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
