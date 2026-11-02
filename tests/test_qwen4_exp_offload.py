@@ -286,13 +286,17 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
     assert cls._uses_paged_checkpoints(builder)
 
 
+_PD = "disaggregated.*kv_connector={!r}"
+_NO_IMAGE = "kv_connector={!r} does not read"
+
+
 @pytest.mark.parametrize(
-    "kv_transfer_config, backend",
+    "kv_transfer_config, backend, error",
     [
-        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "mooncake"),
-        ({"kv_connector": "moriio", "kv_role": "kv_consumer"}, "moriio"),
+        ({"kv_connector": "mooncake", "kv_role": "kv_producer"}, "mooncake", _PD),
+        ({"kv_connector": "moriio", "kv_role": "kv_consumer"}, "moriio", _PD),
         # No connector named: the factory defaults to moriio.
-        ({"kv_role": "kv_producer"}, "moriio"),
+        ({"kv_role": "kv_producer"}, "moriio", _PD),
         (
             {
                 "kv_connector": "multi",
@@ -302,21 +306,37 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
                 ],
             },
             "mooncake",
+            _PD,
+        ),
+        (
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                ],
+            },
+            "mooncake",
+            _PD,
         ),
         # Checked by the canonical name the connector is built from.
-        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake"),
-        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio"),
-        # An offload backend that does not read the PAGE image.
-        ({"kv_connector": "Mooncake_Store", "kv_role": "offload"}, "mooncake_store"),
+        ({"kv_connector": "Mooncake", "kv_role": "kv_producer"}, "mooncake", _PD),
+        ({"kv_connector": " moriio", "kv_role": "kv_consumer"}, "moriio", _PD),
+        ({"kv_connector": "MoRIIO", "kv_role": "kv_consumer"}, "moriio", _PD),
+        (
+            {"kv_connector": "Mooncake_Store", "kv_role": "offload"},
+            "mooncake_store",
+            _NO_IMAGE,
+        ),
     ],
 )
 def test_validate_config_refuses_connectors_that_drop_the_state(
-    kv_transfer_config, backend
+    kv_transfer_config, backend, error
 ):
     """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
     builder, _ = _builder()
     builder.model_runner.config.kv_transfer_config = kv_transfer_config
-    with pytest.raises(ValueError, match=f"kv_connector={backend!r}"):
+    with pytest.raises(ValueError, match=error.format(backend)):
         _qwen4_exp_backend().validate_config(builder.model_runner.config)
 
 

@@ -7627,8 +7627,15 @@ def test_another_image_with_the_same_text_misses_the_first_ones_kv(media_schedul
     assert tier.hit(media_scheduler._lookup_token_ids(c)) == (_MEDIA_PROMPT, {"B"})
     again = media_scheduler._lookup_token_ids(_media_seq("A2", 11))
     assert tier.hit(again) == (_MEDIA_PROMPT, {"A"})
+
+
+def test_a_text_prompt_keys_on_its_ids_alone(media_scheduler):
     text = _media_seq("T", -1)
     assert media_scheduler._lookup_token_ids(text) == text.token_ids
+    tier = _MediaTier()
+    _media_save(media_scheduler, tier, text)
+    assert tier.hit(list(text.token_ids)) == (_MEDIA_PROMPT, {"T"})
+    assert tier.hit(media_scheduler._lookup_token_ids(_media_seq("I", 11)))[0] == 0
 
 
 def test_the_load_keys_what_the_lookup_and_save_keyed(media_scheduler):
