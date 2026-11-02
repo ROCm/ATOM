@@ -606,6 +606,14 @@ dp_size = envs.ATOM_DP_SIZE
 
 See `atom/utils/envs.py` for the full list of lazy-evaluated environment variables.
 
+## P/D request path
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_POLL_FRESH_WAIT_MS** | int | 0 | Non-PP engines with KV transfer. While requests are parked for remote KV, block up to this many ms after each forward for a fresh worker completion poll, so a receive that landed during the forward is scheduled on the next step rather than the one after. Fresh-poll counts and blocking time are logged every 30 s. `0` keeps the poll one step behind. |
+| **ATOM_PD_PROMPT_IDS_B64** | bool | 0 | Prefill only. Answer a router's P/D prefill request (`kv_transfer_params.do_remote_decode`) with its prompt ids as base64 little-endian int32 inside `kv_transfer_params` (`prompt_token_ids_b64`), which the router forwards to decode verbatim, instead of a top-level JSON int list. Any other request with `return_token_ids`, a decode's included, still gets the list. For a 670K-token prompt the decode's event loop spends ~15 ms on this form against ~130 ms parsing and validating the list. Every decode accepts both forms. Enable it only behind a router that forwards `kv_transfer_params` to decode as is, as ATOM's router does; one that reads only the top-level list gets none, and its decode tokenizes the prompt again. |
+| **ATOM_PD_EARLY_T0** | bool | 0 | Decode (`kv_consumer`) only. Stream the prefill's sampled first token (T0) to the client as soon as the request's KV lands, ahead of the first local decode forward, instead of with that forward's output, which deferred output makes visible two forwards later. |
+
 ## Mooncake PD matched rails
 
 | Variable | Type | Default | Description |

@@ -3,10 +3,15 @@
 
 """Pydantic request/response models for the OpenAI-compatible API."""
 
+import array
+import base64
+import binascii
 import json
+import sys
 import time
 from typing import Annotated, Any
 
+import numpy as np
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -46,17 +51,61 @@ def validate_max_tokens(max_tokens: int) -> int:
 PromptTokenIds = list[NonNegativeInt]
 _PROMPT_TOKEN_IDS_ADAPTER = TypeAdapter(PromptTokenIds)
 
+#: `kv_transfer_params` key of the prompt as base64 little-endian int32 -- the
+#: compact form of `prompt_token_ids` (`ATOM_PD_PROMPT_IDS_B64`). For a 670K
+#: token prompt the decode's event loop spends ~130 ms parsing and validating
+#: the JSON list, ~15 ms on this form.
+PROMPT_TOKEN_IDS_B64 = "prompt_token_ids_b64"
+
+
+def encode_prompt_token_ids(token_ids) -> str:
+    """`token_ids` in the `PROMPT_TOKEN_IDS_B64` wire form."""
+    ids = array.array("i", token_ids)
+    if sys.byteorder != "little":
+        ids.byteswap()
+    return base64.b64encode(ids).decode("ascii")
+
+
+def decode_prompt_token_ids(encoded: Any) -> array.array:
+    """Inverse of `encode_prompt_token_ids`, as an `array("i")`.
+
+    An array rather than a list: the engine stores prompts as one anyway
+    (`new_token_ids`), so no id is ever boxed into a Python int.
+    """
+    key = f"kv_transfer_params[{PROMPT_TOKEN_IDS_B64!r}]"
+    if not isinstance(encoded, str):
+        # ValueError like every other bad request field: handlers answer it 400.
+        raise ValueError(f"{key} must be a base64 string")  # noqa: TRY004
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ValueError(f"{key} is not valid base64: {e}") from e
+    if len(raw) % 4:
+        raise ValueError(f"{key} must decode to whole int32s, got {len(raw)} bytes")
+    ids = array.array("i")
+    ids.frombytes(raw)
+    if sys.byteorder != "little":
+        ids.byteswap()
+    if ids and int(np.frombuffer(ids, dtype=np.int32).min()) < 0:
+        raise ValueError(f"{key} must hold non-negative token ids")
+    return ids
+
 
 def resolve_prompt_token_ids(
     prompt_token_ids: PromptTokenIds | None,
     kv_transfer_params: dict[str, Any] | None,
-) -> PromptTokenIds | None:
+) -> PromptTokenIds | array.array | None:
     """Resolve IDs from the top-level field or vLLM-compatible PD metadata.
 
-    Reject empty lists and conflicting IDs between the two locations.
+    The PD metadata carries a list (`prompt_token_ids`) or, if it has no list,
+    the compact `PROMPT_TOKEN_IDS_B64`; the latter resolves to an
+    `array("i")`. Reject empty prompts and conflicting IDs between the
+    top-level field and the metadata.
     """
-    from_kv = (kv_transfer_params or {}).get("prompt_token_ids")
-    if prompt_token_ids is None and from_kv is None:
+    kv = kv_transfer_params or {}
+    from_kv = kv.get("prompt_token_ids")
+    encoded = kv.get(PROMPT_TOKEN_IDS_B64) if from_kv is None else None
+    if prompt_token_ids is None and from_kv is None and encoded is None:
         return None
 
     if from_kv is not None:
@@ -67,9 +116,16 @@ def resolve_prompt_token_ids(
                 "kv_transfer_params['prompt_token_ids'] must be a list of "
                 f"non-negative integers: {e.errors()[0]['msg']}"
             ) from e
-        if prompt_token_ids is not None and from_kv != prompt_token_ids:
+    elif encoded is not None:
+        from_kv = decode_prompt_token_ids(encoded)
+    if from_kv is not None and prompt_token_ids is not None:
+        same = (
+            from_kv.tolist() if isinstance(from_kv, array.array) else from_kv
+        ) == prompt_token_ids
+        if not same:
+            field = "prompt_token_ids" if encoded is None else PROMPT_TOKEN_IDS_B64
             raise ValueError(
-                "prompt_token_ids and kv_transfer_params['prompt_token_ids'] "
+                f"prompt_token_ids and kv_transfer_params[{field!r}] "
                 "disagree; a request cannot carry two different prompts"
             )
 
@@ -274,7 +330,7 @@ class ChatCompletionRequest(BaseModel):
     # Echo prompt IDs in non-streaming responses, including n > 1.
     return_token_ids: bool | None = None
 
-    def get_prompt_token_ids(self) -> PromptTokenIds | None:
+    def get_prompt_token_ids(self) -> PromptTokenIds | array.array | None:
         """This request's pre-tokenized prompt, or None to render+tokenize."""
         return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
 
@@ -324,11 +380,11 @@ class CompletionRequest(BaseModel):
     prompt_token_ids: PromptTokenIds | None = None
     return_token_ids: bool | None = None
 
-    def get_prompt_token_ids(self) -> PromptTokenIds | None:
+    def get_prompt_token_ids(self) -> PromptTokenIds | array.array | None:
         """This request's pre-tokenized prompt, or None to tokenize `prompt`."""
         return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
 
-    def get_prompt_or_tokens(self) -> "str | PromptTokenIds":
+    def get_prompt_or_tokens(self) -> "str | PromptTokenIds | array.array":
         """Return pre-tokenized IDs when supplied, otherwise require text."""
         ids = self.get_prompt_token_ids()
         if ids is not None:

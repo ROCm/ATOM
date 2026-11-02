@@ -126,7 +126,8 @@ def prompt_tokens_start_in_reasoning(
     if not _REASONING_OPEN_MARKERS or not len(token_ids):
         return False
     tail = max(len(m) for m in _REASONING_OPEN_MARKERS)
-    return prompt_starts_in_reasoning(decode(token_ids[-tail:]))
+    # list(): `token_ids` may be an `array("i")`, which tokenizers reject.
+    return prompt_starts_in_reasoning(decode(list(token_ids[-tail:])))
 
 
 def separate_reasoning(

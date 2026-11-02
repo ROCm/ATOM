@@ -75,7 +75,7 @@ def _install_api_server_stubs() -> list[str]:
         def from_cli_args(cls, args):
             return cls()
 
-        def create_engine(self, tokenizer=None):
+        def create_engine(self, tokenizer=None, keep_finished_outputs=True):
             return None
 
     _try_import_else_stub(

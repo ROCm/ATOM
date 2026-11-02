@@ -68,7 +68,7 @@ def _calls_shared_initialiser(cls) -> bool:
     raise AssertionError(f"{cls.__name__}.__init__ not found")
 
 
-def _bare_manager(cls, **kwargs):
+def _bare_manager(cls, local_engine_count=2, **kwargs):
     """A manager with its shared state set up and no engine processes spawned."""
     mgr = cls.__new__(cls)
     mgr._init_shared_state(
@@ -78,7 +78,8 @@ def _bare_manager(cls, **kwargs):
             prefill_context_parallel_size=1,
         ),
         label=cls.__name__,
-        local_engine_count=kwargs.get("local_engine_count", 2),
+        local_engine_count=local_engine_count,
+        **kwargs,
     )
     return mgr
 
@@ -158,6 +159,60 @@ class OutputThreadStateTest(unittest.TestCase):
         """It stays None until the API server resolves it; offline never does."""
         for mgr in self.managers:
             self.assertIsNone(mgr._flush_stream_batch_fn)
+
+    def test_finished_outputs_are_kept_unless_turned_off(self):
+        """Offline `generate()` reads them; callback-only hosts turn this off."""
+        for mgr in self.managers:
+            self.assertTrue(mgr.keep_finished_outputs)
+        for cls in (CoreManager, DisaggCoreManager):
+            mgr = _bare_manager(cls, keep_finished_outputs=False)
+            self.addCleanup(mgr.ctx.term)
+            self.assertFalse(mgr.keep_finished_outputs)
+
+    def test_hosts_that_never_read_outputs_do_not_keep_them(self):
+        """Checked as a rule, like the GC policy in `test_gc_utils.py`.
+
+        A server that builds an engine and answers through callbacks never
+        drains the queue, so each finished Sequence would stay for the life of
+        the process.
+        """
+        root = SOURCE.parents[1]
+        hosts = sorted(
+            p
+            for p in root.rglob("*.py")
+            if ".create_engine(" in p.read_text() and "examples/" not in p.as_posix()
+        )
+        self.assertTrue(hosts, "no engine host found; this test has stopped checking")
+        missing = [
+            p.relative_to(root).as_posix()
+            for p in hosts
+            if not any(
+                s in p.read_text()
+                for s in (".get_output(", ".step()", "get_output_async")
+            )
+            and "keep_finished_outputs=False" not in p.read_text()
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "these build an engine but never read get_output(); pass "
+            "create_engine(..., keep_finished_outputs=False)",
+        )
+
+    def test_finished_outputs_are_queued_only_when_kept(self):
+        for node in ast.walk(TREE):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "put_nowait"
+                and ast.unparse(node.func.value) == "self.outputs_queue"
+            ):
+                guards = [
+                    ast.unparse(n.test)
+                    for n in ast.walk(TREE)
+                    if isinstance(n, ast.If) and node in ast.walk(n)
+                ]
+                self.assertIn("self.keep_finished_outputs", guards)
 
     def test_load_accounting_is_sized_for_the_engine_count(self):
         mgr = _bare_manager(CoreManager, local_engine_count=4)
