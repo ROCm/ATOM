@@ -394,6 +394,19 @@ suppressed. `/v1/messages` reads the field too, in Anthropic's
 it nowhere, so a client that forbade tool calls got `tool_use` blocks and
 `stop_reason: tool_use` anyway.
 
+**`tool_choice: "required"` on Kimi-K3 opens the tools channel.** The chat
+template only tells the model it MUST call a tool, and at T=1 it still closed
+the message after its response on a share of requests, writing the arguments
+as `content`. On a chat request with `tool_choice: "required"` and a non-empty
+`tools`, both chat endpoints now hold K3's output to its tools channel on the
+GPU: it may not end before the channel opens, and once the response channel
+closes (`<|close|>response<|sep|>`) the next tokens are forced to
+`<|open|>tools<|sep|><|open|>call tool="`. The tool name and arguments stay the
+model's. A model that writes `<|open|>tools<|sep|>` itself, by any other way,
+has opened it too: nothing is held back from then on. Every other format, every other `tool_choice`, and `/v1/messages` and
+`/v1/responses` sample as before; see `atom/model_ops/required_channel.py`.
+A required request's own `stop` strings can still end it before a call.
+
 Forwarding it to the chat template is a separate step, and one that used to be
 a 500. The handler passes template controls it cannot know the model reads —
 `response_format`, `tool_choice`, `thinking_effort`, and whatever a client puts
