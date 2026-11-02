@@ -224,9 +224,11 @@ def flydsl_plan_shape(head_dim, num_seqs=None) -> dict:
 
 
 # aiter traits.D256_PIPE_MAX_ROWS values ATOM_FLYDSL_D256_PIPE_MAX_ROWS may
-# set: 1-3 M-tiles of 16 rows. Four take a different per-token V-scale load
-# (op_softmax, M_TILES >= 4) that no test covers on the pipe.
-_FLYDSL_D256_PIPE_ROWS_ALLOWED = (16, 32, 48)
+# set: 1-4 M-tiles of 16 rows, the range ROCm/aiter#7199 validates on the
+# pipe. 48 takes MTP-5 verify at GQA 8 (TP4), 64 MTP-3 verify at GQA 16
+# (TP2). The pipe body is M-generic; the M_TILES >= 4 per-token V-scale
+# reload is in aiter's generic path only.
+_FLYDSL_D256_PIPE_ROWS_ALLOWED = (16, 32, 48, 64)
 _flydsl_d256_pipe_rows_applied = False
 
 

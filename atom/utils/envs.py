@@ -922,8 +922,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
     "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
     # FlyDSL paged decode, head_dim 256 FP8: query-row limit of the gfx950
-    # pipe (aiter traits.D256_PIPE_MAX_ROWS, 32 today), set in-process before
-    # the first call. 48 takes MTP-5 verify at GQA 8. Unset/0: aiter's value.
+    # pipe (aiter traits.D256_PIPE_MAX_ROWS: 32 before ROCm/aiter#7199, 64
+    # with it), set in-process before the first call. 48 takes MTP-5 verify
+    # at GQA 8 (TP4), 64 MTP-3 verify at GQA 16 (TP2). Unset/0: aiter's value.
     "ATOM_FLYDSL_D256_PIPE_MAX_ROWS": lambda: int(
         os.getenv("ATOM_FLYDSL_D256_PIPE_MAX_ROWS", "0") or 0
     ),

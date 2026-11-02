@@ -273,7 +273,21 @@ class TestPipeRows:
         assert traits.d256_pipe("gfx950", "fp8", 256, 16, 4, 8), "MTP-3 unchanged"
         assert not traits.d256_pipe("gfx950", "fp8", 256, 16, 7, 8)
 
-    @pytest.mark.parametrize("rows", ["64", "40", "-16"])
+    def test_64_puts_tp2_mtp3_verify_on_the_pipe(self, monkeypatch, traits):
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(traits, "D256_PIPE_MAX_ROWS", 32)
+        # MTP-3 verify, GQA 16 (TP2): 64 rows, generic path at aiter's 32.
+        assert not traits.d256_pipe("gfx950", "fp8", 256, 16, 4, 16)
+        monkeypatch.setenv("ATOM_FLYDSL_D256_PIPE_MAX_ROWS", "64")
+        ba._apply_flydsl_d256_pipe_max_rows()
+        assert traits.D256_PIPE_MAX_ROWS == 64
+        assert traits.d256_pipe("gfx950", "fp8", 256, 16, 4, 16)
+        assert traits.d256_pipe("gfx950", "fp8", 256, 16, 8, 8)
+        assert not traits.d256_pipe("gfx950", "fp8", 256, 16, 5, 16)
+        assert not traits.d256_pipe("gfx950", "fp8", 256, 16, 9, 8)
+
+    @pytest.mark.parametrize("rows", ["80", "40", "-16"])
     def test_unvalidated_values_are_refused(self, monkeypatch, traits, caplog, rows):
         from atom.model_ops import base_attention as ba
 
