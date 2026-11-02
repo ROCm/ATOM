@@ -336,7 +336,9 @@ def sparse_attn_indexer(
         out=topk_indices[: rows.out_rows],
         keys=(
             _dcp_gather_indexer_k_prefill(kv_cache, attn_metadata, head_dim, k.device)
-            if rows.concat is not None and rows.split.world > 1
+            if rows.concat is not None
+            and rows.split.world > 1
+            and rows.split.group == "dcp"
             else None
         ),
         request_local=not single_rank_prefill,

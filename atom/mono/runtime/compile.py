@@ -89,6 +89,15 @@ def scratch_bytes(launcher) -> int:
     return max(sizes)
 
 
+def kernel_names(launcher) -> list[str]:
+    """The kernel name of each binary a compiled ``launcher`` holds: a mono
+    kernel's name spells its build's parameters."""
+    return [
+        _symbol(_code_object(artifact._ir_text))
+        for artifact in launcher._mem_cache.values()
+    ]
+
+
 def launcher_resources(launcher) -> list[dict]:
     """``kernel_resources`` of each binary a compiled ``launcher`` holds (its
     ``_mem_cache``): what this process runs, unlike FlyDSL's disk cache, whose

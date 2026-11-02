@@ -403,6 +403,7 @@ def test_a_transfer_that_never_reports_stops_the_engine(monkeypatch, kind):
     now = [1000.0]
     monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
     scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    assert scheduler._scheduler_deadline_s == 40.0
     seq = sequence(computed=0 if kind == "load" else 16)
     if kind == "save":
         checkpoint(scheduler, checkpoints, seq, 16)
