@@ -60,9 +60,14 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns: what `attn_family` resolves to
-# `Family.GDN` or `Family.QSA_GDN`. Matched against the text config's
-# `model_type`, the attribute `attn_family` reads.
+# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
+# `Family.GDN` or `Family.QSA_GDN`, but note the attribute skew: the guard below reads
+# `hf_config.model_type` while `attn_family` reads the text config. On the
+# native path they agree only because `get_hf_config` flattens the text type
+# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
+# offload is ever wired into plugin mode this guard must switch to the text
+# config to stay in sync.
+# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
 # MiniMax-M3 is not here either: it is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
 # state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
@@ -476,9 +481,17 @@ def lmcache_engine_id(config) -> str:
     (0) or not a port, the DP rank alone is used. The id is not part of a
     chunk's key.
     """
-    parallel = getattr(config, "parallel_config", None)
-    dp_rank = int(getattr(parallel, "data_parallel_rank", 0) or 0)
-    port = getattr(parallel, "data_parallel_base_port", None)
+    dp_rank = int(
+        getattr(
+            getattr(config, "parallel_config", None),
+            "data_parallel_rank",
+            0,
+        )
+        or 0
+    )
+    port = getattr(
+        getattr(config, "parallel_config", None), "data_parallel_base_port", None
+    )
     # `type(...) is int`: a bool is an int, and True would name port 1.
     if type(port) is int and port > 0:
         return f"atom-offload-r{port}-dp{dp_rank}"

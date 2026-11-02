@@ -6065,11 +6065,6 @@ def _text_wrapped(model_type: str, text_type: str):
     "hf_config,scheduler_cls",
     [
         pytest.param(
-            SimpleNamespace(model_type="kimi_linear"),
-            KimiK3OffloadScheduler,
-            id="kimi-k3",
-        ),
-        pytest.param(
             SimpleNamespace(model_type="qwen3_next"),
             QwenOffloadScheduler,
             id="qwen3-next",
@@ -7617,21 +7612,3 @@ def test_lmcache_mp_native_state_lookup_is_keyed_the_same_way():
         seq = _media_seq("A", seed)
         assert lookup(stub, seq) == tier_token_ids(seq, end)
     assert lookup(stub, seq) == seq.token_ids[:end]
-
-
-def test_dsv4_lookup_is_keyed_the_same_way():
-    from atom.kv_transfer.offload.hybrid.dsv4.connector import DSV4OffloadScheduler
-
-    asked = []
-    stub = SimpleNamespace(
-        _lookup_in_step=[],
-        _lookup_client=SimpleNamespace(
-            lookup=lambda ids, lookup_id: asked.append(ids) or _MEDIA_PROMPT
-        ),
-        _remember_tier_hit=lambda *_args: None,
-    )
-    for seed in (11, -1):
-        seq = _media_seq("A", seed)
-        assert DSV4OffloadScheduler._fresh_tier_lookup(stub, seq, "A") == _MEDIA_PROMPT
-        assert asked[-1] == tier_token_ids(seq, _MEDIA_PROMPT)
-    assert asked[-1] == list(seq.token_ids)

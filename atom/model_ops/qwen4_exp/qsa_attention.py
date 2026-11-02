@@ -300,9 +300,9 @@ class Qwen4ExpAttention(nn.Module):
         self.kv_format, self.index_format = (
             ("bf16", "bf16") if is_plugin_mode() else qsa_cache_formats(atom_config)
         )
-        # The MTP draft layer keeps BF16 caches under quantized target caches,
-        # in a row space of its own: an FP8 draft KV costs ~3.5% of the real
-        # acceptance length, a BF16 one none.
+        # The MTP draft layer sits past the target stack. It keeps BF16 caches
+        # under quantized target caches, in a row space of its own: an FP8
+        # draft KV costs ~3.5% of the real acceptance length, a BF16 one none.
         self.qsa_row_space = (
             QSA_ROWS
             if is_plugin_mode()

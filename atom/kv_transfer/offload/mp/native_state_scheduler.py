@@ -360,28 +360,18 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                     memo[3],
                 )
                 return memo[3]
+        found = 0
         boundaries = getattr(seq, "_mp_boundary_by_hash", None)
         if boundaries is None:
             boundaries = seq._mp_boundary_by_hash = {}
-        found = self._highest_image(seq, floor, frontier, boundaries)
+        for boundary in range(frontier, floor, -self.chunk_size):
+            prefix_hash = self._boundary_hash(seq, boundary)
+            boundaries[prefix_hash] = boundary
+            if self._checkpoints.contains(prefix_hash):
+                found = boundary
+                break
         seq._mp_save_frontier_memo = (frontier, floor, store.generation, found)
         return found
-
-    def _highest_image(
-        self, seq: Any, low: int, high: int, boundaries: dict | None = None
-    ) -> int:
-        """Highest chunk boundary in `(low, high]` holding a checkpoint, or 0.
-
-        One image per save: storing every rung would hold `should_defer_free`
-        and the state budget for a whole ladder per prompt.
-        """
-        for boundary in range(self._chunk_floor(high), low, -self.chunk_size):
-            prefix_hash = self._boundary_hash(seq, boundary)
-            if boundaries is not None:
-                boundaries[prefix_hash] = boundary
-            if self._checkpoints.contains(prefix_hash):
-                return boundary
-        return 0
 
     def _save_floor(self, lower: int) -> int:
         """Exclusive lower bound for boundaries worth storing (never 0)."""
@@ -391,7 +381,10 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         available = self._chunk_floor(available)
         if self._page_only:
             return available if available > self._save_floor(saved) else saved
-        return self._highest_image(seq, self._save_floor(saved), available) or saved
+        for boundary in range(available, self._save_floor(saved), -self.chunk_size):
+            if self._checkpoints.contains(self._boundary_hash(seq, boundary)):
+                return boundary
+        return saved
 
     def _may_emit_save(self) -> bool:
         return len(self._save_inflight) < self._max_pending_saves

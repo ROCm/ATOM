@@ -620,8 +620,8 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         super().relocate_state_slots(pairs)
         destinations, sources = [], []
         # The shared pool relocates individual slots, never request groups.
-        for plane in self._ple_planes:
-            state = getattr(self.model_runner, plane.name, None)
+        for name in ("ple_conv_state", "ple_ngram_state"):
+            state = getattr(self.model_runner, name, None)
             if state is not None:
                 for src, dst in pairs:
                     destinations.append(state[dst : dst + 1])

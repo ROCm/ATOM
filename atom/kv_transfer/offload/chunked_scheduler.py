@@ -510,8 +510,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         if not hit:
             return 0, False
+        num_prompt = seq.num_prompt_tokens
         frontier = int(seq.num_cached_tokens)
-        hit = self._loadable_hit(seq, hit)
+        hit = self._loadable_hit(hit, num_prompt, seq)
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will
             # actually be requested; before the save floor is recorded, so a

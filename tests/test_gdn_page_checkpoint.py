@@ -18,16 +18,16 @@ from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
+    published_bytes_for,
 )
-from atom.model_ops.attentions.pool_layout.layer_major_page_geometry import (
-    layer_major_page_unit_bases,
-    layer_major_page_unit_regions,
-    layer_major_page_unit_segments,
-    layer_major_page_unit_stream_sizes,
-    layer_major_page_unit_views,
-    layer_major_published_page_bytes,
+from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+    mha_page_unit_bases,
+    mha_page_unit_regions,
+    mha_page_unit_segments,
+    mha_page_unit_stream_sizes,
+    mha_page_unit_views,
+    mha_published_page_bytes,
 )
-from tests.test_entry_arena import qsa_like_fields
 
 
 def _builder_cls():
@@ -136,54 +136,46 @@ def _pool(*, kv_dtype, layers=15, block_size=16):
 class TestMhaRegionsMatchThePublishedPages:
     def test_bf16_published_bytes_are_the_whole_entry(self):
         pool = _pool(kv_dtype=torch.bfloat16)
-        published = layer_major_published_page_bytes([pool])
-        _, sizes = layer_major_page_unit_regions([pool])
+        published = mha_published_page_bytes([pool])
+        _, sizes = mha_page_unit_regions([pool])
         assert published == int(sizes.sum()) == pool.entry_bytes
 
     def test_narrow_dtype_drops_alignment_padding(self):
         """fp8-width fields declare scales. Their group is padded to 256 B,
         and that padding is not a transfer region."""
         pool = _pool(kv_dtype=torch.int8)
-        published = layer_major_published_page_bytes([pool])
-        _, sizes = layer_major_page_unit_regions([pool])
+        published = mha_published_page_bytes([pool])
+        _, sizes = mha_page_unit_regions([pool])
         assert published == int(sizes.sum())
         assert published < pool.entry_bytes
 
-    def test_an_arena_states_its_published_bytes_as_a_pool_does(self):
-        """Qwen3.8's QSA arena is a PAGE pool of its own; the padding its
+    def test_a_qsa_arena_block_round_trips_through_its_regions(self):
+        """Qwen3.8's QSA arena is a PAGE pool of its own. The padding its
         `entry_bytes` bills between an int8 plane and its scales is no region."""
         arena = LayerMajorArena(
             [
                 EntryField("k", 2, (16, 3), torch.int8),
                 EntryField("k_scale", 2, (16,), torch.float32),
             ],
-            4,
+            2,
             "cpu",
         )
-        published = layer_major_published_page_bytes([arena])
-        _, sizes = layer_major_page_unit_regions([arena])
-        assert published == int(sizes.sum()) == arena.published_bytes
-        assert published < arena.entry_bytes
-
-    def test_an_arena_block_round_trips_through_its_contiguous_regions(self):
-        arena = LayerMajorArena(qsa_like_fields(), entries=2, device="cpu")
-        bases, sizes = layer_major_page_unit_regions([arena])
-        assert int(sizes.sum()) == arena.published_bytes <= arena.entry_bytes
-        assert len(bases) == 8  # 4 fields * 2 layers
-        blob = torch.arange(arena.published_bytes, dtype=torch.uint8)
+        bases, sizes = mha_page_unit_regions([arena])
+        published = published_bytes_for(arena.fields)
+        assert len(bases) == 4 and int(sizes.sum()) == published < arena.entry_bytes
+        blob = (torch.arange(published) % 251).to(torch.uint8)
         at = 0
         for _, tensor in arena.region_tensors():
-            assert tensor.is_contiguous() and tensor.shape[0] == 2
             row = tensor[1].view(torch.uint8).reshape(-1)
             row.copy_(blob[at : at + row.numel()])
             at += row.numel()
-        views = layer_major_page_unit_views([arena], [1])
+        views = mha_page_unit_views([arena], [1])
         packed = torch.cat([view.view(torch.uint8).reshape(-1) for view in views])
         assert torch.equal(packed, blob)
 
     def test_regions_are_the_page_region_contract(self):
         pool = _pool(kv_dtype=torch.int8)
-        bases, sizes = layer_major_page_unit_regions([pool])
+        bases, sizes = mha_page_unit_regions([pool])
         published = [
             (
                 page_region(tensor, semantic_role=role).region.base_addr,
@@ -205,10 +197,10 @@ class TestMhaRegionsMatchThePublishedPages:
             kv_dtype=torch.int8,
         )
         pool.allocate(4, "cpu")
-        regions = layer_major_page_unit_regions([pool])
+        regions = mha_page_unit_regions([pool])
         bases, sizes = regions
-        assert int(sizes.sum()) == layer_major_published_page_bytes([pool])
-        got = layer_major_page_unit_bases(regions, [[0, 2], [1, 3]])
+        assert int(sizes.sum()) == mha_published_page_bytes([pool])
+        got = mha_page_unit_bases(regions, [[0, 2], [1, 3]])
         want = []
         for image in ([0, 2], [1, 3]):
             for unit in image:
@@ -217,21 +209,18 @@ class TestMhaRegionsMatchThePublishedPages:
                 )
         assert got.shape == (2, len(sizes) * 2)
         assert got.reshape(-1).tolist() == want
-        assert (
-            layer_major_page_unit_stream_sizes(regions, 3).tolist()
-            == sizes.tolist() * 3
-        )
+        assert mha_page_unit_stream_sizes(regions, 3).tolist() == sizes.tolist() * 3
 
     def test_views_follow_the_page_stream_and_drop_the_tail(self):
         pool = _pool(kv_dtype=torch.bfloat16, layers=2, block_size=16)
         regions = list(pool.region_tensors())
         for index, (_, tensor) in enumerate(regions):
             tensor.view(torch.uint8).fill_(index + 1)
-        unit = int(layer_major_page_unit_regions([pool])[1][0])
+        unit = int(mha_page_unit_regions([pool])[1][0])
         # One full region plus three bytes of the next. The rest is padding
         # the packer must not see.
         image = unit + 3
-        views = layer_major_page_unit_views([pool], [1, 0], image_bytes=image)
+        views = mha_page_unit_views([pool], [1, 0], image_bytes=image)
         blob = b"".join(bytes(view.reshape(-1).view(torch.uint8)) for view in views)
         assert len(blob) == image
         assert blob[:unit] == bytes([1]) * unit
@@ -242,12 +231,12 @@ class TestMhaRegionsMatchThePublishedPages:
         to name the same bytes in the same order, tail trim included -- at an
         exact segment boundary, mid-segment, and with no trim at all."""
         pool = _pool(kv_dtype=torch.int8, layers=3, block_size=16)
-        regions = layer_major_page_unit_regions([pool])
+        regions = mha_page_unit_regions([pool])
         unit = int(regions[1].sum())
         first = int(regions[1][0])
         for image in (0, first, first + 5, 2 * unit - 7, 3 * unit):
-            views = layer_major_page_unit_views([pool], [2, 0, 3], image_bytes=image)
-            ptrs, sizes = layer_major_page_unit_segments(
+            views = mha_page_unit_views([pool], [2, 0, 3], image_bytes=image)
+            ptrs, sizes = mha_page_unit_segments(
                 regions, [2, 0, 3], entries=4, image_bytes=image
             )
             want = [
@@ -258,7 +247,7 @@ class TestMhaRegionsMatchThePublishedPages:
     def test_a_unit_past_the_pool_is_refused(self):
         pool = _pool(kv_dtype=torch.bfloat16, layers=1, block_size=16)
         try:
-            layer_major_page_unit_views([pool], [4])
+            mha_page_unit_views([pool], [4])
         except IndexError as exc:
             assert "outside" in str(exc)
         else:

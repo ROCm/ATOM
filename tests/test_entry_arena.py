@@ -219,20 +219,14 @@ class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
             LayerMajorArena(fields, 3, device="cpu", buf=buf)
 
 
-def qsa_like_fields(block=4):
-    """Shaped after Qwen3.8's QSA arena, scaled down."""
-    return [
-        EntryField("k", 2, (block, 2, 8), torch.bfloat16),
-        EntryField("v", 2, (block, 2, 8), torch.bfloat16),
-        EntryField("index_raw", 2, (block, 1, 4), torch.bfloat16),
-        EntryField("index_compressed", 2, (block // 4, 1, 4), torch.bfloat16),
-    ]
-
-
 def test_a_layer_major_arena_publishes_one_region_per_field_layer():
-    """The walk `MhaKvPool`, `MlaKvPool` and Qwen3.8's QSA arena share: role
-    names and order as the MHA pool always published them, at the views."""
-    arena = LayerMajorArena(qsa_like_fields(), entries=5, device="cpu")
+    """Qwen3.8's QSA arena publishes its regions as `MhaKvPool` does: role
+    names and order, at the views, and at the declared offsets."""
+    fields = [
+        EntryField("k", 2, (4, 2, 8), torch.bfloat16),
+        EntryField("index_compressed", 2, (1, 1, 4), torch.bfloat16),
+    ]
+    arena = LayerMajorArena(fields, entries=5, device="cpu")
     expected = [
         (view[layer].data_ptr(), view[layer].stride(0) * view.element_size())
         for field in arena.fields
