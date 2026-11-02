@@ -205,3 +205,4 @@ def response_logprobs(
             choice["logprobs"] = values
         finally:
             tracker.close()
+    return response

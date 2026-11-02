@@ -52,7 +52,7 @@ def records(text):
 )
 def test_nonstream_joins_source_spans_without_search(text, answer, thought):
     response = SimpleNamespace(choices=[{"message": {"content": "old"}}])
-    response_logprobs(
+    returned = response_logprobs(
         response,
         [{"token_ids": list(map(ord, text)), "logprobs": records(text)}],
         Codec(),
@@ -61,6 +61,7 @@ def test_nonstream_joins_source_spans_without_search(text, answer, thought):
         tools=TOOLS,
         tool_parser_cls=DsmlV41Parser,
     )
+    assert returned is response
     choice = response.choices[0]
     assert choice["message"]["content"] == answer
     assert choice["message"].get("reasoning_content") == thought
