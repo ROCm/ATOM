@@ -176,7 +176,7 @@ def response_logprobs(
     reasoning,
     tools=None,
     tool_choice=None,
-    tool_parser_cls=None
+    tool_parser_cls=None,
 ):
     from .serving_chat import _tool_parser_for_request
     from .tool_parser import parse_tool_calls
