@@ -57,7 +57,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `replay_history_tokens` | `int` | `0` | Set by the model, not a flag: the tokens before a forward that starts below where its prefill resumed which the backend reads (`Replay.history_ids`). DeepSeek-V4.1: its Engram n-gram lookback, `engram_max_ngram_size - 1` |
 | `state_replay_tokens` | `int` | `0` | Set by the model, not a flag: how far below a prefix hit with no state checkpoint behind it a prefill starts to rebuild that state exactly (`BlockManager.replay_start`); 0 takes no such hit. DeepSeek-V4 under `ATOM_DSV4_STATE_REPLAY`: the window receptive field `W + (L-1)(W-1)`, 7,748 on V4-Pro and 7,875 with MTP or DSpark |
 | `port` | `int` | `8006` | Engine internal communication port |
-| `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
+| `torch_profiler_dir` | `str \| None` | `envs.ATOM_TORCH_PROFILER_DIR` (unset or empty → `None`) | Directory for saving PyTorch profiler traces; creates the directory if it does not exist. `--torch-profiler-dir` takes precedence over the environment default |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
 | `quant_config` | `QuantizationConfig` | *(auto-detected)* | Quantization settings; auto-detected from HuggingFace config during `__post_init__` via `QuantizationConfig(hf_config)` (see Section 3) |
 | `asyncio_mode` | `bool` | `False` | Enable asyncio-based engine loop |
@@ -258,7 +258,7 @@ Notes:
 - An empty JSON object (`--online_quant_config '{}'`) is treated the same as not passing the flag and does not enable online quantization.
 - Online quantization currently applies when the source model is unquantized or uses supported FP8 block quantization (`QuantType.per_1x128`). The loader dequantizes FP8 block weights before applying the requested target format.
 - Tensor-parallel weights are gathered before quantization only when local quantization would produce different scales than quantizing the full unpartitioned weight.
-- Rank 0 writes an `online_quant_info_*.json` summary with elapsed time and per-layer target formats. The file is written under `ATOM_TORCH_PROFILER_DIR` when set, otherwise the current working directory.
+- Rank 0 writes an `online_quant_info_*.json` summary with elapsed time and per-layer target formats. The file is written under `ATOM_ONLINE_QUANT_INFO_DIR` when set, otherwise under `ATOM_TORCH_PROFILER_DIR`, otherwise in the current working directory.
 
 ## Parallel configuration (`ParallelConfig`)
 

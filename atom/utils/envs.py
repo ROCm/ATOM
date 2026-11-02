@@ -788,7 +788,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: (
         os.getenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "0") == "1"
     ),
-    "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Unset reads as None, and so does empty: `ATOM_TORCH_PROFILER_DIR=` is
+    # how a launcher clears the variable inline, and Config would otherwise
+    # abort startup on os.makedirs("") for the empty path.
+    "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR") or None,
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.
@@ -904,6 +907,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to a warning when bringing up a checkpoint that is known to be partial.
     "ATOM_LOADER_STRICT_COVERAGE": lambda: (
         os.getenv("ATOM_LOADER_STRICT_COVERAGE", "true").lower() == "true"
+    ),
+    # Directory rank 0 writes the online_quant_info_*.json dump to. Its own
+    # knob so that a launcher collecting the dump no longer has to hand the
+    # engine a profiler directory to get it: unset (or empty) falls back to
+    # ATOM_TORCH_PROFILER_DIR, the dump's only home before this one existed.
+    # The caller falls back to the working directory from there.
+    "ATOM_ONLINE_QUANT_INFO_DIR": lambda: (
+        os.getenv("ATOM_ONLINE_QUANT_INFO_DIR")
+        or os.getenv("ATOM_TORCH_PROFILER_DIR")
+        or None
     ),
     # Quantize eligible modules as they load to reduce peak memory. Streaming
     # quantizes local TP shards, so results may differ slightly from offline.
