@@ -109,7 +109,7 @@ def test_step_rows_accepts_a_uniform_spec_verify():
         {"num_accepted_tokens": None},
         {"num_actual_tokens": 7},  # disagrees with the rows
         {"spec_state_indices_tensor": torch.zeros(2, 4, dtype=torch.int64)},
-        {"has_state_fork": True},  # the layer's own branch moves the state
+        {"has_state_fork": True},  # K1 has no read-side slot index
     ],
 )
 def test_step_rows_refuses_every_other_shape(over):

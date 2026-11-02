@@ -52,10 +52,10 @@ def step_shape(metadata, rows: int) -> tuple[int | None, str]:
     if metadata.num_prefills:
         return None, f"{metadata.num_prefills} prefills in the batch"
     if getattr(metadata, "has_state_fork", False):
-        # A forked step reads one slot and writes another. `KimiKDAAttention`
-        # moves the state across before its kernels run; a mono step replaces
-        # that branch, so it would run on the unseeded write slot.
-        return None, "state fork (the layer's own branch moves the state)"
+        # A forked step reads one slot and writes another. The production
+        # kernels take that read-side index; K1 reads `st_idx` only, so it
+        # would run on the unseeded write slot.
+        return None, "state fork (K1 has no read-side slot index)"
     if getattr(metadata, "spec_sequence_masks", None) is None:
         return _plain_decode_shape(metadata, rows)
     if metadata.num_decodes:
