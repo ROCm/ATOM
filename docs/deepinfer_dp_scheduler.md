@@ -53,16 +53,24 @@ gates both partial resumes and fresh admission. Allocation failure, a full
 sequence limit, or KV pressure does not reset the clock. A rejection-only
 prefill output counts as a prompt step, as upstream's `ignored_seqs` does.
 
-On a global prefill, a rank without its own batch pauses decode and uses ATOM's
-existing dummy-prefill execution, **even without prefill token graphs**.
-ATOM executes a dummy tensor rather than DeepInfer's zero-request output;
-graph and TBO eligibility still follow ATOM's existing cross-rank metadata.
+On a global prefill, a rank without its own batch pauses decode and submits an
+empty scheduled batch, **even without prefill token graphs**. It creates no
+synthetic request. `ForwardMode.decide()` takes the phase from its peers' real
+prefills and supplies the padding rows needed by ATOM's collectives and graphs.
+DeepInfer represents this as an empty scheduler output, but its
+[worker also materializes a placeholder and executes the model](https://github.com/deepseek-ai/DeepInfer/blob/553741557a57df44a46fb3ab72b6aafeaf945337/deepinfer/worker/worker.py#L111-L117);
+the [placeholder has one query token](https://github.com/deepseek-ai/DeepInfer/blob/553741557a57df44a46fb3ab72b6aafeaf945337/deepinfer/worker/model_runner.py#L355-L371).
+An empty scheduler output must not be interpreted as skipping GPU execution.
+ATOM materializes padding after the DP metadata exchange; graph and TBO
+eligibility still follow ATOM's existing cross-rank metadata.
 Consequently, enabling TBO does not guarantee it activates on dummy-heavy steps.
 
 This mode replaces PrefillDelayer; it does not layer on top of it:
 
 - `ATOM_ENABLE_PREFILL_DELAYER`, `ATOM_PREFILL_DECODE_INTERVAL` and the other
   `ATOM_PREFILL_DELAYER_*` settings do not control this mode.
+- `--prefill-admit-policy` selects ATOM's native admission rule only. Its
+  `interval` and `adaptive` settings do not alter DeepInfer's ALL/ANY votes.
 - DP chunk-cost balancing is bypassed because it depends on the delayer's
   extra exchange and would introduce a different scheduling rule.
 - Request routing, KV allocation, chunked prefill, native sequence/token
