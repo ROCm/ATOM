@@ -106,6 +106,7 @@ def test_standard_post_routing_arguments_are_preserved(monkeypatch, fp8_activati
     monkeypatch.setattr(moe_mod, "fused_moe", fake_fused_moe)
     method = object.__new__(moe_mod.Mxfp4MoEMethod)
     method.fused_experts = None
+    method.use_flydsl_herd = False
     method.quant_type = "mxfp4"
     method.is_guinterleave = True
     method.fp8_activations = fp8_activations
