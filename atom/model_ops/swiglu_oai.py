@@ -32,6 +32,12 @@ def _swiglu_oai_kernel(
     has_limit: tl.constexpr,
     block_i: tl.constexpr,
 ):
+    # Inductor may pass Python float arguments as fp64, unlike eager
+    # Triton. Keep the activation in fp32 in both execution modes.
+    alpha = tl.cast(alpha, tl.float32)
+    beta = tl.cast(beta, tl.float32)
+    limit = tl.cast(limit, tl.float32)
+
     row = tl.program_id(0)
     tile = tl.program_id(1)
     cols = tile * block_i + tl.arange(0, block_i)
