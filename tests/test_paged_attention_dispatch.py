@@ -613,6 +613,43 @@ class TestFlyDSLPastGluon:
             assert "max_seqlen_q=6 x 8" in hints[0].getMessage()
         assert not calls
 
+    @pytest.mark.parametrize("case", ["sinks", "bf16_kv"])
+    def test_no_hint_where_atom_keeps_the_call_off_flydsl(
+        self, monkeypatch, caplog, case
+    ):
+        """Sinks, and BF16 KV on a gluon GPU, stay off FlyDSL even with
+        ATOM_PA_FLYDSL=1, so a default user past the envelope is not told
+        the flag would route them there."""
+        import logging
+
+        import torch
+
+        from atom.model_ops import attention_mha as mha
+
+        calls = self._flydsl_on(monkeypatch, on=False)
+        monkeypatch.setattr(mha, "_flydsl_off_hint_logged", False)
+        monkeypatch.setattr(mha, "unified_attention", lambda *a, **k: None)
+        layer = self._layer(
+            scale=1.0,
+            kv_scale=None,
+            sinks=torch.empty(self.HEADS, device="meta") if case == "sinks" else None,
+            kv_cache_dtype="bf16" if case == "bf16_kv" else "fp8",
+        )
+        q, kc, vc, md = self._call(
+            6, kv_dtype=torch.bfloat16 if case == "bf16_kv" else None
+        )
+        md.cu_seqlens_q = md.max_seqlen_k = None
+        assert not layer._flydsl_route_open(md)
+        # The same layer with the condition lifted is open: not vacuous.
+        assert self._layer()._flydsl_route_open(md)
+        with caplog.at_level(logging.INFO, logger="atom"):
+            mha.PagedAttentionImpl.paged_attention_unified(
+                *(layer, q, None, None, kc, vc, None, None),
+                SimpleNamespace(attn_metadata=md),
+            )
+        assert not [r for r in caplog.records if "ATOM_PA_FLYDSL" in r.getMessage()]
+        assert not calls
+
     def test_no_hint_inside_the_gluon_envelope(self, monkeypatch):
         """MTP-3 (qlen 4) keeps gluon; the refusal names no opt-in."""
         import torch
@@ -2096,13 +2133,23 @@ class TestNoGluonFlyDSLRouting:
             with pytest.raises(NotImplementedError, match=error):
                 call()
 
-    def test_use_unified_attn_keeps_decode_off_flydsl(self, monkeypatch):
+    @pytest.mark.parametrize("unified", [False, True])
+    def test_use_unified_attn_keeps_decode_off_flydsl(self, monkeypatch, unified):
+        """FlyDSL opted in and accepting: only ATOM_USE_UNIFIED_ATTN keeps the
+        call off it (the False case shows the call would otherwise be taken)."""
         mha, _ba = self._no_gluon(monkeypatch)
-        monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", True)
+        monkeypatch.setattr(mha.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
         monkeypatch.setattr(mha, "flydsl_decode_seqs", lambda **kw: 4)
         layer = mha.PagedAttentionImpl.__new__(mha.PagedAttentionImpl)
-        layer.sliding_window = -1
-        assert not layer._flydsl_takes_decode(None, None, None, None, None, None)
+        layer.sliding_window, layer.kv_cache_dtype, layer.sinks = -1, "fp8", None
+        layer.use_flash_layout = False
+        layer.num_heads, layer.num_kv_heads = 16, 1
+        m = self._meta
+        md = SimpleNamespace(context_lens=m(4), block_tables=m(4, 8), max_seqlen_q=1)
+        kc, vc = m(8, 1, 8, 128, 16), m(8, 1, 8, 128, 16)
+        taken = layer._flydsl_takes_decode(m(4, 16, 128), kc, vc, None, None, md)
+        assert taken == (False if unified else 4)
 
     @pytest.mark.parametrize(
         "arch, takes_max_batch", [("gfx950", True), ("gfx1250", False)]

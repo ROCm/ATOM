@@ -638,15 +638,22 @@ class PagedAttentionImpl(nn.Module):
 
     def _flydsl_route_open(self, attn_metadata) -> bool:
         """Whether this unified-bound decode is one ATOM_PA_FLYDSL offers to
-        FlyDSL: not forced to unified, paged layout, no window, and on a gluon
-        GPU past the gluon envelope (inside it the gluon route is kept)."""
+        FlyDSL: not forced to unified, paged layout, no window, no sinks, not
+        BF16 KV on a gluon GPU (ATOM's own routing in
+        ``_flydsl_pa_decode_num_seqs``), and on a gluon GPU past the gluon
+        envelope (inside it the gluon route is kept). aiter's predicate is not
+        asked here; the opt-in hint relies on this, so it never names a route
+        ATOM's routing would refuse."""
+        gluon = pa_decode_gluon_supports_arch()
         if (
             envs.ATOM_USE_UNIFIED_ATTN
             or self.use_flash_layout
             or self.sliding_window > 0
+            or self.sinks is not None
+            or (self.kv_cache_dtype == "bf16" and gluon)
         ):
             return False
-        return not pa_decode_gluon_supports_arch() or gluon_decode_over_limit(
+        return not gluon or gluon_decode_over_limit(
             attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
         )
 
