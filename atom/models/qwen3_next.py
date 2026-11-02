@@ -48,6 +48,9 @@ from atom.model_ops.moe_tail_norm import (
     MoEGatedSum,
     MoENormed,
     combine_tail_request,
+    gated_gemm_available,
+    interleave_gate_up,
+    silu_gate_up_gemm,
 )
 from atom.model_ops.sigmoid_gate import output_gate_mul, shared_expert_gate_add
 from atom.model_ops.topK import (
@@ -172,10 +175,28 @@ class Qwen3NextMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        # ATOM_SHARED_EXPERT_GATED_GEMM: gate_up_proj's weight rows interleaved
+        # gate / up after load, read by one GEMM whose epilogue is the SiLU.
+        self.gated_gate_up = False
+
+    def process_weights_after_loading(self):
+        proj = self.gate_up_proj
+        if (
+            envs.ATOM_SHARED_EXPERT_GATED_GEMM
+            and not self.gated_gate_up
+            and proj.quant_type.value == QuantType.No.value
+            and proj.weight.dtype == torch.bfloat16
+            and proj.bias is None
+            and gated_gemm_available()
+        ):
+            proj.weight.data = interleave_gate_up(proj.weight.data)
+            self.gated_gate_up = True
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        if self.gated_gate_up:
+            out = silu_gate_up_gemm(x, self.gate_up_proj.weight)
+        else:
+            out = self.act_fn(self.gate_up_proj(x))
         out = self.down_proj(out)
 
         if self.expert_gate is not None:

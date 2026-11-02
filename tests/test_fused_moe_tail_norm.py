@@ -633,3 +633,39 @@ def test_mori_call_site_asks_for_the_tail_only_when_it_can(monkeypatch):
         )
         assert mpf._combine_tail_kwargs(hs, "mxfp4") == {}  # quantized combine wire
         assert mpf._combine_tail_kwargs(hs[:3], "none") == {}  # not the block's rows
+
+
+# ---------------------------------------------------------------------------
+# ATOM_SHARED_EXPERT_GATED_GEMM
+# ---------------------------------------------------------------------------
+
+
+def test_interleave_gate_up_pairs_rows():
+    w = torch.arange(12.0).view(6, 2)  # gate rows 0-2, up rows 3-5
+    out = mt.interleave_gate_up(w)
+    assert torch.equal(out[0::2], w[:3]) and torch.equal(out[1::2], w[3:])
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_shared_expert_mlp_uses_the_gated_gemm(monkeypatch, gated):
+    qn = _qwen3_next()
+    mlp = object.__new__(qn.Qwen3NextMLP)
+    nn.Module.__init__(mlp)
+    mlp.expert_gate = None
+    mlp.gated_gate_up = gated
+    w = torch.randn(8, 4)
+    mlp.gate_up_proj = SimpleNamespace(weight=w)
+    mlp.gate_up_proj = lambda x: x @ w.T
+    mlp.gate_up_proj.weight = w  # type: ignore[attr-defined]
+    mlp.act_fn = lambda gu: F.silu(gu[:, :4]) * gu[:, 4:]
+    mlp.down_proj = lambda x: x * 2
+    seen = []
+    monkeypatch.setattr(
+        qn, "silu_gate_up_gemm", lambda x, wi: (seen.append(wi), x[:, :4] + 1)[1]
+    )
+    x = torch.randn(3, 4)
+    out = mlp.forward(x)
+    if gated:
+        assert seen == [w] and torch.equal(out, (x[:, :4] + 1) * 2)
+    else:
+        assert seen == [] and torch.allclose(out, mlp.act_fn(x @ w.T) * 2)

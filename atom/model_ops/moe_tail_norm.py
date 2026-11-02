@@ -407,3 +407,50 @@ class combine_tail_request:  # a context manager, named as one
 
 def current_combine_tail_request() -> CombineTailRequest | None:
     return _COMBINE_TAIL_REQUEST
+
+
+# ---------------------------------------------------------------------------
+# ATOM_SHARED_EXPERT_GATED_GEMM: the shared expert's SiLU-and-mul in its GEMM
+# ---------------------------------------------------------------------------
+
+
+def gated_gemm_available() -> bool:
+    """aiter's gfx1250 gluon GEMM with the gate / up SiLU epilogue."""
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import (  # noqa: F401
+            gemm_a16w16_gated,
+        )
+    except ImportError:
+        return False
+    return get_gfx() == "gfx1250"
+
+
+def interleave_gate_up(w: Tensor) -> Tensor:
+    """[gate; up] rows -> g0, u0, g1, u1, ...: the layout the gated GEMM reads."""
+    half = w.shape[0] // 2
+    return torch.stack((w[:half], w[half:]), dim=1).reshape(w.shape).contiguous()
+
+
+def _silu_gate_up_gemm_impl(x: Tensor, w_interleaved: Tensor) -> Tensor:
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16_gated
+
+    return gemm_a16w16_gated(x, w_interleaved, dtype=x.dtype)
+
+
+def _silu_gate_up_gemm_fake(x: Tensor, w_interleaved: Tensor) -> Tensor:
+    return x.new_empty((x.shape[0], w_interleaved.shape[0] // 2))
+
+
+@torch_compile_guard(gen_fake=_silu_gate_up_gemm_fake, mutates_args=[])
+def silu_gate_up_gemm_op(x: Tensor, w_interleaved: Tensor) -> Tensor:
+    return _silu_gate_up_gemm_impl(x, w_interleaved)
+
+
+def silu_gate_up_gemm(x: Tensor, w_interleaved: Tensor) -> Tensor:
+    """`silu(x @ gate.T) * (x @ up.T)` in one GEMM (bitwise the GEMM +
+    act_and_mul pair at the Qwen3.5 shared-expert shapes up to 4k rows, within
+    one bf16 ulp above)."""
+    if torch.compiler.is_compiling():
+        return silu_gate_up_gemm_op(x, w_interleaved)
+    return _silu_gate_up_gemm_impl(x, w_interleaved)

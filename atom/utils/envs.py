@@ -450,6 +450,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
     # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
     # MI455X: ahead at 32-512 rows, even at 640-1500, behind at 3700).
+    # Qwen3-Next / Qwen3.5 shared expert (bf16, gfx1250): its gate_up GEMM and
+    # SiLU-and-mul in one aiter gluon GEMM with a gated epilogue; gate_up's
+    # weight rows are interleaved gate / up in place at load. Off by default.
+    "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
+        os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
+    ),
     "ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
     ),
