@@ -155,3 +155,11 @@ def test_relay_send_is_sized_to_the_forward_rows():
         torch.testing.assert_close(sent[:, :16], torch.ones(n, 16))
         torch.testing.assert_close(sent[:, 16:], torch.full((n, 8), 6.0))
         assert relay._send is None, "pack must hand the buffer over"
+
+
+def test_relay_a_skipped_first_tap_is_caught_not_written_around():
+    # Only layer 2 fires: it must allocate on its own, and pack() must name -1.
+    relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
+    target.layers[2](torch.zeros(3, 8))
+    with pytest.raises(AssertionError, match=r"\[-1\] not captured"):
+        relay.pack(None, 3)

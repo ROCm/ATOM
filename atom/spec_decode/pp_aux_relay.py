@@ -67,12 +67,13 @@ class PPAuxRelay:
 
         # The send payload, allocated per step at the forward's row count (a
         # resident max_num_batched_tokens buffer is ~0.5 GB per rank): the
-        # first own tap allocates it, every own tap captures into its columns
+        # first own tap to fire allocates it, every own tap captures into its columns
         # and pack() copies the received taps into the leading ones. The last
         # stage's hooks write into the drafter's own buffers instead.
         # shortcut: a recorded graph would bake the capture-time buffer, so
         # this holds only while PP stages run their target eagerly.
         self._send: torch.Tensor | None = None
+        self._filled: set[int] = set()  # own taps captured into `_send`
         self._col = {lid: col for col, lid in enumerate(self.outgoing_ids)}
 
         self._armed = False
@@ -119,11 +120,15 @@ class PPAuxRelay:
             tensor = extract(output, module)
             if tensor is None:
                 return
-            if lid == self.own_ids[0]:
+            # Whichever tap fires first allocates, so a skipped tap cannot
+            # leave the next one writing into a stale or missing buffer.
+            if self._send is None or self._send.shape[0] != tensor.shape[0]:
                 self._send = torch.empty(
                     tensor.shape[0], width, device=tensor.device, dtype=tensor.dtype
                 )
+                self._filled = set()
             self._send[:, col * h : (col + 1) * h].copy_(tensor)
+            self._filled.add(lid)
 
         return _hook
 
@@ -145,6 +150,8 @@ class PPAuxRelay:
         assert (
             send is not None and send.shape[0] == num_tokens
         ), f"PPAuxRelay: no capture of {num_tokens} rows to send"
+        missing = set(self.own_ids) - self._filled
+        assert not missing, f"PPAuxRelay: target layers {sorted(missing)} not captured"
         if self.incoming_ids:
             send[:, : received.shape[-1]].copy_(received[:num_tokens])
         return send
