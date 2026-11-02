@@ -1110,7 +1110,12 @@ class GDNStateMixin(PoolRowsMixin):
         slots = self.non_spec_state_indices_tensor.np[:num_prefills]
         slots = slots[slots >= 0]
         if slots.size:
-            k[:, :, live:, :].index_fill_(1, self._staged_i64("conv_dead", slots), 0)
+            dead = k[:, :, live:, :]
+            # One chunk per (layer, slot): the tail columns are the slot's last
+            # `window - live` rows, contiguous, so the fused zeroing takes them.
+            if envs.ATOM_FUSED_ZERO_FILL and self._zero_spans([dead], slots):
+                return
+            dead.index_fill_(1, self._staged_i64("conv_dead", slots), 0)
 
     def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
         """Checkpoints this step reaches, as device index tensors.

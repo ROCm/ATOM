@@ -502,6 +502,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
+    # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
+    # instead of an `index_fill_` per pool field -- per field AND per layer once
+    # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
+    # staged through pinned memory so the upload never waits on the stream.
+    # Qwen3.5 c1024 (MI455X): 705 released units 981 -> 39 us, the dead conv
+    # columns of 32 slots 49 -> ~4 us.
+    "ATOM_FUSED_ZERO_FILL": lambda: _flag_env("ATOM_FUSED_ZERO_FILL", "0"),
+    # A prefill's `batch_id_per_k_token` from the uploaded `cu_seqlens_k` in one
+    # Triton launch (`build_batch_ids_from_cu`) instead of `repeat_interleave`,
+    # whose kernel walks each sequence's whole context on one wavefront: the
+    # same int32 ids, 260-350 -> ~5 us at 3-47 cached sequences of 4k-190k.
+    "ATOM_FAST_PREFILL_BATCH_IDS": lambda: _flag_env(
+        "ATOM_FAST_PREFILL_BATCH_IDS", "0"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
