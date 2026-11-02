@@ -257,10 +257,10 @@ class WeightUpdaterMixin:
 
         atom_name, shard_id, tgt_suffix = resolved
         module, param_name, param = param_to_module[atom_name]
+        if self._synced_by_module(module, param_name, tensor, shard_id):
+            return "updated"
         weight_loader = getattr(module, "weight_loader", None)
         if weight_loader is None:
-            if self._synced_by_module(module, param_name, tensor, shard_id):
-                return "updated"
             return "skipped"
 
         if self._is_fp8_param(module, param) and tensor.dtype != param.dtype:

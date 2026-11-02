@@ -259,6 +259,7 @@ class _Embedding(torch.nn.Module):
             return False
         if shard_id is None and not self.table.on_host:
             self.table.check_resumed()
+            self.table.check_rows(tensor)
             return False
         self.table.sync_rows(0 if shard_id is None else shard_id * SHARD_ROWS, tensor)
         return True
@@ -349,6 +350,77 @@ def test_a_sync_between_release_and_resume_is_out_of_order(
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, table.dtype)
     assert _bitwise_equal(got, table.neg()[ids])
+
+
+@pytest.mark.parametrize("fail_at", [None, 1])
+def test_a_released_table_has_no_addresses(fake_pin, monkeypatch, fail_at):
+    """Between release and resume there are no rows to address -- on the HBM
+    fallback `weight` is released and empty -- so asking raises rather than
+    handing the kernel an address that is not the table's."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    fake_pin.fail_at = fail_at
+    model = _Model()
+    emb = model.ple.ngram_embedding
+    _load(_table(), emb.table)
+    emb.bind()
+    runner = _runner(model)
+    runner.release_memory(tags=["weights"])
+    with pytest.raises(ValueError, match="released; take its addresses after"):
+        emb.table.shard_bases(NUM_SHARDS)
+    runner.resume_memory(tags=["weights"])
+    emb.table.shard_bases(NUM_SHARDS)
+
+
+def test_resumed_rows_are_host_memory_whatever_the_default_device(fake_pin):
+    """The rows a resume page-locks and the addresses it hands out are host
+    tensors even under a device default (`ModelRunner` sets one while it
+    builds the model): the page-locking copies with `memmove`."""
+    table = _table()
+    host = _host()
+    _load(table, host)
+    host.release()
+    torch.set_default_device("meta")
+    try:
+        host.resume()
+        bases = host.shard_bases(NUM_SHARDS)
+    finally:
+        torch.set_default_device(None)
+    assert bases.device.type == "cpu"
+    assert all(pinned.device.type == "cpu" for _, pinned in host._rows.values())
+    assert host.pinned_bytes == table.nbytes
+
+
+class _HbmEmbedding(torch.nn.Module):
+    """`_Qwen4ExpEmbedding` as the updater sees it: the `weight_loader` it
+    inherits from `VocabParallelEmbedding` takes the whole table, and
+    `sync_weight` (`_ShardsIntoWeight`) writes one checkpoint shard."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(_table(), requires_grad=False)
+
+    def weight_loader(self, param, loaded_weight):
+        param.data.copy_(loaded_weight)
+
+    def sync_weight(self, param_name, tensor, shard_id=None):
+        if param_name != "weight" or shard_id is None:
+            return False
+        self.weight.data.narrow(0, shard_id * SHARD_ROWS, tensor.shape[0]).copy_(tensor)
+        return True
+
+
+def test_shards_reach_a_module_that_also_has_a_whole_table_loader(fake_pin):
+    """A packed name is offered to the module's `sync_weight` before its
+    `weight_loader`, which would be handed a shard and its index and raise."""
+    model = _Model()
+    emb = model.ple.ngram_embedding = _HbmEmbedding()
+    new = _table().neg()
+    proj = torch.randn(4, 4)
+    updated = _updater(model).update_weights(_sync_tensors(new, proj, True))
+    assert updated == NUM_SHARDS + 1
+    assert torch.equal(emb.weight, new)
+    assert torch.equal(model.proj.weight, proj)
 
 
 def test_the_modules_holding_weight_memory_are_found_once(fake_pin, monkeypatch):
@@ -638,7 +710,8 @@ def test_an_fp8_table_syncs_where_its_rows_are(fake_pin, monkeypatch, fail_at):
     """A same-dtype FP8 sync by the table's own name. On the host `weight`
     is a placeholder: the module writes the rows, ahead of the updater's FP8
     branches, which would copy into the placeholder. An HBM fallback table
-    is `weight` and goes through the FP8 branch as any FP8 parameter does."""
+    is `weight` and goes through the FP8 branch as any FP8 parameter does.
+    BF16 rows raise on either, rather than reach the FP8 requantization."""
     fake_pin.fail_at = fail_at
     dtype = torch.float8_e4m3fn
     model = _Model()
@@ -654,6 +727,8 @@ def test_an_fp8_table_syncs_where_its_rows_are(fake_pin, monkeypatch, fail_at):
     updater = _updater(model)
     assert updater.update_weights([("ple.ngram_embedding.weight", new)]) == 1
     assert asked == [fail_at is None]
+    with pytest.raises(ValueError, match="expected torch.float8_e4m3fn n-gram rows"):
+        updater.update_weights([("ple.ngram_embedding.weight", new.bfloat16())])
     ids = _probe_ids(TABLE_ROWS)
     got = _follow(emb.shard_bases, ids, 0, TABLE_ROWS, dtype)
     assert _bitwise_equal(got, new[ids])
@@ -858,6 +933,26 @@ def _load_layer(layer, table):
         layer.ngram_embedding.process_weights_after_loading()
 
 
+def _ngram_model(layer):
+    """The layer as the updater sees it in the model, shard names mapped."""
+    model = torch.nn.Module()
+    model.ple = layer
+    model.packed_modules_mapping = {
+        f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
+        for shard in range(layer.split_ngram_parts)
+    }
+    return model
+
+
+def _layer_sync_tensors(layer, table, by_shard):
+    if not by_shard:
+        return [("ple.ngram_embedding.weight", table)]
+    return [
+        (f"ple.ngram_embedding.shard_{index}.weight", part)
+        for index, part in enumerate(table.split(layer.checkpoint_shard_rows))
+    ]
+
+
 def _layer_table(layer):
     gen = torch.Generator().manual_seed(2)
     return torch.randn(layer.table_rows, layer.head_dim, generator=gen).bfloat16()
@@ -950,6 +1045,8 @@ def test_released_weights_free_the_hbm_fallback(ngram_layer, monkeypatch):
     runner.release_memory(tags=["weights"])
     assert allocated - torch.cuda.memory_allocated() >= table_bytes
     squatter = torch.empty(table_bytes, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="released; take its addresses after"):
+        embedding.table.shard_bases(embedding.shard_bases.numel())
     # The whole table is `weight`, which the updater would otherwise find
     # empty and skip as a shape mismatch.
     updater = _updater(host_layer, "cuda")
@@ -989,25 +1086,14 @@ def test_weight_sync_reaches_the_rows_a_captured_lookup_reads(ngram_layer, shard
     with torch.cuda.graph(graph):
         out = embedding(ids)
 
-    def sync(layer, by_shard):
-        model = torch.nn.Module()
-        model.ple = layer
-        model.packed_modules_mapping = {
-            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
-            for shard in range(_NGRAM_CONFIG.split_ngram_parts)
-        }
-        if by_shard:
-            parts = new.split(layer.checkpoint_shard_rows)
-            tensors = [
-                (f"ple.ngram_embedding.shard_{index}.weight", part)
-                for index, part in enumerate(parts)
-            ]
-        else:
-            tensors = [("ple.ngram_embedding.weight", new)]
-        assert _updater(model, "cuda").update_weights(tensors) == len(tensors)
+    def sync(layer):
+        tensors = _layer_sync_tensors(layer, new, shards)
+        assert _updater(_ngram_model(layer), "cuda").update_weights(tensors) == len(
+            tensors
+        )
 
-    sync(host_layer, shards)
-    sync(hbm_layer, False)
+    sync(host_layer)
+    sync(hbm_layer)
     assert torch.equal(embedding.shard_bases, bases)
     assert [p.data_ptr() for _, p in embedding.table._rows.values()] == pinned
     reference = hbm_layer.ngram_embedding
@@ -1098,6 +1184,34 @@ def test_fp8_ngram_embedding_on_host_matches_hbm_embedding(ngram_layer):
     assert host_layer.ngram_embedding.table.on_host
     inputs = _layer_inputs()
     assert _bitwise_equal(host_layer(*inputs), hbm_layer(*inputs))
+
+
+@_gpu
+@pytest.mark.parametrize("uva", [True, False])
+def test_an_fp8_table_in_hbm_syncs_its_shards_and_refuses_bf16_rows(
+    ngram_layer, monkeypatch, uva
+):
+    """An FP8 table in HBM -- the host table after a refused page-lock, or the
+    HBM embedding: shards synced by name land in the table, and BF16 rows for
+    the whole table raise as on the host, rather than reach the updater's FP8
+    requantization, which knows no PLE scale and leaves the rows as they were
+    while counting them updated."""
+    monkeypatch.setattr(host_memory, "pin_rows", lambda sources, copy=None: None)
+    config = SimpleNamespace(**vars(_NGRAM_CONFIG), ple_embedding_dtype="float8_e4m3fn")
+    layer = ngram_layer(uva, config)
+    embedding = layer.ngram_embedding
+    scale = embedding.weight_scale
+    scale.weight_loader(scale, torch.tensor([0.0625]))
+    _load_layer(layer, _layer_table(layer).to(torch.float8_e4m3fn))
+    assert embedding.weight.is_cuda
+    new = _layer_table(layer).neg().to(torch.float8_e4m3fn)
+    updater = _updater(_ngram_model(layer), "cuda")
+    shards = _layer_sync_tensors(layer, new, True)
+    assert updater.update_weights(shards) == len(shards)
+    assert _bitwise_equal(embedding.weight.data.cpu(), new)
+    with pytest.raises(ValueError, match="expected torch.float8_e4m3fn n-gram rows"):
+        updater.update_weights(_layer_sync_tensors(layer, new.bfloat16(), False))
+    assert _bitwise_equal(embedding.weight.data.cpu(), new)
 
 
 @_gpu

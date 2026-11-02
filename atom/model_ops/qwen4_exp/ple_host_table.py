@@ -165,22 +165,16 @@ class PleHostTable:
         with self._lock:
             self._check_resumed()
 
-    def _check_resumed(self) -> None:
+    def _check_resumed(self, use: str = "sync its rows") -> None:
         # In HBM, `weight` itself is released, with the other parameters.
         if self._released or (self._in_hbm and not self.weight.numel()):
             raise ValueError(
-                f"{self.prefix}: the n-gram table is released; sync its "
-                "rows after the weights are resumed"
+                f"{self.prefix}: the n-gram table is released; {use} after the "
+                "weights are resumed"
             )
 
-    def sync_rows(self, first: int, rows: torch.Tensor) -> None:
-        """A weight sync's global rows `[first, first + len(rows))`: this
-        rank's part is written in place, over the page-locked rows or into
-        `weight` in HBM. Nothing is allocated or page-locked again, so
-        `shard_bases`, and the graphs that captured it, stay valid.
-
-        The caller makes sure no lookup is still reading the rows.
-        """
+    def check_rows(self, rows: torch.Tensor) -> None:
+        """Raise unless `rows` can be written into the table as they are."""
         if rows.dim() != 2 or rows.shape[1] != self.dim:
             raise ValueError(
                 f"{self.prefix}: expected [rows, {self.dim}] n-gram rows, "
@@ -191,6 +185,16 @@ class PleHostTable:
             raise ValueError(
                 f"{self.prefix}: expected {self.dtype} n-gram rows, got {rows.dtype}"
             )
+
+    def sync_rows(self, first: int, rows: torch.Tensor) -> None:
+        """A weight sync's global rows `[first, first + len(rows))`: this
+        rank's part is written in place, over the page-locked rows or into
+        `weight` in HBM. Nothing is allocated or page-locked again, so
+        `shard_bases`, and the graphs that captured it, stay valid.
+
+        The caller makes sure no lookup is still reading the rows.
+        """
+        self.check_rows(rows)
         lo = max(first, self.vocab_start)
         hi = min(first + rows.shape[0], self.vocab_end)
         with self._lock:
@@ -245,7 +249,7 @@ class PleHostTable:
         with self._lock:
             released, self._released = self._released, {}
         for shard, (row_start, num_rows) in released.items():
-            rows = torch.empty(num_rows, self.dim, dtype=self.dtype)
+            rows = torch.empty(num_rows, self.dim, dtype=self.dtype, device="cpu")
             self.load_rows(shard, row_start, rows)
 
     def _to_hbm(self, pin_failed: bool) -> None:
@@ -292,8 +296,7 @@ class PleHostTable:
         missing only some shards is an error.
         """
         with self._lock:
-            if self._released:
-                raise ValueError(f"{self.prefix}: the n-gram table is released")
+            self._check_resumed("take its addresses")
             missing = [shard for shard in self.shards if shard not in self._rows]
             empty = len(missing) == len(self.shards)
             if empty:
@@ -306,7 +309,7 @@ class PleHostTable:
         if empty and initialize is not None:
             initialize()
         row_bytes = self.dim * self.dtype.itemsize
-        bases = torch.zeros(num_shards, dtype=torch.int64)
+        bases = torch.zeros(num_shards, dtype=torch.int64, device="cpu")
         with self._lock:
             for shard in self.shards:
                 first = shard * self.shard_rows

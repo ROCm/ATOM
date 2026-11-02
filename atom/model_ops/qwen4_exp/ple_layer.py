@@ -119,6 +119,28 @@ class _ShardsIntoWeight:
         local = row_start - self.vocab_start_idx
         self.weight.data.narrow(0, local, rows.shape[0]).copy_(rows)
 
+    def sync_weight(
+        self, param_name: str, tensor: torch.Tensor, shard_id: int | None = None
+    ) -> bool:
+        """`WeightUpdaterMixin`: checkpoint shard `shard_id` of `weight`,
+        through the shard loader the checkpoint went through (it checks the
+        shard, its shape and dtype), in place. The updater would otherwise
+        hand the shard to the module's own `weight_loader`, which takes the
+        whole table, or have none and skip it. The whole table is `weight`,
+        the updater's to sync, unless its rows cannot go into an FP8 table
+        as they are."""
+        if param_name != "weight":
+            return False
+        if shard_id is None:
+            if self.weight.dtype.itemsize < 2 and tensor.dtype != self.weight.dtype:
+                raise ValueError(
+                    f"{self.prefix}: expected {self.weight.dtype} n-gram rows, "
+                    f"got {tensor.dtype}"
+                )
+            return False
+        self.weight.weight_loader(self.weight, tensor, shard_id)
+        return True
+
 
 class _Qwen4ExpEmbedding(_ShardsIntoWeight, VocabParallelEmbedding):
     """The BF16 table in HBM."""
@@ -266,8 +288,9 @@ class _Qwen4ExpHostEmbedding(nn.Module):
         shard `shard_id` of it -- written in place (`PleHostTable.sync_rows`).
         False for other parameters, and for the whole table in HBM: that is
         `weight` itself, which the updater syncs as any other parameter --
-        unless it is released, which raises as a shard would rather than
-        reach the updater as a shape mismatch.
+        unless it is released or the rows are not the table's dtype (BF16
+        rows for an FP8 table), which raise as a shard would rather than
+        reach the updater as a shape mismatch or an FP8 requantization.
 
         The last lookups of the step that just ended may still be reading the
         rows over the bus; the updater has waited for them, once per update.
@@ -276,6 +299,7 @@ class _Qwen4ExpHostEmbedding(nn.Module):
             return False
         if shard_id is None and not self.table.on_host:
             self.table.check_resumed()
+            self.table.check_rows(tensor)
             return False
         num_rows = (self.vocab_end_idx - self.vocab_start_idx) * self.tp_size
         first = 0 if shard_id is None else shard_id * self.shard_rows
