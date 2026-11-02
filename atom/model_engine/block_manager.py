@@ -789,7 +789,8 @@ class BlockManager:
         server needs it published because `num_kvcache_blocks` is measured in
         the engine subprocess and its own Config never learns the value.
         """
-        capacity = self.kv.num_blocks
+        # Usable blocks: block 0 is never handed out while it is the null page.
+        capacity = self.kv.num_usable
         # A prompt this long needs more than `capacity` blocks on some rank, so
         # it bounds the search from above: each rank holds at least
         # `1 / dcp_world_size` of it, i.e. over `capacity` blocks' worth.

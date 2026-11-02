@@ -168,6 +168,15 @@ class BlockPool:
         return len(self._used)
 
     @property
+    def num_usable(self) -> int:
+        """Blocks the pool can ever hand out: `num_blocks` minus the null page.
+
+        The ceiling for any "does this fit an empty pool" check; `num_blocks`
+        still counts block 0 when it is the null page.
+        """
+        return max(0, self.num_blocks - self.first_block)
+
+    @property
     def num_indexed(self) -> int:
         """Blocks reachable by content hash, live or merely not-yet-overwritten."""
         return len(self._hash_to_block_id)
