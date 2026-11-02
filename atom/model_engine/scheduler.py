@@ -219,6 +219,23 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.structured_requests = {
+            i: (
+                (
+                    (seq.json_schema, seq.structured_tool_format)
+                    if getattr(seq, "structured_tool_format", None)
+                    else seq.json_schema
+                ),
+                seq.structured_reasoning_end,
+                list(
+                    seq.output_tokens[
+                        : len(seq.output_tokens) - seq.num_placeholder_tokens
+                    ]
+                ),
+            )
+            for i, seq in enumerate(seqs.values())
+            if getattr(seq, "json_schema", None) is not None
+        }
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.

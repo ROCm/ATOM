@@ -19,6 +19,7 @@ from atom.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
 )
+from atom.sampling_params import SamplingParams
 
 PROMPT_IDS = [101, 102, 103, 104]
 
@@ -333,7 +334,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
     )
     monkeypatch.setattr(api_server, "engine", engine)
     monkeypatch.setattr(
-        api_server, "_validate_sequence_context_length", lambda _s: None
+        api_server, "_validate_sequence_context_length", lambda _s, _sampling=None: None
     )
     monkeypatch.setattr(api_server, "delivered_text", lambda _ids: "hello")
     monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
@@ -347,9 +348,9 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(
             else api_server.generate_async
         )
         args = (
-            ([11, 12], {"image": "fixture"}, object(), "req-1")
+            ([11, 12], {"image": "fixture"}, SamplingParams(), "req-1")
             if multimodal
-            else ([11, 12], object(), "req-1")
+            else ([11, 12], SamplingParams(), "req-1")
         )
         return [output async for output in generate(*args, return_token_ids=return_ids)]
 
@@ -564,3 +565,58 @@ def test_multimodal_chat_returns_requested_prompt_ids(
     assert body["usage"]["prompt_tokens"] == len(PROMPT_IDS)
     assert len(body["choices"]) == n
     assert calls == ["single" if n == 1 else "fanout"] and server.templates == 0
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "completion"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "cap",
+    [
+        {},
+        {"max_tokens": None},
+        {"max_tokens": 512},
+        {"max_completion_tokens": 512},
+        {"max_tokens": 8192},
+    ],
+)
+def test_output_cap_default_presence_reaches_sampling(
+    server, monkeypatch, endpoint, stream, cap
+):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(
+        api_server, "_get_engine_config", lambda: SimpleNamespace(max_model_len=4096)
+    )
+    original = api_server._build_sampling_params
+    seen = []
+
+    def capture(**kwargs):
+        result = original(**kwargs)
+        seen.append(result)
+        return result
+
+    monkeypatch.setattr(api_server, "_build_sampling_params", capture)
+    req, handler = _request(endpoint, stream=stream, **cap)
+    if endpoint == "completion":
+        req.prompt = "hi"
+
+    # Stop after sampling construction; generation is covered by this module's
+    # endpoint tests and the context-budget tests exercise engine prompt lengths.
+    def stop(*args, **kwargs):
+        raise RuntimeError("sampling captured")
+
+    monkeypatch.setattr(api_server, "apply_chat_template", stop)
+    monkeypatch.setattr(type(req), "get_prompt_or_tokens", stop, raising=False)
+    if cap.get("max_tokens") == 8192:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(handler(req, SimpleNamespace()))
+        assert exc.value.status_code == 400
+        return
+    try:
+        asyncio.run(handler(req, SimpleNamespace()))
+    except (RuntimeError, HTTPException):
+        pass
+    assert len(seen) == 1
+    explicit = any(value is not None for value in cap.values())
+    assert seen[0].max_tokens_is_default == (not explicit)
+    assert seen[0].max_tokens == (512 if explicit else 4096)

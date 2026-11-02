@@ -485,6 +485,9 @@ class Sequence:
         # collector a slot to walk for each one. `json.dumps` is the only
         # consumer that needs a list, and it converts at its own boundary.
         self.logprobs: array.array = array.array("d")
+        self.json_schema = sampling_params.json_schema
+        self.structured_reasoning_end = sampling_params.structured_reasoning_end
+        self.structured_tool_format = sampling_params.structured_tool_format
         # stream callback
         self.stream_callback = stream_callback
         # The completion half of `token_ids`, kept in step with it by every

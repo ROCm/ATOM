@@ -3292,6 +3292,13 @@ class ModelRunner:
         )
         return device_channel, base
 
+    def prepare_structured_output(self, schema, tool_format, fingerprint, vocab_size):
+        from atom.structured_output import prepare_worker_grammar
+
+        return prepare_worker_grammar(
+            self, schema, tool_format, fingerprint, vocab_size
+        )
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3309,6 +3316,30 @@ class ModelRunner:
         bs = batch.total_seqs_num
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)
+        structured = getattr(self, "structured_output", None)
+        structured_requests = getattr(batch, "structured_requests", None)
+        if structured_requests and structured is None:
+            raise ValueError("Structured output must be prepared before enqueue")
+        if structured_requests and logits.shape[-1] != structured.vocab_size:
+            raise ValueError(
+                "Target logits do not match the prepared structured vocabulary"
+            )
+        structured_prefixes = {}
+        premask_lse = None
+        if structured_requests and need_logprobs and spec_decode_metadata is None:
+            # Keep main's scalar engine logprobs normalized to the raw model
+            # distribution, before either grammar or required-channel masks.
+            premask_lse = torch.logsumexp(logits[:bs].float(), dim=-1)
+        if structured_requests:
+            structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
+        elif structured is not None and (
+            structured.pending
+            or structured.current
+            or getattr(structured, "commit_records", None) is not None
+        ):
+            # Release completed/cancelled state once. Ordinary batches never
+            # build masks, copy tensors to CPU, or synchronize for this feature.
+            structured.clear()
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3319,18 +3350,11 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            # `_constrain_required_channel` below masks `logits` in place, so
-            # each row's logsumexp is taken BEFORE it. Logprobs report the
-            # model's own distribution, as they do for a request without a
-            # channel and on the verification path, which masks copies. The
-            # mask never moves a logit that can still be sampled (an end id it
-            # bans cannot be, a forced id keeps its value), so the sampled
-            # token's logprob is its masked logit minus that logsumexp: a
-            # forced token's is its real logprob, not the masked row's 0.0.
-            # (A forced id the model itself gave -inf is written as 0, so it
-            # reports `-logsumexp` rather than -inf.)
-            premask_lse = None
-            if need_logprobs and batch.required_channel is not None:
+            if (
+                need_logprobs
+                and batch.required_channel is not None
+                and premask_lse is None
+            ):
                 premask_lse = torch.logsumexp(logits.float(), dim=-1)
             channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
@@ -3415,6 +3439,9 @@ class ModelRunner:
         channel_states = None
         if channel is not None and self.tokenID_processor.is_deferred_out:
             channel_states = advance_states(*channel, sampled_tokens)
+
+        if structured_prefixes:
+            structured.commit(sampled_tokens, batch, structured_prefixes)
 
         sampled_logprobs = None
         if need_logprobs:
@@ -3571,6 +3598,12 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if getattr(batch, "structured_requests", None):
+            # Snapshot draft ids before target forward, so their D2H can overlap
+            # it. This runs after device-side deferred input assembly.
+            self.structured_output.prepare(
+                batch, get_forward_context().spec_decode_metadata
+            )
         logits, hidden_states = self.run_model(input_ids, batch)
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
