@@ -58,8 +58,12 @@ fingerprint and configured vocabulary against its target LM head, then compiles
 and caches the grammar used by decoding. Any rank failure rejects the request
 before generation (HTTP 400). Supported deployments need collective worker RPC
 and a `ParallelLMHead` target projection; unsupported topologies/projections are
-rejected at admission. Cold compilation pauses scheduling on the affected ranks;
-repeated schema/tool-format pairs use bounded caches. Ordinary requests do not
+rejected at admission. Cold compilation runs in a worker background executor, polled by admission RPCs.
+The ready-cache lock is never held across RPCs. Before enqueue, each request gets
+its own matcher, which retains the compiled grammar even after cache eviction.
+Compilation and tokenizer setup still consume CPU/GIL time; background execution
+does not imply zero interference. Repeated schema/tool/reasoning configurations
+use bounded compilation caches. Ordinary requests do not
 initialize this path or perform these RPCs.
 
 Only local references are allowed, including references reached transitively
@@ -107,13 +111,14 @@ Constraints apply to the final answer. Grammar activation uses the same rendered
 prompt or token-ID prefix and reasoning-channel state as response parsing, rather
 than assuming a missing reasoning toggle means thinking is enabled. If generation
 starts inside an inline reasoning block, it remains unconstrained until its
-configured end marker; otherwise JSON is constrained immediately. Framed/multiple-
+configured end-marker text; the grammar recognizes that text across alternative
+tokenizations and inside speculative prefixes. Otherwise JSON is constrained immediately. Framed/multiple-
 transition reasoning dialects such as Kimi-K3 are rejected before worker admission
 until their complete channel framing is supported. Target logits are masked before sampling. For speculative
 decoding each verification row uses the grammar state after its proposed draft
 prefix; rejected drafts never advance the committed state. The implementation
-bridges deferred output delivery and reconstructs grammar state from committed
-history on replay. No target-model forward or AITER operator is added.
+bridges deferred output delivery with persistent request state and incremental
+acknowledgements. Replay rolls back only tokens not yet acknowledged by the scheduler. No target-model forward or AITER operator is added.
 
 Once the answer grammar is active, inline reasoning markers inside JSON strings
 remain literal answer text. The grammar tokenizer also preserves HF added tokens
@@ -132,7 +137,9 @@ This change preserves the existing non-speculative engine's scalar logprob
 semantics: normalization uses the raw model distribution before grammar and
 required-channel masks. Chat token-logprob responses, top candidates, and
 DSpark speculative logprobs are a separate change, not a prerequisite for
-structured output. The ordinary path does not copy logits for this feature.
+structured output. A constrained request asking for speculative logprobs is
+rejected before enqueue until token-level speculative logprob support is available.
+The ordinary path does not copy logits for this feature.
 
 With a DSML parser, normal function tools can accompany Chat `response_format`
 or Responses `text.format`. The grammar admits the parser's canonical function
@@ -144,13 +151,15 @@ multimodal input, custom stop strings, and `ignore_eos` remain unsupported with
 constraints. Synthetic forced acceptance is also rejected. No image
 implementation is included.
 
-Committed grammar states are retained for the immediately preceding batch and
-advanced only by newly committed tokens. Each speculative request clones that
-state once and advances its draft branch incrementally; rejected drafts cannot
-mutate the committed state. Prefill/replay, history mismatches, or requests absent
-from the preceding batch reconstruct from the scheduler's authoritative history.
-An ordinary batch skips grammar processing and releases any prior states once;
-it does not allocate masks or add CPU/GPU synchronization for this feature.
+Committed grammar states live until request completion, rejection, or cancellation,
+including across interleaved prefills and ordinary batches. The scheduler sends
+schema configuration once and then only newly acknowledged output tokens, excluding
+deferred placeholders. Speculative mask construction temporarily consumes draft
+tokens and rolls them back in a `finally` block; it does not clone full matcher
+history every step. Terminated/unreachable branches reuse a precomputed stop mask.
+A grammar failure terminates the affected request with a structured-output error;
+other requests retain their matcher state. Ordinary batches do not initialize
+this machinery or discard state belonging to requests scheduled later.
 
 Constrained requests fill reusable CPU bitmask rows directly through llguidance.
 On GPU, a Triton kernel reads packed 32-bit words and writes negative infinity
@@ -160,8 +169,8 @@ CPU execution retains a reference implementation. Pinned host and device mask
 buffers grow on demand and are reused; events protect host writes from an
 unfinished copy and device reuse from an unfinished kernel, including when the
 runner changes streams. No buffers or kernel imports are needed for a request
-batch without constraints. Speculative matcher cloning and committed-state
-semantics are unchanged by this mask optimization.
+batch without constraints. Speculative rows within a request remain sequential because each depends on its
+draft prefix. This implementation does not parallelize independent CPU matchers.
 
 Deferred output remains asynchronous. Target/bonus row indices use their CPU
 mirrors, not GPU `tolist()` calls. After device-side input assembly and before
@@ -173,8 +182,8 @@ Neither publication waits for D2H. Consumption waits only for the corresponding
 copy event, so residual waits are possible if that copy has not finished.
 Owned snapshots and request IDs protect against input-buffer reuse, batch
 reordering, cancellation, and replay. Ordinary output delivery keeps its existing
-deferred queue. CPU history snapshots are still retained; this does not remove
-the separate history-copying cost.
+deferred queue. The scheduler-to-worker protocol carries token deltas rather than
+copying the full generated history every step.
 
 Enabled requests still copy masks and committed tokens between CPU and GPU and
 perform host grammar work. There is no zero-overhead claim. Performance results

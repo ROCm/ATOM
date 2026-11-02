@@ -50,13 +50,7 @@ class StructuredOutputMask:
         if not count:
             return
         if logits.device.type != "cuda":
-            # CPU reference path; GPU execution never expands the packed mask.
-            tokens = torch.arange(logits.shape[1])
-            for i, row in enumerate(rows):
-                allowed = (
-                    (self.host_masks[i, tokens // 32] >> (tokens % 32)) & 1
-                ).bool()
-                logits[row].masked_fill_(~allowed, float("-inf"))
+            apply_bitmask_reference(logits, self.host_masks, rows)
             return
 
         from atom.model_ops.triton_structured_output import apply_packed_bitmask
@@ -109,3 +103,11 @@ class AsyncTokenCopy:
         # Callers must consume the view before start() reuses the pinned buffer.
         self.done.synchronize()
         return self.value
+
+
+def apply_bitmask_reference(logits, masks, rows):
+    """Pure CPU oracle for the packed-mask GPU kernel."""
+    tokens = torch.arange(logits.shape[1])
+    for i, row in enumerate(rows):
+        allowed = ((masks[i, tokens // 32] >> (tokens % 32)) & 1).bool()
+        logits[row].masked_fill_(~allowed, float("-inf"))

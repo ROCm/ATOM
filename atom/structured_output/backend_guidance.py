@@ -5,7 +5,11 @@
 
 import json
 
-import torch
+from llguidance import LLMatcher, LLTokenizer, TokenizerWrapper
+from llguidance.hf import from_tokenizer
+from llguidance.torch import fill_next_token_bitmask
+
+from .schema import check_schema_safety, normalize_schema
 
 
 class _VisibleAddedTokenAdapter:
@@ -27,9 +31,6 @@ class _VisibleAddedTokenAdapter:
 
 
 def grammar_tokenizer(tokenizer, vocab_size, stop_ids):
-    from llguidance import LLTokenizer, TokenizerWrapper
-    from llguidance.hf import from_tokenizer
-
     source = from_tokenizer(tokenizer, n_vocab=vocab_size, eos_token=stop_ids)
     # llguidance 1.9.1 classifies HF added tokens as grammar specials even
     # when HF marks them special=False. Its mask can then allow <think> as
@@ -52,36 +53,28 @@ class GrammarMatcher:
     def __init__(self, compiled):
         self.matcher = compiled.deep_copy()
 
-    def copy(self):
-        return GrammarMatcher(self.matcher)
-
     def accept_token(self, token):
         return self.matcher.consume_token(int(token))
+
+    def rollback(self, count):
+        self.matcher.rollback(count)
+        if self.matcher.is_error():
+            raise ValueError(self.matcher.get_error())
 
     def is_terminated(self):
         return self.matcher.is_stopped()
 
     def fill_next_token_bitmask(self, mask):
-        from llguidance.torch import fill_next_token_bitmask
-
         fill_next_token_bitmask(self.matcher, mask)
         if self.matcher.is_error():
             raise ValueError(self.matcher.get_error())
-
-
-def allocate_token_bitmask(batch_size, vocab_size):
-    return torch.full((batch_size, (vocab_size + 31) // 32), -1, dtype=torch.int32)
 
 
 class GrammarCompiler:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
-    def compile_json_schema(self, schema, tool_format=None):
-        from llguidance import LLMatcher
-
-        from .schema import check_schema_safety, normalize_schema
-
+    def compile_json_schema(self, schema, tool_format=None, reasoning_end=""):
         value = json.loads(schema)
         check_schema_safety(value)
         value = normalize_schema(value)
@@ -100,10 +93,11 @@ class GrammarCompiler:
             # function calls use the parser's native envelope, not beta strict
             # argument schemas. Names and structural strings are quoted literals.
             q = json.dumps
-            names = " | ".join(q(name) for name in spec["names"])
+            headers = " | ".join(
+                q("<" + prefix + 'invoke name="' + name + '">')
+                for name in spec["names"]
+            )
             root = "calls" if spec["required"] else "answer | calls"
-            invoke_open = q("<" + prefix + 'invoke name="')
-            name_end = q('">')
             value = (
                 dict(
                     value, **{"x-guidance": {"lenient": False, "coerce_one_of": False}}
@@ -114,9 +108,16 @@ class GrammarCompiler:
             lark = (
                 f"start: {root}\nanswer: %json {q(value)}\n"
                 f"calls: {q('<' + prefix + section + '>')} invoke+ {q('</' + prefix + section + '>')}\n"
-                f"invoke: {invoke_open} name {name_end} body\n"
-                f"name: {names}\nbody[suffix={q('</' + prefix + 'invoke>')}]: /(.|\\n)*/\n%ignore /[ \\t\\r\\n]+/\n"
+                f"invoke: INVOKE_OPEN body\nINVOKE_OPEN: {headers}\n"
+                f"body[suffix={q('</' + prefix + 'invoke>')}]: /(.|\\n)*/\n%ignore /[ \\t\\r\\n]+/\n"
             )
+            grammar = {"grammars": [{"lark_grammar": lark}]}
+        if reasoning_end:
+            q = json.dumps
+            if not tool_format:
+                lark = f"start: answer\nanswer: %json {q(value)}\n"
+            lark = lark.replace("start: ", "start: reasoning response\nresponse: ", 1)
+            lark += f"reasoning[suffix={q(reasoning_end)}]: /(.|\\n)*/\n"
             grammar = {"grammars": [{"lark_grammar": lark}]}
         matcher = LLMatcher(self.tokenizer, grammar, log_level=0)
         if matcher.is_error():

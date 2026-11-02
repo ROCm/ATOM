@@ -49,7 +49,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     producer_endpoint,
 )
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.llm_engine import _load_tokenizer
+from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
@@ -58,6 +58,14 @@ from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output.validation import (
+    configure_request,
+    schema_from_format,
+    structured_response_channel,
+    validate_chat_stream,
+    validate_output,
+    validate_responses_output,
+)
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -1775,45 +1783,21 @@ async def _configure_structured_output(
 ):
     if schema is None:
         return
-    if envs.ATOM_ENABLE_RELAXED_MTP:
-        raise ValueError("Structured output cannot use relaxed MTP verification")
-    if kv_transfer or multimodal:
-        raise ValueError("Structured output currently requires text without P/D")
-    config = _get_engine_config()
-    spec = getattr(config, "speculative_config", None)
-    if synthetic_token_text is not None or getattr(
-        spec, "synthetic_acceptance_rates", None
-    ):
-        raise ValueError("Structured output cannot use synthetic forced acceptance")
-    if sampling_params.ignore_eos or sampling_params.stop_strings:
-        raise ValueError(
-            "Structured output does not support ignore_eos or custom stop strings"
-        )
-    from atom.structured_output.validation import (
-        WorkerGrammarPreflight,
-        structured_reasoning_marker,
-        structured_tool_format,
+    await configure_request(
+        engine,
+        tokenizer,
+        _get_engine_config(),
+        sampling_params,
+        schema,
+        channel,
+        parser_cls=tool_call_parser_cls,
+        tools=tools,
+        tool_choice=tool_choice,
+        kv_transfer=kv_transfer,
+        multimodal=multimodal,
+        relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        synthetic=synthetic_token_text is not None,
     )
-
-    marker = structured_reasoning_marker(channel, tokenizer)
-    tool_format = structured_tool_format(tool_call_parser_cls, tools, tool_choice)
-    preflight = getattr(_configure_structured_output, "preflight", None)
-    try:
-        if (
-            preflight is None
-            or preflight.engine is not engine
-            or preflight.tokenizer is not tokenizer
-        ):
-            preflight = await asyncio.to_thread(
-                WorkerGrammarPreflight, engine, tokenizer, config
-            )
-            _configure_structured_output.preflight = preflight
-        await preflight.prepare(schema, tool_format)
-    except Exception as exc:
-        raise ValueError(f"Cannot compile JSON Schema: {exc}") from exc
-    sampling_params.json_schema = schema
-    sampling_params.structured_tool_format = tool_format
-    sampling_params.structured_reasoning_end = marker
 
 
 @app.post("/v1/chat/completions")
@@ -1870,8 +1854,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 required_tool_channel, request.tool_choice, request.tools
             ),
         )
-
-        from atom.structured_output.validation import schema_from_format
 
         schema = schema_from_format(request.response_format)
 
@@ -1937,9 +1919,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             kv_transfer=request.kv_transfer_params,
             multimodal=_has_multimodal_content(messages),
         )
-        from atom.structured_output.validation import (
-            structured_response_channel,
-        )
 
         _reasoning = structured_response_channel(_reasoning, schema)
 
@@ -2004,9 +1983,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     ),
                 )
             if schema is not None:
-                from atom.structured_output.validation import (
-                    validate_chat_stream,
-                )
 
                 gen = validate_chat_stream(gen, schema)
             return StreamingResponse(
@@ -2115,7 +2091,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         if schema is not None:
-            from atom.structured_output.validation import validate_output
 
             for choice in resp.choices:
                 validate_output(
@@ -2396,17 +2371,11 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if not max_ctx:
             max_ctx = 30720
         logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = (
-            1
-            if sampling_params.max_tokens_is_default and kv_transfer_params is None
-            else _prompt_headroom(
-                sampling_params.max_tokens, max_ctx, kv_transfer_params
-            )
+        headroom = _prompt_headroom(
+            sampling_params.max_tokens, max_ctx, kv_transfer_params
         )
         max_input = max_ctx - headroom
         if input_tokens > max_input:
-            if sampling_params.max_tokens_is_default and kv_transfer_params is None:
-                raise ValueError("The prompt leaves no context space for output tokens")
             logger.warning(
                 f"Prompt too long ({input_tokens} > {max_input}), truncating"
             )
@@ -2814,11 +2783,6 @@ async def responses_create(raw_request: Request):
             top_p=(request.top_p if request.top_p is not None else model_top_p),
         )
 
-        from atom.structured_output.validation import (
-            schema_from_format,
-            validate_output,
-        )
-
         text_config = getattr(request, "text", None)
         if text_config is not None and not isinstance(text_config, dict):
             raise ValueError("text must be an object")
@@ -2838,17 +2802,11 @@ async def responses_create(raw_request: Request):
             if value:
                 max_ctx = int(value)
                 break
-        headroom = (
-            1
-            if sampling_params.max_tokens_is_default and kv_transfer_params is None
-            else _prompt_headroom(
-                sampling_params.max_tokens, max_ctx, kv_transfer_params
-            )
+        headroom = _prompt_headroom(
+            sampling_params.max_tokens, max_ctx, kv_transfer_params
         )
         max_input = max_ctx - headroom
         if input_tokens > max_input:
-            if sampling_params.max_tokens_is_default and kv_transfer_params is None:
-                raise ValueError("The prompt leaves no context space for output tokens")
             logger.warning(
                 f"Prompt too long ({input_tokens} > {max_input}), truncating"
             )
@@ -2867,9 +2825,6 @@ async def responses_create(raw_request: Request):
             tools=openai_tools,
             tool_choice=request.tool_choice,
             kv_transfer=kv_transfer_params,
-        )
-        from atom.structured_output.validation import (
-            structured_response_channel,
         )
 
         _reasoning = structured_response_channel(_reasoning, schema)
@@ -3024,9 +2979,6 @@ async def responses_create(raw_request: Request):
             finish_reason=final_output.get("finish_reason"),
         )
         if schema is not None:
-            from atom.structured_output.validation import (
-                validate_responses_output,
-            )
 
             validate_responses_output(
                 schema, response, final_output.get("finish_reason")
@@ -3325,7 +3277,7 @@ def main():
         logger.info(f"Default chat template kwargs: {default_chat_template_kwargs}")
 
     logger.info(f"Loading tokenizer from {args.model}...")
-    tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
+    tokenizer = load_tokenizer(args.model, args.trust_remote_code)
     if args.chat_template:
         if os.path.isfile(args.chat_template):
             with open(args.chat_template, "r", encoding="utf-8") as f:

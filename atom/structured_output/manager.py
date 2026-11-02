@@ -1,31 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Target-logit constraints with incremental committed grammar state.
+"""Persistent per-request grammar state, delta acknowledgements and draft rollback."""
 
-Only the previous forward's output prefix is retained to bridge deferred CPU
-delivery. Older requests reconstruct from the scheduler's committed history.
-Only the immediately preceding batch retains matchers. Prefill/replay or a
-history mismatch reconstructs from the scheduler rather than reusing stale state.
-"""
+import hashlib
+import json
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from threading import Lock
 
-from functools import lru_cache
+import torch
+
+from . import backend_guidance as grammar
+from .utils import AsyncTokenCopy, StructuredOutputMask
 
 
-def structured_stop_token_ids(config, tokenizer):
-    stops = list(getattr(config, "stop_token_ids", None) or [])
-    if tokenizer.eos_token_id is not None:
-        stops.append(tokenizer.eos_token_id)
+def structured_stop_token_ids(config, tokenizer=None):
+    stops = config.end_token_ids
     if not stops:
         raise ValueError("Structured output requires a configured EOS token")
-    return list(dict.fromkeys(stops))
+    return list(stops)
 
 
 def tokenizer_fingerprint(tokenizer, stop_token_ids):
     """Identify the actual token mapping/decoder and effective termination IDs."""
-    import hashlib
-    import json
-
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is None:
         raise ValueError("Structured output requires a serializable fast tokenizer")
@@ -36,7 +35,9 @@ def tokenizer_fingerprint(tokenizer, stop_token_ids):
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def prepare_worker_grammar(runner, schema, tool_format, fingerprint, vocab_size):
+def _compile_worker_grammar(
+    runner, schema, tool_format, reasoning_end, fingerprint, vocab_size, request_ids=()
+):
     """Compile on the execution rank via RPC, before the request is enqueued.
 
     The RPC dispatcher catches failures without terminating the worker loop.
@@ -48,7 +49,7 @@ def prepare_worker_grammar(runner, schema, tool_format, fingerprint, vocab_size)
         raise ValueError("Structured output cannot use relaxed MTP verification")
     structured = getattr(runner, "structured_output", None)
     if structured is None:
-        from atom.model_engine.llm_engine import _load_tokenizer
+        from atom.model_engine.llm_engine import load_tokenizer
         from atom.model_ops.embed_head import ParallelLMHead
 
         # Use the physical target projection, never a first-forward tensor or
@@ -63,57 +64,168 @@ def prepare_worker_grammar(runner, schema, tool_format, fingerprint, vocab_size)
             raise ValueError(
                 "Structured output vocabulary differs from the target LM head"
             )
-        tokenizer = _load_tokenizer(
-            runner.config.model, runner.config.trust_remote_code
-        )
+        tokenizer = load_tokenizer(runner.config.model, runner.config.trust_remote_code)
         stops = structured_stop_token_ids(runner.config, tokenizer)
         worker_fingerprint = tokenizer_fingerprint(tokenizer, stops)
         if worker_fingerprint != fingerprint:
             raise ValueError(
                 "Structured output tokenizer/stop tokens differ from the API"
             )
-        structured = StructuredOutput(tokenizer, vocab_size, stops)
-        structured.fingerprint = worker_fingerprint
+        structured = StructuredOutput(tokenizer, vocab_size, stops, worker_fingerprint)
         runner.structured_output = structured
     if structured.vocab_size != vocab_size or structured.fingerprint != fingerprint:
         raise ValueError("Structured output deployment changed; restart the server")
-    structured.compile(schema, tool_format)
-    return {"fingerprint": fingerprint, "vocab_size": vocab_size}
+    compiled = structured.compile(schema, tool_format, reasoning_end)
+    # Matchers own their compiled grammar after admission, independently of the
+    # bounded compilation cache. Build them before any request can be scheduled.
+    result = {"fingerprint": fingerprint, "vocab_size": vocab_size}
+    if request_ids:
+        result["compiled"] = compiled
+    return result
+
+
+def prepare_worker_grammar(
+    runner, schema, tool_format, reasoning_end, fingerprint, vocab_size, request_ids=()
+):
+    """Poll background compilation without blocking the worker's forward loop."""
+    structured = getattr(runner, "structured_output", None)
+    if (
+        structured is not None
+        and structured.fingerprint == fingerprint
+        and structured.vocab_size == vocab_size
+    ):
+        compiled = structured.grammars.get((schema, tool_format, reasoning_end))
+        if compiled is not None:
+            states = {
+                req_id: RequestState(structured.backend.GrammarMatcher(compiled))
+                for req_id in request_ids
+                if req_id not in structured.states
+            }
+            structured.states.update(states)
+            return {"ready": True, "fingerprint": fingerprint, "vocab_size": vocab_size}
+    key = (
+        schema,
+        tool_format,
+        reasoning_end,
+        fingerprint,
+        vocab_size,
+        tuple(request_ids),
+    )
+    if runner.structured_compile_executor is None:
+        runner.structured_compile_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="grammar-compile"
+        )
+    future = runner.structured_compilations.get(key)
+    if future is None:
+        future = runner.structured_compile_executor.submit(
+            _compile_worker_grammar, runner, *key
+        )
+        runner.structured_compilations[key] = future
+    if not future.done():
+        return {"ready": False}
+    try:
+        result = future.result()
+    except Exception:
+        runner.structured_compilations.pop(key, None)
+        raise
+    if request_ids:
+        structured = runner.structured_output
+        compiled = result["compiled"]
+        states = {
+            req_id: RequestState(structured.backend.GrammarMatcher(compiled))
+            for req_id in request_ids
+            if req_id not in structured.states
+        }
+        structured.states.update(states)
+    runner.structured_compilations.move_to_end(key)
+    while len(runner.structured_compilations) > 128:
+        oldest = next(iter(runner.structured_compilations))
+        if not runner.structured_compilations[oldest].done():
+            break
+        runner.structured_compilations.pop(oldest)
+    return {"ready": True, "fingerprint": fingerprint, "vocab_size": vocab_size}
+
+
+@dataclass
+class RequestState:
+    matcher: grammar.GrammarMatcher
+    acknowledged: int = 0
+    pending: deque = field(default_factory=deque)
+
+    def acknowledge(self, update, replay):
+        if update.start != self.acknowledged:
+            raise ValueError("Structured token delta is out of order")
+        for token in update.tokens:
+            if self.pending:
+                if self.pending.popleft() != token:
+                    raise ValueError("Structured output differs from committed tokens")
+            elif not self.matcher.accept_token(token):
+                raise ValueError("Committed output violates the requested grammar")
+            self.acknowledged += 1
+        if replay and self.pending:
+            self.matcher.rollback(len(self.pending))
+            self.pending.clear()
 
 
 class StructuredOutput:
-    def __init__(self, tokenizer, vocab_size, stop_token_ids):
-        from . import backend_guidance as grammar
-
-        self.xgr = grammar
+    def __init__(self, tokenizer, vocab_size, stop_token_ids, fingerprint=None):
+        self.backend = grammar
         self.stop_ids = list(stop_token_ids)
         info = grammar.grammar_tokenizer(tokenizer, vocab_size, self.stop_ids)
         self.compiler = grammar.GrammarCompiler(info)
-        self.compile = lru_cache(maxsize=128)(self.compiler.compile_json_schema)
+        self.fingerprint = fingerprint
         self.vocab_size = vocab_size
-        self.pending = {}
+        self.grammars = OrderedDict()
+        self.compile_lock = Lock()
         self.states = {}
+        self.errors = {}
         self.current = {}
-
-    def clear(self):
-        self.pending.clear()
-        self.states.clear()
-        self.current.clear()
-        self.commit_records = None
         self.draft_plan = None
+        self.commit_records = None
+        self.draft_copy = None
+        self.commit_copy = None
+        self.mask_buffer = StructuredOutputMask(vocab_size)
+        self.stop_mask = torch.zeros((1, (vocab_size + 31) // 32), dtype=torch.int32)
+        for token in self.stop_ids:
+            value = (
+                int(self.stop_mask[0, token // 32]) | (1 << (token % 32))
+            ) & 0xFFFFFFFF
+            self.stop_mask[0, token // 32] = value if value < 2**31 else value - 2**32
+
+    def compile(self, schema, tool_format=None, reasoning_end=""):
+        key = (schema, tool_format, reasoning_end)
+        with self.compile_lock:
+            compiled = self.grammars.get(key)
+            if compiled is None:
+                compiled = self.compiler.compile_json_schema(*key)
+                self.grammars[key] = compiled
+                if len(self.grammars) > 128:
+                    self.grammars.popitem(last=False)
+            else:
+                self.grammars.move_to_end(key)
+            return compiled
+
+    def release(self, request_ids):
+        for req_id in request_ids:
+            self.states.pop(req_id, None)
+            self.errors.pop(req_id, None)
+            self.current.pop(req_id, None)
+        # Keep even an empty record list until the outstanding D2H has finished;
+        # its pinned buffer must not be reused while that copy is in flight.
+        if self.commit_records is not None:
+            removed = set(request_ids)
+            self.commit_records = [
+                (i, req, state)
+                for i, req, state in self.commit_records
+                if req not in removed
+            ]
 
     def prepare(self, batch, metadata):
-        """Publish compact draft snapshots before launching the target forward."""
+        """Snapshot only this step's constrained drafts before target forward."""
         self.draft_plan = None
-        requests = getattr(batch, "structured_requests", {})
+        requests = batch.structured_requests
         if not requests or metadata is None:
             return
-        import torch
-
-        from .utils import AsyncTokenCopy
-
-        # Host mirrors are consumed here, while this step owns the staging slot.
-        # Copy row numbers into Python, never retain a reusable NumPy view.
         target = metadata.target_logits_indices_np
         bonus = metadata.bonus_logits_indices_np
         if target is None or bonus is None:
@@ -127,213 +239,136 @@ class StructuredOutput:
             start, count = int(starts[i]), int(lengths[i])
             rows = target[start : start + count].tolist()
             plan[i] = (rows + [int(bonus[i])], offset, count)
-            # Target rows are contiguous within a request's verification span.
-            # cat owns the snapshot before an input buffer can be reused.
             if count:
                 pieces.append(metadata.input_ids[rows[0] + 1 : rows[0] + 1 + count])
             offset += count
         self.draft_plan = plan
         if pieces:
-            if getattr(self, "draft_copy", None) is None:
+            if self.draft_copy is None:
                 self.draft_copy = AsyncTokenCopy(metadata.input_ids.device)
             self.draft_copy.start(torch.cat(pieces))
 
     def _finish_commit(self):
-        records = getattr(self, "commit_records", None)
-        if records is not None:
-            # Called after this step's forward has been submitted. Only wait for
-            # last step's token copy, never for the current forward or sampler.
+        if self.commit_records is not None:
+            # The next target forward is already submitted. Wait only for the
+            # previous step's compact token snapshot, never the current forward.
             ids = self.commit_copy.wait().tolist()
-            self.commit_records = None
+            records, self.commit_records = self.commit_records, None
             self._commit_ids(ids, records)
 
-    def advance(self, matcher, active, marker, history, token):
-        if active and not matcher.accept_token(token):
-            raise ValueError("Committed output violates the structured-output grammar")
-        history.append(token)
-        if not active and tuple(history[-len(marker) :]) == tuple(marker):
-            active = True
-        return active
+    def _state(self, req_id, update, replay):
+        state = self.states.get(req_id)
+        if state is None:
+            if update.schema is None:
+                raise ValueError("Missing initial structured request configuration")
+            compiled = self.grammars.get(update.schema)
+            if compiled is None:
+                raise ValueError("Structured preparation expired before admission")
+            state = RequestState(self.backend.GrammarMatcher(compiled))
+            self.states[req_id] = state
+        state.acknowledge(update, replay)
+        return state
 
-    def matcher(self, schema, marker, history):
-        compiled = (
-            self.compile(*schema) if isinstance(schema, tuple) else self.compile(schema)
-        )
-        matcher = self.xgr.GrammarMatcher(compiled)
-        body = history
-        if marker:
-            end = next(
-                (
-                    i + len(marker)
-                    for i in range(len(history))
-                    if tuple(history[i : i + len(marker)]) == tuple(marker)
-                ),
-                None,
-            )
-            if end is None:
-                return matcher, False
-            body = history[end:]
-        for token in body:
-            if not matcher.accept_token(token):
-                raise ValueError(
-                    "Committed output violates the structured-output grammar"
-                )
-            if token in self.stop_ids:
-                break
-        return matcher, True
+    def _fill_rows(self, matcher, masks, drafts):
+        consumed = 0
+        try:
+            reachable = True
+            for pos, mask in enumerate(masks):
+                if matcher.is_terminated() or not reachable:
+                    mask.copy_(self.stop_mask[0])
+                else:
+                    matcher.fill_next_token_bitmask(mask.view(1, -1))
+                if pos < len(drafts) and reachable:
+                    token = drafts[pos]
+                    reachable = bool((int(mask[token // 32]) >> (token % 32)) & 1)
+                    if reachable and not matcher.is_terminated():
+                        if not matcher.accept_token(token):
+                            raise ValueError("Draft token disagrees with grammar mask")
+                        consumed += 1
+        finally:
+            # A speculative branch never owns committed state. Roll it back
+            # even when a mask fill fails, then terminate only that request.
+            if consumed:
+                matcher.rollback(consumed)
 
     def apply(self, logits, batch, metadata):
-        requests = getattr(batch, "structured_requests", {})
-        if not requests:
-            self.clear()
+        if not batch.structured_requests:
             return {}
         self._finish_commit()
-        previous, self.pending = self.pending, {}
-        states, self.states = self.states, {}
         self.current = {}
-        plan = getattr(self, "draft_plan", None)
+        plan = self.draft_plan
         drafts = []
         if metadata is not None:
             if plan is None:
-                # CPU reference tests can execute without a runner. GPU callers
-                # must prefetch: never silently reintroduce synchronous D2H.
-                if metadata.input_ids.device.type != "cpu":
-                    raise ValueError("Structured draft tokens were not prefetched")
-                target = metadata.target_logits_indices.tolist()
-                bonus = metadata.bonus_logits_indices.tolist()
-                lengths = metadata.num_draft_tokens_np.tolist()
-                input_ids = metadata.input_ids.tolist()
-                plan = {}
-                for i in requests:
-                    start = sum(lengths[:i])
-                    rows = target[start : start + lengths[i]]
-                    plan[i] = (rows + [bonus[i]], len(drafts), len(rows))
-                    drafts.extend(input_ids[row + 1] for row in rows)
-            elif any(count for _, _, count in plan.values()):
+                raise ValueError("Structured draft tokens were not prefetched")
+            if any(count for _, _, count in plan.values()):
                 drafts = self.draft_copy.wait().tolist()
         self.draft_plan = None
-        if getattr(self, "mask_buffer", None) is None:
-            from .utils import StructuredOutputMask
-
-            self.mask_buffer = StructuredOutputMask(self.vocab_size)
-        mask_count = (
-            sum(len(rows) for rows, _, _ in plan.values())
+        count = (
+            sum(len(v[0]) for v in plan.values())
             if metadata
-            else len(requests)
+            else len(batch.structured_requests)
         )
-        masks = self.mask_buffer.prepare(mask_count, logits.device)
-        prefixes = {}
+        masks = self.mask_buffer.prepare(count, logits.device)
         rows = []
-        for i, (schema, marker, committed) in requests.items():
-            if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
-                continue
+        for i, update in batch.structured_requests.items():
             req_id = batch.req_ids[i]
-            history = list(committed)
-            pending = previous.get(req_id)
-            # A prefill/replay uses the scheduler's authoritative history.
-            if (
-                i >= batch.total_seqs_num_prefill
-                and pending is not None
-                and pending[: len(history)] == history
-            ):
-                history = list(pending)
-            prefixes[i] = (schema, marker, history)
-            state = states.get(req_id)
-            if (
-                i >= batch.total_seqs_num_prefill
-                and state is not None
-                and state[:3] == (schema, marker, history)
-            ):
-                matcher, active = state[3:]
-            else:
-                matcher, active = self.matcher(schema, marker, history)
-            self.current[i] = (matcher, active)
-            # The speculative branch may be rejected. Never advance the
-            # committed matcher with draft tokens; clone it once per request.
-            if metadata:
-                matcher = matcher.copy()
-            if metadata:
-                branch_rows, draft_start, _ = plan[i]
-            else:
-                branch_rows = [i]
-            branch = list(history)
-            unreachable = False
-            for pos, row in enumerate(branch_rows):
-                mask = masks[len(rows) : len(rows) + 1]
-                if active and matcher.is_terminated():
-                    # Deferred delivery may leave a final forward in flight
-                    # after EOS, before the scheduler retires this request.
-                    mask.zero_()
-                    for stop in self.stop_ids:
-                        value = (
-                            int(mask[0, stop // 32]) | (1 << (stop % 32))
-                        ) & 0xFFFFFFFF
-                        mask[0, stop // 32] = value if value < 2**31 else value - 2**32
-                    unreachable = True
-                elif active and not unreachable:
-                    matcher.fill_next_token_bitmask(mask)
-                else:
-                    mask.fill_(-1)
-                    if not unreachable:
-                        for stop in self.stop_ids:
-                            value = (
-                                int(mask[0, stop // 32]) & ~(1 << (stop % 32))
-                            ) & 0xFFFFFFFF
-                            mask[0, stop // 32] = (
-                                value if value < 2**31 else value - 2**32
-                            )
-                rows.append(row)
-                if metadata and pos < len(branch_rows) - 1:
-                    draft = drafts[draft_start + pos]
-                    if active and not unreachable and not matcher.accept_token(draft):
-                        unreachable = True
-                    if active and matcher.is_terminated():
-                        unreachable = True
-                    if not unreachable:
-                        branch.append(draft)
-                        if not active and tuple(branch[-len(marker) :]) == tuple(
-                            marker
-                        ):
-                            active = True
+            final = batch.is_final_chunk is None or batch.is_final_chunk[i]
+            branch_rows, start, size = (
+                plan.get(i, ([], 0, 0)) if metadata else ([i], 0, 0)
+            )
+            request_masks = masks[len(rows) : len(rows) + len(branch_rows)]
+            try:
+                if req_id in self.errors:
+                    raise ValueError(self.errors[req_id])
+                state = self._state(req_id, update, i < batch.total_seqs_num_prefill)
+                if not final:
+                    continue
+                self._fill_rows(
+                    state.matcher, request_masks, drafts[start : start + size]
+                )
+                self.current[i] = state
+            except (ValueError, RuntimeError) as exc:
+                self.errors[req_id] = str(exc)
+                request_masks.copy_(self.stop_mask.expand_as(request_masks))
+            rows.extend(branch_rows)
         if rows:
             self.mask_buffer.apply(logits, rows)
-        return prefixes
+        return dict(self.current)
 
     def commit(self, sampled, batch, prefixes):
         if not prefixes:
             return
-        # Own request identities and matcher states across scheduler RPCs and
-        # batch reorder/removal. Do not retain the mutable ScheduledBatch.
-        records = [(batch.req_ids[i], prefixes[i], self.current[i]) for i in prefixes]
+        records = [
+            (j, batch.req_ids[i], state)
+            for j, (i, state) in enumerate(prefixes.items())
+        ]
         sampled = sampled.reshape(len(batch.req_ids), -1)
         if sampled.device.type == "cuda":
-            import torch
-
-            from .utils import AsyncTokenCopy
-
-            if getattr(self, "commit_copy", None) is None:
+            if self.commit_copy is None:
                 self.commit_copy = AsyncTokenCopy(sampled.device)
-            snapshot = torch.cat([sampled[i : i + 1] for i in prefixes])
-            self.commit_copy.start(snapshot)
+            self.commit_copy.start(torch.cat([sampled[i : i + 1] for i in prefixes]))
             self.commit_records = records
         else:
             self._commit_ids([sampled[i].tolist() for i in prefixes], records)
         self.current = {}
 
     def _commit_ids(self, ids, records):
-        for tokens, (req_id, (schema, marker, history), state) in zip(ids, records):
-            emitted = [token for token in tokens if token >= 0]
-            for j, token in enumerate(emitted):
-                if token in self.stop_ids:
-                    emitted = emitted[: j + 1]
-                    break
-            full = list(history)
-            matcher, active = state
-            for token in emitted:
-                # An already-finished request can have one forward in flight.
-                if active and matcher.is_terminated() and token in self.stop_ids:
-                    full.append(token)
-                    break
-                active = self.advance(matcher, active, marker, full, token)
-            self.pending[req_id] = full
-            self.states[req_id] = (schema, marker, full, matcher, active)
+        for index, req_id, state in records:
+            if req_id in self.errors:
+                continue
+            try:
+                for token in ids[index]:
+                    if token < 0:
+                        continue
+                    if state.matcher.is_terminated() and token in self.stop_ids:
+                        break
+                    if not state.matcher.accept_token(token):
+                        raise ValueError(
+                            "Committed output violates the requested grammar"
+                        )
+                    state.pending.append(token)
+                    if token in self.stop_ids:
+                        break
+            except (ValueError, RuntimeError) as exc:
+                self.errors[req_id] = str(exc)

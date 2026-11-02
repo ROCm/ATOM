@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -26,6 +27,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
+from atom import structured_output
 from atom.config import Config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -715,6 +717,9 @@ def _profile_runner_stage(method):
 class ModelRunner:
     def __init__(self, rank: int, config: Config):
         self.config = config
+        self.structured_output = None
+        self.structured_compile_executor = None
+        self.structured_compilations = OrderedDict()
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1123,6 +1128,8 @@ class ModelRunner:
             return
         self.still_running = False
         self.vision_embeddings.clear()
+        if self.structured_compile_executor is not None:
+            self.structured_compile_executor.shutdown(wait=True, cancel_futures=True)
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -3292,11 +3299,27 @@ class ModelRunner:
         )
         return device_channel, base
 
-    def prepare_structured_output(self, schema, tool_format, fingerprint, vocab_size):
-        from atom.structured_output import prepare_worker_grammar
+    def release_structured_requests(self, request_ids):
+        if self.structured_output is not None:
+            self.structured_output.release(request_ids)
 
-        return prepare_worker_grammar(
-            self, schema, tool_format, fingerprint, vocab_size
+    def prepare_structured_output(
+        self,
+        schema,
+        tool_format,
+        reasoning_end,
+        fingerprint,
+        vocab_size,
+        request_ids=(),
+    ):
+        return structured_output.prepare_worker_grammar(
+            self,
+            schema,
+            tool_format,
+            reasoning_end,
+            fingerprint,
+            vocab_size,
+            request_ids,
         )
 
     @_profile_runner_stage
@@ -3332,14 +3355,6 @@ class ModelRunner:
             premask_lse = torch.logsumexp(logits[:bs].float(), dim=-1)
         if structured_requests:
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
-        elif structured is not None and (
-            structured.pending
-            or structured.current
-            or getattr(structured, "commit_records", None) is not None
-        ):
-            # Release completed/cancelled state once. Ordinary batches never
-            # build masks, copy tensors to CPU, or synchronize for this feature.
-            structured.clear()
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3543,6 +3558,9 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
+            structured_errors=(
+                dict(structured.errors) if structured is not None else None
+            ),
         )
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:

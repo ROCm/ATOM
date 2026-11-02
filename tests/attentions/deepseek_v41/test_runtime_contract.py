@@ -629,7 +629,7 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     monkeypatch.setattr(engine_module, "CoreManager", start_core)
     monkeypatch.setattr(
         engine_module,
-        "_load_tokenizer",
+        "load_tokenizer",
         lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
     )
     kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}

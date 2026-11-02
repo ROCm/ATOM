@@ -150,7 +150,7 @@ class SamplingParams:
     json_schema: str | None = None
     structured_tool_format: str | None = None
     # Generated reasoning tokens are unconstrained until this marker closes.
-    structured_reasoning_end: tuple[int, ...] = ()
+    structured_reasoning_end: str = ""
     # Frontend default may shrink after tokenization; explicit client caps may not.
     max_tokens_is_default: bool = False
 

@@ -479,7 +479,12 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _release_multimodal_requests(self, sequences):
+    def _release_request_resources(self, sequences):
+        structured_ids = [
+            seq.id for seq in sequences if getattr(seq, "json_schema", None) is not None
+        ]
+        if structured_ids:
+            self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -497,7 +502,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self._release_multimodal_requests(rejected)
+            self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -566,7 +571,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
-            self._release_multimodal_requests(finished_seqs)
+            self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
     def has_pending_kv_work(self) -> bool:

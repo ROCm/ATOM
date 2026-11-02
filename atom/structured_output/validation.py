@@ -5,7 +5,13 @@
 
 import asyncio
 import json
+import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from threading import Lock
+
+from atom import structured_output
 
 
 def schema_from_format(fmt, *, responses=False):
@@ -77,23 +83,22 @@ def structured_reasoning_marker(channel, tokenizer):
             "Structured output does not yet support framed reasoning channels"
         )
     if not channel.starts_open:
-        return ()
+        return ""
     marker = dialect.think_end_marker
-    tokens = tuple(tokenizer.encode(marker, add_special_tokens=False)) if marker else ()
-    if not tokens:
+    if not marker:
         raise ValueError(
             "Structured thinking requires an explicit reasoning end marker"
         )
-    return tokens
+    return marker
 
 
 def structured_response_channel(channel, schema):
-    from dataclasses import replace
-
     return replace(channel, literal_answer=True) if schema is not None else channel
 
 
 def validate_output(schema, text, finish_reason, *, tool_calls=False):
+    if schema is not None and finish_reason == "structured_output_error":
+        raise RuntimeError("Structured decoding failed for this request")
     if schema is None or finish_reason in {"length", "max_tokens", "max_new_tokens"}:
         return
     if tool_calls and not text.strip():
@@ -163,51 +168,166 @@ async def validate_chat_stream(source, schema):
         await source.aclose()
 
 
-class WorkerGrammarPreflight:
-    def __init__(self, engine, tokenizer, config):
-        from atom.structured_output import (
-            structured_stop_token_ids,
-            tokenizer_fingerprint,
+def validate_execution_options(
+    config,
+    params,
+    *,
+    kv_transfer=None,
+    multimodal=False,
+    relaxed_mtp=False,
+    synthetic=False,
+):
+    if relaxed_mtp:
+        raise ValueError("Structured output cannot use relaxed MTP verification")
+    if (
+        kv_transfer
+        or multimodal
+        or getattr(config, "enable_rapidserve", False)
+        or getattr(config, "kv_transfer_config", None)
+    ):
+        raise ValueError("Structured output currently requires text without P/D")
+    spec = getattr(config, "speculative_config", None)
+    if synthetic or getattr(spec, "synthetic_acceptance_rates", None):
+        raise ValueError("Structured output cannot use synthetic forced acceptance")
+    if params.ignore_eos or params.stop_strings:
+        raise ValueError(
+            "Structured output does not support ignore_eos or custom stop strings"
+        )
+    if params.logprobs and getattr(spec, "num_speculative_tokens", 0):
+        raise ValueError(
+            "Structured output with speculative logprobs requires token-level logprob support"
         )
 
+
+class WorkerGrammarPreflight:
+    def __init__(self, engine, tokenizer, config):
         self.engine = engine
         self.tokenizer = tokenizer
         hf = config.hf_config
         self.vocab_size = (getattr(hf, "text_config", None) or hf).vocab_size
-        self.fingerprint = tokenizer_fingerprint(
-            tokenizer, structured_stop_token_ids(config, tokenizer)
+        self.fingerprint = structured_output.tokenizer_fingerprint(
+            tokenizer, config.end_token_ids
         )
         self.ready = OrderedDict()
-        self.lock = asyncio.Lock()
+        self.pending = {}
+        self.lock = Lock()
+        self.executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="grammar-admission"
+        )
 
-    async def prepare(self, schema, tool_format):
-        key = (schema, tool_format)
-        async with self.lock:
+    def submit(self, schema, tool_format, reasoning_end=""):
+        key = (schema, tool_format, reasoning_end)
+        with self.lock:
             if key in self.ready:
                 self.ready.move_to_end(key)
-                return
+                return self.ready[key]
+            if key not in self.pending:
+                self.pending[key] = self.executor.submit(self._prepare, key)
+            future = self.pending[key]
+        return future
+
+    async def prepare(self, schema, tool_format, reasoning_end=""):
+        future = self.submit(schema, tool_format, reasoning_end)
+        return await asyncio.shield(asyncio.wrap_future(future))
+
+    def prepare_requests(self, key, request_ids):
+        self._prepare(key, tuple(request_ids))
+
+    def _prepare(self, key, request_ids=()):
+        # Neither the RPC nor compilation holds the ready-cache lock. A cached
+        # request must not queue behind another client's slow schema.
+        try:
             manager = getattr(self.engine, "core_mgr", None)
             rpc = getattr(manager, "collective_rpc", None)
             if rpc is None:
                 raise ValueError(
                     "Structured output requires worker preflight RPC support"
                 )
-            replies = await asyncio.to_thread(
-                rpc,
-                "prepare_structured_output",
-                args=(schema, tool_format, self.fingerprint, self.vocab_size),
-                timeout=60.0,
-            )
-            if not replies or any(not reply.ok for reply in replies):
-                errors = [reply.error for reply in replies if not reply.ok]
-                raise ValueError(
-                    "Worker JSON Schema preparation failed: " + str(errors)
+            deadline = time.monotonic() + 60
+            while True:
+                args = (*key, self.fingerprint, self.vocab_size)
+                if request_ids:
+                    args += (request_ids,)
+                replies = rpc(
+                    "prepare_structured_output",
+                    args=args,
+                    timeout=max(0.1, deadline - time.monotonic()),
                 )
-            expected = {"fingerprint": self.fingerprint, "vocab_size": self.vocab_size}
-            if any(reply.value != expected for reply in replies):
-                raise ValueError(
-                    "Structured output configuration differs across workers"
-                )
-            self.ready[key] = None
+                if not replies or any(not reply.ok for reply in replies):
+                    raise ValueError(
+                        "Worker JSON Schema preparation failed: "
+                        + str([reply.error for reply in replies if not reply.ok])
+                    )
+                if all(reply.value.get("ready", True) for reply in replies):
+                    expected = {
+                        "fingerprint": self.fingerprint,
+                        "vocab_size": self.vocab_size,
+                    }
+                    if any(
+                        any(reply.value.get(k) != v for k, v in expected.items())
+                        for reply in replies
+                    ):
+                        raise ValueError(
+                            "Structured output configuration differs across workers"
+                        )
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Worker JSON Schema preparation timed out")
+                time.sleep(0.01)
+        except Exception:
+            if request_ids:
+                # Another rank may have prepared successfully. Release those
+                # states before propagating an admission failure to the caller.
+                rpc("release_structured_requests", args=(request_ids,), timeout=60)
+                raise
+            with self.lock:
+                self.pending.pop(key, None)
+            raise
+        if request_ids:
+            return
+        with self.lock:
+            self.ready[key] = self.pending.pop(key)
             if len(self.ready) > 128:
                 self.ready.popitem(last=False)
+
+    def close(self):
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+
+async def configure_request(
+    engine,
+    tokenizer,
+    config,
+    sampling_params,
+    schema,
+    channel,
+    *,
+    parser_cls=None,
+    tools=None,
+    tool_choice=None,
+    kv_transfer=None,
+    multimodal=False,
+    relaxed_mtp=False,
+    synthetic=False,
+):
+    if schema is None:
+        return
+    validate_execution_options(
+        config,
+        sampling_params,
+        kv_transfer=kv_transfer,
+        multimodal=multimodal,
+        relaxed_mtp=relaxed_mtp,
+        synthetic=synthetic,
+    )
+    tool_format = structured_tool_format(parser_cls, tools, tool_choice)
+    reasoning_end = structured_reasoning_marker(channel, tokenizer)
+    sampling_params.json_schema = schema
+    sampling_params.structured_tool_format = tool_format
+    sampling_params.structured_reasoning_end = reasoning_end
+    # Schema's DSML grammar already enforces the tool alternative. Never apply
+    # two independently stateful masks to the same request.
+    sampling_params.required_channel = None
+    await asyncio.to_thread(
+        engine.prepare_structured_request, sampling_params, kv_transfer, multimodal
+    )

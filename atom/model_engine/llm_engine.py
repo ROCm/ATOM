@@ -4,6 +4,7 @@
 import importlib.util
 import itertools
 import logging
+import threading
 import time
 from collections import Counter
 from dataclasses import fields, replace
@@ -18,12 +19,16 @@ from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import RequiredChannel, SamplingParams
+from atom.structured_output.validation import (
+    WorkerGrammarPreflight,
+    validate_execution_options,
+)
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
 
-def _load_tokenizer(model: str, trust_remote_code: bool = False):
+def load_tokenizer(model: str, trust_remote_code: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(
         model, use_fast=True, trust_remote_code=trust_remote_code
     )
@@ -45,7 +50,7 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
-        self.tokenizer = tokenizer or _load_tokenizer(
+        self.tokenizer = tokenizer or load_tokenizer(
             config.model, config.trust_remote_code
         )
         config.bos_token_id = self.tokenizer.bos_token_id
@@ -178,6 +183,9 @@ class LLMEngine:
             self.core_mgr = DisaggCoreManager(config)
         else:
             self.core_mgr = CoreManager(config)
+        self._structured_preflight = None
+        self._structured_lock = threading.Lock()
+        self.io_processor.structured_admission = self.prepare_structured_request
         self._step_lock = None
         self._pending_results = {}
         import json
@@ -197,8 +205,38 @@ class LLMEngine:
 
     def close(self):
         """Shut down engine and release all GPU resources."""
+        if getattr(self, "_structured_preflight", None) is not None:
+            self._structured_preflight.close()
         if hasattr(self, "core_mgr"):
             self.core_mgr.close()
+
+    def prepare_structured_request(
+        self, params, kv_transfer=None, multimodal=False, request_ids=()
+    ):
+        if params.json_schema is None:
+            return
+        validate_execution_options(
+            self.config,
+            params,
+            kv_transfer=kv_transfer,
+            multimodal=multimodal,
+            relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        )
+        with self._structured_lock:
+            if self._structured_preflight is None:
+                self._structured_preflight = WorkerGrammarPreflight(
+                    self, self.tokenizer, self.config
+                )
+            preflight = self._structured_preflight
+        key = (
+            params.json_schema,
+            params.structured_tool_format,
+            params.structured_reasoning_end,
+        )
+        if request_ids:
+            preflight.prepare_requests(key, request_ids)
+        else:
+            preflight.submit(*key).result()
 
     def add_request(
         self,
@@ -708,6 +746,7 @@ class InputOutputProcessor:
         self.config = config
         self.tokenizer = tokenizer
         self.block_size = block_size
+        self.structured_admission = None
         self.requests = {}
         # The one channel `tool_choice="required"` holds this engine's requests
         # to (`_engine_channel`): as the server's format named it, and as built
@@ -821,9 +860,7 @@ class InputOutputProcessor:
         request together and holds one channel.
         """
         if self._required_channel is None:
-            held = channel.ending_on(
-                (self.config.eos_token_id, *self.config.stop_token_ids)
-            )
+            held = channel.ending_on(self.config.end_token_ids)
             self._format_channel, self._required_channel = channel, held
         elif channel != self._format_channel and channel != self._required_channel:
             raise ValueError(
@@ -861,6 +898,12 @@ class InputOutputProcessor:
           deltas to independent queues (one per choice index). Falls back to
           the scalar ``stream_callback`` for every sibling.
         """
+        if sampling_params.json_schema is not None:
+            if self.structured_admission is None:
+                raise ValueError("Structured output requires engine admission")
+            self.structured_admission(
+                sampling_params, kv_transfer_params, multimodal_data is not None
+            )
         request_validator = getattr(self.config.hf_config, "validate_request", None)
         if request_validator is not None:
             request_validator(
@@ -947,11 +990,20 @@ class InputOutputProcessor:
                 dp_parent_session_id=dp_parent_session_id,
             )
             seq.arrive_time = time.time()
+            seqs.append(seq)
+
+        if sampling_params.json_schema is not None:
+            self.structured_admission(
+                sampling_params,
+                kv_transfer_params,
+                multimodal_data is not None,
+                tuple(seq.id for seq in seqs),
+            )
+        for seq in seqs:
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
-            seqs.append(seq)
 
         # Runs in an executor or submit thread, not the event loop. Siblings
         # share a prompt and seed, so one chain serves them all.
