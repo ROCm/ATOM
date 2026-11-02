@@ -306,9 +306,10 @@ def test_emitted_order_is_full_blocks_by_score_then_the_partial_tail():
     q_tiles = triton.cdiv(kw["max_query_len"], m.SCORE_BLOCK_SIZE_Q)
     cb = m._score_chunk_blocks(max_block, q_tiles, len(qlens), heads, torch.device("cuda"))  # fmt: skip
     m._index_block_score_kernel[(q_tiles, len(qlens) * heads, triton.cdiv(max_block, cb))](
-        kw["idx_q"], kw["index_kv_cache"], score, kw["block_table"], kw["cu_seqlens_q"],
-        kw["seq_lens"], kw["prefix_lens"], heads, HEAD_DIM, kw["sm_scale"], cb,
-        *kw["idx_q"].stride(), *kw["index_kv_cache"].stride(), *score.stride(),
+        kw["idx_q"], kw["index_kv_cache"], kw["index_kv_cache"], score,
+        kw["block_table"], kw["cu_seqlens_q"], kw["seq_lens"], kw["prefix_lens"],
+        heads, HEAD_DIM, kw["sm_scale"], cb,
+        *kw["idx_q"].stride(), *kw["index_kv_cache"].stride(), 0, 0, *score.stride(),
         kw["block_table"].stride(0), BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE, num_stages=m.SCORE_NUM_STAGES,
     )  # fmt: skip
@@ -655,6 +656,7 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
         ](
             q,
             cache,
+            cache,  # scale pointer, unused without IS_FP4
             result,
             kw["block_table"],
             kw["cu_seqlens_q"],
@@ -666,6 +668,8 @@ def test_prefill_launch_policy_preserves_scores_and_selection(
             chunk,
             *q.stride(),
             *cache.stride(),
+            0,  # scale strides, unused without IS_FP4
+            0,
             *result.stride(),
             kw["block_table"].stride(0),
             BLOCK_SIZE_Q=m.SCORE_BLOCK_SIZE_Q,
