@@ -44,6 +44,8 @@ _register_atom_qwen35_moe()
 _register_atom_glm5_moe()
 
 # Qwen3.8-Flash-Next uses the Qwen4Exp architecture, not Qwen3.5-MoE.
-register_model("atom_qwen4_exp", ATOMQwen4Exp, ["Qwen4ExpForConditionalGeneration"])
+# RTP also registers this architecture for its native Qwen4Exp model. Keep
+# the ATOM model available by explicit model_type without replacing that map.
+register_model("atom_qwen4_exp", ATOMQwen4Exp, [])
 register_model("atom_qwen4_exp_mtp", ATOMQwen4ExpMTP, [])
 register_renderer("atom_qwen4_exp", Qwen35Renderer)

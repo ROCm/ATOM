@@ -813,6 +813,10 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
 class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
     """Bridge RTP's flat HC hand-off to ATOM's reusable QSA draft layer."""
 
+    def cuda_graph_draft_prefill_uses_request_lanes(self) -> bool:
+        # RTP captures only active request lanes for each draft-prefill key.
+        return True
+
     @staticmethod
     def _draft_vision_embeddings(input_ids, embed_tokens, is_multimodal):
         if not is_multimodal or embed_tokens.tp_size != 1:

@@ -126,6 +126,23 @@ def _prepare_model_atom_rtpllm(
         hf = (
             getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
         )
+        # Block-FP8 checkpoints may leave the PLE table in BF16 without
+        # declaring its dtype. The official Qwen3.8 FP8 checkpoint explicitly
+        # lists the table in modules_to_convert, so keep that table FP8.
+        quantization = getattr(hf, "quantization_config", None) or getattr(
+            atom_config.hf_config, "quantization_config", None
+        )
+        ple_is_fp8 = isinstance(quantization, dict) and any(
+            "ple.ple_embedding.ngram_embedding" in item
+            for item in (quantization.get("modules_to_convert") or ())
+        )
+        if (
+            getattr(hf, "ple_embedding_dtype", None) is None
+            and isinstance(quantization, dict)
+            and quantization.get("weight_block_size")
+            and not ple_is_fp8
+        ):
+            hf.ple_embedding_dtype = "bfloat16"
         packed = qwen4_exp_packed_modules_mapping(
             getattr(model_cls, "packed_modules_mapping", {}),
             int(hf.split_ngram_parts),
