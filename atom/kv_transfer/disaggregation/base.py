@@ -40,6 +40,17 @@ class KVConnectorBase(ABC):
         """
         return 0
 
+    @classmethod
+    def allocate_kv_pool(cls, config: Any, nbytes: int, device: Any) -> Any:
+        """A zeroed uint8 tensor of ``nbytes`` to back the paged KV pool, or None.
+
+        For a backend whose peer maps this rank's KV cache, so the pool must
+        live in exportable memory. Asked before any connector is built (see
+        :meth:`KVConnectorFactory.allocate_kv_pool`); None, the default, lets
+        the model runner allocate it.
+        """
+        return None
+
     @abstractmethod
     def register_kv_caches(
         self,

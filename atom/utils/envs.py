@@ -137,6 +137,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Prefill (`kv_producer`, plain `mooncake`) only: one INFO line per
+    # block transfer with its size and timings.
+    "ATOM_MOONCAKE_TRANSFER_STATS": lambda: _flag_env("ATOM_MOONCAKE_TRANSFER_STATS"),
     # Prefill (`kv_producer`, plain `mooncake`) only: gather the MLA tokens a
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.

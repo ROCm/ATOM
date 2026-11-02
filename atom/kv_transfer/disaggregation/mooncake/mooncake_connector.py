@@ -47,6 +47,14 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
 )
+from atom.kv_transfer.disaggregation.mooncake.fabric import (
+    FABRIC_METADATA,
+    SegmentImporter,
+    allocate_fabric_pool,
+    is_fabric_protocol,
+    registration_ranges,
+    segment_tag,
+)
 from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
     MLA_LANDING_CREDIT_WAIT_S,
     MLA_LANDING_MIN_SLOTS,
@@ -267,7 +275,7 @@ def _select_ib_devices(
     hca_count: int = 8,
 ) -> list[str]:
     """Resolve the HCAs on which Mooncake registers this rank's GPU memory."""
-    if protocol.strip().lower() == "tcp":
+    if protocol.strip().lower() == "tcp" or is_fabric_protocol(protocol):
         return []
     if configured_devices:
         return _parse_ib_devices(configured_devices)
@@ -393,6 +401,26 @@ def _configure_mooncake_transport(protocol: str) -> None:
     """
     if protocol.strip().lower() == "tcp":
         os.environ["MC_FORCE_TCP"] = "true"
+
+
+def _contiguous_block_runs(
+    src_block_ids: list[int], dst_block_ids: list[int]
+) -> list[tuple[int, int, int]]:
+    """(src_block, dst_block, blocks) for each run of blocks consecutive on
+    both sides.
+
+    Only for a destination registered as one buffer (the fabric pool): an RDMA
+    descriptor must not cross the consumer's MR chunks.
+    """
+    runs: list[list[int]] = []
+    for sb, db in zip(src_block_ids, dst_block_ids):
+        if runs:
+            last = runs[-1]
+            if sb == last[0] + last[2] and db == last[1] + last[2]:
+                last[2] += 1
+                continue
+        runs.append([sb, db, 1])
+    return [(sb, db, n) for sb, db, n in runs]
 
 
 # ZMQ side-channel message types
@@ -868,6 +896,11 @@ class MooncakeConnector(KVConnectorBase):
     # ``__init__`` aborted before the matched-rail block; both must fall back to
     # the single shared ``transfer_engine`` instead of raising AttributeError.
     _rail_pool: RailEnginePool | None = None
+    # Likewise for the fabric state (see fabric.py): off unless __init__ says.
+    _fabric = False
+    _segment_importer: SegmentImporter | None = None
+    _segment_blob: bytes | None = None
+    _segment_tag: str | None = None
 
     def __init__(self, config: Config) -> None:
         self.tp_rank = get_tp_group().rank_in_group
@@ -904,6 +937,8 @@ class MooncakeConnector(KVConnectorBase):
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.protocol = kv_transfer_config.get("protocol", MOONCAKE_DEFAULT_PROTOCOL)
+        # Scale-up fabric instead of a NIC; see fabric.py.
+        self._fabric = is_fabric_protocol(self.protocol)
 
         # Side channel port (ZMQ) — deterministic from config for proxy relay
         self.base_handshake_port = kv_transfer_config.get(
@@ -942,7 +977,8 @@ class MooncakeConnector(KVConnectorBase):
         )
         hca_count = int(kv_transfer_config.get("ib_hca_count", 8))
         phys_idx: int | None = None
-        if self.protocol.strip().lower() != "tcp" and not configured_ib_device:
+        uses_hca = self.protocol.strip().lower() != "tcp" and not self._fabric
+        if uses_hca and not configured_ib_device:
             visible_idx = torch.cuda.current_device()
             # ROCR first, for the reason in numa_utils._physical_index: it
             # filters before HIP, so a ROCR-only mask must not fall through to
@@ -975,6 +1011,11 @@ class MooncakeConnector(KVConnectorBase):
         self._rail_pool = None
         if self.protocol.strip().lower() == "tcp":
             logger.info("Mooncake TCP selected; RDMA device selection is disabled")
+        elif self._fabric:
+            logger.info(
+                "Mooncake fabric (%s) selected; RDMA device selection is disabled",
+                self.protocol,
+            )
         elif not configured_ib_device:
             logger.info(
                 "Auto-selecting RDMA devices %s for physical GPU %d "
@@ -988,9 +1029,14 @@ class MooncakeConnector(KVConnectorBase):
         # The device filter independently selects the RDMA data path; the
         # server name below is also advertised in consumer/notification metadata.
         self.transfer_engine = TransferEngine()
+        if self._fabric and not hasattr(self.transfer_engine, "import_segment"):
+            raise RuntimeError(
+                f"protocol={self.protocol!r} needs a Mooncake build with the "
+                "EXTERNAL metadata API (export_local_segment / import_segment)"
+            )
         ret = self.transfer_engine.initialize(
             self.local_ip,
-            "P2PHANDSHAKE",
+            FABRIC_METADATA if self._fabric else "P2PHANDSHAKE",
             self.protocol,
             ib_device,
         )
@@ -1010,6 +1056,15 @@ class MooncakeConnector(KVConnectorBase):
             ib_device,
             self.rpc_port,
         )
+        # Fabric: the producer maps each decode rank's segment from its write
+        # requests; the consumer exports its own once registered.
+        self._segment_importer = (
+            SegmentImporter(self.transfer_engine, torch.cuda.current_device())
+            if self._fabric and self.is_producer
+            else None
+        )
+        self._segment_blob: bytes | None = None
+        self._segment_tag: str | None = None
 
         if matched_rails and self.is_producer:
             # _resolve_matched_rails requires exactly one primary HCA.
@@ -1263,6 +1318,16 @@ class MooncakeConnector(KVConnectorBase):
         """
         return mla_staging_reserve_bytes(config) + mla_landing_reserve_bytes(config)
 
+    @classmethod
+    def allocate_kv_pool(cls, config, nbytes: int, device):
+        """Fabric protocols keep the KV pool in fabric-exportable memory."""
+        kv_transfer_config = config.kv_transfer_config or {}
+        if not is_fabric_protocol(kv_transfer_config.get("protocol")):
+            return None
+        if not kv_transfer_config.get("fabric_kv_pool", True):
+            return None
+        return allocate_fabric_pool(kv_transfer_config, nbytes, device)
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -1386,12 +1451,19 @@ class MooncakeConnector(KVConnectorBase):
         self._mla_landing = self._build_mla_landing()
         if self._mla_landing is not None:
             all_regions.append(self._mla_landing.region())
-        for r in all_regions:
-            offset = 0
-            for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
-                reg_ptrs.append(r.base_addr + offset)
-                reg_sizes.append(chunk)
-                offset += chunk
+        if self._fabric:
+            for ptr, size in registration_ranges(
+                [(r.base_addr, r.total_bytes) for r in all_regions]
+            ):
+                reg_ptrs.append(ptr)
+                reg_sizes.append(size)
+        else:
+            for r in all_regions:
+                offset = 0
+                for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
+                    reg_ptrs.append(r.base_addr + offset)
+                    reg_sizes.append(chunk)
+                    offset += chunk
 
         logger.info(
             "Registering %d RDMA chunks (%d block regions, %d slot regions, "
@@ -1437,6 +1509,15 @@ class MooncakeConnector(KVConnectorBase):
 
         if self._rail_pool is not None:
             self._rail_pool.set_regions(reg_ptrs, reg_sizes)
+        if self._fabric and not self.is_producer:
+            # Fixed from here on: this side registers nothing else.
+            self._segment_blob = bytes(self.transfer_engine.export_local_segment())
+            self._segment_tag = segment_tag(self._segment_blob)
+            logger.info(
+                "Mooncake fabric: exported segment %s (%d B)",
+                self.engine_id,
+                len(self._segment_blob),
+            )
         if self._mla_landing is not None:
             # Registered and warmed up before any producer can learn its
             # address, and before CUDA graph capture.
@@ -1861,6 +1942,10 @@ class MooncakeConnector(KVConnectorBase):
                 "consumer_dcp_rank": self.dcp_rank,
                 "consumer_dcp_interleave": self.dcp_interleave_size,
             }
+            if self._segment_blob is not None:
+                # EXTERNAL metadata: the producer maps this rank from here.
+                request_body["consumer_segment"] = self._segment_blob
+                request_body["consumer_segment_tag"] = self._segment_tag
 
             consumer_staging_pool_idx = -1
             if self._has_slot_regions or (
@@ -2511,6 +2596,8 @@ class MooncakeConnector(KVConnectorBase):
                     int(request_data.get("dst_slot_index", -1)),
                 )
             target = f"{consumer_host}:{consumer_rpc_port}"
+            if self._segment_importer is not None:
+                self._segment_importer.ensure(target, request_data)
 
             # Keep this engine local to the request: concurrent requests can
             # target different decode rails, including during retries/staging.
@@ -2533,6 +2620,7 @@ class MooncakeConnector(KVConnectorBase):
                         target,
                     )
 
+            write_started = time.monotonic()
             if has_slot_data:
                 transfer_ok = self._execute_block_slot_transfer(
                     request_data,
@@ -2552,6 +2640,10 @@ class MooncakeConnector(KVConnectorBase):
                     req_id,
                     kv_cache_ready_event,
                     engine=engine,
+                )
+            if envs.ATOM_MOONCAKE_TRANSFER_STATS:
+                self._log_transfer_stats(
+                    request_data, dst_block_ids, write_started, transfer_ok
                 )
 
             if not transfer_ok:
@@ -2615,6 +2707,31 @@ class MooncakeConnector(KVConnectorBase):
                 logger.exception(
                     "[PRODUCER] failed to notify consumer of transfer failure"
                 )
+
+    def _log_transfer_stats(
+        self,
+        request_data: dict,
+        dst_block_ids: list[int],
+        write_started: float,
+        transfer_ok: bool,
+    ) -> None:
+        done = time.monotonic()
+        write_ms = (done - write_started) * 1e3
+        # Received at the deadline's origin (see _write_listener).
+        received = request_data.get("_deadline", done) - PD_TRANSFER_DEADLINE_S
+        nbytes = len(dst_block_ids) * sum(self._per_block_bytes_list)
+        logger.info(
+            "Mooncake transfer stats: req=%s protocol=%s ok=%s blocks=%d "
+            "bytes=%d wait_ms=%.3f write_ms=%.3f gbps=%.1f",
+            request_data.get("request_id"),
+            self.protocol,
+            transfer_ok,
+            len(dst_block_ids),
+            nbytes,
+            (write_started - received) * 1e3,
+            write_ms,
+            nbytes / max(write_ms, 1e-6) / 1e6,
+        )
 
     def _acquire_chunked_reader(
         self, state: ChunkedPrefill, request_data: dict
@@ -2757,6 +2874,8 @@ class MooncakeConnector(KVConnectorBase):
             target = (
                 f"{request_data['consumer_host']}:{request_data['consumer_rpc_port']}"
             )
+            if self._segment_importer is not None:
+                self._segment_importer.ensure(target, request_data)
             engine = self.transfer_engine
             if self._rail_pool is not None:
                 engine = self._rail_pool.get(request_data.get("consumer_ib_device"))
@@ -2987,6 +3106,8 @@ class MooncakeConnector(KVConnectorBase):
 
         staged_regions: list[tuple[int, int, int]] = []
         staged_mla_regions: list[tuple[int, int, int]] = []
+        # (src_block, dst_block, blocks) per descriptor, shared by every region.
+        block_runs: list[tuple[int, int, int]] | None = None
         # The plan comes from this stage's region order but the bytes land at
         # cmap[region_idx], and equal region counts do not make the two orders
         # match. Validate both semantic role and physical width so incompatible
@@ -3014,13 +3135,19 @@ class MooncakeConnector(KVConnectorBase):
                 staged_regions.append((region_idx, dst_base, bpb))
                 continue
             if sharded_runs is None:
-                for sb, db in zip(src_block_ids, dst_block_ids):
+                if block_runs is None:
+                    block_runs = (
+                        _contiguous_block_runs(src_block_ids, dst_block_ids)
+                        if self._fabric
+                        else [(sb, db, 1) for sb, db in zip(src_block_ids, dst_block_ids)]
+                    )
+                for sb, db, run in block_runs:
                     src_addrs.append(src_base + sb * bpb)
                     dst_addrs.append(dst_base + db * bpb)
-                    sizes.append(bpb)
+                    sizes.append(run * bpb)
                     block_descriptor_count += 1
                     if debug_block_transfer:
-                        total_block_bytes += bpb
+                        total_block_bytes += run * bpb
                     if (
                         len(src_addrs) == self._MAX_RDMA_ENTRIES_PER_BATCH
                         and not flush_block_descriptors()
