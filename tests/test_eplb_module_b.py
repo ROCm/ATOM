@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Tests for atom/model_ops/eplb.py (Module-B manager only)
 
+import tempfile
 import types
 
 import pytest
@@ -523,6 +524,71 @@ def test_step_peak_rebalance_reduces_each_window_once(monkeypatch):
     assert shapes == [(2, 1, 2), (2, 1, 4)]
     # Alternating hotspots are paired so every step loads both GPUs.
     p2l = plans[0].new_meta.physical_to_logical_map
+    assert all(len(pair & {0, 1}) == 1 for pair in _gpu_pairs(p2l))
+
+
+def _step_peak_rank_worker(rank, world, init, out):
+    """One EP rank of the alternating-hotspot setup on a real gloo group: both
+    step windows are all-reduced, rank 0 fits and broadcasts, and every other
+    rank must take the broadcast plan without fitting."""
+    torch.distributed.init_process_group(
+        "gloo", init_method=init, rank=rank, world_size=world
+    )
+    if rank != 0:
+
+        def _no_fit(*args, **kwargs):
+            raise AssertionError("the step_peak fit ran off rank 0")
+
+        eplb.step_peak_rebalance = _no_fit
+    group = torch.distributed.group.WORLD
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    monitor.set_load_group(types.SimpleNamespace(world_size=world, device_group=group))
+    monitor.track_step_load = True
+    monitor.initialize(
+        num_layers=1, num_physical=4, device=torch.device("cpu"), num_gpus=world
+    )
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=2,
+        rebalance_min_balancedness=0.9,
+        rebalance_balancedness_agg="min",
+        placement_policy="step_peak",
+    )
+    manager.live_metadata = eplb.ExpertLocationMetadata.from_trivial(
+        num_layers=1, num_logical_experts=4, ep_size=world, ep_rank=rank
+    )
+    manager._moe_layers = {0: types.SimpleNamespace(num_expert_group=1)}
+    manager._ep_group = manager._migration_group = group
+    manager._dp_is_migration_group = True
+    plans = []
+
+    def _migrate(plan):
+        plans.append(plan)
+        yield
+
+    manager._migrate = _migrate
+    _prefill_step(manager, [0, 1])
+    _prefill_step(manager, [2, 3])
+    out[rank] = [plan.new_meta.physical_to_logical_map.tolist() for plan in plans]
+    torch.distributed.destroy_process_group()
+
+
+def test_step_peak_plan_is_broadcast_to_the_other_ranks():
+    # The planning test above runs rank 0 alone with a no-op broadcast. Here
+    # rank 1 runs the non-root branch for real: it allocates the receive
+    # buffer, never fits (its fit raises) and migrates rank 0's plan.
+    world = 2
+    with tempfile.TemporaryDirectory() as d:
+        out = torch.multiprocessing.Manager().dict()
+        torch.multiprocessing.spawn(
+            _step_peak_rank_worker,
+            args=(world, f"file://{d}/store", out),
+            nprocs=world,
+            join=True,
+        )
+    assert len(out[0]) == 1 and out[1] == out[0]
+    p2l = torch.tensor(out[0][0])
     assert all(len(pair & {0, 1}) == 1 for pair in _gpu_pairs(p2l))
 
 

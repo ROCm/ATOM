@@ -389,12 +389,13 @@ def resolve_placement_policy(name: str | None):
 
 
 def _step_peak_pack_indices(
-    vectors: torch.Tensor, p2l: torch.Tensor, logcnt: torch.Tensor, capacity: int
+    vectors: torch.Tensor, p2l: torch.Tensor, num_gpus: int
 ) -> torch.Tensor:
     """Pack replicas onto GPUs against the per-step peak (see step_peak_rebalance).
 
-    vectors [L, Lg, S] per-replica load per step, p2l [L, P], logcnt [L, Lg].
-    Returns [L, P]: a permutation of the slots of p2l, `capacity` per GPU.
+    vectors [L, Lg, S] per-replica load per step, p2l [L, P] with P a multiple
+    of num_gpus. Returns [L, P]: a permutation of the slots of p2l, GPU g taking
+    the g-th block of P // num_gpus slots (the ep_size layout).
 
     Each replica, heaviest first, goes to the GPU with the lowest sum of step
     peaks. A replica that raises no step's peak scores the same on every GPU
@@ -413,7 +414,8 @@ def _step_peak_pack_indices(
     expert_order = phys.gather(-1, order)
     num_layers, num_logical, num_steps = vectors.shape
     num_physical = order.size(1)
-    num_gpus = num_physical // capacity
+    assert num_physical % num_gpus == 0, "num_physical must be divisible by num_gpus"
+    capacity = num_physical // num_gpus
     f64 = torch.float64
     loads = vectors.new_zeros((num_layers, num_gpus, num_steps), dtype=f64)
     peaks = vectors.new_zeros((num_layers, num_steps), dtype=f64)
@@ -526,10 +528,9 @@ def step_peak_rebalance(
         logcnt[layers, pick] += 1
         score[:, layers, pick] = tokens[:, layers, pick] / logcnt[layers, pick]
     del tokens
-    capacity = num_physical // num_gpus
-    if capacity > 1:
+    if num_physical > num_gpus:  # more than one slot per GPU to arrange
         vectors = score.permute(1, 2, 0)  # [L, Lg, S], no copy
-        p2l = p2l.gather(-1, _step_peak_pack_indices(vectors, p2l, logcnt, capacity))
+        p2l = p2l.gather(-1, _step_peak_pack_indices(vectors, p2l, num_gpus))
     return p2l
 
 

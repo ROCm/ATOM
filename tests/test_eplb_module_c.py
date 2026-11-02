@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 try:
     from atom.model_ops.eplb import (
         _build_logical_to_physical_map,
+        _step_peak_pack_indices,
         balanced_packing,
         rebalance_experts,
         replicate_experts,
@@ -216,9 +217,28 @@ def test_step_peak_invariants(num_gpus, num_physical):
     step_load = torch.randint(0, 50, (6, 3, 8), generator=gen)
     p2l = step_peak_rebalance(step_load, num_physical=num_physical, num_gpus=num_gpus)
     assert tuple(p2l.shape) == (3, num_physical)
-    for row in p2l:
+    # The replica counts (logcnt) come from replication, which never looks at
+    # the GPUs: one slot per GPU leaves nothing to pack, so that plan is them.
+    # Packing may only move slots, so every expert keeps its count.
+    unpacked = step_peak_rebalance(
+        step_load, num_physical=num_physical, num_gpus=num_physical
+    )
+    for row, ref in zip(p2l, unpacked):
         counts = torch.bincount(row, minlength=8)
         assert int(counts.min()) >= 1 and int(counts.sum()) == num_physical
+        assert counts.tolist() == torch.bincount(ref, minlength=8).tolist()
+
+
+@pytest.mark.parametrize("num_gpus,num_physical", [(2, 8), (4, 12), (4, 16)])
+def test_step_peak_packing_is_a_permutation_of_the_slots(num_gpus, num_physical):
+    gen = torch.Generator().manual_seed(num_physical)
+    vectors = torch.randint(0, 50, (3, 8, 6), generator=gen).to(torch.float32)
+    p2l = torch.cat(
+        [torch.arange(8), torch.randint(0, 8, (num_physical - 8,), generator=gen)]
+    ).expand(3, -1)
+    indices = _step_peak_pack_indices(vectors, p2l, num_gpus)
+    for row in indices:
+        assert sorted(row.tolist()) == list(range(num_physical))
 
 
 def test_step_peak_rejects_physical_not_divisible_by_gpus():
