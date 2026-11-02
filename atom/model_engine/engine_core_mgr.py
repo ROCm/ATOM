@@ -339,6 +339,10 @@ class CoreManager:
         # seq_id -> (dp_rank, req_cost, tok_cost) so release subtracts exactly
         # what dispatch added, and only for ranks that were actually charged.
         self._seq_load = {}
+        # Seqs whose prefill has not produced a first output yet. Kept apart
+        # from the token charge, which is 0 for a fully cached prompt that is
+        # nevertheless still prefilling (prefix-spread busy-source guard).
+        self._seq_prefilling = set()
         self._lb_lock = Lock()
         # --- Backpressure (lazy) DP dispatch --------------------------------
         # ATOM_DP_DISPATCH_DEPTH > 0 holds load-balanced seqs in _bp_pending and
@@ -1589,8 +1593,7 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         lightest = min(((offset + i) % n for i in range(n)), key=load)
         rank = lightest
-        source_load = self._seq_load.get(source) if source is not None else None
-        if owner is not None and source_load is not None and source_load[2] > 0:
+        if owner is not None and source is not None and source in self._seq_prefilling:
             # The request that ran this prefix is still prefilling it: its KV
             # is not in the offload tier yet, so another rank would recompute
             # what the tier cannot supply. Share the prefix's rank instead.
@@ -1661,6 +1664,7 @@ class CoreManager:
         self._rank_reqs[dp_rank] += req_cost
         self._rank_tokens[dp_rank] += tok_cost
         self._seq_load[seq.id] = (dp_rank, req_cost, tok_cost)
+        self._seq_prefilling.add(seq.id)
 
     def _deliver_terminal_output(self, seq) -> bool:
         """Give an online client the terminal output for a seq that never streamed.
@@ -1715,6 +1719,7 @@ class CoreManager:
 
     def _release_seq_load_locked(self, seq_id) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
+        self._seq_prefilling.discard(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1732,9 +1737,10 @@ class CoreManager:
         if entry is None:
             return
         _, _, tok_cost = entry
-        if tok_cost == 0:
+        if tok_cost == 0 and seq_id not in self._seq_prefilling:
             return
         with self._lb_lock:
+            self._seq_prefilling.discard(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1770,6 +1776,7 @@ class CoreManager:
             self._rank_reqs = [0] * self._routable_engine_count
             self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
+            self._seq_prefilling.clear()
             pending = getattr(self, "_bp_pending", None)
             if pending:
                 logger.warning(
