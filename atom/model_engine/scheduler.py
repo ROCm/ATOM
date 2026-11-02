@@ -1065,8 +1065,12 @@ class Scheduler:
         slots = self.max_num_seqs - len(self.running)
         for seq in self._waiting_prefills():
             offload_resume = self._is_offload_prefill_resume(seq)
-            if offload_resume:
-                resume = self._offload_prefill_start(seq)
+            finished_load = (
+                None if offload_resume else self._finished_load_tokens(seq)
+            )
+            if offload_resume or finished_load is not None:
+                offload_resume = True
+                resume = self._offload_prefill_start(seq, finished_load)
                 # A replayed hit resumes as one, as admission starts it.
                 cached = self.block_manager.replay_start(
                     seq, resume, hit=self.block_manager.tier_resume_replays(seq)
@@ -1126,9 +1130,30 @@ class Scheduler:
         otherwise hold it, and everything queued behind it, forever."""
         return start + chunk <= resume and not seq.replays_hit
 
-    def _offload_prefill_start(self, seq: Sequence) -> int:
-        if seq.num_cached_tokens < seq.num_tokens:
-            return seq.num_cached_tokens
+    def _finished_load_tokens(self, seq: Sequence) -> int | None:
+        """Cached tokens `seq` will resume at once admission consumes its
+        finished offload load, or None if it has no such load.
+
+        A finished load stays ``WAITING_FOR_REMOTE_KVS`` until admission marks
+        it a resume (`_mark_offload_load_ready`), but it already holds its
+        blocks. The delayer's probes size it as that resume instead of asking
+        `can_allocate_memoized`, which would re-run the hit walk and rewrite
+        the replay flags (`replays_hit`) it was admitted with.
+        """
+        if (
+            seq.status != SequenceStatus.WAITING_FOR_REMOTE_KVS
+            or not self._connector_flag("is_offload")
+            or self._still_loading(seq)
+            or len(seq.block_table) == 0
+        ):
+            return None
+        loaded = getattr(seq, "offload_loaded_tokens", None)
+        return max(seq.num_cached_tokens, loaded or 0)
+
+    def _offload_prefill_start(self, seq: Sequence, cached: int | None = None) -> int:
+        cached = seq.num_cached_tokens if cached is None else cached
+        if cached < seq.num_tokens:
+            return cached
         hbs = self.block_manager.hash_block_size
         return max(0, (seq.num_tokens - 1) // hbs * hbs)
 
@@ -1229,8 +1254,11 @@ class Scheduler:
         for seq in itertools.islice(self._waiting_prefills(), self.max_num_seqs):
             if tokens >= token_cap:
                 break
-            if self._is_offload_prefill_resume(seq):
-                resume = seq.num_cached_tokens
+            finished_load = self._finished_load_tokens(seq)
+            if finished_load is not None or self._is_offload_prefill_resume(seq):
+                resume = (
+                    seq.num_cached_tokens if finished_load is None else finished_load
+                )
                 start = self.block_manager.replay_start(
                     seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
