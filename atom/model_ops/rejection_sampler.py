@@ -117,21 +117,6 @@ class RejectionSampler(nn.Module):
         # that takes that path, so no two steps replay a stream.
         self._ratio_step = 0
 
-    @staticmethod
-    def needs_target_draw(all_greedy: bool, draft_q) -> bool:
-        """Does this verify step have to draw the target's own tokens?
-
-        `Sampler.sample_verification_tokens` (plus, under TP, a broadcast of
-        its result) feeds the exact-match kernel and nothing else. The ratio
-        path reads `draft_q` and the logits instead, so the draw is skipped
-        exactly when `draft_q` is given -- not whenever the batch is sampled:
-        a sampled batch with no q (flag off) still verifies by exact match,
-        and without the draw that kernel would fall back to the target argmax,
-        a different and lossy rule for a stochastic request. An all-greedy
-        batch never needed it.
-        """
-        return not all_greedy and draft_q is None
-
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -154,7 +139,7 @@ class RejectionSampler(nn.Module):
         # one per request), so the ratio rule targets the same p_f.
         top_ks: int | torch.Tensor | None = None,
         top_ps: float | torch.Tensor | None = None,
-        # Preallocated device scratch for the ratio path; None allocates.
+        # Preallocated device scratch for the ratio path. Required with draft_q.
         ratio_scratch: SamplingScratch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
@@ -232,7 +217,8 @@ def rejection_sample(
     # Per-step key for the (rank-consistent) accept coins and residual race,
     # < 2**32.
     ratio_step: int = 0,
-    # Preallocated device scratch for the ratio path; None allocates per call.
+    # Preallocated device scratch for the ratio path (`ratio_verify_scratch`).
+    # Required with draft_q.
     ratio_scratch: SamplingScratch | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
@@ -266,16 +252,6 @@ def rejection_sample(
         assert temperatures is not None, (
             "the probability-ratio path needs the target temperatures: p is "
             "softmax(target_logits / T), not softmax(target_logits)"
-        )
-        # The ratio branch below sits above the relaxed one, so the relaxed
-        # path would simply never run, and the two are not combinable: relaxed
-        # acceptance is deliberately not distribution-preserving. The pair is
-        # refused when any drafter is constructed (`Drafter.__init__`), so this
-        # only fires if that gate was bypassed.
-        assert RELAXED_TOP_N <= 1, (
-            "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
-            "mutually exclusive; this should have been refused at drafter "
-            "construction"
         )
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:

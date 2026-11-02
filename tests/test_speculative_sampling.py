@@ -6,6 +6,7 @@ import torch
 
 pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER ops")
 
+from atom.model_ops.ratio_verify import ratio_verify_scratch
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
 from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
@@ -79,6 +80,7 @@ def two_token_batch(probabilities, drafts, width):
         "bonus_logits_indices": bonus_rows([width] * batch),
         # The ratio path's q rows, flat: request b's start at b * width.
         "q_row_base": torch.arange(batch, device="cuda", dtype=torch.int32) * width,
+        "ratio_scratch": ratio_verify_scratch(batch, width, 2, "cuda"),
     }
 
 

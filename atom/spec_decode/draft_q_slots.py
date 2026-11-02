@@ -221,8 +221,9 @@ class DraftQStaging:
         DP dummy's -1) never enter the slot map.
 
         ``verifies``: this forward's verify scores drafts and so may read q
-        (`ModelRunner._verifies_drafts`). False for a prefill, align-only or
-        dummy forward: no lookup is made, so none is counted.
+        (`ModelRunner._verifies_drafts`), the only gate on the lookup. False
+        for a prefill, align-only or dummy forward: no lookup is made, so none
+        is counted.
 
         ``step``: the forward this staging is for (`ModelRunner.forward_step`),
         which `consume` checks.
@@ -235,7 +236,7 @@ class DraftQStaging:
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may hand a slot to a new request,
         # and a request's verify must still read the slot its drafts came from.
-        if verifies and not batch.is_dummy_run:
+        if verifies:
             self.slots.verify_bases(req_ids, self._verify)
         else:
             self._verify[:bs] = -1

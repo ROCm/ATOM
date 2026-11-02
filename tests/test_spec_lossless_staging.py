@@ -17,7 +17,6 @@ from torch import nn
 
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
-from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import Sampler
 from atom.spec_decode import dspark_proposer
 from atom.spec_decode.drafter import Drafter
@@ -429,17 +428,6 @@ def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     assert base.shape == (2,) and scratch is prop._verify_scratch
 
 
-@pytest.mark.parametrize(
-    "all_greedy, has_q, draws",
-    [(True, False, False), (False, False, True), (False, True, False)],
-)
-def test_the_target_draw_is_taken_exactly_when_exact_match_needs_it(
-    all_greedy, has_q, draws
-):
-    q = torch.zeros(1) if has_q else None
-    assert RejectionSampler.needs_target_draw(all_greedy, q) is draws
-
-
 # ---- exclusion with relaxed MTP ----------------------------------------------
 
 
@@ -452,18 +440,24 @@ class _Bare(Drafter):
 
 
 @pytest.mark.parametrize("lossless, relaxed", [(1, 1), (1, 0), (0, 1), (0, 0)])
-def test_relaxed_mtp_and_lossless_sampling_refuse_each_other_first(
+def test_dspark_refuses_relaxed_mtp_where_lossless_sampling_arms(
     monkeypatch, lossless, relaxed
 ):
-    """Refused before anything else and for every drafter flavor, so whether
-    the pair errors cannot depend on PP, PCP, or the draft model."""
-    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", str(lossless))
     monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", str(relaxed))
-    drafter = _Bare.__new__(_Bare)
     if lossless and relaxed:
         with pytest.raises(ValueError, match="ATOM_ENABLE_RELAXED_MTP"):
-            Drafter.__init__(drafter, None, None, None)
+            proposer(monkeypatch)
     else:
-        # Past the check, construction fails on the missing config instead.
-        with pytest.raises(AttributeError):
-            Drafter.__init__(drafter, None, None, None)
+        prop = proposer(monkeypatch, lossless=bool(lossless))
+        assert (prop.draft_sampling is not None) is bool(lossless)
+
+
+def test_a_plain_drafter_starts_with_both_flags_set(monkeypatch):
+    """Only DSpark reads ATOM_SPEC_LOSSLESS_SAMPLING to arm, so an MTP/EAGLE
+    relaxed deployment that inherits it is not refused."""
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
+    drafter = _Bare.__new__(_Bare)
+    # Not a ValueError: construction gets as far as the missing config.
+    with pytest.raises(AttributeError):
+        Drafter.__init__(drafter, None, None, None)

@@ -749,16 +749,13 @@ def _ratio_sample(
     bonus_logits_indices: torch.Tensor,
     num_spec_steps: int,
     ratio_step: int,
-    scratch: SamplingScratch | None = None,
+    scratch: SamplingScratch,
 ) -> None:
     """Launch the probability-ratio verify: stats, combine, the filter where
-    the batch has one, accept, densify, residual.
-
-    Its scratch comes out of ``scratch`` when given (the serving path) and is
-    allocated per call otherwise."""
+    the batch has one, accept, densify, residual, carving its partials out of
+    ``scratch`` (`ratio_verify_scratch`)."""
     num_tokens, vocab_size = target_logits.shape
     batch_size = cu_num_draft_tokens.shape[0]
-    device = target_logits.device
     n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
     stride = target_logits.stride(0)
     temperatures = temperatures.to(torch.float32).contiguous()
@@ -787,13 +784,7 @@ def _ratio_sample(
             filter_i32,
             floor_counts,
         ),
-    ) = take(
-        f32_shapes,
-        i32_shapes,
-        device,
-        None if scratch is None else scratch.f32,
-        None if scratch is None else scratch.i32,
-    )
+    ) = take(f32_shapes, i32_shapes, scratch.f32, scratch.i32)
     filtered = _ratio_target_p(
         target_logits,
         cu_num_draft_tokens,

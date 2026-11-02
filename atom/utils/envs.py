@@ -700,8 +700,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
-    # default; needs an aiter with ROCm/aiter#6954 under TP, and is exclusive
-    # with ATOM_ENABLE_RELAXED_MTP. See docs/model_ops_guide.md.
+    # default; needs an aiter with ROCm/aiter#6954 under TP, and DSparkProposer
+    # refuses ATOM_ENABLE_RELAXED_MTP where it arms. See docs/model_ops_guide.md.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: _flag_env("ATOM_SPEC_LOSSLESS_SAMPLING"),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding

@@ -3420,7 +3420,8 @@ class ModelRunner:
                     bs, target_logits.dtype
                 )
             target_token_ids = None
-            if RejectionSampler.needs_target_draw(all_greedy, draft_q):
+            # Only exact match on a sampled batch reads the target's own draw.
+            if not all_greedy and draft_q is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,

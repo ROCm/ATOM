@@ -22,6 +22,7 @@ pytest.importorskip(
 
 import torch
 
+import atom.model_ops.dspark_markov_sample as dspark_markov_sample_mod
 import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
@@ -107,29 +108,38 @@ def test_semi_autoregressive_bias_changes_argmax():
     assert int(combined.argmax(-1)) == 2
 
 
-def test_the_sampled_block_chains_positions_through_the_shared_head():
+def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch):
     """`DSparkMarkovHead.sample_block_q`, the one sampled loop every flavor
     shares: position k draws from x_{k-1} into its own column, at store
     position k, with the noise counter strided by the buffers' max batch."""
     max_bs, bs, steps, V = 4, 3, 3, 10
     head = DSparkMarkovHead(vocab_size=V, rank=2)
+    per_row = torch.zeros(max_bs)
     sampling = types.SimpleNamespace(
+        q_store=(None, None, None),
         s_scratch=torch.empty(max_bs, V),
         q_row_base=torch.zeros(max_bs, dtype=torch.int32),
+        temperatures=per_row,
+        greedy_mask=per_row,
+        top_k=per_row,
+        top_p=per_row,
+        seed=None,
+        scratch=types.SimpleNamespace(f32=None, i32=None),
     )
     calls = []
 
-    def sample_next_q(prev, base, out, bound, rows, position, noise_offset):
-        calls.append((bound, rows, position, noise_offset))
+    def sample(base, prev, w1, w2, out, *args):
+        row_base, position, noise_offset = args[4], args[5], args[11]
+        calls.append((row_base.shape[0], position, noise_offset))
         assert torch.equal(base, base_logits[:, position])
         out.copy_(prev + 1)
 
-    head.sample_next_q = sample_next_q
+    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
     base_logits = torch.randn(bs, steps, V)
     anchors = torch.tensor([0, 3, 5])
     drafts = head.sample_block_q(base_logits, anchors, sampling)
     assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
-    assert calls == [(sampling, bs, k, k * max_bs * V) for k in range(steps)]
+    assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
     with pytest.raises(AssertionError, match="score scratch"):
         head.sample_block_q(torch.randn(bs, steps, V + 1), anchors, sampling)
 

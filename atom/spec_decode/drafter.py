@@ -18,7 +18,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
-from atom.utils import CpuGpuBuffer, envs, resolve_obj_by_qualname
+from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
@@ -162,18 +162,6 @@ class Drafter(abc.ABC):
     """
 
     def __init__(self, atom_config: Config, device: torch.device, runner):
-        if envs.ATOM_SPEC_LOSSLESS_SAMPLING and envs.ATOM_ENABLE_RELAXED_MTP:
-            # A contradictory request, refused before anything else and for every
-            # flavor, so the answer does not depend on which capability gate a
-            # given model or parallel layout happens to trip first. Relaxed top-N
-            # accepts tokens the target would not have drawn; the ratio rule's
-            # claim is that the emitted stream is the target's distribution.
-            raise ValueError(
-                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
-                "mutually exclusive: relaxed top-N acceptance is approximate "
-                "by construction and the probability-ratio rule is exact, so "
-                "there is no defensible way to apply both. Turn one off."
-            )
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
         self.runner = runner

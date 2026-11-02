@@ -10,7 +10,7 @@ from atom.model_ops.sampling_scratch import SamplingScratch, take
 
 def test_views_are_laid_out_in_order_with_the_requested_shapes():
     scratch = SamplingScratch.for_shapes([(2, 3), (4,)], [(5,)], "cpu")
-    (a, b), (c,) = take([(2, 3), (4,)], [(5,)], "cpu", scratch.f32, scratch.i32)
+    (a, b), (c,) = take([(2, 3), (4,)], [(5,)], scratch.f32, scratch.i32)
     assert a.shape == (2, 3) and b.shape == (4,) and c.shape == (5,)
     assert a.dtype is torch.float32 and c.dtype is torch.int32
     assert a.data_ptr() == scratch.f32.data_ptr()
@@ -26,7 +26,7 @@ def test_the_views_are_where_plan_regions_puts_them():
     scratch = SamplingScratch.for_shapes(shapes, [], "cpu")
     offsets, total = plan_regions([4 * 3, 0, 4 * 35, 4])
     assert scratch.f32.numel() * 4 == total
-    views, _ = take(shapes, [], "cpu", scratch.f32, scratch.i32)
+    views, _ = take(shapes, [], scratch.f32, scratch.i32)
     # Byte offsets in the buffer; an empty view's data_ptr means nothing.
     assert [v.storage_offset() * 4 for v in views] == offsets
     assert [v.shape for v in views] == [torch.Size(s) for s in shapes]
@@ -41,17 +41,12 @@ def test_every_view_is_16_byte_aligned_whatever_the_batch(rows):
     scratch = SamplingScratch.for_shapes(
         [(8,), (3, 8), (8, 5)], [(8,), (8, 7), (2,)], "cpu"
     )
-    fv, iv = take(f32, i32, "cpu", scratch.f32, scratch.i32)
+    fv, iv = take(f32, i32, scratch.f32, scratch.i32)
     for view, base in [(v, scratch.f32) for v in fv] + [(v, scratch.i32) for v in iv]:
         assert (view.data_ptr() - base.data_ptr()) % 16 == 0
-
-
-def test_no_buffer_allocates_per_call():
-    (a,), (b,) = take([(3,)], [(2, 2)], "cpu")
-    assert a.shape == (3,) and b.shape == (2, 2)
 
 
 def test_a_batch_larger_than_the_scratch_is_refused():
     scratch = SamplingScratch(5, 5, "cpu")
     with pytest.raises(ValueError, match="sized for a smaller batch"):
-        take([(2, 3)], [], "cpu", scratch.f32, scratch.i32)
+        take([(2, 3)], [], scratch.f32, scratch.i32)

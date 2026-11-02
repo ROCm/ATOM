@@ -172,55 +172,13 @@ class DSparkMarkovHead(nn.Module):
         out.copy_((base_logits + bias).argmax(dim=-1))
         return markov_embed
 
-    def sample_next_q(
-        self,
-        token_ids: torch.Tensor,  # [B]   x_{k-1}
-        base_logits: torch.Tensor,  # [B, V]
-        out: torch.Tensor,  # [B]   destination for x_k
-        sampling: "DraftSampling",  # the bound store, scratch and row inputs
-        bs: int,  # rows of the per-row inputs this block runs
-        position: int,  # k: this position's row is q_row_base + k
-        noise_offset: int,
-    ) -> torch.Tensor:
-        """One sampled block position: draw ``x_k`` from the top of
-        ``softmax(biased / T)`` and write exactly that q out.
-
-        A separate entry point from ``sample_next`` rather than a flag on it:
-        the two have different outputs (this one publishes a distribution the
-        other exists not to materialize), so a caller that takes the wrong one
-        fails loudly rather than silently drafting under a policy the accept
-        rule does not match.
-        """
-        # Imported here for the reason `sample_next` gives.
-        from atom.model_ops.dspark_markov_sample import dspark_markov_sample
-
-        return dspark_markov_sample(
-            base_logits,
-            token_ids,
-            self.markov_w1.weight,
-            self.markov_w2.weight,
-            out,
-            *sampling.q_store,
-            sampling.s_scratch,
-            sampling.q_row_base[:bs],
-            position,
-            sampling.temperatures[:bs],
-            sampling.greedy_mask[:bs],
-            sampling.top_k[:bs],
-            sampling.top_p[:bs],
-            sampling.seed,
-            noise_offset,
-            sampling.scratch.f32,
-            sampling.scratch.i32,
-        )
-
     def sample_block_q(
         self,
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
         sampling: "DraftSampling",
     ) -> torch.Tensor:
-        """The sampled block, left to right, through ``sample_next_q``:
+        """The sampled block, left to right, through ``dspark_markov_sample``:
 
             logits_k <- U_k + B(x_{k-1}, .)
             q_k      <- top of softmax(logits_k / T) -- stored at q_store[base + k]
@@ -231,7 +189,13 @@ class DSparkMarkovHead(nn.Module):
         kernel reads it back from there a step later. Returns the drafts
         ``[B, T]``. One loop for every flavor that drafts losslessly, so the
         noise counters cannot differ between them.
+
+        A separate entry point from ``sample_next`` rather than a flag on it:
+        this one publishes the q the other exists not to materialize.
         """
+        # Imported here for the reason `sample_next` gives.
+        from atom.model_ops.dspark_markov_sample import dspark_markov_sample
+
         bs, num_draft, vocab = base_logits.shape
         assert sampling.s_scratch.shape[1] == vocab, (
             f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
@@ -244,14 +208,24 @@ class DSparkMarkovHead(nn.Module):
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
         for k in range(num_draft):
-            self.sample_next_q(
-                out_ids[:, k],
+            dspark_markov_sample(
                 base_logits[:, k],
+                out_ids[:, k],
+                self.markov_w1.weight,
+                self.markov_w2.weight,
                 out_ids[:, k + 1],
-                sampling,
-                bs,
+                *sampling.q_store,
+                sampling.s_scratch,
+                sampling.q_row_base[:bs],
                 k,
+                sampling.temperatures[:bs],
+                sampling.greedy_mask[:bs],
+                sampling.top_k[:bs],
+                sampling.top_p[:bs],
+                sampling.seed,
                 k * position_stride,
+                sampling.scratch.f32,
+                sampling.scratch.i32,
             )
         return out_ids[:, 1:]
 
@@ -320,10 +294,9 @@ class DSparkDraftModel(nn.Module):
     block_attention_is_mla = True
 
     #: Does this flavor's block sampler branch on ``draft_sampling`` and draw
-    #: from, and publish, a real q (``DSparkMarkovHead.sample_block_q``)? An
-    #: explicit class flag rather than a probe of the head: every flavor shares
-    #: ``DSparkMarkovHead``, so it has ``sample_block_q`` whether or not the
-    #: flavor's own sampling loop calls it.
+    #: from, and publish, a real q (``DSparkMarkovHead.sample_block_q``)? A
+    #: class flag, not a probe: every flavor's head has ``sample_block_q``.
+    #: ``DSparkProposer`` binds sampling buffers only where it is set.
     supports_lossless_draft = False
 
     #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
@@ -339,12 +312,6 @@ class DSparkDraftModel(nn.Module):
         Switching it per step would not work: the branch is python, and a
         captured graph holds whichever side was taken at capture.
         """
-        if sampling is not None and not self.supports_lossless_draft:
-            raise ValueError(
-                f"{type(self).__name__} does not declare supports_lossless_draft; "
-                "binding draft sampling buffers to it would publish a q the "
-                "block sampler never draws from"
-            )
         self.draft_sampling = sampling
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):

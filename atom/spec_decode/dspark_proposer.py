@@ -164,6 +164,14 @@ class DSparkProposer(Drafter):
                 reason,
             )
             return
+        if envs.ATOM_ENABLE_RELAXED_MTP:
+            # Relaxed top-N accepts tokens the target would not have drawn.
+            raise ValueError(
+                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
+                "mutually exclusive: relaxed top-N acceptance is approximate "
+                "by construction and the probability-ratio rule is exact, so "
+                "there is no defensible way to apply both. Turn one off."
+            )
         max_bs = self.config.max_num_seqs
         t = self.draft_tokens_per_seq
         vocab = int(self.model.vocab_size)

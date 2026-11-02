@@ -735,8 +735,8 @@ def _dspark_markov_sample_fake(
     top_p: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
-    scratch_f32: torch.Tensor | None = None,
-    scratch_i32: torch.Tensor | None = None,
+    scratch_f32: torch.Tensor,
+    scratch_i32: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty(
         base_logits.shape[0],
@@ -830,8 +830,8 @@ def dspark_markov_sample(
     top_p: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
-    scratch_f32: torch.Tensor | None = None,
-    scratch_i32: torch.Tensor | None = None,
+    scratch_f32: torch.Tensor,
+    scratch_i32: torch.Tensor,
 ) -> torch.Tensor:
     """Draw ``x_k`` from the top of ``softmax((base_logits + W1[prev_ids] @
     W2^T) / T)`` and publish exactly the q it was drawn from.
@@ -863,8 +863,7 @@ def dspark_markov_sample(
                               position. Static (position * max_B * V), so it
                               does not make the launch data-dependent.
         scratch_f32, scratch_i32: flat buffers the call's partials are carved
-                              from (`dspark_markov_sample_scratch`); None
-                              allocates per call.
+                              from (`dspark_markov_sample_scratch`).
 
     Returns:
         ``[B, r]`` ``W1[prev_ids]``, for the same reason the greedy op returns it.
@@ -938,7 +937,7 @@ def dspark_markov_sample(
     (
         (part_max, part_amax_val, row_max),
         (part_amax_idx, row_argmax, *select_scratch),
-    ) = take(f32_shapes, i32_shapes, device, scratch_f32, scratch_i32)
+    ) = take(f32_shapes, i32_shapes, scratch_f32, scratch_i32)
 
     _dspark_markov_sample_stage1[(gemv_tiles, row_tiles)](
         base_logits,

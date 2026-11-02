@@ -62,7 +62,7 @@ from atom.model_ops.sampling_filter import (
     _ratio_filter_pass_kernel,
     _request_of_row,
 )
-from atom.model_ops.sampling_scratch import take
+from atom.model_ops.sampling_scratch import SamplingScratch, take
 from atom.model_ops.softmax_tiles import (
     argmax_lowest_id,
     race_key,
@@ -127,8 +127,11 @@ def sample(
     noise_offset=0,
     scratch=None,
 ):
-    """One `dspark_markov_sample` call; ``(out, s_scratch)``."""
+    """One `dspark_markov_sample` call; ``(out, s_scratch)``. Its scratch is
+    sized to ``base``'s rows unless one is given."""
     rows, vocab = base.shape
+    if scratch is None:
+        scratch = dspark_markov_sample_scratch(rows, vocab, DEV)
     if top_k is None:
         top_k, _ = filters(rows)
     if top_p is None:
@@ -151,8 +154,8 @@ def sample(
         top_p,
         seed,
         noise_offset,
-        None if scratch is None else scratch.f32,
-        None if scratch is None else scratch.i32,
+        scratch.f32,
+        scratch.i32,
     )
     return out, s
 
@@ -268,7 +271,7 @@ def test_a_row_without_a_destination_drafts_the_argmax_and_writes_nothing(
     assert all((t == -7).all() for t in store)
 
 
-def test_the_preallocated_scratch_drafts_exactly_what_allocation_does():
+def test_an_oversized_scratch_drafts_exactly_what_an_exact_one_does():
     rows, vocab, rank, width = 24, 3000, 64, 100
     base, prev, w1, w2 = tables(rows, vocab, rank)
     temps, greedy, seed = draft_args(rows, temperature=0.9, step=5)
@@ -622,9 +625,10 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
 # ---- verify: the probability-ratio rule ---------------------------------------
 
 
-def verify_batch(drafts, width, logits, temperatures, row_base=None):
+def verify_batch(drafts, width, logits, temperatures, row_base=None, scratch=None):
     """`rejection_sample` arguments for equal-width requests whose row r
-    scores ``logits[r]`` and drafts ``drafts[r]``."""
+    scores ``logits[r]`` and drafts ``drafts[r]``, with a ratio scratch sized
+    to the batch unless one is given."""
     rows = drafts.numel()
     batch = rows // width
     ids, logit_rows = [], []
@@ -651,6 +655,11 @@ def verify_batch(drafts, width, logits, temperatures, row_base=None):
             torch.arange(batch, device=DEV, dtype=torch.int32) * width
             if row_base is None
             else row_base
+        ),
+        "ratio_scratch": (
+            ratio_verify_scratch(batch, width, logits.shape[1], DEV)
+            if scratch is None
+            else scratch
         ),
     }
 
@@ -992,7 +1001,7 @@ def test_the_shared_race_keys_and_picks_the_lowest_id(tile_2d):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("filters", ["none", "per-row", "scalar"])
-def test_the_preallocated_scratch_verifies_exactly_what_allocation_does(dtype, filters):
+def test_a_reused_scratch_verifies_exactly_what_a_fresh_one_does(dtype, filters):
     """Production reuses one scratch, holding whatever the last step left in
     it; no buffer of it, the filter's included, may be read before written."""
     torch.manual_seed(43)
@@ -1019,12 +1028,11 @@ def test_the_preallocated_scratch_verifies_exactly_what_allocation_does(dtype, f
         scratch.f32.fill_(garbage)
         scratch.i32.random_(-(2**31), 2**31 - 1)
         reused = rejection_sample(
-            **args,
+            **{**args, "ratio_scratch": scratch},
             draft_q=q,
             ratio_step=11,
             top_ks=ks,
             top_ps=ps,
-            ratio_scratch=scratch,
         )
         assert torch.equal(plain[0], reused[0]) and torch.equal(plain[1], reused[1])
 
@@ -1091,6 +1099,7 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
                 logits[:rows],
                 torch.ones(max_bs, device=DEV)[:batch_n],
                 row_base=torch.arange(batch_n, device=DEV, dtype=torch.int32) * width,
+                scratch=scratch,
             )
             rejection_sample(
                 **args,
@@ -1098,7 +1107,6 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
                 ratio_step=3,
                 top_ks=top_ks_form,
                 top_ps=top_ps_form,
-                ratio_scratch=scratch,
             )
         torch.cuda.synchronize()
         grew = [
@@ -1633,10 +1641,12 @@ def filtered_p(logits, temps, top_ks=None, top_ps=None, widths=None):
     widths = torch.ones(rows, dtype=torch.int64) if widths is None else widths
     cu = widths.cumsum(0).to(device=DEV, dtype=torch.int32)
     assert int(cu[-1]) == rows
+    shapes = _ratio_scratch_shapes(rows, len(widths), vocab)
+    scratch = SamplingScratch.for_shapes(*shapes, DEV)
     (
         (row_max, row_inv_z, row_floor, part_max, part_sum, part_val, _, *filt_f32),
         (row_argmax, part_idx, _, _, *filt_i32),
-    ) = take(*_ratio_scratch_shapes(rows, len(widths), vocab), DEV, None, None)
+    ) = take(*shapes, scratch.f32, scratch.i32)
     temps = temps.float().contiguous()
     assert _ratio_target_p(
         logits,

@@ -57,22 +57,18 @@ class SamplingScratch:
 def take(
     f32_shapes: Sequence[tuple[int, ...]],
     i32_shapes: Sequence[tuple[int, ...]],
-    device,
-    f32: torch.Tensor | None = None,
-    i32: torch.Tensor | None = None,
+    f32: torch.Tensor,
+    i32: torch.Tensor,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Views of the given shapes, laid out in order in ``f32`` / ``i32`` by
-    `plan_regions`; freshly allocated tensors when no buffer is given (tests,
-    one-off calls)."""
+    `plan_regions`."""
     return (
-        _carve(f32_shapes, torch.float32, device, f32),
-        _carve(i32_shapes, torch.int32, device, i32),
+        _carve(f32_shapes, torch.float32, f32),
+        _carve(i32_shapes, torch.int32, i32),
     )
 
 
-def _carve(shapes, dtype, device, flat):
-    if flat is None:
-        return [torch.empty(shape, dtype=dtype, device=device) for shape in shapes]
+def _carve(shapes, dtype, flat):
     need = _planned_elems(shapes)
     if need > flat.numel():
         raise ValueError(
