@@ -574,30 +574,6 @@ def state_tier_cpu_bytes() -> int:
     return int(float(os.environ.get("OFFLOAD_STATE_CPU_SIZE", "32")) * (1 << 30))
 
 
-def state_tier_budget_warning(state_gib: float, pool_gib: float) -> str | None:
-    """Why the state cap and the LMCache pool it shares do not fit together
-    (e.g. `LMCACHE_MAX_LOCAL_CPU_SIZE=32` with the 32 GiB default cap), or
-    None."""
-    if pool_gib <= 0:
-        return None
-    sizes = (
-        f"OFFLOAD_STATE_CPU_SIZE={state_gib:.1f} GiB, "
-        f"LMCACHE_MAX_LOCAL_CPU_SIZE={pool_gib:.1f} GiB"
-    )
-    if state_gib >= pool_gib:
-        return (
-            f"{sizes}: the state cap is not below the pool, so it bounds "
-            "nothing and state images can take the whole pool from paged KV. "
-            "Lower OFFLOAD_STATE_CPU_SIZE or raise LMCACHE_MAX_LOCAL_CPU_SIZE."
-        )
-    if 2 * state_gib > pool_gib:
-        return (
-            f"{sizes}: state images may take more than half of the pool, "
-            "leaving paged KV the smaller share under pressure."
-        )
-    return None
-
-
 def state_tier_chunk_tokens(config) -> int:
     """The LMCache chunk size in tokens for the joint KV leg, or 0.
 

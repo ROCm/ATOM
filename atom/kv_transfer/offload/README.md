@@ -131,8 +131,7 @@ admission that would load an image not confirmed within `tier_verified_for_s`
 (0.25 s per GiB of `LMCACHE_MAX_LOCAL_CPU_SIZE`, 5-60 s) is held a pass, at most
 `OFFLOAD_LOOKUP_DEFER_S`, for that verdict. Touches that only confirmed presence
 (the image is held by another backend only, or the touch raised) are counted in
-the connector statistic `state_touches_unrefreshed`. The worker warns when
-`OFFLOAD_STATE_CPU_SIZE` is more than half of the pool.
+the connector statistic `state_touches_unrefreshed`.
 
 ## LMCache Multiprocess (`lmcache_mp`)
 

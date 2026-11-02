@@ -1577,28 +1577,41 @@ class BlockManager:
         block_hashes: list[int],
         decision: JointBoundaryDecision,
     ) -> int:
-        """The hash `allocate` would restore `seq`'s state from, when HBM does
-        not hold it; -1 for no state, an HBM-held one, or a replay.
-
-        Mirrors `allocate`'s choice: the joint boundary when there is one (above
-        the HBM hit by construction), else the HBM hit's last block unless a
-        replay rebuilds the state instead.
-        """
+        """The `_state_resume_hash` `allocate` would restore from, when HBM
+        does not hold it; -1 for no state, an HBM-held one, or a replay."""
         if not seq.has_per_req_cache:
             return -1
-        if decision.skip_reason is None:
-            return -1 if decision.state_from_hbm else decision.boundary_hash
-        if self.tier_resume_replays(seq) or not (
-            0 < num_cached_blocks <= len(block_hashes)
-        ):
+        joint = decision.skip_reason is None
+        if joint and decision.state_from_hbm:
             return -1
-        h = block_hashes[num_cached_blocks - 1]
-        in_hbm = (
-            self.paged_state_checkpoints.contains(h)
-            if self.paged_state_checkpoints is not None
-            else self.state.lookup(h) >= 0
+        hit_hash = (
+            block_hashes[num_cached_blocks - 1]
+            if 0 < num_cached_blocks <= len(block_hashes)
+            else -1
         )
-        return -1 if in_hbm else h
+        h = self._state_resume_hash(
+            seq, decision.boundary_hash if joint else -1, hit_hash
+        )
+        if h != -1 and not joint:
+            in_hbm = (
+                self.paged_state_checkpoints.contains(h)
+                if self.paged_state_checkpoints is not None
+                else self.state.lookup(h) >= 0
+            )
+            if in_hbm:
+                return -1
+        return h
+
+    def _state_resume_hash(self, seq: Sequence, joint_hash: int, hit_hash: int) -> int:
+        """The hash whose state `seq` resumes from, or -1 for none.
+
+        The joint boundary when there is one (above the HBM hit by
+        construction), else the HBM hit's last block. A replay rebuilds the
+        state instead of restoring it, so it resumes from none.
+        """
+        if joint_hash != -1:
+            return joint_hash
+        return -1 if self.tier_resume_replays(seq) else hit_hash
 
     def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
         """Drop a failed unaligned joint and resume at the HBM hit it lowered.
@@ -1795,13 +1808,16 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
-        if self.state_replay_tokens and seq.replays_hit:
-            # A replay starts from a fresh state slot, never a checkpoint: it
-            # rebuilds the state below whatever the claim above reached.
-            hit_hash = -1
-            if num_cached_blocks < requested_blocks:
-                # A KV-only load past the hit would start above a gap.
-                seq.replay_kv_load = False
+        # A replay starts from a fresh state slot, never a checkpoint: it
+        # rebuilds the state below whatever the claim above reached
+        # (`_state_resume_hash` gives it none). A KV-only load past the hit
+        # would start above a gap.
+        if (
+            self.state_replay_tokens
+            and seq.replays_hit
+            and num_cached_blocks < requested_blocks
+        ):
+            seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1817,9 +1833,9 @@ class BlockManager:
             # joint boundary and `_claim_after_load` raised `num_cached_tokens`
             # to it, so the forward resumed over a prefix the state does not
             # cover. Silent wrong output, no exception.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         for _ in range(len(seq.block_table), self.num_pool_blocks(len(seq))):
             seq.block_table.append(self._fresh_block())
@@ -1836,9 +1852,9 @@ class BlockManager:
             # above the HBM hit by construction. `num_cached_tokens` stays at
             # the HBM prefix until the KV leg lands, so the forward covers
             # `[hbm, num_prompt)` if anything goes wrong from here.
-            joint_hash = seq.offload_joint.boundary_hash
             state_holds = self._attach_state_slots(
-                seq, joint_hash if joint_hash != -1 else hit_hash
+                seq,
+                self._state_resume_hash(seq, seq.offload_joint.boundary_hash, hit_hash),
             )
         if seq.has_per_req_cache:
             seq._state_initialized_after_alloc = False

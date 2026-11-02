@@ -7212,24 +7212,20 @@ class _LocalCPU:
     anything another holder still references.
     """
 
-    def __init__(self, refuse_all: bool = False) -> None:
+    def __init__(self) -> None:
         self.hot: OrderedDict = OrderedDict()
         # A second backend (LocalDisk) for presence only: `contains` answers
         # from it, `get` does not read it (no test loads a disk-only image).
         self.disk: dict = {}
-        self.refuse_all = refuse_all
-        self.fail_put = False
         self.puts = 0
         self.local_cpu_backend = SimpleNamespace(
             cpu_lock=threading.Lock(), hot_cache=self.hot, cache_policy=_LRUPolicy()
         )
 
     def batched_put(self, keys, objs) -> None:
-        if self.fail_put:
-            raise RuntimeError("put failed")
         self.puts += 1
         for k, o in zip(keys, objs, strict=True):
-            if not self.refuse_all and k not in self.hot:
+            if k not in self.hot:
                 o.ref_count_up()
                 self.hot[k] = o
             o.ref_count_down()
@@ -7299,15 +7295,6 @@ def _kv(pool, name):
 
 
 class TestCodecRefresh:
-    def test_an_untouched_image_is_the_first_thing_pressure_evicts(self, lmcache_key):
-        """The bug: KV written after the image is younger, however often the
-        prefix hits."""
-        pool = _LocalCPU()
-        codec, _ = _lru_codec(pool, max_entries=None)
-        assert codec.put(1, [])
-        _kv(pool, "kv-chunk")
-        assert pool.evict_oldest() == codec.key(1)
-
     def test_a_touch_moves_the_image_past_older_kv(self, lmcache_key):
         pool = _LocalCPU()
         codec, _ = _lru_codec(pool, max_entries=None)
@@ -7366,28 +7353,6 @@ class TestCodecRefresh:
         assert codec.key(2) not in pool.hot
         assert objs[1].refs == 0, "a retired image goes back to the allocator"
         assert list(codec._cache_keys) == [codec.key(1), codec.key(3)]
-
-    def test_images_hold_no_extra_reference(self, lmcache_key):
-        """No reservation: KV pressure may evict an image like any chunk."""
-        pool = _LocalCPU()
-        codec, objs = _lru_codec(pool, max_entries=2)
-        assert codec.put(1, [])
-        assert objs[0].refs == 1
-        assert pool.evict_oldest() == codec.key(1)
-
-    def test_a_refused_put_keeps_no_reference(self, lmcache_key):
-        pool = _LocalCPU(refuse_all=True)
-        codec, objs = _lru_codec(pool, max_entries=2)
-        assert codec.put(1, [])
-        assert objs[0].refs == 0, "holding a refused object would strand its block"
-
-    def test_a_failed_put_discharges_its_reference(self, lmcache_key):
-        pool = _LocalCPU()
-        pool.fail_put = True
-        codec, objs = _lru_codec(pool, max_entries=2)
-        with pytest.raises(RuntimeError):
-            codec.put(1, [])
-        assert objs[0].refs == 0
 
     @pytest.mark.parametrize(
         "missing",

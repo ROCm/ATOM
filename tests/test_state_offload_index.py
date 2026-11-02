@@ -6,11 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.model_engine import state_offload as so
-from atom.model_engine.state_offload import (
-    StateOffloadIndex,
-    state_tier_budget_warning,
-    state_tier_cpu_bytes,
-)
+from atom.model_engine.state_offload import StateOffloadIndex, state_tier_cpu_bytes
 
 
 def _stored(idx, hashes):
@@ -310,18 +306,3 @@ class TestTouchPlumbing:
             SimpleNamespace(take_state_touch_verdicts=lambda: {7: False, 8: True})
         )
         assert not idx.could_serve(7) and idx.could_serve(8)
-
-
-@pytest.mark.parametrize(
-    "state_gib, pool_gib, says",
-    [
-        (59, 208, None),
-        (32, 32, "bounds nothing"),  # #2562's accuracy run: the default cap
-        (40, 64, "more than half"),
-        (32, 64, None),
-        (32, 0, None),
-    ],
-)
-def test_the_state_cap_is_judged_against_the_pool(state_gib, pool_gib, says):
-    msg = state_tier_budget_warning(state_gib, pool_gib)
-    assert msg is None if says is None else says in msg

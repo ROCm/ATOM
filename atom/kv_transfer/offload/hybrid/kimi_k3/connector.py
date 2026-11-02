@@ -40,10 +40,7 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import (
     _JointPark,
 )
 from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-from atom.model_engine.state_offload import (
-    state_tier_budget_warning,
-    state_tier_cpu_bytes,
-)
+from atom.model_engine.state_offload import state_tier_cpu_bytes
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -262,12 +259,6 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
-        pool_gib = float(getattr(cfg, "max_local_cpu_size", 0) or 0)
-        budget_warning = state_tier_budget_warning(
-            state_tier_cpu_bytes() / (1 << 30), pool_gib
-        )
-        if budget_warning:
-            logger.warning("kimi_k3 offload: %s", budget_warning)
         # No index here: StateOffloadIndex lives in the engine process; both
         # directions report and the engine applies.
         self._state_tier = StateOffloadTier(codec)
