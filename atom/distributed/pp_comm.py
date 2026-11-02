@@ -15,6 +15,7 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.communication import set_custom_all_reduce
 
+from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
 from atom.models.utils import IntermediateTensors
 from atom.utils import envs
 
@@ -22,7 +23,7 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
-_PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
+_PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices", PP_TOPK_METADATA)
 # And a drafter's taps on their way to the last stage (`pp_aux_relay`).
 PP_DRAFT_AUX_PREFIX = "draft_aux_"
 
@@ -33,6 +34,14 @@ def _stage_payload(it: IntermediateTensors) -> dict:
         for k, v in it.tensors.items()
         if k in _PP_PROXY_KEYS or k.startswith(PP_DRAFT_AUX_PREFIX)
     }
+
+
+def _rank_local_topk(it: IntermediateTensors) -> dict:
+    has_metadata = PP_TOPK_METADATA in it.tensors
+    has_indices = PP_TOPK_INDICES in it.tensors
+    if has_metadata != has_indices:
+        raise RuntimeError("Incomplete MiniMax-M3 PP top-k payload")
+    return {PP_TOPK_INDICES: it.tensors[PP_TOPK_INDICES]} if has_indices else {}
 
 
 def pp_send_allgather_group():
@@ -107,8 +116,13 @@ def send_intermediate_tensors(it: IntermediateTensors) -> None:
     """Blocking send of hidden_states/residual to the next PP stage."""
     pp = get_pp_group()
     tensors = _stage_payload(it)
+    topk = _rank_local_topk(it)
     dst = (pp.rank_in_group + 1) % pp.world_size
     pp.send_tensor_dict(tensors, dst=dst, all_gather_group=pp_send_allgather_group())
+    if topk:
+        # Each TP rank selects its own heads: gathering other ranks' slices
+        # would silently substitute a different head's selected blocks.
+        pp.send_tensor_dict(topk, dst=dst, all_gather_group=None)
 
 
 def recv_intermediate_tensors() -> IntermediateTensors:
@@ -116,6 +130,11 @@ def recv_intermediate_tensors() -> IntermediateTensors:
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
     tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
+    if PP_TOPK_METADATA in tensors:
+        topk = pp.recv_tensor_dict(src=src, all_gather_group=None)
+        if set(topk) != {PP_TOPK_INDICES}:
+            raise RuntimeError("Missing MiniMax-M3 rank-local PP top-k indices")
+        tensors.update(topk)
     return IntermediateTensors(tensors)
 
 
@@ -134,20 +153,15 @@ def _async_send_object(
     return works
 
 
-def async_send_intermediate_tensors(
-    it: IntermediateTensors,
-) -> list[P2PWork]:
-    """Non-blocking send of hidden_states/residual to the next PP stage."""
+def _async_send_tensor_dict(tensors: dict, ag_group) -> list[P2PWork]:
     pp = get_pp_group()
     dst_local = (pp.rank_in_group + 1) % pp.world_size
     dst_global = pp.ranks[dst_local]
 
-    tensors = _stage_payload(it)
     metadata_list, tensor_list = _split_tensor_dict(tensors)
 
     works = _async_send_object(metadata_list, dst_global, pp.cpu_group)
 
-    ag_group = pp_send_allgather_group()
     ag_size = 1 if ag_group is None else ag_group.world_size
     ag_rank = 0 if ag_group is None else ag_group.rank_in_group
 
@@ -163,6 +177,17 @@ def async_send_intermediate_tensors(
             w = torch.distributed.isend(buf, dst=dst_global, group=pp.device_group)
         works.append(P2PWork(w, buf))
 
+    return works
+
+
+def async_send_intermediate_tensors(
+    it: IntermediateTensors,
+) -> list[P2PWork]:
+    """Send activations and, when needed, rank-local MiniMax index heads."""
+    topk = _rank_local_topk(it)
+    works = _async_send_tensor_dict(_stage_payload(it), pp_send_allgather_group())
+    if topk:
+        works.extend(_async_send_tensor_dict(topk, None))
     return works
 
 

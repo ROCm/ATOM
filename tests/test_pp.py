@@ -8,6 +8,7 @@ import tempfile
 import types
 from collections import deque
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -283,10 +284,13 @@ def _real_split_tensor_dict(tensor_dict):
     metadata_list = []
     tensor_list = []
     for key, value in tensor_dict.items():
-        metadata_list.append(
-            {"key": key, "dtype": value.dtype, "shape": list(value.shape)}
-        )
-        tensor_list.append(value)
+        if isinstance(value, torch.Tensor):
+            metadata_list.append(
+                {"key": key, "dtype": value.dtype, "shape": list(value.shape)}
+            )
+            tensor_list.append(value)
+        else:
+            metadata_list.append((key, value))
     return metadata_list, tensor_list
 
 
@@ -1143,3 +1147,66 @@ def test_dynamic_pp_prefill_registers_prefix_hashes():
     assert seq.num_cached_tokens == prompt
     hit = sched.block_manager.can_allocate(_make_seq(prompt, block_size=bs))
     assert hit == prompt // bs - 1
+
+
+@pytest.mark.parametrize("allgather", [False, True])
+def test_m3_topk_transport_preserves_rank_local_heads(monkeypatch, allgather):
+    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
+
+    grp, _ = _fake_pp_group(monkeypatch)
+    tp = SimpleNamespace(world_size=4, rank_in_group=1)
+    monkeypatch.setattr(pp_comm, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", allgather)
+    ids = torch.arange(48, dtype=torch.int32).reshape(2, 8, 3)
+    it = IntermediateTensors(
+        {
+            "hidden_states": torch.ones(8, 8),
+            PP_TOPK_INDICES: ids,
+            PP_TOPK_METADATA: {"source": (12, 12)},
+        }
+    )
+    pp_comm.send_intermediate_tensors(it)
+    calls = grp.send_tensor_dict.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["all_gather_group"] is (tp if allgather else None)
+    assert PP_TOPK_INDICES not in calls[0].args[0]
+    assert calls[1].kwargs["all_gather_group"] is None
+    assert calls[1].args[0][PP_TOPK_INDICES] is ids
+    grp.recv_tensor_dict.side_effect = [c.args[0] for c in calls]
+    out = pp_comm.recv_intermediate_tensors()
+    torch.testing.assert_close(out[PP_TOPK_INDICES], ids)
+    assert grp.recv_tensor_dict.call_args_list[1].kwargs["all_gather_group"] is None
+
+
+def test_m3_async_topk_is_full_rank_local_owned_buffer(monkeypatch):
+    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_INDICES, PP_TOPK_METADATA
+
+    _fake_async_pp_group(monkeypatch)
+    tp = SimpleNamespace(world_size=4, rank_in_group=1)
+    monkeypatch.setattr(pp_comm, "get_tp_group", lambda: tp)
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", True)
+    sizes = _capture_isend(monkeypatch)
+    ids = torch.arange(48, dtype=torch.int32).reshape(2, 8, 3)
+    it = IntermediateTensors(
+        {
+            "hidden_states": torch.ones(8, 8),
+            PP_TOPK_INDICES: ids,
+            PP_TOPK_METADATA: {"source": (12, 12)},
+        }
+    )
+    work = pp_comm.async_send_intermediate_tensors(it)
+    assert sizes[2] == 16  # hidden-state TP slice
+    assert sizes[-1] == 48  # full index heads, no TP slice
+    saved = work[-1].payload.clone()
+    ids.fill_(-1)
+    torch.testing.assert_close(work[-1].payload, saved)
+    assert work[-1].payload.data_ptr() != ids.data_ptr()
+
+
+def test_incomplete_m3_payload_rejected_before_send(monkeypatch):
+    from atom.model_ops.minimax_m3.pp_topk import PP_TOPK_METADATA
+
+    grp, _ = _fake_pp_group(monkeypatch)
+    with pytest.raises(RuntimeError, match="Incomplete"):
+        pp_comm.send_intermediate_tensors(IntermediateTensors({PP_TOPK_METADATA: {}}))
+    grp.send_tensor_dict.assert_not_called()

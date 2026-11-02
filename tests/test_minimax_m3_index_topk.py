@@ -563,3 +563,63 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("pages,stride", [(1, 1), (8, 8), (8, 16)])
+@pytest.mark.parametrize("decode", [False, True])
+def test_received_topk_uses_local_pages_and_preserves_selection(
+    heads, pages, stride, decode
+):
+    # Distinct request maps and head-specific orders expose rank/head mixups.
+    lengths = [2, 2] if decode else [1, 3]
+    prefixes = [255, 383]
+    rows = sum(lengths)
+    ids = torch.tensor([2, 0, 1, -1], dtype=torch.int32, device="cuda").repeat(
+        heads, rows, 1
+    )
+    for h in range(heads):
+        ids[h] = ids[h].roll(h, dims=-1)
+    table = torch.tensor(
+        [[7, 3, 11, 5], [13, 2, 17, 19]], dtype=torch.int32, device="cuda"
+    )
+    starts = torch.tensor([0, lengths[0], rows], dtype=torch.int32, device="cuda")
+    seqs = torch.tensor(
+        [p + n for p, n in zip(prefixes, lengths)], dtype=torch.int32, device="cuda"
+    )
+    prefix = torch.tensor(prefixes, dtype=torch.int32, device="cuda")
+    bt, ctx = m.emit_sparse_block_table(
+        ids,
+        table,
+        seqs if decode else starts,
+        seqs if decode else prefix,
+        max_query_len=max(lengths),
+        decode=decode,
+        pages_per_block=pages,
+        block_page_stride=stride,
+    )
+    expected_bt = torch.zeros(rows * heads, 4 * pages, dtype=torch.int32)
+    expected_ctx = torch.zeros(rows * heads, dtype=torch.int32)
+    cpu_ids, cpu_table = ids.cpu(), table.cpu()
+    row = 0
+    for b, count in enumerate(lengths):
+        for q in range(count):
+            pos = prefixes[b] + q
+            tail = pos // 128
+            for h in range(heads):
+                selected = [int(i) for i in cpu_ids[h, row] if 0 <= int(i) <= tail]
+                full = [i for i in selected if i < tail]
+                ordered = full + ([tail] if tail in selected else [])
+                out = row * heads + h
+                for k, blk in enumerate(ordered):
+                    base = int(cpu_table[b, blk]) * stride * heads + h
+                    expected_bt[out, k * pages : (k + 1) * pages] = (
+                        torch.arange(pages) * heads + base
+                    )
+                expected_ctx[out] = len(full) * 128 + (
+                    (pos % 128 + 1) if tail in selected else 0
+                )
+            row += 1
+    torch.testing.assert_close(bt.cpu(), expected_bt, rtol=0, atol=0)
+    torch.testing.assert_close(ctx.cpu(), expected_ctx, rtol=0, atol=0)

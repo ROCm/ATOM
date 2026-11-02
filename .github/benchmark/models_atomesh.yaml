@@ -2511,7 +2511,7 @@ models:
       apply_chat_template: true
 
   # All cells below evaluate the same integrated MXFP4 runtime with real DSpark.
-  MiniMax-M3.1-Flash-MXFP4-Stack:
+  MiniMax-M3.1-Flash-MXFP4-Stack: &m31_stack_model
     <<: *m31_flash_model
     image: rocm/atom-dev:nightly_202610291449
     env:
@@ -2618,4 +2618,36 @@ models:
               <<: *m31_flash_pp4_direct_prefill_env
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","enable_chunked_transfer":true}
+            decode: *m31_flash_pp4_direct_decode_env
+
+  # Paired PP boundary regression; use the same pinned MXFP4 runtime.
+  MiniMax-M3.1-Flash-MXFP4-Stack-PP-TopK:
+    <<: *m31_stack_model
+    image: rocm/atom-dev:m31-mxfp4-stack-20261031
+    suites:
+      accuracy:
+        - &m31_stack_pp_topk
+          <<: *m31_stack_pp
+          name: m31-stack-mxfp4-pp4-index-freq4-equal-gsm8k20
+          runner:
+            slurm_qos: amd-atom-qos
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+          env:
+            common:
+              # The pinned stack image already contains its AITER build.
+              ATOMESH_M31_AITER_REF: ""
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              VLLM_PP_LAYER_PARTITION: "15,15,15,15"
+            decode: *m31_flash_pp4_direct_decode_env
+        - <<: *m31_stack_pp_topk
+          name: m31-stack-mxfp4-pp4-index-freq4-aligned-gsm8k20
+          env:
+            common:
+              ATOMESH_M31_AITER_REF: ""
+            prefill:
+              <<: *m31_flash_pp4_direct_prefill_env
+              VLLM_PP_LAYER_PARTITION: "16,16,16,12"
             decode: *m31_flash_pp4_direct_decode_env
