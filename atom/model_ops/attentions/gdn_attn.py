@@ -20,6 +20,10 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
+from atom.model_ops.mamba_ops.causal_conv1d import (
+    PAD_SLOT_ID,
+    compute_causal_conv1d_metadata,
+)
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
@@ -143,6 +147,10 @@ class GDNAttentionMetadata:
     ssm_chunk_offsets: torch.Tensor | None = None
     # Conv tokens a checkpoint holds, `conv_kernel - 1`; see `_conv_state_len`.
     ssm_conv_state_len: int = 0
+    # Keep the chunk kernel's per-chunk states for a caller that places its own
+    # checkpoints after the forward (the SGLang plugin's mamba radix cache),
+    # read back with `pop_last_intermediate_states`. `ssm_checkpoints` implies it.
+    keep_intermediate_states: bool = False
     # Qwen4Exp-only optional AITER schedule, built once outside the layer loop.
     flydsl_prefill_metadata: object | None = None
     # --- ReplaySSM ---------------------------------------------------------
@@ -1338,7 +1346,7 @@ class GDNStateMixin(PoolRowsMixin):
             )
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
-                    batch.num_scheduled_tokens[:num_prefills], self.device
+                    non_spec_query_start_loc, batch.total_tokens_num
                 )
             )
         else:
@@ -2042,51 +2050,3 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             running_tokens=capture_tokens,
         )
         return attn_metadata, context
-
-
-PAD_SLOT_ID = -1
-
-
-def compute_causal_conv1d_metadata(seqlens: np.ndarray, device: torch.device):
-    """causal_conv1d's program table for prefill requests of `seqlens` tokens
-    each, built on the host and uploaded to `device`."""
-    nums_dict = {}  # type: ignore
-    batch_ptr = None
-    token_chunk_offset_ptr = None
-    for BLOCK_M in [8]:  # cover all BLOCK_M values
-        nums = -(-seqlens // BLOCK_M)
-        nums_dict[BLOCK_M] = {}
-        nums_dict[BLOCK_M]["nums"] = nums
-        nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
-        nums_dict[BLOCK_M]["mlist"] = mlist
-        mlist_len = len(nums_dict[BLOCK_M]["mlist"])
-        nums_dict[BLOCK_M]["mlist_len"] = mlist_len
-        MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
-        offsetlist = []  # type: ignore
-        for idx, num in enumerate(nums):
-            offsetlist.extend(range(num))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
-        nums_dict[BLOCK_M]["offsetlist"] = offsetlist
-
-        if batch_ptr is None:
-            # Update default value after class definition
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-        else:
-            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
-                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(  # type: ignore
-                    PAD_SLOT_ID
-                )
-
-        batch_ptr[0:mlist_len].copy_(mlist)
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist)  # type: ignore
-        nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
-        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
-
-    return nums_dict, batch_ptr, token_chunk_offset_ptr

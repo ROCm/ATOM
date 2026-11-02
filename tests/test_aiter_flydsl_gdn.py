@@ -290,7 +290,7 @@ def test_qwen_backend_binds_zero_copy_vk_state(
 
 
 @requires_gfx942
-def test_align_flydsl_decode_accepts_strided_and_padded_indices():
+def test_align_flydsl_decode_rejects_strided_and_views_padded_indices():
     q, k, v, a, b, log, bias = inputs(4)
     state = torch.randn(8, 24, 128, 128, device="cuda", dtype=torch.float32)
     state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
@@ -303,10 +303,21 @@ def test_align_flydsl_decode_accepts_strided_and_padded_indices():
         _align_flydsl_decode_slots,
     )
 
-    reads = _align_flydsl_decode_slots(strided, 4)
+    # Fail closed instead of materializing a contiguous copy: the fresh
+    # allocation would bake a throwaway address into the decode graph.
+    with pytest.raises(RuntimeError, match="contiguous view"):
+        _align_flydsl_decode_slots(strided, 4)
+    with pytest.raises(RuntimeError, match="int32"):
+        _align_flydsl_decode_slots(padded.to(torch.int64), 4)
+
+    # The graph-bucket case: narrowing a padded contiguous buffer keeps the
+    # original storage, so the slot vector the graph recorded stays live.
+    reads = _align_flydsl_decode_slots(wide[:4], 4)
     writes = _align_flydsl_decode_slots(padded, 4)
+    assert reads.data_ptr() == wide.data_ptr()
+    assert writes.data_ptr() == padded.data_ptr()
     assert fly.decode_supported(q, k, v, a, b, state, log, bias, reads, writes)
-    assert reads.tolist() == [0, 2, 4, 6]
+    assert reads.tolist() == [0, 1, 2, 3]
     assert writes.tolist() == [0, 1, 2, 3]
 
 
