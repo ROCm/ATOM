@@ -14,7 +14,6 @@ Two things, and the first is the important one:
 Nothing here touches the network: _api is replaced in every test that could reach it.
 """
 
-import json
 import pathlib
 import sys
 
@@ -23,7 +22,7 @@ import pytest
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import _publish  # noqa: E402
+import _publish
 
 DIFF = """diff --git a/atom/model_ops/moe.py b/atom/model_ops/moe.py
 --- a/atom/model_ops/moe.py
@@ -79,6 +78,7 @@ def report(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------ the --post closure
 
+
 def test_dry_run_reaches_no_post(report, monkeypatch, capsys):
     calls = []
 
@@ -133,6 +133,7 @@ def test_no_source_line_can_make_it_approve_or_request_changes():
 
 # ------------------------------------------------------------ anchoring
 
+
 def test_commentable_counts_right_side_lines_only():
     c = _publish.commentable(DIFF)
     assert c["atom/model_ops/moe.py"] == {20, 21, 22, 23, 24}
@@ -179,7 +180,7 @@ def test_summary_carries_the_verdict_and_validation_lines(report, monkeypatch):
     body = _publish.review_payload("9999")["body"]
     assert "Review: ⚠️ NEEDS WORK" in body
     assert "Validation (advisory): nothing ran here." in body
-    assert f"rocm-atom-bot review pr=9999 head=deadbeef" in body
+    assert "rocm-atom-bot review pr=9999 head=deadbeef" in body
 
 
 def test_card_md_is_not_rewritten(report, monkeypatch):
