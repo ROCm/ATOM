@@ -147,8 +147,13 @@ class SamplingParams:
     # Set by the server for `tool_choice="required"` when the tool-call format
     # defines one (Kimi-K3 only); None leaves the output unconstrained.
     required_channel: RequiredChannel | None = None
+    top_logprobs: int = 0
 
     def __post_init__(self):
+        if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20:
+            raise ValueError("top_logprobs must be an integer between 0 and 20")
+        if self.top_logprobs and not self.logprobs:
+            raise ValueError("top_logprobs requires logprobs")
         # 0 also means disabled, as in vLLM/SGLang; MLPerf Endpoints workloads send it
         if self.top_k == 0:
             self.top_k = -1

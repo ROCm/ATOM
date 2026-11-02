@@ -734,6 +734,8 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
+    if getattr(request_output, "logprobs", None) is not None:
+        chunk_data["logprobs"] = request_output.logprobs
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
     return chunk_data
@@ -814,6 +816,7 @@ async def generate_async(
     # the counters and never `token_ids`, so nothing serializes it. A
     # consumer that starts reading that key has to convert.
     all_token_ids = new_token_ids()
+    all_logprobs = [] if sampling_params.logprobs else None
     finish_reason: str | None = None
     seq = None
     kv_transfer_output_meta_info = None
@@ -832,6 +835,7 @@ async def generate_async(
             token_queue.put_nowait,
             {
                 "token_ids": request_output.output_tokens,
+                "logprobs": getattr(request_output, "logprobs", None),
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
@@ -868,6 +872,8 @@ async def generate_async(
                     record_nonstream_first_token()
                 last_token_at = item.get("ts", time.time())
                 all_token_ids.extend(token_ids)
+                if all_logprobs is not None:
+                    all_logprobs.extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 finish_reason = item.get("finish_reason")
                 _finished_ok = True
@@ -887,7 +893,13 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = delivered_text(all_token_ids)
+    text = (
+        tokenizer.decode(
+            all_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )
+        if sampling_params.logprobs
+        else delivered_text(all_token_ids)
+    )
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -912,6 +924,7 @@ async def generate_async(
     response = {
         "text": text,
         "token_ids": all_token_ids,
+        "logprobs": all_logprobs,
         "finish_reason": finish_reason,
         "num_tokens_input": num_tokens_input,
         "num_tokens_output": num_tokens_output,
@@ -1060,6 +1073,7 @@ async def generate_async_fanout(
 
     started_at = time.time()
     per_tokens = [new_token_ids() for _ in range(n)]
+    per_logprobs = [[] for _ in range(n)] if sampling_params.logprobs else None
     per_first_token_at: list[float | None] = [None] * n
     per_last_token_at: list[float | None] = [None] * n
     per_finish_reason: list[str | None] = [None] * n
@@ -1074,6 +1088,7 @@ async def generate_async_fanout(
                     idx,
                     {
                         "token_ids": request_output.output_tokens,
+                        "logprobs": getattr(request_output, "logprobs", None),
                         "finished": request_output.finished,
                         "finish_reason": request_output.finish_reason,
                         "ts": now,
@@ -1121,6 +1136,8 @@ async def generate_async_fanout(
                     record_nonstream_first_token()
                 per_last_token_at[idx] = item.get("ts", time.time())
                 per_tokens[idx].extend(tokens)
+                if per_logprobs is not None:
+                    per_logprobs[idx].extend(item.get("logprobs") or [])
             if item.get("finished", False):
                 per_finish_reason[idx] = item.get("finish_reason")
                 finished[idx] = True
@@ -1153,8 +1170,17 @@ async def generate_async_fanout(
         )
         outputs.append(
             {
-                "text": delivered_text(per_tokens[i]),
+                "text": (
+                    tokenizer.decode(
+                        per_tokens[i],
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    if sampling_params.logprobs
+                    else delivered_text(per_tokens[i])
+                ),
                 "token_ids": per_tokens[i],
+                "logprobs": per_logprobs[i] if per_logprobs is not None else None,
                 "finish_reason": per_finish_reason[i],
                 "num_tokens_input": num_tokens_input,
                 "num_tokens_output": num_tokens_output,
@@ -1276,6 +1302,8 @@ async def setup_streaming_request(
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
     detokenizer = _stream_batch_dispatcher.new_state()
+    if sampling_params.logprobs:
+        detokenizer.detokenizer.clean_up_tokenization_spaces = False
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1487,6 +1515,8 @@ async def setup_streaming_request_fanout(
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
         detokenizer = _stream_batch_dispatcher.new_state()
+        if sampling_params.logprobs:
+            detokenizer.detokenizer.clean_up_tokenization_spaces = False
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1752,6 +1782,25 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         request.tools = normalize_chat_tools(request.tools)
         validate_chat_request(request)
         messages = request.get_messages()
+        logprob_codec = None
+        if request.logprobs:
+            from .chat_logprobs import token_bytes
+
+            if getattr(engine.config, "enable_rapidserve", False):
+                raise ValueError("logprobs is unavailable with RapidServe")
+            spec = getattr(engine.config, "speculative_config", None)
+            if (
+                synthetic_token_text is not None
+                or getattr(spec, "synthetic_acceptance_rates", None) is not None
+            ):
+                raise ValueError(
+                    "logprobs is unavailable with synthetic forced acceptance"
+                )
+            if request.kv_transfer_params or _has_multimodal_content(messages):
+                raise ValueError(
+                    "Chat logprobs currently supports text without P/D transfer"
+                )
+            logprob_codec = token_bytes(tokenizer)
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -1791,6 +1840,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 required_tool_channel, request.tool_choice, request.tools
             ),
         )
+
+        sampling_params.logprobs = bool(request.logprobs)
+        sampling_params.top_logprobs = request.top_logprobs or 0
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1860,6 +1912,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         **dp_routing,
                     )
                 )
+                if logprob_codec is not None:
+                    from .chat_logprobs import LogprobCollector
+
+                    stream_collector = LogprobCollector(
+                        stream_collector,
+                        logprob_codec,
+                        request.top_logprobs or 0,
+                        effective_n,
+                    )
                 gen = stream_chat_response_fanout(
                     request_id,
                     model_name,
@@ -1888,6 +1949,12 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         **dp_routing,
                     )
                 )
+                if logprob_codec is not None:
+                    from .chat_logprobs import LogprobCollector
+
+                    stream_collector = LogprobCollector(
+                        stream_collector, logprob_codec, request.top_logprobs or 0, 1
+                    )
                 gen = stream_chat_response(
                     request_id,
                     model_name,
@@ -1905,6 +1972,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         (request.stream_options or {}).get("include_usage")
                     ),
                 )
+            if logprob_codec is not None:
+                from .chat_logprobs import stream_logprobs
+
+                gen = stream_logprobs(gen, stream_collector.trackers)
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2008,6 +2079,19 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
+                tool_parser_cls=tool_call_parser_cls,
+            )
+        if logprob_codec is not None:
+            from .chat_logprobs import response_logprobs
+
+            resp = response_logprobs(
+                resp,
+                outputs if effective_n > 1 else [final_output],
+                logprob_codec,
+                request.top_logprobs or 0,
+                reasoning=_reasoning,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)

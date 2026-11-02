@@ -201,7 +201,7 @@ class MarkerScanner:
         at, hit = self._earliest_complete(buf)
         if hit is not None:
             self._buf = ""
-            return Scan(buf[:at], hit, buf[at + len(hit) :])
+            return Scan(buf[:at], buf[at : at + len(hit)], buf[at + len(hit) :])
 
         cut = len(buf) - _suffix_len(buf, *self._plan)
         self._buf = buf[cut:]
