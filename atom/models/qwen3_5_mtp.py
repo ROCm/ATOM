@@ -3,6 +3,7 @@
 """Inference-only Qwen3.5 MTP model."""
 
 import re
+from typing import ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -18,6 +19,7 @@ from atom.models.qwen3_5 import (
     get_qwen3_5_text_config,
 )
 from atom.models.utils import IntermediateTensors
+from atom.utils import envs
 
 from .utils import maybe_prefix
 
@@ -108,7 +110,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
 # @support_torch_compile
 class Qwen3_5MTP(nn.Module):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict] = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
@@ -117,7 +119,31 @@ class Qwen3_5MTP(nn.Module):
         ".gate.": (".gate.", 0),
         "shared_expert_gate": ("gate", 1),
     }
-    weights_mapping = {"mtp.": "model."}
+    weights_mapping: ClassVar[dict[str, str]] = {"mtp.": "model."}
+    # Stage the `[3, N]` MRoPE positions batch-last so draft steps 1..k-1
+    # are warmed and captured instead of running eager (see
+    # `EagleProposer._declare_draft_graphs`).
+    draft_graph_supports_mrope = True
+
+    @property
+    def reuse_draft_graph_step_buffers(self) -> bool:
+        """Let the draft mid-step graph write its outputs into its own inputs.
+
+        Read once by ``EagleProposer._declare_draft_graphs``. With it, the
+        captured epilogue copies the step's hidden states into the staged
+        ``hidden_states`` buffer and writes the argmax ids into the staged
+        ``input_ids`` buffer, so the replay needs no clones and the next stage
+        no copies; step 0's ``index_select`` lands in the staged buffer too.
+
+        Safe here because the draft is one ``full_attention`` decoder layer: it
+        reads ``input_ids`` (embedding) and ``hidden_states``
+        (``pre_fc_norm_hidden``, out of place) only at the top of its forward,
+        before the epilogue overwrites them in stream order, and it touches no
+        GDN conv/SSM state or checkpoint slot -- the only cache it writes is
+        its own paged KV, through ``slot_mapping``, which this does not change.
+        ``ATOM_QWEN35_MTP_REUSE_STEP_BUFFERS=0`` turns it off.
+        """
+        return envs.ATOM_QWEN35_MTP_REUSE_STEP_BUFFERS
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         """Filter MTP weights; remap (mtp.* → model.*) is via weights_mapping."""

@@ -121,14 +121,17 @@ class EagleProposer(Drafter):
         per sequence. That rewrite is what ``warmup_inputs`` replays, so the two
         go through the same code rather than a copy that can drift.
 
-        MRoPE declares nothing, by the same rule Kimi-K3 does: its positions are
-        ``[3, N]``, so there is no leading batch axis to stage, hence nothing to
-        pad and nothing a graph could pin. Declaring anyway used to warm and
-        capture a ONE-dimensional-positions shape that serving never runs --
-        graphs nobody replays, paid for at every startup.
+        MRoPE positions are ``[3, N]``, batch axis last. A draft model that
+        sets ``draft_graph_supports_mrope`` stages them batch-last; any other
+        MRoPE model declares nothing, by the same rule Kimi-K3 does. Declaring
+        one-dimensional positions instead used to warm and capture a shape
+        serving never runs -- graphs nobody replays, paid for at every startup.
         """
         self.step = None
-        if self.runner.use_mrope or self.mtp_k < 2:
+        mrope = self.runner.use_mrope
+        if (
+            mrope and not getattr(self.model, "draft_graph_supports_mrope", False)
+        ) or self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
@@ -148,7 +151,11 @@ class EagleProposer(Drafter):
             # `input_ids` from that buffer to this one, and `stage` asserts the
             # two agree.
             "input_ids": StagedInput(dtype=torch.int32),
-            "positions": StagedInput(dtype=torch.int64),
+            "positions": (
+                StagedInput(shape=(3,), dtype=torch.int64, batch_last=True)
+                if mrope
+                else StagedInput(dtype=torch.int64)
+            ),
             "hidden_states": StagedInput(
                 shape=hidden_shape,
                 dtype=self.dtype,
@@ -809,10 +816,6 @@ class EagleProposer(Drafter):
                         # from it, so it has to be `running_bs` long before THAT --
                         # padding it with the other rows, just before the
                         # forward, is a step too late.
-                        #
-                        # No MRoPE case to guard: a model whose positions keep
-                        # the token axis last declares no pass, so `self.step` is
-                        # None and these stay the target's own 2-D positions.
                         if self.step is not None:
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}

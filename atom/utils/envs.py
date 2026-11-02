@@ -971,6 +971,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DRAFT_CUDAGRAPH": lambda: (
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
     ),
+    # Qwen3.5 MTP draft mid-steps feed each step's hidden states and draft ids
+    # straight back into the pass's fixed staging buffers (the contract
+    # DeepSeekMTP already opts into): 2 copies per mid-step instead of 5. On by
+    # default; 0 restores the clone-and-restage path, for an A/B or a bisect.
+    "ATOM_QWEN35_MTP_REUSE_STEP_BUFFERS": lambda: (
+        os.getenv("ATOM_QWEN35_MTP_REUSE_STEP_BUFFERS", "1").lower() == "1"
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
