@@ -25,6 +25,9 @@ ARRIVED = 8
 BLOCKED = 9
 # reduce-buffer slot of the ranks without prefill that cannot align in time
 UNREACHABLE = 10
+# Mixed-step execution and the prefillable ranks' actual token budget.
+PREFILL_ONLY = 11
+PREFILL_BUDGET = 12
 
 
 def _noop_all_reduce(tensor, op=None, group=None):
@@ -37,11 +40,13 @@ def _add_rank(slots):
 
     `slots` maps buffer index → that sibling rank's value (indices per
     PrefillDelayer._reduce_buf: 0=prefillable, 1=pending, 2=running_decode,
-    9=prefill_budget -- a prefillable rank reports the one it can admit).
+    PREFILL_BUDGET=prefill_budget -- a prefillable rank reports the one it can
+    admit, defaulting to the full batch budget like should_allow_prefill).
     """
 
     def f(tensor, op=None, group=None):
-        for i, v in slots.items():
+        contribution = {PREFILL_BUDGET: slots.get(0, 0) * MAX_BATCHED, **slots}
+        for i, v in contribution.items():
             tensor[i] += v
         return tensor
 
@@ -270,7 +275,7 @@ class TestAlignmentGate:
         # dp_size=2, sibling prefillable + full → aligned, aggregate fill high.
         d = make_delayer(dp_size=2, ttft_max_ticks=1000)
         skip_first(d)
-        aligned = _add_rank({0: 1, 1: MAX_BATCHED, 2: 64, 9: MAX_BATCHED})
+        aligned = _add_rank({0: 1, 1: MAX_BATCHED, 2: 64, PREFILL_BUDGET: MAX_BATCHED})
         assert call(d, pending_tokens=MAX_BATCHED, reduce=aligned) is True
         assert d._stat_fire_fill == 1
 
@@ -558,7 +563,7 @@ class TestCostGate:
         clock = _Clock()
         d = make_gated(clock=clock)
         skip_first(d)
-        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, 9: MAX_BATCHED})
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, PREFILL_BUDGET: MAX_BATCHED})
         for _ in range(3):
             clock.now += 0.010
             call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
@@ -571,7 +576,7 @@ class TestCostGate:
         clock = _Clock()
         d = make_gated(clock=clock)
         skip_first(d)
-        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, 9: MAX_BATCHED})
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, PREFILL_BUDGET: MAX_BATCHED})
         # decode steps of 10 ms (no prefill ran)
         for _ in range(3):
             clock.now += 0.010
@@ -601,7 +606,7 @@ class TestCostGate:
         clock = _Clock()
         d = make_gated(clock=clock)
         skip_first(d)
-        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, 9: MAX_BATCHED})
+        sibling = _add_rank({0: 1, 1: MAX_BATCHED, 2: 1, PREFILL_BUDGET: MAX_BATCHED})
         for _ in range(3):
             clock.now += 0.010
             call(d, prefillable=False, running_decode_batch=1, reduce=sibling)
@@ -749,8 +754,8 @@ class TestPrefillDecodeInterval:
     def test_execution_on_peer_arms_all_ranks(self):
         d = make_delayer(dp_size=2, prefill_decode_interval=1)
         skip_first(d)
-        # slot 7: a prefill ran; slot 8: it decoded nothing.
-        peer_prefill_only = _add_rank({7: 1, 8: 1})
+        # slot 7: a prefill ran; PREFILL_ONLY: it decoded nothing.
+        peer_prefill_only = _add_rank({7: 1, PREFILL_ONLY: 1})
         assert call(d, pending_tokens=1000, reduce=peer_prefill_only) is False
         assert d._stat_hold_decode_interval == 1
 
@@ -759,6 +764,14 @@ class TestPrefillDecodeInterval:
         skip_first(d)
         peer_mixed = _add_rank({7: 1})
         call(d, pending_tokens=1000, reduce=peer_mixed)
+        assert d._stat_hold_decode_interval == 0
+
+    def test_arrival_on_peer_does_not_arm_interval(self):
+        d = make_delayer(dp_size=2, prefill_decode_interval=3)
+        skip_first(d)
+        arriving = _add_rank({0: 1, 1: MAX_BATCHED, 2: 64, ARRIVED: 1})
+        assert call(d, pending_tokens=MAX_BATCHED, reduce=arriving) is True
+        assert d._decode_interval_remaining == 0
         assert d._stat_hold_decode_interval == 0
 
 
