@@ -466,10 +466,10 @@ else
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
-  # CI 41409705072: g24 still hosts other jobs (235-255 GB VRAM per GPU).
+  # CI 41409705072: g24 has occupied GPUs; g51 failed Store MR registration.
   # This validation branch keeps automatic placement across the other nodes.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd" ]]; then
-    SBATCH_CMD+=(--exclude pit2-p03-g24)
+    SBATCH_CMD+=(--exclude pit2-p03-g24,pit2-p03-g51)
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
