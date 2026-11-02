@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from atom.model_engine import structured_output as so
+from atom.structured_output import manager as so
 
 
 @pytest.fixture

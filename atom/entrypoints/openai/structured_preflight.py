@@ -9,7 +9,7 @@ from collections import OrderedDict
 
 class WorkerGrammarPreflight:
     def __init__(self, engine, tokenizer, config):
-        from atom.model_engine.structured_output import (
+        from atom.structured_output import (
             structured_stop_token_ids,
             tokenizer_fingerprint,
         )

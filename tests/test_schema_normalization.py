@@ -4,7 +4,7 @@ import pytest
 
 Draft202012Validator = pytest.importorskip("jsonschema").Draft202012Validator
 
-from atom.model_engine.schema_normalization import normalize_schema
+from atom.structured_output.schema_normalization import normalize_schema
 
 VALUES = [
     None,
@@ -170,7 +170,7 @@ def test_unsupported_or_excessive_expansions_are_explicit(schema):
 
 @pytest.mark.parametrize("size", [257, 100_000])
 def test_literal_negation_budget_checked_before_regex_allocation(monkeypatch, size):
-    from atom.model_engine import schema_normalization as module
+    from atom.structured_output import schema_normalization as module
 
     def no_escape(_value):
         raise AssertionError("oversized literal must be rejected before expansion")

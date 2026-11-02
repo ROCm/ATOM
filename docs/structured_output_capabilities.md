@@ -4,6 +4,29 @@ The native Chat and Responses endpoints support JSON output constraints through
 the optional `atom[structured-output]` dependency. This is separate from the
 SGLang plugin's structured-output implementation.
 
+## Code organization
+
+The engine implementation lives in `atom/structured_output/`, following the
+manager/backend separation used by vLLM's `vllm/v1/structured_output/` package.
+ATOM currently has one backend, so it does not introduce a backend registry or
+multi-backend interfaces.
+
+| Module | Responsibility |
+| --- | --- |
+| `__init__.py` | Lightweight entry points used by the API preflight and model runner. |
+| `manager.py` | Worker admission, cached compilation, committed and speculative grammar state, and prepare/apply/commit ordering. |
+| `backend_guidance.py` | llguidance compiler and matcher adapter. |
+| `schema_normalization.py` | Exact constraint lowering and shared expansion budgets. |
+| `mask.py` | Reusable packed mask buffers, H2D transfer and kernel dispatch. |
+| `transfer.py` | Owned token snapshots, pinned host buffers and asynchronous D2H events. |
+
+HTTP parameter extraction and final response validation remain in
+`atom/entrypoints/openai/structured_output.py`; API admission orchestration stays
+in `structured_preflight.py` alongside it. The GPU kernel remains in
+`atom/model_ops/triton_structured_output.py`. The engine package does not depend
+on the HTTP layer, and importing its entry points does not load llguidance or
+allocate mask/transfer resources.
+
 ## Request formats
 
 Chat accepts `response_format: {"type": "json_object"}` or:

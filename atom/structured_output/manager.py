@@ -81,7 +81,7 @@ class StructuredOutput:
     def __init__(self, tokenizer, vocab_size, stop_token_ids):
         from llguidance.hf import from_tokenizer
 
-        from . import structured_grammar as grammar
+        from . import backend_guidance as grammar
 
         self.xgr = grammar
         self.stop_ids = list(stop_token_ids)
@@ -108,7 +108,7 @@ class StructuredOutput:
             return
         import torch
 
-        from .structured_output_transfer import AsyncTokenCopy
+        from .transfer import AsyncTokenCopy
 
         # Host mirrors are consumed here, while this step owns the staging slot.
         # Copy row numbers into Python, never retain a reusable NumPy view.
@@ -211,7 +211,7 @@ class StructuredOutput:
                 drafts = self.draft_copy.wait().tolist()
         self.draft_plan = None
         if getattr(self, "mask_buffer", None) is None:
-            from .structured_output_mask import StructuredOutputMask
+            from .mask import StructuredOutputMask
 
             self.mask_buffer = StructuredOutputMask(self.vocab_size)
         mask_count = (
@@ -307,7 +307,7 @@ class StructuredOutput:
         if sampled.device.type == "cuda":
             import torch
 
-            from .structured_output_transfer import AsyncTokenCopy
+            from .transfer import AsyncTokenCopy
 
             if getattr(self, "commit_copy", None) is None:
                 self.commit_copy = AsyncTokenCopy(sampled.device)

@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from atom.entrypoints.openai.structured_preflight import WorkerGrammarPreflight
-from atom.model_engine.structured_output import tokenizer_fingerprint
+from atom.structured_output import tokenizer_fingerprint
 
 
 def frontend(rpc):

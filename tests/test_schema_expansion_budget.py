@@ -6,8 +6,8 @@ import json
 import pytest
 from jsonschema import Draft202012Validator
 
-from atom.model_engine import schema_normalization as normalization
-from atom.model_engine.schema_normalization import (
+from atom.structured_output import schema_normalization as normalization
+from atom.structured_output.schema_normalization import (
     SchemaExpansionLimit,
     normalize_schema,
 )
@@ -105,7 +105,7 @@ def test_unexpanded_properties_are_not_charged_as_generated_branches():
 
 def test_budget_failure_precedes_backend_compilation(monkeypatch):
     llguidance = pytest.importorskip("llguidance")
-    from atom.model_engine.structured_grammar import GrammarCompiler
+    from atom.structured_output.backend_guidance import GrammarCompiler
 
     class NoBackend:
         @staticmethod

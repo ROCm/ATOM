@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from atom.model_engine.structured_output_mask import StructuredOutputMask
+from atom.structured_output.mask import StructuredOutputMask
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")

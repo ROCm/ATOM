@@ -8,11 +8,11 @@ import torch
 
 llg = pytest.importorskip("llguidance")
 
-from atom.model_engine import structured_grammar as xgr
-from atom.model_engine.structured_output import (
+from atom.structured_output import (
     StructuredOutput,
     structured_stop_token_ids,
 )
+from atom.structured_output import backend_guidance as xgr
 
 
 def test_missing_generation_config_uses_engine_and_tokenizer_stops():

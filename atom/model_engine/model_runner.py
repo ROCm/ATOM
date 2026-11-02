@@ -3293,7 +3293,7 @@ class ModelRunner:
         return device_channel, base
 
     def prepare_structured_output(self, schema, tool_format, fingerprint, vocab_size):
-        from atom.model_engine.structured_output import prepare_worker_grammar
+        from atom.structured_output import prepare_worker_grammar
 
         return prepare_worker_grammar(
             self, schema, tool_format, fingerprint, vocab_size
