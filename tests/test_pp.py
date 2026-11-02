@@ -364,6 +364,24 @@ def test_async_send_full_tensor_when_not_divisible(monkeypatch):
     assert sent[2:] == [35]
 
 
+def test_async_send_hands_owned_tensors_over_uncloned(monkeypatch):
+    _fake_async_pp_group(monkeypatch, rank_in_group=0, world_size=2)
+    monkeypatch.setattr(pp_comm.envs, "ATOM_PP_SEND_ALLGATHER", False)
+    sent = []
+    monkeypatch.setattr(
+        pp_comm.torch.distributed,
+        "isend",
+        lambda buf, dst, group: sent.append(buf) or MagicMock(),
+    )
+    hidden, aux = torch.randn(4, 8), torch.randn(4, 16)
+    pp_comm.async_send_intermediate_tensors(
+        IntermediateTensors({"hidden_states": hidden, pp_comm.PP_AUX_KEY: aux}),
+        owned=(pp_comm.PP_AUX_KEY,),
+    )
+    assert sent[2] is not hidden and torch.equal(sent[2], hidden)
+    assert sent[3] is aux
+
+
 # ---------------------------------------------------------------------------
 # Inter-stage transport (PPStageTransport ZMQ)
 # ---------------------------------------------------------------------------

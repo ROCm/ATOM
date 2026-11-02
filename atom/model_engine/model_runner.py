@@ -90,6 +90,7 @@ from atom.models.registry import mono_decode_installers, support_model_arch_dict
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
+from atom.spec_decode.pp_aux_relay import PPAuxRelay
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils import (
     CpuGpuBuffer,
@@ -955,12 +956,9 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
-        from atom.spec_decode.pp_aux_relay import PPAuxRelay
-
         self.pp_aux_relay = PPAuxRelay.build(
             self.config, self.model, getattr(self, "drafter", None)
         )
-        self._pp_recv_aux = None
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
@@ -3190,7 +3188,7 @@ class ModelRunner:
                 if pp_enabled:
                     self._setup_pp_shared_indexer()
 
-                intermediate_tensors = None
+                intermediate_tensors = recv_aux = None
                 if pp_enabled and not pp_group.is_first_rank:
                     intermediate_tensors = recv_intermediate_tensors()
                     # GLM-5.2 IndexShare: load prior rank's top-k for leading
@@ -3203,13 +3201,9 @@ class ModelRunner:
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
                     # DSpark aux hidden states from target layers on earlier
                     # stages. Popped for the same reason as the top-k above.
-                    self._pp_recv_aux = intermediate_tensors.tensors.pop(
-                        PP_AUX_KEY, None
-                    )
+                    recv_aux = intermediate_tensors.tensors.pop(PP_AUX_KEY, None)
                     if self.pp_aux_relay is not None and pp_group.is_last_rank:
-                        self.pp_aux_relay.absorb(
-                            self._pp_recv_aux, self.drafter._aux_buffers
-                        )
+                        self.pp_aux_relay.absorb(recv_aux, self.drafter._aux_buffers)
 
                 # Time only the chunk computation between PP receive and send.
                 chunk_sample = self._dynamic_chunking.start_sample(batch)
@@ -3238,15 +3232,16 @@ class ModelRunner:
                         )
                     if self.pp_aux_relay is not None:
                         aux = self.pp_aux_relay.pack(
-                            self._pp_recv_aux,
+                            recv_aux,
                             model_output.tensors["hidden_states"].shape[0],
                         )
                         if aux is not None:
                             model_output.tensors[PP_AUX_KEY] = aux
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
+                    # The relay hands its payload over: no clone needed.
                     self._pp_pending_send = async_send_intermediate_tensors(
-                        model_output
+                        model_output, owned=(PP_AUX_KEY,)
                     )
                     hidden_states = None
                     logits = None
