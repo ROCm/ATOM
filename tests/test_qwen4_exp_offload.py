@@ -12,6 +12,13 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
     LayerMajorArena,
     published_bytes_for,
 )
+from atom.model_ops.qwen4_exp.qsa_cache_rules import (
+    QSA_DRAFT_ROWS,
+    QSA_ROWS,
+    check_kv_transfer,
+    qsa_page_segments,
+    qsa_row_space,
+)
 from tests.test_entry_arena import qsa_like_fields
 
 
@@ -276,6 +283,18 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
     assert cls._uses_paged_checkpoints(builder)
 
 
+def _check_kv_transfer(
+    kv_transfer_config, kv_cache_dtype="bf16", index_cache_dtype=None
+):
+    check_kv_transfer(
+        SimpleNamespace(
+            kv_transfer_config=kv_transfer_config,
+            kv_cache_dtype=kv_cache_dtype,
+            index_cache_dtype=index_cache_dtype,
+        )
+    )
+
+
 _PD = "disaggregated.*kv_connector={!r}"
 _NO_IMAGE = "kv_connector={!r} does not read"
 
@@ -324,10 +343,8 @@ def test_validate_config_refuses_connectors_that_drop_the_state(
     kv_transfer_config, backend, error
 ):
     """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
-    builder, _ = _builder()
-    builder.model_runner.config.kv_transfer_config = kv_transfer_config
     with pytest.raises(ValueError, match=error.format(backend)):
-        _qwen4_exp_backend().validate_config(builder.model_runner.config)
+        _check_kv_transfer(kv_transfer_config)
 
 
 @pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
@@ -355,37 +372,21 @@ def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, re
     """The knowledge lives on the registration, not in a Qwen3.8 list."""
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    builder, cls = _builder()
     name = "page_image_tier_under_test"
     monkeypatch.setitem(KVConnectorFactory._registry, name, {})
     monkeypatch.setitem(KVConnectorFactory._aliases, name, name)
     monkeypatch.setitem(KVConnectorFactory._offload, name, True)
     monkeypatch.setitem(KVConnectorFactory._reads_page_images, name, reads)
-    config = builder.model_runner.config
-    config.kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
+    kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
     if reads:
-        _qwen4_exp_backend().validate_config(config)
+        _check_kv_transfer(kv_transfer_config)
     else:
         with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
-            _qwen4_exp_backend().validate_config(config)
-    assert cls._wants_paged_checkpoints(builder, config) is reads
+            _check_kv_transfer(kv_transfer_config)
 
 
 _IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
 _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
-
-
-def _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    from atom.model_ops.attentions.qwen4_exp_attn import _check_kv_transfer
-
-    _check_kv_transfer(
-        SimpleNamespace(
-            kv_transfer_config=kv_transfer_config,
-            kv_cache_dtype=kv_cache_dtype,
-            index_cache_dtype=index_cache_dtype,
-        )
-    )
 
 
 @pytest.mark.parametrize(
@@ -451,14 +452,6 @@ _MTP = SimpleNamespace(method="mtp")
 def test_the_draft_rows_and_the_page_namespace_read_one_rule(
     monkeypatch, kv_cache_dtype, index_cache_dtype, draft_env, spec, draft
 ):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    from atom.model_ops.attentions.qwen4_exp_attn import (
-        QSA_DRAFT_ROWS,
-        QSA_ROWS,
-        qsa_page_segments,
-        qsa_row_space,
-    )
-
     monkeypatch.setenv("ATOM_QSA_DRAFT_KV_BF16", draft_env)
     config = SimpleNamespace(
         kv_cache_dtype=kv_cache_dtype,

@@ -5719,8 +5719,8 @@ def test_engine_id_splits_servers_on_one_host_and_their_replicas():
     assert len(ids) == 15
 
 
-@pytest.mark.parametrize("base_port", [0, None])
-def test_engine_id_ignores_an_unresolved_port(base_port):
+@pytest.mark.parametrize("base_port", [0, None, -1, True, "41000"])
+def test_engine_id_ignores_an_unresolved_or_malformed_port(base_port):
     assert offcfg.lmcache_engine_id(_server_config(base_port)) == "atom-offload-dp0"
 
 

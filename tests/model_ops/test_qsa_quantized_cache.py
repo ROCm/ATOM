@@ -10,6 +10,7 @@ pytest.importorskip("triton")
 pytest.importorskip("aiter")
 
 from atom.model_ops.qwen4_exp.ops import qsa
+from atom.model_ops.qwen4_exp.qsa_cache_rules import qsa_cache_formats
 
 gpu = pytest.mark.skipif(
     not torch.version.hip or not torch.cuda.is_available(), reason="requires a ROCm GPU"
@@ -34,13 +35,13 @@ def _config(kv, index=None):
     ],
 )
 def test_cache_formats_follow_the_kv_dtype(kv, index, expected):
-    assert qsa.qsa_cache_formats(_config(kv, index)) == expected
+    assert qsa_cache_formats(_config(kv, index)) == expected
 
 
 @pytest.mark.parametrize(("kv", "index"), [("int8", None), ("fp4", None)])
 def test_cache_formats_reject_unserved(kv, index):
     with pytest.raises(ValueError, match="Qwen QSA serves"):
-        qsa.qsa_cache_formats(_config(kv, index))
+        qsa_cache_formats(_config(kv, index))
 
 
 def _builder(kv, index, draft_rows, block=16, rope=False):
