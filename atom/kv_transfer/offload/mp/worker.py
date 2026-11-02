@@ -8,9 +8,10 @@ Attention backends publish block-major tensor views through
 the same engine block-id space, so this connector registers those opaque views
 without knowing which model or attention implementation produced them.
 
-Transfers are submitted and polled on a drain thread (`drain.py`), wait on a
-step event from a reusable ring (`step_events.py`), and leave their finished
-futures to be destroyed on the step thread (`ipc_lifetime.py`).
+Transfers are submitted and polled on the step thread for native ATOM, or on a
+drain thread for the vLLM plugin (`drain.py`), wait on a step event from a
+reusable ring (`step_events.py`), and leave their finished futures to be
+destroyed on the step thread (`ipc_lifetime.py`).
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
 )
-from atom.kv_transfer.offload.mp.drain import TransferDrain
+from atom.kv_transfer.offload.mp.drain import InlineTransfers, TransferDrain
 from atom.kv_transfer.offload.mp.ipc_lifetime import OwnedFutures
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,
@@ -68,10 +69,10 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
-# How long `get_finished` waits for a drain round to report a transfer that
-# landed during the forward (`_wants_last_look_locked`). Bounded, so the step
-# never waits out an IPC import or a submit in progress: what misses it is
-# reported on the next step.
+# How long `get_finished` waits for a drain thread's round to report a
+# transfer that landed during the forward (`_wants_last_look_locked`). Bounded,
+# so the step never waits out an IPC import or a submit in progress: what
+# misses it is reported on the next step.
 _LAST_LOOK_WAIT_S = 0.001
 # How long `close` lets the drain finish its last round.
 _CLOSE_TIMEOUT_S = 30.0
@@ -84,7 +85,7 @@ def _req_id_of(completion: Any) -> str:
 
 @dataclass(frozen=True)
 class _QueuedTransfer:
-    """One submit for the drain thread."""
+    """One submit, as `_transfers.put` takes it."""
 
     kind: str
     operation_id: str
@@ -102,7 +103,9 @@ class LMCacheMPConnector(KVConnectorBase):
 
     is_producer = False
 
-    def __init__(self, config: Any) -> None:
+    def __init__(self, config: Any, *, transfer_thread: bool = False) -> None:
+        """``transfer_thread`` submits and polls on a drain thread (the vLLM
+        plugin); without it they run on the step thread (native ATOM)."""
         _validate_mp_config(config)
         self._config = config
         kvc = getattr(config, "kv_transfer_config", {}) or {}
@@ -124,7 +127,9 @@ class LMCacheMPConnector(KVConnectorBase):
         self._adapter: Any = None
         self._is_kv_writer = True
         self._lock = threading.Lock()
-        self._drain = TransferDrain(self._lock, self._perform_submit, self._poll_round)
+        self._transfers = (TransferDrain if transfer_thread else InlineTransfers)(
+            self._lock, self._perform_submit, self._poll_round
+        )
         self._step_events = StepEventRing()
         # The ring index each queued or pending transfer holds.
         self._step_event_of: dict[str, int] = {}
@@ -134,10 +139,10 @@ class LMCacheMPConnector(KVConnectorBase):
         self._submitting_saves: set[str] = set()
         self._submitting_loads: set[str] = set()
         # The request each queued or submitting operation reads or writes the
-        # blocks of. `fence` covers these too: they reach the server after the
-        # step that queued them.
+        # blocks of. `fence` covers these too: on a drain thread they reach
+        # the server after the step that queued them.
         self._submitting_owner: dict[str, str] = {}
-        # What the drain thread settled since the last `get_finished`.
+        # What a round settled since the last `get_finished`.
         self._drained_done_save: set[SaveCompletionId] = set()
         self._drained_completions: set[ConnectorCompletion] = set()
         self._drained_done_load: set[LoadCompletionId] = set()
@@ -337,7 +342,7 @@ class LMCacheMPConnector(KVConnectorBase):
         `AtomMPWorkerAdapter.shutdown` drains in-flight operations, stops the
         heartbeat and unregisters.
         """
-        if not self._drain.close(timeout=_CLOSE_TIMEOUT_S):
+        if not self._transfers.close(timeout=_CLOSE_TIMEOUT_S):
             # A submit is still blocked (the client's own timeout is longer),
             # and the client is not thread-safe: shutting it down under the
             # drain thread is worse than leaving the instance to the server's
@@ -385,17 +390,18 @@ class LMCacheMPConnector(KVConnectorBase):
         start: int = 0,
         end: int = 0,
     ) -> None:
-        """Queue one submit for the drain thread, holding the step's event.
+        """Hand one submit to `_transfers`, holding the step's event.
 
-        The caller has already put `operation_id` in its submitting set; the
-        drain hands it to the pending map once the submit lands, so a duplicate
-        operation id is still refused while the submit is in flight.
+        The caller has already put `operation_id` in its submitting set;
+        `_perform_submit` moves it to the pending map once the submit lands,
+        so a duplicate operation id is still refused while the submit is in
+        flight.
         """
         with self._lock:
             index, step_event = event.hold_locked()
             self._step_event_of[operation_id] = index
             self._submitting_owner[operation_id] = str(req.req_id)
-        self._drain.put(
+        self._transfers.put(
             _QueuedTransfer(
                 kind,
                 operation_id,
@@ -607,14 +613,14 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
             # Nothing was queued: a round is the only place this terminal
             # entry is ever reported from.
-            self._drain.ensure_running()
+            self._transfers.ensure_running()
             return
         self._queue_transfer(
             "save", operation_id, completion, req, spec, event, start, end
         )
 
     def _perform_submit(self, item: _QueuedTransfer) -> None:
-        """Submit one queued transfer, on the drain thread."""
+        """Submit one transfer, on whichever thread `_transfers` runs it."""
         loading = item.kind == "load"
         try:
             if loading:
@@ -657,7 +663,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 )
 
     def _poll_round(self) -> None:
-        """Advance every pending transfer once, on the drain thread."""
+        """Advance every pending transfer once: one round of `_transfers`."""
         self._poll_pending_loads()
         self._poll_pending_saves()
 
@@ -791,14 +797,15 @@ class LMCacheMPConnector(KVConnectorBase):
 
         For a frontend that hands a preempted request's blocks to the next
         allocation at once: a save still reading them would store the next
-        occupant's bytes under the preempted request's tokens. Waits on the
-        drain's rounds, up to the transfer deadline, and fail-stops past it.
+        occupant's bytes under the preempted request's tokens. Waits on
+        `_transfers`' rounds, up to the transfer deadline, and fail-stops past
+        it.
         The completions stay for `get_finished`, which releases their leases.
         """
         wanted = {str(req_id) for req_id in req_ids}
         if not wanted:
             return
-        self._drain.fence(
+        self._transfers.fence(
             lambda: self._outstanding_locked(wanted),
             self._transfer_deadline_s,
             f"requests {sorted(wanted)}",
@@ -808,20 +815,21 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._adapter is None:
             return KVConnectorOutput()
         # The drain thread cannot stop the engine; the step can.
-        self._drain.raise_if_failed()
+        self._transfers.raise_if_failed()
         with self._lock:
-            last_look = self._wants_last_look_locked()
-        if last_look:
-            # One last look before reporting, by the drain thread.
-            self._drain.wait_round(_LAST_LOOK_WAIT_S)
-            self._drain.raise_if_failed()
+            look = self._transfers.inline or self._wants_last_look_locked()
+        if look:
+            # Inline, the step's poll of every pending transfer. On the drain
+            # thread, one bounded last look before reporting.
+            self._transfers.wait_round(_LAST_LOOK_WAIT_S)
+            self._transfers.raise_if_failed()
         output = KVConnectorOutput()
         with self._lock:
             # A step that queues nothing (an idle engine waiting on a load)
             # raises no wake of its own; without this the result waits for
             # the drain thread's backstop.
             if self._transfers_in_flight_locked():
-                self._drain.wake()
+                self._transfers.wake()
             # Heartbeat health is a control-plane signal, not proof that GPU
             # work has quiesced, so a save is only reported once its device
             # event is terminal -- that check lives in `_poll_pending_saves`.

@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The thread that submits and polls LMCache MP transfers off the model step.
+"""Where LMCache MP transfers are submitted and polled: a thread or the step.
+
+`TransferDrain`, for the vLLM plugin, runs them on a thread of its own.
+`InlineTransfers`, for native ATOM, runs the same calls on the step thread: a
+submit before the forward and a poll at the report, the timing native's save
+admission (`max_pending_saves`, two by default) is sized to. On a thread a
+native save started during the forward instead, and GSM8K pass 1 stored 9%
+fewer tokens.
 
 Submitting a transfer and polling it to completion are both HIP IPC calls
 (`export_event` / `from_ipc_handle`). On an idle GPU they cost microseconds,
 but under the rank's own kernel-launch pressure milliseconds each -- and under
 TP rank collapse only the writer pays, so the whole TP group waits at the next
-collective. A conc16 step probe priced it on the step thread: 18.7 ms per
+collective. A conc16 step probe of the plugin priced it on the step thread: 18.7 ms per
 `submit_retrieve_request` and 13.8 ms per terminal load poll (the IPC handle
 import; a non-terminal poll costs 0.2 us). Both release the GIL, so on this
 thread a hard per-step stall becomes a brief launch-latency tax.
@@ -33,6 +40,8 @@ logger = logging.getLogger("atom")
 # The wait for a wake when nothing asks: a backstop for teardown and for a
 # rank that has stopped stepping, not the working cadence.
 _IDLE_WAIT_S = 0.05
+# How long an inline fence sleeps between its polls.
+_FENCE_POLL_S = 0.001
 
 
 class TransferDrain:
@@ -44,6 +53,9 @@ class TransferDrain:
     connector's ``lock`` themselves around its bookkeeping, and this class
     shares that lock for its round signal.
     """
+
+    # Whether `wait_round` runs the round itself, on the calling thread.
+    inline = False
 
     def __init__(
         self,
@@ -212,4 +224,81 @@ class TransferDrain:
                 return
 
 
-__all__ = ["TransferDrain"]
+class InlineTransfers:
+    """`TransferDrain`'s interface, run on the calling thread.
+
+    A submit happens in `put`, and a round -- one poll of every pending
+    transfer -- in `wait_round`, whatever its timeout. Anything either raises,
+    a transfer deadline included, raises to the caller.
+    """
+
+    inline = True
+    error: BaseException | None = None
+
+    def __init__(
+        self,
+        lock: threading.Lock,
+        submit: Callable[[Any], None],
+        poll: Callable[[], None],
+    ) -> None:
+        self._lock = lock
+        self._submit = submit
+        self._poll = poll
+        self._closed = False
+
+    @property
+    def alive(self) -> bool:
+        return not self._closed
+
+    def _refuse_if_closed(self) -> None:
+        if self._closed:
+            raise RuntimeError("LMCache MP transfers are closed")
+
+    def put(self, item: Any) -> None:
+        self._refuse_if_closed()
+        self._submit(item)
+
+    def ensure_running(self) -> None:
+        self._refuse_if_closed()
+
+    def wake(self) -> None:
+        pass
+
+    def raise_if_failed(self) -> None:
+        pass
+
+    def wait_round(self, timeout: float) -> bool:
+        del timeout
+        if self._closed:
+            return False
+        self._poll()
+        return True
+
+    def fence(
+        self,
+        outstanding: Callable[[], list[Any]],
+        deadline_s: float,
+        what: str,
+    ) -> None:
+        """`TransferDrain.fence`, polling on this thread between waits."""
+        deadline = time.monotonic() + deadline_s
+        while True:
+            self.wait_round(0.0)
+            with self._lock:
+                left = outstanding()
+            if not left:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"LMCache MP fence for {what} timed out after {deadline_s:.0f}s, "
+                    f"the transfer deadline, with {len(left)} transfer(s) in flight"
+                )
+            time.sleep(_FENCE_POLL_S)
+
+    def close(self, timeout: float) -> bool:
+        del timeout
+        self._closed = True
+        return True
+
+
+__all__ = ["InlineTransfers", "TransferDrain"]

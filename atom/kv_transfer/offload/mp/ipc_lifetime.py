@@ -63,9 +63,9 @@ def take_unshared(owned: deque[Any], limit: int | None = None) -> list[Any]:
 class OwnedFutures:
     """Finished futures, handed over by any thread, destroyed on the step thread.
 
-    LMCache keeps each future until its next submission, and the drain
-    thread's locals hold some between rounds; letting go first would leave the
-    destroy to whichever of them lets go last, on the drain thread.
+    LMCache keeps each future until its next submission, and a drain thread's
+    locals hold some between rounds; letting go first would leave the destroy
+    to whichever of them lets go last, on the drain thread.
     """
 
     def __init__(self, lock: threading.Lock) -> None:
@@ -97,7 +97,7 @@ class OwnedFutures:
         if owned < OWNED_IPC_CAP and not idle:
             return
         limit = None if idle else max(BUSY_RELEASE_BATCH, owned - OWNED_IPC_CAP)
-        # Added under `_lock` by the drain thread; destroyed outside it.
+        # Added under `_lock` by a round; destroyed outside it.
         with self._lock:
             unshared = take_unshared(self._owned, limit)
         del unshared

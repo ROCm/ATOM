@@ -3,11 +3,11 @@
 
 """Native PAGE-backed checkpoint transport over standalone LMCache.
 
-Transfers ride the base connector's drain thread, which submits them and polls
-them to a terminal state, so the step thread pays no IPC submit or import. A
-load whose retrieve succeeded is then restored into its Active SLOT on the step
-thread, ordered after the compute stream, and reported once that restore is
-done.
+Transfers go through the base connector's `_transfers`, which native ATOM
+runs on the step thread (`InlineTransfers`): a submit before the forward and a
+poll at the report. A load whose retrieve succeeded is then restored into its
+Active SLOT, ordered after the compute stream, and reported once that restore
+is done.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ _NATIVE_SAVE = "native_save"
 class _NativePending:
     request: LMCacheReqMeta
     future: Any = None
-    # Queued for the drain thread and not yet submitted.
+    # Handed to `_transfers` and not yet submitted.
     queued: bool = False
     # The retrieve or store reached a terminal state; `result` is its result.
     terminal: bool = False
@@ -234,7 +234,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             ]
 
     def _poll_native_saves(self) -> None:
-        """Advance every submitted save, on the drain thread."""
+        """Advance every submitted save, in a round."""
         completions: set[ConnectorCompletion] = set()
         terminal_ops = []
         for operation_id, entry in self._submitted_native(self._native_saves):
@@ -259,7 +259,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             self._drained_completions |= completions
 
     def _poll_native_loads(self) -> None:
-        """Advance every submitted retrieve, on the drain thread.
+        """Advance every submitted retrieve, in a round.
 
         A finished retrieve is only marked: the restore it may need runs on
         the step thread (`_advance_native_load`).
@@ -373,21 +373,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 compute.wait_event(event)
         super().start_load_kv(metadata)
 
-    def _native_in_flight_locked(self) -> bool:
-        return any(
+    def _transfers_in_flight_locked(self) -> bool:
+        return super()._transfers_in_flight_locked() or any(
             not entry.terminal
             for pending in (self._native_saves, self._native_loads)
             for entry in pending.values()
         )
-
-    def _wants_last_look_locked(self) -> bool:
-        """Loads, and saves too: the scheduler admits at most
-        `max_pending_saves` of them (2 by default), so one reported a step late
-        keeps the next save out, and a backlog builds that later lookups miss."""
-        return super()._wants_last_look_locked() or self._native_in_flight_locked()
-
-    def _transfers_in_flight_locked(self) -> bool:
-        return super()._transfers_in_flight_locked() or self._native_in_flight_locked()
 
     def _outstanding_locked(self, wanted: set[str]) -> list[str]:
         outstanding = super()._outstanding_locked(wanted)
@@ -412,7 +403,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if self._adapter is None:
             return output
         with self._lock:
-            # Saves that never reached the drain: a collapsed-TP non-writer's
+            # Saves that never reached `_transfers`: a collapsed-TP non-writer's
             # immediate success, a refusal, an invalid descriptor.
             for operation_id, pending in list(self._native_saves.items()):
                 if pending.terminal:
@@ -450,12 +441,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
     def _advance_native_load(self, operation_id: str, pending: _NativePending) -> bool:
         """Move a load toward its outcome, on the step thread; True once final.
 
-        A retrieve the drain found failed is final at once. One that succeeded
+        A retrieve a round found failed is final at once. One that succeeded
         starts the native restore, and is final only once the restore's event
         is done.
         """
         if not pending.terminal:
-            return False  # the drain thread polls the retrieve
+            return False  # a round polls the retrieve
         if pending.restore_unprovable:
             _enforce_transfer_deadline(
                 operation_id, pending.started_at, self._transfer_deadline_s

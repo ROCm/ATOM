@@ -51,7 +51,6 @@ from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
 from tests.lmcache_mp_support import (
     close_workers,  # noqa: F401
     cpu_step_events,  # noqa: F401
-    settle,
     step_event,
 )
 
@@ -141,25 +140,6 @@ def _make_worker(*, images=True):
     instance._adapter = SimpleNamespace(
         submit_store_request=submit, submit_retrieve_request=submit
     )
-    # Submits and polls run on the drain thread. These tests are about the
-    # bookkeeping around them, so each submit and each report waits for a
-    # round; the hand-off itself is covered by
-    # `test_native_transfers_are_submitted_and_polled_off_the_step_thread`.
-    for name in ("_submit_save", "_submit_load"):
-        submit_now = getattr(instance, name)
-
-        def settling(req, event, _submit=submit_now):
-            _submit(req, event)
-            settle(instance)
-
-        setattr(instance, name, settling)
-    get_finished_now = instance.get_finished
-
-    def settled_get_finished():
-        settle(instance)
-        return get_finished_now()
-
-    instance.get_finished = settled_get_finished
     return instance
 
 
@@ -801,31 +781,24 @@ def test_a_native_transfer_holds_its_step_event_until_terminal(worker):
     assert worker._step_events._holds[index] == 0
 
 
-def test_a_save_that_landed_during_the_forward_is_reported_that_step(
-    worker, monkeypatch
-):
-    """The scheduler admits at most `max_pending_saves` native saves, so a
-    save reported a step late keeps the next one out: `get_finished` takes
-    the drain's last look for saves too, not for loads alone."""
-    from atom.kv_transfer.offload.mp import worker as mp_worker
-
-    monkeypatch.setattr(mp_worker, "_LAST_LOOK_WAIT_S", 5.0)
+def test_a_save_that_landed_during_the_forward_is_reported_that_step(worker):
+    """The scheduler admits at most `max_pending_saves` native saves (two by
+    default), so one reported a step late keeps the next out: the report
+    polls every save, on the step thread."""
     req = request()
     worker._submit_save(req, step_event(worker))
     worker.future.ready = True
-    # Unwrapped: no settling round before the report.
-    completions = NativeStateLMCacheMPConnector.get_finished(
-        worker
-    ).connector_completions
+    completions = worker.get_finished().connector_completions
     assert (
         ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
         in completions
     )
 
 
-def test_native_transfers_are_submitted_and_polled_off_the_step_thread():
-    """Both are HIP IPC calls that cost milliseconds under launch pressure;
-    the step thread only restores, once a retrieve has landed."""
+def test_native_transfers_are_submitted_and_polled_on_the_step_thread():
+    """As native ATOM always has: a submit before the forward and a poll at
+    the report, the timing its save admission is sized to. No drain thread
+    starts."""
     import threading
 
     instance = _make_worker()
@@ -844,8 +817,10 @@ def test_native_transfers_are_submitted_and_polled_off_the_step_thread():
         return future
 
     instance._adapter.submit_store_request = recording_submit
+    threads = threading.active_count()
     instance._submit_save(request(), step_event(instance))
     future.ready = True
+    assert submit == [True]
     instance.get_finished()
-    assert submit == [False]
-    assert query and not any(query)
+    assert query and all(query)
+    assert threading.active_count() == threads

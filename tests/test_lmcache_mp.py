@@ -1068,14 +1068,15 @@ class _WorkerAdapter:
 
 
 def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
-    worker = mp_worker.LMCacheMPConnector(_config())
+    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
-    # Both legs are submitted and polled on the connector's drain thread, off
-    # the model step. These tests are about the bookkeeping that submit
-    # produces, not about the hand-off, so settle each one before returning;
-    # the hand-off itself is covered by
-    # `test_worker_save_settles_off_the_step_thread`.
+    # The plugin's worker: both legs are submitted and polled on a drain
+    # thread, off the model step. These tests are about the bookkeeping that
+    # submit produces, not about the hand-off, so settle each one before
+    # returning; the hand-off itself is covered by
+    # `test_worker_save_settles_off_the_step_thread`, and native's inline run
+    # by the `test_inline_*` tests.
     submit_save = worker._submit_save
     submit_load = worker._submit_load
 
@@ -1132,11 +1133,10 @@ def _await_drain_stop(
 ) -> None:
     """Wait out the drain thread after a fail-stop.
 
-    The transfer deadline is noticed on the save drain thread, which cannot stop
-    the engine, so it records the failure and exits; the next step is what
-    raises. Loads are still submitted and polled inline and have no thread.
+    The transfer deadline is noticed on the drain thread, which cannot stop the
+    engine, so it records the failure and exits; the next step is what raises.
     """
-    drain = worker._drain._thread
+    drain = worker._transfers._thread
     if drain is not None:
         drain.join(timeout=timeout)
 
@@ -1189,7 +1189,7 @@ def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
     adapter.submit_store_request = blocking_submit
     # Deliberately not `_worker`: that wrapper settles each save, which is the
     # very thing under test here.
-    worker = mp_worker.LMCacheMPConnector(_config())
+    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
     operation = SaveOperationId(req_id=77, generation=1)
@@ -1214,6 +1214,87 @@ def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
     assert set(worker._pending_saves) == {"save:77:1"}
     _finish_save(worker, "save:77:1")
     assert worker.get_finished().finished_saving == {operation}
+
+
+def _inline_worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
+    """Native ATOM's worker: its transfers run on the step thread."""
+    worker = mp_worker.LMCacheMPConnector(_config())
+    worker._adapter = adapter
+    worker.chunk_size = 8
+    return worker
+
+
+@pytest.mark.parametrize("kind", ["load", "save"])
+def test_inline_transfers_settle_on_the_step_thread(fake_lmcache_modules, kind):
+    """Native ATOM submits before the forward and polls at the report, as it
+    always has: its save admission is sized to a save reported the step it
+    lands. No drain thread starts."""
+    adapter = _WorkerAdapter()
+    worker = _inline_worker(adapter)
+    threads = threading.active_count()
+    request = _unprovable_request(kind)
+    if kind == "load":
+        worker._submit_load(request, _step_event(worker))
+        pending, (*_, future) = worker._pending_loads, adapter.loads[0]
+    else:
+        worker._submit_save(request, _step_event(worker))
+        pending, (*_, future) = worker._pending_saves, adapter.saves[0]
+    assert len(pending) == 1, "submitted before the call returned"
+    future.ready = True
+    output = worker.get_finished()
+    if kind == "load":
+        assert output.finished_loading == {request.load_operation}
+    else:
+        assert output.finished_saving == {request.save_operation}
+    assert not pending
+    assert threading.active_count() == threads
+
+
+def test_inline_transfer_deadline_raises_from_the_report(
+    fake_lmcache_modules, monkeypatch
+):
+    """Inline, the step's own poll notices the deadline and stops the engine."""
+    now = [1000.0]
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: now[0])
+    worker = _inline_worker(_WorkerAdapter())
+    worker._submit_save(_unprovable_request("save"), _step_event(worker))
+    now[0] += worker._transfer_deadline_s + 1
+    with pytest.raises(transfer.LMCacheTransferUnprovable):
+        worker.get_finished()
+    assert len(worker._pending_saves) == 1
+
+
+def test_inline_fence_polls_until_the_transfer_settles(fake_lmcache_modules):
+    adapter = _WorkerAdapter()
+    worker = _inline_worker(adapter)
+    worker._submit_save(_unprovable_request("save"), _step_event(worker))
+    *_, future = adapter.saves[0]
+    worker.fence(["8"])  # someone else's transfer: no wait
+    landing = threading.Timer(0.05, setattr, (future, "ready", True))
+    landing.start()
+    worker.fence(["16"])
+    landing.join()
+    assert not worker._pending_saves
+    assert worker.get_finished().finished_saving == {SaveOperationId(16, 1)}
+
+    worker._submit_save(
+        replace(_unprovable_request("save"), save_operation=SaveOperationId(16, 2)),
+        _step_event(worker),
+    )
+    worker._transfer_deadline_s = 0.05
+    with pytest.raises(RuntimeError, match="transfer deadline|still not terminal"):
+        worker.fence(["16"])
+
+
+def test_inline_close_shuts_the_client_down_and_refuses_new_transfers(
+    fake_lmcache_modules,
+):
+    adapter = _WorkerAdapter()
+    worker = _inline_worker(adapter)
+    worker.close()
+    assert adapter.shutdown_called
+    with pytest.raises(RuntimeError, match="transfers are closed"):
+        worker._transfers.put(None)
 
 
 def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules):
@@ -2458,7 +2539,7 @@ def test_the_fence_covers_queued_transfers_and_fails_stop(fake_lmcache_modules):
     worker = _worker(_WorkerAdapter())
     worker._transfer_deadline_s = 0.05
     worker._submitting_owner["save:7:1"] = "7"
-    worker._drain.ensure_running()
+    worker._transfers.ensure_running()
     worker.fence(["8"])  # someone else's transfer: no wait
     with pytest.raises(RuntimeError, match="timed out after 0s, the transfer deadline"):
         worker.fence(["7"])
@@ -2472,11 +2553,11 @@ def test_the_fence_names_what_waiting_cannot_clear(fake_lmcache_modules):
     worker._submitting_owner["save:7:1"] = "7"
     with pytest.raises(RuntimeError, match="no drain thread"):
         worker.fence(["7"])
-    worker._drain.ensure_running()
-    worker._drain.error = ConnectionError("server went away")
+    worker._transfers.ensure_running()
+    worker._transfers.error = ConnectionError("server went away")
     with pytest.raises(RuntimeError, match="drain failed"):
         worker.fence(["7"])
-    worker._drain.error = None
+    worker._transfers.error = None
     worker._submitting_owner.clear()
     worker._pending_saves["save:7:1"] = mp_worker._PendingSave(
         completion="7", future=_UnprovableSubmission(), start=0, end=8
@@ -2490,14 +2571,14 @@ def test_get_finished_wakes_the_drain_while_transfers_are_pending(
 ):
     """An idle engine queues nothing, so only this call can wake the poll."""
     worker = _worker(_WorkerAdapter())
-    worker._drain._wake.clear()
+    worker._transfers._wake.clear()
     worker.get_finished()
-    assert not worker._drain._wake.is_set()
+    assert not worker._transfers._wake.is_set()
     worker._pending_loads["load:5:1"] = mp_worker._PendingLoad(
         completion=LoadOperationId(req_id=5, generation=1), future=_WorkerFuture()
     )
     worker.get_finished()
-    assert worker._drain._wake.is_set()
+    assert worker._transfers._wake.is_set()
 
 
 def test_ipc_resources_are_destroyed_on_the_step_thread(
@@ -2626,7 +2707,7 @@ def test_close_leaves_a_stuck_drains_client_alone(fake_lmcache_modules, monkeypa
     adapter = _WorkerAdapter()
     released = threading.Event()
     adapter.submit_store_request = lambda *_a: released.wait(5.0)
-    worker = mp_worker.LMCacheMPConnector(_config())
+    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
     monkeypatch.setattr(mp_worker, "_CLOSE_TIMEOUT_S", 0.05)

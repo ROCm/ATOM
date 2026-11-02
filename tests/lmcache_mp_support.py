@@ -4,8 +4,9 @@
 """Fixtures every LMCache MP worker test file shares.
 
 Imported into a test module, the autouse fixtures apply to its tests: step
-events work on CPU torch, and every worker a test builds has its drain thread
-stopped in teardown, so none outlives its test and reads another test's clock.
+events work on CPU torch, and every worker a test builds has its transfers
+closed in teardown, so no drain thread outlives its test and reads another
+test's clock.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def cpu_step_events(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def close_workers(monkeypatch):
-    """Stop the drain thread of every worker built during the test."""
+    """Close the transfers of every worker built during the test."""
     built = []
     init = mp_worker.LMCacheMPConnector.__init__
 
@@ -54,7 +55,7 @@ def close_workers(monkeypatch):
     monkeypatch.setattr(mp_worker.LMCacheMPConnector, "__init__", tracking_init)
     yield
     for worker in built:
-        worker._drain.close(timeout=5.0)
+        worker._transfers.close(timeout=5.0)
 
 
 def step_event(worker) -> mp_step_events.PendingStepEvent:
@@ -68,8 +69,10 @@ def settle(worker) -> None:
     A transfer that settles without the server (an invalid descriptor, a
     collapsed-TP non-writer's save) starts no drain thread.
     """
-    if worker._drain.alive:
-        finished = worker._drain.wait_round(5.0)
+    if worker._transfers.alive:
+        finished = worker._transfers.wait_round(5.0)
         # A round that failed (a deadline, say) ends the thread; the step's
         # next `get_finished` raises what it recorded.
-        assert finished or worker._drain.error is not None, "no drain round finished"
+        assert (
+            finished or worker._transfers.error is not None
+        ), "no drain round finished"
