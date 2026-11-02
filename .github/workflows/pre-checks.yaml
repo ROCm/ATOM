@@ -97,7 +97,7 @@ jobs:
           pip3 install torch --index-url https://download.pytorch.org/whl/cpu
           # Isolate CPU test installation from unrelated repository tags (e.g.
           # lmcache-*). Release and GPU benchmark versions are resolved separately.
-          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e .
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_ATOM=0.0.0+cpu.ci pip3 install -e '.[tracing]'
           # requests is imported by tests/ only. datasets>=5.1 stopped pulling it
           # in, and one failed import at collection aborts the whole run.
           pip3 install pytest msgpack quart jsonschema requests

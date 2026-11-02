@@ -420,6 +420,9 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             max_blocks,
         )
 
+    def _graph_buffers_for_inputs(self, attn_inputs):
+        return getattr(self, "_cg_meta_bufs", None)
+
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         if bool(getattr(fmha_impl, "is_cuda_graph", False)):
             inputs.attention_inputs.is_cuda_graph = True
@@ -460,7 +463,7 @@ class _ATOMQwen35MoeRuntime(GptModelBase):
             positions=positions,
             layer_maps=self._rtp_layer_maps,
             cg_max_seq_len=int(self._cg_max_seq_len),
-            cg_bufs=getattr(self, "_cg_meta_bufs", None),
+            cg_bufs=self._graph_buffers_for_inputs(inputs.attention_inputs),
         ):
             hidden_states = self.model(
                 input_ids=input_ids,

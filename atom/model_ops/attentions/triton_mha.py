@@ -44,8 +44,12 @@ class TritonMHAMetadataBuilder(AiterAttentionMetadataBuilder):
 
     BACKEND: ClassVar[type[AiterBackend]] = TritonMHABackend
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
-        attn_metadata, positions = super().prepare_prefill(batch, running_bs)
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
+        attn_metadata, positions = super().prepare_prefill(
+            batch, running_bs, running_tokens
+        )
 
         # When there are no cached tokens, the base builder leaves
         # `block_tables=None` because AiterBackend's prefill consumes raw q/k/v

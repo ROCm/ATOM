@@ -20,6 +20,8 @@ been given the startup answer. One question, one place to ask it.
 import logging
 from typing import Any
 
+from atom.sampling_params import RequiredChannel
+
 from ..chat_encoders import render_probe_prompt
 from .deepseekv4_tool_parser import DsmlParser
 from .deepseekv41_tool_parser import DsmlV41Parser
@@ -141,6 +143,34 @@ TOOL_CALL_PARSER_HELP = (
     "resolves, tool calls are delivered as plain text and the startup log "
     "says so \u2014 the format is never guessed from output."
 )
+
+
+def required_call_channel(
+    parser_cls: type[ToolCallParser] | None, tokenizer: Any
+) -> RequiredChannel | None:
+    """The channel this server holds a request that must call a tool to, in
+    its tool-call format's token ids; None where the format defines none
+    (`ToolCallParser.required_call_channel`: every format but Kimi-K3).
+
+    Derived once, at startup beside `resolve_tool_call_parser`: it is fixed
+    for the server, and each request only asks `channel_for_request`.
+    """
+    if parser_cls is None:
+        return None
+    return parser_cls.required_call_channel(tokenizer)
+
+
+def channel_for_request(
+    channel: RequiredChannel | None, tool_choice: Any, tools: list | None
+) -> RequiredChannel | None:
+    """The server's channel for a string ``tool_choice="required"`` with
+    tools to call; None for every other request, which samples exactly as
+    before. That includes a named ``tool_choice`` (``{"type": "function",
+    ...}``): it requires a call too, but to one tool, which holding the
+    channel open does not express."""
+    if channel is None or tool_choice != "required" or not tools:
+        return None
+    return channel
 
 
 def forbids_tool_calls(tool_choice: Any) -> bool:

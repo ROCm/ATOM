@@ -304,7 +304,10 @@ class TestHttpResponseSerialization:
 
 
 @pytest.mark.parametrize("return_ids", [False, True])
-def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return_ids):
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_generate_async_reads_prompt_ids_from_local_sequence(
+    monkeypatch, return_ids, multimodal
+):
     seq = SimpleNamespace(
         id=7,
         prompt_token_ids=list(PROMPT_IDS),
@@ -336,12 +339,19 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
     monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
 
     async def collect():
-        return [
-            output
-            async for output in api_server.generate_async(
-                PROMPT_IDS, object(), "req-1", return_token_ids=return_ids
-            )
-        ]
+        # Read the IDs retained by preprocessing, rather than echoing its
+        # input: multimodal preprocessing may have expanded placeholders.
+        generate = (
+            api_server.generate_async_multimodal
+            if multimodal
+            else api_server.generate_async
+        )
+        args = (
+            ([11, 12], {"image": "fixture"}, object(), "req-1")
+            if multimodal
+            else ([11, 12], object(), "req-1")
+        )
+        return [output async for output in generate(*args, return_token_ids=return_ids)]
 
     outputs = asyncio.run(collect())
     assert len(outputs) == 1
@@ -351,3 +361,206 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
         assert output["prompt_token_ids"] == PROMPT_IDS
     else:
         assert "prompt_token_ids" not in output
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+def test_chunked_transfer_discovery_advertises_pp_and_page_geometry(
+    monkeypatch, enabled, multi
+):
+    sub = {
+        "kv_connector": "mooncake",
+        "kv_role": "kv_producer",
+        "enable_chunked_transfer": enabled,
+        "handshake_port": 6401,
+    }
+    config = SimpleNamespace(
+        kv_transfer_config=(
+            {"kv_connector": "multi", "connectors": [sub]} if multi else sub
+        ),
+        tensor_parallel_size=4,
+        pipeline_parallel_size=3,
+        parallel_config=SimpleNamespace(data_parallel_size=2),
+        kv_cache_block_size=64,
+        decode_context_parallel_size=2,
+    )
+    monkeypatch.setattr(api_server, "engine", SimpleNamespace(config=config))
+    monkeypatch.setattr("atom.utils.network.get_ip", lambda: "127.0.0.1")
+    info = asyncio.run(api_server.kv_transfer_info())
+    assert info["kv_role"] == "kv_producer"
+    assert info["handshake_port"] == 6401
+    assert ("chunked_transfer" in info) is enabled
+    if enabled:
+        assert info["chunked_transfer"] == {
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 6401,
+            "remote_pp_size": 3,
+            "block_size": 64,
+            "dcp_size": 2,
+        }
+
+
+class TestChunkedAdmissionTopology:
+    @pytest.mark.parametrize(
+        "endpoint", ["chat/completions", "completions", "messages", "responses"]
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        "p_tp,d_tp,d_pp", [(2, 1, 1), (3, 4, 1), (1, 1, 2), (0, 1, 1)]
+    )
+    def test_incompatible_pair_is_http_400_before_enqueue(
+        self, monkeypatch, server, endpoint, stream, p_tp, d_tp, d_pp
+    ):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    tensor_parallel_size=d_tp,
+                    pipeline_parallel_size=d_pp,
+                )
+            ),
+        )
+
+        async def unexpected_enqueue(*_args, **_kwargs):
+            pytest.fail("incompatible D request must be rejected before enqueue")
+
+        monkeypatch.setattr(api_server, "setup_streaming_request", unexpected_enqueue)
+        body = {
+            "model": "m",
+            "max_tokens": 2,
+            "stream": stream,
+            "kv_transfer_params": {
+                "chunked_transfer": True,
+                "do_remote_prefill": True,
+                "transfer_id": "rejected-pair",
+                "remote_tp_size": p_tp,
+            },
+        }
+        if endpoint == "completions":
+            body["prompt"] = "hi"
+        elif endpoint == "responses":
+            body.pop("max_tokens")
+            body["input"] = "hi"
+        else:
+            body["messages"] = [{"role": "user", "content": "hi"}]
+
+        async def post():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api_server.app),
+                base_url="http://d",
+            ) as client:
+                return await client.post(f"/v1/{endpoint}", json=body)
+
+        response = asyncio.run(asyncio.wait_for(post(), 5))
+        assert response.status_code == 400, response.text
+        assert "Chunked P/D requires" in response.text
+        assert not server.generate and not server.templates
+
+    @pytest.mark.parametrize("p_tp,d_tp", [(1, 1), (1, 4), (2, 4), (4, 4)])
+    def test_supported_receive_keeps_admission_path(self, monkeypatch, p_tp, d_tp):
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    tensor_parallel_size=d_tp,
+                    pipeline_parallel_size=1,
+                )
+            ),
+        )
+        api_server._validate_chunked_receive(
+            {
+                "chunked_transfer": True,
+                "do_remote_prefill": True,
+                "remote_tp_size": p_tp,
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            None,
+            {},
+            {"do_remote_prefill": True},
+            {"chunked_transfer": True, "do_remote_decode": True},
+        ],
+    )
+    def test_legacy_offload_and_producer_do_not_require_decode_topology(
+        self, monkeypatch, params
+    ):
+        monkeypatch.setattr(api_server, "engine", None)
+        api_server._validate_chunked_receive(params)
+
+
+@pytest.mark.parametrize("return_ids", [False, True])
+@pytest.mark.parametrize("n", [1, 2])
+def test_multimodal_chat_returns_requested_prompt_ids(
+    monkeypatch, server, return_ids, n
+):
+    media = {"image": "fixture"}
+    calls = []
+
+    def output():
+        result = {
+            "text": "red",
+            "finish_reason": "stop",
+            "num_tokens_input": len(PROMPT_IDS),
+            "num_tokens_output": 1,
+        }
+        if return_ids:
+            result["prompt_token_ids"] = list(PROMPT_IDS)
+        return result
+
+    async def single(ids, images, _sampling, _request_id, **kwargs):
+        assert ids == PROMPT_IDS and images is media
+        assert kwargs["return_token_ids"] is return_ids
+        calls.append("single")
+        yield output()
+
+    async def fanout(ids, _sampling, _request_id, **kwargs):
+        assert ids == PROMPT_IDS and kwargs["multimodal_data"] is media
+        assert kwargs["return_token_ids"] is return_ids
+        calls.append("fanout")
+        return [output() for _ in range(n)]
+
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    monkeypatch.setattr(
+        api_server,
+        "_prepare_multimodal_inputs",
+        lambda *_args: (list(PROMPT_IDS), media),
+    )
+    monkeypatch.setattr(api_server, "generate_async_multimodal", single)
+    monkeypatch.setattr(api_server, "generate_async_fanout", fanout)
+    payload = {
+        "model": "m",
+        "temperature": 1.0,
+        "n": n,
+        "return_token_ids": return_ids,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe the image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AA=="},
+                    },
+                ],
+            }
+        ],
+    }
+
+    async def post():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.post("/v1/chat/completions", json=payload)
+
+    response = asyncio.run(post())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["prompt_token_ids"] == (PROMPT_IDS if return_ids else None)
+    assert body["usage"]["prompt_tokens"] == len(PROMPT_IDS)
+    assert len(body["choices"]) == n
+    assert calls == ["single" if n == 1 else "fanout"] and server.templates == 0

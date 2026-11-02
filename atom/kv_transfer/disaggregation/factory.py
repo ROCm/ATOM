@@ -37,6 +37,14 @@ def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
     only the LMCache offload tier configures one too. ``multi`` is unwrapped,
     since ``multi[mooncake + lmcache_offload]`` is a mooncake peer.
     """
+    sub = pd_transfer_config(kv_transfer_config)
+    return None if sub is None else sub.get("kv_connector", _DEFAULT_BACKEND)
+
+
+def pd_transfer_config(kv_transfer_config: dict | None) -> dict | None:
+    """The config of the connector that will do P/D transfer (see
+    ``resolve_pd_backend``): ``multi``'s P/D sub-connector, whose own
+    ``kv_role`` says the instance's side; ``None`` if none will."""
     cfg = kv_transfer_config or {}
     if not cfg:
         return None
@@ -44,11 +52,11 @@ def resolve_pd_backend(kv_transfer_config: dict | None) -> str | None:
     name = cfg.get("kv_connector", _DEFAULT_BACKEND)
     if name == "multi":
         for sub in cfg.get("connectors", []) or []:
-            sub_name = (sub or {}).get("kv_connector", _DEFAULT_BACKEND)
-            if sub_name in PD_TRANSFER_BACKENDS:
-                return sub_name
+            sub = sub or {}
+            if sub.get("kv_connector", _DEFAULT_BACKEND) in PD_TRANSFER_BACKENDS:
+                return sub
         return None
-    return name if name in PD_TRANSFER_BACKENDS else None
+    return cfg if name in PD_TRANSFER_BACKENDS else None
 
 
 class KVConnectorFactory:
@@ -85,6 +93,10 @@ class KVConnectorFactory:
     # Whether a backend is a KV offload tier, whose scheduler half rewrites the
     # completion sets it is handed (`process_completions`). Absent means no.
     _offload: ClassVar[dict[str, bool]] = {}
+    # Whether a backend stores and restores a PAGE checkpoint image, the
+    # per-request state behind a hybrid's pages (Qwen3.8's GDN and PLE).
+    # Absent means no: a model whose state rides that image refuses it.
+    _reads_page_images: ClassVar[dict[str, bool]] = {}
 
     @classmethod
     def register(
@@ -100,6 +112,7 @@ class KVConnectorFactory:
         copies_whole_block_regions: bool = False,
         requires_pd_staging: bool = True,
         offload: bool = False,
+        reads_page_images: bool = False,
     ) -> None:
         """Register a KV connector backend.
 
@@ -111,6 +124,8 @@ class KVConnectorFactory:
             scheduler_class: Class name within *scheduler_module*.
             offload: The backend is a KV offload tier; a ``multi`` runs at most
                 one (`is_offload_backend`).
+            reads_page_images: The backend carries PAGE checkpoint images
+                (`reads_page_images`).
         """
         cls._registry[name] = {
             "worker_module": worker_module,
@@ -135,6 +150,7 @@ class KVConnectorFactory:
         cls._reads_block_regions[name] = bool(reads_block_regions)
         cls._copies_whole_block_regions[name] = bool(copies_whole_block_regions)
         cls._offload[name] = bool(offload)
+        cls._reads_page_images[name] = bool(reads_page_images)
 
     @classmethod
     def canonical_name(cls, value: object, *, path: str = "kv_transfer_config") -> str:
@@ -161,6 +177,19 @@ class KVConnectorFactory:
         """Whether the registered backend ``name`` (canonical) is an offload tier."""
 
         return cls._offload.get(name, False)
+
+    @classmethod
+    def reads_page_images(cls, name: str) -> bool:
+        """Whether the registered backend ``name`` (canonical) carries PAGE
+        checkpoint images."""
+
+        return cls._reads_page_images.get(name, False)
+
+    @classmethod
+    def page_image_readers(cls) -> list[str]:
+        """Every registered backend that carries PAGE checkpoint images."""
+
+        return sorted(name for name, reads in cls._reads_page_images.items() if reads)
 
     @classmethod
     def connector_name(cls, kv_transfer_config: dict[str, Any] | None) -> str | None:

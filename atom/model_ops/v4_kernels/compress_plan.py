@@ -32,9 +32,6 @@ Each plan is sliced to a kernel-grid length that depends on the mode: tight
 `num_compress` / `num_write` for eager, or a fixed `running_bs * per_seq_bound`
 for the decode CUDAGraph path (padding rows sentinel-filled). See
 `make_compress_plans` for the exact per-mode capacities.
-
-Caller (per-seq loop) gets `cu_compress_cpu` for slicing the kernel's flat
-output `[num_compress, head_dim]` back to per-seq chunks.
 """
 
 from collections.abc import Iterable
@@ -59,13 +56,6 @@ class CompressPlan:
     write_plan_gpu: torch.Tensor  # [≥num_write, 4]    int32
     num_compress: int  # CPU scalar — actual count for downstream slicing
     num_write: int  # CPU scalar — actual count for downstream slicing
-    cu_compress_cpu: (
-        np.ndarray
-    )  # [bs+1] int32 — per-seq slice into out[num_compress, D]
-    # Host copy of the compress rows (only the active head [:num_compress, 4]).
-    # Consumed by the indexer-FP8 path to derive a flat slot_mapping for
-    # `indexer_k_quant_and_cache`. None for empty fwds.
-    compress_plan_cpu: np.ndarray | None = None  # [num_compress, 4] int32 or None
     # Where `fused_compress` rotated each group's main latent, so where that
     # group's index key has to be rotated too -- anywhere else selects other
     # rows. int64 because the RoPE ABI casts to it regardless.
@@ -114,6 +104,7 @@ def make_compress_plans(
     running_bs: int | None = None,
     max_q_len: int | None = None,
     decode_capacity_per_ratio: dict[int, int] | None = None,
+    decode_write_capacity: int | None = None,
     extra_write: int,
     write_from: np.ndarray | None = None,
 ) -> dict[int, CompressPlan]:
@@ -167,7 +158,12 @@ def make_compress_plans(
                     sized to a dynamic token count). Mutually exclusive with
                     `running_bs`. The write plan then keeps the full-buffer legacy
                     slice (fixed = buffer capacity, sentinel-filled) since that
-                    path's write grid is bounded by its buffer sizing.
+                    path's write grid is bounded by its buffer sizing -- unless
+                    `decode_write_capacity` names a narrower one.
+      decode_write_capacity: optional int — the FIXED WRITE slice length that
+                    goes with `decode_capacity_per_ratio`, for a path that
+                    bounds its write grid tighter than the buffer (a token
+                    graph: a plan row is a token, so the forward's token count).
                     When BOTH this and `running_bs` are None (eager prefill /
                     eager plugin bridges): compress slice = `n_compress` (tight)
                     and write slice = full buffer (legacy). Slices are
@@ -248,8 +244,9 @@ def make_compress_plans(
             every token it computed) — content-independent, so capture/replay
             dispatch identical shapes and the `[n_actual, cap)` region is
             exactly the `[bs, running_bs)` padding.
-          * decode_capacity_per_ratio set (extend-shaped verify CG): compress =
-            explicit cap; write = full buffer (fixed by buffer sizing).
+          * decode_capacity_per_ratio set (extend-shaped verify CG, token
+            graph): compress = explicit cap; write = `decode_write_capacity`,
+            else the full buffer (fixed by buffer sizing).
           * neither (eager): compress = n_compress (tight); write = full buffer.
         """
         if running_bs is not None:
@@ -258,7 +255,9 @@ def make_compress_plans(
                 running_bs * min(max_q_len, K_pool_size),
             )
         if decode_capacity_per_ratio is not None:
-            return decode_capacity_per_ratio[ratio], full_wcap
+            return decode_capacity_per_ratio[ratio], (
+                full_wcap if decode_write_capacity is None else decode_write_capacity
+            )
         return n_compress, full_wcap
 
     if total == 0 or bs == 0:
@@ -284,8 +283,6 @@ def make_compress_plans(
                 write_plan_gpu=publish(wbuf, wcap),
                 num_compress=0,
                 num_write=0,
-                cu_compress_cpu=np.zeros(max(bs, 1) + 1, dtype=np.int32),
-                compress_plan_cpu=None,
                 key_rope_positions_gpu=_prepare_key_rope_positions(
                     plan_buffers, ratio, cbuf, ccap, publish
                 ),
@@ -301,12 +298,11 @@ def make_compress_plans(
     j_in_seq = ragged_ids - cu_extend[batch_ids]
     prefix_lens = context_lens_cpu - extend_lens_cpu
     positions = prefix_lens[batch_ids] + j_in_seq
+    token_ends = context_lens_cpu[batch_ids]
 
     # Only `window_len` depends on the ratio, so the row block is built once and
-    # the loop rewrites that one column. Both selections below are boolean
-    # fancy-indexing, which numpy always materializes as a copy -- that is what
-    # lets the next ratio overwrite column 3 without reaching a plan this one
-    # already published. Keep them gathers.
+    # the loop rewrites that one column, after this ratio's rows are copied
+    # into its buffers.
     plan_rows = np.empty((total, 4), dtype=np.int32)
     plan_rows[:, 0] = ragged_ids
     plan_rows[:, 1] = batch_ids
@@ -318,25 +314,19 @@ def make_compress_plans(
         # wider than it would drop its own tokens, and a rejection would then
         # read back into positions nobody kept.
         K_pool_size = K + extra_write
-        # window_len = K - min(j_in_seq + 1, K)
+        # window_len = K - min(j_in_seq + 1, K) = max(K - 1 - j_in_seq, 0)
         # Number of leading K-loop iterations that go to state cache.
-        plan_rows[:, 3] = np.maximum(0, K - np.minimum(j_in_seq + 1, K))
+        np.maximum(K - 1 - j_in_seq, 0, out=plan_rows[:, 3])
 
-        # compress: token at a compression boundary
-        compress_mask = (positions + 1) % ratio == 0
-        if write_from is not None:
-            # a group the cache already holds whole is not compressed again
-            compress_mask &= positions >= write_from[batch_ids]
-        compress_plan = plan_rows[compress_mask]
-        # cu_compress: per-seq prefix-sum of boundary counts (for caller slicing).
-        # bincount preserves seq order because compress_plan rows are already
-        # sorted by ragged_id (and ragged_id increases monotonically with batch_id).
-        compress_counts = np.bincount(compress_plan[:, 1], minlength=bs).astype(
-            np.int32
-        )
-        cu_compress = np.empty(bs + 1, dtype=np.int32)
-        cu_compress[0] = 0
-        np.cumsum(compress_counts, out=cu_compress[1:])
+        # compress: token at a compression boundary -- every token at ratio 1
+        if ratio == 1 and write_from is None:
+            compress_plan = plan_rows
+        else:
+            compress_mask = (positions + 1) % ratio == 0
+            if write_from is not None:
+                # a group the cache already holds whole is not compressed again
+                compress_mask &= positions >= write_from[batch_ids]
+            compress_plan = plan_rows[compress_mask]
 
         # write: tokens whose absolute position falls in the per-seq
         # "last STATE_SIZE positions" window (see `_ring_slots`).
@@ -346,10 +336,9 @@ def make_compress_plans(
         # is a stricter bound that includes only ratio-aligned writes; the looser
         # `context_len - STATE_SIZE` is what ATOM's update_compressor_states already
         # uses (state_writes.py:152-154 docstring) and what the fused kernel's
-        # state-cache reader expects.
-        write_starts = np.maximum(0, context_lens_cpu - K_pool_size).astype(np.int32)
-        write_mask = positions >= write_starts[batch_ids]
-        write_plan = plan_rows[write_mask]
+        # state-cache reader expects. Positions are >= 0, so the window is
+        # `positions + K_pool >= context_len`.
+        write_plan = plan_rows[positions + K_pool_size >= token_ends]
 
         n_compress = int(compress_plan.shape[0])
         n_write = int(write_plan.shape[0])
@@ -389,8 +378,6 @@ def make_compress_plans(
             write_plan_gpu=write_plan_gpu,
             num_compress=n_compress,
             num_write=n_write,
-            cu_compress_cpu=cu_compress,
-            compress_plan_cpu=compress_plan if n_compress > 0 else None,
             key_rope_positions_gpu=_prepare_key_rope_positions(
                 plan_buffers, ratio, cbuf, compress_slice, publish
             ),

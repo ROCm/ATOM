@@ -12,7 +12,7 @@ controls ATOM's runtime behaviour.
 | `Config` | Master dataclass — model path, memory, TP size, scheduler limits, KV cache, profiler, and references to all sub-configs |
 | `CompilationConfig` | Compilation level (0-3), CUDA graph capture sizes, piecewise splitting ops, inductor settings |
 | `CompilationLevel` | Integer constants for the four compilation levels |
-| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (none / piecewise / full / hybrid) |
+| `CUDAGraphMode` | Enum controlling how CUDA graphs are captured (`NONE` / `TR_HYBRID` token graphs / `FULL` / `FULL_AND_TR_HYBRID`) |
 | `QuantizationConfig` | Layer-wise quantization orchestrator: global config, per-layer overrides, exclude lists, layer name remapping |
 | `LayerQuantConfig` | Per-layer quantization spec (frozen dataclass): quant type, dtype, dynamic flag, method |
 | `ParallelConfig` | Data-parallel size, rank, master IP/port |
@@ -44,6 +44,7 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
+| `throughput_log_interval_steps` | `int` | `0` | Forwards between engine-status lines, replacing the clock above when > 0. For offline / MLPerf runs comparing one DP rank's lines against another's: the clock lands on a different step number on each rank, a forward count lands on the same one (an idle DP rank counts its dummy). The line reports a cumulative forward count, which is the quantity two ranks share; an all-dummy window still emits its line, since a missing line is what a comparison cannot recover from. Because the window closes on a count rather than a deadline it can span any amount of wall clock, so stretches where no forward ran — idle, stalled on a deferred save or PrefillDone, weights parked by an RL rollout — are subtracted from the `tokens/s` divisor. The first line is warmup: a DP rank's window one opens before its first `_sync_dp_state`, so the barrier waiting for the slowest rank lands in that divisor. Base and DP engines only — pipeline parallel replaces the busy loop that counts, and RapidServe and P/D are not covered yet; all three fall back to the clock with a warning. A decode step is milliseconds, so an interval below ~20 will dominate the log |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
 | `enable_dynamic_chunking` | `bool` | `False` | Size pipeline-parallel prefill chunks from a calibrated equal-latency model. Needs `pipeline_parallel_size > 1` and chunked prefill, and does not apply to RapidServe or a P/D decode instance (`kv_role: kv_consumer`); otherwise the flag is turned off with a warning and chunking stays fixed |
 | `dynamic_chunking_smooth_factor` | `float \| None` | `None` | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). `None` takes `ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR`, read only when the feature is on. Must be in `[0, 1]` when the feature is on |
@@ -92,7 +93,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `NO_COMPILATION` | `0` | No compilation — pure eager execution |
 | `DYNAMO_AS_IS` | `1` | Use torch.compile / TorchDynamo as-is |
 | `DYNAMO_ONCE` | `2` | TorchDynamo with a single compilation pass |
-| `PIECEWISE` | `3` | Piecewise compilation with CUDA graph capture (recommended for production) |
+| `PIECEWISE` | `3` | Piecewise compilation: the graph is split at `splitting_ops` and each piece compiled by Inductor (recommended for production; CUDA graphs are chosen separately by `CUDAGraphMode`) |
 
 ### `CompilationConfig` fields
 
@@ -105,9 +106,9 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `PIECEWISE` automatically at level 3 |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph capture mode (see [CUDA graph mode](#cuda-graph-mode-cudagraphmode)); set to `TR_HYBRID` automatically at level 3 |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Ops that split the graph into sub-graphs for piecewise compilation; auto-populated at level 3 with `["aiter.unified_attention_with_output", "aiter.mla_attention"]` |
-| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; only effective in PIECEWISE mode |
+| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors into internally managed buffers before CUDA graph replay; effective at level 3 whenever `cudagraph_mode` is not `NONE` |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Sizes to compile for inductor; accepts integers and the string `"cudagraph_capture_sizes"` |
 | `inductor_compile_config` | `dict` | `{}` | Additional configuration passed to the inductor backend |
 
@@ -116,16 +117,16 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | Mode | Value | Description |
 |---|---|---|
 | `NONE` | `0` | No CUDA graph capture |
-| `PIECEWISE` | `1` | Piecewise CUDA graphs — attention ops stay outside the graph for flexibility (default at level 3) |
+| `TR_HYBRID` | `1` | Token graphs and request graphs mixed: a token graph per token bucket, breaking only where a launch depends on host data (default at level 3) |
 | `FULL` | `2` | Full CUDA graph capture for all batches; best for small models / short prompts |
 | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full CUDA graphs for decode batches only; mixed prefill-decode runs without graphs (useful in P/D setups) |
-| `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full graphs for decode, piecewise for prefill/mixed — most performant mode for most models |
+| `FULL_AND_TR_HYBRID` | `(FULL, TR_HYBRID)` | Recorded as `TR_HYBRID` by the native runner: decode replays token graphs too, no full decode graph |
 
 Helper methods on `CUDAGraphMode`:
 
 - `decode_mode()` — returns the mode used for pure decode batches.
 - `mixed_mode()` — returns the mode used for mixed prefill-decode batches.
-- `requires_piecewise_compilation()` — whether the mode needs piecewise compilation.
+- `uses_tr_hybrid()` — whether the mode records token graphs.
 - `has_full_cudagraphs()` — whether the mode includes full CUDA graph capture.
 - `separate_routine()` — whether decode and mixed batches use different routines.
 
@@ -369,6 +370,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--enable_prefix_caching` | | flag | `False` | Enable prefix caching |
 | `--enable-log-stats` / `--no-enable-log-stats` | | flag | `True` | Emit the periodic engine-status line |
 | `--throughput-log-interval` | | `float` | `10.0` | Seconds between engine-status lines |
+| `--throughput-log-interval-steps` | | `int` | `0` | Forwards between engine-status lines instead of seconds; base and DP engines only |
 | `--port` | | `int` | `8006` | Engine internal port |
 | `--kv_cache_dtype` | | `str` | `"bf16"` | KV cache dtype; choices: `bf16`, `fp8` |
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
@@ -427,6 +429,7 @@ anything else (including unset) as `False`, unless noted otherwise.
 | `ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION` | `bool` | `True` | Enable fused input RMSNorm + quantization for DeepSeek models |
 | `ATOM_ENABLE_DS_QKNORM_QUANT_FUSION` | `bool` | `True` | Enable fused QK-norm + quantization for DeepSeek models |
 | `ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION` | `bool` | `True` | Enable fused all-reduce + RMSNorm kernel |
+| `ATOM_ENABLE_GLUON_FUSED_AR` | `bool` | `True` | Use aiter's Gluon fused all-reduce + RMSNorm for decode at TP4 (sets `AITER_GLUON_FUSED_AR=1`; aiter uses it on gfx1250 only) |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT` | `bool` | `True` | Enable AITER Triton fused RMSNorm + quantization for LLaMA models |
 | `ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT` | `bool` | `True` | Enable AITER Triton fused SiLU + multiply + quantization for LLaMA models |
 
@@ -455,14 +458,14 @@ Do you need torch.compile but no graph splitting?
   v
 Production inference on ROCm/HIP GPU?
   |-- Yes --> Level 3 (PIECEWISE) [default in EngineArgs]
-              - Auto-sets CUDAGraphMode.PIECEWISE
+              - Auto-sets CUDAGraphMode.TR_HYBRID
               - Auto-populates splitting_ops for attention ops
               - Pair with --cudagraph-capture-sizes for your batch profile
   |
   v
 Need maximum decode throughput?
-  |-- Yes --> Level 3 + set cudagraph_mode to FULL_AND_PIECEWISE
-              (full graphs for decode, piecewise for prefill)
+  |-- Yes --> set cudagraph_mode to FULL
+              (a whole-forward request graph per decode bucket)
 ```
 
 **Rules of thumb:**

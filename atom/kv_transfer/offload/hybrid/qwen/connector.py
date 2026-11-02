@@ -5,9 +5,9 @@
 
 Qwen has no second codec. ``KimiK3OffloadConnector`` already packs
 ``page_unit_views`` and unpacks ``state_entry_views``, and it does not assume
-KDA shapes. Qwen publishes those views from its MHA pool
-(``pool_layout/mha_page_unit_geometry``) under the ``gdn-paged-state`` layout id
-spelled in ``GDNAttentionMetadataBuilder.state_transfer``. These
+KDA shapes. Qwen publishes those views from its MHA pool, or Qwen3.8's QSA
+arena (``pool_layout/layer_major_page_geometry``), under the ``gdn-paged-state``
+layout id spelled in ``GDNAttentionMetadataBuilder.state_transfer``. These
 subclasses exist so the selected layout is ``qwen`` rather than ``kimi_k3``.
 """
 
@@ -20,7 +20,7 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
 
 
 class QwenOffloadConnector(KimiK3OffloadConnector):
-    """Worker side: dense MHA KV plus the GDN page-image state tier."""
+    """Worker side: the paged KV (MHA or QSA) plus the GDN page-image state tier."""
 
 
 class QwenOffloadScheduler(KimiK3OffloadScheduler):

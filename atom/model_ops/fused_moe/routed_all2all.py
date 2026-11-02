@@ -127,8 +127,9 @@ def build_routed_dispatch_plan(
     token_indices = pairs[:, 1]
     send_counts = destination_mask.sum(dim=0, dtype=torch.int64)
 
-    # AITER's EP sorting kernels index expert_mask with every top-k ID before
-    # filtering non-local routes, so -1 sentinels are not safe here. Preserve
+    # AITER's CK EP sorting (AITER_USE_CK_MOE_SORTING) indexes expert_mask with
+    # every top-k ID before filtering non-local routes, so -1 sentinels are not
+    # safe here (the default opus sorter skips ids < 0, CK does not). Preserve
     # the complete global routing row for parity with the gather/scatter path,
     # and sanitize only genuinely empty input slots to an in-range zero-weight
     # route. The destination's binary expert_mask performs the ownership

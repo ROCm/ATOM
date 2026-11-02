@@ -65,7 +65,7 @@ def _shape(call: ast.Call) -> tuple[list[str], dict[str, str]]:
             ("self.config.", "hf_config."),
             ("self.block_size", "block_size"),
             ("num_drafts", "speculative_tokens"),
-            ("model_runner.config.kv_cache_dtype == 'fp4'", "packed"),
+            ("model_runner.config.kv_cache_dtype", "kv_dtype"),
             ("model_runner.config.index_cache_dtype == 'fp4'", "index_fp4"),
         ):
             text = text.replace(before, after)

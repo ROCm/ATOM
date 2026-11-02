@@ -18,7 +18,7 @@ Producers fill the final group's counts directly; compression plans use
 | `token_inputs` | Sampling parameters, padded query prefix, input IDs, deferred source indices and speculative verification indices | Token assembly, then draft ID gather |
 | `prefill_inputs` | Prefill attention mirrors and ordinary positions | Attention preparation |
 | `mha_decode` | Slots, context lengths, block tables, KV prefix and positions | KV-index generation |
-| `v41_metadata` | Compression/write plans, state slots, positions, token batch IDs, visibility and changed block tables | Step indptr generation |
+| `v41_metadata` | Compression/write plans, state slots, positions, token batch IDs, visibility and changed block tables | State-slot preparation, then the forward (index pointers are filled by their first reader) |
 
 V4.1 ordinary DSpark decode uses two H2Ds and two scatters: token inputs and
 V4.1 metadata. All graph padding is included. Other attention builders, MRoPE

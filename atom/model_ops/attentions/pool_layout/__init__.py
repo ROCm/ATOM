@@ -7,8 +7,9 @@ One topic across eight modules -- how many entries a byte budget buys
 (`sub_pool_spec`), which row of the unified pool a DeepSeek-V4 layer's window
 or compressed group occupies (`v4_pool_geometry`), what one of those rows and
 one indexer block hold (`v4_pool_fields`), where a checkpoint image's bytes
-land in the MLA paged pool (`page_unit_geometry`) or in an MHA paged pool
-(`mha_page_unit_geometry`), what one entry holds and where those bytes are put
+land in the MLA paged pool (`page_unit_geometry`) or in a layer-major pool
+such as MHA's or Qwen3.8's QSA arena (`layer_major_page_geometry`), what one
+entry holds and where those bytes are put
 (`entry_arena`), what the row spaces are and which row of one each module was
 given (`pool_rows`), and how one entry's run is scattered across PAGE units
 and gathered back (`paged_state_copy`). All of it answers a question about the

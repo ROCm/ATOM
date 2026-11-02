@@ -62,10 +62,9 @@ def window_lens(geo, *, start, extend):
         plan_buffers=buffers,
         extra_write=0,
     )
-    # No host plan is a forward that closes no group.
     return {
-        ratio: np.zeros(0) if rows is None else rows[:, 3]
-        for ratio, rows in ((r, p.compress_plan_cpu) for r, p in plans.items())
+        ratio: buffers[ratio]["compress"].np[: plan.num_compress, 3]
+        for ratio, plan in plans.items()
     }
 
 
@@ -92,7 +91,9 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     # A window wide enough that one image outgrows a PAGE unit: an FP8 index
     # plane puts 32 tokens in a PAGE, and the fixture's own 4-token window
     # leaves a state entry that fits in a single one.
-    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
     spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     # Enough PAGEs for the interleaved unit ids below, which is what makes the
@@ -175,7 +176,9 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
         DeepseekV41MetadataBuilder,
     )
 
-    geo = replace(geometry(small_config), packed=packed, window_size=32)
+    geo = replace(
+        geometry(small_config), kv_dtype="fp4" if packed else "bf16", window_size=32
+    )
     spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     pages = max(40, 2 * spec.units_per_checkpoint)
@@ -232,6 +235,38 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     assert builder.get_kv_transfer_tensors() is None
 
 
+def test_pd_transfer_publishes_the_state_slot(small_config):
+    """Mooncake P/D: PAGE units plus the whole STATE slot, slot-indexed.
+
+    The connector writes `src_slot * unit` to `dst_slot * unit`, and sends the
+    consumer's slot only when `slot_regions` is non-empty. Encoder bounded
+    replay keeps no checkpoint, so the spec may be None. `lmcache_mp` gets no
+    slot region: it moves STATE through checkpoint copies.
+    """
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=None),
+    )
+    builder.cache = cache
+    transfer = builder.get_kv_transfer_tensors()
+    assert not transfer.swa_block_regions and transfer.staging_region is None
+    (region,) = transfer.slot_regions
+    assert transfer.num_slots == 4
+    assert region.unit_bytes == geo.state_bytes and not region.reverse_indexed
+    for slot in range(4):
+        assert region.unit_addr(slot) == cache.state_bytes[slot].data_ptr()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("ratio", [1, 2])
@@ -262,7 +297,7 @@ def test_a_rows_prefix_slice_is_exactly_as_long_as_what_gets_written(
         8,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         layer_ratios=(ratio,),
         index_topk=topk,
     )
@@ -321,7 +356,7 @@ def test_one_grouped_build_writes_what_the_per_layer_builds_would(ratio):
         8,
         512,
         32,
-        packed=True,
+        kv_dtype="fp4",
         layer_ratios=(ratio,),
         index_topk=8,
     )
@@ -680,7 +715,7 @@ def test_shared_indptr_launch_matches_row_counts_and_replay(
         128,
         512,
         32,
-        packed=packed,
+        kv_dtype="fp4" if packed else "bf16",
         layer_ratios=ratios,
         index_topk=64,
     )

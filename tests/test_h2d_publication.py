@@ -453,6 +453,7 @@ def test_real_runner_and_prefill_builder_share_reuse_and_publication(pp_size):
     runner.forward_vars = {
         "input_ids": buffer(16, device="cuda"),
         "decode_src": buffer(16, device="cuda"),
+        "batch_info": buffer(3, device="cuda"),
     }
     for name, shape in (
         ("slot_mapping", (16,)),
@@ -517,7 +518,11 @@ def test_rapidserve_entries_gate_sources_on_the_selected_stream(prefill):
     runner.enforce_eager = True
     data = buffer(16, device="cuda")
     data.publication_group = "early"
-    runner.forward_vars = {"input_ids": data, "decode_src": buffer(16, device="cuda")}
+    runner.forward_vars = {
+        "input_ids": data,
+        "decode_src": buffer(16, device="cuda"),
+        "batch_info": buffer(3, device="cuda"),
+    }
     runner.tokenID_processor = SimpleNamespace(input_ids=data)
     runner._init_forward_vars_ring()
     runner._init_h2d_publication()
@@ -539,7 +544,9 @@ def test_rapidserve_entries_gate_sources_on_the_selected_stream(prefill):
     runner._record_kv_cache_ready = lambda batch: None
     results = []
     for value in range(6):
-        batch = SimpleNamespace(cu_stream_fraction=value % 2, value=value + 1)
+        batch = SimpleNamespace(
+            cu_stream_fraction=value % 2, value=value + 1, required_channel=None
+        )
         output = runner.prefill_forward(batch) if prefill else runner.forward(batch)
         results.append(output)
     torch.cuda.synchronize()

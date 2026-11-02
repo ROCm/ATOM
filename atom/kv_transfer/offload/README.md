@@ -25,8 +25,10 @@ For the in-process path, the public configuration remains
 layouts: `m3` for MiniMax-M3 PAGE regions
 (including its NSA index cache), `kimi_k3` when the text config has
 `model_type == "kimi_linear"` (dense paged MLA KV plus a KDA per-request state
-tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`; a subclass of the
-K3 tier over an MHA page image), `hybrid` when `hf_config.compress_ratios` is
+tier), `qwen` for GDN hybrids (`qwen3_next`, `qwen3_5_*`, `qwen4_exp`; a
+subclass of the K3 tier over a PAGE image in the MHA pool, or in the QSA arena
+for Qwen3.8, whose image also carries the PLE windows), `hybrid` when
+`hf_config.compress_ratios` is
 present (DSV4 PAGE+SLOT), and `dense` otherwise.
 `kv_transfer_config.offload_layout` can override compatible choices without
 giving scheduler and worker different connector names. MiniMax-M3 cannot be
@@ -97,7 +99,7 @@ Four rules carry the module:
 | `hybrid/dsv4/codec.py` | `DSV4PageSlotCodec`, `DSV4CheckpointCodec`, and `DSV4CheckpointStore`: unified GPU layout plans plus AOS1 framing/storage. |
 | `hybrid/dsv4/triton_page_slot.py` | Raw-`uint8` PAGE/SLOT gather/scatter kernels; PAGE is forward-indexed and SLOT is reverse-indexed. |
 | `hybrid/kimi_k3/connector.py` | Kimi-K3 worker and scheduler: the dense paged-KV path plus one extra leg for the KDA per-request state tier. |
-| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool. |
+| `hybrid/qwen/connector.py` | Qwen GDN worker and scheduler. Subclasses the K3 tier; the pages come from the MHA pool or Qwen3.8's QSA arena. |
 | `hybrid/kimi_k3/staging.py` | Single-entry bounded GPU staging buffer, D2H/H2D copy stream, and producer event for one flat state entry per transfer. |
 | `hybrid/kimi_k3/state_object.py` | One state checkpoint as a single opaque object keyed by ATOM's own hash, bypassing LMCache's `ChunkedTokenDatabase` (state bytes are not token-sliceable). |
 | `hybrid/kimi_k3/state_tier.py` | Worker-side store/load driver for the state tier on its own executor; reports store/finished/failed hash sets for the engine-side `StateOffloadIndex` to apply. |
@@ -222,12 +224,22 @@ Engine memory under an MP transfer (PAGE sources, restore destinations,
 checkpoint pins, descriptor slots) is released only on a terminal report from
 the server. A timeout cannot prove that a remote DMA stopped, so no clock ever
 frees it. Instead, a transfer that is still not terminal after
-`lmcache.mp.transfer_deadline_s` (default 1200 s) is fatal: the worker, or the
-scheduler for a report that never arrives, raises `LMCacheTransferUnprovable`
-and the engine stops. This covers a submission that raised, a future whose
-poll keeps raising, a restore whose event cannot be queried, and a lost or
-never-aggregated completion. The engine-wide stalled-save reclaim leaves MP
-leases alone for the same reason.
+`lmcache.mp.transfer_deadline_s` (default 30 s) is fatal: the worker raises
+`LMCacheTransferUnprovable` and the engine stops. This is a per-transfer deadline
+from submission, including time queued at the MP server, not a model request
+timeout or a heartbeat timeout. It also catches a live server whose ZMQ handler
+failed without replying; no LMCache transport changes are required. The scheduler
+independently watches dispatched operations with an additional 10 s margin for
+lost or never-aggregated completion reports. These checks run when the respective
+worker/scheduler polls completions; they are not an independent watchdog for a
+blocked process. A future query/result exception stops the engine immediately.
+The engine-wide stalled-save reclaim leaves MP leases alone for the same reason.
+
+Set `"lmcache.mp.transfer_deadline_s": 180` in `kv_connector_extra_config`, for
+example, if measured normal transfer/queue latency on a slower storage tier
+requires a longer deadline. The value must be finite and positive. The default
+is a failure-detection policy, not a guarantee that every overloaded deployment
+can complete transfers within 30 s.
 
 The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the
@@ -1168,6 +1180,15 @@ Under `--kv_cache_dtype fp8`, each KV block carries its own `k_scale` / `v_scale
 (`dense/kv_byte_codec.py`). The scales travel with the quantized data, so a
 reloaded fp8 block dequantizes identically; no scale is recomputed or dropped.
 
+### Multimodal prompts: seeded keys
+
+Image placeholder ids are the same for every picture, so every LMCache lookup,
+save and load keys its ids through `tier_token_ids(seq, end)`
+(`_offload_common.py`): the first 4 ids of a prompt with a `cache_seed` become
+digests of `(cache_seed, position, id)` with bit 31 set, off every vocabulary
+id. Text prompts key unchanged. mooncake_store seeds its own chain hash with
+the same `cache_seed` (`chain_seed`).
+
 ### Invariants enforced in code
 
 | Invariant | Where | Why |
@@ -1399,7 +1420,8 @@ env var. This per-thread isolation is exactly why load and save never contend.
   `lookup_server_worker_ids=[0]` so rank 0 is the authoritative lookup answerer at
   TP>1. `build_lmcache_metadata()` fills `kv_shape` from `hf_config` and pins a
   shared `engine_id` so the scheduler's lookup client and the workers' lookup
-  servers derive the **same** ZMQ socket path.
+  servers derive the **same** ZMQ socket path, one per server
+  (`data_parallel_base_port`) and DP rank.
 - **`metadata.py`** — `ATOMRawBytesLMCacheMetadata` overrides LMCache's allocation
   to hand out opaque `uint8` MemoryObjs (`get_shapes` returns
   `nblocks × bytes_per_block`) and asserts

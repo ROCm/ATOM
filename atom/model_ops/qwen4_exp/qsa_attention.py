@@ -39,13 +39,22 @@ import torch
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
+from atom.model_ops.attentions.qwen4_exp_attn import (
+    QSA_DRAFT_ROWS,
+    QSA_ROWS,
+    qsa_row_space,
+)
 from atom.model_ops.layernorm import DualRMSNorm, GemmaRMSNorm
 from atom.model_ops.linear import (
     QKVGParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_mul_quant,
+)
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_cache_formats,
@@ -57,7 +66,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_store_rows,
 )
 from atom.plugin.prepare import is_plugin_mode
-from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 
@@ -292,17 +300,16 @@ class Qwen4ExpAttention(nn.Module):
         self.kv_format, self.index_format = (
             ("bf16", "bf16") if is_plugin_mode() else qsa_cache_formats(atom_config)
         )
-        # The MTP draft layer sits past the target stack. It keeps BF16 caches
-        # under quantized target caches, in a row space of its own: an FP8
-        # draft KV costs ~3.5% of the real acceptance length, a BF16 one none.
-        self.qsa_row_space = "qsa"
-        if (
-            layer_num >= int(config.num_hidden_layers)
-            and envs.ATOM_QSA_DRAFT_KV_BF16
-            and (self.kv_format, self.index_format) != ("bf16", "bf16")
-        ):
+        # The MTP draft layer keeps BF16 caches under quantized target caches,
+        # in a row space of its own: an FP8 draft KV costs ~3.5% of the real
+        # acceptance length, a BF16 one none.
+        self.qsa_row_space = (
+            QSA_ROWS
+            if is_plugin_mode()
+            else qsa_row_space(atom_config, layer_num, int(config.num_hidden_layers))
+        )
+        if self.qsa_row_space == QSA_DRAFT_ROWS:
             self.kv_format = self.index_format = "bf16"
-            self.qsa_row_space = "qsa_draft"
         self.profile_block_size = getattr(atom_config, "kv_cache_block_size", 64)
 
     def bind_caches(
@@ -418,10 +425,20 @@ class Qwen4ExpAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
+        that an FP8 `qkv_proj` takes instead of quantizing it again; the
+        indexer still reads the BF16 `hidden_states`."""
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
+        qkv = (
+            self.qkv_proj(hidden_states)
+            if quantized is None
+            else self.qkv_proj(quantized[0], x_scale=quantized[1])
+        )
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
@@ -456,6 +473,11 @@ class Qwen4ExpAttention(nn.Module):
                 ),
             )
 
+        if is_per_token_fp8_linear(self.o_proj):
+            gated, gated_scale = sigmoid_mul_quant(
+                attn_out.reshape(num_tokens, -1), gate, self.o_proj.params_dtype
+            )
+            return self.o_proj(gated, x_scale=gated_scale)
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
 

@@ -2,16 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 import torch
-from aiter import QuantType, dtypes
+from aiter import QuantType
 from aiter.jit.utils.chip_info import get_cu_num
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
-from atom.utils import envs
+from atom.model_ops.fused_moe.routed_rows import RoutedRowsWire
 from atom.utils.forward_context import get_forward_context
 
 try:
@@ -23,56 +22,9 @@ except ImportError:
     MORI_AVAILABLE = False
 
 
-_FP8_DTYPES = (
-    torch.float8_e4m3fn,
-    torch.float8_e4m3fnuz,
-    torch.float8_e5m2,
-    torch.float8_e5m2fnuz,
-)
-
-# Read once at import: the wire format is fixed for the life of the process, and
-# make_prepare_finalize runs per MoE layer (58x for DSR1). envs.__getattr__ does
-# not cache, so binding here also keeps it to a single getenv.
-_FP4_DISPATCH = envs.ATOM_MORI_FP4_DISPATCH
-
-
-@dataclass(frozen=True)
-class MoriDispatchFormat:
-    dtype: torch.dtype  # what dispatch() receives -> picks the MoRI kernel
-    quant_type: Any | None  # aiter QuantType for the pre-dispatch quantizer
-    scale_dim: int
-    scale_type_size: int
-
-    @property
-    def is_fp4(self) -> bool:
-        return self.dtype == dtypes.fp4x2
-
-    @property
-    def is_fp8(self) -> bool:
-        return self.dtype in _FP8_DTYPES
-
-
-def resolve_mori_dispatch(
-    in_dtype: torch.dtype,
-    hidden_dim: int,
-    quant_config: FusedMoEQuantConfig | None = None,
-) -> MoriDispatchFormat:
-    """Decide the MoRI wire format. Call once per layer construction."""
-    if _FP4_DISPATCH:
-        # fp4 blockwise is one scale per 32 elements, not per 128 as fp8 uses,
-        # and get_hip_quant(per_1x32) emits e8m0 scales (1 byte), not fp32.
-        return MoriDispatchFormat(
-            dtype=dtypes.fp4x2,
-            quant_type=QuantType.per_1x32,
-            scale_dim=hidden_dim // 32,
-            scale_type_size=torch.float8_e8m0fnu.itemsize,
-        )
-    return MoriDispatchFormat(
-        dtype=in_dtype,
-        quant_type=None,
-        scale_dim=0,
-        scale_type_size=torch.float32.itemsize,
-    )
+# Decode launch geometry switches above this many tokens on the rank; see
+# MoriPrepareAndFinalize._get_dispatch_config.
+_DECODE_SMALL_TOKENS = 48
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
@@ -85,7 +37,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         mori_ops: list[Any],
         max_tokens_per_rank: int,
         num_dispatchers: int,
-        dispatch_format: MoriDispatchFormat,
+        dispatch_format: RoutedRowsWire,
         *,
         low_latency: bool,
         internode: bool,
@@ -106,19 +58,22 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.quant_dtype = quant_dtype
         self._use_split_send_recv = low_latency and not internode
 
-    # Derived from the resolved format so there is no second copy to keep in
-    # sync with the staging config.
-    @property
-    def use_fp4_dispatch(self) -> bool:
-        return self.dispatch_format.is_fp4
-
-    @property
-    def use_fp8_dispatch(self) -> bool:
-        return self.dispatch_format.is_fp8
-
     @property
     def quant_type(self):
         return self.dispatch_format.quant_type
+
+    def _in_wire(
+        self, a1: torch.Tensor, x_scale: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`a1` as dispatch sends it: quantized here, or already in the wire
+        (a gathered routed row) with its `x_scale`."""
+        if x_scale is None:
+            return self.dispatch_format.quantize(a1)
+        assert a1.dtype == self.dispatch_format.dtype, (
+            f"a1 arrived as {a1.dtype} with scales, the wire is "
+            f"{self.dispatch_format.dtype}"
+        )
+        return a1, x_scale
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -163,12 +118,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         MI308X) leaves the surplus blocks unscheduled -> the barrier never
         completes -> warmup deadlocks. Capping at multi_processor_count keeps
         big-CU GPUs (MI300X/MI355X, >=128 CU) at 128 with no perf loss.
+
+        Decode by this rank's token count, measured on MI355X EP2 (V4.1,
+        hidden 5120, top-6): 128x8 is the fastest up to 48 tokens, 256x16 from
+        96 on (384 tokens: 185 us a dispatch+combine round against 210 at the
+        64x4 this replaced).
         """
         mp = get_cu_num()
         context = get_forward_context().context
         if context.is_prefill:
             return min(128, mp), 16
-        return min(64, mp), 4
+        if num_tokens is not None and num_tokens <= _DECODE_SMALL_TOKENS:
+            return min(128, mp), 8
+        return min(256, mp), 16
 
     # ---- Synchronous (non-TBO) path ----
 
@@ -182,6 +144,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         apply_router_weight_on_input: bool,
         quant_config: FusedMoEQuantConfig,
         quant_type: QuantType = QuantType.No,
+        x_scale: torch.Tensor | None = None,
     ) -> mk.PrepareResultType:
         """
         Returns a tuple of:
@@ -196,18 +159,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
-        scale = None
-        if self.use_fp4_dispatch:
-            from aiter import get_hip_quant
-
-            quant_func = get_hip_quant(self.quant_type or quant_type)
-            a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
-        elif self.use_fp8_dispatch:
-            from aiter import get_hip_quant
-
-            quant_func = get_hip_quant(quant_type)
-            a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
-
+        a1, scale = self._in_wire(a1, x_scale)
         block_num, warp_per_block = self._get_dispatch_config(a1.shape[0])
 
         (
@@ -271,45 +223,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         num_experts: int,
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
+        x_scale: torch.Tensor | None = None,
     ) -> mk.ReceiverType:
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
 
-        scale = None
-        if self.use_fp4_dispatch:
-            from aiter import get_hip_quant
-
-            num_tokens = a1.shape[0]
-            if num_tokens > 0:
-                quant_func = get_hip_quant(self.quant_type or QuantType.per_1x32)
-                a1, scale = quant_func(a1, quant_dtype=dtypes.fp4x2)
-            else:
-                hidden_size = a1.shape[1] if a1.dim() > 1 else 0
-                a1 = torch.empty(a1.shape, dtype=dtypes.fp4x2, device=a1.device)
-                # per_1x32 emits e8m0 scales, one byte each -- must match the
-                # scale_type_size handed to MoRI in moe.py.
-                scale = torch.empty(
-                    (0, hidden_size // 32),
-                    dtype=torch.float8_e8m0fnu,
-                    device=a1.device,
-                )
-        elif self.use_fp8_dispatch:
-            from aiter import get_hip_quant
-
-            num_tokens = a1.shape[0]
-            if num_tokens > 0:
-                quant_func = get_hip_quant(QuantType.per_1x128)
-                a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
-            else:
-                hidden_size = a1.shape[1] if a1.dim() > 1 else 0
-                a1 = torch.empty(a1.shape, dtype=dtypes.fp8, device=a1.device)
-                scale = torch.empty(
-                    (0, hidden_size // 128),
-                    dtype=torch.float32,
-                    device=a1.device,
-                )
-
+        a1, scale = self._in_wire(a1, x_scale)
         if self._use_split_send_recv:
             return self._prepare_async_ll(a1, topk_weights, topk_ids, scale)
         return self._prepare_async_comm_stream(a1, topk_weights, topk_ids, scale)

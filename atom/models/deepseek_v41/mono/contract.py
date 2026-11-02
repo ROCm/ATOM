@@ -61,16 +61,27 @@ def k1_regions(key: k1.AttnPreBuild) -> list[RegionDecl]:
     return regions
 
 
-def indexer_regions(bound_max: int) -> list[RegionDecl]:
+def indexer_regions(bound_max: int, tok_par: bool) -> list[RegionDecl]:
     """The indexer's: the scores, then per kind (sel, blk) a stage a tree level,
     each level but the last putting its lists for the next. A token's selection
     is final at the level its bound reaches (``index_plan.final_level``), so any
-    sel level may put its ready flag."""
-    sel_levels = range(ip.top_level("sel", bound_max) + 1)
-    regions = [
-        RegionDecl("isf", S, "k2a.iscore"),
-        RegionDecl("irdy", S, tuple(f"k2a.isel{lv}" for lv in sel_levels)),
-    ]
+    sel level may put its ready flag. In a token-parallel launch a row's owner
+    puts its flags on every rank, the candidate blocks' too (ICRDY, awaited by
+    ``k2a.icwait``)."""
+
+    def finals(kind):
+        return tuple(
+            f"k2a.i{kind}{lv}" for lv in range(ip.top_level(kind, bound_max) + 1)
+        )
+
+    regions = [RegionDecl("isf", S, "k2a.iscore")]
+    if tok_par:
+        regions += [
+            RegionDecl("irdy", P, finals("sel")),
+            RegionDecl("icrdy", P, finals("blk")),
+        ]
+    else:
+        regions += [RegionDecl("irdy", S, finals("sel"))]
     for kind in ip.KINDS:
         regions += [
             RegionDecl(f"i{kind}{lv}", S, f"k2a.i{kind}{lv}")
@@ -82,7 +93,9 @@ def indexer_regions(bound_max: int) -> list[RegionDecl]:
 def k2a_regions(key: k2a.AttnPostBuild) -> list[RegionDecl]:
     """K2a's: (a selecting layer) the indexer, then attn_score, irq, wo_a,
     wo_b (pushing the all-reduce's partials), slice, gate, norm."""
-    regions = indexer_regions(key.index_bound_max) if key.index_bound_max else []
+    regions = (
+        indexer_regions(key.index_bound_max, key.tok_par) if key.index_bound_max else []
+    )
     return regions + [
         RegionDecl("am", S, "k2a.attn_score"),
         RegionDecl("al", S, "k2a.attn_score"),
@@ -145,12 +158,18 @@ if __name__ == "__main__":
             check_k1(k1.AttnPreBuild(tokens=s, feeds_index=feeds_index, index_fp4=fp4))
         for bound, fp4 in ((0, False), (65536, False), (65536, True)):
             check_k2(k2.LayerPostBuild(tokens=s, index_bound_max=bound, index_fp4=fp4))
+        # an FP8 pool: the window row's bytes, the attention's dequant
+        check_k1(k1.AttnPreBuild(tokens=s, kv_fp8=True))
+        check_k2(k2.LayerPostBuild(
+            tokens=s, index_bound_max=65536, index_fp4=True, kv_fp8=True
+        ))  # fmt: skip
         if s % 4 == 0 and s >= 12:
             for feeds_index in (False, True):
                 check_k1(k1.AttnPreBuild(
                     tokens=s, feeds_index=feeds_index, index_fp4=feeds_index,
                     tok_par=True,
                 ))  # fmt: skip
+            check_k1(k1.AttnPreBuild(tokens=s, tok_par=True, kv_fp8=True))
             check_k2(k2.LayerPostBuild(
                 tokens=s, index_bound_max=65536, index_fp4=True, tok_par=True
             ))  # fmt: skip

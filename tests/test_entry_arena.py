@@ -219,6 +219,42 @@ class TestALayerMajorArenaCannotFillSomeoneElsesBuffer:
             LayerMajorArena(fields, 3, device="cpu", buf=buf)
 
 
+def qsa_like_fields(block=4):
+    """Shaped after Qwen3.8's QSA arena, scaled down."""
+    return [
+        EntryField("k", 2, (block, 2, 8), torch.bfloat16),
+        EntryField("v", 2, (block, 2, 8), torch.bfloat16),
+        EntryField("index_raw", 2, (block, 1, 4), torch.bfloat16),
+        EntryField("index_compressed", 2, (block // 4, 1, 4), torch.bfloat16),
+    ]
+
+
+def test_a_layer_major_arena_publishes_one_region_per_field_layer():
+    """The walk `MhaKvPool`, `MlaKvPool` and Qwen3.8's QSA arena share: role
+    names and order as the MHA pool always published them, at the views."""
+    arena = LayerMajorArena(qsa_like_fields(), entries=5, device="cpu")
+    expected = [
+        (view[layer].data_ptr(), view[layer].stride(0) * view.element_size())
+        for field in arena.fields
+        for view in (arena.view(field.name),)
+        for layer in range(field.layers)
+    ]
+    regions = arena.region_tensors()
+    assert [role for role, _ in regions] == [
+        f"{field.name}.layer_{layer}"
+        for field in arena.fields
+        for layer in range(field.layers)
+    ]
+    assert (
+        [
+            (tensor.data_ptr(), tensor.stride(0) * tensor.element_size())
+            for _, tensor in regions
+        ]
+        == arena.region_layout()
+        == expected
+    )
+
+
 class TestMixedDtypes:
 
     def test_fields_may_differ_in_dtype(self):

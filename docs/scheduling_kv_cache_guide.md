@@ -184,21 +184,60 @@ class ScheduledBatch:
 
 Returned by the model runner after a forward pass:
 
-```python
-class ScheduledBatchOutput:
-    def __init__(
-        self,
-        token_ids: dict[int, tuple[int, ...]],
-        draft_token_ids,
-    ):
-        self.req_ids = list(token_ids.keys())
-        self.token_ids = token_ids        # {seq_id: (accepted_token_ids...)}
-        self.draft_token_ids = draft_token_ids  # {seq_id: [draft_ids]} or None
-```
+| Field | Contents |
+| --- | --- |
+| `req_ids` | Request IDs corresponding to the rows of accepted output |
+| `token_ids` | Accepted token tuples, aligned with `req_ids`; `get_idx(req_id)` finds a request's row |
+| `draft_token_ids` | Optional NumPy array of speculative draft tokens |
+| `num_rejected`, `num_bonus` | Optional NumPy arrays of per-request speculative rejection and bonus counts |
+| `is_deferred_out`, `is_prev_prefill` | Deferred-output and previous-prefill state |
+| `logprobs` | Optional sampled-token log probabilities |
+| `dspark_ell` | Optional request-ID-to-verification-length map from the DSpark scheduler |
 
-- `token_ids` maps sequence ID to a tuple of accepted token IDs.
-- `draft_token_ids` maps sequence ID to a list of speculative draft token IDs for the next step (when MTP is active).
-- A special key `-1` in `token_ids` signals deferred output mode.
+The output owns the storage of `draft_token_ids`, `num_rejected`, and
+`num_bonus`. The constructor copies non-owning NumPy views and retains
+already-owned arrays and `None`. This prevents the transport thread from
+holding the last reference to pinned PyTorch storage and paying its allocator
+release cost while replacing a previous result.
+
+#### Deferred output transfers
+
+| Module | Responsibility |
+| --- | --- |
+| `model_engine/output_transfer.py` | FIFO transfers, reusable pinned slots and completion events, and independent NumPy snapshots |
+| `spec_decode/status.py` | Copy the two packed speculative status rows into independently owned arrays in scheduler order |
+| `model_engine/model_runner.py` | Provide contiguous status counts and consume outputs at the existing scheduling boundaries |
+| `model_engine/scheduler.py` | Enforce the output object's storage-ownership contract |
+
+Each D2H slot has fixed capacity based on the server's `max_num_seqs`, with a
+floor of two requests for the existing block-drafter warmup. Draft capacity is
+that request limit times `num_speculative_tokens`; status capacity is twice
+the request limit. Slots are allocated on first use, and their number is bounded
+by peak outstanding outputs. Only the active batch region is copied. Changing
+batch size reuses the same allocation; exceeding capacity is an error. A dtype
+change replaces a free slot. No additional GPU staging buffer is allocated.
+
+The queue keeps each pending slot until receiving it has waited for D2H and
+copied its active NumPy output. The slot and its completed event can then be
+reused; no per-transfer handle is allocated. Already received arrays remain
+valid after later copies or processor cleanup. Each slot caches only its current
+shape's views, so changing batch sizes does not retain a growing view cache.
+
+Both prefill and verification submit contiguous `[bonus, rejected]` rows with
+one D2H operation and one completion event. Verification uses the final
+post-broadcast verdict, excluding its GPU-only anchor. Prefill views a persistent
+flat zero buffer, slicing before reshaping to keep the active rows contiguous.
+Neither path launches a packing kernel. `SpecStatusQueue` specializes only the
+snapshot: it copies each row once and returns `(rejected, bonus)` in scheduler
+order. Each returned row owns its storage, so `ScheduledBatchOutput` does not
+copy it a second time.
+
+Draft IDs use a separate queue. Their transfer waits on the producer stream;
+the next draft graph replay still follows a target forward, preserving the
+existing overlap. Ordinary sampled-token and logprob transfers are unchanged.
+
+`token_ids` contains accepted-token rows, not the runner's intermediate mapping:
+the runner extracts the deferred-output sentinel before constructing this object.
 
 ## Block manager
 

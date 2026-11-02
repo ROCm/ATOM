@@ -630,6 +630,24 @@ def test_mesh_setup_builds_once_and_passes_a_reusable_binary_path(tmp_path):
         assert result.stdout.strip() == expected
     assert len(calls.read_text().splitlines()) == 1
 
+    log_root = tmp_path / "log root"
+    default_env = {
+        key: value for key, value in env.items() if key != "ATOMESH_MESH_TARGET_DIR"
+    }
+    command[3] = str(log_root / "cell-run" / "slurm_job-124")
+    command[-1] = "124"
+    result = subprocess.run(
+        command, env=default_env, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    host = subprocess.run(
+        ["hostname", "-s"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    cache = log_root / ".mesh-cache" / f"{host}-{os.getuid()}"
+    assert cache.is_dir()
+    recorded = json.loads(calls.read_text().splitlines()[-1])
+    assert f"{cache}:/mesh-cache" in recorded
+
 
 @pytest.mark.skipif(
     not os.environ.get("ATOMESH_TEST_PROMETHEUS_BIN"),

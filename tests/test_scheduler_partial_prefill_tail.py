@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 from conftest import MockConfig
 
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -52,7 +53,7 @@ class _VetoDelayer:
         return False
 
     def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
-        return False
+        return PrefillDecision(allow=False, prefillable_ranks=int(prefillable))
 
 
 class TestSkippedPartialPrefillGoesToTail:

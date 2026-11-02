@@ -60,14 +60,9 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "indexer_types",
 }
 # GDN/linear model types carrying a per-request recurrent state but NOT in the
-# `kimi_linear` family `kimi_k3` owns. Same set as `attn_family` resolves to
-# `Family.GDN`, but note the attribute skew: the guard below reads
-# `hf_config.model_type` while `attn_family` reads the text config. On the
-# native path they agree only because `get_hf_config` flattens the text type
-# up; `is_vllm()` drops `qwen3_5`/`qwen3_5_moe` from that flatten, so if
-# offload is ever wired into plugin mode this guard must switch to the text
-# config to stay in sync.
-# Unreachable today -- no plugin caller passes a `kv_transfer_config`.
+# `kimi_linear` family `kimi_k3` owns: what `attn_family` resolves to
+# `Family.GDN` or `Family.QSA_GDN`. Matched against the text config's
+# `model_type`, the attribute `attn_family` reads.
 # MiniMax-M3 is not here either: it is sparse *paged* attention
 # (`MiniMaxM3SparseForCausalLM` -> `SparseMHAPagedAttentionImpl`), no recurrent
 # state, so it is NOT a GDN/linear model. It does get its own PAGE-only `m3`
@@ -80,9 +75,6 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
         "qwen3_next_mtp",
         "qwen3_5_text",
         "qwen3_5_moe_text",
-        # Qwen3.8 publishes its QSA arena as the PAGE image and appends PLE
-        # to the same GDN checkpoint. The tier is still `qwen`.
-        "qwen4_exp",
         "qwen4_exp_text",
     }
 )
@@ -388,6 +380,13 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
+    from atom.utils import get_hf_text_config
+    from atom.utils.selector import Family, attn_family
+
+    if attn_family(get_hf_text_config(hf)) is Family.QSA_GDN:
+        from atom.model_ops.attentions.qwen4_exp_attn import qsa_page_segments
+
+        document.update(qsa_page_segments(config))
     canonical = json.dumps(
         document,
         sort_keys=True,
@@ -457,7 +456,7 @@ def build_lmcache_config(
 
 
 def lmcache_engine_id(config) -> str:
-    """Return the LMCache engine id for this process, namespaced by DP rank.
+    """Return the LMCache engine id for this process: one per server and DP rank.
 
     A scheduler's ``LookupClient`` and its workers' ``LookupServer`` derive the
     same ZMQ ipc socket path from this id, so it must be identical inside one
@@ -470,27 +469,17 @@ def lmcache_engine_id(config) -> str:
     ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
     ``tensor_parallel_size == 1``.
 
-    The DP rank alone only separates replicas of one server. The socket lives
-    under a fixed host directory (``/tmp/vllm_rpc`` without vLLM), so two
-    servers on one host -- one per GPU is the usual way to serve a TP1 model --
-    both bind ``dp0``; each bind takes the path over, and a scheduler connects
-    to whichever server bound last. Its loads then follow another server's
-    hits. ``config.port`` is the model runner's rendezvous port (MASTER_PORT),
-    which no two servers on a host can share, and every process of one server
-    carries the same value, so it tells servers apart without splitting a
-    replica.
+    The socket lives under a fixed host directory, so two servers on one host
+    would both bind ``dp0`` and a scheduler would follow the other server's
+    hits. ``data_parallel_base_port`` (the runners' TCPStore port, bound by
+    ``CoreManager`` for the server's lifetime) tells servers apart; unresolved
+    (0), the DP rank alone is used. The id is not part of a chunk's key.
     """
-    dp_rank = int(
-        getattr(
-            getattr(config, "parallel_config", None),
-            "data_parallel_rank",
-            0,
-        )
-        or 0
-    )
-    port = getattr(config, "port", None)
-    if isinstance(port, int) and port > 0:
-        return f"atom-offload-p{port}-dp{dp_rank}"
+    parallel = getattr(config, "parallel_config", None)
+    dp_rank = int(getattr(parallel, "data_parallel_rank", 0) or 0)
+    port = int(getattr(parallel, "data_parallel_base_port", 0) or 0)
+    if port:
+        return f"atom-offload-r{port}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 
 

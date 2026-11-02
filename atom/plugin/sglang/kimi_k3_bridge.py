@@ -26,6 +26,30 @@ def _is_kimi_k3_owner(owner: Any) -> bool:
     return is_kimi_k3_config(getattr(model_config, "hf_config", None))
 
 
+def _kimi_k3_pool_latent_dims(pool: Any) -> tuple[int, int]:
+    """Return the K/V widths SGLang actually allocated.
+
+    0.5.19 hybrid pools are MHA buffers with ``head_dim`` / ``v_head_dim``.
+    0.5.20 allocates an ``MLATokenToKVPool`` whose latent width is
+    ``kv_cache_dim`` and which has no separate V head.
+    """
+    if hasattr(pool, "head_dim"):
+        k_dim = int(pool.head_dim)
+        return k_dim, int(getattr(pool, "v_head_dim", k_dim))
+    kv_dim = getattr(pool, "kv_cache_dim", None)
+    if kv_dim is None:
+        buffers = getattr(pool, "kv_buffer", None)
+        if buffers:
+            kv_dim = int(buffers[0].shape[-1])
+    if kv_dim is None:
+        raise RuntimeError(
+            "Kimi-K3 KV pool ABI mismatch: cannot read latent width from "
+            f"{type(pool).__name__}"
+        )
+    width = int(kv_dim)
+    return width, width
+
+
 def _kimi_k3_mem_fraction_already_restored(ctx: Any) -> bool:
     # 0.5.20: overrides_log is a method (not a property). Prefer the public
     # API; fall back to the private list for older trees / plain mocks.
@@ -216,14 +240,11 @@ def install_kimi_k3_pool_patch() -> None:
         full_pool = getattr(pool, "full_kv_pool", pool)
         if full_pool is None:
             raise RuntimeError("Kimi-K3 SGLang full-attention KV pool is missing")
-        if (
-            int(full_pool.head_dim) != KIMI_K3_MLA_CACHE_ENTRY_DIM
-            or int(full_pool.v_head_dim) != KIMI_K3_MLA_CACHE_ENTRY_DIM
-        ):
+        k_dim, v_dim = _kimi_k3_pool_latent_dims(full_pool)
+        if k_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM or v_dim != KIMI_K3_MLA_CACHE_ENTRY_DIM:
             raise RuntimeError(
                 "Kimi-K3 KV pool ABI mismatch: "
-                f"K={full_pool.head_dim}, V={full_pool.v_head_dim}, "
-                "expected "
+                f"K={k_dim}, V={v_dim}, expected "
                 f"{KIMI_K3_MLA_CACHE_ENTRY_DIM}/{KIMI_K3_MLA_CACHE_ENTRY_DIM}"
             )
         req_pool = pools.req_to_token_pool
@@ -476,6 +497,106 @@ def _build_block_table(
     )
 
 
+def _sglang_mla_work_metadata(forward_metadata: Any) -> torch.Tensor | None:
+    """SGLang names this buffer ``work_metadata``; ATOM reads ``work_meta_data``."""
+
+    for name in ("work_meta_data", "work_metadata"):
+        value = getattr(forward_metadata, name, None)
+        if torch.is_tensor(value):
+            return value
+    return None
+
+
+def retarget_kimi_k3_decode_mla_plan(
+    forward_metadata: Any,
+    *,
+    batch_size: int,
+    num_heads: int,
+    dtype_q,
+    dtype_kv,
+    fast_mode: bool,
+    intra_batch_mode: bool,
+    max_split_per_batch: int | None,
+) -> bool:
+    """Rewrite SGLang's persistent MLA plan onto ATOM's per-token pages.
+
+    PR #1821 attached SGLang's decode plan unchanged. ``make_mla_meta_data``
+    builds that plan with ``kv_granularity=page_size`` (128 on this server)
+    and stores it on ``ForwardMetadata.work_metadata``. ATOM's K3 kernel, with
+    ``ATOM_MLA_PAGE_SIZE=1``, reads ``work_meta_data`` and consumes one KV slot
+    per index at granularity 16. The old lookup never saw SGLang's buffer, so
+    the 128-granularity plan stayed in place: padding no longer clobbers slot
+    0, but decode still attends the wrong tokens.
+
+    ``get_mla_metadata_v1`` writes the existing work buffers in place, so a
+    captured CUDA graph keeps its pointers and only the contents change.
+    """
+
+    if forward_metadata is None or batch_size <= 0:
+        return False
+    kv_indptr = getattr(forward_metadata, "kv_indptr", None)
+    work_metadata = _sglang_mla_work_metadata(forward_metadata)
+    work_buffers = (
+        work_metadata,
+        getattr(forward_metadata, "work_info_set", None),
+        getattr(forward_metadata, "work_indptr", None),
+        getattr(forward_metadata, "reduce_indptr", None),
+        getattr(forward_metadata, "reduce_final_map", None),
+        getattr(forward_metadata, "reduce_partial_map", None),
+        kv_indptr,
+    )
+    if not all(torch.is_tensor(buf) for buf in work_buffers):
+        return False
+    last_page = getattr(forward_metadata, "kv_last_page_len", None)
+    if not torch.is_tensor(last_page) or int(last_page.numel()) < batch_size:
+        return False
+
+    # Page size 1 means every occupied page holds one token.
+    last_page[:batch_size].fill_(1)
+    qo = getattr(forward_metadata, "qo_indptr", None)
+    if torch.is_tensor(qo) and int(qo.numel()) >= batch_size + 1:
+        qo_indptr = qo[: batch_size + 1]
+        qo_indptr.copy_(
+            torch.arange(batch_size + 1, dtype=qo_indptr.dtype, device=qo_indptr.device)
+        )
+    else:
+        qo_indptr = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=kv_indptr.device
+        )
+
+    from aiter import get_mla_metadata_v1
+
+    get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr[: batch_size + 1],
+        last_page[:batch_size],
+        max(int(num_heads), 16),
+        1,
+        True,
+        work_metadata,
+        forward_metadata.work_info_set,
+        forward_metadata.work_indptr,
+        forward_metadata.reduce_indptr,
+        forward_metadata.reduce_final_map,
+        forward_metadata.reduce_partial_map,
+        page_size=1,
+        kv_granularity=16,
+        max_seqlen_qo=1,
+        uni_seqlen_qo=1,
+        fast_mode=fast_mode,
+        max_split_per_batch=(
+            -1 if max_split_per_batch is None else int(max_split_per_batch)
+        ),
+        intra_batch_mode=intra_batch_mode,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
+    )
+    # The captured kernel and ATOM's decode path both have to see this buffer.
+    forward_metadata.work_metadata = work_metadata
+    forward_metadata.work_meta_data = work_metadata
+    return True
+
+
 def _attach_sglang_mla_metadata(metadata: Any) -> Any:
     """Reuse the active SGLang backend's graph-stable MLA decode buffers."""
 
@@ -496,7 +617,7 @@ def _attach_sglang_mla_metadata(metadata: Any) -> Any:
     metadata.kv_indptr = getattr(forward_metadata, "kv_indptr", None)
     metadata.kv_indices = getattr(forward_metadata, "kv_indices", None)
     metadata.kv_last_page_lens = getattr(forward_metadata, "kv_last_page_len", None)
-    metadata.work_meta_data = getattr(forward_metadata, "work_meta_data", None)
+    metadata.work_meta_data = _sglang_mla_work_metadata(forward_metadata)
     metadata.work_info_set = getattr(forward_metadata, "work_info_set", None)
     metadata.work_indptr = getattr(forward_metadata, "work_indptr", None)
     metadata.reduce_indptr = getattr(forward_metadata, "reduce_indptr", None)
@@ -600,6 +721,14 @@ def build_kimi_k3_attention_metadata(
         metadata.dtype_q = dtype_q
         return _attach_sglang_mla_metadata(metadata)
 
+    num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+    real_bs = max(bs - num_padding, 0)
+    if num_padding > 0:
+        # Graph / DP padding rows arrive as seq_len=1 with out_cache_loc on
+        # request 0. Zero the length and invalidate the write slot in place
+        # on the tensors this metadata publishes.
+        seq_lens = seq_lens.clone()
+        seq_lens[real_bs:].zero_()
     max_seq_len = (
         int(req_to_token_pool.req_to_token.shape[1])
         if _is_stream_capturing()
@@ -617,6 +746,9 @@ def build_kimi_k3_attention_metadata(
         max_seq_len=max_seq_len,
     )
     slot_mapping = forward_batch.out_cache_loc[:bs]
+    if num_padding > 0 and torch.is_tensor(slot_mapping):
+        slot_mapping = slot_mapping.clone()
+        slot_mapping[real_bs:].fill_(-1)
     metadata = AttentionMetaData(
         cu_seqlens_q=torch.arange(
             0, bs + 1, dtype=torch.int32, device=positions.device

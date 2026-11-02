@@ -13,10 +13,13 @@ from rtp_llm.model_factory_register import (
     _model_factory,
     register_model,
 )
+from rtp_llm.openai.renderer_factory_register import register_renderer
+from rtp_llm.openai.renderers.qwen35_renderer import Qwen35Renderer
 
+from atom.plugin.rtpllm.models import qwen4_exp_vision  # noqa: F401
 from atom.plugin.rtpllm.models.glm5 import ATOMGlm5Moe
 from atom.plugin.rtpllm.models.qwen3_5 import ATOMQwen35Moe
-from atom.plugin.rtpllm.models.qwen4_exp import ATOMQwen4Exp
+from atom.plugin.rtpllm.models.qwen4_exp import ATOMQwen4Exp, ATOMQwen4ExpMTP
 
 
 def _register_atom_qwen35_moe() -> None:
@@ -42,3 +45,5 @@ _register_atom_glm5_moe()
 
 # Qwen3.8-Flash-Next uses the Qwen4Exp architecture, not Qwen3.5-MoE.
 register_model("atom_qwen4_exp", ATOMQwen4Exp, ["Qwen4ExpForConditionalGeneration"])
+register_model("atom_qwen4_exp_mtp", ATOMQwen4ExpMTP, [])
+register_renderer("atom_qwen4_exp", Qwen35Renderer)

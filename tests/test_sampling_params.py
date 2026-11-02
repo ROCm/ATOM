@@ -53,3 +53,10 @@ class TestSamplingParamsCustom:
     def test_n_negative_rejected(self):
         with pytest.raises(ValueError, match="n must be >= 1"):
             SamplingParams(n=-3)
+
+    def test_top_k_zero_means_disabled(self):
+        assert SamplingParams(top_k=0).top_k == -1
+
+    def test_top_k_negative_other_than_minus_one_rejected(self):
+        with pytest.raises(ValueError, match="top_k must be"):
+            SamplingParams(top_k=-2)

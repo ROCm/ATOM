@@ -16,6 +16,7 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine import block_manager as bm_module
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -41,7 +42,7 @@ class _Delayer:
         self.reported.append(prefill_cost)
         self.pending.append(pending_tokens)
         self.rank_prefill_costs = [prefill_cost, *self.others]
-        return True
+        return PrefillDecision(allow=True, prefillable_ranks=1 + len(self.others))
 
 
 def _sched(

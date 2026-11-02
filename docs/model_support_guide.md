@@ -4,7 +4,7 @@ ATOM (AiTer Optimized Model) is AMD's lightweight LLM inference engine built on 
 
 ## Quick Reference
 
-The model registry lives in `atom/model_engine/model_runner.py` as `support_model_arch_dict`:
+The model registry lives in `atom/models/registry.py` as `support_model_arch_dict`:
 
 ```python
 support_model_arch_dict = {
@@ -155,14 +155,14 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **KDA Recurrent State:** The KDA layers keep per-request recurrent state in the generic per-request slot pool, like Qwen3-Next's Gated DeltaNet.
 - **MoE:** MXFP4 latent MoE (`KimiSparseMoeBlock`) with SiTU activation and optional dual-stream shared/routed overlap (`ATOM_K3_SHARED_EXPERT_OVERLAP`).
 - **Vision:** `atom/models/kimi_k3_vl.py` implements MoonViT3d — patch embed with a bilinearly resampled learnable position grid, 27 blocks with packed `wqkv` and complex 2D RoPE over non-causal varlen attention, then an `sd2_tpool` 2x2 merge and a `patchmergerv2` projector into the 7168-wide text space. Replicated per TP rank (~0.9 GB bf16), built only on the first pipeline rank.
-- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
+- **Image tokens:** The HF processor emits one `<|media_pad|>` per image and expands it inside the model. ATOM instead expands it during input processing (`build_kimi_k3_inputs` in `atom/models/kimi_k3/image_processing.py`, using the shared helper in `atom/multimodal/processing.py`) so the scheduler, KV blocks and positions see the true prompt length. Multimodal prefills are consequently never chunked.
 
 ### DeepSeek-V4.1 (`DeepseekV41ForCausalLM`)
 
 - **Architecture:** Its own package, `atom/models/deepseek_v41/`, rather than a reshape of V4 — CSA2 attention topology with compressor/indexer ownership per layer, single-pass mHC, Engram n-gram memory and an optional vision tower. The V4 BF16 sparse attention and inverse RoPE kernels are reused unmodified.
 - **Cache:** A paged main KV plane plus an index plane: `index_cache_dtype="fp8"` (default), or `"fp4"` -- the official E2M1 + E8M0 arithmetic in `flydsl_pa_mqa_logits_fp4_rowgroup`'s page-8 layout, values and scales in two planes (`atom/model_ops/deepseek_v41/index_plane.py`), written by aiter's fused `k_norm_rope_mxfp4_cache`. The runtime refuses any other format before loading weights. Main storage takes `bf16` or a packed `fp4` layout. Geometry is declared in `atom/model_ops/attentions/pool_layout/v41_pool_geometry.py` with no model or scheduler imports.
 - **MoE:** V4's `FusedMoE`, subclassed only to flatten the offline caller's batch dimension and declare `bias_vl`. There is no second expert backend.
-- **Graphs:** `CUDAGraphMode.FULL` captures the whole decode forward, one graph per `(batch size, query bucket)`; `PIECEWISE` records the dense pieces with attention eager between them. `torch.compile` is not supported.
+- **Graphs:** `CUDAGraphMode.FULL` captures the whole decode forward, one graph per `(batch size, query bucket)`; `TR_HYBRID` records token graphs with attention eager between their segments. `torch.compile` is not supported.
 - **Speculation:** Native DSpark proposes five tokens from the checkpoint's three draft stages. Implemented and tested, with quality acceptance still open — see [the DSpark guide](deepseek_v41_dspark.md).
 - **Guides:** [runtime](deepseek_v41_runtime.md), [cache format and graphs](deepseek_v41_performance.md), [protocol](deepseek_v41_protocol.md), [image requests](deepseek_v41_vision.md), [DSpark](deepseek_v41_dspark.md), [recipe](../recipes/DeepSeek-V4.1-Flash.md).
 
@@ -312,7 +312,7 @@ Each model typically defines three core module classes:
 
 ### Step 4: Register the model
 
-Add an entry to `support_model_arch_dict` in `atom/model_engine/model_runner.py`:
+Add an entry to `support_model_arch_dict` in `atom/models/registry.py`:
 
 ```python
 support_model_arch_dict = {
@@ -403,7 +403,8 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 
 | File | Description |
 |------|-------------|
-| `atom/model_engine/model_runner.py` | Model registry (`support_model_arch_dict`) and `ModelRunner` class |
+| `atom/models/registry.py` | Model registry (`support_model_arch_dict`) and mono decode installers (`mono_decode_installers`) |
+| `atom/model_engine/model_runner.py` | `ModelRunner` class |
 | `atom/models/llama.py` | Llama model: `LlamaForCausalLM`, `LlamaModel`, `LlamaDecoderLayer`, `LlamaAttention`, `LlamaMLP` |
 | `atom/models/qwen3.py` | Qwen3 model: `Qwen3ForCausalLM`, `Qwen3Model`, `Qwen3DecoderLayer`, `Qwen3Attention`, `Qwen3MLP` |
 | `atom/models/qwen3_moe.py` | Qwen3-MoE model: `Qwen3MoeForCausalLM`, `Qwen3MoeModel`, `Qwen3MoeDecoderLayer`, `Qwen3MoeAttention`, `Qwen3MoeSparseMoeBlock`, `Qwen3MoeMLP` |

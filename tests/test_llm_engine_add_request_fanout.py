@@ -14,6 +14,7 @@ that re-implemented "raise above n = 1" could not tell us whether the real one
 still does.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -117,6 +118,7 @@ class _GeneratingEngine:
         self._pending = True
         self.core_mgr = SimpleNamespace(
             reset_dp_router=lambda: None,
+            offline_backpressure_batch=lambda: nullcontext(),
             add_request=self._submitted.extend,
             get_output=self._get_output,
             is_alive=lambda: True,

@@ -17,6 +17,8 @@ import pytest
 import torch
 
 from atom.utils.forward_context import ForwardMode
+from atom.utils.region_graph import TokenGraph
+from atom.utils.tbo.ubatching import DPSyncResult
 
 # What `ModelRunner.capture_sizes_np` is: ascending int32, sorted where it is
 # built. `decide` searches it, so a test that passed a plain list would be
@@ -41,10 +43,13 @@ def _batch(*, seqs, tokens=None, prefill_tokens=0, q=1):
         # this stub's per-seq length the way `prepare_model` passes the shrink's.
         max_seqlen_q=q,
         is_dummy_run=False,
+        final_prefill_requests=lambda: 0,
     )
 
 
-def _decide(batch=None, **kw):
+def _decide(batch=None, captured_tokens=None, **kw):
+    """``captured_tokens``: the decode token buckets recorded, which `decide`
+    reads off `TokenGraph`."""
     base = {
         "batch": batch if batch is not None else _batch(seqs=8, q=1),
         "dp_size": 1,
@@ -52,7 +57,6 @@ def _decide(batch=None, **kw):
         "enforce_eager": False,
         "step_needs_eager": False,
         "capture_sizes": LADDER,
-        "captured_tokens": None,
         "is_block_drafter": False,
         "tbo_on": False,
         "local_tbo": (False, False, 0, 0),
@@ -61,7 +65,16 @@ def _decide(batch=None, **kw):
     # The batch no longer carries it -- `decide` is handed the step's per-seq
     # length, so the stub's `q` travels the same way production's does.
     merged.setdefault("max_seqlen_q", merged["batch"].max_seqlen_q)
-    return ForwardMode.decide(**merged)
+    merged.setdefault(
+        "running_tokens_per_dp_rank", np.zeros(merged["dp_size"], dtype=np.int32)
+    )
+    sizes = {"decode": tuple(captured_tokens or ())}
+    with mock.patch.object(
+        TokenGraph,
+        "captured_sizes",
+        staticmethod(lambda phase=None: sizes.get(phase, ())),
+    ):
+        return ForwardMode.decide(**merged)
 
 
 def _fake_sync(
@@ -110,7 +123,7 @@ def test_a_batch_the_ladder_cannot_hold_keeps_the_reduction_and_replays_nothing(
     """Running off the end of the ladder is the same fact twice: there is no
     recording that fits, so the batch stays what the reduction said and the
     step cannot replay. One lookup has to answer both, or a step dispatches
-    PIECEWISE at a width nothing recorded."""
+    TR_HYBRID at a width nothing recorded."""
     mode = _decide(_batch(seqs=100, q=1))
     assert mode.running_bs == 100 and not mode.use_cudagraph
 
@@ -140,21 +153,22 @@ def test_forcing_eager_changes_the_dispatch_and_not_the_batch():
 def test_a_width_nothing_recorded_declines_the_graph_and_not_the_batch():
     """Fitting the ladder settles only half of the lookup.
 
-    A recording is keyed by `(running_bs, max_seqlen_q)`. A P/D prefill
-    producer owns a drafter, so capture holds only the q=mtp_k+1 shapes, while
-    the scheduler never speculates for it and it decodes at q=1. Replaying on
+    A recording is keyed by its request bucket, `(running_bs, draft_num)`. A
+    P/D prefill producer owns a drafter, so capture holds only the
+    draft_num=mtp_k buckets, while the scheduler never speculates for it and
+    it decodes with no draft. Replaying on
     batch eligibility alone would claim a key nobody recorded. The batch is
     the same either way: this is the dispatch question, asked separately.
     """
-    producer = _decide(_batch(seqs=8, q=1), graph_shapes={(8, 4)})
+    producer = _decide(_batch(seqs=8, q=1), graph_shapes={(8, 3)})
     assert not producer.use_cudagraph and producer.running_bs == 8
 
-    recorded = _decide(_batch(seqs=8, q=1), graph_shapes={(8, 1)})
+    recorded = _decide(_batch(seqs=8, q=1), graph_shapes={(8, 0)})
     assert recorded.use_cudagraph and recorded.running_bs == 8
 
 
 def test_not_being_told_the_shapes_leaves_the_dispatch_to_the_ladder():
-    """`None` is "the caller cannot enumerate them" -- eager, PIECEWISE, or a
+    """`None` is "the caller cannot enumerate them" -- eager, TR_HYBRID, or a
     runner that has not captured yet -- and must not read as an empty set,
     which would force every step eager."""
     assert _decide(_batch(seqs=8, q=1), graph_shapes=None).use_cudagraph
@@ -169,13 +183,13 @@ def test_declining_a_graph_the_ladder_offered_is_reported_once(monkeypatch):
     logger = mock.Mock()
     monkeypatch.setattr(forward_context, "_logger", logger)
 
-    _decide(_batch(seqs=8, q=1), graph_shapes={(8, 1)})
-    _decide(_batch(seqs=8, q=1), graph_shapes={(8, 4)}, enforce_eager=True)
-    _decide(_batch(seqs=3, tokens=900, prefill_tokens=900), graph_shapes={(8, 4)})
+    _decide(_batch(seqs=8, q=1), graph_shapes={(8, 0)})
+    _decide(_batch(seqs=8, q=1), graph_shapes={(8, 3)}, enforce_eager=True)
+    _decide(_batch(seqs=3, tokens=900, prefill_tokens=900), graph_shapes={(8, 3)})
     logger.warning.assert_not_called()
 
     for _ in range(3):
-        _decide(_batch(seqs=8, q=1), graph_shapes={(8, 4)})
+        _decide(_batch(seqs=8, q=1), graph_shapes={(8, 3)})
     logger.warning.assert_called_once()
 
 
@@ -327,7 +341,7 @@ def test_a_flat_step_takes_the_bucket_and_not_a_product():
     )
     assert mode.running_bs == 16, "the batch still rounds onto the seq ladder"
     assert mode.running_tokens == 96, "smallest q-divisible bucket >= 60"
-    assert mode.piecewise_captured
+    assert mode.token_graph
 
 
 def test_a_rectangular_layout_never_takes_a_bucket_below_its_own_rectangle():
@@ -348,23 +362,23 @@ def test_no_fitting_bucket_declines_the_graph_rather_than_claiming_one():
     """The miss must not be reported as captured.
 
     `running_bs * q` is the fallback precisely because no bucket covered the
-    step, so it is not in the captured set either -- and dispatching PIECEWISE
+    step, so it is not in the captured set either -- and dispatching TR_HYBRID
     at a width nothing recorded makes the wrapper capture one mid-serve.
     """
     mode = _decide(
         _batch(seqs=10, q=6), captured_tokens=[12, 24], is_block_drafter=True
     )
     assert mode.running_tokens == 16 * 6
-    assert not mode.piecewise_captured
+    assert not mode.token_graph
 
 
 def test_the_rectangle_replays_only_when_it_was_captured():
     fits = _decide(
         _batch(seqs=8, q=2), captured_tokens=[16, 32], is_block_drafter=False
     )
-    assert fits.running_tokens == 16 and fits.piecewise_captured
+    assert fits.running_tokens == 16 and fits.token_graph
     misses = _decide(_batch(seqs=8, q=2), captured_tokens=[24], is_block_drafter=False)
-    assert misses.running_tokens == 16 and not misses.piecewise_captured
+    assert misses.running_tokens == 16 and not misses.token_graph
 
 
 # --------------------------------------------------------------------------- #
@@ -384,11 +398,11 @@ def _packed(*, scheduled_tokens, q, captured):
 
 
 def test_nothing_recorded_means_no_packed_width_to_land_on():
-    """Under FULL (non-PIECEWISE) cudagraphs nothing flat is recorded, so the
+    """Under FULL (non-TR_HYBRID) cudagraphs nothing flat is recorded, so the
     run has nowhere to land and the step stays rectangular."""
     for captured in ([], None):
         mode = _packed(scheduled_tokens=3, q=6, captured=captured)
-        assert mode.running_tokens == 1 * 6 and not mode.piecewise_captured
+        assert mode.running_tokens == 1 * 6 and not mode.token_graph
 
 
 def test_the_width_covers_the_run_and_tiles_it():
@@ -401,11 +415,11 @@ def test_the_width_covers_the_run_and_tiles_it():
 
     # Longer than anything recorded -> forwarded eagerly at its own length.
     over = _packed(scheduled_tokens=25, q=6, captured=captured)
-    assert over.running_tokens == 25 and not over.piecewise_captured
+    assert over.running_tokens == 25 and not over.token_graph
 
     # Covers the run but does not tile the per-seq rows at stride q.
     untiled = _packed(scheduled_tokens=3, q=6, captured=[10])
-    assert untiled.running_tokens == 1 * 6 and not untiled.piecewise_captured
+    assert untiled.running_tokens == 1 * 6 and not untiled.token_graph
 
 
 # --------------------------------------------------------------------------- #
@@ -495,3 +509,129 @@ def test_a_backend_that_publishes_none_is_not_invented_a_width_for():
     md.slot_mapping = None
     md.state_slot_out = None
     mode.assert_shape_contract(_ids(mode), md)
+
+
+def _graph_sync(across, prefill, tbo=False, eager=False):
+    return DPSyncResult(
+        scheduled_tokens_per_dp_rank=np.array(across, dtype=np.int32),
+        max_bs_across_dp=1,
+        any_rank_needs_eager=eager,
+        tbo_collective_active=tbo,
+        ub_max_tokens_across_dp=None,
+        ub_tokens_across_dp=None,
+        prefill_across_dp=tuple(bool(p) for p in prefill),
+    )
+
+
+BUCKETS = (128, 256, 384, 512)
+
+
+def _bucket(sync):
+    """The step's bucket and the running table it settles in place, on a
+    step graphable unless the group needs eager or splits into TBO."""
+    graphable = not (sync.any_rank_needs_eager or sync.tbo_collective_active)
+    running = np.full(len(sync.scheduled_tokens_per_dp_rank), -1, dtype=np.int32)
+    with mock.patch.object(
+        TokenGraph,
+        "captured_sizes",
+        staticmethod(lambda phase=None: BUCKETS if phase == "prefill" else ()),
+    ):
+        own = ForwardMode._pad_to_token_graph(graphable, sync, running)
+    return own, running.tolist()
+
+
+def test_one_rank_pads_its_prefill_to_the_smallest_bucket_that_holds_it():
+    """A group of one is a table of one row, padded like any other."""
+
+    def bucket(tokens):
+        return _bucket(_graph_sync([tokens], prefill=(1,)))
+
+    assert bucket(300) == (384, [384])
+    assert bucket(600) == (0, [600])
+
+
+def test_a_decoding_peer_replays_the_prefill_bucket_too():
+    """A peer decoding its own 6 rows beside a prefill pads them to the
+    prefill's bucket: running eagerly beside a replay hung the group."""
+    assert _bucket(_graph_sync([300, 6], prefill=(1, 0))) == (384, [384, 384])
+
+
+def test_the_bucket_holds_a_decode_larger_than_the_prefill():
+    assert _bucket(_graph_sync([100, 300], prefill=(1, 0))) == (384, [384, 384])
+
+
+def test_a_step_no_rank_prefills_replays_no_prefill_bucket():
+    """Decode steps keep their own recordings (`_running_tokens`)."""
+    assert _bucket(_graph_sync([6, 12], prefill=(0, 0))) == (0, [6, 12])
+
+
+def test_every_prefilling_rank_replays_the_groups_bucket():
+    """An idle peer's dummy prefill (one row) replays the prefilling rank's
+    bucket: ranks on different buckets hung the group."""
+    assert _bucket(_graph_sync([300, 1], (1, 1))) == (384, [384, 384])
+
+
+def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
+    for sync in (
+        _graph_sync([100, 50], (1, 0), tbo=True),
+        _graph_sync([100, 50], (1, 0), eager=True),
+        _graph_sync([100, 900], (1, 1)),
+    ):
+        own, running = _bucket(sync)
+        assert own == 0
+        assert running == sync.scheduled_tokens_per_dp_rank.tolist()
+
+
+# --------------------------------------------------------------------------- #
+# TBO decode: which batch a split step's micro-batches are cut from.          #
+# --------------------------------------------------------------------------- #
+
+SPLIT = (True, True, 2, 3)  # this rank can split, and it is worth splitting
+
+
+def test_without_tbo_recordings_a_split_decode_runs_eagerly_on_its_requests():
+    mode = _decide(_batch(seqs=5, q=1), tbo_on=True, local_tbo=SPLIT)
+    assert mode.tbo_collective_active and not mode.use_cudagraph
+    assert mode.ubatch_split_bs == 5
+
+
+def test_a_split_decode_replays_its_bucket_recorded_split():
+    """The bucket's recording cut its micro-batches at the bucket, so the step
+    lays them out there, not at the 5 requests it scheduled."""
+    mode = _decide(
+        _batch(seqs=5, q=1), tbo_on=True, local_tbo=SPLIT, tbo_decode_graphs=True
+    )
+    assert mode.use_cudagraph and mode.running_bs == 8
+    assert mode.ubatch_split_bs == 8
+
+
+def test_a_replayed_bucket_that_splits_is_split_whatever_this_rank_decided():
+    """Every rank replays the group's bucket; a rank whose own batch could not
+    split runs the same split recording as its peers."""
+    mode = _decide(_batch(seqs=3, q=1), tbo_on=True, tbo_decode_graphs=True)
+    assert not mode.tbo_collective_active and mode.use_cudagraph
+    assert mode.running_bs == 4 and mode.ubatch_split_bs == 4
+
+
+def test_a_bucket_too_small_to_split_replays_whole():
+    mode = _decide(_batch(seqs=2, q=1), tbo_on=True, tbo_decode_graphs=True)
+    assert mode.use_cudagraph and mode.ubatch_split_bs is None
+
+
+def test_eager_or_prefill_tbo_does_not_replay_a_split_recording():
+    eager = _decide(
+        _batch(seqs=5, q=1),
+        tbo_on=True,
+        local_tbo=SPLIT,
+        tbo_decode_graphs=True,
+        enforce_eager=True,
+    )
+    assert not eager.use_cudagraph and eager.ubatch_split_bs == 5
+    prefill = _decide(
+        _batch(seqs=3, tokens=900, prefill_tokens=900),
+        tbo_on=True,
+        local_tbo=(True, True, 450, 450),
+        tbo_decode_graphs=True,
+    )
+    assert prefill.tbo_collective_active and not prefill.req_graphs
+    assert prefill.ubatch_split_bs is None

@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Qwen MTP history recovery must equal execution of accepted tokens only."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,46 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+
+
+def test_qwen_mtp_does_not_import_deepseek_when_pcp_disabled(monkeypatch):
+    from atom.spec_decode import eagle_proposer
+
+    monkeypatch.setattr(eagle_proposer, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", None)
+    assert not eagle_proposer._pcp_active_for_draft_model(SimpleNamespace())
+
+
+def test_rtpllm_mtp_hooks_are_instance_scoped_without_rtp_import():
+    from atom.model_ops.attention_gdn import GatedDeltaNet
+    from atom.models.qwen4_exp import Qwen4ExpDecoderLayer
+    from atom.plugin.rtpllm.models.qwen4_exp_mtp_hooks import (
+        _rtp_apply_ple,
+        _rtp_spec_conv1d_update,
+        bind_qwen4_exp_mtp_hooks,
+    )
+
+    ple_layer = Qwen4ExpDecoderLayer.__new__(Qwen4ExpDecoderLayer)
+    torch.nn.Module.__init__(ple_layer)
+    ple_layer.ple = torch.nn.Identity()
+    ple_layer.layer_type = "full_attention"
+
+    gdn_layer = Qwen4ExpDecoderLayer.__new__(Qwen4ExpDecoderLayer)
+    torch.nn.Module.__init__(gdn_layer)
+    gdn_layer.ple = None
+    gdn_layer.layer_type = "linear_attention"
+    gdn_layer.linear_attn = torch.nn.Module()
+    gdn_layer.linear_attn.attn = torch.nn.Module()
+    gdn = GatedDeltaNet.__new__(GatedDeltaNet)
+    torch.nn.Module.__init__(gdn)
+    gdn_layer.linear_attn.attn.impl = gdn
+
+    bind_qwen4_exp_mtp_hooks(torch.nn.ModuleList([ple_layer, gdn_layer]))
+
+    assert ple_layer._apply_ple.__func__ is _rtp_apply_ple
+    assert gdn._spec_conv1d_update.__func__ is _rtp_spec_conv1d_update
+    assert Qwen4ExpDecoderLayer._apply_ple is not _rtp_apply_ple
+    assert GatedDeltaNet._spec_conv1d_update is not _rtp_spec_conv1d_update
 
 
 @pytest.fixture
@@ -114,7 +155,7 @@ def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_dra
         qsa_attention,
         "get_forward_context",
         lambda: SimpleNamespace(
-            context=SimpleNamespace(is_draft=is_draft, is_prefill=False)
+            context=SimpleNamespace(is_draft=is_draft, is_prefill=count > 1)
         ),
     )
     layers = [

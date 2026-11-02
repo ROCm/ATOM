@@ -781,18 +781,20 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
 
     # -- joint boundary ----------------------------------------------------
     def _withholds_last_prompt_token(self, seq) -> bool:
-        """Not for a hybrid: it claims the joint boundary, never the hit.
+        """Not when the joint boundary lies in the withheld chunk.
 
-        `_joint_kv_boundary` caps the boundary at the last hash block that
-        leaves a token to compute, and `_claim_after_load` stops the claim
-        there. Withholding as well floors a chunk-aligned prompt one whole
-        chunk below its end, under both rungs that prompt kept (the ladder's
-        at the end, the anchor a block before it): no boundary forms and the
-        CPU copy is never read.
+        A hybrid claims the joint boundary, which already leaves a token to
+        compute. Withholding would floor a chunk-aligned prompt a whole chunk
+        below the rungs it kept near its end, so no boundary forms. A hit no
+        boundary backs is still withheld: `_decide_load_after_alloc` refuses it.
         """
-        if getattr(seq, "has_per_req_cache", False):
-            return False
-        return super()._withholds_last_prompt_token(seq)
+        if not getattr(seq, "has_per_req_cache", False):
+            return super()._withholds_last_prompt_token(seq)
+        num_prompt = int(seq.num_prompt_tokens)
+        withheld = self._chunk_floor(num_prompt - 1)
+        if self._block_manager is None or withheld == self._chunk_floor(num_prompt):
+            return True
+        return self._block_manager.joint_boundary_tokens(seq, num_prompt) <= withheld
 
     def _decide_load_after_alloc(self, seq, ls):
         """Clamp a hybrid's KV leg to the boundary the state leg is aimed at.
@@ -813,15 +815,17 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         joint = int(seq.offload_joint.boundary_tokens or 0)
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk
-        # Where the transfer starts -- NOT where the request may call itself
-        # cached. `allocate` claimed every matched block, not just resumable
-        # ones, so the KV below this is already resident; asking LMCache to
-        # resend it would land a second copy in HBM (`publish_loaded_prefix`
-        # keeps the canonical mapping, fresh blocks stay private). Floored to the
-        # chunk grid by `_joint_kv_boundary`, so aligned whenever `hbm` was.
+        # Where the transfer starts -- not where the request may call itself
+        # cached. After allocate, `claim_tokens` is at or above
+        # `num_cached_tokens` and on the chunk grid. Blocks strictly below
+        # `start` are the shared prefix; resending them would land a second
+        # copy (`publish_loaded_prefix` keeps the canonical mapping). An
+        # unaligned hit has already lowered `num_cached_tokens` to the chunk
+        # floor, and the partial chunk `[floor, hbm)` is private and sits at
+        # `start`, which is what this leg writes.
         start = max(hbm, int(seq.offload_joint.claim_tokens or 0))
-        # The KV leg moves whole chunks and the blocks below `start` are shared,
-        # so an unaligned start cannot be rounded down.
+        # Whole chunks only. Blocks below `start` are shared, so an unaligned
+        # start cannot be rounded down onto them.
         if start % chunk != 0:
             return False, "joint_unaligned_hbm_prefill", start, lmc, lmc - start, chunk
         # Transfer the chunk covering the boundary, claim only the boundary.

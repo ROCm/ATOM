@@ -40,7 +40,6 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
         moe_gemm_a16w4,
     )
-    from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
     from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
@@ -139,7 +138,7 @@ def routing_from_dispatched(
     dispatch_ids: torch.Tensor,
     expert_map: torch.Tensor,
     num_local_experts: int,
-    num_local_tokens: torch.Tensor,
+    num_local_tokens: torch.Tensor | None,
     ep_scatter_geometry=None,
 ):
     """Build triton RoutingData / gather / scatter from mori-dispatched rows.
@@ -160,9 +159,12 @@ def routing_from_dispatched(
     3. ``num_local_tokens`` is a device tensor and rows past it hold garbage from
        the over-allocated receive buffer. Masking them the same way keeps this
        function sync-free and its shapes static (so it stays cudagraph-safe).
-       It is REQUIRED, not optional: the mori buffer always has M > R, so
+       It is REQUIRED for a mori receive buffer: that always has M > R, so
        skipping the row mask would fold garbage rows into the histogram as live
-       gates -- silently wrong rather than an error.
+       gates -- silently wrong rather than an error. Rows routed on this rank
+       pass their real row count the same way: the sort clamps an id of -1
+       into the map, so the id alone does not keep a pad row out. None only
+       where every row is live.
     Returns ``(routing_data, gather_indx, scatter_indx, gate_valid, dst_row)`` --
     the first three match ``routing()``; ``gate_valid`` is the extra piece EP
     needs, since ``routing()`` never produces dead gates. ``dst_row`` is None
@@ -175,6 +177,10 @@ def routing_from_dispatched(
         ep_sort_routing,
     )
 
+    # The sort reads both flat, at row * topk + k: a column slice of a wider
+    # buffer (routed columns ahead of a fused shared one) must be compacted.
+    dispatch_ids = dispatch_ids.contiguous()
+    dispatch_weights = dispatch_weights.contiguous()
     M, topk = dispatch_ids.shape
     device = dispatch_ids.device
     n_gates = M * topk
@@ -300,15 +306,24 @@ def _gluon_fused_quant_supported(m, n, k, routing_data) -> bool:
     return get_kernel_config_gluon(m, n, k, routing_data)["persistent_iters"] <= 1
 
 
-# Pre-quantized MXFP4 activations. The caller already holds the (packed e2m1,
-# e8m0) pair -- straight out of a mori fp4 dispatch, say -- so there is nothing
-# to quantize and, more to the point, nothing to allocate: both tensors go into
-# moe_gemm_a4w4 as views. uint8 payload + a non-None a13_scale is the signal.
-#
-# a8w4 has no equivalent: its wire is bf16 and downcast_to_mxfp must materialise
-# a fresh (M, K) fp8 tensor plus scales on arrival, every layer.
-def _is_prequant_mxfp4(hidden_states, a13_scale) -> bool:
-    return hidden_states.dtype == torch.uint8 and a13_scale is not None
+# Pre-quantized activations. The caller already holds the (payload, e8m0) pair
+# -- straight out of a quantizing dispatch or a routed-rows gather -- passed as
+# `hidden_states` plus `x_scale`, so there is nothing to quantize and nothing to
+# allocate: both go into the GEMM as views. The payload says which experts:
+# packed e2m1 (uint8 / fp4x2) is MXFP4 for a4w4, fp8 is MXFP8 for a8w4.
+MXFP4_DTYPES = (torch.uint8, torch.float4_e2m1fn_x2)
+
+
+def _check_activations(hidden_states, x_scale) -> None:
+    if x_scale is None:
+        assert (
+            hidden_states.dtype == torch.bfloat16
+        ), f"activations without x_scale must be bf16, got {hidden_states.dtype}"
+    else:
+        assert hidden_states.dtype in (*MXFP4_DTYPES, torch.float8_e4m3fn), (
+            "x_scale names the e8m0 rows of an MXFP4 (packed e2m1) or MXFP8 "
+            f"payload, got {hidden_states.dtype}"
+        )
 
 
 def _fused_experts_silu_gugu(
@@ -333,6 +348,7 @@ def _fused_experts_silu_gugu(
     act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
     y_out: torch.Tensor | None = None,
     ep_scatter=None,
+    x_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused-SiLU MoE experts over GUGU (interleaved ``[gate, up]``) weights.
 
@@ -370,13 +386,7 @@ def _fused_experts_silu_gugu(
     reduced output, the other says there is no local reduction to produce one.
     """
     assert hidden_states.ndim == 2
-    assert hidden_states.dtype == torch.bfloat16 or _is_prequant_mxfp4(
-        hidden_states, a13_scale
-    ), (
-        "activations are bf16, or already-MXFP4 (uint8 payload + a13_scale as "
-        f"its e8m0 rows); got {hidden_states.dtype} with "
-        f"a13_scale={'set' if a13_scale is not None else 'None'}"
-    )
+    _check_activations(hidden_states, x_scale)
     assert y_out is None or ep_scatter is None, (
         "y_out and ep_scatter are alternatives: the first names GEMM2's reduced "
         "output, the second says the rows leave unreduced"
@@ -390,11 +400,11 @@ def _fused_experts_silu_gugu(
         (get_arch() == "gfx1250") if preshuffled is None else bool(preshuffled)
     )
 
-    _prequant = _is_prequant_mxfp4(hidden_states, a13_scale)
+    _prequant = x_scale is not None
     if (
         envs.ATOM_USE_TRITON_MOE_A4W4
         or act_quant == MoEActivationQuant.FP4
-        or _prequant
+        or hidden_states.dtype in MXFP4_DTYPES
     ):
         # a4w4 takes the preshuffled gfx1250 weight through `preshuffle_weights`
         # -- a different parameter name from a8w4's `preshuffled`, which is why
@@ -414,21 +424,23 @@ def _fused_experts_silu_gugu(
             "x_static_scale / quant_static_scale in its signature), so a2_scale "
             "would be silently dropped."
         )
+        assert a13_scale is None, (
+            "moe_gemm_a4w4 has no static activation scale, so a13_scale would be "
+            "silently dropped."
+        )
         if _prequant:
+            assert (
+                hidden_states.dtype in MXFP4_DTYPES
+            ), "the a4w4 experts take MXFP4 activations, got an MXFP8 payload"
             # Zero-copy: these are views of whatever produced them (for the mori
             # fp4 wire, the dispatch arena itself). moe_gemm_a4w4 takes the scale
-            # strides explicitly, so a13_scale may keep the transport's padded
+            # strides explicitly, so x_scale may keep the transport's padded
             # arrival pitch -- it does NOT have to be contiguous.
             #
             # It also wants the e8m0 rows UNSWIZZLED, which is what they already
             # are: SWIZZLE_MX_SCALE applies to w_scales only.
-            x_fp4, x_scale = hidden_states, a13_scale
+            x_fp4 = hidden_states
         else:
-            assert a13_scale is None, (
-                "a13_scale on a bf16 activation would be silently dropped: "
-                "moe_gemm_a4w4 has no static activation scale. It is only read "
-                "as the e8m0 rows of an already-MXFP4 (uint8) payload."
-            )
             x_fp4, x_scale = mxfp4_quant(hidden_states)
         # Keyword-addressed from `bias` on: a4w4 has SIX parameters before
         # gather_indx where a8w4 has eight, so the a8w4 positional layout landed
@@ -497,7 +509,10 @@ def _fused_experts_silu_gugu(
             ep_scatter=ep_scatter,
         )
 
-    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+    if _prequant:
+        x_fp8 = hidden_states  # MXFP8 as it arrived, with its e8m0 x_scale
+    else:
+        x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
 
     # GEMM1: SiLU(gate)*up fused into write-back.
     #
@@ -568,60 +583,6 @@ def _fused_experts_silu_gugu(
     )
 
 
-def triton_kernel_moe_forward(
-    hidden_states: torch.Tensor,
-    w1,  # Tensor or triton_kernels.Tensor
-    w2,  # Tensor or triton_kernels.Tensor
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    activation: ActivationType = ActivationType.Silu,
-    w13_scale: torch.Tensor | None = None,
-    w2_scale: torch.Tensor | None = None,
-    a13_scale: torch.Tensor | None = None,
-    a2_scale: torch.Tensor | None = None,
-    w13_swizzle_layout: torch.Tensor | None = None,
-    w2_swizzle_layout: torch.Tensor | None = None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    swiglu_limit: float = 7.0,
-    apply_router_weight_on_input: bool = False,
-    global_num_experts: int = -1,
-    expert_map: torch.Tensor | None = None,
-    act_quant: MoEActivationQuant = MoEActivationQuant.BF16,
-) -> torch.Tensor:
-    routing_data, gather_idx, scatter_idx = routing(
-        gating_output, topk, sm_first=not renormalize
-    )
-
-    output = torch.empty_like(hidden_states)
-
-    return triton_kernel_fused_experts(
-        output,
-        hidden_states,
-        w1,
-        w2,
-        routing_data,
-        gather_idx,
-        scatter_idx,
-        topk=topk,
-        activation=activation,
-        w13_scale=w13_scale,
-        w2_scale=w2_scale,
-        a13_scale=a13_scale,
-        a2_scale=a2_scale,
-        w13_swizzle_layout=w13_swizzle_layout,
-        w2_swizzle_layout=w2_swizzle_layout,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-        swiglu_limit=swiglu_limit,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        global_num_experts=global_num_experts,
-        expert_map=expert_map,
-        act_quant=act_quant,
-    )
-
-
 # This is a triton implementation of the fused_experts function
 def triton_kernel_fused_experts(
     output_tensor: torch.Tensor,
@@ -657,8 +618,8 @@ def triton_kernel_fused_experts(
     # the EP callers pass True unconditionally and do run on CDNA, where
     # `preshuffled` resolves to False.
     use_triton_gfx1250_silu: bool = False,
-    # EP only: dead-gate mask for rows the all-to-all did not route here.
-    # routing() never produces dead gates, so the TP callers leave it None.
+    # Dead-gate mask from `routing_from_dispatched`: rows the all-to-all did
+    # not route here, or rows past the real row count.
     gate_valid: torch.Tensor | None = None,
     # GUGU only. None = pick by arch (pre-shuffled only on gfx1250, where the
     # gluon kernel supports it). Overridable so the two weight layouts can be
@@ -676,18 +637,11 @@ def triton_kernel_fused_experts(
     # instead of reducing them locally (aiter's EpCombineScatter). Alternative to
     # y_out, not a companion.
     ep_scatter=None,
+    # GUGU only. The e8m0 rows of `hidden_states` when it arrived already
+    # MXFP4 (a4w4) or MXFP8 (a8w4); None: bf16, quantized here.
+    x_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # type check, uint8 means mxfp4 -- with a13_scale carrying its e8m0 rows
-    assert hidden_states.dtype == torch.bfloat16 or _is_prequant_mxfp4(
-        hidden_states, a13_scale
-    ), (
-        "activations must be bf16, or already-MXFP4: a uint8 packed-e2m1 payload "
-        "WITH a13_scale as its e8m0 rows. Got "
-        f"{hidden_states.dtype} / a13_scale="
-        f"{'set' if a13_scale is not None else 'None'}. A uint8 payload with no "
-        "a13_scale is what a mori fp4 dispatch hands an expert path that cannot "
-        "take it -- only the a4w4 experts can, so select those."
-    )
+    _check_activations(hidden_states, x_scale)
     assert w1_bias is None or w1_bias.dtype == torch.float32
     assert w2_bias is None or w2_bias.dtype == torch.float32
 
@@ -729,11 +683,12 @@ def triton_kernel_fused_experts(
             act_quant=act_quant,
             y_out=y_out,
             ep_scatter=ep_scatter,
+            x_scale=x_scale,
         )
 
-    assert y_out is None and ep_scatter is None, (
-        "y_out / ep_scatter are only wired through the GUGU fused-SiLU path; the "
-        "GGUU path writes its result into `output_tensor`."
+    assert y_out is None and ep_scatter is None and x_scale is None, (
+        "y_out / ep_scatter / x_scale are only wired through the GUGU fused-SiLU "
+        "path; the GGUU path writes its result into `output_tensor`."
     )
 
     # aiter kernels expect 2d inputs/outputs
@@ -1057,21 +1012,21 @@ def triton_mega_moe(
     # On a quantizing wire the payload arrives already MXFP4/MXFP8 and its e8m0
     # rows sit in the arena. Take them as a view: the experts consume the
     # transport's own buffers, with nothing quantized or allocated on arrival.
-    a13_scale = (
+    x_scale = (
         mega._recv_dispatch_scales() if mega._config.is_quant_dispatch_wire else None
     )
 
     if recv_token_bound is not None:
         bound = min(int(recv_token_bound), recv_x.shape[0])
         recv_x, recv_w, recv_idx = recv_x[:bound], recv_w[:bound], recv_idx[:bound]
-        if a13_scale is not None:
-            a13_scale = a13_scale[:bound]
+        if x_scale is not None:
+            x_scale = x_scale[:bound]
     if m_eff is not None:
         m = min(int(m_eff), recv_x.shape[0])
         recv_x, recv_w, recv_idx = recv_x[:m], recv_w[:m], recv_idx[:m]
-        if a13_scale is not None:
+        if x_scale is not None:
             # Same rows, or the scales desynchronize from the payload.
-            a13_scale = a13_scale[:m]
+            x_scale = x_scale[:m]
 
     view, peer_rows, max_tokens_per_rank, _topk = _mega_combine_window(mega)
     routing_data, gather_indx, scatter_indx, gate_valid, dst_row = (
@@ -1108,7 +1063,7 @@ def triton_mega_moe(
         swiglu_limit=swiglu_limit,
         gate_valid=gate_valid,
         act_quant=act_quant,
-        a13_scale=a13_scale,
+        x_scale=x_scale,
         ep_scatter=EpCombineScatter(out=view, dst_row=dst_row),
     )
     return mega._combine(routing)

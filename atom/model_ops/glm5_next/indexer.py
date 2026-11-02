@@ -6,14 +6,9 @@
 from __future__ import annotations
 
 import torch
-from aiter import dtypes
 from aiter.ops.cache import (
-    cp_gather_indexer_k_quant_cache,
     indexer_k_quant_and_cache,
 )
-from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
-from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
-from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_world_size
@@ -22,8 +17,8 @@ from atom.model_ops.attention_mla import (
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
 )
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
-from atom.utils import envs, forward_context
+from atom.model_ops.indexer import IndexCache, score_topk
+from atom.utils import forward_context
 from atom.utils.custom_register import direct_register_custom_op
 
 from . import kpool
@@ -113,11 +108,6 @@ def _kpool_write_completed_pools(
     )
 
 
-def _kpool_pool_counts(seq_lens_k: torch.Tensor, pool_size: int) -> torch.Tensor:
-    """Return complete-pool counts; incomplete tails are not cached."""
-    return seq_lens_k.to(torch.int64) // pool_size
-
-
 def _sparse_attn_indexer_kpool(
     hidden_states: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -134,12 +124,15 @@ def _sparse_attn_indexer_kpool(
     topk_tokens: int,
     index_kpool: int,
     head_dim: int,
-    max_model_len: int,
+    mtp: bool,
     topk_out_width: int,
     scale_fmt: str,
     stable_topk: bool,
 ) -> torch.Tensor:
-    """Run pooled sparse top-k and update its cache/index side buffers."""
+    """Run pooled sparse top-k and update its cache/index side buffers.
+
+    `mtp`: an MTP layer, whose `positions` run one behind the step's, so its
+    prefill rows close their pools a token later (`mtp_index_rows`)."""
     fwd = forward_context.get_forward_context()
     attn_metadata = fwd.attn_metadata
     context = fwd.context
@@ -164,6 +157,7 @@ def _sparse_attn_indexer_kpool(
 
         run_speculative_kpool_indexer(
             attn_metadata,
+            attn_metadata.mtp_index_rows if mtp else attn_metadata.index_rows,
             kv_cache,
             q_fp8,
             k,
@@ -179,7 +173,6 @@ def _sparse_attn_indexer_kpool(
             topk_tokens,
             topk_out_width,
             get_current_atom_config().kv_cache_block_size,
-            max_model_len,
             scale_fmt,
             stable_topk,
         )
@@ -192,7 +185,6 @@ def _sparse_attn_indexer_kpool(
     pool_bt = attn_metadata.block_tables
     select_k = topk_tokens // index_kpool
     n_tokens = hidden_states.shape[0]
-    n_head = q_fp8.shape[1]
     topk_indices = torch.full(
         (n_tokens, topk_out_width),
         -1,
@@ -238,77 +230,24 @@ def _sparse_attn_indexer_kpool(
             index_kpool,
             slot_idx_in=state_slot_idx_in,
         )
-        if attn_metadata.max_seqlen_k <= topk_tokens:
+        # The builder publishes no rows below index_topk (every pool is then
+        # selected and prefill runs dense) or before any request closed a pool.
+        rows = attn_metadata.mtp_index_rows if mtp else attn_metadata.index_rows
+        if rows is None:
             return result
-
-        bs = cu_q.shape[0] - 1
-        if attn_metadata.has_cached:
-            cu_k = attn_metadata.cu_seqlens_k
-            seq_lens_k = (cu_k[1 : bs + 1] - cu_k[:bs]).to(torch.int64)
-        else:
-            seq_lens_k = (cu_q[1:] - cu_q[:-1]).to(torch.int64)
-        pool_counts = _kpool_pool_counts(seq_lens_k, index_kpool)
-        pool_cu = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-        pool_cu[1:] = torch.cumsum(pool_counts, 0).to(torch.int32)
-
-        max_pools = attn_metadata.kpool_total_pools
-        if max_pools is None:
-            raise RuntimeError("pooled prefill metadata is missing kpool_total_pools")
-        if max_pools <= 0:
-            return result
-        k_fp8 = torch.empty((max_pools, head_dim), device=device, dtype=dtypes.fp8)
-        k_scale = torch.empty((max_pools, 1), device=device, dtype=torch.float32)
-        cp_gather_indexer_k_quant_cache(
-            kv_cache,
-            k_fp8,
-            k_scale.view(dtypes.fp8),
-            pool_bt,
-            pool_cu,
-            preshuffle=True,
+        pool_topk = score_topk(
+            q_fp8,
+            weights,
+            IndexCache(kv_cache, None, pool_rows),
+            rows,
+            topk=select_k,
+            stable=stable_topk,
         )
-
-        pool_ks = pool_cu.to(torch.int64)[req_idx]
-        pool_ke = pool_ks + (positions.to(torch.int64) + 1) // index_kpool
-        pool_ks = pool_ks.to(torch.int32)
-        pool_ke = pool_ke.to(torch.int32)
-        pool_topk = torch.empty((n_tokens, select_k), dtype=torch.int32, device=device)
-
-        chunk_rows = sparse_indexer_row_chunk(
-            n_tokens, max_pools, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
-        )
-
-        for start in range(0, n_tokens, chunk_rows):
-            end = min(start + chunk_rows, n_tokens)
-            row_starts = pool_ks[start:end]
-            row_ends = pool_ke[start:end]
-            logits = fp8_mqa_logits(
-                Q=q_fp8[start:end],
-                KV=k_fp8,
-                kv_scales=k_scale.squeeze(-1).contiguous(),
-                weights=weights[start:end],
-                cu_starts=row_starts,
-                cu_ends=row_ends,
-            )
-            top_k_per_row_prefill(
-                logits=logits,
-                rowStarts=row_starts,
-                rowEnds=row_ends,
-                indices=pool_topk[start:end],
-                values=None,
-                numRows=end - start,
-                stride0=logits.stride(0),
-                stride1=logits.stride(1),
-                k=select_k,
-                stable=stable_topk,
-            )
-
         kpool.expand_pools_and_append_tail(
             pool_topk,
             positions.to(torch.int32) + 1,
             index_kpool,
             out=topk_indices,
-            pool_base=pool_ks,
-            tok_base=attn_metadata.cu_seqlens_k.to(torch.int32)[req_idx],
         )
         triton_convert_req_index_to_global_index_dsa_prefill(
             attn_metadata.sparse_cu_seqlens_q,
@@ -357,39 +296,21 @@ def _sparse_attn_indexer_kpool(
         preshuffle=True,
     )
 
-    seq_lens = attn_metadata.context_lens[:bs]
-    pool_ctx = (seq_lens.to(torch.int32) // index_kpool).contiguous()
-    pool_max_len = -(-max_model_len // index_kpool)
-    logits = torch.empty((bs, pool_max_len), dtype=torch.float32, device=device)
-    deepgemm_fp8_paged_mqa_logits(
-        q_fp8[:bs].view(bs, 1, n_head, head_dim),
-        kv_cache.unsqueeze(-2),
+    pool_topk = score_topk(
+        q_fp8[:bs],
         weights[:bs],
-        logits,
-        pool_ctx,
-        pool_bt,
-        pool_max_len,
-        KVBlockSize=pool_rows,
-        Preshuffle=True,
-    )
-    pool_topk = torch.empty((bs, select_k), dtype=torch.int32, device=device)
-    top_k_per_row_decode(
-        logits,
-        1,
-        pool_ctx,
-        pool_topk,
-        bs,
-        logits.stride(0),
-        logits.stride(1),
-        k=select_k,
+        IndexCache(kv_cache, None, pool_rows),
+        attn_metadata.index_rows,
+        topk=select_k,
         stable=stable_topk,
     )
     kpool.expand_pools_and_append_tail(
         pool_topk,
-        seq_lens.to(torch.int32),
+        attn_metadata.context_lens[:bs].to(torch.int32),
         index_kpool,
         out=topk_indices[:bs],
     )
+
     triton_convert_req_index_to_global_index(
         attn_metadata.cu_seqlens_q,
         attn_metadata.kv_indptr,
@@ -418,7 +339,7 @@ def _sparse_attn_indexer_kpool_fake(
     topk_tokens: int,
     index_kpool: int,
     head_dim: int,
-    max_model_len: int,
+    mtp: bool,
     topk_out_width: int,
     scale_fmt: str,
     stable_topk: bool,

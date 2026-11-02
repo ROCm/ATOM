@@ -1267,9 +1267,16 @@ class DualRMSNormMXFP8:
     the token count is shared, which is what a Q latent normed beside a KV
     latent needs. Q comes back as the ``(e4m3, e8m0 group-32)`` pair a
     native-quant GEMM reads without quantizing again. RoPE is the caller's.
+    ``amax_floor``: each Q group's amax floor (0: none).
     """
 
-    def __init__(self, q_norm: nn.Module, k_norm: nn.Module, prefix: str) -> None:
+    def __init__(
+        self,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+        prefix: str,
+        amax_floor: float = 0.0,
+    ) -> None:
         assert _is_mxfp8(q_norm.quant_type.value, q_norm.params_dtype), (
             f"{prefix}: Q emits MXFP8, not "
             f"{q_norm.quant_type}/{q_norm.params_dtype}"
@@ -1277,6 +1284,7 @@ class DualRMSNormMXFP8:
         self.q_norm = q_norm
         self.k_norm = k_norm
         self.prefix = prefix
+        self.amax_floor = amax_floor
 
     @mark_trace
     def __call__(
@@ -1292,6 +1300,7 @@ class DualRMSNormMXFP8:
             self.k_norm.weight,
             self.q_norm.eps,
             eps_k=self.k_norm.eps,
+            amax_floor=self.amax_floor,
         )
         # The kernel types the scale by its bytes; its readers read e8m0.
         q_scale = q_scale.view(torch.float8_e8m0fnu)

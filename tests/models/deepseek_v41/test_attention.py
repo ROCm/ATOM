@@ -145,7 +145,7 @@ def test_fused_seam_reproduces_rope_quant_and_window_byte_for_byte(packed):
         rope.sin_cache,
         step.positions,
         rope_dim=rope_dim,
-        ring=(actual_pool, step, window, packed),
+        ring=(actual_pool, step, window),
     )
 
     assert torch.equal(actual_query, rope(query.clone(), step.positions))
@@ -192,6 +192,48 @@ def test_fused_seam_emits_the_rows_a_prefill_attends_to():
     assert torch.equal(actual_qat.view(tokens, dim), qat.view(tokens, dim))
     assert torch.equal(actual_values.view(torch.uint8), values.view(torch.uint8))
     assert torch.equal(actual_scales.view(torch.uint8), scales.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_fused_seam_writes_the_fp8_pools_query_and_rows():
+    """The FP8 pool's prefill: the rotated query quantized by the KV row's rule
+    (`query_fp8`), and the rows into a `[tokens, 528]` buffer through strided
+    views -- the bytes `quantize_fp8` gives, packed values then scales."""
+    from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
+    from atom.model_ops.blockscale import quantize_fp8
+    from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
+
+    torch.manual_seed(727)
+    device, tokens, heads, dim, rope_dim = "cuda", 13, 4, 512, 64
+    rope = RotaryEmbedding(rope_dim, 1024, base=10000).to(device)
+    positions = torch.arange(tokens, device=device, dtype=torch.int32)
+    normed = torch.randn(1, tokens, dim, device=device, dtype=torch.bfloat16)
+    query = torch.randn(1, tokens, heads, dim, device=device, dtype=torch.bfloat16)
+
+    values, scales = quantize_fp8(rope(query.clone(), positions))
+    rows = torch.empty(tokens, dim + dim // 32, device=device, dtype=torch.uint8)
+    query_values = torch.empty_like(values).view(tokens, heads, dim)
+    query_scales = torch.empty_like(scales).view(tokens, heads, dim // 32)
+    rope_quant_window(
+        query.clone().view(tokens, heads, dim),
+        normed.view(tokens, dim),
+        rope.cos_cache,
+        rope.sin_cache,
+        positions,
+        rope_dim=rope_dim,
+        values=rows[:, :dim].view(values.dtype),
+        scales=rows[:, dim:].view(scales.dtype),
+        query_fp8=(query_values, query_scales),
+    )
+
+    expected_rows = pack_rows(*quantize_fp8(rope(normed.clone(), positions)))
+    assert torch.equal(rows, expected_rows.view(tokens, -1))
+    assert torch.equal(
+        query_values.view(torch.uint8), values.view(torch.uint8).view_as(query_values)
+    )
+    assert torch.equal(
+        query_scales.view(torch.uint8), scales.view(torch.uint8).view_as(query_scales)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

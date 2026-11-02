@@ -144,7 +144,9 @@ class EngineArgs:
     enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     throughput_log_interval: float = 10.0
+    throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
     # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
@@ -340,12 +342,12 @@ class EngineArgs:
             "--cudagraph-mode",
             type=str,
             default="FULL",
-            choices=["NONE", "PIECEWISE", "FULL", "FULL_AND_PIECEWISE", "AF_PIECEWISE"],
+            choices=["NONE", "TR_HYBRID", "FULL", "FULL_AND_TR_HYBRID"],
             help="CUDA graph runtime mode. FULL = manual whole-forward capture "
-            "(default, existing behavior). PIECEWISE = per-piece cudagraph with "
-            "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
-            "the attention core is also captured into its own cudagraph with "
-            "zero-copy buffers (DeepSeek-V4 DSpark).",
+            "(default, existing behavior). TR_HYBRID = a token graph per token "
+            "bucket, breaking only where a launch depends on host data, which "
+            "runs eagerly or as a request graph; recorded at any --level. "
+            "FULL_AND_TR_HYBRID is recorded as TR_HYBRID.",
         )
         parser.add_argument(
             "--load_dummy",
@@ -572,6 +574,14 @@ class EngineArgs:
             "Use --no-enable_chunked_prefill to disable.",
         )
         parser.add_argument(
+            "--enable-request-context-metrics",
+            action="store_true",
+            default=False,
+            help="Enable per-request prefill/decode context metrics (default: disabled). "
+            "Retains request-labelled series after completion; use only for short "
+            "diagnostic captures. Aggregate metrics are unaffected.",
+        )
+        parser.add_argument(
             "--enable-log-stats",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -588,7 +598,24 @@ class EngineArgs:
             type=float,
             default=10.0,
             help="Seconds between engine-status lines (default: 10, matching "
-            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats, and "
+            "superseded by --throughput-log-interval-steps when that is set.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval-steps",
+            type=int,
+            default=0,
+            help="Forwards between engine-status lines, replacing the "
+            "--throughput-log-interval clock when > 0 (default: 0, use the "
+            "clock). For offline / MLPerf runs that compare one DP rank's "
+            "lines against another's: wall-clock sampling lands on a "
+            "different step number on each rank, a cumulative forward count "
+            "lands on the same one. The window can then span any amount of "
+            "wall clock, so time with no forward running is kept out of the "
+            "tokens/s divisor. Base and DP engines only -- pipeline parallel "
+            "replaces the busy loop that counts, and RapidServe and P/D are "
+            "not covered yet; all three fall back to the clock with a "
+            "warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",

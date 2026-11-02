@@ -14,6 +14,9 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
+from torch import nn
+from transformers import PretrainedConfig
+
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -34,9 +37,8 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from torch import nn
-from transformers import PretrainedConfig
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 
 def _prefused_qkv_weight_loader(self, param, loaded_weight, loaded_shard_id=None):
@@ -444,6 +446,7 @@ class MiMoV2DecoderLayer(nn.Module):
         return self.config.hybrid_layer_pattern[self.layer_idx] == 1
 
 
+@token_graph
 @support_torch_compile
 class MiMoV2Model(nn.Module):
     def __init__(
