@@ -804,7 +804,15 @@ def _check_rows(name, t, rows, dtype):
 
 @torch_compile_guard(
     gen_fake=_dspark_markov_sample_fake,
-    mutates_args=["out", "q_ids", "q_probs", "q_meta", "s_scratch"],
+    mutates_args=[
+        "out",
+        "q_ids",
+        "q_probs",
+        "q_meta",
+        "s_scratch",
+        "scratch_f32",
+        "scratch_i32",
+    ],
 )
 def dspark_markov_sample(
     base_logits: torch.Tensor,
