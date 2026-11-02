@@ -236,6 +236,9 @@ jobs:
               # image to pull: the ROCm 10 stack is assembled from the AMD
               # stable wheel channel on plain ubuntu:24.04.
               BASE_IMAGE="rocm10-base"
+              # The 10.1 SDK has no rocm_smi headers, which the RCCL source
+              # build requires; it ships its own librccl instead.
+              EXTRA_BUILD_ARGS="--build-arg BUILD_RCCL=0"
               ;;
             */*|*:*)
               # A literal image reference, for a one-off build on something

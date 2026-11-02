@@ -348,13 +348,16 @@ FROM base AS build_rccl
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
 ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
 # BUILD_RCCL=0 skips the source build and keeps whatever RCCL the base image
-# already provides. Required on the ROCm 10.1 nightly line for two reasons:
+# already provides. Required on the ROCm 10.1 line (docker-release.yaml
+# passes it) for three reasons:
 #   1. the ROCm SDK wheels already ship a matching librccl (2.30.7, built
 #      against the same ROCm, with gfx942 + gfx950), so rebuilding is redundant;
 #   2. ROCm/rccl no longer builds at all -- RCCL development moved into the
 #      ROCm/rocm-systems monorepo (projects/rccl), and the standalone
 #      ROCm/rccl mirror is missing commits, so its develop tip references
-#      ncclComm::forcePatEnable and rcclUseAinic without declaring them.
+#      ncclComm::forcePatEnable and rcclUseAinic without declaring them;
+#   3. even the pinned RCCL_BRANCH fails to configure on the 10.1 SDK, which
+#      ships no rocm_smi headers (CMakeLists.txt reads rocm_smi/rocm_smi.h).
 # The default stays 1 so every existing line keeps building RCCL from source.
 ARG BUILD_RCCL=1
 
