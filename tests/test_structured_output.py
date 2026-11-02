@@ -44,7 +44,7 @@ def batch(
     marker="",
     schema=None,
     request_id=11,
-    prefill=0
+    prefill=0,
 ):
     schema = json.dumps(schema or {"const": {"x": 1}})
     key = (schema, None, marker)
