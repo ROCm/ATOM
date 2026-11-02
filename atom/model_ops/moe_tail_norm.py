@@ -349,3 +349,61 @@ def gated_sum(moe: MoEGatedSum) -> Tensor:
     if gate is None:
         return shared + routed
     return shared_expert_gate_add(shared, gate, routed, True)
+
+
+# ---------------------------------------------------------------------------
+# ATOM_MEGA_COMBINE_TAIL: the tail inside aiter's MegaMoE combine
+# ---------------------------------------------------------------------------
+#
+# With mori EP on aiter's MegaMoEGfx1250, the routed sum comes out of a combine
+# kernel that already owns whole token rows. aiter's one-kernel combine
+# (`MegaMoEGfx1250.forward(combine_tail=)`) then does the cross-device wait,
+# the top-k reduce, this module's gated add, the residual add and the norm in
+# ONE launch (instead of combine_sync + combine + the kernel above). The MoE
+# block needs the norm's weight and the residual for that, which live in the
+# decoder layer; it hands them down through `combine_tail_request` (a scope
+# around its `self.experts(...)` call, read by the mori MegaMoE call site) and
+# gets back `MoENormed`. Eager and CUDA-graph capture only: under torch.compile
+# the FusedMoE custom op hides the call, so the block keeps MoEGatedSum.
+
+
+class MoENormed(NamedTuple):
+    """The next norm's outputs, already computed by the MoE combine:
+    `(normed, new_residual)`; `residual` is None for a final norm."""
+
+    out: Tensor
+    residual: Tensor | None
+
+
+class CombineTailRequest:
+    """What the combine needs to finish the layer, and what it produced."""
+
+    def __init__(self, shared, gate, residual, weight, eps, write_residual):
+        self.shared = shared
+        self.gate = gate
+        self.residual = residual
+        self.weight = weight
+        self.eps = eps
+        self.write_residual = write_residual
+        self.result: tuple[Tensor, Tensor | None] | None = None
+
+
+_COMBINE_TAIL_REQUEST: CombineTailRequest | None = None
+
+
+class combine_tail_request:  # a context manager, named as one
+    def __init__(self, req: CombineTailRequest):
+        self.req = req
+
+    def __enter__(self):
+        global _COMBINE_TAIL_REQUEST
+        self.prev, _COMBINE_TAIL_REQUEST = _COMBINE_TAIL_REQUEST, self.req
+        return self.req
+
+    def __exit__(self, *exc):
+        global _COMBINE_TAIL_REQUEST
+        _COMBINE_TAIL_REQUEST = self.prev
+
+
+def current_combine_tail_request() -> CombineTailRequest | None:
+    return _COMBINE_TAIL_REQUEST

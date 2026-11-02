@@ -438,6 +438,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_MOE_TAIL_NORM": lambda: (
         os.getenv("ATOM_FUSED_MOE_TAIL_NORM", "0") == "1"
     ),
+    # With ATOM_FUSED_MOE_TAIL_NORM, under mori EP on aiter's MegaMoEGfx1250
+    # (bf16 combine wire): the gated shared-expert add, the residual add and the
+    # next RMSNorm run inside aiter's one-kernel combine (its cross-device wait
+    # and top-k reduce in the same launch), replacing combine_sync + combine +
+    # the fused tail kernel. The shared expert then runs before the dispatch.
+    # Eager / CUDA graphs only (torch.compile keeps the tail kernel). Off by
+    # default; needs an aiter whose MegaMoEGfx1250.forward takes combine_tail.
+    "ATOM_MEGA_COMBINE_TAIL": lambda: (os.getenv("ATOM_MEGA_COMBINE_TAIL", "0") == "1"),
+    # Steps above this many rows a rank keep the separate tail kernel: aiter's
+    # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
+    # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
+    # MI455X: ahead at 32-512 rows, even at 640-1500, behind at 3700).
+    "ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
+    ),
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
     # loses at prefill sizes while saving launches at decode sizes (crossover

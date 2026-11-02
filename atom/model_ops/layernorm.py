@@ -28,6 +28,7 @@ from torch.overrides import handle_torch_function, has_torch_function_unary
 from atom.config import QuantizationConfig
 from atom.model_ops.moe_tail_norm import (
     MoEGatedSum,
+    MoENormed,
     can_fuse_moe_tail,
     gated_sum,
     moe_tail_rmsnorm,
@@ -1102,9 +1103,12 @@ class GemmaRMSNorm(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor | MoEGatedSum,
+        x: torch.Tensor | MoEGatedSum | MoENormed,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(x, MoENormed):
+            # The MoE combine already ran this norm (ATOM_MEGA_COMBINE_TAIL).
+            return x.out, x.residual
         if isinstance(x, MoEGatedSum):
             # A MoE block that deferred its gated shared-expert add to us.
             assert residual is not None, "a MoEGatedSum comes with a residual"

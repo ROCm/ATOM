@@ -43,7 +43,12 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.moe_tail_norm import MoEGatedSum
+from atom.model_ops.moe_tail_norm import (
+    CombineTailRequest,
+    MoEGatedSum,
+    MoENormed,
+    combine_tail_request,
+)
 from atom.model_ops.sigmoid_gate import output_gate_mul, shared_expert_gate_add
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
@@ -197,6 +202,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     # is known to fold the gated shared-expert add in (ATOM_FUSED_MOE_TAIL_NORM):
     # forward then returns a MoEGatedSum instead of the summed tensor.
     defer_gated_sum = False
+    # ATOM_MEGA_COMBINE_TAIL (set with defer_gated_sum): the norm that reads this
+    # block's output (not a registered submodule: it is the next layer's), run
+    # by the MoE combine itself, and whether its new residual is read.
+    combine_tail_norm = None
+    combine_tail_writes_residual = True
 
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
@@ -313,6 +323,35 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             ),
         )
 
+    def combine_tail_forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> MoENormed | MoEGatedSum:
+        """ATOM_MEGA_COMBINE_TAIL: the shared expert first, then the routed
+        experts with the gated add, the residual add and the next norm handed to
+        the MoE combine. A combine that cannot take them (another transport, a
+        quantized combine wire) leaves the request unanswered, and the block
+        returns the unsummed parts for the norm to finish."""
+        logits = self.gate(hidden_states)
+        shared_output = self.shared_expert(hidden_states)
+        gate_logits = logits[:, self.n_routed_experts :]
+        norm = self.combine_tail_norm
+        req = CombineTailRequest(
+            shared_output,
+            gate_logits,
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            self.combine_tail_writes_residual,
+        )
+        with combine_tail_request(req):
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=logits[:, : self.n_routed_experts],
+            )
+        if req.result is not None:
+            return MoENormed(*req.result)
+        return MoEGatedSum(routed_output, shared_output, gate_logits)
+
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts + 1)
         logits = self.gate(hidden_states)
@@ -358,12 +397,21 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             ATOM_FUSED_SIGMOID_GATE,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         _num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        if (
+            residual is not None
+            and self.combine_tail_norm is not None
+            and hidden_states.shape[0] <= envs.ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS
+            and not torch.compiler.is_compiling()
+        ):
+            return self.combine_tail_forward(hidden_states, residual)
         if self._use_dual_stream:
             final_hidden_states = torch.ops.aiter.maybe_dual_stream_forward(
                 hidden_states, self.prefix
@@ -381,7 +429,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-def defer_moe_gated_sums(layers, final_norm) -> int:
+def defer_moe_gated_sums(layers, final_norm, combine_tail: bool = True) -> int:
     """ATOM_FUSED_MOE_TAIL_NORM: let each sparse MoE block of `layers` hand its
     output unsummed (`MoEGatedSum`) to the norm that reads it -- the next
     layer's input_layernorm, or `final_norm` after the last layer -- which then
@@ -390,7 +438,8 @@ def defer_moe_gated_sums(layers, final_norm) -> int:
     Only where that norm can (GemmaRMSNorm, neither all-reduce-fused nor
     FP8-quantizing), the block runs single-stream with a separate shared expert
     at TP1 (a TP-partial sum would need its all-reduce first) and the layer has
-    no layer_scale. Returns how many blocks defer.
+    no layer_scale. Returns how many blocks defer. With ATOM_MEGA_COMBINE_TAIL
+    (and `combine_tail`), those blocks also hand the norm to the MoE combine.
     """
     # Plugin frontends patch the decoder layer's forward (rtpllm), which knows
     # nothing of a MoEGatedSum.
@@ -416,6 +465,10 @@ def defer_moe_gated_sums(layers, final_norm) -> int:
         ):
             mlp.defer_gated_sum = True
             deferred += 1
+            if envs.ATOM_MEGA_COMBINE_TAIL and combine_tail:
+                # Not a submodule: the norm belongs to the next layer / model.
+                object.__setattr__(mlp, "combine_tail_norm", consumer)
+                mlp.combine_tail_writes_residual = consumer is not final_norm
     moe_blocks = sum(
         isinstance(getattr(ly, "mlp", None), Qwen3NextSparseMoeBlock) for ly in layers
     )
@@ -1056,7 +1109,11 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states, residual
             )
 
-        hidden_states = self.mlp(hidden_states)
+        if getattr(self.mlp, "combine_tail_norm", None) is not None:
+            # The MoE combine runs the next norm too (ATOM_MEGA_COMBINE_TAIL).
+            hidden_states = self.mlp(hidden_states, residual)
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -1144,6 +1201,8 @@ class Qwen3NextModel(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
+        if isinstance(hidden_states, MoENormed):
+            return hidden_states.out  # the MoE combine ran the final norm
         if isinstance(hidden_states, MoEGatedSum):
             # The last MoE block's gated add folded into the final norm, which
             # skips the residual store nobody reads.

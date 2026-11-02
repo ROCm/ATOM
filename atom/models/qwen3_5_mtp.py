@@ -114,8 +114,10 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         )
         # One MTP layer a step, each read by the final norm (mtp_num_hidden_layers
         # is 1 for every Qwen3.5 checkpoint; with more, each still feeds `norm`).
+        # The final norm covers only the rows the head reads (select_rows),
+        # which the combine's tail does not: it stays the tail kernel's.
         for layer in self.layers:
-            defer_moe_gated_sums([layer], self.norm)
+            defer_moe_gated_sums([layer], self.norm, combine_tail=False)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

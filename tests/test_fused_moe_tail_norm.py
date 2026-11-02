@@ -516,3 +516,120 @@ def test_kernel_in_a_cuda_graph_and_on_strided_rows():
     shifted.copy_(t.shared)
     out, res = mt.moe_tail_rmsnorm(t.routed, shifted, t.gate, t.residual, t.weight, EPS)
     assert torch.equal(out, eager[0]) and torch.equal(res, eager[1])
+
+
+# ---------------------------------------------------------------------------
+# ATOM_MEGA_COMBINE_TAIL: the tail handed to the MoE combine
+# ---------------------------------------------------------------------------
+
+
+def test_combine_tail_request_scope_nests_and_restores():
+    assert mt.current_combine_tail_request() is None
+    a = mt.CombineTailRequest(None, None, None, None, 1e-6, True)
+    b = mt.CombineTailRequest(None, None, None, None, 1e-6, False)
+    with mt.combine_tail_request(a):
+        assert mt.current_combine_tail_request() is a
+        with mt.combine_tail_request(b):
+            assert mt.current_combine_tail_request() is b
+        assert mt.current_combine_tail_request() is a
+    assert mt.current_combine_tail_request() is None
+
+
+def test_norm_passes_a_combine_normed_result_through():
+    t = _inputs(3)
+    norm = _norm(t.weight)
+    done = mt.MoENormed(t.routed, t.residual)
+    out, res = norm(done, t.shared)
+    assert out is t.routed and res is t.residual
+
+
+@pytest.mark.parametrize("answered", [False, True])
+def test_moe_block_hands_its_tail_to_the_combine(monkeypatch, answered):
+    """The shared expert runs first; the experts call sees the request (the
+    norm's weight / eps, the residual, the gate column); an answered request
+    comes back as MoENormed, an unanswered one as the MoEGatedSum fallback."""
+    qn = _qwen3_next()
+    t = _inputs(5)
+    calls = []
+    block = _moe_block(qn, t)
+    block.shared_expert = lambda h: (calls.append("shared"), t.shared)[1]
+    nrm = _norm(t.weight)
+    object.__setattr__(block, "combine_tail_norm", nrm)
+    block.combine_tail_writes_residual = True
+    block.defer_gated_sum = True
+    monkeypatch.setenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
+
+    def experts(hidden_states, router_logits):
+        calls.append("experts")
+        req = mt.current_combine_tail_request()
+        assert req.shared is t.shared and req.residual is t.residual
+        assert req.weight is nrm.weight and req.eps == nrm.variance_epsilon
+        assert torch.equal(req.gate, t.gate) and req.write_residual
+        if answered:
+            req.result = ("normed", "res")
+        return t.routed
+
+    block.experts = experts
+    out = block.forward(torch.zeros(5, HIDDEN, dtype=torch.bfloat16), t.residual)
+    assert calls == ["shared", "experts"]
+    assert mt.current_combine_tail_request() is None
+    if answered:
+        assert out == mt.MoENormed("normed", "res")
+    else:
+        assert isinstance(out, mt.MoEGatedSum) and out.routed is t.routed
+    # Above the row threshold (and without a residual) the block sums as before.
+    monkeypatch.setenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "4")
+    calls.clear()
+    block.experts = lambda hidden_states, router_logits: (
+        (
+            calls.append("experts:no-request")
+            if mt.current_combine_tail_request() is None
+            else None
+        ),
+        t.routed,
+    )[1]
+    out = block.forward(torch.zeros(5, HIDDEN, dtype=torch.bfloat16), t.residual)
+    assert isinstance(out, mt.MoEGatedSum)
+    assert calls == ["experts:no-request", "shared"]  # the usual order
+
+
+def test_defer_links_the_combine_tail_only_when_asked(monkeypatch):
+    qn = _qwen3_next()
+    monkeypatch.setattr(qn, "is_plugin_mode", lambda: False)
+    monkeypatch.setenv("ATOM_FUSED_MOE_TAIL_NORM", "1")
+    final = ln().GemmaRMSNorm(16)
+    layers = [_layer(_moe_block(qn)), _layer(_moe_block(qn))]
+    monkeypatch.delenv("ATOM_MEGA_COMBINE_TAIL", raising=False)
+    qn.defer_moe_gated_sums(layers, final)
+    assert all(ly.mlp.combine_tail_norm is None for ly in layers)
+    monkeypatch.setenv("ATOM_MEGA_COMBINE_TAIL", "1")
+    qn.defer_moe_gated_sums(layers, final)
+    assert layers[0].mlp.combine_tail_norm is layers[1].input_layernorm
+    assert layers[0].mlp.combine_tail_writes_residual
+    assert layers[1].mlp.combine_tail_norm is final
+    assert not layers[1].mlp.combine_tail_writes_residual
+    # Not a registered submodule (no second copy of the next layer's weight).
+    assert "combine_tail_norm" not in dict(layers[0].mlp.named_children())
+    fresh = [_layer(_moe_block(qn))]
+    qn.defer_moe_gated_sums(fresh, final, combine_tail=False)
+    assert fresh[0].mlp.defer_gated_sum and fresh[0].mlp.combine_tail_norm is None
+
+
+def test_mori_call_site_asks_for_the_tail_only_when_it_can(monkeypatch):
+    try:
+        from atom.model_ops.fused_moe import mori_v2_prepare_finalize as mpf
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"mori_v2_prepare_finalize does not import here: {exc}")
+    pytest.importorskip("aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe")
+    t = _inputs(4)
+    hs = torch.zeros(4, HIDDEN, dtype=torch.bfloat16)
+    assert mpf._combine_tail_kwargs(hs, "none") == {}  # no request
+    req = mt.CombineTailRequest(t.shared, t.gate, t.residual, t.weight, 1e-6, False)
+    with mt.combine_tail_request(req):
+        kw = mpf._combine_tail_kwargs(hs, "none")
+        tail = kw["combine_tail"]
+        assert (
+            tail.shared is t.shared and tail.gate is t.gate and not tail.write_residual
+        )
+        assert mpf._combine_tail_kwargs(hs, "mxfp4") == {}  # quantized combine wire
+        assert mpf._combine_tail_kwargs(hs[:3], "none") == {}  # not the block's rows
