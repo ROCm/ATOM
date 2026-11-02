@@ -69,6 +69,11 @@ class ATOMDeepseekV4BackendForSgl(AttentionBackend):
             # buffer on the capture dummy (slot 0) while the request's SWA ring
             # lives on the allocator slot. Rebuild decode so the replay reads
             # the same ring the prefill wrote.
+            #
+            # Target decode does not take this branch. Its replay view is
+            # ``build_replay_fb_view``, which sets ``actual_forward_mode``, so
+            # it already rebuilt metadata before this change. The per-step
+            # window refresh lives on the draft nextn wrapper, not the target.
             mode = getattr(forward_batch, "forward_mode", None)
             is_decode = bool(mode is not None and mode.is_decode_or_idle())
             if not is_decode:

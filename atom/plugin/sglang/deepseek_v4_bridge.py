@@ -935,6 +935,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         allocator = getattr(self, "_atom_v4_slot_allocator", None)
         if allocator is not None:
             allocator.remap_blocks(block_pairs[:, 1], block_pairs[:, 0])
+            _publish_allocator_table(self, block_pairs.device)
 
 
 def install_deepseek_v4_proxy_pool_patch() -> None:
@@ -1222,6 +1223,49 @@ class _V4StateSlotAllocator:
             self._block_to_slot.pop(old, None)
         self._slot_to_block[victim] = -1
         return victim
+
+
+def _block_slot_table(proxy_pool, device) -> torch.Tensor:
+    """GPU first-block -> ring slot table.
+
+    Draft-extend graph replay reads this instead of calling the CPU allocator.
+    A host sync on that replay would stall the captured extend. Prefill and
+    eager extend already ran ``assign`` and published the same mapping.
+    """
+    n = max(1, int(proxy_pool.num_blocks))
+    table = getattr(proxy_pool, "_atom_v4_block_slot_gpu", None)
+    dev = torch.device(device)
+    if table is None or table.numel() != n or table.device != dev:
+        table = torch.zeros(n, dtype=torch.int32, device=dev)
+        proxy_pool._atom_v4_block_slot_gpu = table
+        proxy_pool._atom_v4_published_blocks = None
+    return table
+
+
+def _publish_allocator_table(proxy_pool, device) -> None:
+    """Mirror the CPU allocator into ``_block_slot_table`` after assign/remap."""
+    alloc = getattr(proxy_pool, "_atom_v4_slot_allocator", None)
+    if alloc is None:
+        return
+    table = _block_slot_table(proxy_pool, device)
+    curr = np.asarray(alloc._slot_to_block, dtype=np.int64)
+    prev = getattr(proxy_pool, "_atom_v4_published_blocks", None)
+    if prev is None or getattr(prev, "shape", None) != curr.shape:
+        prev = np.full(curr.shape, -1, dtype=np.int64)
+    stale = prev[(prev >= 0) & (prev != curr)]
+    if stale.size:
+        stale_t = torch.as_tensor(stale, device=table.device, dtype=torch.int64)
+        stale_t.clamp_(0, table.shape[0] - 1)
+        table.index_fill_(0, stale_t, 0)
+    live_slots = np.nonzero(curr >= 0)[0]
+    if live_slots.size:
+        blocks = torch.as_tensor(
+            curr[live_slots], device=table.device, dtype=torch.int64
+        )
+        blocks.clamp_(0, table.shape[0] - 1)
+        slots = torch.as_tensor(live_slots, device=table.device, dtype=torch.int32)
+        table.index_copy_(0, blocks, slots)
+    proxy_pool._atom_v4_published_blocks = curr.copy()
 
 
 def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
@@ -1806,6 +1850,8 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
 
     if reset_slots and model is not None:
         reset_deepseek_v4_state_slots(model, reset_slots)
+    if reset_slots:
+        _publish_allocator_table(proxy_pool, device)
 
     # Graph replay updates/reset state outside the captured region.  Do not let
     # the wrapper repeat the reset inside capture, because allocating the index
@@ -2141,19 +2187,17 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     )
     slot_arr = np.zeros(bs, dtype=np.int32)
     reset_slots: set[int] = set()
-    if is_draft_extend and os.environ.get(
-        "ATOM_SGLANG_V4_DRAFT_EXTEND_USE_ALLOCATOR_SLOT", "0"
-    ) not in ("1", "true", "True", "yes", "on"):
-        # Draft-extend graph replay must not synchronize GPU metadata back to
-        # CPU. It runs after request slots already exist, so use SGLang's
-        # req_pool_indices as stable per-request ATOM state slots and update the
-        # persistent GPU buffers directly.
+    if is_draft_extend:
+        # req_pool_indices is not a ring slot (a live request was handed 256).
+        # Replay stays on device: gather the slot prefill published for this
+        # first KV block. Do not call the CPU allocator here.
+        table = _block_slot_table(proxy_pool, device)
         if scheduled_bs:
-            src = forward_batch.req_pool_indices[:scheduled_bs]
-            bufs.state_slot_out.gpu[:scheduled_bs].copy_(src)
-            bufs.state_slot_in.gpu[:scheduled_bs].copy_(
-                bufs.state_slot_out.gpu[:scheduled_bs]
-            )
+            first = block_tables[:scheduled_bs, 0].to(dtype=torch.int64)
+            first.clamp_(0, table.shape[0] - 1)
+            gathered = table.index_select(0, first)
+            bufs.state_slot_out.gpu[:scheduled_bs].copy_(gathered)
+            bufs.state_slot_in.gpu[:scheduled_bs].copy_(gathered)
             slot_arr[:scheduled_bs] = -1
         if bs > scheduled_bs:
             bufs.state_slot_out.gpu[scheduled_bs:bs].zero_()
@@ -2179,6 +2223,8 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
             slot_arr[:scheduled_bs] = slot_real
         if reset_slots and model is not None:
             reset_deepseek_v4_state_slots(model, reset_slots)
+        if reset_slots:
+            _publish_allocator_table(proxy_pool, device)
         md.reset_slots = set()
         _stage_graph_state_slots(md, bufs, slot_arr, bs)
     _resolve_v4_pool_geometry(md, proxy_pool, model)
@@ -2416,6 +2462,8 @@ def build_atom_v4_attention_metadata_from_sglang(
         else np.zeros(num_reqs, dtype=bool)
     )
     slot_arr, reset_slots = allocator.assign(first_block_ids, fresh_mask)
+    if reset_slots:
+        _publish_allocator_table(proxy_pool, device)
     md.reset_slots = reset_slots
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = torch.from_numpy(slot_arr).to(
