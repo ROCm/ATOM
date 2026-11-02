@@ -12,9 +12,10 @@ through to it. Nothing in ``atom/models/kimi_k3/model.py`` changes.
 The configuration is checked once (``config.config_refusal``). A step is then
 routed only when it is a pure, uniform speculative verify or plain decode of at
 most ``MAX_ROWS`` rows (``plan.step_shape``). Every per-step input read here is
-TP-uniform: the kernels wait in-kernel on every peer rank, so ranks that
-disagreed would wait on each other for ever (a per-rank flag such as
-``is_dummy_run`` must never gate this).
+TP-uniform: gfx950 kernels wait in-kernel on every peer, while gfx1250 submits
+the same ordered RCCL collectives on every rank. Ranks that disagreed could
+therefore hang either path (a per-rank flag such as ``is_dummy_run`` must never
+gate this).
 """
 
 import logging
@@ -57,11 +58,20 @@ class MonoDecodeModel(nn.Module):
             # is before this runner reaches any collective, so every rank
             # refuses at the same point.
             try:
-                from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
+                from aiter.jit.utils.chip_info import get_gfx
+
+                if get_gfx() == "gfx1250":
+                    from atom.models.kimi_k3.mono.runner_gfx1250 import (
+                        K3Gfx1250MonoDecodeRunner as Runner,
+                    )
+                else:
+                    from atom.models.kimi_k3.mono.runner import (
+                        K3MonoDecodeRunner as Runner,
+                    )
             except ImportError as error:
                 raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
 
-            return K3MonoDecodeRunner(model, drafter, metadata_builder)
+            return Runner(model, drafter, metadata_builder)
 
         self._mono = LazyRunner(_build_runner, "Kimi-K3 mono decode")
         self._declines: set[str] = set()

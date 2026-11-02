@@ -30,6 +30,12 @@ layer) and their E8M0 scales are read exactly where ``FusedMoE`` left them.
 permutation is the one ``atom.mono.device.mx.scale_index`` indexes a byte of --
 the same layout the MoE kernel's scale readers were written for. That holds only
 for the non-interleaved gate/up layout, so ``is_guinterleave`` is checked.
+
+The gfx1250 K2 path has an architecture-explicit scale binder below. A
+gfx1250-loaded model already carries AITER's n32k4 scales and gets zero-copy
+handles; a legacy gfx950 scale plane is converted once and cached by source
+version, TP rank, architecture, and physical layout. The FP4 payload is shared
+by both architectures and is never repacked here.
 """
 
 import logging
@@ -47,12 +53,22 @@ from atom.models.kimi_k3.mono.config import (
     Dims,
     layer_block,
 )
+from atom.models.kimi_k3.mono.expert_scales import (
+    ExpertScaleCache,
+    KimiExpertScaleHandles,
+    materialize_expert_scale,
+)
+from atom.models.kimi_k3.mono.kernels.stages.moe_expert_layout import (
+    ExpertScaleLayout,
+    ExpertScaleSpec,
+)
 from atom.models.kimi_k3.mono.layouts import (
     SCALE_GROUP_ALIGN,
     SCALE_ROW_ALIGN,
     unshuffle_scale,
     unshuffle_weight,
 )
+from atom.mono.plan.architecture import GFX1250, Architecture
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")
@@ -322,6 +338,84 @@ def _experts(moe, layer_id: int, dims: Dims):
             f"{name}: {plane} is {got} B, expected {pad_rows} x {pad_groups}",
         )
     return w13.data, s13.data, w2.data, s2.data
+
+
+def bind_k2_expert_scales(
+    moe,
+    layer_id: int,
+    dims: Dims,
+    rank: int,
+    architecture: Architecture,
+) -> KimiExpertScaleHandles:
+    """Materialize the explicit gfx1250 K2 scale arguments.
+
+    This is deliberately separate from ``_experts``: the production gfx950
+    binder continues to return AITER's existing tensors byte-for-byte.  A
+    The gfx1250 runner calls this function and passes the returned handles to
+    its K2 declaration.
+    """
+
+    if architecture is not GFX1250:
+        raise ValueError(
+            "bind_k2_expert_scales is the architecture-explicit gfx1250 path"
+        )
+    experts = moe.experts
+    method = experts.quant_method
+    name = f"layer {layer_id} experts"
+    _need(hasattr(method, "is_gfx1250"), f"{name}: no source scale-layout metadata")
+    _need(
+        not getattr(method, "is_guinterleave", True),
+        f"{name}: gate/up interleaving is not supported by Kimi mono",
+    )
+    source_layout = (
+        ExpertScaleLayout.GFX1250_N32K4
+        if method.is_gfx1250
+        else ExpertScaleLayout.GFX950_SHUFFLE
+    )
+    cache = getattr(experts, "_kimi_mono_expert_scale_cache", None)
+    if cache is None:
+        cache = ExpertScaleCache()
+        experts._kimi_mono_expert_scale_cache = cache
+    _need(
+        isinstance(cache, ExpertScaleCache),
+        f"{name}: incompatible expert scale materialization cache",
+    )
+
+    w13_spec = ExpertScaleSpec(
+        "w13_scale",
+        EXPERTS,
+        2 * dims.inter,
+        LATENT,
+        rank,
+        dims.tp,
+    )
+    w2_spec = ExpertScaleSpec(
+        "w2_scale",
+        EXPERTS,
+        LATENT,
+        dims.inter,
+        rank,
+        dims.tp,
+    )
+    handles = KimiExpertScaleHandles(
+        architecture,
+        materialize_expert_scale(
+            experts.w13_weight_scale,
+            spec=w13_spec,
+            source_layout=source_layout,
+            architecture=architecture,
+            cache=cache,
+        ),
+        materialize_expert_scale(
+            experts.w2_weight_scale,
+            spec=w2_spec,
+            source_layout=source_layout,
+            architecture=architecture,
+            cache=cache,
+        ),
+    )
+    handles.validate()
+    return handles
 
 
 def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
