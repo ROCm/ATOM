@@ -16,9 +16,8 @@ from atom.model_ops.linear import ColumnParallelLinear
 from atom.model_ops.moe import FusedMoE
 from atom.models.qwen3_next import Qwen3NextDecoderLayer, Qwen3NextRMSNorm
 from atom.models.utils import IntermediateTensors
-from atom.utils import envs
 
-from .utils import maybe_prefix
+from .utils import maybe_prefix, mtp_fc_gather_use_custom
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -94,9 +93,12 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         hidden_states = self.fc(hidden_states)
         # Custom, as in `qwen3_5_mtp.py` and the LM head's gather: the default
         # `use_custom=False` is RCCL. The fc output is [N, hidden / tp] bf16,
-        # gathered along the last dim.
-        hidden_states = get_tp_group().all_gather(
-            hidden_states, use_custom=envs.ATOM_USE_CUSTOM_ALL_GATHER
+        # gathered along the last dim; a prefill-sized step 0 stays on RCCL
+        # (`mtp_fc_gather_use_custom`).
+        tp_group = get_tp_group()
+        hidden_states = tp_group.all_gather(
+            hidden_states,
+            use_custom=mtp_fc_gather_use_custom(hidden_states, tp_group.world_size),
         )
         residual = None
 

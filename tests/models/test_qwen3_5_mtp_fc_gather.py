@@ -93,6 +93,38 @@ def test_fc_gather_follows_the_knob_off(monkeypatch, module, cls_name):
     assert group.calls[0]["use_custom"] is False
 
 
+@pytest.mark.parametrize("module, cls_name", PREDICTORS)
+def test_prefill_sized_fc_gather_stays_on_rccl(monkeypatch, module, cls_name):
+    """aiter's custom all-gather has no size fallback, and step 0 of the draft
+    runs over a whole prefill chunk. Above the per-rank bound the gather asks
+    for RCCL; at the bound it still asks for custom."""
+    from atom.models import utils as model_utils
+
+    monkeypatch.delenv("ATOM_USE_CUSTOM_ALL_GATHER", raising=False)
+    row_bytes = (HIDDEN // TP) * 4  # fp32 stand-in rows
+    # Shrink the bound so that 8 rows a rank fit exactly and 9 do not.
+    monkeypatch.setattr(
+        model_utils, "MTP_FC_CUSTOM_AG_BYTES_PER_RANK", 8 * row_bytes // TP
+    )
+    group, _ = _run(monkeypatch, module, cls_name, n_tokens=8)
+    assert group.calls[0]["use_custom"] is True
+    group, _ = _run(monkeypatch, module, cls_name, n_tokens=9)
+    assert group.calls[0]["use_custom"] is False
+
+
+def test_qwen35_prefill_chunk_is_over_the_bound_and_decode_is_under():
+    """The shipped bound on the shapes it is meant to separate: Qwen3.5-397B
+    (hidden 4096) bf16 fc output at TP4, a 16384-token prefill chunk vs a
+    64-request x 6-row decode step."""
+    from atom.models.utils import mtp_fc_gather_use_custom
+
+    cols = 4096 // 4
+    prefill = torch.empty(16384, cols, dtype=torch.bfloat16, device="meta")
+    decode = torch.empty(64 * 6, cols, dtype=torch.bfloat16, device="meta")
+    assert mtp_fc_gather_use_custom(prefill, 4) is False
+    assert mtp_fc_gather_use_custom(decode, 4) is True
+
+
 def test_env_knob_defaults_on(monkeypatch):
     """The default the change relies on, shared with the LM head's gather."""
     from atom.utils import envs
