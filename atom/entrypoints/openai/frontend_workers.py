@@ -175,6 +175,9 @@ class FrontendHub:
                         f"{timeout:.0f} s"
                     )
                 self._ready_cond.wait(min(remaining, 1.0))
+        dead = self.dead_workers()
+        if dead:
+            raise RuntimeError(f"front-end workers {dead} exited after starting")
 
     def dead_workers(self) -> list[int]:
         return [
@@ -269,6 +272,11 @@ class FrontendHub:
             self._output_sockets[worker_index].send(frame, copy=False)
 
     def close(self) -> None:
+        """Stop the workers and the request thread. Call after the engine has
+        stopped calling ``flush``."""
+        for proc in self._processes:
+            if proc.exitcode is None:
+                proc.terminate()
         self._closing.set()
         if self._thread.is_alive():
             self._thread.join()

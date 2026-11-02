@@ -177,6 +177,10 @@ def test_sequence_ids_wrap_inside_the_worker_window():
 class _Proc:
     def __init__(self):
         self.exitcode = None
+        self.terminated = False
+
+    def terminate(self):
+        self.terminated = True
 
 
 def test_hub_waits_until_every_worker_serves(hub_and_worker):
@@ -235,3 +239,28 @@ def test_metrics_cover_every_worker():
             f'atom:gc_collections_total{{generation="0",process="{process}"}}' in text
         )
         assert f'atom:gc_threshold{{generation="2",process="{process}"}}' in text
+
+
+def test_hub_fails_the_launch_if_a_worker_dies_after_serving(hub_and_worker):
+    _core, hub, worker = hub_and_worker
+    other = fw.RemoteCoreManager(hub.connection_info(0))
+    try:
+        procs = [_Proc(), _Proc()]
+        other.announce_ready()
+        worker.announce_ready()
+        assert _wait(lambda: len(hub._ready) == 2)
+        procs[0].exitcode = 1  # announced, then died
+        with pytest.raises(RuntimeError, match=r"\[0\] exited after starting"):
+            hub.wait_for_workers(procs, timeout=5)
+    finally:
+        other.close()
+
+
+def test_hub_close_stops_the_workers():
+    core = _FakeCoreManager()
+    hub = fw.FrontendHub(core, num_workers=1)
+    hub.start()
+    proc = _Proc()
+    hub._processes = [proc]
+    hub.close()
+    assert proc.terminated

@@ -1640,7 +1640,12 @@ async def lifespan(app: FastAPI):
             if engine is not None:
                 engine.close()
         finally:
-            await asyncio.to_thread(shutdown_tracing)
+            try:
+                # After the engine: its output threads flush into the hub.
+                if _frontend_hub is not None:
+                    _frontend_hub.close()
+            finally:
+                await asyncio.to_thread(shutdown_tracing)
 
 
 app = FastAPI(title="ATOM OpenAI API Server", lifespan=lifespan)
@@ -1686,6 +1691,14 @@ async def _forward_to_frontend_hub(request: Request, call_next):
             connector=aiohttp.UnixConnector(path=_frontend_hub_uds),
             timeout=aiohttp.ClientTimeout(total=None),
         )
+    try:
+        return await _relay_to_hub(request)
+    except aiohttp.ClientConnectionError:
+        # Workers serve before the hub binds its socket, and after it exits.
+        return JSONResponse({"detail": "Engine hub is not serving"}, status_code=503)
+
+
+async def _relay_to_hub(request: Request) -> Response:
     async with _frontend_hub_session.request(
         request.method,
         f"http://hub{request.url.path}",

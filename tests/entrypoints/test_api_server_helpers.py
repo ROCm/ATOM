@@ -992,3 +992,18 @@ def test_hub_flush_runs_even_when_the_local_flush_fails():
     calls.clear()
     api_server._flush_local_and_hub(None, hub)()
     assert calls == ["hub"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
+def test_relay_answers_503_while_the_hub_is_not_serving(monkeypatch, tmp_path):
+    # Workers are serving before the hub binds its socket (and after it exits).
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(api_server, "_frontend_hub_uds", str(tmp_path / "none.sock"))
+    api_server._frontend_hub_session = None
+    try:
+        reply = TestClient(api_server.app).get("/health")
+    finally:
+        api_server._frontend_hub_session = None
+    assert reply.status_code == 503
+    assert reply.json()["detail"] == "Engine hub is not serving"
