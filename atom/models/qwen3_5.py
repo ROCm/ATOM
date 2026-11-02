@@ -26,6 +26,11 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
+from atom.models.qwen3_5_gdn_in_proj import (
+    _QWEN3_5_PACKED_MODULES_MAPPING,
+    _apply_merged_in_proj_mapping,
+    gdn_in_proj_is_merged,
+)
 from atom.models.qwen3_next import (
     ENABLE_ALLREDUCE_RMSNORM_FUSION,
     Qwen3NextAttention,
@@ -44,8 +49,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.plugin.prepare import is_plugin_mode
-from atom.quant_spec import QuantType
-from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
@@ -548,88 +551,6 @@ class Qwen3_5Model(Qwen3NextModel):
             eps=config.rms_norm_eps,
             fused_allreduce=fuse_allreduce_norm,
         )
-
-
-_QWEN3_5_PACKED_MODULES_MAPPING = {
-    "q_proj": ("qkv_proj", "q"),
-    "k_proj": ("qkv_proj", "k"),
-    "v_proj": ("qkv_proj", "v"),
-    "gate_proj": ("gate_up_proj", 0),
-    "up_proj": ("gate_up_proj", 1),
-    "gate_up_proj": ["gate_proj", "up_proj"],
-    "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvz", 3),
-    "in_proj_b": ("in_proj_ba", 0),
-    "in_proj_a": ("in_proj_ba", 1),
-    ".gate.": (".gate.", 0),
-    "shared_expert_gate": ("gate", 1),
-}
-
-
-_MERGED_IN_PROJ_MAPPING = {
-    "in_proj_qkv": ("in_proj_qkvzba", (0, 1, 2)),
-    "in_proj_z": ("in_proj_qkvzba", 3),
-    "in_proj_b": ("in_proj_qkvzba", 4),
-    "in_proj_a": ("in_proj_qkvzba", 5),
-}
-
-
-def _first_linear_attention_prefix(atom_config: Config) -> str | None:
-    """`model.layers.<i>.linear_attn` for the first GDN layer, or None if there is none.
-
-    Only used to resolve a quantization spec: the per-layer specs are fnmatch
-    patterns (`*linear_attn*`), so any GDN layer answers for all of them.
-    """
-    config = get_qwen3_5_text_config(atom_config)
-    layer_types = getattr(config, "layer_types", None) or []
-    for i, layer_type in enumerate(layer_types):
-        if layer_type == "linear_attention":
-            return f"model.layers.{i}.linear_attn"
-    return None
-
-
-def gdn_in_proj_is_merged(atom_config: Config) -> bool:
-    """True when the GDN input projection is one `in_proj_qkvzba` layer.
-
-    Both the layer construction (`Qwen3_5GatedDeltaNet.create_qkvzba_proj`) and
-    the checkpoint mapping (`_apply_merged_in_proj_mapping`) call this, because a
-    disagreement would load `in_proj_b` / `in_proj_a` into a module that does not
-    exist, or leave the merged weight's last two shards unwritten.
-
-    BF16 checkpoints merge unconditionally, as they always have. A quantized
-    checkpoint merges only when `in_proj_qkvz` and `in_proj_ba` carry the same
-    per-token spec: per-token activation scales are one value per row and
-    per-channel weight scales one per column, so concatenating along the output
-    dimension just concatenates the scales. A block-scale checkpoint must not
-    merge -- `in_proj_ba` contributes 32 columns per rank, which is not a whole
-    number of 128-column scale blocks.
-    """
-    quant_config = atom_config.quant_config
-    if quant_config is None:
-        return False
-    if quant_config.global_quant_config.quant_dtype == torch.bfloat16:
-        return True
-    if not envs.ATOM_QWEN35_GDN_MERGE_QKVZBA:
-        return False
-    prefix = _first_linear_attention_prefix(atom_config)
-    if prefix is None:
-        return False
-    qkvz = quant_config.get_layer_quant_config(f"{prefix}.in_proj_qkvz")
-    ba = quant_config.get_layer_quant_config(f"{prefix}.in_proj_ba")
-    if qkvz != ba:
-        return False
-    return qkvz.quant_type == QuantType.per_Token and qkvz.weight_block_size is None
-
-
-def _apply_merged_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
-    if not gdn_in_proj_is_merged(atom_config):
-        return mapping
-
-    mapping.pop("in_proj_qkvz", None)
-    mapping.pop("in_proj_ba", None)
-    mapping["in_proj_qkvzba"] = ("in_proj_qkvzba", None)
-    mapping.update(_MERGED_IN_PROJ_MAPPING)
-    return mapping
 
 
 class Qwen3_5ForCausalLMBase(nn.Module):
