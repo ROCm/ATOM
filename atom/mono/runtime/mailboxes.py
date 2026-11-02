@@ -19,21 +19,33 @@ from atom.mono.runtime.step_begin import MISSING, STATE_WORDS, step_begin
 class StepMailboxes:
     """``peers``' data region and this rank's ``scratch`` buffers, zeroed
     together by ``begin_step``. ``debug``: a bounded fence wait, a rank that
-    never arrived reported by ``missing_ranks``."""
+    never arrived reported by ``missing_ranks``; ``gfx1250`` bounds it out of
+    a debug build too, a give-up stopping the queue (``step_begin``)."""
 
     def __init__(
-        self, peers: PeerBuffer, *scratch: torch.Tensor, debug: bool = False
+        self,
+        peers: PeerBuffer,
+        *scratch: torch.Tensor,
+        debug: bool = False,
+        gfx1250: bool = False,
     ) -> None:
         self.peers = peers
         self._scratch = scratch
         self._debug = debug
+        self._gfx1250 = gfx1250
         self._state = torch.zeros(
             STATE_WORDS, dtype=torch.int64, device=peers.bytes.device
         )
 
     def begin_step(self) -> None:
         """Before the step's first kernel, on its stream (a graph records it)."""
-        step_begin(self._scratch, self.peers, self._state, self._debug)
+        step_begin(
+            self._scratch,
+            self.peers,
+            self._state,
+            self._debug,
+            gfx1250=self._gfx1250,
+        )
 
     def missing_ranks(self) -> list[int]:
         """The ranks the fences since the last call gave up on (a debug build;
