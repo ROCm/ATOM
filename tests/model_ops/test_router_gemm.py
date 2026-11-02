@@ -362,8 +362,11 @@ def test_rtpllm_patched_moe_forward_keeps_router_dtype_policy(
     stub.Qwen3NextGatedDeltaNet = type("Qwen3NextGatedDeltaNet", (), {})
     stub.is_rocm_aiter_fusion_shared_expert_enabled = lambda: False
     monkeypatch.setitem(sys.modules, "atom.models.qwen3_next", stub)
-    if "atom.models" not in sys.modules:  # its real __init__ needs AITER
+    if "atom.models" not in sys.modules:
         monkeypatch.setitem(sys.modules, "atom.models", ModuleType("atom.models"))
+    # `import atom.models.qwen3_next as m` reads the parent's attribute before
+    # sys.modules, so a real module imported earlier would win over the stub.
+    monkeypatch.setattr(sys.modules["atom.models"], "qwen3_next", stub, raising=False)
     path = (
         Path(__file__).resolve().parents[2] / "atom/plugin/rtpllm/models/qwen3_next.py"
     )
