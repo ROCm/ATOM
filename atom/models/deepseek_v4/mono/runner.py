@@ -34,7 +34,7 @@ from atom.models.deepseek_v4.mono.config import (
 from atom.models.deepseek_v4.mono.runtime import require_resident_grid
 from atom.models.deepseek_v4.mono.state import Dsv4Variant
 from atom.models.deepseek_v4.mono.weights import pack_layer_weights
-from atom.mono.runtime.compile import compile_only, launcher_resources
+from atom.mono.runtime.compile import compile_only, kernel_names, launcher_resources
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed, tp_agree
 
 logger = logging.getLogger("atom")
@@ -376,6 +376,16 @@ class V4MonoDecodeRunner:
             self._refused.add(key)
             return False
         Dsv4Variant._cache.update(builds)
+        if self.rank == 0:
+            names = sorted(
+                {
+                    n
+                    for launches in builds.values()
+                    for launch in launches
+                    for n in kernel_names(launch)
+                }
+            )
+            logger.info("V4 Mono kernels built: %s", ", ".join(names))
         lane_builds, allocated_variants = [], []
         try:
             for _lane in range(lanes):

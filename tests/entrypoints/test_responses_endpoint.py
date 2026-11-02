@@ -332,7 +332,7 @@ class TestResponseStreamEmitter:
         assert "response.custom_tool_call_input.done" in joined
         assert "*** Begin Patch" in joined
         assert "response.function_call_arguments" not in joined
-        assert "data: [DONE]" in joined
+        assert "data: [DONE]" not in joined
 
     def test_function_tool_emits_argument_deltas(self):
         emitter = ResponseStreamEmitter("resp_x", "m", created_at=0)
