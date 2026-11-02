@@ -7,15 +7,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("triton")
+pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+
 from atom.model_ops.attentions.pool_layout.entry_arena import (
     EntryField,
     LayerMajorArena,
     published_bytes_for,
 )
-from atom.model_ops.qwen4_exp.qsa_cache_rules import (
+from atom.model_ops.attentions.qwen4_exp_attn import (
+    PLE_STATE_SLOT_CLASS,
     QSA_DRAFT_ROWS,
     QSA_ROWS,
-    check_kv_transfer,
+    Qwen4ExpBackend,
+    Qwen4ExpMetadataBuilder,
+    _check_kv_transfer,
     qsa_page_segments,
     qsa_row_space,
 )
@@ -23,9 +29,6 @@ from tests.test_entry_arena import qsa_like_fields
 
 
 def _builder():
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
-
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.num_spec = 1
     builder.ngram_context_len = 2
@@ -69,7 +72,6 @@ def _builder():
 
 @pytest.fixture
 def one_tp_rank(monkeypatch):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
     monkeypatch.setattr(
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=1),
@@ -185,7 +187,6 @@ def _flydsl_builder(monkeypatch, *, replayssm=False):
 def test_ssm_storage_follows_the_decode_switches(
     monkeypatch, one_tp_rank, env, replayssm, storage
 ):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
     from atom.model_ops.fla_ops import gdn_flydsl
 
     for name, value in env.items():
@@ -200,7 +201,6 @@ def test_ssm_storage_follows_the_decode_switches(
 
 
 def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
-    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
     from atom.model_ops.fla_ops import gdn_flydsl
 
@@ -224,7 +224,6 @@ def test_binding_refuses_an_ssm_order_the_layout_id_does_not_say(monkeypatch):
 def test_allocated_ple_state_is_what_the_layout_id_spells(monkeypatch):
     builder, cls = _builder()
     from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
-    from atom.model_ops.attentions.qwen4_exp_attn import PLE_STATE_SLOT_CLASS
 
     if not torch.cuda.is_available():
         pytest.skip("allocates the PLE state on the GPU")
@@ -239,12 +238,6 @@ def test_allocated_ple_state_is_what_the_layout_id_spells(monkeypatch):
     assert (tuple(ngram.shape), ngram.dtype) == ((4, 3), torch.int64)
     assert bool((ngram == builder.eos_token_id).all())
     assert cls._ple_state_spec(builder).entry_bytes == conv[0].nbytes + ngram[0].nbytes
-
-
-def _qwen4_exp_backend():
-    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
-
-    return Qwen4ExpBackend
 
 
 @pytest.mark.parametrize(
@@ -270,7 +263,7 @@ def test_lmcache_tiers_are_accepted_and_turn_page_checkpoints_on(
     """A server without offload keeps main's fork slots."""
     builder, cls = _builder()
     builder.model_runner.config.kv_transfer_config = kv_transfer_config
-    _qwen4_exp_backend().validate_config(builder.model_runner.config)
+    Qwen4ExpBackend.validate_config(builder.model_runner.config)
     assert cls._uses_paged_checkpoints(builder) is paged
     assert bool(cls.state_transfer(builder).copies) is paged
     if not paged:
@@ -283,10 +276,8 @@ def test_page_checkpoints_do_not_hang_on_the_model_type_spelling():
     assert cls._uses_paged_checkpoints(builder)
 
 
-def _check_kv_transfer(
-    kv_transfer_config, kv_cache_dtype="bf16", index_cache_dtype=None
-):
-    check_kv_transfer(
+def _check(kv_transfer_config, kv_cache_dtype="bf16", index_cache_dtype=None):
+    _check_kv_transfer(
         SimpleNamespace(
             kv_transfer_config=kv_transfer_config,
             kv_cache_dtype=kv_cache_dtype,
@@ -344,7 +335,7 @@ def test_validate_config_refuses_connectors_that_drop_the_state(
 ):
     """A P/D peer would get the QSA pages and continue from a zero GDN/PLE state."""
     with pytest.raises(ValueError, match=error.format(backend)):
-        _check_kv_transfer(kv_transfer_config)
+        _check(kv_transfer_config)
 
 
 @pytest.mark.parametrize("switch", ["pipeline_parallel_size", "enable_rapidserve"])
@@ -364,7 +355,7 @@ def test_pipeline_parallel_and_rapidserve_refuse_offload(
     setattr(config, switch, 2 if switch == "pipeline_parallel_size" else True)
     config.kv_transfer_config = kv_transfer_config
     with pytest.raises(ValueError, match=error):
-        _qwen4_exp_backend().validate_config(config)
+        Qwen4ExpBackend.validate_config(config)
 
 
 @pytest.mark.parametrize("reads", [True, False])
@@ -379,10 +370,10 @@ def test_qwen38_runs_any_tier_that_declares_it_reads_page_images(monkeypatch, re
     monkeypatch.setitem(KVConnectorFactory._reads_page_images, name, reads)
     kv_transfer_config = {"kv_connector": name, "kv_role": "offload"}
     if reads:
-        _check_kv_transfer(kv_transfer_config)
+        _check(kv_transfer_config)
     else:
         with pytest.raises(ValueError, match=f"kv_connector={name!r} does not"):
-            _check_kv_transfer(kv_transfer_config)
+            _check(kv_transfer_config)
 
 
 _IN_PROCESS = {"kv_connector": "LMCacheOffloadConnector", "kv_role": "offload"}
@@ -412,7 +403,7 @@ def test_qwen38_refuses_in_process_offload_of_quantized_caches(
 ):
     """The in-process codec has no field for the QSA scale planes."""
     with pytest.raises(ValueError, match="lmcache_offload.*#2655"):
-        _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
+        _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 
 @pytest.mark.parametrize(
@@ -431,7 +422,7 @@ def test_qwen38_refuses_in_process_offload_of_quantized_caches(
 def test_qwen38_keeps_bf16_in_process_and_every_lmcache_mp_cache(
     kv_transfer_config, kv_cache_dtype, index_cache_dtype
 ):
-    _check_kv_transfer(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
+    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 
 _MTP = SimpleNamespace(method="mtp")
