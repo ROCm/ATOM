@@ -218,20 +218,18 @@ def triton_topk_softmax_rows(
 ) -> int | None:
     """The most rows a launch of this routing runs `triton_topk_softmax` for;
     None: always AITER. The shapes are those of AITER's fused
-    `topkGatingSoftmax`. `cu_masked`: count the CUs of RapidServe's smallest
-    CU-masked stream. `get_cu_num()` ignores an `HSA_CU_MASK` set outside
-    ATOM; set `CU_NUM` then."""
-    if fused_shared_experts_scoring_func is None:
-        num_shared, scoring_func = 0, ""
-    else:
-        num_shared = num_fused_shared_experts
-        scoring_func = fused_shared_experts_scoring_func
+    `topkGatingSoftmax` from top-4 up (at top-1 / top-2 Triton is slower near
+    the cutoff). `cu_masked`: count the CUs of RapidServe's smallest CU-masked
+    stream. `get_cu_num()` ignores an `HSA_CU_MASK` set outside ATOM; set
+    `CU_NUM` then."""
+    scoring_func = fused_shared_experts_scoring_func
+    num_shared = 0 if scoring_func is None else num_fused_shared_experts
     if not (
         renormalize
-        and scoring_func in ("", "sigmoid")
+        and scoring_func in (None, "sigmoid")
         and 32 <= num_experts <= 512
         and num_experts & (num_experts - 1) == 0
-        and 0 < topk <= 32
+        and 4 <= topk <= 32
         and num_shared in (0, 1, 2, 4, 8)
     ):
         return None

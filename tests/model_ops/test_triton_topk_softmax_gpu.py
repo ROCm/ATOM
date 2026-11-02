@@ -88,7 +88,7 @@ def _layer_rows(experts, k, shared, **kwargs):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("shared", [0, 1, 2, 4, 8])
-@pytest.mark.parametrize("k", [1, 8, 10, 32])
+@pytest.mark.parametrize("k", [4, 8, 10, 32])
 @pytest.mark.parametrize("experts", [32, 64, 128, 256, 512])
 def test_every_supported_shape_matches_aiter(experts, k, shared, dtype, gpu):
     assert _layer_rows(experts, k, shared) is not None
@@ -114,12 +114,15 @@ def test_every_supported_shape_matches_aiter(experts, k, shared, dtype, gpu):
         (1024, 10, 1, "sigmoid", True),
         (8, 2, 0, None, True),  # Mixtral
         (16, 4, 0, None, True),
+        (128, 1, 0, None, True),  # Triton slower near the cutoff
+        (512, 2, 0, None, True),
         (160, 8, 0, None, True),  # Qwen3-Coder-480B
         (513, 10, 0, None, True),
         (512, 33, 0, None, True),
         (512, 0, 0, None, True),
         (512, 10, 3, "sigmoid", True),
         (512, 10, 1, "softplus", True),
+        (512, 10, 1, "", True),  # AITER refuses shared columns unscored by ""
         (512, 10, 1, "sigmoid", False),
     ],
 )
