@@ -196,9 +196,23 @@ def flagged_citations(pr):
     """-> set of 'path:line' that check_citations.py would not vouch for, or None if unknown.
 
     Reuses the checker's own verdicts (run_one writes them to citations.txt) rather than
-    re-deciding here: both halves count, the hard failures and the proximity notes. None
-    means the checker never ran on this card -- and a citation nobody checked is not a
-    citation that checks out, so the caller anchors nothing.
+    re-deciding here. **Only the hard failures disqualify** -- a citation whose file is
+    absent or whose line is past the end of it resolves to nothing, and anchoring there
+    would either fail at the API or point at empty space. The proximity notes do not: they
+    say a symbol the finding quoted is not within five lines of the one it cites, which is
+    a quality hint, not evidence the line is wrong, and the checker's own docstring puts
+    that half at roughly 50% precision.
+
+    Counting both halves was measured doing real damage. On aiter#7303 the reviewer
+    produced five findings, every one of them cited, and published with zero inline
+    comments: four proximity notes vetoed four anchors, and the fifth was lost to the
+    merge-target bug fixed alongside this. A 50%-precision heuristic silently switching
+    off the feature it was meant to protect is a worse failure than the wrong anchor it
+    was guarding against -- the wrong anchor is visible and correctable, the absent one
+    looks exactly like a review that had nothing to say.
+
+    None means the checker never ran on this card -- and a citation nobody checked is not
+    a citation that checks out, so the caller still anchors nothing in that case.
     """
     f = REPORTS / f"PR-{pr}" / "citations.txt"
     if not f.is_file():
@@ -209,8 +223,18 @@ def flagged_citations(pr):
     if not text.strip():
         return None
     out = set()
+    # Hard failures only. They are printed under the `CITATIONS BAD:` header, one per
+    # indented line; `CITATIONS NOTE:` lines are advisory and are left to the human
+    # reading the card.
+    in_bad = False
     for ln in text.split("\n"):
-        if not (ln.startswith("CITATIONS NOTE:") or ln.startswith("  ")):
+        if ln.startswith("CITATIONS BAD:"):
+            in_bad = True
+            continue
+        if ln.startswith("CITATIONS"):
+            in_bad = False
+            continue
+        if not (in_bad and ln.startswith("  ")):
             continue
         m = check_citations.CITATION.search(ln)
         if m:
