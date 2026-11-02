@@ -409,7 +409,16 @@ def _attn_out_buffer(self, hidden):
 
 
 def _attend_block(
-    self, attn_out, hidden, hidden_scale, cache, _step, rope, queries, hidden_fp8=None
+    self,
+    attn_out,
+    hidden,
+    hidden_scale,
+    cache,
+    _step,
+    rope,
+    queries,
+    hidden_fp8=None,
+    hidden_scale_dtype=None,
 ):
     """Everything from the compressor fork to the attention rows, in place.
 
@@ -418,7 +427,12 @@ def _attend_block(
     to rebind them, so an argument would hold the capture's step on every
     replay. The cache outlives every step and `begin_step` leaves the current
     one on it. `_step` is the fallback for the window before a pool is bound.
+
+    `hidden_scale_dtype` is set when `_forward` passed the scale as a uint8
+    view; the scale is viewed back to it here.
     """
+    if hidden_scale_dtype is not None:
+        hidden_scale = hidden_scale.view(hidden_scale_dtype)
     step = getattr(cache, "current_step", None) or _step
     compressed = self._fork_compress(hidden, cache, step, rope)
     # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
@@ -516,8 +530,25 @@ def _forward(
 ):
     """`Attention.forward` with its attention half inside a capture break."""
     attn_out = _attn_out_buffer(self, hidden)
+    # The break weak-refs every argument through a stable-ABI op that refuses
+    # float8_e8m0fnu ("Not yet supported ScalarType 44"), the MX scale the
+    # fused MHC quant hands QKV. The scale crosses as a uint8 view of the same
+    # bytes, so the weak ref still points at the caller's buffer on replay.
+    scale_view_kwargs = {}
+    if hidden_scale is not None and hidden_scale.dtype == torch.float8_e8m0fnu:
+        scale_view_kwargs = {"hidden_scale_dtype": hidden_scale.dtype}
+        hidden_scale = hidden_scale.view(torch.uint8)
     type(self)._atom_v41_attend_block(
-        self, attn_out, hidden, hidden_scale, cache, step, rope, queries, hidden_fp8
+        self,
+        attn_out,
+        hidden,
+        hidden_scale,
+        cache,
+        step,
+        rope,
+        queries,
+        hidden_fp8,
+        **scale_view_kwargs,
     )
     return self._project_out(
         attn_out,

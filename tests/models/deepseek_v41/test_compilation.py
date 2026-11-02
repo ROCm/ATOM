@@ -254,8 +254,11 @@ def test_mhc_guard_outputs_and_input_alias(mode, backend):
         "norm_eps": 1e-6,
     }
     if backend != "triton":
-        if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx950":
-            pytest.skip("ATOM HIP Mega-MHC requires gfx950")
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if arch not in ("gfx950", "gfx1250"):
+            pytest.skip("ATOM HIP Mega-MHC requires gfx950 or gfx1250")
+        if backend == "hip_quant" and not mhc.fuse_quant_supported():
+            pytest.skip("AITER Mega-MHC cannot write row-major MXFP8 scales here")
         from aiter.ops.mega_mhc import mega_mhc_shuffle_fn
 
         fn = mega_mhc_shuffle_fn(fn)

@@ -34,6 +34,7 @@ returns it as the single pending and folds any two it was handed into K1's one
 """
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -42,6 +43,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.kimi_k3.mono.config import (
     MAX_ROWS,
@@ -51,12 +53,17 @@ from atom.models.kimi_k3.mono.config import (
 )
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
+from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.models.kimi_k3.mono.plan import (
     _width,
     kda_metadata,
+    state_slots,
     width_key,
+    width_refusal,
 )
 from atom.models.kimi_k3.mono.weights import bind_model
+from atom.mono.dsa_indexer import kernel as kix
+from atom.mono.dsa_indexer.runner import IndexerRunner
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import (
@@ -67,6 +74,7 @@ from atom.mono.runtime.debug import (
 )
 from atom.mono.runtime.lifecycle import owned_peer_buffer
 from atom.mono.runtime.mailboxes import StepMailboxes
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -76,6 +84,8 @@ logger = logging.getLogger("atom")
 # K2's mailbox tags start past every layer's K1: a step's two launches of one
 # layer must not share a tag, and the model has fewer layers than this
 K2_TAG0 = 128
+# the DSA layers' indexer launches, past every K2's
+IX_TAG0 = 2 * K2_TAG0
 
 
 def inner_model(model):
@@ -87,17 +97,55 @@ def inner_model(model):
 
 @dataclass(frozen=True)
 class WidthBuild:
-    """A width's kernels: K1's build key a layer with its launcher, and K2's."""
+    """A width's kernels: K1's build key a layer with its launcher, K2's, and
+    the DSA layers' indexer (one build for all of them; None when the width is
+    past its bound or the indexers are not mono's)."""
 
     k1_keys: dict[int, k1.KdaPreBuild]
     k1_launchers: dict[k1.KdaPreBuild, object]
     k2_keys: dict[int, k2.K2Build]
     k2_launchers: dict[k2.K2Build, object]
+    indexer: object | None = None
 
     def kernels(self) -> list:
-        return [(f, k1.ABI) for f in self.k1_launchers.values()] + [
-            (f, k2.ABI) for f in self.k2_launchers.values()
-        ]
+        ix = [] if self.indexer is None else [(self.indexer, kix.ABI)]
+        return (
+            [(f, k1.ABI) for f in self.k1_launchers.values()]
+            + [(f, k2.ABI) for f in self.k2_launchers.values()]
+            + ix
+        )
+
+
+def ix_peer_offset(max_rows: int) -> int:
+    """Where the DSA indexer's regions start in the peer buffer it shares with
+    K2: past every K2 width's (up to ``max_rows``). A rank already in the next
+    layer's K2 (its AR pushes from offset 0) then cannot land on hist pairs a
+    peer's indexer is still polling; at a shared 0 they overlapped from 2 rows."""
+    return -(-k2.peer_bytes(max_rows) // 256) * 256
+
+
+def _lean_width(built: WidthBuild, spilled: list) -> WidthBuild | None:
+    """``built`` with each K1 build whose launcher spilled staged a column group
+    a GEMV unit (``KdaPreBuild.gemv_unit``): half the weights in flight, slower
+    where ``kda.gemv_staging`` keeps two groups, so only where those do not fit.
+    None when no spilled launcher is such a K1 build (a K2 or indexer spill, or
+    a K1 at one group a unit already): there is nothing leaner to build."""
+    lean = {
+        key: replace(key, gemv_unit=1)
+        for key, launcher in built.k1_launchers.items()
+        if launcher in spilled and key.gemv_unit > 1
+    }
+    if not lean:
+        return None
+    k1_keys = {layer: lean.get(key, key) for layer, key in built.k1_keys.items()}
+    return replace(
+        built,
+        k1_keys=k1_keys,
+        k1_launchers={
+            key: k1.build(key) if key in lean.values() else built.k1_launchers[key]
+            for key in set(k1_keys.values())
+        },
+    )
 
 
 class K3MonoDecodeRunner:
@@ -106,24 +154,39 @@ class K3MonoDecodeRunner:
 
     max_rows = MAX_ROWS
 
-    def __init__(self, model, drafter=None) -> None:
+    def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
-        bind_agreed(lambda: self._bind(model, drafter), group)
+        bind_agreed(lambda: self._bind(model, drafter, metadata_builder), group)
+        peer_bytes = k2.peer_bytes(self.max_rows)
+        if self.ix is not None:
+            peer_bytes = max(peer_bytes, self.ix.peer_bytes)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            k2.peer_bytes(self.max_rows),
+            peer_bytes,
             group,
             self.rank,
             self.tp,
             self.device,
+            plain_bytes=self.plain_bytes,
         )
-        self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
+        self.plain = self.peers.plain
+        self.mailboxes = StepMailboxes(
+            self.peers, self.scratch, self.queue, debug=self.debug
+        )
         self.widths = WidthBuilds(
-            self._build_width, WidthBuild.kernels, group, "Kimi-K3 mono"
+            self._build_width,
+            WidthBuild.kernels,
+            group,
+            "Kimi-K3 mono",
+            lean=_lean_width,
         )
+        # the DSA indexers hooked last, once every rank holds a whole runner
+        # (K3's layers run eagerly here: no trace before the hook)
+        if self.ix is not None:
+            self.ix.attach(self.scratch, self.plain, self.peers, IX_TAG0)
 
     # ------------------------------------------------------------------ bind
-    def _bind(self, model, drafter=None) -> None:
+    def _bind(self, model, drafter=None, metadata_builder=None) -> None:
         self.model = model
         self.rank = get_tensor_model_parallel_rank()
         self.tp = get_tensor_model_parallel_world_size()
@@ -132,8 +195,7 @@ class K3MonoDecodeRunner:
         self.inner = inner_model(model)
         self.plans = bind_model(self.inner, self.dims, self.rank)
         self.num_blocks = num_blocks(len(self.inner.layers))
-        # K3 mono requires DSpark (`config_refusal`), so in an armed deployment
-        # there is always a drafter and always taps to keep current.
+        # a DSpark drafter taps hidden states; a plain-decode deployment has none
         self.aux = (
             AuxTaps((), ())
             if drafter is None
@@ -142,6 +204,20 @@ class K3MonoDecodeRunner:
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
         self.state_len = self._state_len()
+        self.replay_cap = self._replay_cap()
+        self._replay_tables = {}  # layer id -> (K1's ReplaySSM table, its pointers)
+        # the DSA layers' indexers: static checks every rank shares, so no
+        # vote; refused, the layers keep their own and the rest stays mono
+        try:
+            self.ix = IndexerRunner(
+                self.inner,
+                metadata_builder,
+                peer_offset=ix_peer_offset(self.max_rows),
+                max_rows=self.max_rows,
+            )
+        except MonoUnsupported as why:
+            logger.info("mono DSA indexer off: %s", why)
+            self.ix = None
         self._allocate()
 
     def _state_len(self) -> int:
@@ -189,6 +265,38 @@ class K3MonoDecodeRunner:
             )
         return lens.pop()
 
+    def _replay_cap(self) -> int:
+        """ReplaySSM's record buffer length (its ``cache_len``), 0 without:
+        read off the buffers allocated, every mono layer's checked as
+        ``_state_len`` checks the state pools -- a build constant, refused for
+        the whole runner. K1 indexes them as contiguous [slot][head][cap][128]:
+        k and u bf16, the log gates fp32."""
+        caps = set()
+        for plan in self.plans:
+            if not plan.mono:
+                continue
+            cache = get_forward_context().kv_cache_data[f"layer_{plan.layer_id}"]
+            bufs = [getattr(cache, f"replay_buf_{n}", None) for n in "kug"]
+            if bufs[0] is None:
+                caps.add(0)
+                continue
+            for buf, dtype in zip(
+                bufs, (torch.bfloat16, torch.bfloat16, torch.float32)
+            ):
+                if (
+                    buf.dtype != dtype
+                    or not buf.is_contiguous()
+                    or tuple(buf.shape[1::2]) != (k1.NH, k1.HD)
+                ):
+                    raise MonoUnsupported(
+                        f"layer {plan.layer_id}: a ReplaySSM record buffer is "
+                        f"{tuple(buf.shape)} {buf.dtype}"
+                    )
+            caps.add(bufs[0].shape[2])
+        if len(caps) != 1:
+            raise MonoUnsupported(f"mono layers disagree on ReplaySSM: {sorted(caps)}")
+        return caps.pop()
+
     def _recurrent_state(self, layer_id: int) -> torch.Tensor:
         """The layer's KDA recurrent state, checked.
 
@@ -227,28 +335,54 @@ class K3MonoDecodeRunner:
     def _allocate(self) -> None:
         """The scratch every launch shares, sized for the widest build. It is
         zeroed, and the peers fenced, before each step's first kernel
-        (``StepMailboxes.begin_step``), so a layer's tag is all that tells its
-        pairs from the previous layer's."""
+        (``StepMailboxes.begin_step``), and holds tagged pairs only, so a
+        layer's tag is all that tells its pairs from the previous layer's."""
+        # (K1's regions do not depend on the query length)
         widest_k1 = max(
-            k1.scratch_bytes(key) for key in self._k1_keys(MAX_ROWS, MAX_ROWS).values()
+            k1.scratch_bytes(key) for key in self._k1_keys(MAX_ROWS, 1).values()
         )
         widest_k2 = max(
             k2.scratch_bytes(key) for key in self._k2_keys(MAX_ROWS).values()
         )
         nbytes = max(widest_k1, widest_k2)
+        if self.ix is not None:
+            nbytes = max(nbytes, self.ix.scratch_bytes)
         # a debug build's per-CTA wait records sit past every kernel's regions
         # and are cleared with them at each step's start
         self.diag_off = -1
         if self.debug:
             self.diag_off = -(-nbytes // 256) * 256
             nbytes = self.diag_off + DIAG_BYTES
-        # a multiple of the step zeroing's 16 B store
+        # a multiple of the step zeroing's 16 B store. The step's buffers are
+        # uncached (``uncached``): a hand-off's consumer reads the line at its
+        # home memory, not through the producer XCD's L2 -- K1 + K2 a layer
+        # -3.7 us at 1 row, -6 at 64 (2026-10-30, bits equal)
         nbytes = -(-nbytes // 16) * 16
-        self.scratch = torch.zeros(nbytes, dtype=torch.uint8, device=self.device)
+        self.scratch = uncached_bytes(nbytes, self.device)
+        # the plain words every launch hands on behind a flag (``plain_layout``):
+        # out of the scratch, where a later launch's tag could match a stale
+        # one; never cleared, a reader waits for the flag first. They live in
+        # the peer buffer's own plain region (``PeerBuffer.plain``)
+        self.plain_bytes = max(
+            *(k1.plain_bytes(key) for key in self._k1_keys(MAX_ROWS, 1).values()),
+            *(k2.plain_bytes(key) for key in self._k2_keys(MAX_ROWS).values()),
+        )
+        if self.ix is not None:
+            self.plain_bytes = max(self.plain_bytes, self.ix.plain_bytes)
+        # K2's ug task queue: counts from the step's clear, so out of the
+        # scratch the other launches write
+        self.queue = uncached_bytes(k2b.QUEUE_BYTES, self.device)
+        # a plain decode's accepted-token counts (`plan.state_slots`): fixed, so
+        # a captured step reads them at one address
+        self.ones = torch.ones(MAX_ROWS, dtype=torch.int32, device=self.device)
 
     # ---------------------------------------------------------------- builds
     def _k1_keys(self, rows: int, qlen: int) -> dict[int, k1.KdaPreBuild]:
-        return {
+        # ReplaySSM's verify window: the step being built is a decode, its
+        # metadata the builder's (a constant of the deployment)
+        md = kda_metadata(get_forward_context()) if self.replay_cap else None
+        window = md.replayssm_max_query_len if md is not None else 0
+        keys = {
             p.layer_id: k1.KdaPreBuild(
                 tokens=rows,
                 qlen=qlen,
@@ -261,10 +395,17 @@ class K3MonoDecodeRunner:
                 onorm_eps=p.kda.onorm_eps,
                 lower_bound=p.kda.lower_bound,
                 write_idx=p.kda.write_idx,
+                replay_cap=self.replay_cap,
+                replay_window=window,
+                **k1.gemv_staging(rows),
             )
             for p in self.plans
             if p.mono
         }
+        for key in set(keys.values()):
+            if k1.lds_refusal(key):
+                raise MonoUnsupported(k1.lds_refusal(key))
+        return keys
 
     def _k2_keys(self, rows: int) -> dict[int, k2.K2Build]:
         return {
@@ -272,7 +413,6 @@ class K3MonoDecodeRunner:
                 tokens=rows,
                 # the MLP seam mixes this layer's own block too, when it wrote one
                 nblocks=p.moe.blocks + (p.moe.write_idx >= 0),
-                reset=p.moe.write_idx >= 0,
                 eps=p.moe.seam.eps,
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
@@ -291,16 +431,21 @@ class K3MonoDecodeRunner:
             k1_launchers={k: k1.build(k) for k in set(k1_keys.values())},
             k2_keys=k2_keys,
             k2_launchers={k: k2.build(k) for k in set(k2_keys.values())},
+            # past the indexer's widths the DSA layers run their own
+            indexer=None if self.ix is None else self.ix.launcher(rows, qlen),
         )
 
     def prepare(self, rows: int, qlen: int) -> bool:
         """Whether every rank holds this step's kernels (``WidthBuilds``)."""
-        if not 0 < rows <= self.max_rows or rows % qlen:
+        if not 0 < rows <= self.max_rows or rows % qlen or width_refusal(rows):
             return False
         return self.widths.prepare(width_key(rows, qlen))
 
     def close(self) -> None:
-        """Free the peer memory now (once no rank can launch another step)."""
+        """Give the DSA indexers their own forward back and close the peer
+        mappings now (once no rank can launch another step)."""
+        if self.ix is not None:
+            self.ix.unhook()
         self._finalizer()
 
     # --------------------------------------------------------------- forward
@@ -316,10 +461,14 @@ class K3MonoDecodeRunner:
         blocks = prefix.new_empty(rows, self.num_blocks, prefix.size(1))
         self.mailboxes.begin_step()
         add = add2 = None
-        for plan in self.plans:
-            prefix, add, add2 = self._layer(
-                build, plan, positions, prefix, blocks, add, add2, metadata
-            )
+        serving = (
+            nullcontext() if self.ix is None else self.ix.hook.serving(build.indexer)
+        )
+        with serving:
+            for plan in self.plans:
+                prefix, add, add2 = self._layer(
+                    build, plan, positions, prefix, blocks, add, add2, metadata
+                )
         hidden, _ = self.inner.output_attn_res(prefix, blocks, add, add2)
         self._raise_on_given_up_waits(rows)
         return hidden
@@ -413,8 +562,8 @@ class K3MonoDecodeRunner:
         and NEITHER branch above calls that module -- ``_fallback`` reruns the
         layer's forward from its submodules -- so the hook cannot fire on a
         mono step and the drafter would keep reading whatever the last
-        production step left in the buffer. K3 mono requires DSpark, so that is
-        every armed deployment drafting from stale features.
+        production step left in the buffer: every DSpark deployment would
+        draft from stale features.
 
         The reconstruction is the layer's own ``aux_hidden_state``, called on
         this step's return rather than reimplemented, so the two cannot drift
@@ -459,7 +608,9 @@ class K3MonoDecodeRunner:
         launcher = build.k1_launchers[key]
         if taps is not None:
             key = replace(key, debug=True)
-            launcher = k1.build(key)
+            if key not in build.k1_launchers:
+                build.k1_launchers[key] = k1.build(key)
+            launcher = build.k1_launchers[key]
         state = self._conv_state(plan.layer_id)
         if state.size(-1) != key.state_len:
             raise MonoUnsupported(
@@ -467,6 +618,7 @@ class K3MonoDecodeRunner:
                 f"built {key.state_len}"
             )
         rstate = self._recurrent_state(plan.layer_id)
+        slots, accepted = state_slots(metadata, self.ones)
         core = prefix.new_empty(prefix.size(0), self.dims.proj)
         p = torch.Tensor.data_ptr
         args = k1.ABI.pack({
@@ -479,18 +631,49 @@ class K3MonoDecodeRunner:
             "cs_tok": state.stride(2), "a_log": p(w.a_log),
             "dt_bias": p(w.dt_bias), "on_w": p(w.on_w),
             "rstate": p(rstate), "rs_seq": rstate.stride(0),
-            "st_idx": p(metadata.spec_state_indices_tensor),
-            "st_stride": metadata.spec_state_indices_tensor.stride(0),
-            "num_acc": p(metadata.num_accepted_tokens), "core_out": p(core),
+            "st_idx": p(slots), "st_stride": slots.stride(0),
+            "num_acc": p(accepted),
+            "replay": self._replay_table(plan.layer_id, metadata),
+            "core_out": p(core),
             "x_dbg": 0 if taps is None else p(taps["x"]),
             "proj_dbg": 0 if taps is None else p(taps["proj"]),
-            "scratch": p(self.scratch),
+            "scratch": p(self.scratch), "plain": p(self.plain),
             "layer": plan.layer_id, "tl": 0,
         })  # fmt: skip
         # the caller's stream: a FlyDSL launcher left to its default submits on
         # the NULL stream outside a graph capture
-        launcher(*args, stream=torch.cuda.current_stream())
+        _run_compiled(launcher, *args, torch.cuda.current_stream())
         return core
+
+    def _replay_table(self, layer_id: int, metadata) -> int:
+        """K1's ``replay`` argument (``KdaPreBuild.replay_cap``; 0 without):
+        a device table of the layer's ReplaySSM pointers in ``k1.REPLAY_TABLE``
+        order -- the requests' checkpoint slots and the cursors the step's
+        commit moved (metadata), the layer's record buffers. Every one is a
+        persistent buffer, so a layer's table is written once, on the first
+        (eager) step; one that moved under a graph capture could not be
+        rewritten into it, and raises."""
+        if not self.replay_cap:
+            return 0
+        cache = get_forward_context().kv_cache_data[f"layer_{layer_id}"]
+        sources = {
+            "slot_idx": metadata.slot_idx,
+            "write_pos": metadata.write_pos,
+            "rbuf_k": cache.replay_buf_k,
+            "rbuf_u": cache.replay_buf_u,
+            "rbuf_g": cache.replay_buf_g,
+        }
+        ptrs = tuple(sources[name].data_ptr() for name in k1.REPLAY_TABLE)
+        table, held = self._replay_tables.get(layer_id, (None, None))
+        if held != ptrs:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"layer {layer_id}: a ReplaySSM buffer moved under a graph "
+                    "capture; K1's pointer table was written for the old one"
+                )
+            table = torch.tensor(ptrs, dtype=torch.int64, device=self.scratch.device)
+            self._replay_tables[layer_id] = (table, ptrs)
+        return table.data_ptr()
 
     def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
         w = plan.moe
@@ -509,9 +692,13 @@ class K3MonoDecodeRunner:
             # not ``peers.kernel_args()``: that also hands over ``sym``, this
             # rank's own buffer, and K2 takes only the table -- it loads its own
             # base from entry ``rank`` of it (``load_ptr64(peers, rank)``)
-            "scratch": p(self.scratch),
+            "scratch": p(self.scratch), "plain": p(self.plain),
+            "queue": p(self.queue) + k2b.queue_offset(K2_TAG0 + plan.layer_id),
             "peers": self.peers.addresses.data_ptr(), "rank": self.peers.rank,
-            "layer": K2_TAG0 + plan.layer_id, "diag": self._diag_ptr(), "tl": 0,
+            "layer": K2_TAG0 + plan.layer_id,
+            # a block-write layer's MLP seam restarts its prefix
+            "reset": int(plan.moe.write_idx >= 0),
+            "diag": self._diag_ptr(), "tl": 0,
         })  # fmt: skip
-        build.k2_launchers[key](*args, stream=torch.cuda.current_stream())
+        _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())
         return out

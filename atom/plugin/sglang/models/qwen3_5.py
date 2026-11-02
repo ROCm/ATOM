@@ -70,6 +70,72 @@ _BF16_IN_PROJ_MAPPING = {
 }
 
 
+def _validate_qwen35_runtime_contract(
+    server_args: Any | None = None,
+    *,
+    unified_attn_enabled: bool | None = None,
+) -> None:
+    """Reject Qwen3.5 plugin combinations that otherwise fail silently.
+
+    ATOM's GDN chunk kernel exposes recurrent states every 64 tokens, while
+    SGLang snapshots at ``mamba_cache_chunk_size = max(64, page_size)``. An
+    ``extra_buffer`` page size other than 64 therefore reads a valid but wrong
+    recurrent-state row, producing fluent corruption instead of an exception.
+
+    DFLASH target verification with Aiter has no ``custom_mask`` and must use
+    Aiter's unified-attention path. Detect that at model construction rather
+    than crashing on the first verify batch.
+    """
+    if server_args is None:
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            server_args = get_server_args()
+        except Exception:  # noqa: BLE001 - standalone imports have no server
+            return
+    if server_args is None:
+        return
+
+    strategy = str(getattr(server_args, "mamba_radix_cache_strategy", "") or "")
+    radix_disabled = bool(getattr(server_args, "disable_radix_cache", False))
+    if (
+        not radix_disabled
+        and "extra_buffer" in strategy.lower()
+        and int(getattr(server_args, "page_size", 0) or 0) != 64
+    ):
+        raise ValueError(
+            "ATOM Qwen3.5 mamba radix cache with extra_buffer requires "
+            "--page-size 64. Other page sizes select the wrong GDN snapshot "
+            "offset and can silently produce incorrect output."
+        )
+
+    algorithm = str(getattr(server_args, "speculative_algorithm", "") or "").upper()
+    backends = {
+        str(getattr(server_args, name, "") or "").lower()
+        for name in (
+            "attention_backend",
+            "decode_attention_backend",
+            "prefill_attention_backend",
+        )
+    }
+    if "DFLASH" not in algorithm or "aiter" not in backends:
+        return
+
+    if unified_attn_enabled is None:
+        try:
+            from sglang.srt.environ import envs as sglang_envs
+
+            unified_attn_enabled = sglang_envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+        except Exception:  # noqa: BLE001 - absence means SGLang's false default
+            unified_attn_enabled = False
+    if not unified_attn_enabled:
+        raise ValueError(
+            "ATOM Qwen3.5 DFLASH with Aiter requires "
+            "SGLANG_USE_AITER_UNIFIED_ATTN=1. Refusing to defer this "
+            "misconfiguration to a first-request verify crash."
+        )
+
+
 def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Any) -> dict:
     if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
         return mapping
@@ -390,6 +456,7 @@ class _Qwen3_5ConditionalGenerationSglangBase:
         quant_config: SGLangQuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        _validate_qwen35_runtime_contract()
         self._prepare_sglang_root_config(config)
         stack_cls = _get_qwen35_language_model_stack_cls(
             type(self).atom_language_model_cls

@@ -1044,6 +1044,43 @@ class TestSchedule:
         assert failed.block_table == [0]
         assert sched._num_parked_remote_kv == 0
 
+    def test_a_retreated_joint_resumes_on_its_existing_blocks(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=64,
+                num_kvcache_blocks=100,
+            )
+        )
+        sched.kv_connector = SimpleNamespace(
+            is_offload=True,
+            build_connector_meta=lambda: None,
+        )
+        seq = seq_factory(list(range(32)))
+        seq.num_cached_tokens = 8
+        seq.block_table = [7, 8]
+        seq.offload_joint.boundary_tokens = 256
+        seq.offload_joint.load_hash = 99
+
+        def retreat(retreated):
+            retreated.num_cached_tokens = 16
+            retreated.offload_joint.load_hash = -1
+            retreated.offload_joint.reset_joint()
+            return True
+
+        sched.block_manager.retreat_joint_to_hbm = retreat
+        sched._park_for_remote_load(seq, deque())
+        sched.failed_recving_kv_req_ids.append(seq.id)
+        sched.waiting.append(seq)
+
+        sched.schedule()
+
+        assert seq.offload_load_failed is True
+        assert seq.block_table == [7, 8]
+        assert seq.num_cached_tokens == 16
+        assert seq in sched.running
+        assert sched._num_parked_remote_kv == 0
+
     def test_a_resumed_offload_prefill_reports_the_hit_the_load_gave_it(
         self, seq_factory
     ):
@@ -1714,6 +1751,33 @@ class TestPreempt:
         assert block_table_at_release  # non-empty at the moment of release
         assert seq.status == SequenceStatus.WAITING
         assert len(seq.block_table) == 0
+
+
+class TestNextDecodeCompletionSteps:
+    """Steps until a running decode reaches max_tokens, the delayer's
+    `next_completion_steps`: partial prefills excluded, drafts accepted."""
+
+    def test_none_without_decode(self, scheduler, seq_factory):
+        partial = seq_factory(list(range(8)))
+        partial.is_partial_prefill = True
+        scheduler.running = deque([partial])
+        assert scheduler._next_decode_completion_steps() is None
+
+    def test_fewest_tokens_left_in_steps(self, scheduler, seq_factory):
+        near = seq_factory(
+            list(range(8)), sampling_params=SamplingParams(max_tokens=10)
+        )
+        for t in range(3):
+            near.append_token(t)  # 7 left
+        far = seq_factory(list(range(8)), sampling_params=SamplingParams(max_tokens=50))
+        scheduler.running = deque([far, near])
+        assert scheduler._next_decode_completion_steps() == 7
+        scheduler.mtp_k = 3  # up to 4 tokens a step
+        scheduler.spec_decode_local = True
+        assert scheduler._next_decode_completion_steps() == 2
+        # drafting only (PP): this engine verifies none, a token a step
+        scheduler.spec_decode_local = False
+        assert scheduler._next_decode_completion_steps() == 7
 
 
 def _spec_config(mtp_k):

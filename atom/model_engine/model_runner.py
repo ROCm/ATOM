@@ -19,7 +19,6 @@ import tqdm
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
-    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -30,6 +29,7 @@ from torch.profiler import record_function
 from atom.config import Config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
+    get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
@@ -77,8 +77,16 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
+from atom.model_ops.required_channel import (
+    DeviceChannel,
+    advance_states,
+    constrain_logits,
+)
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.models.registry import mono_decode_installers, support_model_arch_dict
+from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.status import SpecStatusQueue
@@ -114,57 +122,6 @@ from atom.utils.tbo import (
 
 logger = logging.getLogger("atom")
 
-support_model_arch_dict = {
-    "Qwen3ForCausalLM": "atom.models.qwen3.Qwen3ForCausalLM",
-    "Qwen3MoeForCausalLM": "atom.models.qwen3_moe.Qwen3MoeForCausalLM",
-    "LlamaForCausalLM": "atom.models.llama.LlamaForCausalLM",
-    "MixtralForCausalLM": "atom.models.mixtral.MixtralForCausalLM",
-    "DeepseekV3ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV32ForCausalLM": "atom.models.deepseek_v2.DeepseekV2ForCausalLM",
-    "DeepseekV41ForCausalLM": "atom.models.deepseek_v41.runtime.DeepseekV41RuntimeModel",
-    "DeepseekV4ForCausalLM": "atom.models.deepseek_v4.DeepseekV4ForCausalLM",
-    "GptOssForCausalLM": "atom.models.gpt_oss.GptOssForCausalLM",
-    "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2.GlmMoeDsaForCausalLM",
-    "Glm4MoeForCausalLM": "atom.models.glm4_moe.Glm4MoeForCausalLM",
-    "Qwen3NextForCausalLM": "atom.models.qwen3_next.Qwen3NextForCausalLM",
-    "Qwen4ExpForConditionalGeneration": (
-        "atom.models.qwen4_exp.Qwen4ExpForConditionalGeneration"
-    ),
-    "Qwen3_5ForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MultimodalModel",
-    "Qwen3_5MoeForConditionalGeneration": "atom.models.qwen3_5.Qwen3_5MoeMultimodalModel",
-    "Qwen3_5MoeForCausalLM": "atom.models.qwen3_5.Qwen3_5MoeForCausalLM",
-    "KimiK25ForConditionalGeneration": "atom.models.kimi_k25.KimiK25ForCausalLM",
-    "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.KimiK3ForConditionalGeneration"
-    ),
-    "MiniMaxM2ForCausalLM": "atom.models.minimax_m2.MiniMaxM2ForCausalLM",
-    "MiMoV2ForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
-    "MiMoV2FlashForCausalLM": "atom.models.mimo_v2.MiMoV2ForCausalLM",
-    "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
-    "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
-    "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration": (
-        "atom.models.minimax_m3.vl.MiniMaxM3SparseForConditionalGenerationVL"
-    ),
-    "Glm5NextForConditionalGeneration": (
-        "atom.models.glm5_next.Glm5NextForConditionalGeneration"
-    ),
-}
-# Mono decode by wrapping the loaded model: the installer runs after the drafter
-# armed its hooks on the unwrapped layers. Architectures not listed here route
-# mono decode inside their own model class instead.
-mono_decode_installers = {
-    "DeepseekV4ForCausalLM": (
-        "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
-    ),
-    "DeepseekV41ForCausalLM": (
-        "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
-    ),
-    "KimiK3ForConditionalGeneration": (
-        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
-    ),
-}
-
 
 def max_schedulable_decode_bs(
     max_num_seqs: int, max_num_batched_tokens: int, full_q_len: int
@@ -188,6 +145,13 @@ def max_schedulable_decode_bs(
 # Re-exported under the old private name: this module is where the predicate
 # used to live and where callers (and tests) still import it from.
 _kv_config_has_producer = kv_config_has_producer
+
+
+def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
+    """Whether sampled ids feed the next forward on device (deferred-out or a
+    drafter), so they must agree across a group. Shared by the PCP and TP
+    broadcasts so the two conditions cannot drift."""
+    return is_deferred_out or has_drafter
 
 
 class TokenLocations(NamedTuple):
@@ -352,6 +316,13 @@ class tokenIDProcessor:
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
+        # `prev_batch`'s required-channel states after its output, beside its
+        # ids and for the same reason: the host has not seen that output yet.
+        # None when `prev_batch` had no channel.
+        self.prev_channel_states: torch.Tensor | None = None
+        # Whether this step carries requests over from `prev_batch` on the
+        # GPU, so that its `decode_src` holds the row each one held there.
+        self.carries_over = False
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
@@ -392,6 +363,7 @@ class tokenIDProcessor:
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
         sampled_logprobs: torch.Tensor | None = None,
+        channel_states: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
@@ -443,6 +415,7 @@ class tokenIDProcessor:
 
         self.prev_batch = batch
         self.prev_token_ids = sampled_token_ids
+        self.prev_channel_states = channel_states
         token_id_dict[-1] = 1
         return token_id_dict, logprobs_map
 
@@ -525,6 +498,7 @@ class tokenIDProcessor:
             bs * self.draft_tokens_per_seq,
         )
         input_ids, locs = self._stage_input_ids(batch, max_seqlen_q, publication_group)
+        self.carries_over = locs is not None
         # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
         # before postprocess when the batch produces no output (every prefill in
@@ -768,6 +742,8 @@ class ModelRunner:
             torch.float16,
         ]:
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+        if envs.ATOM_ENABLE_GLUON_FUSED_AR:
+            os.environ["AITER_GLUON_FUSED_AR"] = "1"
         # Which attention this model's config asks for. The runner holds the
         # answer, not the question: what makes a model MLA or a hybrid is the
         # selector's to know, and it is asked the same way of a draft.
@@ -834,6 +810,8 @@ class ModelRunner:
             self.num_spec_tokens,
         )
         self.sampler = Sampler()
+        # Each `RequiredChannel` a batch has carried, as the kernels read it.
+        self._device_channels: dict[RequiredChannel, DeviceChannel] = {}
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -1157,26 +1135,38 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
-        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
-        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
-        destroy_dist_env()
-        # 2. Release CUDA graphs
-        self.req_graph = None
-        # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
-        # scales and any indexer cache are regions of it, not attributes.
-        for attr in (
-            "kv_cache",
-            "mamba_k_cache",
-            "mamba_v_cache",
-            "kpool_tail_cache",
-        ):
-            if hasattr(self, attr):
-                delattr(self, attr)
-        if hasattr(self, "model"):
-            del self.model
-        if hasattr(self, "drafter"):
-            del self.drafter
-        torch.cuda.empty_cache()
+        # MegaMoE's arenas live on the EP all2all manager's cco communicator,
+        # which destroy_dist_env() destroys. A close error propagates once the
+        # rest of the teardown has run.
+        try:
+            if envs.ATOM_MORI_V2:
+                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                    close_mega_transports,
+                )
+
+                close_mega_transports()
+        finally:
+            # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
+            #    Must happen while ops module is still alive for CustomAllreduce
+            #    cleanup.
+            destroy_dist_env()
+            # 2. Release CUDA graphs
+            self.req_graph = None
+            # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
+            # scales and any indexer cache are regions of it, not attributes.
+            for attr in (
+                "kv_cache",
+                "mamba_k_cache",
+                "mamba_v_cache",
+                "kpool_tail_cache",
+            ):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+            if hasattr(self, "model"):
+                del self.model
+            if hasattr(self, "drafter"):
+                del self.drafter
+            torch.cuda.empty_cache()
         return True
 
     def start_profiler(self, trace_name: str | None = None):
@@ -1450,6 +1440,9 @@ class ModelRunner:
             ),
             "top_ps": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **f32_kwargs
+            ),
+            "required_channel_states": CpuGpuBuffer(
+                self.max_bs, publication_group="sampling", **i32_kwargs
             ),
             # Keep enough space for MTP decode (max_q_len > 1).
             # `extra_output_dims` lets a model insert dims between N and dim
@@ -2697,6 +2690,14 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
+        # Read back by `postprocess` through `_constrain_required_channel`.
+        channel_count = None
+        if batch.required_channel is not None:
+            self.forward_vars["required_channel_states"].np[
+                :bs
+            ] = batch.required_channel_states
+            channel_count = bs
+
         group = (
             self.h2d_groups["sampling"]
             if publication_group is None
@@ -2706,6 +2707,7 @@ class ModelRunner:
         counts[group.indices["temperatures"]] = bs
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
+        counts[group.indices["required_channel_states"]] = channel_count
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -2956,34 +2958,15 @@ class ModelRunner:
         if not hasattr(inner, "start_layer"):
             return
 
-        # Replicate the model's per-layer shared/full classification
-        # (_should_skip_index_topk in deepseek_v2.py).
         hf = self.config.hf_config
-        num_layers = int(hf.num_hidden_layers)
-        indexer_types = getattr(hf, "indexer_types", None)
-        index_topk_pattern = getattr(hf, "index_topk_pattern", None)
-        index_topk_freq = int(getattr(hf, "index_topk_freq", 1))
-        index_skip_topk_offset = int(getattr(hf, "index_skip_topk_offset", 1))
-
-        def _is_shared(layer_idx):
-            if not 0 <= layer_idx < num_layers:
-                return False
-            if indexer_types is not None:
-                return indexer_types[layer_idx] == "shared"
-            if index_topk_pattern is not None:
-                return index_topk_pattern[layer_idx] == "S"
-            if index_topk_freq <= 1:
-                return False
-            return max(layer_idx - index_skip_topk_offset, 0) % index_topk_freq != 0
-
         # This rank consumes the prior rank's top-k iff its first layer is shared.
-        self._pp_recv_needs_sparse = (not pp.is_first_rank) and _is_shared(
-            inner.start_layer
+        self._pp_recv_needs_sparse = (not pp.is_first_rank) and skips_index_topk(
+            hf, inner.start_layer
         )
         # The next rank consumes this rank's top-k iff ITS first layer
         # (== this rank's end_layer) is shared.
-        self._pp_send_needs_sparse = (not pp.is_last_rank) and _is_shared(
-            inner.end_layer
+        self._pp_send_needs_sparse = (not pp.is_last_rank) and skips_index_topk(
+            hf, inner.end_layer
         )
         # Transfer the physical producer row width, not the logical top-k.
         # GLM-5.3 appends up to index_kpool-1 tail tokens and rounds each row
@@ -3269,6 +3252,46 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
+    def _constrain_required_channel(
+        self,
+        batch: ScheduledBatch,
+        last_logits: torch.Tensor,
+        spec_decode_metadata=None,
+        target_logits: torch.Tensor | None = None,
+    ) -> tuple[DeviceChannel, torch.Tensor] | None:
+        """Mask the step's target rows of the requests that must open a
+        channel (see `atom.model_ops.required_channel`).
+
+        Returns the channel and each request's state at the start of the step,
+        which the caller advances over the step's output; None when no request
+        in the batch has one, which costs nothing.
+        """
+        channel = batch.required_channel
+        if channel is None:
+            return None
+        device_channel = self._device_channels.get(channel)
+        if device_channel is None:
+            device_channel = DeviceChannel.of(channel, self.device)
+            self._device_channels[channel] = device_channel
+        tp = self.tokenID_processor
+        bs = batch.total_seqs_num
+        # Without states from the previous forward no carried request had a
+        # channel then, so it has none now and the host's -1 is right.
+        carried = tp.carries_over and tp.prev_channel_states is not None
+        md = spec_decode_metadata
+        base = constrain_logits(
+            device_channel,
+            self.forward_vars["required_channel_states"].gpu[:bs],
+            last_logits,
+            carried_from=tp.decode_src.gpu[:bs] if carried else None,
+            carried_states=tp.prev_channel_states if carried else None,
+            target_logits=target_logits,
+            cu_num_draft_tokens=None if md is None else md.cu_num_draft_tokens,
+            input_ids=None if md is None else md.input_ids,
+            target_logits_indices=None if md is None else md.target_logits_indices,
+        )
+        return device_channel, base
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3284,6 +3307,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # Compute logprobs if any sequence requested them
+        need_logprobs = any(batch.return_logprobs)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3294,6 +3319,20 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
+            # `_constrain_required_channel` below masks `logits` in place, so
+            # each row's logsumexp is taken BEFORE it. Logprobs report the
+            # model's own distribution, as they do for a request without a
+            # channel and on the verification path, which masks copies. The
+            # mask never moves a logit that can still be sampled (an end id it
+            # bans cannot be, a forced id keeps its value), so the sampled
+            # token's logprob is its masked logit minus that logsumexp: a
+            # forced token's is its real logprob, not the masked row's 0.0.
+            # (A forced id the model itself gave -inf is written as 0, so it
+            # reports `-logsumexp` rather than -inf.)
+            premask_lse = None
+            if need_logprobs and batch.required_channel is not None:
+                premask_lse = torch.logsumexp(logits.float(), dim=-1)
+            channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
                 temperatures,
@@ -3317,6 +3356,10 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            premask_lse = None
+            channel = self._constrain_required_channel(
+                batch, bonus_logits, spec_decode_metadata, target_logits
+            )
             target_token_ids = None
             if not all_greedy:
                 target_token_ids = self.sampler.sample_verification_tokens(
@@ -3342,34 +3385,50 @@ class ModelRunner:
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
             )
-            # PCP ranks decode redundantly and are consistent only while their
-            # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
-            # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
-            # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and the verdict.
+            # PCP ranks decode redundantly but not bit-identically, so their
+            # accept counts can differ: take rank 0's verdict. Ids are synced
+            # below, outside this branch.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
-                _g = get_pcp_group()
-                sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                verdict = _g.broadcast(verdict, src=0)
+                verdict = get_pcp_group().broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
-        # Drafter input must agree across TP ranks.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        # Near-tie argmaxes differ across PCP ranks (~1 bf16 ULP) and the ids
+        # feed the next forward, whose MoE all_reduce assumes identical rows.
+        if get_pcp_world_size() > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        ):
+            sampled_tokens = get_pcp_group().broadcast(
+                sampled_tokens.contiguous(), src=0
+            )
+
+        # Drafter input must agree across TP ranks. Ids only: the verdict is
+        # deterministic on TP ranks' bit-identical inputs.
+        if get_tp_group().world_size > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
-        # Compute logprobs if any sequence requested them
-        need_logprobs = any(batch.return_logprobs)
+        # From the ids every rank now agrees on. Only a deferred step needs
+        # it: otherwise the host has these ids before the next forward.
+        channel_states = None
+        if channel is not None and self.tokenID_processor.is_deferred_out:
+            channel_states = advance_states(*channel, sampled_tokens)
+
         sampled_logprobs = None
         if need_logprobs:
-            logits_fp32 = logits.float()
-            log_probs = torch.log_softmax(logits_fp32, dim=-1)
-            sampled_logprobs = log_probs.gather(
-                -1, sampled_tokens.to(torch.long).unsqueeze(-1)
-            ).squeeze(-1)
+            sampled_ids = sampled_tokens.to(torch.long).unsqueeze(-1)
+            if premask_lse is not None:
+                sampled_logprobs = (
+                    logits.gather(-1, sampled_ids).squeeze(-1).float() - premask_lse
+                )
+            else:
+                logits_fp32 = logits.float()
+                log_probs = torch.log_softmax(logits_fp32, dim=-1)
+                sampled_logprobs = log_probs.gather(-1, sampled_ids).squeeze(-1)
+            # No PCP broadcast: logprobs never feed the next forward and only
+            # worker 0's leave.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
@@ -3377,7 +3436,11 @@ class ModelRunner:
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
-            batch, sampled_tokens, self.forward_done_event, sampled_logprobs
+            batch,
+            sampled_tokens,
+            self.forward_done_event,
+            sampled_logprobs,
+            channel_states=channel_states,
         )
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
@@ -3456,9 +3519,13 @@ class ModelRunner:
         )
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
-        """Publish a GPU event for final prefill chunks to transfer connectors."""
+        """Publish completed chunk snapshots and the legacy final-ready event."""
         if batch.total_seqs_num_prefill <= 0:
             return
+        connector = get_kvconnector()
+        publish = getattr(connector, "publish_prefill_chunks", None)
+        if callable(publish):
+            publish(batch)
         if batch.is_final_chunk is None:
             req_ids = batch.req_ids
         else:
@@ -3471,10 +3538,16 @@ class ModelRunner:
             ]
         if not req_ids:
             return
-        connector = get_kvconnector()
         callback = getattr(connector, "record_kv_cache_ready", None)
         if callable(callback):
             callback(req_ids)
+
+    def _settle_target_pcp_split(self) -> None:
+        """Snapshot the target forward's `pcp_split` before drafting clears it.
+        Call right after `run_model`."""
+        if getattr(self, "drafter", None) is not None:
+            ctx = get_forward_context().context
+            ctx.target_pcp_split = bool(ctx.pcp_split)
 
     @_profile_runner_stage
     @torch.inference_mode()
@@ -3499,11 +3572,12 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
+        self._settle_target_pcp_split()
+        drafter = getattr(self, "drafter", None)
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
 
-        drafter = getattr(self, "drafter", None)
         # An output-less batch still runs propose() for its DP collectives.
         will_align_draft = (
             self._dp_draft_lockstep_active()
@@ -4576,6 +4650,7 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
+            self._settle_target_pcp_split()
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
@@ -4933,7 +5008,11 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
-            # Sample the first generated token from each sequence's last logit
+            # Sample the first generated token from each sequence's last logit.
+            # Masked in place with no pre-mask copy, unlike `postprocess`: this
+            # path returns token ids only and computes no logprobs, so nothing
+            # reads the unmasked row.
+            self._constrain_required_channel(batch, logits)
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
             self._record_forward_vars_event()

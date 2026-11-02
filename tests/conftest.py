@@ -60,6 +60,7 @@ class MockConfig:
             "enable_prefix_caching": False,
             "enable_log_stats": True,
             "throughput_log_interval": 10.0,
+            "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
             "enable_dynamic_chunking": False,
@@ -291,3 +292,14 @@ def req_graph_recordings(monkeypatch):
     monkeypatch.setattr(ReqGraph, "replay", lambda self, key=None, **_: held[key]())
     monkeypatch.setattr(ReqGraph, "release_graphs", release_graphs)
     return recordings
+
+
+@pytest.fixture(autouse=True)
+def mono_runs_on_gfx950(monkeypatch):
+    """Mono's deployment checks see gfx950, the only arch its kernels are built
+    for, so a refusal test asserts on its own condition on any runner (a CPU
+    one has no chip to ask). The arch check itself is tested by patching back.
+    """
+    from atom.mono.runtime import deployment
+
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")

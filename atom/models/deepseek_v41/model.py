@@ -12,6 +12,7 @@ from torch import nn
 from atom.model_loader.weight_names import WeightsMapper
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import (
+    fuse_quant_supported,
     pack_mhc_fn,
     pre_delayed,
 )
@@ -88,6 +89,9 @@ class Block(nn.Module):
                     atom_parameter(torch.empty(shape, dtype=torch.float32)),
                 )
             self.register_buffer(f"hc_{sublayer}_fn_packed", None, persistent=False)
+        # Set with the packs: attention's fused MXFP8 norm output, where the
+        # HIP kernel can write row-major scales (`fuse_quant_supported`).
+        self.hc_fuse_quant = False
         self.engram = None
         if spec.layer_id in config.engram_layer_ids:
             width = (
@@ -113,6 +117,9 @@ class Block(nn.Module):
                 f"hc_{sublayer}_fn_packed",
                 pack_mhc_fn(getattr(self, f"hc_{sublayer}_fn")),
             )
+        self.hc_fuse_quant = (
+            self.hc_attn_fn_packed is not None and fuse_quant_supported()
+        )
 
     def attention_forward(self, normed, cache, step, rope):
         """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
@@ -151,7 +158,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.attn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
-            fuse_quant=hc_fn is not None,
+            fuse_quant=self.hc_fuse_quant,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,

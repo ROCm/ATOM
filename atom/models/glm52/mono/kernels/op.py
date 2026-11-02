@@ -9,6 +9,7 @@ import os
 from dataclasses import replace
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     GLM5_CONFIG,
@@ -45,6 +46,7 @@ from atom.mono.weights.packing import (
 )
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
+from atom.mono.runtime.uncached import uncached_bytes
 from atom.mono.weights.layer import LayerWeights, prepare_mxfp4_expert_storage
 
 __all__ = ["Glm5MonoKernel"]
@@ -323,7 +325,7 @@ class Glm5MonoKernel:
             # nobody is left holding a buffer the others do not have.
             local_error = None
             try:
-                self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
+                self.scratch = uncached_bytes(self.scr_layout["_bytes"], dev)
                 self.step = torch.zeros(1, dtype=torch.int32, device=dev)
             except Exception as error:
                 self.scratch = None
@@ -544,7 +546,8 @@ class Glm5MonoKernel:
         p = lambda x: x.data_ptr()  # noqa: E731
         for chunk in range(chunks):
             row = chunk * self.S
-            self.launch(
+            _run_compiled(
+                self.launch,
                 p(h) + row * HIDDEN * h.element_size(),
                 p(x_out) + row * HIDDEN * x_out.element_size(),
                 p(block_tables) if self.with_indexer and self.kv_cache_layout is KvCacheLayout.ATOM else p(cur_pos),
@@ -584,7 +587,7 @@ class Glm5MonoKernel:
                 p(self.step),
                 self.rank,
                 layer,
-                stream=torch.cuda.current_stream(),
+                torch.cuda.current_stream(),
             )
             if chunk + 1 < chunks or advance:
                 self.advance_step()
