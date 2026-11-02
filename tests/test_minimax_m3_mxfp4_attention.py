@@ -135,8 +135,7 @@ def test_plan_free_rows_attend_their_selected_pages(rows, hkv):
 def test_plan_free_is_the_planned_path_with_one_task_a_row():
     """Bit for bit the kernel run with a plan of max_partitions=1 (the splits coincide),
     and the production planned split (default partitions) agrees to bf16 rounding."""
-    from aiter.ops.flydsl.pa_decode import plan_pa_decode
-    from aiter.ops.flydsl.pa_decode_mxfp4 import pa_decode_mxfp4
+    from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
     from atom.model_ops.minimax_m3.kv_mxfp4 import page_views
     from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
@@ -147,9 +146,9 @@ def test_plan_free_is_the_planned_path_with_one_task_a_row():
     vd, vs = page_views(v.view(-1, 1, PAGE_BYTES))
     out = torch.empty(37, GROUP, 128, dtype=torch.bfloat16, device="cuda")
     plan = plan_pa_decode(ctx, 1, max_partitions=1, query_length=1)
-    pa_decode_mxfp4(
-        out, q.view(37, GROUP, 128), kd, ks, vd, vs, ctx, bt, SCALE,
-        work_plan=plan, max_context_length=TOPK * 128,
+    pa_decode(
+        out, q.view(37, GROUP, 128), kd, vd, ctx, bt, SCALE, 1,
+        key_scale=ks, value_scale=vs, work_plan=plan, max_context_length=TOPK * 128,
     )  # fmt: skip
     assert torch.equal(free, out.view(q.shape))
     planned = sparse_pa_mxfp4(
@@ -164,7 +163,7 @@ def test_plan_free_builds_nothing_per_row_count():
     """A prefill chunk has a new row count nearly every forward; the planner would
     compile a kernel for each. Plan-free touches neither the planner's compile cache,
     nor the plan cache, nor the PA kernel's build cache after its first call."""
-    from aiter.ops.flydsl.kernels.pa_decode_mxfp4_kernel import build_pa_decode_mxfp4
+    from aiter.ops.flydsl.kernels.pa_decode_kernel import _PA_DECODE_TILE_CACHE
     from aiter.ops.flydsl.kernels.pa_decode_plan import compile_pa_decode_plan
 
     from atom.model_ops.minimax_m3 import sparse_attn_mxfp4 as m
@@ -173,7 +172,7 @@ def test_plan_free_builds_nothing_per_row_count():
     m.sparse_pa_mxfp4(q, k, v, bt, ctx, 1, SCALE, torch.bfloat16, None)  # first build
     state = (
         compile_pa_decode_plan.cache_info().currsize,
-        build_pa_decode_mxfp4.cache_info().currsize,
+        len(_PA_DECODE_TILE_CACHE),
         len(m._PLANS),
     )
     for rows in (1, 9, 31, 100, 255, 256, 257, 300, 511, 513, 1000, 1023):
@@ -182,6 +181,6 @@ def test_plan_free_builds_nothing_per_row_count():
         assert out.shape == q.shape
     assert state == (
         compile_pa_decode_plan.cache_info().currsize,
-        build_pa_decode_mxfp4.cache_info().currsize,
+        len(_PA_DECODE_TILE_CACHE),
         len(m._PLANS),
     )

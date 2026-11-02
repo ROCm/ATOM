@@ -5,7 +5,7 @@
 A row is a decode query token or a prefill query token: one sparse selection of
 at most ``topk`` 128-token pages, the tail page last, with its exact context
 length -- what index_topk emits at ``pages_per_block=1``. Each row is a length-1
-"sequence" for ``pa_decode_mxfp4`` (query e4m3 as the fused writer emitted it,
+"sequence" for ``pa_decode`` (MXFP4 K/V) (query e4m3 as the fused writer emitted it,
 K and V MXFP4 pages), the same fold ``sparse_pa_per_row`` makes for the fp8
 caches, with the (token, kv head) pair collapsed into the row so the kernel runs
 one kv head per call: the emitted page id is ``page * Hkv + head``, which is the
@@ -85,7 +85,7 @@ def sparse_pa_mxfp4(
     plan-free, one task a row, written directly (prefill); every row then needs a
     context of at most ``sparse_bt.shape[1]`` pages, which index_topk's emit gives.
     """
-    from aiter.ops.flydsl.pa_decode_mxfp4 import pa_decode_mxfp4
+    from aiter.ops.flydsl.pa_decode import pa_decode
 
     rows, num_heads, head_dim = q.shape
     if head_dim != HEAD_DIM or not q.is_contiguous():
@@ -107,18 +107,18 @@ def sparse_pa_mxfp4(
     out = torch.empty((n, group, HEAD_DIM), dtype=out_dtype, device=q.device)
     bound = sparse_bt.shape[1] * PAGE_TOKENS
     if plan_owner is None:
-        pa_decode_mxfp4(
+        pa_decode(
             out,
             q_rows,
             k_data,
-            k_scale,
             v_data,
-            v_scale,
             sparse_ctx,
             sparse_bt,
             sm_scale,
+            1,
+            key_scale=k_scale,
+            value_scale=v_scale,
             work_plan=None,
-            max_partitions=1,
             max_context_length=bound,
         )
         return out.view(rows, num_heads, HEAD_DIM)
@@ -129,16 +129,17 @@ def sparse_pa_mxfp4(
         exp_sums, max_logits, tmp = _flydsl_plan_scratch(
             plan, 1, group, HEAD_DIM, out_dtype, q.device
         )
-        pa_decode_mxfp4(
+        pa_decode(
             out[start:end],
             q_rows[start:end],
             k_data,
-            k_scale,
             v_data,
-            v_scale,
             ctx,
             sparse_bt[start:end],
             sm_scale,
+            1,
+            key_scale=k_scale,
+            value_scale=v_scale,
             work_plan=plan,
             max_context_length=bound,
             exp_sums=exp_sums,

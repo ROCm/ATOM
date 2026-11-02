@@ -3,7 +3,7 @@
 
 The pool lays one (page, kv head) of K, of V and of the index key out as one
 8704 B field -- [128 x 64 B e2m1][128 x 4 B e8m0] -- which is what the aiter
-writer produces and `pa_decode_mxfp4` / `score_flydsl_fp4` read. Pinned here:
+writer produces and `pa_decode` (MXFP4 K/V) / `score_flydsl_fp4` read. Pinned here:
 the bytes per token the capacity arithmetic rests on, the views the kernels are
 handed, and the combinations that must fail at startup and not in a forward.
 """

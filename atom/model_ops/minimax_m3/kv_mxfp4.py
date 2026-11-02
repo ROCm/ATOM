@@ -10,7 +10,7 @@ element) and one e8m0 scale per 32 elements::
     [128 tokens x 64 B data][128 tokens x 4 B scale]      = 8704 B
 
 This is the page the aiter writer (``fused_qknorm_idxrqknorm`` with
-``kv_cache_dtype="mxfp4"``) produces and ``pa_decode_mxfp4`` /
+``kv_cache_dtype="mxfp4"``) produces and ``pa_decode`` (MXFP4 K/V) /
 ``score_flydsl_fp4`` read: 68 B a token, 136 B for K and V together, against
 the 264 B an fp8 K/V token costs (128 B of values and a 4 B scale, twice).
 """
