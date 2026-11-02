@@ -45,7 +45,6 @@ from atom.model_engine.state_runtime import (
     StateTransfer,
     midstep_target_ok,
     snap_midstep_position,
-    zeroes_released_units,
 )
 from atom.utils import envs
 
@@ -274,13 +273,12 @@ class BlockManager:
             on_remap=self._note_index_change,
             # ATOM_ZERO_EVICTED_BLOCKS: block 0 stays the zero null page and
             # released checkpoint units are zeroed before reuse (see BlockPool).
-            # Only queued for a layout whose runner has the zero kernel: a
-            # drained id nobody zeroes would only look handled.
+            # Only queued when the runner's builder has the zero kernel
+            # (`StateRuntime.zeroes_released_units`): a drained id nobody
+            # zeroes would only look handled.
             null_block=envs.ATOM_ZERO_EVICTED_BLOCKS,
             scrub_released=(
-                envs.ATOM_ZERO_EVICTED_BLOCKS
-                and state_runtime.checkpoint_spec is not None
-                and zeroes_released_units(state_runtime.checkpoint_spec.layout_id)
+                envs.ATOM_ZERO_EVICTED_BLOCKS and state_runtime.zeroes_released_units
             ),
         )
         # Per-request cache slot pool. Used by attention types with a

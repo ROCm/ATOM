@@ -360,7 +360,29 @@ class UnitZeroer:
             TILE=_TILE_BYTES,
             num_warps=4,
         )
+        if self.device.type == "cuda":
+            # Loads that write these ids from their own streams wait on this
+            # while it is pending (`state_runtime.pending_unit_zero`).
+            from atom.model_engine.state_runtime import note_unit_zero
+
+            done = torch.cuda.Event()
+            done.record()
+            note_unit_zero(done)
         return n
+
+
+def zero_units_once(regions, unit_ids, device) -> None:
+    """Zero these PAGE ids once, on the current stream.
+
+    For a builder with no `zero_page_units` of its own (Kimi-K3, DeepSeek-V4)
+    that still writes units outside a checkpoint: the warm-up copies slot 0
+    into units 0..n-1, and block 0 is the null page masked lanes read.
+    `regions` is the builder's `_page_unit_regions()`: base and per-unit size
+    of each region, the same affine layout every PAGE builder publishes.
+    """
+    ids = [int(u) for u in unit_ids]
+    if ids:
+        UnitZeroer(regions, max(ids) + 1, device).launch(ids)
 
 
 class DescriptorStaging:

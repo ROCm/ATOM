@@ -128,7 +128,7 @@ class StateOffloadTier:
         Its own lane, so a load is never behind a backlog of stores. What the
         two lanes still share is the staging-memory budget; see `__init__`.
         `_do_load` warns when that remaining wait crosses `_LOAD_WAIT_WARN_MS`.
-        `ready_event` (`record_load_fence`) is waited on before the write.
+        `ready_event` (`pending_zero_fence`) is waited on before the write.
         """
         self._register(
             self._load_executor.submit(

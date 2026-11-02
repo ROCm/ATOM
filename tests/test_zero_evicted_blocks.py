@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from conftest import MockConfig
 
+from atom.model_engine import state_runtime as state_runtime_mod
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.page_unit_checkpoint import (
@@ -126,6 +127,13 @@ class TestNullBlock:
         with pytest.raises(ValueError, match="1-block pool"):
             scrubbing_pool(1)
         assert BlockPool(1).pop() == 0  # switch off: unchanged
+
+    def test_growing_to_only_the_null_page_is_refused(self):
+        pool = BlockPool(0, max_blocks=4, null_block=True)
+        with pytest.raises(ValueError):
+            pool.extend(1)
+        assert pool.num_blocks == 0
+        assert pool.extend(2) == 2 and pool.pop() == 1
 
     def test_pool_grown_from_empty_keeps_block_zero_out(self):
         pool = BlockPool(0, max_blocks=4, null_block=True)
@@ -269,11 +277,13 @@ def test_kv_eviction_orphans_a_checkpoint_and_its_units_are_queued_first():
 
 
 # ------------------------ BlockManager carries them ------------------------ #
-def _paged_runtime(layout_id):
+def _paged_runtime(layout_id, zeroes=True):
     spec = PagedStateCheckpointSpec(
         page_unit_bytes=10, slot_bytes=95, layout_id=layout_id, image_bytes=95
     )
-    return StateRuntime(StateTransfer.copy(layout_id), spec)
+    return StateRuntime(
+        StateTransfer.copy(layout_id), spec, zeroes_released_units=zeroes
+    )
 
 
 def test_block_manager_puts_released_units_in_the_batch(monkeypatch):
@@ -291,18 +301,54 @@ def test_block_manager_puts_released_units_in_the_batch(monkeypatch):
     assert bm.take_state_maintenance_ops().zero_units == ()
 
 
-@pytest.mark.parametrize("layout_id", [None, "dsv4-paged-state-v3:test"])
+@pytest.mark.parametrize(
+    "layout_id", [None, "dsv4-paged-state-v3:test", GDN_PAGED_LAYOUT_PREFIX + "v1"]
+)
 def test_block_manager_queues_nothing_without_a_zero_kernel(monkeypatch, layout_id):
-    # No PAGE checkpoints, or a layout whose runner cannot zero: nothing is
+    # No PAGE checkpoints, or a runtime whose builder has no zero: nothing is
     # queued (a drained id nobody zeroes would only look handled), but block 0
-    # is still the null page.
+    # is still the null page. Keyed on the capability, not the layout name:
+    # even a GDN-named layout queues nothing without it.
     monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", "1")
-    kw = {} if layout_id is None else {"state_runtime": _paged_runtime(layout_id)}
+    kw = (
+        {}
+        if layout_id is None
+        else {"state_runtime": _paged_runtime(layout_id, zeroes=False)}
+    )
     bm = BlockManager(MockConfig(num_kvcache_blocks=50), **kw)
     assert bm.kv.first_block == 1 and not bm.kv.scrub_released
     units = bm.kv.reserve_units(7, owner="ck")
     bm.kv.release_units(units, owner="ck")
     assert bm.take_state_maintenance_ops().zero_units == ()
+
+
+def test_a_renamed_layout_keeps_scrubbing(monkeypatch):
+    monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", "1")
+    runtime = StateRuntime.from_wire(_paged_runtime("renamed-layout-v9").to_wire())
+    assert runtime.zeroes_released_units
+    bm = BlockManager(MockConfig(num_kvcache_blocks=50), state_runtime=runtime)
+    assert bm.kv.scrub_released
+
+
+def test_zero_capability_needs_a_checkpoint_spec():
+    with pytest.raises(ValueError):
+        StateRuntime(zeroes_released_units=True)
+
+
+def test_builder_capability_is_the_zero_override():
+    from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+
+    class _NoZero(AttentionMetadataBuilder):
+        pass
+
+    class _Zero(_NoZero):
+        def zero_page_units(self, unit_ids):
+            pass
+
+    for cls in (_NoZero, _Zero):
+        cls.__abstractmethods__ = frozenset()
+    assert not _NoZero.__new__(_NoZero).zeroes_page_units()
+    assert _Zero.__new__(_Zero).zeroes_page_units()
 
 
 @pytest.mark.parametrize(
@@ -402,33 +448,30 @@ def test_capacity_checks_count_only_usable_blocks(
 
 # ------------------- loads wait for zeros queued before them ------------------ #
 class _FakeEvent:
-    """Records which stream it was recorded on and whether a thread waited."""
+    """A zero's event: `done` is what `query` reports; records waits."""
 
-    def __init__(self):
-        self.stream = None
+    def __init__(self, done=False):
+        self.done = done
         self.synchronized = False
 
-    def record(self, stream):
-        self.stream = stream
+    def query(self):
+        return self.done
 
     def synchronize(self):
         self.synchronized = True
+        self.done = True
 
 
-def _patch_cuda_events(monkeypatch):
+@pytest.fixture
+def no_cuda_events(monkeypatch):
+    """No load-side event may be created: the fence is only the zero's own."""
     from atom.kv_transfer.offload import _offload_common
 
-    made = []
-    stream = object()
+    def _refuse(*a, **kw):
+        raise AssertionError("a load must not record its own event")
 
-    def _event():
-        made.append(_FakeEvent())
-        return made[-1]
-
-    monkeypatch.setattr(_offload_common.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(_offload_common.torch.cuda, "Event", _event)
-    monkeypatch.setattr(_offload_common.torch.cuda, "current_stream", lambda: stream)
-    return made, stream
+    monkeypatch.setattr(_offload_common.torch.cuda, "Event", _refuse)
+    monkeypatch.setattr(state_runtime_mod, "_pending_unit_zero", None)
 
 
 def _dense_load_meta(n_loads):
@@ -448,29 +491,36 @@ def _dense_load_meta(n_loads):
     return metadata
 
 
-@pytest.mark.parametrize("switch", ["1", "0"])
-def test_dense_loads_carry_one_fence_recorded_at_dispatch(monkeypatch, switch):
-    # Dense LMCache loads write from the load thread on their own streams. With
-    # zeroing on, every load of the step carries one event recorded on the
-    # dispatching stream, after the engine's zero; with it off, none.
+def _dense_conn(submitted):
     from atom.kv_transfer.offload.dense.connector import DenseOffloadConnector
 
-    monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", switch)
-    made, stream = _patch_cuda_events(monkeypatch)
-    submitted = []
     conn = DenseOffloadConnector.__new__(DenseOffloadConnector)
     conn._do_load, conn._do_save = True, False
     conn._engine = SimpleNamespace(lookup_unpin=lambda _id: None)
     conn._load_executor = SimpleNamespace(submit=lambda *a, **kw: submitted.append(kw))
     conn._track_job = lambda req_id, future: None
-    conn.start_load_kv(_dense_load_meta(2))
+    return conn
 
-    if switch == "1":
-        assert len(made) == 1 and made[0].stream is stream
-        assert [kw["ready_event"] for kw in submitted] == [made[0], made[0]]
-    else:
-        assert made == []
-        assert [kw["ready_event"] for kw in submitted] == [None, None]
+
+@pytest.mark.parametrize("zero", [None, "done", "pending"])
+def test_dense_loads_wait_only_on_a_pending_zero(no_cuda_events, zero):
+    # Dense LMCache loads write from the load thread on their own streams. They
+    # carry the last unit zero's event only while the GPU has not finished it;
+    # with no zero, or a finished one, there is nothing to wait on.
+    event = None if zero is None else _FakeEvent(done=zero == "done")
+    state_runtime_mod.note_unit_zero(event)
+    submitted = []
+    _dense_conn(submitted).start_load_kv(_dense_load_meta(2))
+    want = event if zero == "pending" else None
+    assert [kw["ready_event"] for kw in submitted] == [want, want]
+
+
+def test_a_finished_zero_is_forgotten(no_cuda_events):
+    from atom.kv_transfer.offload._offload_common import pending_zero_fence
+
+    state_runtime_mod.note_unit_zero(_FakeEvent(done=True))
+    assert pending_zero_fence() is None
+    assert state_runtime_mod._pending_unit_zero is None
 
 
 def test_dense_load_waits_on_the_fence_before_its_first_write():
@@ -506,23 +556,23 @@ def test_state_load_writes_only_after_the_fence():
 
     tier = StateOffloadTier(_Codec())
     try:
-        tier.submit_load("ok", 7, 3, ready_event=fence)
-        # A fence that could not be recorded fails the load: it recomputes.
-        tier.submit_load("no-fence", 8, 4, ready_event=RuntimeError("hip"))
+        tier.submit_load("fenced", 7, 3, ready_event=fence)
+        tier.submit_load("unfenced", 8, 4)
         tier.drain()
-        assert seen == [True]
-        assert tier.get_finished() == ({"ok"}, {"no-fence"})
+        assert seen == [True, True]
+        assert tier.get_finished() == ({"fenced", "unfenced"}, set())
     finally:
         tier.shutdown()
 
 
-def test_k3_state_loads_carry_the_fence(monkeypatch):
+@pytest.mark.parametrize("pending", [True, False])
+def test_k3_state_loads_carry_only_a_pending_zero(no_cuda_events, pending):
     from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
         KimiK3OffloadConnector,
     )
 
-    monkeypatch.setenv("ATOM_ZERO_EVICTED_BLOCKS", "1")
-    made, _ = _patch_cuda_events(monkeypatch)
+    event = _FakeEvent(done=not pending)
+    state_runtime_mod.note_unit_zero(event)
     calls = []
     conn = KimiK3OffloadConnector.__new__(KimiK3OffloadConnector)
     conn._do_load = True
@@ -530,7 +580,68 @@ def test_k3_state_loads_carry_the_fence(monkeypatch):
         submit_load=lambda *a, **kw: calls.append(kw["ready_event"])
     )
     conn._start_state_loads(SimpleNamespace(state_loads=[("r0", 7, 3), ("r1", 8, 4)]))
-    assert len(made) == 1 and calls == [made[0], made[0]]
+    want = event if pending else None
+    assert calls == [want, want]
+
+
+# --------------------- warm-up units of builders without a zero ---------------- #
+def test_zero_units_once_zeroes_exactly_those_units(monkeypatch):
+    from atom.model_ops.attentions.pool_layout import paged_state_copy
+
+    launched = []
+
+    class _Zeroer:
+        def __init__(self, regions, num_blocks, device):
+            launched.append((regions, num_blocks, device))
+
+        def launch(self, ids):
+            launched.append(list(ids))
+
+    monkeypatch.setattr(paged_state_copy, "UnitZeroer", _Zeroer)
+    paged_state_copy.zero_units_once("regions", range(3), "dev")
+    paged_state_copy.zero_units_once("regions", [], "dev")
+    assert launched == [("regions", 3, "dev"), [0, 1, 2]]
+
+
+def test_dsv4_warmup_zeroes_the_units_it_copied_into(monkeypatch):
+    dsv4 = pytest.importorskip("atom.model_ops.attentions.deepseek_v4_attn")
+    _assert_warmup_zeroes(monkeypatch, dsv4, dsv4.DeepseekV4AttentionMetadataBuilder)
+
+
+def test_kimi_warmup_zeroes_the_units_it_copied_into(monkeypatch):
+    gdn = pytest.importorskip("atom.model_ops.attentions.gdn_attn")
+    kimi = pytest.importorskip("atom.model_ops.attentions.kimi_mla_gdn_attn")
+    _assert_warmup_zeroes(monkeypatch, gdn, kimi.KimiTritonMLAGDNMetadataBuilder)
+
+
+def _assert_warmup_zeroes(monkeypatch, module, cls):
+    # The warm-up copies slot 0 into units 0..n-1, block 0 among them. A
+    # builder with no `zero_page_units` must zero them through its regions.
+    events = []
+    monkeypatch.setattr(
+        module, "launch_copy_descriptor", lambda *a: events.append("copy")
+    )
+    monkeypatch.setattr(
+        module,
+        "zero_units_once",
+        lambda regions, ids, device: events.append(("zero", list(ids), regions)),
+    )
+    spec = SimpleNamespace(units_per_checkpoint=3)
+    builder = cls.__new__(cls)
+    assert not builder.zeroes_page_units()
+    builder.model_runner = SimpleNamespace(
+        state_runtime=SimpleNamespace(checkpoint_spec=spec)
+    )
+    staging = SimpleNamespace(rows=lambda i: np.zeros((4, 8)), upload=lambda *a: None)
+    plan = SimpleNamespace(num_spans=2, write_descriptor=lambda *a, **kw: None)
+    builder._checkpoint_copy_plan = lambda: plan
+    builder._checkpoint_staging = lambda: staging
+    builder._checkpoint_slot_bases = lambda: np.zeros((1, 2))
+    builder._page_unit_bases = lambda ids: np.zeros((1, 2))
+    builder._page_unit_regions = lambda: "regions"
+    builder._checkpoint_descriptor_device = lambda: "dev"
+    builder.warmup_per_req_cache()
+    assert events == ["copy", ("zero", [0, 1, 2], "regions")]
 
 
 def test_block_manager_switch_off_restores_old_pool(monkeypatch):

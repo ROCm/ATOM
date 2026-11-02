@@ -51,8 +51,8 @@ from atom.kv_transfer.offload._block_gpu_connector import BlockGPUConnector
 from atom.kv_transfer.offload._offload_common import (
     OffloadWorkerMixin,
     build_offload_engine,
+    pending_zero_fence,
     pp_aware_rank_and_world,
-    record_load_fence,
     tokens_to_tensor,
     validated_kv_role,
     wait_load_fence,
@@ -201,7 +201,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 self._lookup_unpin(lookup_id)
         save_ready_event = None
         save_fence_failed = False
-        load_fence = record_load_fence() if load_requests else None
+        load_fence = pending_zero_fence() if load_requests else None
         for req in metadata.requests:
             # The futures are tracked, not discarded: `wait_for_requests` fences
             # them when vLLM preempts a request and reuses its blocks.
@@ -344,7 +344,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         mask[:hbm] = False
 
         # Before the first write: a pending zero of these blocks must land
-        # first (`record_load_fence`).
+        # first (`pending_zero_fence`).
         wait_load_fence(ready_event)
         t_retrieve0 = time.perf_counter()
         self._reset_gpu_connector_transfer_stats()

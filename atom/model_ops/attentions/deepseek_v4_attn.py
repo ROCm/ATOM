@@ -86,6 +86,7 @@ from atom.model_ops.attentions.pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
+    zero_units_once,
 )
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     SubPoolSpec,
@@ -1180,8 +1181,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
 
         Slot 0 into the pool's first units. Both are real addresses, which is
         the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
+        A KV block is written before it is read and this runs before any block
+        has been handed out, but block 0 is the null page masked lanes read,
+        so the units are zeroed straight after.
         """
         if self.model_runner.state_runtime.checkpoint_spec is None:
             return
@@ -1196,6 +1198,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._page_unit_bases([list(range(units))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        zero_units_once(
+            self._page_unit_regions(),
+            range(units),
+            self._checkpoint_descriptor_device(),
+        )
 
     def _checkpoint_descriptor_device(self) -> torch.device:
         return self._kv_planes()[0].device

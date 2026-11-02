@@ -539,6 +539,12 @@ class BlockPool:
         — beyond it there is nothing to hand out even if the caller has bytes.
         """
         taken = min(count, self.max_blocks - self.num_blocks)
+        if self.first_block and self.num_blocks + taken == 1:
+            # Same state `__init__` refuses: only the null page, nothing usable.
+            raise ValueError(
+                "growing to 1 block leaves no usable block once block 0 is the "
+                "null page; extend by at least 2 or set ATOM_ZERO_EVICTED_BLOCKS=0"
+            )
         # A pool grown from empty still keeps its null page out.
         start = max(self.num_blocks, self.first_block)
         for block_id in range(start, self.num_blocks + taken):

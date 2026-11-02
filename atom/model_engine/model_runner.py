@@ -1982,6 +1982,11 @@ class ModelRunner:
         state_runtime = StateRuntime(
             transfer=transfer,
             checkpoint_spec=checkpoint_spec,
+            # A capability of the builder, not of the layout's name.
+            zeroes_released_units=(
+                checkpoint_spec is not None
+                and self.attn_metadata_builder.zeroes_page_units()
+            ),
         )
         self.state_runtime = state_runtime
         for name in sorted(plan.entries):

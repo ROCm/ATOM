@@ -320,14 +320,23 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             "implement state_entry_views"
         )
 
+    def zeroes_page_units(self) -> bool:
+        """Whether this builder has a PAGE unit zero: it overrides
+        `zero_page_units`. The capability the scheduler's released-unit scrub
+        keys on, so it follows the kernel rather than a layout name."""
+        return (
+            type(self).zero_page_units is not AttentionMetadataBuilder.zero_page_units
+        )
+
     def zero_page_units(self, unit_ids: Sequence[int]) -> None:
         """Zero every published byte of these PAGE ids, on the current stream.
 
         The ids are raw units a released state checkpoint held
-        (`StateMaintenanceOps.zero_units`). The scheduler queues them only for
-        a layout `state_runtime.zeroes_released_units` names, whose builder
-        overrides this; ids reaching the default are a wiring error, not
-        something to drop silently.
+        (`StateMaintenanceOps.zero_units`). The scheduler queues them only
+        when `zeroes_page_units()` (published as
+        `StateRuntime.zeroes_released_units`), i.e. when a builder overrides
+        this; ids reaching the default are a wiring error, not something to
+        drop silently.
         """
         if len(unit_ids):
             raise NotImplementedError(

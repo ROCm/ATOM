@@ -23,8 +23,8 @@ from atom.kv_transfer.offload._offload_common import (
     StateOffloadFace,
     max_pending_saves,
     offload_save_abandon_timeout_s,
+    pending_zero_fence,
     pp_aware_rank_and_world,
-    record_load_fence,
 )
 from atom.kv_transfer.offload.dense.connector import (
     DenseOffloadConnector,
@@ -357,7 +357,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         No producer fence, unlike the save path: a load writes the entry, the
         owning request is parked so no forward touches it, and unpack
         synchronizes the producing stream before it returns. It does wait on
-        `record_load_fence` before writing: the destination units may still
+        `pending_zero_fence` before writing: the destination units may still
         have a zero queued on the compute stream (ATOM_ZERO_EVICTED_BLOCKS).
         """
         loads = getattr(metadata, "state_loads", None)
@@ -384,7 +384,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             self._fail_state_loads(loads)
             return
-        fence = record_load_fence()
+        fence = pending_zero_fence()
         for req_id, h, group in loads:
             # Isolate each submit (finding #4): a shut-down executor or an OS
             # thread refusal fails only this load -- settle its state leg False

@@ -18,7 +18,6 @@ from atom.model_engine.state_runtime import (
     GDN_PAGED_LAYOUT_PREFIX,
     StateTransfer,
     midstep_checkpoint_targets,
-    zeroes_released_units,
 )
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.replayssm import (
@@ -46,6 +45,7 @@ from .pool_layout.paged_state_copy import (
     SegmentedCopyPlan,
     launch_copy_descriptor,
     plan_segmented_copy,
+    zero_units_once,
 )
 from .pool_layout.pool_rows import PoolRowsMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
@@ -944,11 +944,19 @@ class GDNStateMixin(PoolRowsMixin):
         # The copy above put slot 0's bytes into units 0..n-1, and block 0 is
         # the null page every masked lane reads. Zero them back whatever
         # ATOM_ZERO_EVICTED_BLOCKS says, so the switch's off arm starts from
-        # the same all-zero pool (this also compiles the zero kernel before
-        # the first request). Only a layout with a zero kernel can: Kimi's
-        # MLA pool shares this warmup but not `zero_page_units`.
-        if zeroes_released_units(spec.layout_id):
-            self.zero_page_units(list(range(spec.units_per_checkpoint)))
+        # the same all-zero pool. A builder with its own zero (Qwen's MHA
+        # pool) uses it, which also compiles it before the first request;
+        # Kimi's MLA pool shares this warmup but not `zero_page_units`, so it
+        # zeroes through its published unit regions instead.
+        units = list(range(spec.units_per_checkpoint))
+        if self.zeroes_page_units():
+            self.zero_page_units(units)
+        else:
+            zero_units_once(
+                self._page_unit_regions(),
+                units,
+                self._checkpoint_descriptor_device(),
+            )
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
