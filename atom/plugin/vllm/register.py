@@ -437,6 +437,14 @@ def register_model() -> None:
         return
 
     _set_plugin_mode()
+    # Before anything imports vllm.models.kimi_k3: its KDA kernels name an
+    # autotune key that is not an argument, which Triton 3.8 rejects at import.
+    # vLLM's model-inspection subprocess runs this hook too.
+    from atom.plugin.vllm.kimi_k3_kda_autotune_patch import (
+        apply_vllm_kimi_k3_kda_autotune_patch,
+    )
+
+    apply_vllm_kimi_k3_kda_autotune_patch()
     # The general-plugin hook runs in the EngineCore process that owns the
     # scheduler/KVCacheManager; install these here as well as in the platform
     # hook, which vLLM does not always reach.

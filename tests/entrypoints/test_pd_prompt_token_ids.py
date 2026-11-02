@@ -304,7 +304,10 @@ class TestHttpResponseSerialization:
 
 
 @pytest.mark.parametrize("return_ids", [False, True])
-def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return_ids):
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_generate_async_reads_prompt_ids_from_local_sequence(
+    monkeypatch, return_ids, multimodal
+):
     seq = SimpleNamespace(
         id=7,
         prompt_token_ids=list(PROMPT_IDS),
@@ -336,12 +339,19 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
     monkeypatch.setattr(api_server, "record_nonstream_first_token", lambda: None)
 
     async def collect():
-        return [
-            output
-            async for output in api_server.generate_async(
-                PROMPT_IDS, object(), "req-1", return_token_ids=return_ids
-            )
-        ]
+        # Read the IDs retained by preprocessing, rather than echoing its
+        # input: multimodal preprocessing may have expanded placeholders.
+        generate = (
+            api_server.generate_async_multimodal
+            if multimodal
+            else api_server.generate_async
+        )
+        args = (
+            ([11, 12], {"image": "fixture"}, object(), "req-1")
+            if multimodal
+            else ([11, 12], object(), "req-1")
+        )
+        return [output async for output in generate(*args, return_token_ids=return_ids)]
 
     outputs = asyncio.run(collect())
     assert len(outputs) == 1
@@ -481,3 +491,76 @@ class TestChunkedAdmissionTopology:
     ):
         monkeypatch.setattr(api_server, "engine", None)
         api_server._validate_chunked_receive(params)
+
+
+@pytest.mark.parametrize("return_ids", [False, True])
+@pytest.mark.parametrize("n", [1, 2])
+def test_multimodal_chat_returns_requested_prompt_ids(
+    monkeypatch, server, return_ids, n
+):
+    media = {"image": "fixture"}
+    calls = []
+
+    def output():
+        result = {
+            "text": "red",
+            "finish_reason": "stop",
+            "num_tokens_input": len(PROMPT_IDS),
+            "num_tokens_output": 1,
+        }
+        if return_ids:
+            result["prompt_token_ids"] = list(PROMPT_IDS)
+        return result
+
+    async def single(ids, images, _sampling, _request_id, **kwargs):
+        assert ids == PROMPT_IDS and images is media
+        assert kwargs["return_token_ids"] is return_ids
+        calls.append("single")
+        yield output()
+
+    async def fanout(ids, _sampling, _request_id, **kwargs):
+        assert ids == PROMPT_IDS and kwargs["multimodal_data"] is media
+        assert kwargs["return_token_ids"] is return_ids
+        calls.append("fanout")
+        return [output() for _ in range(n)]
+
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    monkeypatch.setattr(
+        api_server,
+        "_prepare_multimodal_inputs",
+        lambda *_args: (list(PROMPT_IDS), media),
+    )
+    monkeypatch.setattr(api_server, "generate_async_multimodal", single)
+    monkeypatch.setattr(api_server, "generate_async_fanout", fanout)
+    payload = {
+        "model": "m",
+        "temperature": 1.0,
+        "n": n,
+        "return_token_ids": return_ids,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe the image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AA=="},
+                    },
+                ],
+            }
+        ],
+    }
+
+    async def post():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.post("/v1/chat/completions", json=payload)
+
+    response = asyncio.run(post())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["prompt_token_ids"] == (PROMPT_IDS if return_ids else None)
+    assert body["usage"]["prompt_tokens"] == len(PROMPT_IDS)
+    assert len(body["choices"]) == n
+    assert calls == ["single" if n == 1 else "fanout"] and server.templates == 0

@@ -44,7 +44,7 @@ diffusion_server.py → DiffusionEngine → DiffusionCoreManager → DiffusionEn
 Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
-- Models: `atom/models/` — registered in `model_runner.py:support_model_arch_dict`
+- Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
@@ -70,15 +70,23 @@ Key entry points:
   / math primitives), a model's
   kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
   Kimi-K3, both wrapped after load through
-  `model_runner.mono_decode_installers`; V4.1's per-step cell decisions live in
+  `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
   kernel and its CPU I3 test. Kimi-K3 runs K1 (the attention seam through
-  the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, and
-  only on a uniform speculative verify of at most 16 rows. The MLA layers keep
+  the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, on
+  a plain decode or a uniform speculative verify of at most 64 rows (16-row
+  token groups past 16), with or without ReplaySSM. The MLA layers keep
   their original paged attention but also run K2; an MLA layer that cannot bind
   K2 stays on the production path alone. Which steps it serves and how a served step is
   keyed live in `kimi_k3/mono/plan.py`, apart from `runner.py` so the CPU test
-  gate can reach them without AITER or FlyDSL. GLM-5.2's single `kernels/kernel.py` covers the
+  gate can reach them without AITER or FlyDSL. Its DSA layers' indexer (plain
+  decode or verify) runs the shared `atom/mono/dsa_indexer/` launch: under DCP over
+  each rank's own keys, without DCP over the replicated cache (a request's rows
+  owned by one rank, a long request's keys split over the ranks) (`wq_b`
+  through the selected KV slots; any model with the V3.2-style `Indexer`, keyed and
+  named by the layer's `IndexerShape`, `plan.unsupported` the shapes it is not
+  written for); the bf16 GEMV it shares with K1 / K2 is
+  `atom/mono/device/gemv.py`. GLM-5.2's single `kernels/kernel.py` covers the
   whole layer, `kernels/op.py` is its host wrapper, and `kernels/geometry.py` /
   `kernels/geometry_config.py` hold its launch geometry and its own `LayerConfig`.
   What is NOT GLM-5.2's sits in `atom/mono/`: the storage vocabulary and host-side
@@ -89,7 +97,9 @@ Key entry points:
   implementations side by side — `PeerBuffer` (aiter's heap) and
   `SymmetricPeerBuffer` (HIP directly, GLM-5.2's) — because they are different
   implementations rather than two copies, and merging them is a GPU behaviour
-  change, not a move. Where a model ships a
+  change, not a move; both allocate through `runtime/uncached.py`, as do every
+  model's step scratch buffers (uncached device memory: a hand-off's polls
+  never hit a stale cache line). Where a model ships a
   `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
   python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the

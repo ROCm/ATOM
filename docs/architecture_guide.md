@@ -44,7 +44,7 @@ LLMEngine (user-facing API)
 └── Config (master configuration)
 ```
 
-**Supported model architectures** (registered in `support_model_arch_dict`, a module-level dict in `model_runner.py`):
+**Supported model architectures** (registered in `support_model_arch_dict`, a module-level dict in `atom/models/registry.py`):
 
 | Architecture key | Implementation |
 |---|---|

@@ -61,9 +61,11 @@ if _HAS_TRITON:
         hs2_ptr,
         pref_ptr,
         ow_ptr,
-        B,
-        Bp,
-        H,
+        # Shapes are known at dispatch; specialize loop bounds and masks
+        # without changing the fixed BF16 reduction layout below.
+        B: tl.constexpr,
+        Bp: tl.constexpr,
+        H: tl.constexpr,
         eps,
         out_eps,
         fp8_max,
@@ -202,6 +204,10 @@ _ATTN_RES_CONFIGS = (
     (2048, 4, 2, 2),
 )
 _ATTN_RES_CATCHALL = (4, 2, 2)  # T > largest bucket
+# Use one FP32 reduction layout for unquantized BF16 output. Changing the
+# warp count at T=512 can move a value across a BF16 midpoint and alter MoE
+# routing when the same prefix is evaluated with different batch peers.
+_ATTN_RES_BF16_CONFIG = (8, 2, 2)
 
 
 def _pick_attn_res_config(tokens: int):
@@ -279,7 +285,11 @@ def _apply_attn_res_impl(
     hs2 = add_hidden2.contiguous() if do_add2 else ps
     pref = torch.empty_like(ps) if do_add else ps
 
-    nw, ns, bl = _pick_attn_res_config(T)
+    nw, ns, bl = (
+        _ATTN_RES_BF16_CONFIG
+        if ps.dtype == torch.bfloat16 and quant_dtype is None
+        else _pick_attn_res_config(T)
+    )
     _attn_res_fused_kernel[(T,)](
         br,
         ps,

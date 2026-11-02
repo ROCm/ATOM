@@ -236,7 +236,7 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
 
 def _is_gfx950() -> bool:
     """True on gfx950, and on no device at all -- a contract check builds
-    compile-only and never binds one, as ``_cu_count`` does for K3."""
+    compile-only and never binds one, as ``deployment._cu_count`` does."""
     import torch
 
     if not torch.cuda.is_available():

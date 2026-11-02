@@ -8,6 +8,7 @@ at the wrong offset -- so each is pinned here rather than only inside a kernel
 that needs a GPU to run.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -101,11 +102,10 @@ def test_step_rows_accepts_a_uniform_spec_verify():
 @pytest.mark.parametrize(
     "over",
     [
-        {"spec_sequence_masks": None},  # not a spec step
+        {"spec_sequence_masks": None},  # spec decodes in a plain step
         {"num_prefills": 1},  # a prefill in the batch
         {"num_decodes": 1},  # a plain decode mixed in
         {"num_spec_decodes": 0},
-        {"replayssm": True},  # only column 0 of the slot table is live
         {"num_accepted_tokens": None},
         {"num_actual_tokens": 7},  # disagrees with the rows
         {"spec_state_indices_tensor": torch.zeros(2, 4, dtype=torch.int64)},
@@ -115,6 +115,106 @@ def test_step_rows_refuses_every_other_shape(over):
     from atom.models.kimi_k3.mono.plan import step_rows
 
     assert step_rows(_metadata(**over), 8) is None
+
+
+def _plain_metadata(requests=3, **over):
+    """A KDA metadata of a plain decode: one token a request, no speculation."""
+    base = {
+        "spec_sequence_masks": None,
+        "num_prefills": 0,
+        "num_decodes": requests,
+        "num_spec_decodes": 0,
+        "num_actual_tokens": requests,
+        "non_spec_state_indices_tensor": torch.arange(requests, dtype=torch.int32),
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_step_rows_accepts_a_plain_decode_as_one_token_a_request():
+    from atom.models.kimi_k3.mono.plan import step_rows
+
+    assert step_rows(_plain_metadata(), 3) == 1
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"num_prefills": 1},  # a prefill in the batch
+        {"num_decodes": 0},
+        {"num_decodes": 2},  # disagrees with the rows
+        {"num_actual_tokens": 4},  # disagrees with the rows
+        {"non_spec_state_indices_tensor": None},
+        {"non_spec_state_indices_tensor": torch.arange(3, dtype=torch.int64)},
+        # a strided slot table: K1 reads it at a stride of one
+        {"non_spec_state_indices_tensor": torch.arange(6, dtype=torch.int32)[::2]},
+    ],
+)
+def test_step_rows_refuses_every_other_plain_shape(over):
+    from atom.models.kimi_k3.mono.plan import step_rows
+
+    assert step_rows(_plain_metadata(**over), 3) is None
+
+
+def test_step_rows_refuses_a_plain_decode_wider_than_the_buffers():
+    from atom.models.kimi_k3.mono.plan import step_rows
+
+    rows = MAX_ROWS + 1
+    assert step_rows(_plain_metadata(requests=rows), rows) is None
+
+
+@pytest.mark.parametrize(
+    ("rows", "served"),
+    [
+        (9, True),
+        (16, True),
+        (24, True),
+        (40, True),
+        (56, True),
+        (64, True),
+        (65, False),
+    ],
+)
+def test_past_one_token_group_a_plain_decode_is_served_to_the_buffers(rows, served):
+    """Past 16 rows the kernels run 16-row token groups and a partial last one
+    (``kda.group_rows``): every width up to the buffers has a build, 24 / 40 /
+    56 (a DSpark verify of 3 / 5 / 7 requests) as much as 32 / 48 / 64."""
+    from atom.models.kimi_k3.mono.plan import step_rows
+
+    assert (step_rows(_plain_metadata(requests=rows), rows) == 1) is served
+
+
+@pytest.mark.parametrize(
+    ("rows", "groups"), [(24, [16, 8]), (40, [16, 16, 8]), (64, [16] * 4), (8, [8])]
+)
+def test_a_wide_step_s_last_token_group_takes_the_rest(rows, groups):
+    from atom.models.kimi_k3.mono.config import group_rows
+    from atom.models.kimi_k3.mono.config import groups as n_groups
+
+    assert [group_rows(rows, g) for g in range(n_groups(rows))] == groups
+
+
+def test_a_plain_decode_reads_and_writes_each_request_s_one_slot():
+    from atom.models.kimi_k3.mono.plan import state_slots
+
+    metadata = _plain_metadata(
+        non_spec_state_indices_tensor=torch.tensor([5, 0, 9], dtype=torch.int32)
+    )
+    ones = torch.ones(MAX_ROWS, dtype=torch.int32)
+    slots, accepted = state_slots(metadata, ones)
+    # K1 resumes from slots[r][accepted - 1] and writes token 0 to slots[r][0]
+    assert slots.tolist() == [[5], [0], [9]]
+    assert slots.stride(0) == 1
+    assert accepted is ones
+
+
+def test_a_spec_verify_reads_the_spec_slot_table():
+    from atom.models.kimi_k3.mono.plan import state_slots
+
+    metadata = _metadata()
+    slots, accepted = state_slots(metadata, torch.ones(MAX_ROWS, dtype=torch.int32))
+    assert slots is metadata.spec_state_indices_tensor
+    assert accepted is metadata.num_accepted_tokens
 
 
 def test_step_rows_refuses_a_step_wider_than_the_buffers():
@@ -278,3 +378,57 @@ def test_bind_moe_does_not_refuse_a_dual_stream_moe():
     with pytest.raises(Exception) as refusal:
         bind_moe(layer, 0, Dims(tp=8), rank=0)
     assert "dual-stream" not in str(refusal.value)
+
+
+def test_a_replay_buffer_too_long_for_the_lds_is_refused_by_name():
+    """K1 stages a task's ReplaySSM records in LDS (``kda_lds_words``): the
+    default cache_len fits; one long enough that the records pass the LDS is
+    a named refusal (``lds_refusal``), not a failed compile."""
+    pytest.importorskip("flydsl", reason="the K3 K1 kernel module needs FlyDSL")
+    from atom.models.kimi_k3.mono.kernels.attention import kda as k1
+
+    def key(cap, window):
+        return k1.KdaPreBuild(
+            tokens=64,
+            qlen=8,
+            nblocks=2,
+            delta=True,
+            state_len=10,
+            replay_cap=cap,
+            replay_window=window,
+        )
+
+    assert k1.lds_refusal(key(0, 0)) == ""
+    assert k1.lds_refusal(key(16, 8)) == ""
+    why = k1.lds_refusal(key(128, 8))
+    assert "ReplaySSM" in why and "cache_len 128" in why
+
+
+def test_a_lean_width_restages_only_the_spilled_k1_builds(monkeypatch):
+    """``_lean_width``: the K1 builds whose launchers spilled are rebuilt with a
+    column group a GEMV unit (slower, so the others keep two), every layer
+    keyed on them moved to the lean key, K2 untouched."""
+    pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
+    pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
+    from atom.models.kimi_k3.mono import runner
+    from atom.models.kimi_k3.mono.kernels.attention import kda as k1
+
+    monkeypatch.setattr(k1, "build", lambda key: ("lean", key.nblocks))
+    fat = [
+        k1.KdaPreBuild(tokens=56, qlen=8, nblocks=n, delta=True, state_len=10)
+        for n in (2, 6)
+    ]
+    built = runner.WidthBuild(
+        k1_keys={1: fat[0], 2: fat[0], 5: fat[1]},
+        k1_launchers={fat[0]: "spill", fat[1]: "fits"},
+        k2_keys={1: "k2"},
+        k2_launchers={"k2": "k2f"},
+    )
+    lean = runner._lean_width(built, ["spill"])
+    thin = replace(fat[0], gemv_unit=1)
+    assert lean.k1_keys == {1: thin, 2: thin, 5: fat[1]}
+    assert lean.k1_launchers == {thin: ("lean", 2), fat[1]: "fits"}
+    assert lean.k2_launchers == {"k2": "k2f"}
+    # a K2 spill, or a K1 already at one group a unit: nothing leaner
+    assert runner._lean_width(built, ["k2f"]) is None
+    assert runner._lean_width(lean, [("lean", 2)]) is None
