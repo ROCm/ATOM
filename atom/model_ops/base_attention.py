@@ -184,7 +184,18 @@ _flydsl_pa_routed: set[tuple] = set()
 _flydsl_plan_refused: set[tuple] = set()
 
 
-def flydsl_plan_shape(head_dim) -> dict:
+# ATOM_FLYDSL_PA_LOWBS_CAP: head-256 plan shape per batch size, measured at
+# MTP-3 verify (32 rows), ctx 150k, tile + reduce per layer: bs1 53.2 -> 26.4
+# us at 256 partitions, bs2 55.1 -> 37.8 us at 128 (256 gives 46.1 there). The
+# budget is 4x the ceiling, as benched. Every other batch keeps the 64 / 256
+# shape.
+_FLYDSL_D256_LOWBS_SHAPE = {
+    1: {"max_partitions": 256, "workgroup_budget": 1024},
+    2: {"max_partitions": 128, "workgroup_budget": 512},
+}
+
+
+def flydsl_plan_shape(head_dim, num_seqs=None) -> dict:
     """plan_pa_decode shape kwargs for a head size: empty, i.e. aiter's
     defaults, except at head_dim 256.
 
@@ -196,10 +207,72 @@ def flydsl_plan_shape(head_dim) -> dict:
     19 Qwen3.5 TP4 MTP-3 shapes, same error against the reference). Remove
     once aiter #5949, a parallel head-256 reducer above 64 partitions, is in
     the image.
+
+    ``num_seqs``: the plan's batch. With ATOM_FLYDSL_PA_LOWBS_CAP=1, batch 1
+    and 2 take a larger ceiling (``_FLYDSL_D256_LOWBS_SHAPE``): at 64 a
+    single long request runs on 64 of 256 CUs. That needs a reducer that is
+    fast above 64 partitions (nightly_202610251529: 4.9-5.4 us at 256).
+    None, or any other batch, keeps the 64 cap.
     """
     if head_dim == 256:
+        if num_seqs is not None and envs.ATOM_FLYDSL_PA_LOWBS_CAP:
+            lowbs = _FLYDSL_D256_LOWBS_SHAPE.get(int(num_seqs))
+            if lowbs is not None:
+                return dict(lowbs)
         return {"max_partitions": 64, "workgroup_budget": 256}
     return {}
+
+
+# aiter traits.D256_PIPE_MAX_ROWS values ATOM_FLYDSL_D256_PIPE_MAX_ROWS may
+# set: 1-3 M-tiles of 16 rows. Four take a different per-token V-scale load
+# (op_softmax, M_TILES >= 4) that no test covers on the pipe.
+_FLYDSL_D256_PIPE_ROWS_ALLOWED = (16, 32, 48)
+_flydsl_d256_pipe_rows_applied = False
+
+
+def _apply_flydsl_d256_pipe_max_rows() -> None:
+    """Set aiter's head-256 pipe row limit from ATOM_FLYDSL_D256_PIPE_MAX_ROWS.
+
+    Once per process, before the first FlyDSL paged decode. aiter reads the
+    module global inside ``d256_pipe`` at kernel selection, so assigning it
+    is the same change as editing traits.py, without touching the install
+    (the pa_k5_rows bench applied it the same way). No stale kernel: the
+    selected path (``D256_PIPE``) is part of the traits cache key, which is
+    part of both the in-process and FlyDSL's on-disk cache keys; a shape
+    that flips to the pipe is a new key. Kernels already selected are not
+    re-selected, which is why this runs before the first call.
+    """
+    global _flydsl_d256_pipe_rows_applied
+    _flydsl_d256_pipe_rows_applied = True
+    rows = envs.ATOM_FLYDSL_D256_PIPE_MAX_ROWS
+    if not rows:
+        return
+    if rows not in _FLYDSL_D256_PIPE_ROWS_ALLOWED:
+        logger.warning(
+            "ATOM_FLYDSL_D256_PIPE_MAX_ROWS=%d ignored: accepted values are %s",
+            rows,
+            _FLYDSL_D256_PIPE_ROWS_ALLOWED,
+        )
+        return
+    try:
+        from aiter.ops.flydsl.kernels.pa_decode import traits
+    except ImportError:
+        traits = None
+    old = getattr(traits, "D256_PIPE_MAX_ROWS", None)
+    if old is None:
+        logger.warning(
+            "ATOM_FLYDSL_D256_PIPE_MAX_ROWS=%d ignored: this aiter has no "
+            "pa_decode traits.D256_PIPE_MAX_ROWS",
+            rows,
+        )
+        return
+    traits.D256_PIPE_MAX_ROWS = rows
+    logger.info(
+        "flydsl pa_decode: head-256 pipe row limit %d -> %d "
+        "(ATOM_FLYDSL_D256_PIPE_MAX_ROWS)",
+        old,
+        rows,
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -513,7 +586,17 @@ def _flydsl_prepare_explicit_plan(
 
     device = q.device
     num_kv_heads = int(k_cache.shape[1])
-    shape = {} if plan_partition_cap is not None else flydsl_plan_shape(q.shape[-1])
+    # Checked first: this runs on every layer's call, and a matching plan
+    # needs no shape.
+    if existing_plan is not None and flydsl_plan_matches(
+        existing_plan, num_seqs, num_kv_heads
+    ):
+        return existing_plan
+    shape = (
+        {}
+        if plan_partition_cap is not None
+        else flydsl_plan_shape(q.shape[-1], num_seqs)
+    )
     if existing_plan is not None:
         max_partitions = int(existing_plan.max_partitions)
     elif plan_partition_cap is not None:
@@ -521,11 +604,6 @@ def _flydsl_prepare_explicit_plan(
     else:
         max_partitions = shape.get("max_partitions")
     workgroup_budget = shape.get("workgroup_budget")
-
-    if existing_plan is not None and flydsl_plan_matches(
-        existing_plan, num_seqs, num_kv_heads
-    ):
-        return existing_plan
 
     from atom.utils.tbo.ubatching import tbo_current_ubatch_id
 
@@ -717,6 +795,8 @@ def run_pa_decode(
         )
 
     if flydsl_seqs:
+        if not _flydsl_d256_pipe_rows_applied:
+            _apply_flydsl_d256_pipe_max_rows()
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
         n = flydsl_seqs
