@@ -162,7 +162,8 @@ class Qwen3_5ForConditionalGeneration_(vLLMQwen3_5):
         self.atom_config = atom_config
         # The decision the ATOM layer construction makes (BF16, or per-token
         # FP8), so the mapping names the modules that exist.
-        if gdn_in_proj_is_merged(self.atom_config):
+        # The ATOM language model below is built under `language_model`.
+        if gdn_in_proj_is_merged(self.atom_config, "language_model.model.layers"):
             self.packed_modules_mapping.pop("in_proj_qkv")
             self.packed_modules_mapping.pop("in_proj_b")
             self.packed_modules_mapping.pop("in_proj_a")
@@ -245,7 +246,8 @@ class Qwen3_5MoeForConditionalGeneration_(vLLMQwen3_5Moe):
         multimodal_config = vllm_config.model_config.multimodal_config
         # The decision the ATOM layer construction makes (BF16, or per-token
         # FP8), so the mapping names the modules that exist.
-        if gdn_in_proj_is_merged(self.atom_config):
+        # The ATOM language model below is built under `language_model`.
+        if gdn_in_proj_is_merged(self.atom_config, "language_model.model.layers"):
             self.packed_modules_mapping.pop("in_proj_qkv")
             self.packed_modules_mapping.pop("in_proj_b")
             self.packed_modules_mapping.pop("in_proj_a")

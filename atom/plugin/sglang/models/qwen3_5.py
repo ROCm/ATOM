@@ -129,12 +129,6 @@ def _validate_qwen35_runtime_contract(
         )
 
 
-def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Any) -> dict:
-    # Not only BF16: the same decision the ATOM layer construction makes (also
-    # per-token FP8), so the mapping always names the modules that exist.
-    return _apply_merged_in_proj_mapping(mapping, atom_config)
-
-
 def _make_qwen35_hf_mapper(language_model_prefix: str) -> WeightsMapper:
     # Qwen3.5 uses the same HF checkpoint keys for both paths below, but the
     # language-model subtree differs: the SGLang outer wrapper nests it under
@@ -168,11 +162,14 @@ def _patch_qwen35_moe_text_for_sparse_moe_block(hf_config: Any) -> None:
 
 
 def remap_qwen35_quant_config_for_sglang_plugin(atom_config: Any) -> None:
+    # The split mapping, as ModelRunner remaps for the native model: each
+    # projection keeps its own per-layer spec, and `gdn_in_proj_is_merged`
+    # (asked afterwards, by the layers and the mapping below) sees them apart.
+    # A merged remap would fold the in_proj_qkv/z/b/a specs onto one name
+    # before that decision is made.
     atom_config.quant_config.remap_layer_name(
         atom_config.hf_config,
-        packed_modules_mapping=_apply_bf16_in_proj_mapping(
-            dict(_PACKED_MODULES_MAPPING), atom_config
-        ),
+        packed_modules_mapping=dict(_PACKED_MODULES_MAPPING),
         weights_mapper=_QWEN35_ATOM_HF_MAPPER,
     )
 
@@ -462,7 +459,8 @@ class _Qwen3_5ConditionalGenerationSglangBase:
         self.language_model = self.model
         self.atom_config = self.model.atom_config
         self.lm_head = self.model.lm_head
-        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+        # The inner ATOM model is built with prefix "" (`model.layers.*`).
+        self.packed_modules_mapping = _apply_merged_in_proj_mapping(
             dict(type(self).packed_modules_mapping), self.atom_config
         )
         self.make_empty_intermediate_tensors = (

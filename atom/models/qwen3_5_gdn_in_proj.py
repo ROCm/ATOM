@@ -40,19 +40,21 @@ _MERGED_IN_PROJ_MAPPING = {
 }
 
 
-def _linear_attention_prefixes(atom_config: Any) -> list[str]:
-    """`model.layers.<i>.linear_attn` for every GDN layer."""
+def _linear_attention_prefixes(atom_config: Any, layers_prefix: str) -> list[str]:
+    """`<layers_prefix>.<i>.linear_attn` for every GDN layer."""
     hf_config = atom_config.hf_config
     config = getattr(hf_config, "text_config", None) or hf_config
     layer_types = getattr(config, "layer_types", None) or []
     return [
-        f"model.layers.{i}.linear_attn"
+        f"{layers_prefix}.{i}.linear_attn"
         for i, layer_type in enumerate(layer_types)
         if layer_type == "linear_attention"
     ]
 
 
-def gdn_in_proj_is_merged(atom_config: Any) -> bool:
+def gdn_in_proj_is_merged(
+    atom_config: Any, layers_prefix: str = "model.layers"
+) -> bool:
     """True when the GDN input projection is one `in_proj_qkvzba` layer.
 
     Both the layer construction (`Qwen3_5GatedDeltaNet.create_qkvzba_proj`) and
@@ -71,6 +73,10 @@ def gdn_in_proj_is_merged(atom_config: Any) -> bool:
     does not qualify keeps them all split. A block-scale checkpoint must not
     merge -- `in_proj_ba` contributes 32 columns per rank, which is not a whole
     number of 128-column scale blocks.
+
+    `layers_prefix` is the decoder stack's module prefix as the layers are
+    built (`model.layers`, or `language_model.model.layers` under a multimodal
+    wrapper): exact-name quantization excludes only match the full name.
     """
     quant_config = atom_config.quant_config
     if quant_config is None:
@@ -79,7 +85,7 @@ def gdn_in_proj_is_merged(atom_config: Any) -> bool:
         return True
     if not envs.ATOM_QWEN35_GDN_MERGE_QKVZBA:
         return False
-    prefixes = _linear_attention_prefixes(atom_config)
+    prefixes = _linear_attention_prefixes(atom_config, layers_prefix)
     if not prefixes:
         return False
     for prefix in prefixes:
@@ -93,8 +99,10 @@ def gdn_in_proj_is_merged(atom_config: Any) -> bool:
     return True
 
 
-def _apply_merged_in_proj_mapping(mapping: dict, atom_config: Any) -> dict:
-    if not gdn_in_proj_is_merged(atom_config):
+def _apply_merged_in_proj_mapping(
+    mapping: dict, atom_config: Any, layers_prefix: str = "model.layers"
+) -> dict:
+    if not gdn_in_proj_is_merged(atom_config, layers_prefix):
         return mapping
 
     mapping.pop("in_proj_qkvz", None)

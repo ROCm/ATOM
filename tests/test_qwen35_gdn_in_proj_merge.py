@@ -200,3 +200,21 @@ def test_per_token_overrides_on_a_block_scale_default_do_not_merge():
 def test_pattern_specs_covering_the_merged_name_merge():
     quant = _real_quant(per_1x128(), per_layer=[("*linear_attn*", per_token())])
     assert gdn_in_proj_is_merged(_Cfg(quant, GDN_LAYERS))
+
+
+def test_exact_name_excludes_match_under_the_wrapper_prefix():
+    # vLLM / multimodal builds the stack under `language_model.model.layers`;
+    # an exact-name exclude there must be seen by the merge decision.
+    stack = "language_model.model.layers"
+    exclude = [f"{stack}.2.linear_attn.in_proj_b", f"{stack}.2.linear_attn.in_proj_a"]
+    quant = _real_quant(per_token(), exclude=exclude)
+    assert quant.get_layer_quant_config(f"{stack}.2.linear_attn.in_proj_ba") != (
+        per_token()
+    )
+    assert not gdn_in_proj_is_merged(_Cfg(quant, GDN_LAYERS), stack)
+    # The bare `model.layers` names miss that exclude, which is why the
+    # wrappers pass their prefix.
+    assert gdn_in_proj_is_merged(_Cfg(quant, GDN_LAYERS))
+    assert _apply_merged_in_proj_mapping(
+        dict(_QWEN3_5_PACKED_MODULES_MAPPING), _Cfg(quant, GDN_LAYERS), stack
+    )["in_proj_b"] == ("in_proj_ba", 0)

@@ -288,7 +288,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # drops the second activation quant of the same normed hidden state
         # (4.12 us). The merged N is 5152, padded to 5248, against qkvz's 5120.
         # `gdn_in_proj_is_merged` decides, so the checkpoint mapping agrees.
-        if gdn_in_proj_is_merged(self.atom_config):
+        # prefix is `<stack>.layers.<i>.linear_attn`.
+        if gdn_in_proj_is_merged(self.atom_config, prefix.rsplit(".", 2)[0]):
             self.in_proj_qkvzba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_sizes=[
@@ -456,7 +457,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         # input projection is not merged feeds the same normed activation to
         # in_proj_qkvz and in_proj_ba, so the norm writes BF16 and each
         # projection quantizes it; see `gdn_in_proj_is_merged`.
-        gdn_merged = gdn_in_proj_is_merged(atom_config)
+        gdn_merged = gdn_in_proj_is_merged(atom_config, prefix.rsplit(".", 1)[0])
         if self.layer_type == "full_attention":
             input_norm_proj = f"{prefix}.self_attn.qkv_proj"
         elif gdn_merged:
@@ -564,7 +565,9 @@ class Qwen3_5ForCausalLMBase(nn.Module):
 
         super().__init__()
         self.packed_modules_mapping = _apply_merged_in_proj_mapping(
-            dict(self.packed_modules_mapping), atom_config
+            dict(self.packed_modules_mapping),
+            atom_config,
+            f"{maybe_prefix(prefix, 'model')}.layers",
         )
         self.config = config
         self.model = Qwen3_5Model(
@@ -827,7 +830,9 @@ class _Qwen3_5MultimodalBase(nn.Module):
             prefix=maybe_prefix("", "language_model"),
         )
         self.packed_modules_mapping = _apply_merged_in_proj_mapping(
-            dict(self.packed_modules_mapping), atom_config
+            dict(self.packed_modules_mapping),
+            atom_config,
+            "language_model.model.layers",
         )
         self.image_token_id = getattr(multimodal_config, "image_token_id", 248056)
         self.video_token_id = getattr(multimodal_config, "video_token_id", 248057)
