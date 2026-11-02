@@ -666,3 +666,54 @@ def test_prefix_spread_keeps_prefix_while_its_source_still_prefills():
     mgr._mark_seq_prefill_complete(2)
     (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
     assert rank != owner
+
+
+class _SinkSocket:
+    def send_multipart(self, parts, copy=False):
+        pass
+
+
+def test_prefix_spread_tracks_load_through_dispatch_under_round_robin():
+    """Prefix-spread scores ranks by in-flight load whatever the strategy, so
+    dispatch must charge it even when the fallback strategy is round_robin;
+    otherwise every load reads 0 and a busy owner never spills."""
+    mgr = _make_spread_mgr()
+    mgr._dp_lb_strategy = "round_robin"
+    mgr.engine_core_identities = [b"e0", b"e1"]
+    mgr.input_sockets = [_SinkSocket(), _SinkSocket()]
+    first = _chain_seq(1, 100_000)
+    mgr._dispatch_to_dp_ranks([first])
+    (owner,) = [r for r, n in enumerate(mgr._rank_reqs) if n]
+    assert mgr._rank_tokens[owner] == 100_000
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens[owner] = 200_000  # busy past the margin
+    moved = _chain_seq(2, 110_000)
+    mgr._dispatch_to_dp_ranks([moved])
+    assert mgr._seq_load[2][0] != owner
+    assert mgr._dp_route_counters["prefix_moved_total"] == 1
+
+
+def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded(
+    monkeypatch,
+):
+    """The connector only loads a hit of at least OFFLOAD_MIN_LOAD_TOKENS. A
+    smaller one that moves rank is recomputed there, so it is not credited."""
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "8192")
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 4_096)])
+    mgr._mark_seq_prefill_complete(1)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    small = _chain_seq(2, 5_000)
+    (rank,) = _route(mgr, [small])
+    assert rank != owner
+    assert not getattr(small, "dp_prefetch_priority", False)
+    assert mgr._seq_load[2][2] == 5_000
+    # Staying on the owner credits the prefix whatever its size.
+    mgr._mark_seq_prefill_complete(2)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    stay = _chain_seq(3, 5_000)
+    assert _route(mgr, [stay]) == [rank]
+    assert mgr._seq_load[3][2] == 5_000 - 4_096
