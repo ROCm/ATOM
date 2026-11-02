@@ -323,3 +323,87 @@ def test_float_cardinality_complement_is_enforced_during_decoding(
     for text, expected in [(small, negate_min), (large, not negate_min)]:
         matcher = xgr.GrammarMatcher(compiled)
         assert all(matcher.accept_token(t) for t in [*text.encode(), 127]) == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU transfer test")
+def test_gpu_deferred_commit_and_draft_copy(controller, monkeypatch):
+    """No CUDA tolist, and commit must not synchronously consume its own copy."""
+    original = torch.Tensor.tolist
+
+    def cpu_only(tensor):
+        assert tensor.device.type == "cpu", "synchronous GPU tolist"
+        return original(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", cpu_only)
+    b = batch(prefill=1)
+    p = controller.apply(torch.zeros(1, 128, device="cuda"), b, None)
+    sampled = torch.tensor([[ord("{")]], device="cuda")
+    with monkeypatch.context() as m:
+
+        def no_wait(*args, **kwargs):
+            raise AssertionError("commit waited for D2H")
+
+        m.setattr(torch.cuda.Event, "synchronize", no_wait)
+        controller.commit(sampled, b, p)
+    assert not controller.pending  # CPU grammar not advanced yet
+    # Simulate the next RPC with a fresh, reordered batch and lagging history.
+    b = batch(mixed=True)
+    b.req_ids = [12, 11]
+    b.structured_requests = {1: b.structured_requests[0]}
+    ids = torch.tensor([0, 0, 0, 0, ord('"'), ord("x")], device="cuda")
+    md = NS(
+        target_logits_indices_np=np.array([0, 1, 3, 4]),
+        bonus_logits_indices_np=np.array([2, 5]),
+        num_draft_tokens_np=np.array([2, 2]),
+        input_ids=ids,
+    )
+    # GPU row metadata must never be needed by the CPU grammar path.
+    md.target_logits_indices = md.bonus_logits_indices = object()
+    controller.prepare(b, md)
+    # Next forward may reuse input staging. The async copy owns its snapshot.
+    ids.fill_(ord("!"))
+    md.target_logits_indices_np.fill(99)
+    md.bonus_logits_indices_np.fill(99)
+    logits = torch.zeros(6, 128, device="cuda")
+    p = controller.apply(logits, b, md)
+    assert torch.isfinite(logits[3, ord('"')])
+    assert torch.isneginf(logits[3, ord("{")])
+    assert torch.isfinite(logits[4, ord("x")])
+    assert torch.isfinite(logits[5, ord('"')])
+    assert torch.equal(logits[:3], torch.zeros(3, 128, device="cuda"))
+    # Reject the draft; commit a different legal token (whitespace).
+    controller.commit(torch.tensor([[-1, -1, -1], [32, -1, -1]], device="cuda"), b, p)
+    # Reorder again and deliver the previous result to the scheduler.
+    logits = torch.zeros(1, 128, device="cuda")
+    controller.prepare(batch([ord("{")]), None)
+    controller.apply(logits, batch([ord("{")]), None)
+    assert torch.isfinite(logits[0, ord('"')])
+    assert torch.isneginf(logits[0, ord("x")])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU transfer test")
+def test_async_commit_replay_cancel_and_buffer_reuse(controller):
+    # Replay wins over a still-in-flight old grammar state.
+    b = batch(prefill=1)
+    p = controller.apply(torch.zeros(1, 128, device="cuda"), b, None)
+    controller.commit(torch.tensor([[ord("{")]], device="cuda"), b, p)
+    logits = torch.zeros(1, 128, device="cuda")
+    p = controller.apply(logits, batch(prefill=1), None)
+    assert torch.isfinite(logits[0, ord("{")])
+    controller.commit(torch.tensor([[ord("{")]], device="cuda"), b, p)
+    # Cancellation drops state without waiting. Reuse the copy slot afterwards.
+    controller.clear()
+    for token in [3, 4]:
+        b = batch(schema={"const": token}, prefill=1)
+        p = controller.apply(torch.zeros(1, 128, device="cuda"), b, None)
+        controller.commit(torch.tensor([[ord(str(token))]], device="cuda"), b, p)
+        controller.clear()
+    assert controller.commit_records is None
+    assert not controller.pending and not controller.states
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU transfer test")
+def test_gpu_metadata_requires_prefetch(controller):
+    md = NS(input_ids=torch.zeros(3, device="cuda"))
+    with pytest.raises(ValueError, match="not prefetched"):
+        controller.apply(torch.zeros(1, 128, device="cuda"), batch(), md)

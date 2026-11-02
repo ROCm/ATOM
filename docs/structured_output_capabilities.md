@@ -118,6 +118,19 @@ runner changes streams. No buffers or kernel imports are needed for a request
 batch without constraints. Speculative matcher cloning and committed-state
 semantics are unchanged by this mask optimization.
 
+Deferred output remains asynchronous. Target/bonus row indices use their CPU
+mirrors, not GPU `tolist()` calls. After device-side input assembly and before
+target forward, the runner snapshots only constrained requests' draft tokens and
+copies them to pinned host memory on a separate stream. It consumes the snapshot
+after submitting the forward. Sampled tokens are likewise copied asynchronously;
+the next step advances committed grammar state after submitting its own forward.
+Neither publication waits for D2H. Consumption waits only for the corresponding
+copy event, so residual waits are possible if that copy has not finished.
+Owned snapshots and request IDs protect against input-buffer reuse, batch
+reordering, cancellation, and replay. Ordinary output delivery keeps its existing
+deferred queue. CPU history snapshots are still retained; this does not remove
+the separate history-copying cost.
+
 Enabled requests still copy masks and committed tokens between CPU and GPU and
 perform host grammar work. There is no zero-overhead claim. Performance results
 must distinguish enabled-request overhead from disabled-request regression and

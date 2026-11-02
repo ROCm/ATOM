@@ -97,6 +97,53 @@ class StructuredOutput:
         self.pending.clear()
         self.states.clear()
         self.current.clear()
+        self.commit_records = None
+        self.draft_plan = None
+
+    def prepare(self, batch, metadata):
+        """Publish compact draft snapshots before launching the target forward."""
+        self.draft_plan = None
+        requests = getattr(batch, "structured_requests", {})
+        if not requests or metadata is None:
+            return
+        import torch
+
+        from .structured_output_transfer import AsyncTokenCopy
+
+        # Host mirrors are consumed here, while this step owns the staging slot.
+        # Copy row numbers into Python, never retain a reusable NumPy view.
+        target = metadata.target_logits_indices_np
+        bonus = metadata.bonus_logits_indices_np
+        if target is None or bonus is None:
+            raise ValueError("Structured draft preparation requires host indices")
+        lengths = metadata.num_draft_tokens_np
+        starts = lengths.cumsum() - lengths
+        plan, pieces, offset = {}, [], 0
+        for i in requests:
+            if batch.is_final_chunk is not None and not batch.is_final_chunk[i]:
+                continue
+            start, count = int(starts[i]), int(lengths[i])
+            rows = target[start : start + count].tolist()
+            plan[i] = (rows + [int(bonus[i])], offset, count)
+            # Target rows are contiguous within a request's verification span.
+            # cat owns the snapshot before an input buffer can be reused.
+            if count:
+                pieces.append(metadata.input_ids[rows[0] + 1 : rows[0] + 1 + count])
+            offset += count
+        self.draft_plan = plan
+        if pieces:
+            if getattr(self, "draft_copy", None) is None:
+                self.draft_copy = AsyncTokenCopy(metadata.input_ids.device)
+            self.draft_copy.start(torch.cat(pieces))
+
+    def _finish_commit(self):
+        records = getattr(self, "commit_records", None)
+        if records is not None:
+            # Called after this step's forward has been submitted. Only wait for
+            # last step's token copy, never for the current forward or sampler.
+            ids = self.commit_copy.wait().tolist()
+            self.commit_records = None
+            self._commit_ids(ids, records)
 
     def advance(self, matcher, active, marker, history, token):
         if active and not matcher.accept_token(token):
@@ -135,20 +182,43 @@ class StructuredOutput:
 
     def apply(self, logits, batch, metadata):
         requests = getattr(batch, "structured_requests", {})
+        if not requests:
+            self.clear()
+            return {}
+        self._finish_commit()
         previous, self.pending = self.pending, {}
         states, self.states = self.states, {}
         self.current = {}
-        if not requests:
-            return {}
-        target = metadata.target_logits_indices.tolist() if metadata else []
-        bonus = metadata.bonus_logits_indices.tolist() if metadata else []
-        lengths = metadata.num_draft_tokens_np.tolist() if metadata else []
-        input_ids = metadata.input_ids.tolist() if metadata else []
+        plan = getattr(self, "draft_plan", None)
+        drafts = []
+        if metadata is not None:
+            if plan is None:
+                # CPU reference tests can execute without a runner. GPU callers
+                # must prefetch: never silently reintroduce synchronous D2H.
+                if metadata.input_ids.device.type != "cpu":
+                    raise ValueError("Structured draft tokens were not prefetched")
+                target = metadata.target_logits_indices.tolist()
+                bonus = metadata.bonus_logits_indices.tolist()
+                lengths = metadata.num_draft_tokens_np.tolist()
+                input_ids = metadata.input_ids.tolist()
+                plan = {}
+                for i in requests:
+                    start = sum(lengths[:i])
+                    rows = target[start : start + lengths[i]]
+                    plan[i] = (rows + [bonus[i]], len(drafts), len(rows))
+                    drafts.extend(input_ids[row + 1] for row in rows)
+            elif any(count for _, _, count in plan.values()):
+                drafts = self.draft_copy.wait().tolist()
+        self.draft_plan = None
         if getattr(self, "mask_buffer", None) is None:
             from .structured_output_mask import StructuredOutputMask
 
             self.mask_buffer = StructuredOutputMask(self.vocab_size)
-        mask_count = len(target) + len(bonus) if metadata else len(requests)
+        mask_count = (
+            sum(len(rows) for rows, _, _ in plan.values())
+            if metadata
+            else len(requests)
+        )
         masks = self.mask_buffer.prepare(mask_count, logits.device)
         prefixes = {}
         rows = []
@@ -181,8 +251,7 @@ class StructuredOutput:
             if metadata:
                 matcher = matcher.copy()
             if metadata:
-                start = sum(lengths[:i])
-                branch_rows = target[start : start + lengths[i]] + [bonus[i]]
+                branch_rows, draft_start, _ = plan[i]
             else:
                 branch_rows = [i]
             branch = list(history)
@@ -213,7 +282,7 @@ class StructuredOutput:
                             )
                 rows.append(row)
                 if metadata and pos < len(branch_rows) - 1:
-                    draft = input_ids[row + 1]
+                    draft = drafts[draft_start + pos]
                     if active and not unreachable and not matcher.accept_token(draft):
                         unreachable = True
                     if active and matcher.is_terminated():
@@ -231,21 +300,38 @@ class StructuredOutput:
     def commit(self, sampled, batch, prefixes):
         if not prefixes:
             return
-        ids = sampled.reshape(len(batch.req_ids), -1).tolist()
-        for i, (schema, marker, history) in prefixes.items():
-            emitted = [token for token in ids[i] if token >= 0]
+        # Own request identities and matcher states across scheduler RPCs and
+        # batch reorder/removal. Do not retain the mutable ScheduledBatch.
+        records = [(batch.req_ids[i], prefixes[i], self.current[i]) for i in prefixes]
+        sampled = sampled.reshape(len(batch.req_ids), -1)
+        if sampled.device.type == "cuda":
+            import torch
+
+            from .structured_output_transfer import AsyncTokenCopy
+
+            if getattr(self, "commit_copy", None) is None:
+                self.commit_copy = AsyncTokenCopy(sampled.device)
+            snapshot = torch.cat([sampled[i : i + 1] for i in prefixes])
+            self.commit_copy.start(snapshot)
+            self.commit_records = records
+        else:
+            self._commit_ids([sampled[i].tolist() for i in prefixes], records)
+        self.current = {}
+
+    def _commit_ids(self, ids, records):
+        for tokens, (req_id, (schema, marker, history), state) in zip(ids, records):
+            emitted = [token for token in tokens if token >= 0]
             for j, token in enumerate(emitted):
                 if token in self.stop_ids:
                     emitted = emitted[: j + 1]
                     break
             full = list(history)
-            matcher, active = self.current[i]
+            matcher, active = state
             for token in emitted:
                 # An already-finished request can have one forward in flight.
                 if active and matcher.is_terminated() and token in self.stop_ids:
                     full.append(token)
                     break
                 active = self.advance(matcher, active, marker, full, token)
-            self.pending[batch.req_ids[i]] = full
-            self.states[batch.req_ids[i]] = (schema, marker, full, matcher, active)
-        self.current.clear()
+            self.pending[req_id] = full
+            self.states[req_id] = (schema, marker, full, matcher, active)

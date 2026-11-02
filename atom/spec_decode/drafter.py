@@ -765,5 +765,9 @@ class Drafter(abc.ABC):
             cu_num_draft_tokens=cu_num_draft_tokens,
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
+            target_logits_indices_np=var["target_logits_indices"].np[
+                :sum_drafted_tokens
+            ],
+            bonus_logits_indices_np=var["bonus_logits_indices"].np[:scheduled_bs],
         )
         return metadata

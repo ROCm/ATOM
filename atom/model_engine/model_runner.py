@@ -3332,7 +3332,11 @@ class ModelRunner:
             premask_lse = torch.logsumexp(logits[:bs].float(), dim=-1)
         if structured_requests:
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
-        elif structured is not None and (structured.pending or structured.current):
+        elif structured is not None and (
+            structured.pending
+            or structured.current
+            or getattr(structured, "commit_records", None) is not None
+        ):
             # Release completed/cancelled state once. Ordinary batches never
             # build masks, copy tensors to CPU, or synchronize for this feature.
             structured.clear()
@@ -3594,6 +3598,12 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if getattr(batch, "structured_requests", None):
+            # Snapshot draft ids before target forward, so their D2H can overlap
+            # it. This runs after device-side deferred input assembly.
+            self.structured_output.prepare(
+                batch, get_forward_context().spec_decode_metadata
+            )
         logits, hidden_states = self.run_model(input_ids, batch)
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
