@@ -1342,7 +1342,9 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert worker._pending_loads == {}
     assert worker._pending_saves == {}
     if ipc_reclamation:
-        assert worker._event_reclaimer.acquire_ready_event(object) is ready_event
+        # Both transfers are terminal: the next batch retires the event.
+        worker._event_reclaimer.acquire_ready_event(object)
+        assert ready_event in worker._event_reclaimer._retired
 
 
 def _unprovable_request(kind: str) -> LMCacheReqMeta:
