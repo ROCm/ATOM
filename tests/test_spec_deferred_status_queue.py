@@ -17,7 +17,7 @@ from atom.model_engine.model_runner import (
     _kv_config_has_producer,
     tokenIDProcessor,
 )
-from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.scheduler import ScheduledBatch, defers_output
 from atom.spec_decode.status import SpecStatusQueue
 from atom.utils.selector import Family
 
@@ -165,6 +165,26 @@ def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
         return tokenIDProcessor(runner, max_num_batched_tokens=8)
 
 
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_the_scheduler_resolves_the_runners_deferral(pp_size):
+    """The scheduler has no runner: it reads the family off the config, and
+    must land where the runner does for a recurrent-state producer."""
+    config = SimpleNamespace(
+        pipeline_parallel_size=pp_size,
+        kv_transfer_config={"kv_role": "kv_producer"},
+        hf_config=object(),
+    )
+    with (
+        mock.patch("atom.model_engine.scheduler.get_hf_text_config"),
+        mock.patch(
+            "atom.model_engine.scheduler.attn_family", return_value=Family.KIMI_MLA
+        ),
+    ):
+        assert defers_output(config) is False
+    config.kv_transfer_config = {}
+    assert defers_output(config) is (pp_size == 1)
+
+
 def test_a_consumer_keeps_deferred_output():
     """The other polarity of the sweep below, which fixes the role to producer.
 
@@ -224,11 +244,11 @@ def _decode_batch(*, num_spec_step: int) -> ScheduledBatch:
 
 
 def _recurrent_producer_processor() -> tokenIDProcessor:
-    """Non-deferred, and `has_drafter` still on: the runner keeps the drafter."""
+    """Non-deferred, and `use_spec` still on: the runner keeps the drafter."""
     processor = _processor()
     processor.is_deferred_out = False
     processor.is_pipeline_parallel = False
-    processor.has_drafter = True
+    processor.use_spec = True
     return processor
 
 
@@ -379,7 +399,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     )
     processor.is_deferred_out = True
     processor.prev_batch = object()
-    processor.has_drafter = True
+    processor.use_spec = True
     processor.prev_rejected_num = None
     processor.prev_bonus_num = None
     processor.pre_num_decode_token_per_seq = 1
@@ -453,7 +473,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
 
 
 def test_a_producer_dp_dummy_stages_without_a_draft_table():
-    """A producer keeps `has_drafter` (its drafter writes context KV) but its DP
+    """A producer keeps `use_spec` (its drafter writes context KV) but its DP
     dummy is q=1 with `num_spec_step=0`, so the batch has no
     `scheduled_spec_decode_tokens`. The dummy is always a new sequence; reading
     the draft table for it raised AttributeError on every idle DPA rank."""

@@ -68,6 +68,7 @@ from atom.model_ops.attention_mla import (
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
+from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -587,8 +588,6 @@ class KimiK3DSpark(DSparkDraftModel):
         # embedding is a PPMissingLayer, so load the checkpoint's own copy.
         self.own_embed_tokens = not get_pp_group().is_first_rank
         if self.own_embed_tokens:
-            from atom.model_ops.embed_head import VocabParallelEmbedding
-
             self.skip_weight_prefixes = tuple(
                 p for p in self.skip_weight_prefixes if p != "embed_tokens."
             )

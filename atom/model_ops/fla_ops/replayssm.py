@@ -438,6 +438,21 @@ def _replayssm_commit_kernel(
     tl.store(write_pos + slot, base + tl.load(num_accepted + i_n))
 
 
+def seed_forked_slots(
+    ckpt: torch.Tensor, slot_idx: torch.Tensor, slot_idx_in: torch.Tensor | None
+) -> None:
+    """Copy a state fork's source checkpoint onto its write slot.
+
+    The kernels read and write `slot_idx` only, and a fork's write slot must
+    hold the base its records fold onto. The builder parks that slot's cursor
+    at -1, so nothing is folded over it. Eager-only: a fork means pp>1.
+    """
+    if slot_idx_in is None:
+        return
+    live = (slot_idx >= 0) & (slot_idx_in != slot_idx)
+    ckpt[slot_idx[live].long()] = ckpt[slot_idx_in[live].long()]
+
+
 def replayssm_commit(
     write_pos: torch.Tensor,
     slot_idx: torch.Tensor,
@@ -1369,6 +1384,7 @@ def replayssm_gated_delta_rule(
     is_kda: bool = False,
     route: str = "auto",
     o: torch.Tensor | None = None,
+    slot_idx_in: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM forward for one linear-attention layer.
 
@@ -1390,6 +1406,8 @@ def replayssm_gated_delta_rule(
         o: optional contiguous ``[T_tot, HV, V]`` destination (e.g. a slice of
             the layer's output buffer); the kernel writes into it directly
             instead of a fresh tensor, saving the caller a device copy.
+        slot_idx_in: optional ``[N]`` slot each sequence's state is read from
+            (a state fork's source); see :func:`seed_forked_slots`.
 
     Returns:
         ``o`` of shape ``[1, T_tot, HV, V]`` -- same leading-batch convention
@@ -1397,6 +1415,7 @@ def replayssm_gated_delta_rule(
         replacement at the call sites in ``attention_gdn.py``.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    seed_forked_slots(ckpt, slot_idx, slot_idx_in)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1
@@ -1778,6 +1797,7 @@ def replayssm_sigmoid_gating_delta_rule(
     scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     lower_bound: float | None = None,
+    slot_idx_in: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """ReplaySSM for the KDA (Kimi-K3) linear-attention layer.
 
@@ -1786,9 +1806,11 @@ def replayssm_sigmoid_gating_delta_rule(
     the pool holds one checkpoint per request instead of one state per
     speculative token.  See the module docstring for the algebra.
 
-    ``o`` may be passed to write the output in place (K3 does this).
+    ``o`` may be passed to write the output in place (K3 does this);
+    ``slot_idx_in`` as in :func:`replayssm_gated_delta_rule`.
     """
     assert q.shape[0] == 1, "varlen layout expected (B == 1)"
+    seed_forked_slots(ckpt, slot_idx, slot_idx_in)
     _, T_tot, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     N = cu_seqlens.numel() - 1

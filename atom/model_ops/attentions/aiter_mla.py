@@ -2973,7 +2973,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
                 for i, (ctx_len, is_first) in enumerate(
                     zip(
-                        batch.context_lens,
+                        context_lens,
                         batch.is_first_decode_without_local_prefill,
                     )
                 )

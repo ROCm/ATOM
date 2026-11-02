@@ -24,12 +24,15 @@ pytest.importorskip(
     exc_type=ImportError,
 )
 
+import torch
+
 from atom.model_ops.attentions.gdn_attn import PAD_SLOT_ID, GDNStateMixin
+from atom.model_ops.fla_ops.replayssm import seed_forked_slots
 
 WIDTH = 4  # mtp_k + 1 reserved slots per request
 
 
-def _builder(honours_fork, rows=8):
+def _builder(rows=8):
     def buf(shape):
         return SimpleNamespace(np=np.full(shape, -7, dtype=np.int32))
 
@@ -39,7 +42,6 @@ def _builder(honours_fork, rows=8):
         non_spec_state_indices_in_tensor=buf(rows),
         spec_state_indices_tensor=buf((rows, WIDTH)),
         replayssm=False,
-        spec_honours_state_fork=honours_fork,
     )
 
 
@@ -52,7 +54,7 @@ def _slots(n):
 
 
 def test_decode_fork_publishes_the_source_as_the_read_slot():
-    b = _builder(honours_fork=False)
+    b = _builder()
     GDNStateMixin.prepare_state_indices(b, _batch([-1, 30], _slots(2)), with_spec=False)
     assert b._has_state_fork
     np.testing.assert_array_equal(b.non_spec_state_indices_tensor.np[:2], [0, 4])
@@ -61,18 +63,20 @@ def test_decode_fork_publishes_the_source_as_the_read_slot():
 
 
 def test_spec_fork_publishes_the_source_too():
-    b = _builder(honours_fork=True)
+    b = _builder()
     GDNStateMixin.prepare_state_indices(b, _batch([-1, 30], _slots(2)), with_spec=True)
     assert b._has_state_fork
     # The spec kernels resume from column 0, which is the write slot...
     np.testing.assert_array_equal(b.spec_state_indices_tensor.np[:2, 0], [0, 4])
-    # ...and the model moves the state there from the slot published here.
+    # ...and the builder reads the source published here in its place.
     np.testing.assert_array_equal(b.non_spec_state_indices_in_tensor.np[:2], [0, 30])
+    # ReplaySSM parks the forked write slot's record cursor.
+    assert b._fork_dst_slots == [4]
 
 
 def test_no_fork_reads_the_slot_it_writes_on_both_paths():
     for with_spec in (False, True):
-        b = _builder(honours_fork=True)
+        b = _builder()
         GDNStateMixin.prepare_state_indices(
             b, _batch([-1, -1], _slots(2)), with_spec=with_spec
         )
@@ -80,17 +84,16 @@ def test_no_fork_reads_the_slot_it_writes_on_both_paths():
         np.testing.assert_array_equal(b.non_spec_state_indices_in_tensor.np[:2], [0, 4])
 
 
-def test_spec_fork_is_refused_by_a_backend_that_cannot_move_the_state():
-    b = _builder(honours_fork=False)
-    with pytest.raises(AssertionError, match="spec_honours_state_fork"):
-        GDNStateMixin.prepare_state_indices(
-            b, _batch([-1, 30], _slots(2)), with_spec=True
-        )
-
-
 def test_rows_past_the_batch_are_padded_on_every_table():
-    b = _builder(honours_fork=True, rows=8)
+    b = _builder(rows=8)
     GDNStateMixin.prepare_state_indices(b, _batch([-1], _slots(1)), with_spec=True)
     assert (b.non_spec_state_indices_tensor.np[1:] == PAD_SLOT_ID).all()
     assert (b.non_spec_state_indices_in_tensor.np[1:] == PAD_SLOT_ID).all()
     assert (b.spec_state_indices_tensor.np[1:] == PAD_SLOT_ID).all()
+
+
+def test_replayssm_seeds_only_the_forked_write_slots():
+    ckpt = torch.arange(6.0).view(6, 1)
+    slot = torch.tensor([0, 4, PAD_SLOT_ID], dtype=torch.int32)
+    seed_forked_slots(ckpt, slot, torch.tensor([0, 2, PAD_SLOT_ID], dtype=torch.int32))
+    torch.testing.assert_close(ckpt.view(-1), torch.tensor([0.0, 1, 2, 3, 2, 5]))

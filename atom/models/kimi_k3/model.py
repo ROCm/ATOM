@@ -1360,7 +1360,7 @@ class KimiKDAAttention(nn.Module):
         # resumes from whatever the recycled group still held. Under pp=1 only
         # prefill carries a fork, since the checkpoint is taken between prompt
         # chunks; under pp>1 it lands after the prompt, so the decode and
-        # spec-decode branches below honour it too, gated on `has_state_fork`.
+        # spec-decode branches below read it too.
         # Falling back to the write slot leaves every non-fork forward
         # bit-identical. Mirrors attention_gdn.py.
         state_indices_in = kda_metadata.non_spec_state_indices_in_tensor
@@ -1421,12 +1421,6 @@ class KimiKDAAttention(nn.Module):
             # conv update and the fused recurrence below).
             decode_state_indices = state_indices[:num_actual_tokens]
             decode_state_indices_in = state_indices_in[:num_actual_tokens]
-            if kda_metadata.has_state_fork:
-                # Under pp>1 the checkpoint can land after the prompt, so a fork
-                # can reach decode. The conv update reads the _in slot itself; the
-                # recurrence kernel updates in place with no _in index, so copy
-                # the source state onto the (zeroed) destination slot first.
-                ssm_state[decode_state_indices] = ssm_state[decode_state_indices_in]
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1474,6 +1468,11 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    slot_idx_in=(
+                        decode_state_indices_in[:nd]
+                        if kda_metadata.has_state_fork
+                        else None
+                    ),
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1489,6 +1488,7 @@ class KimiKDAAttention(nn.Module):
                     inplace_final_state=True,
                     cu_seqlens=query_start_loc[: kda_metadata.num_decodes + 1],
                     ssm_state_indices=decode_state_indices,
+                    ssm_state_indices_in=decode_state_indices_in,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,
                     lower_bound=self._kda_gate_lower_bound,
@@ -1498,23 +1498,10 @@ class KimiKDAAttention(nn.Module):
             spec_state_indices = kda_metadata.spec_state_indices_tensor
             spec_query_start_loc = kda_metadata.spec_query_start_loc
             num_accepted_tokens = kda_metadata.num_accepted_tokens
-            if kda_metadata.has_state_fork:
-                # Same moment as the decode branch above: under pp>1 the
-                # checkpoint can land after the prompt, and with DSpark on the
-                # first decode after it IS a verify step. Neither kernel below
-                # takes a read-side index -- the conv one walks forward from
-                # `spec_state_indices[:, 0]` and the recurrence updates in
-                # place -- so move both halves onto the write slot first and
-                # let them run on it. Only the resume slot (column 0) is
-                # seeded: the rest of the row is this request's own rollback
-                # scratch, which the kernels write as they walk forward. The
-                # builder ships `_in` on this path only when forked, which is
-                # exactly when this gate is open.
-                nsd = kda_metadata.num_spec_decodes
-                fork_dst = spec_state_indices[:nsd, 0]
-                fork_src = state_indices_in[:nsd]
-                ssm_state[fork_dst] = ssm_state[fork_src]
-                conv_state[fork_dst] = conv_state[fork_src]
+            # Under pp>1 the first verify after the prompt can fork off a
+            # checkpoint: the builder then ships the source as the read side.
+            spec_state_indices_in = kda_metadata.spec_state_indices_in_tensor
+            nsd = kda_metadata.num_spec_decodes
             q, k, v = causal_conv1d_update(
                 mixed_qkv,
                 conv_state,
@@ -1525,9 +1512,12 @@ class KimiKDAAttention(nn.Module):
                 self.activation,
                 # First reserved slot per seq holds the resume state; the kernel
                 # walks forward via num_accepted_tokens + query_start_loc.
-                conv_state_indices=spec_state_indices[:, 0][
-                    : kda_metadata.num_spec_decodes
-                ],
+                conv_state_indices=spec_state_indices[:nsd, 0],
+                conv_state_indices_in=(
+                    None
+                    if spec_state_indices_in is None
+                    else spec_state_indices_in[:nsd, 0]
+                ),
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=spec_query_start_loc,
                 # Verify window: sizes the conv rollback window and hence the
@@ -1545,7 +1535,6 @@ class KimiKDAAttention(nn.Module):
             k = rearrange(k, "t (h d) -> 1 t h d", d=self.head_dim)
             v = rearrange(v, "t (h d) -> 1 t h d", d=self.head_dim)
             if getattr(kda_metadata, "replayssm", False):
-                nsd = kda_metadata.num_spec_decodes
                 replayssm_sigmoid_gating_delta_rule(
                     q,
                     k,
@@ -1565,6 +1554,9 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
+                    slot_idx_in=(
+                        state_indices_in[:nsd] if kda_metadata.has_state_fork else None
+                    ),
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1585,6 +1577,7 @@ class KimiKDAAttention(nn.Module):
                     # num_accepted_tokens the kernel reads the resume state from
                     # slot[num_accepted-1] and writes a snapshot after each token.
                     ssm_state_indices=spec_state_indices,
+                    ssm_state_indices_in=spec_state_indices_in,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
                     is_kda=True,

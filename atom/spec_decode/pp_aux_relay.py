@@ -20,10 +20,11 @@ from aiter.dist.parallel_state import get_pp_group
 from atom.models.utils import PPMissingLayer
 from atom.spec_decode.drafter import (
     AuxCaptureSpec,
-    _identity_extract,
+    _aux_hook,
     _resolve_decoder_layers,
-    _resolve_embedding,
+    install_aux_taps,
 )
+from atom.spec_decode.factory import drafter_class
 
 logger = logging.getLogger("atom")
 
@@ -44,7 +45,7 @@ class PPAuxRelay:
         stage_start = next(
             i for i, layer in enumerate(layers) if not isinstance(layer, PPMissingLayer)
         )
-        taps = sorted(spec.layer_ids)
+        taps = spec.layer_ids
 
         def resident(lid):
             # The embedding tap (-1) is resident on the first stage.
@@ -67,9 +68,10 @@ class PPAuxRelay:
 
         # The send payload, allocated per step at the forward's row count (a
         # resident max_num_batched_tokens buffer is ~0.5 GB per rank): the
-        # first own tap to fire allocates it, every own tap captures into its columns
-        # and pack() copies the received taps into the leading ones. The last
-        # stage's hooks write into the drafter's own buffers instead.
+        # first own tap to fire allocates it (a TBO ubatch past it grows it),
+        # every own tap captures into its columns and pack() copies the
+        # received taps into the leading ones. The last stage's hooks write
+        # into the drafter's own buffers instead.
         # shortcut: a recorded graph would bake the capture-time buffer, so
         # this holds only while PP stages run their target eagerly.
         self._send: torch.Tensor | None = None
@@ -78,59 +80,68 @@ class PPAuxRelay:
 
         self._armed = False
 
-    def arm(self, target_model: torch.nn.Module, is_draft_forward) -> None:
-        """Install capture hooks for this stage's taps (no-op on the last stage).
+    @classmethod
+    def build(cls, config, target_model, drafter) -> "PPAuxRelay | None":
+        """This stage's armed relay, or None when no tap crosses a PP boundary.
 
-        ``is_draft_forward`` is a callable so the hook re-reads it per call.
+        Runs on every stage; drafterless stages take the drafter class's
+        config-only spec.
         """
-        if self._armed or get_pp_group().is_last_rank or not self.own_ids:
+        if get_pp_group().world_size <= 1 or config.speculative_config is None:
+            return None
+        if drafter is not None:
+            spec = drafter._aux_capture_spec(target_model)
+        else:
+            spec = drafter_class(config).aux_capture_spec(config)
+        if spec is None:
+            return None
+        relay = cls(spec, target_model)
+        if not relay.incoming_ids and not relay.outgoing_ids:
+            return None
+        relay.arm(target_model)
+        return relay
+
+    def arm(self, target_model: torch.nn.Module) -> None:
+        """Install capture hooks for this stage's taps (no-op on the last stage,
+        whose taps the drafter's own ``arm_aux_capture`` hooks)."""
+        if self._armed or get_pp_group().is_last_rank:
             return
         self._armed = True
-        layers = _resolve_decoder_layers(target_model)
-        for lid in self.own_ids:
-            # Same (module, extract) resolution as `Drafter.arm_aux_capture`:
-            # -1 taps the embedding output verbatim, not `layers[-1]`.
-            module, extract = (
-                (_resolve_embedding(target_model), _identity_extract)
-                if lid == -1
-                else (layers[lid], self.spec.extract)
-            )
-            hook = self._make_hook(lid, extract, is_draft_forward)
-            if lid != -1 and self.spec.capture == "input":
-
-                def pre_hook(module, inputs, hook=hook):
-                    hook(module, (), inputs)
-
-                module.register_forward_pre_hook(pre_hook)
-            else:
-                module.register_forward_hook(hook)
+        install_aux_taps(
+            target_model,
+            self.spec,
+            self.own_ids,
+            lambda lid, extract: _aux_hook(extract, self._capture_into(lid)),
+        )
         logger.info(
             "PPAuxRelay: capturing target layers %s, relaying %s forward",
             list(self.own_ids),
             list(self.outgoing_ids),
         )
 
-    def _make_hook(self, lid, extract, is_draft_forward):
+    def _capture_into(self, lid):
         h, col = self.hidden_size, self._col[lid]
         width = len(self.outgoing_ids) * h
 
-        def _hook(module, _inputs, output):
-            if is_draft_forward():
-                return
-            tensor = extract(output, module)
-            if tensor is None:
-                return
+        def write(tensor, off):
+            end = off + tensor.shape[0]
+            # A tap already captured firing at row 0 starts a new forward:
+            # drop whatever an unsent forward left behind.
+            if off == 0 and lid in self._filled:
+                self._send, self._filled = None, set()
             # Whichever tap fires first allocates, so a skipped tap cannot
             # leave the next one writing into a stale or missing buffer.
-            if self._send is None or self._send.shape[0] != tensor.shape[0]:
-                self._send = torch.empty(
-                    tensor.shape[0], width, device=tensor.device, dtype=tensor.dtype
+            if self._send is None or self._send.shape[0] < end:
+                grown = torch.empty(
+                    end, width, device=tensor.device, dtype=tensor.dtype
                 )
-                self._filled = set()
-            self._send[:, col * h : (col + 1) * h].copy_(tensor)
+                if self._send is not None:
+                    grown[: self._send.shape[0]].copy_(self._send)
+                self._send = grown
+            self._send[off:end, col * h : (col + 1) * h].copy_(tensor)
             self._filled.add(lid)
 
-        return _hook
+        return write
 
     def pack(self, received: torch.Tensor | None, num_tokens: int):
         """Payload to send on (received block, then own captures), or None."""
@@ -145,7 +156,7 @@ class PPAuxRelay:
             self._check_width(received)
             if not self.own_ids:
                 return received[:num_tokens]
-        # Hand the step's buffer over: the send path clones it.
+        # Hand the step's buffer over: the send path owns it from here.
         send, self._send = self._send, None
         assert (
             send is not None and send.shape[0] == num_tokens

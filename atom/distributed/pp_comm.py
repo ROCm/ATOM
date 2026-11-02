@@ -22,10 +22,10 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
-# `block_residual` is Kimi-K3's AttnRes block window [T, k, H]. `dspark_aux`
-# relays the drafter's target aux hidden states (set/popped by model_runner).
-# Keys missing here are silently dropped by the send.
-PP_AUX_KEY = "dspark_aux"
+# `block_residual` is Kimi-K3's AttnRes block window [T, k, H]. `PP_AUX_KEY`
+# relays a drafter's target aux hidden states (`PPAuxRelay`, set/popped by
+# model_runner). Keys missing here are silently dropped by the send.
+PP_AUX_KEY = "pp_aux"
 
 _PP_PROXY_KEYS = (
     "hidden_states",
@@ -136,15 +136,21 @@ def _async_send_object(
 
 
 def async_send_intermediate_tensors(
-    it: IntermediateTensors,
+    it: IntermediateTensors, owned: tuple[str, ...] = ()
 ) -> list[P2PWork]:
-    """Non-blocking send of hidden_states/residual to the next PP stage."""
+    """Non-blocking send of hidden_states/residual to the next PP stage.
+
+    ``owned`` keys name tensors the caller hands over and never touches
+    again: they are sent as they are. The rest are cloned, since the model
+    may overwrite them (a graph's output buffer, say) before the send lands.
+    """
     pp = get_pp_group()
     dst_local = (pp.rank_in_group + 1) % pp.world_size
     dst_global = pp.ranks[dst_local]
 
     tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
     metadata_list, tensor_list = _split_tensor_dict(tensors)
+    owned_ids = {id(tensors[k]) for k in owned if k in tensors}
 
     works = _async_send_object(metadata_list, dst_global, pp.cpu_group)
 
@@ -155,9 +161,10 @@ def async_send_intermediate_tensors(
     for tensor in tensor_list:
         if tensor.numel() == 0:
             continue
+        is_owned = id(tensor) in owned_ids
         if ag_group is not None and tensor.numel() % ag_size == 0:
             tensor = tensor.reshape(ag_size, -1)[ag_rank]
-        buf = tensor.clone()
+        buf = tensor if is_owned else tensor.clone()
         if buf.device.type == "cpu":
             w = torch.distributed.isend(buf, dst=dst_global, group=pp.cpu_group)
         else:

@@ -39,6 +39,17 @@ class _FakeTarget(nn.Module):
             self.embed_tokens = nn.Identity()
 
 
+_CTX = types.SimpleNamespace(is_draft=False, ubatch_token_offset=0)
+
+
+@pytest.fixture(autouse=True)
+def _forward_context():
+    _CTX.is_draft, _CTX.ubatch_token_offset = False, 0
+    fc = types.SimpleNamespace(context=_CTX)
+    with mock.patch("atom.spec_decode.drafter.get_forward_context", return_value=fc):
+        yield _CTX
+
+
 def _relay(layer_ids, n_layers, resident_range, *, first, last, hidden=8):
     target = _FakeTarget(n_layers, resident_range, with_embed=first)
     spec = AuxCaptureSpec(
@@ -47,7 +58,7 @@ def _relay(layer_ids, n_layers, resident_range, *, first, last, hidden=8):
     group = types.SimpleNamespace(is_first_rank=first, is_last_rank=last)
     with mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group):
         relay = PPAuxRelay(spec, target)
-        relay.arm(target, lambda: False)
+        relay.arm(target)
     return relay, target
 
 
@@ -112,12 +123,10 @@ def test_relay_tap_split_partitions_the_layer_ids(pp_size):
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
-@pytest.mark.parametrize(
-    "layer_ids", [(-1, 2, 23, 47, 71, 89), (47, -1, 89, 2), (-1, 2, 89)]
-)
+@pytest.mark.parametrize("layer_ids", [(-1, 2, 23, 47, 71, 89), (-1, 2, 89)])
 def test_relay_round_trip_lands_each_tap_in_its_drafter_buffer(pp_size, layer_ids):
-    # Unsorted taps, and stages that own none, must still hand the last stage
-    # each tap's rows in the drafter's `layer_ids` slot.
+    # Stages that own no tap must still hand the last stage each tap's rows in
+    # the drafter's `layer_ids` slot.
     n_layers, hidden, n = 93, 8, 3
     payload = None
     for rank in range(pp_size):
@@ -136,6 +145,35 @@ def test_relay_round_trip_lands_each_tap_in_its_drafter_buffer(pp_size, layer_id
         if lid in relay.incoming_ids:
             torch.testing.assert_close(buf[:n], torch.full((n, hidden), float(lid)))
     assert set(relay.incoming_ids) == {lid for lid in layer_ids if lid < lo}
+
+
+@pytest.mark.parametrize("layer_ids", [(47, -1, 89, 2), (-1, 2, 2), (-1, 2, 93)])
+def test_relay_rejects_the_ids_the_drafter_rejects(layer_ids):
+    with pytest.raises(ValueError, match="strictly increasing|out of range"):
+        _relay(layer_ids, 93, (0, 47), first=True, last=False)
+
+
+def test_relay_skips_draft_forwards(_forward_context):
+    relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
+    _forward_context.is_draft = True
+    _run_target(relay, target, 3, 8)
+    assert relay._send is None
+
+
+def test_relay_tbo_ubatches_land_on_their_own_rows(_forward_context):
+    # Two micro-batches of 3 and 2 rows: the second lands at its token offset
+    # instead of reallocating over the first.
+    relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
+    for off, n in ((0, 3), (3, 2)):
+        _forward_context.ubatch_token_offset = off
+        for lid in relay.own_ids:
+            module = target.embed_tokens if lid == -1 else target.layers[lid]
+            module(torch.full((n, 8), float(lid * 10 + off)))
+    sent = relay.pack(None, 5)
+    torch.testing.assert_close(sent[:3, :8], torch.full((3, 8), -10.0))
+    torch.testing.assert_close(sent[3:, :8], torch.full((2, 8), -7.0))
+    torch.testing.assert_close(sent[:3, 8:], torch.full((3, 8), 20.0))
+    torch.testing.assert_close(sent[3:, 8:], torch.full((2, 8), 23.0))
 
 
 def test_relay_rejects_a_payload_of_the_wrong_width():
@@ -163,3 +201,29 @@ def test_relay_a_skipped_first_tap_is_caught_not_written_around():
     target.layers[2](torch.zeros(3, 8))
     with pytest.raises(AssertionError, match=r"\[-1\] not captured"):
         relay.pack(None, 3)
+
+
+@pytest.mark.parametrize("world_size", [1, 2])
+@pytest.mark.parametrize("with_drafter", [True, False])
+def test_build_takes_the_drafters_spec_and_arms_only_under_pp(world_size, with_drafter):
+    target = _FakeTarget(8, (0, 4), with_embed=True)
+    spec = AuxCaptureSpec(layer_ids=(-1, 2), hidden_size=8, extract=lambda o, m: o)
+    drafter = types.SimpleNamespace(_aux_capture_spec=lambda model: spec)
+    # A drafterless stage takes the same spec from the drafter class.
+    drafter_cls = types.SimpleNamespace(aux_capture_spec=lambda config: spec)
+    config = types.SimpleNamespace(speculative_config=object())
+    group = types.SimpleNamespace(
+        world_size=world_size, is_first_rank=True, is_last_rank=False
+    )
+    with (
+        mock.patch("atom.spec_decode.pp_aux_relay.get_pp_group", return_value=group),
+        mock.patch(
+            "atom.spec_decode.pp_aux_relay.drafter_class", return_value=drafter_cls
+        ),
+    ):
+        relay = PPAuxRelay.build(config, target, drafter if with_drafter else None)
+    if world_size == 1:
+        assert relay is None
+        return
+    assert relay.spec is spec and relay.own_ids == (-1, 2)
+    assert target.embed_tokens._forward_hooks, "build must arm the relay"

@@ -34,7 +34,7 @@ def test_drafts_fill_only_their_rows_columns():
         is_deferred_out=False,
         is_pipeline_parallel=True,
         is_pd_producer=False,
-        is_spec_run=True,
+        use_spec=True,
         input_ids=staged,
         runner=SimpleNamespace(
             attn_metadata_builder=SimpleNamespace(decode_spans=lambda b: (3, lens, cu))
