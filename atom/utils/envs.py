@@ -911,7 +911,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
-    # instead of gluon. Needs aiter with #5809.
+    # instead of gluon. Needs aiter with #5809 (explicit work plan) and #7206
+    # (can_use_flydsl_pa_decode, which decides per call whether FlyDSL takes it).
     "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",
     # Qwen QSA: score decode-sized index calls (<= 256 rows) with the MFMA
     # kernel that stacks the index heads into M; 0 keeps the CUDA-core one.

@@ -639,6 +639,7 @@ def run_pa_decode(
     plan_cache_owner=None,
     plan_partition_cap: int | None = None,
     require_flydsl: bool = False,
+    flydsl_seqs: int | None = None,
 ):
     """Run the AITER paged-attention decode kernel.
 
@@ -661,26 +662,32 @@ def run_pa_decode(
     gluon GPU, raise before any plan or scratch is built rather than fall back
     to gluon, which may be outside its query-length envelope. A GPU without
     gluon raises below as it always has.
+
+    ``flydsl_seqs``: the sequence count the caller already got from
+    ``flydsl_decode_seqs`` for these exact arguments
+    (``PagedAttentionImpl._flydsl_takes_decode``). Given, the check is not
+    asked again, so a layer asks aiter's predicate once per call.
     """
-    flydsl_seqs = flydsl_decode_seqs(
-        output=output,
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        block_tables=block_tables,
-        context_lens=context_lens,
-        max_seqlen_q=max_seqlen_q,
-        context_partition_size=context_partition_size,
-        compute_type=compute_type,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        alibi_slopes=alibi_slopes,
-        sinks=sinks,
-        sliding_window=sliding_window,
-        ps=ps,
-        max_context_length=max_context_length,
-    )
+    if not flydsl_seqs:
+        flydsl_seqs = flydsl_decode_seqs(
+            output=output,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            max_seqlen_q=max_seqlen_q,
+            context_partition_size=context_partition_size,
+            compute_type=compute_type,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            alibi_slopes=alibi_slopes,
+            sinks=sinks,
+            sliding_window=sliding_window,
+            ps=ps,
+            max_context_length=max_context_length,
+        )
     if require_flydsl and not flydsl_seqs and pa_decode_gluon_supports_arch():
         raise NotImplementedError(
             "pa_decode: the caller routed this call to FlyDSL, which declined it "

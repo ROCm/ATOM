@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from functools import cache
 
 import aiter
@@ -28,6 +29,12 @@ from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
 
 from .attention_mla import MLAModules
+
+logger = logging.getLogger("atom")
+
+# Once per process: the hint names the opt-in, not the shape, so one line says
+# all a default user needs, and the decode loop pays one bool test after it.
+_flydsl_off_hint_logged = False
 
 
 @cache
@@ -618,15 +625,20 @@ class PagedAttentionImpl(nn.Module):
 
     def _flydsl_takes_decode(
         self, q, k_cache, v_cache, k_scale, v_scale, attn_metadata
-    ) -> bool:
-        """Whether a decode routed to unified runs on FlyDSL instead.
+    ):
+        """Sequence count FlyDSL runs a decode routed to unified with, or a
+        falsy value to keep it on unified.
 
         Two cases reach unified with a call FlyDSL may take: a GPU without
         gluon decode (gfx1250), and a gluon GPU whose query length x group is
         past the gluon envelope (Qwen3.5 MTP-5: qlen 6, group 8). Inside that
         envelope a gluon GPU keeps its route. The decision is made per call,
         on the same tensors and metadata ``run_pa_decode`` then receives, and
-        passed down as ``require_flydsl`` so the two cannot disagree.
+        the count is passed down as ``flydsl_seqs``, so aiter's predicate is
+        asked once per call and the two cannot disagree.
+
+        With ATOM_PA_FLYDSL unset, such a call stays on unified and one info
+        line per process says that the flag would route it to FlyDSL.
 
         ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
 
@@ -643,8 +655,21 @@ class PagedAttentionImpl(nn.Module):
             attn_metadata.max_seqlen_q, self.num_heads, self.num_kv_heads
         ):
             return False
+        if not envs.ATOM_PA_FLYDSL:
+            global _flydsl_off_hint_logged
+            if not _flydsl_off_hint_logged:
+                _flydsl_off_hint_logged = True
+                logger.info(
+                    "decode with max_seqlen_q=%d x %d q heads per kv head runs on "
+                    "unified_attention because ATOM_PA_FLYDSL is unset; "
+                    "ATOM_PA_FLYDSL=1 lets aiter's FlyDSL pa_decode take it "
+                    "(needs aiter with ROCm/aiter#7206)",
+                    attn_metadata.max_seqlen_q,
+                    self.num_heads // self.num_kv_heads,
+                )
+            return False
         k_scale, v_scale = self._pa_decode_kv_scales(k_scale, v_scale)
-        return bool(
+        return (
             flydsl_decode_seqs(
                 output=q,
                 q=q,
@@ -667,6 +692,7 @@ class PagedAttentionImpl(nn.Module):
                 sliding_window=self.sliding_window,
                 ps=True,
             )
+            or False
         )
 
     @mark_trace(prefix="paged_attention_unified", torch_compile=False)
@@ -680,9 +706,10 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
-        if self._flydsl_takes_decode(
+        flydsl_seqs = self._flydsl_takes_decode(
             q, k_cache, v_cache, k_scale, v_scale, attn_metadata
-        ):
+        )
+        if flydsl_seqs:
             return self.paged_attention_triton(
                 q,
                 k,
@@ -692,7 +719,7 @@ class PagedAttentionImpl(nn.Module):
                 k_scale,
                 v_scale,
                 fwd_ctx,
-                require_flydsl=True,
+                flydsl_seqs=flydsl_seqs,
             )
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
@@ -738,13 +765,14 @@ class PagedAttentionImpl(nn.Module):
         k_scale,
         v_scale,
         fwd_ctx: ForwardContext,
-        require_flydsl: bool = False,
+        flydsl_seqs: int | None = None,
     ):
         """Decode through ``run_pa_decode``: gluon, or opted-in FlyDSL.
 
         Callers must have cleared ``gluon_decode_over_limit`` in
         ``_dispatch_decode`` or established through ``_flydsl_takes_decode``
-        that FlyDSL accepts the call; the latter pass ``require_flydsl=True``.
+        that FlyDSL accepts the call; the latter pass the sequence count it
+        returned as ``flydsl_seqs``, so ``run_pa_decode`` does not ask again.
         """
 
         attn_metadata = fwd_ctx.attn_metadata
@@ -795,7 +823,7 @@ class PagedAttentionImpl(nn.Module):
             # max_context_length: the block-table bound is the same in graph
             # and eager, so both pick the same kernel specialization.
             work_plan=getattr(attn_metadata, "flydsl_work_plan", None),
-            require_flydsl=require_flydsl,
+            flydsl_seqs=flydsl_seqs,
         )
 
         return o

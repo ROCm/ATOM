@@ -532,7 +532,7 @@ class TestFlyDSLPastGluon:
         from atom.model_ops import attention_mha as mha
 
         monkeypatch.setattr(
-            mha.PagedAttentionImpl, "_flydsl_takes_decode", lambda *a: True
+            mha.PagedAttentionImpl, "_flydsl_takes_decode", lambda *a: 4
         )
         layer = self._layer()
         layer.paged_attention_triton = lambda *a, **k: k
@@ -540,7 +540,58 @@ class TestFlyDSLPastGluon:
         out = mha.PagedAttentionImpl.paged_attention_unified(
             layer, q, None, None, kc, vc, None, None, SimpleNamespace(attn_metadata=md)
         )
-        assert out == {"require_flydsl": True}
+        assert out == {"flydsl_seqs": 4}
+
+    def test_the_gate_is_asked_once_per_call(self, monkeypatch):
+        """unified -> paged_attention_triton -> run_pa_decode asks ATOM's FlyDSL
+        gate (and so aiter's predicate) once, not once in _flydsl_takes_decode
+        and again in run_pa_decode. Stops at the plan, past the gate."""
+        from atom.model_ops import attention_mha as mha
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", False)
+        asked = []
+        monkeypatch.setattr(
+            ba, "_flydsl_pa_decode_num_seqs", lambda **kw: asked.append(kw) or 4
+        )
+        monkeypatch.setattr(ba, "_flydsl_plan_max_batch", lambda: 4096)
+        monkeypatch.setattr(mha, "dense_decode_splits", lambda n, h: 8)
+
+        class Reached(Exception):
+            pass
+
+        def at_plan(**kw):
+            raise Reached(kw["num_seqs"])
+
+        monkeypatch.setattr(ba, "_flydsl_prepare_explicit_plan", at_plan)
+        layer = self._layer(scale=1.0)
+        q, kc, vc, md = self._call(6)
+        with pytest.raises(Reached) as hit:
+            mha.PagedAttentionImpl.paged_attention_unified(
+                *(layer, q, None, None, kc, vc, None, None),
+                SimpleNamespace(attn_metadata=md),
+            )
+        assert hit.value.args == (4,)
+        assert len(asked) == 1
+
+    def test_flydsl_off_hints_once_and_skips_the_gate(self, monkeypatch, caplog):
+        """A default user past the gluon envelope gets one line naming the
+        opt-in; aiter's predicate is never asked."""
+        import logging
+
+        from atom.model_ops import attention_mha as mha
+
+        calls = self._flydsl_on(monkeypatch, on=False)
+        monkeypatch.setattr(mha, "_flydsl_off_hint_logged", False)
+        q, kc, vc, md = self._call(6)
+        with caplog.at_level(logging.INFO, logger="atom"):
+            for _ in range(3):
+                assert not self._layer()._flydsl_takes_decode(q, kc, vc, None, None, md)
+        hints = [r for r in caplog.records if "ATOM_PA_FLYDSL=1" in r.getMessage()]
+        assert len(hints) == 1
+        assert "max_seqlen_q=6 x 8" in hints[0].getMessage()
+        assert not calls
 
     @pytest.mark.parametrize("gluon", [True, False])
     def test_a_required_flydsl_call_never_reaches_gluon_or_a_plan(
