@@ -801,6 +801,28 @@ def test_a_native_transfer_holds_its_step_event_until_terminal(worker):
     assert worker._step_events._holds[index] == 0
 
 
+def test_a_save_that_landed_during_the_forward_is_reported_that_step(
+    worker, monkeypatch
+):
+    """The scheduler admits at most `max_pending_saves` native saves, so a
+    save reported a step late keeps the next one out: `get_finished` takes
+    the drain's last look for saves too, not for loads alone."""
+    from atom.kv_transfer.offload.mp import worker as mp_worker
+
+    monkeypatch.setattr(mp_worker, "_LAST_LOOK_WAIT_S", 5.0)
+    req = request()
+    worker._submit_save(req, step_event(worker))
+    worker.future.ready = True
+    # Unwrapped: no settling round before the report.
+    completions = NativeStateLMCacheMPConnector.get_finished(
+        worker
+    ).connector_completions
+    assert (
+        ConnectorCompletion(NATIVE_STATE_MP_STORE_CHANNEL, req.save_operation, True)
+        in completions
+    )
+
+
 def test_native_transfers_are_submitted_and_polled_off_the_step_thread():
     """Both are HIP IPC calls that cost milliseconds under launch pressure;
     the step thread only restores, once a retrieve has landed."""

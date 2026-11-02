@@ -68,10 +68,11 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
-# How long `get_finished` waits for a drain round to report a load that landed
-# during the forward. Bounded, so the step never waits out an IPC import or a
-# submit in progress: what misses it is reported on the next step.
-_LOAD_REPORT_WAIT_S = 0.001
+# How long `get_finished` waits for a drain round to report a transfer that
+# landed during the forward (`_wants_last_look_locked`). Bounded, so the step
+# never waits out an IPC import or a submit in progress: what misses it is
+# reported on the next step.
+_LAST_LOOK_WAIT_S = 0.001
 # How long `close` lets the drain finish its last round.
 _CLOSE_TIMEOUT_S = 30.0
 
@@ -750,7 +751,10 @@ class LMCacheMPConnector(KVConnectorBase):
             self._drained_done_save |= done_save
             self._drained_completions |= completions
 
-    def _loads_in_flight(self) -> bool:
+    def _wants_last_look_locked(self) -> bool:
+        """Whether a transfer still pending would delay a request if reported
+        a step late: a load, which keeps its request in WAITING_FOR_REMOTE_KVS.
+        A save reported a step later delays no request here."""
         return bool(self._pending_loads)
 
     def _transfers_in_flight_locked(self) -> bool:
@@ -805,12 +809,11 @@ class LMCacheMPConnector(KVConnectorBase):
             return KVConnectorOutput()
         # The drain thread cannot stop the engine; the step can.
         self._drain.raise_if_failed()
-        if self._loads_in_flight():
-            # One last look before reporting: a load that landed during the
-            # forward would otherwise wait a whole step in
-            # WAITING_FOR_REMOTE_KVS. Loads only: a save reported a step later
-            # delays no request.
-            self._drain.wait_round(_LOAD_REPORT_WAIT_S)
+        with self._lock:
+            last_look = self._wants_last_look_locked()
+        if last_look:
+            # One last look before reporting, by the drain thread.
+            self._drain.wait_round(_LAST_LOOK_WAIT_S)
             self._drain.raise_if_failed()
         output = KVConnectorOutput()
         with self._lock:

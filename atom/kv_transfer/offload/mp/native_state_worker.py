@@ -373,17 +373,21 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 compute.wait_event(event)
         super().start_load_kv(metadata)
 
-    def _loads_in_flight(self) -> bool:
-        return super()._loads_in_flight() or any(
-            not entry.terminal for entry in self._native_loads.values()
-        )
-
-    def _transfers_in_flight_locked(self) -> bool:
-        return super()._transfers_in_flight_locked() or any(
+    def _native_in_flight_locked(self) -> bool:
+        return any(
             not entry.terminal
             for pending in (self._native_saves, self._native_loads)
             for entry in pending.values()
         )
+
+    def _wants_last_look_locked(self) -> bool:
+        """Loads, and saves too: the scheduler admits at most
+        `max_pending_saves` of them (2 by default), so one reported a step late
+        keeps the next save out, and a backlog builds that later lookups miss."""
+        return super()._wants_last_look_locked() or self._native_in_flight_locked()
+
+    def _transfers_in_flight_locked(self) -> bool:
+        return super()._transfers_in_flight_locked() or self._native_in_flight_locked()
 
     def _outstanding_locked(self, wanted: set[str]) -> list[str]:
         outstanding = super()._outstanding_locked(wanted)
