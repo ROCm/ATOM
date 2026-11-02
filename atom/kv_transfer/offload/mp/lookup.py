@@ -175,6 +175,15 @@ class _MPLookupClient:
         driver.notify()
         return True
 
+    def _window_freed(self) -> None:
+        """An answered lookup left the window; let the driver send the next.
+
+        The driver sleeps `_DRIVER_IDLE_S` when nothing is in flight, which
+        includes a window full of answered, unconsumed lookups.
+        """
+        if self._driver is not None and self._offered:
+            self._driver.notify()
+
     def _drive(self, window: int) -> bool:
         """One driver pass. True while a lookup is still in flight."""
 
@@ -429,6 +438,7 @@ class _MPLookupClient:
         self._async_hits.pop(lookup_id, None)
         self._answered_at.pop(lookup_id, None)
         self._try_cleanup_lookup_result(lookup_id)
+        self._window_freed()
 
     def _try_cleanup_lookup_result(self, lookup_id: str) -> None:
         """Clear the adapter's entry for `lookup_id`; never raises."""
@@ -461,6 +471,7 @@ class _MPLookupClient:
             self._async_hits.pop(lookup_id, None)
             # `free_lookup_locks` may have raised before the cleanup ran.
             self._try_cleanup_lookup_result(lookup_id)
+        self._window_freed()
 
     def _release_unconsumed(self, lookup_id: str) -> None:
         request_id = _mp_session_id(self._config, lookup_id)
@@ -544,6 +555,7 @@ class _MPLookupClient:
             self._lookups[lookup_id] = state
             if async_hit is not None:
                 state.hit = async_hit
+                self._window_freed()
                 return async_hit
             request_id = _mp_session_id(self._config, lookup_id)
             self._adapter.maybe_submit_lookup_request(request_id, token_ids)

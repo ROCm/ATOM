@@ -95,10 +95,15 @@ def test_driver_keeps_answered_plus_in_flight_lookups_within_the_window():
         time.sleep(0.02)
         assert len(fake.lookups) == 2  # held: answered ones keep read locks
         assert list(client._offered) == ["r2", "r3", "r4"]
-        # Consuming one frees a slot for the next arrival, in order.
+        # Consuming one frees a slot for the next arrival, in order, at once
+        # rather than after the driver's idle wake.
         assert client.lookup(list(range(8)), "r0") == CHUNK
-        assert _wait_until(lambda: "r2" in client._async_hits)
+        assert _wait_until(lambda: "r2" in client._async_hits, timeout=0.5)
         assert len(fake.lookups) == 3
+        # So does discarding an answered one.
+        client.discard("r1")
+        assert _wait_until(lambda: "r3" in client._async_hits, timeout=0.5)
+        assert len(fake.lookups) == 4
     finally:
         client.close()
 
