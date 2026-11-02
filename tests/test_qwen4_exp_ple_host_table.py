@@ -644,7 +644,7 @@ _NGRAM_CONFIG = SimpleNamespace(
 @pytest.fixture
 def ngram_layer(monkeypatch):
     """Builds the model's n-gram embedding on the device, BF16, at TP 1: on
-    the host path (`uva`) or the HBM `VocabParallelEmbedding`."""
+    the host path (`uva`) or the HBM `_Qwen4ExpEmbedding`."""
     pytest.importorskip("aiter.dist.parallel_state", exc_type=ImportError)
     from atom.model_ops import embed_head
     from atom.model_ops.qwen4_exp import ple_layer

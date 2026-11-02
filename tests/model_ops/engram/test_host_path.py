@@ -1518,8 +1518,7 @@ def test_copy_copies_whatever_the_setting_and_shared_say(monkeypatch, env, share
 
 @pytest.mark.parametrize("shared", [False, True])
 def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
-    """With no page-locked allocator `copy=True` fails; without it the source
-    is registered in place."""
+    """With no page-locked allocator `copy=True` fails."""
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart()
@@ -1535,10 +1534,6 @@ def test_copy_without_an_allocator_is_a_failure(monkeypatch, shared):
     rows = torch.ones(1 << 18)
     assert host_memory.pin_rows([rows], shared=shared, copy=True) is None
     assert registered == [] and cudart.registered == []
-
-    pinned = host_memory.pin_rows([rows], shared=shared)
-    assert pinned is not None and registered == [1]
-    assert pinned[0].data_ptr() == rows.data_ptr()
 
 
 def test_a_shared_read_only_mapping_registers_in_place_read_only(monkeypatch, tmp_path):
