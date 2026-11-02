@@ -1297,13 +1297,21 @@ class EagleProposer(Drafter):
                         running_bs, borrow=True, **staged0
                     )
                 elif i == 0:
+                    # A model that selects rows itself returns only the
+                    # sequences' last rows (ATOM_FUSED_MOE_TAIL_NORM).
+                    step0_rows = self._select_rows_kwargs(last_token_indices)
                     ret_hidden_states = self.model(
                         input_ids=target_token_ids,
                         positions=positions,
                         hidden_states=target_hidden_states,
+                        **step0_rows,
                     )
-                    out_hidden = torch.index_select(
-                        ret_hidden_states, 0, last_token_indices
+                    out_hidden = (
+                        ret_hidden_states
+                        if step0_rows
+                        else torch.index_select(
+                            ret_hidden_states, 0, last_token_indices
+                        )
                     )
                     out_ids = self.model.compute_draft_ids(
                         out_hidden,
