@@ -2298,6 +2298,13 @@ class Config:
             self.enable_tbo = False
             self.enable_tbo_decode = False
 
+        self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
+        if self.prefill_admit_policy not in ("interval", "adaptive"):
+            raise ValueError(
+                "prefill_admit_policy must be one of {'interval', 'adaptive'}, "
+                f"got {self.prefill_admit_policy!r}"
+            )
+
         self.moe_backend = self.moe_backend.strip().lower()
         if self.moe_backend not in ("standard", "mega"):
             raise ValueError(
