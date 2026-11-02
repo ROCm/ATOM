@@ -621,3 +621,8 @@ def test_the_delayer_probes_size_a_finished_load_without_rewalking_its_hit():
     # A load still in flight is not work yet and is not a resume either.
     engine.finished_recving_kv_req_ids = []
     assert engine._finished_load_tokens(seq) is None
+
+    # A failed load recomputes past its local hit; the planned boundary in
+    # `offload_loaded_tokens` is not cached.
+    engine.failed_recving_kv_req_ids = [seq.id]
+    assert engine._finished_load_tokens(seq) == seq.num_cached_tokens
