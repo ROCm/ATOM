@@ -21,17 +21,48 @@ case "${ATOMESH_ATOM_SOURCE}" in
     exit 1
     ;;
 esac
-atom_origin="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c \
-  'import importlib.util as u; s = u.find_spec("atom"); print(s.origin if s else "")')"
+atom_dir="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c '
+import importlib.util as u
+s = u.find_spec("atom")
+print(next(iter(s.submodule_search_locations or ()), "") if s else "")')"
 atom_version="$(python3 -c \
   'import importlib.metadata as m; print(m.version("atom"))' 2>/dev/null || echo unknown)"
-echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_origin:-<missing>} image_dist=${atom_version}"
-if [[ -z "${atom_origin}" ]] \
-  || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_origin}" != "${PWD}"/* ]]; } \
-  || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_origin}" == "${PWD}"/* ]]; }; then
-  echo "ERROR: atom resolves to '${atom_origin}', which does not match ATOMESH_ATOM_SOURCE=${ATOMESH_ATOM_SOURCE} (cwd ${PWD})" >&2
+echo "[atom] source=${ATOMESH_ATOM_SOURCE} package=${atom_dir:-<missing>} image_dist=${atom_version}"
+if [[ -z "${atom_dir}" ]] \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] && [[ "${atom_dir}" != "${PWD}"/* ]]; } \
+  || { [[ "${ATOMESH_ATOM_SOURCE}" == "image" ]] && [[ "${atom_dir}" == "${PWD}"/* ]]; }; then
+  echo "ERROR: atom resolves to '${atom_dir}', which does not match ATOMESH_ATOM_SOURCE=${ATOMESH_ATOM_SOURCE} (cwd ${PWD})" >&2
   exit 1
 fi
+
+# An ATOM ignores a setting it does not define, so a cell measured with one
+# names it in requires_atom_env and fails here on an ATOM without it, rather
+# than publishing numbers that lack the setting. envs.py imports only the
+# standard library, so it loads without the package.
+ATOMESH_REQUIRED_ATOM_ENV="${ATOMESH_REQUIRED_ATOM_ENV:-}"
+check_required_atom_env() {
+  [[ -n "${ATOMESH_REQUIRED_ATOM_ENV}" ]] || return 0
+  local envs_py="${atom_dir}/utils/envs.py" missing
+  if ! missing="$(python3 - "${envs_py}" "${ATOMESH_REQUIRED_ATOM_ENV}" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("atom_envs", sys.argv[1])
+envs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(envs)
+names = [name for name in sys.argv[2].split(",") if name]
+print(" ".join(name for name in names if name not in envs.environment_variables))
+PY
+  )"; then
+    echo "ERROR: cannot read the settings ATOM defines from ${envs_py}" >&2
+    exit 1
+  fi
+  if [[ -n "${missing}" ]]; then
+    echo "ERROR: ${ATOMESH_CELL_ID:-this cell} needs ATOM settings that ${atom_dir} does not define: ${missing}" >&2
+    exit 1
+  fi
+}
+check_required_atom_env
 
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
@@ -166,6 +197,9 @@ DECODE_MAX_NUM_SEQS="${DECODE_MAX_NUM_SEQS:-}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-}"
 DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-}"
 ONLINE_QUANT_CONFIG="${ONLINE_QUANT_CONFIG:-}"
+# pd_submit.sh sets each role's from its online_quant_extra_exclude_layer.
+PREFILL_ONLINE_QUANT_CONFIG="${PREFILL_ONLINE_QUANT_CONFIG:-${ONLINE_QUANT_CONFIG}}"
+DECODE_ONLINE_QUANT_CONFIG="${DECODE_ONLINE_QUANT_CONFIG:-${ONLINE_QUANT_CONFIG}}"
 HF_OVERRIDES="${HF_OVERRIDES:-}"
 SPEC_METHOD="${SPEC_METHOD:-}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-}"
@@ -206,6 +240,17 @@ fi
 if [[ -n "${DECODE_EXTRA_SERVER_ARGS}" ]]; then
   DECODE_SERVER_ARGS="${DECODE_SERVER_ARGS:+${DECODE_SERVER_ARGS} }${DECODE_EXTRA_SERVER_ARGS}"
 fi
+# PP size is not a top-level env var on this launcher; parse it from extra_args.
+_pp_from_args() {
+  local args="$1"
+  if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo 1
+  fi
+}
+PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
+DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
 
 has_cli_flag() {
   local args="$1"
@@ -316,18 +361,19 @@ if [[ "${ATOMESH_EXECUTION_PHASE}" != "combined" ]]; then
 fi
 mkdir -p "${RUNTIME_LOG_DIR}" "${RUN_DIR}"/{benchmark_results,eval_results} "${ATOM_TORCH_PROFILER_DIR}"
 
-role_tp="${PREFILL_TP_SIZE}"
+# A role's server spans TP * PP GPUs: every pipeline stage holds a full TP group.
+role_gpus=$(( PREFILL_TP_SIZE * PREFILL_PP_SIZE ))
 if [[ "${AGGREGATED}" == "1" ]]; then
   # The aggregated server launches with decode_parallel, so its GPU count is the
-  # decode TP. Rank 0 would otherwise fall through to the prefill TP below.
-  role_tp="${DECODE_TP_SIZE}"
+  # decode's. Rank 0 would otherwise fall through to the prefill's below.
+  role_gpus=$(( DECODE_TP_SIZE * DECODE_PP_SIZE ))
 elif [[ "${PREFILL_SINGLE_NODE_PD}" == "1" && "${NODE_RANK}" -gt 0 ]]; then
-  role_tp="${DECODE_TP_SIZE}"
+  role_gpus=$(( DECODE_TP_SIZE * DECODE_PP_SIZE ))
 elif [[ "${NODE_RANK}" -ge "${xP}" ]]; then
-  role_tp="${DECODE_TP_SIZE}"
+  role_gpus=$(( DECODE_TP_SIZE * DECODE_PP_SIZE ))
 fi
 if [[ -z "${HIP_VISIBLE_DEVICES:-}" ]]; then
-  export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_tp - 1))")"
+  export HIP_VISIBLE_DEVICES="$(seq -s, 0 "$((role_gpus - 1))")"
 fi
 rm -rf /root/.cache/atom/* 2>/dev/null || true
 echo "[runtime] phase=${ATOMESH_EXECUTION_PHASE} service_port_offset=${ATOMESH_SERVICE_PORT_OFFSET}"
@@ -485,17 +531,6 @@ elif [[ "${SINGLE_NODE_PD}" == "1" ]]; then
   decode_ports+=("${DECODE_PORT}")
   decode_args+=(--decode "http://${IP_ARRAY[0]}:${DECODE_PORT}")
 elif [[ "${PACKED_NODES_PD}" == "1" ]]; then
-  # PP size is not a top-level env var on this launcher; parse it from extra_args.
-  _pp_from_args() {
-    local args="$1"
-    if [[ "${args}" =~ --pipeline-parallel-size[=\ ]+([0-9]+) ]]; then
-      echo "${BASH_REMATCH[1]}"
-    else
-      echo 1
-    fi
-  }
-  PREFILL_PP_SIZE="$(_pp_from_args "${PREFILL_SERVER_ARGS}")"
-  DECODE_PP_SIZE="$(_pp_from_args "${DECODE_SERVER_ARGS}")"
   prefill_nodes=()
   prefill_gpus=()
   decode_nodes=()
@@ -757,9 +792,6 @@ if [[ -n "${MAX_MODEL_LEN}" ]]; then
 fi
 if [[ -n "${MAX_NUM_BATCHED_TOKENS}" ]]; then
   server_common+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
-fi
-if [[ -n "${ONLINE_QUANT_CONFIG}" ]]; then
-  server_common+=(--online_quant_config "${ONLINE_QUANT_CONFIG}")
 fi
 if [[ -n "${HF_OVERRIDES}" ]]; then
   server_common+=(--hf-overrides "${HF_OVERRIDES}")
@@ -1857,6 +1889,16 @@ write_metadata() {
 EOF
 }
 
+# Goes right after server_common, where the shared flag used to be, so a
+# --online_quant_config in a role's extra_args still wins.
+build_online_quant_args() {
+  local config="$1"
+  local -n out_args="$2"
+  out_args=()
+  [[ -n "${config}" ]] || return 0
+  out_args=(--online_quant_config "${config}")
+}
+
 # ATOM_TORCH_PROFILER_DIR above does not reach the engine: EngineArgs always
 # passes its own torch_profiler_dir (None by default), which overrides the env
 # default in Config, so the profiler is off unless the flag is on the command.
@@ -1902,10 +1944,13 @@ start_prefill() {
   prefill_kv_transfer_config="$(kv_transfer_config kv_producer "${PREFILL_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a prefill_profiler_args=()
   build_torch_profiler_args "${log_name}" prefill_profiler_args
+  local -a prefill_quant_args=()
+  build_online_quant_args "${PREFILL_ONLINE_QUANT_CONFIG}" prefill_quant_args
   echo "[prefill] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${prefill_cudagraph_args[*]:-none}"
   local -a prefill_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
+    "${prefill_quant_args[@]}"
     --server-port "${server_port}"
     "${prefill_parallel[@]}"
     --max-num-seqs "${MAX_NUM_SEQS}"
@@ -1965,10 +2010,13 @@ start_decode() {
   decode_kv_transfer_config="$(kv_transfer_config kv_consumer "${DECODE_KV_TRANSFER_CONFIG}" "${host_ip}" "${handshake_port}")" || exit 2
   local -a decode_profiler_args=()
   build_torch_profiler_args "${log_name}" decode_profiler_args
+  local -a decode_quant_args=()
+  build_online_quant_args "${DECODE_ONLINE_QUANT_CONFIG}" decode_quant_args
   echo "[decode] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} handshake=${handshake_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a decode_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
+    "${decode_quant_args[@]}"
     --server-port "${server_port}"
     "${decode_parallel[@]}"
     --max-num-seqs "${decode_max_num_seqs}"
@@ -2021,10 +2069,13 @@ start_aggregated() {
   fi
   local -a server_profiler_args=()
   build_torch_profiler_args "${log_name}" server_profiler_args
+  local -a server_quant_args=()
+  build_online_quant_args "${DECODE_ONLINE_QUANT_CONFIG}" server_quant_args
   echo "[server] rank=${NODE_RANK} host=${host_name} ip=${host_ip} gpu=${HIP_VISIBLE_DEVICES} port=${server_port} dp_master=${dp_master_port} dp_base=${dp_base_port} cudagraph=${decode_cudagraph_args[*]:-none}"
   local -a server_cmd=(
     python3 -m atom.entrypoints.openai_server
     "${server_common[@]}"
+    "${server_quant_args[@]}"
     --server-port "${server_port}"
     "${decode_parallel[@]}"
     --max-num-seqs "${server_max_num_seqs}"
@@ -2265,8 +2316,11 @@ run_torch_profile_window() {
   # Wait on the curl pids only: a bare `wait` also waits on the caller's tee
   # process substitution, which cannot end before this function does.
   local -a pids=()
-  local start_marker="${out_dir}/.torch_trace_start"
-  touch "${start_marker}"
+  # Names, not mtimes, tell a rank's new trace from an older one: mtimes on the
+  # shared log mount come from clocks that disagree by more than a window lasts.
+  local traces_before="${out_dir}/.torch_traces_before"
+  find "${RUN_DIR}/torch_traces" -name '*.pt.trace.json.gz' -printf '%f\n' \
+    > "${traces_before}" 2>/dev/null || true
   echo "[profile] start_profile at $(date -Is)"
   for target in "${targets[@]}"; do
     curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
@@ -2301,7 +2355,7 @@ run_torch_profile_window() {
   wait "${pids[@]}"
   echo "[profile] stop_profile returned at $(date -Is)"
 
-  if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
+  if ! wait_for_torch_traces "${traces_before}" "${stop_files[@]}"; then
     echo "[profile] traces incomplete; leaving aiperf to finish on its own"
     return 0
   fi
@@ -2318,24 +2372,30 @@ run_torch_profile_window() {
 
 # stop_profile returns once TP rank 0 has exported, while the other ranks may
 # still be writing. Each rank writes a raw .pt.trace.json, gzips it, then
-# removes the raw file, so a rank is done once it holds a .gz newer than the
-# window start and no raw .json.
+# removes the raw file, so a rank is done once it holds a .gz whose name is not
+# in $1, the traces on disk when the window opened, and no raw .json. The ranks
+# are the dirs stop_profile reported and their siblings that ModelRunner named
+# for a rank: rank_<tp> or dp<d>_tp<tp>, prefixed pp<k>_ under PP. Any other
+# subdir is not a rank.
 wait_for_torch_traces() {
-  local marker="$1"
+  local traces_before="$1"
   shift
   local stop_file trace_dir worker_dir rank_dir
-  local -A worker_dirs=()
+  local rank_dir_re='^(pp[0-9]+_)?(rank_[0-9]+|dp[0-9]+_tp[0-9]+)$'
+  local -A worker_dirs=() rank_dirs=()
   for stop_file in "$@"; do
     if ! grep -qE '"status" *: *"success"' "${stop_file}" 2>/dev/null; then
       echo "[profile] stop_profile failed: $(cat "${stop_file}" 2>/dev/null)"
       return 1
     fi
     while IFS= read -r trace_dir; do
-      [[ -n "${trace_dir}" ]] && worker_dirs["$(dirname "${trace_dir}")"]=1
+      [[ -n "${trace_dir}" ]] || continue
+      worker_dirs["$(dirname "${trace_dir}")"]=1
+      rank_dirs["${trace_dir%/}/"]=1
     done < <(grep -oE '"trace_dir" *: *"[^"]+"' "${stop_file}" \
       | sed -E 's/.*"([^"]+)"$/\1/')
   done
-  if [[ "${#worker_dirs[@]}" -eq 0 ]]; then
+  if [[ "${#rank_dirs[@]}" -eq 0 ]]; then
     echo "[profile] stop_profile reported no trace_dir"
     return 1
   fi
@@ -2343,18 +2403,20 @@ wait_for_torch_traces() {
   local deadline=$(( $(date +%s) + ${ATOM_PROFILER_TIMEOUT:-300} ))
   local pending ranks
   while :; do
-    pending=0
-    ranks=0
     for worker_dir in "${!worker_dirs[@]}"; do
-      for rank_dir in "${worker_dir}"/rank_*/; do
-        ranks=$(( ranks + 1 ))
-        if [[ ! -d "${rank_dir}" ]] \
-          || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
-          || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' \
-            -newer "${marker}" -print -quit)" ]]; then
-          pending=$(( pending + 1 ))
-        fi
+      for rank_dir in "${worker_dir}"/*/; do
+        [[ "$(basename "${rank_dir}")" =~ ${rank_dir_re} ]] && rank_dirs["${rank_dir}"]=1
       done
+    done
+    pending=0
+    ranks="${#rank_dirs[@]}"
+    for rank_dir in "${!rank_dirs[@]}"; do
+      if [[ ! -d "${rank_dir}" ]] \
+        || [[ -n "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json' -print -quit)" ]] \
+        || [[ -z "$(find "${rank_dir}" -maxdepth 1 -name '*.pt.trace.json.gz' -printf '%f\n' \
+          | grep -vxF -f "${traces_before}")" ]]; then
+        pending=$(( pending + 1 ))
+      fi
     done
     if (( pending == 0 )); then
       echo "[profile] all ${ranks} rank traces on disk at $(date -Is): ${!worker_dirs[*]}"
@@ -2714,16 +2776,143 @@ PY
   fi
 }
 
+# A role's expect_log is a JSON list of lines every one of its servers must
+# have logged while starting: it is checked once they are healthy and before
+# any request, warmup included, so a line first logged while serving fails a
+# healthy cell. It is for a feature that, when a deployment rules it out, logs
+# why at INFO and serves without it: the cell would otherwise publish numbers
+# under a name that says the feature ran. RUN_DIR is shared, so node 0 reads
+# the logs of servers on the other nodes too.
+PREFILL_EXPECT_LOG="${PREFILL_EXPECT_LOG:-}"
+DECODE_EXPECT_LOG="${DECODE_EXPECT_LOG:-}"
+ATOMESH_EXPECT_LOG_TIMEOUT="${ATOMESH_EXPECT_LOG_TIMEOUT:-60}"
+# Sets role_logs to a role's server logs, failing the cell when there are none
+# to check `what` against. The aggregated server is configured as the decode,
+# so an aggregated cell has no prefill server to check anything in.
+collect_role_logs() {
+  local role="$1" what="$2" glob log
+  if [[ "${AGGREGATED}" != "1" ]]; then
+    glob="${role}-rank-*.log"
+  elif [[ "${role}" == "decode" ]]; then
+    glob="server-rank-*.log"
+  else
+    echo "[check][FAIL] an aggregated cell has no prefill server to check ${what} in" >&2
+    exit 1
+  fi
+  role_logs=()
+  for log in "${RUNTIME_LOG_DIR}"/${glob}; do
+    if [[ -f "${log}" ]]; then
+      role_logs+=("${log}")
+    fi
+  done
+  if (( ${#role_logs[@]} == 0 )); then
+    echo "[check][FAIL] no ${role} server log in ${RUNTIME_LOG_DIR} to check ${what} in" >&2
+    exit 1
+  fi
+}
+
+# Sets lines to the entries of a role's expect_log or reject_log, which
+# pd_submit.sh passes as a JSON list. A bare JSON string would load as well
+# and be split char by char, and an empty list or entry checks nothing.
+parse_log_lines() {
+  local role="$1" key="$2" listed="$3" parsed
+  if ! parsed="$(python3 -c '
+import json, sys
+lines = json.loads(sys.argv[1])
+if not (
+    isinstance(lines, list)
+    and lines
+    and all(isinstance(line, str) and line for line in lines)
+):
+    sys.exit(1)
+print("\n".join(lines))
+' "${listed}")"; then
+    echo "[check][FAIL] ${role} ${key} is not a non-empty JSON list of" \
+      "non-empty strings: ${listed}" >&2
+    exit 1
+  fi
+  mapfile -t lines <<< "${parsed}"
+}
+
+check_expected_logs() {
+  local role expected log line deadline
+  local -a role_logs lines pending
+  for role in prefill decode; do
+    if [[ "${role}" == "prefill" ]]; then
+      expected="${PREFILL_EXPECT_LOG}"
+    else
+      expected="${DECODE_EXPECT_LOG}"
+    fi
+    [[ -n "${expected}" ]] || continue
+    parse_log_lines "${role}" expect_log "${expected}"
+    collect_role_logs "${role}" "its expect_log"
+    # Another node's writes can take a few seconds to show up over NFS.
+    deadline=$((SECONDS + ATOMESH_EXPECT_LOG_TIMEOUT))
+    while :; do
+      pending=()
+      for log in "${role_logs[@]}"; do
+        for line in "${lines[@]}"; do
+          grep -qF -- "${line}" "${log}" || pending+=("${log} never logged '${line}'")
+        done
+      done
+      if (( ${#pending[@]} == 0 )); then
+        break
+      fi
+      if (( SECONDS >= deadline )); then
+        printf '[check][FAIL] %s\n' "${pending[@]}" >&2
+        exit 1
+      fi
+      sleep 5
+    done
+    echo "[check] all ${#role_logs[@]} ${role} server log(s) show all ${#lines[@]} expected line(s)"
+  done
+}
+
+# A role's reject_log is a JSON list of lines none of its servers may log: how
+# a feature its expect_log saw armed says it then turned itself off, which can
+# happen on the first request as well as at startup. Checked before the first
+# request and again after the last, which is called with `last`. A line's
+# absence cannot be retried the way expect_log retries a line's presence, so
+# the last check first waits out the same NFS lag; whatever the first check
+# misses, the last one still reads.
+PREFILL_REJECT_LOG="${PREFILL_REJECT_LOG:-}"
+DECODE_REJECT_LOG="${DECODE_REJECT_LOG:-}"
+check_rejected_logs() {
+  local when="${1:-}" role rejected line log hit
+  local -a role_logs lines
+  if [[ "${when}" == "last" && -n "${PREFILL_REJECT_LOG}${DECODE_REJECT_LOG}" ]]; then
+    echo "[check] waiting ${ATOMESH_EXPECT_LOG_TIMEOUT}s for the servers' last lines to reach ${RUNTIME_LOG_DIR}"
+    sleep "${ATOMESH_EXPECT_LOG_TIMEOUT}"
+  fi
+  for role in prefill decode; do
+    if [[ "${role}" == "prefill" ]]; then
+      rejected="${PREFILL_REJECT_LOG}"
+    else
+      rejected="${DECODE_REJECT_LOG}"
+    fi
+    [[ -n "${rejected}" ]] || continue
+    parse_log_lines "${role}" reject_log "${rejected}"
+    collect_role_logs "${role}" "its reject_log"
+    for log in "${role_logs[@]}"; do
+      for line in "${lines[@]}"; do
+        if hit="$(grep -m1 -F -- "${line}" "${log}")"; then
+          echo "[check][FAIL] ${log} logged '${line}': ${hit}" >&2
+          exit 1
+        fi
+      done
+    done
+    echo "[check] no ${role} server log shows any of ${#lines[@]} rejected line(s)"
+  done
+}
+
 run_benchmark_and_eval() {
+  check_expected_logs
+  check_rejected_logs
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
-    return
-  fi
-  if [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+  elif [[ "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
     run_eval
-    return
-  fi
-  if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
+  elif [[ "${BENCHMARK_KIND}" == "aiperf_agentic" \
     && ( "${EVAL_TASK}" == "swebench_lite" || "${EVAL_TASK}" == "gsm8k" ) \
     && ( "${RUN_EVAL}" == "true" || "${RUN_EVAL}" == "1" ) ]]; then
     # Agentic performance cases require a fresh prefix/state-cache state. Run
@@ -2734,6 +2923,7 @@ run_benchmark_and_eval() {
     run_eval
     run_benchmark
   fi
+  check_rejected_logs last
 }
 
 validate_mooncake_store_settings

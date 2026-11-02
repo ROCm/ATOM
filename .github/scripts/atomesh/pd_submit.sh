@@ -105,6 +105,65 @@ def csv_value(value):
 def q(value):
     return shlex.quote(str(shell_value(value)))
 
+def fail(reason):
+    # pd_submit.sh runs this through `eval "$(...)"`, which ignores the status,
+    # so the printed `exit 1` is what stops it.
+    print(f"echo {shlex.quote(reason)} >&2")
+    print("exit 1")
+    raise SystemExit(1)
+
+def as_list(value):
+    """As pd_matrix.normalize_list: a single pattern is a list of one, not of
+    its characters."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+def role_online_quant_config(role, role_cfg):
+    """The role's --online_quant_config: the shared one, with the shared and
+    the role's `online_quant_extra_exclude_layer` appended to its exclude_layer.
+    A role's own key keeps its exclusions off the other role's command line."""
+    config = server_args.get("online_quant_config", "")
+    extra = [
+        *as_list(server_args.get("online_quant_extra_exclude_layer")),
+        *as_list(role_cfg.get("online_quant_extra_exclude_layer")),
+    ]
+    if not extra:
+        return config
+    if not config:
+        fail(
+            f"ERROR: {cell['id']} {role} sets online_quant_extra_exclude_layer "
+            "without an online_quant_config to extend"
+        )
+    try:
+        parsed = json.loads(config) if isinstance(config, str) else config
+    except ValueError as exc:
+        fail(f"ERROR: {cell['id']} online_quant_config is not JSON: {exc}")
+    if not isinstance(parsed, dict):
+        fail(
+            f"ERROR: {cell['id']} online_quant_config is a JSON "
+            f"{type(parsed).__name__}, not an object"
+        )
+    exclude = [*as_list(parsed.get("exclude_layer")), *extra]
+    return json.dumps({**parsed, "exclude_layer": exclude}, separators=(",", ":"))
+
+def role_log_lines(role, role_cfg, key):
+    """The role's expect_log or reject_log as a JSON list, or "" when it sets
+    none. One line, because the docker env file that carries it holds one per
+    variable. An empty list would check nothing, so it fails the cell rather
+    than read as unset."""
+    if role_cfg.get(key) is None:
+        return ""
+    lines = as_list(role_cfg[key])
+    if not lines:
+        fail(f"ERROR: {cell['id']} {role} {key} lists no line")
+    if not all(isinstance(line, str) and line for line in lines):
+        fail(
+            f"ERROR: {cell['id']} {role} {key} has an entry that is not "
+            "a non-empty string"
+        )
+    return json.dumps(lines)
+
 slurm_submit_runner = runner.get("slurm_submit_runner", "atomesh-cicd")
 is_crusoe_v2 = slurm_submit_runner == "atomesh-cicd-mi355-crusoe"
 spur_controller_addr = runner.get("spur_controller_addr")
@@ -122,6 +181,7 @@ elif not spur_controller_addr:
 
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
+    "ATOMESH_REQUIRED_ATOM_ENV": ",".join(cell.get("requires_atom_env", [])),
     "MODEL_NAME": cell["model"],
     "BACKEND": cell["backend"],
     "DOCKER_IMAGE": cell["image"],
@@ -214,6 +274,8 @@ exports = {
         "decode_max_num_batched_tokens", ""
     ),
     "ONLINE_QUANT_CONFIG": server_args.get("online_quant_config", ""),
+    "PREFILL_ONLINE_QUANT_CONFIG": role_online_quant_config("prefill", prefill),
+    "DECODE_ONLINE_QUANT_CONFIG": role_online_quant_config("decode", decode),
     "HF_OVERRIDES": server_args.get("hf_overrides", ""),
     "SPEC_METHOD": server_args.get("method", ""),
     "DRAFT_MODEL_PATH": server_args.get("draft_model", ""),
@@ -227,6 +289,10 @@ exports = {
     "EXTRA_SERVER_ARGS": server_args.get("extra_args", ""),
     "PREFILL_EXTRA_SERVER_ARGS": prefill.get("extra_args", ""),
     "DECODE_EXTRA_SERVER_ARGS": decode.get("extra_args", ""),
+    "PREFILL_EXPECT_LOG": role_log_lines("prefill", prefill, "expect_log"),
+    "DECODE_EXPECT_LOG": role_log_lines("decode", decode, "expect_log"),
+    "PREFILL_REJECT_LOG": role_log_lines("prefill", prefill, "reject_log"),
+    "DECODE_REJECT_LOG": role_log_lines("decode", decode, "reject_log"),
     "RUN_EVAL": str(cell.get("run_eval", False)).lower(),
     "EVAL_ONLY": str(cell.get("eval_only", False)).lower(),
     "EVAL_TASK": accuracy.get("task", "gsm8k"),
@@ -266,14 +332,10 @@ exports = {
 server_args.get("trust_remote_code")
 dropped = sorted(set(server_args) - server_args.seen)
 if dropped:
-    reason = (
+    fail(
         f"ERROR: {cell['id']} sets unsupported server_args {dropped}; "
         "raw server flags belong in extra_args"
     )
-    # A non-zero exit here is swallowed by `eval "$(...)"`, so fail via the shell.
-    print(f"echo {shlex.quote(reason)} >&2")
-    print("exit 1")
-    raise SystemExit(0)
 
 for key, value in exports.items():
     print(f"export {key}={q(value)}")
