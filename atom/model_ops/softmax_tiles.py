@@ -15,6 +15,9 @@ mass over Exp(1) noise from Philox, and `argmax_lowest_id` takes the winner,
 the lowest id on a tie. The verify's residual race, its p fallback and the
 draft's draw over its stored q all go through these two, so they are one
 sampler by construction and cannot drift apart bit by bit.
+
+`argmax_lowest_id` is also every greedy pick: the verify's per-tile raw
+argmax, the ``WITH_ARGMAX`` combine here, and the DSpark draft's greedy stage 2.
 """
 
 import triton
@@ -131,9 +134,7 @@ def softmax_combine_kernel(
             mask=tile_mask,
             other=2147483647,
         )
-        best = tl.max(vals, axis=0)
-        cand = tl.where((vals == best) & tile_mask, idxs, 2147483647)
-        winner = tl.min(cand, axis=0)
+        _, winner = argmax_lowest_id(vals, idxs, tile_mask, 2147483647)
         # An all-NaN row matches nothing; answer id 0, as `torch.argmax` would
         # not, but in range, so no consumer can index past the vocab.
         tl.store(row_argmax_ptr + row, tl.where(winner == 2147483647, 0, winner))

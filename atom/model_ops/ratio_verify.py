@@ -189,8 +189,7 @@ def _ratio_stats_kernel(
         mask=vmask,
         other=float("-inf"),
     ).to(tl.float32)
-    raw_max = tl.max(x, axis=0)
-    raw_idx = tl.min(tl.where((x == raw_max) & vmask, offs, 2147483647), axis=0)
+    raw_max, raw_idx = argmax_lowest_id(x, offs, vmask, 2147483647)
     scaled_max, scaled_sum = tile_max_sumexp(x / temp, vmask)
     part = tile * num_tokens + row
     tl.store(part_max_ptr + part, scaled_max)

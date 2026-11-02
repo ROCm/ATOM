@@ -262,10 +262,8 @@ def _dspark_markov_argmax_stage2(
     idxs = tl.load(
         part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=vocab_size
     )
-    best = tl.max(vals, axis=0)
     # Ids are global, so the sentinel is anything past every tile's id.
-    cand = tl.where((vals == best) & tile_mask, idxs, 2147483647)
-    winner = tl.min(cand, axis=0)
+    best, winner = argmax_lowest_id(vals, idxs, tile_mask, 2147483647)
     if PACKED:
         # An all-NaN row keeps the sentinel; publish id 0 with the NaN, which
         # `torch.argmax` across ranks then treats as the max, as it would the
