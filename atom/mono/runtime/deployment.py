@@ -181,9 +181,13 @@ def _cu_count() -> int | None:
     ).multi_processor_count
 
 
-def resident_grid_refusals(atom_config) -> list[tuple[bool, str]]:
+def resident_grid_refusals(
+    atom_config, *, served_connector=lambda _: False
+) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
-    and spin on each other (``plan.execution.BLOCKS``)."""
+    and spin on each other (``plan.execution.BLOCKS``). ``served_connector``
+    admits a KV connector it returns True for: one that queues no copy kernel
+    of its own on this rank."""
     cus = _cu_count()
     return [
         # a spin wait on another CTA only makes progress while that CTA runs
@@ -192,7 +196,11 @@ def resident_grid_refusals(atom_config) -> list[tuple[bool, str]]:
         # which wedges a kernel that waits on every one of them. The field is a
         # dict that defaults to empty, so this is a truthiness test, as every
         # other reader of it in ATOM does: `is None` refuses every deployment.
-        (not getattr(atom_config, "kv_transfer_config", None), "KV connector"),
+        (
+            not getattr(atom_config, "kv_transfer_config", None)
+            or served_connector(atom_config),
+            "KV connector",
+        ),
     ]
 
 
