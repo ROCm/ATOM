@@ -300,9 +300,12 @@ class UnitZeroer:
 
     RING = 4
 
-    def __init__(self, regions, num_blocks: int, device) -> None:
+    def __init__(self, regions, num_blocks: int, device, on_launch=None) -> None:
         base, size = regions
         self.regions = regions
+        # Called with an event recorded right after each zero (CUDA only).
+        # The caller owns what it means; this package imports nothing of ATOM.
+        self.on_launch = on_launch
         self.num_blocks = int(num_blocks)
         self.device = torch.device(device)
         cuda = self.device.type == "cuda"
@@ -360,18 +363,14 @@ class UnitZeroer:
             TILE=_TILE_BYTES,
             num_warps=4,
         )
-        if self.device.type == "cuda":
-            # Loads that write these ids from their own streams wait on this
-            # while it is pending (`state_runtime.pending_unit_zero`).
-            from atom.model_engine.state_runtime import note_unit_zero
-
+        if self.on_launch is not None and self.device.type == "cuda":
             done = torch.cuda.Event()
             done.record()
-            note_unit_zero(done)
+            self.on_launch(done)
         return n
 
 
-def zero_units_once(regions, unit_ids, device) -> None:
+def zero_units_once(regions, unit_ids, device, on_launch=None) -> None:
     """Zero these PAGE ids once, on the current stream.
 
     For a builder with no `zero_page_units` of its own (Kimi-K3, DeepSeek-V4)
@@ -382,7 +381,7 @@ def zero_units_once(regions, unit_ids, device) -> None:
     """
     ids = [int(u) for u in unit_ids]
     if ids:
-        UnitZeroer(regions, max(ids) + 1, device).launch(ids)
+        UnitZeroer(regions, max(ids) + 1, device, on_launch).launch(ids)
 
 
 class DescriptorStaging:

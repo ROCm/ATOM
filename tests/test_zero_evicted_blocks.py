@@ -336,6 +336,9 @@ def test_zero_capability_needs_a_checkpoint_spec():
 
 
 def test_builder_capability_is_the_zero_override():
+    # `backends` imports `attention_mla`, which needs Triton (absent on the
+    # CPU-only CI runner).
+    pytest.importorskip("triton")
     from atom.model_ops.attentions.backends import AttentionMetadataBuilder
 
     class _NoZero(AttentionMetadataBuilder):
@@ -591,16 +594,16 @@ def test_zero_units_once_zeroes_exactly_those_units(monkeypatch):
     launched = []
 
     class _Zeroer:
-        def __init__(self, regions, num_blocks, device):
-            launched.append((regions, num_blocks, device))
+        def __init__(self, regions, num_blocks, device, on_launch=None):
+            launched.append((regions, num_blocks, device, on_launch))
 
         def launch(self, ids):
             launched.append(list(ids))
 
     monkeypatch.setattr(paged_state_copy, "UnitZeroer", _Zeroer)
-    paged_state_copy.zero_units_once("regions", range(3), "dev")
+    paged_state_copy.zero_units_once("regions", range(3), "dev", print)
     paged_state_copy.zero_units_once("regions", [], "dev")
-    assert launched == [("regions", 3, "dev"), [0, 1, 2]]
+    assert launched == [("regions", 3, "dev", print), [0, 1, 2]]
 
 
 def test_dsv4_warmup_zeroes_the_units_it_copied_into(monkeypatch):
@@ -624,7 +627,9 @@ def _assert_warmup_zeroes(monkeypatch, module, cls):
     monkeypatch.setattr(
         module,
         "zero_units_once",
-        lambda regions, ids, device: events.append(("zero", list(ids), regions)),
+        lambda regions, ids, device, on_launch: events.append(
+            ("zero", list(ids), regions, on_launch)
+        ),
     )
     spec = SimpleNamespace(units_per_checkpoint=3)
     builder = cls.__new__(cls)
@@ -641,7 +646,10 @@ def _assert_warmup_zeroes(monkeypatch, module, cls):
     builder._page_unit_regions = lambda: "regions"
     builder._checkpoint_descriptor_device = lambda: "dev"
     builder.warmup_per_req_cache()
-    assert events == ["copy", ("zero", [0, 1, 2], "regions")]
+    assert events == [
+        "copy",
+        ("zero", [0, 1, 2], "regions", state_runtime_mod.note_unit_zero),
+    ]
 
 
 def test_block_manager_switch_off_restores_old_pool(monkeypatch):

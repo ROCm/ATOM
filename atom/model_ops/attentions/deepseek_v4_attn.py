@@ -67,7 +67,7 @@ from atom.model_engine.page_unit_checkpoint import (
     CheckpointStoreOp,
 )
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_runtime import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer, note_unit_zero
 from atom.model_ops.attentions.backends import (
     AttentionBackend,
     AttentionMetadataBuilder,
@@ -1202,6 +1202,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._page_unit_regions(),
             range(units),
             self._checkpoint_descriptor_device(),
+            note_unit_zero,
         )
 
     def _checkpoint_descriptor_device(self) -> torch.device:

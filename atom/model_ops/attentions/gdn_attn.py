@@ -18,6 +18,7 @@ from atom.model_engine.state_runtime import (
     GDN_PAGED_LAYOUT_PREFIX,
     StateTransfer,
     midstep_checkpoint_targets,
+    note_unit_zero,
 )
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.replayssm import (
@@ -956,6 +957,7 @@ class GDNStateMixin(PoolRowsMixin):
                 self._page_unit_regions(),
                 units,
                 self._checkpoint_descriptor_device(),
+                note_unit_zero,
             )
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
@@ -1802,6 +1804,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 regions,
                 int(self.model_runner.config.num_kvcache_blocks),
                 self._checkpoint_descriptor_device(),
+                # Offload loads wait on the zero while it is pending
+                # (`state_runtime.pending_unit_zero`).
+                on_launch=note_unit_zero,
             )
         zeroer.launch(unit_ids)
 
