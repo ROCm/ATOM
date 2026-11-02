@@ -179,51 +179,41 @@ _DEC_HALF_LIFE = 2000.0
 _PF_HALF_LIFE = 200.0
 _DEC_MIN_N = 64
 _PF_MIN_N = 8
-_DEC_MIN_CV = 0.02
 _PF_MIN_CV = 0.05
-# prior while the decode fit is not identifiable (batch ~constant): T0 share
-_DEC_T0_PRIOR = 0.75
 # prior fixed prefill cost while the prefill fit is not identifiable: share of
 # a mean prefill step
 _PF_A_PRIOR = 0.25
 # fixed slots: W_eff, T0 (us), A (us), fitted ranks; then dp_size one-hot slots
 # of each rank's prefill tokens executed on the previous tick
 _ADAPT_FIXED = 4
-# v2 (ATOM_PREFILL_ADMIT_VERSION=2, the default): v1 extrapolated T0 as the
-# intercept of T_d(b) over a narrow batch range (b ~ 300-400 total), which
-# drifted toward 0 under load (13 ms -> 2-5 ms) and stretched the cycle to
-# 30-41 ticks (-4.6% thr, TTFT 2.7x vs interval 24). v2 makes every estimate
-# robust and bounds the cycle:
-#   T0 = T0_FRAC * EMA mean decode step                (no extrapolation)
-#   A  = prefill-fit intercept clamped to [A_MIN, A_MAX] * mean prefill step
-#   FIRE when regret >= A*B and hold_ticks >= MIN_TICKS, or when
-#   hold_ticks >= MAX_TICKS = MAX_HOLD_MS / mean decode step  (TTFT budget;
-#   600 ms ~ 24 ticks at ~25 ms/tick), clamped to [MIN_TICKS, _V2_TICKS_CAP].
-_V2_DEFAULTS = {
-    "T0_FRAC": 0.75,
-    "A_MIN_FRAC": 0.3,
-    "A_MAX_FRAC": 1.5,
-    "MAX_HOLD_MS": 600.0,
-    "MIN_TICKS": 4.0,
-}
-_V2_TICKS_CAP = 200
+# Every estimate is bounded; an intercept extrapolation of T_d(b) over the
+# narrow batch range seen in serving (b ~ 300-400 total) drifted toward 0 under
+# load (13 ms -> 2-5 ms) and stretched the cycle to 30-41 ticks (-4.6% thr,
+# TTFT 2.7x vs interval 24), so:
+#   T0 = _T0_FRAC * EMA mean decode step                 (no extrapolation)
+#   A  = prefill-fit intercept clamped to [_A_MIN_FRAC, _A_MAX_FRAC] * mean
+#        prefill step
+#   FIRE on the n-th decision since the last FIRE (n-1 held ticks) once
+#   regret >= A*B and n >= _MIN_TICKS, or once n >= the TTFT cap
+#   _MAX_HOLD_MS / mean decode step (600 ms ~ 24 at ~25 ms/tick), clamped to
+#   [_MIN_TICKS, _TICKS_CAP].
+# Tuned on DSV4.1 DEP4 8k/1k; not meant to be tuned per deployment.
+_T0_FRAC = 0.75
+_A_MIN_FRAC = 0.3
+_A_MAX_FRAC = 1.5
+_MAX_HOLD_MS = 600.0
+_MIN_TICKS = 4
+_TICKS_CAP = 200
 # cap before the decode mean is known (cold start)
-_V2_COLD_MAX_TICKS = 24
-
-
-def _admit_env(name: str, default: float) -> float:
-    raw = getattr(envs, f"ATOM_PREFILL_ADMIT_{name}").strip()
-    return float(raw) if raw else float(default)
+_COLD_MAX_TICKS = 24
 
 
 def admit_policy_from_env() -> str:
     policy = envs.ATOM_PREFILL_ADMIT.strip().lower()
-    if policy in ("0", "off", "none", "interval"):
-        policy = ""
-    if policy in ("1", "eoq"):
-        policy = "adaptive"
     if policy not in _ADMIT_POLICIES:
-        raise ValueError(f"unknown ATOM_PREFILL_ADMIT={policy!r}")
+        raise ValueError(
+            f"unknown ATOM_PREFILL_ADMIT={policy!r}; expected '' or 'adaptive'"
+        )
     return policy
 
 
@@ -318,9 +308,7 @@ class PrefillDelayer:
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
-        "_v2",
         "admit_policy",
-        "admit_version",
         "cpu_group",
         "dp_size",
         "kv_high_watermark",
@@ -352,8 +340,6 @@ class PrefillDelayer:
         cost_gate: bool = False,
         clock=time.perf_counter,
         admit_policy: str = "",
-        admit_version: int | None = None,
-        admit_params: dict | None = None,
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -405,21 +391,6 @@ class PrefillDelayer:
         if admit_policy not in _ADMIT_POLICIES:
             raise ValueError(f"unknown admit_policy={admit_policy!r}")
         self.admit_policy = admit_policy
-        if admit_version is None:
-            admit_version = int(_admit_env("VERSION", 2))
-        if admit_version not in (1, 2):
-            raise ValueError(f"unknown ATOM_PREFILL_ADMIT_VERSION={admit_version}")
-        self.admit_version = admit_version
-        v2 = {k: _admit_env(k, d) for k, d in _V2_DEFAULTS.items()}
-        v2.update(admit_params or {})
-        if not (0 < v2["T0_FRAC"] <= 1):
-            raise ValueError(
-                f"ATOM_PREFILL_ADMIT_T0_FRAC={v2['T0_FRAC']} not in (0, 1]"
-            )
-        if not (0 < v2["A_MIN_FRAC"] <= v2["A_MAX_FRAC"]):
-            raise ValueError("need 0 < ATOM_PREFILL_ADMIT_A_MIN_FRAC <= A_MAX_FRAC")
-        v2["MIN_TICKS"] = max(0, int(v2["MIN_TICKS"]))
-        self._v2 = v2
         if admit_policy == "adaptive" and prefill_decode_interval:
             logger.info(
                 "ATOM_PREFILL_ADMIT=adaptive: ignoring "
@@ -543,11 +514,6 @@ class PrefillDelayer:
             f"prefill_decode_interval={prefill_decode_interval} "
             f"cost_gate={self._cost_gate} "
             f"admit_policy={admit_policy!r}"
-            + (
-                f" admit_version={admit_version} admit_v2={self._v2}"
-                if admit_policy
-                else ""
-            )
         )
 
     @staticmethod
@@ -962,55 +928,29 @@ class PrefillDelayer:
 
     # ---------------- ATOM_PREFILL_ADMIT=adaptive ----------------
     def _adapt_local_fits(self) -> tuple[float, float]:
-        """This rank's (T0, A) in us; 0 = not estimated yet."""
-        if self.admit_version >= 2:
-            return self._adapt_local_fits_v2()
+        """This rank's (T0, A) in us; 0 = not estimated yet.
+        T0 = _T0_FRAC * mean decode step; A = prefill-fit intercept (prior
+        share if not identifiable) clamped to [_A_MIN_FRAC, _A_MAX_FRAC] *
+        mean prefill step."""
         dec = self._adapt_dec_fit
         pf = self._adapt_pf_fit
-        t0 = 0.0
-        if dec.n >= _DEC_MIN_N:
-            f = dec.fit(_DEC_MIN_N, _DEC_MIN_CV)
-            my = dec.mean_y()
-            if f is None:
-                t0 = _DEC_T0_PRIOR * my
-            else:
-                # a negative slope (noise) clamps to "all fixed"
-                t0 = min(max(f[0], 0.1 * my), my)
-        a = 0.0
-        if pf.n >= _PF_MIN_N:
-            f = pf.fit(_PF_MIN_N, _PF_MIN_CV)
-            my = pf.mean_y()
-            if f is None or f[1] <= 0:
-                a = _PF_A_PRIOR * my
-            else:
-                a = min(max(f[0], 0.02 * my), my)
-        return t0, a
-
-    def _adapt_local_fits_v2(self) -> tuple[float, float]:
-        """v2: T0 = T0_FRAC * mean decode step (no intercept extrapolation);
-        A = prefill-fit intercept (prior share if not identifiable) clamped to
-        [A_MIN_FRAC, A_MAX_FRAC] * mean prefill step."""
-        v2 = self._v2
-        dec = self._adapt_dec_fit
-        pf = self._adapt_pf_fit
-        t0 = v2["T0_FRAC"] * dec.mean_y() if dec.n >= _DEC_MIN_N else 0.0
+        t0 = _T0_FRAC * dec.mean_y() if dec.n >= _DEC_MIN_N else 0.0
         a = 0.0
         if pf.n >= _PF_MIN_N:
             my = pf.mean_y()
             f = pf.fit(_PF_MIN_N, _PF_MIN_CV)
             a = _PF_A_PRIOR * my if f is None or f[1] <= 0 else f[0]
-            a = min(max(a, v2["A_MIN_FRAC"] * my), v2["A_MAX_FRAC"] * my)
+            a = min(max(a, _A_MIN_FRAC * my), _A_MAX_FRAC * my)
         return t0, a
 
     def _adapt_max_ticks(self, t0: float, fitted: bool) -> int:
-        """v2 hold cap from the TTFT budget, identical on every rank (t0 is
-        the reduced mean)."""
-        lo = self._v2["MIN_TICKS"]
+        """Cap on decisions per cycle from the TTFT budget, identical on every
+        rank (t0 is the reduced mean)."""
         if not fitted or t0 <= 0:
-            return max(lo, _V2_COLD_MAX_TICKS)
-        mean_dec_us = t0 / self._v2["T0_FRAC"]
-        n = round(self._v2["MAX_HOLD_MS"] * 1000.0 / mean_dec_us)
-        return min(max(n, lo, 1), _V2_TICKS_CAP)
+            return max(_MIN_TICKS, _COLD_MAX_TICKS)
+        mean_dec_us = t0 / _T0_FRAC
+        n = round(_MAX_HOLD_MS * 1000.0 / mean_dec_us)
+        return min(max(n, _MIN_TICKS), _TICKS_CAP)
 
     def _adapt_observe(
         self, reduced: list[int], step_s: float, prefill_ran: bool, g_running_dec: int
@@ -1048,17 +988,13 @@ class PrefillDelayer:
         self._adapt_regret += w_eff * t0
         thr = a * g_running_dec
         self._adapt_thr_last = (t0, a, thr)
-        if self.admit_version >= 2:
-            # this tick would be the (hold_ticks+1)-th since the last FIRE
-            ticks = self._hold_ticks + 1
-            if ticks >= self._adapt_max_ticks(t0, fitted > 0):
-                self._stat_adapt_cycles += 1
-                return self._fire("adaptcap", g_pending)
-            if ticks >= self._v2["MIN_TICKS"] and self._adapt_regret >= thr:
-                self._stat_adapt_cycles += 1
-                return self._fire("adaptive", g_pending)
-            return self._adapt_hold(g_pending)
-        if self._adapt_regret >= thr:
+        # n counts decisions since the last FIRE, this one included: a FIRE
+        # on the n-th follows n-1 held ticks
+        n = self._hold_ticks + 1
+        if n >= self._adapt_max_ticks(t0, fitted > 0):
+            self._stat_adapt_cycles += 1
+            return self._fire("adaptcap", g_pending)
+        if n >= _MIN_TICKS and self._adapt_regret >= thr:
             self._stat_adapt_cycles += 1
             return self._fire("adaptive", g_pending)
         return self._adapt_hold(g_pending)
@@ -1143,7 +1079,7 @@ class PrefillDelayer:
                 t0, a, thr = self._adapt_thr_last
                 cyc = self._stat_adapt_cycles
                 logger.info(
-                    f"[PrefillDelayer adaptive v{self.admit_version}] "
+                    "[PrefillDelayer adaptive] "
                     f"fire_adaptive={self._stat_fire_adaptive} "
                     f"fire_cap={self._stat_fire_adaptcap} "
                     f"max_ticks={self._adapt_max_ticks(t0, t0 > 1.0)} "

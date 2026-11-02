@@ -26,7 +26,7 @@ class _Clock:
         return self.t
 
 
-def _run(a_us, t0_us, c_us, lam, ticks=6000, seed=0, b0=300, version=1, params=None):
+def _run(a_us, t0_us, c_us, lam, ticks=6000, seed=0, b0=300):
     """Plant: B decode seqs, arrivals ~lam/tick, each FIRE admits all waiting.
     Returns (delayer, mean decode ticks between fires)."""
     rng = random.Random(seed)
@@ -38,8 +38,6 @@ def _run(a_us, t0_us, c_us, lam, ticks=6000, seed=0, b0=300, version=1, params=N
         prefill_decode_interval=32,
         clock=clk,
         admit_policy="adaptive",
-        admit_version=version,
-        admit_params=params,
     )
     running, waiting, fires, decode_ticks = b0, 0, 0, 0
     for _ in range(ticks):
@@ -69,7 +67,7 @@ def _run(a_us, t0_us, c_us, lam, ticks=6000, seed=0, b0=300, version=1, params=N
 def test_env_parsing(monkeypatch):
     monkeypatch.delenv("ATOM_PREFILL_ADMIT", raising=False)
     assert admit_policy_from_env() == ""
-    for v, want in (("adaptive", "adaptive"), ("eoq", "adaptive"), ("off", "")):
+    for v, want in (("adaptive", "adaptive"), (" Adaptive ", "adaptive"), ("", "")):
         monkeypatch.setenv("ATOM_PREFILL_ADMIT", v)
         assert admit_policy_from_env() == want
     monkeypatch.setenv("ATOM_PREFILL_ADMIT", "bogus")
@@ -125,53 +123,9 @@ def test_no_admittable_holds_without_regret():
     assert d._adapt_regret == 0.0
 
 
-@pytest.mark.parametrize("a_us,t0_us,lam", [(30000, 20000, 2.0), (60000, 20000, 2.0)])
-def test_cycle_matches_eoq(a_us, t0_us, lam):
-    d, cyc = _run(a_us, t0_us, c_us=20.0, lam=lam)
-    t0_fit, a_fit = d._adapt_local_fits()
-    assert abs(t0_fit - t0_us) / t0_us < 0.15
-    assert abs(a_fit - a_us) / a_us < 0.25
-    b = 300
-    k_eoq = math.sqrt(2 * a_us * b / (lam * t0_us))
-    assert 0.7 * k_eoq < cyc < 1.4 * k_eoq, (cyc, k_eoq)
-
-
-def test_slower_prefill_lengthens_cycle():
-    _, fast = _run(30000, 20000, 20.0, 2.0)
-    _, slow = _run(90000, 20000, 20.0, 2.0)
-    # EOQ: cycle ~ sqrt(A) -> x sqrt(3)
-    assert 1.4 < slow / fast < 2.1, (fast, slow)
-
-
-# ---------------- v2 (ATOM_PREFILL_ADMIT_VERSION=2, default) ----------------
-
-
-def test_v2_is_default_and_env(monkeypatch):
-    for k in ("VERSION", "T0_FRAC", "MAX_HOLD_MS", "MIN_TICKS"):
-        monkeypatch.delenv(f"ATOM_PREFILL_ADMIT_{k}", raising=False)
-    d = PrefillDelayer(
-        dp_size=1, cpu_group=None, max_num_batched_tokens=16384, admit_policy="adaptive"
-    )
-    assert d.admit_version == 2 and d._v2["T0_FRAC"] == 0.75
-    monkeypatch.setenv("ATOM_PREFILL_ADMIT_VERSION", "1")
-    monkeypatch.setenv("ATOM_PREFILL_ADMIT_MAX_HOLD_MS", "300")
-    d = PrefillDelayer(
-        dp_size=1, cpu_group=None, max_num_batched_tokens=16384, admit_policy="adaptive"
-    )
-    assert d.admit_version == 1 and d._v2["MAX_HOLD_MS"] == 300.0
-    monkeypatch.setenv("ATOM_PREFILL_ADMIT_VERSION", "3")
-    with pytest.raises(ValueError):
-        PrefillDelayer(
-            dp_size=1,
-            cpu_group=None,
-            max_num_batched_tokens=16384,
-            admit_policy="adaptive",
-        )
-
-
-def test_v2_t0_is_fraction_of_mean():
-    # decode step 25 ms at b~300; v1's intercept would be ~19 ms, v2 = 0.75*mean
-    d, _ = _run(60000, 19000, 20.0, 2.0, version=2)
+def test_t0_is_fraction_of_mean():
+    # decode step 25 ms at b~300; T0 = 0.75*mean, not the ~19 ms intercept
+    d, _ = _run(60000, 19000, 20.0, 2.0)
     t0, a = d._adapt_local_fits()
     mean_dec = d._adapt_dec_fit.mean_y()
     assert abs(t0 - 0.75 * mean_dec) < 1e-6
@@ -179,16 +133,16 @@ def test_v2_t0_is_fraction_of_mean():
     assert 0.3 * my - 1e-6 <= a <= 1.5 * my + 1e-6
 
 
-def test_v2_a_clamped_low():
+def test_a_clamped_low():
     # A tiny vs the per-token part: intercept below 0.3*mean -> clamped
-    d, _ = _run(1000, 20000, 20.0, 2.0, version=2)
+    d, _ = _run(1000, 20000, 20.0, 2.0)
     _, a = d._adapt_local_fits()
     assert abs(a - 0.3 * d._adapt_pf_fit.mean_y()) < 1.0
 
 
-def test_v2_cycle_capped_by_budget():
+def test_cycle_capped_by_budget():
     # huge A: EOQ would hold ~100+ ticks; cap = 600 ms / ~26 ms ~ 23 ticks
-    d, cyc = _run(400000, 20000, 20.0, 0.3, version=2)
+    d, cyc = _run(400000, 20000, 20.0, 0.3)
     t0, _ = d._adapt_local_fits()
     cap = d._adapt_max_ticks(t0, True)
     assert 18 <= cap <= 28, cap
@@ -197,19 +151,24 @@ def test_v2_cycle_capped_by_budget():
     assert d._stat_fire_adaptcap > 0
 
 
-def test_v2_min_ticks():
+def test_min_ticks():
     # tiny A, big queue: EOQ wants to fire every tick -> held to MIN_TICKS
-    _d, cyc = _run(1000, 20000, 20.0, 8.0, version=2, params={"MIN_TICKS": 4})
+    _d, cyc = _run(1000, 20000, 20.0, 8.0)
     assert cyc >= 3.5, cyc
 
 
-def test_v2_max_hold_ms_scales_cap():
-    _, c600 = _run(400000, 20000, 20.0, 0.3, version=2)
-    _, c300 = _run(400000, 20000, 20.0, 0.3, version=2, params={"MAX_HOLD_MS": 300})
-    assert 0.4 < c300 / c600 < 0.65, (c300, c600)
-
-
-def test_v2_slower_prefill_not_shorter_and_bounded():
-    _, fast = _run(30000, 20000, 20.0, 2.0, version=2)
-    _, slow = _run(90000, 20000, 20.0, 2.0, version=2)
+def test_slower_prefill_not_shorter_and_bounded():
+    _, fast = _run(30000, 20000, 20.0, 2.0)
+    _, slow = _run(90000, 20000, 20.0, 2.0)
     assert fast <= slow <= 26, (fast, slow)
+
+
+@pytest.mark.parametrize("a_us,lam", [(15000, 2.0), (25000, 2.0)])
+def test_cycle_matches_eoq_with_fitted_costs(a_us, lam):
+    # between the MIN_TICKS floor and the TTFT cap the cycle follows EOQ
+    # with the (bounded) fitted T0 and A
+    d, cyc = _run(a_us, 20000, c_us=20.0, lam=lam)
+    t0, a = d._adapt_local_fits()
+    k_eoq = math.sqrt(2 * a * 300 / (lam * t0))
+    assert 4 < k_eoq < d._adapt_max_ticks(t0, True)
+    assert 0.7 * k_eoq < cyc < 1.4 * k_eoq, (cyc, k_eoq)

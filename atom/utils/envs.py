@@ -1186,21 +1186,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode and prefill step times (see prefill_delayer.py). Also enables
     # local coalescing on TP without PP.
     "ATOM_PREFILL_ADMIT": lambda: os.getenv("ATOM_PREFILL_ADMIT", ""),
-    # ATOM_PREFILL_ADMIT=adaptive knobs; "" keeps the built-in default.
-    "ATOM_PREFILL_ADMIT_VERSION": lambda: os.getenv("ATOM_PREFILL_ADMIT_VERSION", ""),
-    "ATOM_PREFILL_ADMIT_T0_FRAC": lambda: os.getenv("ATOM_PREFILL_ADMIT_T0_FRAC", ""),
-    "ATOM_PREFILL_ADMIT_A_MIN_FRAC": lambda: os.getenv(
-        "ATOM_PREFILL_ADMIT_A_MIN_FRAC", ""
-    ),
-    "ATOM_PREFILL_ADMIT_A_MAX_FRAC": lambda: os.getenv(
-        "ATOM_PREFILL_ADMIT_A_MAX_FRAC", ""
-    ),
-    "ATOM_PREFILL_ADMIT_MAX_HOLD_MS": lambda: os.getenv(
-        "ATOM_PREFILL_ADMIT_MAX_HOLD_MS", ""
-    ),
-    "ATOM_PREFILL_ADMIT_MIN_TICKS": lambda: os.getenv(
-        "ATOM_PREFILL_ADMIT_MIN_TICKS", ""
-    ),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.

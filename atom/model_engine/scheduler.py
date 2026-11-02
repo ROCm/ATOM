@@ -2106,14 +2106,10 @@ class Scheduler:
                 ),
                 # ATOM_PREFILL_ADMIT=adaptive: what a FIRE could add to the
                 # decode batch -- partials plus waiting heads up to free slots
-                admittable_requests=(
-                    self._partial_prefill_count
-                    + min(
-                        len(self.waiting),
-                        max(0, self.max_num_seqs - len(self.running)),
-                    )
-                    if self.prefill_delayer.admit_policy
-                    else None
+                admittable_requests=self._partial_prefill_count
+                + min(
+                    len(self.waiting),
+                    max(0, self.max_num_seqs - len(self.running)),
                 ),
             )
         else:
