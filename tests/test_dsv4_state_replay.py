@@ -26,7 +26,7 @@ from atom.model_engine.scheduler import (
     _cut_floor,
     _scheduled_replay_until,
 )
-from atom.model_engine.sequence import Replay, Sequence
+from atom.model_engine.sequence import Replay, Sequence, SequenceStatus
 from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 from atom.model_ops.attentions.deepseek_v4_replay import state_replay_tokens
 
@@ -592,3 +592,32 @@ def test_deallocate_forgets_the_kv_only_load(monkeypatch):
     assert bm.allocate(seq, bm.can_allocate(seq))
     bm.deallocate(seq)
     assert not seq.replay_kv_load and not seq.replays_hit
+
+
+def test_the_delayer_probes_size_a_finished_load_without_rewalking_its_hit():
+    """A finished tier load still waits for admission to mark it a resume. The
+    delayer's probes must size it as that resume, not re-ask the hit walk,
+    which would rewrite the `replays_hit` flag it was admitted with."""
+    engine, seq = _engine_with_a_replayed_head(budget=64)
+    bm = engine.block_manager
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    assert seq.replays_hit
+    engine.waiting.remove(seq)
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    seq.offload_loaded_tokens = 36
+    engine.waiting.append(seq)
+    engine.kv_connector = SimpleNamespace(is_offload=True)
+    engine.finished_recving_kv_req_ids = [seq.id]
+
+    assert engine._finished_load_tokens(seq) == 36
+    walks = []
+    real = bm.can_allocate_memoized
+    bm.can_allocate_memoized = lambda s: walks.append(s) or real(s)
+    assert engine._local_prefill_pending_work()[0]
+    engine._estimate_prefill_chunk_cost()
+    assert not walks
+    assert seq.replays_hit
+
+    # A load still in flight is not work yet and is not a resume either.
+    engine.finished_recving_kv_req_ids = []
+    assert engine._finished_load_tokens(seq) is None
