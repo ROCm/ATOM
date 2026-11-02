@@ -655,13 +655,11 @@ def test_overlapping_native_batches_keep_their_ready_fences(
     first_future.ready = True
     batch(3)
     third, _ = transfers[2]
-    if unprovable:
-        assert third is not first and third is not second
-        assert first.records == 1
-    else:
-        assert third is first
-        assert first.records == 2
-    assert second.records == 1
+    # Ready events are never re-recorded; a finished one is retired instead.
+    assert third is not first and third is not second
+    assert first.records == second.records == third.records == 1
+    retired = worker._event_reclaimer._retired
+    assert (first in retired) is (not unprovable)
 
 
 @pytest.mark.parametrize("loading", [False, True])
