@@ -625,6 +625,24 @@ quant_config.remap_layer_name.assert_called_once()
             None,
             None,
         ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": ["re:.*ple\\.ple_embedding\\.ngram_embedding$"],
+            },
+            None,
+            None,
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "model.layers.*.ple.ple_embedding.ngram_embedding"
+                ],
+            },
+            None,
+            None,
+        ),
         ({"quant_method": "fp8"}, None, None),
         ({"weight_block_size": [128, 128]}, "float8_e4m3fnuz", "float8_e4m3fnuz"),
     ],
@@ -639,9 +657,11 @@ def test_qwen4_exp_rtp_block_fp8_ple_dtype_selection(
         quantization_config=quantization,
         ple_embedding_dtype=explicit_dtype,
     )
+    # Production Qwen4Exp configs expose the same object as text_config.
+    hf.text_config = hf
     quant_config = SimpleNamespace(exclude_layers=[], remap_layer_name=Mock())
     atom_config = SimpleNamespace(
-        hf_config=SimpleNamespace(text_config=hf),
+        hf_config=hf,
         quant_config=quant_config,
         multimodal_config=object(),
     )
@@ -1718,8 +1738,10 @@ def test_qwen4_exp_prefill_reads_prefix_block_when_continuing_across_boundary():
         is_cuda_graph=False,
         input_lengths=torch.tensor([1], dtype=torch.int32),
         prefix_lengths=torch.tensor([64], dtype=torch.int32),
-        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
-        kv_cache_kernel_block_id_device=torch.tensor([[10, 11]], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[10, 11]], dtype=torch.int32, device="cuda"
+        ),
     )
     metadata = RTPQwen4ExpContext._build_gdn_metadata(
         attn_inputs, seq_size_per_block=64, num_tokens=1

@@ -111,6 +111,7 @@ def _prepare_model_atom_rtpllm(
         )
 
     if model_arch == "Qwen4ExpForConditionalGeneration":
+        from atom.config import QuantizationConfig
         from atom.model_loader.loader import WeightsMapper
         from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
 
@@ -132,8 +133,10 @@ def _prepare_model_atom_rtpllm(
         quantization = getattr(hf, "quantization_config", None) or getattr(
             atom_config.hf_config, "quantization_config", None
         )
+        ple_module = "ple.ple_embedding.ngram_embedding"
         ple_is_fp8 = isinstance(quantization, dict) and any(
-            "ple.ple_embedding.ngram_embedding" in item
+            QuantizationConfig._matches_exclude(ple_module, item, check_contains=True)
+            or QuantizationConfig._matches_exclude(f"model.layers.0.{ple_module}", item)
             for item in (quantization.get("modules_to_convert") or ())
         )
         if (
