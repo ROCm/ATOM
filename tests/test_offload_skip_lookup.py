@@ -229,6 +229,27 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
     assert "7" not in sched._pending_session_ends()
 
 
+def test_a_late_save_token_prefix_is_dropped_when_the_session_ends(monkeypatch):
+    """A save emitted after `request_finished` re-creates the shipped-token
+    state the finish already dropped; ending the session drops it again, so
+    the workers' token cache cannot keep a finished request's prefix."""
+    sched, _client, adapter = _scheduler(monkeypatch, lookup_done=True)
+    adapter.end_session = lambda rid: None
+    seq = _seq()
+    sched._ship_tokens(seq, 32)
+    sched.request_finished(seq)
+    assert 7 not in sched._shipped_tokens
+    assert sched._shipped_drops == [7]
+    sched._shipped_drops = []
+
+    sched._ship_tokens(seq, 64)  # the late save
+    assert 7 in sched._shipped_tokens
+    sched._pending_session_ends()["7"] = seq
+    sched._end_finished_sessions()
+    assert 7 not in sched._shipped_tokens
+    assert sched._shipped_drops == [7]
+
+
 # ── review findings (#2547) ──────────────────────────────────────────────
 
 
