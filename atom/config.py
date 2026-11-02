@@ -2038,6 +2038,10 @@ class Config:
     # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
+    # Prefill admission (`--prefill-admit-policy`): "interval" keeps
+    # ATOM_PREFILL_DECODE_INTERVAL and the coalescer; "adaptive" replaces both
+    # with the rent-or-buy rule in prefill_delayer.py.
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9

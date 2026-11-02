@@ -2104,7 +2104,7 @@ class Scheduler:
                     if not prefillable and not waiting_requests
                     else None
                 ),
-                # ATOM_PREFILL_ADMIT=adaptive: what a FIRE could add to the
+                # prefill_admit_policy adaptive: what a FIRE could add to the
                 # decode batch -- partials plus waiting heads up to free slots
                 admittable_requests=self._partial_prefill_count
                 + min(

@@ -1181,11 +1181,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
-    # Prefill admission policy. "" keeps the interval + coalescer above;
-    # "adaptive" replaces both with a rent-or-buy rule fitted from measured
-    # decode and prefill step times (see prefill_delayer.py). Also enables
-    # local coalescing on TP without PP.
-    "ATOM_PREFILL_ADMIT": lambda: os.getenv("ATOM_PREFILL_ADMIT", ""),
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.

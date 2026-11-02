@@ -1,4 +1,4 @@
-"""ATOM_PREFILL_ADMIT=adaptive (rent-or-buy / EOQ prefill admission).
+"""--prefill-admit-policy adaptive (rent-or-buy / EOQ prefill admission).
 
 Single-rank (dp_size=1, no group) with an injected clock; a small plant model
 drives the delayer so the fitted step costs and the resulting cycle length can
@@ -14,7 +14,6 @@ from atom.model_engine.prefill_delayer import (
     _FIXED_SLOTS,
     PrefillDelayer,
     _EwFit,
-    admit_policy_from_env,
 )
 
 
@@ -64,21 +63,17 @@ def _run(a_us, t0_us, c_us, lam, ticks=6000, seed=0, b0=300):
     return d, decode_ticks / max(fires, 1)
 
 
-def test_env_parsing(monkeypatch):
-    monkeypatch.delenv("ATOM_PREFILL_ADMIT", raising=False)
-    assert admit_policy_from_env() == ""
-    for v, want in (("adaptive", "adaptive"), (" Adaptive ", "adaptive"), ("", "")):
-        monkeypatch.setenv("ATOM_PREFILL_ADMIT", v)
-        assert admit_policy_from_env() == want
-    monkeypatch.setenv("ATOM_PREFILL_ADMIT", "bogus")
-    with pytest.raises(ValueError):
-        admit_policy_from_env()
-
-
 def test_default_off_buffer_unchanged():
     d = PrefillDelayer(dp_size=1, cpu_group=None, max_num_batched_tokens=16384)
-    assert d.admit_policy == ""
+    assert d.admit_policy == "interval"
     assert d._reduce_buf.numel() == _FIXED_SLOTS
+
+
+def test_unknown_policy_rejected():
+    with pytest.raises(ValueError):
+        PrefillDelayer(
+            dp_size=1, cpu_group=None, max_num_batched_tokens=16384, admit_policy=""
+        )
 
 
 def test_adaptive_ignores_interval():

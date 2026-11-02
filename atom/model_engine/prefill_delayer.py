@@ -123,8 +123,6 @@ from typing import NamedTuple
 
 import torch
 
-from atom.utils import envs
-
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "true")
@@ -150,7 +148,7 @@ def _ema(avg: float, sample: float) -> float:
 
 
 # --------------------------------------------------------------------------
-# ATOM_PREFILL_ADMIT=adaptive  (default off; "" keeps the legacy behavior)
+# --prefill-admit-policy adaptive  (default "interval" keeps the legacy behavior)
 #
 # Replaces the fixed post-prefill decode interval (ATOM_PREFILL_DECODE_INTERVAL)
 # and the fill/stall coalescer with a rent-or-buy (EOQ) rule derived from
@@ -173,7 +171,7 @@ def _ema(avg: float, sample: float) -> float:
 # and the per-tick waiting counts ride the existing SUM all_reduce, and every
 # rank decides from the identical reduced means.
 # --------------------------------------------------------------------------
-_ADMIT_POLICIES = ("", "adaptive")
+_ADMIT_POLICIES = ("interval", "adaptive")
 # decode / prefill fit half-lives in samples, and identifiability guards
 _DEC_HALF_LIFE = 2000.0
 _PF_HALF_LIFE = 200.0
@@ -206,15 +204,6 @@ _MIN_TICKS = 4
 _TICKS_CAP = 200
 # cap before the decode mean is known (cold start)
 _COLD_MAX_TICKS = 24
-
-
-def admit_policy_from_env() -> str:
-    policy = envs.ATOM_PREFILL_ADMIT.strip().lower()
-    if policy not in _ADMIT_POLICIES:
-        raise ValueError(
-            f"unknown ATOM_PREFILL_ADMIT={policy!r}; expected '' or 'adaptive'"
-        )
-    return policy
 
 
 class _EwFit:
@@ -339,7 +328,7 @@ class PrefillDelayer:
         exchange_prefill_costs: bool = False,
         cost_gate: bool = False,
         clock=time.perf_counter,
-        admit_policy: str = "",
+        admit_policy: str = "interval",
     ):
         if dp_size > 1 and cpu_group is None:
             raise ValueError("Cross-DP prefill coalescing requires a CPU group")
@@ -393,7 +382,7 @@ class PrefillDelayer:
         self.admit_policy = admit_policy
         if admit_policy == "adaptive" and prefill_decode_interval:
             logger.info(
-                "ATOM_PREFILL_ADMIT=adaptive: ignoring "
+                "prefill_admit_policy=adaptive: ignoring "
                 f"prefill_decode_interval={prefill_decode_interval}"
             )
             prefill_decode_interval = 0
@@ -438,7 +427,8 @@ class PrefillDelayer:
         if admit_policy == "adaptive" and cpu_group is not None:
             self._rank = cpu_group.rank()
         self._reduce_buf = torch.zeros(
-            self._adapt_at + (_ADAPT_FIXED + dp_size if admit_policy else 0),
+            self._adapt_at
+            + (_ADAPT_FIXED + dp_size if admit_policy == "adaptive" else 0),
             dtype=torch.int64,
             device="cpu",
         )
@@ -601,7 +591,7 @@ class PrefillDelayer:
                 its draft tokens (EOS can come sooner); None when it runs no
                 decode. Read only when this rank has no prefill and no
                 waiting work.
-            admittable_requests: (ATOM_PREFILL_ADMIT=adaptive) requests a
+            admittable_requests: (prefill_admit_policy adaptive) requests a
                 FIRE could put into this rank's decode batch now: resumable
                 partials plus waiting heads that fit the free seq slots.
                 None falls back to `waiting_requests`.
@@ -670,7 +660,7 @@ class PrefillDelayer:
             )
             for offset, value in enumerate(gate):
                 self._reduce_buf[self._gate_at + offset] = value
-        if self.admit_policy:
+        if self.admit_policy == "adaptive":
             if not self._cost_gate:
                 now_a = self._clock()
                 if self._last_call_s is not None:
@@ -734,7 +724,7 @@ class PrefillDelayer:
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
             self._prev_running_dec = g_running_dec
-        if self.admit_policy:
+        if self.admit_policy == "adaptive":
             self._adapt_observe(reduced, step_s, prefill_ran_n > 0, g_running_dec)
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
@@ -792,7 +782,7 @@ class PrefillDelayer:
             return self._fire("queue_ms", g_pending)
         if self._hold_ticks >= self.ttft_max_ticks:
             return self._fire("ttft", g_pending)
-        if self.admit_policy:
+        if self.admit_policy == "adaptive":
             return self._adapt_decide(reduced, g_running_dec, g_pending)
         if any_partial and self._hold_ticks >= self.partial_max_ticks:
             return self._fire("partial", g_pending)
@@ -926,7 +916,7 @@ class PrefillDelayer:
         self._maybe_log()
         return True
 
-    # ---------------- ATOM_PREFILL_ADMIT=adaptive ----------------
+    # ---------------- prefill_admit_policy adaptive ----------------
     def _adapt_local_fits(self) -> tuple[float, float]:
         """This rank's (T0, A) in us; 0 = not estimated yet.
         T0 = _T0_FRAC * mean decode step; A = prefill-fit intercept (prior
@@ -1075,7 +1065,7 @@ class PrefillDelayer:
                 f"hold={self._stat_hold} "
                 f"(hold_rate={self._stat_hold / total:.2%})"
             )
-            if self.admit_policy:
+            if self.admit_policy == "adaptive":
                 t0, a, thr = self._adapt_thr_last
                 cyc = self._stat_adapt_cycles
                 logger.info(
