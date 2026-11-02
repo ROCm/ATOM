@@ -67,8 +67,8 @@ def test_uniform_rows_travel_in_one_collective(monkeypatch):
         sent, False, SimpleNamespace(), group
     )
 
-    # ids travel as the float of their width, the collectives' contract.
-    assert group.calls == [([torch.bfloat16, torch.float32, torch.float32], [3, 3])]
+    # Every dtype travels as is but one-byte ones (`pcp_utils.gather_rows`).
+    assert group.calls == [([torch.bfloat16, torch.float32, torch.int32], [3, 3])]
     assert local_tokens == 3 and sizes is None
     _check(rows, sent, 3)
 
@@ -99,7 +99,7 @@ def test_eager_rows_travel_in_one_collective_with_the_dp_sizes():
 
     rows, local_tokens, sizes = moe.dp_gather_routed_rows(sent, True, ctx, group)
 
-    assert group.calls == [([torch.bfloat16, torch.float32, torch.float32], [3, 5])]
+    assert group.calls == [([torch.bfloat16, torch.float32, torch.int32], [3, 5])]
     assert local_tokens == 3 and sizes == [3, 5]
     _check(rows, sent, 5)
 

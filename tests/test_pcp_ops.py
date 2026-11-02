@@ -12,11 +12,15 @@ Groups:
   * draft prefill split  --- `_pcp_split_draft_inputs`
   * row ownership        --- `pcp_round_robin_split` vs `pcp_round_robin_query_indices`
   * metadata padding     --- `pcp_pad_dense` vs `pcp_pad_indptr`
-  * ragged reindex       --- `pcp_reindex_ragged`
+  * ragged reindex       --- `pcp_reindex_ragged`, `pcp_local_indptr`
+  * grouped gather       --- `pcp_allgather_rerange_many`
+  * DSpark context KV    --- `DSparkProposer._write_split_context_kv`
 """
 
+import types
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from import_guard import skip_if_dependency_missing
 
@@ -147,6 +151,18 @@ def test_ownership_partitions_every_row_exactly_once(monkeypatch):
     assert sorted(seen) == list(range(n_global))
 
 
+@pytest.mark.parametrize("rows_per_rank", [1, 2])
+def test_split_shards_have_unit_strides(rows_per_rank):
+    """A one-row shard counts as contiguous at any stride, but aiter's
+    cached-positions RoPE checks `positions.view(1, n).stride(1) == 1` itself
+    and aborts: a 2-token chunk under PCP8 leaves every rank one row."""
+    n = rows_per_rank * WS
+    pos = pu.pcp_round_robin_split(torch.arange(n), WS, 1)
+    hid = pu.pcp_round_robin_split(torch.zeros(n, HID), WS, 1)
+    assert pos.stride() == (1,) and pos.view(1, -1).stride(1) == 1
+    assert hid.stride() == (HID, 1)
+
+
 def test_pad_len_rounds_up_to_a_pcp_multiple():
     assert pu.pcp_pad_len(10, 4) == 12
     assert pu.pcp_pad_len(12, 4) == 12  # already aligned, no growth
@@ -204,12 +220,17 @@ def _ragged(lens):
     return indptr, indices
 
 
+def _reindex(kv_indptr, kv_indices, owned):
+    local = pu.pcp_local_indptr(kv_indptr.numpy(), owned.numpy())
+    return pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned, local)
+
+
 @pytest.mark.parametrize("lens", [[2, 3, 1, 4, 0, 2], [1, 1, 1, 1], [0, 0, 5, 0]])
 @pytest.mark.parametrize("rank,ws", [(0, 2), (1, 2), (2, 3)])
 def test_reindex_ragged_preserves_each_owned_segment(lens, rank, ws):
     kv_indptr, kv_indices = _ragged(lens)
     owned = pu.pcp_round_robin_query_indices(len(lens), ws, rank)
-    ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned)
+    ip_local, idx_local = _reindex(kv_indptr, kv_indices, owned)
 
     assert ip_local.shape[0] == owned.shape[0] + 1
     assert int(ip_local[0]) == 0
@@ -223,9 +244,99 @@ def test_reindex_ragged_handles_an_all_empty_shard():
     # every owned query has a zero-length segment -> the `total == 0` fast path
     kv_indptr, kv_indices = _ragged([0, 3, 0, 4])
     owned = torch.tensor([0, 2], dtype=torch.long)  # both empty
-    ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned)
+    ip_local, idx_local = _reindex(kv_indptr, kv_indices, owned)
     assert ip_local.tolist() == [0, 0, 0]
     assert idx_local.numel() == 0
+
+
+def test_reindex_ragged_reads_nothing_back_from_the_device(monkeypatch):
+    """The output is sized from the host indptr. A readback here would block
+    the host until the GPU drains, for every ragged field of every prefill."""
+    kv_indptr, kv_indices = _ragged([2, 3, 1, 4, 0, 2])
+    owned = torch.tensor([1, 3, 5], dtype=torch.long)
+    local = pu.pcp_local_indptr(kv_indptr.numpy(), owned.numpy())
+
+    def readback(*args, **kwargs):
+        raise AssertionError("read a device value back")
+
+    for name in ("item", "tolist", "__int__"):
+        monkeypatch.setattr(torch.Tensor, name, readback)
+    ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned, local)
+    monkeypatch.undo()
+    assert ip_local.tolist() == [0, 3, 7, 9]
+    assert idx_local.tolist() == [102, 103, 104, 106, 107, 108, 109, 110, 111]
+
+
+@pytest.mark.parametrize("ws", [2, 3, 8])
+def test_local_indptr_sums_exactly_the_owned_segments(ws):
+    """Strided (a rank's share, padding queries past the end keep nothing) and
+    contiguous (a TBO request group) ownership alike."""
+    rng = np.random.default_rng(ws)
+    for _ in range(25):
+        lens = rng.integers(0, 6, size=int(rng.integers(1, 30)))
+        indptr = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+        padded = pu.pcp_pad_len(len(lens), ws)
+        lo, hi = sorted(int(v) for v in rng.integers(0, len(lens) + 1, size=2))
+        ownerships = [np.arange(r, padded, ws) for r in range(ws)]
+        for owned in ownerships + [np.arange(lo, hi)]:
+            want = np.cumsum([0] + [lens[q] if q < len(lens) else 0 for q in owned])
+            assert pu.pcp_local_indptr(indptr, owned).tolist() == want.tolist()
+
+
+def _bytes(t):
+    return t.contiguous().view(torch.uint8)
+
+
+class _FakePcpGroup:
+    """One process standing in for every PCP rank: a gather returns, per
+    tensor, the rank-major concatenation of what each rank would pass in
+    (`shards[rank][i]`), and is recorded. Like aiter's PyNCCL fallback, it
+    takes only the dtypes NCCL has."""
+
+    def __init__(self, shards, rank):
+        self.shards, self.rank, self.calls = shards, rank, []
+        self.device_communicator = self
+
+    def all_gatherv(self, inputs, dim=0, sizes=None):
+        from aiter.dist.device_communicators.pynccl_wrapper import ncclDataTypeEnum
+
+        assert dim == 0 and sizes is None
+        self.calls.append(len(inputs))
+        for i, t in enumerate(inputs):
+            ncclDataTypeEnum.from_torch(t.dtype)
+            assert torch.equal(_bytes(t), _bytes(self.shards[self.rank][i]))
+        return [
+            torch.cat([s[i].view(t.dtype) for s in self.shards])
+            for i, t in enumerate(inputs)
+        ]
+
+    def all_gather(self, x, dim=0):
+        (out,) = self.all_gatherv([x], dim)
+        return out
+
+
+@pytest.mark.parametrize("ws", [2, 4, 6, 8])
+def test_grouped_gather_restores_every_tensor_in_one_collective(monkeypatch, ws):
+    """The extend K (fp8 bytes + bf16 RoPE tail) and its positions travel in
+    one collective, and each comes back in global token order."""
+    n = 5 * ws
+    fulls = [
+        torch.randint(0, 255, (n, 1, 8), dtype=torch.uint8).view(torch.float8_e4m3fn),
+        torch.randn(n, 1, 4).to(torch.bfloat16),
+        torch.arange(n, dtype=torch.int64) + 100,
+    ]
+    shards = [[pu.pcp_round_robin_split(t, ws, r) for t in fulls] for r in range(ws)]
+    for rank in range(ws):
+        group = _FakePcpGroup(shards, rank)
+        monkeypatch.setattr(pu, "get_pcp_group", lambda g=group: g)
+        got = pu.pcp_allgather_rerange_many(shards[rank], ws)
+        assert group.calls == [len(fulls)]
+        for g, f in zip(got, fulls):
+            assert g.dtype == f.dtype and torch.equal(_bytes(g), _bytes(f))
+        # The single-tensor gather restores the same order.
+        group = _FakePcpGroup([[s[2]] for s in shards], rank)
+        monkeypatch.setattr(pu, "get_pcp_group", lambda g=group: g)
+        assert torch.equal(pu.pcp_allgather_rerange(shards[rank][2], ws), fulls[2])
 
 
 def test_needs_id_sync_is_one_predicate_for_both_groups():
@@ -290,3 +401,88 @@ def test_draft_split_follows_the_target_not_the_current_pass(monkeypatch):
     assert ep._pcp_active_for_draft_model(None) is True
     ctx.context.target_pcp_split, ctx.context.pcp_split = False, True
     assert ep._pcp_active_for_draft_model(None) is False
+
+
+def test_dspark_split_context_kv_projects_each_rank_s_own_rows(monkeypatch):
+    """After a PCP prefill each rank projects its own round-robin aux rows at
+    their own positions and gathers the projected KV: the window gets exactly
+    what projecting every row writes. A draft whose layers cannot project
+    apart from writing keeps gathering the aux states instead."""
+    dp = pytest.importorskip("atom.spec_decode.dspark_proposer")
+    dr = pytest.importorskip("atom.spec_decode.drafter")
+    ws, n = 4, 10  # pads to 12: 3 rows per rank
+    n_local = 3
+    positions = torch.arange(50, 50 + n + 6)  # the forward buffer runs past n
+    aux_full = [torch.randn(n, 3), torch.randn(n, 2)]
+
+    class Layer:
+        def __init__(self, k):
+            self.k, self.written = k, []
+
+        def context_kv_rows(self, x, pos):
+            return x.sum(-1, keepdim=True) * self.k + pos[:, None].float()
+
+        def write_context_kv_rows(self, rows, pos):
+            self.written.append((rows, pos))
+
+    layers = [Layer(1.0), Layer(-2.0)]
+    model = SimpleNamespace(
+        context_kv_by_rows=True,
+        project_context=lambda a: a * 3,
+        context_layers=layers,
+    )
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(target_pcp_split=True, scheduled_bs=2)
+    )
+    for mod in (dr, dp):
+        monkeypatch.setattr(mod, "get_pcp_world_size", lambda: ws)
+        monkeypatch.setattr(mod, "get_forward_context", lambda: ctx)
+
+    def run(rank, gather):
+        monkeypatch.setattr(pu, "get_pcp_rank", lambda: rank)
+        monkeypatch.setattr(dp, "pcp_allgather_rerange_many", gather)
+        # A hook buffer holds the rank's stripe, then rows of earlier steps.
+        bufs = [
+            torch.cat([pu.pcp_round_robin_split(pu.pcp_pad_dense(a, 2), ws), a])
+            for a in aux_full
+        ]
+        drafter = SimpleNamespace(model=model, _captures_aux=True, _aux_buffers=bufs)
+        drafter._write_split_context_kv = types.MethodType(
+            dp.DSparkProposer._write_split_context_kv, drafter
+        )
+        drafter.aux_for = lambda hidden: pytest.fail("gathered the aux states")
+        dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)
+
+    sent = []
+    for rank in range(ws):
+        run(rank, lambda ts, w: sent.append(ts) or [t.repeat(w, 1) for t in ts])
+    # Row t of the gather is rank t % ws's local row t // ws.
+    gathered = [
+        torch.stack([sent[r][i] for r in range(ws)], dim=1).reshape(ws * n_local, -1)
+        for i in range(len(layers))
+    ]
+    ctx_full = model.project_context(torch.cat(aux_full, dim=-1))
+    for layer, rows in zip(layers, gathered):
+        assert torch.allclose(rows[:n], layer.context_kv_rows(ctx_full, positions[:n]))
+
+    for layer in layers:
+        layer.written.clear()
+    run(0, lambda ts, w: gathered)
+    for layer, rows in zip(layers, gathered):
+        ((written, pos),) = layer.written
+        assert torch.equal(written, rows[:n]) and torch.equal(pos[:n], positions[:n])
+
+    # Either half of the gate alone keeps the aux path: a draft that cannot
+    # project by rows, or a target forward that did not split.
+    aux_reads = []
+    for by_rows, split in ((False, True), (True, False)):
+        ctx.context.target_pcp_split = split
+        drafter = SimpleNamespace(
+            model=SimpleNamespace(
+                context_kv_by_rows=by_rows, write_context_kv=lambda x, p: None
+            ),
+            _captures_aux=True,
+            aux_for=lambda hidden: aux_reads.append(hidden) or aux_full,
+        )
+        dp.DSparkProposer.compute_draft_kv(drafter, positions, torch.zeros(n, 7), None)
+    assert len(aux_reads) == 2

@@ -29,6 +29,7 @@ from atom.config import (
     get_current_atom_config,
 )
 from atom.distributed.pcp_utils import (
+    gather_rows,
     pcp_all_reduce,
     pcp_reduce_scatter,
 )
@@ -67,7 +68,6 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import (
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.routed_rows import (
     RoutedRowsWire,
-    gather_rows,
     pack_routed_rows,
     resolve_routed_rows_wire,
 )
@@ -109,12 +109,7 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import get_forward_context, pass_scheduled_tokens_gpu
-from atom.utils.tbo.ubatching import (
-    tbo_active,
-    tbo_enabled,
-    tbo_switch_to_compute_sync,
-    tbo_yield_and_switch_from_compute_to_comm,
-)
+from atom.utils.tbo.ubatching import tbo_enabled, tbo_on_comm
 
 logger = logging.getLogger("atom")
 
@@ -5376,19 +5371,17 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
                 x_scale,
             )
-            tbo = tbo_active()
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             # One grouped collective, rank-major: every PCP shard is one height.
             pcp_group = get_pcp_group()
             heights = [hidden_states.shape[0]] * pcp_group.world_size
-            hidden_states, topk_weights, topk_ids, *scale = gather_rows(
-                lambda ts: all_gatherv(ts, heights, pcp_group), rows
-            )
+
+            def gather():
+                out = gather_rows(lambda ts: all_gatherv(ts, heights, pcp_group), rows)
+                reassign_gathered_shared_ids(self, out[2])
+                return out
+
+            hidden_states, topk_weights, topk_ids, *scale = tbo_on_comm(gather)
             x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
-            if tbo:
-                tbo_switch_to_compute_sync()
         gathered = gathered or split
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
@@ -5411,11 +5404,7 @@ class FusedMoE(torch.nn.Module):
             ),
         )
         if split:
-            if tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-            output = pcp_reduce_scatter(output)
-            if tbo:
-                tbo_switch_to_compute_sync()
+            output = tbo_on_comm(pcp_reduce_scatter, output)
         elif pcp:
             output = pcp_all_reduce(output)
         return output
@@ -5455,26 +5444,23 @@ class FusedMoE(torch.nn.Module):
                 topk_ids,
             )
 
-            _tbo = tbo_active()
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
-
-            rows, local_tokens, sizes = dp_gather_routed_rows(
-                rows, dp_eager_mode, ctx, dp_group
-            )
-
             # Stand in for the DP ranks a simulated run did not launch. Same row
             # order for every tensor, so a copied token keeps its own routing.
             dp_repeat = self.moe_parallel_config.dp_logical_ratio
-            gathered_rows = rows[0].shape[0]
-            if dp_repeat > 1:
-                rows = tuple(repeat_rows(t, dp_repeat) for t in rows)
-            hidden_states, topk_weights, topk_ids, *scale = rows
-            x_scale = scale[0] if scale else None
-            reassign_gathered_shared_ids(self, topk_ids)
 
-            if _tbo:
-                tbo_switch_to_compute_sync()
+            def gather():
+                out, local_tokens, sizes = dp_gather_routed_rows(
+                    rows, dp_eager_mode, ctx, dp_group
+                )
+                gathered_rows = out[0].shape[0]
+                if dp_repeat > 1:
+                    out = tuple(repeat_rows(t, dp_repeat) for t in out)
+                reassign_gathered_shared_ids(self, out[2])
+                return out, local_tokens, sizes, gathered_rows
+
+            out, local_tokens, sizes, gathered_rows = tbo_on_comm(gather)
+            hidden_states, topk_weights, topk_ids, *scale = out
+            x_scale = scale[0] if scale else None
 
         final_hidden_states = self._run_experts(
             hidden_states, topk_weights, topk_ids, x_scale, use_dp_gather_scatter
@@ -5485,18 +5471,14 @@ class FusedMoE(torch.nn.Module):
             # `sizes` and the scatter below are sized for the real ranks.
             if dp_repeat > 1:
                 final_hidden_states = final_hidden_states[:gathered_rows]
-            if _tbo:
-                tbo_yield_and_switch_from_compute_to_comm()
             if dp_eager_mode:
-                final_hidden_states = reduce_scatterv(
-                    final_hidden_states, sizes, dp_group
+                final_hidden_states = tbo_on_comm(
+                    reduce_scatterv, final_hidden_states, sizes, dp_group
                 )
             else:
-                final_hidden_states = reduce_scatter_with_unpadding(
-                    final_hidden_states, local_tokens
+                final_hidden_states = tbo_on_comm(
+                    reduce_scatter_with_unpadding, final_hidden_states, local_tokens
                 )
-            if _tbo:
-                tbo_switch_to_compute_sync()
 
         if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
             # Default set to False. (May have to add shared expert outputs.)

@@ -22,11 +22,15 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
     from atom.model_ops.attentions.deepseek_v4_attn import (
         DeepseekV4AttentionMetadataBuilder,
     )
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
     runner = ModelRunner.__new__(ModelRunner)
     runner.device = torch.device("cuda", 0)
     runner.config = SimpleNamespace(
-        pipeline_parallel_size=pp_size, enable_tbo=True, enable_tbo_decode=True
+        pipeline_parallel_size=pp_size,
+        enable_tbo=True,
+        enable_tbo_decode=True,
+        max_num_seqs=4,
     )
     monkeypatch.setattr(atom.config, "_current_atom_config", runner.config)
     runner.enforce_eager = True
@@ -41,6 +45,7 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
         ("cu_seqlens_q", 5, torch.int32, "early"),
         ("cu_seqlens_k", 5, torch.int32, "cu_k"),
         ("batch_id_per_q_token", 32, torch.int32, None),
+        ("batch_info", 3, torch.int32, "input_ids"),
     ):
         runner.forward_vars[name] = CpuGpuBuffer(
             capacity, dtype=dtype, device=runner.device, publication_group=group
@@ -61,6 +66,12 @@ def make_runner(monkeypatch, *, pp_size=1, base=None):
     builder.block_table_cols = 4
     builder.max_spec_steps = 2
     builder._unique_compress_ratios_overlap = [(4, True)]
+    builder.csa_layers = [0]
+    builder.max_model_len_idx = 16  # max_model_len // 4
+    builder._local_heads = 16
+    builder.index_logits_workspace = LogitsWorkspace.for_rows(
+        builder.max_decode_tokens, builder.max_model_len_idx, builder.device
+    )
     builder._indexer_fp4 = False
     builder.indexer_layout = "fp8"
     builder._indexer_qsplit_world = 1
@@ -126,16 +137,11 @@ def make_metadata(builder, lengths=(3, 5, 3), starts=(8, 16, 0), *, stage_map=Tr
 
 
 def set_pcp(monkeypatch, size, rank):
-    from atom.distributed.pcp_utils import pcp_round_robin_query_indices
     from atom.model_ops.attentions import deepseek_v4_attn as module
 
     monkeypatch.setattr(module, "pcp_is_enabled", lambda: True)
     monkeypatch.setattr(module, "get_pcp_world_size", lambda: size)
-    monkeypatch.setattr(
-        module,
-        "pcp_round_robin_query_indices",
-        lambda total, width: pcp_round_robin_query_indices(total, width, rank),
-    )
+    monkeypatch.setattr(module, "get_pcp_rank", lambda: rank)
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
@@ -152,6 +158,10 @@ def test_pcp_ragged_queries_publish_indexer_once(monkeypatch, pp_size, rank):
         )
         md.kv_indptr_extend = torch.arange(12, dtype=torch.int32, device="cuda")
         md.kv_indices_extend = torch.arange(11, dtype=torch.int32, device="cuda")
+        # The builder publishes the host copy beside each prefill indptr.
+        md.paged_prefill_indptr_cpu = {
+            "kv_indptr_extend": np.arange(12, dtype=np.int32)
+        }
         buf = runner.forward_vars["v4_indexer_cu_committed"]
         buf.gpu.fill_(77)
         torch.cuda._sleep(5_000_000)
@@ -205,7 +215,7 @@ def test_prepare_prefill_defers_indexer_only_for_real_pcp(monkeypatch, balanced,
         state_slots_committed=[],
         state_fork_srcs=None,
     )
-    actual, _ = builder.prepare_prefill(batch, 3, batch.total_tokens_num)
+    actual, _ = builder.prepare_prefill(batch, 3, batch.total_tokens_num_prefill)
     binding = runner.forward_vars["v4_indexer_cu_committed"]._publication
     assert (binding._epoch == runner.h2d_owner.epoch) == (dummy or not balanced)
     assert len(actual.batch_id_per_q_token) == (11 if dummy or balanced else 3)
@@ -353,7 +363,6 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
     from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
         UnifiedPoolGeometry,
     )
-    from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
     runner, builder = make_runner(monkeypatch, pp_size=pp_size)
     builder.pool_geometry = UnifiedPoolGeometry([0, 4, 128], 8, 4, 6, 256)
@@ -362,7 +371,6 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
     runner.enforce_eager = not padded
     if padded:
         monkeypatch.setattr(module, "get_forward_context", lambda: None)
-        monkeypatch.setattr(UBatchWrapper, "_decode_ub_running_bs", lambda *args: 2)
     names = [
         f"ub{i}_{name}"
         for i in range(2)
@@ -409,6 +417,8 @@ def test_decode_ubatch_inputs_padding_and_graph_consumers(
         kwargs = {
             "scheduled_bs": len(lens),
             "running_bs": 4 if padded else len(lens),
+            # A graph bucket splits the padded batch; eager, the scheduled one.
+            "split_bs": 4 if padded else None,
             "max_seqlen_q": 3,
             "context_lens_np": starts + lengths,
             "state_slot_np": slots,
