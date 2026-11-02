@@ -1,7 +1,7 @@
 """Fixed device scratch for the lossless sampling kernels.
 
 The sampled draft (`dspark_markov_sample`) and the ratio verify
-(`rejection_sampler`) each need a handful of small fp32/int32 tensors per call,
+(`ratio_verify`) each need a handful of small fp32/int32 tensors per call,
 sized by the batch. Allocated once at the largest batch and carved into
 per-call views, they exist before the KV cache is sized -- so the profiling run
 sees them like any other buffer -- and no step allocates.

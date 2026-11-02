@@ -3411,13 +3411,11 @@ class ModelRunner:
             # before this step's (`propose_draft_token_ids` below) -- and the
             # forward that may run on another stream (the disaggregated decode
             # runner's) touches neither. Keep the two on one stream.
-            draft_probs = draft_probs_row_base = ratio_scratch = None
+            draft_q = q_row_base = ratio_scratch = None
             if drafter is not None and not all_greedy:
-                draft_probs, draft_probs_row_base, ratio_scratch = (
-                    drafter.lossless_verify_inputs(bs)
-                )
+                draft_q, q_row_base, ratio_scratch = drafter.lossless_verify_inputs(bs)
             target_token_ids = None
-            if RejectionSampler.needs_target_draw(all_greedy, draft_probs):
+            if RejectionSampler.needs_target_draw(all_greedy, draft_q):
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3440,8 +3438,8 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
-                draft_probs=draft_probs,
-                draft_probs_row_base=draft_probs_row_base,
+                draft_q=draft_q,
+                q_row_base=q_row_base,
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,

@@ -429,14 +429,14 @@ class Drafter(abc.ABC):
         return
 
     def lossless_verify_inputs(self, bs: int):
-        """``(draft_probs, q_row_base, ratio_scratch)`` for the ratio accept
-        rule (``draft_probs`` a `sparse_q_store.RatioDraftQ`), or all None
+        """``(draft_q, q_row_base, ratio_scratch)`` for the ratio accept
+        rule (``draft_q`` a `sparse_q_store.RatioDraftQ`), or all None
         for exact match."""
         return None, None, None
 
     def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
         """Compile the ratio verify before serving; see
-        `rejection_sampler.warmup_ratio_verify`."""
+        `ratio_verify.warmup_ratio_verify`."""
         return
 
     @property

@@ -1,7 +1,7 @@
 """The sparse draft q a probability-ratio verify reads.
 
 A drafter that samples its tokens keeps, for each draft row, the top of the
-distribution q it drew from, and the verify (`rejection_sampler`) tests the
+distribution q it drew from, and the verify (`ratio_verify`) tests the
 row's token against that q. The store (`SparseQStore`), per draft row
 R = q_row_base[b] + position:
   ids   [R, :n]  distinct vocab ids;

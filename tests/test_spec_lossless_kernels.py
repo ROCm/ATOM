@@ -4,7 +4,7 @@
 * `dspark_markov_sample`: each row stores the top of ``softmax((base + bias) /
   T)`` -- ids, renormalized probabilities, and the slot of the id it drew --
   at its own row block, nowhere else, and draws ``x`` from exactly that q.
-* The probability-ratio verify (`rejection_sample` with ``draft_probs``): the
+* The probability-ratio verify (`rejection_sample` with ``draft_q``): the
   emitted tokens follow the target's p whatever q the drafts came from, read
   from the sparse store exactly as a dense q would be read; greedy rows are
   exact match; a request without q falls back to p. A request with top-k /
@@ -34,12 +34,10 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample,
     dspark_markov_sample_scratch,
 )
-from atom.model_ops.rejection_sampler import (
+from atom.model_ops.ratio_verify import (
     _RATIO_ACCEPT_KEY,
     _RATIO_BLOCK_V,
     _RATIO_RESIDUAL_KEY,
-    _draft_token,
-    _finish_request,
     _ratio_accept_kernel,
     _ratio_densify_clear_kernel,
     _ratio_densify_scatter_kernel,
@@ -49,8 +47,12 @@ from atom.model_ops.rejection_sampler import (
     _ratio_stats_kernel,
     _ratio_target_p,
     ratio_verify_scratch,
-    rejection_sample,
     warmup_ratio_verify,
+)
+from atom.model_ops.rejection_sampler import (
+    _draft_token,
+    _finish_request,
+    rejection_sample,
 )
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.model_ops.sampling_filter import (
@@ -645,7 +647,7 @@ def verify_batch(drafts, width, logits, temperatures, row_base=None):
         ),
         "temperatures": temperatures,
         # Flat ragged q unless told otherwise: request b's rows start at b * width.
-        "draft_probs_row_base": (
+        "q_row_base": (
             torch.arange(batch, device=DEV, dtype=torch.int32) * width
             if row_base is None
             else row_base
@@ -759,7 +761,7 @@ def test_the_emitted_token_follows_p_across_vocab_tiles():
     drafts = draw(q, n)
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, 1, p.log().expand(n, -1), torch.ones(n, device=DEV)),
-        draft_probs=draft_q(q, drafts),
+        draft_q=draft_q(q, drafts),
         ratio_step=5,
     )
     freq = torch.bincount(out[:, 0].long(), minlength=VOCAB).float() / n
@@ -777,7 +779,7 @@ def test_a_residual_draw_never_lands_on_an_id_without_residual_mass():
     drafts = draw(q, n)
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, 1, p.log().expand(n, -1), torch.ones(n, device=DEV)),
-        draft_probs=draft_q(q, drafts),
+        draft_q=draft_q(q, drafts),
         ratio_step=6,
     )
     replaced = out[accepted == 0, 0].long()
@@ -795,7 +797,7 @@ def test_a_residual_without_mass_falls_back_to_p():
     drafts = torch.full((n,), 7, dtype=torch.int32, device=DEV)
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, 1, p.log().expand(n, -1), torch.ones(n, device=DEV)),
-        draft_probs=draft_q(p, drafts),
+        draft_q=draft_q(p, drafts),
         ratio_step=8,
     )
     assert (accepted == 0).all()
@@ -820,7 +822,7 @@ def test_a_row_without_a_finite_z_emits_its_argmax_not_id_0():
     drafts = draw(q, 2 * n)
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, 1, logits.repeat(n, 1), torch.ones(2 * n, device=DEV)),
-        draft_probs=draft_q(q, drafts),
+        draft_q=draft_q(q, drafts),
         ratio_step=9,
     )
     assert (accepted == 0).all()
@@ -840,7 +842,7 @@ def test_a_request_without_q_rejects_and_draws_from_p():
             torch.ones(n, device=DEV),
             row_base=torch.full((n,), -1, dtype=torch.int32, device=DEV),
         ),
-        draft_probs=draft_q(q, dense_rows=n),
+        draft_q=draft_q(q, dense_rows=n),
         ratio_step=7,
     )
     assert (accepted == 0).all()
@@ -860,16 +862,16 @@ def test_q_is_read_through_the_row_base_not_the_batch_position():
     temps = torch.full((batch_n,), 0.9, device=DEV)
     args = verify_batch(drafts, width, logits, temps)
     flat = draft_q(q_rows, drafts)
-    flat_out, flat_verdict = rejection_sample(**args, draft_probs=flat, ratio_step=9)
+    flat_out, flat_verdict = rejection_sample(**args, draft_q=flat, ratio_step=9)
     slots = torch.randperm(2 * batch_n, device=DEV)[:batch_n]
     store = empty_store(2 * batch_n * width, flat.store.ids.shape[1])
     base = (slots * width).to(torch.int32)
     for k in range(width):
         for dst, src in zip(store, flat.store):
             dst[base.long() + k] = src.view(batch_n, width, -1)[:, k]
-    args["draft_probs_row_base"] = base
+    args["q_row_base"] = base
     out, verdict = rejection_sample(
-        **args, draft_probs=RatioDraftQ(store, flat.dense), ratio_step=9
+        **args, draft_q=RatioDraftQ(store, flat.dense), ratio_step=9
     )
     assert torch.equal(out, flat_out) and torch.equal(verdict, flat_verdict)
 
@@ -889,7 +891,7 @@ def test_the_key_purpose_word_separates_streams_at_any_offset_width(wide):
     """Draft noise, accept coins and residual race differ only in the key's
     high word (0, 1, 2); that word must reach Philox whether the offset is
     32-bit (the coins) or 64-bit (the draft noise and the residual race)."""
-    from atom.model_ops.rejection_sampler import (
+    from atom.model_ops.ratio_verify import (
         _RATIO_ACCEPT_KEY,
         _RATIO_RESIDUAL_KEY,
     )
@@ -1011,14 +1013,14 @@ def test_the_preallocated_scratch_verifies_exactly_what_allocation_does(dtype, f
     }[filters]
     args = verify_batch(drafts, width, logits, temps)
     q = draft_q(q_rows, drafts)
-    plain = rejection_sample(**args, draft_probs=q, ratio_step=11, top_ks=ks, top_ps=ps)
+    plain = rejection_sample(**args, draft_q=q, ratio_step=11, top_ks=ks, top_ps=ps)
     scratch = ratio_verify_scratch(64, width, vocab, DEV)  # sized above the batch
     for garbage in (float("nan"), -1.0):
         scratch.f32.fill_(garbage)
         scratch.i32.random_(-(2**31), 2**31 - 1)
         reused = rejection_sample(
             **args,
-            draft_probs=q,
+            draft_q=q,
             ratio_step=11,
             top_ks=ks,
             top_ps=ps,
@@ -1092,7 +1094,7 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
             )
             rejection_sample(
                 **args,
-                draft_probs=RatioDraftQ(store, stale(max_bs, vocab)),
+                draft_q=RatioDraftQ(store, stale(max_bs, vocab)),
                 ratio_step=3,
                 top_ks=top_ks_form,
                 top_ps=top_ps_form,
@@ -1120,9 +1122,9 @@ def test_the_same_key_gives_the_same_verdict():
     drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
     args = verify_batch(drafts, width, logits, torch.ones(batch_n, device=DEV))
     q = draft_q(q_rows, drafts)
-    a = rejection_sample(**args, draft_probs=q, ratio_step=40)
-    b = rejection_sample(**args, draft_probs=q, ratio_step=40)
-    c = rejection_sample(**args, draft_probs=q, ratio_step=41)
+    a = rejection_sample(**args, draft_q=q, ratio_step=40)
+    b = rejection_sample(**args, draft_q=q, ratio_step=40)
+    c = rejection_sample(**args, draft_q=q, ratio_step=41)
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
     assert not torch.equal(a[0], c[0])
 
@@ -1154,7 +1156,7 @@ def test_a_greedy_row_is_exact_match_whatever_its_batch_mates(draft_first):
             greedy_logits,
             torch.full((1,), SAMPLER_EPS, device=DEV),
         ),
-        draft_probs=None,
+        draft_q=None,
     )
     expected_accept = {"tie-low": 3, "tie-high": 0, "other": 0}[draft_first]
     assert ref_verdict[0, 0].item() == expected_accept
@@ -1184,7 +1186,7 @@ def test_a_greedy_row_is_exact_match_whatever_its_batch_mates(draft_first):
             q = torch.softmax(logits.float(), -1)
             out, verdict = rejection_sample(
                 **verify_batch(drafts, width, logits, temps),
-                draft_probs=draft_q(q, drafts),
+                draft_q=draft_q(q, drafts),
                 ratio_step=100 + step,
             )
             assert torch.equal(out[slot, :width], ref_out[0, :width]), (slot, step)
@@ -1207,7 +1209,7 @@ def test_the_target_law_holds_at_the_real_vocab():
             torch.ones(n, device=DEV),
             row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         ),
-        draft_probs=draft_q(q, dense_rows=n),
+        draft_q=draft_q(q, dense_rows=n),
         ratio_step=3,
     )
     p_bf16 = torch.softmax(p.log().to(torch.bfloat16).float(), -1)
@@ -1314,7 +1316,7 @@ def dense_verify(args, q_dense, ratio_step):
     cu = args["cu_num_draft_tokens"]
     steps = args["num_spec_steps"]
     temps = args["temperatures"].float().contiguous()
-    base = args["draft_probs_row_base"]
+    base = args["q_row_base"]
     num_tokens, vocab = logits.shape
     batch_n = cu.numel()
     tiles = triton.cdiv(vocab, _RATIO_BLOCK_V)
@@ -1456,13 +1458,13 @@ def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q():
     logits = (q_logits + torch.randn(rows, vocab, device=DEV)).to(torch.bfloat16)
     temps = torch.tensor([1.0, 0.6, SAMPLER_EPS, 1.3], device=DEV).repeat(batch_n // 4)
     args = verify_batch(drafts, width, logits, temps)
-    args["draft_probs_row_base"][7::11] = -1
+    args["q_row_base"][7::11] = -1
     q = draft_q(q_rows, drafts, dense_rows=batch_n)
     n, xslot = q.store.meta.unbind(1)
     # Slots that name another stored id: the walk must find x's true q.
     xslot[1::9] = (xslot[1::9] + 1) % n[1::9]
     for step in (0, 1, 2):
-        out, verdict = rejection_sample(**args, draft_probs=q, ratio_step=step)
+        out, verdict = rejection_sample(**args, draft_q=q, ratio_step=step)
         ref_out, ref_verdict = dense_verify(args, q_rows, step)
         assert torch.equal(out, ref_out), step
         assert torch.equal(verdict, ref_verdict), step
@@ -1500,7 +1502,7 @@ def test_a_slot_that_does_not_hold_the_draft_still_reads_its_true_q(others):
             row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         )
         out, (accepted, _, _) = rejection_sample(
-            **args, draft_probs=RatioDraftQ(store, stale(n, vocab)), ratio_step=13
+            **args, draft_q=RatioDraftQ(store, stale(n, vocab)), ratio_step=13
         )
         assert abs(accepted.float().mean().item() - rate) < 0.015, draft
         # relu(p - q) is all on `outside`: x's 0.3 is below its q of 0.99.
@@ -1538,7 +1540,7 @@ def test_the_first_token_follows_p_at_any_store_width(width, temperature):
     )
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts.to(torch.int32), 1, target.expand(n, -1), temps),
-        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        draft_q=RatioDraftQ(store, stale(n, vocab)),
         ratio_step=19,
     )
     p = torch.softmax(target / temperature, -1)
@@ -1600,7 +1602,7 @@ def test_a_chained_block_follows_the_autoregressive_target(width):
     logits = torch.stack(scored, 1).view(n * steps, vocab)
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, steps, logits, temps),
-        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        draft_q=RatioDraftQ(store, stale(n, vocab)),
         ratio_step=29,
     )
     cond = torch.softmax(table, -1)
@@ -1808,7 +1810,7 @@ def test_a_counted_top_k_keeps_what_the_descent_keeps(monkeypatch, dtype):
     per request, at the real vocab and at one whose last tile is ragged. A
     top_p that is off (1.0, scalar or per request) changes nothing, the
     +inf row included: it gets its top-k floor whatever its batch passes."""
-    import atom.model_ops.rejection_sampler as rs
+    import atom.model_ops.ratio_verify as rv
     import atom.model_ops.sampling_filter as sf
 
     for vocab in (163840, 3 * _RATIO_BLOCK_V + 123):
@@ -1837,7 +1839,7 @@ def test_a_counted_top_k_keeps_what_the_descent_keeps(monkeypatch, dtype):
         for ks in (top_ks, 1, 20, 50, 256):
             counted = filtered_p(logits, temps, ks)
             with monkeypatch.context() as m:
-                for module in (rs, sf):
+                for module in (rv, sf):
                     m.setattr(module, "_FILTER_COUNT_MAX_K", 0)
                 descended = filtered_p(logits, temps, ks)
             assert torch.equal(counted[0], descended[0]), (vocab, ks)
@@ -1953,7 +1955,7 @@ def first_token_law(target, temps, top_ks, top_ps, width=1024, step=41):
     )
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts.to(torch.int32), 1, target.expand(n, -1), temps),
-        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        draft_q=RatioDraftQ(store, stale(n, vocab)),
         ratio_step=step,
         top_ks=top_ks,
         top_ps=top_ps,
@@ -2039,7 +2041,7 @@ def test_each_position_of_a_filtered_block_is_served_its_own_p_f():
     store = SparseQStore(q_ids, q_probs.contiguous(), meta.to(torch.int32))
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, width, target.repeat(n, 1), temps),
-        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        draft_q=RatioDraftQ(store, stale(n, vocab)),
         ratio_step=53,
         top_ks=ks,
         top_ps=ps,
@@ -2077,7 +2079,7 @@ def test_a_filtered_out_draft_is_always_rejected():
             temps,
             row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         ),
-        draft_probs=RatioDraftQ(store, stale(n, vocab)),
+        draft_q=RatioDraftQ(store, stale(n, vocab)),
         ratio_step=43,
         top_ks=ks,
     )
@@ -2105,7 +2107,7 @@ def test_a_filtered_residual_without_mass_falls_back_to_p_f():
     drafts = torch.full((n,), outside, dtype=torch.int32, device=DEV)
     out, (accepted, _, _) = rejection_sample(
         **verify_batch(drafts, 1, target.expand(n, -1), temps),
-        draft_probs=draft_q(q, drafts),
+        draft_q=draft_q(q, drafts),
         ratio_step=59,
         top_ks=ks,
     )
@@ -2139,7 +2141,7 @@ def test_masked_and_nan_target_rows_filter_and_emit_inside_the_vocab(dtype):
     drafts = draw(q, 2 * n)
     out, _ = rejection_sample(
         **verify_batch(drafts, 1, target.repeat(n, 1), temps.repeat(n)),
-        draft_probs=draft_q(q, drafts),
+        draft_q=draft_q(q, drafts),
         ratio_step=47,
         top_ks=ks.repeat(n),
         top_ps=ps.repeat(n),
@@ -2165,14 +2167,12 @@ def test_filters_that_keep_everything_leave_the_verify_bit_for_bit():
     temps = torch.tensor([1.0, 0.6, SAMPLER_EPS, 1.3], device=DEV).repeat(batch_n // 4)
     args = verify_batch(drafts, width, logits, temps)
     q = draft_q(q_rows, drafts, dense_rows=batch_n)
-    ref = rejection_sample(**args, draft_probs=q, ratio_step=3)
+    ref = rejection_sample(**args, draft_q=q, ratio_step=3)
     every_k = torch.tensor([-1, vocab, vocab + 5, -1], device=DEV, dtype=torch.int32)
     for ks, ps in (
         (every_k.repeat(batch_n // 4), torch.ones(batch_n, device=DEV)),
         (vocab, None),
         (None, 1.0),
     ):
-        got = rejection_sample(
-            **args, draft_probs=q, ratio_step=3, top_ks=ks, top_ps=ps
-        )
+        got = rejection_sample(**args, draft_q=q, ratio_step=3, top_ks=ks, top_ps=ps)
         assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1]), (ks, ps)

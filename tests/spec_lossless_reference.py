@@ -3,10 +3,11 @@
 
 """Eager oracles for the lossless speculative-sampling kernels, for tests.
 
-Kept out of `atom/model_ops/dspark_markov_sample.py` so the shipped module
-holds only what serving runs. The level grid (bins, levels per nat, the
-19-nat floor) is imported from the kernel module rather than restated, so a
-change there reaches the oracle too.
+Kept out of `atom/model_ops/dspark_markov_sample.py` and
+`atom/model_ops/sparse_q_select.py` so the shipped modules hold only what
+serving runs. The level grid (bins, levels per nat, the 19-nat floor) is
+imported from the kernel module rather than restated, so a change there
+reaches the oracle too.
 
 Not a test file (no ``test_`` prefix): it is imported, not collected. It
 imports the kernel module, so import it only below a test file's AITER / GPU
@@ -15,7 +16,7 @@ guards.
 
 import torch
 
-from atom.model_ops.dspark_markov_sample import (
+from atom.model_ops.sparse_q_select import (
     _Q_BINS,
     _Q_LEVELS_PER_NAT,
     _Q_MAX_GAP,

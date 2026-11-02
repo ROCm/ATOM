@@ -5,7 +5,7 @@ A full-vocab softmax over ``[rows, V]`` is computed in two launches: every
 program per row combines the tiles into the row's max and ``1/Z``. Consumers
 then evaluate ``exp(x - max) * inv_z`` for exactly the entries they need.
 
-The probability-ratio verify (`rejection_sampler`) builds the target's p this
+The probability-ratio verify (`ratio_verify`) builds the target's p this
 way. The sampled DSpark draft (`dspark_markov_sample`) takes only the row max
 (and the raw argmax) from the combine: its q is normalized over the entries it
 stores, not by a full-vocab 1/Z, so it skips the sum (``WITH_INV_Z=False``).

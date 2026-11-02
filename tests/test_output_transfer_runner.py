@@ -163,7 +163,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
         return
     forward = runner.rejection_sampler.forward.call_args.kwargs
     assert forward["top_ks"] is top_ks and forward["top_ps"] is top_ps
-    assert forward["draft_probs"] is q[0]
+    assert forward["draft_q"] is q[0]
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
     assert runner.sampler.sample_verification_tokens.called is not armed
 

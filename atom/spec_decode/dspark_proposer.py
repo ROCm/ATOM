@@ -14,7 +14,7 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample_scratch,
     dspark_markov_sample_unsupported,
 )
-from atom.model_ops.rejection_sampler import (
+from atom.model_ops.ratio_verify import (
     ratio_count_scratch_bytes,
     ratio_verify_scratch,
     warmup_ratio_verify,
@@ -370,16 +370,17 @@ class DSparkProposer(Drafter):
         self._staging.consume(self.runner.forward_step)
 
     def lossless_verify_inputs(self, bs: int):
-        """The verify step's ``(draft_probs, q_row_base, ratio_scratch)``.
+        """The verify step's ``(draft_q, q_row_base, ratio_scratch)``.
 
         All None keeps exact-match verification; anything else selects the
-        probability-ratio rule in `rejection_sampler.rejection_sample`.
+        probability-ratio rule in `rejection_sampler.rejection_sample`
+        (`ratio_verify`).
         Asked only for a batch that is not all greedy: an all-greedy batch
         keeps the exact-match kernel, so its accept rule is the flag-off one
         (its draft still runs the sampled block, in greedy mode). A greedy row
         inside a mixed batch is matched exactly by the ratio kernel itself,
         and a row with top-k or top-p is verified against `Sampler`'s
-        filtered p (`rejection_sampler._ratio_target_p`).
+        filtered p (`ratio_verify._ratio_target_p`).
         """
         if self.draft_sampling is None:
             return None, None, None

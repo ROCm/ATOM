@@ -18,11 +18,8 @@ from torch import nn
 
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
-from atom.model_ops.rejection_sampler import (
-    RejectionSampler,
-    _ratio_scratch_shapes,
-    ratio_count_scratch_bytes,
-)
+from atom.model_ops.ratio_verify import _ratio_scratch_shapes, ratio_count_scratch_bytes
+from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import Sampler
 from atom.spec_decode import dspark_proposer
 from atom.spec_decode.drafter import Drafter

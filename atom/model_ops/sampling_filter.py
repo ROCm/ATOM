@@ -1,6 +1,6 @@
 """The ratio verify's top-k / top-p floor, found on the device.
 
-The probability-ratio verify (`rejection_sampler`) serves a filtered request
+The probability-ratio verify (`ratio_verify`) serves a filtered request
 `Sampler`'s filtered p, p_f, at every position -- its bonus token is
 `Sampler`'s own draw. `Sampler` filters with aiter (`top_k_renorm_probs`,
 `top_[k_]top_p_sampling_from_probs`), whose rule is: id t survives iff fewer than top_k ids score strictly above it and

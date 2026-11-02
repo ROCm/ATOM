@@ -58,7 +58,7 @@ def two_token_batch(probabilities, drafts, width):
     verification row scores ``probabilities``, drafting ``drafts``.
 
     The accept rule is the only thing left varying between the two arms below,
-    so both take this same batch and add their own `draft_probs`.
+    so both take this same batch and add their own `draft_q`.
 
     ``target_logits`` is raw LOGITS here -- `rejection_sample` builds
     `p = softmax(logits / T)` itself, because ATOM's unfiltered verify draw
@@ -78,8 +78,7 @@ def two_token_batch(probabilities, drafts, width):
         "bonus_token_ids": torch.zeros(batch, device="cuda", dtype=torch.int32),
         "bonus_logits_indices": bonus_rows([width] * batch),
         # The ratio path's q rows, flat: request b's start at b * width.
-        "draft_probs_row_base": torch.arange(batch, device="cuda", dtype=torch.int32)
-        * width,
+        "q_row_base": torch.arange(batch, device="cuda", dtype=torch.int32) * width,
     }
 
 
@@ -271,7 +270,7 @@ def test_ratio_acceptance_emits_the_target_law_from_a_draft_that_drew_another():
     )
     output, (accepted, _, _) = rejection_sample(
         **two_token_batch(p, drafts, 2),
-        draft_probs=two_token_q(q, drafts, 2),
+        draft_q=two_token_q(q, drafts, 2),
         temperatures=torch.ones(n, device="cuda"),
     )
     marginal = torch.bincount(output[:, 0].long(), minlength=2).float() / n
@@ -303,13 +302,13 @@ def test_ratio_acceptance_accepts_at_least_as_often_as_exact_match(q0):
     batch = two_token_batch(p, drafts, 2)
     _, (ratio_accepted, _, _) = rejection_sample(
         **batch,
-        draft_probs=two_token_q(q, drafts, 2),
+        draft_q=two_token_q(q, drafts, 2),
         temperatures=torch.ones(n, device="cuda"),
     )
     # The same drafts against the target's own draw, which is what the default
     # path verifies by equality.
     _, (exact_accepted, _, _) = rejection_sample(
-        **batch, draft_probs=None, target_token_ids=draw(p, n * 2)
+        **batch, draft_q=None, target_token_ids=draw(p, n * 2)
     )
     ratio_rate = torch.minimum(p, q).sum().item()
     exact_rate = (p * q).sum().item()
