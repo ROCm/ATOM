@@ -1144,10 +1144,14 @@ class CoreManager:
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
             return
 
-        # round_robin normally skips load bookkeeping. Session affinity still
-        # needs queued-prefill counters even if the fallback strategy is RR.
+        # round_robin normally skips load bookkeeping. Session affinity and
+        # prefix-spread routing still need the in-flight counters (prefix-spread
+        # scores ranks by them whatever the strategy), even if the fallback
+        # strategy is RR.
         track_load = (
-            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
+            self._dp_lb_strategy != "round_robin"
+            or self._dp_session_affinity_enabled
+            or getattr(self, "_prefix_spread", False)
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
@@ -1604,8 +1608,12 @@ class CoreManager:
             )
         ):
             rank = owner
-        # Either rank holds the prefix or loads it; only the rest is prefill.
-        seq._dp_est_hit = hit
+        # The prefix is not prefill on the owner, nor on a rank that loads it
+        # from the tier. A moved request whose hit is below the load threshold
+        # is not loaded (the connector skips it), so that rank recomputes it
+        # and is charged the full prompt.
+        loaded = hit >= envs.OFFLOAD_MIN_LOAD_TOKENS
+        seq._dp_est_hit = hit if owner is not None and (rank == owner or loaded) else 0
         if owner is None or hit <= 0:
             decision = "prefix_cold_total"
         elif rank == owner:
@@ -1613,7 +1621,7 @@ class CoreManager:
         else:
             decision = "prefix_moved_total"
             self._dp_route_counters["prefix_moved_tokens"] += hit
-            if hit >= envs.OFFLOAD_MIN_LOAD_TOKENS:
+            if loaded:
                 seq.dp_prefetch_priority = True
         self._prefix_owner_record(chain, rank, seq.id)
         return self._record_dp_route_locked(decision, rank)
