@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 from transformers import PretrainedConfig
 
 import atom.config as config_module
@@ -200,3 +201,75 @@ def test_non_fp4_indexer_predicate_does_not_query_arch(monkeypatch):
 
     assert not v4_kernels.fp4_indexer_enabled("fp8")
     assert probe.calls == 0
+
+
+@pytest.mark.parametrize(
+    "gfx,backend,dtype,expected",
+    [
+        ("gfx950", "flydsl", "fp4", "fp4_gfx950_flydsl"),
+        ("gfx950", "opus", "fp4", "fp4_gfx950_opus"),
+        ("gfx1250", "opus", "fp4", "fp4"),
+        ("gfx950", "flydsl", "fp8", "fp8_per_row"),
+        ("gfx950", "opus", "fp8", "fp8_per_row"),
+        ("gfx942", "flydsl", "fp4", "fp8_per_row"),
+    ],
+)
+def test_indexer_initializes_compressor_writer_layout(
+    monkeypatch, gfx, backend, dtype, expected
+):
+    """Plugins and graph tracing need the writer mode before cache binding."""
+    from atom.model_ops.attentions.pool_layout import v4_pool_fields
+
+    v4_kernels, _ = _load_v4_kernels(monkeypatch, gfx)
+    config = SimpleNamespace(
+        max_model_len=64,
+        index_cache_dtype=dtype,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    path = _V4_KERNELS_INIT.parents[2] / "models/deepseek_v4/__init__.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    indexer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Indexer"
+    )
+    # Run the actual constructor, isolating projections and unrelated GPU
+    # forward methods so this regression also runs in CPU-only CI.
+    indexer.body = [
+        node
+        for node in indexer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    ]
+    namespace = dict(
+        vars(v4_pool_fields),
+        nn=torch.nn,
+        torch=torch,
+        DeepseekV4Args=SimpleNamespace,
+        ReplicatedLinear=lambda *args, **kwargs: torch.nn.Identity(),
+        Compressor=lambda *args, **kwargs: SimpleNamespace(),
+        get_current_atom_config=lambda: config,
+        fp4_indexer_enabled=v4_kernels.fp4_indexer_enabled,
+        get_gfx_runtime=lambda: gfx,
+        envs=SimpleNamespace(ATOM_V4_UNIFIED_MQA=backend),
+        NATURAL="natural",
+        MFMA="mfma",
+        PRESHUFFLE="preshuffle",
+    )
+    exec(  # noqa: S102 -- execute only the checked-in constructor AST
+        compile(ast.Module(body=[indexer], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    args = SimpleNamespace(
+        dim=16,
+        index_n_heads=64,
+        index_head_dim=128,
+        rope_head_dim=64,
+        index_topk=16,
+        q_lora_rank=8,
+        quant_config=None,
+    )
+    module = namespace["Indexer"](args, prefix="layers.0.attn.indexer")
+
+    assert module.quant_mode == expected
+    assert module.compressor.quant_mode == expected
+    assert config.compilation_config.static_forward_context[module.prefix] is module

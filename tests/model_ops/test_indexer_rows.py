@@ -241,12 +241,19 @@ def test_striped_split_deals_every_row_once(world, count):
 
 
 @pytest.mark.parametrize(
-    "fp4, concat",
-    [(False, False), (False, True), (True, False)],
-    ids=["fp8", "fp8_concat", "fp4"],
+    "fp4, concat, mfma",
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, False, True),
+    ],
+    ids=["fp8", "fp8_concat", "fp4", "fp4_mfma"],
 )
 @pytest.mark.parametrize("count, world", [(13, 4), (16, 4), (3, 4), (4097, 8)])
-def test_striped_rows_come_back_rank_major(monkeypatch, fp4, concat, count, world):
+def test_striped_rows_come_back_rank_major(
+    monkeypatch, fp4, concat, mfma, count, world
+):
     """Each rank scores its rows of the step's query, every `world`-th from
     its rank, into its slot; the slots gather rank-major and every rank gets
     them as they are, row i at `(i % world) * stride + i // world`. A row scores
@@ -259,6 +266,13 @@ def test_striped_rows_come_back_rank_major(monkeypatch, fp4, concat, count, worl
     query = (values, values + 0.5) if fp4 else values
     weights = ids.view(count, 1)
     cache = rows_module.IndexCache(torch.zeros(1), torch.zeros(1) if fp4 else None, 64)
+    if mfma:
+        values = ids.view(count, 1, 1, 1).expand(count, 1, 64, 64).contiguous()
+        scale_pattern = torch.arange(256).view(1, 1, 2, 32, 4)
+        scales = ids.view(count, 1, 1, 1, 1) * 256 + scale_pattern
+        query = values, scales
+        weights = weights.expand(count, 64).contiguous()
+        cache = cache._replace(layout=rows_module.MFMA)
 
     def score(query, weights, rows, out):
         values = query[0] if fp4 else query
@@ -268,9 +282,14 @@ def test_striped_rows_come_back_rank_major(monkeypatch, fp4, concat, count, worl
                 t.is_contiguous() and t.stride(0) == t.shape[1:].numel()
                 for t in (*query, weights)
             )
-            assert torch.equal(query[1], values + 0.5)
-        assert torch.equal(weights[:, 0], values[:, 0, 0])
-        mine = values[: rows.split.end, 0, :1].to(torch.int32)
+            if mfma:
+                row_ids = values[:, 0, 0, 0].view(-1, 1, 1, 1, 1)
+                assert torch.equal(query[1], row_ids * 256 + scale_pattern)
+            else:
+                assert torch.equal(query[1], values + 0.5)
+        row_ids = values[:, 0, 0, 0] if mfma else values[:, 0, 0]
+        assert torch.equal(weights[:, 0], row_ids)
+        mine = row_ids[: rows.split.end, None].to(torch.int32)
         out[: rows.split.end] = mine.expand(-1, topk)
 
     monkeypatch.setattr(
