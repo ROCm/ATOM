@@ -3586,14 +3586,9 @@ class Scheduler:
             chunk = bm.state.min_fork_tokens
             on_rung = False
         # With several forwards in flight, hold the next chunk until this
-        # checkpoint is filed. A rung at prompt end needs no hold: the first
-        # decode is already held by `_pp_inflight_token_block`.
-        if (
-            on_rung
-            and self.advance_on_schedule
-            and bm.enable_prefix_caching
-            and start + chunk < seq.num_prompt_tokens
-        ):
+        # checkpoint is filed. PP refuses PAGE checkpoints, so a rung here is
+        # strictly inside the prompt and there always is a next chunk.
+        if on_rung and self.advance_on_schedule and bm.enable_prefix_caching:
             self._pp_checkpoint_hold.add(seq.id)
         return chunk
 
