@@ -96,3 +96,18 @@ def test_the_int4_reduce_scatter_is_logged_once(runtime, caplog):
             quick_rs.try_quick_reduce_scatter(x, runtime.group)
     assert runtime.kernel.call_count == 2
     assert sum("INT4" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("sp", [False, True])
+def test_pcp_merge_alone_keeps_the_exact_reduce_scatter(monkeypatch, sp):
+    from atom.distributed import pcp_utils
+
+    quick = Mock(return_value=sentinel.int4)
+    exact = Mock(return_value=sentinel.exact)
+    monkeypatch.setattr(quick_rs, "try_quick_reduce_scatter", quick)
+    monkeypatch.setattr(pcp_utils, "reduce_scatter_tokens", exact)
+    monkeypatch.setattr(pcp_utils, "get_pcp_group", lambda: sentinel.group)
+    monkeypatch.setattr(pcp_utils, "sp_is_enabled", lambda: sp)
+    out = pcp_utils.pcp_reduce_scatter(torch.zeros(4, 8), pcp_size=4)
+    assert out is (sentinel.int4 if sp else sentinel.exact)
+    assert quick.call_count == int(sp)

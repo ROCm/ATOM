@@ -159,16 +159,20 @@ def pcp_reduce_scatter(
 ) -> torch.Tensor:
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
     stripe via a plain reduce_scatter (dim=0). Inverse of the rank-major gather
-    (FusedMoE._run_experts gathers its routed rows that way)."""
+    (FusedMoE._run_experts gathers its routed rows that way). Only SP may take
+    the INT4 QuickReduce reduce-scatter; PCP merge alone stays exact."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
         return input_
-    from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
-
     group = get_pcp_group()
-    out = try_quick_reduce_scatter(input_.contiguous(), group)
-    return out if out is not None else reduce_scatter_tokens(input_, group)
+    if sp_is_enabled():
+        from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
+
+        out = try_quick_reduce_scatter(input_.contiguous(), group)
+        if out is not None:
+            return out
+    return reduce_scatter_tokens(input_, group)
 
 
 def pcp_all_reduce(input_: torch.Tensor, pcp_size: int | None = None) -> torch.Tensor:
