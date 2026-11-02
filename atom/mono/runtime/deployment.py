@@ -86,14 +86,16 @@ def common_refusals(
     supported_dpa=(),
     *,
     refuse_tr_hybrid: bool = True,
+    supported_gfx: tuple[str, ...] = ("gfx950",),
     refuse_decode_cp: bool = True,
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
     and no expert or data parallelism -- or DP attention over one of
     ``supported_dpa`` ranks with the MoE expert parallel (``dims(1, ranks)``)
-    or TP (``dims(ranks)``) over them; no pipeline or context parallelism, no
-    TBO, not a plugin.
+    or TP (``dims(ranks)``) over them; one of ``supported_gfx``; no pipeline or
+    context parallelism, no TBO, not a plugin. Models that do not pass
+    ``supported_gfx`` retain the historical gfx950-only admission.
 
     ``refuse_tr_hybrid`` gates one more check: no TR_HYBRID graph mode.
     MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner model, so a
@@ -131,8 +133,9 @@ def common_refusals(
         ]
     gfx = _gfx()
     checks = [
-        # the persistent kernels are gfx950 code: wave64, MFMA, permlane32
-        (gfx == "gfx950", f"arch {gfx}"),
+        # Each model opts into architectures only after its complete runner,
+        # weight layouts and collective protocol are deployment-qualified.
+        (gfx in supported_gfx, f"arch {gfx} not in {supported_gfx}"),
         *parallel,
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
         (

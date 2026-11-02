@@ -66,6 +66,7 @@ SITU_LINEAR_BETA = 25.0
 
 # the GEMV task tile the in-projection is padded up to
 GEMV_ROWS = 16
+GFX1250_BLOCKS = 256
 
 
 @dataclass(frozen=True)
@@ -246,7 +247,13 @@ def config_refusal(atom_config) -> str | None:
     # layers' mono indexer is written for the DCP split -- it serves only
     # under DCP = TP and is off otherwise (``dsa_indexer.bind._refusal``).
     checks += (
-        common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
+        common_refusals(
+            atom_config,
+            Dims,
+            SUPPORTED_TP,
+            supported_gfx=("gfx950", "gfx1250"),
+            refuse_decode_cp=False,
+        )
         + resident_grid_refusals(atom_config)
     ) + [
         # the KDA recurrence reads and writes fp32 state in place; a narrower
