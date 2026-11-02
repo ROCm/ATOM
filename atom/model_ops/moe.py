@@ -2322,7 +2322,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "a2_scale": getattr(layer, "w2_input_scale", None),
                 "w1_bias": getattr(layer, "w13_bias", None),
                 "w2_bias": getattr(layer, "w2_bias", None),
-                "swiglu_limit": getattr(layer, "swiglu_limit", 10.0),
+                "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
             }
 
         if self.fused_experts is None:
@@ -2403,7 +2403,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     a2_scale=getattr(layer, "w2_input_scale", None),
                     w1_bias=getattr(layer, "w13_bias", None),
                     w2_bias=getattr(layer, "w2_bias", None),
-                    swiglu_limit=getattr(layer, "swiglu_limit", 10.0),
+                    swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=apply_router_weight_on_input,
                     gate_valid=gate_valid,
                     x_scale=x_scale,
