@@ -6566,6 +6566,40 @@ def test_every_member_the_worker_reads_is_reachable_through_the_shell():
         )
 
 
+@pytest.mark.parametrize("composite", [False, True])
+@pytest.mark.parametrize("has_reclaimer", [False, True])
+def test_worker_shell_forwards_optional_event_reclamation(composite, has_reclaimer):
+    import gc
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import MultiConnector
+    from atom.kv_transfer.offload.connector import LMCacheOffloadConnector as Shell
+    from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
+
+    released = []
+
+    class Event:
+        def __del__(self):
+            released.append(True)
+
+    reclaimer = IPCEventReclaimer()
+    reclaimer.defer(Event())
+    shell = object.__new__(Shell)
+    shell._impl = SimpleNamespace()
+    if has_reclaimer:
+        shell._impl.release_deferred_events = reclaimer.release
+    connector = shell
+    if composite:
+        connector = object.__new__(MultiConnector)
+        connector._connectors = [SimpleNamespace(), shell]
+
+    gc.collect()
+    assert released == []
+    connector.release_deferred_events()
+    assert released == ([True] if has_reclaimer else [])
+    connector.release_deferred_events()
+    assert released == ([True] if has_reclaimer else [])
+
+
 def test_the_shells_no_impl_fallbacks_match_what_the_caller_unpacks():
     """Existence is not enough -- a fallback of the wrong SHAPE is worse.
 

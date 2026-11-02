@@ -39,6 +39,7 @@ from atom.kv_transfer.offload.mp.deployment import (
     _tp_replication_factor,
     _validate_mp_config,
 )
+from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
@@ -94,6 +95,25 @@ class LMCacheMPConnector(KVConnectorBase):
         self._transfer_deadline_s = _transfer_deadline_s(config)
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
+        parallel = getattr(config, "parallel_config", None)
+        self._event_reclaimer = (
+            IPCEventReclaimer(background=True)
+            if torch.version.hip and getattr(parallel, "data_parallel_size", 1) > 1
+            else None
+        )
+
+    def release_deferred_events(self) -> None:
+        """Called after the forward's DP metadata collective, before GPU work."""
+        if self._event_reclaimer is not None:
+            # DP metadata joins DP peers; join TP peers as well when each DP
+            # replica contains multiple workers. Every worker calls this,
+            # including workers with no retired resources and dummy batches.
+            from aiter.dist.parallel_state import get_tp_group
+
+            tp = get_tp_group()
+            if tp.world_size > 1:
+                torch.distributed.barrier(group=tp.cpu_group)
+            self._event_reclaimer.release()
 
     def register_kv_caches(
         self,
@@ -219,7 +239,12 @@ class LMCacheMPConnector(KVConnectorBase):
         ]
         if not requests:
             return
-        event = torch.cuda.Event(interprocess=True)
+        if self._event_reclaimer is not None:
+            event = self._event_reclaimer.acquire_ready_event(
+                lambda: torch.cuda.Event(interprocess=True)
+            )
+        else:
+            event = torch.cuda.Event(interprocess=True)
         event.record(torch.cuda.current_stream())
         for req in requests:
             if req.load_spec is not None and self._do_load:
@@ -311,6 +336,8 @@ class LMCacheMPConnector(KVConnectorBase):
                 req.req_id,
             )
             transfer = _UnprovableSubmission()
+        if self._event_reclaimer is not None:
+            self._event_reclaimer.track_ready_event(event, transfer)
         with self._lock:
             self._submitting_loads.discard(operation_id)
             self._pending_loads[operation_id] = _PendingLoad(
@@ -404,6 +431,8 @@ class LMCacheMPConnector(KVConnectorBase):
                 req.req_id,
             )
             transfer = _UnprovableSubmission()
+        if self._event_reclaimer is not None:
+            self._event_reclaimer.track_ready_event(event, transfer)
         with self._lock:
             self._submitting_saves.discard(operation_id)
             self._pending_saves[operation_id] = _PendingSave(
@@ -411,6 +440,15 @@ class LMCacheMPConnector(KVConnectorBase):
                 future=transfer,
                 start=start,
                 end=end,
+            )
+
+    def _retain_completion_event(self, future: Any) -> None:
+        if self._event_reclaimer is not None:
+            # DeviceMessagingFuture imports this event on its first query.
+            # It must be retained independently of the producer-ready event:
+            # both kinds of HIP IPC event synchronize on destruction.
+            self._event_reclaimer.retain_until_released(
+                future, getattr(future, "event_", None)
             )
 
     def get_finished(self) -> KVConnectorOutput:
@@ -446,6 +484,7 @@ class LMCacheMPConnector(KVConnectorBase):
                         operation_id, pending.started_at, self._transfer_deadline_s
                     )
                 if terminal:
+                    self._retain_completion_event(pending.future)
                     self._pending_saves.pop(operation_id, None)
                     _remember_operation_tombstone(
                         operation_id,
@@ -475,6 +514,7 @@ class LMCacheMPConnector(KVConnectorBase):
                         operation_id, pending.started_at, self._transfer_deadline_s
                     )
                     continue
+                self._retain_completion_event(pending.future)
                 self._pending_loads.pop(operation_id, None)
                 _remember_operation_tombstone(
                     operation_id,

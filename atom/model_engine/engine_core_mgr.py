@@ -12,7 +12,7 @@ import queue
 import time
 import uuid
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, Lock, RLock, Thread, local
@@ -293,7 +293,30 @@ class CoreManager:
         # growth is new prefill debt.  Keeping this small scalar per session
         # avoids charging the complete cached conversation on every turn.
         self._dp_session_prompt_tokens: dict[str, int] = {}
+        # Prefix-spread routing (`_select_prefix_spread_locked`): prompt-prefix
+        # block hash, sampled every `_prefix_stride_tokens`, -> the rank that
+        # last ran it. A bounded LRU of routing history, not KV residency.
+        self._prefix_spread = envs.ATOM_DP_PREFIX_SPREAD
+        self._prefix_owner_margin = envs.ATOM_DP_PREFIX_OWNER_MARGIN
+        self._prefix_max_req_gap = envs.ATOM_DP_PREFIX_MAX_REQ_GAP
+        self._prefix_policy = envs.ATOM_DP_PREFIX_POLICY
+        if self._prefix_policy not in ("margin", "cost"):
+            raise ValueError(
+                f"ATOM_DP_PREFIX_POLICY must be margin or cost, not {self._prefix_policy!r}"
+            )
+        self._prefix_imbalance_s = envs.ATOM_DP_PREFIX_IMBALANCE_S
+        self._prefix_work_per_s = envs.ATOM_DP_PREFIX_PREFILL_WORK_PER_S
+        self._prefix_load_tok_per_s = envs.ATOM_DP_PREFIX_LOAD_TOKENS_PER_S
+        self._prefill_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
+        self._prefix_owner: OrderedDict[int, int] = OrderedDict()
+        self._prefix_owner_cap = 1 << 19
+        self._prefix_stride_tokens = 4096
         self._dp_route_counters = {
+            "prefix_owner_total": 0,
+            "prefix_moved_total": 0,
+            "prefix_moved_tokens": 0,
+            "prefix_cold_total": 0,
+            "prefix_source_busy_total": 0,
             "affinity_new_total": 0,
             "affinity_owner_hit_total": 0,
             # Kept as an explicit invariant/metric: strict affinity must leave
@@ -1423,6 +1446,8 @@ class CoreManager:
 
         session_id = getattr(seq, "dp_session_id", None)
         parent_id = getattr(seq, "dp_parent_session_id", None)
+        if getattr(self, "_prefix_spread", False):
+            return self._select_prefix_spread_locked(seq)
         if not self._dp_session_affinity_enabled or not session_id:
             rank = self._select_dp_rank_locked()
             return self._record_dp_route_locked("load_balanced_total", rank)
@@ -1449,6 +1474,117 @@ class CoreManager:
 
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
 
+    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int, object]:
+        """(rank that last ran this prompt's longest sampled prefix, its tokens,
+        the request that ran it)."""
+        if chain is None or not self._prefix_owner:
+            return None, 0, None
+        hbs = int(chain.hash_block_size)
+        stride = max(1, self._prefix_stride_tokens // hbs)
+        hashes = chain.hashes
+        for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
+            entry = self._prefix_owner.get(hashes[i])
+            if entry is not None and 0 <= entry[0] < self._routable_engine_count:
+                return entry[0], (i + 1) * hbs, entry[1]
+        return None, 0, None
+
+    def _prefix_owner_record(self, chain, rank: int, seq_id=None) -> None:
+        if chain is None:
+            return
+        hbs = int(chain.hash_block_size)
+        stride = max(1, self._prefix_stride_tokens // hbs)
+        index = self._prefix_owner
+        hashes = chain.hashes
+        for i in range(stride - 1, len(hashes), stride):
+            index[hashes[i]] = (rank, seq_id)
+            index.move_to_end(hashes[i])
+        while len(index) > self._prefix_owner_cap:
+            index.popitem(last=False)
+
+    def _prefix_cost_rank(self, seq: Sequence, owner: int, hit: int) -> int:
+        """The "cost" rule: minimum estimated TTFT plus decode-imbalance penalty.
+
+        A rank's queued prefill is its charged tokens (each with the
+        per-token weight of `prefill_cost`); the request's own prefill is its
+        uncached suffix attending to the prefix; a rank other than the
+        prefix's pays the tier load of the prefix. The penalty prices, in
+        seconds, each request of in-flight imbalance the placement leaves.
+        """
+        weight = self._prefill_token_weight
+        prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        n = self._routable_engine_count
+        best_rank, best_score = owner, None
+        for r in range(n):
+            prefix = hit if r == owner else 0
+            loaded = 0 if r == owner else hit
+            new = max(0, prompt - prefix - loaded)
+            queued = self._rank_tokens[r] * weight / self._prefix_work_per_s
+            own = new * (weight + prefix + loaded + new / 2) / self._prefix_work_per_s
+            load_s = loaded / self._prefix_load_tok_per_s if loaded else 0.0
+            reqs = list(self._rank_reqs)
+            reqs[r] += 1
+            imbalance = max(reqs) - min(reqs)
+            score = queued + own + load_s + self._prefix_imbalance_s * imbalance
+            if best_score is None or score < best_score:
+                best_rank, best_score = r, score
+        return best_rank
+
+    def _select_prefix_spread_locked(self, seq: Sequence) -> int:
+        """Least-loaded rank, unless the prefix's last rank is within the margin.
+
+        No session stickiness: the frontend prompt-hash chain names the rank
+        that last ran this prefix. A request sent elsewhere carrying a loadable
+        prefix is flagged so its rank queues it first and the tier load into
+        that rank's HBM starts on arrival, not when it reaches the queue head.
+        """
+        chain = getattr(seq, "prompt_hash_chain", None)
+        owner, hit, source = self._prefix_owner_lookup(chain)
+
+        def load(rank: int) -> int:
+            return (
+                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
+            )
+
+        # The `least_tokens` score whatever the strategy: prefill debt plus
+        # decode slots, ties rotated so equal ranks share new prefixes.
+        n = self._routable_engine_count
+        offset = self._rank_rotation_cursor % n
+        self._rank_rotation_cursor += 1
+        lightest = min(((offset + i) % n for i in range(n)), key=load)
+        rank = lightest
+        source_load = self._seq_load.get(source) if source is not None else None
+        if owner is not None and source_load is not None and source_load[2] > 0:
+            # The request that ran this prefix is still prefilling it: its KV
+            # is not in the offload tier yet, so another rank would recompute
+            # what the tier cannot supply. Share the prefix's rank instead.
+            rank = owner
+            self._dp_route_counters["prefix_source_busy_total"] += 1
+        elif owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
+            rank = self._prefix_cost_rank(seq, owner, hit)
+        elif (
+            owner is not None
+            and load(owner) <= load(lightest) + self._prefix_owner_margin
+            and (
+                getattr(self, "_prefix_max_req_gap", -1) < 0
+                or self._rank_reqs[owner] - self._rank_reqs[lightest]
+                <= self._prefix_max_req_gap
+            )
+        ):
+            rank = owner
+        # Either rank holds the prefix or loads it; only the rest is prefill.
+        seq._dp_est_hit = hit
+        if owner is None or hit <= 0:
+            decision = "prefix_cold_total"
+        elif rank == owner:
+            decision = "prefix_owner_total"
+        else:
+            decision = "prefix_moved_total"
+            self._dp_route_counters["prefix_moved_tokens"] += hit
+            if hit >= envs.OFFLOAD_MIN_LOAD_TOKENS:
+                seq.dp_prefetch_priority = True
+        self._prefix_owner_record(chain, rank, seq.id)
+        return self._record_dp_route_locked(decision, rank)
+
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
         with self._lb_lock:
@@ -1471,7 +1607,9 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        if self._dp_session_affinity_enabled and session_id:
+        if getattr(self, "_prefix_spread", False):
+            tok_cost = max(0, prompt_tokens - int(getattr(seq, "_dp_est_hit", 0)))
+        elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
                 # Agentic turns normally extend their previous prompt.  Charge
