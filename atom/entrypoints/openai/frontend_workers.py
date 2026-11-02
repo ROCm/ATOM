@@ -20,12 +20,19 @@ that owns the request.
     client --HTTP--> worker k --ADD/ABORT (ZMQ)--> hub --> CoreManager --> engines
     client <--SSE--- worker k <--outputs (ZMQ)---- hub <--------------------'
 
-Sequence ids stay unique across processes: worker k numbers its requests from
-``(k + 1) << 24``, the hub from 0.
+Sequence ids stay unique across processes: worker k numbers its requests in
+``[(k + 1) << 24, (k + 2) << 24)``, wrapping inside that window, and the hub
+from 0.
+
+The hub waits for every worker to bind the port before it serves, fails the
+launch if one exits first, and reports 503 on ``/health`` if one dies later.
+Workers publish their stream-silence and GC readings to a shared board that
+the hub's ``/metrics`` reads, so those series cover every process.
 """
 
 from __future__ import annotations
 
+import gc
 import itertools
 import logging
 import os
@@ -33,6 +40,7 @@ import pickle
 import socket
 import tempfile
 import threading
+import time
 import uuid
 from collections import defaultdict
 
@@ -41,13 +49,19 @@ import zmq
 from atom.model_engine.engine_core_mgr import _add_frame
 from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.sequence import Sequence
+from atom.utils import get_open_zmq_ipc_path, make_zmq_socket
 
 logger = logging.getLogger("atom")
 
-# Worker k numbers its sequences from (k + 1) << _SEQ_ID_SHIFT; the hub keeps
-# [0, 1 << _SEQ_ID_SHIFT). 16M requests per process, and 127 workers still fit
-# an int32.
+# Worker k numbers its sequences in [(k + 1) << _SEQ_ID_SHIFT, (k + 2) <<
+# _SEQ_ID_SHIFT), wrapping inside it; the hub keeps [0, 1 << _SEQ_ID_SHIFT).
+# An id comes back only after 16M newer requests on the same worker, and 127
+# workers still fit an int32.
 _SEQ_ID_SHIFT = 24
+_SEQ_ID_MASK = (1 << _SEQ_ID_SHIFT) - 1
+
+# How long the hub waits for a worker to load its tokenizer and bind the port.
+_WORKER_READY_TIMEOUT_S = 600.0
 
 # The receive loops wake this often to notice close(); a socket may only be
 # closed by the thread that last used it once that thread has stopped.
@@ -63,8 +77,10 @@ def worker_seq_id_base(index: int) -> int:
     return (index + 1) << _SEQ_ID_SHIFT
 
 
-def _ipc_path(tag: str) -> str:
-    return f"ipc://{tempfile.gettempdir()}/atom-fe-{tag}-{uuid.uuid4().hex[:12]}"
+def worker_seq_ids(index: int, start: int = 0):
+    """Worker ``index``'s sequence ids, wrapping inside its own window."""
+    base = worker_seq_id_base(index)
+    return (base | (n & _SEQ_ID_MASK) for n in itertools.count(start))
 
 
 def bind_shared_listener(host: str, port: int) -> socket.socket:
@@ -91,22 +107,26 @@ class FrontendHub:
         self.core_mgr = core_mgr
         self.num_workers = num_workers
         self.ctx = zmq.Context.instance()
-        self.request_address = _ipc_path("req")
-        self.output_addresses = [_ipc_path(f"out{i}") for i in range(num_workers)]
+        self.request_address = get_open_zmq_ipc_path()
+        self.output_addresses = [get_open_zmq_ipc_path() for _ in range(num_workers)]
+        # A filesystem path for uvicorn, not a ZMQ address.
         self.admin_uds = (
             f"{tempfile.gettempdir()}/atom-fe-hub-{uuid.uuid4().hex[:12]}.sock"
         )
+        self.stats = FrontendStatsBoard(num_workers)
+        self._ready: set[int] = set()
+        self._ready_cond = threading.Condition()
+        self._processes: list = []
 
-        self._request_socket = self.ctx.socket(zmq.PULL)
-        self._request_socket.setsockopt(zmq.RCVHWM, 0)
-        self._request_socket.bind(self.request_address)
+        self._request_socket = make_zmq_socket(
+            self.ctx, self.request_address, zmq.PULL, bind=True
+        )
         self._output_sockets = []
         self._output_locks = []
         for address in self.output_addresses:
-            sock = self.ctx.socket(zmq.PUSH)
-            sock.setsockopt(zmq.SNDHWM, 0)
-            sock.bind(address)
-            self._output_sockets.append(sock)
+            self._output_sockets.append(
+                make_zmq_socket(self.ctx, address, zmq.PUSH, bind=True)
+            )
             self._output_locks.append(threading.Lock())
         # The engine's output threads buffer here between a step's callbacks
         # and its flush: one list per worker, per thread.
@@ -127,7 +147,41 @@ class FrontendHub:
             "output_address": self.output_addresses[worker_index],
             "admin_uds": self.admin_uds,
             "max_pool_tokens": getattr(self.core_mgr, "max_pool_tokens", None),
+            "stats": self.stats,
         }
+
+    # worker lifecycle ------------------------------------------------------
+    def wait_for_workers(
+        self, processes, timeout: float = _WORKER_READY_TIMEOUT_S
+    ) -> None:
+        """Block until every worker has bound the port. Raises if one exits
+        first or the timeout passes: a launch whose public port is not served
+        must fail, not report that it started."""
+        self._processes = list(processes)
+        deadline = time.monotonic() + timeout
+        with self._ready_cond:
+            while len(self._ready) < len(self._processes):
+                for index, proc in enumerate(self._processes):
+                    if index not in self._ready and proc.exitcode is not None:
+                        raise RuntimeError(
+                            f"front-end worker {index} exited with code "
+                            f"{proc.exitcode} before it was serving"
+                        )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    missing = sorted(set(range(len(self._processes))) - self._ready)
+                    raise RuntimeError(
+                        f"front-end workers {missing} not serving after "
+                        f"{timeout:.0f} s"
+                    )
+                self._ready_cond.wait(min(remaining, 1.0))
+
+    def dead_workers(self) -> list[int]:
+        return [
+            index
+            for index, proc in enumerate(self._processes)
+            if proc.exitcode is not None
+        ]
 
     # engine output threads -------------------------------------------------
     def _make_callback(self, worker_index: int):
@@ -178,9 +232,15 @@ class FrontendHub:
                 elif kind == _MSG_ABORT:
                     self.core_mgr.abort_request(int(bytes(parts[1].buffer)))
                 elif kind == _MSG_HELLO:
+                    worker_index = int(bytes(parts[1].buffer))
                     logger.info(
-                        "Frontend worker %s connected", bytes(parts[1].buffer).decode()
+                        "Frontend worker %d (pid %s) serving",
+                        worker_index,
+                        bytes(parts[2].buffer).decode(),
                     )
+                    with self._ready_cond:
+                        self._ready.add(worker_index)
+                        self._ready_cond.notify_all()
             except Exception:
                 # One bad request must not take every worker's traffic with it.
                 logger.exception("Frontend hub: failed to handle a %r message", kind)
@@ -227,13 +287,13 @@ class RemoteCoreManager:
         self.index = info["index"]
         self.max_pool_tokens = info.get("max_pool_tokens")
         self.ctx = zmq.Context.instance()
-        self._send_socket = self.ctx.socket(zmq.PUSH)
-        self._send_socket.setsockopt(zmq.SNDHWM, 0)
-        self._send_socket.connect(info["request_address"])
+        self._send_socket = make_zmq_socket(
+            self.ctx, info["request_address"], zmq.PUSH, bind=False
+        )
         self._send_lock = threading.Lock()
-        self._output_socket = self.ctx.socket(zmq.PULL)
-        self._output_socket.setsockopt(zmq.RCVHWM, 0)
-        self._output_socket.connect(info["output_address"])
+        self._output_socket = make_zmq_socket(
+            self.ctx, info["output_address"], zmq.PULL, bind=False
+        )
         self._seq_id_to_callback: dict = {}
         self._flush_stream_batch_fn = None
         self._index_bytes = str(self.index).encode()
@@ -244,7 +304,10 @@ class RemoteCoreManager:
             daemon=True,
         )
         self._thread.start()
-        self._send(_MSG_HELLO, str(os.getpid()).encode())
+
+    def announce_ready(self) -> None:
+        """Tell the hub this worker has bound the public port."""
+        self._send(_MSG_HELLO, self._index_bytes, str(os.getpid()).encode())
 
     def _send(self, *parts) -> None:
         with self._send_lock:
@@ -318,10 +381,68 @@ class FrontendEngine:
             config, tokenizer, config.kv_cache_block_size
         )
         self.core_mgr = RemoteCoreManager(info)
-        Sequence.counter = itertools.count(worker_seq_id_base(info["index"]))
+        Sequence.counter = worker_seq_ids(info["index"])
 
     def close(self) -> None:
         self.core_mgr.close()
+
+
+class FrontendStatsBoard:
+    """Per-worker readings that the hub's ``/metrics`` exports for every
+    process: when the oldest waiting stream started waiting, and the GC
+    counters.
+
+    Shared memory, written by each worker on its metrics cadence. The wait
+    start is a ``time.monotonic()`` stamp (CLOCK_MONOTONIC, one clock for
+    every process on the host), turned into a silence at scrape time, so a
+    worker whose loop is stuck still shows a growing silence.
+    """
+
+    _GENERATIONS = 3
+    _GC_KEYS = ("collections", "collected", "uncollectable")
+    # waiting_since, then gc stats (generation x key), then thresholds
+    _SLOTS = 1 + _GENERATIONS * len(_GC_KEYS) + _GENERATIONS
+
+    def __init__(self, num_workers: int):
+        import multiprocessing
+
+        self.num_workers = num_workers
+        self._values = multiprocessing.get_context("spawn").RawArray(
+            "d", num_workers * self._SLOTS
+        )
+
+    def publish(self, index: int, waiting_since: float | None) -> None:
+        values = [0.0 if waiting_since is None else waiting_since]
+        stats = gc.get_stats()
+        for gen in range(self._GENERATIONS):
+            values += [float(stats[gen].get(key, 0)) for key in self._GC_KEYS]
+        values += [float(v) for v in gc.get_threshold()[: self._GENERATIONS]]
+        row = index * self._SLOTS
+        self._values[row : row + self._SLOTS] = values
+
+    def longest_silence(self, now: float | None = None) -> float:
+        starts = [
+            self._values[i * self._SLOTS]
+            for i in range(self.num_workers)
+            if self._values[i * self._SLOTS] > 0
+        ]
+        if not starts:
+            return 0.0
+        now = time.monotonic() if now is None else now
+        return max(0.0, now - min(starts))
+
+    def gc_readings(self) -> list[tuple[str, list[dict], tuple[float, ...]]]:
+        """``(process, gc.get_stats()-shaped list, thresholds)`` per worker."""
+        n_keys = len(self._GC_KEYS)
+        rows = []
+        for i in range(self.num_workers):
+            row = self._values[i * self._SLOTS : (i + 1) * self._SLOTS]
+            stats = [
+                dict(zip(self._GC_KEYS, row[1 + g * n_keys : 1 + (g + 1) * n_keys]))
+                for g in range(self._GENERATIONS)
+            ]
+            rows.append((f"worker{i}", stats, tuple(row[-self._GENERATIONS :])))
+        return rows
 
 
 def watch_parent(parent_pid: int, interval_s: float = 2.0) -> None:

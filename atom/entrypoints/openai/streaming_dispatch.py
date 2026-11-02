@@ -496,6 +496,12 @@ class FrameWait:
             )
 
 
+def oldest_waiting_since() -> float | None:
+    """``time.monotonic()`` at which the most starved in-flight stream started
+    waiting, or None. What a front-end worker publishes for the hub."""
+    return min(_WAITING_SINCE.values()) if _WAITING_SINCE else None
+
+
 def longest_silence_seconds() -> float:
     """How long the most starved in-flight stream has been waiting.
 

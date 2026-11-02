@@ -874,3 +874,121 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
 
     asyncio.run(drive())
     assert events == ["initialize", "serving", "shutdown"]
+
+
+# ---- --api-server-count: the worker side of api_server ----
+
+
+def test_engine_routes_are_the_management_endpoints():
+    # Registered with `_engine_route`: a worker relays exactly these to the
+    # hub. Everything else, inference and /debug/gc_census included, is served
+    # where it arrives, so a new route is local unless it says otherwise.
+    assert api_server._ENGINE_ROUTES == {
+        "/health",
+        "/metrics",
+        "/debug/mtp_stats",
+        "/debug/cache_stats",
+        "/kv_transfer_info",
+        "/server_info",
+        "/start_profile",
+        "/stop_profile",
+    }
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Unix socket")
+def test_worker_relays_engine_routes_to_the_hub_over_its_unix_socket(
+    monkeypatch, tmp_path
+):
+    from aiohttp import web
+    from fastapi.testclient import TestClient
+
+    seen = []
+
+    async def hub_handler(request):
+        seen.append(
+            (request.method, request.path, request.query_string, await request.read())
+        )
+        return web.json_response({"from": "hub"}, status=503)
+
+    uds = str(tmp_path / "hub.sock")
+    ready = threading.Event()
+    stop = {}
+
+    def serve():
+        loop = asyncio.new_event_loop()
+        hub = web.Application()
+        hub.router.add_route("*", "/{tail:.*}", hub_handler)
+        runner = web.AppRunner(hub)
+        loop.run_until_complete(runner.setup())
+        loop.run_until_complete(web.UnixSite(runner, uds).start())
+        stop["loop"], stop["runner"] = loop, runner
+        ready.set()
+        loop.run_forever()
+        loop.run_until_complete(runner.cleanup())
+        loop.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(5)
+    monkeypatch.setattr(api_server, "_frontend_hub_uds", uds)
+    monkeypatch.setattr(api_server, "model_name", "m")
+    client = TestClient(api_server.app)
+    try:
+        # Each TestClient call runs on a fresh loop; a worker has one.
+        api_server._frontend_hub_session = None
+        reply = client.get("/health?a=1&a=2")
+        assert reply.status_code == 503 and reply.json() == {"from": "hub"}
+        api_server._frontend_hub_session = None
+        reply = client.post("/start_profile", content=b"x")
+        assert reply.json() == {"from": "hub"}
+        assert seen == [
+            ("GET", "/health", "a=1&a=2", b""),
+            ("POST", "/start_profile", "", b"x"),
+        ]
+        # Served by the worker itself, never relayed.
+        api_server._frontend_hub_session = None
+        assert client.get("/v1/models").json()["data"][0]["id"] == "m"
+        assert client.get("/no/such/route").status_code == 404
+        assert len(seen) == 2
+    finally:
+        api_server._frontend_hub_session = None
+        stop["loop"].call_soon_threadsafe(stop["loop"].stop)
+        thread.join(5)
+
+
+def test_health_is_unavailable_once_a_frontend_worker_dies(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(core_mgr=SimpleNamespace(is_healthy=lambda: True)),
+    )
+    dead = []
+    monkeypatch.setattr(
+        api_server, "_frontend_hub", SimpleNamespace(dead_workers=lambda: dead)
+    )
+    client = TestClient(api_server.app)
+    assert client.get("/health").status_code == 200
+    dead.append(2)
+    reply = client.get("/health")
+    assert reply.status_code == 503 and "[2]" in reply.json()["detail"]
+
+
+def test_hub_flush_runs_even_when_the_local_flush_fails():
+    # The engine output thread's flush with a hub. A failing local flush must
+    # not keep the step's outputs from the workers' clients.
+    calls = []
+
+    def local():
+        calls.append("local")
+        raise RuntimeError("local flush")
+
+    hub = SimpleNamespace(flush=lambda: calls.append("hub"))
+    flush = api_server._flush_local_and_hub(local, hub)
+    with pytest.raises(RuntimeError):
+        flush()
+    assert calls == ["local", "hub"]
+    calls.clear()
+    api_server._flush_local_and_hub(None, hub)()
+    assert calls == ["hub"]

@@ -122,7 +122,7 @@ def test_a_rejected_request_still_ends(hub_and_worker):
 def test_sequence_id_ranges_do_not_overlap():
     bases = [0] + [fw.worker_seq_id_base(i) for i in range(8)]
     assert bases == sorted(set(bases))
-    # 16M ids per process, and a 127th worker still fits an int32.
+    # 16M ids per worker window, and a 127th worker still fits an int32.
     assert fw.worker_seq_id_base(0) == 1 << 24
     assert fw.worker_seq_id_base(126) + (1 << 24) - 1 < 2**31
 
@@ -165,3 +165,73 @@ def test_hub_flush_sends_one_message_per_worker_per_step(hub_and_worker):
     t.join()
     hub._output_sockets[1] = counting.sock
     assert counting.frames == 1
+
+
+def test_sequence_ids_wrap_inside_the_worker_window():
+    mask = (1 << 24) - 1
+    base = fw.worker_seq_id_base(2)
+    ids = fw.worker_seq_ids(2, start=mask - 1)
+    assert [next(ids) for _ in range(3)] == [base + mask - 1, base + mask, base]
+
+
+class _Proc:
+    def __init__(self):
+        self.exitcode = None
+
+
+def test_hub_waits_until_every_worker_serves(hub_and_worker):
+    _core, hub, worker = hub_and_worker
+    other = fw.RemoteCoreManager(hub.connection_info(0))
+    try:
+        procs = [_Proc(), _Proc()]
+        threading.Timer(0.2, worker.announce_ready).start()
+        threading.Timer(0.3, other.announce_ready).start()
+        hub.wait_for_workers(procs, timeout=5)
+        assert hub.dead_workers() == []
+        procs[1].exitcode = -9
+        assert hub.dead_workers() == [1]
+    finally:
+        other.close()
+
+
+def test_hub_fails_the_launch_if_a_worker_exits_before_serving(hub_and_worker):
+    _core, hub, worker = hub_and_worker
+    procs = [_Proc(), _Proc()]
+    worker.announce_ready()  # worker 1 is fine
+    threading.Timer(0.2, lambda: setattr(procs[0], "exitcode", 1)).start()
+    with pytest.raises(RuntimeError, match="worker 0 exited with code 1"):
+        hub.wait_for_workers(procs, timeout=5)
+
+
+def test_hub_fails_the_launch_if_a_worker_never_serves(hub_and_worker):
+    _core, hub, _worker = hub_and_worker
+    with pytest.raises(RuntimeError, match=r"\[0, 1\] not serving"):
+        hub.wait_for_workers([_Proc(), _Proc()], timeout=0.3)
+
+
+def test_metrics_cover_every_worker():
+    # The hub's /metrics: the most starved stream across all processes, and
+    # each worker's GC counters under its own `process` label.
+    from atom.metrics.exporter import AtomMetricsExporter
+
+    board = fw.FrontendStatsBoard(2)
+    board.publish(0, None)
+    board.publish(1, time.monotonic() - 30.0)
+    assert 29.0 < board.longest_silence() < 60.0
+
+    exporter = AtomMetricsExporter(stream_silence=lambda: 1.0)
+    text = exporter.render().decode()
+    assert 'process="' not in text  # one process: unchanged
+    exporter.attach_frontend_board(board)
+    text = exporter.render().decode()
+    silence = next(
+        line
+        for line in text.splitlines()
+        if line.startswith("atom:stream_longest_silence_seconds ")
+    )
+    assert float(silence.split()[1]) >= 29.0
+    for process in ("hub", "worker0", "worker1"):
+        assert (
+            f'atom:gc_collections_total{{generation="0",process="{process}"}}' in text
+        )
+        assert f'atom:gc_threshold{{generation="2",process="{process}"}}' in text

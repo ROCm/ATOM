@@ -156,6 +156,7 @@ from .streaming_dispatch import (
     StreamBatchDispatcher,
     StreamOutputCollector,
     enable_delta_reuse,
+    oldest_waiting_since,
 )
 from .tool_parser import (
     ToolCallStreamParser,
@@ -214,6 +215,9 @@ _stream_batch_dispatcher: StreamBatchDispatcher | None = None
 # FrontendHub that feeds the workers' requests to the engine.
 _frontend_hub_uds: str | None = None
 _frontend_hub = None
+# In a front-end worker: (FrontendStatsBoard, worker index), published on the
+# metrics cadence so the hub's /metrics covers this process too.
+_frontend_stats = None
 # `SYNTHETIC_TOKEN_TEXT` while a run's own text is meaningless, None otherwise.
 # One switch for both delivery modes: they decode in different places, and a
 # response that read differently depending on `stream` is the asymmetry the
@@ -1615,8 +1619,10 @@ async def lifespan(app: FastAPI):
         for interval, step in (
             (metrics_interval, _refresh_metrics_once),
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
+            (metrics_interval, _publish_frontend_stats_once),
         )
-        if refresh_metrics or step is not _refresh_metrics_once
+        if (refresh_metrics or step is not _refresh_metrics_once)
+        and (_frontend_stats is not None or step is not _publish_frontend_stats_once)
     ]
     try:
         yield
@@ -1644,54 +1650,63 @@ app.add_middleware(
 )
 app.add_middleware(TraceMiddleware, model=lambda: model_name)
 
-# Answered by a front-end worker itself; any other path is the hub's.
-_FRONTEND_LOCAL_PATHS = frozenset(
-    (
-        "/v1/chat/completions",
-        "/v1/completions",
-        "/v1/messages",
-        "/v1/responses",
-        "/v1/models",
-    )
-)
-_frontend_hub_client = None
+# Management routes that read the engine. With --api-server-count > 1 the
+# process that owns the engine (the hub) answers them, and a front-end worker
+# relays them over the hub's Unix socket; every other route is served where it
+# arrives. Register such a route with `_engine_route`, not `@app.get`.
+_ENGINE_ROUTES: set[str] = set()
+_frontend_hub_session = None
+# Hop-by-hop or recomputed by the relay.
+_RELAY_SKIP_HEADERS = frozenset(("host", "content-length", "transfer-encoding"))
+
+
+def _engine_route(path: str, **kwargs):
+    """``app.api_route`` for a route the engine-owning process answers."""
+    _ENGINE_ROUTES.add(path)
+    kwargs.setdefault("methods", ["GET"])
+    return app.api_route(path, **kwargs)
+
+
+async def _publish_frontend_stats_once() -> None:
+    board, index = _frontend_stats
+    board.publish(index, oldest_waiting_since())
 
 
 @app.middleware("http")
 async def _forward_to_frontend_hub(request: Request, call_next):
-    """In a front-end worker, relay management requests (health, metrics,
-    profiling, cache and debug endpoints) to the hub, which owns the engine."""
-    global _frontend_hub_client
-    if _frontend_hub_uds is None or request.url.path in _FRONTEND_LOCAL_PATHS:
+    """In a front-end worker, relay the engine's management routes (health,
+    metrics, profiling, cache and debug stats) to the hub."""
+    global _frontend_hub_session
+    if _frontend_hub_uds is None or request.url.path not in _ENGINE_ROUTES:
         return await call_next(request)
-    import httpx
+    import aiohttp
 
-    if _frontend_hub_client is None:
-        _frontend_hub_client = httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(uds=_frontend_hub_uds),
-            base_url="http://hub",
-            timeout=None,
+    if _frontend_hub_session is None:
+        _frontend_hub_session = aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(path=_frontend_hub_uds),
+            timeout=aiohttp.ClientTimeout(total=None),
         )
-    reply = await _frontend_hub_client.request(
+    async with _frontend_hub_session.request(
         request.method,
-        request.url.path,
-        params=request.query_params,
-        content=await request.body(),
+        f"http://hub{request.url.path}",
+        params=list(request.query_params.multi_items()),
+        data=await request.body(),
         headers={
             k: v
             for k, v in request.headers.items()
-            if k.lower() not in ("host", "content-length")
+            if k.lower() not in _RELAY_SKIP_HEADERS
         },
-    )
-    return Response(
-        content=reply.content,
-        status_code=reply.status_code,
-        headers={
-            k: v
-            for k, v in reply.headers.items()
-            if k.lower() not in ("content-length", "transfer-encoding")
-        },
-    )
+    ) as reply:
+        return Response(
+            content=await reply.read(),
+            status_code=reply.status,
+            headers={
+                k: v
+                for k, v in reply.headers.items()
+                if k.lower() not in _RELAY_SKIP_HEADERS
+                and k.lower() != "content-encoding"
+            },
+        )
 
 
 # ---- Error handlers ----
@@ -2934,15 +2949,18 @@ async def list_models():
     return ModelList(data=[ModelCard(id=model_name)])
 
 
-@app.get("/health")
+@_engine_route("/health")
 async def health():
     """Report readiness of all engine workers, not just the HTTP process."""
     if engine is None or not engine.core_mgr.is_healthy():
         raise HTTPException(status_code=503, detail="Engine workers unavailable")
+    dead = _frontend_hub.dead_workers() if _frontend_hub is not None else []
+    if dead:
+        raise HTTPException(status_code=503, detail=f"Front-end workers {dead} exited")
     return {"status": "ok"}
 
 
-@app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
+@_engine_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""
     return Response(
@@ -2951,7 +2969,7 @@ async def metrics():
     )
 
 
-@app.get("/debug/mtp_stats")
+@_engine_route("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""
     if engine is None:
@@ -2965,7 +2983,7 @@ async def get_mtp_stats():
         )
 
 
-@app.get("/debug/cache_stats")
+@_engine_route("/debug/cache_stats")
 async def get_cache_stats():
     """Return cumulative prefix-cache reuse statistics."""
     if engine is None:
@@ -3027,7 +3045,7 @@ def _resolve_kv_transfer_role(kv_cfg: dict) -> tuple[str | None, int]:
     return fallback_role, fallback_port
 
 
-@app.get("/kv_transfer_info")
+@_engine_route("/kv_transfer_info")
 async def kv_transfer_info():
     cfg = engine.config
     kv_cfg = cfg.kv_transfer_config or {}
@@ -3058,7 +3076,7 @@ async def kv_transfer_info():
     return info
 
 
-@app.get("/server_info")
+@_engine_route("/server_info")
 async def server_info():
     """Server metadata for the Atomesh router.
 
@@ -3075,7 +3093,7 @@ async def server_info():
     }
 
 
-@app.post("/start_profile")
+@_engine_route("/start_profile", methods=["POST"])
 async def start_profile():
     """Start profiling the engine."""
     try:
@@ -3086,7 +3104,7 @@ async def start_profile():
         raise HTTPException(status_code=500, detail=f"Failed to start profiling: {e!s}")
 
 
-@app.post("/stop_profile")
+@_engine_route("/stop_profile", methods=["POST"])
 async def stop_profile():
     """Stop profiling the engine."""
     try:
@@ -3355,14 +3373,12 @@ def _start_frontend_workers(args) -> None:
     hub = FrontendHub(engine.core_mgr, args.api_server_count)
     hub.start()
     _frontend_hub = hub
-    serve_flush = engine.core_mgr._flush_stream_batch_fn
-
-    def flush_both():
-        serve_flush()
-        hub.flush()
-
-    engine.core_mgr._flush_stream_batch_fn = flush_both
+    _metrics_exporter.attach_frontend_board(hub.stats)
+    engine.core_mgr._flush_stream_batch_fn = _flush_local_and_hub(
+        engine.core_mgr._flush_stream_batch_fn, hub
+    )
     ctx = multiprocessing.get_context("spawn")
+    processes = []
     for index in range(args.api_server_count):
         proc = ctx.Process(
             target=_frontend_worker_main,
@@ -3371,6 +3387,14 @@ def _start_frontend_workers(args) -> None:
             daemon=True,
         )
         proc.start()
+        processes.append(proc)
+    try:
+        hub.wait_for_workers(processes)
+    except RuntimeError:
+        for proc in processes:
+            proc.terminate()
+        engine.close()
+        raise
     logger.info(
         "Started %d front-end workers on %s:%s; engine hub admin socket %s",
         args.api_server_count,
@@ -3380,9 +3404,24 @@ def _start_frontend_workers(args) -> None:
     )
 
 
+def _flush_local_and_hub(local_flush, hub):
+    """The engine output thread's per-step flush with a hub: this process's
+    own streams, then each worker's batch. The hub's flush runs even if the
+    local one fails, or every worker's clients would stall."""
+
+    def flush():
+        try:
+            if local_flush is not None:
+                local_flush()
+        finally:
+            hub.flush()
+
+    return flush
+
+
 def _frontend_worker_main(args, config, info, parent_pid) -> None:
     """Entry point of one front-end worker process."""
-    global engine, _frontend_hub_uds
+    global engine, _frontend_hub_uds, _frontend_stats
     from .frontend_workers import (
         FrontendEngine,
         bind_shared_listener,
@@ -3391,12 +3430,14 @@ def _frontend_worker_main(args, config, info, parent_pid) -> None:
 
     watch_parent(parent_pid)
     _frontend_hub_uds = info["admin_uds"]
+    _frontend_stats = (info["stats"], info["index"])
     _setup_frontend(args)
     _setup_reasoning_and_tools(args)
     engine = FrontendEngine(config, tokenizer, info)
     _setup_stream_dispatch(args)
     engine.core_mgr._flush_stream_batch_fn = flush_stream_batch
     listener = bind_shared_listener(args.host, args.server_port)
+    engine.core_mgr.announce_ready()
     uv_config = uvicorn.Config(
         app,
         loop=_loop_impl(),
