@@ -427,6 +427,47 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
+    # Qwen3-Next / Qwen3.5: the MoE block leaves `routed + sigmoid(gate) *
+    # shared` to the norm that reads it (the next layer's input norm, the final
+    # norm, the MTP drafter's final norm), which adds it, adds the residual and
+    # normalizes in one Triton launch (atom/model_ops/moe_tail_norm.py). The MTP
+    # drafter's final norm then also covers only the rows its LM head reads (one
+    # a sequence), which replaces the row gather. TP1 only (DP attention / EP,
+    # or one GPU); the new residual is bitwise the unfused one, the normed
+    # output within one bf16 ulp. Off by default.
+    "ATOM_FUSED_MOE_TAIL_NORM": lambda: (
+        os.getenv("ATOM_FUSED_MOE_TAIL_NORM", "0") == "1"
+    ),
+    # With ATOM_FUSED_MOE_TAIL_NORM, under mori EP on aiter's MegaMoEGfx1250
+    # (bf16 combine wire): the gated shared-expert add, the residual add and the
+    # next RMSNorm run inside aiter's one-kernel combine (its cross-device wait
+    # and top-k reduce in the same launch), replacing combine_sync + combine +
+    # the fused tail kernel. The shared expert then runs before the dispatch.
+    # Eager / CUDA graphs only (torch.compile keeps the tail kernel). Off by
+    # default; needs an aiter whose MegaMoEGfx1250.forward takes combine_tail.
+    "ATOM_MEGA_COMBINE_TAIL": lambda: (os.getenv("ATOM_MEGA_COMBINE_TAIL", "0") == "1"),
+    # Steps above this many rows a rank keep the separate tail kernel: aiter's
+    # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
+    # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
+    # MI455X: ahead at 32-512 rows, even at 640-1500, behind at 3700).
+    # Qwen3-Next / Qwen3.5 shared expert (bf16, gfx1250): its gate_up GEMM and
+    # SiLU-and-mul in one aiter gluon GEMM with a gated epilogue; gate_up's
+    # weight rows are interleaved gate / up in place at load. Off by default.
+    # With ATOM_FUSED_MOE_TAIL_NORM (which hands the MTP drafter its step-0
+    # rows): the MTP layer keeps those rows right after its attention, so its
+    # MoE and final norm run on one row a sequence instead of the whole token
+    # stream (4 x bs at decode, the prefill chunk at prefill). Each EP rank then
+    # dispatches its own row count; every rank still runs the layer. Off by
+    # default.
+    "ATOM_MTP_SELECT_ROWS_BEFORE_MOE": lambda: (
+        os.getenv("ATOM_MTP_SELECT_ROWS_BEFORE_MOE", "0") == "1"
+    ),
+    "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
+        os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
+    ),
+    "ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
+    ),
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
     # loses at prefill sizes while saving launches at decode sizes (crossover
@@ -1067,6 +1108,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
     # instead of up to seven eager ones. Integer math, so the same result.
     "ATOM_MTP_FUSED_KV_INDPTR": lambda: _flag_env("ATOM_MTP_FUSED_KV_INDPTR", "0"),
+    # Qwen3.5 MTP: the draft token's embedding gather, both pre-fc Gemma norms
+    # and their concat in one launch writing the fc input (instead of gather +
+    # two norm launches + torch.cat, or gather + the dual norm of
+    # ATOM_MTP_DUAL_PRE_FC_NORM, which it supersedes): aiter's norm with its
+    # q_row_index gather where aiter has it, else a Triton kernel reproducing
+    # aiter's reduction order. Bitwise the same either way.
+    "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM": lambda: _flag_env(
+        "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM", "0"
+    ),
+    # GDN-hybrid MTP (Qwen3.5 / Next): EagleProposer's eager glue between its
+    # draft passes fused -- step 0's staging in one launch on a uniform verify
+    # batch, and each later pass's metadata advance + input staging + draft id
+    # export in one launch plus the kv_indices generation (57 launches a
+    # decode step at mtp_k=3 down to 6). Same metadata and inputs, bit for bit.
+    "ATOM_MTP_FUSED_DRAFT_GLUE": lambda: _flag_env("ATOM_MTP_FUSED_DRAFT_GLUE", "0"),
     # Debug: all-gather each step's draft ids over TP after propose and log any
     # rank disagreement. Syncs the host every decode step -- validation only.
     "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (

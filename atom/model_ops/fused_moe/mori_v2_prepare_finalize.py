@@ -47,6 +47,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
 from atom.model_ops.fused_moe.config import FusedMoEQuantConfig
+from atom.model_ops.moe_tail_norm import current_combine_tail_request
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
@@ -853,6 +854,8 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         self._fused_topk_result = None
         fused_routing = fused is not None and fused[0] is topk_ids
         ids = topk_ids.to(torch.int32).contiguous()
+        combine_quant = self.prepare_finalize.combine_quant_for_step()
+        tail_kw = _combine_tail_kwargs(hidden_states, combine_quant)
         out = mega(
             hidden_states.contiguous(),
             topk_weights.to(torch.float32).contiguous(),
@@ -868,9 +871,14 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             recv_token_bound=self._recv_bound(
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
             ),
-            combine_quant=self.prepare_finalize.combine_quant_for_step(),
+            combine_quant=combine_quant,
             recv_counter_is_zero=fused_routing,
+            **tail_kw,
         )
+        if tail_kw:
+            # ATOM_MEGA_COMBINE_TAIL: (normed, new residual) for the MoE block.
+            current_combine_tail_request().result = out
+            return out[0]
         return out
 
     @staticmethod
@@ -910,6 +918,31 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 "this layer's expert-GEMM recipe differs from the one MegaMoE was "
                 f"built with (this layer vs built): {differing}"
             )
+
+
+def _combine_tail_kwargs(hidden_states: torch.Tensor, combine_quant) -> dict:
+    """`combine_tail=` for MegaMoE when a MoE block asked for its tail to run in
+    the combine (ATOM_MEGA_COMBINE_TAIL) and this call can: the bf16 combine
+    wire, the block's own rows, and an aiter that takes it."""
+    req = current_combine_tail_request()
+    if req is None or combine_quant not in (None, "none"):
+        return {}
+    if req.residual.shape[0] != hidden_states.shape[0]:
+        return {}
+    try:
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import CombineTail
+    except ImportError:
+        return {}
+    return {
+        "combine_tail": CombineTail(
+            shared=req.shared,
+            gate=req.gate,
+            residual=req.residual,
+            weight=req.weight,
+            eps=req.eps,
+            write_residual=req.write_residual,
+        )
+    }
 
 
 def make_mori_v2_prepare_finalize(moe, all2all_manager) -> MoriV2PrepareAndFinalize:
