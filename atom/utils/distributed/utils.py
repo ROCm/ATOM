@@ -14,7 +14,7 @@ from torch.distributed.distributed_c10d import (
 )
 from torch.distributed.rendezvous import rendezvous
 
-from atom.utils import is_torch_equal_or_newer
+from atom.utils import envs, is_torch_equal_or_newer
 
 
 def is_valid_ipv6_address(address: str) -> bool:
@@ -44,6 +44,18 @@ def raise_default_group_timeout(seconds: int) -> None:
     distributed_c10d.default_pg_timeout = max(
         distributed_c10d.default_pg_timeout, timedelta(seconds=seconds)
     )
+
+
+def raise_timeout_if_dp_spans_nodes(parallel_config) -> None:
+    """Apply ATOM_MULTINODE_PG_TIMEOUT_S when the DP group has ranks on other nodes.
+
+    Read from the topology, the group's ranks against the ranks this node runs,
+    so every rank of a group agrees. ParallelConfig.is_multinode_dp also reads
+    data_parallel_rank, which in a worker is its own global rank, so it would
+    match ranks 1.. of a single-node group.
+    """
+    if parallel_config.data_parallel_size_local < parallel_config.data_parallel_size:
+        raise_default_group_timeout(envs.ATOM_MULTINODE_PG_TIMEOUT_S)
 
 
 def init_gloo_process_group(

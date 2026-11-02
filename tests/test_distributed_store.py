@@ -251,6 +251,38 @@ def test_standalone_model_runner_keeps_rank_zero_rendezvous(manager):
     )
 
 
+@pytest.mark.parametrize(
+    "dp_size,dp_size_local,first_rank,worker_rank,raised",
+    [
+        (8, 8, 0, 0, False),
+        (8, 8, 0, 3, False),  # single-node DPA8, a non-zero rank
+        (16, 8, 0, 3, True),
+        (16, 8, 8, 11, True),
+    ],
+)
+def test_only_a_dp_group_across_nodes_raises_the_group_timeout(
+    monkeypatch, dp_size, dp_size_local, first_rank, worker_rank, raised
+):
+    from torch.distributed import distributed_c10d
+
+    from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
+
+    for name in ("ATOM_DP_SIZE", "ATOM_DP_SIZE_LOCAL", "ATOM_DP_RANK"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("ATOM_MULTINODE_PG_TIMEOUT_S", raising=False)
+    monkeypatch.setattr(distributed_c10d, "default_pg_timeout", timedelta(minutes=30))
+    pc = ParallelConfig(
+        data_parallel_size=dp_size,
+        data_parallel_size_local=dp_size_local,
+        data_parallel_rank=first_rank,
+    )
+    # What CoreManager does to each engine's copy.
+    pc.data_parallel_rank = worker_rank
+    raise_timeout_if_dp_spans_nodes(pc)
+    expected = timedelta(hours=2) if raised else timedelta(minutes=30)
+    assert distributed_c10d.default_pg_timeout == expected
+
+
 def test_groups_without_a_timeout_outlast_a_slow_nodes_load(monkeypatch):
     from torch.distributed import distributed_c10d
 
