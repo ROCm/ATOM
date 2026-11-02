@@ -191,6 +191,11 @@ class CoreManager:
     # to 0 (backpressure disabled).
     _bp_depth = 0
     _bp_offline_batch = False
+    # Whether something drains ``outputs_queue`` (offline ``LLMEngine.step`` /
+    # ``generate`` and the asyncio path do). An online front end that delivers
+    # every output through the per-sequence callbacks clears it, or each
+    # finished Sequence stays on the queue for the life of the process.
+    consumes_outputs_queue = True
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
 
@@ -833,7 +838,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.consumes_outputs_queue:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when

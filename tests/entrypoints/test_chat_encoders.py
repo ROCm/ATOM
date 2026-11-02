@@ -389,3 +389,46 @@ class TestAModelWithNoChatTemplateStillBoots:
     )
     def test_neither_startup_probe_raises(self, probe):
         assert probe(self.NoTemplate()) is None
+
+
+_COUNTING_ENCODER = """
+CALLS = [0]
+
+
+def find_last_user_index(messages):
+    CALLS[0] += 1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i]["role"] == "user":
+            return i
+    return -1
+
+
+def encode_messages(messages, **kwargs):
+    idx = [find_last_user_index(messages) for _ in messages]
+    return f"{idx[0]}x{len(idx)}|calls={CALLS[0]}"
+"""
+
+
+def test_loader_memoizes_find_last_user_index(tmp_path):
+    # DeepSeek's encoder asks for the last user index once per rendered
+    # message; the loader caches it per messages list so a render is O(n).
+    encoding_dir = tmp_path / "encoding"
+    encoding_dir.mkdir()
+    (encoding_dir / "encoding_dsv4.py").write_text(_COUNTING_ENCODER, encoding="utf-8")
+
+    adapter = _load_encoder_from_dir(str(tmp_path))
+    assert adapter is not None
+    messages = [{"role": "user", "content": "a"}] + [
+        {"role": "assistant", "content": "b"}
+    ] * 9
+
+    first = apply_chat_template(
+        tokenizer=None, custom_encoder=adapter, messages=messages
+    )
+    assert first == "0x10|calls=1"
+    # The next turn appends to the history: a different answer, computed again.
+    messages.append({"role": "user", "content": "c"})
+    second = apply_chat_template(
+        tokenizer=None, custom_encoder=adapter, messages=messages
+    )
+    assert second == "10x11|calls=2"

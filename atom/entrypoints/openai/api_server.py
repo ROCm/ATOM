@@ -19,6 +19,8 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
+import contextvars
+import functools
 import json
 import logging
 import os
@@ -1741,6 +1743,29 @@ def _effective_thinking_enabled(kwargs):
     return effective.get(name, on_value) != off_value
 
 
+async def _render_chat_template(messages, *, tools, **kwargs):
+    """``apply_chat_template`` on a worker thread.
+
+    Rendering grows with the conversation (an agentic turn resends the whole
+    history), and on the event loop it holds up reading every other request:
+    under long agentic load the loop fell behind and requests waited unread in
+    the socket while the engine ran short of work. Context variables (request
+    id, tracing) follow the call.
+    """
+    return await asyncio.get_running_loop().run_in_executor(
+        None,
+        contextvars.copy_context().run,
+        functools.partial(
+            apply_chat_template,
+            tokenizer,
+            custom_message_encoder,
+            messages,
+            tools=tools,
+            **kwargs,
+        ),
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1825,12 +1850,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt_or_tokens = apply_chat_template(
-                tokenizer,
-                custom_message_encoder,
-                messages,
-                tools=request.tools,
-                **merged_kwargs,
+            prompt_or_tokens = await _render_chat_template(
+                messages, tools=request.tools, **merged_kwargs
             )
 
         # The K3 template may open the reasoning channel in text or token IDs.
@@ -2222,12 +2243,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=anthropic_to_openai_tools(request.tools),
-            **merged_kwargs,
+        prompt = await _render_chat_template(
+            messages, tools=anthropic_to_openai_tools(request.tools), **merged_kwargs
         )
 
         generation_config = engine.config.generation_config
@@ -2649,12 +2666,8 @@ async def responses_create(raw_request: Request):
             rules=rules,
         )
 
-        prompt = apply_chat_template(
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=openai_tools,
-            **merged_kwargs,
+        prompt = await _render_chat_template(
+            messages, tools=openai_tools, **merged_kwargs
         )
 
         generation_config = engine.config.generation_config
@@ -3204,6 +3217,9 @@ def main():
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
     engine = engine_args.create_engine(tokenizer=tokenizer)
+    # Every output reaches its request through the per-sequence callbacks;
+    # nothing here reads the offline outputs queue.
+    engine.core_mgr.consumes_outputs_queue = False
     # Forced acceptance emits draft tokens that nothing verified, and once the
     # context is long enough those degenerate into the dialect's own channel
     # framing and nothing else -- read as structure, correctly, that leaves a
