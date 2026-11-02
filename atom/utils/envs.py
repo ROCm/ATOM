@@ -420,6 +420,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine `routed + sigmoid(gate) * shared` and the attention output gate
     # `o * sigmoid(gate)`, instead of three and two eager kernels. Keeps the
     # BF16 rounding of every intermediate, so the outputs match the unfused ops.
+    # MoE routing on gfx1250: aiter's Triton top-8 (one program a row) in place of
+    # topk_softmax for bf16 [T, 256] logits, renormalized, no shared columns. Same
+    # ids and weights, ~1.5 us less a MoE layer.
+    "ATOM_MOE_TRITON_TOPK": lambda: os.getenv("ATOM_MOE_TRITON_TOPK", "0") == "1",
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
