@@ -189,8 +189,8 @@ class DraftQStaging:
         top_k,
         top_p,
         seed,
-        dest_row_base,
-        verify_row_base,
+        q_row_base,
+        verify_q_row_base,
         greedy_threshold: float,
     ):
         self.slots = slots
@@ -199,8 +199,8 @@ class DraftQStaging:
         self._top_k = top_k
         self._top_p = top_p
         self._seed = seed
-        self._dest = dest_row_base
-        self._verify = verify_row_base
+        self._dest = q_row_base
+        self._verify = verify_q_row_base
         # `SAMPLER_EPS`: a row at or below it is greedy, as `Sampler` decides.
         self._eps = greedy_threshold
         self._step = 0
@@ -253,9 +253,8 @@ class DraftQStaging:
             # * a request still mid-prompt in a mixed prefill batch: its drafts
             #   are dropped, like a whole align-only batch's.
             skip = batch.temperatures[:bs] <= self._eps
-            final_chunk = getattr(batch, "is_final_chunk", None)
-            if final_chunk is not None:
-                skip |= ~np.asarray(final_chunk[:bs], dtype=bool)
+            if batch.is_final_chunk is not None:
+                skip |= ~np.asarray(batch.is_final_chunk[:bs], dtype=bool)
             self.slots.claim_bases(req_ids, self._dest, skip if skip.any() else None)
             self._dest[bs:hi] = -1
             self._dest_hi = bs
@@ -268,8 +267,8 @@ class DraftQStaging:
             "greedy_mask": bs or None,
             "top_k": bs or None,
             "top_p": bs or None,
-            "verify_row_base": bs or None,
-            "dest_row_base": hi or None,
+            "verify_q_row_base": bs or None,
+            "q_row_base": hi or None,
         }
         if not bs:
             return counts

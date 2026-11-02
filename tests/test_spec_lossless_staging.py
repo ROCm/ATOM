@@ -28,11 +28,11 @@ VOCAB = 16
 LOSSLESS = (
     "draft_temperatures",
     "draft_greedy_mask",
-    "draft_sample_seed",
+    "draft_seed",
     "draft_top_k",
     "draft_top_p",
     "draft_q_row_base",
-    "verify_q_row_base",
+    "draft_verify_q_row_base",
 )
 
 
@@ -59,7 +59,14 @@ def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
     )
     prop = DSparkProposer.__new__(DSparkProposer)
     prop.config = SimpleNamespace(
-        max_num_seqs=MAX_BS, pipeline_parallel_size=pp, **config
+        max_num_seqs=MAX_BS,
+        pipeline_parallel_size=pp,
+        **{
+            "kv_transfer_config": {},
+            "enable_rapidserve": False,
+            "disagg_is_decode": False,
+            **config,
+        },
     )
     prop.device = torch.device("cpu")
     prop.runner = SimpleNamespace(rank=1, forward_step=0)
@@ -113,7 +120,7 @@ def dest(prop):
 
 
 def verify(prop):
-    return prop.metadata_buffers["verify_q_row_base"].np.tolist()
+    return prop.metadata_buffers["draft_verify_q_row_base"].np.tolist()
 
 
 # ---- arming -----------------------------------------------------------------
@@ -407,9 +414,9 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
     counts = stage(prop, batch([]))
-    assert counts["draft_sample_seed"] == 1
+    assert counts["draft_seed"] == 1
     assert counts["draft_temperatures"] is None
-    assert counts["verify_q_row_base"] is None
+    assert counts["draft_verify_q_row_base"] is None
     assert counts["draft_q_row_base"] == 2 and dest(prop)[:2] == [-1, -1]
 
 

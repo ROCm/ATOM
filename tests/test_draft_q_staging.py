@@ -30,8 +30,8 @@ def staging(slots=2 * MAX_BS):
         "top_k": np.zeros(MAX_BS, np.int32),
         "top_p": np.ones(MAX_BS, np.float32),
         "seed": np.zeros(1, np.int32),
-        "dest_row_base": np.full(MAX_BS, -1, np.int32),
-        "verify_row_base": np.full(MAX_BS, -1, np.int32),
+        "q_row_base": np.full(MAX_BS, -1, np.int32),
+        "verify_q_row_base": np.full(MAX_BS, -1, np.int32),
     }
     return (
         DraftQStaging(DraftQSlots(slots, T), greedy_threshold=EPS, **arrays),
@@ -75,13 +75,13 @@ def stage(st, b, *, verifiable=True, verifies=True, step=None):
 def test_a_verify_finds_the_rows_its_drafts_were_written_to():
     st, a = staging()
     stage(st, batch(["a", "b", "c"]))
-    drafted = dict(zip("abc", a.dest_row_base[:3].tolist()))
-    assert a.verify_row_base[:3].tolist() == [-1, -1, -1], "nothing drafted yet"
+    drafted = dict(zip("abc", a.q_row_base[:3].tolist()))
+    assert a.verify_q_row_base[:3].tolist() == [-1, -1, -1], "nothing drafted yet"
     # Reordered, with a request that never drafted.
     stage(st, batch(["c", "x", "a"]))
-    assert a.verify_row_base[:3].tolist() == [drafted["c"], -1, drafted["a"]]
+    assert a.verify_q_row_base[:3].tolist() == [drafted["c"], -1, drafted["a"]]
     # The same requests draft back into the rows they own.
-    assert a.dest_row_base[0] == drafted["c"] and a.dest_row_base[2] == drafted["a"]
+    assert a.q_row_base[0] == drafted["c"] and a.q_row_base[2] == drafted["a"]
 
 
 def test_a_dummy_forward_claims_nothing_and_verifies_nothing():
@@ -89,23 +89,23 @@ def test_a_dummy_forward_claims_nothing_and_verifies_nothing():
     or a real request 0 would later verify against a dummy's q."""
     st, a = staging()
     stage(st, batch([0, 1, -1], dummy=True), verifiable=False, verifies=False)
-    assert a.dest_row_base[:3].tolist() == [-1, -1, -1]
-    assert a.verify_row_base[:3].tolist() == [-1, -1, -1]
+    assert a.q_row_base[:3].tolist() == [-1, -1, -1]
+    assert a.verify_q_row_base[:3].tolist() == [-1, -1, -1]
     assert len(st.slots) == 0
     stage(st, batch([0]))
-    assert a.verify_row_base[0] == -1
+    assert a.verify_q_row_base[0] == -1
 
 
 def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
     st, a = staging()
     stage(st, batch(["d"]))
-    d = a.dest_row_base[0]
+    d = a.q_row_base[0]
     rows = stage(st, batch(["m1", "m2"]), verifiable=False, verifies=False)
-    assert a.dest_row_base[:2].tolist() == [-1, -1]
-    assert rows["dest_row_base"] == 2
+    assert a.q_row_base[:2].tolist() == [-1, -1]
+    assert rows["q_row_base"] == 2
     assert "m1" not in st.slots and "m2" not in st.slots
     stage(st, batch(["d"]))
-    assert a.verify_row_base[0] == d
+    assert a.verify_q_row_base[0] == d
 
 
 def test_only_a_step_that_verifies_looks_q_up_or_counts():
@@ -117,13 +117,13 @@ def test_only_a_step_that_verifies_looks_q_up_or_counts():
     stage(st, batch(["a"]))
     stage(st, batch(["b"]))  # a expires
     stage(st, batch(["a"]), verifiable=False, verifies=False)  # middle chunk
-    assert a.verify_row_base[0] == -1
+    assert a.verify_q_row_base[0] == -1
     stage(st, batch(["a"], final_chunk=[True]), verifies=False)
-    assert a.verify_row_base[0] == -1
+    assert a.verify_q_row_base[0] == -1
     assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
-    claimed = a.dest_row_base[0]
+    claimed = a.q_row_base[0]
     stage(st, batch(["a"]))
-    assert a.verify_row_base[0] == claimed
+    assert a.verify_q_row_base[0] == claimed
     assert (st.slots.verifies, st.slots.live_expiries) == (1, 0)
 
 
@@ -133,11 +133,11 @@ def test_a_greedy_request_claims_no_slot_and_writes_no_q():
     st, a = staging()
     for top_k in (-1, 5):
         stage(st, batch(["g", "s"], [0.0, 1.0], top_ks=[top_k, top_k]))
-        assert a.dest_row_base[0] == -1 and a.dest_row_base[1] >= 0
+        assert a.q_row_base[0] == -1 and a.q_row_base[1] >= 0
         assert "g" not in st.slots and "s" in st.slots
     stage(st, batch(["g", "s"], [0.0, 1.0]))
-    assert a.verify_row_base[0] == -1
-    assert a.verify_row_base[1] == a.dest_row_base[1]
+    assert a.verify_q_row_base[0] == -1
+    assert a.verify_q_row_base[1] == a.q_row_base[1]
 
 
 def test_a_request_still_mid_prompt_claims_no_slot():
@@ -145,22 +145,22 @@ def test_a_request_still_mid_prompt_claims_no_slot():
     do not, the unfinished ones' drafts are dropped, so they claim nothing."""
     st, a = staging()
     stage(st, batch(["done", "mid", "done2"], final_chunk=[True, False, True]))
-    assert a.dest_row_base[1] == -1
-    assert a.dest_row_base[0] >= 0 and a.dest_row_base[2] >= 0
+    assert a.q_row_base[1] == -1
+    assert a.q_row_base[0] >= 0 and a.q_row_base[2] >= 0
     assert "mid" not in st.slots
     stage(st, batch(["mid"], final_chunk=[True]))
-    assert "mid" in st.slots and a.dest_row_base[0] >= 0
+    assert "mid" in st.slots and a.q_row_base[0] >= 0
 
 
 def test_a_smaller_batch_clears_the_larger_ones_pad_rows():
     """The block runs at `running_bs >= scheduled_bs`; a pad row still naming a
     previous batch's slot would write its q into a live request's rows."""
     st, a = staging()
-    assert stage(st, batch(list("abcd")))["dest_row_base"] == 4
+    assert stage(st, batch(list("abcd")))["q_row_base"] == 4
     rows = stage(st, batch(list("ab")))
-    assert a.dest_row_base[2:].tolist() == [-1, -1]
-    assert rows["dest_row_base"] == 4, "the cleared tail is published too"
-    assert stage(st, batch(list("ab")))["dest_row_base"] == 2
+    assert a.q_row_base[2:].tolist() == [-1, -1]
+    assert rows["q_row_base"] == 4, "the cleared tail is published too"
+    assert stage(st, batch(list("ab")))["q_row_base"] == 2
 
 
 def test_each_row_drafts_within_its_own_filters():
@@ -207,8 +207,8 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail():
     stage(st, batch(["a", "b"]))
     rows = stage(st, batch([]))
     assert rows["seed"] == 1
-    assert rows["temperatures"] is None and rows["verify_row_base"] is None
-    assert rows["dest_row_base"] == 2 and a.dest_row_base[:2].tolist() == [-1, -1]
+    assert rows["temperatures"] is None and rows["verify_q_row_base"] is None
+    assert rows["q_row_base"] == 2 and a.q_row_base[:2].tolist() == [-1, -1]
 
 
 def test_a_propose_needs_a_staging_of_its_own():
@@ -242,7 +242,7 @@ def test_clearing_the_destinations_keeps_the_slot_map():
     st, a = staging()
     stage(st, batch(["a", "b", "c"]))
     st.clear_destinations()
-    assert a.dest_row_base.tolist() == [-1] * MAX_BS
+    assert a.q_row_base.tolist() == [-1] * MAX_BS
     assert {"a", "b", "c"} <= set(st.slots._slot_of)
     # The next step after it clears only what it must.
-    assert stage(st, batch(["a"]))["dest_row_base"] == 1
+    assert stage(st, batch(["a"]))["q_row_base"] == 1

@@ -50,3 +50,7 @@ def test_a_batch_larger_than_the_scratch_is_refused():
     scratch = SamplingScratch(5, 5, "cpu")
     with pytest.raises(ValueError, match="sized for a smaller batch"):
         take([(2, 3)], [], scratch.f32, scratch.i32)
+
+
+def test_nbytes_counts_both_buffers():
+    assert SamplingScratch(5, 3, "cpu").nbytes() == (5 + 3) * 4

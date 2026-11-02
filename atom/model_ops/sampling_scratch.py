@@ -53,6 +53,9 @@ class SamplingScratch:
         ones."""
         return cls(_planned_elems(f32_shapes), _planned_elems(i32_shapes), device)
 
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (self.f32, self.i32))
+
 
 def take(
     f32_shapes: Sequence[tuple[int, ...]],

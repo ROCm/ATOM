@@ -42,46 +42,40 @@ _Q_SLOT_OVERSUBSCRIBE = 2
 class _LosslessInput(NamedTuple):
     """One staged input of the sampled draft or the ratio verify."""
 
-    #: The `metadata_buffers` key, a member of the `sampling` publication.
+    #: The `DraftQStaging` keyword its numpy view is passed as, the key
+    #: `DraftQStaging.stage` reports its row count under, and, if `drafted`,
+    #: the `DraftSampling` field its device tensor binds to.
     name: str
     #: One entry per batch row (`max_num_seqs`), or a single scalar.
     per_row: bool
     dtype: torch.dtype
     #: What rows past the staged batch hold; None leaves the zeros.
     idle: float | int | None
-    #: The `DraftQStaging` keyword its numpy view is passed as, and the key
-    #: `DraftQStaging.stage` reports its published row count under.
-    staging: str
-    #: The `DraftSampling` field its device tensor binds to; None when only
-    #: the verify reads it.
-    sampling: str | None
+    #: Whether the draft reads it; False when only the verify does.
+    drafted: bool = True
+
+    @property
+    def key(self) -> str:
+        """The `metadata_buffers` key, a member of the `sampling` publication;
+        prefixed because it shares `forward_vars` with the runner's."""
+        return "draft_" + self.name
 
 
-#: Every per-step input of lossless speculative sampling. Pad rows idle at
-#: temperature 1.0 rather than a 0 the kernel would divide by, no filter, and
-#: row base -1, so a pad row writes no q.
+#: Every per-step input of lossless speculative sampling, in publication order.
+#: Pad rows idle at temperature 1.0 rather than a 0 the kernel would divide by,
+#: no filter, and row base -1, so a pad row writes no q.
 _LOSSLESS_INPUTS = (
-    _LosslessInput(
-        "draft_temperatures", True, torch.float32, 1.0, "temperatures", "temperatures"
-    ),
-    _LosslessInput(
-        "draft_greedy_mask", True, torch.int32, 1, "greedy_mask", "greedy_mask"
-    ),
-    _LosslessInput("draft_sample_seed", False, torch.int32, None, "seed", "seed"),
+    _LosslessInput("temperatures", True, torch.float32, 1.0),
+    _LosslessInput("greedy_mask", True, torch.int32, 1),
+    _LosslessInput("seed", False, torch.int32, None),
     # The request's own top-k / top-p, for the draft to sample within.
-    _LosslessInput("draft_top_k", True, torch.int32, 0, "top_k", "top_k"),
-    _LosslessInput("draft_top_p", True, torch.float32, 1.0, "top_p", "top_p"),
+    _LosslessInput("top_k", True, torch.int32, 0),
+    _LosslessInput("top_p", True, torch.float32, 1.0),
     # First q row each batch row drafts into; -1 writes nothing.
-    _LosslessInput(
-        "draft_q_row_base", True, torch.int32, -1, "dest_row_base", "q_row_base"
-    ),
+    _LosslessInput("q_row_base", True, torch.int32, -1),
     # First q row each request's drafts were drawn into; -1 means none.
-    _LosslessInput("verify_q_row_base", True, torch.int32, -1, "verify_row_base", None),
+    _LosslessInput("verify_q_row_base", True, torch.int32, -1, drafted=False),
 )
-
-
-def _scratch_mib(scratch) -> float:
-    return (scratch.f32.numel() * 4 + scratch.i32.numel() * 4) / 2**20
 
 
 @triton.jit(do_not_specialize=["scheduled_bs", "vocab_max"])
@@ -151,8 +145,7 @@ class DSparkProposer(Drafter):
         self._staging = None
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return
-        model = getattr(self, "model", None)
-        if model is None or not getattr(model, "supports_lossless_draft", False):
+        if not self.model.supports_lossless_draft:
             # This flavor's block sampler has no sampled entry point. Silent,
             # because "not ported yet" is not an operator error.
             return
@@ -193,8 +186,8 @@ class DSparkProposer(Drafter):
                 vocab,
                 store.nbytes() / 2**20,
                 self.draft_sampling.s_scratch.numel() * 4 / 2**20,
-                _scratch_mib(self.draft_sampling.scratch),
-                _scratch_mib(self._verify_scratch),
+                self.draft_sampling.scratch.nbytes() / 2**20,
+                self._verify_scratch.nbytes() / 2**20,
             )
 
     def _lossless_unsupported_reason(self) -> str | None:
@@ -232,10 +225,8 @@ class DSparkProposer(Drafter):
         if unsupported is not None:
             # Checked once here so the sampled op never has to fail mid-serve.
             return f"cannot run the fused sampled draft ({unsupported})."
-        kv_cfg = getattr(self.config, "kv_transfer_config", None) or {}
-        if kv_config_has_producer(kv_cfg) or (
-            getattr(self.config, "enable_rapidserve", False)
-            and not getattr(self.config, "disagg_is_decode", False)
+        if kv_config_has_producer(self.config.kv_transfer_config) or (
+            self.config.enable_rapidserve and not self.config.disagg_is_decode
         ):
             # A P/D producer (or RapidServe's prefill process) drafts only to
             # hand the drafts off; it never verifies, and the consumer has no
@@ -320,21 +311,17 @@ class DSparkProposer(Drafter):
                 buf.np[:] = spec.idle
                 buf.gpu.fill_(spec.idle)
             buffers[spec.name] = buf
-        self.metadata_buffers.update(buffers)
+        self.metadata_buffers.update({s.key: buffers[s.name] for s in _LOSSLESS_INPUTS})
         staging = DraftQStaging(
             DraftQSlots(q_slots, t, log=self.runner.rank == 0),
             greedy_threshold=SAMPLER_EPS,
-            **{s.staging: buffers[s.name].np for s in _LOSSLESS_INPUTS},
+            **{name: buf.np for name, buf in buffers.items()},
         )
         sampling = DraftSampling(
             q_store=q_store,
             s_scratch=s_scratch,
             scratch=draft_scratch,
-            **{
-                s.sampling: buffers[s.name].gpu
-                for s in _LOSSLESS_INPUTS
-                if s.sampling is not None
-            },
+            **{s.name: buffers[s.name].gpu for s in _LOSSLESS_INPUTS if s.drafted},
         )
         return sampling, staging
 
@@ -360,7 +347,7 @@ class DSparkProposer(Drafter):
             step=self.runner.forward_step,
         )
         for spec in _LOSSLESS_INPUTS:
-            group.counts[group.indices[spec.name]] = rows[spec.staging]
+            group.counts[group.indices[spec.key]] = rows[spec.name]
 
     def _before_propose(self) -> None:
         """Claim this forward's staging for the propose about to run, or refuse.
@@ -401,7 +388,7 @@ class DSparkProposer(Drafter):
             )
         return (
             RatioDraftQ(self.draft_sampling.q_store, self.draft_sampling.s_scratch),
-            self.metadata_buffers["verify_q_row_base"].gpu[:bs],
+            self.metadata_buffers["draft_verify_q_row_base"].gpu[:bs],
             self._verify_scratch,
         )
 
