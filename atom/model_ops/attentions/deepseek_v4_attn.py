@@ -391,7 +391,8 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     """[total_tokens + 1] int32 GPU — packed cumsum of `extend_count`."""
     paged_prefill_indptr_cpu: dict[str, np.ndarray] | None = None
     """Host copies of the four `kv_indptr_*` above, keyed by field name. PCP
-    reindexes from these, so it never reads the GPU copies back."""
+    reindexes from these, so it never reads the GPU copies back; after either
+    reindex both describe the same (rank- or group-local) queries."""
 
 
 class DeepseekV4Backend(AttentionBackend):
@@ -2889,6 +2890,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             indices = getattr(attn_metadata, idx_attr, None)
             if indptr is None or indices is None:
                 continue
+            assert indptr_cpu[ind_attr].shape[0] == indptr.shape[0], ind_attr
             indptr = pcp_pad_indptr(indptr, n_pad)  # dummy queries: 0-length KV
             local_cpu = pcp_local_indptr(indptr_cpu[ind_attr], owned_cpu)
             new_indptr, new_indices = pcp_reindex_ragged(
@@ -3208,9 +3210,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             indices = getattr(src, idx_attr, None)
             if indptr is None or indices is None:
                 continue
-            local_cpu = pcp_local_indptr(
-                src.paged_prefill_indptr_cpu[ind_attr], owned_cpu
-            )
+            src_cpu = src.paged_prefill_indptr_cpu[ind_attr]
+            assert src_cpu.shape[0] == indptr.shape[0], ind_attr
+            local_cpu = pcp_local_indptr(src_cpu, owned_cpu)
             ni, nx = pcp_reindex_ragged(indptr, indices, owned, local_cpu)
             ub.paged_prefill_indptr_cpu[ind_attr] = local_cpu
             # kv_indices_extend are ROW offsets into the per-fwd kv_full tensor.
