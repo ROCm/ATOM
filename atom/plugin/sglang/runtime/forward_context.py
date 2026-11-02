@@ -689,7 +689,11 @@ def _build_kimi_k3_metadata(
             "reduce_partial_map",
             "num_kv_splits",
         ):
-            setattr(attn_metadata, name, getattr(forward_metadata, name, None))
+            value = getattr(forward_metadata, name, None)
+            if name == "work_meta_data" and not torch.is_tensor(value):
+                # SGLang's ForwardMetadata field is work_metadata.
+                value = getattr(forward_metadata, "work_metadata", None)
+            setattr(attn_metadata, name, value)
 
     linear_backend = SGLangGDNForwardContext._linear_attn_backend(attn_backend)
     attn_metadata.gdn_metadata = SGLangGDNForwardContext._build_gdn_metadata(

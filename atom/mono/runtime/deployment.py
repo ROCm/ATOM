@@ -5,9 +5,18 @@ shares (one TP group on one node, decode steps in the model's own graph), which
 a model's own list extends."""
 
 from atom.config import CompilationLevel
+from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.shard import shard_refusal
 from atom.plugin.prepare import is_sglang, is_vllm
 from atom.utils import resolve_obj_by_qualname
+
+
+def _gfx() -> str:
+    """The chip this is running on, imported on use: a non-GPU install carries
+    `aiter` without `aiter.jit`, and this module has to import there."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx()
 
 
 def _uses_tr_hybrid(atom_config) -> bool:
@@ -77,6 +86,7 @@ def common_refusals(
     supported_dpa=(),
     *,
     refuse_tr_hybrid: bool = True,
+    refuse_decode_cp: bool = True,
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``,
@@ -93,7 +103,15 @@ def common_refusals(
     bypasses the compiled inner ``DeepseekV2Model`` entirely, so that
     module's token graph never runs and cannot conflict with mono; GLM-5.2
     passes ``refuse_tr_hybrid=False`` to opt out of this one check while
-    keeping every other shared refusal."""
+    keeping every other shared refusal.
+
+    ``refuse_decode_cp`` likewise: decode context parallelism splits the
+    attention KV over the ranks, which a mono kernel that runs attention
+    would have to know about. A model whose kernels either run no attention
+    (its attention layers stay on the production path, which handles the
+    split) or are written for that split and refuse any other themselves
+    (the shared DSA indexer, ``dsa_indexer.bind``) passes
+    ``refuse_decode_cp=False``."""
     tp = atom_config.tensor_parallel_size
     dpa = dp_attention_ranks(atom_config)
     if dpa not in (0, *supported_dpa):
@@ -111,9 +129,16 @@ def common_refusals(
             (not atom_config.enable_expert_parallel, "expert parallel"),
             (atom_config.parallel_config.data_parallel_size == 1, "DP > 1"),
         ]
-    checks = parallel + [
+    gfx = _gfx()
+    checks = [
+        # the persistent kernels are gfx950 code: wave64, MFMA, permlane32
+        (gfx == "gfx950", f"arch {gfx}"),
+        *parallel,
         (atom_config.pipeline_parallel_size == 1, "PP > 1"),
-        (atom_config.decode_context_parallel_size == 1, "decode CP"),
+        (
+            not refuse_decode_cp or atom_config.decode_context_parallel_size == 1,
+            "decode CP",
+        ),
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
@@ -142,6 +167,33 @@ def common_refusals(
     if refuse_tr_hybrid:
         checks.append((not _uses_tr_hybrid(atom_config), "TR_HYBRID cudagraph"))
     return checks
+
+
+def _cu_count() -> int | None:
+    """This device's CUs, or None where there is no device (a contract check
+    builds compile-only and never binds one)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+def resident_grid_refusals(atom_config) -> list[tuple[bool, str]]:
+    """``(holds, why not)`` of a kernel whose CTAs, one a CU, are all resident
+    and spin on each other (``plan.execution.BLOCKS``)."""
+    cus = _cu_count()
+    return [
+        # a spin wait on another CTA only makes progress while that CTA runs
+        (cus in (None, BLOCKS), f"{cus} CUs, the kernels need {BLOCKS}"),
+        # a connector's copy kernels run on another stream and can hold CUs,
+        # which wedges a kernel that waits on every one of them. The field is a
+        # dict that defaults to empty, so this is a truthiness test, as every
+        # other reader of it in ATOM does: `is None` refuses every deployment.
+        (not getattr(atom_config, "kv_transfer_config", None), "KV connector"),
+    ]
 
 
 def first_refusal(checks) -> str | None:

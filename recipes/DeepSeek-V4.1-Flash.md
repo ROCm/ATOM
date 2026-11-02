@@ -12,7 +12,7 @@ pinned to `2039d2b96cd547ebc52f8d55f5f29ec1b8290796`, and Engram builds on
 ROCm/ATOM PR #2185. The primary deployment scope is TP4 with whole-expert EP
 on MI355X GPUs. For measured TP2/TP4 no-EP, level-3 FULL AgentX performance,
 see the [AgentX benchmark recipe](DeepSeek-V4.1-Flash-Agentic.md), using
-fixed acceptance length 3.51.
+fixed acceptance length 3.51. For MI455X, see [gfx1250 (MI455X)](#gfx1250-mi455x).
 
 | Capability | Status |
 |---|---|
@@ -80,6 +80,80 @@ with numerical behavior described in the cache and graph guide. They
 run under whole-expert EP or shard across TP, whichever the launch selects.
 V4.1 initializes the same distributed environment as every other model and has no
 collective policy of its own.
+
+## gfx1250 (MI455X)
+
+V4.1 runs on gfx1250 at TP4 (`--level 0`, BF16 KV, FP8 index), with or without
+DSpark, and at DEP4 (EP + DP attention). On gfx1250 its FP8 linears, the grouped
+`wo_a` and the FP8 index scoring run on AITER's FlyDSL kernels:
+
+- FP8 linears and `wo_a`: the batched mxfp8_32 GEMM, which reads the 32x32
+  weight scale as stored. The 32x32 linears, including DSpark's `main_proj`
+  and Engram's `wkv`, are held preshuffled on gfx1250 as on gfx950. A K that
+  128 does not divide (the shared expert's down projection at TP4, K = 576)
+  runs as a ragged last k-tile.
+- FP8 index scoring: `flydsl_fp8_paged_mqa_logits`, over the same packed,
+  preshuffled 8-row-page cache.
+
+What differs from gfx950:
+
+- **Mono fused decode is gfx950-only** (wave64, `permlane32`). On gfx1250 the
+  deployment check refuses it and logs `V4.1 mono decode off: arch gfx1250`, so
+  `ATOM_MONO_ENABLE` needs no setting. DSpark still runs: its draft passes and
+  verify steps take the original, unfused path.
+- **The router GEMV** (bf16 MFMA) is gfx950-only; gfx1250 uses the regular gate.
+- **FP8 index only.** The FP4 index plane (`--index-cache-dtype fp4`) scores
+  with a gfx950 FlyDSL kernel and does not compile on gfx1250.
+- **`--level 0`.** A first `--level 3` start can stall while ranks compile and
+  autotune at different times.
+
+TP4 (add `--method dspark --num-speculative-tokens 5` for DSpark):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 ATOM_DISABLE_MMAP=true \
+AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 \
+python3 -m atom.entrypoints.openai_server \
+  --model /models/deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \
+  --server-port 8000 -tp 4 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --block-size 16 --level 0 --max-num-seqs 64 \
+  --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64]'
+```
+
+DEP4 (EP + DP attention, MegaMoE over mori v2):
+
+```bash
+HIP_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=4 ATOM_DISABLE_MMAP=true \
+AITER_REUSE_IDENTICAL_COMM_GROUPS=1 HF_HUB_OFFLINE=1 \
+MORI_GPU_ARCHS=gfx1250 FLYDSL_GPU_ARCH=gfx1250 \
+ATOM_MORI_V2=1 MEGA_DISPATCH_WIRE=fp4 ATOM_MEGA_COMBINE_WIRE=fp4 \
+ATOM_MOE_GU_ITLV=1 ATOM_DP_LM_HEAD_MODE=allgather MORI_SHMEM_HEAP_SIZE=16G \
+python3 -m atom.entrypoints.openai_server \
+  --model /models/deepseek-ai/DeepSeek-V4.1-Flash --trust-remote-code \
+  --server-port 8000 -tp 4 --enable-expert-parallel --enable-dp-attention \
+  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --gpu-memory-utilization 0.9 \
+  --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
+  --block-size 16 --level 0 --max-num-seqs 512 \
+  --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,96,128,192,256,320,384,448,512]'
+```
+
+`--max-num-seqs` counts per DP rank. If the image's mori loads only
+`libamd_smi.so.<N>`, point `MORI_AMD_SMI_PATH` at it.
+
+Validation on MI455X, GSM8K 3-shot on the full test set (`lm_eval
+local-completions`, `num_concurrent=32`):
+
+| Launch | GSM8K |
+|---|---|
+| TP4 | 0.926 |
+| TP4 + DSpark (5 speculative tokens) | 0.926; acceptance about 50% on these prompts |
+| DEP4 | 0.916 |
+
+The DEP4 gap to TP4 has not been investigated; its fp4 dispatch / combine wire
+is the first suspect.
 
 ## Fused decode (mono)
 

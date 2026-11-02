@@ -56,6 +56,11 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
+from atom.models.deepseek_v2 import (
+    FusedIndexerProjection,
+    Indexer,
+    indexer_projection_fusable,
+)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -63,7 +68,7 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from atom.quant_spec import should_skip_online_quant
+from atom.quant_spec import effective_layer_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
@@ -139,6 +144,15 @@ def _kda_packed_modules_mapping(
     return mapping
 
 
+def _kimi_packed_modules_mapping(config) -> dict[str, tuple[str, int]]:
+    mapping = _kda_packed_modules_mapping(config.kimi_kda_layers)
+    for layer_idx in getattr(config, "dsa_layer_indices", ()):
+        prefix = f".layers.{layer_idx}.self_attn."
+        mapping[f"{prefix}indexer.wk"] = (f"{prefix}fused_qkv_a_proj", 2)
+        mapping[f"{prefix}indexer.weights_proj"] = (f"{prefix}fused_qkv_a_proj", 3)
+    return mapping
+
+
 def _extract_layer_idx(prefix: str) -> int:
     for part in reversed(prefix.split(".")):
         if part.isdigit():
@@ -157,26 +171,16 @@ _RMS_FUSABLE_QUANT_TYPES = (
 )
 
 
-def _effective_layer_quant(
-    quant_config: QuantizationConfig | None, prefix: str
-) -> tuple[QuantType, torch.dtype | None]:
-    """Resolve the ``(quant_type, quant_dtype)`` a Linear runs with at runtime.
-
-    Same resolution the Linear itself performs (mirrors
-    ``LinearBase.online_quantize_weight`` and deepseek_v2's MLA setup): the static
-    checkpoint scheme, overridden by the online-quant target when that override
-    actually applies (``should_skip_online_quant``). A preceding RMSNorm uses this
-    to decide whether -- and in which scheme (fp8 / fp4x2, per-token / block) -- to
-    fuse its activation quant, rather than hard-coding one layout.
-    """
-    if quant_config is None:
-        return QuantType.No, None
-    cfg = quant_config.get_layer_quant_config(prefix)
-    if quant_config.online_quant:
-        online_cfg = quant_config.get_layer_quant_config(prefix, use_online_quant=True)
-        if not should_skip_online_quant(cfg.quant_type, cfg.quant_dtype, online_cfg):
-            cfg = online_cfg
-    return cfg.quant_type, cfg.quant_dtype
+def _is_e8m0_blockscale(
+    quant_config: QuantizationConfig | None, quant_type: QuantType
+) -> bool:
+    """Whether a per_1x128 consumer runs E8M0 block scales (same test as
+    LinearBase). FP32-scale fused producers stand down for it."""
+    return (
+        quant_config is not None
+        and quant_type.value == QuantType.per_1x128.value
+        and quant_config.blockscale_e8m0_scale
+    )
 
 
 class SituAndMul(nn.Module):
@@ -211,9 +215,10 @@ class KimiRMSNormGated(nn.Module):
         eps: float,
         quant_type: QuantType | None = None,
         quant_dtype: torch.dtype | None = None,
+        weight_dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.weight = atom_parameter(torch.ones(hidden_size))
+        self.weight = atom_parameter(torch.ones(hidden_size, dtype=weight_dtype))
         self.variance_epsilon = eps
         # When ``quant_type`` names a fusable per-token scheme, the per-head
         # sigmoid-gated norm also emits (quantized, scale) so the consuming
@@ -276,7 +281,7 @@ class KimiMLP(nn.Module):
         # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
         # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
         # standalone quant. gate_up/down share a scheme, so probe down_proj.
-        down_type, down_dtype = _effective_layer_quant(
+        down_type, down_dtype = effective_layer_quant(
             quant_config, f"{prefix}.down_proj"
         )
         self._fuse_act_quant = (
@@ -333,7 +338,7 @@ class KimiSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.e_score_correction_bias = atom_parameter(
-            torch.empty(config.num_experts, dtype=torch.bfloat16)
+            torch.empty(config.num_experts, dtype=torch.float32)
         )
         self.experts = FusedMoE(
             num_experts=config.num_experts,
@@ -368,19 +373,6 @@ class KimiSparseMoeBlock(nn.Module):
             self.shared_experts = None
 
         if self.use_latent_moe:
-
-            def _routed_source_quant_dtype(layer_prefix: str) -> torch.dtype | None:
-                if quant_config is None:
-                    return None
-                layer_quant_config = quant_config.get_layer_quant_config(layer_prefix)
-                if (
-                    layer_quant_config.quant_type == QuantType.per_1x32
-                    and layer_quant_config.quant_dtype
-                    == getattr(torch, "float4_e2m1fn_x2", None)
-                ):
-                    return torch.bfloat16
-                return None
-
             down_proj_prefix = f"{prefix}.routed_expert_down_proj"
             up_proj_prefix = f"{prefix}.routed_expert_up_proj"
             self.routed_expert_down_proj = ReplicatedLinear(
@@ -388,7 +380,6 @@ class KimiSparseMoeBlock(nn.Module):
                 self.moe_hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                source_quant_dtype=_routed_source_quant_dtype(down_proj_prefix),
                 prefix=down_proj_prefix,
             )
             self.routed_expert_up_proj = ReplicatedLinear(
@@ -396,10 +387,9 @@ class KimiSparseMoeBlock(nn.Module):
                 config.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                source_quant_dtype=_routed_source_quant_dtype(up_proj_prefix),
                 prefix=up_proj_prefix,
             )
-            up_proj_quant_type, up_proj_quant_dtype = _effective_layer_quant(
+            up_proj_quant_type, up_proj_quant_dtype = effective_layer_quant(
                 quant_config, up_proj_prefix
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
@@ -719,14 +709,42 @@ class KimiFullAttention(nn.Module):
         self.scaling = self.q_head_dim**-0.5
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_local_heads = self.num_heads // self.tp_size
+        self.layer_num = _extract_layer_idx(prefix)
+        # A DSA layer's indexer key and head-weight projections ride in its
+        # fused q_a/kv_a projection.
+        has_indexer = self.layer_num in getattr(config, "dsa_layer_indices", ())
 
-        self.fused_qkv_a_proj = MergedReplicatedLinear(
-            self.hidden_size,
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fused_qkv_a_proj",
-        )
+        projection_sizes = [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+        self.projection_split_sizes = [
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+        ]
+        if has_indexer:
+            if not indexer_projection_fusable(quant_config, prefix):
+                raise ValueError(
+                    "Indexer projection fusion requires unquantized BF16 projections"
+                )
+            projection_sizes += [config.index_head_dim, config.index_n_heads]
+            self.projection_split_sizes += [config.index_head_dim, config.index_n_heads]
+            self.fused_qkv_a_proj = FusedIndexerProjection(
+                self.hidden_size,
+                projection_sizes,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+                require_checkpoint_shards=not bool(
+                    getattr(atom_config, "load_dummy", None)
+                ),
+            )
+        else:
+            self.fused_qkv_a_proj = MergedReplicatedLinear(
+                self.hidden_size,
+                projection_sizes,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+            )
         self.q_a_layernorm = RMSNorm(
             self.q_lora_rank, eps=1e-6, prefix=f"{prefix}.q_a_layernorm"
         )
@@ -777,6 +795,20 @@ class KimiFullAttention(nn.Module):
             max_position_embeddings=rope_max_position,
             base=rope_theta,
         )
+        self.indexer = (
+            Indexer(
+                atom_config,
+                config,
+                self.hidden_size,
+                self.q_lora_rank,
+                quant_config,
+                atom_config.index_cache_dtype,
+                prefix=f"{prefix}.indexer",
+                external_k_weights=True,
+            )
+            if has_indexer
+            else None
+        )
         mla_modules = MLAModules(
             q_lora_rank=self.q_lora_rank,
             kv_lora_rank=self.kv_lora_rank,
@@ -788,11 +820,10 @@ class KimiFullAttention(nn.Module):
             q_proj=self.q_b_proj,
             kv_b_proj=self.kv_b_proj,
             o_proj=nn.Identity(),
-            indexer=None,
-            is_sparse=False,
-            topk_tokens=None,
+            indexer=self.indexer,
+            is_sparse=self.indexer is not None,
+            topk_tokens=config.index_topk if self.indexer is not None else None,
         )
-        self.layer_num = _extract_layer_idx(prefix)
         self.attn = Attention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -805,19 +836,24 @@ class KimiFullAttention(nn.Module):
             prefix=prefix,
         )
 
-        qknorm_type, qknorm_dtype = _effective_layer_quant(
+        qknorm_type, qknorm_dtype = effective_layer_quant(
             quant_config, f"{prefix}.q_b_proj"
         )
-        self.fuse_qknorm_quant = qknorm_dtype in (dtypes.fp8, dtypes.fp4x2)
+        self.fuse_qknorm_quant = qknorm_dtype in (
+            dtypes.fp8,
+            dtypes.fp4x2,
+        ) and not _is_e8m0_blockscale(quant_config, qknorm_type)
         self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
         )
+        if self.indexer is not None:
+            self.indexer.quantized_q = self.fuse_qknorm_quant
         # input_layernorm fuses its activation quant only when BOTH consumers of
         # the normed hidden state -- fused_qkv_a_proj and g_proj -- run with the
         # same fusable RMSNorm quant scheme (else a mismatched consumer mis-GEMMs).
-        a_scheme = _effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")
-        g_scheme = _effective_layer_quant(quant_config, f"{prefix}.g_proj")
+        a_scheme = effective_layer_quant(quant_config, f"{prefix}.fused_qkv_a_proj")
+        g_scheme = effective_layer_quant(quant_config, f"{prefix}.g_proj")
         self.fuse_input_norm_quant = (
             a_scheme[0] in _RMS_FUSABLE_QUANT_TYPES and a_scheme == g_scheme
         )
@@ -825,10 +861,11 @@ class KimiFullAttention(nn.Module):
         # Fuse sigmoid(g_proj) * attn_out + activation quant into one triton kernel
         # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
         # (ptpc_fp8) or per-1x128 block.
-        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
-        self.fuse_sigmoid_mul_quant = o_dtype == dtypes.fp8 and o_type in (
-            QuantType.per_Token,
-            QuantType.per_1x128,
+        o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        self.fuse_sigmoid_mul_quant = (
+            o_dtype == dtypes.fp8
+            and o_type in (QuantType.per_Token, QuantType.per_1x128)
+            and not _is_e8m0_blockscale(quant_config, o_type)
         )
         # .value, like qknorm_quant_type_value above: comparing the pybind11
         # QuantType inside forward() graph-breaks Dynamo.
@@ -852,11 +889,12 @@ class KimiFullAttention(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_scale = hidden_states
 
-        q_c, kv_c, k_rope = torch.split(
+        projected = torch.split(
             self.fused_qkv_a_proj(hidden_states, hidden_states_scale),
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
+            self.projection_split_sizes,
             dim=-1,
         )
+        q_c, kv_c, k_rope = projected[:3]
         q_shuffle = False
         q_scale_shuffle_padding = False
         if self.qknorm_dtype == dtypes.fp4x2:
@@ -883,10 +921,20 @@ class KimiFullAttention(nn.Module):
             output_unquantized_inp1=False,
             transpose_scale=True,
         )
+        if self.indexer is not None:
+            # Projection weights retain checkpoint precision; the indexer owns
+            # the FP8 MQA/cache representation.
+            self.indexer(
+                hidden_states,
+                q,
+                q_scale,
+                positions,
+                projected_k_weights=(projected[3], projected[4]),
+            )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
-        # sigmoid(gate) * attn_out, fused with fp8 quant when o_proj runs fp8
-        # (per-token ptpc_fp8 or per-1x128 block).
+        # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
+        # runs FP8, the same helper also folds in its activation quantization.
         attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
             attn_out,
             gate,
@@ -966,6 +1014,9 @@ class KimiKDAAttention(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.num_heads = config.linear_num_key_heads
+        # The recurrence controls, short convolutions and output norm are small
+        # and run in FP32, whatever the large projections are stored in.
+        control_dtype = torch.float32
         self.head_dim = config.linear_key_head_dim
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -1035,10 +1086,14 @@ class KimiKDAAttention(nn.Module):
             prefix=f"{prefix}.v_conv1d",
         )
         for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d):
-            conv.weight.data = conv.weight.data.unsqueeze(1)
+            conv.weight.data = conv.weight.data.unsqueeze(1).to(control_dtype)
 
-        self.A_log = atom_parameter(torch.empty(self.num_local_heads))
-        self.dt_bias = atom_parameter(torch.empty(self.local_proj_size))
+        self.A_log = atom_parameter(
+            torch.empty(self.num_local_heads, dtype=control_dtype)
+        )
+        self.dt_bias = atom_parameter(
+            torch.empty(self.local_proj_size, dtype=control_dtype)
+        )
         # Lower bound of the KDA forget gate (Kimi uses -5.0). Consumed by both
         # the fla prefill path (_run_kda) and the fused decode kernel.
         self._kda_gate_lower_bound = (
@@ -1062,12 +1117,15 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        # rmsnorm_gated fuses only per-token FP8; otherwise o_proj quantizes itself.
+        o_type, o_dtype = effective_layer_quant(quant_config, f"{prefix}.o_proj")
+        o_norm_fuses_quant = o_type == QuantType.per_Token and o_dtype == dtypes.fp8
         self.o_norm = KimiRMSNormGated(
             self.head_dim,
             eps=config.rms_norm_eps,
-            quant_type=o_type,
-            quant_dtype=o_dtype,
+            quant_type=o_type if o_norm_fuses_quant else None,
+            quant_dtype=o_dtype if o_norm_fuses_quant else None,
+            weight_dtype=control_dtype,
         )
         self.o_proj = RowParallelLinear(
             self.proj_size,
@@ -1081,7 +1139,7 @@ class KimiKDAAttention(nn.Module):
         # single fused in_proj GEMM (q|k|v|g|b|f_a) that consumes the normed hidden
         # state; the (fp8, scale) rides the splitting custom op into _forward_impl.
         # Enabled for any fusable RMSNorm quant scheme (fp8 / fp4x2).
-        in_proj_type, _ = _effective_layer_quant(quant_config, f"{prefix}.in_proj")
+        in_proj_type, _ = effective_layer_quant(quant_config, f"{prefix}.in_proj")
         self.fuse_input_norm_quant = in_proj_type in _RMS_FUSABLE_QUANT_TYPES
         self.input_quant_prefix = f"{prefix}.in_proj"
 
@@ -1092,7 +1150,7 @@ class KimiKDAAttention(nn.Module):
         # GEMM is what dictates the activation layout): under ptpc the slice is
         # gathered and quantized by one kernel instead, and under any other
         # scheme this stays False and the plain .contiguous() path runs.
-        f_b_type, f_b_dtype = _effective_layer_quant(quant_config, f"{prefix}.f_b_proj")
+        f_b_type, f_b_dtype = effective_layer_quant(quant_config, f"{prefix}.f_b_proj")
         self.fuse_f_a_quant = (
             f_b_type == QuantType.per_Token and f_b_dtype == dtypes.fp8
         )
@@ -1580,7 +1638,7 @@ class KimiDecoderLayer(nn.Module):
         # MoE layers are skipped: their router gate is unquantized and the routed
         # experts are excluded, so the normed output has mixed-precision consumers.
         if hasattr(self, "mlp"):
-            ffn_type, _ = _effective_layer_quant(
+            ffn_type, _ = effective_layer_quant(
                 quant_config, f"{prefix}.mlp.gate_up_proj"
             )
             self.fuse_ffn_norm_quant = ffn_type in _RMS_FUSABLE_QUANT_TYPES
@@ -1864,9 +1922,7 @@ class KimiLinearForCausalLM(nn.Module):
         _normalize_kimi_config(config)
         self.config = config
         self.quant_config = atom_config.quant_config
-        self.packed_modules_mapping = _kda_packed_modules_mapping(
-            config.kimi_kda_layers
-        )
+        self.packed_modules_mapping = _kimi_packed_modules_mapping(config)
         self.model = KimiLinearModel(atom_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1932,9 +1988,7 @@ class KimiK3ForCausalLM(nn.Module):
             _normalize_kimi_config(root_config)
         self.config = _text_config(root_config)
         self.quant_config = atom_config.quant_config
-        self.packed_modules_mapping = _kda_packed_modules_mapping(
-            self.config.kimi_kda_layers
-        )
+        self.packed_modules_mapping = _kimi_packed_modules_mapping(self.config)
         if rebuilt_quant_config:
             self.quant_config.remap_layer_name(
                 self.config,

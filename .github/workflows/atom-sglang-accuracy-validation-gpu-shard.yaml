@@ -188,6 +188,7 @@ jobs:
           }
 
           cache_roots=(
+            /share_nfs/models
             /mnt/dcgpuval
             /shared/data/WRH/models
             /shared_nfs/models
@@ -195,6 +196,7 @@ jobs:
             /mnt/raid0/pretrained_model
             /data/pretrained_model
             /data/models
+            /models
           )
 
           first_existing_root=""
@@ -237,11 +239,11 @@ jobs:
 
           try_hf_cache_root() {
             local candidate="$1"
-            local parent
+            local anchor="${2:-}"
             [ -n "$candidate" ] || return 1
-            parent="$(dirname "$candidate")"
-            [ -d "$parent" ] || return 1
-            if mkdir -p "$candidate" 2>/dev/null; then
+            [ -n "$anchor" ] || anchor="$(dirname "$candidate")"
+            [ -d "$anchor" ] || return 1
+            if mkdir -p "$candidate" 2>/dev/null || sudo -n mkdir -p "$candidate" 2>/dev/null; then
               HF_CACHE_ROOT="$candidate"
               return 0
             fi
@@ -249,17 +251,18 @@ jobs:
             return 1
           }
 
-          for candidate in \
-            "${MODEL_CACHE_ROOT}/.cache/huggingface" \
-            /shared_nfs/.cache/huggingface \
-            /shared_nfs/huggingface \
-            /mnt/raid0/huggingface \
-            /data/huggingface \
-            /shared/data/WRH/huggingface; do
-            if try_hf_cache_root "$candidate"; then
-              break
-            fi
-          done
+          if ! try_hf_cache_root "${MODEL_CACHE_ROOT}/.cache/huggingface" "${MODEL_CACHE_ROOT}"; then
+            for candidate in \
+              /shared_nfs/.cache/huggingface \
+              /shared_nfs/huggingface \
+              /mnt/raid0/huggingface \
+              /data/huggingface \
+              /shared/data/WRH/huggingface; do
+              if try_hf_cache_root "$candidate"; then
+                break
+              fi
+            done
+          fi
 
           if [ -z "$HF_CACHE_ROOT" ]; then
             echo "ERROR: No writable shared HuggingFace cache root found."

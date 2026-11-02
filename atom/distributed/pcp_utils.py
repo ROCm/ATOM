@@ -196,14 +196,13 @@ def pcp_owned_rows_by_request(
     cu_seqlens_q: np.ndarray, first: int, stride: int, owned: int
 ) -> np.ndarray:
     """Starts of the rows a PCP rank owns (`first`, `first + stride`, ...,
-    `owned` of them) grouped by request (`cu_seqlens_q`), then the padding
-    rows past the last request as one more. Rows below `x` it owns number
-    `ceil((x - first) / stride)`, so this is arithmetic on the host."""
+    `owned` of them) grouped by request (`cu_seqlens_q`). Padding rows join
+    the last request's group: one group per `block_tables` row, and at
+    position 0 they read no key."""
     cu = np.asarray(cu_seqlens_q, dtype=np.int64)
     below = (np.maximum(cu - first, 0) + stride - 1) // stride
     starts = below - below[0]
-    if starts[-1] < owned:
-        starts = np.append(starts, owned)
+    starts[-1] = owned
     return starts.astype(np.int32)
 
 

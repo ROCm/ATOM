@@ -974,7 +974,9 @@ jobs:
           MODEL_CACHE_MOUNT=""
           MODEL_CACHE_DESC="container-local /models (no host cache mount)"
           MODEL_MOUNT_PATH="/models"
-          if [ -d "/mnt/dcgpuval" ]; then
+          if [ -d "/share_nfs/models" ]; then
+            MODEL_CACHE_ROOT="/share_nfs/models"
+          elif [ -d "/mnt/dcgpuval" ]; then
             MODEL_CACHE_ROOT="/mnt/dcgpuval"
           elif [ -d "/shared/data/WRH/models" ]; then
             MODEL_CACHE_ROOT="/shared/data/WRH/models"

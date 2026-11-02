@@ -837,9 +837,7 @@ def _proposer_with_graph_bs(
     )
 
     monkeypatch.setattr(DSparkProposer, "_with_draft", False, raising=False)
-    monkeypatch.setattr(
-        DSparkProposer, "aux_for", lambda self, h: [torch.zeros(1)], raising=False
-    )
+    monkeypatch.setattr(DSparkProposer, "_captures_aux", True, raising=False)
     monkeypatch.setattr(DSparkProposer, "verify_scheduler", None, raising=False)
 
     p = DSparkProposer.__new__(DSparkProposer)

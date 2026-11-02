@@ -12,8 +12,9 @@ instead gathers its requests' keys end to end and scores them densely
 way rows run in bands of the plane they were cut to, each band top-k'd as
 soon as it is scored, so nothing wider than one band is ever live. The result
 is `[rows, topk]` int32 column ids local to the row's request, `-1` past a
-row's bound; under DCP each rank scores its share of the rows and the
-selections are all-gathered in place.
+row's bound; split across ranks (`RowSplit`: DCP, or TP for a TP-replicated
+indexer) each rank scores its share of the rows and the selections are
+all-gathered in place -- striped shares left rank-major, slot after slot.
 
 Under a token graph only the FP4 launch breaks: its plan follows the step's
 requests, which a token bucket does not fix. Everything else -- the bands, the
@@ -22,7 +23,9 @@ FP8 launch, the top-k -- follows the rows alone and is recorded.
 
 import torch
 from aiter import cp_gather_indexer_k_quant_cache, dtypes
-from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits, flydsl_pa_mqa_logits_fp4
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -33,6 +36,15 @@ from atom.utils import forward_context
 from atom.utils.region_graph import eager_region
 
 from .rows import NATURAL, IndexCache, IndexRows
+
+# gfx1250 scores the FP8 plane with FlyDSL's paged MQA logits (8-row pages
+# included); it reads the same packed preshuffled pages as the Triton kernel
+# and takes the same arguments.
+_fp8_paged_mqa_logits = (
+    flydsl_fp8_paged_mqa_logits
+    if get_gfx() == "gfx1250"
+    else deepgemm_fp8_paged_mqa_logits
+)
 
 
 def score_topk(
@@ -47,9 +59,13 @@ def score_topk(
     on_band=None,
     out: torch.Tensor | None = None,
     keys=None,
+    request_local: bool = True,
 ) -> torch.Tensor:
     """`[rows.out_rows, topk]` int32 of `rows`' query rows against `cache`,
     each band scored into the plane the rows were cut to (`rows.workspace`).
+    `request_local=False` leaves FP8 concat rows' ids as places in the
+    gathered run, for a consumer that subtracts `rows.concat.row_starts`
+    itself (MLA's prefill slot conversion).
 
     FP8: `query` [rows, heads, dim] e4m3 and `weights` [rows, heads] fp32 with
     the query scale folded in. FP4: `query` is `(values, scales)`, each
@@ -59,31 +75,69 @@ def score_topk(
     top-k: a scorer that reads more than the top-k off them (a layer picking
     its successors' candidate blocks) does it there. `keys`: FP8 concat rows'
     `(values, scales)` already gathered end to end (DCP's all-gathered
-    shards); gathered here from `cache` otherwise."""
+    shards); gathered here from `cache` otherwise.
+
+    A striped split (`RowSplit.striped`) scores this rank's rows of `query`
+    and `weights` into its slot and returns the gathered slots rank-major:
+    slot r holds rows r, r + world, ..., so row i sits at
+    `(i % world) * stride + i // world` (`csa_translate_pack` reads it
+    there). `out`, `on_band`, `keys` and `request_local=False`, which assume
+    rows in order, do not apply."""
+    split = rows.split
+    if split.stripe:
+        if not (out is None and on_band is None and keys is None and request_local):
+            raise ValueError(
+                "a striped split returns its rows rank-major, not in place"
+            )
+        query, weights = _stripe_rows(query, weights, cache, split)
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
+    mine = out[split.slot : split.slot + split.stride] if split.stripe else out
     if rows.concat is not None:
-        _score_concat(query, weights, cache, rows, topk, stable, out, keys)
+        _score_concat(
+            query, weights, cache, rows, topk, stable, mine, keys, request_local
+        )
     else:
         _score_paged(
-            query, weights, cache, rows, topk, weight_scale, stable, on_band, out
+            query, weights, cache, rows, topk, weight_scale, stable, on_band, mine
         )
-    _gather_split(out, rows.split)
+    _gather_split(out, split)
     return out
 
 
+def _stripe_rows(query, weights, cache, split):
+    """This rank's rows of a striped split, every `world`-th from its rank.
+    The FP4 kernels assert dense rows, so those are copied into new ones:
+    `.contiguous()` hands a single row back as is, the stripe's stride and
+    all. FP8 reads them strided."""
+    rows = slice(split.rank, None, split.world)
+    if cache.fp4:
+        values, scales = query
+        return (
+            (_dense(values[rows]), _dense(scales[rows])),
+            _dense(weights[rows]),
+        )
+    return query[rows], weights[rows]
+
+
+def _dense(x):
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 def _gather_split(out, split):
-    """Every DCP rank's rows into `out`, in place: the input is this rank's
-    own slot inside the output, the form RCCL supports, so nothing is
-    allocated or copied. The last slot's tail past the rows is never read.
-    A world of one already holds them all."""
+    """Every rank's rows into `out`, in place: the input is this rank's own
+    slot inside the output, the form RCCL supports, so apart from what RCCL
+    sets aside on a group's first all-gather, the gather allocates and
+    copies nothing. A slot's tail past its rank's rows is never used
+    (`IndexRows.out_rows`). A world of one already holds them all."""
     if split.world == 1:
         return
     region = out[: split.stride * split.world]
+    group = get_tp_group() if split.group == "tp" else get_dcp_group()
     torch.distributed.all_gather_into_tensor(
         region,
         region[split.slot : split.slot + split.stride],
-        group=get_dcp_group().device_group,
+        group=group.device_group,
     )
 
 
@@ -133,7 +187,7 @@ def _score_paged(query, weights, cache, rows, topk, weight_scale, stable, on_ban
                 rows,
             )
         else:
-            deepgemm_fp8_paged_mqa_logits(
+            _fp8_paged_mqa_logits(
                 query[span].view(
                     count // group, group, weights.shape[1], query.shape[-1]
                 ),
@@ -195,7 +249,9 @@ def _gather_concat(query, cache, keys):
     return k_fp8, k_scale
 
 
-def _score_concat(query, weights, cache, rows, topk, stable, out, gathered):
+def _score_concat(
+    query, weights, cache, rows, topk, stable, out, gathered, request_local
+):
     """FP8 prefill against the gathered keys. The top-k reports a key's place
     in the gathered run; less its request's start it is the request's own."""
     keys = rows.concat
@@ -228,7 +284,7 @@ def _score_concat(query, weights, cache, rows, topk, stable, out, gathered):
             k=topk,
             stable=stable,
         )
-    if rows.bands:
+    if request_local and rows.bands:
         scored = slice(rows.bands[0][0], rows.bands[-1][1])
         picked, base = out[scored], keys.row_starts[scored].unsqueeze(1)
         torch.where(picked < 0, picked, picked - base, out=picked)
