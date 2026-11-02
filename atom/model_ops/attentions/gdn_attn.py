@@ -1449,7 +1449,10 @@ class GDNStateMixin(PoolRowsMixin):
             # A fork's write slot starts from the source checkpoint alone (the
             # kernel wrapper seeds it), so park its cursor like a prefill's:
             # otherwise it folds the slot's previous tenant's records.
-            dst = torch.tensor(self._fork_dst_slots, device=write_pos.device)
+            # Pinned: a pageable H2D syncs the stream.
+            dst = torch.tensor(self._fork_dst_slots, pin_memory=True).to(
+                write_pos.device, non_blocking=True
+            )
             write_pos.index_fill_(0, dst, -1)
 
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
