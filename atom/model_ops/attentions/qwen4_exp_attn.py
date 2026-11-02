@@ -36,6 +36,7 @@ from atom.kv_transfer.disaggregation.page_region import page_region
 from atom.kv_transfer.disaggregation.types import KVTransferTensors
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_cache_formats,
     qsa_cache_row_layout,
@@ -525,8 +526,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         )
 
     def state_transfer(self):
-        from atom.model_engine.state_runtime import StateTransfer
-
         transfer = super().state_transfer()
         if not transfer.copies:
             return transfer
