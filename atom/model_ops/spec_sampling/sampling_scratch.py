@@ -28,7 +28,7 @@ class Region(NamedTuple):
 
     @property
     def nbytes(self) -> int:
-        return prod(self.shape) * torch.empty((), dtype=self.dtype).element_size()
+        return prod(self.shape) * self.dtype.itemsize
 
 
 def _regions(spec) -> list[Region]:

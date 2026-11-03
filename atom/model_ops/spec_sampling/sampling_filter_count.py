@@ -166,13 +166,15 @@ def _ratio_filter_count_kernel(
         row_base = row.to(tl.int64) * logits_row_stride
         row_max = tl.load(row_max_ptr + row)
         inv_z = tl.load(row_inv_z_ptr + row)
-        # The smallest gather that holds every run above L: WIDTHS ascends
-        # and its last entry holds the at most k - 1 there can be.
+        # Exactly one window (previous width, width] holds n_runs: WIDTHS
+        # ascends from 0, and its last entry holds the at most k - 1 runs
+        # there can be. That window's width is the smallest gather reading
+        # every run above L.
         cut = low
         mass = 0.0
-        pending = n_runs >= 0
+        below = -1
         for w in tl.static_range(len(WIDTHS)):
-            if pending & (n_runs <= WIDTHS[w]):
+            if (n_runs > below) & (n_runs <= WIDTHS[w]):
                 cut, mass = _count_floor(
                     logits_ptr,
                     row_base,
@@ -189,9 +191,12 @@ def _ratio_filter_count_kernel(
                     WIDTHS[w],
                     KEY_BITS,
                 )
-                pending = n_runs < 0
+            below = WIDTHS[w]
         floor = _key_logit(cut, KEY_BITS)
-        tl.store(row_inv_z_ptr + row, inv_z / mass)
+        # The mass holds at least the floor's own id, so it is 0 only if no
+        # window held n_runs, which the widths rule out; keep 1/Z then rather
+        # than divide by it.
+        tl.store(row_inv_z_ptr + row, tl.where(mass > 0.0, inv_z / mass, inv_z))
     tl.store(row_floor_ptr + row, floor)
 
 
