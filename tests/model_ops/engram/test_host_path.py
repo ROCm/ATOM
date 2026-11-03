@@ -645,12 +645,15 @@ class FakeCudart:
 def scaled_table() -> HostEmbeddingTable:
     """A table whose values and scales are two separate registrations.
 
-    The scales live in their own large (page-aligned) allocation: two small
-    tensors can share a page, and a shared page is registered only once.
+    Both sit in one buffer, two pages apart: a shared page is registered only
+    once, and no two allocations are sure not to share one (a large one too
+    comes off the heap once malloc's mmap threshold has grown).
     """
-    codes = torch.full((1 << 20,), 127, dtype=torch.uint8)  # 2**0 == 1.0
-    scale = codes[:8].view(torch.float8_e8m0fnu).view(4, 2)
-    return HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
+    page = _host_memory._PAGE
+    buf = torch.full((3 * page,), 127, dtype=torch.uint8)  # 2**0 == 1.0
+    values = buf[:128].view(torch.float32).view(4, 8).fill_(1.0)
+    scale = buf[2 * page : 2 * page + 8].view(torch.float8_e8m0fnu).view(4, 2)
+    return HostEmbeddingTable(values, num_rows=4, head_dim=8, scale=scale)
 
 
 def test_refused_scale_registration_gives_back_the_values_it_pinned(monkeypatch):
