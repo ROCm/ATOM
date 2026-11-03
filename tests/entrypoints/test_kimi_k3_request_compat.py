@@ -474,3 +474,40 @@ def test_responses_render_receives_preserve_flag(server):
 
     assert asyncio.run(post()).status_code == 200
     assert server.template_kwargs[-1]["preserve_tool_call_arguments"] is True
+
+
+def test_multimodal_chat_keeps_tool_call_arguments(server, monkeypatch):
+    # Real _prepare_multimodal_inputs; only the media pipeline below it is
+    # stubbed, so the flag is checked where the image path builds its messages.
+    raw = '{"precision":1e2}'
+    seen = []
+
+    def parse_chat_messages(messages):
+        seen.extend(messages)
+        return messages, {"image": "fixture"}
+
+    async def generate_multimodal(_ids, _media, sampling, _request_id, **_kwargs):
+        server.sampling.append(sampling)
+        yield {
+            "text": "ok",
+            "finish_reason": "stop",
+            "num_tokens_input": 4,
+            "num_tokens_output": 1,
+        }
+
+    monkeypatch.setattr(api_server, "_get_multimodal_processor", lambda: object())
+    monkeypatch.setattr(api_server, "parse_chat_messages", parse_chat_messages)
+    monkeypatch.setattr(
+        api_server, "prepare_multimodal_inputs", lambda *_a, **_kw: ([1, 2, 3], {})
+    )
+    monkeypatch.setattr(api_server, "generate_async_multimodal", generate_multimodal)
+    image = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe the image."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ],
+    }
+    call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": raw}}
+    _chat(messages=[*_history(call), image])
+    assert seen[1]["tool_calls"][0]["function"]["arguments"] == raw
