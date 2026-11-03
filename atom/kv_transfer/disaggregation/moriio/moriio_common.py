@@ -14,8 +14,6 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
-from typing import Optional
-
 import msgspec
 
 from atom.kv_transfer.disaggregation.utils import (  # noqa: F401
@@ -59,7 +57,7 @@ class MoRIIOAgentMetadata(
 
     engine_id: str
     agent_metadata: bytes
-    kv_caches_base_addr: Optional[list[int]] = None
+    kv_caches_base_addr: list[int] | None = None
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
@@ -71,7 +69,7 @@ class MoRIIOAgentMetadata(
     # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
     # reverse_indexed, chunk_bytes]), or None for per-layer registration.
     # DeepSeek-V4 publishes PAGE and SLOT regions and no per-layer caches.
-    region_layout: Optional[str] = None
+    region_layout: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +119,7 @@ class _RoleManager:
     instead of accessing this class directly.
     """
 
-    _instance: Optional[_RoleManager] = None
+    _instance: _RoleManager | None = None
     _lock = threading.Lock()
 
     def __init__(self) -> None:

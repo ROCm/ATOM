@@ -43,6 +43,7 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     EngineId,
     KVConnectorOutput,
+    KVTransferRegion,
     ReqId,
     ReqMeta,
     TransferId,
@@ -536,11 +537,14 @@ class MoRIIOConnector(KVConnectorBase):
             )
         descs = self.layer_name_to_remote_kv_cache_metadata[engine_id]
         for local, peer in zip(self._regions, remote):
-            if (local.name, local.kind, local.unit, local.reverse) != (
+            # total is the local pool size. Prefill and decode allocate
+            # different amounts, so only the layout identity is compared.
+            if (local.name, local.kind, local.unit, local.reverse, local.chunk_bytes) != (
                 peer.name,
                 peer.kind,
                 peer.unit,
                 peer.reverse,
+                peer.chunk_bytes,
             ):
                 raise ValueError(
                     f"transfer region mismatch with {engine_id}: local "
@@ -631,8 +635,13 @@ class MoRIIOConnector(KVConnectorBase):
                 )
         return plan
 
-    def _write_regions(self, request: dict[str, Any], engine_id: EngineId) -> list[Any]:
-        """Push a request's PAGE blocks and SLOT units; return the statuses."""
+    def _write_regions(
+        self,
+        request: dict[str, Any],
+        engine_id: EngineId,
+        state_writes: list[tuple[Any, int, int, int]],
+    ) -> list[Any]:
+        """Push a request's PAGE blocks, SLOT units, and state; return statuses."""
         plan = self._region_plan(request, engine_id)
         statuses: list[Any] = []
         try:
@@ -640,6 +649,12 @@ class MoRIIOConnector(KVConnectorBase):
                 statuses.append(
                     self.moriio_wrapper.write_remote_data_status(
                         sizes, l_offs, r_offs, session
+                    )
+                )
+            for session, size, local_offset, remote_offset in state_writes:
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        [size], [local_offset], [remote_offset], session
                     )
                 )
         except Exception:
@@ -1661,15 +1676,9 @@ class MoRIIOConnector(KVConnectorBase):
         self._source_covers(f"transfer {request['transfer_id']}", dst, src)
         if self._regions is not None:
             # Checked before any region write is posted.
-            state_writes = self._state_writes(request, engine_id)
-            statuses = self._write_regions(request, engine_id)
-            for session, size, local_offset, remote_offset in state_writes:
-                statuses.append(
-                    self.moriio_wrapper.write_remote_data_status(
-                        [size], [local_offset], [remote_offset], session
-                    )
-                )
-            return statuses
+            return self._write_regions(
+                request, engine_id, self._state_writes(request, engine_id)
+            )
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
         # Before any block write: a request that cannot carry its state must not
         # leave a half-filled destination behind.
@@ -2658,10 +2667,9 @@ class _Region:
                 f"region {self.name}: unit {index} is outside its "
                 f"{self.num_units} units"
             )
-        if self.reverse:
-            offset = self.total - (index + 1) * self.unit
-        else:
-            offset = index * self.unit
+        offset = KVTransferRegion.unit_offset(
+            index, self.total, self.unit, self.reverse
+        )
         return offset // self.chunk_bytes, offset % self.chunk_bytes
 
 

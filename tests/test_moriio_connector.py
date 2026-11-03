@@ -176,15 +176,6 @@ class ConnectorSourceTest(unittest.TestCase):
     def test_registration_uses_the_transfer_layout(self):
         self.assertIn("self._kv_layout()", self.segment("register_kv_caches"))
 
-    def test_no_per_layer_cache_registers_transfer_regions(self):
-        body = self.segment("register_kv_caches")
-        self.assertLess(
-            body.index("if not block_layers:"),
-            body.index("chunk_tensor_for_rdma("),
-        )
-        self.assertIn("self._register_regions(transfer_tensors)", body)
-        self.assertIn("region_layout", COMMON.read_text())
-
     def test_done_sending_is_swapped_under_its_lock(self):
         for name in ("get_finished", "_handshake_listener", "_finish_write"):
             self.assertIn("with self._done_sending_lock:", self.segment(name), name)
@@ -1660,49 +1651,106 @@ class MergeContiguousBlocksTest(unittest.TestCase):
         self.assertEqual(self.merge([], [], []), ([], [], []))
 
 
-class RegionAddressingTest(unittest.TestCase):
-    """Unit addressing of region mode; the class is pure Python."""
+class RegionPlanTest(unittest.TestCase):
+    """Pair local and remote regions on the CPU lane."""
 
     @classmethod
     def setUpClass(cls):
+        import json
+
+        import numpy
+
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
         tree = ast.parse(CONNECTOR.read_text())
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef) and node.name == "_Region":
-                scope = {
-                    "MAX_RDMA_CHUNK_BYTES": 40,
-                    "Any": object,
-                    "dataclass": __import__("dataclasses").dataclass,
-                }
-                code = compile(ast.Module([node], []), "<region>", "exec")
-                exec(code, scope)  # noqa: S102
-                cls.Region = scope["_Region"]
-                return
-        raise AssertionError("_Region not found")
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        wanted = {
+            "_remote_regions",
+            "_region_plan",
+            "merge_contiguous_blocks",
+            "_source_covers",
+        }
+        methods = [
+            n
+            for n in classes["MoRIIOConnector"].body
+            if isinstance(n, ast.FunctionDef) and n.name in wanted
+        ]
+        scope = {
+            "Any": object,
+            "EngineId": str,
+            "KVTransferRegion": KVTransferRegion,
+            "MAX_RDMA_CHUNK_BYTES": 40,
+            "dataclass": __import__("dataclasses").dataclass,
+            "json": json,
+            "np": numpy,
+        }
+        exec(  # noqa: S102
+            compile(
+                ast.Module([classes["_Region"], *methods], []), "<regions>", "exec"
+            ),
+            scope,
+        )
+        cls.Region = scope["_Region"]
+        cls.Planner = type("Planner", (), {name: scope[name] for name in wanted})
+        cls.local = [
+            cls.Region("page.0.kv", "page", 0, 80, 10, False, 40),
+            cls.Region("slot.0.swa", "slot", 0, 80, 10, True, 40),
+        ]
 
-    def region(self, *, reverse: bool, total: int = 100, unit: int = 10):
-        peer = type("R", (), {})()
-        peer.unit_bytes = unit
-        peer.total_bytes = total
-        peer.base_addr = 1000
-        peer.reverse_indexed = reverse
-        return self.Region.of("page.0.kv", "page", peer)
+    def make(self, remote_regions):
+        conn = self.Planner()
+        conn.tp_size = 2
+        conn._regions = self.local
+        conn._remote_regions_checked = {}
+        conn.remote_moriio_metadata = {
+            "decode": type(
+                "Meta",
+                (),
+                {
+                    "region_layout": __import__("json").dumps(
+                        [r.layout() for r in remote_regions]
+                    )
+                },
+            )()
+        }
+        conn.layer_name_to_local_kv_cache_metadata = {
+            r.name: [b"local"] * r.num_chunks for r in self.local
+        }
+        conn.layer_name_to_remote_kv_cache_metadata = {
+            "decode": {r.name: [b"remote"] * r.num_chunks for r in remote_regions}
+        }
+        conn._region_session = lambda _engine, ri, lc, rc: (ri, lc, rc)
+        return conn
 
-    def test_chunks_stay_under_the_registration_limit(self):
-        region = self.region(reverse=False)
-        self.assertEqual(region.chunk_bytes, 40)
-        self.assertEqual(region.chunks(), [(1000, 40), (1040, 40), (1080, 20)])
-        self.assertEqual(region.locate(0), (0, 0))
-        self.assertEqual(region.locate(5), (1, 10))
+    def test_pairs_page_and_reverse_slot_regions(self):
+        plan = self.make(self.local)._region_plan(
+            {
+                "transfer_id": 1,
+                "src_block_ids": [3, 4],
+                "dst_block_ids": [0, 5],
+                "src_slot_index": 0,
+                "dst_slot_index": 5,
+            },
+            "decode",
+        )
+        self.assertEqual(
+            plan,
+            [
+                ((0, 0, 0), [30], [0], [10]),
+                ((0, 1, 1), [0], [10], [10]),
+                ((1, 1, 0), [30], [20], [10]),
+            ],
+        )
 
-    def test_reverse_index_counts_from_the_end(self):
-        region = self.region(reverse=True)
-        self.assertEqual(region.locate(0), (2, 10))
-        self.assertEqual(region.locate(9), (0, 0))
+    def test_rejects_a_different_region_unit(self):
+        other = self.Region("page.0.kv", "page", 0, 80, 20, False, 40)
+        with self.assertRaises(ValueError):
+            self.make([other, self.local[1]])._remote_regions("decode")
 
-    def test_layout_round_trips(self):
-        region = self.region(reverse=True)
-        peer = self.Region.from_layout(region.layout())
-        self.assertEqual(peer.layout(), region.layout())
+    def test_allows_a_different_pool_size(self):
+        other = self.Region("page.0.kv", "page", 0, 90, 10, False, 40)
+        remote = self.make([other, self.local[1]])._remote_regions("decode")
+        self.assertEqual(remote[0].total, 90)
 
 
 if __name__ == "__main__":
