@@ -89,6 +89,33 @@ _FINE_ITERS = tl.constexpr(18)
 _CAND_CAP = int(os.environ.get("ATOM_DSPARK_PROB_CAP", "8192"))
 _VBLOCK = int(os.environ.get("ATOM_DSPARK_PROB_VBLOCK", "8192"))
 _NUM_WARPS = int(os.environ.get("ATOM_DSPARK_PROB_WARPS", "8"))
+# Vocab-split verification: the full-vocab scans (block residual mass, the
+# residual draw, and with SPLIT_STATS the row statistics) run one program per
+# CHUNK columns of a row instead of one program per row, which left most of the
+# GPU idle at decode batch sizes (a few dozen rows against a ~129k vocab).
+# Every element is computed as the per-row loop computed it; only the
+# cross-chunk combine is new. The residual draw is a Gumbel max, which splits
+# exactly; the sums (row normalizer, residual mass) change association only.
+_SPLIT_BLOCK = int(os.environ.get("ATOM_DSPARK_PROB_SPLIT_BLOCK", "2048"))
+_CHUNK = int(os.environ.get("ATOM_DSPARK_PROB_CHUNK", "8192"))
+assert _CHUNK % _SPLIT_BLOCK == 0, "ATOM_DSPARK_PROB_CHUNK must be a multiple of SPLIT_BLOCK"
+# Row statistics from the split pre-pass (1) or from the per-row kernel (0).
+_SPLIT_STATS = os.environ.get("ATOM_DSPARK_PROB_SPLIT_STATS", "1") == "1"
+# Vocab-split top-p threshold (needs SPLIT_STATS). The per-row search above
+# makes up to ~30 sequential full-row passes on a flat row, and a kernel takes
+# as long as its slowest row. Split: one pass records, per chunk, the mass and
+# count at or above each of _TOPP_K evenly spaced thresholds of the same bracket
+# [m - c, m]; the interval holding the cutoff is refined once more the same way
+# if it holds more than _TOPP_RB tokens; its tokens are compacted (chunk order,
+# then column order) and the bisection finishes on them in registers. The
+# nucleus is the same token set; its mass is summed in another order. A row
+# whose final interval still holds more than _TOPP_RB tokens takes the per-row
+# search.
+_SPLIT_TOPP = os.environ.get("ATOM_DSPARK_PROB_SPLIT_TOPP", "1") == "1"
+_TOPP_K = 32
+_TOPP_SB = 256
+_TOPP_RB = int(os.environ.get("ATOM_DSPARK_PROB_TOPP_RB", "4096"))
+_TOPP_ITERS = tl.constexpr(30)
 
 
 # ---------------------------------------------------------------------------
@@ -390,22 +417,6 @@ class ProbDraftState:
 
 
 @triton.jit
-def _row_max_argmax(row_ptr, V, BLOCK: tl.constexpr):
-    """(max, lowest argmax) of a row; per-lane accumulation, one final reduce."""
-    mxv = tl.zeros((BLOCK,), tl.float32) + float("-inf")
-    idxv = tl.zeros((BLOCK,), tl.int32)
-    for start in range(0, V, BLOCK):
-        offs = start + tl.arange(0, BLOCK)
-        x = tl.load(row_ptr + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
-        take = x > mxv  # strict: a lane keeps its first (lowest) index
-        idxv = tl.where(take, offs, idxv)
-        mxv = tl.where(take, x, mxv)
-    best = tl.max(mxv, axis=0)
-    best_i = tl.min(tl.where(mxv == best, idxv, 2147483647), axis=0)
-    return best, best_i
-
-
-@triton.jit
 def _row_mass_ge(row_ptr, V, inv_t, m, thr, BLOCK: tl.constexpr):
     """sum over v with l_v*inv_t >= thr of exp(l_v*inv_t - m)."""
     acc = tl.zeros((BLOCK,), tl.float32)
@@ -418,15 +429,33 @@ def _row_mass_ge(row_ptr, V, inv_t, m, thr, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _row_online_stats(row_ptr, V, inv_t, BLOCK: tl.constexpr):
-    """One pass: (max of x*inv_t, sum exp(x*inv_t - max), lowest argmax);
-    per-lane online softmax, one final reduce."""
+def _span_max_argmax(row_ptr, lo, hi, BLOCK: tl.constexpr):
+    """(max, lowest argmax) of columns [lo, hi) of a row; per-lane
+    accumulation, one final reduce."""
+    mxv = tl.zeros((BLOCK,), tl.float32) + float("-inf")
+    idxv = tl.zeros((BLOCK,), tl.int32)
+    for start in range(lo, hi, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        x = tl.load(row_ptr + offs, mask=offs < hi, other=float("-inf")).to(tl.float32)
+        take = x > mxv  # strict: a lane keeps its first (lowest) index
+        idxv = tl.where(take, offs, idxv)
+        mxv = tl.where(take, x, mxv)
+    best = tl.max(mxv, axis=0)
+    best_i = tl.min(tl.where(mxv == best, idxv, 2147483647), axis=0)
+    return best, best_i
+
+
+@triton.jit
+def _span_online_stats(row_ptr, lo, hi, inv_t, BLOCK: tl.constexpr):
+    """One pass over columns [lo, hi) of a row: (max of x*inv_t,
+    sum exp(x*inv_t - max), lowest argmax); per-lane online softmax, one final
+    reduce."""
     mxv = tl.zeros((BLOCK,), tl.float32) + float("-inf")
     sv = tl.zeros((BLOCK,), tl.float32)
     idxv = tl.zeros((BLOCK,), tl.int32)
-    for start in range(0, V, BLOCK):
+    for start in range(lo, hi, BLOCK):
         offs = start + tl.arange(0, BLOCK)
-        x = tl.load(row_ptr + offs, mask=offs < V, other=float("-inf")).to(tl.float32)
+        x = tl.load(row_ptr + offs, mask=offs < hi, other=float("-inf")).to(tl.float32)
         y = x * inv_t
         take = y > mxv
         idxv = tl.where(take, offs, idxv)
@@ -439,6 +468,27 @@ def _row_online_stats(row_ptr, V, inv_t, BLOCK: tl.constexpr):
     s = tl.sum(tl.where(mxv == float("-inf"), 0.0, sv * tl.exp(mxv - mx)), axis=0)
     best_i = tl.min(tl.where(mxv == mx, idxv, 2147483647), axis=0)
     return mx, s, best_i
+
+
+@triton.jit
+def _combine_stats(part_ptr, nch, STRIDE: tl.constexpr):
+    """Fold per-chunk (max, sumexp, lowest argmax) records, chunks in column
+    order: (max, sumexp at that max, lowest column holding it). The strict
+    compare keeps the earliest chunk on a tie, i.e. the lowest column, which
+    is the per-row helpers' tie rule."""
+    m = tl.zeros((), tl.float32) + float("-inf")
+    best_i = tl.zeros((), tl.float32)
+    for c in range(nch):
+        mc = tl.load(part_ptr + c * STRIDE)
+        t = mc > m
+        best_i = tl.where(t, tl.load(part_ptr + c * STRIDE + 2), best_i)
+        m = tl.where(t, mc, m)
+    s = tl.zeros((), tl.float32)
+    for c in range(nch):
+        mc = tl.load(part_ptr + c * STRIDE)
+        sc = tl.load(part_ptr + c * STRIDE + 1)
+        s += tl.where(mc == float("-inf"), 0.0, sc * tl.exp(mc - m))
+    return m, s, best_i.to(tl.int32)
 
 
 @triton.jit
@@ -538,7 +588,376 @@ def _topp_threshold(
     return lo, zk
 
 
-@triton.jit(do_not_specialize=["num_spec_steps", "top_p_scalar", "q_width", "q_vs", "q_cols", "q_stride", "rank_id"])
+# ---- vocab-split top-p threshold (`_SPLIT_TOPP`) ----------------------------
+
+
+@triton.jit
+def _pick(vec, js, j):
+    """vec[j] of a small vector (0 when j is past its end)."""
+    return tl.sum(tl.where(js == j, vec, 0), axis=0)
+
+
+@triton.jit
+def _topp_row(temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR: tl.constexpr):
+    """(the row searches a top-p cutoff, its temperature, its top_p)."""
+    temp = tl.load(temps_ptr + req_idx).to(tl.float32)
+    if HAS_TOPP_PTR:
+        top_p = tl.load(top_p_ptr + req_idx).to(tl.float32)
+    else:
+        top_p = top_p_scalar
+    return (temp > _GREEDY_T) & (top_p < 1.0), temp, top_p
+
+
+@triton.jit
+def _ge_records(row_ptr, lo, hi, inv_t, m, thr, K: tl.constexpr, SB: tl.constexpr):
+    """Over columns [lo, hi) of a row: for each of the K thresholds, the mass
+    sum exp(y - m) and the count of y >= thr[j]; per-lane accumulation, one
+    final reduce."""
+    accm = tl.zeros((K, SB), tl.float32)
+    accc = tl.zeros((K, SB), tl.int32)
+    for start in range(lo, hi, SB):
+        offs = start + tl.arange(0, SB)
+        y = tl.load(row_ptr + offs, mask=offs < hi, other=float("-inf")).to(tl.float32) * inv_t
+        e = tl.exp(y - m)
+        ge = y[None, :] >= thr[:, None]
+        accm += tl.where(ge, e[None, :], 0.0)
+        accc += ge.to(tl.int32)
+    return tl.sum(accm, axis=1), tl.sum(accc, axis=1)
+
+
+@triton.jit
+def _sum_records(m_ptr, c_ptr, nch, K: tl.constexpr):
+    """Per-chunk [nch, K] records summed over the chunks, in chunk order."""
+    js = tl.arange(0, K)
+    M = tl.zeros((K,), tl.float32)
+    C = tl.zeros((K,), tl.int32)
+    for ch in range(nch):
+        M += tl.load(m_ptr + ch * K + js)
+        C += tl.load(c_ptr + ch * K + js)
+    return M, C
+
+
+@triton.jit(do_not_specialize=["top_p_scalar", "rank_id"])
+def _topp_level1_kernel(
+    target_ptr,  # [N, V]
+    cu_num_draft_tokens_ptr,
+    temps_ptr,
+    top_p_ptr,
+    top_p_scalar,
+    tpart_ptr,  # [N, NCH, 3] `_verify_stats_partial_kernel`'s target records
+    thr1_ptr,  # [N, K] out: level-1 thresholds
+    l1m_ptr,  # [N, NCH, K] out: chunk mass at or above each threshold
+    l1c_ptr,  # [N, NCH, K] out: chunk count at or above each threshold
+    V,
+    rank_id,
+    QTP: tl.constexpr,
+    HAS_TOPP_PTR: tl.constexpr,
+    K: tl.constexpr,
+    SB: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    """K evenly spaced thresholds over the per-row search's bracket
+    [m - c, m]; this chunk's mass and count at or above each."""
+    req_idx = tl.program_id(0)
+    k = tl.program_id(1)
+    c = tl.program_id(2)
+    nch = tl.num_programs(2)
+    start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
+    if k >= n:
+        return
+    r = start + k
+    active, temp, top_p = _topp_row(temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR)
+    if active & ((r % QTP) == rank_id):
+        m, _, _ = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+        # the per-row search's bracket (`_topp_threshold`)
+        cw = tl.log(V * 1.0) - tl.log(tl.maximum(1.0 - top_p, 1e-30)) + 1.0
+        js = tl.arange(0, K)
+        thr = (m - cw) + js.to(tl.float32) * (cw / K)
+        if c == 0:
+            tl.store(thr1_ptr + r * K + js, thr)
+        lo = c * CHUNK
+        hi = tl.minimum(lo + CHUNK, V)
+        mm, cc = _ge_records(target_ptr + r.to(tl.int64) * V, lo, hi, 1.0 / temp, m, thr, K, SB)
+        tl.store(l1m_ptr + (r * nch + c) * K + js, mm)
+        tl.store(l1c_ptr + (r * nch + c) * K + js, cc)
+
+
+@triton.jit(do_not_specialize=["top_p_scalar", "rank_id"])
+def _topp_level2_kernel(
+    target_ptr,
+    cu_num_draft_tokens_ptr,
+    temps_ptr,
+    top_p_ptr,
+    top_p_scalar,
+    tpart_ptr,
+    thr1_ptr,
+    l1m_ptr,
+    l1c_ptr,
+    dec1_ptr,  # [N, 2] out: level-1 interval index, whether level 2 ran
+    thr2_ptr,  # [N, K] out: level-2 thresholds
+    l2m_ptr,  # [N, NCH, K] out
+    l2c_ptr,  # [N, NCH, K] out
+    V,
+    rank_id,
+    QTP: tl.constexpr,
+    HAS_TOPP_PTR: tl.constexpr,
+    K: tl.constexpr,
+    SB: tl.constexpr,
+    CHUNK: tl.constexpr,
+    RB: tl.constexpr,
+):
+    """The level-1 interval holding the cutoff (the highest threshold whose
+    mass at or above still reaches top_p z); split K ways again when it holds
+    more than RB tokens."""
+    req_idx = tl.program_id(0)
+    k = tl.program_id(1)
+    c = tl.program_id(2)
+    nch = tl.num_programs(2)
+    start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
+    if k >= n:
+        return
+    r = start + k
+    active, temp, top_p = _topp_row(temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR)
+    if active & ((r % QTP) == rank_id):
+        m, z, _ = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+        target = top_p * z
+        js = tl.arange(0, K)
+        M, C = _sum_records(l1m_ptr + r * nch * K, l1c_ptr + r * nch * K, nch, K)
+        thr = tl.load(thr1_ptr + r * K + js)
+        k1 = tl.max(tl.where(M >= target, js, 0), axis=0)
+        n1 = _pick(C, js, k1) - _pick(C, js, k1 + 1)
+        need2 = n1 > RB
+        if c == 0:
+            tl.store(dec1_ptr + r * 2, k1.to(tl.float32))
+            tl.store(dec1_ptr + r * 2 + 1, need2.to(tl.float32))
+        if need2:
+            a1 = _pick(thr, js, k1)
+            w2 = (_pick(thr, js, 1) - _pick(thr, js, 0)) / K
+            thr2 = a1 + js.to(tl.float32) * w2
+            if c == 0:
+                tl.store(thr2_ptr + r * K + js, thr2)
+            lo = c * CHUNK
+            hi = tl.minimum(lo + CHUNK, V)
+            mm, cc = _ge_records(
+                target_ptr + r.to(tl.int64) * V, lo, hi, 1.0 / temp, m, thr2, K, SB
+            )
+            tl.store(l2m_ptr + (r * nch + c) * K + js, mm)
+            tl.store(l2c_ptr + (r * nch + c) * K + js, cc)
+
+
+@triton.jit
+def _final_interval(thr1_ptr, l1m_ptr, l1c_ptr, dec1_ptr, thr2_ptr, l2m_ptr, l2c_ptr,
+                    r, nch, target, K: tl.constexpr):
+    """(a, b, mass at or above b, level, index, k1): the interval [a, b) holding
+    the cutoff, from level 2 where it ran; b is +inf for the top interval."""
+    js = tl.arange(0, K)
+    k1 = tl.load(dec1_ptr + r * 2).to(tl.int32)
+    need2 = tl.load(dec1_ptr + r * 2 + 1) > 0.5
+    M, C = _sum_records(l1m_ptr + r * nch * K, l1c_ptr + r * nch * K, nch, K)
+    thr = tl.load(thr1_ptr + r * K + js)
+    top1 = k1 + 1 >= K
+    b1 = tl.where(top1, float("inf"), _pick(thr, js, k1 + 1))
+    mhi1 = _pick(M, js, k1 + 1)  # 0 past the top
+    a = _pick(thr, js, k1)
+    b = b1
+    mhi = mhi1
+    kk = k1
+    if need2:
+        M2, C2 = _sum_records(l2m_ptr + r * nch * K, l2c_ptr + r * nch * K, nch, K)
+        thr2 = tl.load(thr2_ptr + r * K + js)
+        k2 = tl.max(tl.where(M2 >= target, js, 0), axis=0)
+        top2 = k2 + 1 >= K
+        a = _pick(thr2, js, k2)
+        b = tl.where(top2, b1, _pick(thr2, js, k2 + 1))
+        mhi = tl.where(top2, mhi1, _pick(M2, js, k2 + 1))
+        kk = k2
+    return a, b, mhi, need2, kk, k1
+
+
+@triton.jit
+def _chunk_interval_count(l1c_ptr, l2c_ptr, r, nch, ch, need2, kk, k1, K: tl.constexpr):
+    """Chunk ch's count in the final interval: its count at or above a minus
+    its count at or above b (records of the level the interval came from)."""
+    base1 = l1c_ptr + (r * nch + ch) * K
+    above_b1 = tl.where(k1 + 1 < K, tl.load(base1 + tl.minimum(k1 + 1, K - 1)), 0)
+    cnt = tl.load(base1 + k1) - above_b1
+    if need2:
+        base2 = l2c_ptr + (r * nch + ch) * K
+        above = tl.where(kk + 1 < K, tl.load(base2 + tl.minimum(kk + 1, K - 1)), above_b1)
+        cnt = tl.load(base2 + kk) - above
+    return cnt
+
+
+@triton.jit(do_not_specialize=["top_p_scalar", "rank_id"])
+def _topp_compact_kernel(
+    target_ptr,
+    cu_num_draft_tokens_ptr,
+    temps_ptr,
+    top_p_ptr,
+    top_p_scalar,
+    tpart_ptr,
+    thr1_ptr,
+    l1m_ptr,
+    l1c_ptr,
+    dec1_ptr,
+    thr2_ptr,
+    l2m_ptr,
+    l2c_ptr,
+    dec2_ptr,  # [N, 4] out: a, b, count in [a, b), mass at or above b
+    cand_ptr,  # [N, 2, RB] out: the interval's (y, exp(y - m)), chunk then column order
+    V,
+    rank_id,
+    QTP: tl.constexpr,
+    HAS_TOPP_PTR: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    RB: tl.constexpr,
+):
+    """Compact the final interval's tokens: each chunk writes at the sum of
+    the earlier chunks' counts, so the order is fixed."""
+    req_idx = tl.program_id(0)
+    k = tl.program_id(1)
+    c = tl.program_id(2)
+    nch = tl.num_programs(2)
+    start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
+    if k >= n:
+        return
+    r = start + k
+    active, temp, top_p = _topp_row(temps_ptr, top_p_ptr, top_p_scalar, req_idx, HAS_TOPP_PTR)
+    if active & ((r % QTP) == rank_id):
+        m, z, _ = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+        a, b, mhi, need2, kk, k1 = _final_interval(
+            thr1_ptr, l1m_ptr, l1c_ptr, dec1_ptr, thr2_ptr, l2m_ptr, l2c_ptr,
+            r, nch, top_p * z, K,
+        )
+        total = tl.zeros((), tl.int32)
+        off = tl.zeros((), tl.int32)
+        for ch in range(nch):
+            cnt = _chunk_interval_count(l1c_ptr, l2c_ptr, r, nch, ch, need2, kk, k1, K)
+            off += tl.where(ch < c, cnt, 0)
+            total += cnt
+        if c == 0:
+            tl.store(dec2_ptr + r * 4, a)
+            tl.store(dec2_ptr + r * 4 + 1, b)
+            tl.store(dec2_ptr + r * 4 + 2, total.to(tl.float32))
+            tl.store(dec2_ptr + r * 4 + 3, mhi)
+        if total <= RB:
+            row = target_ptr + r.to(tl.int64) * V
+            inv_t = 1.0 / temp
+            ybuf = cand_ptr + r.to(tl.int64) * (2 * RB)
+            lo = c * CHUNK
+            hi = tl.minimum(lo + CHUNK, V)
+            pos0 = off
+            for st in range(lo, hi, BLOCK):
+                offs = st + tl.arange(0, BLOCK)
+                y = tl.load(row + offs, mask=offs < hi, other=float("-inf")).to(tl.float32) * inv_t
+                inb = (y >= a) & (y < b)
+                csum = tl.cumsum(inb.to(tl.int32), axis=0)
+                pos = pos0 + csum - 1
+                tl.store(ybuf + pos, y, mask=inb)
+                tl.store(ybuf + RB + pos, tl.exp(y - m), mask=inb)
+                pos0 += tl.sum(inb.to(tl.int32), axis=0)
+
+
+@triton.jit
+def _topp_finish(dec2_ptr, cand_ptr, r, m, target, RB: tl.constexpr):
+    """(tau, zk) from the compacted interval: the bisection of `_topp_threshold`
+    on [a, b) over its tokens, held in registers; mass at or above b added."""
+    a = tl.load(dec2_ptr + r * 4)
+    b = tl.load(dec2_ptr + r * 4 + 1)
+    total = tl.load(dec2_ptr + r * 4 + 2).to(tl.int32)
+    mhi = tl.load(dec2_ptr + r * 4 + 3)
+    idx = tl.arange(0, RB)
+    cm = idx < total
+    ybuf = cand_ptr + r.to(tl.int64) * (2 * RB)
+    yv = tl.load(ybuf + idx, mask=cm, other=float("-inf"))
+    ev = tl.load(ybuf + RB + idx, mask=cm, other=0.0)
+    lo = a
+    hi = tl.where(b == float("inf"), m, b)
+    zk = mhi + tl.sum(ev, axis=0)
+    for _ in range(_TOPP_ITERS):
+        mid = 0.5 * (lo + hi)
+        s = mhi + tl.sum(tl.where(yv >= mid, ev, 0.0), axis=0)
+        ge = s >= target
+        lo = tl.where(ge, mid, lo)
+        zk = tl.where(ge, s, zk)
+        hi = tl.where(ge, hi, mid)
+    return lo, zk, total
+
+
+@triton.jit(do_not_specialize=["q_width", "q_vs", "q_cols", "q_stride", "rank_id"])
+def _verify_stats_partial_kernel(
+    target_ptr,  # [N, V]
+    input_ids_ptr,
+    target_logits_indices_ptr,
+    cu_num_draft_tokens_ptr,  # [bs]
+    temps_ptr,  # [bs]
+    src_ptr,  # [bs]
+    q_ptr,  # [max_bs, W, q_stride]
+    q_ids_ptr,  # [max_bs, W]
+    q_temps_ptr,  # [max_bs]
+    tpart_ptr,  # [N, NCH, 3] out: target chunk max, sumexp, lowest argmax
+    qpart_ptr,  # [N, NCH, 3] out: q chunk max, sumexp, (unused)
+    V,
+    q_width,
+    q_vs,
+    q_cols,
+    q_stride,
+    rank_id,
+    QTP: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    """One CHUNK of a verified row's two full-vocab statistics passes -- the
+    target's (on the rank owning the row) and the stored q's -- which
+    `_verify_row_stats_kernel` used to run whole per row. A chunk past a row's
+    end stores the empty record (-inf, 0, 0)."""
+    req_idx = tl.program_id(0)
+    k = tl.program_id(1)
+    c = tl.program_id(2)
+    nch = tl.num_programs(2)
+    start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
+    if k >= n:
+        return
+    r = start + k
+    lo = c * CHUNK
+    row = target_ptr + r.to(tl.int64) * V
+    x = tl.load(input_ids_ptr + tl.load(target_logits_indices_ptr + r) + 1).to(tl.int32)
+    x_ok = (x >= 0) & (x < V)
+    own_row = (r % QTP) == rank_id
+    temp = tl.load(temps_ptr + req_idx).to(tl.float32)
+    greedy = temp <= _GREEDY_T
+    tout = tpart_ptr + (r * nch + c) * 3
+    hi = tl.minimum(lo + CHUNK, V)
+    if greedy:
+        if own_row:
+            mx, ai = _span_max_argmax(row, lo, hi, BLOCK)
+            tl.store(tout, mx)
+            tl.store(tout + 1, 0.0)
+            tl.store(tout + 2, ai.to(tl.float32))
+    else:
+        if own_row:
+            mx, s, ai = _span_online_stats(row, lo, hi, 1.0 / temp, BLOCK)
+            tl.store(tout, mx)
+            tl.store(tout + 1, s)
+            tl.store(tout + 2, ai.to(tl.float32))
+        s_row = tl.load(src_ptr + req_idx)
+        if s_row >= 0:
+            if k < q_width:
+                qid = tl.load(q_ids_ptr + s_row * q_width + k)
+                tq = tl.load(q_temps_ptr + s_row).to(tl.float32)
+                if (qid == x) & x_ok & (tq > _GREEDY_T):
+                    qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
+                    hq = tl.minimum(lo + CHUNK, q_cols)
+                    mq, zq, _ = _span_online_stats(qrow, lo, hq, 1.0 / tq, BLOCK)
+                    qout = qpart_ptr + (r * nch + c) * 3
+                    tl.store(qout, mq)
+                    tl.store(qout + 1, zq)
+                    tl.store(qout + 2, 0.0)
+
+
+@triton.jit(do_not_specialize=["num_spec_steps", "top_p_scalar", "q_width", "q_vs", "q_cols", "q_stride", "rank_id", "nch"])
 def _verify_row_stats_kernel(
     target_ptr,  # [N, V]
     input_ids_ptr,
@@ -552,6 +971,10 @@ def _verify_row_stats_kernel(
     q_ids_ptr,  # [max_bs, W]
     q_temps_ptr,  # [max_bs]
     cand_ptr,  # [N, 2 * CAP] scratch
+    tpart_ptr,  # [N, nch, 3] `_verify_stats_partial_kernel`'s target records
+    qpart_ptr,  # [N, nch, 3] and its q records
+    dec2_ptr,  # [N, 4] `_topp_compact_kernel`'s final interval (SPLIT_TOPP)
+    cand2_ptr,  # [N, 2, RB] and its tokens
     rs_ptr,  # [N, 8] out: amax, m, tau, zk, p(x) | local q max, sumexp, x-logit
     hasq_ptr,  # [N] out
     V,
@@ -561,15 +984,23 @@ def _verify_row_stats_kernel(
     q_stride,
     num_spec_steps,
     rank_id,
+    nch,
     QTP: tl.constexpr,
     HAS_TOPP_PTR: tl.constexpr,
     BLOCK: tl.constexpr,
     CAP: tl.constexpr,
     COARSE: tl.constexpr,
+    SPLIT_STATS: tl.constexpr,
+    SPLIT_TOPP: tl.constexpr,
+    RB: tl.constexpr,
 ):
     """Per verified row. The target half (fields 0-4) is computed only by the
     rank that owns the row (r % QTP), the q half (5-7) by every rank over its
-    own vocab columns; one all-gather then hands every rank both."""
+    own vocab columns; one all-gather then hands every rank both. With
+    SPLIT_STATS the rows' max / sumexp / argmax come from
+    `_verify_stats_partial_kernel`'s chunks, otherwise from a pass here; with
+    SPLIT_TOPP the top-p cutoff finishes on `_topp_compact_kernel`'s interval,
+    falling back to the per-row search when that interval overflowed RB."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1)
     start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
@@ -588,12 +1019,18 @@ def _verify_row_stats_kernel(
     hasq = 0
     if greedy:
         if own_row:
-            lmax, amax = _row_max_argmax(row, V, BLOCK)
+            if SPLIT_STATS:
+                _, _, amax = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+            else:
+                _, amax = _span_max_argmax(row, 0, V, BLOCK)
             tl.store(out, amax.to(tl.float32))
     else:
         if own_row:
             inv_t = 1.0 / temp
-            m, z, amax = _row_online_stats(row, V, inv_t, BLOCK)
+            if SPLIT_STATS:
+                m, z, amax = _combine_stats(tpart_ptr + r * nch * 3, nch, 3)
+            else:
+                m, z, amax = _span_online_stats(row, 0, V, inv_t, BLOCK)
             if HAS_TOPP_PTR:
                 top_p = tl.load(top_p_ptr + req_idx).to(tl.float32)
             else:
@@ -601,10 +1038,18 @@ def _verify_row_stats_kernel(
             tau = tl.zeros((), tl.float32) + float("-inf")
             zk = z
             if top_p < 1.0:
-                tau, zk = _topp_threshold(
-                    row, cand_ptr + r.to(tl.int64) * (2 * CAP), V, inv_t, m, z, top_p,
-                    BLOCK, CAP, COARSE,
-                )
+                if SPLIT_TOPP:
+                    tau, zk, total = _topp_finish(dec2_ptr, cand2_ptr, r, m, top_p * z, RB)
+                    if total > RB:
+                        tau, zk = _topp_threshold(
+                            row, cand_ptr + r.to(tl.int64) * (2 * CAP), V, inv_t, m, z,
+                            top_p, BLOCK, CAP, COARSE,
+                        )
+                else:
+                    tau, zk = _topp_threshold(
+                        row, cand_ptr + r.to(tl.int64) * (2 * CAP), V, inv_t, m, z, top_p,
+                        BLOCK, CAP, COARSE,
+                    )
             lx = tl.load(row + xs).to(tl.float32) * inv_t
             px = tl.where(x_ok & (lx >= tau), tl.exp(lx - m) / zk, 0.0)
             tl.store(out, amax.to(tl.float32))
@@ -621,7 +1066,10 @@ def _verify_row_stats_kernel(
                 if (qid == x) & x_ok & (tq > _GREEDY_T):
                     inv_tq = 1.0 / tq
                     qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
-                    mq, zq, _ = _row_online_stats(qrow, q_cols, inv_tq, BLOCK)
+                    if SPLIT_STATS:
+                        mq, zq, _ = _combine_stats(qpart_ptr + r * nch * 3, nch, 3)
+                    else:
+                        mq, zq, _ = _span_online_stats(qrow, 0, q_cols, inv_tq, BLOCK)
                     xl = x - q_vs
                     own = (xl >= 0) & (xl < q_cols)
                     dx = tl.load(qrow + tl.where(own, xl, 0)) * inv_tq
@@ -677,7 +1125,7 @@ def _block_residual_mass_kernel(
     q_temps_ptr,
     rs_ptr,  # [QTP, N, 8]
     hasq_ptr,
-    rm_ptr,  # [N] out (this shard's part)
+    rm_ptr,  # [N, NCH] out (this shard's part, per vocab chunk)
     N,
     V,
     q_width,
@@ -686,11 +1134,15 @@ def _block_residual_mass_kernel(
     q_stride,
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
 ):
-    """rm[row k] = sum_v max(P_k p_k(v) - q_k(v), 0) for 1 <= k < n, over
-    this rank's vocab columns."""
+    """rm[row k, chunk c] = sum_v max(P_k p_k(v) - q_k(v), 0) for 1 <= k < n,
+    over chunk c of this rank's vocab columns; `_prob_decide_kernel` sums the
+    chunks in order."""
     req_idx = tl.program_id(0)
     k = tl.program_id(1) + 1
+    c = tl.program_id(2)
+    nch = tl.num_programs(2)
     start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
     if k >= n:
         return
@@ -710,20 +1162,22 @@ def _block_residual_mass_kernel(
         row = target_ptr + r.to(tl.int64) * V + q_vs
         qrow = q_ptr + (s_row.to(tl.int64) * q_width + k) * q_stride
         if P > 0.0:
+            lo = c * CHUNK
+            hi = tl.minimum(lo + CHUNK, q_cols)
             accv = tl.zeros((BLOCK,), tl.float32)
-            for st in range(0, q_cols, BLOCK):
+            for st in range(lo, hi, BLOCK):
                 offs = st + tl.arange(0, BLOCK)
-                mask = (offs < q_cols) & (q_vs + offs < V)
+                mask = (offs < hi) & (q_vs + offs < V)
                 y = tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32) * inv_t
                 p = tl.where(mask & (y >= tau), tl.exp(y - m) / zk, 0.0)
                 d = tl.load(qrow + offs, mask=mask, other=float("-inf")) * inv_tq
                 q = tl.where(mask, tl.exp(d - mq) / zq, 0.0)
                 accv += tl.where(mask, tl.maximum(P * p - q, 0.0), 0.0)
             acc = tl.sum(accv, axis=0)
-    tl.store(rm_ptr + r, acc)
+    tl.store(rm_ptr + r * nch + c, acc)
 
 
-@triton.jit(do_not_specialize=["num_spec_steps", "seed_acc"])
+@triton.jit(do_not_specialize=["num_spec_steps", "seed_acc", "rm_nch"])
 def _prob_decide_kernel(
     output_token_ids_ptr,  # [bs, num_spec_steps + 1]
     dec_ptr,  # [3, bs] f32: num_acc, rejected, log coef
@@ -733,10 +1187,11 @@ def _prob_decide_kernel(
     temps_ptr,
     rs_ptr,  # [QTP, N, 8]
     hasq_ptr,
-    rmall_ptr,  # [QTP, N]
+    rmall_ptr,  # [QTP, N, rm_nch]
     N,
     num_spec_steps,
     seed_acc,
+    rm_nch,
     QTP: tl.constexpr,
     USE_BLOCK: tl.constexpr,
 ):
@@ -777,7 +1232,9 @@ def _prob_decide_kernel(
                 if k < n - 1:
                     rm = tl.zeros((), tl.float32)
                     for j in tl.static_range(QTP):
-                        rm += tl.load(rmall_ptr + j * N + start + k + 1)
+                        rbase = rmall_ptr + (j * N + start + k + 1) * rm_nch
+                        for c in range(rm_nch):
+                            rm += tl.load(rbase + c)
                     denom = rm + 1.0 - P
                     h = tl.where(denom > 0.0, rm / denom, 1.0)
                 else:
@@ -815,7 +1272,7 @@ def _prob_decide_kernel(
 
 @triton.jit(do_not_specialize=["q_width", "q_vs", "q_cols", "q_stride", "seed_res"])
 def _prob_resample_kernel(
-    res_ptr,  # [bs, 4] f32: best residual score, id, best p score, id
+    res_ptr,  # [bs, NCH, 4] f32: per vocab chunk best residual score, id, best p score, id
     dec_ptr,
     target_ptr,
     input_ids_ptr,
@@ -836,12 +1293,16 @@ def _prob_resample_kernel(
     seed_res,
     QTP: tl.constexpr,
     BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
 ):
-    """This rank's vocab columns of the residual draw at the rejected row:
-    norm(max(c p - q, 0)) (one-hot q: p without the draft), with p's own draw
-    as the fallback when the residual is all zero."""
+    """One vocab chunk of this rank's columns of the residual draw at the
+    rejected row: norm(max(c p - q, 0)) (one-hot q: p without the draft), with
+    p's own draw as the fallback when the residual is all zero. Gumbel-max
+    splits exactly: `_prob_finish_kernel` takes the best chunk."""
     req_idx = tl.program_id(0)
+    chunk = tl.program_id(1)
     bs = tl.num_programs(0)
+    nch = tl.num_programs(1)
     start, n = _req_span(cu_num_draft_tokens_ptr, req_idx)
     temp = tl.load(temps_ptr + req_idx).to(tl.float32)
     num_acc = tl.load(dec_ptr + req_idx).to(tl.int32)
@@ -864,10 +1325,12 @@ def _prob_resample_kernel(
         mq, zq, _ = _q_comb(rs_ptr, r, N, QTP)
         row = target_ptr + r.to(tl.int64) * V + q_vs
         qrow = q_ptr + (s_row.to(tl.int64) * q_width + num_acc) * q_stride
-        for st in range(0, q_cols, BLOCK):
+        lo = chunk * CHUNK
+        hi = tl.minimum(lo + CHUNK, q_cols)
+        for st in range(lo, hi, BLOCK):
             offs = st + tl.arange(0, BLOCK)
             gid = q_vs + offs
-            mask = (offs < q_cols) & (gid < V)
+            mask = (offs < hi) & (gid < V)
             y = tl.load(row + offs, mask=mask, other=float("-inf")).to(tl.float32) * inv_t
             p = tl.where(mask & (y >= tau), tl.exp(y - m) / zk, 0.0)
             if hq:
@@ -891,18 +1354,19 @@ def _prob_resample_kernel(
     best_pi = tl.min(tl.where(bpv == best_p, bpiv, 2147483647), axis=0)
     best_ri = tl.where(best_r > float("-inf"), best_ri, 0)
     best_pi = tl.where(best_p > float("-inf"), best_pi, 0)
-    tl.store(res_ptr + req_idx * 4, best_r)
-    tl.store(res_ptr + req_idx * 4 + 1, best_ri.to(tl.float32))
-    tl.store(res_ptr + req_idx * 4 + 2, best_p)
-    tl.store(res_ptr + req_idx * 4 + 3, best_pi.to(tl.float32))
+    out = res_ptr + (req_idx * nch + chunk) * 4
+    tl.store(out, best_r)
+    tl.store(out + 1, best_ri.to(tl.float32))
+    tl.store(out + 2, best_p)
+    tl.store(out + 3, best_pi.to(tl.float32))
 
 
-@triton.jit(do_not_specialize=["num_spec_steps"])
+@triton.jit(do_not_specialize=["num_spec_steps", "res_nch"])
 def _prob_finish_kernel(
     output_token_ids_ptr,
     verdict_ptr,
     dec_ptr,
-    resall_ptr,  # [QTP, bs, 4]
+    resall_ptr,  # [QTP, bs, res_nch, 4]
     cu_num_draft_tokens_ptr,
     temps_ptr,
     rs_ptr,  # [QTP, N, 8]
@@ -910,6 +1374,7 @@ def _prob_finish_kernel(
     bonus_logits_indices_ptr,
     N,
     num_spec_steps,
+    res_nch,
     QTP: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -923,20 +1388,25 @@ def _prob_finish_kernel(
         if temp <= _GREEDY_T:
             tok = _ts(rs_ptr, start + num_acc, N, QTP, 0).to(tl.int32)
         else:
-            best_r = tl.load(resall_ptr + req_idx * 4)
-            id_r = tl.load(resall_ptr + req_idx * 4 + 1)
-            best_p = tl.load(resall_ptr + req_idx * 4 + 2)
-            id_p = tl.load(resall_ptr + req_idx * 4 + 3)
-            for j in tl.static_range(1, QTP):
-                base = resall_ptr + (j * bs + req_idx) * 4
-                v = tl.load(base)
-                t = v > best_r
-                id_r = tl.where(t, tl.load(base + 1), id_r)
-                best_r = tl.where(t, v, best_r)
-                v = tl.load(base + 2)
-                t = v > best_p
-                id_p = tl.where(t, tl.load(base + 3), id_p)
-                best_p = tl.where(t, v, best_p)
+            # Shards then chunks: ascending vocab order, so the strict compare
+            # keeps the lowest id among equal scores, as a single scan would.
+            # Every record of an all -inf scan carries id 0, so starting from
+            # (-inf, 0) reproduces the first record's fallback.
+            best_r = tl.zeros((), tl.float32) + float("-inf")
+            id_r = tl.zeros((), tl.float32)
+            best_p = tl.zeros((), tl.float32) + float("-inf")
+            id_p = tl.zeros((), tl.float32)
+            for j in tl.static_range(QTP):
+                for c in range(res_nch):
+                    base = resall_ptr + ((j * bs + req_idx) * res_nch + c) * 4
+                    v = tl.load(base)
+                    t = v > best_r
+                    id_r = tl.where(t, tl.load(base + 1), id_r)
+                    best_r = tl.where(t, v, best_r)
+                    v = tl.load(base + 2)
+                    t = v > best_p
+                    id_p = tl.where(t, tl.load(base + 3), id_p)
+                    best_p = tl.where(t, v, best_p)
             tok = tl.where(best_r > float("-inf"), id_r, id_p).to(tl.int32)
         tl.store(out_row + num_acc, tl.cast(tok, tl.int32))
         last_checked = num_acc
@@ -986,12 +1456,20 @@ def prob_rejection_sample(
         return output, verdict
     f32 = dict(dtype=torch.float32, device=device)
     nrow = max(num_rows, 1)
+    # Vocab chunks: of the target row for the row statistics (which also span
+    # the q columns), of this rank's q columns for the residual passes.
+    nch_q = max(1, triton.cdiv(state.q_cols, _CHUNK))
+    split_stats = _SPLIT_STATS
+    nch_stats = max(nch_q, triton.cdiv(vocab, _CHUNK)) if split_stats else 1
     rs = torch.empty((nrow, 8), **f32)
-    rm = torch.empty(nrow, **f32)
+    rm = torch.empty((nrow, nch_q), **f32)
     hasq = torch.empty(nrow, dtype=torch.int32, device=device)
     cand = torch.empty((nrow, 2 * _CAND_CAP), **f32)
+    stats_rows = nrow if split_stats else 1
+    tpart = torch.empty((stats_rows, nch_stats, 3), **f32)
+    qpart = torch.empty((stats_rows, nch_stats, 3), **f32)
     dec = torch.empty((3, bs), **f32)
-    res = torch.empty((bs, 4), **f32)
+    res = torch.empty((bs * nch_q, 4), **f32)
     if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 1:
         top_p_ptr, top_p_scalar, has_ptr = top_ps.to(torch.float32), 1.0, True
     else:
@@ -1000,6 +1478,21 @@ def prob_rejection_sample(
         top_p_ptr, has_ptr = temperatures, False
         top_p_scalar = 1.0 if top_ps is None else float(top_ps)
     temps = temperatures.to(torch.float32)
+    # The split top-p search reads the split statistics' row max and sum.
+    split_topp = split_stats and _SPLIT_TOPP and (has_ptr or top_p_scalar < 1.0)
+    K, RB = _TOPP_K, _TOPP_RB
+    topp_rows = nrow if split_topp else 1
+    topp_nch = nch_stats if split_topp else 1
+    i32 = dict(dtype=torch.int32, device=device)
+    thr1 = torch.empty((topp_rows, K), **f32)
+    thr2 = torch.empty((topp_rows, K), **f32)
+    l1m = torch.empty((topp_rows, topp_nch, K), **f32)
+    l1c = torch.empty((topp_rows, topp_nch, K), **i32)
+    l2m = torch.empty((topp_rows, topp_nch, K), **f32)
+    l2c = torch.empty((topp_rows, topp_nch, K), **i32)
+    dec1 = torch.empty((topp_rows, 2), **f32)
+    dec2 = torch.empty((topp_rows, 4), **f32)
+    cand2 = torch.empty((topp_rows, 2, RB), **f32)
     gather = (
         (lambda t: tp_group.all_gather(t, dim=0, use_custom=use_custom))
         if qtp > 1
@@ -1009,6 +1502,48 @@ def prob_rejection_sample(
     state.verify_step += 1
     seed_acc = (step % (1 << 28)) * 4 + 1
     seed_res = (step % (1 << 28)) * 4 + 2
+    if num_rows > 0 and num_spec_steps > 0 and split_stats:
+        _verify_stats_partial_kernel[(bs, num_spec_steps, nch_stats)](
+            target_logits,
+            input_ids,
+            target_logits_indices,
+            cu_num_draft_tokens,
+            temps,
+            src,
+            state.q,
+            state.ids,
+            state.temps,
+            tpart,
+            qpart,
+            vocab,
+            q_width,
+            state.q_vs,
+            state.q_cols,
+            q_stride,
+            rank_id,
+            QTP=qtp,
+            BLOCK=_SPLIT_BLOCK,
+            CHUNK=_CHUNK,
+            num_warps=_NUM_WARPS,
+        )
+    if num_rows > 0 and num_spec_steps > 0 and split_topp:
+        grid = (bs, num_spec_steps, nch_stats)
+        row_args = (target_logits, cu_num_draft_tokens, temps, top_p_ptr, top_p_scalar, tpart)
+        _topp_level1_kernel[grid](
+            *row_args, thr1, l1m, l1c, vocab, rank_id,
+            QTP=qtp, HAS_TOPP_PTR=has_ptr, K=K, SB=_TOPP_SB, CHUNK=_CHUNK,
+            num_warps=_NUM_WARPS,
+        )
+        _topp_level2_kernel[grid](
+            *row_args, thr1, l1m, l1c, dec1, thr2, l2m, l2c, vocab, rank_id,
+            QTP=qtp, HAS_TOPP_PTR=has_ptr, K=K, SB=_TOPP_SB, CHUNK=_CHUNK, RB=RB,
+            num_warps=_NUM_WARPS,
+        )
+        _topp_compact_kernel[grid](
+            *row_args, thr1, l1m, l1c, dec1, thr2, l2m, l2c, dec2, cand2, vocab, rank_id,
+            QTP=qtp, HAS_TOPP_PTR=has_ptr, K=K, BLOCK=_SPLIT_BLOCK, CHUNK=_CHUNK, RB=RB,
+            num_warps=_NUM_WARPS,
+        )
     if num_rows > 0 and num_spec_steps > 0:
         _verify_row_stats_kernel[(bs, num_spec_steps)](
             target_logits,
@@ -1023,6 +1558,10 @@ def prob_rejection_sample(
             state.ids,
             state.temps,
             cand,
+            tpart,
+            qpart,
+            dec2,
+            cand2,
             rs,
             hasq,
             vocab,
@@ -1032,17 +1571,21 @@ def prob_rejection_sample(
             q_stride,
             num_spec_steps,
             rank_id,
+            nch_stats,
             QTP=qtp,
             HAS_TOPP_PTR=has_ptr,
             BLOCK=_VBLOCK,
             CAP=_CAND_CAP,
             COARSE=_COARSE_ITERS,
+            SPLIT_STATS=split_stats,
+            SPLIT_TOPP=split_topp,
+            RB=RB,
             num_warps=_NUM_WARPS,
         )
     rsall = gather(rs)
     rmall = rm
     if use_block and num_rows > 0 and num_spec_steps > 1:
-        _block_residual_mass_kernel[(bs, num_spec_steps - 1)](
+        _block_residual_mass_kernel[(bs, num_spec_steps - 1, nch_q)](
             target_logits,
             cu_num_draft_tokens,
             temps,
@@ -1059,7 +1602,8 @@ def prob_rejection_sample(
             state.q_cols,
             q_stride,
             QTP=qtp,
-            BLOCK=_VBLOCK,
+            BLOCK=_SPLIT_BLOCK,
+            CHUNK=_CHUNK,
             num_warps=_NUM_WARPS,
         )
         rmall = gather(rm)
@@ -1076,11 +1620,12 @@ def prob_rejection_sample(
         nrow,
         num_spec_steps,
         seed_acc,
+        nch_q,
         QTP=qtp,
         USE_BLOCK=use_block,
         num_warps=1,
     )
-    _prob_resample_kernel[(bs,)](
+    _prob_resample_kernel[(bs, nch_q)](
         res,
         dec,
         target_logits,
@@ -1101,7 +1646,8 @@ def prob_rejection_sample(
         q_stride,
         seed_res,
         QTP=qtp,
-        BLOCK=_VBLOCK,
+        BLOCK=_SPLIT_BLOCK,
+        CHUNK=_CHUNK,
         num_warps=_NUM_WARPS,
     )
     resall = gather(res)
@@ -1117,6 +1663,7 @@ def prob_rejection_sample(
         bonus_logits_indices,
         nrow,
         num_spec_steps,
+        nch_q,
         QTP=qtp,
         num_warps=1,
     )
