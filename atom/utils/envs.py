@@ -925,6 +925,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_V4_HCA_PERSIST_MIN_ROWS": lambda: int(
         os.getenv("ATOM_V4_HCA_PERSIST_MIN_ROWS", "15")
     ),
+    # MLA DCP + MTP target decode on aiter's opus flat-row kernel
+    # (OpusMlaFlatDecode) instead of mla_decode_fwd. Off by default.
+    "ATOM_OPUS_MLA": lambda: _flag_env("ATOM_OPUS_MLA"),
+    # Running batches below it stay on mla_decode_fwd, which is faster there.
+    "ATOM_OPUS_MLA_MIN_BATCH": lambda: _int_env("ATOM_OPUS_MLA_MIN_BATCH", 11),
+    # Largest running batch that uses it (sizes its plan buffers); larger
+    # batches stay on mla_decode_fwd.
+    "ATOM_OPUS_MLA_MAX_BS": lambda: _int_env("ATOM_OPUS_MLA_MAX_BS", 128),
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",
