@@ -76,7 +76,34 @@ POLL_SLEEP = int(os.environ.get("MONO_POLL_SLEEP", "0"))
 # MONO_IPF=<n>: n s_prefetch_inst_pc_rel of 32 lines each, MONO_IPF_STEP bytes apart, at kernel start (the code
 # after the hardware's launch prefetch, refilled at once when another large kernel ran in between). Experiment.
 IPF = int(os.environ.get("MONO_IPF", "0"))
-IPF_STEP = int(os.environ.get("MONO_IPF_STEP", "4096"))  # s_sleep between the routing polls (idle CTAs)
+IPF_STEP = int(os.environ.get("MONO_IPF_STEP", "4096"))
+# MONO_INSTPREF=<lines>: the descriptor's INST_PREF_SIZE (launch prefetch, 128 B lines; LLVM sets 255 = ~32 KB) set to
+# <lines> after compile (instpref.py). -1: LLVM's value.
+INSTPREF = int(os.environ.get("MONO_INSTPREF", "-1"))
+# MONO_ROLES (code-size accounting only: a build without some roles does not work): bits 1 quant, 2 shared expert,
+# 4 router + top-k + prefix sum, 8 gate_up (+ its early B), 16 down (+ early B), 32 gather + all-reduce + norm
+ROLES = int(os.environ.get("MONO_ROLES", "63"))
+# MONO_ROLL: rolled (unroll=1) loops instead of straight-line code, smaller instruction-cache footprint, same
+# arithmetic order: bits 1 top-k selection, 2 gather (per-lane route lookups + rolled accumulate), 4 shared-expert
+# down sub-tiles, 8 all-reduce norm stores, 16 down tiles (one issue_b / issue_a and two finish call sites, runtime
+# LDS slot, instead of three copies of each)
+ROLL = int(os.environ.get("MONO_ROLL", "0"))
+
+
+def _sel(vals, i):
+    """vals[i] for an index i (uniform or per lane) over a short Python list."""
+    v = vals[0]
+    for k in range(1, len(vals)):
+        v = (i == k).select(vals[k], v)
+    return v
+
+
+def _readlane_f32(x, k):
+    return fx.Int32(rocdl.readlane(T.i32, fx.Float32(x).bitcast(fx.Int32).ir_value(), fx.Int32(k).ir_value())).bitcast(fx.Float32)
+if INSTPREF >= 0:
+    from .instpref import install as _install_instpref
+
+    _install_instpref("moe_mono2", INSTPREF)  # s_sleep between the routing polls (idle CTAs)
 
 
 @ASTRewriter.transform
@@ -169,7 +196,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
     spin = _make_spin(dbg_)
     QL = _quant_layout(D, "fp4", 1)
 
-    @flyc.kernel(name="moe_mono2%s%s%s_pf%d_%d" % ("_timing" if timing else "", "_sh" if shared else "", "_ar" if ar else "", PF, int(PF_DELAY_US * 100)) + "_dm%d_gd%d_sd%d_ps%d_rk%d_dbg%d_tko%d" % (DNMAP, GUDN_, int(SH_DELAY_US * 100), POLL_SLEEP, RKS_R_, DEBUG_SPIN, TKO_) + ("_ipf%d_%d" % (IPF, IPF_STEP) if IPF else ""), known_block_size=[32, 1, 1])
+    @flyc.kernel(name="moe_mono2%s%s%s_pf%d_%d" % ("_timing" if timing else "", "_sh" if shared else "", "_ar" if ar else "", PF, int(PF_DELAY_US * 100)) + "_dm%d_gd%d_sd%d_ps%d_rk%d_dbg%d_tko%d" % (DNMAP, GUDN_, int(SH_DELAY_US * 100), POLL_SLEEP, RKS_R_, DEBUG_SPIN, TKO_) + ("_ipf%d_%d" % (IPF, IPF_STEP) if IPF else "") + ("_ip%d" % INSTPREF if INSTPREF >= 0 else "") + ("_roles%d" % ROLES if ROLES != 63 else "") + ("_rl%d" % ROLL if ROLL else ""), known_block_size=[32, 1, 1])
     def kernel(x: fx.Pointer, gate: fx.Pointer, w13: fx.Pointer, s13: fx.Pointer, w2: fx.Pointer, s2: fx.Pointer,
                lg: fx.Pointer, ti: fx.Pointer, tw: fx.Pointer, tsl: fx.Pointer, etok: fx.Pointer,
                a1t: fx.Pointer, a1ts: fx.Pointer, a2: fx.Pointer, a2s: fx.Pointer, gout: fx.Pointer, out: fx.Pointer,
@@ -261,7 +288,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                 acc = wmma_bf16(prims.lds_ld8w(L0, dwi), prims.lds_ld8w(L0 + 16 * pit, dwi), acc)
             return acc
 
-        if is_rt:
+        if is_rt & fx.const_expr(ROLES & 4 != 0):
             tdm_rows(x, rm * 16, T_ - rm * 16, 16, KBR, 2 * D, rks * KBR, 0, XPR)
             tdm_rows(gate, rn * 16, fx.Int32(E + 1) - rn * 16, 16, KBR, 2 * D, rks * KBR, 16 * XPR, XPR)
         # shared expert operands, early TDM (x and weights are inputs)
@@ -278,10 +305,10 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                 tgt_ = t_start + int(SH_DELAY_US * 100)
                 spin(lambda: fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.readsteadycounter", [], [], [])),
                      lambda c_: c_ < tgt_)
-        if is_sg:
+        if is_sg & fx.const_expr(ROLES & 2 != 0):
             tdm_rows(x, sm * 16, T_ - sm * 16, 16, 1024, 2 * D, sks * 1024, 0, XP)
             tdm_rows(shgu, sn * 16, fx.Int32(2 * SH) - sn * 16, 16, 1024, 2 * D, sks * 1024, 16 * XP, XP)
-        if is_sd:
+        if is_sd & fx.const_expr(ROLES & 2 != 0):
             tdm_rows(shdn, dn_s * 128, fx.Int32(128), 128, 2 * SH, 2 * SH, 0, 0, SDP)
 
         # launch tag: the epoch word (advanced at the end of every launch by its last CTA) + 1, in [1, 2^30]:
@@ -342,7 +369,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
         # ------------------------------------------------------------ quant per token (x is an input): (t, k group)
         if fx.const_expr(upto < 1):
             return
-        if bid < n_q:
+        if (bid < n_q) & fx.const_expr(ROLES & 1 != 0):
             stamp(6)
             t = bid
             block_in_wave = fx.Uint32(lane) // fx.Uint32(QL.lanes_per_mx_block)
@@ -368,7 +395,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             stamp(7)
 
         # ------------------------------------------------------------ shared expert (idle CTAs during the prelude)
-        if is_sg:
+        if is_sg & fx.const_expr(ROLES & 2 != 0):
             # gate_up [16 tok x 16 cols] K split 4 -> fp32 partials; the last of the 8 tiles of (cols n8, n8 + 128)
             # sums them (bf16 GEMM outputs) and writes SiLU(gate) * up (bf16) for those 16 x 16
             tdm_ops.tensor_wait(0)
@@ -409,7 +436,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                     st_dw(r_act, (tr * SH + c0) // 2, [prims.bf16_pack(av[2 * j], av[2 * j + 1]) for j in range(4)])
                 publish(F_ACT + sm * 8 + n8)
                 stamp(18)
-        if is_sd:
+        if is_sd & fx.const_expr(ROLES & 2 != 0):
             # down: [16 tok x 128 in] x [128 out x 128 in]^T, weights already in flight
             wait4(F_ACT + dm_ * 8)
             wait4(F_ACT + dm_ * 8 + 4)
@@ -417,26 +444,46 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             tdm_ops.tensor_wait(0)
             row = lane % 16
             h = lane // 16
-            accs = []
-            for sub in fx.range_constexpr(8):
-                acc = [fx.Float32(0.0) for _ in range(8)]
-                for s_ in fx.range_constexpr(4):
-                    a_ = prims.lds_ld8w(L0 + 128 * SDP, row * (SDP // 4) + 16 * s_ + 8 * h)
-                    b_ = prims.lds_ld8w(L0, (sub * 16 + row) * (SDP // 4) + 16 * s_ + 8 * h)
-                    acc = wmma_bf16(a_, b_, acc)
-                accs.append(acc)
-            prims.lds_barrier()
-            # stage the bf16 tile [16 x 128] in LDS (pairs of lanes -> dwords), then row-contiguous stores
-            for sub in fx.range_constexpr(8):
-                for i in fx.range_constexpr(8):
-                    v = prims.bf16_bits(accs[sub][i])
-                    nb = v.shuffle_xor(1, 32)
-                    if lane % 2 == 0:
-                        prims.lds_sti(L0, ((h * 8 + i) * 128 + sub * 16 + row) // 2, v | (nb << 16))
-            prims.lds_barrier()
+            if fx.const_expr(ROLL & 4):
+                # one loop body for the 8 sub-tiles, each staged right away above the act rows (the weights at L0
+                # are still read by the later sub-tiles)
+                LST = L0 + 128 * SDP + 16 * SDP
+                for sub_ in range(8, unroll=1):
+                    sub = fx.Int32(sub_)
+                    acc = [fx.Float32(0.0) for _ in range(8)]
+                    for s_ in fx.range_constexpr(4):
+                        a_ = prims.lds_ld8w(L0 + 128 * SDP, row * (SDP // 4) + 16 * s_ + 8 * h)
+                        b_ = prims.lds_ld8w(L0, (sub * 16 + row) * (SDP // 4) + 16 * s_ + 8 * h)
+                        acc = wmma_bf16(a_, b_, acc)
+                    for i in fx.range_constexpr(8):
+                        v = prims.bf16_bits(acc[i])
+                        nb = v.shuffle_xor(1, 32)
+                        if lane % 2 == 0:
+                            prims.lds_sti(LST, ((h * 8 + i) * 128 + sub * 16 + row) // 2, v | (nb << 16))
+                prims.lds_barrier()
+                LSD = LST
+            else:
+                accs = []
+                for sub in fx.range_constexpr(8):
+                    acc = [fx.Float32(0.0) for _ in range(8)]
+                    for s_ in fx.range_constexpr(4):
+                        a_ = prims.lds_ld8w(L0 + 128 * SDP, row * (SDP // 4) + 16 * s_ + 8 * h)
+                        b_ = prims.lds_ld8w(L0, (sub * 16 + row) * (SDP // 4) + 16 * s_ + 8 * h)
+                        acc = wmma_bf16(a_, b_, acc)
+                    accs.append(acc)
+                prims.lds_barrier()
+                # stage the bf16 tile [16 x 128] in LDS (pairs of lanes -> dwords), then row-contiguous stores
+                for sub in fx.range_constexpr(8):
+                    for i in fx.range_constexpr(8):
+                        v = prims.bf16_bits(accs[sub][i])
+                        nb = v.shuffle_xor(1, 32)
+                        if lane % 2 == 0:
+                            prims.lds_sti(L0, ((h * 8 + i) * 128 + sub * 16 + row) // 2, v | (nb << 16))
+                prims.lds_barrier()
+                LSD = L0
             orow = lane // 2
             for q in fx.range_constexpr(8):
-                wv = prims.lds_ld4w(L0, orow * 64 + (lane % 2) * 32 + 4 * q)
+                wv = prims.lds_ld4w(LSD, orow * 64 + (lane % 2) * 32 + 4 * q)
                 if dm_ * 16 + orow < T_:
                     st_dw(r_shout, (dm_ * 16 + orow) * (D // 2) + dn_s * 64 + (lane % 2) * 32 + 4 * q, wv)
             publish(F_SD + dm_ * 16 + dn_s)
@@ -445,7 +492,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
         # ------------------------------------------------------------ router tile + top-k in its epilogue
         if fx.const_expr(upto < 2):
             return
-        if is_rt:
+        if is_rt & fx.const_expr(ROLES & 4 != 0):
             tdm_ops.tensor_wait(0)
             stamp(16)
             h = lane // 16
@@ -483,35 +530,65 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                     for k4 in fx.range_constexpr(1, RKS_R_):
                         v = v + parts[k4][i]
                     vals.append(prims.bf16r(v))
-                picked_v = []
-                picked_i = []
-                for k in fx.range_constexpr(TOPK):
-                    bv = vals[0]
-                    bi = lane * 8
-                    for i in fx.range_constexpr(1, 8):
-                        take = vals[i] > bv
-                        bv = take.select(vals[i], bv)
-                        bi = take.select(lane * 8 + i, bi)
-                    for o_ in (16, 8, 4, 2, 1):
-                        ov = bv.shuffle_xor(o_, 32)
-                        oi = bi.shuffle_xor(o_, 32)
-                        take = (ov > bv) | ((ov == bv) & (oi < bi))
-                        bv = take.select(ov, bv)
-                        bi = take.select(oi, bi)
-                    picked_v.append(bv)
-                    picked_i.append(bi)
-                    mine = lane == bi // 8
-                    for i in fx.range_constexpr(8):
-                        vals[i] = (mine & (bi % 8 == i)).select(fx.Float32(-3.0e38), vals[i])
-                es = [fmath.exp(v - picked_v[0]) for v in picked_v]
-                tot = es[0]
-                for k in fx.range_constexpr(1, TOPK):
-                    tot = tot + es[k]
-                my_e = picked_i[0]
-                my_w = es[0]
-                for k in fx.range_constexpr(1, TOPK):
-                    my_e = (lane == k).select(picked_i[k], my_e)
-                    my_w = (lane == k).select(es[k], my_w)
+                if fx.const_expr(ROLL & 1):
+                    # one loop body for the 8 picks: lane k keeps pick k (value, expert)
+                    vv = fx.Vector.from_elements(vals, fx.Float32)
+                    my_e = fx.Int32(0)
+                    my_v = fx.Float32(0.0)
+                    for k_ in range(TOPK, unroll=1):
+                        kq = fx.Int32(k_)
+                        bv = fx.Float32(vv[0])
+                        bi = lane * 8
+                        for i in fx.range_constexpr(1, 8):
+                            vi = fx.Float32(vv[i])
+                            take = vi > bv
+                            bv = take.select(vi, bv)
+                            bi = take.select(lane * 8 + i, bi)
+                        for o_ in (16, 8, 4, 2, 1):
+                            ov = bv.shuffle_xor(o_, 32)
+                            oi = bi.shuffle_xor(o_, 32)
+                            take = (ov > bv) | ((ov == bv) & (oi < bi))
+                            bv = take.select(ov, bv)
+                            bi = take.select(oi, bi)
+                        my_e = (lane == kq).select(bi, my_e)
+                        my_v = (lane == kq).select(bv, my_v)
+                        mine = lane == bi // 8
+                        vv = fx.Vector.from_elements([(mine & (bi % 8 == i)).select(fx.Float32(-3.0e38), fx.Float32(vv[i]))
+                                                      for i in range(8)], fx.Float32)
+                    my_w = fmath.exp(my_v - _readlane_f32(my_v, 0))
+                    tot = _readlane_f32(my_w, 0)
+                    for k in fx.range_constexpr(1, TOPK):
+                        tot = tot + _readlane_f32(my_w, k)
+                else:
+                    picked_v = []
+                    picked_i = []
+                    for k in fx.range_constexpr(TOPK):
+                        bv = vals[0]
+                        bi = lane * 8
+                        for i in fx.range_constexpr(1, 8):
+                            take = vals[i] > bv
+                            bv = take.select(vals[i], bv)
+                            bi = take.select(lane * 8 + i, bi)
+                        for o_ in (16, 8, 4, 2, 1):
+                            ov = bv.shuffle_xor(o_, 32)
+                            oi = bi.shuffle_xor(o_, 32)
+                            take = (ov > bv) | ((ov == bv) & (oi < bi))
+                            bv = take.select(ov, bv)
+                            bi = take.select(oi, bi)
+                        picked_v.append(bv)
+                        picked_i.append(bi)
+                        mine = lane == bi // 8
+                        for i in fx.range_constexpr(8):
+                            vals[i] = (mine & (bi % 8 == i)).select(fx.Float32(-3.0e38), vals[i])
+                    es = [fmath.exp(v - picked_v[0]) for v in picked_v]
+                    tot = es[0]
+                    for k in fx.range_constexpr(1, TOPK):
+                        tot = tot + es[k]
+                    my_e = picked_i[0]
+                    my_w = es[0]
+                    for k in fx.range_constexpr(1, TOPK):
+                        my_e = (lane == k).select(picked_i[k], my_e)
+                        my_w = (lane == k).select(es[k], my_w)
                 if lane < TOPK:
                     slot = fx.Int32(fx.atomic_add(fl_p + (F_EC + my_e), fx.Int32(1), syncscope=AGENT))
                     bo.buffer_store(my_e.ir_value(), r_ti, t * 8 + lane)
@@ -640,10 +717,13 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             # the rest to the gate_up CTAs (whose down weights can only be issued after their gate_up tile)
             G_ = mt * 4
             N1_ = NCTA - G_
-            dts = [(T_ > 64).select((bid >= G_).select((bid - G_) + k * N1_, 3 * N1_ + bid + k * G_), bid + k * NCTA)
-                   for k in range(3)]  # measured: better from T 85, worse at T 16
+
+            def dts_at(k):  # measured: better from T 85, worse at T 16
+                return (T_ > 64).select((bid >= G_).select((bid - G_) + k * N1_, 3 * N1_ + bid + k * G_), bid + k * NCTA)
         else:
-            dts = [bid + k * NCTA for k in range(3)]
+            def dts_at(k):
+                return bid + k * NCTA
+        dts = [dts_at(k) for k in range(3)]
 
         def gemm_call(task, which, mode, tid_, slot=0, late=0, gather=None, drain_cb=None):
             gemm_tdm.HOOKS.clear()
@@ -656,7 +736,11 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             if fx.const_expr(drain_cb is not None and GUDN_ == 2):
                 gemm_tdm.HOOKS["store_cb"] = drain_cb
                 gemm_tdm.HOOKS["store_extra"] = 4
-            gemm_tdm.LDS_BASE[0] = base_ptr + ((DN_BASE_ + slot * DN_SLOT) if which == "dn" else 0)
+            if fx.const_expr(which == "dn" and not isinstance(slot, int)):
+                # runtime slot (MONO_ROLL 16): a 16-byte aligned LDS pointer rebuilt from the address
+                gemm_tdm.LDS_BASE[0] = fx.inttoptr(p8_shared, L0 + DN_BASE_ + slot * DN_SLOT)
+            else:
+                gemm_tdm.LDS_BASE[0] = base_ptr + ((DN_BASE_ + slot * DN_SLOT) if which == "dn" else 0)
             if fx.const_expr(which == "gu"):
                 task(a2, a1t, w13, a1ts, s13, a1t, a1t, a2s, a2, cm, fx.Int32(2 * I), fx.Float32(float("inf")),
                      fx.Float32(1.0), fx.Float32(1.0), tid_, nrows)
@@ -667,9 +751,16 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             gemm_tdm.LDS_BASE[0] = base_ptr
 
         def issue_down_b(skip0=0):
-            for k in fx.range_constexpr(skip0, 3):
-                if dts[k] < n_dn:
-                    gemm_call(dn_task, "dn", "issue_b", dts[k], slot=k)
+            if fx.const_expr(ROLL & 16):
+                for k_ in range(skip0, 3, unroll=1):
+                    kq = fx.Int32(k_)
+                    d_ = dts_at(kq)
+                    if d_ < n_dn:
+                        gemm_call(dn_task, "dn", "issue_b", d_, slot=kq)
+            else:
+                for k in fx.range_constexpr(skip0, 3):
+                    if dts[k] < n_dn:
+                        gemm_call(dn_task, "dn", "issue_b", dts[k], slot=k)
 
         def gu_drain_cb():
             # always exactly 2 (GUDN_ 1) / 4 (GUDN_ 2) TDM ops (the gate_up fences count them): real tiles, clamped
@@ -680,7 +771,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
         # EARLY TDM: expert weights as soon as the routing is known
         if fx.const_expr(upto < 4):
             return
-        if has_gu:
+        if has_gu & fx.const_expr(ROLES & 8 != 0):
             gemm_call(gu_task, "gu", "issue_b", bid)
             if fx.const_expr(PF == 2):
                 # L2 prefetch of this tile's k tiles 2, 3 of B (the halves of its 4 preshuffled 16 KB rows that the
@@ -692,11 +783,11 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                     li = i * 32 + lane
                     prims.prefetch_line(rowb + fx.Int64(li // 64) * 16384 + fx.Int64(li % 64) * 128)
             stamp(17)
-        else:
+        elif fx.const_expr(ROLES & 16 != 0):
             issue_down_b()
 
         # ------------------------------------------------------------ gate_up: A rows gathered by token
-        if has_gu:
+        if has_gu & fx.const_expr(ROLES & 8 != 0):
             gm, gn_ = _swz(bid, nrows, 4)
             blk_m = gm * 16
             ge = expert_of(blk_m)
@@ -714,24 +805,40 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             gemm_call(gu_task, "gu", "rest", bid, gather=gat, drain_cb=gu_drain_cb if GUDN_ else None)
             publish(F_GU + gm * 4 + gn_)
             stamp(9)
-            issue_down_b(skip0=GUDN_)
+            if fx.const_expr(ROLES & 16 != 0):
+                issue_down_b(skip0=GUDN_)
 
         # ------------------------------------------------------------ down: up to 3 tiles a CTA in flight
         if fx.const_expr(upto < 6):
             return
 
         def dn_wait_issue_a(k):
-            dm, _ = _swz(dts[k], nrows, 16)
+            d_ = dts_at(k) if fx.const_expr(ROLL & 16) else dts[k]
+            dm, _ = _swz(d_, nrows, 16)
             wait4(F_GU + dm * 4)
-            gemm_call(dn_task, "dn", "issue_a", dts[k], slot=k)
+            gemm_call(dn_task, "dn", "issue_a", d_, slot=k)
 
         def dn_finish(k, late):
-            dm, dn_ = _swz(dts[k], nrows, 16)
-            gemm_call(dn_task, "dn", "finish", dts[k], slot=k, late=late)
+            d_ = dts_at(k) if fx.const_expr(ROLL & 16) else dts[k]
+            dm, dn_ = _swz(d_, nrows, 16)
+            gemm_call(dn_task, "dn", "finish", d_, slot=k, late=late)
             publish(F_DN + dm * 16 + dn_)
             stamp(11)
 
-        if dts[0] < n_dn:
+        if fx.const_expr((ROLL & 16) != 0 and (ROLES & 16) != 0):
+            # events e = 0..3: tile e's A issued (after its m tile's gate_up flags), then tile e - 1 finished with
+            # tile e's loads still in flight (late 2) or, the last one, with none (late 0); one call site each
+            for e_ in range(4, unroll=1):
+                eq = fx.Int32(e_)
+                nxt = (eq < 3) & (dts_at(eq) < n_dn)
+                if nxt:
+                    dn_wait_issue_a(eq)
+                if (eq >= 1) & (dts_at(eq - 1) < n_dn):
+                    if nxt:
+                        dn_finish(eq - 1, 2)
+                    else:
+                        dn_finish(eq - 1, 0)
+        elif (dts[0] < n_dn) & fx.const_expr(ROLES & 16 != 0):
             dn_wait_issue_a(0)
             stamp(10)
             if dts[1] < n_dn:
@@ -748,19 +855,32 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
 
         # ------------------------------------------------------------ gather-reduce: (token, half) a CTA
         g_id = NCTA - 1 - bid
-        if g_id < T_ * 2:
+        if (g_id < T_ * 2) & fx.const_expr(ROLES & 32 != 0):
             t = g_id // 2
             hh = g_id - t * 2
-            rk = []
-            wk = []
-            for k in fx.range_constexpr(TOPK):
-                ek = uniform(fx.Int32(bo.buffer_load(r_ti, t * 8 + k, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
-                sk = uniform(fx.Int32(bo.buffer_load(r_tsl, t * 8 + k, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
-                rk.append(start_of(ek) + sk)
-                wk.append(uniform(fx.Int32(bo.buffer_load(r_tw, t * 8 + k, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))).bitcast(fx.Float32))
-            my_r = rk[0]
-            for k in fx.range_constexpr(1, TOPK):
-                my_r = (lane // 4 == k).select(rk[k], my_r)
+            if fx.const_expr(ROLL & 2):
+                # route k = lane % 8 on every lane: its expert's start from the prefix sum held by lane (e - 1) // 8
+                kl = lane % 8
+                ek_l = fx.Int32(bo.buffer_load(r_ti, t * 8 + kl, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                sk_l = fx.Int32(bo.buffer_load(r_tsl, t * 8 + kl, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))
+                wk_l = fx.Int32(bo.buffer_load(r_tw, t * 8 + kl, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)).bitcast(fx.Float32)
+                pidx = (ek_l > 0).select(ek_l - 1, fx.Int32(0))
+                cand = [fx.Int32(gpu.shuffle_idx(pv[i], pidx // 8, 32)) for i in range(8)]
+                rk_l = (ek_l > 0).select((_sel(cand, pidx % 8) + 15) // 16 * 16, fx.Int32(0)) + sk_l
+                rk = [fx.Int32(rocdl.readlane(T.i32, rk_l.ir_value(), fx.Int32(k).ir_value())) for k in range(TOPK)]
+                wk = [_readlane_f32(wk_l, k) for k in range(TOPK)]
+                my_r = fx.Int32(gpu.shuffle_idx(rk_l, lane // 4, 32))
+            else:
+                rk = []
+                wk = []
+                for k in fx.range_constexpr(TOPK):
+                    ek = uniform(fx.Int32(bo.buffer_load(r_ti, t * 8 + k, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
+                    sk = uniform(fx.Int32(bo.buffer_load(r_tsl, t * 8 + k, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)))
+                    rk.append(start_of(ek) + sk)
+                    wk.append(uniform(fx.Int32(bo.buffer_load(r_tw, t * 8 + k, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV))).bitcast(fx.Float32))
+                my_r = rk[0]
+                for k in fx.range_constexpr(1, TOPK):
+                    my_r = (lane // 4 == k).select(rk[k], my_r)
             wbase = F_DN + (my_r // 16) * 16 + hh * 8 + (lane % 4) * 2
 
             def load_dn():
@@ -779,10 +899,21 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                 for q in fx.range_constexpr(4):
                     raw += ld_dw(rg, hh * 512 + lane * 16 + q * 4)
                 raws.append(raw)
-            for k in fx.range_constexpr(TOPK):
-                vals = prims.bf16_unpack(raws[k])
-                for j in fx.range_constexpr(32):
-                    acc[j] = acc[j] + wk[k] * vals[j]
+            if fx.const_expr(ROLL & 2):
+                # one loop body for the 8 routes (all 8 rows' loads are already in flight), same order
+                accv = fx.Vector.from_elements(acc, fx.Float32)
+                for k_ in range(TOPK, unroll=1):
+                    kq = fx.Int32(k_)
+                    rw = [_sel([fx.Int32(raws[k][n]) for k in range(TOPK)], kq) for n in range(16)]
+                    wq = _sel(wk, kq)
+                    vals = prims.bf16_unpack([fx.Uint32(w_) for w_ in rw])
+                    accv = fx.Vector.from_elements([fx.Float32(accv[j]) + wq * vals[j] for j in range(32)], fx.Float32)
+                acc = [fx.Float32(accv[j]) for j in range(32)]
+            else:
+                for k in fx.range_constexpr(TOPK):
+                    vals = prims.bf16_unpack(raws[k])
+                    for j in fx.range_constexpr(32):
+                        acc[j] = acc[j] + wk[k] * vals[j]
             if fx.const_expr(shared):
                 # shared_expert_gate_add: bf16(bf16(shared * bf16(sigmoid(g))) + routed_bf16)
                 rsh = rsrc_at(addr(shout) + fx.Int64(t) * (2 * D))
