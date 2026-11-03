@@ -15,6 +15,8 @@ one bf16 ulp off (the fp32 reduction order of the sum of squares and FMA
 contraction are the compiler's). The pool bytes must equal the cast of the
 kernel's own k, and of v untouched, so the write itself is exact.
 
+`qkrope_supported` is plain torch, so its tests run on any CPU runner: without
+Triton, the module is loaded under a private name against a stand-in `triton`.
 The attention-module tests need the draft model module, hence AITER; they skip
 where it cannot import. Against the real aiter ops on a GPU:
 `RUN_QKROPE_GPU_TESTS=1 python -m pytest tests/test_draft_qk_rope_cache.py`.
@@ -22,8 +24,12 @@ where it cannot import. Against the real aiter ops on a GPU:
 
 import functools
 import importlib
+import importlib.util
 import os
+import pathlib
+import sys
 import types
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -264,8 +270,36 @@ def _rope(**overrides):
     )
 
 
+@functools.cache
+def _qkrope_supported():
+    """The real predicate; without Triton, from the module loaded against a
+    stand-in `triton` (it only defines the kernel at import, never runs it)."""
+    if importlib.util.find_spec("triton") is not None:
+        return _kernels().qkrope_supported
+    path = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "atom"
+        / "model_ops"
+        / "draft_qk_rope_cache.py"
+    )
+    fake = MagicMock(name="triton")
+    names = {"triton": fake, "triton.language": fake.language}
+    saved = {name: sys.modules.get(name) for name in names}
+    sys.modules.update(names)
+    try:
+        spec = importlib.util.spec_from_file_location("_draft_qk_rope_no_triton", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        for name, old in saved.items():
+            if old is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = old
+    return module.qkrope_supported
+
+
 def _supported(**overrides):
-    kernels = _kernels()
     args = {
         "qkv": torch.zeros(4, HQ * D + 2 * HKV * D, dtype=torch.bfloat16),
         "k_cache": torch.zeros(2, 16, HKV, D, dtype=torch.float8_e4m3fn),
@@ -277,7 +311,7 @@ def _supported(**overrides):
         "rope": _rope(),
     }
     args.update(overrides)
-    return kernels.qkrope_supported(**args)
+    return _qkrope_supported()(**args)
 
 
 def test_the_supported_case_is_supported():
