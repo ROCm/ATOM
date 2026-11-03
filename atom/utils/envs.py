@@ -558,6 +558,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
+
     # Qwen3-Next / Qwen3.5 GDN prefill without speculative tokens (64 tokens or
     # more): the chunk KKT kernel computes the gates g and beta of its key
     # head's value heads from the in_proj rows, in place of the
@@ -567,6 +568,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # vectors (w, u) from the Gluon kernel fused_inverse_recompute_gfx1250
     # instead of the Triton fused_inverse_recompute. Off by default.
     "ATOM_GDN_GLUON_INVERSE": lambda: os.getenv("ATOM_GDN_GLUON_INVERSE", "0") == "1",
+
+    # gfx1250 GDN prefill state walk (chunk_h): the four operand copies of a
+    # chunk as two fused TDM loads, k^T's operand read before the first product.
+    "ATOM_GDN_CHUNK_H_PAIRED_LOADS": lambda: (
+        os.getenv("ATOM_GDN_CHUNK_H_PAIRED_LOADS", "0") == "1"
+    ),
+    # gfx1250 GDN prefill output (chunk_o) with the gated RMSNorm: the row sum of
+    # squares inside the wave and an approximate silu divide (not bitwise the
+    # unfused norm), z staged in h's LDS: more programs a CU.
+    "ATOM_GDN_CHUNK_O_FAST_NORM": lambda: (
+        os.getenv("ATOM_GDN_CHUNK_O_FAST_NORM", "0") == "1"
+    ),
+
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,

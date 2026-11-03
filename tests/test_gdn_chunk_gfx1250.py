@@ -168,6 +168,7 @@ def test_fixed_length_batch(monkeypatch):
 
 def test_fused_gate_matches_layer_norm(monkeypatch):
     """With the gate, the Gluon output is bitwise chunk_o then layer_norm_fwd."""
+    monkeypatch.setenv("ATOM_GDN_CHUNK_O_FAST_NORM", "0")
     q, k, v, z, g, beta, cu, pool, slots, weight = _inputs([3000, 700, 5], 32, 16)
     fused, _ = _run(
         True, q, k, v, z, g, beta, cu, pool, slots, weight, "slots", True, monkeypatch
@@ -189,3 +190,17 @@ def test_fused_gate_matches_layer_norm(monkeypatch):
         rows_per_block=4,
     )
     assert torch.equal(fused, raw)
+
+
+@pytest.mark.parametrize(
+    "lens,H,Hg", [([3000, 700, 5], 32, 16), ([900, 2100, 30], 8, 4)]
+)
+def test_fast_norm_close_to_exact(lens, H, Hg, monkeypatch):
+    """ATOM_GDN_CHUNK_O_FAST_NORM: within a bf16 rounding step of the exact norm."""
+    x = _inputs(lens, H, Hg)
+    monkeypatch.setenv("ATOM_GDN_CHUNK_O_FAST_NORM", "0")
+    ref, ref_pool = _run(True, *x, "slots", True, monkeypatch)
+    monkeypatch.setenv("ATOM_GDN_CHUNK_O_FAST_NORM", "1")
+    out, pool = _run(True, *x, "slots", True, monkeypatch)
+    assert torch.equal(pool, ref_pool)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2**-7, atol=1e-5)
