@@ -8,6 +8,7 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+from atom.spec_decode.draft_kv import block_page_idx, draft_ctx_slots, entry_slots
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -746,8 +747,6 @@ class DSparkProposer(Drafter):
         # slice stays non-decreasing and `searchsorted` stays defined).
         rows = max(int(ctx.running_bs), int(ctx.scheduled_bs), 1)
         block_tables = var["block_tables"].gpu[:rows]
-        from atom.spec_decode.draft_kv import draft_ctx_slots
-
         draft_ctx_slots(
             out,
             positions[:n],
@@ -1020,15 +1019,7 @@ class DSparkProposer(Drafter):
             # holds the whole token axis. That is the one thing that separates
             # this from the branch above, and it is why `ctx_lens` is the TRUE
             # GLOBAL length rather than a per-rank count.
-            page_idx, in_table = self._block_page_idx(
-                block_positions, entry_tokens, block_tables
-            )
-            slots.copy_(torch.gather(block_tables, 1, page_idx))
-            slots.mul_(entry_tokens)
-            slots.add_(torch.remainder(block_positions, entry_tokens))
-            # Positions the table cannot address are dropped, not clamped --
-            # see `_block_page_idx`.
-            slots.masked_fill_(~in_table, -1)
+            entry_slots(slots, block_tables, None, block_positions, entry_tokens)
             ctx_lens.copy_(global_lens)
 
         # The CSR generator skips entries past the block table's width, so
@@ -1171,29 +1162,7 @@ class DSparkProposer(Drafter):
             ) // self.dcp_world_size
         return min(max(block, 1), self._draft_entry_tokens)
 
-    @staticmethod
-    def _block_page_idx(
-        block_positions: torch.Tensor,
-        tokens_per_entry: int,
-        block_tables: torch.Tensor,
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """Block-table column per block position, and which columns exist.
-
-        The block drafts T positions PAST the anchor, so a request whose anchor
-        sits in its final page addresses a column the table does not have. The
-        index is clamped to keep the gather in bounds, but the clamp is not an
-        answer: it names the row's LAST column, which this request may never
-        have been given, and the slot derived from it keeps the original
-        position's in-page offset. Writing that would carry this block's KV
-        into whatever request owns the page that column points at.
-
-        So the mask is the real return value. Those rows want the same `-1` the
-        pad tail uses -- their draft tokens sit past the model length and cannot
-        survive verification anyway, so dropping them costs nothing.
-        """
-        page_idx = torch.div(block_positions, tokens_per_entry, rounding_mode="floor")
-        in_table = page_idx < block_tables.shape[1]
-        return page_idx.clamp_(max=block_tables.shape[1] - 1), in_table
+    _block_page_idx = staticmethod(block_page_idx)
 
     def _propose_with_draft(
         self,
