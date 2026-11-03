@@ -3,7 +3,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import torch
@@ -26,6 +26,9 @@ from atom.utils.forward_context import (
     set_forward_context,
 )
 from atom.utils.h2d import h2d_producer
+
+if TYPE_CHECKING:
+    from atom.model_ops.ratio_verify import RatioVerifyInputs
 
 logger = logging.getLogger("atom")
 
@@ -416,12 +419,19 @@ class Drafter(abc.ABC):
         publication, which is what carries them to the device."""
         return
 
-    def lossless_verify_inputs(self, bs: int, logits_dtype: torch.dtype | None = None):
-        """``(draft_q, q_row_base, ratio_scratch)`` for the ratio accept
-        rule (``draft_q`` a `sparse_q_store.RatioDraftQ`), or all None
-        for exact match. ``logits_dtype`` is the verify's target logits
-        dtype, which must be the one `warmup_lossless_verify` compiled for."""
-        return None, None, None
+    def lossless_verify_inputs(
+        self,
+        bs: int,
+        logits_dtype: torch.dtype,
+        temperatures: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> "RatioVerifyInputs | None":
+        """The ratio accept rule's inputs for a batch of ``bs`` with these
+        temperatures and `Sampler` filters, or None for exact match.
+        ``logits_dtype`` is the verify's target logits dtype, which must be
+        the one `warmup_lossless_verify` compiled for."""
+        return None
 
     def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
         """Compile the ratio verify before serving; see

@@ -15,6 +15,7 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample_unsupported,
 )
 from atom.model_ops.ratio_verify import (
+    RatioVerifyInputs,
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
@@ -364,10 +365,18 @@ class DSparkProposer(Drafter):
             return
         self._staging.consume(self.runner.forward_step)
 
-    def lossless_verify_inputs(self, bs: int, logits_dtype: torch.dtype | None = None):
-        """The verify step's ``(draft_q, q_row_base, ratio_scratch)``.
+    def lossless_verify_inputs(
+        self,
+        bs: int,
+        logits_dtype: torch.dtype,
+        temperatures: torch.Tensor,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
+    ) -> RatioVerifyInputs | None:
+        """The verify step's `RatioVerifyInputs`, around the batch's own
+        temperatures and `Sampler` filters.
 
-        All None keeps exact-match verification; anything else selects the
+        None keeps exact-match verification; anything else selects the
         probability-ratio rule in `rejection_sampler.rejection_sample`
         (`ratio_verify`).
         Asked only for a batch that is not all greedy: an all-greedy batch
@@ -375,21 +384,24 @@ class DSparkProposer(Drafter):
         (its draft still runs the sampled block, in greedy mode). A greedy row
         inside a mixed batch is matched exactly by the ratio kernel itself,
         and a row with top-k or top-p is verified against `Sampler`'s
-        filtered p (`ratio_verify._ratio_target_p`).
+        filtered p (`ratio_target_p._ratio_target_p`).
         """
         if self.draft_sampling is None:
-            return None, None, None
+            return None
         warmed = self._verify_logits_dtype
-        if logits_dtype is not None and warmed is not None and logits_dtype != warmed:
+        if warmed is not None and logits_dtype != warmed:
             # The kernels were compiled for another logits dtype; this verify
             # would JIT them mid-serving while the TP/DP peers wait.
             raise RuntimeError(
                 f"ratio verify was warmed up for {warmed} "
                 f"logits but the LM head emits {logits_dtype}"
             )
-        return (
+        return RatioVerifyInputs(
             RatioDraftQ(self.draft_sampling.q_store, self.draft_sampling.s_scratch),
             self.metadata_buffers["draft_verify_q_row_base"].gpu[:bs],
+            temperatures,
+            top_ks,
+            top_ps,
             self._verify_scratch,
         )
 

@@ -840,6 +840,31 @@ def row_filters(
     )
 
 
+def _count_run_cells(num_tokens: int, vocab_size: int, stats_block_v: int) -> int:
+    """Cells of each of the counted top-k's two int32 arrays: every run's
+    max, and the id at it."""
+    return num_tokens * triton.cdiv(vocab_size, stats_block_v) * _FILTER_COUNT_GROUPS
+
+
+def filter_scratch_shapes(num_tokens: int, vocab_size: int, stats_block_v: int):
+    """fp32 and int32 shapes `filter_floor`'s ``parts`` take, in that order,
+    for rows whose stats pass walks ``stats_block_v`` tiles."""
+    run_cells = _count_run_cells(num_tokens, vocab_size, stats_block_v)
+    f32 = [
+        (2, num_tokens, _FILTER_F32_WIDTH),  # filter_f32
+        (triton.cdiv(vocab_size, _FILTER_BLOCK_V), num_tokens),  # floor_mass
+    ]
+    i32 = [
+        (2, num_tokens, _FILTER_I32_WIDTH),  # filter_i32
+        # floor_counts: a row of last-digit counts per (row, split) of the
+        # last count.
+        (max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS,),
+        (run_cells,),  # run_max
+        (run_cells,),  # run_at_max
+    ]
+    return f32, i32
+
+
 def filter_floor(
     target_logits: torch.Tensor,  # [num_tokens, V] raw
     cu_num_draft_tokens: torch.Tensor,
@@ -854,17 +879,17 @@ def filter_floor(
 
     Fills ``row_floor`` and rewrites ``row_inv_z`` of ``rows = (row_max,
     row_inv_z, row_floor)``, through the work buffers ``parts = (filter_f32,
-    filter_i32, floor_mass, floor_counts, run_max, run_at_max)``. The last two
-    are the run maxima, and the ids at each, that the stats pass kept per
-    ``stats_block_v`` tile in a ``COUNT`` launch; ``row_max`` and ``row_inv_z``
-    are its combined statistics."""
+    floor_mass, filter_i32, floor_counts, run_max, run_at_max)``, shaped by
+    `filter_scratch_shapes`. The last two are the run maxima, and the ids at
+    each, that the stats pass kept per ``stats_block_v`` tile in a ``COUNT``
+    launch; ``row_max`` and ``row_inv_z`` are its combined statistics."""
     num_tokens, vocab_size = target_logits.shape
     batch_size = cu_num_draft_tokens.shape[0]
     n_tiles = triton.cdiv(vocab_size, stats_block_v)
     stride = target_logits.stride(0)
     search_steps = batch_size.bit_length() + 1
     row_max, row_inv_z, row_floor = rows
-    filter_f32, filter_i32, floor_mass, floor_counts, run_max, run_at_max = parts
+    filter_f32, floor_mass, filter_i32, floor_counts, run_max, run_at_max = parts
     request_filter = filters.args
     key_bits = filters.key_bits
     k_rows, p_rows = filters.k_rows, filters.p_rows

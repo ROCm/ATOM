@@ -6,7 +6,7 @@ import torch
 
 pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER ops")
 
-from atom.model_ops.ratio_verify import ratio_verify_scratch
+from atom.model_ops.ratio_verify import RatioVerifyInputs, ratio_verify_scratch
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
 from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
@@ -42,16 +42,25 @@ def draw(probabilities, rows):
     return (torch.rand(rows, device="cuda") >= probabilities[0]).to(torch.int32)
 
 
-def two_token_q(q, drafts, width):
-    """``q`` as the ratio verify reads it: one stored row per draft, both
-    ids, the drafted one at xslot, plus a dense row per request."""
+def two_token_ratio(q, drafts, width):
+    """The ratio verify's inputs for ``q``: one stored row per draft, both
+    ids, the drafted one at xslot, plus a dense row per request; q rows flat,
+    request b's starting at b * width; temperature 1, no filters."""
     rows = drafts.numel()
+    batch = rows // width
     store = SparseQStore(
         torch.tensor([0, 1], device="cuda", dtype=torch.int32).repeat(rows, 1),
         q.expand(rows, 2).contiguous(),
         torch.stack((torch.full_like(drafts, 2), drafts), 1),
     )
-    return RatioDraftQ(store, torch.empty(rows // width, 2, device="cuda"))
+    return RatioVerifyInputs(
+        RatioDraftQ(store, torch.empty(batch, 2, device="cuda")),
+        torch.arange(batch, device="cuda", dtype=torch.int32) * width,
+        torch.ones(batch, device="cuda"),
+        None,
+        None,
+        ratio_verify_scratch(batch, width, 2, "cuda"),
+    )
 
 
 def two_token_batch(probabilities, drafts, width):
@@ -59,7 +68,7 @@ def two_token_batch(probabilities, drafts, width):
     verification row scores ``probabilities``, drafting ``drafts``.
 
     The accept rule is the only thing left varying between the two arms below,
-    so both take this same batch and add their own `draft_q`.
+    so both take this same batch and add their own `ratio`.
 
     ``target_logits`` is raw LOGITS here -- `rejection_sample` builds
     `p = softmax(logits / T)` itself, because ATOM's unfiltered verify draw
@@ -78,9 +87,6 @@ def two_token_batch(probabilities, drafts, width):
         "target_logits": probabilities.log().expand(rows, -1).contiguous(),
         "bonus_token_ids": torch.zeros(batch, device="cuda", dtype=torch.int32),
         "bonus_logits_indices": bonus_rows([width] * batch),
-        # The ratio path's q rows, flat: request b's start at b * width.
-        "q_row_base": torch.arange(batch, device="cuda", dtype=torch.int32) * width,
-        "ratio_scratch": ratio_verify_scratch(batch, width, 2, "cuda"),
     }
 
 
@@ -271,9 +277,7 @@ def test_ratio_acceptance_emits_the_target_law_from_a_draft_that_drew_another():
         atol=0.015,
     )
     output, (accepted, _, _) = rejection_sample(
-        **two_token_batch(p, drafts, 2),
-        draft_q=two_token_q(q, drafts, 2),
-        temperatures=torch.ones(n, device="cuda"),
+        **two_token_batch(p, drafts, 2), ratio=two_token_ratio(q, drafts, 2)
     )
     marginal = torch.bincount(output[:, 0].long(), minlength=2).float() / n
     torch.testing.assert_close(marginal, p, rtol=0, atol=0.015)
@@ -303,14 +307,12 @@ def test_ratio_acceptance_accepts_at_least_as_often_as_exact_match(q0):
     drafts = draw(q, n * 2)
     batch = two_token_batch(p, drafts, 2)
     _, (ratio_accepted, _, _) = rejection_sample(
-        **batch,
-        draft_q=two_token_q(q, drafts, 2),
-        temperatures=torch.ones(n, device="cuda"),
+        **batch, ratio=two_token_ratio(q, drafts, 2)
     )
     # The same drafts against the target's own draw, which is what the default
     # path verifies by equality.
     _, (exact_accepted, _, _) = rejection_sample(
-        **batch, draft_q=None, target_token_ids=draw(p, n * 2)
+        **batch, ratio=None, target_token_ids=draw(p, n * 2)
     )
     ratio_rate = torch.minimum(p, q).sum().item()
     exact_rate = (p * q).sum().item()

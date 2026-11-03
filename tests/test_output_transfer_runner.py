@@ -108,11 +108,15 @@ class _Reached(Exception):
     pass
 
 
+@pytest.mark.parametrize("all_greedy", [False, True])
 @pytest.mark.parametrize("verified", [False, True])
 @pytest.mark.parametrize("armed", [False, True])
-def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, armed):
-    """The ratio verify gets the batch's own `top_ks`/`top_ps`; the bonus and
-    an unarmed exact-match draw stay `Sampler`'s, one law per process."""
+def test_a_filtered_batch_reaches_one_law_for_every_draw(
+    monkeypatch, verified, armed, all_greedy
+):
+    """The drafter's ratio inputs get the batch's own `top_ks`/`top_ps`; the
+    bonus and an unarmed exact-match draw stay `Sampler`'s, one law per
+    process. An all-greedy verify asks for neither."""
     bs = 2
     top_ks, top_ps = torch.tensor([5, 0]), 0.9
     spec = (
@@ -132,8 +136,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
     monkeypatch.setattr(
         runner_module, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
-    q = (object(), torch.zeros(bs), object()) if armed else (None, None, None)
-    drafter = SimpleNamespace(lossless_verify_inputs=mock.Mock(return_value=q))
+    ratio = object() if armed else None
+    drafter = SimpleNamespace(lossless_verify_inputs=mock.Mock(return_value=ratio))
     runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(zero_spec_counts=torch.zeros(8)),
         sampler=mock.Mock(side_effect=None if verified else _Reached),
@@ -156,15 +160,20 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(monkeypatch, verified, 
             torch.ones(bs),
             top_ks,
             top_ps,
-            False,
+            all_greedy,
             hidden_states=None,
         )
     runner.sampler.assert_called_once()
     if not verified:
         return
-    forward = runner.rejection_sampler.forward.call_args.kwargs
-    assert forward["top_ks"] is top_ks and forward["top_ps"] is top_ps
-    assert forward["draft_q"] is q[0]
+    if all_greedy:
+        drafter.lossless_verify_inputs.assert_not_called()
+        assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is None
+        assert not runner.sampler.sample_verification_tokens.called
+        return
+    asked = drafter.lossless_verify_inputs.call_args.args
+    assert asked[3] is top_ks and asked[4] is top_ps
+    assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is ratio
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
     assert runner.sampler.sample_verification_tokens.called is not armed
 

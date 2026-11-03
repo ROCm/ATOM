@@ -179,7 +179,7 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
     assert prop.draft_sampling is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
-    assert prop.lossless_verify_inputs(2) == (None, None, None)
+    assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is None
     # Staging is a no-op rather than an error.
     prop.stage_draft_sampling_host(
         batch(["a"]), 1, None, drafts_verifiable=True, verifies=True
@@ -306,9 +306,9 @@ def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
     monkeypatch.setattr(dspark_proposer, "warmup_ratio_verify", lambda *args: None)
     prop.warmup_lossless_verify(torch.bfloat16)
     stage(prop, batch(["a", "b"]))
-    assert prop.lossless_verify_inputs(2, torch.bfloat16)[0] is not None
+    assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is not None
     with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
-        prop.lossless_verify_inputs(2, torch.float32)
+        prop.lossless_verify_inputs(2, torch.float32, None, None, None)
 
 
 # ---- staging ----------------------------------------------------------------
@@ -426,13 +426,17 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
 def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"], top_ks=[5, -1], top_ps=[1.0, 0.7]))
-    q, base, scratch = prop.lossless_verify_inputs(2)
+    temps, top_ks, top_ps = torch.ones(2), torch.tensor([5, -1]), 0.7
+    ratio = prop.lossless_verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
     # The sparse store itself, and the draft's score scratch to spread a
     # rejecting request's row into: one dense row per batch row, V wide.
-    assert q.store is prop.draft_sampling.q_store
-    assert q.dense is prop.draft_sampling.s_scratch
-    assert q.dense.shape == (MAX_BS, VOCAB)
-    assert base.shape == (2,) and scratch is prop._verify_scratch
+    assert ratio.q.store is prop.draft_sampling.q_store
+    assert ratio.q.dense is prop.draft_sampling.s_scratch
+    assert ratio.q.dense.shape == (MAX_BS, VOCAB)
+    assert ratio.q_row_base.shape == (2,) and ratio.scratch is prop._verify_scratch
+    # The batch's own temperatures and filters, as `Sampler` gets them.
+    assert ratio.temperatures is temps
+    assert ratio.top_ks is top_ks and ratio.top_ps is top_ps
 
 
 # ---- exclusion with relaxed MTP ----------------------------------------------

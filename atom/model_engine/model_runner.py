@@ -3417,14 +3417,14 @@ class ModelRunner:
             # before this step's (`propose_draft_token_ids` below) -- and the
             # forward that may run on another stream (the disaggregated decode
             # runner's) touches neither. Keep the two on one stream.
-            draft_q = q_row_base = ratio_scratch = None
+            ratio = None
             if drafter is not None and not all_greedy:
-                draft_q, q_row_base, ratio_scratch = drafter.lossless_verify_inputs(
-                    bs, target_logits.dtype
+                ratio = drafter.lossless_verify_inputs(
+                    bs, target_logits.dtype, temperatures, top_ks, top_ps
                 )
             target_token_ids = None
             # Only exact match on a sampled batch reads the target's own draw.
-            if not all_greedy and draft_q is None:
+            if not all_greedy and ratio is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3447,12 +3447,7 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
-                draft_q=draft_q,
-                q_row_base=q_row_base,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                ratio_scratch=ratio_scratch,
+                ratio=ratio,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced

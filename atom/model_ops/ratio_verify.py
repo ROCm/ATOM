@@ -5,10 +5,10 @@ draw the replacement from the residual `relu(p - q)` (normalized). p is the
 target's `softmax(logits / T)`, q the distribution the draft drew x from.
 
 Nothing `[rows, V]` is materialized for p. Every (draft row, V tile) program
-reduces its tile of the row to the softmax statistics
-(`softmax_tiles`) plus the row's raw-logit argmax; the accept walk then needs
-p at one id per position, `exp(l(x) / T - max) / Z`, and only a rejecting row
-is read across V again, by the residual race.
+reduces its tile of the row to the softmax statistics plus the row's
+raw-logit argmax (`ratio_target_p`); the accept walk then needs p at one id
+per position, `exp(l(x) / T - max) / Z`, and only a rejecting row is read
+across V again, by the residual race.
 
 q arrives sparse (`SparseQStore`: each draft row's stored ids, their
 probabilities and the slot of the id it emitted), and is 0 off the stored
@@ -36,38 +36,23 @@ sampled requests share its batch. The ratio rule would not give that: on a
 bf16 logit tie p is 0.5/0.5, not a delta.
 
 `rejection_sampler.rejection_sample` dispatches here when the drafter hands
-it a `RatioDraftQ`; the exact-match, synthetic and relaxed rules stay there.
+it a `RatioVerifyInputs`; the exact-match, synthetic and relaxed rules stay
+there.
 """
+
+from typing import NamedTuple
 
 import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.rejection_sampler import _draft_token, _finish_request
+from atom.model_ops.ratio_target_p import _RATIO_BLOCK_V, _ratio_target_p
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.sampling_filter import (
-    _BATCH_COUNTS,
-    _FILTER_COUNT_GROUPS,
-    _FILTER_COUNT_MAX_K,
-    _FILTER_F32_WIDTH,
-    _FILTER_FLOOR_PROGRAMS,
-    _FILTER_I32_WIDTH,
-    _FILTER_LAST_BINS,
-    _counted_row,
-    _logit_key,
-    _request_filter,
-    _request_of_row,
-    filter_floor,
-    row_filters,
-)
+from atom.model_ops.sampling_filter import _FILTER_COUNT_MAX_K, filter_scratch_shapes
 from atom.model_ops.sampling_scratch import SamplingScratch, take
-from atom.model_ops.softmax_tiles import (
-    argmax_lowest_id,
-    race_key,
-    softmax_combine_kernel,
-    tile_max_sumexp,
-)
+from atom.model_ops.softmax_tiles import argmax_lowest_id, race_key
 from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
+from atom.model_ops.verify_kernels import _draft_token, _finish_request
 
 # Randomness: Philox via `tl.rand`, keyed on a per-step SPMD counter, so every
 # TP rank draws the same uniforms. The key's high word names the purpose --
@@ -81,21 +66,33 @@ from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 _RATIO_ACCEPT_KEY = 1 << 32
 _RATIO_RESIDUAL_KEY = 2 << 32
 
-# Vocab tile every ratio kernel walks in.
-_RATIO_BLOCK_V = 4096
 # Stored q entries one lookup or densify iteration covers.
 _RATIO_BLOCK_Q = 1024
 
 
-def _count_run_cells(num_tokens: int, vocab_size: int) -> int:
-    """Cells of each of the counted top-k's two int32 arrays: every run's
-    max, and the id at it."""
-    return num_tokens * triton.cdiv(vocab_size, _RATIO_BLOCK_V) * _FILTER_COUNT_GROUPS
+class RatioVerifyInputs(NamedTuple):
+    """What a drafter hands one probability-ratio verify."""
+
+    #: The q each draft token was drawn from, and the dense rows the residual
+    #: reads it through.
+    q: RatioDraftQ
+    #: [batch_size] int32: each request's first q row, or < 0 for no live q.
+    q_row_base: torch.Tensor
+    #: [batch_size] fp32, pre-clamped: p is softmax(target_logits / T).
+    temperatures: torch.Tensor
+    #: `Sampler`'s filters for the batch, so the verify targets the same p_f.
+    top_ks: int | torch.Tensor | None
+    top_ps: float | torch.Tensor | None
+    #: Preallocated device scratch (`ratio_verify_scratch`).
+    scratch: SamplingScratch
 
 
 def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
     """fp32 and int32 shapes one ratio verify needs, in `_ratio_sample` order."""
     tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
+    filter_f32, filter_i32 = filter_scratch_shapes(
+        num_tokens, vocab_size, _RATIO_BLOCK_V
+    )
     f32 = [
         (num_tokens,),  # row_max
         (num_tokens,),  # row_inv_z
@@ -104,21 +101,14 @@ def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
         (tiles, num_tokens),  # part_sum
         (tiles, num_tokens),  # part_amax_val
         (tiles, batch_size),  # part_key
-        (2, num_tokens, _FILTER_F32_WIDTH),  # filter_f32
-        (tiles, num_tokens),  # floor_mass
+        *filter_f32,
     ]
     i32 = [
         (num_tokens,),  # row_argmax
         (tiles, num_tokens),  # part_amax_idx
         (batch_size,),  # residual_row
         (tiles, batch_size),  # part_idx
-        (2, num_tokens, _FILTER_I32_WIDTH),  # filter_i32
-        # One row of last-digit counts per (row, split) of the last count,
-        # then the run maxima of the counted rows and the ids at each.
-        (
-            max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS
-            + 2 * _count_run_cells(num_tokens, vocab_size),
-        ),  # floor_counts
+        *filter_i32,
     ]
     return f32, i32
 
@@ -130,90 +120,6 @@ def ratio_verify_scratch(
     ``num_spec_steps`` drafts each, allocated once."""
     f32, i32 = _ratio_scratch_shapes(max_bs * num_spec_steps, max_bs, vocab_size)
     return SamplingScratch.for_shapes(f32, i32, device)
-
-
-@triton.jit(do_not_specialize=_BATCH_COUNTS + ["search_steps", "top_k_val"])
-def _ratio_stats_kernel(
-    logits_ptr,  # [num_tokens, V] raw target logits
-    cu_num_draft_tokens_ptr,  # [batch_size]
-    temperatures_ptr,  # [batch_size] fp32, pre-clamped
-    part_max_ptr,  # [n_tiles, num_tokens] fp32: max of logits / T
-    part_sum_ptr,  # [n_tiles, num_tokens] fp32: sum exp(logits / T - max)
-    part_amax_val_ptr,  # [n_tiles, num_tokens] fp32: max raw logit
-    part_amax_idx_ptr,  # [n_tiles, num_tokens] int32: its lowest id
-    num_tokens,
-    vocab_size,
-    logits_row_stride,
-    batch_size,
-    search_steps,
-    BLOCK_V: tl.constexpr,
-    # A COUNT launch's: the filters as `_request_filter` reads them, and the
-    # [num_tokens * n_tiles, GROUPS] int32 run maxima (keyed) and the count
-    # of ids at each out.
-    greedy_temperature=0.0,
-    top_k_ptr=None,
-    top_k_val=0,
-    top_p_ptr=None,
-    top_p_val=2.0,
-    group_max_ptr=None,
-    group_at_max_ptr=None,
-    COUNT: tl.constexpr = False,
-    KEY_BITS: tl.constexpr = 16,
-    GROUPS: tl.constexpr = 64,
-    MAX_K: tl.constexpr = 0,
-    K_PER_ROW: tl.constexpr = False,
-    P_PER_ROW: tl.constexpr = False,
-):
-    """One (draft row, V tile): softmax statistics plus the raw argmax.
-
-    One row per program, so a small batch still fills the device; the row's
-    temperature is its request's, found in-kernel. The raw argmax is taken
-    before the division: dividing by a near-zero temperature can round two
-    distinct logits onto one value and invent a tie the greedy rule would
-    not see.
-
-    In a ``COUNT`` launch, a row whose filter is a small top-k alone
-    (`_counted_row`) also keeps the largest logit key of each run of
-    ``BLOCK_V // GROUPS`` ids and how many ids are at it, for
-    `_ratio_filter_count_kernel`: one more max, no search -- a per-tile
-    search here would cost more than the pass.
-    """
-    row = tl.program_id(0)
-    tile = tl.program_id(1)
-    req_idx = _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps)
-    temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
-    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
-    vmask = offs < vocab_size
-    x = tl.load(
-        logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
-        mask=vmask,
-        other=float("-inf"),
-    ).to(tl.float32)
-    raw_max, raw_idx = argmax_lowest_id(x, offs, vmask, 2147483647)
-    scaled_max, scaled_sum = tile_max_sumexp(x / temp, vmask)
-    part = tile * num_tokens + row
-    tl.store(part_max_ptr + part, scaled_max)
-    tl.store(part_sum_ptr + part, scaled_sum)
-    tl.store(part_amax_val_ptr + part, raw_max)
-    tl.store(part_amax_idx_ptr + part, raw_idx)
-    if COUNT:
-        top_k, top_p = _request_filter(
-            top_k_ptr, top_k_val, top_p_ptr, top_p_val, req_idx, K_PER_ROW, P_PER_ROW
-        )
-        if _counted_row(temp, top_k, top_p, vocab_size, greedy_temperature, MAX_K):
-            # Max the logits, then key the maxima: NaN goes to -inf first, as
-            # its key has it (masked lanes are -inf already).
-            run_x = tl.reshape(
-                tl.where(x >= float("-inf"), x, float("-inf")),
-                (GROUPS, BLOCK_V // GROUPS),
-            )
-            run_max = tl.max(run_x, axis=1)
-            at_max = tl.sum((run_x == run_max[:, None]).to(tl.int32), axis=1)
-            first = (row * tl.num_programs(1) + tile).to(tl.int64) * GROUPS
-            runs = first + tl.arange(0, GROUPS)
-            group_max = _logit_key(run_max, KEY_BITS)
-            tl.store(group_max_ptr + runs, group_max.to(tl.int32, bitcast=True))
-            tl.store(group_at_max_ptr + runs, at_max)
 
 
 @triton.jit
@@ -626,113 +532,6 @@ def _ratio_residual_pick_kernel(
         )
 
 
-def _ratio_target_p(
-    target_logits: torch.Tensor,  # [num_tokens, V] raw
-    cu_num_draft_tokens: torch.Tensor,
-    temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
-    top_ks: int | torch.Tensor | None,
-    top_ps: float | torch.Tensor | None,
-    rows: tuple[torch.Tensor, ...],
-    parts: tuple[torch.Tensor, ...],
-) -> bool:
-    """Each draft row's p, and p_f where its request filters.
-
-    Fills ``rows = (row_max, row_inv_z, row_argmax, row_floor)`` through the
-    work buffers ``parts = (part_max, part_sum, part_amax_val, part_amax_idx,
-    filter_f32, filter_i32, floor_mass, floor_counts)``, the last flat (the
-    last count's cells, then the counted rows' run maxima and ids at each):
-    p(v) is
-    ``exp(l(v) / T - row_max) * row_inv_z``, and on a filtered row 0 below
-    ``row_floor`` with ``row_inv_z`` renormalized over what is left
-    (`sampling_filter.filter_floor`).
-    ``top_ks``/``top_ps`` are what `Sampler` is given: None (no row filters),
-    one value for the batch, or one per request, a top-k of -1 meaning none.
-    Returns whether the batch filters at all; ``row_floor`` is written only
-    then.
-    """
-    num_tokens, vocab_size = target_logits.shape
-    batch_size = cu_num_draft_tokens.shape[0]
-    n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
-    stride = target_logits.stride(0)
-    search_steps = batch_size.bit_length() + 1
-    row_max, row_inv_z, row_argmax, row_floor = rows
-    (
-        part_max,
-        part_sum,
-        part_amax_val,
-        part_amax_idx,
-        filter_f32,
-        filter_i32,
-        floor_mass,
-        floor_counts,
-    ) = parts
-    # The last count's cells, then the counted rows' run maxima and the ids
-    # at each.
-    radix_cells = max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS
-    run_cells = _count_run_cells(num_tokens, vocab_size)
-    floor_counts, run_max, run_at_max = (
-        floor_counts[:radix_cells],
-        floor_counts[radix_cells : radix_cells + run_cells],
-        floor_counts[radix_cells + run_cells : radix_cells + 2 * run_cells],
-    )
-    filtered = top_ks is not None or top_ps is not None
-    if not num_tokens:
-        return filtered
-    filters = row_filters(top_ks, top_ps, batch_size, target_logits.dtype)
-    _ratio_stats_kernel[(num_tokens, n_tiles)](
-        target_logits,
-        cu_num_draft_tokens,
-        temperatures,
-        part_max,
-        part_sum,
-        part_amax_val,
-        part_amax_idx,
-        num_tokens,
-        vocab_size,
-        stride,
-        batch_size,
-        search_steps,
-        _RATIO_BLOCK_V,
-        SAMPLER_EPS,
-        *filters.args,
-        run_max,
-        run_at_max,
-        COUNT=filters.counts,
-        KEY_BITS=filters.key_bits,
-        GROUPS=_FILTER_COUNT_GROUPS,
-        MAX_K=_FILTER_COUNT_MAX_K,
-        K_PER_ROW=filters.k_rows,
-        P_PER_ROW=filters.p_rows,
-        num_warps=8,
-    )
-    softmax_combine_kernel[(num_tokens,)](
-        part_max,
-        part_sum,
-        row_max,
-        row_inv_z,
-        part_amax_val,
-        part_amax_idx,
-        row_argmax,
-        num_tokens,
-        n_tiles,
-        BLOCK_TILE=triton.next_power_of_2(n_tiles),
-        WITH_ARGMAX=True,
-        num_warps=4,
-    )
-    if not filtered:
-        return False
-    filter_floor(
-        target_logits,
-        cu_num_draft_tokens,
-        temperatures,
-        filters,
-        (row_max, row_inv_z, row_floor),
-        (filter_f32, filter_i32, floor_mass, floor_counts, run_max, run_at_max),
-        _RATIO_BLOCK_V,
-    )
-    return True
-
-
 def _ratio_sample(
     output_token_ids: torch.Tensor,
     verdict: torch.Tensor,
@@ -740,27 +539,36 @@ def _ratio_sample(
     input_ids: torch.Tensor,
     target_logits_indices: torch.Tensor,
     target_logits: torch.Tensor,  # [num_tokens, V] raw
-    temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
-    top_ks: int | torch.Tensor | None,
-    top_ps: float | torch.Tensor | None,
-    draft_q: RatioDraftQ,
-    q_row_base: torch.Tensor,  # [batch_size] int32
+    ratio: RatioVerifyInputs,
     bonus_token_ids: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
     num_spec_steps: int,
     ratio_step: int,
-    scratch: SamplingScratch,
 ) -> None:
     """Launch the probability-ratio verify: stats, combine, the filter where
     the batch has one, accept, densify, residual, carving its partials out of
-    ``scratch`` (`ratio_verify_scratch`)."""
+    ``ratio.scratch`` (`ratio_verify_scratch`)."""
     num_tokens, vocab_size = target_logits.shape
     batch_size = cu_num_draft_tokens.shape[0]
+    store, dense = ratio.q
+    assert all(t.is_contiguous() for t in store) and dense.is_contiguous()
+    assert store.ids.shape == store.probs.shape and store.meta.shape == (
+        store.ids.shape[0],
+        2,
+    )
+    assert dense.ndim == 2 and dense.dtype == torch.float32
+    assert dense.shape[-1] == vocab_size, (
+        f"draft q covers {dense.shape[-1]} ids but the target scored "
+        f"{vocab_size}; the ratio rule indexes both rows with the same id"
+    )
+    assert dense.shape[0] >= batch_size, (
+        f"{batch_size} requests but dense q scratch for {dense.shape[0]}: "
+        "each request's rejecting row is spread into a row of its own"
+    )
     n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
     stride = target_logits.stride(0)
-    temperatures = temperatures.to(torch.float32).contiguous()
-    q_row_base = q_row_base.contiguous()
-    store, dense = draft_q
+    temperatures = ratio.temperatures.to(torch.float32).contiguous()
+    q_row_base = ratio.q_row_base.contiguous()
     q_width = store.ids.shape[1]
 
     f32_shapes, i32_shapes = _ratio_scratch_shapes(num_tokens, batch_size, vocab_size)
@@ -773,35 +581,19 @@ def _ratio_sample(
             part_sum,
             part_amax_val,
             part_key,
-            filter_f32,
-            floor_mass,
+            *filter_f32,
         ),
-        (
-            row_argmax,
-            part_amax_idx,
-            residual_row,
-            part_idx,
-            filter_i32,
-            floor_counts,
-        ),
-    ) = take(f32_shapes, i32_shapes, scratch.f32, scratch.i32)
+        (row_argmax, part_amax_idx, residual_row, part_idx, *filter_i32),
+    ) = take(f32_shapes, i32_shapes, ratio.scratch.f32, ratio.scratch.i32)
     filtered = _ratio_target_p(
         target_logits,
         cu_num_draft_tokens,
         temperatures,
-        top_ks,
-        top_ps,
+        ratio.top_ks,
+        ratio.top_ps,
         (row_max, row_inv_z, row_argmax, row_floor),
-        (
-            part_max,
-            part_sum,
-            part_amax_val,
-            part_amax_idx,
-            filter_f32,
-            filter_i32,
-            floor_mass,
-            floor_counts,
-        ),
+        (part_max, part_sum, part_amax_val, part_amax_idx),
+        (*filter_f32, *filter_i32),
     )
     _ratio_accept_kernel[(batch_size,)](
         output_token_ids,
@@ -961,14 +753,16 @@ def warmup_ratio_verify(
             ints([0] * (num_tokens + 2)),
             torch.arange(num_tokens, dtype=torch.int64, device=device),
             torch.zeros((num_tokens, vocab_size), dtype=logits_dtype, device=device),
-            torch.ones(1, dtype=torch.float32, device=device),
-            top_ks,
-            top_ps,
-            RatioDraftQ(store, dense),
-            ints([-1]),
+            RatioVerifyInputs(
+                RatioDraftQ(store, dense),
+                ints([-1]),
+                torch.ones(1, dtype=torch.float32, device=device),
+                top_ks,
+                top_ps,
+                scratch,
+            ),
             ints([0]),
             ints([num_tokens], torch.int64),
             num_spec_steps,
             0,
-            scratch,
         )
