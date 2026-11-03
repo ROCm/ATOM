@@ -284,12 +284,16 @@ class DraftKvBuilder(PoolRowsMixin):
         module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
+        # The unit scale is one constant, not page data. The registry's scales
+        # are what the offload codec moves as block-major planes, so a
+        # per-tensor pool registers none and the layer keeps its own.
+        planes = not pool.per_tensor_scales
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=k_cache,
             v_cache=v_cache,
-            k_scale=getattr(module, "k_scale", None),
-            v_scale=getattr(module, "v_scale", None),
+            k_scale=getattr(module, "k_scale", None) if planes else None,
+            v_scale=getattr(module, "v_scale", None) if planes else None,
         )
 
     def get_kv_transfer_tensors(self):

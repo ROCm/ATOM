@@ -291,6 +291,39 @@ def test_dflash_layers_share_one_bound_unit_scale_tensor():
     assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
 
 
+@pytest.mark.parametrize("flash_layout", [True, False])
+def test_a_per_tensor_pool_registers_no_scale_planes(flash_layout):
+    """The unit scale is the layer's, not the registry's: the offload codec
+    moves every registered tensor as block-major planes, and a one-element
+    scale divides no block count, so registering it fails the server's start
+    under `lmcache_offload`."""
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.float8_e4m3fnuz,
+        blocks_per_entry=8,
+        per_tensor_scales=True,
+        flash_layout=flash_layout,
+    )
+    pool.allocate(3, "cpu")
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
+    builder = DraftKvBuilder(runner, lambda **_: pool)
+    builder._kv_pool = pool
+    module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
+    module.layer_num = 0
+    kvt = builder.build_kv_cache_tensor(module)
+
+    assert kvt.k_scale is None and kvt.v_scale is None
+    assert module.k_scale.numel() == 1 and module.v_scale is module.k_scale
+    codec = DenseKVByteCodec({0: kvt}, num_blocks=3)
+    assert codec.bytes_per_block * 3 == 2 * kvt.k_cache.numel()
+
+
 def _bind_first_layer(pool, kv_cache_dtype):
     """Bind one paged layer through the builder; return the module."""
     pool.allocate(2, "cpu")
