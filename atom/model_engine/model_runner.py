@@ -3562,6 +3562,11 @@ class ModelRunner:
 
         if self._glue_sampler is None:
             self._glue_sampler = StepSampler(cands.gathered.device)
+            logger.info(
+                "ATOM_GLUE_STEP_SAMPLE: verify sampling in the step kernel "
+                "(rank %d, top_k %d, %d candidates a shard, shard top-k %s)",
+                self.rank, top_k, cands.k, envs.ATOM_GLUE_SHARD_TOPK,
+            )
         step = self._presence_step
         out, verdict, nxt = self._glue_sampler.sample(
             cands.gathered,

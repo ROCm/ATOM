@@ -33,6 +33,8 @@ from atom.model_ops.presence_penalty import PresencePenaltyStep
 _BLOCK = int(os.environ.get("ATOM_GLUE_TOPK_BLOCK", "2048"))
 _METHOD = int(os.environ.get("ATOM_GLUE_TOPK_METHOD", "0"))
 _WARPS = int(os.environ.get("ATOM_GLUE_TOPK_WARPS", "4"))
+_LEAF = int(os.environ.get("ATOM_GLUE_TOPK_LEAF", "256"))
+_FAN = int(os.environ.get("ATOM_GLUE_TOPK_FAN", "8"))
 
 
 @triton.jit
@@ -78,7 +80,9 @@ def _suffix_pick(hist, need, NB: tl.constexpr):
 def _pack(key, cols, valid):
     """(16-bit order key, column) as one int64 that orders by value, then lower column
     first; -1 for padding."""
-    return tl.where(valid, (key.to(tl.int64) << 32) | (2147483647 - cols).to(tl.int64), -1)
+    return tl.where(
+        valid, (key.to(tl.int64) << 32) | (2147483647 - cols).to(tl.int64), -1
+    )
 
 
 @triton.jit
@@ -121,11 +125,15 @@ def _shard_topk_chunk_kernel(
         # context already holds (input ids start + 1 .. start + pos)
         anchor = tl.load(input_ids_ptr + start).to(tl.int32)
         e = tl.arange(0, EXTRA_P2)
-        drafts = tl.load(input_ids_ptr + start + 1 + e, mask=e < pos, other=-1).to(tl.int32)
+        drafts = tl.load(input_ids_ptr + start + 1 + e, mask=e < pos, other=-1).to(
+            tl.int32
+        )
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
     valid = cols < V
     row_ptr = logits_ptr + row.to(tl.int64) * stride_n
-    key, _ = _shard_keys(row_ptr, mrow_ptr, cols, valid, vocab_start, p, anchor, drafts, HAS_PEN)
+    key, _ = _shard_keys(
+        row_ptr, mrow_ptr, cols, valid, vocab_start, p, anchor, drafts, HAS_PEN
+    )
     packed = _pack(key, cols, valid)
     i = tl.arange(0, KP2)
     if METHOD == 0:
@@ -142,11 +150,21 @@ def _shard_topk_chunk_kernel(
 
 
 @triton.jit
-def _topk_merge_kernel(tmp_ptr, nchunk, out_ptr, vocab_start, K: tl.constexpr, KP2: tl.constexpr, C_P2: tl.constexpr):
+def _topk_merge_kernel(
+    tmp_ptr,
+    nchunk,
+    out_ptr,
+    vocab_start,
+    K: tl.constexpr,
+    KP2: tl.constexpr,
+    C_P2: tl.constexpr,
+):
     """Stage 2: a row's top K of its chunks' packed keys -> K f32 values, K f32 ids."""
     row = tl.program_id(0)
     c = tl.arange(0, C_P2)
-    keys = tl.load(tmp_ptr + row.to(tl.int64) * nchunk * KP2 + c, mask=c < nchunk * KP2, other=-1)
+    keys = tl.load(
+        tmp_ptr + row.to(tl.int64) * nchunk * KP2 + c, mask=c < nchunk * KP2, other=-1
+    )
     top = tl.topk(keys, KP2)
     key16 = (top >> 32).to(tl.int32)
     col = 2147483647 - (top & 4294967295).to(tl.int32)
@@ -156,6 +174,92 @@ def _topk_merge_kernel(tmp_ptr, nchunk, out_ptr, vocab_start, K: tl.constexpr, K
     dst = out_ptr + row.to(tl.int64) * (2 * K) + i
     tl.store(dst, val, mask=i < K)
     tl.store(dst + K, (col + vocab_start).to(tl.float32), mask=i < K)
+
+
+@triton.jit
+def _topk_group_merge_kernel(
+    src_ptr, groups_in, dst_ptr, KP2: tl.constexpr, FAN: tl.constexpr
+):
+    """Tree merge: the top KP2 of FAN consecutive groups of KP2 packed keys (one warp)."""
+    row = tl.program_id(0)
+    g = tl.program_id(1)
+    groups_out = tl.num_programs(1)
+    c = tl.arange(0, FAN * KP2)
+    gi = g * FAN + c // KP2
+    keys = tl.load(
+        src_ptr + (row.to(tl.int64) * groups_in + gi) * KP2 + c % KP2,
+        mask=gi < groups_in,
+        other=-1,
+    )
+    top = tl.topk(keys, KP2)
+    tl.store(
+        dst_ptr + (row.to(tl.int64) * groups_out + g) * KP2 + tl.arange(0, KP2), top
+    )
+
+
+@triton.jit
+def _topk_decode_kernel(
+    src_ptr, out_ptr, vocab_start, K: tl.constexpr, KP2: tl.constexpr
+):
+    """A row's final KP2 packed keys (sorted) -> K f32 values, K f32 ids."""
+    row = tl.program_id(0)
+    i = tl.arange(0, KP2)
+    top = tl.load(src_ptr + row.to(tl.int64) * KP2 + i)
+    key16 = (top >> 32).to(tl.int32)
+    col = 2147483647 - (top & 4294967295).to(tl.int32)
+    bits = tl.where(key16 >= 32768, key16 - 32768, 65535 - key16)
+    val = bits.to(tl.uint16).to(tl.bfloat16, bitcast=True).to(tl.float32)
+    dst = out_ptr + row.to(tl.int64) * (2 * K) + i
+    tl.store(dst, val, mask=i < K)
+    tl.store(dst + K, (col + vocab_start).to(tl.float32), mask=i < K)
+
+
+def _shard_topk_tree(logits, k, vocab_start, step, out, leaf, fan):
+    """ATOM_GLUE_TOPK_METHOD=2: one-warp leaves of ``leaf`` logits, then one-warp merges of
+    ``fan`` groups until one group of the top KP2 remains, then the pack."""
+    rows, V = logits.shape
+    kp2 = triton.next_power_of_2(k)
+    groups = triton.cdiv(V, leaf)
+    assert V - (groups - 1) * leaf >= kp2
+    buf = torch.empty(rows, groups, kp2, dtype=torch.int64, device=logits.device)
+    if step is not None:
+        extra = triton.next_power_of_2(max(step.state.max_extra, 1))
+        args = (
+            step.input_ids,
+            step.row_seq,
+            step.row_pos,
+            step.seq_start,
+            step.slots,
+            step.penalties,
+            step.state.mask,
+            step.state.mask.stride(0),
+        )
+    else:
+        extra = 1
+        args = (logits, logits, logits, logits, logits, logits, logits, 0)
+    _shard_topk_chunk_kernel[(rows, groups)](
+        logits,
+        logits.stride(0),
+        V,
+        vocab_start,
+        buf,
+        *args,
+        KP2=kp2,
+        HAS_PEN=step is not None,
+        EXTRA_P2=extra,
+        BLOCK=leaf,
+        METHOD=0,
+        num_warps=1,
+    )
+    while groups > 1:
+        nxt = triton.cdiv(groups, fan)
+        dst = torch.empty(rows, nxt, kp2, dtype=torch.int64, device=logits.device)
+        _topk_group_merge_kernel[(rows, nxt)](
+            buf, groups, dst, KP2=kp2, FAN=fan, num_warps=1
+        )
+        buf, groups = dst, nxt
+    _topk_decode_kernel[(rows,)](buf, out, vocab_start, K=k, KP2=kp2, num_warps=1)
+    return out
 
 
 def shard_topk_packed(
@@ -169,11 +273,15 @@ def shard_topk_packed(
     less the presence penalty when ``step`` is given) and their global token ids. The
     set of ``torch.topk(penalized, k)``; among equal values the lower ids."""
     rows, V = logits.shape
-    assert logits.stride(1) == 1 and k <= V and V < 2**31
+    assert logits.stride(1) == 1 and k <= V < 2**31
     if out is None:
         out = torch.empty(rows, 2 * k, dtype=torch.float32, device=logits.device)
     if rows == 0:
         return out
+    if step is not None:
+        assert step.num_rows == rows, "every candidate row is a penalized decode row"
+    if _METHOD == 2:
+        return _shard_topk_tree(logits, k, vocab_start, step, out, _LEAF, _FAN)
     nchunk = triton.cdiv(V, _BLOCK)
     kp2 = triton.next_power_of_2(k)
     assert kp2 <= 64 and V - (nchunk - 1) * _BLOCK >= kp2
@@ -181,18 +289,43 @@ def shard_topk_packed(
     if step is not None:
         assert step.num_rows == rows, "every candidate row is a penalized decode row"
         extra = triton.next_power_of_2(max(step.state.max_extra, 1))
-        args = (step.input_ids, step.row_seq, step.row_pos, step.seq_start, step.slots,
-                step.penalties, step.state.mask, step.state.mask.stride(0))
+        args = (
+            step.input_ids,
+            step.row_seq,
+            step.row_pos,
+            step.seq_start,
+            step.slots,
+            step.penalties,
+            step.state.mask,
+            step.state.mask.stride(0),
+        )
     else:
         extra = 1
         args = (logits, logits, logits, logits, logits, logits, logits, 0)
     _shard_topk_chunk_kernel[(rows, nchunk)](
-        logits, logits.stride(0), V, vocab_start, tmp, *args,
-        KP2=kp2, HAS_PEN=step is not None, EXTRA_P2=extra, BLOCK=_BLOCK, METHOD=_METHOD,
+        logits,
+        logits.stride(0),
+        V,
+        vocab_start,
+        tmp,
+        *args,
+        KP2=kp2,
+        HAS_PEN=step is not None,
+        EXTRA_P2=extra,
+        BLOCK=_BLOCK,
+        METHOD=_METHOD,
         num_warps=_WARPS,
     )
-    _topk_merge_kernel[(rows,)](tmp, nchunk, out, vocab_start, K=k, KP2=kp2,
-                                C_P2=triton.next_power_of_2(nchunk * kp2), num_warps=4)
+    _topk_merge_kernel[(rows,)](
+        tmp,
+        nchunk,
+        out,
+        vocab_start,
+        K=k,
+        KP2=kp2,
+        C_P2=triton.next_power_of_2(nchunk * kp2),
+        num_warps=4,
+    )
     return out
 
 
@@ -304,8 +437,21 @@ def _step_sample_kernel(
         tok = tl.full([], -1, tl.int32)
         if rejected == 0:
             lrow = tl.load(target_idx_ptr + start + j)
-            tok = _sample_row(gathered_ptr, nrows, lrow, start + j, temp, top_p, seed, eps,
-                              TP, K, TOPK, C_P2, S_P2)
+            tok = _sample_row(
+                gathered_ptr,
+                nrows,
+                lrow,
+                start + j,
+                temp,
+                top_p,
+                seed,
+                eps,
+                TP,
+                K,
+                TOPK,
+                C_P2,
+                S_P2,
+            )
             draft = tl.load(input_ids_ptr + lrow + 1).to(tl.int32)
             if draft != tok:
                 rejected = tl.full([], 1, tl.int32)
@@ -318,8 +464,21 @@ def _step_sample_kernel(
     bonus = tl.full([], -1, tl.int32)
     if rejected == 0:
         brow = tl.load(bonus_idx_ptr + req)
-        bonus = _sample_row(gathered_ptr, nrows, brow, total_targets + req, temp, top_p, seed, eps,
-                            TP, K, TOPK, C_P2, S_P2)
+        bonus = _sample_row(
+            gathered_ptr,
+            nrows,
+            brow,
+            total_targets + req,
+            temp,
+            top_p,
+            seed,
+            eps,
+            TP,
+            K,
+            TOPK,
+            C_P2,
+            S_P2,
+        )
         if HAS_PEN:
             tl.store(mrow + bonus, 1, mask=(bonus >= 0) & (bonus < vocab))
     tl.store(out_row + nd, bonus)
@@ -374,23 +533,49 @@ class StepSampler:
         if bs == 0:
             return out, verdict, nxt
         tp_tensor = isinstance(top_ps, torch.Tensor) and top_ps.numel() > 1
-        top_p_scalar = 2.0 if top_ps is None else (float(top_ps) if not tp_tensor else 0.0)
+        top_p_scalar = (
+            2.0 if top_ps is None else (float(top_ps) if not tp_tensor else 0.0)
+        )
         if tp_tensor:
             top_p_arg = top_ps.float().contiguous()
         else:
             top_p_arg = temperatures
         if step is not None:
-            pen = (step.seq_start, step.slots, step.state.mask, step.state.mask.stride(0),
-                   step.state.mask.shape[1])
+            pen = (
+                step.seq_start,
+                step.slots,
+                step.state.mask,
+                step.state.mask.stride(0),
+                step.state.mask.shape[1],
+            )
             step._anchors_marked = True
         else:
             pen = (cu, cu, out, 0, 0)
         _step_sample_kernel[(bs,)](
-            gathered, nrows, metadata.target_logits_indices, metadata.bonus_logits_indices, cu,
-            input_ids, temperatures, top_p_arg, top_p_scalar, out, verdict, nxt, *pen,
-            self.rng, self.done, S, eps,
-            TP=tp, K=k, TOPK=top_k, C_P2=triton.next_power_of_2(tp * k),
-            S_P2=triton.next_power_of_2(max(top_k, 2)), TOP_P_TENSOR=tp_tensor,
-            HAS_PEN=step is not None, num_warps=1,
+            gathered,
+            nrows,
+            metadata.target_logits_indices,
+            metadata.bonus_logits_indices,
+            cu,
+            input_ids,
+            temperatures,
+            top_p_arg,
+            top_p_scalar,
+            out,
+            verdict,
+            nxt,
+            *pen,
+            self.rng,
+            self.done,
+            S,
+            eps,
+            TP=tp,
+            K=k,
+            TOPK=top_k,
+            C_P2=triton.next_power_of_2(tp * k),
+            S_P2=triton.next_power_of_2(max(top_k, 2)),
+            TOP_P_TENSOR=tp_tensor,
+            HAS_PEN=step is not None,
+            num_warps=1,
         )
         return out, verdict, nxt
