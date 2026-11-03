@@ -563,6 +563,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GDN_CHUNK_H_PAIRED_LOADS": lambda: (
         os.getenv("ATOM_GDN_CHUNK_H_PAIRED_LOADS", "0") == "1"
     ),
+    # gfx1250 GDN prefill output (chunk_o) with the gated RMSNorm: the row sum of
+    # squares inside the wave and an approximate silu divide (not bitwise the
+    # unfused norm), z staged in h's LDS: more programs a CU.
+    "ATOM_GDN_CHUNK_O_FAST_NORM": lambda: (
+        os.getenv("ATOM_GDN_CHUNK_O_FAST_NORM", "0") == "1"
+    ),
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,

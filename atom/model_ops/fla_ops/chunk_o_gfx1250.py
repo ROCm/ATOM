@@ -19,6 +19,8 @@ import functools
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from atom.utils import envs
+
 _TDM_MAX_PAD_INTERVAL_DWORDS = 256
 
 
@@ -52,6 +54,7 @@ def _chunk_o_gfx1250_kernel(
     GATED_NORM: gl.constexpr,
     IS_VARLEN: gl.constexpr,
     HAS_NT: gl.constexpr,
+    FAST_NORM: gl.constexpr,
     WMMA: gl.constexpr,
     OP_A: gl.constexpr,
     OP_B: gl.constexpr,
@@ -146,8 +149,9 @@ def _chunk_o_gfx1250_kernel(
             block_shape=(BT, V),
             layout=SMEM_ROW_V,
         )
-        z_smem = gl.allocate_shared_memory(z.type.element_ty, [BT, V], SMEM_ROW_V)
-        gl.amd.gfx1250.tdm.async_load(z_desc, [t0, 0], z_smem)
+        if not FAST_NORM:
+            z_smem = gl.allocate_shared_memory(z.type.element_ty, [BT, V], SMEM_ROW_V)
+            gl.amd.gfx1250.tdm.async_load(z_desc, [t0, 0], z_smem)
 
     rows = gl.arange(0, BT, layout=gl.SliceLayout(1, WMMA))
     cols_t = gl.arange(0, BT, layout=gl.SliceLayout(0, WMMA))
@@ -180,6 +184,11 @@ def _chunk_o_gfx1250_kernel(
     b_A = gl.where(m_A, b_A, 0.0)
     a_smem.store(b_A.to(a_smem.dtype))
     gl.barrier()
+    if GATED_NORM and FAST_NORM:
+        # z into the first rows of h's buffer (every wave read h before the
+        # barrier): a smaller LDS footprint, more programs a CU
+        z_smem = h_smem.slice(0, BT, 0)
+        gl.amd.gfx1250.tdm.async_load(z_desc, [t0, 0], z_smem)
     b_pv = gl.amd.gfx1250.wmma(
         a_smem.load(OP_A), v_smem.load(OP_B), gl.zeros([BT, V], gl.float32, layout=WMMA)
     )
@@ -187,14 +196,24 @@ def _chunk_o_gfx1250_kernel(
     if GATED_NORM:
         # the unfused chain stores o in bf16 and normalizes what it reads back
         x = b_o.to(o.dtype.element_ty).to(gl.float32)
-        # the sum of squares in layer_norm_fwd's register layout, so its order of
-        # additions -- and the result, bit for bit -- is the unfused kernel's
-        x_rows = gl.convert_layout(x, NORM_LAYOUT)
-        rstd = gl.rsqrt(gl.sum(x_rows * x_rows, 1) / V + eps)
-        rstd = gl.convert_layout(rstd, gl.SliceLayout(1, WMMA))
-        b_z = z_smem.load(WMMA).to(gl.float32)
-        # silu(z) = z * sigmoid(z), sigmoid written as tl.sigmoid computes it
-        b_o = x * rstd[:, None] * weight[None, :] * (b_z * (1.0 / (1.0 + gl.exp(-b_z))))
+        if FAST_NORM:
+            # a wave holds whole rows: the sum of squares stays in the wave;
+            # silu(z) with an approximate divide
+            rstd = gl.rsqrt(gl.sum(x * x, 1) / V + eps)
+            gl.amd.gfx1250.tdm.async_wait(0)
+            gl.barrier()
+            b_z = z_smem.load(WMMA).to(gl.float32)
+            silu = gl.fdiv(b_z, 1.0 + gl.exp(-b_z), approx=True)
+        else:
+            # the sum of squares in layer_norm_fwd's register layout, so its order
+            # of additions -- and the result, bit for bit -- is the unfused kernel's
+            x_rows = gl.convert_layout(x, NORM_LAYOUT)
+            rstd = gl.rsqrt(gl.sum(x_rows * x_rows, 1) / V + eps)
+            rstd = gl.convert_layout(rstd, gl.SliceLayout(1, WMMA))
+            b_z = z_smem.load(WMMA).to(gl.float32)
+            # silu(z) = z * sigmoid(z), sigmoid written as tl.sigmoid computes it
+            silu = b_z * (1.0 / (1.0 + gl.exp(-b_z)))
+        b_o = x * rstd[:, None] * weight[None, :] * silu
     # the output tile reuses q's buffer: every wave read q before the barrier
     # that published the A tile
     o_smem = q_smem
@@ -293,6 +312,7 @@ def chunk_o_gfx1250(
         GATED_NORM=gate is not None,
         IS_VARLEN=cu_seqlens is not None,
         HAS_NT=nt_ptr is not None,
+        FAST_NORM=envs.ATOM_GDN_CHUNK_O_FAST_NORM,
         WMMA=layouts[0],
         OP_A=layouts[1],
         OP_B=layouts[2],
