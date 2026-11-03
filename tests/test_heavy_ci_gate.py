@@ -417,18 +417,18 @@ def test_approval_that_replaced_pending_pr_run_takes_over_its_checks(tmp_path, l
         jobs={100: [{"jobs": []}, {"jobs": []}]},
     )
     assert result["should_run"] == "true"
-    assert result["replaced_pr_run"] == "true"
+    assert result["pr_check_takeover"] == "true"
     assert result["replaced_run_id"] == "100"
 
 
-def test_replaced_pr_run_is_reported_even_when_approval_is_not_sufficient(tmp_path):
+def test_pr_check_takeover_is_reported_even_when_approval_is_not_sufficient(tmp_path):
     result = _approve(
         tmp_path,
         review_decision="CHANGES_REQUESTED",
         runs=[_previous_run(conclusion="cancelled")],
     )
     assert result["should_run"] == "false"
-    assert result["replaced_pr_run"] == "true"
+    assert result["pr_check_takeover"] == "true"
 
 
 def test_replaced_run_does_not_hide_heavy_ci_started_by_earlier_run(tmp_path):
@@ -440,7 +440,7 @@ def test_replaced_run_does_not_hide_heavy_ci_started_by_earlier_run(tmp_path):
     assert result["should_run"] == "false"
     assert result["reason"] == "heavy-ci-already-started"
     assert result["existing_run_id"] == "100"
-    assert result["replaced_pr_run"] == "true"
+    assert result["pr_check_takeover"] == "true"
     assert result["replaced_run_id"] == "150"
 
 
@@ -466,7 +466,7 @@ def test_pr_run_that_started_or_is_unrelated_is_not_treated_as_replaced(
     tmp_path, runs, jobs
 ):
     result = _approve(tmp_path, runs=runs, jobs=jobs)
-    assert "replaced_pr_run" not in result
+    assert "pr_check_takeover" not in result
 
 
 @pytest.mark.parametrize("failed_query", ["runs_query_fails", "jobs_query_fails"])
@@ -478,7 +478,7 @@ def test_replacement_check_failure_does_not_claim_replacement(tmp_path, failed_q
     )
     assert result["should_run"] == "false"
     assert result["reason"] == failed_query.replace("_", "-").replace("fails", "failed")
-    assert "replaced_pr_run" not in result
+    assert "pr_check_takeover" not in result
 
 
 @pytest.mark.parametrize(
@@ -491,7 +491,18 @@ def test_replacement_check_failure_does_not_claim_replacement(tmp_path, failed_q
 )
 def test_only_current_approval_runs_check_for_replaced_pr_run(tmp_path, kwargs):
     result = _approve(tmp_path, runs=[_previous_run(conclusion="cancelled")], **kwargs)
-    assert "replaced_pr_run" not in result
+    assert "pr_check_takeover" not in result
+
+
+def test_retargeted_pr_does_not_take_over_pr_checks(tmp_path):
+    result = _approve(
+        tmp_path,
+        runs=[_previous_run(conclusion="cancelled")],
+        current_pr=_current_pr(base={"ref": "release"}),
+    )
+    assert result["should_run"] == "false"
+    assert result["reason"] == "non-main-base-branch"
+    assert "pr_check_takeover" not in result
 
 
 def test_workflow_without_pr_only_check_does_not_look_for_replaced_run(tmp_path):
@@ -499,7 +510,7 @@ def test_workflow_without_pr_only_check_does_not_look_for_replaced_run(tmp_path)
         tmp_path, runs=[_previous_run(conclusion="cancelled")], pr_check_job=""
     )
     assert result["should_run"] == "true"
-    assert "replaced_pr_run" not in result
+    assert "pr_check_takeover" not in result
 
 
 def _smoke_jobs(conclusion):
@@ -519,7 +530,7 @@ def test_second_approval_does_not_repeat_takeover(tmp_path, conclusion):
         jobs={100: [], 150: _jobs() + _smoke_jobs(conclusion)},
     )
     assert result["reason"] == "heavy-ci-already-started"
-    assert "replaced_pr_run" not in result
+    assert "pr_check_takeover" not in result
 
 
 def test_comment_review_between_does_not_hide_replacement(tmp_path):
@@ -532,7 +543,7 @@ def test_comment_review_between_does_not_hide_replacement(tmp_path):
         jobs={100: [], 150: _smoke_jobs("skipped")},
     )
     assert result["should_run"] == "true"
-    assert result["replaced_pr_run"] == "true"
+    assert result["pr_check_takeover"] == "true"
     assert result["replaced_run_id"] == "100"
 
 
@@ -546,7 +557,7 @@ def test_approval_replaced_while_pending_is_taken_over_again(tmp_path):
         jobs={100: [], 150: []},
     )
     assert result["should_run"] == "true"
-    assert result["replaced_pr_run"] == "true"
+    assert result["pr_check_takeover"] == "true"
 
 
 def test_unreadable_later_review_run_does_not_claim_replacement(tmp_path):
@@ -558,7 +569,7 @@ def test_unreadable_later_review_run_does_not_claim_replacement(tmp_path):
         ],
         jobs={100: [], 150: [{"jobs": None}]},
     )
-    assert "replaced_pr_run" not in result
+    assert "pr_check_takeover" not in result
 
 
 @pytest.mark.parametrize("failed_query", ["runs_query_fails", "jobs_query_fails"])
@@ -588,7 +599,7 @@ def test_explicit_rerun_of_replacing_approval_repeats_the_smoke_test(tmp_path):
         tmp_path, run_attempt=2, runs=[_previous_run(conclusion="cancelled")]
     )
     assert result["should_run"] == "true"
-    assert result["replaced_pr_run"] == "true"
+    assert result["pr_check_takeover"] == "true"
 
 
 def test_queued_approval_revalidates_head_sha(tmp_path):
@@ -630,12 +641,12 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert smoke["needs"] == ["ci-gate"]
             assert smoke["if"].startswith("${{ !cancelled() && ")
             assert "github.event_name != 'pull_request_review'" in smoke["if"]
-            assert "needs.ci-gate.outputs.replaced_pr_run == 'true'" in smoke["if"]
+            assert "needs.ci-gate.outputs.pr_check_takeover == 'true'" in smoke["if"]
             assert (
-                config["jobs"]["ci-gate"]["outputs"]["replaced_pr_run"]
-                == "${{ steps.gate.outputs.replaced_pr_run }}"
+                config["jobs"]["ci-gate"]["outputs"]["pr_check_takeover"]
+                == "${{ steps.gate.outputs.pr_check_takeover }}"
             )
-            assert "needs.ci-gate.outputs.replaced_pr_run != 'true'" in smoke["name"]
+            assert "needs.ci-gate.outputs.pr_check_takeover != 'true'" in smoke["name"]
             assert "'Offline smoke not requested'" in smoke["name"]
             assert "'Offline inference smoke test'" in smoke["name"]
             assert config["jobs"]["atom-test"]["name"] == "Accuracy"

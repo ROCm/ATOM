@@ -243,7 +243,7 @@ detect_replaced_pr_run() {
     fi
   done <<< "${later_ids}"
 
-  echo "replaced_pr_run=true" >> "${OUTPUT_FILE}"
+  echo "pr_check_takeover=true" >> "${OUTPUT_FILE}"
   echo "replaced_run_id=${run_id}" >> "${OUTPUT_FILE}"
   echo "Approval replaced pending PR run ${run_id} before it started; this run takes over its PR checks."
   if [ -n "${SUMMARY_FILE}" ]; then
@@ -339,7 +339,9 @@ if [ "${EVENT_NAME}" = "pull_request_review" ] \
   fi
   BASE_REF="$(jq -r '.base.ref' <<< "${CURRENT_PR}")"
   IS_DRAFT="$(jq -r '.draft // false' <<< "${CURRENT_PR}")"
-  detect_replaced_pr_run
+  if [ "${BASE_REF}" = "main" ]; then
+    detect_replaced_pr_run
+  fi
 fi
 
 if [ "${BASE_REF}" != "main" ]; then
