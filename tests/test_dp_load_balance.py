@@ -563,6 +563,7 @@ def _make_spread_mgr(n_ranks=2, margin=65536):
         prefix_moved_tokens=0,
         prefix_cold_total=0,
         prefix_source_busy_total=0,
+        prefix_moved_partial_total=0,
     )
     return mgr
 
@@ -831,3 +832,63 @@ def test_prefix_spread_idle_ratio_policy():
     mgr._prefix_ratio = 0  # default: B off
     assert place(5, 500_000, 200_000) == "owner"  # both busy: stay
     assert place(6, 100_000, 10_000) == "other"  # A still applies
+
+
+def _dp4_idle_ratio_mgr(similar=16384):
+    mgr = _make_spread_mgr(n_ranks=4)
+    mgr._prefix_policy = "idle_ratio"
+    mgr._prefix_idle_tokens = 32768
+    mgr._prefix_owner_backlog_tokens = 65536
+    mgr._prefix_ratio = 0
+    mgr._prefix_similar_tokens = similar
+    # rank0 ran the whole 100k prefix, rank2 its first 48k.
+    mgr._prefix_owner_record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1)
+    mgr._prefix_owner_record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2)
+    mgr._rank_tokens = [200_000, 0, 4_096, 8_192]
+    mgr._rank_reqs = [0, 0, 0, 0]
+    return mgr
+
+
+def test_prefix_rank_hits_keep_every_rank():
+    mgr = _dp4_idle_ratio_mgr()
+    hits, owner, source = mgr._prefix_rank_hits(
+        _chain_seq(3, 110_000).prompt_hash_chain
+    )
+    assert owner == 0 and source == 1
+    assert hits[0] == 98_304 and hits[2] == 49_152
+    assert 1 not in hits and 3 not in hits
+
+
+def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
+    """Load first; among ranks about as idle, the one with more of the prefix."""
+    mgr = _dp4_idle_ratio_mgr()
+    seq = _chain_seq(3, 110_000)
+    (rank,) = _route(mgr, [seq])
+    assert rank == 2  # 4k above the lightest, holds 48k of the prefix
+    assert seq._dp_est_hit == 98_304  # 48k local + 48k loaded from the tier
+    assert mgr._dp_route_counters["prefix_moved_partial_total"] == 1
+    assert mgr._dp_route_counters["prefix_moved_tokens"] == 98_304 - 49_152
+
+
+def test_idle_ratio_load_wins_over_a_partial_prefix():
+    mgr = _dp4_idle_ratio_mgr()
+    mgr._rank_tokens[2] = 24_576  # still idle, but 24k above the lightest
+    (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
+    assert rank == 1
+
+
+def test_idle_ratio_similar_zero_picks_the_lightest():
+    mgr = _dp4_idle_ratio_mgr(similar=0)
+    (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
+    assert rank == 1
+
+
+def test_partial_prefix_with_a_small_rest_is_recomputed_not_loaded():
+    mgr = _dp4_idle_ratio_mgr()
+    # rank2 now holds 96k of the 98k prefix: the 2k rest is below
+    # OFFLOAD_MIN_LOAD_TOKENS, so only the local part counts as a hit.
+    mgr._prefix_owner_record(_chain_seq(4, 94_208).prompt_hash_chain, 2, 4)
+    seq = _chain_seq(3, 110_000)
+    (rank,) = _route(mgr, [seq])
+    assert rank == 2
+    assert seq._dp_est_hit == 94_208
