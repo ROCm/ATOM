@@ -37,15 +37,47 @@ def snapshot(source, destination):
             path = Path(directory) / name
             if path.is_symlink():
                 continue
-            if path.suffix not in {".log", ".out", ".err", ".json"}:
-                continue
-            # Large exporter JSON/records are not useful for a live log tail.
-            if name in {"server_metrics_export.json", "profile_export.json"}:
+            inventory_only = name in {
+                "server_metrics_export.json",
+                "profile_export.json",
+            }
+            if inventory_only or path.suffix not in {
+                ".log",
+                ".out",
+                ".err",
+                ".json",
+            }:
+                if inventory_only or path.suffix in {".jsonl", ".gz", ".csv"}:
+                    try:
+                        info = path.stat()
+                        rows.append(
+                            {
+                                "path": str(path.relative_to(source)),
+                                "bytes": info.st_size,
+                                "mtime": info.st_mtime,
+                                "inventory_only": True,
+                            }
+                        )
+                    except OSError as exc:
+                        rows.append(
+                            {
+                                "path": str(path.relative_to(source)),
+                                "error": str(exc),
+                            }
+                        )
                 continue
             relative = path.relative_to(source)
             try:
                 info = path.stat()
                 if path.suffix == ".json" and info.st_size > 128 * 1024:
+                    rows.append(
+                        {
+                            "path": str(relative),
+                            "bytes": info.st_size,
+                            "mtime": info.st_mtime,
+                            "inventory_only": True,
+                        }
+                    )
                     continue
                 with path.open("rb") as stream:
                     offset = max(0, info.st_size - 256 * 1024)
@@ -56,6 +88,11 @@ def snapshot(source, destination):
                 target = destination / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
+                if offset:
+                    with path.open("rb") as stream:
+                        target.with_name(target.name + ".head").write_bytes(
+                            stream.read(64 * 1024)
+                        )
                 rows.append(
                     {
                         "path": str(relative),
@@ -75,17 +112,23 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     ids = args.run_ids.split(",")
-    if not 1 <= len(ids) <= 4 or any(not re.fullmatch(r"[0-9]+", rid) for rid in ids):
+    if not 1 <= len(ids) <= 4 or any(
+        not re.fullmatch(r"[0-9]+", rid) for rid in ids
+    ):
         parser.error("provide one to four numeric GitHub run IDs")
     args.output.mkdir(parents=True, exist_ok=True)
-    os.environ["PATH"] = "/usr/local/slurm-24.05.5.1/bin:" + os.environ.get("PATH", "")
+    os.environ["PATH"] = "/usr/local/slurm-24.05.5.1/bin:" + os.environ.get(
+        "PATH", ""
+    )
     queue = command(["squeue", "--noheader", "--format=%i %T %D %j %N %R"])
     lines = queue.get("stdout", "").splitlines()
     queue["stdout"] = "\n".join(
         line for line in lines if any(f"-{rid}-" in line for rid in ids)
     )
     report = {
-        "collected_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "collected_at": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
         "collector_host": socket.gethostname(),
         "sbatch_help": command(["sbatch", "--help"]),
         "queue": queue,
@@ -93,14 +136,13 @@ def main():
     }
     for rid in ids:
         row = {"run_id": rid, "jobs": [], "log_roots": []}
+        job_ids = set()
         for line in lines:
             if f"-{rid}-" not in line:
                 continue
             job_id = line.split()[0]
             if job_id.isdigit():
-                row["jobs"].append(
-                    {"id": job_id, **command(["scontrol", "show", "job", job_id])}
-                )
+                job_ids.add(job_id)
         for base in (
             Path("/share_nfs/ATOMESH_RUNNER/ATOMESH_LOG"),
             Path("/it-share/ATOMESH_LOG"),
@@ -111,14 +153,46 @@ def main():
                 if source.is_dir() and not source.is_symlink():
                     target = args.output / rid / source.name
                     row["log_roots"].append(
-                        {"source": str(source), "files": snapshot(source, target)}
+                        {
+                            "source": str(source),
+                            "files": snapshot(source, target),
+                        }
                     )
+                    for job_dir in source.glob("slurm_job-*"):
+                        job_id = job_dir.name.removeprefix("slurm_job-")
+                        if job_id.isdigit():
+                            job_ids.add(job_id)
+        for job_id in sorted(job_ids):
+            job = {"id": job_id, **command(["scontrol", "show", "job", job_id])}
+            workdir = re.search(r"WorkDir=(\S+)", job.get("stdout", ""))
+            if workdir and workdir[1].startswith("/share_nfs/ATOMESH_RUNNER/"):
+                job["source_head"] = command(
+                    ["git", "-C", workdir[1], "rev-parse", "HEAD"]
+                )
+                job["source_status"] = command(
+                    [
+                        "git",
+                        "-C",
+                        workdir[1],
+                        "status",
+                        "--short",
+                        "--untracked-files=no",
+                    ]
+                )
+            row["jobs"].append(job)
+            # Preserve controller evidence even if the artifact uploader fails.
+            print(
+                f"run={rid} job={job_id} controller={json.dumps(job)}",
+                flush=True,
+            )
         report["runs"].append(row)
         print(
             f"run={rid} jobs={len(row['jobs'])} log_roots={len(row['log_roots'])}",
             flush=True,
         )
-    (args.output / "inspection.json").write_text(json.dumps(report, indent=2) + "\n")
+    (args.output / "inspection.json").write_text(
+        json.dumps(report, indent=2) + "\n"
+    )
 
 
 if __name__ == "__main__":
