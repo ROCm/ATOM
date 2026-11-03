@@ -225,6 +225,9 @@ detect_replaced_pr_run() {
     echo "Could not read jobs of run ${run_id}; assuming it was not replaced."
     return 0
   fi
+  # GitHub cancels a queued run without creating its jobs when a newer run
+  # takes its place in the concurrency group, so a cancelled run with no jobs
+  # never published its PR checks.
   [ "${job_count}" = "0" ] || return 0
 
   later_ids="$(jq -r --argjson id "${run_id}" \
@@ -273,10 +276,12 @@ allow_heavy_ci() {
       emit_decision "false" "jobs-query-failed"
       return
     fi
-    # A successful workflow can contain only skipped GPU jobs. Check entry to
-    # the gated chain instead, across all attempts, including failures. Leaving
-    # the chain untouched also preserves successful cells of a partial failure.
-    if ! started="$(jq -r 'any(.[].jobs[]; .name == "Check Pre Checkin Signal" and .conclusion != "skipped")' <<< "${jobs}")"; then
+    # A successful workflow can contain only skipped GPU jobs. Check whether
+    # any attempt got past the Pre Checkin signal: GPU jobs start only after it
+    # succeeds, so a failed or cancelled signal leaves the approval free to run
+    # them. Leaving a started chain alone preserves successful cells of a
+    # partial failure.
+    if ! started="$(jq -r 'any(.[].jobs[]; .name == "Check Pre Checkin Signal" and (.conclusion == null or .conclusion == "success"))' <<< "${jobs}")"; then
       emit_decision "false" "jobs-query-failed"
       return
     fi

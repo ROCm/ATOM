@@ -172,8 +172,10 @@ jobs:
   offline-smoke-test:
     needs: [ci-gate]
     if: ${{ !cancelled() && (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') }}
-    # Ungated on purpose: this runs on every PR, unlike the accuracy matrix
-    # behind `ci-gate`, which only opens on an approval or a ci:* label.
+    # Not behind the approval/label gate: this runs on every PR, unlike the
+    # accuracy matrix, which only opens on an approval or a ci:* label. It
+    # needs `ci-gate` only so an approval run can take over the check from a
+    # pending PR run it replaced; other review runs skip it.
     #
     # It guards the path the nightly Docker release smoke-tests after it builds
     # the image -- the offline entrypoint. The accuracy job is not a substitute:

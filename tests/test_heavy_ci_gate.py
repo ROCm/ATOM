@@ -328,12 +328,28 @@ def test_first_approval_releases_previously_skipped_heavy_jobs(tmp_path):
     assert result["reason"] == "current-approval"
 
 
-@pytest.mark.parametrize("signal", ["success", "failure", "cancelled", None])
+@pytest.mark.parametrize("signal", ["success", None])
 def test_approval_does_not_restart_existing_heavy_work(tmp_path, signal):
     result = _approve(tmp_path, runs=[_previous_run()], jobs={100: _jobs(signal)})
     assert result["should_run"] == "false"
     assert result["reason"] == "heavy-ci-already-started"
     assert result["existing_run_id"] == "100"
+
+
+@pytest.mark.parametrize("signal", ["failure", "cancelled"])
+def test_approval_runs_heavy_ci_when_pre_checkin_signal_never_passed(tmp_path, signal):
+    result = _approve(tmp_path, runs=[_previous_run()], jobs={100: _jobs(signal)})
+    assert result["should_run"] == "true"
+    assert result["reason"] == "current-approval"
+
+
+def test_failed_signal_attempt_does_not_hide_a_passed_one(tmp_path):
+    result = _approve(
+        tmp_path,
+        runs=[_previous_run()],
+        jobs={100: _jobs("failure") + _jobs("success")},
+    )
+    assert result["reason"] == "heavy-ci-already-started"
 
 
 def test_partial_matrix_failure_keeps_successes_and_failures_in_original_run(tmp_path):
