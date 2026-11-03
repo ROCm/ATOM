@@ -299,6 +299,13 @@ class _MPLookupClient:
             return True
 
     @_locked
+    def has_answer(self, lookup_id: str) -> bool:
+        """Answered and waiting to be consumed. A failed lookup is not: it
+        leaves `_async` without an answer, and consuming it would retry
+        synchronously."""
+        return lookup_id in self._async_hits
+
+    @_locked
     def pending_ids(self):
         """Lookups already submitted and not yet consumed (do not mutate)."""
         if self._driver is not None:

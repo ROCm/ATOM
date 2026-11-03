@@ -450,8 +450,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """Whether `seq`'s tier answer can be consumed without a round trip.
 
         True when the answer is already held (`_lookup_results`) or its async
-        lookup has answered and waits to be consumed (submitted, no longer in
-        flight). `Scheduler._offload_prefetch` asks this so that it
+        lookup has answered and waits to be consumed (`has_answer`; a failed
+        lookup has no answer, so it is not ready). `Scheduler._offload_prefetch` asks this so that it
         never blocks the scheduler thread -- and with it every DP rank -- on a
         synchronous lookup. It does not advance the lookup: call it after
         `lookup_pending`, or after a lookup driver thread answered.
@@ -460,12 +460,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         held = self._lookup_results.get(sid)
         if held is not None:
             return held[0] is seq
-        client = self._lookup_client
-        is_pending = getattr(client, "is_pending", None)
-        pending_ids = getattr(client, "pending_ids", None)
-        if not callable(is_pending) or not callable(pending_ids):
-            return False
-        return sid in pending_ids() and not is_pending(sid)
+        has_answer = getattr(self._lookup_client, "has_answer", None)
+        return callable(has_answer) and bool(has_answer(sid))
 
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler takes back before any dispatch.

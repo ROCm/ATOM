@@ -304,6 +304,18 @@ class CoreManager:
         # rank has over twice that (a real backlog). See
         # `_prefix_stays_on_owner`.
         self._prefix_idle_tokens = envs.ATOM_DP_PREFIX_IDLE_TOKENS
+        if self._prefix_spread:
+            # Prefix spread places every request without an explicit rank
+            # hint: it overrides session affinity and the dp_load_balance
+            # strategy (and the offline backpressure dispatch).
+            overridden = [f"--dp-load-balance {self._dp_lb_strategy}"]
+            if self._dp_session_affinity_enabled:
+                overridden.append("ATOM_DP_SESSION_AFFINITY")
+            logger.info(
+                "%s: ATOM_DP_PREFIX_SPREAD routes requests; it overrides %s",
+                label,
+                " and ".join(overridden),
+            )
         # Sampled prompt-block hash -> {rank: request that ran it there}.
         self._prefix_owner: OrderedDict[int, dict] = OrderedDict()
         self._prefix_owner_cap = 1 << 19
@@ -1141,6 +1153,7 @@ class CoreManager:
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
             and not self._dp_session_affinity_enabled
+            and not getattr(self, "_prefix_spread", False)
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
@@ -1566,14 +1579,6 @@ class CoreManager:
             if len(hits) == n:
                 break
         return hits, owner, source
-
-    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int, object]:
-        """(rank that last ran this prompt's longest sampled prefix, its tokens,
-        the request that ran it)."""
-        hits, owner, source = self._prefix_rank_hits(chain)
-        if owner is None:
-            return None, 0, None
-        return owner, hits[owner], source
 
     def _prefix_owner_record(self, chain, rank: int, seq_id=None) -> None:
         if chain is None:
