@@ -18,6 +18,7 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Float32, Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN
+from atom.models.kimi_k3.mono.external_collectives import FrontPayloadLayout
 from atom.models.kimi_k3.mono.kernels.attention import kda as attention_base
 from atom.models.kimi_k3.mono.kernels.attention import (
     kda_gfx1250 as protocol_device,
@@ -68,8 +69,7 @@ ROLE_LDS_FRONT_ABI = KernelAbi(
         "latent_weight",
         "shared_weight",
         "x_local",
-        "router_local",
-        "latent_local",
+        "front_payload",
         "shared_gate_up",
         "scratch",
         "layer",
@@ -214,8 +214,7 @@ def _projection_direct_task(
     router_weight,
     latent_weight,
     shared_weight,
-    router_local,
-    latent_local,
+    front_payload,
     shared_gate_up,
     activation_lds,
     accumulator_lds,
@@ -226,6 +225,7 @@ def _projection_direct_task(
     tile_start,
     tile_rows,
     rows,
+    latent_offset,
     slabs,
     row_stride,
 ):
@@ -233,7 +233,7 @@ def _projection_direct_task(
         _projection_task(
             x_local,
             router_weight,
-            router_local,
+            front_payload,
             activation_lds,
             accumulator_lds,
             tid,
@@ -252,7 +252,7 @@ def _projection_direct_task(
         _projection_task(
             x_local,
             latent_weight,
-            latent_local,
+            front_payload + fx.Int64(latent_offset),
             activation_lds,
             accumulator_lds,
             tid,
@@ -319,6 +319,7 @@ def build_role_lds_front(
         raise ValueError("role-LDS K2 front lacks gate/norm control CTAs")
 
     rows = plan.tokens
+    payload = FrontPayloadLayout(rows)
     sources = plan.nblocks + 1
     if sources > GFX1250.wave_size:
         raise ValueError("role-LDS AttnRes sources exceed one wave32")
@@ -407,8 +408,7 @@ def build_role_lds_front(
         latent_weight: Int64,
         shared_weight: Int64,
         x_local: Int64,
-        router_local: Int64,
-        latent_local: Int64,
+        front_payload: Int64,
         shared_gate_up: Int64,
         scratch: Int64,
         layer: Int32,
@@ -498,13 +498,9 @@ def build_role_lds_front(
                 delta_values = attention_base.ld_bf4(
                     oproj_reduced, source_token * HIDDEN + column
                 )
-                if reset:
-                    # K1 already banked the old prefix into the new block.
-                    # Restart the live prefix at the reduced o_proj output,
-                    # exactly like gfx950 K2Build(reset=True), rather than
-                    # counting the old prefix both as a block and as prefix.
-                    updated = delta_values
-                else:
+                # K1 already banked the old prefix into the new block on reset.
+                updated = delta_values
+                if not reset:
                     prefix_values = attention_base.ld_bf4(
                         prefix, source_token * HIDDEN + column
                     )
@@ -708,8 +704,7 @@ def build_role_lds_front(
                         router_weight,
                         latent_weight,
                         shared_weight,
-                        router_local,
-                        latent_local,
+                        front_payload,
                         shared_gate_up,
                         projection.activation.ptr,
                         projection.accumulator.ptr,
@@ -720,6 +715,7 @@ def build_role_lds_front(
                         tile_start,
                         tile_rows,
                         rows,
+                        payload.latent_offset,
                         slabs,
                         row_stride,
                     )
@@ -738,8 +734,7 @@ def build_role_lds_front(
         latent_weight: Int64,
         shared_weight: Int64,
         x_local: Int64,
-        router_local: Int64,
-        latent_local: Int64,
+        front_payload: Int64,
         shared_gate_up: Int64,
         scratch: Int64,
         layer: Int32,
@@ -760,8 +755,7 @@ def build_role_lds_front(
             latent_weight,
             shared_weight,
             x_local,
-            router_local,
-            latent_local,
+            front_payload,
             shared_gate_up,
             scratch,
             layer,

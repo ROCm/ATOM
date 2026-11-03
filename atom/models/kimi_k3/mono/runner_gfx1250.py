@@ -283,8 +283,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         return {
             "oproj": empty((rows, HIDDEN), torch.bfloat16),
             "x_local": empty((rows, HIDDEN), torch.bfloat16),
-            "router_local": empty((rows, EXPERTS // self.tp)),
-            "latent_local": empty((rows, LATENT // self.tp), torch.bfloat16),
             "shared_gate_up": empty((rows, 2 * self.dims.sh_inter), torch.bfloat16),
             "latent_logical": empty((rows, LATENT), torch.bfloat16),
             "shared_hidden": empty((rows, self.dims.sh_inter), torch.bfloat16),
@@ -423,21 +421,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 latent.data_ptr(),
                 weight.w_sgu.data_ptr(),
                 buffers["x_local"].data_ptr(),
-                buffers["router_local"].data_ptr(),
-                buffers["latent_local"].data_ptr(),
+                buffers["front_payload"].data_ptr(),
                 buffers["shared_gate_up"].data_ptr(),
                 buffers["front_scratch"].data_ptr(),
                 plan.layer_id,
                 weight.seam.eps,
                 weight.seam.out_eps,
                 stream=stream,
-            )
-            torch.cat(
-                (
-                    buffers["router_local"].view(torch.uint8).flatten(),
-                    buffers["latent_local"].view(torch.uint8).flatten(),
-                ),
-                out=buffers["front_payload"].view(-1),
             )
             return PackedShardedFrontPartials(buffers["front_payload"], buffers)
 

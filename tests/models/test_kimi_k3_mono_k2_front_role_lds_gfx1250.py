@@ -26,6 +26,9 @@ def test_role_lds_front_abi_has_no_full_attnres_workspace():
     assert "attnres_mixed" not in names
     assert "attnres_partials" not in names
     assert "attnres_mean_squares" not in names
+    assert "front_payload" in names
+    assert "router_local" not in names
+    assert "latent_local" not in names
     assert names[3:5] == ("blk_sm", "blk_sr")
     assert candidate.grid == (256,)
     assert candidate.block == (256,)
