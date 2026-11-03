@@ -44,6 +44,7 @@ def chunk_gated_delta_rule_fwd(
     plan=None,
     state_slots=None,
     output_gate=None,
+    checkpoint_slots=None,
 ):
     T = q.shape[1]
 
@@ -83,6 +84,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         plan=plan,
         state_slots=state_slots,
+        checkpoint_slots=checkpoint_slots,
     )
     o = chunk_fwd_o(
         q=q,
@@ -159,6 +161,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         plan=None,
         state_slots=None,
         output_gate=None,
+        checkpoint_slots=None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -182,6 +185,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             plan=plan,
             state_slots=state_slots,
             output_gate=output_gate,
+            checkpoint_slots=checkpoint_slots,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
@@ -217,6 +221,7 @@ def chunk_gated_delta_rule(
     plan=None,
     state_slots=None,
     output_gate=None,
+    checkpoint_slots=None,
 ):
     r"""
     Args:
@@ -256,6 +261,13 @@ def chunk_gated_delta_rule(
             output -- on gfx1250 in the output kernel's epilogue. ``z`` is
             ``[T, H, V]`` (or ``[B, T, H, V]``) with contiguous ``[H, V]`` rows.
             Default: `None`.
+        checkpoint_slots (Optional[tuple]):
+            ``(pool, slot_of_chunk)``: ``slot_of_chunk`` is int32 with one entry
+            a 64-token chunk of the batch (``chunk_offsets[seq] + chunk``), -1
+            for none. The state kernel stores the fp32 state entering each named
+            chunk into that slot of ``pool`` (``[slots, H, K, V]``): the exact
+            state for a state checkpoint at the chunk's first token, where the
+            per-chunk ``h`` holds it rounded to the input dtype. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -381,6 +393,7 @@ def chunk_gated_delta_rule(
         plan,
         state_slots,
         output_gate,
+        checkpoint_slots,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

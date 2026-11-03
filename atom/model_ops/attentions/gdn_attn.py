@@ -1160,6 +1160,14 @@ class GDNStateMixin(PoolRowsMixin):
         is. One slot is the whole checkpoint — a resumed prefix has no
         speculation to roll back, so it needs no scratch beside it.
         """
+        found = self._checkpoint_found(batch)
+        if not found:
+            return None
+        return self._checkpoint_tensors(batch, found)
+
+    def _checkpoint_found(self, batch: ScheduledBatch) -> list | None:
+        """The `(row, slot, off, is_end, runtime)` targets this step reaches
+        (see `_checkpoint_targets`), or None."""
         all_saves = getattr(batch, "state_save_all", None)
         if not all_saves or not any(all_saves):
             return None
@@ -1179,20 +1187,87 @@ class GDNStateMixin(PoolRowsMixin):
             grid=CHUNK_SIZE,
             min_offset=self._conv_state_len(),
         )
-        if not found:
-            return None
+        return list(found) if found else None
+
+    def _checkpoint_capacity(self) -> int:
+        """Targets a graphed prefill step carries in its fixed tables: a
+        sequence reaches at most three (interval rung, demand, prompt-end
+        anchor), and the graphed path holds `ATOM_GDN_GRAPH_MAX_SEQS`."""
+        return 3 * envs.ATOM_GDN_GRAPH_MAX_SEQS
+
+    def _checkpoint_columns(self, found, num_prefills: int):
+        """The target table as int32 columns, and the per-chunk slot table
+        the state kernel stores interior checkpoints through: for each 64-token
+        chunk of this step's prefills (`chunk_offsets[row] + chunk`), the slot
+        that receives the fp32 state entering it, -1 for none. A second target
+        on a chunk already named becomes a slot-to-slot copy of the first
+        (`is_end`'s source path), which the copy kernel runs after the state
+        kernel has written it."""
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+
+        cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
+        counts = -(-np.diff(cu).astype(np.int64) // CHUNK_SIZE)
+        offsets = np.zeros(num_prefills + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(counts)
+        chunk_slots = np.full(int(offsets[-1]), -1, dtype=np.int32)
+        cols = np.array(found, dtype=np.int32).reshape(-1, 5).copy()
+        for i, (row, slot, off, is_end, _) in enumerate(cols):
+            if is_end:
+                continue
+            c = int(offsets[row]) + int(off) // CHUNK_SIZE
+            if chunk_slots[c] < 0:
+                chunk_slots[c] = slot
+            else:
+                cols[i, 3], cols[i, 4] = 1, chunk_slots[c]
+        return cols, chunk_slots
+
+    def _checkpoint_tensors(self, batch: ScheduledBatch, found) -> dict:
+        """Exact-size device tensors of the targets, for a step whose GDN
+        layers run the eager (unplanned) path."""
+        cols, chunk_slots = self._checkpoint_columns(found, batch.total_seqs_num_prefill)
 
         def mk(col):
-            return torch.tensor(col, dtype=torch.int32, device=self.device)
+            return torch.as_tensor(np.ascontiguousarray(col), device=self.device)
 
-        rows, slots, offs, is_end, runtime = zip(*found)
-        return {
-            "rows": mk(rows),
-            "slots": mk(slots),
-            "offs": mk(offs),
-            "is_end": mk(is_end),
-            "runtime": mk(runtime),
-        }
+        names = ("rows", "slots", "offs", "is_end", "runtime")
+        out = {name: mk(cols[:, i]) for i, name in enumerate(names)}
+        out["chunk_slots"] = mk(chunk_slots)
+        return out
+
+    def _staged_checkpoint_targets(self, found, num_prefills: int, nt64_cap: int) -> dict | None:
+        """The targets in fixed-address tables of `_checkpoint_capacity` rows,
+        padded with slot -1, and the per-chunk slot table at its fixed address:
+        what a recorded prefill graph reads, so the same recording serves a step
+        with any number of targets, none included. None if a table does not
+        fit (the caller keeps the eager path)."""
+        cap = self._checkpoint_capacity()
+        # Most steps reach no checkpoint: once the tables hold only padding,
+        # they stay valid until a step writes targets into them.
+        clear = self.__dict__.get("_ckpt_tables_clear")
+        if not found and clear is not None:
+            return clear
+        if found:
+            cols, chunk_slots = self._checkpoint_columns(found, num_prefills)
+        else:
+            cols = np.zeros((0, 5), dtype=np.int32)
+            chunk_slots = np.full(0, -1, dtype=np.int32)
+        if len(cols) > cap or len(chunk_slots) > nt64_cap:
+            return None
+        padded = np.zeros((cap, 5), dtype=np.int32)
+        padded[:, 1] = -1
+        padded[: len(cols)] = cols
+        slots_all = np.full(nt64_cap, -1, dtype=np.int32)
+        slots_all[: len(chunk_slots)] = chunk_slots
+        out = {}
+        for i, name in enumerate(("rows", "slots", "offs", "is_end", "runtime")):
+            out[name] = self._stage_upload(
+                f"ckpt_{name}", np.ascontiguousarray(padded[:, i]), cap, torch.int32
+            )
+        out["chunk_slots"] = self._stage_upload("ckpt_chunk_slots", slots_all, nt64_cap, torch.int32)
+        if any(v is None for v in out.values()):
+            return None
+        self._ckpt_tables_clear = None if found else out
+        return out
 
     def prepare_state_indices(self, batch: ScheduledBatch, with_spec: bool = False):
         """Fill the index tensors the GDN kernels gather their state through.
@@ -2082,13 +2157,19 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             batch, attn_metadata, is_prefill=True, prepare_block_tables=False
         )
 
-        gdn_metadata.ssm_checkpoints = (
-            batch.__dict__.pop("_gdn_checkpoint_targets")
-            if "_gdn_checkpoint_targets" in batch.__dict__
-            else self._checkpoint_targets(batch)
+        found = (
+            batch.__dict__.pop("_gdn_checkpoint_found")
+            if "_gdn_checkpoint_found" in batch.__dict__
+            else self._checkpoint_found(batch)
         )
         gdn_metadata.ssm_conv_state_len = self._conv_state_len()
-        if gdn_metadata.ssm_checkpoints is not None:
+        # A graphed GDN prefill carries its targets in fixed tables (attached
+        # with the plan below); only a step past their capacity keeps the
+        # exact-size tensors and, with them, the unplanned eager path.
+        fits = not found or len(found) <= self._checkpoint_capacity()
+        gdn_metadata.ssm_checkpoints = None
+        if found and not (fits and self._gdn_graph_prefill()):
+            gdn_metadata.ssm_checkpoints = self._checkpoint_tensors(batch, found)
             # Same mapping the chunk kernel builds internally, computed once
             # per step rather than per layer.
             from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
@@ -2100,6 +2181,29 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
         attn_metadata.gdn_metadata = gdn_metadata
         self._attach_gdn_plan(batch, attn_metadata, gdn_metadata, running_tokens)
+        plan = gdn_metadata.varlen_plan
+        if plan is not None and fits:
+            staged = self._staged_checkpoint_targets(
+                found, batch.total_seqs_num_prefill, self._checkpoint_chunk_capacity()
+            )
+            if staged is None and found:
+                raise RuntimeError(
+                    "GDN state checkpoints reserved on a planned prefill whose "
+                    "fixed target tables could not hold them"
+                )
+            if staged is not None:
+                gdn_metadata.ssm_checkpoints = staged
+                gdn_metadata.ssm_chunk_offsets = plan.chunk_offsets
+        elif found and gdn_metadata.ssm_checkpoints is None:
+            # No plan for this step (its GDN layers run the unplanned path):
+            # the exact-size targets serve it.
+            gdn_metadata.ssm_checkpoints = self._checkpoint_tensors(batch, found)
+            from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+            from atom.model_ops.fla_ops.index import prepare_chunk_offsets
+
+            gdn_metadata.ssm_chunk_offsets = prepare_chunk_offsets(
+                gdn_metadata.non_spec_query_start_loc, CHUNK_SIZE
+            )
         self._prefill_running_tokens = None
         self._attach_prefix_split(batch, attn_metadata)
         return attn_metadata, positions
@@ -2231,6 +2335,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 return  # the kernels compute their own (with the sync)
             prepare_chunk_indices.prime(gpu.view(total, 2), query_start_loc, chunk_size)
 
+    def _checkpoint_chunk_capacity(self) -> int:
+        """Entries of the per-chunk checkpoint slot table: every 64-token chunk
+        a planned step can hold (the plan's 64-chunk capacity at the largest
+        batch)."""
+        runner = self.model_runner
+        return runner.max_num_batched_tokens // 64 + envs.ATOM_GDN_GRAPH_MAX_SEQS
+
     def _gdn_graph_prefill(self) -> bool:
         return (
             envs.ATOM_GDN_PREFILL_IN_GRAPH
@@ -2243,16 +2354,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     def step_needs_eager(self, batch: ScheduledBatch) -> bool:
         """A prefill step the graphed GDN path cannot serve runs eagerly: one
-        that writes state checkpoints (their copies read the kernel's chunk
-        states, which the planned launch does not keep) or holds more prefill
-        requests than the plan's sequence capacity."""
+        that holds more prefill requests than the plan's sequence capacity, or
+        reaches more state checkpoints than its fixed target tables hold. Any
+        other checkpoint step replays: the recorded state kernel stores the
+        interior states and the recorded copy the rest, both through tables
+        the builder refills every step."""
         if batch.total_tokens_num_prefill == 0 or not self._gdn_graph_prefill():
             return False
         if batch.total_seqs_num_prefill > envs.ATOM_GDN_GRAPH_MAX_SEQS:
             return True
-        targets = self._checkpoint_targets(batch)
-        batch._gdn_checkpoint_targets = targets
-        return targets is not None
+        found = self._checkpoint_found(batch)
+        batch._gdn_checkpoint_found = found
+        return bool(found) and len(found) > self._checkpoint_capacity()
 
     def _attach_gdn_plan(self, batch, attn_metadata, gdn_metadata, running_tokens) -> None:
         """The `VarlenPlan` for this prefill's GDN kernels when the step runs
@@ -2262,6 +2375,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         n_max = envs.ATOM_GDN_GRAPH_MAX_SEQS
         if (
             not self._gdn_graph_prefill()
+            # exact-size targets: a step past the fixed tables, run unplanned
             or gdn_metadata.ssm_checkpoints is not None
             or n == 0
             or n > n_max

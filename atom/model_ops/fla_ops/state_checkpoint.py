@@ -54,6 +54,7 @@ def _copy_checkpoints_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     STATE_VK: tl.constexpr = False,
+    SSM_FROM_H: tl.constexpr = True,
 ):
     i_t = tl.program_id(0)
     i_blk = tl.program_id(1)
@@ -61,6 +62,9 @@ def _copy_checkpoints_kernel(
     row = tl.load(rows + i_t).to(tl.int64)
     slot = tl.load(slots + i_t).to(tl.int64)
     off = tl.load(offs + i_t).to(tl.int64)
+    # A fixed-capacity target table (the token-graph path) pads with slot -1:
+    # those programs copy nothing.
+    valid = slot >= 0
 
     if i_blk < NBLK_SSM:
         # ── recurrent state -> slot ────────────────────────────────────────
@@ -70,7 +74,7 @@ def _copy_checkpoints_kernel(
         # sequence's first chunk. The final state exists only in the row's
         # runtime slot, which the chunk kernel just wrote.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
-        mask = idx < HKV
+        mask = (idx < HKV) & valid
         dst_idx = idx
         if STATE_VK:
             dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
@@ -83,19 +87,23 @@ def _copy_checkpoints_kernel(
             sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-        else:
+            tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
+        elif SSM_FROM_H:
             src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
             sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-        tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
+            tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
+        # Otherwise the chunk kernel already stored this interior state, in
+        # fp32, straight into `slot` (`chunk_gated_delta_rule`'s
+        # `checkpoint_slots`).
     else:
         # ── conv window: the STATE_LEN tokens ending at the target, ────────
         # oldest first into positions [0, STATE_LEN) of the pool's [D, W]
         # layout -- where the prefill conv kernel reads a resumed state from.
         end = tl.load(cu_seqlens + row).to(tl.int64) + off
         d = (i_blk - NBLK_SSM) * BLOCK + tl.arange(0, BLOCK)
-        dmask = d < D
+        dmask = (d < D) & valid
         for j in tl.static_range(STATE_LEN):
             cv = tl.load(
                 x + (end - STATE_LEN + j) * stride_x_t + d, mask=dmask, other=0.0
@@ -121,6 +129,7 @@ def write_state_checkpoints(
     cu_seqlens: torch.Tensor,
     chunk_size: int,
     conv_state_len: int,
+    ssm_from_h: bool = True,
 ) -> None:
     """Write both halves of every checkpoint this step reached, in one launch.
 
@@ -142,6 +151,12 @@ def write_state_checkpoints(
     newest token at the last position and left the prefill kernel reading
     tokens ``num_spec`` older than the checkpoint -- and read that many rows
     before the target, into the previous sequence's tokens.
+
+    ``ssm_from_h=False``: the chunk kernel already stored every interior
+    target's state, in fp32, into its slot (``chunk_gated_delta_rule``'s
+    ``checkpoint_slots``), so only ``is_end`` targets copy an SSM state here
+    and ``h`` is not read (any tensor will do). A target whose slot is negative
+    is padding and copies nothing.
 
     Neither conv tensor may be assumed contiguous, so the conv half indexes by
     real strides. ``conv_state`` reaches us as a ``transpose(-1, -2)`` view of a
@@ -185,4 +200,5 @@ def write_state_checkpoints(
         K=ssm_state.shape[-2],
         V=ssm_state.shape[-1],
         STATE_VK=ssm_state.stride(-2) == 1,
+        SSM_FROM_H=ssm_from_h,
     )

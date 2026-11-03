@@ -57,6 +57,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h0_idx,
     ht_idx,
     h0_flag,
+    ckpt_pool,
+    ckpt_slot,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -72,6 +74,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     IS_VARLEN: tl.constexpr,
     HAS_N: tl.constexpr,
     USE_STATE_IDX: tl.constexpr,
+    STORE_CKPT: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -195,6 +198,35 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 mask=(_p_h4_0[:, None] < (K)) & (_p_h4_1[None, :] < (V)),
             )
 
+        if STORE_CKPT:
+            # A state checkpoint at this chunk's first token: the fp32 state
+            # entering the chunk, straight into its slot of the pool. `h` holds
+            # the same state only rounded to its dtype.
+            cslot = tl.load(ckpt_slot + boh + i_t)
+            p_c = ckpt_pool + (tl.maximum(cslot, 0).to(tl.int64) * H + i_h) * K * V
+            tl.store(
+                p_c + _p_h1_0[:, None] * V + _p_h1_1[None, :],
+                b_h1.to(p_c.dtype.element_ty),
+                mask=(_p_h1_0[:, None] < K) & (_p_h1_1[None, :] < V) & (cslot >= 0),
+            )
+            if K > 64:
+                tl.store(
+                    p_c + _p_h2_0[:, None] * V + _p_h2_1[None, :],
+                    b_h2.to(p_c.dtype.element_ty),
+                    mask=(_p_h2_0[:, None] < K) & (_p_h2_1[None, :] < V) & (cslot >= 0),
+                )
+            if K > 128:
+                tl.store(
+                    p_c + _p_h3_0[:, None] * V + _p_h3_1[None, :],
+                    b_h3.to(p_c.dtype.element_ty),
+                    mask=(_p_h3_0[:, None] < K) & (_p_h3_1[None, :] < V) & (cslot >= 0),
+                )
+            if K > 192:
+                tl.store(
+                    p_c + _p_h4_0[:, None] * V + _p_h4_1[None, :],
+                    b_h4.to(p_c.dtype.element_ty),
+                    mask=(_p_h4_0[:, None] < K) & (_p_h4_1[None, :] < V) & (cslot >= 0),
+                )
         _p_w_0 = (i_t * BT) + tl.arange(0, BT)
         _p_w_1 = (0) + tl.arange(0, 64)
         b_w = tl.load(
@@ -385,12 +417,20 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.LongTensor | None = None,
     plan=None,
     state_slots=None,
+    checkpoint_slots=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """With ``plan`` (`varlen_plan.VarlenPlan`) ``initial_state`` is the
     state pool: the kernel reads each sequence's initial state from its slot
     and writes the final state back to its slot in place, so the returned
     final state is None. ``state_slots`` = (read slots, write slots, has
-    initial state), one entry a sequence, does the same for an exact grid."""
+    initial state), one entry a sequence, does the same for an exact grid.
+    ``checkpoint_slots`` = (state pool, int32 slot per chunk of the batch, -1
+    for none): the kernel also stores the fp32 state entering each named chunk
+    into that slot of the pool, the exact state for a checkpoint at the chunk's
+    first token (``h`` holds it only rounded to its dtype)."""
+    ckpt_pool, ckpt_slot = (
+        checkpoint_slots if checkpoint_slots is not None else (None, None)
+    )
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size
@@ -473,6 +513,8 @@ def chunk_gated_delta_rule_fwd_h(
             K,
             V,
             BT,
+            ckpt_pool=ckpt_pool,
+            ckpt_slot=ckpt_slot,
         )
         return h, v_new, (None if in_place else final_state)
 
@@ -492,6 +534,8 @@ def chunk_gated_delta_rule_fwd_h(
         h0_idx=h0_idx,
         ht_idx=ht_idx,
         h0_flag=h0_flag,
+        ckpt_pool=ckpt_pool if ckpt_slot is not None else h,
+        ckpt_slot=ckpt_slot if ckpt_slot is not None else h,
         T=T,
         H=H,
         Hg=Hg,
@@ -499,6 +543,7 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         BV=_TRITON_BV,
+        STORE_CKPT=ckpt_slot is not None,
         num_warps=_TRITON_NUM_WARPS,
         num_stages=_TRITON_NUM_STAGES,
     )

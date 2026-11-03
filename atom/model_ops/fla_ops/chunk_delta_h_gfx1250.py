@@ -52,6 +52,8 @@ def _chunk_h_gfx1250_kernel(
     h0_idx,
     ht_idx,
     h0_flag,
+    ckpt_pool,
+    ckpt_slot,
     T,
     NT_ALL,
     H: gl.constexpr,
@@ -69,6 +71,7 @@ def _chunk_h_gfx1250_kernel(
     IS_VARLEN: gl.constexpr,
     HAS_N: gl.constexpr,
     USE_STATE_IDX: gl.constexpr,
+    STORE_CKPT: gl.constexpr,
     WMMA: gl.constexpr,
     OP_A: gl.constexpr,
     OP_B: gl.constexpr,
@@ -213,6 +216,18 @@ def _chunk_h_gfx1250_kernel(
         # every wave's share of the copies has landed and its state rows are in
         # h_smem, and every wave is done with the buffers the next copies overwrite
         gl.barrier()
+        if STORE_CKPT:
+            # A state checkpoint at this chunk's first token: the fp32 state
+            # entering the chunk, straight into its slot of the pool. `h` holds
+            # the same state only rounded to bf16 for the w @ h operand.
+            cslot = gl.load(ckpt_slot + boh + i_t)
+            gl.store(
+                ckpt_pool
+                + (gl.maximum(cslot, 0).to(gl.int64) * H + i_h) * K * V
+                + state_off,
+                state.to(ckpt_pool.dtype.element_ty),
+                mask=(state_off >= 0) & (cslot >= 0),
+            )
         h_cur = h_smem.index(buf)
         if STORE_H:
             gl.amd.gfx1250.tdm.async_store(
@@ -352,7 +367,12 @@ def chunk_h_gfx1250(
     num_warps=None,
     num_buffers=None,
     split="M",
+    ckpt_pool=None,
+    ckpt_slot=None,
 ):
+    """``ckpt_slot`` (int32, one entry a chunk of the batch, -1 for none) names
+    the slot of ``ckpt_pool`` that receives the fp32 state entering that chunk:
+    the exact state for a checkpoint at the chunk's first token."""
     bv, nb, nw = launch_config(H, V, NT_ALL, longest_chunks, _num_cus(k.device.index))
     BV = BV or bv
     num_buffers = num_buffers or nb
@@ -373,6 +393,8 @@ def chunk_h_gfx1250(
         h0_idx,
         ht_idx,
         h0_flag,
+        ckpt_pool if ckpt_slot is not None else h,
+        ckpt_slot if ckpt_slot is not None else h,
         T,
         NT_ALL,
         H=H,
@@ -390,6 +412,7 @@ def chunk_h_gfx1250(
         IS_VARLEN=cu_seqlens is not None,
         HAS_N=n_ptr is not None,
         USE_STATE_IDX=h0_idx is not None,
+        STORE_CKPT=ckpt_slot is not None,
         WMMA=layouts[0],
         OP_A=layouts[1],
         OP_B=layouts[2],
