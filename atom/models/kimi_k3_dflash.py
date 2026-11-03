@@ -2,127 +2,35 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Kimi-K3 DFlash draft: the SpecForge/SGLang DSpark speculator.
 
-`RadixArk/Kimi-K3-DSpark`, trained by SpecForge on hidden states from a live
-SGLang Kimi-K3 target. Same algorithm as the TorchSpec draft in
-`kimi_k3_dspark.py` -- block-parallel draft, low-rank Markov head, confidence
-head -- on a different backbone: 5 Qwen3-style GQA layers instead of MLA.
+`RadixArk/Kimi-K3-DSpark`: the same block-parallel draft, Markov head and
+confidence head as `kimi_k3_dspark.py`, on 5 Qwen3-style GQA layers instead of
+MLA. `embed_tokens` and `lm_head` are shared from the target. The fusion width
+is ``len(target_layer_ids)`` (5), not the config's ``num_target_layers`` (the
+target's depth).
 
-Checkpoint layout (62 tensors, BF16, no biases)::
+Each layer attends non-causally over the cached context K/V followed by the
+block's own K/V, with q/k RMS-normed per head BEFORE rope. The norms run here,
+not in `Attention`, whose non-fused path ropes first. `k_norm` is row-wise, so
+the context half can be normed when it is cached and the block half in the
+block pass.
 
-    fc.weight                                   [7168, 35840]  (= 5 x 7168)
-    hidden_norm.weight                          [7168]
-    norm.weight                                 [7168]
-    layers.{0..4}.self_attn.q_proj.weight       [4096, 7168]
-    layers.{0..4}.self_attn.k_proj.weight       [1024, 7168]
-    layers.{0..4}.self_attn.v_proj.weight       [1024, 7168]
-    layers.{0..4}.self_attn.{q,k}_norm.weight   [64]           per-head QK-norm
-    layers.{0..4}.self_attn.o_proj.weight       [7168, 4096]
-    layers.{0..4}.mlp.{gate,up}_proj.weight     [14336, 7168]
-    layers.{0..4}.mlp.down_proj.weight          [7168, 14336]
-    layers.{0..4}.{input,post_attention}_layernorm.weight  [7168]
-    markov_head.markov_w{1,2}.weight            [163840, 256]
-    confidence_head.proj.{weight,bias}          [1, 7424] / [1]  TRAINING ONLY
+`PagedAttentionImpl` is causal on every arm, so the block pass writes with
+`aiter.reshape_and_cache_flash` and reads with `unified_attention` on the
+folded block: one `qlen == 1` row per request carrying its `T * G` query rows,
+which the causal mask admits over every key (see `_attend_non_causal`). The
+read widens block ids to int64 before the page stride, which an entry this
+wide needs.
 
-No `embed_tokens`, no `lm_head` -- both shared from the target, as the MLA draft
-does. The fusion width is ``len(target_layer_ids)`` (5), NOT the config's
-``num_target_layers`` (93, which is the TARGET's depth); `fc.weight`'s 35840
-confirms it.
+The draft stays out of the DCP group: it is plain TP and needs no LSE merge.
+It still rides the target's block ids, and under DCP one id addresses
+`block_size * dcp` global positions, so its pool is entry-granular
+(`blocks_per_entry = dcp`, read through `MhaKvPool.fa_views`) and every slot
+and block table addressing it is in that unit.
 
-DUAL-SOURCE ATTENTION
----------------------
-Per layer, the reference (`dflash.py` in the checkpoint) computes::
-
-    q = q_norm(q_proj(noise))                   # q-norm BEFORE rope
-    k = k_norm(cat([k_proj(ctx), k_proj(noise)]))   # SAME weights both sources
-    v =        cat([v_proj(ctx), v_proj(noise)])    # v is NOT normed
-    q, k = rope(q, k)                           # rope AFTER norm
-    cache.update(k, v)                          # cache holds post-rope K
-    attention is NON-CAUSAL over the whole concatenation
-
-`k_norm` is an RMSNorm over `head_dim`, i.e. row-wise, so
-``norm(cat(a, b)) == cat(norm(a), norm(b))`` exactly. That identity is what lets
-the context half be normed and cached at `write_context_kv` time and the noise
-half be normed in the block pass, and still equal the reference's single concat.
-
-The norms run HERE, in the model, not inside `Attention`: the op's non-fused
-path applies rope first and the norms second (`attention_mha.py`), which is the
-wrong order for this draft.
-
-NON-CAUSALITY, AND WHY THIS BYPASSES `PagedAttentionImpl`
---------------------------------------------------------
-`PagedAttentionImpl.dispatch_backend` is causal at EVERY arm: `causal=True` is a
-literal in all four runners and `attn_metadata.causal` is read only by the MLA
-impl, so the proposer setting it False is inert here. Routing this block through
-the op would silently apply a causal mask to an attention the reference defines
-as bidirectional -- no error, no fault, just lost acceptance length.
-
-So the block pass does its own write and its own read:
-
-  write  `aiter.reshape_and_cache_flash` -- the block WRITES the KV it attends,
-         before the read: the next step's prefix is this step's block, and the
-         read below takes the block's own rows out of the pool with the prefix.
-  read   aiter's `unified_attention` on the FOLDED block -- see
-         `_attend_non_causal` and `model_ops/attentions/dspark_draft_attn.py`.
-
-THE READ
---------
-`unified_attention` is the kernel `PagedAttentionImpl.paged_attention_unified`
-already decodes through, with the same per-tensor fp8 descale. It asserts
-`causal`, and `pa_decode_gluon` derives `is_causal = query_length > 1`, so no
-aiter paged-GQA entry point is non-causal at `qlen > 1`. A `qlen == 1` query is,
-by construction: the causal mask admits every key below `seqused_k`. So the
-block is FOLDED -- each request becomes ONE query row whose heads are its T
-block rows times its G query heads per KV head, `[bs, h_kv * T * G, d]` --
-and read as an all-decode batch over `[0, anchor + 1 + T)`. All `T * G` rows of
-a KV head share one KV tile, and the all-decode launch is the split-KV grid, so
-a long context is spread over segments rather than walked by one program.
-
-The kernel reads the 4-D FLASH layout `[entries, entry_tokens, h_kv, head_dim]`
-(`MhaKvPool.fa_views`) through `block_table` at any page size; SHUFFLE's x-pack
-would need `shuffled_kv_cache` and a power-of-two page. It widens block ids to
-int64 before scaling by the page stride, which this pool needs: an entry is
-`block_size * dcp` tokens, so `entry * stride` passes 2**31 well inside the
-pool sizes ATOM builds.
-
-NO DCP, AND WHY THE ENTRY IS WIDER THAN A BLOCK
-----------------------------------------------
-SGLang's draft never joins the dcp group: `models/qwen3_5.py:1112` reads
-`dcp_size = 1 if is_nextn else attn_dcp_size` under the comment "Drafts are
-TP-sharded and do not replicate KV under DCP", and `models/dflash.py:146-171`
-shards q, k and v by `tp_size` flat without ever consulting `attn_dcp_size`.
-This module mirrors that exactly: the TARGET stays at DCP8, this draft is
-plain TP, `num_heads == 64 // tp` and `num_kv_heads == 16 // tp`, and there is
-no LSE merge anywhere because the local read already IS the global softmax.
-
-What that costs is a pool geometry, not an attention: the draft rides the
-TARGET's block ids, and under DCP8 one of those ids addresses `block_size`
-LOCAL tokens, i.e. `block_size * dcp_size` GLOBAL positions. So the draft's
-pool is built with `blocks_per_entry = dcp_size` and everything addressing it
--- the block pass's `slot_mapping`, the context write's, and the read's
-`block_table` -- is in that virtual block. That costs the same per-rank bytes
-as sharding the tokens over DCP would (8x the tokens, 8x fewer KV heads), but
-it is not small: at TP8/DCP8 with fp8 KV the draft entry is 1,310,720 B, 42.6%
-of the 3,080,192 B paged block (the MLA draft's is 368,640 B), so the same
-memory holds about a third fewer blocks.
-
-fp8, AND THE ONE SCALE
-----------------------
-The pool is fp8_e4m3fn when the target's is fp8 (SGLang serves this checkpoint
-with `--speculative-draft-kv-cache-dtype fp8_e4m3`; ATOM's draft pool follows
-the target's `--kv_cache_dtype`). Both ends take ONE PER-TENSOR scale and
-neither can take anything else: `aiter.reshape_and_cache_flash` dereferences
-`*k_scale` once per launch, and `unified_attention` loads its `k_descale` /
-`v_descale` once per program. SGLang stores nothing else either -- it refuses,
-"Only support per-tensor scaling factor for fp8 KV cache"
-(`srt/layers/quantization/kv_cache.py:76`) -- and defaults the value to 1.0
-when the checkpoint carries no scale, which this one does not (all 62 tensors
-BF16, no `quantization_config`). So the pool declares NO per-token scale planes
-(`mha_kv_scale_fields(per_tensor_scales=True)`), and the binder hands every
-layer one shared one-element 1.0 tensor (`DraftKvBuilder`). A draft that did
-ship a calibrated scalar scale would need a loader.
-
-The pool's fp8 is the platform's, `aiter.utility.dtypes.d_dtypes["fp8"]`, as
-the target's is: `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
+An fp8 pool takes one per-tensor scale: `reshape_and_cache_flash` and
+`unified_attention` both load a single scalar per launch. The checkpoint ships
+no KV scales, so every layer binds one shared 1.0, and the pool declares no
+per-token scale planes.
 """
 
 import logging
@@ -177,15 +85,10 @@ class KimiK3DFlashAttention(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
-        # The block's read, one instance shared by every layer
-        # (`KimiK3DFlash.__init__`).
         self.block_attn = block_attn
 
-        # PLAIN TP, no DCP anywhere in this module (see the module docstring):
-        # ONE head count, `o_proj` consumes the same slice the read produces,
-        # and no LSE merge exists to get wrong. The target's DCP survives only
-        # as the draft POOL's `blocks_per_entry` (`draft_kv_builder`), whose
-        # `entry_tokens` everything addressing the pool reads.
+        # Plain TP: the draft is outside the target's DCP group, so `o_proj`'s
+        # input shard is exactly the head slice the read produces.
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
@@ -195,17 +98,11 @@ class KimiK3DFlashAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        # Per-rank heads as the projection split them: kv heads shard at or
-        # above TP and replicate below it.
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        # No `override_tp_size` on EITHER projection. Both are sharded by the
-        # one TP group, and `o_proj`'s RowParallel input column shard is
-        # exactly the head slice the read above produces -- which is the whole
-        # point of taking the draft out of DCP.
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -214,9 +111,7 @@ class KimiK3DFlashAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # Per-head QK-norm, Qwen3 style. The block pass norms q and k in one
-        # launch straight off the fused qkv's split views; the context write
-        # norms k alone.
+        # Per-head QK-norm; the context write norms k alone.
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.qk_norm = DualRMSNorm(
@@ -232,8 +127,6 @@ class KimiK3DFlashAttention(nn.Module):
             self.head_dim, rotary_dim=self.head_dim, **_draft_rope_kwargs(config)
         )
 
-        # What the draft pool binds this layer's cache and scales onto
-        # (`DraftKvBuilder.build_kv_cache_tensor`).
         self.kv = KVCacheBinding(layer_num)
 
     def _qkv(self, hidden_states: torch.Tensor):
@@ -243,12 +136,8 @@ class KimiK3DFlashAttention(nn.Module):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
         """One block pass: write this block's own K/V, then attend non-causally.
 
-        Deliberately NOT the paged `Attention` op. `PagedAttentionImpl.dispatch_backend`
-        is causal at every arm -- `causal=True` is a literal in all four runners
-        and `attn_metadata.causal` is read only by the MLA impl -- so routing
-        the block through it would silently apply a causal mask to an attention
-        the reference defines as bidirectional. That is a numerical bug with no
-        error and no fault, visible only as lost acceptance length.
+        Not the paged `Attention` op, which is causal on every arm and would
+        mask silently.
         """
         from atom.utils.forward_context import get_forward_context
 
@@ -257,20 +146,14 @@ class KimiK3DFlashAttention(nn.Module):
 
         q, k, v = self._qkv(hidden_states)
         q, k = self.qk_norm(q, k)
-        # Norm, THEN rope -- the reference's order, and the reason the norms are
-        # not handed to the op (its non-fused path ropes first).
+        # Norm, then rope: the reference's order.
         q, k = self.rotary_emb(positions, q, k)
 
         n = q.shape[0]
         k_cache, v_cache = self._caches()
         if k_cache is None:
-            # warmup_model() runs BEFORE allocate_kv_cache(), so there is no
-            # paged state to write or read. The block forward still runs -- that
-            # pass doubles as memory profiling, and skipping it would leave the
-            # draft's activations out of the KV budget -- but its attention has
-            # nothing to attend, so the output is shaped and left at zero.
-            # One head count, because the read produces exactly what `o_proj`
-            # consumes -- there is no merge between them any more.
+            # Warmup runs before the pool is allocated, and still has to run
+            # the rest of the block so profiling counts its activations.
             o = q.new_zeros((n, self.num_heads * self.head_dim))
             return linear_out(self.o_proj(o))
 
@@ -283,11 +166,6 @@ class KimiK3DFlashAttention(nn.Module):
     def _write_block_kv(self, k, v, slot_mapping, k_cache, v_cache) -> None:
         """Scatter K/V into this layer's rows of the pool: the block's own rows
         on the block pass, the context rows on `write_context_kv`.
-
-        Unlike V4's rolling window, this block WRITES the KV it attends: the T
-        draft rows join the context rows already there, and the single read
-        below then sees `[0, anchor] ++ T` -- the reference's one attention over
-        `cat([k_ctx, k_noise])`.
         """
         import aiter
 
@@ -305,8 +183,6 @@ class KimiK3DFlashAttention(nn.Module):
             k_cache,
             v_cache,
             slot_mapping,
-            # `reshape_and_cache_flash`'s vocabulary: "fp8" divides by the
-            # scale and casts, "auto" stores the source dtype unchanged.
             "fp8" if k_cache.dtype.itemsize == 1 else "auto",
             self.kv.k_scale,
             self.kv.v_scale,
@@ -315,14 +191,9 @@ class KimiK3DFlashAttention(nn.Module):
     def _attend_non_causal(self, q, k, v, attn_metadata, k_cache, v_cache):
         """The block's one non-causal read: aiter `unified_attention`, folded.
 
-        Keys are `[0, context_lens[b])` of the pool, the T block rows included
-        since `_write_block_kv` already landed them; `block_tables` is
-        entry-granular, which is exactly the page `k_cache` (`fa_views`) is.
-        See `model_ops/attentions/dspark_draft_attn.py` for the fold.
-
-        NO LSE AND NO MERGE, by construction -- this draft is not in the dcp
-        group, so there is one head count and the local read already is the
-        global softmax over this rank's TP head slice.
+        Keys are `[0, context_lens[b])` of the pool, the T block rows included;
+        `block_tables` is entry-granular, as the `fa_views` page is. No LSE
+        merge: outside the DCP group the local read is the whole softmax.
         """
         bs = attn_metadata.block_tables.shape[0]
         o = self.block_attn(
@@ -364,12 +235,9 @@ class KimiK3DFlashAttention(nn.Module):
 
         kv = tgemm.mm(ctx_hidden, self.qkv_proj.weight[self.q_size :], None)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-        # Only k is normed -- v is not, matching the reference. Row-wise RMSNorm
-        # makes norming this half separately identical to norming the concat,
-        # which is what lets the context live in the pool at all.
+        # v is not normed, matching the reference.
         k = self.k_norm(k)
-        # Rope at the token's ABSOLUTE position, before the write: that is what
-        # makes a cached row valid on every later step without being rewritten.
+        # Absolute positions, so a cached row stays valid on every later step.
         k = self.rotary_emb(positions, k)
         k_cache, v_cache = self._caches()
         if k_cache is None:
@@ -433,12 +301,8 @@ class KimiK3DFlashDecoderLayer(nn.Module):
 
         fwd_ctx = get_forward_context()
         attn_metadata = fwd_ctx.attn_metadata
-        # The DRAFT's OWN slot mapping, published by
-        # `DSparkProposer._publish_draft_ctx_slots` for exactly this call. NOT
-        # `attn_metadata.slot_mapping`, which is the TARGET's: under DCP that
-        # one is `-1` for the tokens this rank does not own and addresses
-        # `block_size`-token pages. This draft is outside the dcp group, so it
-        # stores EVERY token into `block_size * dcp`-token entries.
+        # Not `attn_metadata.slot_mapping`: under DCP the target's is -1 for
+        # tokens this rank does not own, while this draft stores every token.
         slot_mapping = attn_metadata.draft_ctx_slot_mapping
         if slot_mapping is None:
             raise RuntimeError(
@@ -510,10 +374,7 @@ class KimiK3DFlash(DSparkDraftModel):
     `SpeculativeConfig.hf_config_override` renames it.
     """
 
-    # GQA, read through `unified_attention` straight off `block_tables` /
-    # `context_lens`: no MLA decode plan and no CSR to build.
     block_attention_is_mla = False
-    # Plain TP, outside the target's DCP group, on its own FLASH pool.
     in_dcp_group = False
     owns_flash_pool = True
 
@@ -546,9 +407,8 @@ class KimiK3DFlash(DSparkDraftModel):
         self.target_layer_ids = list(config.dspark_target_layer_ids)
 
         # Aux fusion: [N, hidden * len(target_layer_ids)] -> [N, hidden].
-        # Replicated on purpose: the aux hidden states arrive replicated (they
-        # are the target's residual stream), so a row-parallel split would buy
-        # memory at the cost of an all-reduce every drafting step.
+        # Replicated: the aux hidden states arrive replicated, and a
+        # row-parallel split would cost an all-reduce every drafting step.
         self.fc = ReplicatedLinear(
             self.hidden_size * len(self.target_layer_ids),
             self.hidden_size,
@@ -557,9 +417,7 @@ class KimiK3DFlash(DSparkDraftModel):
         )
         self.hidden_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
-        # One block read for every layer, built here -- on the engine's
-        # device, ahead of any capture -- and sized for the engine's widest
-        # batch and longest context.
+        # One block read for every layer, built before any capture.
         from atom.model_ops.attentions.dspark_draft_attn import (
             DSparkDraftUnifiedAttention,
         )
@@ -639,40 +497,22 @@ class KimiK3DFlash(DSparkDraftModel):
         recombined at each attn-residual site by a softmax mixture over the
         bank plus the prefix (`AttnRes`). ATOM's generic aux tap reconstructs
         the prefix alone (`KimiDecoderLayer.aux_hidden_state` sums the layer's
-        deferred addends into it) and discards the bank; SGLang's dspark aux tap
-        returns the MIXTURE (`aggregate_stream`).
+        deferred addends into it) and discards the bank.
 
-        This checkpoint (`RadixArk/Kimi-K3-DSpark`) was trained by SpecForge on
-        hidden states captured from a live SGLang Kimi-K3 target, so the
-        mixture is the feature it saw. Measured on GSM8K n=1319 at k=5: feeding
-        the prefix scores 55.61% acceptance, feeding the aggregate 62.04%
-        (+6.43 pp), accuracy unchanged within noise.
+        This checkpoint was trained on the mixture, so that is the feature it
+        has to see. It is a per-draft contract: the MLA draft (`KimiK3DSpark`)
+        wants the raw prefix, and gets it by not implementing this method.
 
-        This is a PER-DRAFT contract, not a target-side or global one. The same
-        aggregate makes the vLLM/HF-trained MLA draft (`KimiK3DSpark`,
-        `Inferact/Kimi-K3-DSpark`) about 2.6 pp WORSE -- that one wants the raw
-        prefix, and gets it by not implementing this method at all and falling
-        through to `DSparkProposer._extract_layer_hidden`. Which feature a draft
-        is fed therefore follows from which draft class is loaded, with nothing
-        to configure and no way for the two to disagree.
-
-        The mixture is ATOM's own (`apply_attn_res`), not a transcription of
-        SGLang's: the scoring weight is the NEXT target layer's
-        `self_attention_attn_res.score_weight` (= `self_attention_res_norm.weight *
-        self_attention_res_proj.weight`, folded at load) and the kernel is the
-        one the target itself runs, called with ``out_norm_weight=None`` so the
-        result comes back un-normed -- exactly SGLang's "softmax mixture, no
-        output norm". `kimi_k3/model.py` is `@support_torch_compile` and is not
-        touched; the whole reconstruction lives here, in the draft that wants it.
+        The mixture is ATOM's own `apply_attn_res`, scored by the NEXT target
+        layer's `self_attention_attn_res.score_weight` and called with
+        ``out_norm_weight=None`` so it comes back un-normed. The target model
+        is not touched; the reconstruction lives in this draft.
         """
         # Local: `drafter` imports the model loader, so a module-level import
         # here would close a cycle. Both are resolved once, at arm time.
         from atom.spec_decode.drafter import AuxCaptureSpec, _resolve_decoder_layers
         from atom.spec_decode.dspark_proposer import DSparkProposer
 
-        # The prefix half is still the generic reconstruction -- it is a
-        # property of the TARGET's layer protocol, and the aggregate is a
-        # mixture OF it, not a replacement for it.
         base_extract = DSparkProposer._extract_layer_hidden
         layers = _resolve_decoder_layers(target_model)
 
@@ -693,8 +533,8 @@ class KimiK3DFlash(DSparkDraftModel):
             block_size = getattr(res, "block_size", None)
             if not block_size:
                 continue
-            # CEILING division, matching SGLang's `prev_valid_blocks`: the bank
-            # holds one snapshot per closed block below this layer.
+            # Ceiling division: the bank holds one snapshot per closed block
+            # below this layer.
             nvb = -(-(lid + 1) // block_size)
             if nvb > 0:
                 # Folded here, once after load, never inside the traced and

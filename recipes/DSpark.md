@@ -101,15 +101,17 @@ python -m atom.entrypoints.openai_server \
 ```
 
 Notes:
-- The draft has 2 KV heads at TP8, so it is not split across the DCP group: each
-  rank caches the draft KV for every context token. With DCP8 the draft's
-  entry is `block_size * 8` tokens: 1,310,720 B of a 3,080,192 B paged block
-  at fp8, i.e. 43% of the block including the draft, or 74% on top of the
-  target's own 1,769,472 B of MLA rows. The MLA draft above adds 368,640 B (17%
-  of its 2,138,112 B block), so with the same memory this draft leaves about
-  28% fewer KV blocks.
+- The draft has 2 KV heads at TP8 and, as in SGLang, is not split across the
+  DCP group: each rank caches the draft KV for every context token. With DCP8
+  the draft's entry is `block_size * 8` tokens: 1,310,720 B of a 3,080,192 B
+  paged block at fp8, i.e. 43% of the block including the draft, or 74% on top
+  of the target's own 1,769,472 B of MLA rows. The MLA draft above adds
+  368,640 B (17% of its 2,138,112 B block), so with the same memory this draft
+  leaves about 31% fewer KV blocks (1 - 2,138,112 / 3,080,192 = 30.6%).
 - The draft KV is fp8 when `--kv_cache_dtype fp8`, at a per-tensor scale of 1.0
-  (the checkpoint ships no KV scales).
+  (the checkpoint ships no KV scales). SGLang serves this checkpoint with
+  `--speculative-draft-kv-cache-dtype fp8_e4m3` and supports only per-tensor
+  fp8 KV scales as well.
 
 ### `--dspark-config` knobs
 

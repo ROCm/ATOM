@@ -403,8 +403,7 @@ def test_dflash_resolves_to_mha_not_mla():
     a latent rank), not by a model-type list -- so it must hold for a draft
     whose model_type is the same `qwen3` a target could carry.
 
-    Kept off `get_attn_backend`, which reads the GPU arch through rocminfo; the
-    DRAFT_OWNS_KV_POOL flag it would return is asserted separately below.
+    Kept off `get_attn_backend`, which reads the GPU arch through rocminfo.
     """
     selector = _gpu_stack_import("atom.utils.selector")
 
@@ -416,17 +415,6 @@ def test_dflash_resolves_to_mha_not_mla():
         )
         is not selector.Family.MHA
     )
-
-
-def test_dflash_backend_owns_a_kv_pool():
-    """The MHA backend answers "yes" to owning a draft pool.
-
-    A GQA draft caches rows the target's MLA pool cannot express, so it has to
-    own a sibling pool; `draft_kv_builder` returns None for any backend that
-    says otherwise, and the draft would then silently have no KV at all.
-    """
-    mod = _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
-    assert mod.AiterBackend.DRAFT_OWNS_KV_POOL is True
 
 
 # --------------------------------------------------------------------------
@@ -450,20 +438,6 @@ def _pool(block_size, world_size, kv_dtype=None, blocks_per_entry=1):
     )
 
 
-def test_dflash_pool_needs_the_scheduler_block_size():
-    """The pool must be built at the scheduler's block, not an MLA kernel page.
-
-    An MLA target's builder pages at ATOM_MLA_PAGE_SIZE (1 by default). Sizing
-    the draft pool from it cannot even construct -- SHUFFLE packs 16 elements
-    per tile and 16 does not divide 1 -- which is why DraftKvBuilder reads
-    model_runner.block_size.
-    """
-    _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
-    assert _pool(block_size=128, world_size=8).block_size == 128
-    with pytest.raises(ValueError, match="SHUFFLE"):
-        _pool(block_size=1, world_size=8)
-
-
 @pytest.mark.parametrize("tp,dcp", [(8, 1), (8, 2), (8, 8)])
 def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
     """A wider entry over fewer blocks is the same per-rank footprint.
@@ -475,7 +449,7 @@ def test_dflash_pool_footprint_is_dcp_invariant(tp, dcp):
     `blocks_per_entry = dcp` -- `entry_bytes` grows by dcp while the number of
     entries a request needs falls by dcp.
 
-    This pins the arithmetic; `test_dflash_pool_is_built_at_full_tp` pins that
+    This pins the arithmetic; `test_dflash_pool_entry_is_dcp_blocks` pins that
     `draft_kv_builder` builds this geometry.
     """
     _gpu_stack_import("atom.model_ops.attentions.mha_kv_pool")
@@ -540,23 +514,31 @@ def test_dflash_uses_dflash_pool():
 _FLASH_DRAFT = types.SimpleNamespace(owns_flash_pool=True)
 
 
-def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
-    """The draft caches fp8 beside an fp8 target, at ONE per-tensor scale.
+def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
+    """A ModelRunner stand-in carrying only what `draft_kv_builder` reads."""
+    return types.SimpleNamespace(
+        world_size=tp,
+        block_size=128,
+        config=types.SimpleNamespace(
+            kv_cache_dtype=kv_cache_dtype,
+            tensor_parallel_size=tp,
+            decode_context_parallel_size=dcp,
+        ),
+    )
 
-    SGLang serves this checkpoint with `--speculative-draft-kv-cache-dtype
-    fp8_e4m3`, and both ends of ATOM's pool take exactly the scale it stores:
-    `aiter.reshape_and_cache_flash` dereferences `*k_scale` once per launch and
-    `unified_attention` loads one `k_descale` per program. Neither can read a
-    per-(kv head, token) plane, so the pool must declare none -- `per_tensor_
-    scales=True`. Getting that wrong is not a crash: both read the plane's
-    first element and apply it to every token.
 
-    The platform's fp8 -- `d_dtypes["fp8"]`, as the target's pool is:
-    `float8_e4m3fn` on gfx950, `float8_e4m3fnuz` on gfx942.
+def _make_kv_pool_kwargs(runner):
+    """Build the DFlash draft's pool through a stub backend.
+
+    Returns what `make_kv_pool` was called with. The selector module is
+    patched, not draft_kv: `draft_kv_builder` imports `attn_family` and
+    `get_attn_backend` function-locally.
     """
+    from unittest import mock
 
     dk = _gpu_stack_import("atom.spec_decode.draft_kv")
     _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
+    from atom.utils import selector
 
     seen = {}
 
@@ -565,28 +547,34 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
 
         @staticmethod
         def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
-            seen["kv_dtype"] = kv_dtype
-            seen.update(kw)
+            seen.update(kw, world_size=world_size, kv_dtype=kv_dtype)
             return object()
-
-    runner = _stub_runner()
-    hf = _normalized_radixark()
-
-    # Patch the SELECTOR module, not draft_kv: `draft_kv_builder` imports
-    # attn_family/get_attn_backend function-locally, so a module-attribute
-    # patch on draft_kv would never be consulted.
-    from unittest import mock
-
-    from atom.utils import selector
 
     with (
         mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
         mock.patch.object(selector, "attn_family", lambda _c: None),
     ):
-        builder = dk.draft_kv_builder(runner, hf, model=_FLASH_DRAFT)
+        builder = dk.draft_kv_builder(
+            runner, _normalized_radixark(), model=_FLASH_DRAFT
+        )
 
     assert builder is not None
     builder._make_pool(layers=5, target_block_size=128)
+    return seen
+
+
+def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
+    """The draft caches fp8 beside an fp8 target, at ONE per-tensor scale.
+
+    Both ends of the pool take one scale: `aiter.reshape_and_cache_flash`
+    dereferences `*k_scale` once per launch and `unified_attention` loads one
+    `k_descale` per program. Neither can read a per-(kv head, token) plane, so
+    the pool must declare none. Getting that wrong is not a crash: both read
+    the plane's first element and apply it to every token.
+
+    The platform's fp8 -- `d_dtypes["fp8"]`, as the target's pool is.
+    """
+    seen = _make_kv_pool_kwargs(_stub_runner())
     from aiter import dtypes
 
     assert seen["kv_dtype"] is dtypes.d_dtypes["fp8"], (
@@ -600,7 +588,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 
     pool = MhaKvPool.from_hf_config(
-        hf,
+        _normalized_radixark(),
         world_size=8,
         block_size=128,
         layers=5,
@@ -613,69 +601,12 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         pool.scale_views(0)
 
 
-# --------------------------------------------------------------------------
-# D1: the draft's effective TP, and the plumbing that carries it
-# --------------------------------------------------------------------------
-
-
-def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
-    """A ModelRunner stand-in carrying only what `draft_kv_builder` reads.
-
-    `world_size` IS `config.tensor_parallel_size` on the real runner
-    (model_runner.py); both are present so a regression that goes back to
-    reading `world_size` is visible as a wrong number rather than an
-    AttributeError.
+@pytest.mark.parametrize("dcp", [1, 2, 8])
+def test_dflash_pool_entry_is_dcp_blocks(dcp):
+    """One target block id spans `block_size * dcp` global positions, and the
+    draft, outside the dcp group, stores all of them: `dcp` blocks an entry.
     """
-    return types.SimpleNamespace(
-        world_size=tp,
-        block_size=128,
-        config=types.SimpleNamespace(
-            kv_cache_dtype=kv_cache_dtype,
-            tensor_parallel_size=tp,
-            decode_context_parallel_size=dcp,
-        ),
-    )
-
-
-@pytest.mark.parametrize("tp,dcp", [(8, 1), (8, 2), (8, 8)])
-def test_dflash_pool_is_built_at_full_tp(tp, dcp):
-    """`draft_kv_builder` must size the pool at FULL TP, `dcp` blocks an entry.
-
-    The draft does not join the dcp group, so its KV heads shard by the whole
-    TP world and every rank holds the whole token axis. What DCP costs it is
-    the ENTRY: one target block id spans `block_size * dcp` global positions.
-    The alternative (heads replicated at tp // dcp, tokens sharded) has the
-    same per-rank bytes but needs an LSE merge across ranks the read does not
-    return, so this pins which of the two is built.
-    """
-    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
-    _gpu_stack_import("atom.model_ops.attentions.aiter_attention")
-    from unittest import mock
-
-    from atom.utils import selector
-
-    seen = {}
-
-    class _Backend:
-        DRAFT_OWNS_KV_POOL = True
-
-        @staticmethod
-        def make_kv_pool(hf, *, world_size, kv_dtype, **kw):
-            seen["world_size"] = world_size
-            seen.update(kw)
-            return object()
-
-    hf = _normalized_radixark()
-    with (
-        mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
-        mock.patch.object(selector, "attn_family", lambda _c: None),
-    ):
-        builder = dk.draft_kv_builder(
-            _stub_runner(tp=tp, dcp=dcp), hf, model=_FLASH_DRAFT
-        )
-
-    builder._make_pool(layers=5, target_block_size=128)
-    assert seen["world_size"] == tp
+    seen = _make_kv_pool_kwargs(_stub_runner(dcp=dcp))
     assert seen["blocks_per_entry"] == dcp
 
 
@@ -1001,53 +932,11 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 # --------------------------------------------------------------------------- #
 # draft pool addressing (dspark_proposer)
 #
-# The slot math (`draft_kv.draft_ctx_slots`) runs on CPU. The property and
-# `_publish_draft_ctx_slots` are the REAL proposer methods on a stub carrying
+# The slot math (`draft_kv.draft_ctx_slots`) runs on CPU.
+# `_publish_draft_ctx_slots` is the REAL proposer method on a stub carrying
 # real forward buffers; the proposer module imports triton, so those skip on the
 # CPU-only CI job (ATOM's CI runs no unit tests on a GPU).
 # --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize("dcp", [1, 2, 8])
-def test_the_proposer_reads_the_entry_span_off_the_draft_pool(dcp):
-    """One number: the span the proposer addresses in, the pool's
-    `entry_tokens`, and the page width of the FLASH view a layer is bound to,
-    which `KimiK3DFlash.prepare_paged_block` reads."""
-    import torch
-
-    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
-    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
-
-    pool = MhaKvPool(
-        layers=1,
-        block_size=128,
-        num_kv_heads=2,
-        head_dim=64,
-        kv_dtype=torch.bfloat16,
-        blocks_per_entry=dcp,
-        per_tensor_scales=True,
-        flash_layout=True,
-    )
-    pool.allocate(2, "cpu")
-    stub = types.SimpleNamespace(
-        runner=types.SimpleNamespace(
-            block_size=128,
-            draft_kv_builder=types.SimpleNamespace(kv_pool=pool),
-        ),
-        model=types.SimpleNamespace(owns_flash_pool=True),
-    )
-    span = proposer.DSparkProposer._draft_entry_tokens.fget(stub)
-    assert span == pool.entry_tokens == pool.reader_views(0)[0].shape[1]
-
-
-def test_a_draft_without_a_flash_pool_addresses_by_the_scheduler_block():
-    """The MLA draft has no pool of its own and addresses in LOCAL terms."""
-    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
-    stub = types.SimpleNamespace(
-        runner=types.SimpleNamespace(block_size=128),
-        model=types.SimpleNamespace(owns_flash_pool=False),
-    )
-    assert proposer.DSparkProposer._draft_entry_tokens.fget(stub) == 128
 
 
 def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
@@ -1379,16 +1268,31 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     assert err_causal > 10 * err_bidir, (err_bidir, err_causal)
 
 
-def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(monkeypatch):
-    """The real `_build_paged_block_metadata` for the DFlash pool.
+# The two non-MLA block drafts, by their real classes: DFlash addresses a
+# `block_size * dcp` entry (dcp 8 here), MiniMax-M3.1 the scheduler block.
+_NON_MLA_DRAFTS = [
+    pytest.param("atom.models.kimi_k3_dflash", "KimiK3DFlash", 128 * 8, id="dflash"),
+    pytest.param(
+        "atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", 128, id="minimax_m31"
+    ),
+]
+
+
+@pytest.mark.parametrize("module,cls_name,vblock", _NON_MLA_DRAFTS)
+def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
+    monkeypatch, module, cls_name, vblock
+):
+    """The real `_build_paged_block_metadata` for a non-MLA block draft.
 
     It hands `prepare_paged_block` every token of the block at entry
     granularity, drops the pad row and the position past the table, and
     returns before the CSR generator, which a non-MLA read never consumes.
+    The CSR fields still point at the draft's own buffers.
     """
     import torch
 
     proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    draft_cls = getattr(_gpu_stack_import(module), cls_name)
     from atom.utils import CpuGpuBuffer
     from atom.utils.forward_context import AttentionMetaData
 
@@ -1397,7 +1301,7 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(monkeypatch):
 
     monkeypatch.setattr(proposer, "kv_indices_generate_triton", _no_csr)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    T, vblock, running_bs = 2, 1024, 3
+    T, running_bs = 2, 3
     bt = CpuGpuBuffer(running_bs, 2, dtype=torch.int32, device=dev)
     bt.np[:] = [[5, 6], [8, 9], [0, 0]]
     bt.copy_to_gpu()
@@ -1419,10 +1323,10 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(monkeypatch):
         _paged_pad_ctx_len=1 + T,
         _blk_cu_seqlens_q=torch.zeros(running_bs + 1, **i32),
         _blk_kv_indptr=torch.zeros(running_bs + 1, **i32),
-        _blk_kv_indices=torch.zeros(1, **i32),
+        _blk_kv_indices=torch.zeros(0, **i32),
         _blk_last_page_lens=torch.ones(running_bs, **i32),
         model=types.SimpleNamespace(
-            block_attention_is_mla=False,
+            block_attention_is_mla=draft_cls.block_attention_is_mla,
             prepare_paged_block=lambda md, bt_, pos, slots, ctx, *a: seen.update(
                 slots=slots.cpu().tolist(), ctx=ctx.cpu().tolist()
             ),
@@ -1441,24 +1345,30 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(monkeypatch):
     ]
     assert seen["ctx"] == [vblock + 1, 2 * vblock, 1 + T]
     assert md.causal is False
+    assert md.kv_indices is stub._blk_kv_indices
+    assert md.kv_indptr.shape[0] == running_bs + 1
 
 
-def test_dflash_draft_declares_a_non_mla_block():
-    """KimiK3DFlash takes the proposer's non-MLA path, not the MLA plan."""
-    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    assert dflash.KimiK3DFlash.block_attention_is_mla is False
-
-
-@pytest.mark.parametrize("is_mla", [True, False])
-def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(is_mla):
+@pytest.mark.parametrize(
+    "module,cls_name,is_mla",
+    [
+        ("atom.models.kimi_k3_dspark", "KimiK3DSpark", True),
+        ("atom.models.kimi_k3_dflash", "KimiK3DFlash", False),
+        ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", False),
+    ],
+)
+def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
+    module, cls_name, is_mla
+):
     """Only the MLA block plan fills `_blk_kv_indices` (max_bs x max_model_len).
 
-    A non-MLA draft (DFlash, MiniMax-M3.1) returns from
-    `_build_paged_block_metadata` before the CSR build, so it gets an empty
-    placeholder instead of the full buffer.
+    A non-MLA draft returns from `_build_paged_block_metadata` before the CSR
+    build, so it gets an empty placeholder instead of the full buffer.
     """
     torch = pytest.importorskip("torch")
     proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    draft_cls = getattr(_gpu_stack_import(module), cls_name)
+    assert draft_cls.block_attention_is_mla is is_mla
 
     p = proposer.DSparkProposer.__new__(proposer.DSparkProposer)
     p.config = types.SimpleNamespace(
@@ -1467,7 +1377,8 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(is_mla):
     p.device = torch.device("cpu")
     p.mtp_k = 7
     p.model = types.SimpleNamespace(
-        block_attention_is_mla=is_mla, owns_flash_pool=not is_mla
+        block_attention_is_mla=draft_cls.block_attention_is_mla,
+        owns_flash_pool=draft_cls.owns_flash_pool,
     )
     p._init_draft_block_buffers()
 

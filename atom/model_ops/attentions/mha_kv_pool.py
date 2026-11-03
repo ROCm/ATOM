@@ -8,15 +8,14 @@ metadata, and that half is per-runner: asking for a second pool by building a
 second builder would overwrite the first's `forward_vars`. So anything wanting
 a pool of MHA layers can have one -- the model's own, and a draft's.
 
-Two units, and the pool shapes by exactly one. `block_size` is the caller's
-block, the unit every view is taken at; an entry is `blocks_per_entry` of them
-laid end to end, and exists because that is what `page_pool` charges per.
-Only `fa_views` reads at an entry, for a pool whose caller indexes it by entry
-(the DFlash draft's, `blocks_per_entry = dcp`).
+Two units. `block_size` is the caller's block; an entry is `blocks_per_entry`
+of them laid end to end, and is what `page_pool` charges per.
 
-A field says what an entry costs; `kv_views` says how those bytes read, and is
-the only place the element order may be written -- a second copy of it agrees
-on every byte while disagreeing on a shape, which no size check can see.
+A field says what an entry costs; the two views say how those bytes read, and
+a pool is written and read through exactly one of them (`flash_layout`).
+`kv_views` gives the SHUFFLE order at block granularity, `fa_views` the FLASH
+order at entry granularity. Both cover the same bytes, so a row written through
+one is not readable through the other, and no size check can see the mismatch.
 """
 
 from __future__ import annotations
@@ -78,15 +77,8 @@ def mha_kv_scale_fields(
     it because the dtype is why they exist.
 
     `per_tensor_scales` says the OWNER quantizes at one scale for the whole
-    cache, so there is no per-token plane to store at all -- SGLang's fp8 KV,
-    which carries `layer.k_scale_float` / `layer.v_scale_float`, a single
-    python float defaulting to 1.0 and explicitly refusing anything else
-    ("Only support per-tensor scaling factor for fp8 KV cache",
-    `srt/layers/quantization/kv_cache.py:76`). Empty is not a new state for
-    this pool -- it is what every bf16 pool already reads -- so nothing
-    downstream needs a second code path; `scale_views` keeps raising the
-    `KeyError` it promises, which is the guard that a per-tensor pool is never
-    asked for planes it does not have.
+    cache, so there is no per-token plane to store at all. `scale_views` then
+    raises the `KeyError` it promises, as for a bf16 pool.
 
     OPT-IN, and it has to be: the TARGET's MHA pool writes through
     `aiter.reshape_and_cache_with_pertoken_quant`, which EMITS a scale per
@@ -130,12 +122,6 @@ class MhaKvPool:
         flash_layout: bool = False,
         extra_fields: Sequence[EntryField] = (),
     ):
-        # `block_size` is the caller's block, the only token count the pool
-        # shapes anything by. `blocks_per_entry` is how many of them the entry
-        # class holds -- a count, not a second block size, and the only reason
-        # the pool has it is that `entry_bytes` is what sizing charges. The
-        # blocks are contiguous, so the entry is bookkeeping and nothing reads
-        # at it.
         if blocks_per_entry < 1:
             raise ValueError(
                 f"an entry holds at least one block, not {blocks_per_entry}"
@@ -162,9 +148,9 @@ class MhaKvPool:
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
         #
-        # Kept as an attribute, not a local: it is the token span ONE entry id
-        # addresses, which is what `fa_views` shapes by and what a draft riding
-        # another model's block ids has to agree with (see `fa_views`).
+        # `entry_tokens` is the token span one entry id addresses, which
+        # `fa_views` shapes by and a draft riding another model's block ids
+        # has to agree with.
         self.entry_tokens = entry_tokens = block_size * blocks_per_entry
         self.blocks_per_entry = blocks_per_entry
         self.cache_fields = mha_kv_fields(
@@ -290,8 +276,7 @@ class MhaKvPool:
     def kv_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k, v)`, aliasing the pool, in SHUFFLE.
 
-        The one place the element order is written: the fused writer produces
-        it and `cp_mha_gather_cache_kernel` reads it in place, and declaring V
+        The fused writer produces it and `cp_mha_gather_cache_kernel` reads it in place, and declaring V
         the other way round sends `_gather_prefix_and_concat_kv` down its
         densifying branch. K's tokens are one head-major span where V's are
         already split by the pack -- which fp8 hides, `x == block_size`
@@ -312,24 +297,10 @@ class MhaKvPool:
         x-pack also splits `head_dim` across two non-adjacent axes, so no
         permute of the 5-D view gives this one back.
 
-        The leading axis is the ENTRY and not the block, which is the one place
-        this view differs from `kv_views`. A page table holds ENTRY ids -- that
-        is the unit `page_pool` charges per and the unit a draft riding another
-        model's block ids is handed -- so a reader taking `block_tables`
-        straight has to see `entry_tokens` per id or it addresses one eighth of
-        the span it was given. At `blocks_per_entry == 1` the two coincide,
-        which is exactly how that would go unnoticed.
-
-        The same BYTES as `kv_views`, not the same element order: the pool
-        charges per byte (`mha_kv_fields`), so either layout fits, but a row
-        written through `kv_views` (SHUFFLE) is not readable through this view,
-        nor the reverse. Use it only on a pool every writer fills in FLASH order
-        -- the DFlash draft writes and reads through `fa_views` alone.
-
-        This is the layout the DFlash draft's block read takes: it folds the
-        block into one `qlen == 1` row per request, so `unified_attention`'s
-        causal mask admits every key, and reads the entry-granular page
-        straight off the target's block ids.
+        The leading axis is the entry, not the block: a page table holds entry
+        ids, so a reader taking `block_tables` straight has to see
+        `entry_tokens` per id. At `blocks_per_entry == 1` the two coincide,
+        which is how a block-granular view would go unnoticed.
         """
         nh, hd, et = self.num_kv_heads, self.head_dim, self.entry_tokens
         return (

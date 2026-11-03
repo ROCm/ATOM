@@ -67,10 +67,8 @@ class DSparkProposer(Drafter):
         # (`_draft_is_dcp_sharded`). 1 when -dcp is unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
-        # The draft's own context slot mapping and the token ramp that builds
-        # it. Set for EVERY flavor because `compute_draft_kv`, which reads
-        # them, runs for V4's inline draft too; None means the draft writes
-        # through the target's mapping.
+        # None unless the draft owns a pool: `compute_draft_kv` reads these
+        # for every flavor, V4's inline draft included.
         self._blk_ctx_slots = None
         self._blk_tok_ramp = None
         if self._with_draft:
@@ -251,16 +249,10 @@ class DSparkProposer(Drafter):
         )
 
         if self.model.owns_flash_pool:
-            # The DRAFT's own context slot mapping, one slot per token of the
-            # TARGET forward -- see `_publish_draft_ctx_slots`. Sized at the
-            # widest token axis the scheduler can hand over, because a prefill
-            # chunk is written through it too, and preallocated so the map the
-            # layers read has one fixed home.
+            # One slot per token of the target forward, prefill chunks included.
             n_tok = int(self.config.max_num_batched_tokens)
             self._blk_ctx_slots = torch.zeros(n_tok, **i64)
-            # The token axis as a constant int32 ramp, the left operand of the
-            # `searchsorted` that resolves each token's request. int32 to match
-            # `cu_seqlens_q`'s dtype -- `searchsorted` will not mix them.
+            # int32 to match `cu_seqlens_q`: `searchsorted` will not mix dtypes.
             self._blk_tok_ramp = torch.arange(n_tok, **i32)
 
         self._blk_dtype_q = None
@@ -468,15 +460,10 @@ class DSparkProposer(Drafter):
     def _draft_is_dcp_sharded(self) -> bool:
         """Whether the DRAFT's KV is split across the DCP group, like the target's.
 
-        True for the MLA DSpark draft, which has no pool of its own -- it binds
-        into the target's latent rows, so it inherits the target's sharding and
-        every address it builds is in LOCAL per-rank terms.
-
-        False for the paged GQA draft, whatever `-dcp` says, because that draft
-        OWNS its pool and, as in SGLang, is not in the dcp group (see the
-        `kimi_k3_dflash` module docstring). Its KV heads are TP-sharded and
-        every rank holds the whole token axis. The target is still at DCP8 -- see
-        `_draft_entry_tokens` for what that costs.
+        True for the MLA DSpark draft, which binds into the target's latent
+        rows and so addresses in LOCAL per-rank terms. False for a draft outside
+        the DCP group (`in_dcp_group`), whatever `-dcp` says: every rank holds
+        the whole token axis.
         """
         return self.dcp_world_size > 1 and self.model.in_dcp_group
 
@@ -484,19 +471,11 @@ class DSparkProposer(Drafter):
     def _draft_entry_tokens(self) -> int:
         """Token span of ONE entry of the draft's pool, i.e. of one block id.
 
-        The draft is handed the TARGET's block tables, and under DCP one of
-        those ids addresses `block_size` LOCAL tokens -- `block_size *
-        dcp_world_size` GLOBAL positions, the virtual block
-        `dcp_prefill_slot_mapping` writes in. A draft that is NOT in the dcp
-        group stores all of them in its own pool, so the span is the pool's
-        `entry_tokens`, the one number its views are shaped by.
-
-        For any other draft this is the plain block: the DCP-sharded (MLA)
-        draft addresses in local terms, where one id really is `block_size` of
-        its own tokens.
-
-        Read only after the draft pool can be built (the runner reaches the
-        drafter), never from `__init__`.
+        Under DCP one target block id covers `block_size * dcp_world_size`
+        global positions; a draft that owns a pool stores all of them, so its
+        span is the pool's `entry_tokens`. Any other draft addresses in local
+        terms, one `block_size` per id. Not readable from `__init__`: the pool
+        is built later.
         """
         if self.model.owns_flash_pool:
             return self.runner.draft_kv_builder.kv_pool.entry_tokens
@@ -586,13 +565,8 @@ class DSparkProposer(Drafter):
             raise ValueError(
                 "DSpark requires dspark_target_layer_ids on the draft config."
             )
-        # `target_model` is passed because a draft's feature can depend on more
-        # of the target than the tapped layer's own return: Kimi-K3's aggregate
-        # stream is scored by the NEXT layer's attn-residual weights, which only
-        # the target holds. Every implementor takes it; the ones that do not
-        # need it ignore it (V4.1). Positional, and declared on both signatures
-        # -- no `inspect.signature` sniffing, so a stale implementor is a loud
-        # TypeError at arm time rather than a silently skipped argument.
+        # A draft's feature can need more of the target than the tapped
+        # layer's return (Kimi-K3's aggregate is scored by the next layer).
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is not None:
             return own(layer_ids, self.config.hf_config.hidden_size, target_model)
@@ -689,10 +663,7 @@ class DSparkProposer(Drafter):
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
         main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
-        # Published BEFORE the write and torn down after it, so nothing else
-        # can read a mapping built for a forward it does not belong to -- the
-        # block pass sets `attn_metadata.slot_mapping` out of its own buffer a
-        # few lines later, and the two must not be confusable.
+        # Torn down after the write so no later reader sees a stale mapping.
         self._publish_draft_ctx_slots(forward_context, positions)
         try:
             with record_function(
@@ -708,30 +679,11 @@ class DSparkProposer(Drafter):
 
             slot = block_table[req, pos // vblock] * vblock + pos % vblock
 
-        with `vblock = _draft_entry_tokens`, and NO rank filter.
-
-        The target's mapping (`dcp_prefill_slot_mapping`, `dcp_ops.py`) is
-        `-1` for the positions this rank does not own and addresses
-        `block_size`-token pages; this draft is outside the dcp group, so it
-        stores EVERY position into `vblock`-token entries.
-        `token_layout/slots.py` computes this same expression when handed
-        `vblock`, but on the host, from the scheduler's numpy arrays, while this
-        hook runs after the target forward with everything already on the
-        device.
-
-        NO HOST SYNC, and no host-side array either. Every input is already on
-        the device: `cu_seqlens_q` is uploaded for every step by
-        `publish_cu_seqlens_q` (`model_ops/attentions/backends.py`) and is the only thing needed to
-        resolve a token to its request -- `searchsorted` over its tail does on
-        the device what `build_batch_ids` does with `np.repeat` on the host.
-        The block tables are the ones the target's builder already uploaded
-        for this forward (the Kimi MLA builder uploads them on every prefill
-        when a drafter exists, and on every decode); this hook runs after the
-        metadata owner is sealed, so it reads them and does not publish.
-
-        No-op for a draft that has no pool of its own; the MLA draft writes
-        through the target's latent rows, where the target's own mapping -- DCP
-        filter included -- is exactly right.
+        with `vblock = _draft_entry_tokens` and no DCP rank filter: the draft
+        stores every position, where the target's mapping drops the ones this
+        rank does not own. Computed on the device from `cu_seqlens_q` and the
+        block tables the target's builder already uploaded, so no host sync.
+        No-op for a draft without its own pool.
         """
         if self._blk_ctx_slots is None:
             return
@@ -742,9 +694,7 @@ class DSparkProposer(Drafter):
         if n == 0:
             return
         var = self.runner.forward_vars
-        # The padded batch, which is what `cu_seqlens_q` is filled out to
-        # (`prepare_cu_seqlens_q` writes the flat cumsum over the tail, so the
-        # slice stays non-decreasing and `searchsorted` stays defined).
+        # The padded batch: `cu_seqlens_q` is filled out to it, non-decreasing.
         rows = max(int(ctx.running_bs), int(ctx.scheduled_bs), 1)
         block_tables = var["block_tables"].gpu[:rows]
         draft_ctx_slots(
@@ -974,10 +924,6 @@ class DSparkProposer(Drafter):
         # Each request's KV spans [0, anchor] (context) ++ the T block rows.
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
         global_lens = anchor_positions + (1 + T)
-        # ONE ENTRY'S TOKEN SPAN, which is NOT always one scheduler block: a
-        # draft outside the dcp group stores every position a target block id
-        # covers, so its entry is `block_size * dcp_world_size` wide. See
-        # `_draft_entry_tokens`.
         entry_tokens = self._draft_entry_tokens
         if self._draft_is_dcp_sharded:
             # DCP shards KV token-wise round-robin: one block table entry covers
@@ -1013,12 +959,8 @@ class DSparkProposer(Drafter):
                 )
             )
         else:
-            # slot = entry_id * entry_tokens + offset_in_entry, derived
-            # on-device from the block table so there is no host sync.
-            # UNFILTERED: every scheduled position is stored, because this rank
-            # holds the whole token axis. That is the one thing that separates
-            # this from the branch above, and it is why `ctx_lens` is the TRUE
-            # GLOBAL length rather than a per-rank count.
+            # Unfiltered: this rank holds the whole token axis, so `ctx_lens`
+            # is the global length.
             entry_slots(slots, block_tables, None, block_positions, entry_tokens)
             ctx_lens.copy_(global_lens)
 
@@ -1040,12 +982,9 @@ class DSparkProposer(Drafter):
         attn_metadata.max_seqlen_q = T
         attn_metadata.max_seqlen_k = max_seqlen_k
         if not self.model.block_attention_is_mla:
-            # A draft that attends its block another way builds what it reads
-            # itself: MiniMax-M3.1's per-row MHA decode its page-16 row tables,
-            # the DFlash read nothing beyond `block_tables`/`context_lens`
-            # above. Neither reads a CSR or an MLA decode plan, so neither is
-            # built. The CSR fields stay bound to the draft's buffers so no
-            # reader sees the target step's.
+            # A non-MLA block read builds what it reads itself, so no CSR or
+            # MLA plan is built. The CSR fields still point at the draft's
+            # buffers so no reader sees the target step's.
             attn_metadata.kv_indptr = self._blk_kv_indptr[: running_bs + 1]
             attn_metadata.kv_indices = self._blk_kv_indices
             attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
@@ -1144,16 +1083,13 @@ class DSparkProposer(Drafter):
         """A pad row's KV length, in this rank's own units.
 
         The block anchored at position 0 -- the row `_block_warmup_inputs`
-        builds, and so the row every recording was captured on. A DCP-SHARDED
-        draft holds its round-robin share of those `1 + T` tokens; one outside
-        the dcp group holds all of them.
+        builds, and so the row every recording was captured on. A DCP-sharded
+        draft holds its round-robin share of those `1 + T` tokens.
 
         Both bounds are load-bearing: at least 1, because a zero-page row is
         the shape this tail exists to avoid; at most one ENTRY, because that is
         what lets the build borrow only the first column of the tail's block
-        table. The entry and not the block -- they differ by `dcp_world_size`
-        for a draft that is not DCP-sharded (`_draft_entry_tokens`), and the
-        looser bound is the correct one there.
+        table.
         """
         block = 1 + self.draft_tokens_per_seq
         if self._draft_is_dcp_sharded:

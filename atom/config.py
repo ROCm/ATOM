@@ -1244,14 +1244,11 @@ def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
     return None
 
 
-# The architecture `hf_config_override` renames a SpecForge DFlash draft to,
-# the one name the DFlash draft is keyed on (`draft_kv.uses_dflash_pool`, the
-# drafter registry).
+# What `hf_config_override` renames a SpecForge DFlash draft to.
 K3_DFLASH_ARCH = "K3DFlashModel"
 
-# Targets the Kimi-K3 DFlash draft (`K3_DFLASH_ARCH`) can serve. The rename in
-# `hf_config_override` cannot check this itself: it sees only the draft, and
-# SpecForge stamps the same `DSparkDraftModel` arch on every DFlash draft.
+# Checked against the target separately: the rename sees only the draft, and
+# SpecForge stamps the same arch on every DFlash draft.
 _K3_DFLASH_TARGET_ARCHS: frozenset[str] = frozenset({"KimiK3ForConditionalGeneration"})
 
 
@@ -1282,12 +1279,9 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
       and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
       lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
-    - SpecForge-trained (DFlash) drafts are standalone too, but nest the first
-      two under ``dflash_config`` (an alias above) and record the trained block
-      width as ``block_size``, which ``hf_config_override`` promotes. SpecForge
-      builds them on a plain ``Qwen3Config``, so the backbone is GQA rather
-      than MLA -- which this function does not care about, but the log line
-      below does.
+    - SpecForge DFlash drafts nest the first two under ``dflash_config`` and
+      record the trained block width as ``block_size``, which
+      ``hf_config_override`` promotes.
     """
     target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
@@ -1316,8 +1310,6 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
 
-    # The backbone is the draft's own business, but say which one so a
-    # mis-detected flavor is visible in the log rather than only in acceptance.
     backbone = "MLA" if getattr(hf_config, "kv_lora_rank", None) else "GQA"
     logger.info(
         f"Detected {backbone} DSpark drafter with a separate draft model "
@@ -1449,11 +1441,8 @@ class SpeculativeConfig:
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
         :func:`_normalize_draft_dspark_config`, which :meth:`hf_config_override`
-        runs for every architecture in ``_STANDALONE_DSPARK_ARCHS`` AND for a
-        SpecForge DFlash draft (``DSparkDraftModel`` with a ``dflash_config``,
-        renamed to ``K3DFlashModel``, which is not in that set). So it is set for
-        exactly the configs that went through that normalization -- ask this, not
-        set membership.
+        runs for every architecture in ``_STANDALONE_DSPARK_ARCHS`` and for a
+        SpecForge DFlash draft, so ask this rather than set membership.
         """
         cfg = self.draft_model_hf_config
         return bool(getattr(cfg, "dspark_with_draft", False))
@@ -1557,20 +1546,12 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        # SpecForge DFlash drafts, before the standalone-arch test below: they
-        # are standalone DSpark checkpoints too, but their arch is
-        # `DSparkDraftModel` -- not in `_STANDALONE_DSPARK_ARCHS` -- and
-        # SpecForge stamps that same string on every DFlash draft regardless of
-        # target. So key on the nested `dflash_config` the
-        # backbone actually needs, and rename to an arch that identifies the
-        # model. The rename also resolves a collision: `DSparkDraftModel` is
-        # already the name of ATOM's draft base class in
-        # atom/models/dspark_draft.py, and `support_draft_model_arch_dict` is a
-        # bare dict index keyed on this string.
+        # SpecForge stamps `DSparkDraftModel` on every DFlash draft, and that
+        # is also ATOM's draft base class name, so key on `dflash_config` and
+        # rename to an arch that identifies the model.
         if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
             hf_config.architectures = [K3_DFLASH_ARCH]
-            # The SpecForge-trained verify width. Read only here: `block_size`
-            # is a generic HF key another checkpoint may use for something else.
+            # Read only here: `block_size` is a generic HF key.
             block_size = hf_config.dflash_config.get("block_size") or getattr(
                 hf_config, "block_size", None
             )
