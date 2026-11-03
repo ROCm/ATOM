@@ -70,9 +70,9 @@ class Sampler(nn.Module):
         # Keep a tie group at the top-k cut whole, as every aiter path but one
         # does: for a scalar top-k (small k, large vocab) with a top-p, aiter's
         # joint op selects exactly k ids first, splitting such a group. The
-        # ratio verify's p_f keeps it whole, so with the flag set every draw
-        # does, armed or not: one law for every request in the process, and
-        # for both sides of a P/D handoff that set it.
+        # ratio verify's p_f keeps it whole, so with the flag set every aiter
+        # draw does, armed or not. The native fallback keeps exactly k; on
+        # such builds the ratio verify does not arm.
         self.keep_top_k_ties = envs.ATOM_SPEC_LOSSLESS_SAMPLING
 
     def sample_verification_tokens(
