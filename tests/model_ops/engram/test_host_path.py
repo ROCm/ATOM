@@ -604,7 +604,7 @@ def test_staging_rejects_padding_that_truncates_or_exceeds_capacity():
 
 
 @pytest.fixture(autouse=True)
-def _no_real_host_allocator(monkeypatch):
+def _no_real_host_allocator(monkeypatch, tmp_path):
     """Keep every test off the real `hipHostMalloc`: the registration tests
     script `cudaHostRegister`, and the copy tests install `FakeHostAllocator`
     themselves."""
@@ -615,6 +615,8 @@ def _no_real_host_allocator(monkeypatch):
     # copy policy as a single-GPU or TP rank sees it by default.
     monkeypatch.setattr(host_memory, "_PAGE_RUNS", host_memory._PageRuns())
     monkeypatch.delenv("ATOM_ENGRAM_UVA_COPY", raising=False)
+    # A per-test registration lock file, so tests never share /dev/shm.
+    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", str(tmp_path / "register.lock"))
 
 
 class FakeCudart:
@@ -689,6 +691,110 @@ def test_enabling_the_same_range_twice_registers_once(monkeypatch):
     assert table.enable_uva(0, 4) is True
     assert table.enable_uva(0, 4) is True
     assert cudart.calls == 2
+
+
+WIDE_VALUES = torch.ones(4, 4096)
+
+
+def wide_table() -> HostEmbeddingTable:
+    """One values range of 64 KiB, so a chunk of a page or two splits it."""
+    return HostEmbeddingTable(WIDE_VALUES, num_rows=4, head_dim=4096)
+
+
+def registered_pages(values: torch.Tensor) -> int:
+    from atom.model_ops.engram import host_memory
+
+    base = values.data_ptr()
+    nbytes = values.numel() * values.element_size()
+    lo = base - base % host_memory._PAGE
+    hi = -(-(base + nbytes) // host_memory._PAGE) * host_memory._PAGE
+    return (hi - lo) // host_memory._PAGE
+
+
+def test_registration_is_split_into_chunks(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    assert cudart.calls == -(-registered_pages(WIDE_VALUES) // 2)
+    table.disable_uva()
+    assert cudart.registered == []
+
+
+def test_refused_chunk_gives_back_the_chunks_before_it(monkeypatch):
+    """A refusal part way through a gap releases the pieces already taken.
+
+    The release runs while the registration lock is held, so this also checks
+    that the lock is reentrant within the process.
+    """
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart(refuse_call=3)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is False
+    assert cudart.registered == []
+    assert table._uva is None
+
+
+def test_chunk_size_zero_registers_each_gap_whole(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setenv("ATOM_ENGRAM_REG_CHUNK_MB", "0")
+    assert host_memory._reg_chunk_bytes() == 0
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    assert cudart.calls == 1
+
+
+def test_empty_chunk_size_reads_as_the_default(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    monkeypatch.setenv("ATOM_ENGRAM_REG_CHUNK_MB", "")
+    assert host_memory._reg_chunk_bytes() == 1024 << 20
+
+
+def test_unopenable_lock_file_still_registers_in_place(monkeypatch, tmp_path):
+    """A lock file that cannot be opened is skipped, not treated as a refused
+    registration (which would send the rank to the copy path)."""
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", str(blocker / "register.lock"))
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    assert len(cudart.registered) >= 1
+
+
+def test_registration_and_unregistration_take_the_lock(monkeypatch):
+    import contextlib
+
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    taken = []
+
+    @contextlib.contextmanager
+    def counting_lock_file():
+        taken.append(len(cudart.registered))
+        yield
+
+    monkeypatch.setattr(host_memory, "_register_lock_file", counting_lock_file)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    table.disable_uva()
+    # Once around registering (nothing held yet), once around releasing.
+    assert taken[0] == 0
+    assert len(taken) >= 2
+    assert cudart.registered == []
 
 
 class FakeHostAllocator:

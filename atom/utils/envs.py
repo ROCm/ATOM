@@ -1258,6 +1258,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rather than copied once per rank -- and copies only if that is refused.
     # `tools/engram/bench_uva_shard.py` measures both.
     "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
+    # In-place registration (ATOM_ENGRAM_UVA_COPY=0, the DP-attention default):
+    # the largest single cudaHostRegister in MiB; 0 registers each gap whole.
+    # One registration of a whole V4.1-Flash table is ~92 GiB, and four DP
+    # ranks doing that at once hang in the KFD ioctl.
+    "ATOM_ENGRAM_REG_CHUNK_MB": lambda: _nonnegative_int_env(
+        "ATOM_ENGRAM_REG_CHUNK_MB", 1024
+    ),
+    # Lock file that serializes in-place registration and unregistration
+    # across the processes of a node. Unopenable means "register without it".
+    "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", "")
+    or "/dev/shm/engram-uva-register.lock",
+    # mlock each faulted-in range before registering it, so a cold reclaim
+    # cannot push registration back to disk. Needs RLIMIT_MEMLOCK at least the
+    # table size (e.g. docker --ulimit memlock=-1:-1); a failure only warns.
+    "ATOM_ENGRAM_MLOCK": lambda: _flag_env("ATOM_ENGRAM_MLOCK", "0"),
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

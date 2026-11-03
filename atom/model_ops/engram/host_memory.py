@@ -40,6 +40,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import numpy as np
@@ -547,34 +548,92 @@ def _read_only(lo: int, hi: int) -> bool:
     return False
 
 
-# One cudaHostRegister of a whole Engram table is 90 GiB or more. Four DP
-# ranks doing that together never return (the thread sits in D state inside
-# the ioctl, and the "registered N GiB" log never prints). Default to 1 GiB
-# pieces. ATOM_ENGRAM_REG_CHUNK_MB=0 keeps the old one-BO-per-gap behavior.
-_REG_CHUNK = (
-    (int(os.environ.get("ATOM_ENGRAM_REG_CHUNK_MB", "1024") or "0") << 20)
-    // _PAGE
-    * _PAGE
-)
-_REG_LOCK_PATH = os.environ.get(
-    "ATOM_ENGRAM_REG_LOCK", "/dev/shm/engram-uva-register.lock"
-)
+def _reg_chunk_bytes() -> int:
+    """Largest single `cudaHostRegister` (`ATOM_ENGRAM_REG_CHUNK_MB`), in whole
+    pages; 0 registers each gap in one call.
+
+    One registration of a whole Engram table is 90 GiB or more, and four DP
+    ranks doing that together never return (the thread sits in D state inside
+    the KFD ioctl).
+    """
+    return (envs.ATOM_ENGRAM_REG_CHUNK_MB << 20) // _PAGE * _PAGE
+
+
+# This process's hold on the registration lock. Reentrant: a refused
+# registration unregisters what it already took while still holding it.
+_REG_LOCK_THREADS = threading.RLock()
+_reg_lock_depth = 0
+
+
+def _flock_logging_wait(fd: int, path: str) -> None:
+    """Exclusive `flock` on `fd`; a wait is logged, so a stalled holder shows
+    in every waiting rank's log."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    except BlockingIOError:
+        pass
+    logger.info("engram: waiting for %s; another process is page-locking", path)
+    start = time.monotonic()
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    logger.info("engram: took %s after %.1f s", path, time.monotonic() - start)
+
+
+@contextlib.contextmanager
+def _register_lock_file():
+    """Hold the node-wide lock file `ATOM_ENGRAM_REG_LOCK`.
+
+    A lock file that cannot be opened or locked is logged and skipped: that is
+    registration as it was before the lock, while raising here would read as a
+    refused registration and send every rank to the ~183 GiB-per-rank copy.
+    """
+    path = envs.ATOM_ENGRAM_REG_LOCK
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as exc:
+        logger.warning(
+            "engram: cannot open registration lock %s (%s); page-locking without it",
+            path,
+            exc,
+        )
+        yield
+        return
+    try:
+        try:
+            _flock_logging_wait(fd, path)
+        except OSError as exc:
+            logger.warning(
+                "engram: cannot lock %s (%s); page-locking without it", path, exc
+            )
+            yield
+            return
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager
 def _engram_register_lock():
-    """Hold an exclusive lock so one process at a time page-locks Engram tables.
+    """Page-lock and unlock Engram ranges one process at a time, node-wide.
 
-    The tables are one shared read-only checkpoint mapping. Concurrent
-    cudaHostRegister calls on it deadlock in the HIP/KFD ioctl.
+    Every DP-attention rank page-locks the same shared read-only checkpoint
+    mapping, and concurrent `cudaHostRegister` calls on it hang in the KFD
+    ioctl. Unregistration takes the same lock, so ranks also release the
+    shared pages one at a time. Reentrant within the process.
     """
-    os.makedirs(os.path.dirname(_REG_LOCK_PATH) or ".", exist_ok=True)
-    with open(_REG_LOCK_PATH, "a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    global _reg_lock_depth
+    with _REG_LOCK_THREADS, contextlib.ExitStack() as stack:
+        if _reg_lock_depth == 0:
+            stack.enter_context(_register_lock_file())
+        _reg_lock_depth += 1
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            _reg_lock_depth -= 1
 
 
 class _PageRuns:
@@ -606,8 +665,7 @@ class _PageRuns:
             for base in [*overlapping, None]:
                 gap_end = hi if base is None else base
                 if cursor < gap_end:
-                    # Register in _REG_CHUNK pieces (ATOM_ENGRAM_REG_CHUNK_MB).
-                    step = _REG_CHUNK if _REG_CHUNK > 0 else gap_end - cursor
+                    step = _reg_chunk_bytes() or gap_end - cursor
                     c = cursor
                     while c < gap_end:
                         e = min(gap_end, c + step)
@@ -638,7 +696,9 @@ class _PageRuns:
             return held
 
     def release(self, rt, bases) -> None:
-        with self._lock:
+        # The node-wide lock first, as in `_register`, so the two locks are
+        # always taken in the same order.
+        with _engram_register_lock(), self._lock:
             for base in bases:
                 run = self._runs[base]
                 run[1] -= 1
@@ -681,14 +741,11 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
-# ATOM_ENGRAM_MLOCK=1 pins the faulted-in table before registering it, so
-# the kernel cannot reclaim its pages between _populate and cudaHostRegister
-# (a cold reclaim makes registration fault the table back in from disk). The
-# process needs an unlimited (or table-sized) RLIMIT_MEMLOCK.
-_MLOCK = os.environ.get("ATOM_ENGRAM_MLOCK", "0") == "1"
-
-
 def _mlock(lo: int, hi: int) -> None:
+    """Pin `[lo, hi)` (`ATOM_ENGRAM_MLOCK`) so the pages `_populate` faulted in
+    cannot be reclaimed before `cudaHostRegister`, which would otherwise fault
+    them back in from disk. Needs an unlimited or table-sized RLIMIT_MEMLOCK;
+    a failure only warns."""
     libc = ctypes.CDLL(None, use_errno=True)
     libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     if libc.mlock(lo, hi - lo) != 0:
@@ -707,9 +764,8 @@ def _register(sources, leases):
     checkpoint mapping) is faulted in on several threads first and registered
     read-only.
 
-    The whole function holds a cross-process lock. DP attention registers the
-    same checkpoint pages on every rank, and overlapping cudaHostRegister
-    calls hang.
+    Runs under `_engram_register_lock`: DP attention registers the same
+    checkpoint pages on every rank, and overlapping registrations hang.
     """
     rt = torch.cuda.cudart()
     with _engram_register_lock():
@@ -726,7 +782,7 @@ def _register_locked(rt, sources, leases):
         flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
         if flags:
             _populate(lo, hi)
-        if _MLOCK:
+        if envs.ATOM_ENGRAM_MLOCK:
             _mlock(lo, hi)
         runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
         if runs is None:
