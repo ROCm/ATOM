@@ -329,10 +329,12 @@ def config_refusal(atom_config) -> str | None:
         # here on a path never built or measured for it. Without one, a served
         # step is a plain decode (`plan.step_shape`).
         (spec is None or spec.method == "dspark", "not DSpark"),
-        # The DFlash draft reads the target's aggregate stream, formed in its
-        # own forward hook; a mono step writes the drafter's taps from
-        # `aux_hidden_state` (the prefix), so it would draft from features it
-        # was not trained on.
+        # The DFlash draft's extract mixes the target's block bank into its
+        # tap. A mono step hands it the fixed-size slot stack rather than the
+        # forward's grown bank, so a slot the layer has not banked yet would
+        # read uninitialised memory with no shape error to catch it; mono
+        # stays off for this draft until that mix is checked against the
+        # production tap.
         (
             spec is None
             or not uses_dflash_pool(getattr(spec, "draft_model_hf_config", None)),
