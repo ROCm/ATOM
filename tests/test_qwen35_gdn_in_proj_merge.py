@@ -14,13 +14,20 @@ from types import ModuleType
 import pytest
 import torch
 
+try:
+    from atom.models.qwen3_5 import (
+        _QWEN3_5_PACKED_MODULES_MAPPING,
+        _apply_merged_in_proj_mapping,
+        gdn_in_proj_is_merged,
+    )
+except (ImportError, AttributeError):
+    pytest.skip(
+        "atom.models.qwen3_5 requires a full aiter install",
+        allow_module_level=True,
+    )
+
 from atom import quant_spec
 from atom.config import QuantizationConfig
-from atom.models.qwen3_5 import (
-    _QWEN3_5_PACKED_MODULES_MAPPING,
-    _apply_merged_in_proj_mapping,
-    gdn_in_proj_is_merged,
-)
 from atom.quant_spec import LayerQuantConfig, QuantType
 
 
