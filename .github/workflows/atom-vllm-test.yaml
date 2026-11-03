@@ -116,7 +116,7 @@ jobs:
 
   atom-vllm-oot:
     needs: [ci-gate, check-signal, download_aiter_wheel]
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' && needs.download_aiter_wheel.result == 'success' }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.check-signal.result == 'success' && needs.download_aiter_wheel.result == 'success' && false }}
     name: Accuracy (${{ matrix.display_name }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240

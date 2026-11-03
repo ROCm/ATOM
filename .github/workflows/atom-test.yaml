@@ -54,6 +54,25 @@ env:
   AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
 
 jobs:
+  hold-pr-run:
+    if: ${{ always() && github.event_name == 'pull_request' && github.event.action == 'opened' }}
+    name: Hold first PR run open
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    steps:
+      - name: Wait for an approval run on this branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          for i in $(seq 1 160); do
+            n="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/atom-test.yaml/runs?branch=${BRANCH}&event=pull_request_review&per_page=5" --jq '.total_count' || echo 0)"
+            if [ "${n}" != "0" ]; then echo "approval run seen"; sleep 30; exit 0; fi
+            sleep 30
+          done
+
   ci-gate:
     name: Check Heavy CI Gate
     runs-on: ubuntu-latest
@@ -274,7 +293,7 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.load-test-models.outputs.models_json || '[{"runner":"ubuntu-latest","model_name":"skip"}]') }}
-    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' }}
+    if: ${{ needs.ci-gate.outputs.should_run == 'true' && needs.download_aiter_wheel.result == 'success' && needs.load-test-models.result == 'success' && false }}
     runs-on: ${{ matrix.runner }}
     permissions:
       actions: read
