@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools/issue382/inspect_runs.py"
 SPEC = importlib.util.spec_from_file_location("issue382_inspection", SCRIPT)
@@ -79,6 +80,46 @@ class ResultRecoveryTest(unittest.TestCase):
             self.assertIn("error", entry)
             self.assertNotIn("copied_full", entry)
             self.assertFalse((target / records.relative_to(source)).exists())
+
+
+class ReplacedJobRetirementTest(unittest.TestCase):
+    def test_unknown_run_is_rejected_before_any_cluster_command(self):
+        with patch.object(INSPECT, "command") as command:
+            with self.assertRaises(ValueError):
+                INSPECT.retire_replaced_jobs(["41654896595", "999"])
+            command.assert_not_called()
+
+    def test_reused_job_id_with_different_name_is_not_cancelled(self):
+        with patch.object(
+            INSPECT,
+            "command",
+            return_value={
+                "returncode": 0,
+                "stdout": "JobId=11878 JobName=another-job JobState=RUNNING",
+            },
+        ) as command:
+            with self.assertRaises(RuntimeError):
+                INSPECT.retire_replaced_jobs(["41654896595"])
+            self.assertEqual(command.call_count, 1)
+
+    def test_only_verified_original_job_is_cancelled(self):
+        expected = (
+            "minimax-m3.1-issue382-round1-issue382-a1-c140-mooncake_store-"
+            "41654896595-1"
+        )
+        before = {
+            "returncode": 0,
+            "stdout": f"JobId=11878 JobName={expected} JobState=RUNNING",
+        }
+        with patch.object(
+            INSPECT,
+            "command",
+            side_effect=[before, {"returncode": 0}, {"returncode": 0}],
+        ) as command, patch("builtins.print"):
+            INSPECT.retire_replaced_jobs(["41654896595"])
+            self.assertEqual(
+                command.call_args_list[1].args, (["scancel", "11878"],)
+            )
 
 
 if __name__ == "__main__":

@@ -10,6 +10,45 @@ import socket
 import subprocess
 from pathlib import Path
 
+REPLACED_JOBS = {
+    "41654896595": ("11878", "issue382-a1-c140-mooncake_store"),
+    "41654904191": ("11879", "issue382-a2-c140-mooncake_store"),
+    "41654913083": ("11880", "issue382-a1-correctness64-accuracy"),
+    "41654920836": ("11881", "issue382-a2-correctness64-accuracy"),
+}
+
+
+def retire_replaced_jobs(ids):
+    """Cancel only the four recorded jobs with confirmed source drift.
+
+    This is an explicit recovery action, disabled during normal inspection.
+    Match the full original job name before cancelling a numeric job ID.
+    """
+    if any(rid not in REPLACED_JOBS for rid in ids):
+        raise ValueError("retirement is restricted to the four replaced runs")
+    results = []
+    for rid in ids:
+        job_id, case = REPLACED_JOBS[rid]
+        before = command(["scontrol", "show", "job", job_id])
+        stdout = before.get("stdout", "")
+        expected = f"minimax-m3.1-issue382-round1-{case}-{rid}-1"
+        fields = dict(re.findall(r"(?:^|\s)(\w+)=(\S+)", stdout))
+        if before.get("returncode") != 0:
+            raise RuntimeError(f"cannot verify original job {job_id}: {before}")
+        if fields.get("JobId") != job_id or fields.get("JobName") != expected:
+            raise RuntimeError(f"refusing to cancel mismatched job {job_id}")
+        result = {"run_id": rid, "job_id": job_id, "before": before}
+        if fields.get("JobState") in {"PENDING", "RUNNING", "CONFIGURING"}:
+            result["cancel"] = command(["scancel", job_id])
+            if result["cancel"].get("returncode") != 0:
+                raise RuntimeError(f"cancellation failed: {result}")
+        else:
+            result["skipped_state"] = fields.get("JobState")
+        result["after"] = command(["scontrol", "show", "job", job_id])
+        results.append(result)
+        print(f"retirement={json.dumps(result)}", flush=True)
+    return results
+
 
 def collect_completed_results(source, destination, max_file_bytes=1 << 30):
     """Recover full records after the single-node worker finishes successfully.
@@ -192,12 +231,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-ids", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--retire-replaced-runs", action="store_true")
     args = parser.parse_args()
     ids = args.run_ids.split(",")
     if not 1 <= len(ids) <= 4 or any(
         not re.fullmatch(r"[0-9]+", rid) for rid in ids
     ):
         parser.error("provide one to four numeric GitHub run IDs")
+    if args.retire_replaced_runs and any(
+        rid not in REPLACED_JOBS for rid in ids
+    ):
+        parser.error("retirement is restricted to the four replaced runs")
     args.output.mkdir(parents=True, exist_ok=True)
     os.environ["PATH"] = "/usr/local/slurm-24.05.5.1/bin:" + os.environ.get(
         "PATH", ""
@@ -243,6 +287,15 @@ def main():
                             ),
                         }
                     )
+                    # Preserve workload progress when runner failures prevent
+                    # artifact upload. Full raw records still require recovery.
+                    for log in sorted(target.rglob("aiperf.log")):
+                        if log.parent.name == "logs":
+                            continue
+                        print(
+                            f"run={rid} progress={json.dumps(log.read_text(errors='replace').splitlines()[-12:])}",
+                            flush=True,
+                        )
                     for job_dir in source.glob("slurm_job-*"):
                         job_id = job_dir.name.removeprefix("slurm_job-")
                         if job_id.isdigit():
@@ -275,6 +328,8 @@ def main():
             f"run={rid} jobs={len(row['jobs'])} log_roots={len(row['log_roots'])}",
             flush=True,
         )
+    if args.retire_replaced_runs:
+        report["retirement"] = retire_replaced_jobs(ids)
     (args.output / "inspection.json").write_text(
         json.dumps(report, indent=2) + "\n"
     )

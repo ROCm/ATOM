@@ -34,6 +34,11 @@ on:
         required: false
         default: ''
         type: string
+      retire_replaced_issue382_runs:
+        description: 'After inspection, cancel only the four original issue382 Slurm jobs whose shared source was replaced'
+        required: false
+        default: false
+        type: boolean
       suite:
         description: 'Benchmark suite'
         required: false
@@ -319,7 +324,13 @@ jobs:
       - name: Snapshot existing logs and Slurm states
         env:
           SOURCE_RUN_IDS: ${{ inputs.inspect_run_ids }}
-        run: python3 "$ISSUE382_INSPECTION_DIR/inspect_runs.py" --run-ids "$SOURCE_RUN_IDS" --output "$ISSUE382_INSPECTION_DIR/snapshot"
+          RETIRE_REPLACED_RUNS: ${{ inputs.retire_replaced_issue382_runs }}
+        run: |
+          args=()
+          if [[ "$RETIRE_REPLACED_RUNS" == "true" ]]; then
+            args+=(--retire-replaced-runs)
+          fi
+          python3 "$ISSUE382_INSPECTION_DIR/inspect_runs.py" --run-ids "$SOURCE_RUN_IDS" --output "$ISSUE382_INSPECTION_DIR/snapshot" "${args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

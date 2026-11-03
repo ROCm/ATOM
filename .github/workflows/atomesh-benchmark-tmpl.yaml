@@ -219,6 +219,21 @@ jobs:
           set -euo pipefail
           ORIGINAL_WORKSPACE="${GITHUB_WORKSPACE}"
           CURRENT_USER="$(id -un 2>/dev/null || id -u)"
+          if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd" && '${{ matrix.id }}' == *issue382-* ]]; then
+            # The runner checkout can be reused while its Slurm job survives.
+            # Keep a standalone clone in shared storage for the job's lifetime.
+            ISSUE382_SOURCE_ROOT="/share_nfs/ATOMESH_RUNNER/issue382-sources"
+            mkdir -p "${ISSUE382_SOURCE_ROOT}"
+            SHARED_WORKSPACE="$(mktemp -d "${ISSUE382_SOURCE_ROOT}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.id }}.XXXXXX")"
+            git clone --no-checkout --no-hardlinks "${ORIGINAL_WORKSPACE}" "${SHARED_WORKSPACE}"
+            git -C "${SHARED_WORKSPACE}" checkout --detach "${GITHUB_SHA}"
+            test "$(git -C "${SHARED_WORKSPACE}" rev-parse HEAD)" = "${GITHUB_SHA}"
+            test -z "$(git -C "${SHARED_WORKSPACE}" status --porcelain)"
+            echo "Issue382 immutable source: ${SHARED_WORKSPACE} @ ${GITHUB_SHA}"
+            cd "${SHARED_WORKSPACE}"
+            RESULT_DIR="${ORIGINAL_WORKSPACE}/${RESULT_DIR}"
+            export GITHUB_WORKSPACE="${SHARED_WORKSPACE}"
+          fi
           if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
             SHARED_WORKSPACE="/data/${CURRENT_USER}/atomesh-ci/${GITHUB_RUN_ID}/${{ matrix.id }}"
             rm -rf "${SHARED_WORKSPACE}"

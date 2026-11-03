@@ -88,3 +88,14 @@ shared log directory. Files above 1 GiB are explicitly reported as missing,
 not truncated. Check the recovery manifest, scheduler outcome, worker token,
 complete profiling window and sample records before accepting these results;
 an inspection job's status alone does not validate the experiment.
+
+Issue382 TW submissions now clone the workflow commit into a unique standalone
+repository under `/share_nfs/ATOMESH_RUNNER/issue382-sources` before `sbatch`.
+This keeps the mounted inference source independent of the runner checkout;
+the snapshot is retained for the full Slurm lifetime and later diagnosis.
+Normal inspections remain read-only. The explicit recovery input
+`retire_replaced_issue382_runs=true` is restricted to original jobs
+11878/11879/11880/11881, with their full recorded job names verified before
+cancellation. Their shared checkouts were observed at unrelated commit
+`7ba27eefedba3ad92afc7b4b5340b4ebb0ad0520` on 2026-11-03 17:14 UTC,
+which does not contain this experiment's admission implementation.
