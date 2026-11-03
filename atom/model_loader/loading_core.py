@@ -99,7 +99,13 @@ def _one_omp_thread() -> None:
     OpenMP runtime is already loaded. Looking the symbol up from ``torch._C``
     searches that extension's dependency graph and selects the same runtime
     torch uses instead of loading a second OpenMP implementation.
+
+    torch initializes each thread's OpenMP count lazily, on that thread's
+    first call into ATen, by setting it to the process default. Run that
+    initialization first, or it overwrites the 1 as soon as the loader thread
+    touches a tensor.
     """
+    torch.get_num_threads()
     set_num_threads = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
     set_num_threads.argtypes = [ctypes.c_int]
     set_num_threads.restype = None
