@@ -352,6 +352,12 @@ t "rejected validation evidence degrades instead of aborting" \
 t "a dead fetch names the cause the runner can act on" \
   "$(bash "$S/_fetchfail_test.sh" "$S" 2>&1 | tail -1)" "ok"
 
+# check_citations.py's main() is executed here. The 34 pytest cases covered check(); main()
+# was called by nothing, so a NameError in it survived review and a green gate -- citations.txt
+# carried a traceback, and the publish step read that as "nothing flagged" and anchored freely.
+t "the citation checker runs end to end" \
+  "$(bash "$S/_citations_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
 # anchoring rule (span anchors and the permalinks for what cannot be anchored included), and
