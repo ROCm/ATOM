@@ -10,7 +10,34 @@ import threading
 import pytest
 import torch
 
+from atom.model_loader import loading_core
 from atom.model_loader.loading_core import _one_omp_thread
+
+
+def test_loader_thread_resolves_omp_from_torch_extension(monkeypatch):
+    opened = []
+    calls = []
+
+    class Setter:
+        argtypes = None
+        restype = object()
+
+        def __call__(self, value):
+            calls.append(value)
+
+    class Runtime:
+        omp_set_num_threads = Setter()
+
+    def open_library(path):
+        opened.append(path)
+        return Runtime()
+
+    monkeypatch.setattr(loading_core.ctypes, "CDLL", open_library)
+
+    _one_omp_thread()
+
+    assert opened == [torch._C.__file__]
+    assert calls == [1]
 
 
 def test_a_loader_thread_runs_one_omp_thread_and_no_other_thread_does():
