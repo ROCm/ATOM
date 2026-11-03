@@ -47,7 +47,6 @@ from atom.model_engine.dynamic_chunking import (
     chunk_alignment,
     has_sole_prefill,
 )
-from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.prefill_delayer import PrefillDecision
@@ -65,6 +64,7 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
+from atom.model_engine.tier_prefetch import TierPrefetchState
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
 from atom.structured_output import StructuredRequest
@@ -4057,15 +4057,15 @@ class Scheduler:
     _EARLY_LOAD_KV_WATERMARK = 0.8
 
     @property
-    def _early_load(self) -> EarlyLoadState:
+    def _early_load(self) -> TierPrefetchState:
         """Early-load bookkeeping. Created on first use, so schedulers built
         without `__init__` (test doubles) work."""
         state = self.__dict__.get("_early_load_state")
         if state is None:
-            state = self.__dict__["_early_load_state"] = EarlyLoadState()
+            state = self.__dict__["_early_load_state"] = TierPrefetchState()
         return state
 
-    def _early_load_sweep(self, state: EarlyLoadState) -> None:
+    def _early_load_sweep(self, state: TierPrefetchState) -> None:
         """Drop early-load entries whose request is gone from `waiting`, and
         reclaim an aborted one at once: Phase 2 only pops it on a FIRE tick, and
         until then it would hold its blocks."""
@@ -4083,7 +4083,7 @@ class Scheduler:
             ):
                 state.note_gone(seq_id)
 
-    def _early_load_candidate(self, seq: Sequence, state: EarlyLoadState) -> bool:
+    def _early_load_candidate(self, seq: Sequence, state: TierPrefetchState) -> bool:
         """Cheap filters before `_early_load_tier_prefixes` touches the connector.
 
         A request that fails one for good is remembered (`settled`) so the next

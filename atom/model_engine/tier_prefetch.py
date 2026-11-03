@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Bookkeeping of the scheduler's early tier loads.
+"""Tier prefetch: bookkeeping of the scheduler's early tier loads.
 
 `Scheduler._early_load_tier_prefixes` allocates blocks for a waiting request and
 submits its LMCache load before the request's turn to prefill. This module keeps
@@ -23,7 +23,7 @@ logger = logging.getLogger("atom")
 LIMIT_REASONS = ("watermark",)
 
 
-class EarlyLoadState:
+class TierPrefetchState:
     """Requests holding early-loaded blocks, per-request skip memory, counters."""
 
     LOG_INTERVAL_S = 60.0

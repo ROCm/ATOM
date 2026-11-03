@@ -24,10 +24,10 @@ from test_lmcache_mp_async_threads import (
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
-from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
+from atom.model_engine.tier_prefetch import TierPrefetchState
 
 META = object()
 
@@ -515,7 +515,7 @@ def test_one_info_line_per_interval(setup, caplog):
 
 
 def test_state_counts_a_request_once_per_reason():
-    state = EarlyLoadState()
+    state = TierPrefetchState()
     for _ in range(3):
         state.skip(1, "lookup_not_ready")
     state.skip(2, "lookup_not_ready")
