@@ -375,6 +375,56 @@ RUN echo "========== [Parallel] Building RCCL (BUILD_RCCL=${BUILD_RCCL}) =======
     fi
 
 # --------------------------------------------------------------------
+# Stage 1b: MORI from source — parallel
+# --------------------------------------------------------------------
+FROM base AS build_mori
+ARG MORI_REPO="https://github.com/ROCm/mori.git"
+# The commit the amd-mori-nightly 1.2.5.dev20261101 wheel was built from.
+ARG MORI_COMMIT="bd92eb987e13a542fa71eb149b67c9bac5d83b69"
+# BUILD_MORI=1 builds a MORI wheel against this image's ROCm; atom_image then
+# installs it instead of the amd-mori-nightly wheel. Required on the ROCm 10.1
+# line (docker-release.yaml passes it): MORI picks its GPU topology backend at
+# compile time (ROCm/mori#663), and the nightly wheel is built against ROCm 7,
+# so it dlopens /opt/rocm/lib/librocm_smi64.so.1. The 10.1 SDK no longer ships
+# rocm_smi (only libamd_smi), and every model that brings MORI up dies right
+# after loading its weights. Built against the 10.1 SDK, MORI uses amd_smi.
+# UMBP is off (ATOM does not use it, and it needs system gRPC); kernels JIT at
+# runtime, so there is nothing to precompile without a GPU.
+ARG BUILD_MORI=0
+
+RUN set -eux; \
+    echo "========== [Parallel] Building MORI (BUILD_MORI=${BUILD_MORI}) =========="; \
+    mkdir -p /mori-wheel; \
+    if [ "${BUILD_MORI}" = "1" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends libibverbs-dev; \
+        rm -rf /var/lib/apt/lists/*; \
+        ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
+        if [ -d "${ROCM_SYSDEPS}" ]; then \
+            export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
+            export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
+            export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
+            echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
+            ldconfig; \
+        fi; \
+        git clone "${MORI_REPO}" /app/mori; \
+        cd /app/mori; \
+        git checkout "${MORI_COMMIT}"; \
+        git submodule update --init --recursive 3rdparty/msgpack-c 3rdparty/spdlog; \
+        pip install -r requirements-build.txt; \
+        MORI_GPU_ARCHS="${GPU_ARCH_LIST}" BUILD_UMBP=OFF MORI_SKIP_PRECOMPILE=1 \
+            pip wheel . --no-build-isolation --no-deps -w /mori-wheel; \
+        python -c "import glob, os, zipfile; \
+w = glob.glob('/mori-wheel/*.whl'); assert len(w) == 1, w; \
+lib = zipfile.ZipFile(w[0]).read('mori/libmori_application.so'); \
+assert os.path.exists('/opt/rocm/lib/librocm_smi64.so.1') or b'libamd_smi' in lib, \
+    'this ROCm has no librocm_smi64, but MORI was built for rocm_smi'; \
+print('mori wheel:', w[0])"; \
+    else \
+        echo "BUILD_MORI=0 -- atom_image installs the amd-mori-nightly wheel"; \
+    fi
+
+# --------------------------------------------------------------------
 # Stage 2: Aiter — parallel
 # --------------------------------------------------------------------
 FROM base AS build_aiter
@@ -447,16 +497,20 @@ ARG ATOM_COMMIT="HEAD"
 # pip packages (lm-eval is lightweight, install directly)
 RUN pip install lm-eval[api]
 
-# MORI: install the prebuilt nightly wheel directly (no source build needed).
-# The `amd-mori-nightly` PyPI package provides the `mori` Python module.
-# See: https://pypi.org/project/amd-mori-nightly/
+# MORI: the wheel build_mori built when BUILD_MORI=1, else the prebuilt
+# nightly wheel. Both `amd-mori` and `amd-mori-nightly` provide the `mori`
+# Python module. See: https://pypi.org/project/amd-mori-nightly/
 # On the rocm10 flavor the pip SDK vendors NUMA and libdrm under
 # _rocm_sdk_devel/lib/rocm_sysdeps, which is on none of the search paths the
 # MORI import path needs (rocm_smi.h reaches for <libdrm/drm.h>, mori_application
 # links -ldrm/-ldrm_amdgpu). Register it via ldconfig like sglang does for its
 # rocm1000 MORI build; every soname in there is librocm_sysdeps_*-prefixed, so
 # it shadows nothing system-wide.
-RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
+# MORI's amd_smi path dlopens the unversioned libamd_smi.so (or
+# /opt/rocm/lib/libamd_smi.so); the SDK core wheel ships only the versioned
+# soname, so link it in when nothing else provides it.
+RUN --mount=type=bind,from=build_mori,source=/mori-wheel,target=/tmp/mori-wheel \
+    echo "========== [ATOM] Installing MORI ==========" && \
     if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
         ROCM_SYSDEPS="${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps"; \
         if [ -d "${ROCM_SYSDEPS}" ]; then \
@@ -467,9 +521,19 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
             echo "registered rocm_sysdeps: ${ROCM_SYSDEPS}"; \
         fi; \
     fi && \
-    pip install --pre amd-mori-nightly && \
+    if ls /tmp/mori-wheel/*.whl >/dev/null 2>&1; then \
+        pip install /tmp/mori-wheel/*.whl && \
+        if [ ! -e /opt/rocm/lib/librocm_smi64.so.1 ] && [ ! -e /opt/rocm/lib/libamd_smi.so ]; then \
+            AMD_SMI_LIB="$(ls /opt/rocm/lib/libamd_smi.so.* "${ROCM_HOME:-/opt/rocm}"/../_rocm_sdk_core/lib/libamd_smi.so.* 2>/dev/null | head -n1)"; \
+            [ -n "${AMD_SMI_LIB}" ] || { echo "ERROR: no libamd_smi in this ROCm"; exit 1; }; \
+            ln -s "$(readlink -f "${AMD_SMI_LIB}")" /opt/rocm/lib/libamd_smi.so; \
+        fi && \
+        python -c "import ctypes, os; p = '/opt/rocm/lib/libamd_smi.so'; os.path.exists(p) and ctypes.CDLL(p); print('libamd_smi:', os.path.realpath(p))"; \
+    else \
+        pip install --pre amd-mori-nightly; \
+    fi && \
     python -c "import mori; print(f'mori: {mori.__file__}')" && \
-    pip show amd-mori-nightly
+    pip list 2>/dev/null | grep -i '^amd.mori'
 
 # ========== Mooncake TransferEngine ==========
 # Mooncake and Rust apt operations MUST run before the RCCL dpkg -i --force-all
