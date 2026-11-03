@@ -11,6 +11,12 @@ Do not pin a host or supply a candidate node list. Each allocation requests excl
 8 MI355X GPUs. Do not cancel other users' jobs to obtain the node.
 Do not publish these smoke/experimental results to the dashboard.
 
+Set `ATOMESH_DROP_HOST_CACHES=0`: the global cache-drop helper requires a
+privileged container, which `spur-authz` rejects on managed nodes. Keep the
+existing unprivileged model-file cache eviction, NUMA capacity checks, huge-page
+preparation, and the full 2 TiB Store. Check actual Store registration and ready
+capacity in the runtime logs before treating a run as valid.
+
 | Stage | Case | Client concurrency | N | W | Acceptance | Workload |
 | --- | --- | ---: | ---: | --- | --- | --- |
 | Correctness | issue382-a1-correctness64 | 16 | 4 | disabled | real DSpark7 | GSM8K 20-shot, first 64 samples |

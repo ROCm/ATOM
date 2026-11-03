@@ -2697,7 +2697,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_DROP_HOST_CACHES: '0'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2762,7 +2762,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_DROP_HOST_CACHES: '0'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2828,7 +2828,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_DROP_HOST_CACHES: '0'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2886,7 +2886,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '1'
+            ATOMESH_DROP_HOST_CACHES: '0'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
