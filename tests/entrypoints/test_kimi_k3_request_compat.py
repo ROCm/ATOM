@@ -284,10 +284,62 @@ def test_required_channel_armed_for_message_declared_tools():
     assert channel_for_request(channel, "required", request_tools(request)) is channel
 
 
-def test_request_tools_prefers_top_level_list():
-    system = {"role": "system", "content": "", "tools": [{"type": "function"}]}
+def _tool(name):
+    return {
+        "type": "function",
+        "function": {"name": name, "parameters": {"type": "object"}},
+    }
+
+
+def test_request_tools_is_top_level_plus_message_declared():
+    system = {"role": "system", "content": "", "tools": [_tool("dyn")]}
     request = ChatCompletionRequest(messages=[system, USER], tools=[TOOL])
-    assert request_tools(request) == [TOOL]
+    assert request_tools(request) == [TOOL, _tool("dyn")]
+
+
+def _named(name):
+    return {"type": "function", "function": {"name": name}}
+
+
+@pytest.mark.parametrize(
+    "top_level", [None, [TOOL]], ids=["only-dynamic", "top-level-and-dynamic"]
+)
+def test_named_tool_choice_may_reference_a_message_declared_tool(top_level):
+    system = {"role": "system", "content": "", "tools": [_tool("dyn")]}
+    validate_chat_request(
+        ChatCompletionRequest(
+            messages=[system, USER], tools=top_level, tool_choice=_named("dyn")
+        )
+    )
+
+
+def test_named_tool_choice_for_an_undeclared_tool_rejected():
+    system = {"role": "system", "content": "", "tools": [_tool("dyn")]}
+    with pytest.raises(ValueError, match="unknown tool"):
+        validate_chat_request(
+            ChatCompletionRequest(messages=[system, USER], tool_choice=_named("nope"))
+        )
+
+
+@pytest.mark.parametrize(
+    ("tools", "match"),
+    [
+        ([{"type": "web_search"}], r"messages\[0\]\.tools\[0\]\.type"),
+        ([{"type": "function"}], r"messages\[0\]\.tools\[0\]\.function"),
+        ("not-a-list", r"messages\[0\]\.tools must be an array"),
+        ([_tool("dyn"), _tool("dyn")], r"messages\[0\]\.tools: duplicate tool name"),
+    ],
+    ids=["wrong-type", "no-function", "not-a-list", "duplicate-in-message"],
+)
+def test_malformed_message_declared_tools_rejected(tools, match):
+    system = {"role": "system", "content": "", "tools": tools}
+    with pytest.raises(ValueError, match=match):
+        validate_chat_request(ChatCompletionRequest(messages=[system, USER]))
+
+
+def test_message_may_redeclare_a_top_level_tool():
+    system = {"role": "system", "content": "", "tools": [TOOL]}
+    validate_chat_request(ChatCompletionRequest(messages=[system, USER], tools=[TOOL]))
 
 
 @pytest.mark.parametrize("block", [{}, {"name": ""}], ids=["no-name", "empty-name"])

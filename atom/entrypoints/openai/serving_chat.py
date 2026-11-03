@@ -134,12 +134,28 @@ def _message_field(msg: Any, key: str) -> Any:
 
 
 def request_tools(request: ChatCompletionRequest) -> list:
-    """The request's tools: the top-level list, else the tools Kimi-K3 lets a
-    message declare (dynamic tools)."""
-    if request.tools:
-        return request.tools
+    """Every tool the request declares: the top-level list plus the tools
+    Kimi-K3 lets a message declare (dynamic tools), in order."""
     messages = request.messages if request.messages is not None else request.prompt
-    return [t for m in messages or [] for t in _message_field(m, "tools") or []]
+    declared = [_message_field(m, "tools") for m in messages or []]
+    return [
+        *(request.tools or []),
+        *(t for tools in declared if isinstance(tools, list) for t in tools),
+    ]
+
+
+def _validate_message_tools(messages: Any) -> None:
+    """Each message's dynamic tools pass the same shape check as top-level
+    tools. Names are checked for duplicates within one declaration only."""
+    for i, msg in enumerate(messages or []):
+        tools = _message_field(msg, "tools")
+        if tools is None:
+            continue
+        try:
+            validate_tool_list(tools)
+        except ValueError as exc:
+            sep = "." if str(exc).startswith("tools") else ".tools: "
+            raise ValueError(f"messages[{i}]{sep}{exc}") from exc
 
 
 def validate_history_tool_calls(messages: Any) -> None:
@@ -184,6 +200,7 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
             raise ValueError("stream_options.include_usage must be a boolean")
     validate_tool_list(request.tools)
     messages = request.messages if request.messages is not None else request.prompt
+    _validate_message_tools(messages)
     validate_history_tool_calls(messages)
 
     tool_choice = request.tool_choice
@@ -203,10 +220,11 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError(  # noqa: TRY004
                     "tool_choice.function.name must be a string"
                 )
-            # A named tool_choice must reference a declared tool.
+            # A named tool_choice must reference a declared tool, top-level or
+            # declared in a message.
             names = {
                 qualified_tool_name(t)
-                for t in (request.tools or [])
+                for t in request_tools(request)
                 if isinstance(t, dict) and isinstance(t.get("function"), dict)
             }
             if qualified_tool_name(tool_choice) not in names:
