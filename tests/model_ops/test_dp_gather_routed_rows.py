@@ -24,6 +24,9 @@ with (
         "aiter.utility.fp4_utils",
         "triton",
         "triton.language",
+        # `topK` imports `triton_topk_softmax`, which takes `libdevice` from here.
+        "triton.language.extra",
+        "triton.language.extra.hip",
     ),
     # These CPU contracts never call CUDA custom ops. Registering them would
     # infer schemas from the fake AITER enum defaults and retain stub kernels
