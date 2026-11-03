@@ -1613,6 +1613,50 @@ models:
           server:
             common_args:
               hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+        # CI-only PP/TP comparison; inference code is the PR head.
+        - &m31_pp_review20
+          <<: *m31_flash_gsm8k
+          name: m31-index-review-tp4-freq4-gsm8k20
+          nodes: []
+          runner:
+            slurm_account: amd-atom
+            slurm_partition: amd-spur
+            slurm_qos: amd-atom-qos
+            slurm_submit_runner: atomesh-cicd
+          server:
+            common_args:
+              hf_overrides: '{"use_index_cache": true, "index_topk_freq": 4}'
+              max_model_len: 262144
+          prefill:
+            workers: 1
+            tp: 4
+            extra_args: "--enforce-eager --max-num-batched-tokens 8192"
+          env:
+            common:
+              MC_DISABLE_HIP: "1"
+              ATOMESH_DROP_HOST_CACHES: "1"
+            prefill:
+              HIP_VISIBLE_DEVICES: "0,1,2,3"
+            decode:
+              HIP_VISIBLE_DEVICES: "4,5,6,7"
+              DECODE_KV_TRANSFER_CONFIG: >-
+                {"kv_role":"kv_consumer","kv_connector":"mooncake","proxy_ip":"${ROLE_IP}","handshake_port":6301,"ib_enable_alternate_hca":true,"ib_hca_count":8}
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+        - <<: *m31_pp_review20
+          name: m31-index-review-pp2-tp2-freq4-gsm8k20
+          prefill:
+            workers: 1
+            tp: 2
+            extra_args: "--pipeline-parallel-size 2 --enforce-eager --max-num-batched-tokens 8192"
+        - <<: *m31_pp_review20
+          name: m31-index-review-pp4-tp1-freq4-gsm8k20
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
         # Longer prompts exercise top-k selection beyond 16 x 128 tokens.
         - <<: *m31_flash_gsm8k
           name: minimax-m31-flash-mxfp4-tp4-index-freq1-gsm8k-20shot-c32
