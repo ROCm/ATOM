@@ -160,22 +160,6 @@ def test_relay_skips_draft_forwards(_forward_context):
     assert relay._send is None
 
 
-def test_relay_tbo_ubatches_land_on_their_own_rows(_forward_context):
-    # Two micro-batches of 3 and 2 rows: the second lands at its token offset
-    # instead of reallocating over the first.
-    relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
-    for off, n in ((0, 3), (3, 2)):
-        _forward_context.ubatch_token_offset = off
-        for lid in relay.own_ids:
-            module = target.embed_tokens if lid == -1 else target.layers[lid]
-            module(torch.full((n, 8), float(lid * 10 + off)))
-    sent = relay.pack(None, 5)
-    torch.testing.assert_close(sent[:3, :8], torch.full((3, 8), -10.0))
-    torch.testing.assert_close(sent[3:, :8], torch.full((2, 8), -7.0))
-    torch.testing.assert_close(sent[:3, 8:], torch.full((3, 8), 20.0))
-    torch.testing.assert_close(sent[3:, 8:], torch.full((2, 8), 23.0))
-
-
 def test_relay_rejects_a_payload_of_the_wrong_width():
     relay, _ = _relay([-1, 2, 6], 8, (4, 8), first=False, last=True)
     with pytest.raises(RuntimeError, match="expected 16 aux columns"):

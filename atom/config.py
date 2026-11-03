@@ -2804,7 +2804,7 @@ class Config:
             self.state_replay_tokens = state_replay_tokens(self)
 
     def _check_pp_support(self) -> None:
-        """Refuse what PP does not wire yet: P/D consumers, and speculation
+        """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
         beyond Kimi-K3 with DSpark (a P/D producer does not speculate).
 
         Only Kimi-K3 with DSpark relays the target's aux taps across stages;
@@ -2812,6 +2812,11 @@ class Config:
         """
         if self.pipeline_parallel_size <= 1:
             return
+        # UBatchWrapper.forward takes no intermediate_tensors.
+        if self.enable_tbo:
+            raise ValueError(
+                "TBO (enable_tbo) is not supported with pipeline_parallel_size > 1."
+            )
         from atom.kv_transfer.disaggregation.pd_producer import (
             disaggregated_kv_role,
         )

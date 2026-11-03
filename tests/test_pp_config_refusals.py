@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""What `Config` refuses under PP: P/D consumers, and speculation beyond
+"""What `Config` refuses under PP: TBO, P/D consumers, and speculation beyond
 Kimi-K3 with DSpark."""
 
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ def _cfg(pp=2, arch="KimiK3ForConditionalGeneration", method="dspark", **kw):
         speculative_config=kw.pop("spec", spec),
         dspark=SimpleNamespace(confidence_schedule=kw.pop("confidence", False)),
         kv_transfer_config=kw.pop("kv", None),
+        enable_tbo=kw.pop("tbo", False),
     )
 
 
@@ -54,6 +55,11 @@ def test_unwired_spec_pairs_under_pp_are_refused(arch, method):
 def test_confidence_schedule_under_pp_is_refused():
     with pytest.raises(ValueError, match="confidence_schedule"):
         _check(_cfg(confidence=True))
+
+
+def test_tbo_under_pp_is_refused():
+    with pytest.raises(ValueError, match="TBO"):
+        _check(_cfg(spec=None, tbo=True))
 
 
 def test_kv_consumer_under_pp_is_refused():

@@ -68,7 +68,7 @@ class PPAuxRelay:
 
         # The send payload, allocated per step at the forward's row count (a
         # resident max_num_batched_tokens buffer is ~0.5 GB per rank): the
-        # first own tap to fire allocates it (a TBO ubatch past it grows it),
+        # first own tap to fire allocates it,
         # every own tap captures into its columns and pack() copies the
         # received taps into the leading ones. The last stage's hooks write
         # into the drafter's own buffers instead.
@@ -133,13 +133,10 @@ class PPAuxRelay:
                 self._send, self._filled = None, frozenset()
             # Whichever tap fires first allocates, so a skipped tap cannot
             # leave the next one writing into a stale or missing buffer.
-            if self._send is None or self._send.shape[0] < end:
-                grown = torch.empty(
+            if self._send is None:
+                self._send = torch.empty(
                     end, width, device=tensor.device, dtype=tensor.dtype
                 )
-                if self._send is not None:
-                    grown[: self._send.shape[0]].copy_(self._send)
-                self._send = grown
             self._send[off:end, col * h : (col + 1) * h].copy_(tensor)
             self._filled = self._filled | {lid}
 
