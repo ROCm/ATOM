@@ -144,6 +144,21 @@ def _boom(*_args, **_kwargs):
     raise RuntimeError("boom")
 
 
+@pytest.mark.parametrize("state,expected", [(None, 503), (False, 503), (True, 200)])
+def test_health_reports_worker_readiness(monkeypatch, state, expected):
+    from fastapi.testclient import TestClient
+
+    value = (
+        None
+        if state is None
+        else SimpleNamespace(core_mgr=SimpleNamespace(is_healthy=lambda: state))
+    )
+    monkeypatch.setattr(api_server, "engine", value)
+    # No lifespan: this test supplies the engine and does not load a model.
+    response = TestClient(api_server.app).get("/health")
+    assert response.status_code == expected
+
+
 class TestMultimodalInputs:
     @pytest.mark.parametrize(
         "part",

@@ -63,8 +63,15 @@ class MoRIIOAgentMetadata(
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
-    # name -> [kind, unit_bytes, num_units, reverse_indexed, units_per_chunk]
-    region_layout: dict[str, list[int]] | None = None
+    # Per-request state by tensor name: the packed descriptor of the whole
+    # tensor and the bytes of one slot. Omitted for models without any.
+    state_descs: dict[str, bytes] | None = None
+    state_slot_bytes: dict[str, int] | None = None
+    num_state_slots: int = 0
+    # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
+    # reverse_indexed, chunk_bytes]), or None for per-layer registration.
+    # DeepSeek-V4 publishes PAGE and SLOT regions and no per-layer caches.
+    region_layout: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

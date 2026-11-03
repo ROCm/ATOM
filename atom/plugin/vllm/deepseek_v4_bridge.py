@@ -555,6 +555,14 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         proxy_layer_name = self.layer_names[0]
         proxy = sfc.get(proxy_layer_name)
         model = getattr(proxy, "_atom_v4_model", None) if proxy is not None else None
+        bind = getattr(proxy, "_atom_v4_bind", None)
+        if model is None and bind is not None and bind():
+            # Bind here rather than wait for the forward: Model Runner V2's
+            # kernel warmup runs real-looking requests, and a prefill built
+            # before the bind takes no slots, so its decode would find them
+            # fresh at chunk_start > 0. V1 binds in the same dummy run either
+            # way. The bind refuses the profiling cache, as the forward's does.
+            model = proxy._atom_v4_model
         meta_params = getattr(model, "_atom_v4_meta_params", None)
         if model is None or meta_params is None:
             # Pre-bind (profiling / first warmup forward, before the proxy cache is
@@ -667,6 +675,9 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self._atom_v4_proxy_layer = True
         self._atom_v4_profiling_kv_cache = False
+        # Set by the model wrapper: binds this proxy's cache to its model with
+        # the arguments the wrapper's forward would use (see the builder).
+        self._atom_v4_bind = None
         self.kv_cache = torch.tensor([])
         self.impl = nn.Identity()
 
@@ -683,6 +694,39 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=head_size,
             dtype=torch.uint8,
+        )
+
+
+def check_deepseek_v4_model_runner(vllm_config, *, is_mtp: bool) -> None:
+    """Refuse what the V4 bridge has not ported to vLLM's Model Runner V2.
+
+    vLLM runs DeepseekV4ForCausalLM on V1 on ROCm unless
+    VLLM_USE_V2_MODEL_RUNNER=1. Two V4 features still hook V1 alone:
+
+    - prefix caching: its state checkpoint stores run from V1's
+      `_model_forward` (`paged_state_checkpoint.install_store_sites`), so
+      under V2 a prefix hit would restore a checkpoint nobody stored;
+    - the MTP draft: its KV sharing is a V1 `get_kv_cache_spec` hook
+      (`apply_vllm_v4_draft_kv_sharing_patch`), and V2 sizes the drafter's
+      hidden buffer from the class rather than the instance (see
+      `get_mtp_target_hidden_states` in the model wrapper).
+    """
+    if not getattr(vllm_config, "use_v2_model_runner", False):
+        return
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        deepseek_v4_state_checkpoints_on,
+    )
+
+    unported = []
+    if deepseek_v4_state_checkpoints_on(vllm_config):
+        unported.append("prefix caching")
+    if is_mtp or getattr(vllm_config, "speculative_config", None) is not None:
+        unported.append("MTP speculative decoding")
+    if unported:
+        raise ValueError(
+            "ATOM DeepSeek-V4 on vLLM's Model Runner V2 does not support "
+            f"{' or '.join(unported)} yet; unset VLLM_USE_V2_MODEL_RUNNER "
+            "(V1 is the ROCm default for this architecture)."
         )
 
 

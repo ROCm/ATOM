@@ -6,6 +6,7 @@
 import logging
 import time
 from collections.abc import AsyncGenerator
+from functools import partial
 from typing import Any
 
 from .protocol import (
@@ -18,8 +19,12 @@ from .protocol import (
 )
 from .reasoning import (
     NO_REASONING,
-    VALID_TEMPLATE_EFFORTS,
     ReasoningChannel,
+)
+from .reasoning_controls import (
+    CHAT_REASONING_RULES,
+    ReasoningRules,
+    resolve_reasoning_controls,
 )
 from .sse import data_frame
 from .streaming_dispatch import StreamOutputCollector
@@ -86,41 +91,12 @@ def _tool_parser_for_request(parser_cls, tools):
 
 
 def resolve_thinking(
-    request: ChatCompletionRequest,
+    request: ChatCompletionRequest, *, rules: ReasoningRules = CHAT_REASONING_RULES
 ) -> tuple[bool | None, str | int | None]:
-    """Resolve (enabled, effort) from the request's thinking / reasoning_effort.
-
-    ``thinking`` (extra_body) takes precedence over ``reasoning_effort``.
-    Thinking is disabled when ``thinking.type == "disabled"`` or
-    ``reasoning_effort == "none"``. Effort is only returned when it is one of
-    the values the template understands.
-
-    ``enabled`` is ``None`` when the request stated no preference -- setting
-    an effort is not asking for reasoning to be switched *on*. Collapsing
-    that to ``True`` was harmless while the caller wrote a key no template
-    read; once it wrote the template's real switch, a request carrying only
-    `reasoning_effort` re-enabled reasoning over an operator's
-    `--default-chat-template-kwargs '{"enable_thinking": false}'`, and over a
-    client's own `chat_template_kwargs`, because the toggle is merged last.
-    """
-    thinking = request.thinking or {}
-    enabled: bool | None = None
-    if isinstance(thinking, dict) and thinking.get("type") is not None:
-        enabled = thinking.get("type") != "disabled"
-    if request.reasoning_effort == "none":
-        enabled = False
-
-    effort = None
-    if isinstance(thinking, dict) and thinking.get("effort") is not None:
-        effort = thinking.get("effort")
-    elif request.reasoning_effort is not None:
-        effort = request.reasoning_effort
-    if isinstance(effort, (int, float)):
-        if type(effort) is not int or not 1 <= effort <= 100:
-            raise ValueError("reasoning effort must be an integer in [1, 100]")
-    elif not isinstance(effort, str) or effort not in VALID_TEMPLATE_EFFORTS:
-        effort = None
-    return enabled, effort
+    """Read Chat control fields and resolve them with the selected model rules."""
+    return resolve_reasoning_controls(
+        thinking=request.thinking, effort=request.reasoning_effort, rules=rules
+    )
 
 
 def _validate_one_tool(tool: Any, index: int) -> str:
@@ -157,6 +133,12 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
     Raises ``ValueError`` (surfaced as HTTP 400) on malformed input so the
     engine is never handed a request the chat template cannot render.
     """
+    if request.stream_options is not None:
+        if request.stream is not True:
+            raise ValueError("stream_options requires stream=true")
+        include_usage = request.stream_options.get("include_usage")
+        if include_usage is not None and type(include_usage) is not bool:
+            raise ValueError("stream_options.include_usage must be a boolean")
     validate_tool_list(request.tools)
 
     tool_choice = request.tool_choice
@@ -207,6 +189,9 @@ def create_chat_chunk(
     finish_reason: str | None = None,
     usage: dict | None = None,
     index: int = 0,
+    *,
+    include_usage: bool = False,
+    kv_transfer_params: dict | None = None,
 ) -> str:
     """Create a chat completion chunk in SSE format.
 
@@ -227,9 +212,51 @@ def create_chat_chunk(
             }
         ],
     }
-    if usage is not None:
+    if usage is not None or include_usage:
         chunk["usage"] = usage
+    if kv_transfer_params is not None:
+        chunk["kv_transfer_params"] = kv_transfer_params
     return data_frame(chunk)
+
+
+def chat_finish_frames(
+    request_id,
+    model,
+    reasons,
+    usage,
+    kv_transfer_params=None,
+    *,
+    usage_on_finish=False,
+    include_usage=False,
+):
+    """Serialize final choices once, with aggregate usage on the last choice."""
+    frames = []
+    for index, reason in enumerate(reasons):
+        last = usage_on_finish and index == len(reasons) - 1
+        frames.append(
+            create_chat_chunk(
+                request_id,
+                model,
+                finish_reason=reason,
+                index=index,
+                usage=usage if last else None,
+                include_usage=usage_on_finish and include_usage,
+                kv_transfer_params=kv_transfer_params if last else None,
+            )
+        )
+    if not usage_on_finish:
+        payload = {
+            "id": request_id,
+            "object": CHAT_COMPLETION_CHUNK_OBJECT,
+            "created": int(time.time()),
+            "model": model,
+            "choices": [],
+            "usage": usage,
+        }
+        if kv_transfer_params is not None:
+            payload["kv_transfer_params"] = kv_transfer_params
+        frames.append(data_frame(payload))
+    return "".join(frames) + STREAM_DONE_MESSAGE
 
 
 async def stream_chat_response(
@@ -244,6 +271,8 @@ async def stream_chat_response(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    usage_on_finish: bool = False,
+    include_usage: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming chat completion response with reasoning and tool calls.
 
@@ -256,6 +285,11 @@ async def stream_chat_response(
     num_prompt_tokens``); reusing it avoids re-tokenizing the prompt on the
     event loop at stream start.
     """
+    make_chunk = (
+        partial(create_chat_chunk, include_usage=True)
+        if usage_on_finish and include_usage
+        else create_chat_chunk
+    )
     num_tokens_input = num_prompt_tokens
     num_tokens_output = 0
     num_cached_tokens = 0
@@ -285,7 +319,7 @@ async def stream_chat_response(
             chunk_data = await stream_collector.get()
 
             if not role_sent:
-                yield create_chat_chunk(
+                yield make_chunk(
                     request_id, model, delta={"role": "assistant", "content": ""}
                 )
                 role_sent = True
@@ -309,7 +343,7 @@ async def stream_chat_response(
             for field, text in segments:
                 if field == "reasoning_content":
                     if text:
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id, model, delta={"reasoning_content": text}
                         )
                 elif field == "content":
@@ -317,18 +351,16 @@ async def stream_chat_response(
                     events = tool_parser.process(text)
                     for event_type, data in events:
                         if event_type == "content":
-                            yield create_chat_chunk(
-                                request_id, model, delta={"content": data}
-                            )
+                            yield make_chunk(request_id, model, delta={"content": data})
                         elif event_type == "tool_call_start":
-                            yield create_chat_chunk(
+                            yield make_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
                             )
                         elif event_type == "tool_call_args":
                             has_tool_calls = True
-                            yield create_chat_chunk(
+                            yield make_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
@@ -338,16 +370,14 @@ async def stream_chat_response(
                 # Flush tool parser
                 for event_type, data in tool_parser.flush():
                     if event_type == "content":
-                        yield create_chat_chunk(
-                            request_id, model, delta={"content": data}
-                        )
+                        yield make_chunk(request_id, model, delta={"content": data})
                     elif event_type == "tool_call_start":
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
                     elif event_type == "tool_call_args":
                         has_tool_calls = True
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id, model, delta={"tool_calls": [data]}
                         )
                 break
@@ -364,23 +394,15 @@ async def stream_chat_response(
             "total_tokens": num_tokens_input + num_tokens_output,
             "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
         }
-        usage_chunk = {
-            "id": request_id,
-            "object": CHAT_COMPLETION_CHUNK_OBJECT,
-            "created": int(time.time()),
-            "model": model,
-            "choices": [],
-            "usage": usage,
-        }
-        if kv_transfer_params_value is not None:
-            usage_chunk["kv_transfer_params"] = kv_transfer_params_value
-        # Coalesce finish + usage + [DONE] into one send: at a wave boundary many
-        # requests finalize at once, so collapsing 3 socket writes/req to 1 cuts
-        # the syscalls that saturate the API event loop.
-        yield (
-            create_chat_chunk(request_id, model, finish_reason=finish_reason)
-            + data_frame(usage_chunk)
-            + STREAM_DONE_MESSAGE
+        # Coalesce terminal events without reparsing already serialized deltas.
+        yield chat_finish_frames(
+            request_id,
+            model,
+            [finish_reason],
+            usage,
+            kv_transfer_params_value,
+            usage_on_finish=usage_on_finish,
+            include_usage=include_usage,
         )
     finally:
         cleanup_stream(seq_id, aborted=aborted)
@@ -557,6 +579,8 @@ async def stream_chat_response_fanout(
     tool_choice=None,
     reasoning: ReasoningChannel = NO_REASONING,
     tool_parser_cls=None,
+    usage_on_finish: bool = False,
+    include_usage: bool = False,
 ) -> AsyncGenerator[str, None]:
     """Streaming variant that multiplexes ``len(seq_ids)`` fan-out siblings
     into a single SSE stream, tagging every chunk with ``choices[0].index``.
@@ -570,6 +594,11 @@ async def stream_chat_response_fanout(
     re-tokenizing on the event loop at stream start.
     """
     n = len(seq_ids)
+    make_chunk = (
+        partial(create_chat_chunk, include_usage=True)
+        if usage_on_finish and include_usage
+        else create_chat_chunk
+    )
     num_tokens_input = num_prompt_tokens
     num_tokens_output = [0] * n
     # Every sibling answers the same prompt, so they start in the same state.
@@ -599,7 +628,7 @@ async def stream_chat_response_fanout(
             idx, chunk_data = await shared_collector.get()
 
             if not role_sent[idx]:
-                yield create_chat_chunk(
+                yield make_chunk(
                     request_id,
                     model,
                     delta={"role": "assistant", "content": ""},
@@ -628,7 +657,7 @@ async def stream_chat_response_fanout(
             for field, text in segments:
                 if field == "reasoning_content":
                     if text:
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id,
                             model,
                             delta={"reasoning_content": text},
@@ -637,11 +666,11 @@ async def stream_chat_response_fanout(
                 elif field == "content":
                     for event_type, data in tool_parsers[idx].process(text):
                         if event_type == "content":
-                            yield create_chat_chunk(
+                            yield make_chunk(
                                 request_id, model, delta={"content": data}, index=idx
                             )
                         elif event_type == "tool_call_start":
-                            yield create_chat_chunk(
+                            yield make_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
@@ -649,7 +678,7 @@ async def stream_chat_response_fanout(
                             )
                         elif event_type == "tool_call_args":
                             has_tool_calls[idx] = True
-                            yield create_chat_chunk(
+                            yield make_chunk(
                                 request_id,
                                 model,
                                 delta={"tool_calls": [data]},
@@ -659,11 +688,11 @@ async def stream_chat_response_fanout(
             if chunk_data.get("finished", False):
                 for event_type, data in tool_parsers[idx].flush():
                     if event_type == "content":
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id, model, delta={"content": data}, index=idx
                         )
                     elif event_type == "tool_call_start":
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id,
                             model,
                             delta={"tool_calls": [data]},
@@ -671,7 +700,7 @@ async def stream_chat_response_fanout(
                         )
                     elif event_type == "tool_call_args":
                         has_tool_calls[idx] = True
-                        yield create_chat_chunk(
+                        yield make_chunk(
                             request_id,
                             model,
                             delta={"tool_calls": [data]},
@@ -688,31 +717,20 @@ async def stream_chat_response_fanout(
             "num_choices": n,
             "prompt_tokens_details": {"cached_tokens": num_cached_tokens},
         }
-        usage_chunk = {
-            "id": request_id,
-            "object": CHAT_COMPLETION_CHUNK_OBJECT,
-            "created": int(time.time()),
-            "model": model,
-            "choices": [],
-            "usage": usage,
-        }
-        if kv_transfer_params_value is not None:
-            usage_chunk["kv_transfer_params"] = kv_transfer_params_value
-        # Coalesce the per-sibling finish chunks + usage + [DONE] into one send.
-        yield (
-            "".join(
-                create_chat_chunk(
-                    request_id,
-                    model,
-                    finish_reason=openai_stop_reason_with_calls(
-                        engine_finish_reasons[i], has_tool_calls[i]
-                    ),
-                    index=i,
+        # Coalesce terminal events without reparsing already serialized deltas.
+        yield chat_finish_frames(
+            request_id,
+            model,
+            [
+                openai_stop_reason_with_calls(
+                    engine_finish_reasons[i], has_tool_calls[i]
                 )
                 for i in range(n)
-            )
-            + data_frame(usage_chunk)
-            + STREAM_DONE_MESSAGE
+            ],
+            usage,
+            kv_transfer_params_value,
+            usage_on_finish=usage_on_finish,
+            include_usage=include_usage,
         )
     finally:
         for sid in seq_ids:

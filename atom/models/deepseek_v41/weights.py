@@ -20,13 +20,46 @@ from atom.model_ops.engram.tables import HostEmbeddingTable
 
 from .config import AttentionMode, build_attention_topology
 
-# safetensors dtype names of the tensors read through `_shared_tensor`.
+# safetensors dtype names a shared read-only tensor can have (`shared_tensor`).
 _SAFETENSORS_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F8_E8M0": torch.float8_e8m0fnu,
     "BF16": torch.bfloat16,
+    "F16": torch.float16,
     "F32": torch.float32,
+    "U8": torch.uint8,
+    "I8": torch.int8,
 }
+
+
+def shared_tensor(path, name: str) -> torch.Tensor:
+    """Tensor `name` of safetensors file `path`, as a read-only view of a
+    shared mapping of the file (`MAP_SHARED`, `PROT_READ`).
+
+    For the Engram tables. `safe_open` maps a file privately, so page-locking
+    one of its tensors in place copies every page into the process on its
+    write fault -- under DP attention, where every rank holds the whole
+    table, a ~183 GiB copy per rank. A shared read-only mapping is the page
+    cache itself: an in-place registration pins those pages, the same ones
+    for every process. Writing through the view faults; nothing writes a
+    table. The mapping lives as long as a tensor over it.
+    """
+    with open(path, "rb") as stream:
+        header_size = struct.unpack("<Q", stream.read(8))[0]
+        info = json.loads(stream.read(header_size))[name]
+    start, end = info["data_offsets"]
+    raw = np.memmap(
+        path,
+        dtype=np.uint8,
+        mode="r",
+        offset=8 + header_size + start,
+        shape=(end - start,),
+    )
+    with warnings.catch_warnings():
+        # torch warns the buffer is not writable: that is the point.
+        warnings.simplefilter("ignore", UserWarning)
+        flat = torch.frombuffer(raw, dtype=torch.uint8)
+    return flat.view(_SAFETENSORS_DTYPES[info["dtype"]]).view(info["shape"])
 
 
 @dataclass(frozen=True)
@@ -408,40 +441,18 @@ class CheckpointReader:
             else tensor
         )
 
-    def _shared_tensor(self, name):
-        """`name` as a read-only view of a shared mapping of its shard.
-
-        safe_open's tensors map the file privately, so page-locking one for
-        the Engram UVA lookup copies every page into the process -- a ~95 GiB
-        copy per table on every DP-attention rank, which registers whole
-        tables. A shared read-only mapping is the page cache itself: every
-        rank's registration pins the same pages once. Nothing writes a table.
-        """
-        path = self.directory / self.weight_map[name]
-        with path.open("rb") as stream:
-            header_size = struct.unpack("<Q", stream.read(8))[0]
-            info = json.loads(stream.read(header_size))[name]
-        start, end = info["data_offsets"]
-        raw = np.memmap(
-            path,
-            dtype=np.uint8,
-            mode="r",
-            offset=8 + header_size + start,
-            shape=(end - start,),
-        )
-        with warnings.catch_warnings():
-            # torch warns that the buffer is not writable; it is read-only.
-            warnings.simplefilter("ignore", UserWarning)
-            flat = torch.frombuffer(raw, dtype=torch.uint8)
-        return flat.view(_SAFETENSORS_DTYPES[info["dtype"]]).view(info["shape"])
-
     def engram_tables(self, config):
         # Reuse the table implementation from PR #2185, not a second lookup path.
         tables = {}
         for layer, rows in zip(config.engram_layer_ids, config.engram_num_embeddings):
             name = f"layers.{layer}.engram.embed"
+            # Shared read-only mappings, not safe_open's private ones: see
+            # `shared_tensor`.
             tensors = [
-                self._shared_tensor(name + suffix) for suffix in (".weight", ".scale")
+                shared_tensor(
+                    self.directory / self.weight_map[name + suffix], name + suffix
+                )
+                for suffix in (".weight", ".scale")
             ]
             tables[layer] = HostEmbeddingTable(
                 tensors[0],

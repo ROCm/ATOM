@@ -10,6 +10,7 @@ KV cache migration between producer (prefill) and consumer (decode) nodes.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -17,6 +18,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import msgpack
@@ -68,10 +70,6 @@ if _MORIIO_AVAILABLE:
     )
 
 logger = logging.getLogger("atom")
-
-# 0 PAGE, keyed by block id. 1 SLOT, keyed by state_slot.
-_REGION_PAGE = 0
-_REGION_SLOT = 1
 
 
 # ===================================================================
@@ -188,8 +186,13 @@ class MoRIIOConnector(KVConnectorBase):
         self.kv_cache_block_size: int = config.kv_cache_block_size
         self.blocks_per_chunk: int | None = None
         self.num_k_chunks: int = 0
-        # name -> [kind, unit_bytes, num_units, reverse_indexed, units_per_chunk]
-        self._region_layers: dict[str, list[int]] = {}
+
+        # Per-request state (`KVCacheTensor.per_request_state`), addressed by
+        # state slot rather than block: name -> (descriptor, bytes per slot,
+        # tensor). Never part of the block layout above.
+        self._state_tensors: dict[str, tuple[bytes, int, Any]] = {}
+        self._num_state_slots = 0
+        self._built_state_sessions: dict[str, list[tuple[Any, int]]] = {}
 
         # Session cache: remote_engine_id -> list[session]
         self._built_sessions: defaultdict[str, list] = defaultdict(list)
@@ -229,6 +232,8 @@ class MoRIIOConnector(KVConnectorBase):
         self._verify_kv = envs.ATOM_MORIIO_VERIFY
         self._verify_before: dict[ReqId, dict[str, int]] = {}
         self._verify_rows: dict[ReqId, Any] = {}
+        self._verify_state_before: dict[ReqId, tuple[int, dict[str, int]]] = {}
+        self._write_state_digests: dict[ReqId, dict[str, int]] = {}
         self._logged_layout = False
 
         # Requests rejected before a single transfer was issued. They have no
@@ -267,6 +272,15 @@ class MoRIIOConnector(KVConnectorBase):
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
 
+        # Region mode (backends that publish KVTransferTensors and no
+        # per-layer block caches, e.g. DeepSeek-V4). None until registered.
+        self._regions: list[_Region] | None = None
+        self._region_views: list[Any] = []
+        self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
+        self._remote_regions_checked: dict[EngineId, list[_Region]] = {}
+        self._write_digests: dict[ReqId, list[int]] = {}
+        self._verify_expected: dict[ReqId, list[int]] = {}
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, Any],
@@ -284,19 +298,28 @@ class MoRIIOConnector(KVConnectorBase):
         metadata list layout:
         ``[k_chunk0, k_chunk1, ..., v_chunk0, v_chunk1, ...]``.
         ``self.num_k_chunks`` marks the K/V boundary.
+
+        A backend with no per-layer block caches (DeepSeek-V4) publishes its
+        storage only as ``transfer_tensors`` regions; those are registered
+        instead, see :meth:`_register_regions`.
         """
         self.kv_caches = kv_caches
-        if not kv_caches:
-            if transfer_tensors is None or not transfer_tensors.block_regions:
-                raise ValueError(
-                    "MoRIIO found neither per-layer KV caches nor transfer "
-                    "regions to register"
-                )
-            self._register_regions(transfer_tensors)
+        block_layers = [
+            cache
+            for cache in kv_caches.values()
+            if not getattr(cache, "per_request_state", False)
+        ]
+        if not block_layers:
+            for layer_name, kv_cache in kv_caches.items():
+                self._register_state(layer_name, kv_cache)
+            self._start_handshake_listener(self._register_regions(transfer_tensors))
             return
         cache_tensor = None
 
         for layer_name, kv_cache in kv_caches.items():
+            if getattr(kv_cache, "per_request_state", False):
+                self._register_state(layer_name, kv_cache)
+                continue
             cache_tensor = kv_cache.k_cache
             v_cache = kv_cache.v_cache
             is_mla = v_cache is None
@@ -346,6 +369,20 @@ class MoRIIOConnector(KVConnectorBase):
             len(meta_list) - self.num_k_chunks,
             self.blocks_per_chunk,
         )
+        if self._state_tensors:
+            if not self.is_producer and self.transfer_mode == "read":
+                raise NotImplementedError(
+                    "moriio read mode moves block-addressed KV only, and this "
+                    f"model keeps per-request state in {len(self._state_tensors)} "
+                    "tensors; use moriio_mode=write"
+                )
+            logger.info(
+                "Registered %d per-request state tensors for RDMA: %d slots, "
+                "%d bytes per slot",
+                len(self._state_tensors),
+                self._num_state_slots,
+                sum(slot_bytes for _, slot_bytes, _ in self._state_tensors.values()),
+            )
 
         # The same layout test the transfers use. It also refuses layers shaped
         # unlike the first, so a mixed pool fails here rather than per request.
@@ -355,6 +392,7 @@ class MoRIIOConnector(KVConnectorBase):
             self.num_blocks = cache_tensor.shape[0] // self.block_len
         else:
             self.num_blocks = cache_tensor.shape[0]
+        state = self._state_tensors
         metadata = MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
@@ -362,6 +400,9 @@ class MoRIIOConnector(KVConnectorBase):
             num_blocks=self.num_blocks,
             block_len=self.block_len,
             attn_backend_name="aiter",
+            state_descs={n: d for n, (d, _, _) in state.items()} or None,
+            state_slot_bytes={n: b for n, (_, b, _) in state.items()} or None,
+            num_state_slots=self._num_state_slots,
         )
         self._start_handshake_listener(metadata)
 
@@ -382,92 +423,435 @@ class MoRIIOConnector(KVConnectorBase):
         )
         self._handshake_listener_thread.start()
 
-    def _register_regions(self, tt: Any) -> None:
-        """One pseudo-layer per PAGE or SLOT region. Staging is not registered."""
-        if self.transfer_mode == "read" and not self.is_producer:
-            raise ValueError(
-                "MoRIIO read mode does not support region layouts "
-                "(KVTransferTensors); set moriio_mode=write"
-            )
+    def _register_regions(self, transfer_tensors: Any) -> MoRIIOAgentMetadata:
+        """Register a backend's PAGE and full-SLOT regions for RDMA.
+
+        PAGE regions (``transfer_tensors.pages``) are indexed forward by
+        scheduler block. Full per-request SLOT regions (``swa_block_regions``,
+        plus ``slot_regions`` where a backend has them) are indexed by state
+        slot and may be reverse-indexed. Each region is cut into unit-aligned
+        chunks under the ``ibv_reg_mr`` limit, so no unit straddles two
+        registrations. The compressor-only staging pool is not registered: a
+        full SLOT already carries the compressor state.
+        """
         import torch
 
-        device_id = torch.cuda.current_device()
-        groups = (
-            (_REGION_PAGE, "page", tt.block_regions),
-            (_REGION_SLOT, "slot", list(tt.swa_block_regions) + list(tt.slot_regions)),
-        )
-        for kind, prefix, regions in groups:
-            for i, region in enumerate(regions):
-                unit = int(region.unit_bytes)
-                if unit <= 0 or region.total_bytes % unit:
-                    raise ValueError(
-                        f"{prefix} region {i} ({region.semantic_role}) does not "
-                        f"divide into units: {region.total_bytes} B in units of "
-                        f"{unit} B"
-                    )
-                if unit > MAX_RDMA_CHUNK_BYTES:
-                    raise ValueError(
-                        f"{prefix} region {i} unit of {unit} B exceeds the "
-                        f"{MAX_RDMA_CHUNK_BYTES} B registration limit"
-                    )
-                num_units = region.total_bytes // unit
-                upc = MAX_RDMA_CHUNK_BYTES // unit
-                name = f"{prefix}.{i}.{region.semantic_role or ''}"
-                metas = []
-                for start in range(0, num_units, upc):
-                    end = min(start + upc, num_units)
-                    metas.append(
-                        self.moriio_wrapper.register_local_buffer(
-                            region.base_addr + start * unit,
-                            (end - start) * unit,
-                            device_id,
-                        )
-                    )
-                self.layer_name_to_local_kv_cache_metadata[name] = metas
-                self._region_layers[name] = [
-                    kind,
-                    unit,
-                    num_units,
-                    int(region.reverse_indexed),
-                    upc,
-                ]
+        tt = transfer_tensors
+        if tt is None or not tt.block_regions:
+            raise ValueError(
+                "MoRIIO: the attention backend registered neither per-layer KV "
+                "caches nor transfer regions, so there is nothing to transfer"
+            )
+        if not self.is_producer and self.transfer_mode != "write":
+            raise NotImplementedError(
+                "MoRIIO transfer regions are only moved in write mode; set "
+                "moriio_mode=write (or ATOM_MORIIO_MODE=write) on the consumer"
+            )
+        if tt.block_region_consumer_indices is not None:
+            raise NotImplementedError(
+                "MoRIIO region mode pairs regions one to one and cannot apply "
+                "block_region_consumer_indices"
+            )
+        expected = tt.expected_full_slot_region_count
+        if expected is not None and len(tt.swa_block_regions) != expected:
+            raise ValueError(
+                f"backend declares {expected} full SLOT regions but publishes "
+                f"{len(tt.swa_block_regions)}"
+            )
 
-        metadata = MoRIIOAgentMetadata(
+        regions: list[_Region] = []
+        views: list[Any] = []
+        for i, page in enumerate(tt.pages):
+            role = page.region.semantic_role
+            regions.append(_Region.of(f"page.{i}.{role}", "page", page.region))
+            views.append(page.view)
+        for i, region in enumerate(tt.swa_block_regions):
+            role = region.semantic_role
+            regions.append(_Region.of(f"slot.{i}.{role}", "slot", region))
+            views.append(None)
+        for i, region in enumerate(tt.slot_regions):
+            role = region.semantic_role
+            regions.append(_Region.of(f"state.{i}.{role}", "slot", region))
+            views.append(None)
+
+        device = next((v.device for v in views if v is not None), None)
+        if device is not None and device.index is not None:
+            device_id = device.index
+        else:
+            device_id = torch.cuda.current_device()
+        local_meta: dict[str, list[bytes]] = {}
+        for region in regions:
+            local_meta[region.name] = [
+                self.moriio_wrapper.register_local_buffer(ptr, size, device_id)
+                for ptr, size in region.chunks()
+            ]
+
+        self._regions = regions
+        self._region_views = views
+        self._region_tables: dict[int, Any] = {}
+        self.layer_name_to_local_kv_cache_metadata = local_meta
+        self.num_blocks = int(tt.num_blocks)
+        self.block_len = self.kv_cache_block_size
+        logger.info(
+            "[moriio-regions] registered %d PAGE + %d SLOT regions in %d chunks "
+            "(blocks=%d, slots=%d, page_unit_bytes=%d, slot_unit_bytes=%d)",
+            sum(r.kind == "page" for r in regions),
+            sum(r.kind == "slot" for r in regions),
+            sum(len(d) for d in local_meta.values()),
+            self.num_blocks,
+            tt.num_slots,
+            sum(r.unit for r in regions if r.kind == "page"),
+            sum(r.unit for r in regions if r.kind == "slot"),
+        )
+        state = self._state_tensors
+        return MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
-            region_layout=self._region_layers,
+            kv_caches_base_addr=None,
+            num_blocks=self.num_blocks,
+            block_len=self.block_len,
+            attn_backend_name="aiter",
+            state_descs={n: d for n, (d, _, _) in state.items()} or None,
+            state_slot_bytes={n: b for n, (_, b, _) in state.items()} or None,
+            num_state_slots=self._num_state_slots,
+            region_layout=json.dumps([r.layout() for r in regions]),
         )
-        self._start_handshake_listener(metadata)
 
-    def _check_region_layout(self, remote_engine_id: str) -> dict[str, list[int]]:
-        """Peer layout. Kind, unit, reverse, and chunking must match. Counts may differ."""
-        remote = self.remote_moriio_metadata[remote_engine_id].region_layout
-        if not remote:
+    def _remote_regions(self, engine_id: EngineId) -> list[_Region]:
+        """The peer's regions, checked once against ours."""
+        checked = self._remote_regions_checked.get(engine_id)
+        if checked is not None:
+            return checked
+        meta = self.remote_moriio_metadata[engine_id]
+        if not meta.region_layout:
             raise ValueError(
-                f"{remote_engine_id} advertised no region layout, but this rank "
-                "transfers regions; P and D must run the same model"
+                f"{engine_id} registered per-layer KV caches but this rank "
+                "registered transfer regions; P and D must run the same model"
             )
-        if list(remote) != list(self._region_layers):
+        remote = [_Region.from_layout(e) for e in json.loads(meta.region_layout)]
+        if len(remote) != len(self._regions):
             raise ValueError(
-                f"{remote_engine_id} advertised regions {list(remote)}, not "
-                f"{list(self._region_layers)}"
+                f"{engine_id} advertised {len(remote)} transfer regions, this "
+                f"rank has {len(self._regions)}"
             )
-        for name, local in self._region_layers.items():
-            theirs = list(remote[name])
-            if theirs[:2] + theirs[3:] != local[:2] + local[3:]:
+        descs = self.layer_name_to_remote_kv_cache_metadata[engine_id]
+        for local, peer in zip(self._regions, remote):
+            if (local.name, local.kind, local.unit, local.reverse) != (
+                peer.name,
+                peer.kind,
+                peer.unit,
+                peer.reverse,
+            ):
                 raise ValueError(
-                    f"region {name}: {remote_engine_id} advertised "
-                    f"[kind, unit, units, reverse, per_chunk]={theirs}, ours is "
-                    f"{local}"
+                    f"transfer region mismatch with {engine_id}: local "
+                    f"{local.layout()} vs remote {peer.layout()}"
                 )
+            got = descs.get(peer.name)
+            if got is None or len(got) != peer.num_chunks:
+                raise ValueError(
+                    f"region {peer.name}: {engine_id} advertised "
+                    f"{0 if got is None else len(got)} descriptors for "
+                    f"{peer.num_chunks} chunks"
+                )
+            if got == self.layer_name_to_local_kv_cache_metadata[local.name]:
+                raise ValueError(
+                    f"region {peer.name}: {engine_id} advertised descriptors "
+                    "byte-identical to ours; every transfer would copy this "
+                    "rank's own memory and the KV would never arrive"
+                )
+        self._remote_regions_checked[engine_id] = remote
         return remote
 
-    @staticmethod
-    def _region_unit(layout: list[int], index: int, label: str) -> int:
-        num_units, reverse = layout[2], layout[3]
-        if not 0 <= index < num_units:
-            raise ValueError(f"{label}: unit {index} outside 0..{num_units - 1}")
-        return num_units - 1 - index if reverse else index
+    def _region_session(
+        self, engine_id: EngineId, region_idx: int, local_chunk: int, remote_chunk: int
+    ) -> Any:
+        """The session for one (local chunk, remote chunk) pair, built on use."""
+        sessions = self._region_sessions.setdefault(engine_id, {})
+        key = (region_idx, local_chunk, remote_chunk)
+        session = sessions.get(key)
+        if session is None:
+            name = self._regions[region_idx].name
+            unpack = self.moriio_wrapper.get_unpack_memory_metadata
+            session = self.moriio_wrapper.build_session(
+                unpack(self.layer_name_to_local_kv_cache_metadata[name][local_chunk]),
+                unpack(
+                    self.layer_name_to_remote_kv_cache_metadata[engine_id][name][
+                        remote_chunk
+                    ]
+                ),
+            )
+            sessions[key] = session
+        return session
+
+    def _region_plan(
+        self, request: dict[str, Any], engine_id: EngineId
+    ) -> list[tuple[Any, list[int], list[int], list[int]]]:
+        """Every ``(session, local_offs, remote_offs, sizes)`` batch of a push."""
+        dst = [int(b) for b in request["dst_block_ids"]]
+        src = [int(b) for b in request["src_block_ids"]]
+        label = f"transfer {request['transfer_id']}"
+        self._source_covers(label, dst, src)
+        remote_tp = int(request.get("decode_tp_size") or self.tp_size)
+        if remote_tp != self.tp_size:
+            raise ValueError(
+                f"{label}: region transfer needs equal TP on both ends, "
+                f"producer tp={self.tp_size}, consumer tp={remote_tp}"
+            )
+        src_slot = int(request.get("src_slot_index", -1))
+        dst_slot = int(request.get("dst_slot_index", -1))
+        if any(r.kind == "slot" for r in self._regions) and (
+            src_slot < 0 or dst_slot < 0
+        ):
+            raise ValueError(
+                f"{label}: backend has per-request SLOT regions but the push "
+                f"carries no state slot (src={src_slot}, dst={dst_slot}); decode "
+                "would resume from an empty window and compressor state"
+            )
+        remote = self._remote_regions(engine_id)
+        plan: list[tuple[Any, list[int], list[int], list[int]]] = []
+        for ri, (local, peer) in enumerate(zip(self._regions, remote)):
+            if local.kind == "page":
+                pairs = list(zip(src[: len(dst)], dst))
+            else:
+                pairs = [(src_slot, dst_slot)]
+            groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
+            for su, du in pairs:
+                lc, lo = local.locate(su)
+                rc, ro = peer.locate(du)
+                group = groups.setdefault((lc, rc), ([], [], []))
+                group[0].append(lo)
+                group[1].append(ro)
+                group[2].append(local.unit)
+            for (lc, rc), (l_offs, r_offs, sizes) in groups.items():
+                l_offs, r_offs, sizes = self.merge_contiguous_blocks(
+                    l_offs, r_offs, sizes
+                )
+                plan.append(
+                    (self._region_session(engine_id, ri, lc, rc), l_offs, r_offs, sizes)
+                )
+        return plan
+
+    def _write_regions(self, request: dict[str, Any], engine_id: EngineId) -> list[Any]:
+        """Push a request's PAGE blocks and SLOT units; return the statuses."""
+        plan = self._region_plan(request, engine_id)
+        statuses: list[Any] = []
+        try:
+            for session, l_offs, r_offs, sizes in plan:
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        sizes, l_offs, r_offs, session
+                    )
+                )
+        except Exception:
+            if not statuses:
+                raise
+            logger.exception(
+                "transfer %s: could not post every write", request["transfer_id"]
+            )
+            statuses.append(_POST_FAILED)
+        logger.debug(
+            "RDMA region write issued for transfer %s: %d blocks, slot %s->%s, "
+            "%d batches, %d bytes to %s",
+            request["transfer_id"],
+            len(request["dst_block_ids"]),
+            request.get("src_slot_index"),
+            request.get("dst_slot_index"),
+            len(plan),
+            sum(sum(sizes) for _, _, _, sizes in plan),
+            engine_id,
+        )
+        return statuses
+
+    def _region_table(self, region_idx: int) -> Any:
+        """``uint8 [num_units, unit_bytes]`` over a region's physical rows, or None."""
+        import torch
+
+        if region_idx in self._region_tables:
+            return self._region_tables[region_idx]
+        region = self._regions[region_idx]
+        view = self._region_views[region_idx]
+        table = None
+        if view is not None:
+            table = view.reshape(region.num_units, region.unit)
+        else:
+            for other in self._region_views:
+                if other is None:
+                    continue
+                storage = other.untyped_storage()
+                start = storage.data_ptr()
+                if start <= region.base and (
+                    region.base + region.total <= start + storage.nbytes()
+                ):
+                    table = torch.empty(0, dtype=torch.uint8, device=other.device)
+                    table.set_(
+                        storage,
+                        region.base - start,
+                        (region.num_units, region.unit),
+                        (region.unit, 1),
+                    )
+                    break
+            if table is None:
+                logger.warning(
+                    "[moriio-verify] region %s is in no published allocation; "
+                    "it cannot be digested",
+                    region.name,
+                )
+        self._region_tables[region_idx] = table
+        return table
+
+    def _region_digests(self, blocks: list[int], slot: int) -> list[int] | None:
+        """Position-weighted digest of each region's units, in pairing order."""
+        import torch
+
+        period = 65521
+        slice_bytes = period * 64
+        sums = []
+        for ri, region in enumerate(self._regions):
+            table = self._region_table(ri)
+            if table is None:
+                return None
+            if region.kind == "page":
+                units = blocks
+            else:
+                units = [slot] if slot >= 0 else []
+            device = table.device
+            if getattr(self, "_digest_weights", None) is None or (
+                self._digest_weights.device != device
+            ):
+                self._digest_weights = (
+                    torch.arange(slice_bytes, dtype=torch.int64, device=device) % period
+                    + 1
+                )
+            w = self._digest_weights
+            acc = torch.zeros((), dtype=torch.int64, device=device)
+            for k, unit in enumerate(units):
+                row = table[region.num_units - 1 - unit if region.reverse else unit]
+                for start in range(0, region.unit, slice_bytes):
+                    piece = row[start : start + slice_bytes]
+                    acc += (k + 1) * torch.sum(
+                        piece.to(torch.int64) * w[: piece.numel()]
+                    )
+            sums.append(acc)
+        return [int(x) for x in torch.stack(sums).tolist()]
+
+    def _verify_regions_landed(self, req_id: ReqId) -> None:
+        """Compare the consumer's destination digests with the producer's source."""
+        units = self._verify_rows.pop(req_id, None)
+        before = self._verify_before.pop(req_id, None)
+        expected = self._verify_expected.pop(req_id, None)
+        if units is None:
+            return
+        after = self._region_digests(*units)
+        if after is None:
+            return
+        names = [r.name for r in self._regions]
+        if expected is not None:
+            bad = [i for i, (a, e) in enumerate(zip(after, expected)) if a != e]
+            if bad or len(expected) != len(after):
+                first = bad[0] if bad else 0
+                logger.error(
+                    "[moriio-verify] req %s: %d of %d regions differ from the "
+                    "producer's source after the push (first %s: %s != %s, "
+                    "blocks=%d, slot=%d) -- decode will read KV that did not land",
+                    req_id,
+                    len(bad) or abs(len(expected) - len(after)),
+                    len(after),
+                    names[first],
+                    after[first],
+                    expected[first] if first < len(expected) else None,
+                    len(units[0]),
+                    units[1],
+                )
+            else:
+                logger.info(
+                    "[moriio-verify] req %s: all %d regions match the producer's "
+                    "source (blocks=%d, slot=%d)",
+                    req_id,
+                    len(after),
+                    len(units[0]),
+                    units[1],
+                )
+            return
+        if before is None:
+            return
+        unchanged = [
+            names[i]
+            for i, (b, a) in enumerate(zip(before, after))
+            if b == a and (self._regions[i].kind == "page" or units[1] >= 0)
+        ]
+        if unchanged:
+            logger.error(
+                "[moriio-verify] req %s: %d of %d regions unchanged after the "
+                "push reported done (first %s) and no producer digest to compare",
+                req_id,
+                len(unchanged),
+                len(after),
+                unchanged[0],
+            )
+        else:
+            logger.info(
+                "[moriio-verify] req %s: all %d regions changed", req_id, len(after)
+            )
+
+    def _source_digests(self, request: dict[str, Any]) -> list[int] | None:
+        """Digests of a settled push's source units, for the consumer to check."""
+        if not (self._verify_kv and self._regions is not None):
+            return None
+        dst = request["dst_block_ids"]
+        blocks = [int(b) for b in request["src_block_ids"][: len(dst)]]
+        try:
+            return self._region_digests(blocks, int(request.get("src_slot_index", -1)))
+        except Exception:
+            logger.exception(
+                "[moriio-verify] transfer %s: could not digest the source",
+                request["transfer_id"],
+            )
+            return None
+
+    def _register_state(self, layer_name: str, kv_cache: Any) -> None:
+        """Register one layer's per-request state, one slot per dim-0 row.
+
+        The KDA forward binds its conv state as ``k_cache`` and its SSM state as
+        ``v_cache``, each ``(num_slots, ...)`` and contiguous, so a slot is one
+        run of ``stride(0)`` elements and moves as a single write.
+        """
+        if any(
+            getattr(kv_cache, name, None) is not None
+            for name in ("replay_buf_k", "replay_buf_u", "replay_buf_g")
+        ):
+            # Under ReplaySSM the records and the cursor are part of the state,
+            # and this connector moves neither.
+            raise NotImplementedError(
+                f"{layer_name}: ReplaySSM record buffers are per-request state "
+                "MoRIIO does not move; serve P/D with ATOM_ENABLE_REPLAYSSM=0"
+            )
+        for part, tensor in (("k", kv_cache.k_cache), ("v", kv_cache.v_cache)):
+            if tensor is None or tensor.numel() == 0:
+                continue
+            name = f"{layer_name}.{part}"
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name}: state shaped {tuple(tensor.shape)} with strides "
+                    f"{tensor.stride()} is not one run of bytes per slot"
+                )
+            num_slots = tensor.shape[0]
+            if self._num_state_slots not in (0, num_slots):
+                raise ValueError(
+                    f"{name} has {num_slots} slots, the state registered before "
+                    f"it {self._num_state_slots}"
+                )
+            slot_bytes = tensor.stride(0) * tensor.element_size()
+            if num_slots * slot_bytes > MAX_RDMA_CHUNK_BYTES:
+                raise ValueError(
+                    f"{name}: {num_slots} slots of {slot_bytes} bytes exceed one "
+                    "RDMA registration"
+                )
+            device_id = tensor.device.index if tensor.device.index is not None else -1
+            desc = self.moriio_wrapper.register_local_buffer(
+                tensor.data_ptr(), num_slots * slot_bytes, device_id
+            )
+            self._num_state_slots = num_slots
+            self._state_tensors[name] = (desc, slot_bytes, tensor)
 
     @staticmethod
     def _transfer_mode_from(
@@ -668,11 +1052,29 @@ class MoRIIOConnector(KVConnectorBase):
             return
         src_slot = int(getattr(meta, "remote_slot_index", -1))
         dst_slot = int(getattr(meta, "local_slot_index", -1))
-        has_slots = any(v[0] == _REGION_SLOT for v in self._region_layers.values())
-        if has_slots and (src_slot < 0 or dst_slot < 0):
+        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
+        if self._regions is not None:
+            has_slots = any(r.kind == "slot" for r in self._regions)
+            if remote_tp_size != self.tp_size or (
+                has_slots and (src_slot < 0 or dst_slot < 0)
+            ):
+                logger.error(
+                    "req %s: region transfer needs equal TP (producer %d, "
+                    "consumer %d) and a state slot on both ends (src=%d, dst=%d)",
+                    req_id,
+                    remote_tp_size,
+                    self.tp_size,
+                    src_slot,
+                    dst_slot,
+                )
+                self._fail_before_transfer(req_id, meta)
+                return
+        elif self._state_tensors and (src_slot < 0 or dst_slot < 0):
+            # The KV alone would land, and decode would resume the recurrent
+            # state from whatever its slot last held.
             logger.error(
-                "req %s: this layout moves per-request state but the request "
-                "carries no state slot (src=%d, dst=%d)",
+                "req %s: this model keeps per-request state, but the transfer "
+                "names state slot %d -> %d; refusing to move the KV without it",
                 req_id,
                 src_slot,
                 dst_slot,
@@ -680,14 +1082,21 @@ class MoRIIOConnector(KVConnectorBase):
             self._fail_before_transfer(req_id, meta)
             return
 
-        if self._verify_kv and not self._region_layers:
-            first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
-            is_mla = self.kv_caches[first_layer].v_cache is None
-            rows = self._verify_rows_for(dst, is_mla)
-            self._verify_rows[req_id] = rows
-            self._verify_before[req_id] = self._verify_digest(rows)
-
-        remote_tp_size = int(meta.tp_size or 0) or self.tp_size
+        if self._verify_kv:
+            if self._regions is not None:
+                self._verify_rows[req_id] = (dst, dst_slot)
+                self._verify_before[req_id] = self._region_digests(dst, dst_slot)
+            else:
+                first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
+                is_mla = self.kv_caches[first_layer].v_cache is None
+                rows = self._verify_rows_for(dst, is_mla)
+                self._verify_rows[req_id] = rows
+                self._verify_before[req_id] = self._verify_digest(rows)
+                if self._state_tensors:
+                    self._verify_state_before[req_id] = (
+                        dst_slot,
+                        self._state_digest(dst_slot),
+                    )
         port = int(meta.remote_handshake_port) + get_port_offset(
             int(meta.remote_dp_rank or 0), self.tp_rank, remote_tp_size
         )
@@ -704,8 +1113,8 @@ class MoRIIOConnector(KVConnectorBase):
             "dst_block_ids": dst,
             "src_block_ids": src[: len(dst)],
             "deadline": deadline,
-            "src_slot": src_slot,
-            "dst_slot": dst_slot,
+            "src_slot_index": src_slot,
+            "dst_slot_index": dst_slot,
         }
         try:
             self.moriio_wrapper.send_message(
@@ -718,6 +1127,7 @@ class MoRIIOConnector(KVConnectorBase):
             logger.exception("req %s: could not ask the producer to push KV", req_id)
             self._verify_rows.pop(req_id, None)
             self._verify_before.pop(req_id, None)
+            self._verify_state_before.pop(req_id, None)
             self._fail_before_transfer(req_id, meta)
             return
         self._awaiting_write[req_id] = (deadline, meta)
@@ -823,36 +1233,23 @@ class MoRIIOConnector(KVConnectorBase):
         if remote_engine_id not in self._built_sessions:
             nk = self.num_k_chunks
             remote_meta = self.remote_moriio_metadata[remote_engine_id]
-            remote_layout = (
-                self._check_region_layout(remote_engine_id)
-                if self._region_layers
-                else None
-            )
             # Both ends cut a pool at the same blocks per chunk, which depends
             # only on the size of a block, but each registers as many chunks as
             # its own pool needs. P and D size their KV caches independently,
             # so one can cross a chunk boundary the other does not.
-            if remote_layout is None:
-                remote_nk = -(-remote_meta.num_blocks // self.blocks_per_chunk)
+            remote_nk = -(-remote_meta.num_blocks // self.blocks_per_chunk)
             per_layer_sessions: list[tuple[dict, dict]] = []
             for ln, local_metas in self.layer_name_to_local_kv_cache_metadata.items():
                 remote_metas = self.layer_name_to_remote_kv_cache_metadata[
                     remote_engine_id
                 ][ln]
-                if remote_layout is not None:
-                    _, _, remote_units, _, upc = remote_layout[ln]
-                    nk = len(local_metas)
-                    remote_nk = -(-remote_units // upc)
-                    blocks, per_chunk = remote_units, upc
-                else:
-                    blocks, per_chunk = remote_meta.num_blocks, self.blocks_per_chunk
                 has_v = len(local_metas) > nk
                 if len(remote_metas) != remote_nk * (2 if has_v else 1):
                     raise ValueError(
                         f"layer {ln}: {remote_engine_id} advertised "
                         f"{len(remote_metas)} descriptors for "
-                        f"{blocks} blocks, not {remote_nk} per "
-                        f"cache at {per_chunk} blocks per chunk"
+                        f"{remote_meta.num_blocks} blocks, not {remote_nk} per "
+                        f"cache at {self.blocks_per_chunk} blocks per chunk"
                     )
                 # Packed descriptors carry the owning engine's key, so equal
                 # bytes mean the handshake handed back our own. Every transfer
@@ -867,19 +1264,6 @@ class MoRIIOConnector(KVConnectorBase):
 
                 def _unpack(packed):
                     return self.moriio_wrapper.get_unpack_memory_metadata(packed)
-
-                if remote_layout is not None:
-                    per_layer_sessions.append(
-                        (
-                            _LazySessions(
-                                self.moriio_wrapper,
-                                [_unpack(m) for m in local_metas],
-                                [_unpack(m) for m in remote_metas],
-                            ),
-                            {},
-                        )
-                    )
-                    continue
 
                 # K sessions: grid over the first nk / remote_nk entries
                 k_sessions: dict[tuple[int, int], Any] = {}
@@ -904,19 +1288,52 @@ class MoRIIOConnector(KVConnectorBase):
 
                 per_layer_sessions.append((k_sessions, v_sessions))
 
-            if remote_layout is None:
-                logger.info(
-                    "Built %d K sessions + %d V sessions per layer for %s",
-                    len(k_sessions),
-                    len(v_sessions),
-                    remote_engine_id,
-                )
+            logger.info(
+                "Built %d K sessions + %d V sessions per layer for %s",
+                len(k_sessions),
+                len(v_sessions),
+                remote_engine_id,
+            )
             self._built_sessions[remote_engine_id] = per_layer_sessions
 
         return (
             self._built_sessions[remote_engine_id],
             self.remote_moriio_metadata[remote_engine_id],
         )
+
+    def _get_or_build_state_sessions(self, engine_id: str) -> list[tuple[Any, int]]:
+        """``(session, bytes_per_slot)`` per state tensor, in registration order.
+
+        Built once per consumer, after checking it registered the same state
+        tensors with the same slot size: any difference would land every
+        request's state at the wrong offset without failing a write.
+        """
+        if engine_id not in self._built_state_sessions:
+            remote = self.remote_moriio_metadata[engine_id]
+            ours = {
+                name: slot_bytes
+                for name, (_, slot_bytes, _) in self._state_tensors.items()
+            }
+            theirs = remote.state_slot_bytes or {}
+            if theirs != ours:
+                raise ValueError(
+                    f"{engine_id} registered {len(theirs)} per-request state "
+                    f"tensors to our {len(ours)}, or with other slot sizes"
+                )
+            unpack = self.moriio_wrapper.get_unpack_memory_metadata
+            sessions = []
+            for name, (desc, slot_bytes, _) in self._state_tensors.items():
+                remote_desc = remote.state_descs[name]
+                if remote_desc == desc:
+                    # Our own descriptor back: every write would copy this
+                    # rank's slot onto itself and still succeed.
+                    raise ValueError(f"{engine_id} advertised our own {name}")
+                session = self.moriio_wrapper.build_session(
+                    unpack(desc), unpack(remote_desc)
+                )
+                sessions.append((session, slot_bytes))
+            self._built_state_sessions[engine_id] = sessions
+        return self._built_state_sessions[engine_id]
 
     def _verify_rows_for(self, local_block_ids: list[int], is_mla: bool) -> Any:
         """Row indices into dim 0 covered by the given blocks.
@@ -1000,6 +1417,65 @@ class MoRIIOConnector(KVConnectorBase):
                 "[moriio-verify] req %s: all %d layers changed",
                 req_id,
                 len(before),
+            )
+
+    def _state_digest(self, slot: int) -> dict[str, int]:
+        """Position-weighted byte digest of one slot in every state tensor.
+
+        Weighted like `_verify_digest`, so a slot still holding an earlier
+        request's state with the same byte sum reads as different.
+        """
+        import torch
+
+        rows = [
+            tensor[slot].reshape(-1).view(torch.uint8)
+            for _, _, tensor in self._state_tensors.values()
+        ]
+        weights = (
+            torch.arange(
+                max(row.numel() for row in rows),
+                dtype=torch.int64,
+                device=rows[0].device,
+            )
+            % 65521
+            + 1
+        )
+        sums = [torch.sum(row.to(torch.int64) * weights[: row.numel()]) for row in rows]
+        return dict(zip(self._state_tensors, torch.stack(sums).tolist()))
+
+    def _verify_state_landed(self, req_id: ReqId) -> None:
+        """Compare the destination slot with the producer's source digest."""
+        entry = self._verify_state_before.pop(req_id, None)
+        with self._write_reports_lock:
+            source = self._write_state_digests.pop(req_id, None)
+        if entry is None:
+            return
+        slot, before = entry
+        after = self._state_digest(slot)
+        if source is None:
+            logger.error(
+                "[moriio-verify] req %s: the producer sent no state digest", req_id
+            )
+            return
+        differ = [name for name, value in after.items() if source.get(name) != value]
+        if differ:
+            logger.error(
+                "[moriio-verify] req %s: %d of %d state tensors differ from the "
+                "producer's slot (first %s: %d before, %d after, producer %d) -- "
+                "decode will resume from state the prompt never produced",
+                req_id,
+                len(differ),
+                len(after),
+                differ[0],
+                before[differ[0]],
+                after[differ[0]],
+                source.get(differ[0], -1),
+            )
+        else:
+            logger.info(
+                "[moriio-verify] req %s: all %d state tensors match the producer",
+                req_id,
+                len(after),
             )
 
     def _read_blocks(
@@ -1153,7 +1629,6 @@ class MoRIIOConnector(KVConnectorBase):
         local_block_ids: list[int],
         remote_block_ids: list[int],
         per_block_bytes: int,
-        blocks_per_chunk: int | None = None,
     ) -> dict[tuple[int, int], tuple[list[int], list[int], list[int]]]:
         """Chunk-relative byte offsets of each block pair, grouped by chunk pair.
 
@@ -1163,7 +1638,7 @@ class MoRIIOConnector(KVConnectorBase):
         directions, so a read and a write of the same pair always touch the
         same bytes.
         """
-        bpc = blocks_per_chunk or self.blocks_per_chunk
+        bpc = self.blocks_per_chunk
         groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
         for lb, rb in zip(local_block_ids, remote_block_ids):
             key = (lb // bpc, rb // bpc)
@@ -1184,17 +1659,27 @@ class MoRIIOConnector(KVConnectorBase):
         dst = [int(b) for b in request["dst_block_ids"]]
         src = [int(b) for b in request["src_block_ids"]]
         self._source_covers(f"transfer {request['transfer_id']}", dst, src)
+        if self._regions is not None:
+            # Checked before any region write is posted.
+            state_writes = self._state_writes(request, engine_id)
+            statuses = self._write_regions(request, engine_id)
+            for session, size, local_offset, remote_offset in state_writes:
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        [size], [local_offset], [remote_offset], session
+                    )
+                )
+            return statuses
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
-        if self._region_layers:
-            plan = self._region_write_plan(request, engine_id, src[: len(dst)], dst)
-        else:
-            _is_mla, per_block_bytes = self._kv_layout()
-            groups = self._group_offsets(src[: len(dst)], dst, per_block_bytes)
-            plan = [groups] * len(sessions)
+        # Before any block write: a request that cannot carry its state must not
+        # leave a half-filled destination behind.
+        state_writes = self._state_writes(request, engine_id)
+        _is_mla, per_block_bytes = self._kv_layout()
+        groups = self._group_offsets(src[: len(dst)], dst, per_block_bytes)
 
         statuses: list[Any] = []
         try:
-            for (k_sessions, v_sessions), groups in zip(sessions, plan, strict=True):
+            for k_sessions, v_sessions in sessions:
                 for (lci, rci), (l_offs, r_offs, szs) in groups.items():
                     statuses.append(
                         self.moriio_wrapper.write_remote_data_status(
@@ -1207,6 +1692,12 @@ class MoRIIOConnector(KVConnectorBase):
                                 szs, l_offs, r_offs, v_sessions[(lci, rci)]
                             )
                         )
+            for session, size, local_offset, remote_offset in state_writes:
+                statuses.append(
+                    self.moriio_wrapper.write_remote_data_status(
+                        [size], [local_offset], [remote_offset], session
+                    )
+                )
         except Exception:
             if not statuses:
                 raise
@@ -1218,44 +1709,50 @@ class MoRIIOConnector(KVConnectorBase):
             statuses.append(_POST_FAILED)
         logger.debug(
             "RDMA write issued for transfer %s: %d blocks, %d layers, %d chunk "
-            "groups to %s",
+            "groups, %d state tensors to %s",
             request["transfer_id"],
             len(dst),
             len(sessions),
-            sum(len(groups) for groups in plan),
+            len(groups),
+            len(state_writes),
             engine_id,
         )
         return statuses
 
-    def _region_write_plan(
-        self,
-        request: dict[str, Any],
-        engine_id: str,
-        src: list[int],
-        dst: list[int],
-    ) -> list[dict[tuple[int, int], tuple[list[int], list[int], list[int]]]]:
-        label = f"transfer {request['transfer_id']}"
-        remote_layout = self.remote_moriio_metadata[engine_id].region_layout
-        src_slot = int(request.get("src_slot", -1))
-        dst_slot = int(request.get("dst_slot", -1))
-        plan = []
-        for name, local in self._region_layers.items():
-            remote = remote_layout[name]
-            if local[0] == _REGION_SLOT:
-                pairs = ([src_slot], [dst_slot])
-            else:
-                pairs = (src, dst)
-            local_units = [
-                self._region_unit(local, i, f"{label} {name} source") for i in pairs[0]
-            ]
-            remote_units = [
-                self._region_unit(remote, i, f"{label} {name} destination")
-                for i in pairs[1]
-            ]
-            plan.append(
-                self._group_offsets(local_units, remote_units, local[1], local[4])
+    def _state_writes(
+        self, request: dict[str, Any], engine_id: str
+    ) -> list[tuple[Any, int, int, int]]:
+        """``(session, size, local_offset, remote_offset)`` per state tensor.
+
+        Empty for a model without per-request state. Raises when the request
+        cannot carry the state, before anything has been written.
+        """
+        if not self._state_tensors:
+            return []
+        transfer_id = request["transfer_id"]
+        src = int(request.get("src_slot_index", -1))
+        dst = int(request.get("dst_slot_index", -1))
+        remote_slots = self.remote_moriio_metadata[engine_id].num_state_slots
+        if not (0 <= src < self._num_state_slots and 0 <= dst < remote_slots):
+            raise ValueError(
+                f"transfer {transfer_id}: state slot {src} -> {dst} is out of "
+                f"range ({self._num_state_slots} -> {remote_slots} slots)"
             )
-        return plan
+        decode_tp_size = int(request.get("decode_tp_size") or self.tp_size)
+        if decode_tp_size != self.tp_size:
+            # Each rank holds only its own heads' state, so rank i has to land
+            # on rank i of a consumer sharded the same way.
+            raise ValueError(
+                f"transfer {transfer_id}: per-request state is sharded over TP "
+                f"{self.tp_size}, the consumer runs TP {decode_tp_size}"
+            )
+        sessions = self._get_or_build_state_sessions(engine_id)
+        if self._verify_kv:
+            request["state_digest"] = self._state_digest(src)
+        return [
+            (session, slot_bytes, src * slot_bytes, dst * slot_bytes)
+            for session, slot_bytes in sessions
+        ]
 
     def _service_write_requests(self) -> None:
         """Start queued pushes and report the ones that have finished.
@@ -1332,6 +1829,9 @@ class MoRIIOConnector(KVConnectorBase):
                 self._forget_peer(self._write_engine_id(request))
                 self._finish_write(request, ok=False)
             else:
+                digests = self._source_digests(request)
+                if digests is not None:
+                    request["region_digests"] = digests
                 self._finish_write(request, ok=True)
 
     def _accept_write_request(self, request: dict[str, Any]) -> None:
@@ -1381,8 +1881,8 @@ class MoRIIOConnector(KVConnectorBase):
             int(request.get("decode_dp_rank", 0))
             int(request.get("decode_tp_size") or 0)
             float(request.get("deadline") or 0.0)
-            int(request.get("src_slot", -1))
-            int(request.get("dst_slot", -1))
+            int(request.get("src_slot_index", -1))
+            int(request.get("dst_slot_index", -1))
             valid = (
                 "decode_req_id" in request
                 and isinstance(request["decode_host"], str)
@@ -1457,6 +1957,10 @@ class MoRIIOConnector(KVConnectorBase):
             int(request.get("decode_tp_size") or self.tp_size),
         )
         report = {"decode_req_id": request["decode_req_id"], "ok": ok}
+        if ok and request.get("region_digests") is not None:
+            report["digests"] = request["region_digests"]
+        if ok and "state_digest" in request:
+            report["state_digest"] = request["state_digest"]
         try:
             self.moriio_wrapper.send_message(
                 [MoRIIOConstants.WRITE_DONE, msgpack.dumps(report)],
@@ -1478,12 +1982,15 @@ class MoRIIOConnector(KVConnectorBase):
         """
         with self._write_reports_lock:
             reports, self._write_reports = self._write_reports, {}
+            digests, self._write_digests = self._write_digests, {}
         for req_id, ok in reports.items():
             if self._awaiting_write.pop(req_id, None) is None:
                 logger.warning("Write report for req %s, which is not waiting", req_id)
                 continue
             if ok:
                 done_recving.add(req_id)
+                if req_id in digests:
+                    self._verify_expected[req_id] = digests[req_id]
             else:
                 self._hold_failure(req_id)
 
@@ -1589,11 +2096,17 @@ class MoRIIOConnector(KVConnectorBase):
                     try:
                         report = msgpack.loads(parts[2])
                         req_id, ok = report["decode_req_id"], bool(report["ok"])
+                        state_digest = report.get("state_digest")
+                        region_digests = report.get("digests")
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_DONE")
                         continue
                     with self._write_reports_lock:
                         self._write_reports[req_id] = ok
+                        if state_digest is not None and self._verify_kv:
+                            self._write_state_digests[req_id] = state_digest
+                        if isinstance(region_digests, list) and self._verify_kv:
+                            self._write_digests[req_id] = region_digests
 
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
@@ -1814,6 +2327,13 @@ class MoRIIOConnector(KVConnectorBase):
             sessions = self._built_sessions.pop(engine_id, None)
             if sessions is not None:
                 self._retired_sessions.append(sessions)
+            region_sessions = self._region_sessions.pop(engine_id, None)
+            if region_sessions is not None:
+                self._retired_sessions.append(region_sessions)
+            self._remote_regions_checked.pop(engine_id, None)
+            state_sessions = self._built_state_sessions.pop(engine_id, None)
+            if state_sessions is not None:
+                self._retired_sessions.append(state_sessions)
             self.remote_moriio_metadata.pop(engine_id, None)
             self.layer_name_to_remote_kv_cache_metadata.pop(engine_id, None)
         logger.warning(
@@ -1847,10 +2367,18 @@ class MoRIIOConnector(KVConnectorBase):
             # Outside _pop_done_transfers so the digests stay off the path
             # that holds the wrapper lock.
             for req_id in done_recving:
-                self._verify_landed(req_id)
+                if self._regions is not None:
+                    self._verify_regions_landed(req_id)
+                else:
+                    self._verify_landed(req_id)
+                    self._verify_state_landed(req_id)
             for req_id in failed_recving:
                 self._verify_rows.pop(req_id, None)
                 self._verify_before.pop(req_id, None)
+                self._verify_expected.pop(req_id, None)
+                self._verify_state_before.pop(req_id, None)
+                with self._write_reports_lock:
+                    self._write_state_digests.pop(req_id, None)
         with self._done_sending_lock:
             done_sending, self.done_sending = self.done_sending, set()
         if not self.is_producer:
@@ -1901,8 +2429,8 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         self.dp_rank = config.parallel_config.data_parallel_rank
         self.host_ip = get_ip()
 
-        # Pending receive requests: req_id -> (Sequence, block_table)
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
+        # Pending receive requests: req_id -> (Sequence, block_table, state slot)
+        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int], int]] = {}
         self._reqs_need_save: dict[ReqId, tuple[Any, list[int]]] = {}
 
         # Source-block ownership -- see `MooncakeConnectorScheduler` for why
@@ -1937,8 +2465,10 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
         meta = ConnectorMetadata()
         meta.request_id_to_transfer_id = self.request_id_to_transfer_id
 
-        for req_id, (req, block_ids) in self._reqs_need_recv.items():
+        for req_id, (req, block_ids, slot) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
+            # Ours; the producer's slot came in the params as `remote_slot_index`.
+            req.kv_transfer_params["local_slot_index"] = slot
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
@@ -1971,9 +2501,12 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             assert (
                 not self.is_producer
             ), "Only the decode (consumer) side handles do_remote_prefill"
-            self._reqs_need_recv[seq.id] = (seq, list(seq.block_table))
+            self._reqs_need_recv[seq.id] = (
+                seq,
+                list(seq.block_table),
+                getattr(seq, "state_slot", -1),
+            )
             params["do_remote_prefill"] = False
-            params["local_slot_index"] = getattr(seq, "state_slot", -1)
             logger.debug(
                 "Queued req %s for remote KV loading (%d blocks)",
                 seq.id,
@@ -2009,6 +2542,9 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": list(seq.block_table),
+            # The slot the push reads this request's state from, held with the
+            # blocks until send_finished. -1 for a model without any.
+            "remote_slot_index": getattr(seq, "state_slot", -1),
             "remote_engine_id": self.engine_id,
             "remote_host": self.host_ip,
             "remote_port": self.handshake_port,
@@ -2019,8 +2555,6 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
             "first_token_id": first_token_id,
             "draft_token_ids": draft_token_ids,
             "prefix_cache_hit_tokens": getattr(seq, "prefix_cache_hit_tokens", 0),
-            # Source slot for the SLOT push. The send claim holds it with the blocks.
-            "remote_slot_index": getattr(seq, "state_slot", -1),
         }
 
         # Clean up transfer ID mapping on the consumer side
@@ -2037,6 +2571,98 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
     def source_blocks_released(self, seq: Sequence) -> None:
         """No block-lifetime state remains after the send claim is retired."""
+
+
+@dataclass(frozen=True)
+class _Region:
+    """One registered transfer region, as both ends address it.
+
+    ``kind`` is ``"page"`` (indexed by scheduler block) or ``"slot"`` (indexed
+    by per-request state slot). ``chunk_bytes`` is a whole number of units, so
+    a unit always sits inside a single registered chunk.
+    """
+
+    name: str
+    kind: str
+    base: int
+    total: int
+    unit: int
+    reverse: bool
+    chunk_bytes: int
+
+    @classmethod
+    def of(cls, name: str, kind: str, region: Any) -> _Region:
+        unit = int(region.unit_bytes)
+        total = int(region.total_bytes)
+        if unit <= 0 or total % unit:
+            raise ValueError(
+                f"region {name} does not divide into whole units: {total} B in "
+                f"units of {unit} B"
+            )
+        if unit > MAX_RDMA_CHUNK_BYTES:
+            raise ValueError(
+                f"region {name}: a {unit} B unit exceeds the RDMA registration "
+                f"limit of {MAX_RDMA_CHUNK_BYTES} B"
+            )
+        return cls(
+            name=name,
+            kind=kind,
+            base=int(region.base_addr),
+            total=total,
+            unit=unit,
+            reverse=bool(region.reverse_indexed),
+            chunk_bytes=(MAX_RDMA_CHUNK_BYTES // unit) * unit,
+        )
+
+    @classmethod
+    def from_layout(cls, entry: list[Any]) -> _Region:
+        name, kind, unit, total, reverse, chunk_bytes = entry
+        return cls(
+            name=str(name),
+            kind=str(kind),
+            base=0,
+            total=int(total),
+            unit=int(unit),
+            reverse=bool(reverse),
+            chunk_bytes=int(chunk_bytes),
+        )
+
+    def layout(self) -> list[Any]:
+        return [
+            self.name,
+            self.kind,
+            self.unit,
+            self.total,
+            self.reverse,
+            self.chunk_bytes,
+        ]
+
+    @property
+    def num_units(self) -> int:
+        return self.total // self.unit
+
+    @property
+    def num_chunks(self) -> int:
+        return -(-self.total // self.chunk_bytes)
+
+    def chunks(self) -> list[tuple[int, int]]:
+        return [
+            (self.base + offset, min(self.chunk_bytes, self.total - offset))
+            for offset in range(0, self.total, self.chunk_bytes)
+        ]
+
+    def locate(self, index: int) -> tuple[int, int]:
+        """``(chunk, offset within chunk)`` of unit ``index``."""
+        if not 0 <= index < self.num_units:
+            raise ValueError(
+                f"region {self.name}: unit {index} is outside its "
+                f"{self.num_units} units"
+            )
+        if self.reverse:
+            offset = self.total - (index + 1) * self.unit
+        else:
+            offset = index * self.unit
+        return offset // self.chunk_bytes, offset % self.chunk_bytes
 
 
 class _PostFailed:
@@ -2060,24 +2686,6 @@ class _PostFailed:
 
 
 _POST_FAILED = _PostFailed()
-
-
-class _LazySessions(dict):
-    """A ``(local_chunk, remote_chunk)`` session grid built on first use."""
-
-    def __init__(self, wrapper: Any, local_mds: list[Any], remote_mds: list[Any]):
-        super().__init__()
-        self._wrapper = wrapper
-        self._local_mds = local_mds
-        self._remote_mds = remote_mds
-
-    def __missing__(self, key: tuple[int, int]) -> Any:
-        lci, rci = key
-        session = self._wrapper.build_session(
-            self._local_mds[lci], self._remote_mds[rci]
-        )
-        self[key] = session
-        return session
 
 
 def _zmq_ctx(socket_type: int, addr: str):
