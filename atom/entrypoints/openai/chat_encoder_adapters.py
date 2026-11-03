@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import deepseek_v41_encoder
+from .api_compatibility import DEFAULT_API_COMPATIBILITY, APICompatibility
 from .reasoning_controls import ReasoningRules
 
 logger = logging.getLogger("atom")
@@ -68,6 +69,7 @@ class MessageEncoderAdapter:
     prepare_kwargs: KwargsPreparer = _identity_kwargs
     preserve_content: bool = False
     reasoning_rules: ReasoningRules | None = None
+    api_compatibility: APICompatibility = DEFAULT_API_COMPATIBILITY
 
     def __call__(self, messages: list[dict], **kwargs: Any) -> str:
         """Render, passing on only the kwargs this encoder can take.
@@ -106,6 +108,7 @@ class _EncoderPreparation:
     supports_tools: bool = False
     preserve_content: bool = False
     reasoning_rules: ReasoningRules | None = None
+    api_compatibility: APICompatibility = DEFAULT_API_COMPATIBILITY
 
 
 _PREPARERS = {
@@ -118,6 +121,7 @@ _PREPARERS = {
         supports_tools=True,
         preserve_content=True,
         reasoning_rules=deepseek_v41_encoder.REASONING_RULES,
+        api_compatibility=deepseek_v41_encoder.API_COMPATIBILITY,
     ),
 }
 
@@ -174,6 +178,7 @@ def build_message_encoder_adapter(
         supports_tools=preparation.supports_tools,
         preserve_content=preparation.preserve_content,
         reasoning_rules=preparation.reasoning_rules,
+        api_compatibility=preparation.api_compatibility,
         source_path=source_path,
         accepts=_accepted_kwargs(accepts_from or encoder),
         defaults=dict(defaults or {}),
