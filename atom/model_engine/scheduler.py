@@ -397,9 +397,9 @@ class ScheduledBatch:
             elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
             else:
-                # Undeferred: the tail is one run of exactly `num` placeholders
-                # (rejects already refilled), so the anchor is just before it.
-                offset = seq.num_tokens - num - 1
+                # Undeferred: the tail is the one placeholder run postprocess
+                # recorded (rejects already refilled); the anchor is before it.
+                offset = seq.num_tokens - seq.num_placeholder_tokens - 1
             staged.extend(seq.token_ids[offset : offset + num])
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its

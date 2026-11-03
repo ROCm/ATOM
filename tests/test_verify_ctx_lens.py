@@ -36,6 +36,9 @@ def _decode_batch(seq_factory, length, num_rejected, is_deferred_out):
     seq = seq_factory(list(range(length)))
     seq.type = SequenceType.DECODE
     seq.num_rejected = num_rejected
+    if not is_deferred_out:
+        # postprocess refills the undeferred tail to one full window
+        seq.num_placeholder_tokens = NUM
     return ScheduledBatch(
         {seq.id: seq},
         [NUM],
