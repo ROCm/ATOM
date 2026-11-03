@@ -492,3 +492,15 @@ def test_page_namespace_survives_a_worker_normalising_hf_config():
     assert offcfg.build_page_namespace(
         scheduler, _lmcache_config(), 4
     ) != offcfg.build_page_namespace(worker, _lmcache_config(), 4)
+
+
+def test_m3_page_namespace_separates_legacy_pool_order(monkeypatch):
+    config, cfg = _config(), _lmcache_config()
+    config.kv_transfer_config = {"offload_layout": "m3"}
+    current_m3 = offcfg.build_page_namespace(config, cfg, 4)
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    current_dense = offcfg.build_page_namespace(config, cfg, 4)
+    monkeypatch.setattr(offcfg, "M3_PAGE_MODE", "m3-page-regions")
+    assert offcfg.build_page_namespace(config, cfg, 4) == current_dense
+    config.kv_transfer_config = {"offload_layout": "m3"}
+    assert offcfg.build_page_namespace(config, cfg, 4) != current_m3

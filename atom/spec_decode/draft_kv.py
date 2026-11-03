@@ -191,12 +191,30 @@ class DraftKvBuilder(PoolRowsMixin):
         from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
+        pool = self.kv_pool
+        # Every field is per head. A layer reading and writing its cache through
+        # smaller SHUFFLE pages than the pool's (M3.1's DSpark draft: page-16)
+        # stores each of them head-major.
+        pages = {
+            row: getattr(module, "shuffle_page_tokens", pool.block_size)
+            for module, row in (self._pool_rows or {}).get(DRAFT_KV_ROWS, {}).items()
+        }
         return KVTransferTensors(
             # The draft's rows sit in the same block ids as the target's, so
             # its regions need a name that says which stack they are.
             pages=[
-                page_region(t, semantic_role=f"draft.{role}")
-                for role, t in self.kv_pool.region_tensors()
+                page_region(
+                    t,
+                    semantic_role=f"draft.{role}",
+                    head_major_runs=(
+                        pool.block_size
+                        // pages.get(
+                            int(role.rsplit(".layer_", 1)[1]), pool.block_size
+                        ),
+                        pool.num_kv_heads,
+                    ),
+                )
+                for role, t in pool.region_tensors()
             ],
             # A paged MHA/GQA draft is a per-rank shard. Appending it to an
             # otherwise replicated target must disable whole-object collapse.

@@ -3801,3 +3801,11 @@ def test_m3_store_namespace_fingerprints_checkpoint_index_schedule(field, value)
     base = keys.store_namespace(config, CHUNK)
     setattr(config.hf_config, field, value)
     assert keys.store_namespace(config, CHUNK) != base
+
+
+def test_m3_store_namespace_separates_legacy_pool_order(monkeypatch):
+    config = _config()
+    config.hf_config.model_type = "minimax_m3_vl"
+    current = keys.store_namespace(config, CHUNK)
+    monkeypatch.setattr(offcfg, "M3_PAGE_MODE", "m3-page-regions")
+    assert keys.store_namespace(config, CHUNK) != current
