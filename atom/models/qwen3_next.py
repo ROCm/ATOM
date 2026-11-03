@@ -1,3 +1,4 @@
+import logging
 from typing import ClassVar
 
 import torch
@@ -42,6 +43,15 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe_tail_norm import (
+    CombineTailRequest,
+    MoEGatedSum,
+    MoENormed,
+    combine_tail_request,
+    gated_gemm_available,
+    interleave_gate_up,
+    silu_gate_up_gemm,
+)
 from atom.model_ops.sigmoid_gate import output_gate_mul, shared_expert_gate_add
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
@@ -70,6 +80,8 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
 ATOM_FUSED_SIGMOID_GATE = envs.ATOM_FUSED_SIGMOID_GATE
+
+logger = logging.getLogger("atom")
 
 
 def mamba_v2_sharded_weight_loader(
@@ -163,10 +175,28 @@ class Qwen3NextMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.expert_gate = expert_gate
+        # ATOM_SHARED_EXPERT_GATED_GEMM: gate_up_proj's weight rows interleaved
+        # gate / up after load, read by one GEMM whose epilogue is the SiLU.
+        self.gated_gate_up = False
+
+    def process_weights_after_loading(self):
+        proj = self.gate_up_proj
+        if (
+            envs.ATOM_SHARED_EXPERT_GATED_GEMM
+            and not self.gated_gate_up
+            and proj.quant_type.value == QuantType.No.value
+            and proj.weight.dtype == torch.bfloat16
+            and proj.bias is None
+            and gated_gemm_available()
+        ):
+            proj.weight.data = interleave_gate_up(proj.weight.data)
+            self.gated_gate_up = True
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        if self.gated_gate_up:
+            out = silu_gate_up_gemm(x, self.gate_up_proj.weight)
+        else:
+            out = self.act_fn(self.gate_up_proj(x))
         out = self.down_proj(out)
 
         if self.expert_gate is not None:
@@ -189,6 +219,15 @@ def _shared_expert_stream() -> torch.cuda.Stream:
 class Qwen3NextSparseMoeBlock(nn.Module):
     # set in __init__ (a block built without it runs single-stream)
     _use_dual_stream = False
+    # Set by `defer_moe_gated_sums` once the norm that reads this block's output
+    # is known to fold the gated shared-expert add in (ATOM_FUSED_MOE_TAIL_NORM):
+    # forward then returns a MoEGatedSum instead of the summed tensor.
+    defer_gated_sum = False
+    # ATOM_MEGA_COMBINE_TAIL (set with defer_gated_sum): the norm that reads this
+    # block's output (not a registered submodule: it is the next layer's), run
+    # by the MoE combine itself, and whether its new residual is read.
+    combine_tail_norm = None
+    combine_tail_writes_residual = True
 
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
@@ -295,7 +334,44 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             config=config,
             shared_expert_prefix=f"{prefix}.shared_expert",
+            # The MXFP4 default pads each rank's experts to 256 columns: at TP4
+            # (512 / 4 = 128) half of every expert the grouped GEMMs stream is zeros.
+            pad_align=(
+                128
+                if envs.ATOM_QWEN_MOE_PAD_ALIGN_128
+                and (config.moe_intermediate_size // self.tp_size) % 128 == 0
+                else None
+            ),
         )
+
+    def combine_tail_forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> MoENormed | MoEGatedSum:
+        """ATOM_MEGA_COMBINE_TAIL: the shared expert first, then the routed
+        experts with the gated add, the residual add and the next norm handed to
+        the MoE combine. A combine that cannot take them (another transport, a
+        quantized combine wire) leaves the request unanswered, and the block
+        returns the unsummed parts for the norm to finish."""
+        logits = self.gate(hidden_states)
+        shared_output = self.shared_expert(hidden_states)
+        gate_logits = logits[:, self.n_routed_experts :]
+        norm = self.combine_tail_norm
+        req = CombineTailRequest(
+            shared_output,
+            gate_logits,
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            self.combine_tail_writes_residual,
+        )
+        with combine_tail_request(req):
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=logits[:, : self.n_routed_experts],
+            )
+        if req.result is not None:
+            return MoENormed(*req.result)
+        return MoEGatedSum(routed_output, shared_output, gate_logits)
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts + 1)
@@ -312,6 +388,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             # Apply shared expert gate: the merged gate output contains
             # [routed_logits, shared_expert_gate_logits], extract the tail
             shared_gate_logits = logits[:, self.n_routed_experts :]
+            if self.defer_gated_sum:
+                return MoEGatedSum(routed_output, shared_output, shared_gate_logits)
             return shared_expert_gate_add(
                 shared_output,
                 shared_gate_logits,
@@ -340,23 +418,89 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             ATOM_FUSED_SIGMOID_GATE,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         _num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        if (
+            residual is not None
+            and self.combine_tail_norm is not None
+            and hidden_states.shape[0] <= envs.ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS
+            and not torch.compiler.is_compiling()
+        ):
+            return self.combine_tail_forward(hidden_states, residual)
         if self._use_dual_stream:
             final_hidden_states = torch.ops.aiter.maybe_dual_stream_forward(
                 hidden_states, self.prefix
             )
         else:
             final_hidden_states = self.single_stream_moe_forward(hidden_states)
+        if isinstance(final_hidden_states, MoEGatedSum):
+            # TP1 (see `defer_moe_gated_sums`): nothing to reduce, and the rows
+            # stay 2-D for the norm that sums them.
+            return final_hidden_states
 
         if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
+
+
+def defer_moe_gated_sums(layers, final_norm, combine_tail: bool = True) -> int:
+    """ATOM_FUSED_MOE_TAIL_NORM: let each sparse MoE block of `layers` hand its
+    output unsummed (`MoEGatedSum`) to the norm that reads it -- the next
+    layer's input_layernorm, or `final_norm` after the last layer -- which then
+    adds `routed + sigmoid(gate) * shared` and the residual in its own kernel.
+
+    Only where that norm can (GemmaRMSNorm, neither all-reduce-fused nor
+    FP8-quantizing), the block runs single-stream with a separate shared expert
+    at TP1 (a TP-partial sum would need its all-reduce first) and the layer has
+    no layer_scale. Returns how many blocks defer. With ATOM_MEGA_COMBINE_TAIL
+    (and `combine_tail`), those blocks also hand the norm to the MoE combine.
+    """
+    # Plugin frontends patch the decoder layer's forward (rtpllm), which knows
+    # nothing of a MoEGatedSum.
+    if not envs.ATOM_FUSED_MOE_TAIL_NORM or is_plugin_mode():
+        return 0
+    deferred = 0
+    for i, layer in enumerate(layers):
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, Qwen3NextSparseMoeBlock):
+            continue
+        consumer = (
+            getattr(layers[i + 1], "input_layernorm", None)
+            if i + 1 < len(layers)
+            else final_norm
+        )
+        if (
+            isinstance(consumer, GemmaRMSNorm)
+            and consumer.takes_moe_gated_sum
+            and mlp.shared_expert is not None
+            and not mlp._use_dual_stream
+            and mlp.tp_size == 1
+            and not getattr(layer, "layer_scale", False)
+        ):
+            mlp.defer_gated_sum = True
+            deferred += 1
+            if envs.ATOM_MEGA_COMBINE_TAIL and combine_tail:
+                # Not a submodule: the norm belongs to the next layer / model.
+                object.__setattr__(mlp, "combine_tail_norm", consumer)
+                mlp.combine_tail_writes_residual = consumer is not final_norm
+    moe_blocks = sum(
+        isinstance(getattr(ly, "mlp", None), Qwen3NextSparseMoeBlock) for ly in layers
+    )
+    if moe_blocks:
+        logger.info(
+            "ATOM_FUSED_MOE_TAIL_NORM: %d of %d MoE blocks fold their gated "
+            "shared-expert add into the next norm",
+            deferred,
+            moe_blocks,
+        )
+    return deferred
 
 
 class Qwen3NextAttention(nn.Module):
@@ -925,7 +1069,11 @@ class Qwen3NextDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        select_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`select_rows`: after the attention (which every row needs: it writes
+        their KV), keep only these rows for the MLP; the layer then returns
+        `len(select_rows)` rows (the MTP drafter's step 0)."""
         # Self Attention
         if self.input_layernorm.use_fused_quant:
             if residual is None:
@@ -986,7 +1134,14 @@ class Qwen3NextDecoderLayer(nn.Module):
                 hidden_states, residual
             )
 
-        hidden_states = self.mlp(hidden_states)
+        if select_rows is not None:
+            hidden_states = torch.index_select(hidden_states, 0, select_rows)
+            residual = torch.index_select(residual, 0, select_rows)
+        if getattr(self.mlp, "combine_tail_norm", None) is not None:
+            # The MoE combine runs the next norm too (ATOM_MEGA_COMBINE_TAIL).
+            hidden_states = self.mlp(hidden_states, residual)
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -1036,6 +1191,7 @@ class Qwen3NextModel(nn.Module):
             self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        defer_moe_gated_sums(self.layers, self.norm)
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
@@ -1072,6 +1228,14 @@ class Qwen3NextModel(nn.Module):
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
+            )
+        if isinstance(hidden_states, MoENormed):
+            return hidden_states.out  # the MoE combine ran the final norm
+        if isinstance(hidden_states, MoEGatedSum):
+            # The last MoE block's gated add folded into the final norm, which
+            # skips the residual store nobody reads.
+            return self.norm.forward_moe_tail(
+                hidden_states, residual, write_residual=False
             )
         hidden_states, _ = self.norm(hidden_states, residual)
 

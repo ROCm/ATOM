@@ -252,7 +252,7 @@ class DraftGraph:
         """What a graph holds -- and so what a replay stands in for."""
         return self._forward_and_epilogue if self.capture_epilogue else self.forward
 
-    def run(self, running_bs: int, **staged) -> Any:
+    def run(self, running_bs: int, *, borrow: bool = False, **staged) -> Any:
         """Replay this batch's graph, then whatever it did not cover.
 
         The batch is the whole argument. `running_bs` is the reduction's own
@@ -265,12 +265,16 @@ class DraftGraph:
         captured later -- a reference does not hold them the way the eager
         allocator's does. Only ``capture_epilogue`` can put a survivor in
         there; the eager path allocates normally and needs no copy.
+
+        ``borrow`` hands the replay's own tensors back instead: valid until the
+        next replay of any recording in the pool, for a caller whose next
+        stream work consumes them (`eagle_fused_glue`) and so needs no clone.
         """
         if running_bs not in self._graph:
             out = self._to_capture(running_bs, **staged)
         else:
             out = self._graph.replay(key=running_bs)
-            if self.capture_epilogue:
+            if self.capture_epilogue and not borrow:
                 out = _owned(out, tuple(staged.values()))
         return (
             out

@@ -235,6 +235,36 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    def _fp8_norm_rope_then_cache(
+        self, q_raw, k_raw, v_raw, position, k_cache, v_cache, attn_metadata
+    ):
+        """The unfused fp8 unified-attention path, for a batch the fused kernel
+        declines: the Q/K norm and the RoPE, then K/V clamped and written with the
+        per-tensor scale, and Q clamped and cast to fp8 (neither the cache write nor
+        the cast saturates)."""
+        q = self.q_norm(q_raw.reshape(-1, self.head_dim)).view(q_raw.shape[0], -1)
+        k = self.k_norm(k_raw.reshape(-1, self.head_dim)).view(k_raw.shape[0], -1)
+        q, k = self.rotary_emb(position, q, k)
+        self.per_token_quant = False
+        fp8_max = torch.finfo(k_cache.dtype).max
+        kv_max = fp8_max * self.kv_scale_float
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v_raw.reshape(-1, self.num_kv_heads, self.head_dim)
+        aiter.reshape_and_cache(
+            k.clamp(-kv_max, kv_max),
+            v.clamp(-kv_max, kv_max),
+            k_cache,
+            v_cache,
+            attn_metadata.slot_mapping,
+            kv_cache_dtype="fp8",
+            k_scale=self.kv_scale,
+            v_scale=self.kv_scale,
+            asm_layout=True,
+        )
+        q = q.clamp(-fp8_max, fp8_max).to(k_cache.dtype)
+        return q, k, v, self.kv_scale, self.kv_scale
+
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
@@ -261,6 +291,15 @@ class PagedAttentionImpl(nn.Module):
             from atom.model_ops.layernorm import GemmaRMSNorm
 
             fused = None
+            # An fp8 cache read by unified attention: the fused kernel stores K/V with
+            # the layer's per-tensor scale and hands back Q in fp8.
+            fp8_kv_scale = (
+                self.kv_scale_float
+                if self.kv_cache_dtype == "fp8"
+                and envs.ATOM_USE_UNIFIED_ATTN
+                and not self._can_attempt_prefill_sink_asm(fwd_ctx)
+                else None
+            )
             if isinstance(self.q_norm, GemmaRMSNorm):
                 # GemmaRMSNorm (1+w) path — use the Triton fused kernel
                 from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
@@ -289,11 +328,19 @@ class PagedAttentionImpl(nn.Module):
                     k_cache,
                     v_cache,
                     attn_metadata.slot_mapping,
+                    kv_scale=fp8_kv_scale,
                 )
             if fused is not None:
+                if fp8_kv_scale is not None:
+                    self.per_token_quant = False
+                    k_scale = v_scale = self.kv_scale
                 q = fused[0].view(-1, self.num_heads, self.head_dim)
                 k = fused[1].view(-1, self.num_kv_heads, self.head_dim)
                 v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            elif fp8_kv_scale is not None:
+                q, k, v, k_scale, v_scale = self._fp8_norm_rope_then_cache(
+                    q_raw, k_raw, v_raw, position, k_cache, v_cache, attn_metadata
+                )
             elif isinstance(self.q_norm, GemmaRMSNorm) and (
                 q_raw.shape[0] > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
                 and self._use_asm_cache_layout(
@@ -1046,7 +1093,9 @@ class PagedAttentionImpl(nn.Module):
         )
         rows = plan.merge_rows.numel() // plan.n_full
         out = torch.empty_like(o_b)
-        merge(o_a, lse_a, o_b[:rows], lse_b, plan.merge_rows, plan.n_full, out=out[:rows])
+        merge(
+            o_a, lse_a, o_b[:rows], lse_b, plan.merge_rows, plan.n_full, out=out[:rows]
+        )
         return out
 
     def prefill_attention_triton(
@@ -1114,11 +1163,23 @@ class PagedAttentionImpl(nn.Module):
         # at 0 -- hence is_prefill False, which is the branch this method is
         # reached from. Every is_prefill batch sets the two counts equal.
         n_seqs = fwd_ctx.context.scheduled_bs
+        # A prefill padded to the DP group's token-graph bucket (attention runs
+        # eagerly there) carries pad rows no sequence owns. Hand the kernel only
+        # the scheduled ones: its route and its 3D split buffers are sized by
+        # the row count, and a short chunk at a large bucket would otherwise
+        # take the decode split at bucket height (a 64 GiB segment buffer for
+        # a 1-token chunk at 8192). The pad rows of `o` are zeroed so what
+        # follows attention reads defined values there.
+        n_tok = fwd_ctx.context.scheduled_tokens
+        q_attn, o_attn = q, o
+        if 0 < n_tok < q.shape[0] and not torch.cuda.is_current_stream_capturing():
+            q_attn, o_attn = q[:n_tok], o[:n_tok]
+            o[n_tok:].zero_()
         unified_attention(
-            q,
+            q_attn,
             k_for_attn,
             v_for_attn,
-            o,
+            o_attn,
             # Cut to the requests actually scheduled: the prefill builder pads
             # both of these past them.
             cu_seqlens_q=attn_metadata.cu_seqlens_q[: n_seqs + 1],

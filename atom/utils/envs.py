@@ -420,8 +420,53 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # combine `routed + sigmoid(gate) * shared` and the attention output gate
     # `o * sigmoid(gate)`, instead of three and two eager kernels. Keeps the
     # BF16 rounding of every intermediate, so the outputs match the unfused ops.
+    # MoE routing on gfx1250: aiter's Triton top-8 (one program a row) in place of
+    # topk_softmax for bf16 [T, 256] logits, renormalized, no shared columns. Same
+    # ids and weights, ~1.5 us less a MoE layer.
+    "ATOM_MOE_TRITON_TOPK": lambda: os.getenv("ATOM_MOE_TRITON_TOPK", "0") == "1",
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
+    ),
+    # Qwen3-Next / Qwen3.5: the MoE block leaves `routed + sigmoid(gate) *
+    # shared` to the norm that reads it (the next layer's input norm, the final
+    # norm, the MTP drafter's final norm), which adds it, adds the residual and
+    # normalizes in one Triton launch (atom/model_ops/moe_tail_norm.py). The MTP
+    # drafter's final norm then also covers only the rows its LM head reads (one
+    # a sequence), which replaces the row gather. TP1 only (DP attention / EP,
+    # or one GPU); the new residual is bitwise the unfused one, the normed
+    # output within one bf16 ulp. Off by default.
+    "ATOM_FUSED_MOE_TAIL_NORM": lambda: (
+        os.getenv("ATOM_FUSED_MOE_TAIL_NORM", "0") == "1"
+    ),
+    # With ATOM_FUSED_MOE_TAIL_NORM, under mori EP on aiter's MegaMoEGfx1250
+    # (bf16 combine wire): the gated shared-expert add, the residual add and the
+    # next RMSNorm run inside aiter's one-kernel combine (its cross-device wait
+    # and top-k reduce in the same launch), replacing combine_sync + combine +
+    # the fused tail kernel. The shared expert then runs before the dispatch.
+    # Eager / CUDA graphs only (torch.compile keeps the tail kernel). Off by
+    # default; needs an aiter whose MegaMoEGfx1250.forward takes combine_tail.
+    "ATOM_MEGA_COMBINE_TAIL": lambda: (os.getenv("ATOM_MEGA_COMBINE_TAIL", "0") == "1"),
+    # Steps above this many rows a rank keep the separate tail kernel: aiter's
+    # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
+    # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
+    # MI455X: ahead at 32-512 rows, even at 640-1500, behind at 3700).
+    # Qwen3-Next / Qwen3.5 shared expert (bf16, gfx1250): its gate_up GEMM and
+    # SiLU-and-mul in one aiter gluon GEMM with a gated epilogue; gate_up's
+    # weight rows are interleaved gate / up in place at load. Off by default.
+    # With ATOM_FUSED_MOE_TAIL_NORM (which hands the MTP drafter its step-0
+    # rows): the MTP layer keeps those rows right after its attention, so its
+    # MoE and final norm run on one row a sequence instead of the whole token
+    # stream (4 x bs at decode, the prefill chunk at prefill). Each EP rank then
+    # dispatches its own row count; every rank still runs the layer. Off by
+    # default.
+    "ATOM_MTP_SELECT_ROWS_BEFORE_MOE": lambda: (
+        os.getenv("ATOM_MTP_SELECT_ROWS_BEFORE_MOE", "0") == "1"
+    ),
+    "ATOM_SHARED_EXPERT_GATED_GEMM": lambda: (
+        os.getenv("ATOM_SHARED_EXPERT_GATED_GEMM", "0") == "1"
+    ),
+    "ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_MEGA_COMBINE_TAIL_MAX_TOKENS", "1024")
     ),
     # With that fusion on, batches above this token count run the Gemma q/k
     # norm, RoPE and cache write as separate kernels: the one-kernel version
@@ -461,6 +506,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_END_MARGIN": lambda: max(
         0, int(os.getenv("ATOM_STATE_CHECKPOINT_END_MARGIN", "0"))
     ),
+    # GPU budget for PAGE state checkpoint images, in GiB; 0 (default) sets none.
+    # Without one, an image is spent only once the KV pool's free list runs dry,
+    # and that list holds reusable cached KV, so images displace the prefix
+    # cache. Past the budget the coordinator releases the least recently used
+    # unpinned READY images after each batch. With the CPU state tier attached,
+    # OFFLOAD_STATE_GPU_SIZE governs instead (it releases only images the tier
+    # holds). See `PagedStateCheckpointCoordinator.complete_previous_batch`.
+    "ATOM_STATE_CHECKPOINT_GPU_SIZE": lambda: float(
+        os.getenv("ATOM_STATE_CHECKPOINT_GPU_SIZE", "0")
+    ),
+    # Log `[Image Diag]` each stats interval: how state checkpoint images were
+    # released, and which kind a resume short of its KV frontier needed.
+    "ATOM_STATE_CHECKPOINT_DIAG": lambda: os.getenv("ATOM_STATE_CHECKPOINT_DIAG", "0")
+    == "1",
     # vLLM plugin, state checkpoints: overrides the native checkpoint interval
     # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
     # Unset: the model's native default.
@@ -484,6 +543,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
+    # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
+    # instead of an `index_fill_` per pool field -- per field AND per layer once
+    # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
+    # staged through pinned memory so the upload never waits on the stream.
+    # Qwen3.5 c1024 (MI455X): 705 released units 981 -> 39 us, the dead conv
+    # columns of 32 slots 49 -> ~4 us.
+    "ATOM_FUSED_ZERO_FILL": lambda: _flag_env("ATOM_FUSED_ZERO_FILL", "0"),
+    # A prefill's `batch_id_per_k_token` from the uploaded `cu_seqlens_k` in one
+    # Triton launch (`build_batch_ids_from_cu`) instead of `repeat_interleave`,
+    # whose kernel walks each sequence's whole context on one wavefront: the
+    # same int32 ids, 260-350 -> ~5 us at 3-47 cached sequences of 4k-190k.
+    "ATOM_FAST_PREFILL_BATCH_IDS": lambda: _flag_env(
+        "ATOM_FAST_PREFILL_BATCH_IDS", "0"
+    ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -916,6 +989,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ATOM_GDN_GRAPH_MAX_SEQS, runs eagerly as before. 0 keeps every GDN
     # prefill eager.
     "ATOM_GDN_PREFILL_IN_GRAPH": lambda: os.getenv("ATOM_GDN_PREFILL_IN_GRAPH", "1") == "1",
+    # Drain the compute stream before a step's state maintenance copies
+    # (checkpoint stores / restores, slot relocations). 1 (the default) keeps
+    # the host from running ahead of the GPU across them; see
+    # `AttentionMetadataBuilder.build`.
+    "ATOM_STATE_OPS_DRAIN": lambda: os.getenv("ATOM_STATE_OPS_DRAIN", "1") == "1",
     "ATOM_GDN_GRAPH_MAX_SEQS": lambda: int(os.getenv("ATOM_GDN_GRAPH_MAX_SEQS", "8")),
     # Prefill token graphs for the GDN/MHA builder (Qwen3.5 / Qwen3-Next) under
     # DP attention. A DP group replays a prefill bucket only on a step every
@@ -1000,6 +1078,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_GREEDY_ARGMAX_HEAD": lambda: (
         os.getenv("ATOM_GREEDY_ARGMAX_HEAD", "1").lower() in ("1", "true")
     ),
+    # Speculative verify at TP > 1 with top-k sampling (k <= ATOM_TOPK_CANDIDATES):
+    # the LM head hands the sampler each row's top candidates of every vocab shard
+    # instead of all-gathering the [rows, vocab] logits, and the sampler draws from
+    # those (ModelRunner._topk_candidates_step).
+    "ATOM_TOPK_CANDIDATE_HEAD": lambda: (
+        os.getenv("ATOM_TOPK_CANDIDATE_HEAD", "0").lower() in ("1", "true")
+    ),
+    "ATOM_TOPK_CANDIDATES": lambda: int(os.getenv("ATOM_TOPK_CANDIDATES", "20")),
     # Pure-DP draft greedy argmax: shard the draft lm_head vocab across the DP
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
@@ -1052,6 +1138,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
     # instead of up to seven eager ones. Integer math, so the same result.
     "ATOM_MTP_FUSED_KV_INDPTR": lambda: _flag_env("ATOM_MTP_FUSED_KV_INDPTR", "0"),
+    # Qwen3.5 MTP: the draft token's embedding gather, both pre-fc Gemma norms
+    # and their concat in one launch writing the fc input (instead of gather +
+    # two norm launches + torch.cat, or gather + the dual norm of
+    # ATOM_MTP_DUAL_PRE_FC_NORM, which it supersedes): aiter's norm with its
+    # q_row_index gather where aiter has it, else a Triton kernel reproducing
+    # aiter's reduction order. Bitwise the same either way.
+    "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM": lambda: _flag_env(
+        "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM", "0"
+    ),
+    # GDN-hybrid MTP (Qwen3.5 / Next): EagleProposer's eager glue between its
+    # draft passes fused -- step 0's staging in one launch on a uniform verify
+    # batch, and each later pass's metadata advance + input staging + draft id
+    # export in one launch plus the kv_indices generation (57 launches a
+    # decode step at mtp_k=3 down to 6). Same metadata and inputs, bit for bit.
+    "ATOM_MTP_FUSED_DRAFT_GLUE": lambda: _flag_env("ATOM_MTP_FUSED_DRAFT_GLUE", "0"),
     # Debug: all-gather each step's draft ids over TP after propose and log any
     # rank disagreement. Syncs the host every decode step -- validation only.
     "ATOM_MTP_DRAFT_RANK_CHECK": lambda: (
@@ -1065,6 +1166,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # branch on a second stream, so every decode step runs on two streams.
     "ATOM_QWEN_SHARED_EXPERT_STREAM": lambda: (
         os.getenv("ATOM_QWEN_SHARED_EXPERT_STREAM", "0").lower() in ("1", "true")
+    ),
+    # Qwen3-Next / Qwen3.5: pad each rank's MXFP4 experts to 128 columns instead
+    # of 256 when the shard is a multiple of 128 (TP4: 128 rather than 256).
+    "ATOM_QWEN_MOE_PAD_ALIGN_128": lambda: (
+        os.getenv("ATOM_QWEN_MOE_PAD_ALIGN_128", "0").lower() in ("1", "true")
     ),
     # Run the engine-core and worker loops under a frame that holds one large
     # CPython data-stack chunk (atom/utils/deep_stack.py): on CPython 3.11 / 3.12
@@ -1274,6 +1380,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before allowing another prefill. Mirrors SGLang's
     # --prefill-decode-interval; 0 disables the hard interval.
     # A nonzero interval also enables local coalescing on TP without PP.
+    # Latency over coalescing: with a TP-local PrefillDelayer holding, still
+    # finish mid-chunked-prefill seqs that have at most this many tokens left
+    # (the tail after a state-checkpoint cut). 0 disables.
+    "ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS": lambda: int(
+        os.getenv("ATOM_PREFILL_TAIL_SKIPS_HOLD_TOKENS", "0")
+    ),
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),

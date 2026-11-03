@@ -11,6 +11,7 @@ the generic rotary embedding implementation.
 from __future__ import annotations
 
 import functools
+import inspect
 from typing import TYPE_CHECKING
 
 import torch
@@ -299,15 +300,30 @@ def try_fused_qk_norm_mrope(
     )
 
 
+@functools.cache
+def _gfx1250_fused_qk_norm_mrope_cache_fp8() -> bool:
+    """Whether aiter's kernel also writes an fp8 cache (its ``kv_scale`` argument)."""
+    op = _gfx1250_aiter_op("fused_qk_norm_mrope_cache")
+    return op is not None and "kv_scale" in inspect.signature(op).parameters
+
+
 def gfx1250_fused_qk_norm_mrope_cache_applies(
     rotary_emb: nn.Module, head_size: int, kv_cache_dtype: str
 ) -> bool:
     """Whether ``try_fused_qk_norm_mrope_cache`` takes every batch of an attention:
     gfx1250 with the aiter kernel, the interleaved Qwen3.5 MRoPE (head 256, rotary
-    64, Neox) and a cache that is not fp8."""
+    64, Neox) and a cache in the model dtype, or an fp8 cache read by unified
+    attention when the kernel writes fp8 (one per-tensor scale, Q in fp8)."""
+    from atom.utils import envs
+
+    fp8_ok = (
+        kv_cache_dtype == "fp8"
+        and envs.ATOM_USE_UNIFIED_ATTN
+        and _gfx1250_fused_qk_norm_mrope_cache_fp8()
+    )
     return (
         _gfx1250_aiter_op("fused_qk_norm_mrope_cache") is not None
-        and not kv_cache_dtype.startswith("fp8")
+        and (not kv_cache_dtype.startswith("fp8") or fp8_ok)
         and _mrope_rotary_supported(rotary_emb, head_size)
     )
 
@@ -326,19 +342,29 @@ def try_fused_qk_norm_mrope_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    kv_scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """The Q/K Gemma RMSNorm, the Qwen3.5 MRoPE and the K/V write into the SHUFFLE
     KV cache in one aiter Gluon kernel on gfx1250.
 
-    Returns ``None`` where the kernel does not apply (also under ``torch.compile``
-    and for an fp8 cache), so callers keep their other paths.
+    For an fp8 cache pass its per-tensor ``kv_scale``: K and V are stored scaled and
+    clamped, and Q comes back in fp8 (clamped, unscaled), ready for unified attention.
+
+    Returns ``None`` where the kernel does not apply (also under ``torch.compile``,
+    and for an fp8 cache without ``kv_scale`` or with an aiter that lacks it), so
+    callers keep their other paths.
     """
     if torch.compiler.is_compiling():
         return None
     fused_qk_norm_mrope_cache = _gfx1250_aiter_op("fused_qk_norm_mrope_cache")
+    fp8 = kv_scale is not None
+    if fp8 and (
+        k_cache.element_size() != 1 or not _gfx1250_fused_qk_norm_mrope_cache_fp8()
+    ):
+        return None
     if (
         fused_qk_norm_mrope_cache is None
-        or k_cache.dtype != q.dtype
+        or (not fp8 and k_cache.dtype != q.dtype)
         or k_cache.dim() != 5
         or not _mrope_qk_supported(
             rotary_emb, positions, q, k, num_q_heads, num_k_heads, head_size
@@ -365,6 +391,7 @@ def try_fused_qk_norm_mrope_cache(
         k_cache,
         v_cache,
         slot_mapping,
+        **({"kv_scale": kv_scale} if fp8 else {}),
     )
 
 

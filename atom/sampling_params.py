@@ -19,6 +19,9 @@ class SamplingParams:
     # outputs diverge when temperature > 0.
     n: int = 1
     logprobs: bool | int | None = None
+    # OpenAI presence_penalty: subtracted from the logit of every token the
+    # request has generated (not its prompt), before temperature and top-k/p.
+    presence_penalty: float = 0.0
 
     def __post_init__(self):
         # 0 also means disabled, as in vLLM/SGLang; MLPerf Endpoints workloads send it
@@ -30,3 +33,5 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+        if not (-2.0 <= self.presence_penalty <= 2.0):
+            raise ValueError("presence_penalty must be in range [-2.0, 2.0]")

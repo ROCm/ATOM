@@ -78,8 +78,10 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.presence_penalty import PresencePenaltyState, PresencePenaltyStep
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler, sample_topk_candidates
+from atom.observability import timeline
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
 from atom.spec_decode.status import SpecStatusQueue
@@ -198,6 +200,15 @@ class GreedyTokenIds(NamedTuple):
     """The LM head's per-row argmax, standing in for its logits on an all-greedy
     step (see `ModelRunner._greedy_ids_step`). int32 `[rows]`, one per logits row."""
 
+    ids: torch.Tensor
+
+
+class TopKCandidates(NamedTuple):
+    """The LM head's per-row top candidates of every vocab shard, standing in for
+    its logits on a top-k sampled verify (see `ModelRunner._topk_candidates_step`):
+    fp32 logits and int64 token ids, `[rows, tp * k]` each."""
+
+    vals: torch.Tensor
     ids: torch.Tensor
 
 
@@ -853,6 +864,9 @@ class ModelRunner:
             self.num_spec_tokens,
         )
         self.sampler = Sampler()
+        # presence_penalty: per-request generated-token masks, made on first use
+        self._presence_state: PresencePenaltyState | None = None
+        self._presence_step: PresencePenaltyStep | None = None
         self.arange_np = np.arange(
             max(
                 self.config.max_num_seqs + 1,
@@ -2816,6 +2830,7 @@ class ModelRunner:
                 forward_context.context.draft_anchor_overrides = (
                     self.drafter.anchors_to_gpu(batch.next_token_ids)
                 )
+        self._presence_step = self._begin_presence_step(batch, input_ids)
         return (
             input_ids,
             temperatures,
@@ -3059,13 +3074,15 @@ class ModelRunner:
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
         greedy_ids: bool = False,
-    ) -> tuple[torch.Tensor | GreedyTokenIds, torch.Tensor]:
+        topk_cands: int = 0,
+    ) -> tuple[torch.Tensor | GreedyTokenIds | TopKCandidates, torch.Tensor]:
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
         is_prefill = context.is_prefill
         # Decode only: a prefill head picks each sequence's last row first.
         greedy_ids = greedy_ids and not is_prefill
+        topk_cands = 0 if is_prefill else topk_cands
         positions = context.positions
 
         # Dispatch is owned by ForwardMode.decide() (called in prepare_model).
@@ -3253,7 +3270,7 @@ class ModelRunner:
                     logits = (
                         None
                         if self._is_pure_middle_chunk(batch)
-                        else self._compute_logits(hidden_states, greedy_ids)
+                        else self._compute_logits(hidden_states, greedy_ids, topk_cands)
                     )
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
@@ -3281,7 +3298,7 @@ class ModelRunner:
                             else scheduled_tokens
                         )
                     ]
-                    logits = self._compute_logits(hidden_states, greedy_ids)
+                    logits = self._compute_logits(hidden_states, greedy_ids, topk_cands)
                     return logits, hidden_states
 
                 graph_key = request_bucket(
@@ -3293,8 +3310,10 @@ class ModelRunner:
                 # copy ops were captured into the graph.
                 if logits is not None:
                     logits = logits[:scheduled_tokens]
+                    if self._presence_step is not None:
+                        self._presence_step.apply(logits)
                 else:
-                    logits = self._compute_logits(hidden_states, greedy_ids)
+                    logits = self._compute_logits(hidden_states, greedy_ids, topk_cands)
 
         return logits, hidden_states
 
@@ -3307,6 +3326,30 @@ class ModelRunner:
                 head if hasattr(head, "compute_argmax_token") else None
             )
         return self._greedy_head_cache
+
+    def _begin_presence_step(
+        self, batch: ScheduledBatch, input_ids: torch.Tensor
+    ) -> PresencePenaltyStep | None:
+        """This forward's presence-penalty rows (`atom.model_ops.presence_penalty`),
+        or None: no request in it has a penalty, or it is not a decode step."""
+        pens = getattr(batch, "presence_penalties", None)
+        if pens is None or not np.any(pens != 0):
+            return None
+        if self._presence_state is None:
+            if (
+                self.config.parallel_config.data_parallel_size > 1
+                or get_pcp_world_size() > 1
+            ):
+                logger.warning("presence_penalty is untested under DP or PCP")
+            head = self._greedy_lm_head()
+            vocab = max(
+                self.config.hf_config.vocab_size,
+                getattr(head, "num_embeddings", 0) if head is not None else 0,
+            )
+            self._presence_state = PresencePenaltyState(
+                vocab, self.config.max_num_seqs, max_extra=8, device=self.device
+            )
+        return self._presence_state.begin_step(batch, input_ids)
 
     def _greedy_ids_step(self, batch: ScheduledBatch | None, all_greedy: bool) -> bool:
         """Whether this step's LM head may hand back argmax ids instead of logits.
@@ -3324,6 +3367,7 @@ class ModelRunner:
             envs.ATOM_GREEDY_ARGMAX_HEAD
             and all_greedy
             and batch is not None
+            and self._presence_step is None
             and not envs.ATOM_ENABLE_RELAXED_MTP
             and self.config.parallel_config.data_parallel_size == 1
             and not any(batch.return_logprobs)
@@ -3332,11 +3376,58 @@ class ModelRunner:
         head = self._greedy_lm_head()
         return head is not None and head.tp_size > 1
 
+    def _topk_candidates_step(
+        self, batch: ScheduledBatch | None, all_greedy: bool, top_ks
+    ) -> int:
+        """How many candidates a vocab shard hands the sampler on this step, or 0
+        for the logits.
+
+        A fused speculative verify (ATOM_SPEC_FUSED_VERIFY_SAMPLE) whose rows all
+        sample top-k with one k of at most ATOM_TOPK_CANDIDATES needs only each
+        row's top k logits, which are among the top k of some shard: the sampler
+        then draws from `[rows, tp * k]` candidates instead of the logits gathered
+        to `[rows, vocab]`. Not under DP or PCP, with logprobs, with relaxed MTP, or
+        at TP1 (no gather to save), as `_greedy_ids_step`.
+        """
+        k = envs.ATOM_TOPK_CANDIDATES
+        if not (
+            envs.ATOM_TOPK_CANDIDATE_HEAD
+            and envs.ATOM_SPEC_FUSED_VERIFY_SAMPLE
+            and not all_greedy
+            and batch is not None
+            and isinstance(top_ks, int)
+            and 1 <= top_ks <= k
+            and get_forward_context().spec_decode_metadata is not None
+            and not envs.ATOM_ENABLE_RELAXED_MTP
+            and self.config.parallel_config.data_parallel_size == 1
+            and get_pcp_world_size() == 1
+            and not any(batch.return_logprobs)
+        ):
+            return 0
+        head = self._greedy_lm_head()
+        if head is None or head.tp_size <= 1 or not hasattr(
+            head, "compute_topk_candidates"
+        ):
+            return 0
+        return k
+
     def _compute_logits(
-        self, hidden_states: torch.Tensor, greedy_ids: bool
-    ) -> torch.Tensor | GreedyTokenIds:
+        self, hidden_states: torch.Tensor, greedy_ids: bool, topk_cands: int = 0
+    ) -> torch.Tensor | GreedyTokenIds | TopKCandidates:
+        step = self._presence_step
+        if topk_cands:
+            return TopKCandidates(
+                *self._greedy_lm_head().compute_topk_candidates(
+                    hidden_states,
+                    topk_cands,
+                    logits_hook=None if step is None else step.apply,
+                )
+            )
         if not greedy_ids:
-            return self.model.compute_logits(hidden_states)
+            logits = self.model.compute_logits(hidden_states)
+            if step is not None and isinstance(logits, torch.Tensor):
+                step.apply(logits)
+            return logits
         ids = torch.empty(
             hidden_states.shape[0], dtype=torch.int32, device=hidden_states.device
         )
@@ -3365,7 +3456,7 @@ class ModelRunner:
         broadcast (ATOM_SPEC_FUSED_VERIFY_SAMPLE). Same rows and per-row
         filters as the two calls, independent noise per row as both had."""
         rows = target_logits_indices.numel()
-        device = logits.device
+        device = target_logits_indices.device
         per_row = torch.cat(
             [
                 torch.searchsorted(
@@ -3386,16 +3477,24 @@ class ModelRunner:
                 return values
             return values[per_row]
 
-        tokens = self.sampler(
-            torch.index_select(
-                logits, 0, torch.cat([target_logits_indices, bonus_logits_indices])
-            ),
-            temperatures[per_row],
-            expand(top_ks),
-            expand(top_ps),
-            all_greedy=False,
-            needs_independent_noise=True,
-        )
+        row_indices = torch.cat([target_logits_indices, bonus_logits_indices])
+        if isinstance(logits, TopKCandidates):
+            tokens = sample_topk_candidates(
+                torch.index_select(logits.vals, 0, row_indices),
+                torch.index_select(logits.ids, 0, row_indices),
+                temperatures[per_row],
+                top_ks,
+                expand(top_ps),
+            )
+        else:
+            tokens = self.sampler(
+                torch.index_select(logits, 0, row_indices),
+                temperatures[per_row],
+                expand(top_ks),
+                expand(top_ps),
+                all_greedy=False,
+                needs_independent_noise=True,
+            )
         if get_tp_group().world_size > 1:
             tokens = broadcast_from_rank0(tokens, get_tp_group())
         return tokens[:rows], tokens[rows:]
@@ -3459,7 +3558,7 @@ class ModelRunner:
                     logits.ids, 0, target_logits_indices
                 )
                 target_logits = None
-            elif (
+            elif isinstance(logits, TopKCandidates) or (
                 envs.ATOM_SPEC_FUSED_VERIFY_SAMPLE
                 and not all_greedy
                 and target_logits_indices.numel()
@@ -3529,6 +3628,8 @@ class ModelRunner:
             and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
         ):
             sampled_tokens = broadcast_from_rank0(sampled_tokens, get_tp_group())
+        if self._presence_step is not None:
+            self._presence_step.mark(sampled_tokens.view(bs, -1))
 
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)
@@ -3656,6 +3757,13 @@ class ModelRunner:
         # buffers. Excluding them here leaves no event between a dummy and the
         # following real forward, allowing that real forward's CPU writes to
         # race the dummy's still-pending H2D copies.
+        # ATOM_REQ_TIMELINE: rank 0's host time at each phase of the forward.
+        step_key = None
+        if timeline.enabled() and self.rank == 0 and not batch.is_dummy_run:
+            self._timeline_step = getattr(self, "_timeline_step", 0) + 1
+            kind = "P" if batch.total_seqs_num_prefill else "D"
+            step_key = f"r{self._timeline_step}:{kind}{batch.total_tokens_num}"
+            timeline.mark(step_key, "fwd_start")
         self._advance_forward_vars()
         self._gate_staging_reuse()
         (
@@ -3667,9 +3775,16 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if step_key is not None:
+            timeline.mark(step_key, "prepared")
         logits, hidden_states = self.run_model(
-            input_ids, batch, greedy_ids=self._greedy_ids_step(batch, all_greedy)
+            input_ids,
+            batch,
+            greedy_ids=self._greedy_ids_step(batch, all_greedy),
+            topk_cands=self._topk_candidates_step(batch, all_greedy, top_ks),
         )
+        if step_key is not None:
+            timeline.mark(step_key, "model_launched")
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3696,6 +3811,8 @@ class ModelRunner:
                 hidden_states,
                 batch.next_token_ids,
             )
+            if step_key is not None:
+                timeline.mark(step_key, "draft_kv_launched")
         if pp_non_last or self._is_pure_middle_chunk(batch):
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.
@@ -3737,6 +3854,8 @@ class ModelRunner:
             hidden_states,
             needs_independent_noise=needs_independent_noise,
         )
+        if step_key is not None:
+            timeline.mark(step_key, "postprocessed")
 
         reset_forward_context()
         self._record_forward_vars_event()

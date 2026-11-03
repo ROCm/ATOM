@@ -8,6 +8,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from atom.observability import timeline
+
 
 def _has_text(fields: Any, keys: tuple[str, ...]) -> bool:
     return isinstance(fields, dict) and any(
@@ -67,6 +69,9 @@ class RequestTiming:
         if not self.recorded:
             self.recorded = True
             self.observe(time.perf_counter() - self.started_at, streaming)
+            key = getattr(self, "timeline_key", None)
+            if key is not None:
+                timeline.mark(key, "first_out")
 
 
 _request_timing: ContextVar[RequestTiming | None] = ContextVar(
@@ -131,3 +136,8 @@ class RequestTimingMiddleware:
             await self.app(scope, receive, timed_send)
         finally:
             _request_timing.reset(context_token)
+
+
+def current_request_timing() -> RequestTiming | None:
+    """The running request's timing, before or after its response headers."""
+    return _request_timing.get()
