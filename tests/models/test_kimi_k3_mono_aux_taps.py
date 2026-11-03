@@ -52,7 +52,7 @@ def _runner(tapped, *, mono):
     out = (torch.full((ROWS, HIDDEN), 2.0), torch.full((ROWS, HIDDEN), 3.0), None)
     if mono:
         runner._k1 = lambda *a, **k: None
-        runner._k2 = lambda build, plan, core, prefix, blocks: out[1]
+        runner._k2 = lambda build, plan, core, prefix, blocks, dcp=None: out[1]
     else:
         runner._fallback = lambda *a, **k: out
     return runner, out

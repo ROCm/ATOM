@@ -34,7 +34,9 @@ logger = logging.getLogger("atom")
 class MonoDecodeModel(nn.Module):
     """The loaded K3 model, with its supported steps routed to mono."""
 
-    def __init__(self, model: nn.Module, drafter=None, metadata_builder=None) -> None:
+    def __init__(
+        self, model: nn.Module, drafter=None, metadata_builder=None, dcp_merge=False
+    ) -> None:
         super().__init__()
         self.model = model
 
@@ -61,8 +63,11 @@ class MonoDecodeModel(nn.Module):
             except ImportError as error:
                 raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
 
-            return K3MonoDecodeRunner(model, drafter, metadata_builder)
+            return K3MonoDecodeRunner(
+                model, drafter, metadata_builder, dcp_merge=dcp_merge
+            )
 
+        self._dcp_merge = dcp_merge
         self._mono = LazyRunner(_build_runner, "Kimi-K3 mono decode")
         self._declines: set[str] = set()
 
@@ -125,4 +130,8 @@ def install_mono_decode(
         logger.info("Kimi-K3 mono decode off: %s", why)
         return model
     logger.info("Kimi-K3 mono decode armed (TP%d)", atom_config.tensor_parallel_size)
-    return MonoDecodeModel(model, drafter, metadata_builder)
+    from atom.models.kimi_k3.mono import dcp
+
+    # collective, before any graph capture (``mono.dcp``)
+    dcp_merge = dcp.arm_dcp_merge(dcp.inner_model(model), *dcp.tp_context())
+    return MonoDecodeModel(model, drafter, metadata_builder, dcp_merge=dcp_merge)

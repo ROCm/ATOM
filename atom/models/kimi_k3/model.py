@@ -878,6 +878,21 @@ class KimiFullAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """sigmoid(g_proj) * attention output, i.e. ``o_proj``'s input, and its
         activation scale when ``o_proj`` runs fp8 (else None)."""
+        attn_out, gate = self.attn_and_gate(positions, hidden_states)
+        # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
+        # runs FP8, the same helper also folds in its activation quantization.
+        return fused_sigmoid_mul_maybe_quant(
+            attn_out,
+            gate,
+            quant=self.fuse_sigmoid_mul_quant,
+            quant_type_value=self.o_proj_quant_type_value,
+        )
+
+    def attn_and_gate(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The attention output and the ungated ``g_proj`` output: ``_gated_core``
+        before its sigmoid/mul, for a mono K2 that applies the gate itself."""
         # deepseek_v2 pattern: one _fuse_rmsnorm_quant kernel does q_a norm +
         # kv_a norm (+ q-activation quant), then q's scale is forwarded into the
         # MLA module (q_proj consumes it).
@@ -933,15 +948,7 @@ class KimiFullAttention(nn.Module):
             )
         attn_out = self.attn(q, kv, k_rope, positions, q_scale=q_scale)
         gate = self.g_proj(hidden_states, hidden_states_scale)
-        # BF16 output gating uses the shared fused sigmoid/mul. When o_proj
-        # runs FP8, the same helper also folds in its activation quantization.
-        attn_out, attn_scale = fused_sigmoid_mul_maybe_quant(
-            attn_out,
-            gate,
-            quant=self.fuse_sigmoid_mul_quant,
-            quant_type_value=self.o_proj_quant_type_value,
-        )
-        return attn_out, attn_scale
+        return attn_out, gate
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor

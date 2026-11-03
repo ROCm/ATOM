@@ -35,6 +35,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from atom.models.kimi_k3.mono.kernels.attention import back as k2a
+from atom.models.kimi_k3.mono.kernels.attention import dcp_merge
 from atom.models.kimi_k3.mono.kernels.attention.kda import (
     _SOURCES,
     COLS,
@@ -49,7 +50,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.mono.device import gemv
-from atom.mono.device.ops import kernel_symbol, load_ptr64, traced
+from atom.mono.device.ops import CM_DEV, kernel_symbol, load_ptr64, traced
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, sreg
@@ -76,12 +77,13 @@ E0 = 160  # router / latent CTAs (their weights in flight under their o_proj)
 # timeline points: 0 start, 1 o_proj done / AR reduced, 2 early done / slice,
 # 3 ug, 4 down/sdown, 5 lnorm, 6 up, 7 reduce, 8 gate, 9 mix (x published),
 # 10 route, 11 route table, 12 latent quant, 13 route starts
-TL_POINTS = 18  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down done,
-# 17 the latent's first block polled
+TL_POINTS = 21  # + 14 route's logits polled, 15 lnorm's latent sums in, 16 down done,
+# 17 the latent's first block polled; a DCP build's 18 pushed, 19 merged (merge
+# CTAs), 20 the first group's core in (o_proj CTAs)
 
 assert E0 + k2b.R_TASKS + k2b.L_TASKS <= BLOCKS and k2b.G_TASKS <= E0 - O0
 
-REGIONS = ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS
+REGIONS = ("part", "wgt", "msq", "xrdy", "ar", "dg") + k2b.REGIONS + ("dcp", "crdy")
 
 _STREAM = fx.Stream(None)
 
@@ -97,6 +99,9 @@ class K2Build:
     ln_eps: float = 1e-5  # the latent RMSNorm
     # the final reduce here (else the next layer's K1)
     reduce: bool = field(default=True, metadata={"sym": "r"})
+    # a DCP full-attention layer: the decode partials merged and gated here
+    # (``dcp_merge``), the core rows then this launch's own
+    dcp: bool = field(default=False, metadata={"sym": "d"})
     diag: bool = field(default=False, metadata={"sym": "g"})
     timeline: bool = field(default=False, metadata={"sym": "t"})
 
@@ -133,20 +138,30 @@ ABI = KernelAbi(
         # 1 on a block-write layer: the prefix restarts at the o_proj output (a
         # runtime argument, not a build: one build serves both kinds of layer)
         "reset",
+        # ``dcp`` builds: the partial o [S, 96, 128] bf16, its LSE [S, 96] fp32,
+        # the owned KV counts [S] int32 and the ungated g_proj [S, 1536] bf16
+        # (0 elsewhere)
+        "part_o",
+        "part_lse",
+        "owned",
+        "gate",
         "diag",
         "tl",
     )
 )
 
 
-def peer_layout(s):
-    """K2a's AR and DG regions, then K2b's: name -> (byte offset, bytes)."""
+def peer_layout(s, dcp=False):
+    """K2a's AR and DG regions, then K2b's, then a ``dcp`` build's DCP region:
+    name -> (byte offset, bytes)."""
     pairs = {"ar": k2a.ar_pairs(s), "dg": k2a.dg_pairs(s), **k2b.peer_pairs(s)}
+    if dcp:
+        pairs["dcp"] = dcp_merge.dcp_pairs(s)
     return pair_layout(pairs.items())
 
 
-def peer_bytes(s):
-    lay = peer_layout(s)
+def peer_bytes(s, dcp=False):
+    lay = peer_layout(s, dcp)
     return max(o + n for o, n in lay.values())
 
 
@@ -158,6 +173,9 @@ def scratch_layout(key: K2Build) -> dict:
     lay = dict(a)
     for name, (o, n) in b.items():
         lay[name] = ((end + 15) // 16 * 16 + o, n)
+    if key.dcp:
+        end = max(o + n for o, n in lay.values())
+        lay["crdy"] = ((end + 15) // 16 * 16, dcp_merge.crdy_pairs(s) * 8)
     return lay
 
 
@@ -193,6 +211,10 @@ def stage_oproj(c, gi):
     for g in range_constexpr(c["G"]):
         # ``stage_o`` ends at a barrier: the previous group's core rows are read
         cg = k2a.group_view(c, g)
+        if const_expr(c["DCP"]):
+            dcp_merge.wait_core(c, g)
+            if g == 0:
+                stamp(c["tl_on"], c["tls"], c["tid"], 20)
         k2a.load_core(cg)
         for j in range_constexpr(O_ROUNDS):
             t = gi + BLOCKS * j
@@ -256,6 +278,9 @@ def build(key: K2Build):
     G, sg = groups(s), min(s, TG)
     # every group's XRDY flags polled at once (``early_compute``)
     assert s >= 1 and NA * G <= THREADS
+    # the merge CTAs are AttnRes CTAs (below O0), which take their o_proj last:
+    # the merge does not hold up the first o_proj round
+    assert dcp_merge.merge_tasks(s) <= O0
     # the early GEMVs stage their K slice a slab at a time; ``xl`` holds the
     # widest slab any of the three kinds asks for (one slab, i.e. the whole
     # slice, at every row count up to 8)
@@ -264,7 +289,7 @@ def build(key: K2Build):
     assert s * (k2b.SI + gemv.LDS_PAD) <= sg * (xcols + gemv.LDS_PAD)
     lay = scratch_layout(key)
     plain_lay = plain_layout(key)
-    play = peer_layout(s)
+    play = peer_layout(s, key.dcp)
     RouteLds = k2b.route_lds(s)
 
     @fx.struct
@@ -323,6 +348,10 @@ def build(key: K2Build):
         rank: Int32,
         layer: Int32,
         reset: Int32,
+        part_o: Int64,
+        part_lse: Int64,
+        owned: Int64,
+        gate: Int64,
         diag: Int64,
         tl: Int64,
     ):
@@ -344,7 +373,7 @@ def build(key: K2Build):
         bases = peer_bases(peers, TP_)
         own = load_ptr64(peers, rank)
         peer = {}
-        for region in k2b.PEER_REGIONS + ("ar", "dg"):
+        for region in k2b.PEER_REGIONS + ("ar", "dg") + (("dcp",) if key.dcp else ()):
             off = play[region][0]
             peer[region] = [preg(b, off, region) for b in bases]
             peer[region + "_own"] = preg(own, off, region)
@@ -374,6 +403,10 @@ def build(key: K2Build):
             "ar_peer": peer["ar"],
             "ar_own": peer["ar_own"],
             "dg_peer": peer["dg"],
+            "DCP": key.dcp,
+            "core_cm": CM_DEV if key.dcp else 0,
+            "dcp_peer": peer.get("dcp"),
+            "dcp_own": peer.get("dcp_own"),
             "dg_own": peer["dg_own"],
             "xl": el.xl.ptr,
             "rcand": rsel.cand.ptr,
@@ -405,6 +438,10 @@ def build(key: K2Build):
                 "ares_qk": ares_qk,
                 "in_nw": in_nw,
                 "x_dbg": 0,
+                "part_o": part_o,
+                "part_lse": part_lse,
+                "owned": owned,
+                "gate": gate,
                 "w_gate": w_gate,
                 "bias": bias,
                 "w_ld": w_ld,
@@ -433,7 +470,7 @@ def build(key: K2Build):
             "lmsq",
             "lnrdy",
             "shrdy",
-        ):
+        ) + (("crdy",) if key.dcp else ()):
             c[region] = sreg(scratch, lay[region][0], region)
         on, tls = key.timeline, lds.tls.ptr
         stamp_begin(on, tls, tid, TL_POINTS)
@@ -442,6 +479,14 @@ def build(key: K2Build):
         lb = eb - k2b.R_TASKS
         is_r = (bid >= E0) & (eb < k2b.R_TASKS)
         is_l = (bid >= E0 + k2b.R_TASKS) & (lb < k2b.L_TASKS)
+        # ---- a DCP layer's merge first: every o_proj CTA waits for its core
+        if const_expr(key.dcp):
+            enter_stage("k2.dcp")
+            dcp_merge.stage_push(c, bid)
+            stamp(on, tls, tid, 18)
+            if bid < dcp_merge.merge_tasks(s):
+                dcp_merge.stage_dcp_merge(c, bid)
+                stamp(on, tls, tid, 19)
         # o_proj first (every AttnRes CTA waits on the slowest partial; loads
         # retire in order), the early weights after: they land before x does
         if bid >= O0:
@@ -542,6 +587,10 @@ def build(key: K2Build):
         rank: Int32,
         layer: Int32,
         reset: Int32,
+        part_o: Int64,
+        part_lse: Int64,
+        owned: Int64,
+        gate: Int64,
         diag: Int64,
         tl: Int64,
         stream: fx.Stream = _STREAM,
@@ -576,6 +625,10 @@ def build(key: K2Build):
             rank,
             layer,
             reset,
+            part_o,
+            part_lse,
+            owned,
+            gate,
             diag,
             tl,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)

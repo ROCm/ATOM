@@ -857,6 +857,13 @@ class MLAAttention(nn.Module):
         )
         # Which collective pattern the output merge uses; see _dcp_merge.
         self.dcp_comm_backend = get_current_atom_config().dcp_config.comm_backend
+        # A dict while a caller merges this layer's decode output itself
+        # (``_dcp_defer_merge``); None otherwise.
+        self.dcp_merge_sink = None
+        # Set by a caller whose own merge must match this layer's decode merge
+        # bit for bit (the Kimi-K3 mono DCP merge): the decode's a2a combine
+        # sums in rank order. Prefill keeps the production combine.
+        self.dcp_rank_order_merge = False
 
         # Row view of q_proj used by prefill; see _local_q_proj. Initialized here
         # rather than in process_weights_after_loading so it exists no matter
@@ -1305,7 +1312,9 @@ class MLAAttention(nn.Module):
             self._qrep_local_src = w
         return self._qrep_local_proj
 
-    def _dcp_merge(self, o, lse, ctx=None, owned_counts=None, quant_dtype=None):
+    def _dcp_merge(
+        self, o, lse, ctx=None, owned_counts=None, quant_dtype=None, rank_order=False
+    ):
         """Bind this layer's DCP group and backend to ``dcp_ops.dcp_lse_merge``."""
         from atom.model_ops.dcp_ops import dcp_lse_merge
 
@@ -1317,6 +1326,7 @@ class MLAAttention(nn.Module):
             ctx=ctx,
             owned_counts=owned_counts,
             quant_dtype=quant_dtype,
+            rank_order=rank_order and quant_dtype is None,
         )
 
     def _dcp_fused_quant_dtype(self):
@@ -1352,7 +1362,7 @@ class MLAAttention(nn.Module):
 
     @mark_trace(prefix="dcp_project_merge_out", torch_compile=False)
     def _dcp_project_merge_out(
-        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None
+        self, o, lse, ctx=None, merge_in_fp32=False, owned_counts=None, rank_order=False
     ):
         """Shared tail of both DCP paths: PBM projection, merge, o_proj.
 
@@ -1370,12 +1380,21 @@ class MLAAttention(nn.Module):
         fused_quant = None if merge_in_fp32 else self._dcp_fused_quant_dtype()
         if merge_in_fp32:
             dtype = o.dtype
-            o = self._dcp_merge(o.float(), lse, ctx=ctx, owned_counts=owned_counts).to(
-                dtype
-            )
+            o = self._dcp_merge(
+                o.float(),
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                rank_order=rank_order,
+            ).to(dtype)
         else:
             o = self._dcp_merge(
-                o, lse, ctx=ctx, owned_counts=owned_counts, quant_dtype=fused_quant
+                o,
+                lse,
+                ctx=ctx,
+                owned_counts=owned_counts,
+                quant_dtype=fused_quant,
+                rank_order=rank_order,
             )
         if fused_quant is not None:
             o, o_scale = o
@@ -1440,12 +1459,25 @@ class MLAAttention(nn.Module):
             if self.is_sparse_mla and self.dcp_owned_counts_buffer is not None
             else None
         )
+        if self.dcp_merge_sink is not None:
+            return self._dcp_defer_merge(o, lse, owned_counts)
         return self._dcp_project_merge_out(
             o,
             lse,
             ctx=self._cp_triton_ctx,
             owned_counts=owned_counts,
+            rank_order=self.dcp_rank_order_merge,
         )
+
+    def _dcp_defer_merge(self, o, lse, owned_counts):
+        """A decode step whose merge a later kernel does (the Kimi-K3 mono K2):
+        the PBM-projected partial ``[B, H_group, v_head_dim]``, its LSE and the
+        sparse owned counts go to ``dcp_merge_sink``; the partial is returned
+        unmerged, for a caller that reads the sink instead."""
+        assert self.pbm_enabled, "a deferred DCP merge needs project-before-merge"
+        o = self._v_up_proj(o, self.W_V_dcp, self.W_V_dcp_scale, num_heads=o.shape[1])
+        self.dcp_merge_sink.update(o=o, lse=lse, owned_counts=owned_counts)
+        return o
 
     def _v_up_proj(self, x, W_V=None, W_V_scale=None, num_heads=None):
         """V up-projection only: ``[B, N, kv_lora_rank] -> [B, N, v_head_dim]``.
