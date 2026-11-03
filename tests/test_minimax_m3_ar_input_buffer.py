@@ -181,6 +181,17 @@ def test_moe_into_output_copies_only_if_backend_declines(monkeypatch):
     assert torch.equal(output, produced)
 
 
+def test_moe_into_output_schema_exposes_both_mutations_without_alias_return():
+    schema = torch.ops.aiter.moe_forward_into_output.default._schema
+    written = [
+        arg.name
+        for arg in schema.arguments
+        if arg.alias_info is not None and arg.alias_info.is_write
+    ]
+    assert written == ["hidden_states", "output"]
+    assert len(schema.returns) == 0
+
+
 def test_mxfp4_moe_advertises_out_only_for_direct_gfx1250_path(monkeypatch):
     method = moe_mod.Mxfp4MoEMethod.__new__(moe_mod.Mxfp4MoEMethod)
     method.fused_experts = None
@@ -202,6 +213,44 @@ def test_mxfp4_moe_advertises_out_only_for_direct_gfx1250_path(monkeypatch):
     assert method.supports_out(layer)
     monkeypatch.setenv("AITER_DISABLE_GROUPED_A8W4", "1")
     assert not method.supports_out(layer)
+
+
+class _Mxfp4OutCapability(nn.Module):
+    """The production ownership chain that Dynamo sees at the first MoE."""
+
+    def __init__(self):
+        super().__init__()
+        method = object.__new__(moe_mod.Mxfp4MoEMethod)
+        method.fused_experts = None
+        method.is_gfx1250 = True
+        method.is_guinterleave = True
+        method.quant_type = moe_mod.QuantType.per_1x32
+        method.use_triton = False
+        method.use_triton_ep = False
+        method.moe = SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(
+                use_ep=False,
+                dp_size=1,
+                dp_logical_ratio=1,
+                pcp_merge=False,
+            )
+        )
+        self.method = method
+        self.layer = SimpleNamespace(reduce_results=False)
+
+    def forward(self, x):
+        return x + 1 if self.method.supports_out(self.layer) else x - 1
+
+
+def test_mxfp4_out_capability_is_strict_export_safe():
+    # QuantType object equality used to graph-break here. VllmBackend accepts
+    # one graph only, so the continuation became its fatal second invocation.
+    exported = torch.export.export(
+        _Mxfp4OutCapability(),
+        (torch.ones(2),),
+        strict=True,
+    )
+    assert torch.equal(exported.module()(torch.ones(2)), torch.full((2,), 2.0))
 
 
 def test_minimax_moe_passes_flat_registered_output_to_experts():
