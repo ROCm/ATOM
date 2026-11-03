@@ -668,7 +668,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # DSpark block sampling: replace the Markov head's
     #   bias = W1[x] @ W2.float().t() ; argmax(base_logits + bias)
-    # with one fused Triton kernel (atom/model_ops/dspark_markov_sample.py).
+    # with one fused Triton kernel (atom/model_ops/dspark_markov_argmax.py).
     # The unfused spelling casts the whole [V, r] W2 table to fp32 INSIDE the
     # T-iteration loop (~252MB of traffic per iteration for a table that never
     # changes) and materializes two [B, V] fp32 tensors per iteration (42MB

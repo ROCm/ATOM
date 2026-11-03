@@ -14,10 +14,8 @@ import torch
 
 from atom.distributed.pcp_utils import get_pcp_world_size
 from atom.kv_transfer.disaggregation import kv_config_has_producer
-from atom.model_ops.dspark_markov_draw import (
-    dspark_markov_sample_scratch,
-    dspark_markov_sample_unsupported,
-)
+from atom.model_ops.dspark_markov_argmax import markov_weights_unsupported
+from atom.model_ops.dspark_markov_sample import dspark_markov_sample_scratch
 from atom.model_ops.ratio_verify import (
     RatioVerifyInputs,
     ratio_verify_scratch,
@@ -103,7 +101,7 @@ def lossless_unsupported_reason(drafter) -> str | None:
             "native fallback filters differently."
         )
     head = drafter.model.markov_head
-    unsupported = dspark_markov_sample_unsupported(
+    unsupported = markov_weights_unsupported(
         head.markov_w1.weight, head.markov_w2.weight
     )
     if unsupported is not None:

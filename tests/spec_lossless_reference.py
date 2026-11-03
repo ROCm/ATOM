@@ -3,7 +3,7 @@
 
 """Eager oracles for the lossless speculative-sampling kernels, for tests.
 
-Kept out of `atom/model_ops/dspark_markov_draw.py` and
+Kept out of `atom/model_ops/dspark_markov_sample.py` and
 `atom/model_ops/sparse_q_select.py` so the shipped modules hold only what
 serving runs. The level grid (bins, levels per nat, the 19-nat floor) is
 imported from the kernel module rather than restated, so a change there

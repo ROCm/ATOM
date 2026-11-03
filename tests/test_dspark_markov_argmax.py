@@ -17,7 +17,7 @@ import torch
 
 pytest.importorskip("aiter", reason="the Markov sampler is a Triton/AITER op")
 
-from atom.model_ops.dspark_markov_sample import (
+from atom.model_ops.dspark_markov_argmax import (
     _torch_dspark_markov_argmax,
     dspark_markov_argmax,
 )
@@ -150,7 +150,7 @@ def test_sharded_sampling_matches_the_whole_vocab(tp, rows):
     """Each rank's `(max, id)` over its vocab shard, reduced across ranks, is
     the whole-vocab op's id and gathered row, bit for bit -- including a
     maximum tied across two shards, where the lower id must win."""
-    from atom.model_ops.dspark_markov_sample import _launch, dspark_markov_argmax_tp
+    from atom.model_ops.dspark_markov_argmax import _launch, dspark_markov_argmax_tp
 
     vocab, rank = 129280, 256
     base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
@@ -199,7 +199,7 @@ def test_argmax_gather_is_the_three_ops_it_replaces(num_j, rows, dtype):
     """`argmax_gather` against `argmax` over j, the id gather at the winner
     and the copy -- with ties across j and NaN values, written into a strided
     integer column."""
-    from atom.model_ops.dspark_markov_sample import argmax_gather
+    from atom.model_ops.dspark_markov_argmax import argmax_gather
 
     g = torch.Generator(device="cuda").manual_seed(rows * num_j)
     vals = torch.randint(0, 4, (num_j, rows), device="cuda", generator=g).float()
@@ -245,7 +245,7 @@ def test_confidence_head_matches_the_fp32_reference(rows):
 def test_sharded_step_writes_its_embed_column_in_place():
     """`embed_out` receives the step's W1[x] rows: a [B, T, r] block filled
     column by column equals the stack of fresh results."""
-    from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
+    from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax_tp
 
     rows, steps, vocab, rank, tp = 32, 5, 129280, 256, 2
     base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
@@ -254,7 +254,7 @@ def test_sharded_step_writes_its_embed_column_in_place():
     fresh = []
     for k in range(steps):
         packed = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
-        from atom.model_ops.dspark_markov_sample import _launch
+        from atom.model_ops.dspark_markov_argmax import _launch
 
         _launch(
             base[:, :shard], prev, w1, w2, _ids(rows, "cuda", torch.int32), 0, packed

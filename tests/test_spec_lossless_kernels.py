@@ -29,11 +29,11 @@ import triton
 import triton.language as tl
 from spec_lossless_reference import dspark_markov_sample_reference, sparse_q_reference
 
-from atom.model_ops.dspark_markov_draw import (
+from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax
+from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample,
     dspark_markov_sample_scratch,
 )
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.ratio_target_p import (
     _RATIO_BLOCK_V,
     _ratio_stats_kernel,

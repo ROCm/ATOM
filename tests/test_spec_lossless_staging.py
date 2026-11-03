@@ -55,7 +55,7 @@ def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
     monkeypatch.setattr(dspark_lossless, "get_pcp_world_size", lambda: pcp)
     # CPU stand-in weights; the GPU arming check has its own test below.
     monkeypatch.setattr(
-        dspark_lossless, "dspark_markov_sample_unsupported", lambda w1, w2: None
+        dspark_lossless, "markov_weights_unsupported", lambda w1, w2: None
     )
     prop = DSparkProposer.__new__(DSparkProposer)
     prop.config = SimpleNamespace(
@@ -219,7 +219,7 @@ def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
     monkeypatch.setattr(
         dspark_lossless,
-        "dspark_markov_sample_unsupported",
+        "markov_weights_unsupported",
         lambda w1, w2: "markov weights are torch.float32/torch.float32",
     )
     prop._init_lossless_sampling()

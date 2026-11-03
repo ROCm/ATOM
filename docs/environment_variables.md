@@ -256,7 +256,7 @@ samples it left-to-right with a low-rank first-order Markov head
 (`logits_k = base_logits_k + W1[x_{k-1}] @ W2ᵀ`, `x_k = argmax(logits_k)`). The
 unfused loop casts the whole `[V, r]` `W2` table to fp32 on every iteration and
 materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
-`atom/model_ops/dspark_markov_sample.py`.
+`atom/model_ops/dspark_markov_argmax.py`.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|

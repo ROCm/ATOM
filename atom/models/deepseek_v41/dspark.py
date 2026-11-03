@@ -21,7 +21,7 @@ from atom.model_ops.deepseek_v41.dspark import (
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
+from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax_tp
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import ReplicatedLinear
 from atom.model_ops.moe import FusedMoE

@@ -157,7 +157,7 @@ class DSparkMarkovHead(nn.Module):
         if self.fused_sample:
             # Imported here, not at module scope: the op imports Triton and
             # AITER, and this module stays importable without them.
-            from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
+            from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax
 
             return dspark_markov_argmax(
                 base_logits,
@@ -194,7 +194,7 @@ class DSparkMarkovHead(nn.Module):
         this one publishes the q the other exists not to materialize.
         """
         # Imported here for the reason `sample_next` gives.
-        from atom.model_ops.dspark_markov_draw import dspark_markov_sample
+        from atom.model_ops.dspark_markov_sample import dspark_markov_sample
 
         bs, num_draft, vocab = base_logits.shape
         assert sampling.s_scratch.shape[1] == vocab, (
