@@ -45,10 +45,10 @@ from atom.model_ops.ratio_verify import (
     _RATIO_RESIDUAL_KEY,
     RatioVerifyInputs,
     _ratio_accept_kernel,
-    _ratio_densify_clear_kernel,
-    _ratio_densify_scatter_kernel,
     _ratio_residual_pick_kernel,
     _ratio_residual_race_kernel,
+    _rejecting_row_of,
+    _target_p_tile,
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
@@ -67,7 +67,7 @@ from atom.model_ops.softmax_tiles import (
     race_key,
     softmax_combine_kernel,
 )
-from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
+from atom.model_ops.sparse_q_store import SparseQStore
 from atom.model_ops.verify_kernels import _draft_token, _finish_request
 
 DEV = "cuda"
@@ -692,11 +692,11 @@ def draw(dist, n):
     return torch.multinomial(dist, n, replacement=True).to(torch.int32)
 
 
-def draft_q(q, drafts=None, *, dense_rows=None):
-    """The `RatioDraftQ` of dense q rows: each row's support, ascending, at
+def draft_q(q, drafts=None):
+    """The `SparseQStore` of dense q rows: each row's support, ascending, at
     its q, with xslot naming ``drafts[r]`` (slot 0 where that is not stored,
     or with no drafts). A 1-D ``q`` is one row, or every draft's row when
-    ``drafts`` is given. The dense scratch starts `stale`."""
+    ``drafts`` is given."""
     rows = q.view(-1, q.shape[-1])
     vocab = rows.shape[1]
     present = rows > 0
@@ -713,21 +713,11 @@ def draft_q(q, drafts=None, *, dense_rows=None):
     if drafts is not None:
         hit = ids[: drafts.numel()] == drafts.view(-1, 1)
         xslot[: drafts.numel()] = hit.int().argmax(1)
-    store = SparseQStore(
+    return SparseQStore(
         ids.to(torch.int32).contiguous(),
         probs.float().contiguous(),
         torch.stack((n, xslot), 1).to(torch.int32).contiguous(),
     )
-    return RatioDraftQ(store, stale(dense_rows or ids.shape[0], vocab))
-
-
-def stale(rows, vocab):
-    """A dense scratch as the verify finds it: leftovers, every one of which
-    reads as a plausible q (in [0, 1), unlike NaN, which the race maps to 0),
-    so a residual that read an id the verify did not clear would show. Its
-    own generator, so the test's stream is left as it was."""
-    leftovers = torch.Generator(device=DEV).manual_seed(rows)
-    return torch.rand(rows, vocab, device=DEV, generator=leftovers)
 
 
 # Supports spread over three vocab tiles, the last one ragged.
@@ -867,7 +857,7 @@ def test_a_request_without_q_rejects_and_draws_from_p():
             torch.ones(n, device=DEV),
             row_base=torch.full((n,), -1, dtype=torch.int32, device=DEV),
         ),
-        q=draft_q(q, dense_rows=n),
+        q=draft_q(q),
         ratio_step=7,
     )
     assert (accepted == 0).all()
@@ -889,13 +879,13 @@ def test_q_is_read_through_the_row_base_not_the_batch_position():
     flat = draft_q(q_rows, drafts)
     flat_out, flat_verdict = verify(**args, q=flat, ratio_step=9)
     slots = torch.randperm(2 * batch_n, device=DEV)[:batch_n]
-    store = empty_store(2 * batch_n * width, flat.store.ids.shape[1])
+    store = empty_store(2 * batch_n * width, flat.ids.shape[1])
     base = (slots * width).to(torch.int32)
     for k in range(width):
-        for dst, src in zip(store, flat.store):
+        for dst, src in zip(store, flat):
             dst[base.long() + k] = src.view(batch_n, width, -1)[:, k]
     args["q_row_base"] = base
-    out, verdict = verify(**args, q=RatioDraftQ(store, flat.dense), ratio_step=9)
+    out, verdict = verify(**args, q=store, ratio_step=9)
     assert torch.equal(out, flat_out) and torch.equal(verdict, flat_verdict)
 
 
@@ -1067,8 +1057,6 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
         _ratio_filter_floor_kernel,
         _ratio_filter_cut_kernel,
         _ratio_accept_kernel,
-        _ratio_densify_clear_kernel,
-        _ratio_densify_scatter_kernel,
         _ratio_residual_race_kernel,
         _ratio_residual_pick_kernel,
     )
@@ -1117,7 +1105,7 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
             )
             verify(
                 **args,
-                q=RatioDraftQ(store, stale(max_bs, vocab)),
+                q=store,
                 ratio_step=3,
                 top_ks=top_ks_form,
                 top_ps=top_ps_form,
@@ -1231,7 +1219,7 @@ def test_the_target_law_holds_at_the_real_vocab():
             torch.ones(n, device=DEV),
             row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         ),
-        q=draft_q(q, dense_rows=n),
+        q=draft_q(q),
         ratio_step=3,
     )
     p_bf16 = torch.softmax(p.log().to(torch.bfloat16).float(), -1)
@@ -1329,11 +1317,69 @@ def _dense_accept_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["batch_size", "residual_seed"])
+def _dense_residual_race_kernel(
+    residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
+    logits_ptr,  # [num_tokens, V] raw target logits
+    temperatures_ptr,  # [batch_size] fp32
+    row_max_ptr,  # [num_tokens] fp32
+    row_inv_z_ptr,  # [num_tokens] fp32
+    row_floor_ptr,  # [num_tokens] fp32, the lowest logit p_f keeps (FILTER)
+    dense_ptr,  # [>= batch_size, V] fp32: a rejecting request's q at its row
+    q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
+    part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
+    part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
+    batch_size,
+    vocab_size,
+    logits_row_stride,
+    residual_seed,
+    BLOCK_V: tl.constexpr,
+    FILTER: tl.constexpr,
+):
+    """`_ratio_residual_race_kernel` over a dense q row per request, the
+    reference the sparse race is held to bit for bit."""
+    req_idx = tl.program_id(0)
+    tile = tl.program_id(1)
+    row, _, has_q = _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx)
+    if row >= 0:
+        temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+        offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab_size
+        p = _target_p_tile(
+            logits_ptr,
+            row,
+            logits_row_stride,
+            offs,
+            vmask,
+            temp,
+            tl.load(row_max_ptr + row),
+            tl.load(row_inv_z_ptr + row),
+            row_floor_ptr,
+            FILTER,
+        )
+        q = tl.load(
+            dense_ptr + req_idx.to(tl.int64) * vocab_size + offs,
+            mask=vmask & has_q,
+            other=0.0,
+        )
+        # Anything that is not a probability (NaN, inf, negative) counts as 0,
+        # so the residual falls back toward p rather than inheriting garbage.
+        q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+        residual = tl.maximum(p - q, 0.0)
+        key = race_key(
+            residual, residual_seed, row.to(tl.int64) * vocab_size, offs, vmask
+        )
+        best, best_id = argmax_lowest_id(key, offs, vmask, 2147483647)
+        part = tile * batch_size + req_idx
+        tl.store(part_key_ptr + part, best)
+        tl.store(part_idx_ptr + part, best_id)
+
+
 def dense_verify(args, q_dense, ratio_step):
     """The verify over a dense q: the same stats, race and pick kernels the
-    sparse path runs, around `_dense_accept_kernel`, the race reading the
-    rejecting position's row of ``q_dense`` copied to the request's row, where
-    the sparse path densifies it."""
+    sparse path runs, around `_dense_accept_kernel` and
+    `_dense_residual_race_kernel`, the race reading the rejecting position's
+    row of ``q_dense`` copied to the request's row."""
     logits = args["target_logits"]
     cu = args["cu_num_draft_tokens"]
     steps = args["num_spec_steps"]
@@ -1407,13 +1453,12 @@ def dense_verify(args, q_dense, ratio_step):
         _RATIO_ACCEPT_KEY | ratio_step,
         num_warps=1,
     )
-    # The rejecting position's own q row at its request's row, as the sparse
-    # path densifies it. A request without one gets some row the race masks
+    # The rejecting position's own q row at its request's row. A request without one gets some row the race masks
     # off, since it decides from ``residual`` and ``base`` alone.
     start = torch.cat((cu.new_zeros(1), cu[:-1]))
     has_row = (residual >= 0) & (base >= 0)
     q_row = torch.where(has_row, base + residual - start, 0)
-    _ratio_residual_race_kernel[(batch_n, tiles)](
+    _dense_residual_race_kernel[(batch_n, tiles)](
         residual,
         logits,
         temps,
@@ -1481,7 +1526,7 @@ def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q():
     temps = torch.tensor([1.0, 0.6, SAMPLER_EPS, 1.3], device=DEV).repeat(batch_n // 4)
     args = verify_batch(drafts, width, logits, temps)
     args["q_row_base"][7::11] = -1
-    q = draft_q(q_rows, drafts, dense_rows=batch_n)
+    q = draft_q(q_rows, drafts)
     n, xslot = q.store.meta.unbind(1)
     # Slots that name another stored id: the walk must find x's true q.
     xslot[1::9] = (xslot[1::9] + 1) % n[1::9]
@@ -1523,9 +1568,7 @@ def test_a_slot_that_does_not_hold_the_draft_still_reads_its_true_q(others):
             torch.ones(n, device=DEV),
             row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         )
-        out, (accepted, _, _) = verify(
-            **args, q=RatioDraftQ(store, stale(n, vocab)), ratio_step=13
-        )
+        out, (accepted, _, _) = verify(**args, q=store, ratio_step=13)
         assert abs(accepted.float().mean().item() - rate) < 0.015, draft
         # relu(p - q) is all on `outside`: x's 0.3 is below its q of 0.99.
         assert (out[accepted == 0, 0] == outside).all(), draft
@@ -1562,7 +1605,7 @@ def test_the_first_token_follows_p_at_any_store_width(width, temperature):
     )
     out, (accepted, _, _) = verify(
         **verify_batch(drafts.to(torch.int32), 1, target.expand(n, -1), temps),
-        q=RatioDraftQ(store, stale(n, vocab)),
+        q=store,
         ratio_step=19,
     )
     p = torch.softmax(target / temperature, -1)
@@ -1624,7 +1667,7 @@ def test_a_chained_block_follows_the_autoregressive_target(width):
     logits = torch.stack(scored, 1).view(n * steps, vocab)
     out, (accepted, _, _) = verify(
         **verify_batch(drafts, steps, logits, temps),
-        q=RatioDraftQ(store, stale(n, vocab)),
+        q=store,
         ratio_step=29,
     )
     cond = torch.softmax(table, -1)
@@ -1959,7 +2002,7 @@ def first_token_law(target, temps, top_ks, top_ps, width=1024, step=41):
     )
     out, (accepted, _, _) = verify(
         **verify_batch(drafts.to(torch.int32), 1, target.expand(n, -1), temps),
-        q=RatioDraftQ(store, stale(n, vocab)),
+        q=store,
         ratio_step=step,
         top_ks=top_ks,
         top_ps=top_ps,
@@ -2045,7 +2088,7 @@ def test_each_position_of_a_filtered_block_is_served_its_own_p_f():
     store = SparseQStore(q_ids, q_probs.contiguous(), meta.to(torch.int32))
     out, (accepted, _, _) = verify(
         **verify_batch(drafts, width, target.repeat(n, 1), temps),
-        q=RatioDraftQ(store, stale(n, vocab)),
+        q=store,
         ratio_step=53,
         top_ks=ks,
         top_ps=ps,
@@ -2083,7 +2126,7 @@ def test_a_filtered_out_draft_is_always_rejected():
             temps,
             row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         ),
-        q=RatioDraftQ(store, stale(n, vocab)),
+        q=store,
         ratio_step=43,
         top_ks=ks,
     )
@@ -2170,7 +2213,7 @@ def test_filters_that_keep_everything_leave_the_verify_bit_for_bit():
     logits = (q_logits + torch.randn(rows, vocab, device=DEV)).to(torch.bfloat16)
     temps = torch.tensor([1.0, 0.6, SAMPLER_EPS, 1.3], device=DEV).repeat(batch_n // 4)
     args = verify_batch(drafts, width, logits, temps)
-    q = draft_q(q_rows, drafts, dense_rows=batch_n)
+    q = draft_q(q_rows, drafts)
     ref = verify(**args, q=q, ratio_step=3)
     every_k = torch.tensor([-1, vocab, vocab + 5, -1], device=DEV, dtype=torch.int32)
     for ks, ps in (

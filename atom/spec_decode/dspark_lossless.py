@@ -23,7 +23,7 @@ from atom.model_ops.ratio_verify import (
     warmup_ratio_verify,
 )
 from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
-from atom.model_ops.sparse_q_store import Q_WIDTH, RatioDraftQ, SparseQStore
+from atom.model_ops.sparse_q_store import Q_WIDTH, SparseQStore
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
 from atom.spec_decode.draft_q_staging import DraftQStaging
@@ -201,9 +201,7 @@ class DSparkLossless:
         # One row block per live request, not per batch slot: the verify reads
         # it a step later, after the batch may have been reordered.
         q_store = SparseQStore.allocate(q_slots * t, min(Q_WIDTH, vocab), device)
-        # The verify borrows the draft's score scratch to densify a rejecting
-        # request's q; the draft never runs while a verify does
-        # (`ModelRunner.postprocess`).
+        # The draft's own: the verify reads q from the store, not from here.
         s_scratch = torch.empty((max_bs, vocab), dtype=torch.float32, device=device)
         draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
         # Members of the runner's `sampling` publication, uploaded by the H2D
@@ -295,7 +293,7 @@ class DSparkLossless:
                 f"logits but the LM head emits {logits_dtype}"
             )
         return RatioVerifyInputs(
-            RatioDraftQ(self.sampling.q_store, self.sampling.s_scratch),
+            self.sampling.q_store,
             self._verify_q_row_base[:bs],
             temperatures,
             top_ks,

@@ -3459,8 +3459,6 @@ class ModelRunner:
             )
             # Lossless (`u * q < p`) inputs, asked first: they decide whether the
             # verification sample below runs. All-greedy batches keep exact match.
-            # The verify borrows the draft's score scratch: it must stay on this
-            # stream, between the previous step's propose and this step's.
             ratio = None
             if drafter is not None and not all_greedy:
                 ratio = drafter.lossless_verify_inputs(

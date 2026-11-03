@@ -9,7 +9,7 @@ pytest.importorskip("aiter", reason="the sampler and rejection sampler are AITER
 from atom.model_ops.ratio_verify import RatioVerifyInputs, ratio_verify_scratch
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import Sampler
-from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
+from atom.model_ops.sparse_q_store import SparseQStore
 
 ANCHOR = 7  # never a target below: a draft read from an anchor's slot is rejected
 
@@ -54,7 +54,7 @@ def two_token_ratio(q, drafts, width):
         torch.stack((torch.full_like(drafts, 2), drafts), 1),
     )
     return RatioVerifyInputs(
-        RatioDraftQ(store, torch.empty(batch, 2, device="cuda")),
+        store,
         torch.arange(batch, device="cuda", dtype=torch.int32) * width,
         torch.ones(batch, device="cuda"),
         None,

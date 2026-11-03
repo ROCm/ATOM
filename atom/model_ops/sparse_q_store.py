@@ -44,13 +44,3 @@ class SparseQStore(NamedTuple):
 
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self)
-
-
-class RatioDraftQ(NamedTuple):
-    """The q a ratio verify reads: the draft's sparse store, plus a dense
-    ``[>= batch_size, V]`` fp32 scratch a rejecting request's q row is spread
-    into for the residual. Its contents are overwritten; nothing else may need
-    them across the verify."""
-
-    store: SparseQStore
-    dense: torch.Tensor

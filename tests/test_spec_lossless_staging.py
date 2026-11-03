@@ -417,11 +417,8 @@ def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     stage(prop, batch(["a", "b"], top_ks=[5, -1], top_ps=[1.0, 0.7]))
     temps, top_ks, top_ps = torch.ones(2), torch.tensor([5, -1]), 0.7
     ratio = prop.lossless_verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
-    # The sparse store itself, and the draft's score scratch to spread a
-    # rejecting request's row into: one dense row per batch row, V wide.
-    assert ratio.q.store is prop._lossless.sampling.q_store
-    assert ratio.q.dense is prop._lossless.sampling.s_scratch
-    assert ratio.q.dense.shape == (MAX_BS, VOCAB)
+    # The sparse store itself; the verify borrows nothing of the draft's.
+    assert ratio.q is prop._lossless.sampling.q_store
     assert (
         ratio.q_row_base.shape == (2,)
         and ratio.scratch is prop._lossless.verify_scratch
