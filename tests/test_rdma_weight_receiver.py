@@ -1420,6 +1420,28 @@ def test_a_repeated_init_reuses_its_group_only_for_the_same_join(monkeypatch):
     assert joined == ["tcp://10.0.0.1:29500", "tcp://10.0.0.2:29500"]
 
 
+def test_a_new_weight_group_starts_its_own_version_count(monkeypatch):
+    """A restarted trainer counts from 1 again in a new group."""
+    import torch
+
+    _joins(monkeypatch)
+    monkeypatch.setattr(receiver.dist, "destroy_process_group", lambda group: None)
+    runner = _runner_holding(torch.zeros(2))
+    runner._vote_with_engine_peers = lambda ballot, will_join: (ballot, will_join)
+    join = {"base_rank": 1, "world_size": 2, "group_name": "g"}
+
+    assert runner.init_rdma_weight_group("10.0.0.1", 29500, **join)
+    runner.begin_weight_update(5)
+    runner.abort_weight_update(5, "trainer died")
+    assert runner.init_rdma_weight_group("10.0.0.1", 29500, **join)  # a retry
+    with pytest.raises(RuntimeError, match="must increase"):
+        runner.begin_weight_update(1)
+
+    runner.destroy_rdma_weight_group("g")
+    assert runner.init_rdma_weight_group("10.0.0.2", 29500, **join)
+    assert runner.begin_weight_update(1)["version"] == 1
+
+
 def _voting_worker(outcome):
     """A worker whose engine's vote on joining comes out as *outcome* gives it;
     records the ballots it cast."""
@@ -1630,6 +1652,8 @@ def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
 # the two. CI reads a snapshot -- everything above receive_weight_stream in
 # lumenrl/engine/inference/rdma_weight_transfer.py, copied verbatim -- and with
 # LUMENRL_ROOT naming a checkout, the snapshot is held to the sender itself.
+# LumenRL's CI runs that, on changes to the sender and daily:
+# https://github.com/ZhangDanyang-AMD/Lumen-RL/blob/main/.github/workflows/atom-receiver-contract.yaml
 
 _SENDER_SNAPSHOT = Path(__file__).parent / "fixtures" / "lumenrl_rdma_sender.txt"
 _HEADER_ORDER = r"\[\s*command,\s*metadata_bytes,\s*payload_bytes,\s*version\s*,?\s*\]"

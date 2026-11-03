@@ -642,6 +642,9 @@ class Scheduler:
 
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
+    # A preempted sequence recomputes its prompt on this engine, which is what
+    # pausing generation for a weight update relies on.
+    can_recompute_prompts = True
 
     def __init__(
         self,
@@ -3950,13 +3953,18 @@ class Scheduler:
         """Preempt every running sequence; return how many.
 
         For a weight update mid-generation: the update clears the KV cache, so
-        each sequence recomputes its prompt and the tokens it has so far once
-        scheduling resumes, and goes on from there on the new weights. Raises,
-        preempting none, if a KV connector holds one's blocks, or under
-        pipeline parallelism if one's token is still in flight through the
-        stages: left running it would decode on the cleared cache, and
-        preempted its token would land on a sequence no longer running.
+        each sequence recomputes its prompt and tokens on the new weights once
+        scheduling resumes. Raises, preempting none, while the clear would hit
+        blocks still in use: a KV connector holds a running sequence's, a token
+        is in flight through the pipeline, or remote KV is loading for a
+        parked request. ``preempt()`` refuses only a sequence that check
+        already rules out, so the loop below does not stop part-way.
         """
+        if self._num_parked_remote_kv:
+            raise RuntimeError(
+                f"cannot preempt while {self._num_parked_remote_kv} request(s) "
+                f"wait for remote KV in blocks the update would clear"
+            )
         in_pipeline = self._pp_inflight_token_block
         held = [
             seq.id
@@ -5184,6 +5192,8 @@ class PrefillScheduler:
     # in-flight prefill is not counted on both. See `_METRICS_ROLE` on
     # `Scheduler`.
     _METRICS_ROLE = "prefill"
+    # Its KV blocks are the decode engine's, assigned per request.
+    can_recompute_prompts = False
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
         self.max_num_seqs = config.max_num_seqs
@@ -5401,6 +5411,9 @@ class DecodeScheduler(Scheduler):
 
     _ENGINE_LABEL = "Decode "
     _METRICS_ROLE = "decode"
+    # Its prompts are prefilled on the prefill engine: a preempted one would
+    # wait for a PrefillDone that is not coming again.
+    can_recompute_prompts = False
 
     def abort_request(self, req_id: int) -> bool:
         # RapidServe does not drain the standard scheduler's rejection queue.

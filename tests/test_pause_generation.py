@@ -24,7 +24,12 @@ from atom.model_engine.engine_utility import (
     RESUME_GENERATION_CMD,
     EngineUtilityHandler,
 )
-from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.scheduler import (
+    DecodeScheduler,
+    PrefillScheduler,
+    ScheduledBatchOutput,
+    Scheduler,
+)
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -95,6 +100,16 @@ def test_preempt_running_refuses_while_a_token_is_in_the_pipeline():
     assert list(sched.running) == seqs
 
 
+def test_preempt_running_refuses_while_remote_kv_is_parked():
+    sched, seqs, _ = _running(2)
+    sched._num_parked_remote_kv = 1
+
+    with pytest.raises(RuntimeError, match="wait for remote KV"):
+        sched.preempt_running()
+
+    assert list(sched.running) == seqs
+
+
 def test_preempt_running_with_nothing_running_is_a_no_op():
     sched = Scheduler(MockConfig(num_kvcache_blocks=64))
     assert sched.preempt_running() == 0
@@ -112,6 +127,8 @@ class _BlockManager:
 
 
 class _Scheduler:
+    can_recompute_prompts = True
+
     def __init__(self, preempted=3, raises=None):
         self.block_manager = _BlockManager()
         self.calls = 0
@@ -189,7 +206,7 @@ def test_resume_lets_the_engine_schedule_again():
     [
         (_Scheduler(), {"mode": "abort"}, "unsupported pause mode"),
         (_Scheduler(raises=RuntimeError("connector holds 1")), {}, "connector"),
-        (object(), {}, "cannot preempt to pause"),
+        (object(), {}, "cannot recompute"),
     ],
 )
 def test_a_refused_pause_answers_the_error_and_keeps_serving(scheduler, args, message):
@@ -202,6 +219,18 @@ def test_a_refused_pause_answers_the_error_and_keeps_serving(scheduler, args, me
     assert not engine._generation_paused
 
 
+@pytest.mark.parametrize("scheduler_cls", [DecodeScheduler, PrefillScheduler])
+def test_a_disaggregated_engine_refuses_to_pause(scheduler_cls):
+    # A decode engine's prompts were prefilled on the prefill engine, so a
+    # preempted one would wait for a PrefillDone that is not coming again.
+    scheduler, engine = scheduler_cls(MockConfig(num_kvcache_blocks=64)), _Engine()
+
+    reply = _run(scheduler, engine, PAUSE_GENERATION_CMD)
+
+    assert "cannot recompute" in reply["error"]
+    assert not engine._generation_paused
+
+
 # ── the busy loop ──────────────────────────────────────────────────────────
 
 
@@ -209,7 +238,7 @@ def test_a_refused_pause_answers_the_error_and_keeps_serving(scheduler, args, me
     "flag",
     ["_is_rl_weights_offloaded", "_weight_sync_fenced", "_generation_paused"],
 )
-def test_the_busy_loop_skips_the_forward_while_any_flag_is_set(flag):
+def test_each_flag_alone_holds_the_engine(flag):
     engine = EngineCore.__new__(EngineCore)
     engine._is_rl_weights_offloaded = False
     engine._weight_sync_fenced = False

@@ -684,6 +684,9 @@ class RDMAWeightReceiverMixin:
             group_name=group_name,
         )
         joins[group_name] = join
+        # A new group is a new sender, e.g. a restarted trainer counting from 1
+        # again. Versions still have to rise within a group.
+        self._last_started_weight_version = None
         logger.info(
             "%s: joined RDMA weight group %s as rank %d/%d (worker %d)",
             getattr(self, "label", "runner"),

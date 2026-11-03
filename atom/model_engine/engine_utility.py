@@ -37,6 +37,24 @@ RESUME_GENERATION_CMD = "resume_generation"
 GENERATION_PAUSE_MODES = ("keep",)
 
 
+def _stales_cached_prefixes(cmd: str, args, reply) -> bool:
+    """Whether *cmd* zeroed, freed or reallocated the KV pool, or committed new
+    weights, so that cached prefixes no longer hold what was hashed."""
+    args = args if isinstance(args, dict) else {}
+    if cmd == "clear_kv_cache":
+        return True
+    if cmd in ("release_memory", "resume_memory"):
+        tags = args.get("tags")  # none means weights and KV, as the runner reads it
+        return tags is None or "kv_cache" in tags
+    if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+        return completes_weight_sync(cmd, args)
+    return (
+        cmd == COLLECTIVE_RPC_CMD
+        and isinstance(reply, dict)
+        and reply.get("method") in WEIGHT_WRITING_RPC_METHODS
+    )
+
+
 def completes_weight_sync(cmd: str, args: dict) -> bool:
     """Whether *cmd* is the update a sync ends on: direct, or a last bucket."""
     return cmd == "update_weights" or (
@@ -178,6 +196,8 @@ class EngineUtilityHandler:
                     self._weight_sync_in_progress = True
                     self._weight_sync_open = True
                 reply = self._execute_utility_command(cmd, args)
+                if _stales_cached_prefixes(cmd, args, reply):
+                    self._forget_cached_prefixes()
                 if cmd in (PAUSE_GENERATION_CMD, RESUME_GENERATION_CMD) and not (
                     isinstance(reply, dict) and reply.get("error")
                 ):
@@ -265,6 +285,13 @@ class EngineUtilityHandler:
                         )
             except queue.Empty:
                 break
+
+    def _forget_cached_prefixes(self) -> None:
+        """Drop the prefix-cache index; live sequences keep their blocks."""
+        block_manager = getattr(self.scheduler, "block_manager", None)
+        clear = getattr(block_manager, "clear_cache", None)
+        if callable(clear):
+            clear()
 
     def _execute_utility_command(self, cmd: str, args: dict) -> dict | None:
         """Run *cmd*'s handler and return what it returned: the weight
@@ -755,14 +782,14 @@ class EngineUtilityHandler:
                     f"unsupported pause mode {mode!r}; supported: "
                     f"{GENERATION_PAUSE_MODES}"
                 )
-            preempt_running = getattr(self.scheduler, "preempt_running", None)
-            if not callable(preempt_running):
+            if not getattr(self.scheduler, "can_recompute_prompts", False):
                 raise TypeError(
-                    f"{type(self.scheduler).__name__} cannot preempt to pause"
+                    f"{type(self.scheduler).__name__} cannot recompute a "
+                    f"preempted prompt, so it cannot pause"
                 )
-            preempted = preempt_running()
+            preempted = self.scheduler.preempt_running()
             if args.get("clear_cache", True):
-                self.scheduler.block_manager.clear_cache()
+                self._forget_cached_prefixes()
             reply = {"cmd": PAUSE_GENERATION_CMD, "preempted": preempted}
             logger.info(
                 f"{self.label}: generation paused, {preempted} sequence(s) "
