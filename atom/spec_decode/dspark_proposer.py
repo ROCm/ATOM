@@ -638,7 +638,11 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        # One block when every tap was relayed from earlier PP stages.
+        if len(aux_hidden_states) == 1:
+            main_hidden_all = aux_hidden_states[0]
+        else:
+            main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
         ):

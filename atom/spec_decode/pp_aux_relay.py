@@ -81,18 +81,15 @@ class PPAuxRelay:
         self._armed = False
 
     @classmethod
-    def build(cls, config, target_model, drafter) -> "PPAuxRelay | None":
+    def build(cls, config, target_model) -> "PPAuxRelay | None":
         """This stage's armed relay, or None when no tap crosses a PP boundary.
 
-        Runs on every stage; drafterless stages take the drafter class's
-        config-only spec.
+        Every stage takes the drafter class's config-only spec, so all agree on
+        the columns; a draft with its own contract refuses PP when it arms.
         """
         if get_pp_group().world_size <= 1 or config.speculative_config is None:
             return None
-        if drafter is not None:
-            spec = drafter._aux_capture_spec(target_model)
-        else:
-            spec = drafter_class(config).aux_capture_spec(config)
+        spec = drafter_class(config).aux_capture_spec(config)
         if spec is None:
             return None
         relay = cls(spec, target_model)
@@ -165,9 +162,8 @@ class PPAuxRelay:
                 f"{list(self.incoming_ids)}, got {received.shape[-1]}."
             )
 
-    def absorb(self, received: torch.Tensor | None, aux_buffers: list) -> None:
-        """Copy relayed rows into ``Drafter._aux_buffers`` (indexed by
-        ``layer_ids`` position)."""
+    def absorb(self, received: torch.Tensor | None, drafter) -> None:
+        """Hand the relayed block to the drafter, which reads it in place."""
         if not self.incoming_ids:
             return
         if received is None:
@@ -176,8 +172,4 @@ class PPAuxRelay:
                 f"{list(self.incoming_ids)} from the previous stage, got none."
             )
         self._check_width(received)
-        n = received.shape[0]
-        for col, lid in enumerate(self.incoming_ids):
-            start = col * self.hidden_size
-            buf = aux_buffers[self.layer_ids.index(lid)]
-            buf[:n].copy_(received[:, start : start + self.hidden_size])
+        drafter.take_relayed_aux(received)

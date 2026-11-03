@@ -223,6 +223,9 @@ class Drafter(abc.ABC):
     ModelRunner used to scatter through its code.
     """
 
+    # The leading taps' rows relayed from earlier PP stages, as one block.
+    _relayed_aux: torch.Tensor | None = None
+
     def __init__(self, atom_config: Config, device: torch.device, runner):
         self.config = atom_config
         self.speculative_config = self.config.speculative_config
@@ -502,16 +505,23 @@ class Drafter(abc.ABC):
         """
         if not self._captures_aux:
             return None
+        blocks = self._aux_buffers
+        if self._relayed_aux is not None:
+            relayed = self._relayed_aux.shape[-1] // blocks[0].shape[-1]
+            blocks = [self._relayed_aux, *blocks[relayed:]]
         n = target_hidden_states.shape[0]
         pcp_ws = get_pcp_world_size()
         ctx = getattr(get_forward_context(), "context", None)
         if pcp_ws > 1 and n > 0 and getattr(ctx, "target_pcp_split", False):
             n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
-            return [
-                pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n]
-                for buf in self._aux_buffers
-            ]
-        return [buf[:n] for buf in self._aux_buffers]
+            return [pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n] for buf in blocks]
+        return [buf[:n] for buf in blocks]
+
+    def take_relayed_aux(self, block: torch.Tensor) -> None:
+        """This forward's leading taps, relayed from earlier PP stages as one
+        ``[N, k * hidden_size]`` block in ``layer_ids`` order; ``aux_for``
+        serves it in place of their capture buffers, uncopied."""
+        self._relayed_aux = block
 
     def anchors_to_gpu(self, anchors: list[int]) -> torch.Tensor:
         """Scheduler-supplied anchors as an int32 GPU tensor, without blocking.
