@@ -283,10 +283,15 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     def load_failed(self, req_id: Any) -> bool:
         raw_id = req_id.req_id if hasattr(req_id, "req_id") else req_id
         active = self._active_load_operations.get(str(raw_id))
-        if isinstance(req_id, LoadOperationId):
-            is_current = active is not None and active[1] == req_id
-        else:
-            is_current = active is None
+        # Only a submitted retrieve hands its lookup's read locks to the
+        # transfer. A promise withdrawn before dispatch (a raw request id) did
+        # not: the base's cleanup reaches `clear_lookup_status`, which frees
+        # them, as long as nothing popped the lookup first.
+        is_current = (
+            isinstance(req_id, LoadOperationId)
+            and active is not None
+            and active[1] == req_id
+        )
         if is_current:
             try:
                 self._lookup_client.complete_retrieve(

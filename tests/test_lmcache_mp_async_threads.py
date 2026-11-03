@@ -295,6 +295,23 @@ def test_transfer_thread_reraises_a_failed_submission_on_the_caller():
         thread.close(5.0)
 
 
+def test_a_handed_back_future_is_dropped_once_nothing_else_holds_it():
+    """One LMCache still references stays queued: its last reference would
+    otherwise be dropped by LMCache's next submission, on the transfer
+    thread."""
+    thread = transfer_thread._TransferThread("mp-transfer-test", poll=lambda: None)
+    try:
+        lmcache = [object()]
+        ident = id(lmcache[0])
+        thread.hand_back(lmcache[0])
+        assert thread.take_returned() == []
+        lmcache.clear()
+        assert [id(future) for future in thread.take_returned()] == [ident]
+        assert thread.take_returned() == []
+    finally:
+        thread.close(5.0)
+
+
 # ── worker: same-step saves go out behind the forward ───────────────────
 
 

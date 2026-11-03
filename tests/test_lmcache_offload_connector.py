@@ -2327,6 +2327,31 @@ def test_a_prefix_the_tier_dropped_is_not_retrieved():
     assert "742" not in sched._load_specs
 
 
+def test_dsv4_a_load_the_tier_lost_stores_the_recomputed_span_back():
+    """Evicted between the lookup and the dispatch: the request recomputes
+    `[HBM, hit)`, the span the tier no longer holds, so it is saved again
+    from the HBM frontier rather than counted as persisted up to the hit."""
+    sched = _scheduler()
+    sched._lookup_client = _LookupClient(hit=12)
+    seq = SimpleNamespace(
+        id=744,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+    assert sched.get_num_new_matched_tokens(seq) == (12, True)
+    sched.update_state_after_alloc(seq)
+    assert sched._save_tracker["744"][1] == 12
+    sched._lookup_client.hit = 4
+
+    meta = sched.build_connector_meta()
+
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert sched._save_tracker["744"][1] == 0
+
+
 def test_a_failed_load_leaves_no_remembered_hit_behind():
     """A hit that the transfer could not honour must not be replayed.
 

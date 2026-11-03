@@ -563,6 +563,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if ls is not None:
             ls.can_load = True
             self._reqs_need_recv[sid] = seq
+            # Recorded now, not at dispatch: a load that never goes out (the
+            # tier lost the prefix, a withdrawn promise) recomputes
+            # `[HBM, hit)` as well, and has to store it back.
+            self._load_save_floors[sid] = self._chunk_floor(
+                int(getattr(seq, "num_cached_tokens", 0) or 0)
+            )
         # Track for save; build_connector_meta stores chunks once the scheduler's
         # computed frontier (seq.num_cached_tokens) has advanced past them.
         #
@@ -662,14 +668,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             is_last_prefill=is_last_prefill,
             save_operation=operation,
         )
-
-    def _unbuilt_save_is_final(self) -> bool:
-        """Whether a save `_build_save_request` declined stays unbuildable once
-        its request has finished, so its tracker is retired rather than kept
-        for a retry. False, as before this hook existed: a layout that only
-        declines for reasons that clear (a full pin budget, a source still
-        being written) retries. A layout whose declines are final opts in."""
-        return False
 
     def _retire_finished_save(self, sid: str, seq) -> None:
         """Retire a finished request's save that will never be emitted.
@@ -829,6 +827,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # from a remembered hit has none yet.
             if not self._ensure_lookup_pin(seq, sid, ls):
                 self._mark_load_skip(seq, "tier_lost_prefix", hbm, lmc, need, chunk)
+                # The tier no longer holds the prefix this request recomputes.
+                self._reopen_saves(sid, hbm)
                 self._clear_pending_load(sid)
                 continue
             # num_cached after load = max(HBM, offload); never drop below HBM.
@@ -938,12 +938,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if request is None:
                 if late_acquired:
                     self._block_manager.free_leased_blocks(late_acquired)
-                if (
-                    getattr(seq, "_offload_finished", False)
-                    and self._unbuilt_save_is_final()
-                ):
-                    # A tracker left behind would hold its lease forever.
-                    self._retire_finished_save(sid, seq)
                 continue
             self._track_save_statistics(save_operation, aligned - saved)
             meta.add_request(request)
@@ -1417,12 +1411,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return False
         self._finish_load_statistics(req_id, succeeded=False)
         floor = self._load_save_floors.get(sid)
-        entry = self._save_tracker.get(sid)
-        if floor is not None and entry is not None:
+        if floor is not None:
             # The LMCache hit was not actually loaded. Let the recomputed
             # [HBM, LMC) chunks be saved again instead of permanently treating
             # them as already persisted.
-            entry[1] = self._chunk_floor(floor)
+            self._reopen_saves(sid, floor)
         self._record_failed_load_attempt(sid)
         # Drop the hit too. `_repeat_load_suppressed` already answers for this
         # request, but the memo must not outlive the load spec it would imply
@@ -1430,6 +1423,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._forget_tier_hit(sid)
         self._clear_pending_load(sid)
         return True
+
+    def _reopen_saves(self, sid: str, hbm: int) -> None:
+        """The tier hit will not be loaded, so `[hbm, hit)` is recomputed:
+        let its chunks be stored again rather than treated as persisted."""
+        entry = self._save_tracker.get(sid)
+        if entry is not None:
+            entry[1] = min(int(entry[1]), self._chunk_floor(hbm))
 
     def load_finished(self, req_id) -> bool:
         sid = str(req_id.req_id if isinstance(req_id, LoadOperationId) else req_id)

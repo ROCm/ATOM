@@ -89,15 +89,6 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
 # (silent wrong output) -- see `select_offload_layout`.
 _STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen", "dsv41"})
 
-# Every spelling of the V4.1 family, mirroring `atom.utils.selector._V41_TYPES`.
-# Matching only the text config's own type left the wrapper and DSpark
-# spellings to fall through to the `compress_ratios` probe below and resolve to
-# `hybrid` -- outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense`
-# override would be honoured on a model that carries per-request state, and
-# sharing DSV4's key space besides.
-_DSV41_MODEL_TYPES = frozenset(
-    {"deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"}
-)
 
 logger = logging.getLogger("atom")
 
@@ -234,11 +225,13 @@ def _layout_from_model(config) -> str:
     # otherwise answer: V4.1 declares compress ratios exactly as DSV4 does, but
     # it also carries per-request CSA2 state (window ring per layer, the
     # compressor's incomplete group, the Engram cursor) that the `hybrid`
-    # PAGE+SLOT codec owns no tier for. Resolving it to `hybrid` would both
-    # share DSV4's key space and leave it outside `_STATE_OWNING_LAYOUTS`, so
-    # an `offload_layout: dense` override would silently restore a KV prefix
-    # over a window ring that never existed.
-    if model_type in _DSV41_MODEL_TYPES:
+    # PAGE+SLOT codec owns no tier for. Resolving it to `hybrid` would leave it
+    # outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense` override
+    # would silently restore a KV prefix over a window ring that never
+    # existed. Every spelling (wrapper, text, DSpark) is the selector's CSA2.
+    from atom.utils.selector import Family, attn_family
+
+    if attn_family(text_config) is Family.CSA2:
         return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"

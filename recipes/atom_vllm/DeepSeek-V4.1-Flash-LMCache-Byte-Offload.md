@@ -45,9 +45,8 @@ vllm serve $MODEL --served-model-name DeepSeek-V4.1-Flash --port 8021 \
 - `--chunk-size` must equal `ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS` (a
   multiple of 256) and the client's LMCache chunk size (`LMCACHE_CHUNK_SIZE`,
   default 256). `--separate-object-groups` and `--no-l1-use-lazy` are
-  required. `--null-block-id` must equal the client's `lmcache.mp.null_block_id`
-  (default `-1`, as the native ATOM recipes start the server), so native ATOM
-  and this frontend can share one server. `OFFLOAD_MIN_LOAD_TOKENS` (default 8192) is the shortest tier
+  required. `--null-block-id -1` is what a chunk with no checkpoint names, as
+  the native ATOM recipes start the server. `OFFLOAD_MIN_LOAD_TOKENS` (default 8192) is the shortest tier
   load worth making. Give the MP server the model's `HIP_VISIBLE_DEVICES`:
   its GPU workers open the model's buffers by local device index.
 - `--enable-prefix-caching` with `--mamba-cache-mode align` registers the

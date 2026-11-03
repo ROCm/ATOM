@@ -146,7 +146,7 @@ class V41StateMPScheduler(PluginMPScheduler):
     def _last_checkpointed_boundary(self, seq: Any, aligned: int) -> int:
         """The highest chunk edge in (saved, aligned] whose checkpoint vLLM
         still holds in every group, or *aligned* when none does (the save is
-        then declined and retired, `_unbuilt_save_is_final`)."""
+        then declined, and retired once its request has finished)."""
         entry = self._save_tracker.get(str(seq.id))
         saved = int(entry[1]) if entry is not None and entry[0] is seq else 0
         request = self._request_of(seq)
@@ -183,6 +183,11 @@ class V41StateMPScheduler(PluginMPScheduler):
                 seq.id,
                 end,
             )
+            if getattr(seq, "_offload_finished", False):
+                # A finished request commits no further checkpoint, so the
+                # decline is final; a tracker left behind would hold its lease
+                # forever.
+                self._retire_finished_save(str(seq.id), seq)
             return None
         request_meta = super()._build_save_request(
             seq, saved, end, operation, block_ids, is_last_prefill
@@ -191,11 +196,6 @@ class V41StateMPScheduler(PluginMPScheduler):
             units, end, self._planner.boundary_hash(request, end)
         )
         return request_meta
-
-    def _unbuilt_save_is_final(self) -> bool:
-        # A save is declined only for want of a checkpoint, and a finished
-        # request commits no further one.
-        return True
 
     def build_connector_meta(self):
         metadata = super().build_connector_meta()

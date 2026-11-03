@@ -25,10 +25,6 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
-from atom.kv_transfer.offload.mp.step_events import (
-    PendingStepEvent,
-    RecordedStepEvent,
-)
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -112,7 +108,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
     def _submit_native(
         self,
         req: LMCacheReqMeta,
-        event: PendingStepEvent | RecordedStepEvent,
+        event: Any,
         *,
         loading: bool,
     ) -> None:
@@ -179,9 +175,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         with self._lock:
             entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
-            index, step_event = event.hold_locked()
-            if index is not None:
-                self._step_event_of[operation_id] = index
         submit = (
             self._adapter.submit_retrieve_request
             if loading
@@ -195,7 +188,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             future = submit(
                 _mp_session_id(self._config, req.req_id),
                 spec,
-                step_event,
+                event,
                 **self._submit_kwargs(),
             )
         except Exception:
@@ -209,14 +202,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         with self._lock:
             entry.future = future
 
-    def _submit_load(
-        self, req: LMCacheReqMeta, event: PendingStepEvent | RecordedStepEvent
-    ) -> None:
+    def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
         self._submit_native(req, event, loading=True)
 
-    def _submit_save(
-        self, req: LMCacheReqMeta, event: PendingStepEvent | RecordedStepEvent
-    ) -> None:
+    def _submit_save(self, req: LMCacheReqMeta, event: Any) -> None:
         self._submit_native(req, event, loading=False)
 
     @staticmethod
@@ -330,8 +319,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         )
         del self._native_saves[operation_id]
-        self._release_step_event(operation_id)
-        self._owned_futures.add_locked(pending.future)
         _remember_operation_tombstone(
             operation_id,
             self._completed_save_operations,
@@ -351,8 +338,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         )
         target.add(pending.request.load_operation)
         del self._native_loads[operation_id]
-        self._release_step_event(operation_id)
-        self._owned_futures.add_locked(pending.future)
         _remember_operation_tombstone(
             operation_id,
             self._completed_load_operations,
@@ -377,8 +362,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                     operation_id, pending.started_at, self._transfer_deadline_s
                 )
                 return False
-            # The server no longer waits on the step's event.
-            self._release_step_event(operation_id)
             if result is not True:
                 return True
             if pending.request.native_state.kv_only:

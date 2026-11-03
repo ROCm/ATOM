@@ -196,32 +196,16 @@ def test_unit_validation_rejects_missing_null_out_of_range_and_duplicate_units(i
         _layout(_transfer()).validate_unit_ids(ids)
 
 
-@pytest.mark.parametrize("null_block_id", [-1, 0])
-def test_transfer_nulls_every_image_chunk_but_the_boundary(null_block_id):
-    """PAGE names every chunk; each image ordinal only the last, the server's
-    null block id before it. -1 is ATOM's (PAGE unit 0 is real data); 0 is
-    LMCache's default, for a pool that never hands out block 0."""
-    layout = build_native_state_mp_layout(
-        _transfer(), block_size=4, chunk_size=16, null_block_id=null_block_id
-    )
-    n = null_block_id
-    assert layout.null_block_id == n
+def test_transfer_nulls_every_image_chunk_but_the_boundary():
+    """PAGE names every chunk; each image ordinal only the last, -1 before it
+    (PAGE unit 0 is real data, so the server's null block id is -1)."""
+    layout = build_native_state_mp_layout(_transfer(), block_size=4, chunk_size=16)
     assert layout.transfer_block_ids([10, 11, 12, 13], (4, 2, 3), 2) == [
         [10, 11, 12, 13],
-        [n, 4],
-        [n, 2],
-        [n, 3],
+        [-1, 4],
+        [-1, 2],
+        [-1, 3],
     ]
-
-
-def test_the_null_block_id_is_never_an_image_unit():
-    """A unit equal to the server's null id would read as an absent image."""
-    assert _layout(_transfer()).validate_unit_ids([0, 1, 2]) == (0, 1, 2)
-    layout = build_native_state_mp_layout(
-        _transfer(), block_size=4, chunk_size=16, null_block_id=0
-    )
-    with pytest.raises(ValueError, match="unit ID"):
-        layout.validate_unit_ids([0, 1, 2])
 
 
 def test_equal_shape_unequal_stride_is_rejected_before_registration():

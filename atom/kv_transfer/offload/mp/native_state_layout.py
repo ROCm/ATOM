@@ -45,9 +45,6 @@ class NativeStateMPLayout:
     checkpoint_spec: Any
     # False: PAGE alone, no image group (`stores_state_images`).
     images: bool = True
-    # What an image group names for a chunk that holds no image: the MP
-    # server's `--null-block-id`. See `build_native_state_mp_layout`.
-    null_block_id: int = -1
 
     def engine_group_infos(self) -> list[Any]:
         """Convert the neutral plan at the actual LMCache registration boundary."""
@@ -75,12 +72,7 @@ class NativeStateMPLayout:
             )
         num_blocks = self.tensors[0].shape[0]
         for unit_id in ids:
-            # The null id would read as an absent image on the server.
-            if (
-                type(unit_id) is not int
-                or not 0 <= unit_id < num_blocks
-                or unit_id == self.null_block_id
-            ):
+            if type(unit_id) is not int or not 0 <= unit_id < num_blocks:
                 raise ValueError(f"invalid native checkpoint unit ID: {unit_id!r}")
         if len(set(ids)) != len(ids):
             raise ValueError("native checkpoint unit IDs must be distinct")
@@ -92,13 +84,11 @@ class NativeStateMPLayout:
         """One block-id list per engine group for a transfer of `count` chunks.
 
         PAGE engine group 0 names `pages`. Image ordinal ``j`` names its unit
-        at the final chunk and the null block before it: earlier chunks have
-        PAGE only, and a boundary image is indivisible, so all its ordinal
-        groups are present at exactly the same final chunk.
+        at the final chunk and the server's null block (``-1``) before it:
+        earlier chunks have PAGE only, and a boundary image is indivisible, so
+        all its ordinal groups are present at exactly the same final chunk.
         """
-        return [list(pages)] + [
-            [self.null_block_id] * (count - 1) + [unit] for unit in unit_ids
-        ]
+        return [list(pages)] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
 
 
 def _positive_int(name: str, value: Any) -> int:
@@ -114,19 +104,15 @@ def build_native_state_mp_layout(
     chunk_size: int,
     num_blocks: int | None = None,
     images: bool = True,
-    null_block_id: int = -1,
 ) -> NativeStateMPLayout:
     """Validate and alias PAGE plus compact native STATE for LMCache MP.
 
     PAGE uses engine group zero. STATE ordinal ``j`` uses group ``1+j`` and one
-    logical chunk per block. ``null_block_id`` is what a STATE group names for
-    a chunk with no image, and the MP server's global null block ID must be
-    configured to it: ``-1`` for ATOM's own pool, where PAGE unit 0 is real
-    data; a pool that never hands out block 0 may keep LMCache's default of
-    0. The final ordinal's final region ends exactly at ``image_bytes``; its
-    dim-0 stride continues to address the original full PAGE region.
-    ``images=False`` registers PAGE alone: with no image group, LMCache's hit
-    is the PAGE KV's own extent.
+    logical chunk per block. The MP server's global null block ID must be
+    configured as ``-1``. The final ordinal's final region ends exactly at
+    ``image_bytes``; its dim-0 stride continues to address the original full
+    PAGE region. ``images=False`` registers PAGE alone: with no image group,
+    LMCache's hit is the PAGE KV's own extent.
     """
     block_size = _positive_int("native PAGE block size", block_size)
     chunk_size = _positive_int("native checkpoint chunk size", chunk_size)
@@ -234,7 +220,6 @@ def build_native_state_mp_layout(
         kernel_groups=groups,
         checkpoint_spec=spec,
         images=images,
-        null_block_id=int(null_block_id),
     )
 
 
