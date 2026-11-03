@@ -1223,12 +1223,19 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
     is_indexed_sparse_attention = True
 
     @staticmethod
-    def qkv_fields(num_heads, num_kv_heads, head_dim, index_head_dim=0, **kwargs):
+    def qkv_fields(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        index_head_dim=0,
+        skip_index_topk=False,
+        **kwargs,
+    ):
+        fields = PagedAttentionImpl.qkv_fields(num_heads, num_kv_heads, head_dim)
+        if skip_index_topk:
+            return fields
         # The indexer's queries (one head per kv head), then its one key head.
-        return PagedAttentionImpl.qkv_fields(num_heads, num_kv_heads, head_dim) + [
-            (num_kv_heads, index_head_dim),
-            (1, index_head_dim),
-        ]
+        return fields + [(num_kv_heads, index_head_dim), (1, index_head_dim)]
 
     def __init__(
         self,
@@ -1399,10 +1406,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
             q_size = self.num_heads * self.head_dim
             kv_size = self.num_kv_heads * self.head_dim
-            q_raw, k_raw, v_raw, _, _ = torch.split(
-                qkv,
-                [q_size, kv_size, kv_size, self.index_q_size, self.index_head_dim],
-                dim=-1,
+            # The unread index columns trail, except after a Ulysses exchange
+            # (`qkv_fields`).
+            q_raw, k_raw, v_raw = qkv[..., : q_size + 2 * kv_size].split(
+                [q_size, kv_size, kv_size], dim=-1
             )
             q_out, k_out = triton_fused_norm_rope_cache(
                 q_raw,

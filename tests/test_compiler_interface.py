@@ -71,6 +71,39 @@ def test_saveable_artifact_returns_cache_handle(monkeypatch):
     assert compilation_counter.num_compiled_artifacts_saved == 1
 
 
+@pytest.mark.parametrize("aot", [False, True])
+def test_load_flattens_tuple_inputs_only_for_cache_artifacts(monkeypatch, aot):
+    """A cache-backed artifact takes the leaves; an AOT one keeps its own call
+    convention and takes the (activation, scale) tuple as given."""
+    standalone = pytest.importorskip("torch._inductor.standalone_compile")
+    calls = []
+
+    class CacheArtifact:
+        def __call__(self, *args):
+            calls.append(args)
+            return (args[-1],)
+
+    class AOTArtifact(CacheArtifact):
+        pass
+
+    artifact = AOTArtifact() if aot else CacheArtifact()
+    monkeypatch.setattr(standalone, "AOTCompiledArtifact", AOTArtifact, raising=False)
+    monkeypatch.setattr(
+        torch._inductor.CompiledArtifact, "load", lambda **kwargs: artifact
+    )
+
+    class TupleInput(torch.nn.Module):
+        def forward(self, pair, n):
+            return (pair[0] * pair[1] + n,)
+
+    pair = (torch.ones(2), torch.ones(2))
+    loaded = InductorStandaloneAdaptor().load(
+        ("g", "/unused"), torch.fx.symbolic_trace(TupleInput()), [pair, 3], 0
+    )
+    loaded(pair, 3)
+    assert calls == [(pair, 3) if aot else (*pair, 3)]
+
+
 def test_standalone_cpu_artifact_roundtrip_with_tuple_input(tmp_path, monkeypatch):
     """Reload retains tuple-input flattening and input-mutation argument order.
 

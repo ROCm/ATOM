@@ -4151,7 +4151,13 @@ class ModelRunner:
                 "TBO decode has no token graph: under TR_HYBRID a decode step "
                 "split into microbatches runs eagerly."
             )
-        logits_in_graph = self.world_size == 1
+        # Logits record only where the head runs no RCCL collective, which HIP
+        # cannot capture: TP 1, whose SP vocab shards gather on the custom
+        # all-gather `graph_capture()` arms, unless that is turned off.
+        sp_head_gathers_on_rccl = (
+            sp_is_enabled() and not envs.ATOM_USE_CUSTOM_ALL_GATHER
+        )
+        logits_in_graph = self.world_size == 1 and not sp_head_gathers_on_rccl
 
         # start capture profiler
         self.start_capture_profiler()

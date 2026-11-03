@@ -40,6 +40,23 @@ def _layer(moe):
     )
 
 
+def test_small_decode_batches_keep_the_native_moe():
+    """AITER's own resolver: at SP4, M3's MXFP4 SwiGLU MoE quantizes to FP4,
+    so MegaMoE runs, from 256 global tokens, 64 rows a rank. First in the
+    module, so that on a GPU host it imports the real MoE before any stub."""
+    resolver = pytest.importorskip("aiter.fused_moe")
+    if not hasattr(resolver, "resolve_activation_dtype"):
+        pytest.skip("AITER without resolve_activation_dtype")
+    from atom.model_ops import moe
+
+    layer = _layer(moe)
+    layer.quant_method.is_guinterleave = False
+    layer.w13_weight = torch.empty(1, dtype=moe.dtypes.fp4x2)
+    runtime = SimpleNamespace(cfg=SimpleNamespace(world_size=4))
+    backend = SPMegaMoE(runtime, layer, 1, None)
+    assert [backend.runs(r) for r in (1, 63, 64, 8192)] == [False, False, True, True]
+
+
 @pytest.mark.parametrize("use_mega", [False, True])
 def test_mega_moe_runs_where_aiter_picks_fp4_activations(
     monkeypatch, sp_modules, use_mega

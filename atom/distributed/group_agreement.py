@@ -13,7 +13,7 @@ def group_max(value: int, group) -> int:
     """The largest ``value`` any rank of ``group`` passed."""
     if group is None:
         return value
-    flag = torch.tensor([value], dtype=torch.int64)
+    flag = torch.tensor([value], dtype=torch.int64, device="cpu")
     dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
     return int(flag.item())
 
