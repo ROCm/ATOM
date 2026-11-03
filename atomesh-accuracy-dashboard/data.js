@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793638685529,
+  "lastUpdate": 1793729862526,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4694,6 +4694,40 @@ window.BENCHMARK_DATA = {
             "value": 0.8976,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41479235946 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611021458 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1645 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "la",
+            "username": "junhaha666",
+            "email": "junchen2@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "58ba50180312cc2ba57f8c21d28598352db1a561",
+          "message": "fix(dsv41): add 5, 6, 7, 12 to the default decoder request graph sizes (#2951)\n\n* fix(dsv41): record decoder request graphs at every capture size up to 16\n\nA prefill step lays the V4.1 decoder tail out for the step's running_bs,\nand ForwardMode.decide rounds the DP group's batch up the cudagraph\ncapture ladder to get it. The decoder therefore only ever runs at a\ncapture size, but ATOM_DECODER_GRAPH_SIZES defaulted to a fixed\n1,2,3,4,8,16: on the recipes' ladder (1..8, 12, 16, 24, ...) steps that\nsettled on 5, 6, 7 or 12 requests ran the whole decoder eagerly.\n\nUnset, ATOM_DECODER_GRAPH_SIZES now records every capture size up to 16\n(decoder_buckets.decoder_graph_sizes), e.g. 1..8, 12, 16. An explicit\nlist is honored as before, and an empty one still records nothing.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n* fix(dsv41): just add 5, 6, 7, 12 to the default decoder graph sizes\n\nDrop the capture-ladder-derived default (and its helper module and tests)\nin favor of the minimal change: ATOM_DECODER_GRAPH_SIZES defaults to\n1,2,3,4,5,6,7,8,12,16, the usual cudagraph capture ladder up to 16.\nForwardMode.decide rounds a step's batch up that ladder, so without 5, 6,\n7 and 12 steps of 5-7 and 9-12 requests ran the decoder eagerly.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-11-03T16:26:09Z",
+          "url": "https://github.com/ROCm/ATOM/commit/58ba50180312cc2ba57f8c21d28598352db1a561"
+        },
+        "date": 1793729840887,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41671740285 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202611031701 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8931,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/41671740285 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202611031701 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1061 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
