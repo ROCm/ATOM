@@ -5,19 +5,19 @@
 
 The sampler needs AITER at import, which a CPU runner does not have, so it is
 loaded here against a fake `aiter` under a private module name and the fakes are
-removed again. Nothing runs a kernel: the aiter ops and the fused draw are
-recording stand-ins.
+removed again. `atom.model_ops.bonus_sample` (Triton) is faked the same way, so
+these tests need neither AITER nor Triton and run on any CPU runner. Nothing
+runs a kernel: the aiter ops and the fused draw are recording stand-ins.
 """
 
 import importlib.util
 import pathlib
 import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-
-pytest.importorskip("triton")
 
 SAMPLER_PATH = (
     pathlib.Path(__file__).resolve().parents[1] / "atom" / "model_ops" / "sampler.py"
@@ -43,6 +43,9 @@ def load_sampler(monkeypatch):
             torch.zeros(x.shape[0], 1, dtype=torch.int32),
         )
     )
+    fused = types.ModuleType("atom.model_ops.bonus_sample")
+    fused.bonus_temperature_sample = MagicMock(name="fused_draw")
+    monkeypatch.setitem(sys.modules, "atom.model_ops.bonus_sample", fused)
 
     def load(fused: bool):
         monkeypatch.setenv("ATOM_SPEC_BONUS_FUSED", "1" if fused else "0")
@@ -53,11 +56,17 @@ def load_sampler(monkeypatch):
         spec.loader.exec_module(module)
         return module, stub
 
+    load.fused_draw = fused.bonus_temperature_sample
     return load
 
 
 def _batch(rows=4, vocab=64):
     return torch.randn(rows, vocab), torch.ones(rows)
+
+
+def test_flag_on_wires_the_fused_draw(load_sampler):
+    module, _ = load_sampler(fused=True)
+    assert module.Sampler()._fused_temperature_sample is load_sampler.fused_draw
 
 
 def test_flag_off_keeps_the_aiter_path(load_sampler):
