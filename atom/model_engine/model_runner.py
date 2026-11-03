@@ -199,7 +199,7 @@ class tokenIDProcessor:
         # The scheduler never speculates for a P/D producer, though the runner
         # keeps its drafter loaded: every decode it runs is q=1.
         self.is_pd_producer = _kv_config_has_producer(kv_cfg)
-        self.is_deferred_out = defers_output(runner.config)
+        self.is_deferred_out = defers_output(runner.config, runner.attn_family)
 
         self.runner = runner
         device = runner.device
@@ -950,9 +950,7 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
-        self.pp_aux_relay = PPAuxRelay.build(
-            self.config, self.model, getattr(self, "drafter", None)
-        )
+        self.pp_aux_relay = PPAuxRelay.build(self.config, self.model)
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
@@ -3278,7 +3276,7 @@ class ModelRunner:
                     # stages. Popped for the same reason as the top-k above.
                     recv_aux = intermediate_tensors.tensors.pop(PP_AUX_KEY, None)
                     if self.pp_aux_relay is not None and pp_group.is_last_rank:
-                        self.pp_aux_relay.absorb(recv_aux, self.drafter._aux_buffers)
+                        self.pp_aux_relay.absorb(recv_aux, self.drafter)
 
                 # Time only the chunk computation between PP receive and send.
                 chunk_sample = self._dynamic_chunking.start_sample(batch)

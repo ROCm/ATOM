@@ -1163,7 +1163,7 @@ def test_dynamic_pp_prefill_registers_prefix_hashes():
     assert hit == prompt // bs - 1
 
 
-# --- _pp_checkpoint_hold: skipped while held, released when its batch files --
+# --- _checkpoint_holds: skipped while held, released when its batch files --
 
 
 def _held_after_first_chunk(prompt=400, bs=16):
@@ -1180,8 +1180,13 @@ def _held_after_first_chunk(prompt=400, bs=16):
     sched.add(seq)
     batch, seqs = sched.schedule()
     assert seq.id in batch.req_ids and seq.is_partial_prefill
-    sched._pp_checkpoint_hold.add(seq.id)
+    sched._checkpoint_holds[seq.id] = _chunk_end(batch, seq.id)
     return sched, seq, batch, seqs
+
+
+def _chunk_end(batch, req_id):
+    i = list(batch.req_ids).index(req_id)
+    return int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
 
 
 def _prefill_ids(sched):
@@ -1197,16 +1202,33 @@ def test_held_seq_is_skipped_by_both_prefill_scans():
     pending, _ = sched._local_prefill_pending_work()
     assert not pending, "the probe counted a held chunk as pending work"
     assert seq.id not in _prefill_ids(sched)
-    assert seq.id in sched._pp_checkpoint_hold
+    assert seq.id in sched._checkpoint_holds
 
 
 def test_hold_is_released_when_its_batch_files_its_hashes():
     sched, seq, batch, seqs = _held_after_first_chunk()
-    assert sched.holds_checkpoint_hostage(batch)
+    assert sched.carries_held_checkpoint(batch)
     sched.register_prefill_hashes(batch, seqs.values())
-    assert seq.id not in sched._pp_checkpoint_hold
-    assert not sched.holds_checkpoint_hostage(batch)
+    assert seq.id not in sched._checkpoint_holds
+    assert not sched.carries_held_checkpoint(batch)
     assert seq.id in _prefill_ids(sched)
+
+
+def test_hold_is_released_only_by_the_chunk_that_holds_it():
+    # An earlier chunk of the same seq, in flight when the held one was
+    # scheduled, files first: the held chunk's checkpoint is not filed yet.
+    sched, seq, first, first_seqs = _held_after_first_chunk()
+    del sched._checkpoint_holds[seq.id]
+    held, held_seqs = sched.schedule()
+    assert seq.id in held.req_ids and seq.is_partial_prefill
+    sched._checkpoint_holds[seq.id] = _chunk_end(held, seq.id)
+    assert not sched.carries_held_checkpoint(first)
+    sched.register_prefill_hashes(first, first_seqs.values())
+    assert seq.id in sched._checkpoint_holds
+    assert seq.id not in _prefill_ids(sched)
+    assert sched.carries_held_checkpoint(held)
+    sched.register_prefill_hashes(held, held_seqs.values())
+    assert seq.id not in sched._checkpoint_holds
 
 
 @pytest.mark.parametrize("acked", [False, True])
@@ -1240,7 +1262,7 @@ def test_head_flushes_a_held_chunk_whether_or_not_it_is_acked(acked):
     )
     core._pp_head_step()
     assert not core._in_flight and not core._pending_prefix_hash
-    assert seq.id not in sched._pp_checkpoint_hold
+    assert seq.id not in sched._checkpoint_holds
     assert seq.id in _prefill_ids(sched)
 
 
@@ -1265,7 +1287,7 @@ def test_hold_is_released_even_if_the_seq_left_running(filer):
             is_deferred_out=False,
         )
         sched.postprocess([], out, batch=batch)
-    assert seq.id not in sched._pp_checkpoint_hold
+    assert seq.id not in sched._checkpoint_holds
 
 
 def test_hold_is_released_even_if_hashing_raises():
@@ -1283,8 +1305,10 @@ def test_hold_is_released_even_if_hashing_raises():
         sched.add(seq)
     batch, by_id = sched.schedule()
     assert all(seq.id in batch.req_ids for seq in seqs)
-    sched._pp_checkpoint_hold.update(batch.req_ids)
+    sched._checkpoint_holds.update(
+        {req_id: _chunk_end(batch, req_id) for req_id in batch.req_ids}
+    )
     sched.block_manager.hash_blocks = MagicMock(side_effect=RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         sched.register_prefill_hashes(batch, by_id.values())
-    assert not sched._pp_checkpoint_hold
+    assert not sched._checkpoint_holds

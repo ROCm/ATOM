@@ -433,11 +433,7 @@ class GatedDeltaNet(nn.Module):
                     is_kda=False,
                     route=gdn_metadata.replayssm_route,
                     o=(core_attn_out[: query_spec.shape[1]] if spec_only else None),
-                    slot_idx_in=(
-                        non_spec_state_indices_in_tensor[:nsd]
-                        if gdn_metadata.has_state_fork
-                        else None
-                    ),
+                    fork_slots=gdn_metadata.replayssm_fork_slots,
                 )
                 last_recurrent_state = None
             else:
@@ -626,11 +622,7 @@ class GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 is_kda=False,
                 route=gdn_metadata.replayssm_route,
-                slot_idx_in=(
-                    non_spec_state_indices_in_tensor[:nd]
-                    if gdn_metadata.has_state_fork
-                    else None
-                ),
+                fork_slots=gdn_metadata.replayssm_fork_slots,
             )
             last_recurrent_state = None
         elif gdn_metadata.num_decodes > 0:

@@ -2804,14 +2804,18 @@ class Config:
             self.state_replay_tokens = state_replay_tokens(self)
 
     def _check_pp_support(self) -> None:
-        """Refuse what PP does not wire yet: P/D consumers, and speculation
-        beyond Kimi-K3 with DSpark.
-
-        Only Kimi-K3 with DSpark relays the target's aux taps across stages;
-        anything else fails mid-serving or drafts from zero buffers.
+        """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
+        an architecture does not declare in ``pp_speculative_methods`` (a P/D
+        producer does not speculate); anything else fails mid-serving or drafts
+        from zero buffers.
         """
         if self.pipeline_parallel_size <= 1:
             return
+        # UBatchWrapper.forward takes no intermediate_tensors.
+        if self.enable_tbo:
+            raise ValueError(
+                "TBO (enable_tbo) is not supported with pipeline_parallel_size > 1."
+            )
         from atom.kv_transfer.disaggregation.pd_producer import (
             disaggregated_kv_role,
         )
@@ -2819,20 +2823,25 @@ class Config:
         # A consumer's first decode leaves T0 plus mtp_k placeholders, not the
         # mtp_k + 1 the PP verify window assumes, and the PP loop has no
         # remote-KV path at all.
-        if disaggregated_kv_role(self) == "kv_consumer":
+        role = disaggregated_kv_role(self)
+        if role == "kv_consumer":
             raise ValueError(
                 "A P/D kv_consumer is not supported with pipeline_parallel_size > 1."
             )
-        if self.speculative_config is None:
+        # A producer never speculates; it loads the drafter only to write the
+        # draft layer's KV.
+        if self.speculative_config is None or role == "kv_producer":
             return
+        from atom.models.registry import pp_speculative_methods
+
         archs = getattr(self.hf_config, "architectures", None) or ()
-        if "KimiK3ForConditionalGeneration" not in archs or not (
-            self.speculative_config.use_dspark()
-        ):
+        spec = self.speculative_config
+        method = "dspark" if spec.use_dspark() else spec.method
+        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
             raise ValueError(
                 "pipeline_parallel_size > 1 with speculative decoding supports "
-                f"only Kimi-K3 with DSpark, got architectures={list(archs)}, "
-                f"method={self.speculative_config.method!r}."
+                "only the methods registry.pp_speculative_methods declares, got "
+                f"architectures={list(archs)}, method={method!r}."
             )
         if self.dspark.confidence_schedule:
             raise ValueError(

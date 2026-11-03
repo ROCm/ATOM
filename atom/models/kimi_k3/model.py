@@ -1476,11 +1476,7 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
-                    slot_idx_in=(
-                        decode_state_indices_in[:nd]
-                        if kda_metadata.has_state_fork
-                        else None
-                    ),
+                    fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(
@@ -1562,9 +1558,7 @@ class KimiKDAAttention(nn.Module):
                     o=out,
                     use_qk_l2norm_in_kernel=True,
                     lower_bound=self._kda_gate_lower_bound,
-                    slot_idx_in=(
-                        state_indices_in[:nsd] if kda_metadata.has_state_fork else None
-                    ),
+                    fork_slots=kda_metadata.replayssm_fork_slots,
                 )
             else:
                 fused_sigmoid_gating_delta_rule_update(

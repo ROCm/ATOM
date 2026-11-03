@@ -397,9 +397,9 @@ class ScheduledBatch:
             elif is_deferred_out or num_spec_step == 0:
                 offset = seq.num_tokens - num_rejected[i] - num
             else:
-                # Undeferred: the tail is one run of exactly `num` placeholders
-                # (rejects already refilled), so the anchor is just before it.
-                offset = seq.num_tokens - num - 1
+                # Undeferred: the tail is the one placeholder run postprocess
+                # recorded (rejects already refilled); the anchor is before it.
+                offset = seq.num_tokens - seq.num_placeholder_tokens - 1
             staged.extend(seq.token_ids[offset : offset + num])
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its
@@ -863,11 +863,12 @@ class Scheduler:
         # them until the head releases the id after postprocess, so a seq is
         # never decoded against a token not yet appended.
         self._pp_inflight_token_block: set[int] = set()
-        # Seqs whose last chunk ended on a state-checkpoint rung not yet filed;
-        # prefill skips them. Under PP the next chunk would otherwise overwrite
-        # the state slot before it is filed under the rung's hash. Only a class
+        # Seqs whose last chunk ended on a state-checkpoint rung not yet filed,
+        # by that chunk's end; prefill skips them. Under PP the next chunk would
+        # otherwise overwrite the state slot before it is filed under the rung's
+        # hash. Keyed on advance_on_schedule, which only PP sets. Only a class
         # that must file at retire lands here; see `_finalize_prefill_chunk`.
-        self._pp_checkpoint_hold: set[int] = set()
+        self._checkpoint_holds: dict[int, int] = {}
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -1062,7 +1063,7 @@ class Scheduler:
                 if not seq.is_partial_prefill:
                     continue
                 # Phase 1 skips a held seq, so its chunk is not pending work.
-                if seq.id in self._pp_checkpoint_hold:
+                if seq.id in self._checkpoint_holds:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -2176,7 +2177,7 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                if seq.id in self._pp_checkpoint_hold:
+                if seq.id in self._checkpoint_holds:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -3640,7 +3641,7 @@ class Scheduler:
             and start + chunk < seq.num_prompt_tokens
             and not bm.checkpoint_when_scheduled(seq, start + chunk)
         ):
-            self._pp_checkpoint_hold.add(seq.id)
+            self._checkpoint_holds[seq.id] = start + chunk
         return chunk
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
@@ -4121,7 +4122,8 @@ class Scheduler:
         """Hash blocks for middle chunked-prefill chunks that skip postprocess."""
         # Before any bail-out or hashing that can raise, so no seq of this
         # batch (preempted, or after a failing one) is held forever.
-        self._pp_checkpoint_hold.difference_update(batch.req_ids)
+        for req_id in self._checkpoint_holds_owned_by(batch):
+            del self._checkpoint_holds[req_id]
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
@@ -4145,15 +4147,26 @@ class Scheduler:
                 replay_until=_scheduled_replay_until(batch, i),
             )
 
-    def holds_checkpoint_hostage(self, batch: ScheduledBatch) -> bool:
-        """Whether any seq in `batch` is waiting on this batch's checkpoint.
+    def carries_held_checkpoint(self, batch: ScheduledBatch) -> bool:
+        """Whether `batch` carries the chunk a held seq waits on.
 
         If so, its prefix hashes must be filed now rather than deferred: a held
         seq is out of the prefill scan until then and would stall.
         """
-        return bool(self._pp_checkpoint_hold) and any(
-            req_id in self._pp_checkpoint_hold for req_id in batch.req_ids
-        )
+        return bool(self._checkpoint_holds_owned_by(batch))
+
+    def _checkpoint_holds_owned_by(self, batch: ScheduledBatch) -> list[int]:
+        """Held seqs whose held chunk is in `batch`; an earlier chunk of the
+        same seq, still in flight, must not release the hold."""
+        if not self._checkpoint_holds:
+            return []
+        return [
+            req_id
+            for i, req_id in enumerate(batch.req_ids)
+            if req_id in self._checkpoint_holds
+            and int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
+            >= self._checkpoint_holds[req_id]
+        ]
 
     def postprocess(
         self,
@@ -4204,7 +4217,8 @@ class Scheduler:
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
             # Before the loop; see register_prefill_hashes.
-            self._pp_checkpoint_hold.difference_update(batch.req_ids)
+            for req_id in self._checkpoint_holds_owned_by(batch):
+                del self._checkpoint_holds[req_id]
             for i, req_id in enumerate(batch.req_ids):
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
@@ -4650,7 +4664,13 @@ class Scheduler:
         if need_placeholder:
             # placeholder for the each decode step
             for seq in seqs:
-                if seq.status == SequenceStatus.RUNNING and not seq.is_partial_prefill:
+                # Frozen chunk state under schedule-time advancement, as above.
+                mid_prefill = (
+                    seq.id in pp_middle_chunk_ids
+                    if self.advance_on_schedule
+                    else seq.is_partial_prefill
+                )
+                if seq.status == SequenceStatus.RUNNING and not mid_prefill:
                     # Clamped because `preempt()` strips exactly this many:
                     # `range()` on a negative width appends nothing, so storing
                     # one unclamped would claim placeholders that are not there.

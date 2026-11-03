@@ -176,7 +176,7 @@ class PPEngineCoreProc(EngineCore):
             if not needs_output and not scheduled_batch.pp_completion_ack:
                 self._in_flight.popleft()
                 self.scheduler.release_pp_inflight(scheduled_batch)
-                self._defer_prefill_hashes(scheduled_batch, seqs)
+                self._queue_or_flush_prefill_hashes(scheduled_batch, seqs)
                 continue
             completion = self.pp_transport.recv_completion(timeout_ms=poll_ms)
             if completion is None:
@@ -193,7 +193,7 @@ class PPEngineCoreProc(EngineCore):
             self._in_flight.popleft()
             self.scheduler.release_pp_inflight(scheduled_batch)
             if not needs_output:
-                self._defer_prefill_hashes(scheduled_batch, seqs)
+                self._queue_or_flush_prefill_hashes(scheduled_batch, seqs)
                 continue
 
             assert fwd_out is not None, "final PP chunk completed without output"
@@ -217,15 +217,16 @@ class PPEngineCoreProc(EngineCore):
             if finished_seqs:
                 self.output_queue.put_nowait(finished_seqs)
 
-    def _defer_prefill_hashes(self, batch, seqs):
-        """Queue a no-output chunk's hashes, flushing at once if it holds a seq."""
+    def _queue_or_flush_prefill_hashes(self, batch, seqs):
+        """Queue a no-output chunk's hashes; flush the whole queue if it carries
+        a held seq's chunk."""
         if not self._defer_prefix_hash:
             return
         self._pending_prefix_hash.append((batch, seqs))
         # A seq waiting on this chunk's state checkpoint is out of the prefill
         # scan, so no later step would flush for it. Filing a checkpoint copies
         # nothing; it only needs FIFO order, so flush now.
-        if self.scheduler.holds_checkpoint_hostage(batch):
+        if self.scheduler.carries_held_checkpoint(batch):
             self._flush_pending_prefix_hashes()
 
     def _flush_pending_prefix_hashes(self):

@@ -529,11 +529,12 @@ class DSparkProposer(Drafter):
             extract=cls._extract_layer_hidden,
         )
 
-    def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec:
+    def _aux_capture_spec(self) -> AuxCaptureSpec:
         """Resolve the draft's feature contract; the base owns capture buffers."""
+        spec = self.aux_capture_spec(self.config)
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is None:
-            return self.aux_capture_spec(self.config)
+            return spec
         if int(getattr(self.config, "pipeline_parallel_size", 1) or 1) > 1:
             # Drafterless PP stages can only rebuild the default spec; relaying
             # it to a draft with its own contract would be silently wrong.
@@ -542,15 +543,7 @@ class DSparkProposer(Drafter):
                 "target_aux_capture_spec, which pipeline parallelism cannot "
                 "reconstruct on a drafterless stage."
             )
-        draft_cfg = self.speculative_config.draft_model_hf_config
-        layer_ids = tuple(
-            int(i) for i in getattr(draft_cfg, "dspark_target_layer_ids", ())
-        )
-        if not layer_ids:
-            raise ValueError(
-                "DSpark requires dspark_target_layer_ids on the draft config."
-            )
-        return own(layer_ids, self.config.hf_config.hidden_size)
+        return own(spec.layer_ids, spec.hidden_size)
 
     @staticmethod
     def _extract_layer_hidden(output, block: nn.Module):
@@ -638,7 +631,11 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        # One block when every tap was relayed from earlier PP stages.
+        if len(aux_hidden_states) == 1:
+            main_hidden_all = aux_hidden_states[0]
+        else:
+            main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
         ):

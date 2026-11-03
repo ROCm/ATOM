@@ -88,6 +88,7 @@ def _metadata(**over):
         "spec_state_indices_tensor": torch.zeros(2, 4, dtype=torch.int32),
         "num_accepted_tokens": torch.ones(2, dtype=torch.int32),
         "replayssm": False,
+        "has_state_fork": False,
     }
     base.update(over)
     return SimpleNamespace(**base)
@@ -127,6 +128,7 @@ def _plain_metadata(requests=3, **over):
         "num_spec_decodes": 0,
         "num_actual_tokens": requests,
         "non_spec_state_indices_tensor": torch.arange(requests, dtype=torch.int32),
+        "has_state_fork": False,
     }
     base.update(over)
     return SimpleNamespace(**base)
