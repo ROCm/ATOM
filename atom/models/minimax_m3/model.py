@@ -79,7 +79,9 @@ def _registered_ar_output(
     """Byte-zero view for an ``out=`` producer, or the ordinary-path sentinel.
 
     The shared buffer is offered only to producers that explicitly promise
-    ``out=`` support.  Any capability/size miss returns ``None`` so the
+    ``out=`` support. The model stores a dtype-stable view of the arena: making
+    a uint8 -> bf16 view inside the compiled forward causes AOTAutograd to reject
+    the mutated alias. Any capability/dtype/size miss returns ``None`` so the
     producer allocates exactly as it did before F5.
     """
     supports_out = getattr(producer, "supports_out", None)
@@ -87,16 +89,13 @@ def _registered_ar_output(
         registered_buffer is None
         or supports_out is None
         or not supports_out()
+        or registered_buffer.dtype != like.dtype
     ):
         return None
     nbytes = like.numel() * like.element_size()
-    if nbytes > registered_buffer.numel():
+    if nbytes > registered_buffer.numel() * registered_buffer.element_size():
         return None
-    return (
-        registered_buffer.narrow(0, 0, nbytes)
-        .view(like.dtype)
-        .view(like.shape)
-    )
+    return registered_buffer.narrow(0, 0, like.numel()).view(like.shape)
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -916,7 +915,10 @@ class MiniMaxM3Model(nn.Module):
             lease = tensor_model_parallel_lease_registered_input_buffer()
             if lease is not None:
                 self._registered_ar_input_lease = lease
-                self._registered_ar_input = lease.buffer
+                # Keep the dtype-changing view out of the compiled forward.
+                # AOTAutograd cannot functionalize mutations through a view
+                # whose dtype differs from its graph input's dtype.
+                self._registered_ar_input = lease.buffer.view(atom_config.torch_dtype)
 
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
