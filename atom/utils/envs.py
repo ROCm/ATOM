@@ -475,6 +475,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Eager / CUDA graphs only (torch.compile keeps the tail kernel). Off by
     # default; needs an aiter whose MegaMoEGfx1250.forward takes combine_tail.
     "ATOM_MEGA_COMBINE_TAIL": lambda: (os.getenv("ATOM_MEGA_COMBINE_TAIL", "0") == "1"),
+    # Qwen3.5 MoE TP4 decode on gfx1250: the sparse MoE block (router, top-k,
+    # MXFP4 experts, shared expert, gated add), the all-reduce, the residual add
+    # and the next RMSNorm in one FlyDSL kernel
+    # (atom/model_ops/qwen_mono_moe/integration.py) for decode steps of up to
+    # 128 rows; others run the native chain. Off by default.
+    "ATOM_QWEN_MONO_MOE": lambda: (os.getenv("ATOM_QWEN_MONO_MOE", "0") == "1"),
     # Steps above this many rows a rank keep the separate tail kernel: aiter's
     # one-kernel combine reduces with plain buffer loads, which from ~1-4k rows
     # on lose the tail's saving to the TDM reduce they replace (4-GPU EP on
