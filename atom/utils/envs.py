@@ -1362,8 +1362,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum external-tier hit worth loading, in tokens. And the shortest
     # prefix native lmcache_mp stores: an absolute boundary, for normal and
     # late saves alike (other connectors ignore it).
+    # Early tier load: a waiting request whose async lookup answered and that
+    # must load its prefix from the external tier gets its blocks and its load
+    # on any tick (prefill-delayer HOLD or FIRE), wherever it sits in `waiting`.
+    # Its prefill still waits for its turn and a FIRE. 1 (default): on, and a
+    # moved request is no longer queued first. 0: the old path (queue first,
+    # allocate and load only in the admission pass).
+    "ATOM_OFFLOAD_EARLY_LOAD": lambda: _flag_env("ATOM_OFFLOAD_EARLY_LOAD", "1"),
+    # No early allocation once the KV pool would be fuller than this fraction.
+    "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.7, allow_zero=True
+    ),
+    # Cap on the blocks held by early-loaded requests, as a fraction of the pool.
+    "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
+    ),
+    # Also load early when the load carries a state leg (state images / joint
+    # boundary). Off: only plain KV and PAGE-only (replay) loads go early.
+    "ATOM_OFFLOAD_EARLY_LOAD_STATE": lambda: _flag_env(
+        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "0"
+    ),
     # Prefix-spread: queue a moved request first only while its rank's queued
-    # prefill is at most this many tokens; -1 always queues it first.
+    # prefill is at most this many tokens; -1 always queues it first. Only with
+    # ATOM_OFFLOAD_EARLY_LOAD=0 (early loading replaces the queue jump).
     "ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE": lambda: int(
         os.getenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "-1")
     ),
