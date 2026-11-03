@@ -34,7 +34,13 @@ ROOT = Path(__file__).resolve().parents[2]
 QSA_PY = ROOT / "atom" / "model_ops" / "qwen4_exp" / "ops" / "qsa.py"
 SELECT_PY = ROOT / "atom" / "model_ops" / "qwen4_exp" / "qsa_index_scorer" / "select.py"
 ATTN_PY = ROOT / "atom" / "model_ops" / "qwen4_exp" / "qsa_attention.py"
+# The frozen scorer source: aaa78f43... is its sha256 with CRLF line endings
+# (the golden_baseline copy and a Windows autocrlf checkout); c2e46e50... is
+# the same content with LF (the git blob, a Linux checkout).
 FROZEN_QSA_SHA256 = "aaa78f43255cf950bfbdf5d618246f9a7a671f0262cff2398b2ca4ea703810ee"
+FROZEN_QSA_SHA256_LF = (
+    "c2e46e50cd9b8bdbdc4b6a09b29cafc5c971dfff4246799a3c8dc32f8b4d14b9"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +55,10 @@ def _func(path: Path, name: str) -> ast.FunctionDef:
 
 
 def test_qsa_py_is_the_frozen_scorer():
-    assert hashlib.sha256(QSA_PY.read_bytes()).hexdigest() == FROZEN_QSA_SHA256
+    lf = QSA_PY.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(lf).hexdigest() == FROZEN_QSA_SHA256_LF
+    crlf = lf.replace(b"\n", b"\r\n")
+    assert hashlib.sha256(crlf).hexdigest() == FROZEN_QSA_SHA256
 
 
 def test_native_params_match_qsa_py():
