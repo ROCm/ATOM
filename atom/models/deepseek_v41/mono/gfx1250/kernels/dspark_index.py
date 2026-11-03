@@ -40,9 +40,13 @@ LATE_PTRS=('icand','table','ilog','ibmax','isel','irow','icout','kmeta')
 LATE_WORDS=('rows_per_page','page_rows','main_off','ilift','iprod','lstride','bstride')
 
 def late_pointer(c,offset):
-    low=scalar_word(fx.ptr_load(c['late_meta']+offset))
-    high=scalar_word(fx.ptr_load(c['late_meta']+offset+1))
-    return (fx.Int64(low)&fx.Int64(0xffffffff))|(fx.Int64(high)<<32)
+    # One 8-byte LDS read per pointer. Every caller's offset is an even
+    # compile-time word index, so the read is aligned.
+    assert isinstance(offset,int) and offset%2==0,offset
+    pair=fx.Vector(fx.ptr_load(c['late_meta']+offset,result_type=fx.Vector.make_type(2,fx.Int32)))
+    value=(fx.Int64(pair[0])&fx.Int64(0xffffffff))|(fx.Int64(pair[1])<<32)
+    lane=fx.Int64(rocdl.readfirstlane(T.i64,value.ir_value()))
+    return fx.Int64(llvm.inline_asm(T.i64,[lane.ir_value()],"s_mov_b64 $0, $1","=s,s",has_side_effects=False))
 
 def late_word(c,name):
     return scalar_word(fx.ptr_load(c['late_meta']+2*len(LATE_PTRS)+LATE_WORDS.index(name)))
@@ -64,8 +68,11 @@ def restored_bounds(c,n):
     return [scalar_word(fx.ptr_load(c['late_meta']+32+t)) for t in range(n)]
 
 def scalar_word(value):
+    # No side effects: a side-effecting asm keeps the next LDS read from
+    # being issued before it, so a stage context of N late_meta words took N
+    # serial LDS round trips (60 in the c8 down context).
     lane=rocdl.readfirstlane(T.i32,fx.Int32(value).ir_value())
-    return fx.Int32(llvm.inline_asm(T.i32,[lane],"s_mov_b32 $0, $1","=s,s",has_side_effects=True))
+    return fx.Int32(llvm.inline_asm(T.i32,[lane],"s_mov_b32 $0, $1","=s,s",has_side_effects=False))
 def plane_ptr(plane, tile, byte):
     return fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
                       plane + fx.Int64(tile)*TILE_BYTES + fx.Int64(byte))
