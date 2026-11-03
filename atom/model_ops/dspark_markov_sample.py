@@ -24,9 +24,9 @@ from atom.model_ops.dspark_markov_argmax import (
     _BLOCK_K,
     _BLOCK_V,
     _MAX_BLOCK_ROW,
-    _ID_DTYPES,
     _MIN_BLOCK_ROW,
     _markov_stage1,
+    check_markov_inputs,
     markov_weights_unsupported,
 )
 from atom.model_ops.sampling_scratch import SamplingScratch, take
@@ -166,20 +166,11 @@ def dspark_markov_sample(
     Raises rather than falling back: an eager fallback would draw from the
     global RNG, which TP ranks do not share, and the drafts would fork.
     """
-    if base_logits.dim() != 2 or markov_w1.dim() != 2 or markov_w2.dim() != 2:
-        raise ValueError("dspark_markov_sample expects 2-D base_logits/w1/w2")
+    check_markov_inputs(
+        "dspark_markov_sample", base_logits, prev_ids, markov_w1, markov_w2, out
+    )
     num_rows, vocab_size = base_logits.shape
     rank = markov_w2.shape[1]
-    if prev_ids.shape != (num_rows,) or prev_ids.dtype not in _ID_DTYPES:
-        raise ValueError(
-            f"prev_ids {tuple(prev_ids.shape)} {prev_ids.dtype} is not the "
-            f"[{num_rows}] int32 or int64 an id block is made of"
-        )
-    if out.shape != (num_rows,) or out.dtype not in _ID_DTYPES:
-        raise ValueError(
-            f"out {tuple(out.shape)} {out.dtype} is not the [{num_rows}] int32 "
-            "or int64 an id block is made of"
-        )
     store_rows, store_width = q_ids.shape if q_ids.dim() == 2 else (0, 0)
     if (
         store_width < 1
