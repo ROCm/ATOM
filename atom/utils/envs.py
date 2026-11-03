@@ -257,6 +257,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefix is not resident) plus ATOM_DP_PREFIX_IMBALANCE_S seconds per
     # request of in-flight imbalance the placement leaves between the ranks.
     "ATOM_DP_PREFIX_POLICY": lambda: os.getenv("ATOM_DP_PREFIX_POLICY", "margin"),
+    # "idle_ratio" policy: leave the prefix's rank when the lightest rank has
+    # under IDLE_TOKENS queued prefill (about to idle) and the owner over
+    # OWNER_BACKLOG_TOKENS, or when the owner's queued prefill exceeds RATIO x
+    # the lightest rank's.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_IDLE_TOKENS", "32768")
+    ),
+    "ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS", "65536")
+    ),
+    "ATOM_DP_PREFIX_RATIO": lambda: float(os.getenv("ATOM_DP_PREFIX_RATIO", "2.0")),
     "ATOM_DP_PREFIX_IMBALANCE_S": lambda: float(
         os.getenv("ATOM_DP_PREFIX_IMBALANCE_S", "0.1")
     ),
