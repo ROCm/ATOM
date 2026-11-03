@@ -41,6 +41,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
+from atom.models.minimax_m3.pp import MiniMaxM3PPTopK, validate_pp_index_reuse
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -706,6 +707,11 @@ class MiniMaxM3Model(nn.Module):
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
         self.config = config
+        validate_pp_index_reuse(
+            config,
+            pipeline_parallel_size=atom_config.pipeline_parallel_size,
+            enable_tbo=atom_config.enable_tbo or atom_config.enable_tbo_decode,
+        )
         cache_config = atom_config.kv_cache_dtype
         index_cache_config = atom_config.index_cache_dtype
         quant_config = atom_config.quant_config
@@ -748,6 +754,11 @@ class MiniMaxM3Model(nn.Module):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def make_pp_shared_indexer(self, pp_group):
+        return MiniMaxM3PPTopK.create(
+            self.config, self.start_layer, self.end_layer, pp_group
+        )
 
     def forward(
         self,

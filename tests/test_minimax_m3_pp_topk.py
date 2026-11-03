@@ -3,12 +3,13 @@
 
 import logging
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from atom.config import _is_minimax_m3_config
+from atom.models.minimax_m3.pp import MiniMaxM3PPTopK, validate_pp_index_reuse
 from atom.models.utils import IntermediateTensors
 from tests.test_minimax_m3_index_cache_rows import definitions
 
@@ -172,7 +173,6 @@ def runner(start, end, cfg, *, mla=False, wrappers=(), dummy=False):
             attn_metadata=SimpleNamespace(sparse_attention_metadata=md),
             context=context,
         ),
-        "_is_minimax_m3_config": _is_minimax_m3_config,
         "logger": logging.getLogger(__name__),
     }
     names = {
@@ -189,6 +189,18 @@ def runner(start, end, cfg, *, mla=False, wrappers=(), dummy=False):
     obj._test_layer_range = range(start, end)
     obj.model = torch.nn.Module()
     obj.model.start_layer, obj.model.end_layer = start, end
+    if _is_minimax_m3_config(cfg):
+        ns["MiniMaxM3PPTopK"] = MiniMaxM3PPTopK
+        definitions(
+            "atom/models/minimax_m3/model.py",
+            {"make_pp_shared_indexer"},
+            ns,
+            "MiniMaxM3Model",
+        )
+        obj.model.config = getattr(cfg, "text_config", cfg)
+        obj.model.make_pp_shared_indexer = MethodType(
+            ns["make_pp_shared_indexer"], obj.model
+        )
     for name in reversed(wrappers):
         wrapper = torch.nn.Module()
         wrapper.add_module(name, obj.model)
@@ -265,7 +277,7 @@ def stage(obj, md, cfg, schedule, incoming, layout, mode, seed=0):
 @pytest.mark.parametrize("mode", ["prefill", "decode"])
 @pytest.mark.parametrize("layout", ["fp8", "nvfp4"])
 @pytest.mark.parametrize(
-    "partition", [(15, 15, 15, 15), (16, 16, 16, 12), (13, 1, 1, 45)]
+    "partition", [(30, 30), (15, 15, 15, 15), (16, 16, 16, 12), (13, 1, 1, 45)]
 )
 def test_partition_preserves_all_cached_values(model_schedule, mode, layout, partition):
     cfg = config()
@@ -287,7 +299,7 @@ def test_partition_preserves_all_cached_values(model_schedule, mode, layout, par
     [("model",), ("language_model", "model"), ("model", "language_model", "model")],
 )
 def test_wrapped_model_transfers_topk_at_each_equal_boundary(model_schedule, wrappers):
-    # CausalLM, the M3.1 conditional-generation wrapper, and UBatchWrapper.
+    # CausalLM, the M3.1 conditional-generation wrapper, and nested model wrappers.
     cfg = config()
     incoming = None
     for start in range(0, 60, 15):
@@ -346,7 +358,7 @@ def test_existing_schedule_and_dense_only_relay(model_schedule, policy):
                 torch.testing.assert_close(actual, want)
 
 
-def test_forward_reset_and_independent_microbatch_memos(model_schedule):
+def test_forward_reset_and_independent_memos(model_schedule):
     cfg = config()
     first, first_md = runner(0, 15, cfg)
     left, lmd = runner(15, 30, cfg)
@@ -387,6 +399,27 @@ def test_glm_existing_buffer_copy_and_physical_row_width():
     assert set(out.tensors) == {"hidden_states"}
 
 
+def test_runner_uses_model_hook_without_model_type_switch():
+    obj, _ = runner(15, 30, config(model_type="custom"))
+    calls = []
+    adapter = SimpleNamespace(
+        recv_needs_sparse=True,
+        send_needs_sparse=True,
+        rank_local_keys=("custom_selection",),
+        load=lambda tensors, ctx: calls.append(("load", tensors)),
+        store=lambda tensors, ctx: calls.append(("store", tensors)),
+    )
+    obj.model.make_pp_shared_indexer = lambda pp: adapter
+    obj._pp_share_indexer_ready = False
+    obj._setup_pp_shared_indexer()
+    assert obj._pp_rank_local_keys == ("custom_selection",)
+    assert obj._pp_recv_needs_sparse and obj._pp_send_needs_sparse
+    incoming, outgoing = IntermediateTensors({}), IntermediateTensors({})
+    obj._load_pp_shared_indexer(incoming)
+    obj._store_pp_shared_indexer(outgoing)
+    assert calls == [("load", incoming), ("store", outgoing)]
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -401,6 +434,53 @@ def test_no_index_reuse_needs_no_sparse_metadata(model_schedule, overrides):
         IntermediateTensors({"hidden_states": torch.zeros(6, 8)})
     )
     assert not hasattr(md, "_index_topk_cache_state")
+
+
+@pytest.mark.parametrize("pp", [2, 4])
+@pytest.mark.parametrize("tbo_flag", ["enable_tbo", "enable_tbo_decode"])
+def test_tbo_pp_reuse_is_rejected_before_model_allocation(model_schedule, pp, tbo_flag):
+    ns = dict(model_schedule.__dict__)
+    ns.update(
+        torch=torch,
+        nn=torch.nn,
+        Config=object,
+        MiniMaxM3DecoderLayer=object,
+        IntermediateTensors=IntermediateTensors,
+        token_graph=lambda cls: cls,
+        support_torch_compile=lambda cls: cls,
+        validate_pp_index_reuse=validate_pp_index_reuse,
+    )
+    definitions(
+        "atom/models/minimax_m3/model.py", {"_get_text_config", "MiniMaxM3Model"}, ns
+    )
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=config()),
+        pipeline_parallel_size=pp,
+        enable_tbo=tbo_flag == "enable_tbo",
+        enable_tbo_decode=tbo_flag == "enable_tbo_decode",
+    )
+    # No GPU factories/weight fields are supplied: validation must run first.
+    with pytest.raises(ValueError, match="pipeline parallelism does not support TBO"):
+        ns["MiniMaxM3Model"](cfg)
+
+
+@pytest.mark.parametrize(
+    "pp,tbo,overrides",
+    [
+        (1, True, {}),
+        (4, False, {}),
+        (4, True, {"use_index_cache": False}),
+        (4, True, {"index_topk_freq": 1}),
+        (4, True, {"index_topk_pattern": "C" * 60}),
+        (4, True, {"sparse_attention_config": {"sparse_attention_freq": [0] * 60}}),
+    ],
+)
+def test_pp_reuse_guard_does_not_reject_unaffected_settings(
+    model_schedule, pp, tbo, overrides
+):
+    validate_pp_index_reuse(
+        config(**overrides), pipeline_parallel_size=pp, enable_tbo=tbo
+    )
 
 
 @pytest.mark.parametrize("layout", ["fp8", "nvfp4"])
