@@ -29,7 +29,7 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
         ]
 
     settings = SimpleNamespace(sequence_parallel_size=world)
-    monkeypatch.setattr(ulysses_sp, "get_current_atom_config", lambda: settings)
+    monkeypatch.setattr(ulysses_sp, "get_current_atom_config_or_none", lambda: settings)
     monkeypatch.setattr(ulysses_sp, "custom_gather_ok", lambda x, group, limit: True)
     columns = ulysses_sp.send_columns(fields, source.device)
     packed = pack_columns(source, columns)

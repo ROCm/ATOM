@@ -54,7 +54,7 @@ def test_runner_model_height_and_sampling_rows(
     ulysses_sp, sp_wrapper = modules.ulysses_sp, modules.sp_wrapper
     runner_module = modules.runner
     sp = SimpleNamespace(sequence_parallel_size=1 if sp_rank is None else 4)
-    monkeypatch.setattr(ulysses_sp, "get_current_atom_config", lambda: sp)
+    monkeypatch.setattr(ulysses_sp, "get_current_atom_config_or_none", lambda: sp)
     group = SimpleNamespace(rank_in_group=sp_rank)
     monkeypatch.setattr(modules.parallel_state, "get_pcp_group", lambda: group)
     monkeypatch.setattr(runner_module, "pcp_stripe_count", lambda: 1)
