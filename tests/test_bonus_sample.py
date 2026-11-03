@@ -138,3 +138,48 @@ def test_winner_in_a_late_tile_survives_the_reduction():
     temps = torch.tensor([1.0])
     out = _bonus_sample().bonus_temperature_sample(logits, temps, noise, EPS, EPS)
     assert int(out[0]) == win
+
+
+@in_the_interpreter
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+@pytest.mark.parametrize("forced", [5, 100000, 163837])
+def test_a_forced_channel_row_samples_the_forced_id(forced):
+    # `constrain_logits` writes -inf over every id but the forced one, so all
+    # tiles but one are entirely -inf: their tile max is -inf and the race
+    # must not compute exp(-inf - -inf) = NaN on the way to the forced id.
+    vocab = 163840
+    gen = torch.Generator().manual_seed(forced)
+    logits = torch.full((2, vocab), float("-inf"))
+    logits[:, forced] = 3.0
+    temps = torch.tensor([1.0, EPS])
+    noise = torch.empty(2, vocab).exponential_(1, generator=gen)
+    out = _bonus_sample().bonus_temperature_sample(
+        logits.to(torch.bfloat16), temps, noise, EPS, EPS
+    )
+    assert out.tolist() == [forced, forced]
+
+
+@in_the_interpreter
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_masked_ids_never_win_and_every_id_is_in_range():
+    # Whole -inf tiles next to tiles with scattered -inf ids, and one row that
+    # is -inf throughout: no NaN, no -inf id drawn, and with no clamp on the
+    # result every id must already be in range.
+    vocab = 50000
+    gen = torch.Generator().manual_seed(9)
+    logits = (torch.randn(4, vocab, generator=gen) * 4).to(torch.bfloat16)
+    logits[:, : 3 * 4096] = float("-inf")
+    banned = torch.randint(0, vocab, (256,), generator=gen)
+    logits[:, banned] = float("-inf")
+    logits[3] = float("-inf")
+    temps = torch.tensor([1.0, 0.7, EPS, 1.0])
+    noise = torch.empty(4, vocab).exponential_(1, generator=gen)
+    out = _bonus_sample().bonus_temperature_sample(logits, temps, noise, EPS, EPS)
+    assert ((out >= 0) & (out < vocab)).all()
+    for r in range(3):
+        assert logits[r, int(out[r])] != float("-inf")
+        if temps[r] <= EPS:
+            assert int(out[r]) == int(torch.nonzero(logits[r] == logits[r].max())[0])
+            continue
+        best, runner_up, gap = _reference_pick(logits[r], temps[r], noise[r])
+        assert int(out[r]) == best or (gap < 1e-5 and int(out[r]) == runner_up)

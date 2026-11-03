@@ -59,7 +59,11 @@ def _bonus_tile_kernel(
     xs = x * inv_t
     m = tl.max(xs, axis=0)
     e = tl.load(exp_ptr + r.to(tl.int64) * stride_e + offs, mask=mask, other=1.0) + eps
-    key = tl.where(mask, tl.exp(xs - m) / e, -1.0)
+    # A tile the required channel masked to -inf has m = -inf, and
+    # exp(-inf - -inf) is NaN. Shifting by 0 instead keys every id 0: the tile
+    # loses to any tile with a finite logit and its idx stays in range.
+    m_safe = tl.where(m == -float("inf"), 0.0, m)
+    key = tl.where(mask, tl.exp(xs - m_safe) / e, -1.0)
     best = tl.max(key, axis=0)
     idx = tl.min(tl.where((key == best) & mask, offs, vocab), axis=0)
     gmax = tl.max(x, axis=0)
@@ -102,10 +106,11 @@ def _bonus_pick_kernel(
         k = tl.load(part_key_ptr + o, mask=tm, other=-1.0)
         ki = tl.load(part_idx_ptr + o, mask=tm, other=vocab)
         mm = tl.max(m, axis=0)
+        # An all -inf row would otherwise compute exp(-inf - -inf) here too.
+        mm = tl.where(mm == -float("inf"), 0.0, mm)
         ks = tl.where(tm, k * tl.exp(m - mm), -1.0)
         best = tl.max(ks, axis=0)
         tok = tl.min(tl.where((ks == best) & tm, ki, vocab), axis=0)
-    tok = tl.minimum(tok, vocab - 1)
     tl.store(out_ptr + r, tok.to(tl.int32))
 
 
