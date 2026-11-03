@@ -249,6 +249,18 @@ def test_a_late_save_token_prefix_is_dropped_when_the_session_ends(monkeypatch):
     assert 7 not in sched._shipped_tokens
     assert sched._shipped_drops == [7]
 
+    # The drop alone keeps an idle engine stepping the connector, and the
+    # next metadata build ships it to the workers even with no transfer.
+    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
+
+    assert sched.has_pending_work()
+    meta = sched.build_connector_meta()
+    assert not meta.requests
+    assert meta.token_cache_drops == [7]
+    assert connector_metadata_has_work(meta)
+    assert not sched.__dict__.get("_shipped_drops")
+    assert not sched.has_pending_work()
+
 
 # ── review findings (#2547) ──────────────────────────────────────────────
 
