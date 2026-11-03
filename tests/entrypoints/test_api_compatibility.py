@@ -141,6 +141,44 @@ def post(path, body):
     return asyncio.run(run())
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("effort", ["none", "low"])
+def test_flash_ignores_hosted_web_search_but_returns_answer(server, stream, effort):
+    response = post(
+        "/v1/responses",
+        {
+            "model": "renamed-model",
+            "input": "Say answer",
+            "tools": [{"type": "web_search"}],
+            "reasoning": {"effort": effort},
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200
+    assert "answer" in response.text
+    assert "web_search_call" not in response.text
+    if stream:
+        assert "response.completed" in response.text
+        assert "[DONE]" not in response.text
+
+
+def test_models_metadata_is_deployment_scoped(server, monkeypatch):
+    monkeypatch.setattr(api_server.engine.config, "method", "dspark", raising=False)
+
+    async def run():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_server.app), base_url="http://test"
+        ) as client:
+            return await client.get("/v1/models")
+
+    response = asyncio.run(run())
+    card = response.json()["data"][0]
+    assert card["id"] == "renamed-model"
+    assert card["context_window"] == card["max_output_tokens"] == 8192
+    assert card["input_modalities"] == ["text"]
+    assert card["effort"]["default_level"] == "high"
+
+
 @pytest.mark.parametrize("endpoint", ["chat/completions", "responses"])
 @pytest.mark.parametrize(
     "effort,expected",

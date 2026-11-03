@@ -262,7 +262,7 @@ def test_atomesh_front_end_builds_the_engine_without_kept_outputs(monkeypatch):
             return "engine"
 
     monkeypatch.setattr(arg_utils, "EngineArgs", FakeArgs)
-    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *a: "tok")
+    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *a: "tok")
     engine, _ = atomesh_server.initialize_engine(
         SimpleNamespace(model="m", trust_remote_code=False)
     )
