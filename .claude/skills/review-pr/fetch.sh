@@ -397,12 +397,36 @@ PY
 # Each way the auto-run can give up records why, because "required but not run" is only useful
 # to a reader if it names the reason. Triage's own blocker covers the cases where no run was
 # ever attempted; this file covers the ones where it was.
+# Whether the PR's AUTHOR is on the trigger allowlist, decided here rather than by a
+# global switch alone. REVIEW_AUTO_VALIDATE was off for everything on the grounds that
+# validating a PR runs its code on a self-hosted box and this repo is public. That is
+# true of 4% of PRs: measured over 60 merged ones, 58 authors were already on
+# authorized.txt, and ATOM's own pre-checks.yaml runs every PR's code on `pull_request`
+# anyway -- so for those 58 the validator executes nothing CI did not already execute.
+# The 4% this does exclude are exactly the case the blanket switch was written for.
+AUTHOR_TRUSTED=0
+_pr_author=$(python3 -c \
+  'import json,sys; print((json.load(open(sys.argv[1])).get("author") or {}).get("login",""))' \
+  "$WORK/pr_meta.json" 2>/dev/null || true)
+_allow="$SKILLS_ROOT/review-pr/authorized.txt"
+if [ -n "$_pr_author" ] && [ -r "$_allow" ] \
+   && grep -qix -- "$_pr_author" "$_allow" 2>/dev/null; then
+  AUTHOR_TRUSTED=1
+fi
+
 if [ "${REVIEW_AUTO_VALIDATE:-0}" != 1 ]; then
   echo "auto-validation is disabled (REVIEW_AUTO_VALIDATE=0)" \
     >"$WORK/auto_validation_outcome.txt"
+elif [ "$AUTHOR_TRUSTED" != 1 ]; then
+  # Loud about WHICH half refused: "not validated, outside contribution" and "not
+  # validated, switch off" are different facts about a PR, and a line that cannot tell
+  # them apart teaches the reader to skip it.
+  printf 'auto-validation skipped: PR author %s is not on authorized.txt, so this is an outside contribution and its code is not run on this box\n' \
+    "${_pr_author:-<unknown>}" >"$WORK/auto_validation_outcome.txt"
 fi
 if [ -z "$VALIDATION_REPORT" ] \
   && [ "${REVIEW_AUTO_VALIDATE:-0}" = 1 ] \
+    && [ "$AUTHOR_TRUSTED" = 1 ] \
   && python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if r["required"] and r["target"] else 1)' \
     "$WORK/validation_requirement.json"; then
   AUTO_TARGET=$(python3 -c \
