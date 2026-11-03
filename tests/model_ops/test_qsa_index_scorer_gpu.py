@@ -66,7 +66,11 @@ def test_golden_replay_engine_path(adapter_result):
     recs = _records(adapter_result, "engine")
     bad = [r["name"] for r in recs if not r["passed"]]
     assert not bad, bad
-    assert all(r["routed_native_equals_stock"] for r in recs if not r.get("skipped"))
+    assert all(
+        r.get("routed_native_equals_stock", "native_skipped" in r)
+        for r in recs
+        if not r.get("skipped")
+    )
 
 
 def test_engine_pad_m(adapter_result):

@@ -57,7 +57,7 @@ import time
 
 import torch
 
-from .route import CAPTURE_ONLY, QSAScorerRoute
+from .route import CAPTURE_ONLY, OK, QSAScorerRoute
 
 RTOL = ATOL = 1e-4  # frozen Phase-1 tolerance
 W, PAGES, CTX = 16384, 738964, 262144
@@ -474,6 +474,15 @@ def run_site(name, spec, route):
     rs = torch.full((rows,), 7, dtype=torch.int32, device="cuda")
     args = scorer_args(d, row_starts=rs, allow_flydsl=is_prefill)
     reason, detail = route.decision_for(*args)
+    if reason != OK and native_aborts(args):
+        return {
+            "name": name,
+            "mode": "site",
+            "reason": reason,
+            "detail": detail,
+            "passed": False,
+            "error": f"not fused and {NATIVE_ABORT_NOTE}",
+        }
     before = dict(route.counts)
     out, vis = route(*args)
     torch.cuda.synchronize()
@@ -507,14 +516,17 @@ def run_site(name, spec, route):
         row_starts=torch.empty(rows, dtype=torch.int32, device="cuda"),
         allow_flydsl=is_prefill,
     )
-    nout, nvis = route.native(*nat_args)
     G, _ = load_golden()
-    if spec.get("patch") == "bad_page_oob":
+    if native_aborts(nat_args):
+        vs_native = {"pass": True, "skipped": NATIVE_ABORT_NOTE}
+    elif spec.get("patch") == "bad_page_oob":
+        nout, nvis = route.native(*nat_args)
         vs_native = {
             "pass": bool(torch.equal(vis, nvis)),
             "note": "oob page: visible only",
         }
     else:
+        nout, nvis = route.native(*nat_args)
         _, (_gold, gvis, valid) = golden_compare(nout, nvis, nat_args)
         vs_native = G.compare_logits(out, vis, nout, nvis, valid, rtol=RTOL, atol=ATOL)
     # CUDA graph: capture the route call, replay, bitwise == eager
@@ -542,15 +554,40 @@ def run_site(name, spec, route):
     return rec
 
 
-class _Tap:
-    """Scorer wrapper recording each chunk call of the select loop."""
+#: Pre-existing ATOM issue (records/g2/final-report.md): the native scorer's
+#: fp8 MFMA route (rows > 256) hits an LLVM PHINode assertion on gfx1250 and
+#: aborts the process. The adapter never calls native there.
+NATIVE_ABORT_NOTE = (
+    "ATOM native fp8 scorer, rows > 256: aborts (LLVM PHINode); native leg skipped"
+)
 
-    def __init__(self, scorer):
+
+def native_aborts(args) -> bool:
+    q, cache = args[0], args[1]
+    return int(q.shape[0]) > 256 and cache.dtype not in (torch.bfloat16, torch.uint8)
+
+
+class _NativeAbortRisk(RuntimeError):
+    pass
+
+
+class _Tap:
+    """Scorer wrapper recording each chunk call of the select loop.
+
+    Refuses (raises) a chunk that would reach ATOM's aborting fp8 native route.
+    """
+
+    def __init__(self, scorer, route=None):
         self.scorer = scorer
+        self.route = route
         self.calls = []
 
     def __call__(self, *args, **kwargs):
         a = QSAScorerRoute._bind(args, kwargs)
+        if native_aborts(a) and (
+            self.route is None or self.route.decision_for(*a)[0] != OK
+        ):
+            raise _NativeAbortRisk(f"rows={int(a[0].shape[0])}: {NATIVE_ABORT_NOTE}")
         out = self.scorer(*a)
         self.calls.append((a, out))
         return out
@@ -603,20 +640,27 @@ def run_engine(name, spec, route, pad=0):
         "allow_flydsl": is_prefill,
         "compressed_k_scale": d["compressed_k_scale"],
     }
-    tap = _Tap(route)
+    tap = _Tap(route, route)
     before = dict(route.counts)
-    sel = qsa_select_paged_tokens_routed(
-        d["q"],
-        d["compressed_k_cache"],
-        table,
-        t2r,
-        pos,
-        ctx,
-        TOKEN_TOPK,
-        4,
-        scorer=tap,
-        **kw,
-    )
+    tag = {
+        "name": name + (f"+pad{pad}" if pad else ""),
+        "mode": "engine_pad" if pad else "engine",
+    }
+    try:
+        sel = qsa_select_paged_tokens_routed(
+            d["q"],
+            d["compressed_k_cache"],
+            table,
+            t2r,
+            pos,
+            ctx,
+            TOKEN_TOPK,
+            4,
+            scorer=tap,
+            **kw,
+        )
+    except _NativeAbortRisk as exc:
+        return {**tag, "passed": False, "error": f"uncovered chunk: {exc}"}
     torch.cuda.synchronize()
     took = {
         f"{p}:{r}": v - before.get((p, r), 0)
@@ -637,6 +681,14 @@ def run_engine(name, spec, route, pad=0):
             }
         )
         ok &= res["pass"]
+    if any(native_aborts(a) for a, _ in tap.calls):
+        return {
+            **tag,
+            "chunks": chunks,
+            "paths": took,
+            "native_skipped": NATIVE_ABORT_NOTE,
+            "passed": bool(ok),
+        }
     nat_tap = _Tap(route.native)
     sel_native = qsa_select_paged_tokens_routed(
         d["q"],
@@ -657,8 +709,7 @@ def run_engine(name, spec, route, pad=0):
     stock_equal = bool(torch.equal(sel_native, sel_stock))
     rows_equal = (sel == sel_native).all(dim=1)
     rec = {
-        "name": name + (f"+pad{pad}" if pad else ""),
-        "mode": "engine_pad" if pad else "engine",
+        **tag,
         "chunks": chunks,
         "paths": took,
         "routed_native_equals_stock": stock_equal,

@@ -27,7 +27,7 @@ the named profile covers the call; everything else stays on ATOM's scorer.
 
 ## Call path
 
-```
+``
 Qwen4ExpAttention.__init__     build_route(cfg, site=<layer prefix>)       (ON only)
 Qwen4ExpAttention.bind_caches  route.prepare(compressed_key_cache, scale)  -> aiter layout_eligibility, once per cache
 Qwen4ExpAttention._select_tokens
@@ -39,7 +39,7 @@ Qwen4ExpAttention._select_tokens
       decision = cache[class key] or aiter.decide(...)      (once per class)
       ok      -> aiter.qsa_paged_mqa_logits(..., profile=P)  (fused)
       else    -> ATOM qsa_paged_mqa_logits(...)              (native, same args)
-```
+``
 
 * `qsa_select_paged_tokens_routed` (`qsa_index_scorer/select.py`) is the stock
   loop with the scorer injected; a CPU test AST-compares it to `qsa.py`, so an
@@ -97,6 +97,10 @@ Qwen4ExpAttention._select_tokens
   (`--index-cache-dtype fp4`) → `cache_format_unsupported`.
 * Eager mode pays aiter's `decide` again inside its public op on every fused
   call (pure Python, no sync); CUDA-graph replay pays nothing.
+* Pre-existing ATOM issue: the native scorer's fp8 MFMA route (more than 256
+  rows, i.e. fp8 prefill chunks) aborts on gfx1250 (LLVM PHINode assertion).
+  Fused-covered fp8 prefill chunks avoid it; uncovered ones still reach it. The
+  golden adapter never calls native there (`native_skipped`).
 * Plugin hosts (SGLang / RTP-LLM) do not carry the switch: always stock.
 * The fused kernel is built lazily on the first covered call; the CUDA-graph
   smoke must confirm the build happens in ATOM's warm-up, not inside capture.
@@ -107,7 +111,7 @@ Image `rocm/fw-bringup-mlperf:gfx1250-atom-20261008`; aiter from
 `demonsan/aiter:qsa-index-scorer/stage2`; ATOM from
 `demonsan/ATOM:qsa-index-scorer/stage2`.
 
-```bash
+``bash
 # inside the container, aiter + ATOM checkouts installed editable (pip install -e .)
 export AITER_LOG_LEVEL=WARNING QSA_GOLDEN_DIR=/work/task/MI455_QSA_INDEX_SCORER/golden_baseline
 unset AITER_QSA_INDEX_SCORER_PROFILE; env | grep '^QSA_' && echo "unset QSA_* first"
@@ -135,4 +139,4 @@ python -m atom.model_ops.qwen4_exp.qsa_index_scorer.capture merge '/results/cap_
 
 # 4. accuracy (same seed/settings OFF vs ON), per /ci-pr-guide lm_eval gsm8k against a server
 python -m atom.entrypoints.openai_server $COMMON [--qsa-index-scorer-profile qsa_page4_gfx1250_v1]  # run OFF and ON, same lm_eval args
-```
+``
