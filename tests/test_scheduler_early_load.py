@@ -194,6 +194,51 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     # would have moved up; an early-loaded one keeps its place
 
 
+def test_loaded_request_passes_a_head_refused_kv_blocks(monkeypatch, seq_factory):
+    """A head that cannot allocate must not wait forever on an early-loaded
+    request behind it that holds blocks and could run and release them."""
+    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {a.id}
+    sched.schedule()  # b parks with its early load, a waits
+    sched.finished_recving_kv_req_ids.append(b.id)
+    # The last admission pass found the head refused KV blocks.
+    sched._admission_head_blocked = True
+
+    sched._promote_ready_remote_kv_requests()
+
+    assert list(sched.waiting) == [b, a]
+
+
+def test_resource_blocked_head_sets_the_bypass_flag(monkeypatch, seq_factory):
+    sched, delayer, (a,) = _make(monkeypatch, seq_factory, n=1)
+    sched.kv_connector.not_ready_ids = {a.id}
+    sched.kv_connector.match = (0, False)
+    delayer.allow = True
+    monkeypatch.setattr(
+        sched.block_manager, "can_allocate_memoized", lambda seq, *a, **k: -1
+    )
+    monkeypatch.setattr(
+        sched.block_manager, "can_allocate", lambda seq, *a, **k: -1, raising=False
+    )
+
+    sched.schedule()
+
+    assert sched._admission_head_blocked
+    assert a in sched.waiting
+
+
+def test_finished_disagg_consumer_load_is_not_prefill_work(setup):
+    """A disaggregation consumer's finished load goes straight to decode."""
+    sched, _, seq = setup
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+    sched.finished_recving_kv_req_ids.append(seq.id)
+    assert next(sched._waiting_prefills(), None) is seq  # offload: prefills
+    sched.kv_connector.is_offload = False
+    assert next(sched._waiting_prefills(), None) is None
+    sched.failed_recving_kv_req_ids.append(seq.id)
+    assert next(sched._waiting_prefills(), None) is seq  # failed: recomputes
+
+
 def test_old_path_parked_request_is_still_promoted(monkeypatch, seq_factory):
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id, b.id}

@@ -1059,11 +1059,24 @@ class Scheduler:
             or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
         )
 
+    def _no_prefill_work(self, seq: Sequence) -> bool:
+        """Nothing for the prefill probes: a load in flight, or a finished
+        disaggregation-consumer load, which admission sends straight to its
+        first decode (only an offload tier's finished load, or a failed one,
+        prefills)."""
+        if self._still_loading(seq):
+            return True
+        return (
+            seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            and not self._connector_flag("is_offload")
+            and not self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+        )
+
     def _waiting_prefills(self):
         for seq in self.waiting:
             if (
                 seq.status != SequenceStatus.ABORTED
-                and not self._still_loading(seq)
+                and not self._no_prefill_work(seq)
                 and self._unschedulable_reason(seq) is None
             ):
                 yield seq
@@ -1426,7 +1439,7 @@ class Scheduler:
                 break
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status == SequenceStatus.ABORTED or self._still_loading(seq):
+            if seq.status == SequenceStatus.ABORTED or self._no_prefill_work(seq):
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 # Its load finished: it already holds its blocks and resumes
@@ -1522,7 +1535,7 @@ class Scheduler:
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status == SequenceStatus.ABORTED or self._still_loading(seq):
+            if seq.status == SequenceStatus.ABORTED or self._no_prefill_work(seq):
                 continue
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if (
@@ -1599,7 +1612,7 @@ class Scheduler:
         for seq in self.waiting:
             if self._unschedulable_reason(seq) is not None:
                 continue
-            if seq.status == SequenceStatus.ABORTED or self._still_loading(seq):
+            if seq.status == SequenceStatus.ABORTED or self._no_prefill_work(seq):
                 continue
             if oldest_arrive is None or seq.arrive_time < oldest_arrive:
                 oldest_arrive = seq.arrive_time
@@ -2283,6 +2296,10 @@ class Scheduler:
         # Early-loading requests held in `prefix_waiters` (they keep their place
         # but bound nothing: they are not waiting on a lookup).
         early_waiting = 0
+        if delayer_allows:
+            # Set below when the head is refused slots or KV blocks; read by
+            # the next tick's `_promote_ready_remote_kv_requests`.
+            self._admission_head_blocked = False
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -2334,6 +2351,7 @@ class Scheduler:
                 continue
 
             if len(self.running) >= self.max_num_seqs:
+                self._admission_head_blocked = True
                 self.waiting.appendleft(seq)
                 break
 
@@ -2485,6 +2503,7 @@ class Scheduler:
                 needs_remote_load
                 and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
             ):
+                self._admission_head_blocked = True
                 self.waiting.appendleft(seq)
                 break
 
@@ -2505,6 +2524,7 @@ class Scheduler:
                 hbm_probe = self._probe_hbm_prefix(seq)
             num_cached_blocks = hbm_probe.num_cached_blocks
             if num_cached_blocks < 0:
+                self._admission_head_blocked = True
                 self.waiting.appendleft(seq)
                 break
             if (
@@ -2515,6 +2535,7 @@ class Scheduler:
                 # A replay that loads its KV first parks for that load like any
                 # remote load (`needs_remote_load` knew only the state-carrying
                 # hit), so it needs a parked slot too.
+                self._admission_head_blocked = True
                 self.waiting.appendleft(seq)
                 break
 
@@ -2570,6 +2591,7 @@ class Scheduler:
                 # Return the seq to waiting for a clean recompute once the pool
                 # has room, and stop admitting this pass.
                 self.block_manager.deallocate(seq)
+                self._admission_head_blocked = True
                 self.waiting.appendleft(seq)
                 break
             self._allocate_prefill_draft_lookahead(seq)
@@ -5309,11 +5331,15 @@ class Scheduler:
         blocked: deque[Sequence] = deque()
         # An early-loaded request keeps its place in line: it was not parked by
         # the head of the queue, and moving it up would let it prefill ahead of
-        # earlier arrivals. (The deadlock this function guards against -- a
-        # fresh head that cannot allocate while a finished waiter behind it
-        # holds the blocks -- needs the waiters to hold most of the pool; the
-        # early ones are capped at ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC of it.)
-        early = self._early_load.entries
+        # earlier arrivals. Unless the last admission pass found the head
+        # refused slots or KV blocks: then the finished early loads, which hold
+        # blocks of their own, must be able to run and release them, or a head
+        # that cannot allocate would wait on them forever.
+        early = (
+            ()
+            if getattr(self, "_admission_head_blocked", False)
+            else self._early_load.entries
+        )
         while self.waiting:
             seq = self.waiting.popleft()
             if (
