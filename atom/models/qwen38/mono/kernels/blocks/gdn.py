@@ -119,7 +119,7 @@ from atom.models.qwen38.mono.kernels.device.ops import (
     traced,
     uniform,
 )
-from atom.models.qwen38.mono.kernels.geometry import GDNGeometry
+from atom.models.qwen38.mono.kernels.geometry import REPLAY_MAX, GDNGeometry
 from atom.models.qwen38.mono.kernels.program import Region, Scenario, Stage
 from atom.models.qwen38.mono.kernels.target import MI355X
 
@@ -139,7 +139,6 @@ RED_COL = 20  # column stride of a 16 x 16 partial tile (16 rows + 4 pad)
 RED_TILE = 16 * RED_COL
 STATE_CM = CM_NT  # cache policy of the snapshot stores
 STATE_LD_CM = 0  # cache policy of the state loads
-REPLAY_MAX = 64  # ReplaySSM record capacities the device code is built for (the replay loop is unrolled)
 # the contract's rounding choices (``numerics.GDNNumerics`` fields conv_rounding, gate, qk_norm): each conv tap
 # product rounded to bf16, the norm gated by sigmoid(z), the q / k norm factors as 1 / sqrt(.)
 FLASH_NUMERICS = ("tap_bf16", "sigmoid", "div_sqrt")

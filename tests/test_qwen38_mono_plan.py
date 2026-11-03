@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Which deployments and steps Qwen3.8-Flash-Next mono serves, and its host-side contracts (CPU)."""
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -158,6 +160,50 @@ def test_engine_switches_are_checked(native, monkeypatch, env, value, reason):
     )
 
 
+def test_install_reads_a_hub_id_checkpoint_from_its_local_directory(
+    native, monkeypatch, tmp_path
+):
+    """``--model`` may be a hub id: the installer resolves the directory once and hands it to every reader (the
+    geometry, the drafter's layer, the target's layers), and wraps the target and the drafter.
+    """
+    from atom.models.qwen38.mono import dispatch
+
+    hub_id, seen = "amd/Qwen3.8-Flash-Next-Quark-MXFP4", []
+    monkeypatch.setattr(
+        dispatch, "local_model_dir", lambda m: str(tmp_path) if m == hub_id else m
+    )
+    monkeypatch.setattr(dispatch, "load_geometry", lambda d: seen.append(d) or "geo")
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            seen.append(args[-1])
+
+    class Wrapped:
+        def __init__(self, draft, runner):
+            self.draft, self.runner = draft, runner
+
+    # (the runners, the drafter and ATOM's MTP model need a GPU: stand-ins record what they are given)
+    def module(name, **attrs):
+        m = types.ModuleType(name)
+        m.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, m)
+
+    mtp = type("Qwen4ExpMTP", (), {})
+    module("atom.models.qwen38.mono.runner", TargetRunner=Runner)
+    module("atom.models.qwen38.mono.draft_runner", DraftRunner=Runner)
+    module("atom.models.qwen38.mono.draft_model", MonoDraftModel=Wrapped)
+    module("atom.models.qwen4_exp_mtp", Qwen4ExpMTP=mtp)
+    draft = mtp()
+    draft.model = SimpleNamespace()
+    drafter = SimpleNamespace(model=draft)
+    out = dispatch.install_mono_decode(
+        torch.nn.Module(), _atom_config(model=hub_id), drafter
+    )
+    assert isinstance(out, dispatch.MonoTargetModel)
+    assert isinstance(drafter.model, Wrapped) and drafter.model.draft is draft
+    assert seen == [str(tmp_path)] * 3
+
+
 def _fwd(batch=2, spec=4, prefill=False, replayssm=False, decodes=0, idx_rows=None):
     gdn = SimpleNamespace(
         replayssm=replayssm,
@@ -266,11 +312,16 @@ def test_pools_refuse_another_layout_or_dtype():
     with pytest.raises(ValueError, match="index_cmp"):
         step_meta.QSAPools(G, kv, kv.clone(), raw, raw)
     conv = torch.zeros(5, 6, G.conv_dim, dtype=torch.bfloat16)
-    pools = step_meta.GDNPools(
-        G.gdn, conv.transpose(1, 2), torch.zeros(5, 48, 128, 128)
-    )
-    assert pools.conv.shape == (5, 6, G.conv_dim)
+    pools = step_meta.GDNPools(G.gdn, conv, torch.zeros(5, 48, 128, 128))
     pools.check_window(4)
+    # a channel-major pool, or a view of the token-major one, is not what the kernels read
+    for other in (conv.transpose(1, 2).contiguous(), conv.transpose(1, 2)):
+        with pytest.raises(ValueError, match="unsupported conv pool"):
+            step_meta.GDNPools(G.gdn, other, torch.zeros(5, 48, 128, 128))
+    with pytest.raises(ValueError, match="dense"):  # every other slot of a wider pool
+        step_meta.GDNPools(
+            G.gdn, conv.repeat(2, 1, 1)[::2], torch.zeros(5, 48, 128, 128)
+        )
     with pytest.raises(ValueError, match="conv rows"):
         pools.check_window(1)
     with pytest.raises(ValueError, match="state pool is torch.bfloat16"):

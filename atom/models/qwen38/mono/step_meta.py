@@ -122,8 +122,7 @@ def target_puts(m: dict, meta: StepMeta) -> list[Put]:
 
 @dataclass
 class GDNPools:
-    """One GDN layer's conv window pool ``[slots, W, conv_dim]`` (token-major; a ``[slots, conv_dim, W]`` view of the
-    same bytes is transposed) and recurrent state pool ``[slots, v_heads, K, V]`` (``geo.state_dtype``). Under
+    """One GDN layer's conv window pool ``[slots, W, conv_dim]`` (token-major, dense) and recurrent state pool ``[slots, v_heads, K, V]`` (``geo.state_dtype``). Under
     ReplaySSM the state pool holds each request's checkpoint, and ``rec`` the layer's records ``(k, u, g)``:
     bf16 ``[slots, v_heads, L, K]``, bf16 ``[slots, v_heads, L, V]``, f32 ``[slots, v_heads, L]``, with the record
     cursor ``write_pos`` int32 ``[slots]`` (one for every layer).
@@ -137,10 +136,11 @@ class GDNPools:
 
     def __post_init__(self):
         g = self.geo
-        if self.conv.shape[-1] != g.conv_dim and self.conv.shape[-2] == g.conv_dim:
-            self.conv = self.conv.transpose(-1, -2)
+        # ATOM's pool (``gdn_attn``'s ``mamba_k_cache``) is token-major, as the kernels read it
         if self.conv.shape[-1] != g.conv_dim or self.conv.shape[1] < g.conv_kernel - 1:
-            raise ValueError(f"unsupported conv pool {tuple(self.conv.shape)}")
+            raise ValueError(
+                f"unsupported conv pool {tuple(self.conv.shape)}: mono reads [slots, rows, {g.conv_dim}]"
+            )
         if tuple(self.ssm.shape[1:]) != (g.v_heads, g.k_dim, g.v_dim):
             raise ValueError(f"unsupported state pool {tuple(self.ssm.shape)}")
         # the kernels address both pools by slot with dense strides

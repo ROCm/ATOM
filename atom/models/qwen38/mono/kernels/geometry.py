@@ -163,6 +163,10 @@ class IndexerGeometry:
             raise ValueError(f"unsupported indexer geometry {self}")
 
 
+# ReplaySSM record capacities the GDN programs are built for (``blocks.gdn``: the replay loop is unrolled); the
+# deployment contract refuses a larger ``ATOM_REPLAYSSM_CACHE_LEN`` (``config``)
+REPLAY_MAX = 64
+
 QSA_TYPES = ("full_attention", "qwen_sparse_attention")
 QSA_KINDS = ("qsa", "mtp")  # kinds whose mixer is QSA (one recipe, one kernel)
 ROPE_OFFSET = {"qsa": 0, "mtp": 1}  # RoPE position - cache row, per QSA kind

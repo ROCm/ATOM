@@ -16,6 +16,7 @@ caches.
 
 import torch
 
+from atom.models.qwen38.mono.kernels.geometry import REPLAY_MAX
 from atom.mono.plan.shard import Shard
 from atom.mono.runtime.deployment import (
     common_refusals,
@@ -30,7 +31,6 @@ BATCHES = (1, 2, 3, 4)  # requests a served target or draft step carries
 HEAD_ROWS = (2, 4)
 KV_BLOCK = 64
 SUPPORTED_TP = (1,)
-REPLAY_MAX = 64  # ReplaySSM record capacities the GDN programs are built for (``gdn.REPLAY_MAX``)
 # KV connectors served beside the programs: LMCache CPU offload's transfers are bounded gather / scatter kernels and
 # host copies on its own streams, fenced by events, that never wait on the model
 OFFLOAD_CONNECTORS = ("lmcache_offload",)
