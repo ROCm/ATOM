@@ -4,8 +4,10 @@
 
 ``install_mono_decode`` (``models.registry.mono_decode_installers``) wraps the loaded model after load: a served MTP
 verify step (``step_meta.verify_step``) runs every decoder layer as one mono program, reading and writing ATOM's GDN
-pools and QSA caches in place; every other step runs ATOM's own model. The kernels of every served shape are built
-here, before warm-up and graph capture; the pointer tables on the first eager step of each shape.
+pools and QSA caches in place; every other step runs ATOM's own model. The drafter's ``Qwen4ExpMTP`` is wrapped the
+same way (``draft_model.MonoDraftModel``, its layer on ``draft_runner.DraftRunner``). Both are built here, before
+warm-up and graph capture: the kernels of every served shape and the drafter's weights; the target's pointer tables
+on the first eager step of each shape.
 """
 
 import logging
@@ -60,11 +62,17 @@ def install_mono_decode(
         else:
             logger.info("Qwen mono off: %s", why)
         return model
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+    from atom.models.qwen38.mono.draft_model import MonoDraftModel
+    from atom.models.qwen38.mono.draft_runner import DraftRunner
     from atom.models.qwen38.mono.runner import TargetRunner
 
     # (``--model`` may be a hub id: mono reads the checkpoint's files, so resolve its directory once)
     checkpoint = local_model_dir(atom_config.model)
     geo = load_geometry(checkpoint)
+    if drafter is not None and isinstance(drafter.model, Qwen4ExpMTP):
+        runner = DraftRunner(drafter.model.model, atom_config, geo, checkpoint)
+        drafter.model = MonoDraftModel(drafter.model, runner)
     # the GDN verify ATOM picked (ReplaySSM by default under MTP, classic with ATOM_ENABLE_REPLAYSSM=0)
     replay = (
         int(metadata_builder.replayssm_cache_len)
