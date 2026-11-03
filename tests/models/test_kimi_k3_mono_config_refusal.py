@@ -167,17 +167,14 @@ def test_the_query_cap_bounds_the_speculative_width(servable, draft_tokens, refu
     assert (config_refusal(atom_config) is not None) is refused
 
 
-@pytest.mark.parametrize(
-    ("arch", "refused"), [("K3DFlashModel", True), ("K3DSparkModel", False)]
-)
-def test_the_dflash_draft_is_refused(servable, arch, refused):
-    # A mono step fills the drafter's taps with the prefix; the DFlash draft
-    # reads the aggregate stream, which only its forward hook forms.
+@pytest.mark.parametrize("arch", ["K3DFlashModel", "K3DSparkModel"])
+def test_both_k3_drafts_are_served(servable, arch):
+    # Mono hands the drafter's own extract the step's bank, so the DFlash
+    # draft's aggregate tap is formed on a mono step as on the regular path.
     atom_config = _atom_config()
     atom_config.speculative_config = SimpleNamespace(
         method="dspark",
         num_speculative_tokens=5,
         draft_model_hf_config=SimpleNamespace(architectures=[arch]),
     )
-    reason = config_refusal(atom_config)
-    assert (reason is not None and "DFlash" in reason) is refused
+    assert config_refusal(atom_config) is None

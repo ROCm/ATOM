@@ -3,7 +3,7 @@ from functools import partial
 
 import torch
 
-from atom.config import K3_DFLASH_ARCH, KVCacheTensor
+from atom.config import KVCacheTensor
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec, page_pool
 
@@ -12,29 +12,6 @@ logger = logging.getLogger("atom")
 # This pool's one row space. Named, not a geometry: `make_kv_pool` already
 # settled the draft's geometry, and there is only ever the one.
 DRAFT_KV_ROWS = "draft_kv"
-
-
-#: Drafts whose pool `draft_kv_builder` builds outside the target's DCP group,
-#: entry-granular in FLASH layout, with one per-tensor scale. Keyed on the
-#: architecture `SpeculativeConfig.hf_config_override` renames the SpecForge
-#: DFlash checkpoint to.
-_DFLASH_POOL_ARCHS = frozenset({K3_DFLASH_ARCH})
-
-
-def uses_dflash_pool(draft_hf) -> bool:
-    """Whether this draft owns the DFlash pool rather than the generic one.
-
-    Asked of the config for the config-time checks, which run before any draft
-    model is built. Once the model exists, read its `owns_flash_pool` instead.
-
-    Keyed on the architecture, NOT on "a non-MLA block drafter": MiniMax-M3.1's
-    DSpark draft is one of those too, and it binds a 5-D SHUFFLE pool with
-    per-token fp8 scales that its per-row decode reads. Handing it this pool's
-    FLASH layout and 1.0 scales would be wrong bytes with no error. An MLA draft
-    owns no pool at all -- it binds into the target's latent rows.
-    """
-    arch = (getattr(draft_hf, "architectures", None) or [""])[0]
-    return arch in _DFLASH_POOL_ARCHS
 
 
 def block_page_idx(

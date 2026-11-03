@@ -485,31 +485,6 @@ def _normalized_radixark():
     return hf
 
 
-def test_dflash_uses_dflash_pool():
-    """Only the SpecForge DFlash draft owns the DCP1 FLASH-layout pool."""
-    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
-    assert dk.uses_dflash_pool(_normalized_radixark()) is True
-
-    # MiniMax-M3.1's DSpark draft is ALSO a non-MLA block drafter with a pool of
-    # its own, but it binds a SHUFFLE pool with per-token scales; keying on
-    # "non-MLA block drafter" handed it this one.
-    minimax = types.SimpleNamespace(
-        architectures=["DSparkMiniMaxDraftModel"], dspark_with_draft=True
-    )
-    assert dk.uses_dflash_pool(minimax) is False
-
-    # The MLA DSpark draft binds into the target's latent rows: no pool.
-    mla = types.SimpleNamespace(
-        architectures=["K3DSparkModel"], dspark_with_draft=True, kv_lora_rank=512
-    )
-    assert dk.uses_dflash_pool(mla) is False
-
-    # A serial MTP/EAGLE draft, and a config with no architectures at all.
-    eagle = types.SimpleNamespace(architectures=["Eagle3LlamaModel"])
-    assert dk.uses_dflash_pool(eagle) is False
-    assert dk.uses_dflash_pool(types.SimpleNamespace(num_hidden_layers=1)) is False
-
-
 # What `draft_kv_builder` reads off a built draft that owns the DFlash pool.
 _FLASH_DRAFT = types.SimpleNamespace(owns_flash_pool=True)
 

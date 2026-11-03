@@ -221,8 +221,6 @@ def num_blocks(layers: int) -> int:
 
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use K3 mono decode, or None."""
-    from atom.spec_decode.draft_kv import uses_dflash_pool
-
     hf = getattr(atom_config.hf_config, "text_config", atom_config.hf_config)
     linear = getattr(hf, "linear_attn_config", None) or {}
     spec = atom_config.speculative_config
@@ -329,17 +327,6 @@ def config_refusal(atom_config) -> str | None:
         # here on a path never built or measured for it. Without one, a served
         # step is a plain decode (`plan.step_shape`).
         (spec is None or spec.method == "dspark", "not DSpark"),
-        # The DFlash draft's extract mixes the target's block bank into its
-        # tap. A mono step hands it the fixed-size slot stack rather than the
-        # forward's grown bank, so a slot the layer has not banked yet would
-        # read uninitialised memory with no shape error to catch it; mono
-        # stays off for this draft until that mix is checked against the
-        # production tap.
-        (
-            spec is None
-            or not uses_dflash_pool(getattr(spec, "draft_model_hf_config", None)),
-            "the DFlash draft's aggregate tap",
-        ),
         (
             spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_QLEN,
             f"speculative width past the {MAX_QLEN}-token query K1 tiles for",
