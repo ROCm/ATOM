@@ -33,6 +33,7 @@ which no longer matches at all, and the rows encoder bounded replay recomputes
 below a hit, a whole page; 128 keeps both at the window's size.
 """
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -64,6 +65,11 @@ MAIN_FP4 = {"group_size": 16, "scale_dtype": torch.float8_e4m3fn}
 # which one meant what.
 INDEX_FP8_SCALE_FMT = "ue8m0"
 
+# The main pool's formats (`--kv_cache_dtype`). FP8 rows are `fp8_rows`': row
+# addressed like BF16, which is what `mla_sparse_prefill_v41`'s int32 row
+# indices need; FP4 rows are byte addressed through tagged addresses.
+KV_DTYPES = ("bf16", "fp4", "fp8")
+
 # The rows one page of the FP4 index plane holds: the row-group scorer's page-8
 # layout, a page being a candidate block so a kept list is its block table.
 FP4_INDEX_PAGE_ROWS = 8
@@ -78,7 +84,7 @@ class V41PoolGeometry:
     head_dim: int
     index_dim: int
     history_size: int = 3
-    packed: bool = False
+    kv_dtype: str = "bf16"
     speculative_tokens: int = 0
     # The distinct compression ratios this configuration's layers run, read
     # off the topology rather than enumerated, so a ratio no layer wants gets
@@ -101,6 +107,10 @@ class V41PoolGeometry:
     def __post_init__(self):
         if self.speculative_tokens < 0:
             raise ValueError("Speculative window slack cannot be negative")
+        if self.kv_dtype not in KV_DTYPES:
+            raise ValueError(
+                f"KV cache dtype {self.kv_dtype} is not one of {KV_DTYPES}"
+            )
         if (
             min(
                 self.layers,
@@ -115,7 +125,7 @@ class V41PoolGeometry:
             raise ValueError("Cache dimensions must be positive")
         if self.head_dim % 32 or self.index_dim % 32:
             raise ValueError("Cache dimensions must be divisible by 32")
-        if not self.packed and self.row_bytes % 256:
+        if self.kv_dtype == "bf16" and self.row_bytes % 256:
             raise ValueError("BF16 attention rows must align to 256 bytes")
         if len({owner for owner, _ in self.owners}) != len(self.owners):
             raise ValueError("Each global owner must be declared once")
@@ -147,12 +157,28 @@ class V41PoolGeometry:
                 )
 
     @property
+    def packed(self):
+        """FP4 main rows, byte addressed: the pool a reader decodes first."""
+        return self.kv_dtype == "fp4"
+
+    @property
+    def window_fp8(self):
+        """Whether a window row is FP8 values then E8M0 scales (FP4 and FP8
+        pools both), rather than BF16."""
+        return self.kv_dtype != "bf16"
+
+    @property
     def row_bytes(self):
+        """The unit a row index counts in a row-addressed pool."""
+        if self.kv_dtype == "fp8":
+            return self.head_dim + self.head_dim // 32
         return self.head_dim * 2
 
     @property
     def alignment(self):
-        return 256 if self.packed else self.row_bytes
+        # A row-addressed region starts on a whole row, and on the arena's own
+        # 256 bytes: 528-byte FP8 rows make that every 16 rows.
+        return 256 if self.packed else math.lcm(self.row_bytes, 256)
 
     @property
     def main_row_bytes(self):
@@ -191,7 +217,9 @@ class V41PoolGeometry:
 
     @property
     def window_row_bytes(self):
-        return self.head_dim + self.head_dim // 32 if self.packed else self.row_bytes
+        return (
+            self.head_dim + self.head_dim // 32 if self.window_fp8 else self.row_bytes
+        )
 
     @property
     def ring_slots(self):
@@ -243,9 +271,9 @@ class V41PoolGeometry:
                 1,
                 (
                     self.rows_per_page(ratio),
-                    self.main_row_bytes if self.packed else self.head_dim,
+                    self.main_row_bytes if self.window_fp8 else self.head_dim,
                 ),
-                torch.uint8 if self.packed else torch.bfloat16,
+                torch.uint8 if self.window_fp8 else torch.bfloat16,
                 align=self.alignment,
             )
             for owner, ratio in self.owners
@@ -307,8 +335,11 @@ class V41PoolGeometry:
         window = EntryField(
             "window",
             self.layers,
-            (self.ring_slots, self.window_row_bytes if self.packed else self.head_dim),
-            torch.uint8 if self.packed else torch.bfloat16,
+            (
+                self.ring_slots,
+                self.window_row_bytes if self.window_fp8 else self.head_dim,
+            ),
+            torch.uint8 if self.window_fp8 else torch.bfloat16,
             align=self.alignment,
         )
         # The compressor's own ring, V4's `kv_state` / `score_state`: the last
@@ -362,27 +393,39 @@ class V41PoolGeometry:
         )
 
     def window(self, layer, pages):
-        if not 0 <= layer < self.layers:
-            raise IndexError("Window layer is outside the cache")
-        # Behind every PAGE-scaled region, main and index alike -- not just the
-        # main pages.
-        state_start = self.paged_extents(pages)[1]
+        """`layer`'s ring in the pool's own units: bytes when packed, rows
+        otherwise."""
         if self.packed:
-            return WindowParams(
-                ring_start=state_start
-                + layer * self.ring_slots * self.window_row_bytes,
-                slot_rows=self.state_bytes,
-                ring_slots=self.ring_slots,
-                ring_stride=1,
-                run_rows=self.window_row_bytes,
-            )
+            return self.window_bytes(layer, pages)
         return WindowParams(
-            ring_start=state_start // self.row_bytes + layer * self.ring_slots,
+            ring_start=self._state_start(layer, pages) // self.row_bytes
+            + layer * self.ring_slots,
             slot_rows=self.state_bytes // self.row_bytes,
             ring_slots=self.ring_slots,
             ring_stride=self.ring_slots,
             run_rows=self.ring_slots,
         )
+
+    def window_bytes(self, layer, pages):
+        """`layer`'s ring in bytes from the pool's base: where the FP8 window
+        writers and readers (`packed_rows`) address an FP8 window row."""
+        if not self.window_fp8:
+            raise ValueError("A BF16 window is addressed in rows")
+        return WindowParams(
+            ring_start=self._state_start(layer, pages)
+            + layer * self.ring_slots * self.window_row_bytes,
+            slot_rows=self.state_bytes,
+            ring_slots=self.ring_slots,
+            ring_stride=1,
+            run_rows=self.window_row_bytes,
+        )
+
+    def _state_start(self, layer, pages):
+        if not 0 <= layer < self.layers:
+            raise IndexError("Window layer is outside the cache")
+        # Behind every PAGE-scaled region, main and index alike -- not just the
+        # main pages.
+        return self.paged_extents(pages)[1]
 
     @property
     def layout_id(self):
@@ -401,7 +444,8 @@ class V41PoolGeometry:
             # the prefix is a different computation. It is spelled out rather
             # than read off a field because FP8 is the only plane the scorer
             # takes -- an image from a build that had another must not match.
-            f"dsv41-{'packed' if self.packed else 'bf16'}-index-fp8"
+            # FP4 keeps the name it was published under.
+            f"dsv41-{'packed' if self.packed else self.kv_dtype}-index-fp8"
             f"-state-v3:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"

@@ -65,6 +65,21 @@ def _copies_paged_state(transfer_tensors: Any) -> bool:
     return callable(state_transfer) and bool(state_transfer().copies)
 
 
+def _replays_state(transfer_tensors: Any) -> bool:
+    """Whether the backend rebuilds its per-request state at every hit.
+
+    A `replay` state transfer keeps no checkpoint: a prefix hit resumes with a
+    fresh state slot and the forward recomputes the hash block below it
+    (`BlockManager.replay_start`), so a PAGE-only load is resumable as is.
+    """
+
+    builder = getattr(transfer_tensors, "state_backend", None)
+    state_transfer = getattr(builder, "state_transfer", None)
+    return callable(state_transfer) and bool(
+        getattr(state_transfer(), "replays", False)
+    )
+
+
 class LMCacheMPConnector(KVConnectorBase):
     """Worker shell selecting PAGE-only or native-state transport by capability."""
 
@@ -103,6 +118,11 @@ class LMCacheMPConnector(KVConnectorBase):
                 "but publishes no paged_state_checkpoint_spec and "
                 "execute_paged_state_copies for the native-state transfer"
             )
+        elif _replays_state(transfer_tensors):
+            # The forward rebuilds the state from the PAGE below any hit
+            # (`StateTransfer.replay`), a tier load's included, so PAGE alone
+            # is all a load has to bring.
+            impl = mp_worker.LMCacheMPConnector(self._config)
         elif _has_per_request_state(kv_caches):
             # Fork-slot GDN (pipeline parallelism, RapidServe) publishes no
             # checkpoint image. PAGE-only would restore full-attention KV

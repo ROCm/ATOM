@@ -117,8 +117,10 @@ omits `--mesh`. Its report uses the `standalone` deployment panels.
 Prometheus 3.5.0 is downloaded and verified against its release checksums when
 no executable is already available. `ATOMESH_PROMETHEUS_BIN` can point to an
 installed executable. `ATOMESH_MESH_TARGET_DIR` selects the host's persistent
-Cargo build cache (default: `/tmp/atomesh-mesh-cache-<uid>`), mounted into the
-setup container. If the image's Rust installation is inaccessible to the CI
+Cargo build cache (default: `<log root>/.mesh-cache/<host>-<uid>` on the shared
+log storage), mounted into the setup container. Avoid `/tmp` and `/var/tmp`:
+the Spur epilog deletes the CI user's files there once they are a day old,
+which corrupts Cargo's extracted crate sources. If the image's Rust installation is inaccessible to the CI
 user, setup installs Rust 1.94.0 into that cache; `ATOMESH_MESH_RUST_TOOLCHAIN`
 can select another fallback version. These settings pass through the existing
 CI environment handling and are independent of metrics collection.

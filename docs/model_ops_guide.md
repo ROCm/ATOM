@@ -14,7 +14,8 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `Attention` | `base_attention.py` | `unified_attention_with_output_base` (custom op) | Unified attention entry |
 | MHA `Attention` | `attention_mha.py` | `flash_attn_varlen_func`, `pa_fwd_asm`, `pa_persistent_fwd`, `pa_decode_gluon` | Multi-head attention |
 | `MLAAttention` | `attention_mla.py` | `mla_decode_fwd`, `mla_prefill_fwd`, `concat_and_cache_mla`, `fused_qk_rope_concat_and_cache_mla` | Multi-head latent attention |
-| DSA sparse indexer | `sparse_indexer_fp4.py` | `flydsl_pa_mqa_logits_fp4`, `indexer_qk_rope_quant_and_cache`, `top_k_per_row_decode` | FP4 (E2M1 + e8m0) index-cache geometry, scoring and the prefill CTA schedule |
+| Shared DSA indexer scorer | `indexer/` | `deepgemm_fp8_paged_mqa_logits`, `fp8_mqa_logits`, `flydsl_pa_mqa_logits_fp4`, `pa_mqa_logits_mxfp4`, `top_k_per_row_decode`, `top_k_per_row_prefill` | Scoring and top-k for every DSA indexer (DeepSeek-V3.2 / GLM-5.x, GLM-5.3 kpool, DeepSeek-V4, V4.1): the attention builder publishes a step's rows once (`attn_metadata.index_rows`: `fp8_rows`, `fp4_rows`, `concat_rows`, a DCP or TP rank's share by `RowSplit`) cut to its logits plane (`LogitsWorkspace`), and a model calls `score_topk` against its cache (`IndexCache`) |
+| DSA FP4 index cache | `sparse_indexer_fp4.py` | `indexer_qk_rope_quant_and_cache` | FP4 (E2M1 + e8m0) index-cache geometry and the DSA FP4 predicate |
 | `Fp4MqaRaggedMetadata` | `fp4_mqa_ragged_metadata.py` | `make_fp4_mqa_plan` | FP4 MQA scoring's ragged rows (DeepSeek-V4, V4.1, V3.2 decode and its DCP shard): rows grouped into sequences (`query_start_loc`, `max_qlen`, block tables, `pages_per_block`), each row's bound, and their shape-only launch plan |
 | `FusedMoE` | `moe.py` | `aiter.fused_moe.fused_moe`, `asm_moe` | Mixture of experts |
 | `RMSNorm` | `layernorm.py` | `rmsnorm2d_fwd`, `rmsnorm2d_fwd_with_add`, `fused_add_rmsnorm_pad` | RMS normalization |
@@ -25,6 +26,8 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
+| `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
 
@@ -88,7 +91,7 @@ LinearBase (nn.Module)
 | `per_Token` (INT8) | INT8 | `gemm_a8w8` | `[output_size, 1]` |
 | `per_Token` (FP8) | FP8 | `gemm_a8w8_bpreshuffle` | `[output_size, 1]` |
 | `per_1x128` | FP8 | `gemm_a8w8_blockscale_bpreshuffle` | `[ceil(N/128), ceil(K/128)]` |
-| `per_1x32` | MXFP4 (`fp4x2`) | `gemm_a4w4` | `[N, ceil(K/32)]` (e8m0) |
+| `per_1x32` | MXFP4 (`fp4x2`) | `gemm_a4w4` (preshuffled: K a multiple of 256, see MXFP4 K alignment) | `[N, ceil(K/32)]` (e8m0) |
 
 When `x_scale` is not provided, the input is dynamically quantized via `get_hip_quant(quant_type)`.
 
@@ -105,6 +108,7 @@ After loading, `process_weights_after_loading()` handles:
 - **e4m3fn to e4m3fnuz normalization** (AMD FP8 format conversion).
 - **Weight reshuffling** via `shuffle_weights()` for pre-shuffled GEMM kernels.
 - **Scale reshuffling** via `fp4_utils.e8m0_shuffle()` for MXFP4 block scales.
+- **MXFP4 K alignment**: a preshuffled MXFP4 weight must have K a multiple of 256 (`MXFP4_PRESHUFFLE_K_ALIGN`); the preshuffled GEMMs walk K in 256-wide steps and do not mask a tail. A `gate_up -> act -> down` MLP whose per-rank intermediate is unaligned pads it as a pair, like MoE's `intermediate_pad`: pass `mxfp4_k_pad_align(quant_config, down_prefix)` as `output_pad_align` to `MergedColumnParallelLinear` and `input_pad_align` to `RowParallelLinear`. Only a pair that is MXFP4 or bf16 in the checkpoint is padded (a bf16 pair may be quantized online; its zeroed rows quantize to zero): the padded parameters are zeroed when allocated, and every load path writes the real shard at the front of its padded slot (requires `act(0, 0) == 0`). A padded layer requantized online from a quantized source (NVFP4, FP8), or a static pair whose halves aren't both MXFP4 or bf16, is refused at construction. Any preshuffled MXFP4 weight still unaligned is refused here at load. Exempt: the gfx1250 32x4 scale layout, whose kernels take K % 128 (`mxfp4_k_pad_align` pads to 128 there), and `ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1`, whose GEMM reads the raw layout. A refused layer can be kept out of MXFP4 (online quant: `exclude_layer`).
 - **Per-tensor requantization** via `requantize_with_max_scale()` when multiple output partitions have separate scales.
 
 ## Attention operations
@@ -264,7 +268,7 @@ FusedMoE(
 | `QuantType.No` | `UnquantizedFusedMoEMethod` | `aiter.fused_moe.fused_moe` |
 | FP8 (`dtypes.fp8`) | `Fp8MoEMethod` | `aiter.fused_moe.fused_moe` with quant_type |
 | FP8 compressed-tensors | `CompressedTensorsFp8MoEMethod` | `aiter.fused_moe.fused_moe` or `asm_moe` |
-| MXFP4 (`dtypes.fp4x2`) | `Mxfp4MoEMethod` | `aiter.fused_moe.fused_moe` or Triton `triton_kernel_moe_forward` |
+| MXFP4 (`dtypes.fp4x2`) | `Mxfp4MoEMethod` | `aiter.fused_moe.fused_moe` or Triton `triton_kernel_fused_experts` |
 
 The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 methods and supports `a16` mode where activations remain in BF16/FP16 while weights are FP8/INT8.
 
@@ -276,7 +280,7 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
 
-**Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`.
+**Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`. Under DP attention with MoRI EP, fusion is wired up only for MXFP4 / NVFP4 routed experts; FP8 MoE models such as DeepSeek-V3 must run with `ATOM_FUSE_SHARED_EXPERT=0`, or `FusedMoE` raises `NotImplementedError`.
 
 ### `FusedMoEParallelConfig`
 
@@ -301,10 +305,42 @@ Key properties:
 
 MORI (MoE Router Infrastructure) provides all-to-all communication kernels for expert parallelism. `MoriPrepareAndFinalize` implements:
 
-- `prepare()`: Dispatches tokens to remote experts via `mori_op.dispatch()`. Optionally quantizes activations to FP8 before dispatch.
+- `prepare()`: Dispatches tokens to remote experts via `mori_op.dispatch()`, in the layer's routed-rows wire (MXFP8 with e8m0 scales where the experts take MXFP8, `ATOM_MORI_FP4_DISPATCH` for MXFP4, bf16 otherwise).
 - `finalize()`: Combines expert outputs via `mori_op.combine()` and copies results back.
 
 The `FusedMoEModularKernel` orchestrates the prepare-compute-finalize pipeline.
+
+### Routing before the rows move (`fused_moe/routed_rows.py`)
+
+A MoE method splits into `select_experts(layer, x, router_logits)` (logical
+routes), `place_experts(layer, topk_weights, topk_ids, gathered)` (the EPLB
+remap and load record, the shared column in the layer's expert layout) and
+`apply(layer, x, topk_weights, topk_ids, ..., x_scale=None)`. `FusedMoE` routes
+on the rank that owns the rows, before any of them move: the MORI dispatch, the
+DP gather (DP attention without the all2all kernels), the PCP gather
+(`ATOM_PCP_MOE_MERGE`, inside `FusedMoE._run_experts`) and the comm-fused DPA
+gather all carry top-k weights and ids rather than router logits. Rows are
+placed after every gather, so a gathered row -- held alike by every rank --
+picks the same EPLB replica on each (`gathered`); and where the legacy layout
+widens in the prefilled shared column (`LEGACY_AITER`), whose ids say by row
+position which rank runs a row's shared expert, a gather is followed by
+`reassign_gathered_shared_ids`, which gives the rows this rank's ids for their
+gathered positions. Every routing kernel takes the pass's real row count,
+`Context.scheduled_tokens_gpu` (an entry of the step's
+`forward_vars["batch_info"]`, read on device so a replayed graph follows its
+own step), and routes the rows past it to -1, so they are neither sent nor
+computed. Only a consumer of the pass's whole rows (`running_tokens`) gets the
+count (`pass_scheduled_tokens_gpu`): the MoE sort reads it as its row count, so
+a subset of the rows -- a PCP shard, gathered rows -- gets None and runs every
+row, unless it declares a pass of its own with its own count
+(`ForwardContext.use_pass_rows`, as V4.1's decoder does over a prefill's tails
+with `ReplayPlan.filled_gpu` / `finishing_gpu`). The rows travel in
+`RoutedRowsWire`, the method's `routed_rows_wire` -- the one format both the
+gathers and the MoRI v1 dispatch use: MXFP4 under `ATOM_MORI_FP4_DISPATCH`,
+MXFP8 where the experts take MXFP8 activations (FlyDSL `fused_moe`, the Triton
+a8w4 EP experts), bf16 otherwise (the TP Triton path, MegaMoE, the MoRI v2
+transport). Rows already in the wire carry their e8m0 rows as `x_scale` through
+`apply`, the modular kernel and `prepare`, so nothing is quantized twice.
 
 ### MoE quantization config (`fused_moe/config.py`)
 
@@ -326,7 +362,7 @@ Factory functions:
 
 ### Triton MoE fallback (`fused_moe_triton.py`)
 
-`triton_kernel_moe_forward()` provides a Triton-based MoE path using the `triton_kernels` library. It uses `routing()` for expert assignment and `matmul_ogs()` for the expert GEMM. This path is currently used for MXFP4 MoE on GFX94x hardware.
+`triton_kernel_fused_experts()` provides a Triton-based MoE path. It takes rows routed already (`FusedMoE.select_experts`, before any gather or dispatch): `routing_from_dispatched()` sorts their top-k ids into the Triton routing data, with a `gate_valid` mask for rows another rank owns or rows past the real row count, and the expert GEMMs run on that. This path is used for MXFP4 MoE under `ATOM_USE_TRITON_MOE`.
 
 ## Normalization
 
@@ -458,6 +494,34 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 - `greedy_sample()`: `aiter.ops.triton.topk.topk(logits, 1)`
 - `random_sample()`: `aiter.ops.triton.softmax.softmax(logits)` followed by exponential sampling and `topk`.
 
+### Required channel (`required_channel.py`)
+
+Holds a request with a `RequiredChannel` (`atom/sampling_params.py`; today only
+Kimi-K3 under `tool_choice="required"`) to its tools channel by masking the
+target logits before any sampler reads them. Until the channel opens, the end
+ids (the format's own plus the engine's EOS and `stop_token_ids`) are `-inf`;
+once the output ends with `after` (K3: `<|close|>response<|sep|>`), each next
+row keeps only the forced id of `opening`. The channel is open once `opening`
+is written, or once the model writes `opening[:opens_at]` itself (K3:
+`<|open|>tools<|sep|>`); the state is then `UNCONSTRAINED` and the request
+costs nothing more.
+
+- `constrain_logits` masks a step's rows in place: plain decode and prefill
+  rows by the request's state, verification rows as if the drafts before them
+  were accepted, and the bonus row after every draft. A mismatching draft is
+  therefore rejected by the ordinary rejection sampler.
+- `advance_states` folds the step's emitted ids into each state on the GPU, so
+  a deferred-output step reads its predecessor's states through `decode_src`
+  before the host has seen those ids.
+
+`constrain_logits` runs `VOCAB_PROGRAMS` (16) programs per request, each
+writing every 16th 1,024-column block of a forced row without reading it;
+`advance_states` runs one per request. On MI355X over K3's vocabulary a step
+with no forced row costs what one program per request did (5-7 us for a
+DSpark7 verify step at bs 1-64), and one with all seven draft rows forced
+15-52 us. A batch with no unopened channel launches neither kernel. `constrain_logits_reference` / `advance_states_reference` are
+the pure-torch twins the tests hold the kernels to.
+
 ### `RejectionSampler` (`rejection_sampler.py`)
 
 Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
@@ -500,12 +564,13 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `attention_mha.py` | MHA implementation: prefill (flash), decode (ASM/Triton paged attention) |
 | `attention_mla.py` | `MLAAttention`, `MLAModules` — DeepSeek MLA with compressed KV |
 | `moe.py` | `FusedMoE`, `FusedMoEParallelConfig`, `UnquantizedFusedMoEMethod`, `Fp8MoEMethod`, `Mxfp4MoEMethod`, `CompressedTensorsFp8MoEMethod` |
-| `fused_moe_triton.py` | `triton_kernel_moe_forward` — Triton MoE via `triton_kernels` library |
+| `fused_moe_triton.py` | `triton_kernel_fused_experts` — Triton MoE experts on rows routed already (`routing_from_dispatched`) |
 | `embed_head.py` | `VocabParallelEmbedding`, `ParallelLMHead` |
 | `rotary_embedding.py` | `RotaryEmbedding`, `get_rope` |
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
+| `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |
 
@@ -562,6 +627,7 @@ positions are ragged, and the one-token decode slot mapping comes from
 | `config.py` | `FusedMoEConfig`, `FusedMoEQuantConfig`, `FusedMoEQuantDesc`, `GroupShape`, factory functions (`fp8_w8a8_moe_quant_config`, `mxfp4_w4a16_moe_quant_config`) |
 | `modular_kernel.py` | `FusedMoEModularKernel`, `FusedMoEPrepareAndFinalize`, `ExpertTokensMetadata` — modular MoE kernel pipeline |
 | `mori_prepare_finalize.py` | `MoriPrepareAndFinalize` — MORI all-to-all dispatch/combine for expert parallelism |
+| `routed_rows.py` | `RoutedRowsWire`, `resolve_routed_rows_wire` — the format routed rows travel in across a dispatch or a DP / PCP gather |
 | `utils.py` | MoE utility functions |
 
 ### `atom/utils/`

@@ -20,6 +20,8 @@ def _hash(spec=None):
         index_cache_dtype="fp4",
         enable_decoder_swa_bounded_replay=True,
         hf_config=SimpleNamespace(),
+        max_model_len=4096,
+        max_num_seqs=256,
         speculative_config=spec,
     )
     return Config.compute_hash(cfg)

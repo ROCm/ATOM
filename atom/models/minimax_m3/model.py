@@ -7,10 +7,12 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon_supports_arch
 from aiter.rotary_embedding import get_rope
 from torch import nn
 from transformers import PretrainedConfig
@@ -19,7 +21,12 @@ from atom.config import Config, QuantizationConfig
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
-from atom.model_ops.base_attention import Attention
+from atom.model_ops.base_attention import (
+    Attention,
+    _flydsl_arch_supported,
+    _flydsl_explicit_plan_api,
+    _flydsl_plan_max_batch,
+)
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import (
     GemmaRMSNorm,
@@ -32,6 +39,7 @@ from atom.model_ops.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
@@ -47,7 +55,9 @@ from atom.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.region_graph import token_graph
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -69,6 +79,42 @@ def _sparse_attention_layer_ordinals(config: PretrainedConfig) -> dict[int, int]
         layer_id: ordinal
         for ordinal, layer_id in enumerate(sorted(_sparse_attention_layer_ids(config)))
     }
+
+
+def _validate_sparse_flydsl_config(
+    atom_config: Config, config: PretrainedConfig
+) -> None:
+    """Reject gfx1250 M3 sparse PA configurations that cannot be served."""
+    if not _sparse_attention_layer_ids(config) or pa_decode_gluon_supports_arch():
+        return
+    if not envs.ATOM_PA_FLYDSL:
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention on this GPU requires "
+            "ATOM_PA_FLYDSL=1 because there is no gluon fallback"
+        )
+    if not _flydsl_arch_supported():
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention requires a GPU supported by "
+            "aiter's FlyDSL paged decode because there is no gluon fallback"
+        )
+    if not _flydsl_explicit_plan_api():
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
+            "explicit-plan API (#5809) because there is no gluon fallback"
+        )
+    tp_size = get_tensor_model_parallel_world_size()
+    local_kv_heads = max(1, int(config.num_key_value_heads) // tp_size)
+    max_tokens = int(atom_config.max_num_batched_tokens)
+    max_rows = max_tokens * local_kv_heads
+    plan_limit = _flydsl_plan_max_batch()
+    if max_rows > plan_limit:
+        raise ValueError(
+            "MiniMax-M3 sparse paged attention can schedule at most "
+            f"{plan_limit} FlyDSL rows, but max_num_batched_tokens "
+            f"({max_tokens}) * local num_kv_heads ({local_kv_heads}) "
+            f"= {max_rows}; lower --max-num-batched-tokens to at most "
+            f"{plan_limit // local_kv_heads}"
+        )
 
 
 def _should_skip_minimax_m3_index_topk(
@@ -197,14 +243,19 @@ class MiniMaxM3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        hidden_act: str | None = None,
     ) -> None:
         super().__init__()
+        # An MXFP4 down_proj cannot take an unaligned K (its per-rank
+        # intermediate); the pair pads it together. See mxfp4_k_pad_align.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -213,10 +264,12 @@ class MiniMaxM3MLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
-        if config.hidden_act != "swigluoai":
+        hidden_act = hidden_act or config.hidden_act
+        if hidden_act != "swigluoai":
             raise ValueError(
-                f"Unsupported MiniMax-M3 activation {config.hidden_act!r}; "
+                f"Unsupported MiniMax-M3 activation {hidden_act!r}; "
                 "expected 'swigluoai'."
             )
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
@@ -674,7 +727,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
+    @staticmethod
+    def aux_hidden_state(output: tuple) -> torch.Tensor:
+        """This layer's output as a DSpark draft reads it: the residual stream
+        after the layer, ``hidden + residual``.
 
+        ``hidden`` is TP-partial -- o_proj and the FFN skip their all-reduce,
+        which the next layer's fused all-reduce RMSNorm performs -- so it is
+        reduced here first. That costs one all-reduce per tapped layer per
+        target forward, only when a DSpark drafter taps this layer.
+        """
+        hidden_states, residual = output[0], output[1]
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states + residual
+
+
+@token_graph
 @support_torch_compile
 class MiniMaxM3Model(nn.Module):
     def __init__(
@@ -685,6 +754,7 @@ class MiniMaxM3Model(nn.Module):
     ) -> None:
         super().__init__()
         config = _get_text_config(atom_config.hf_config)
+        _validate_sparse_flydsl_config(atom_config, config)
         self.config = config
         cache_config = atom_config.kv_cache_dtype
         index_cache_config = atom_config.index_cache_dtype
@@ -822,6 +892,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.model.make_empty_intermediate_tensors
         )
         self._mono = MonoDecode(self, atom_config)
+        # Set by a VL model with a vision tower: its compiled MiniMaxM3Model is
+        # captured once, so it must always see inputs_embeds -- a text-only
+        # capture would replay without them and drop the image embeddings.
+        self.embed_before_model = False
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -831,6 +905,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
+
+    def bind_mono_drafter(self, drafter) -> None:
+        self._mono.bind_drafter(drafter)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         """Default Eagle3 aux hidden-state layer ids: early / middle / late of
@@ -854,6 +931,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             input_ids, positions, intermediate_tensors, inputs_embeds
         ):
             return self._mono.forward(input_ids, positions)
+        if self.embed_before_model and inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -914,6 +993,9 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.language_model.set_aux_hidden_state_layers(layers)
 
+    def bind_mono_drafter(self, drafter) -> None:
+        self.language_model.bind_mono_drafter(drafter)
+
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return self.language_model.get_eagle3_aux_hidden_state_layers()
 
@@ -940,9 +1022,8 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
         return self.language_model.get_expert_mapping()
 
 
-# Native full VL support will be wired after the MiniMax-M3 vision tower is
-# ported to ATOM.  Keep the architecture name available as a text-only fallback
-# so checkpoints with the VL arch can start loading during language bring-up.
+# The plugin entry points (vLLM/SGLang) bring their own vision stacks and keep
+# the text-only view; native ATOM serving selects the VL class directly.
 MiniMaxM3SparseForConditionalGeneration = (
     MiniMaxM3SparseForConditionalGenerationTextOnly
 )

@@ -245,6 +245,7 @@ class ChatCompletionRequest(BaseModel):
     stop: list[str] | None = None
     ignore_eos: bool | None = False
     stream: bool | None = False
+    stream_options: dict[str, Any] | None = None
     seed: int | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     # Tool calling
@@ -394,6 +395,12 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "atom"
+    name: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    input_modalities: list[str] | None = None
+    output_modalities: list[str] | None = None
+    effort: dict[str, Any] | None = None
 
 
 class ModelList(BaseModel):

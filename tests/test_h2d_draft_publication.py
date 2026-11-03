@@ -34,7 +34,7 @@ def make_runner(
     runner.drafter = SimpleNamespace(mtp_k=num_spec, runner=runner)
     runner.forward_vars = {
         name: CpuGpuBuffer(32, dtype=torch.int32, device=runner.device)
-        for name in ("input_ids", "decode_src")
+        for name in ("input_ids", "decode_src", "batch_info")
     }
     runner.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
         4, dtype=torch.int32, device=runner.device, publication_group="draft_anchors"

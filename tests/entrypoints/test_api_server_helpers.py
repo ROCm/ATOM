@@ -144,6 +144,21 @@ def _boom(*_args, **_kwargs):
     raise RuntimeError("boom")
 
 
+@pytest.mark.parametrize("state,expected", [(None, 503), (False, 503), (True, 200)])
+def test_health_reports_worker_readiness(monkeypatch, state, expected):
+    from fastapi.testclient import TestClient
+
+    value = (
+        None
+        if state is None
+        else SimpleNamespace(core_mgr=SimpleNamespace(is_healthy=lambda: state))
+    )
+    monkeypatch.setattr(api_server, "engine", value)
+    # No lifespan: this test supplies the engine and does not load a model.
+    response = TestClient(api_server.app).get("/health")
+    assert response.status_code == expected
+
+
 class TestMultimodalInputs:
     @pytest.mark.parametrize(
         "part",
@@ -328,6 +343,20 @@ class TestDPSessionAffinityHeaders:
             "child",
             "parent",
         )
+
+    def test_mlperf_session_id_header(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-session-id": "conv", "x-correlation-id": "fallback"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("conv", None)
+
+    def test_dynamo_session_id_wins_over_session_id(self, monkeypatch):
+        monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "1")
+        request = SimpleNamespace(
+            headers={"x-dynamo-session-id": "child", "x-session-id": "conv"}
+        )
+        assert api_server._get_dp_session_affinity_ids(request) == ("child", None)
 
     def test_correlation_id_is_session_fallback(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_SESSION_AFFINITY", "true")
@@ -815,3 +844,88 @@ class TestTheCensusEndpointKeepsTheLoopFree:
             )
 
         assert asyncio.run(call()) == [False, False], "two walks ran at once"
+
+
+def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
+    events = []
+    loop_thread = threading.get_ident()
+
+    def initialize():
+        assert threading.get_ident() != loop_thread
+        events.append("initialize")
+
+    for name in (
+        "tune_gc",
+        "maybe_attach_gc_debug_callback",
+        "freeze_gc_heap",
+        "arm_reclaim_watch",
+    ):
+        monkeypatch.setattr(api_server, name, lambda *a, **k: None)
+    monkeypatch.setattr(api_server, "engine", None)
+    monkeypatch.setattr(api_server, "initialize_tracing", initialize)
+    monkeypatch.setattr(
+        api_server, "shutdown_tracing", lambda: events.append("shutdown")
+    )
+
+    async def drive():
+        async with api_server.lifespan(api_server.app):
+            assert events == ["initialize"]
+            events.append("serving")
+
+    asyncio.run(drive())
+    assert events == ["initialize", "serving", "shutdown"]
+
+
+class TestDeploymentDefaultOutputCap:
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_small_deployment_distinguishes_default_from_explicit(
+        self, monkeypatch, explicit
+    ):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(
+            api_server, "_get_engine_config", lambda: NS(max_model_len=4096)
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        kwargs = {
+            "temperature": 1.0,
+            "max_tokens": 8192,
+            "stop_strings": None,
+            "ignore_eos": False,
+            "max_tokens_is_default": not explicit,
+        }
+        if explicit:
+            with pytest.raises(ValueError, match="max_tokens must be <= 4096"):
+                api_server._build_sampling_params(**kwargs)
+            return
+        sampling = api_server._build_sampling_params(**kwargs)
+        assert sampling.max_tokens == 4096
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        monkeypatch.setattr(api_server, "_get_engine_max_pool_tokens", lambda: None)
+        seq = NS(num_prompt_tokens=100, max_tokens=sampling.max_tokens)
+        api_server._validate_sequence_context_length(seq, sampling)
+        assert seq.max_tokens == 3996
+
+    @pytest.mark.parametrize("prompt", [4096, 4097])
+    def test_full_prompt_is_not_given_zero_or_negative_output(
+        self, monkeypatch, prompt
+    ):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        with pytest.raises(ValueError, match="no context space"):
+            api_server._validate_sequence_context_length(
+                NS(num_prompt_tokens=prompt, max_tokens=4096),
+                NS(max_tokens_is_default=True),
+            )
+
+    def test_explicit_cap_is_not_silently_reduced_after_tokenization(self, monkeypatch):
+        from types import SimpleNamespace as NS
+
+        monkeypatch.setattr(api_server, "_get_engine_max_model_len", lambda: 4096)
+        seq = NS(num_prompt_tokens=4000, max_tokens=512)
+        with pytest.raises(ValueError, match="maximum context length"):
+            api_server._validate_sequence_context_length(
+                seq, NS(max_tokens_is_default=False)
+            )
+        assert seq.max_tokens == 512

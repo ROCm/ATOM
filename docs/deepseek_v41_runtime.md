@@ -84,9 +84,12 @@ arithmetic (E2M1, one E8M0 per 32 dims) in the row-group scorer's page-8
 layout, values and scales in two planes (`index_plane.py`); one aiter kernel
 norms, rotates, quantizes and stores a key, bit for bit the FP8 path's key
 chain before its quantization. The main pool is independent of it and takes
-`kv_cache_dtype="bf16"` or `"fp4"`; under FP4, main rows use their own format
-and SWA uses FP8. Both use the original V4 BF16 attention kernels and inverse
-RoPE; no V4 file is modified to serve V4.1.
+`kv_cache_dtype="fp8"` (the deployed configuration), `"bf16"` or `"fp4"`.
+Under FP8, main and SWA rows are MXFP8 (E4M3, one E8M0 per 32 dims) and
+attention runs on them through AITER's `mla_sparse_prefill_v41`; under FP4,
+main rows use their own format and SWA uses FP8. BF16 and FP4 use the original
+V4 BF16 attention kernels and inverse RoPE; no V4 file is modified to serve
+V4.1.
 
 Each plane format has one scorer, for every shape. It reads the plane in place and
 gives each query row its own bound and its own tile list, so a prefill token, a
@@ -113,8 +116,8 @@ with `enforce_eager=False` and `CompilationConfig(level=0, ...)`:
   it. The scorer reads its bounds off the device, so there is nothing here for
   a capture to freeze. Prefill stays eager -- the runner only ever captures
   decode shapes.
-- `cudagraph_mode=CUDAGraphMode.PIECEWISE` records the compiled dense pieces
-  and leaves attention eager between them.
+- `cudagraph_mode=CUDAGraphMode.TR_HYBRID` records the forward as token
+  graphs, attention running eagerly between their segments.
 
 Under either mode a decode forward runs the width the step declares --
 `running_bs` requests and `running_tokens` rows -- rather than the scheduled
@@ -129,15 +132,18 @@ backend to select and no capture exclusion.
 
 See [cache format and graph execution](deepseek_v41_performance.md) for cache
 formats, graph ownership and memory limits. Native five-token DSpark admits
-TP sizes that satisfy model dimension divisibility, with BF16 caches and
-optional target graphs; its draft
+TP sizes that satisfy model dimension divisibility, with FP8 or BF16 caches
+and optional target graphs; its draft
 windows, accepted-prefix state, calibration profile, supported scope and **quality
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
 PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe
 and EPLB — all before loading. Plugin execution is no longer among them: V4.1
 runs on the vLLM plugin backend, described in
-[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units and
+[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units. With
+encoder SWA bounded replay (the default) it moves PAGE alone, and a tier load
+resumes like an HBM hit: the forward replays the hash block below it
+(`BlockManager.tier_resume_replays`). With `--no-encoder-swa-bounded-replay` it
 restores STATE through the same PAGE-backed checkpoint images the local prefix
 cache uses (`get_kv_transfer_tensors` publishes each plane of a unit, in
 `StateCopies` order).
@@ -162,13 +168,14 @@ the CPU; moving the lookup to HBM and fusing it further is future work.
 `--tensor-parallel-size 4 --enable-dp-attention` starts four attention ranks,
 each with TP1 attention, embeddings and output head. Tensor-sharded routed
 experts exchange activations through the existing DP gather/scatter transport.
-For five-token DSpark, keep BF16 KV and the FP8 index plane:
+For five-token DSpark, use the FP8 KV cache (BF16 also works) and the FP4 or
+FP8 index plane:
 
 ```bash
 HIP_VISIBLE_DEVICES=0,1,2,3 python -m atom.entrypoints.openai_server \
   --model /mnt/DeepSeek-V4.1-Flash \
   --tensor-parallel-size 4 --enable-dp-attention \
-  --kv-cache-dtype bf16 --index-cache-dtype fp8 \
+  --kv-cache-dtype fp8 --index-cache-dtype fp4 \
   --method dspark --num-speculative-tokens 5 \
   --level 3 --cudagraph-mode FULL \
   --max-num-seqs 64 --max-num-batched-tokens 16384 \
@@ -301,8 +308,8 @@ row at position `i` reads `[max(s, i - W + 1), i]`, `s` the tail's first
 position. A forward that does not finish its prompt
 (`ScheduledBatch.is_final_chunk`) runs nothing past the encoder but layer 20's
 compression: no kernel of the decoder's attention or FFN -- except under DP
-attention, where, while another rank has decoder work, it runs the decoder on
-one placeholder row so every MoE collective has all ranks (see below). Layer 39's queries
+attention, where, while another rank runs the decoder, it runs the decoder on
+its tail of padding so every MoE collective has all ranks (see below). Layer 39's queries
 are fewer than its KV rows (`QueryRows`): the rows are gathered in one launch
 (`token_layout.gather_rows`), the index lists built over all KV rows with every
 other row's batch id -1, so the queries' lists come out adjacent, and attention
@@ -330,22 +337,34 @@ With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
 as one graph (`runtime._Backbone`), as before. Otherwise layers 0..19 and
 21..38 are two graphs (`_EarlyLayers`, `_LateLayers`, each with its own
 compile-cache key) and layers 20 and 39 run between and after them, where a
-replay cuts their rows. Decode, warmup, draft, TBO-split and padded steps run
-every layer on every row.
+replay cuts their rows. Decode, warmup, draft and TBO-split steps run every
+layer on every row.
+
+The tail is a request bucket. The backend lays it out for the step's
+`running_bs` requests, `W` rows each (`bounded_replay.tail_width`, within the
+token buffer): the finishing requests' rows first, then zero-length padding
+requests and rows no request owns, which repeat a real row
+(`lay_out_tail`, `DeepseekV41MetadataBuilder._publish_decoder`). Every step of
+a `running_bs` publishes at the same addresses, so the decoder -- layer 20's
+attention and FFN through layer 39 -- records once per bucket as a `ReqGraph`
+(`decoder_graph.DecoderGraph`, at `ATOM_DECODER_GRAPH_SIZES`) and replays
+with no Python; any other `running_bs`, a step with image rows, an FP8 index
+plane, or a decoder reading a selection carried off the encoder runs the same
+layout eagerly. The runner records the buckets after the token graphs
+(`ModelRunner._record_prefill_req_graphs`).
 
 Under DP attention a prefill replays too. The decoder's MoE collectives are
-sized by every rank's token count, which a tail changes, so each rank decides
-from its batch (`bounded_replay.replays_batch`) and reports its decoder and
-layer-39 token counts in the step's one packed DP sync
-(`AttentionMetadataBuilder.dp_stage_report` -> `sync_dp_metadata`). The
-group's per-stage `DPMetadata` is built with the forward context
-(`ForwardContext.dp_stages`), and each stage runs under its own
-(`ForwardContext.use_dp_stage`, `bounded_replay.run_decoder_stages`). A rank
-that does not replay runs all its rows under the same tables; one with no tail
-joins on one placeholder row while any rank has decoder work, and when none
-has every rank skips the decoder. The forward checks it runs the counts its
-rank reported. After a replay only each finishing request's last row of
-the model output is defined; the LM head reads only those.
+sized by every rank's rows, which a tail changes. `running_bs` is the group's,
+so every prefilling rank runs the same tail width and request count, and a rank
+still decoding runs its own rows: each derives that table from the step's one
+packed DP sync, which carries every rank's prefill flag and the requests whose
+prompt it finishes (`sync_dp_metadata`), and runs each stage under it
+(`bounded_replay.decoder_stages`, `run_decoder_stages`,
+`ForwardContext.use_dp_stage`). While any rank runs the decoder -- one finishing
+a prompt, or one still decoding -- a rank finishing none runs it on its tail of
+padding (a recording of its own under DP); when none does, every rank skips
+it. After a replay only each finishing request's last row of the model output
+is defined; the LM head reads only those.
 
 Accuracy: this is not a full prefill. In every decoder layer the tail's rows
 see a window truncated at the tail start, so from layer 21 on even the last

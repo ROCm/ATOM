@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.blockscale_kernels.quantization import (
+    AMAX_FLOOR,
     FP8_DTYPE,
     FP8_MAX,
     FP8_TL_DTYPE,
@@ -365,7 +366,7 @@ def _fused_draft_kv_tail_kernel(
     # quantize_fp8's group-32 ue8m0 ceil scale, sharing its exponent helper so
     # the two cannot drift. The reshape is free: `offs` already runs group-major.
     groups = tl.reshape(y, (GROUPS, 32))
-    amax = tl.maximum(tl.max(tl.abs(groups), 1), 1e-4)
+    amax = tl.maximum(tl.max(tl.abs(groups), 1), AMAX_FLOOR)
     code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
     scale = (code << 23).to(tl.float32, bitcast=True)
     q = tl.minimum(tl.maximum(groups / scale[:, None], -FP8_MAX), FP8_MAX).to(

@@ -7,11 +7,15 @@ from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 from torch import nn
 
+from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    sparse_attn_v41_paged_2src,
+)
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
 from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
+from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import (
     quantize_query_fp4,
@@ -28,10 +32,24 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.utils import atom_parameter
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.utils.forward_context import side_stream
+from atom.utils import forward_context
+from atom.utils.region_graph import eager_region, forks, join_stream
 
 from .config import AttentionMode
 from .layers import native_quant_config
+
+
+def _live_step():
+    """The step a replayed region serves: the live forward's, not the one
+    its graph recorded."""
+    metadata = forward_context.get_forward_context().attn_metadata
+    return {"cache": metadata.cache, "step": metadata.step}
+
+
+def _live_rows():
+    """`_live_step` plus bounded replay's query rows."""
+    metadata = forward_context.get_forward_context().attn_metadata
+    return {**_live_step(), "queries": metadata.queries}
 
 
 class Indexer(nn.Module):
@@ -242,7 +260,10 @@ class Attention(nn.Module):
         # Both latents are slices of the one `wqkv_a` output and neither norm
         # reads the other's result, so they are one launch rather than two.
         self.qk_norm = DualRMSNormMXFP8(
-            self.q_norm, self.kv_norm, f"layers.{spec.layer_id}.qk_norm"
+            self.q_norm,
+            self.kv_norm,
+            f"layers.{spec.layer_id}.qk_norm",
+            amax_floor=AMAX_FLOOR.value,
         )
         # wo_a: grouped LoRA, FP8 + 32x32 e8m0 block scale. Allocated as a
         # quantized ColumnParallelLinear so both tensors load through the
@@ -281,9 +302,15 @@ class Attention(nn.Module):
         The cache owns where the main latent lands; what comes back is the
         unrotated latent, which is all the index key needs. A step without a
         compress plan is some rows of a forward whose compression ran over
-        all of them (bounded replay): nothing to do.
+        all of them (bounded replay), and one without requests an idle rank's
+        dummy prefill: nothing to do.
         """
-        if not self.spec.ratio or self.compressor is None or not step.plans:
+        if (
+            not self.spec.ratio
+            or self.compressor is None
+            or not step.plans
+            or not step.requests
+        ):
             return
         owner = self.spec.kv_owner
         values, scores = self.compressor.project(hidden)
@@ -338,9 +365,14 @@ class Attention(nn.Module):
 
         Reports whether it forked, which is all `_fork_select` needs to know.
         """
-        with side_stream(self.compress_stream) as (_, joins):
-            self._compress_batch(hidden, cache, step, rope)
-        return joins is not None
+        self._compress(hidden, cache, step, rope)
+        return forks(self.compress_stream)
+
+    @eager_region(stream=lambda self: self.compress_stream, live=_live_step)
+    def _compress(self, hidden, cache, step, rope):
+        """`_compress_batch` as a TR-graph break: its launches are sized by
+        the boundaries the batch crosses, not by its token count."""
+        self._compress_batch(hidden, cache, step, rope)
 
     def _fork_select(self, hidden, qr, qr_scale, cache, step, rope, *, compressed):
         """The scorer, and the compressor's join, wherever those two run.
@@ -348,29 +380,36 @@ class Attention(nn.Module):
         Moving the indexer off the main stream buys nothing by itself; what it
         buys is the other side, where the query projection and the fused
         rope/window launch stop being in front of it. Where it is not forked,
-        `scorer` is the main stream and the wait below is that stream's join
+        the scorer runs on the main stream and its wait is that stream's join
         with the compressor -- the same edge, drawn on one stream fewer.
 
-        Returns the stream to join on, `None` when nothing was forked. Both
-        waits are lines here: the projections cannot precede `qk_norm`, the
-        scorer cannot precede the compressor's index row.
+        Both waits are lines here: the projections cannot precede `qk_norm`,
+        the scorer cannot precede the compressor's index row.
         """
-        if self.indexer is None:
-            return None
-        with side_stream(self.index_stream) as (scorer, joins):
-            projected = self.indexer.project(hidden, qr, qr_scale, cache, step, rope)
-            if compressed:
-                scorer.wait_stream(self.compress_stream)
-            self.indexer.score(*projected, cache, step)
-        return joins
+        if self.indexer is not None:
+            self._select(hidden, qr, qr_scale, cache, step, rope, compressed)
 
-    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+    @eager_region(stream=lambda self: self.index_stream, live=_live_step)
+    def _select(self, hidden, qr, qr_scale, cache, step, rope, compressed: bool):
+        """The indexer as a TR-graph break: its bands follow the context."""
+        if not step.requests:  # a dummy prefill on a token graph
+            return
+        projected = self.indexer.project(hidden, qr, qr_scale, cache, step, rope)
+        if compressed:
+            torch.cuda.current_stream().wait_stream(self.compress_stream)
+        self.indexer.score(*projected, cache, step)
+
+    def forward(
+        self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
+    ):
         """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
         layer is asked outputs for; KV is still every row's."""
         compressed = self._fork_compress(hidden, cache, step, rope)
-        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
+        q_lora, kv_pre = self.project_qkv(
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
-        selecting = self._fork_select(
+        self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
         if queries is not None:
@@ -380,27 +419,50 @@ class Attention(nn.Module):
         )
         # One launch for both rotations, the KV row's FP8 bytes and, where a
         # decode allows it, the window write. `window_kv` is what is left for
-        # `write_window` below, which is nothing when that fold happened.
+        # `write_window` below, which is nothing when that fold happened. The
+        # FP8 pool's attention reads the query as MXFP8 (`query_fp8`).
+        query_fp8 = cache.query_fp8(query)
         if queries is None:
             kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, query, kv_normed, rope, step
+                self.spec.layer_id, query, kv_normed, rope, step, query_fp8
             )
         else:
             kv, window_kv = cache.rope_quant_window(
                 self.spec.layer_id, None, kv_normed, rope, step
             )
-            cache.rotate_query(query, rope, queries.positions)
-        # A forked compressor is already inside this join, having been waited
-        # at the scorer; where the scorer itself was not forked it waited on
-        # the main stream instead and there is nothing left to join here.
-        if selecting is not None:
-            selecting.wait_stream(self.index_stream)
+            cache.rotate_query(query, rope, queries.positions, query_fp8)
+        # A forked compressor was already waited at the scorer; it is named
+        # too because a TR recording holds every forked stream until it is
+        # joined -- with or without a forked scorer (`ATOM_DSV41_SIDE_STREAMS`
+        # 1 forks the compressor alone).
+        join_stream(self.index_stream, self.compress_stream)
+        output = self._attend(query, query_fp8, kv, window_kv, cache, step, queries)
+        return self._project_out(
+            output.view_as(query),
+            rope,
+            cache.rope_positions(step) if queries is None else queries.positions,
+        )
+
+    @eager_region(live=_live_rows)
+    def _attend(self, query, query_fp8, kv, window_kv, cache, step, queries):
+        """Indices, sparse attention and the window write: the TR-graph break
+        whose launches follow each request's query length and context. The
+        result is written over ``query`` in place wherever the kernel takes
+        ``out=``. The FP8 pool attends with ``query_fp8``, its MXFP8 copy."""
+        if not step.requests:  # a dummy prefill on a token graph
+            return query
         prefix, prefix_indptr, second, second_indptr = (
             cache.attention_indices(self.spec, step)
             if queries is None
             else queries.indices(cache, self.spec)
         )
         flat_query = query.flatten(0, 1)
+        if cache.kv_fp8:
+            attend = sparse_attn_v41_paged_2src
+            attending = tuple(part.flatten(0, 1) for part in query_fp8)
+        else:
+            attend = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
+            attending = flat_query
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
             if cache.packed:
@@ -415,8 +477,8 @@ class Attention(nn.Module):
             else:
                 # The window, this step's rows included, is read through the
                 # ring: the second source, beside the selection in the pool.
-                output = sparse_attn_v4_paged_2src(
-                    flat_query,
+                output = attend(
+                    attending,
                     cache.pool,
                     prefix,
                     prefix_indptr,
@@ -428,13 +490,12 @@ class Attention(nn.Module):
                     out=flat_query,
                 )
         else:
-            prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
-            output = prefill(
-                flat_query,
+            output = attend(
+                attending,
                 cache.pool,
                 prefix,
                 prefix_indptr,
-                kv.flatten(0, 1),
+                kv.flatten(0, -2),
                 second,
                 second_indptr,
                 self.attn_sink,
@@ -443,8 +504,4 @@ class Attention(nn.Module):
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        return self._project_out(
-            output.view_as(query),
-            rope,
-            cache.rope_positions(step) if queries is None else queries.positions,
-        )
+        return output

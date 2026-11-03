@@ -14,11 +14,11 @@ the memory a colocated trainer sleeps the rollout engine to reclaim.
 Either release invalidates the graphs, including the KV-only one that
 `sleep(level=1)` performs.
 
-"the graphs" is four stores, not one. `runner.graphs` is the manual
-whole-forward capture; PIECEWISE -- `--level 3`, the default -- fills only the
-per-piece wrappers, TBO keeps a parallel entry per shape, and the drafter holds
-a recording per warmed batch. Each is asked separately below, because a gate
-they shared is what left three of them behind.
+"the graphs" is several stores, not one. `runner.req_graph` is the
+whole-forward capture's request buckets; TR_HYBRID -- `--level 3`, the default
+-- fills only the per-piece wrappers, the drafter holds a recording per warmed
+batch, and prefill holds its token buckets. Each is asked separately below,
+because a gate they shared is what left the others behind.
 """
 
 from types import SimpleNamespace
@@ -37,6 +37,21 @@ from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.utils.graph_holders import register_graph_holder
 
 
+class _Buckets:
+    """A `ReqGraph` as the release sees it: its buckets, and their release."""
+
+    def __init__(self, *keys):
+        self._keys = dict.fromkeys(keys)
+
+    def keys(self):
+        return self._keys.keys()
+
+    def release_graphs(self):
+        dropped = len(self._keys)
+        self._keys.clear()
+        return dropped
+
+
 class _Runner(MemoryManagerMixin):
     """The surface `MemoryManagerMixin` documents, and nothing else."""
 
@@ -53,8 +68,7 @@ class _Runner(MemoryManagerMixin):
         )
         self.model = nn.Linear(4, 4, bias=False)
         self.kv_cache = torch.zeros(8)
-        self.graphs = {1: object(), 2: object()} if with_graphs else {}
-        self.graph_pool = object()
+        self.req_graph = _Buckets(1, 2) if with_graphs else _Buckets()
         self.tokenID_processor = SimpleNamespace(clean=lambda: None)
         self.allocated_blocks = []
         self.captures = 0
@@ -103,7 +117,7 @@ def test_default_still_releases_everything_outside_eager_mode():
     assert runner.model.weight.numel() == 0
     assert runner.kv_cache is None
     assert runner._kv_cache_num_blocks == 7
-    assert runner.graphs == {}
+    assert not runner.req_graph.keys()
     assert runner._graphs_backup_keys == [1, 2]
 
 
@@ -118,7 +132,7 @@ def test_resident_sleep_moves_no_weight_and_frees_no_pool():
     assert runner.kv_cache is pool
     # Not recorded, because nothing has to be re-allocated on wake.
     assert not hasattr(runner, "_kv_cache_num_blocks")
-    assert runner.graphs.keys() == {1, 2}
+    assert runner.req_graph.keys() == {1, 2}
     assert not hasattr(runner, "_graphs_backup_keys")
 
 
@@ -268,7 +282,7 @@ def test_releasing_only_the_kv_pool_still_invalidates_the_graphs():
 
     runner.release_memory(tags=["kv_cache"])
 
-    assert runner.graphs == {}
+    assert not runner.req_graph.keys()
     assert runner._graphs_backup_keys == [1, 2]
 
     # The weights never left the device on a level-1 sleep.
@@ -288,7 +302,7 @@ def test_resident_sleep_keeps_the_graphs_on_a_kv_only_release():
     runner.resume_memory(tags=["kv_cache"])
 
     assert runner.kv_cache is pool
-    assert runner.graphs.keys() == {1, 2}
+    assert runner.req_graph.keys() == {1, 2}
     assert runner.captures == 0
 
 
@@ -302,7 +316,7 @@ def test_resident_wake_has_nothing_to_recapture():
     runner._recapture_cudagraphs_if_needed()
 
     assert runner.captures == 0
-    assert runner.graphs.keys() == {1, 2}
+    assert runner.req_graph.keys() == {1, 2}
 
 
 def test_option_is_inert_under_enforce_eager():
@@ -345,98 +359,14 @@ def test_a_host_without_the_config_field_releases():
     assert sleep_keeps_memory_resident(runner) is False
 
 
-# ── the TBO graph store ───────────────────────────────────────────────────
+# ── the token graphs, which TR_HYBRID fills ──────────────────────────────
 
 
-def _with_tbo(runner, graphs=(("bs", "q"),)):
-    """`UBatchWrapper` keeps a second store beside `runner.graphs`, holding each
-    graph, its per-ubatch contexts and the output tensor it captured.
-
-    Hung on the real model rather than a stand-in, because the release path
-    walks it for parameters and KV views on the way past.
-    """
-    runner.model.tbo_graphs = {key: object() for key in graphs}
-    return runner.model.tbo_graphs
-
-
-@pytest.mark.parametrize("tags", [None, ["kv_cache"]])
-def test_a_release_clears_the_tbo_graphs_too(tags):
-    """`ModelRunner.exit()` clears both stores; a release for sleep has to
-    clear the same two. Left behind, the entry pins the graph's private memory
-    pool -- the footprint the caller went to sleep to reclaim."""
-    runner = _Runner(enforce_eager=False, keep_resident=False)
-    tbo_graphs = _with_tbo(runner)
-
-    runner.release_memory(**({} if tags is None else {"tags": tags}))
-
-    assert tbo_graphs == {}
-    assert runner.graphs == {}
-
-
-def test_the_tbo_store_is_cleared_even_with_no_plain_graphs():
-    """The early return used to be `not runner.graphs`, which skipped the TBO
-    store along with it."""
-    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
-    tbo_graphs = _with_tbo(runner)
-
-    memory_manager.release_cudagraphs(runner)
-
-    assert tbo_graphs == {}
-
-
-def test_a_resident_sleep_keeps_the_tbo_graphs():
-    runner = _Runner(enforce_eager=False, keep_resident=True)
-    tbo_graphs = _with_tbo(runner)
-
-    runner.release_memory()
-
-    assert tbo_graphs.keys() == {("bs", "q")}
-
-
-def test_a_release_clears_the_captured_logits_too():
-    """`graph_logits` holds the logits tensor each capture produced, allocated
-    from the graph's own pool. Clearing `graphs` stops the replay but leaves
-    that reference, so the pool `empty_cache()` is about to reclaim stays
-    pinned -- the same leak shape as the TBO store."""
-    runner = _Runner(enforce_eager=False, keep_resident=False)
-    runner.graph_logits = {(1, 1): torch.zeros(4)}
-
-    runner.release_memory(tags=["kv_cache"])
-
-    assert runner.graph_logits == {}
-
-
-def test_a_resident_sleep_keeps_the_captured_logits():
-    runner = _Runner(enforce_eager=False, keep_resident=True)
-    runner.graph_logits = {(1, 1): torch.zeros(4)}
-
-    runner.release_memory()
-
-    assert runner.graph_logits.keys() == {(1, 1)}
-
-
-def test_a_host_without_graph_logits_still_releases():
-    """`graph_logits` only exists once `capture_cudagraph` has run, and the
-    mixin's methods are called on stand-ins that provide what they touch."""
-    runner = _Runner(enforce_eager=False, keep_resident=False)
-    assert not hasattr(runner, "graph_logits")
-
-    runner.release_memory(tags=["kv_cache"])
-
-    assert runner.graphs == {}
-
-
-# ── the piecewise store, which is what the default configuration fills ────
-
-
-class _PieceHolder:
-    """Stands in for a `CUDAGraphWrapper`: the graphs of one compiled piece.
-
-    Not the real one: `atom/utils/cuda_graph.py` reaches aiter, which CI has no
-    build of. What the release path depends on is the registration protocol, and
-    the real wrapper's conformance to it is asserted in
-    `tests/test_graph_holders.py`.
-    """
+class _TokenGraphHolder:
+    """Stands in for a module's `TokenGraph`: what the release path depends
+    on is the registration protocol, whose real conformance is asserted in
+    `tests/test_graph_holders.py`. Under TR_HYBRID `runner.req_graph` stays
+    EMPTY -- every bucket's graph lives in the model's token graph instead."""
 
     def __init__(self, graphs=2):
         self.graphs = graphs
@@ -447,44 +377,27 @@ class _PieceHolder:
         return dropped
 
 
-def _with_piecewise(runner, tokens=(128, 256)):
-    """The state a PIECEWISE capture pass leaves behind.
-
-    `runner.graphs` stays EMPTY -- the capture loop moves on before the
-    assignment, every shape's graph living in the per-piece wrappers instead --
-    and the runner's record of which shapes got one is
-    `_piecewise_captured_tokens`. PIECEWISE is `--level 3`, the default, so this
-    is the ordinary case rather than a corner of one.
-    """
-    runner._piecewise_captured_tokens = set(tokens)
-    runner._piecewise_sorted_tokens = sorted(tokens)
-    return _PieceHolder()
-
-
 @pytest.mark.parametrize("tags", [None, ["kv_cache"]])
-def test_a_release_drops_the_graphs_a_piecewise_capture_made(tags):
-    """A gate on `runner.graphs` made the whole release a no-op here, on the
+def test_a_release_drops_the_token_graphs(tags):
+    """A gate on the whole-forward store made the whole release a no-op here, on the
     configuration whose fault it exists to prevent."""
     runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
-    holder = _with_piecewise(runner)
+    holder = _TokenGraphHolder()
 
     runner.release_memory(**({} if tags is None else {"tags": tags}))
 
     assert holder.graphs == 0
-    assert runner._piecewise_captured_tokens == set()
-    # Not bookkeeping: an uncleared record is what would let the next step
-    # dispatch PIECEWISE and replay into the pool this release just freed.
-    assert runner._piecewise_sorted_tokens == []
 
 
-def test_a_piecewise_only_release_still_arranges_the_recapture():
+def test_a_token_graph_only_release_still_arranges_the_recapture():
     """`_graphs_backup_keys` records the manual store and is never set here, so
     keying the wake on it skipped the same configuration the release did."""
     runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
-    _with_piecewise(runner)
+    holder = _TokenGraphHolder()
 
     runner.release_memory(tags=["kv_cache"])
 
+    assert holder.graphs == 0
     assert not hasattr(runner, "_graphs_backup_keys")
     assert runner._graphs_released_for_sleep is True
 
@@ -495,26 +408,13 @@ def test_a_piecewise_only_release_still_arranges_the_recapture():
     assert runner._graphs_released_for_sleep is False
 
 
-def test_a_resident_sleep_keeps_the_piecewise_graphs():
+def test_a_resident_sleep_keeps_the_token_graphs():
     runner = _Runner(enforce_eager=False, keep_resident=True, with_graphs=False)
-    holder = _with_piecewise(runner)
+    holder = _TokenGraphHolder()
 
     runner.release_memory()
 
     assert holder.graphs == 2
-    assert runner._piecewise_captured_tokens == {128, 256}
-
-
-def test_the_captured_logits_are_dropped_with_no_manual_graphs_to_gate_on():
-    """The clear sat behind the gate on `runner.graphs`, so under PIECEWISE the
-    leak it was added for survived the release."""
-    runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
-    runner.graph_logits = {(1, 1): torch.zeros(4)}
-
-    runner.release_memory(tags=["kv_cache"])
-
-    assert runner.graph_logits == {}
-    assert runner._graphs_released_for_sleep is True
 
 
 def test_the_warning_reaches_the_configuration_that_walks_into_the_fault(
@@ -523,11 +423,12 @@ def test_the_warning_reaches_the_configuration_that_walks_into_the_fault(
     """Behind the same gate, and so silent for the same runners."""
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
-    _with_piecewise(runner)
+    holder = _TokenGraphHolder()
 
     with caplog.at_level("WARNING", logger="atom"):
         runner.release_memory(tags=["kv_cache"])
 
+    assert holder.graphs == 0
     assert "sleep_keeps_memory_resident" in caplog.text
 
 
@@ -546,7 +447,7 @@ def test_a_runner_that_captured_nothing_is_told_nothing():
 # ── the drafter's recordings ──────────────────────────────────────────────
 
 
-def _with_draft_graphs(runner, batches=(48,)):
+def _with_draft_graphs(runner, recordings, batches=(48,)):
     """A draft pass holding a recording per batch it was warmed at.
 
     The real `DraftGraph`: it is deliberately importable without a GPU aiter
@@ -554,17 +455,17 @@ def _with_draft_graphs(runner, batches=(48,)):
     """
     pass_ = DraftGraph(forward=lambda bs, **staged: None, inputs={"ids": StagedInput()})
     for bs in batches:
-        pass_._cuda_graphs[bs] = ("graph", "out")
+        recordings.add(bs, "recording")
     runner.drafter = SimpleNamespace(draft_graphs=(pass_,))
     return pass_
 
 
-def test_a_release_drops_the_draft_recordings_too():
+def test_a_release_drops_the_draft_recordings_too(req_graph_recordings):
     """A draft pass WRITES the KV it attends, so its recording holds the base of
     the pool exactly the way a decode graph does -- and `ATOM_DRAFT_CUDAGRAPH`
     is on by default."""
     runner = _Runner(enforce_eager=False, keep_resident=False, with_graphs=False)
-    pass_ = _with_draft_graphs(runner)
+    pass_ = _with_draft_graphs(runner, req_graph_recordings)
 
     runner.release_memory(tags=["kv_cache"])
 
@@ -572,9 +473,9 @@ def test_a_release_drops_the_draft_recordings_too():
     assert runner._graphs_released_for_sleep is True
 
 
-def test_a_resident_sleep_keeps_the_draft_recordings():
+def test_a_resident_sleep_keeps_the_draft_recordings(req_graph_recordings):
     runner = _Runner(enforce_eager=False, keep_resident=True, with_graphs=False)
-    pass_ = _with_draft_graphs(runner)
+    pass_ = _with_draft_graphs(runner, req_graph_recordings)
 
     runner.release_memory()
 
@@ -590,15 +491,6 @@ def test_a_drafter_with_no_recordings_releases_nothing():
     runner.release_memory(tags=["kv_cache"])
 
     assert not getattr(runner, "_graphs_released_for_sleep", False)
-
-
-def test_eager_has_no_tbo_graphs_to_clear():
-    runner = _Runner(enforce_eager=True, keep_resident=False, with_graphs=False)
-    tbo_graphs = _with_tbo(runner)
-
-    memory_manager.release_cudagraphs(runner)
-
-    assert tbo_graphs.keys() == {("bs", "q")}
 
 
 # ── saying so before the fault ────────────────────────────────────────────
@@ -644,7 +536,7 @@ def test_a_failed_recapture_says_the_option_is_now_inert(caplog):
     but it means the option the operator set stops taking effect, and from here
     its log lines never appear again."""
     runner = _Runner(enforce_eager=False, keep_resident=True)
-    runner.graphs = {1: object()}
+    runner.req_graph = _Buckets(1)
     _as_if_released(runner)
     _report_weights_on_device(runner)
 

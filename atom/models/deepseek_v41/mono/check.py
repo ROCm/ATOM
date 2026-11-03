@@ -9,7 +9,10 @@ import torch
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
 
+from atom.model_ops.attentions.deepseek_v41.fp8_attention import dequantize_rows
+from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
 from atom.model_ops.blockscale import quantize_fp8
+from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
 from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.paged_scoring import quantize_query_rows
 from atom.model_ops.deepseek_v41.rope_window import rope_quant_window
@@ -151,6 +154,11 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
     query = attn.wq_b(qr, x_scale=qr_scale).unflatten(-1, (attn.heads, attn.head_dim))
     width = runner.q.shape[1]
     qat = torch.empty(width, attn.head_dim, device=query.device, dtype=query.dtype)
+    # the FP8 pool's row
+    values = torch.empty_like(qat, dtype=FP8_DTYPE)
+    scales = torch.empty(
+        width, attn.head_dim // 32, device=qat.device, dtype=torch.float8_e8m0fnu
+    )
     rope_quant_window(
         query.view(width, attn.heads, attn.head_dim),
         kv_normed.view(width, attn.head_dim),
@@ -159,12 +167,16 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
         step.positions,
         rope_dim=rope.rope_dim,
         qat=qat,
+        values=values,
+        scales=scales,
     )
     rows = (
         runner.ring_rel.long()
         + cache.geometry.window(layer_id, cache.num_pages).ring_start
     )
     ring = cache.pool[rows.clamp_min(0)]
+    if cache.kv_fp8:
+        qat = pack_rows(values, scales)
     parts = [
         _diff("residual", res_out, residual),
         _diff("pre", gates[0], pre),
@@ -226,10 +238,15 @@ def _attention_ref(runner, block, keys, cache):
     heads of a call (``kernels.attention``), and the mono attention keeps that
     call's at every width and TP size. A short last call repeats its last row,
     and a ragged tile's dead heads its last live head, as the mono attention's
-    do."""
+    do. On an FP8 pool the mono attention's QK multiplies the MXFP8 key rows by
+    q quantized to MXFP8, and its PV reads the rows dequantized: the same
+    values as BF16 (exact), so this dequantizes q and a call's key rows (a
+    BF16 pool of their own) and differs from it by the sums' order alone."""
     prefix, indptr = keys
     t = attention_kernel.ORDER_ROWS
     q = runner.q.flatten(0, 1)
+    if cache.kv_fp8:
+        q = quantize_fp8(q, dequantize=True)
     rows, heads = q.shape[:2]
     tiles = runner.dims.head_tiles.count
     padded = torch.arange(tiles * HEAD_TILE, device=q.device).clamp(max=heads - 1)
@@ -243,10 +260,18 @@ def _attention_ref(runner, block, keys, cache):
         ids = torch.cat([prefix[bounds[r] : bounds[r + 1]] for r in picks])
         lens = [bounds[r + 1] - bounds[r] for r in picks]
         ptr = torch.tensor([0] + lens, device=indptr.device).cumsum(0)
+        pool = cache.pool
+        if cache.kv_fp8:
+            dim = q.shape[-1]
+            key_rows = cache.pool[ids.long()]
+            pool = dequantize_rows(
+                key_rows[:, :dim].view(FP8_DTYPE), key_rows[:, dim:]
+            ).bfloat16()
+            ids = torch.arange(ids.numel(), device=ids.device, dtype=ids.dtype)
         call = [
             _sparse_attn_v4_paged_decode_triton(
                 q[picks, h : h + HEAD_TILE].contiguous(),
-                cache.pool,
+                pool,
                 ids,
                 ptr.to(indptr.dtype),
                 sink[h : h + HEAD_TILE].contiguous(),

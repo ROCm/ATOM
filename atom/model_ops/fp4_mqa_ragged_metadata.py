@@ -21,14 +21,17 @@ class Fp4MqaRaggedMetadata(NamedTuple):
     block_tables: torch.Tensor
     pages_per_block: int = 1
 
-    def band(self, start, count, rows):
+    def band(self, start, count, rows, out=None):
         """These sequences over rows [start, start + count) of `rows`: each
-        sequence's rows inside, none for one outside."""
+        sequence's rows inside, none for one outside -- their starts written
+        into `out` when given, a home a captured graph can replay."""
         if count == rows:
             return self
-        return self._replace(
-            query_start_loc=self.query_start_loc.clamp(start, start + count) - start
-        )
+        starts = self.query_start_loc
+        if out is not None:
+            out = out[: starts.shape[0]]
+        starts = torch.clamp(starts, start, start + count, out=out)
+        return self._replace(query_start_loc=starts.sub_(start))
 
     def kernel_args(self, row_ends, *, heads, page_size, max_seq_len):
         """`flydsl_pa_mqa_logits_fp4`'s keyword arguments for these rows, each

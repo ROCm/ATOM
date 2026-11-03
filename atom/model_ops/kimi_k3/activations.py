@@ -349,12 +349,15 @@ def rmsnorm_gated(
     x2 = x2.contiguous()
     y = torch.empty_like(x2)
     BLOCK = triton.next_power_of_2(h)
-    # K3 prefill has many 128-wide rows; grouping them amortizes the otherwise
-    # oversized grid. These thresholds count flattened rows (tokens * heads),
-    # and were measured independently on gfx1250 and gfx950. Keep decode and
-    # the region below the crossover on the original one-row kernel.
-    if is_prefill and h == 128 and m >= _RMSNORM_MULTIROW_MIN_ROWS:
-        is_long = m >= _RMSNORM_MULTIROW_LONG_ROWS
+    # BF16 prefill keeps the same per-head reduction layout at every batch
+    # size. Switching between the one-row and multirow layouts changes FP32
+    # variance reduction and sqrt rounding; a BF16 midpoint can then change
+    # downstream expert selection after a prefix is resumed in a smaller batch.
+    # Reuse the existing eight-row kernel, including for short prefills.
+    # Other dtypes retain the measured flattened-row (tokens * heads) cutoffs.
+    stable_bf16 = x.dtype == torch.bfloat16
+    if is_prefill and h == 128 and (stable_bf16 or m >= _RMSNORM_MULTIROW_MIN_ROWS):
+        is_long = not stable_bf16 and m >= _RMSNORM_MULTIROW_LONG_ROWS
         block_m = (
             _RMSNORM_MULTIROW_LONG_BLOCK_M if is_long else _RMSNORM_MULTIROW_BLOCK_M
         )

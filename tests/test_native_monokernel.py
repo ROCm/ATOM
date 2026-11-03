@@ -190,7 +190,7 @@ def test_peer_buffer_allocation_failure_is_collective(monkeypatch):
         gathers.append((local, group))
         output[:] = [local, (None, (b"peer-handle", 0))]
 
-    monkeypatch.setattr(runtime.torch, "zeros", fail_allocation)
+    monkeypatch.setattr(runtime, "uncached_bytes", fail_allocation)
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     monkeypatch.setattr(
         torch.distributed,
@@ -225,7 +225,7 @@ def test_peer_buffer_remote_open_failure_is_collective(monkeypatch):
     closed = []
     open_calls = []
     monkeypatch.setattr(runtime.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(runtime.torch, "zeros", lambda *_args, **_kwargs: Storage())
+    monkeypatch.setattr(runtime, "uncached_bytes", lambda *_args: Storage())
     monkeypatch.setattr(runtime, "get_allocation_base", lambda _address: 0x1000)
     monkeypatch.setattr(runtime, "get_ipc_handle", lambda _base: b"local-handle")
 
@@ -379,7 +379,7 @@ def test_glm_native_fp4_agentx_concurrency_contract():
     "override",
     [
         {"samples": 4},
-        {"tp_size": 8},
+        {"tp_size": 2},
         {"kv_cache_dtype": "auto"},
         {"kv_cache_dtype": "bf16"},
         {"mtp": False},
@@ -410,7 +410,7 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
     layers = [SimpleNamespace(layer_idx=layer_idx) for layer_idx in (1, 2)]
 
     class FakeOwned:
-        op = object()
+        op = SimpleNamespace(launch="glm5_mono_s5_tp4")
 
         def close(self):
             pass
@@ -430,6 +430,8 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
         module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
+    # a compiled launcher's kernel names: here the fake launcher is its name
+    monkeypatch.setattr(module, "kernel_names", lambda launch: [launch])
 
     def runner():
         value = object.__new__(module.Glm52MonoRunner)
@@ -476,15 +478,19 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
     assert rank_zero.prepare(5)
     assert rank_zero.prepare(5)
     assert rank_zero.prepare(10)
+    # a width's first forward announces it, once: its kernels by name (a name
+    # carries the build, the fused indexer included), so an arm is verifiable
+    # from its log alone
+    assert messages == []
+    for chunk in (5, 5, 10):
+        rank_zero._announce(chunk)
     rank[0] = 1
-    assert runner().prepare(5)
-    # The announcement names the one thing a build still varies on -- the
-    # indexer, `external` with the fused path off -- so an arm is verifiable
-    # from its log alone. Everything else about the schedule is fixed, so
-    # there is nothing else to say.
+    other = runner()
+    assert other.prepare(5)
+    other._announce(5)
     assert messages == [
-        ("GLM-5.2 MonoKernel on: S=%d chunk=%d indexer=%s", 5, 5, "external"),
-        ("GLM-5.2 MonoKernel on: S=%d chunk=%d indexer=%s", 10, 10, "external"),
+        ("GLM-5.2 MonoKernel on: %s", "glm5_mono_s5_tp4"),
+        ("GLM-5.2 MonoKernel on: %s", "glm5_mono_s5_tp4"),
     ]
     rank_zero.close()
     assert rank_zero._announced == set()
@@ -499,6 +505,18 @@ def test_glm_scaled_fp4_dispatch_contract():
         query_length=5,
     )
     assert config == glm5_tp_config(4)
+
+
+def test_glm_tp8_dispatches_the_reference_shard():
+    # TP8 is the kernel's reference shard (8 heads / 256 intermediate per rank).
+    config = glm52_native_config(
+        samples=4,
+        tp_size=8,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        query_length=4,
+    )
+    assert config == glm5_tp_config(8) == GLM5_CONFIG
 
 
 def test_glm_tp4_geometry_and_padded_graph_ladder():

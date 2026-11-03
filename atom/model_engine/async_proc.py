@@ -475,8 +475,10 @@ class AsyncIOProcManager:
         runner: str,
         *args,
         local_proc_num: int | None = None,
+        on_worker_failure=None,
     ):
         self.parent_finalizer = finalizer
+        self.on_worker_failure = on_worker_failure
         self.proc_num = proc_num
         # Ranks from local_proc_num on run on other nodes (tp_multinode.py) and
         # reach this node over TCP.
@@ -1055,6 +1057,14 @@ class AsyncIOProcManager:
                 f"{self.label}: [{dead_proc.name}] proc died unexpectedly "
                 f"(exitcode={dead_proc.exitcode}), shutting down.",
             )
+            # Notify the frontend before exit() can block draining GPU work.
+            # A live EngineCore process alone does not imply healthy runners.
+            try:
+                callback = getattr(_self, "on_worker_failure", None)
+                if callback is not None:
+                    callback()
+            except Exception:
+                logger.exception("Failed to report ModelRunner death")
             _self.exit()
 
         Thread(

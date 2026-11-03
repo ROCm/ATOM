@@ -36,7 +36,9 @@ def test_an_unwidened_empty_batch_stages_nothing():
     assert g.stage(0, {"row": torch.zeros(0, dtype=torch.int32)})["row"].shape[0] == 0
 
 
-def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at():
+def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at(
+    req_graph_recordings,
+):
     """The proposers widen to `running_bs` only when `is_captured` says that
     batch replays, so this answer decides whether a pad row is ever fabricated.
 
@@ -46,13 +48,15 @@ def test_owning_a_recording_says_nothing_about_a_batch_it_is_not_at():
     rows on a step that replays nothing.
     """
     g = _graph()
-    g._cuda_graphs[48] = ("graph", "out")
+    req_graph_recordings.add(48, "out")
     assert g.is_captured(48)
     assert not g.is_captured(256)
     assert not g.is_captured(44)
 
 
-def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly():
+def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly(
+    req_graph_recordings,
+):
     """A draft pass WRITES the KV it attends, so its recording holds the base of
     the pool a decode graph does, and a sleep that frees the pool has to drop
     these too (`atom/rollout/memory_manager.py`). Nothing else has to be
@@ -60,8 +64,8 @@ def test_releasing_the_recordings_leaves_the_pass_runnable_eagerly():
     `ATOM_DRAFT_CUDAGRAPH=0` state, and the next warmup records again.
     """
     g = _graph()
-    g._cuda_graphs[48] = ("graph", "out")
-    g._cuda_graphs[64] = ("graph", "out")
+    req_graph_recordings.add(48, "out")
+    req_graph_recordings.add(64, "out")
 
     assert g.release_graphs() == 2
     assert not g.is_captured(48)
@@ -263,15 +267,11 @@ def test_a_captured_epilogue_can_feed_output_back_to_fixed_input(monkeypatch):
     assert second.tolist() == [12, 22]
 
 
-def test_run_replays_the_recording_instead_of_the_forward():
+def test_run_replays_the_recording_instead_of_the_forward(req_graph_recordings):
     """The replay seam. A `run` that returned the recorded output WITHOUT
     replaying would serve every step the previous step's draft tokens, and
     nothing else in the suite would notice."""
     replays, forwards = [], []
-
-    class _Graph:
-        def replay(self):
-            replays.append(1)
 
     g = _graph(forward=lambda running_bs, **rows: forwards.append(running_bs))
     src = {"row": torch.zeros(4, dtype=torch.int32)}
@@ -280,13 +280,15 @@ def test_run_replays_the_recording_instead_of_the_forward():
     g.run(4, **g.stage(4, src))
     assert (forwards, replays) == ([4], []), "no recording: must run the forward"
 
-    g._cuda_graphs[4] = (_Graph(), "recorded")
+    req_graph_recordings.add(4, "recorded", on_replay=lambda: replays.append(1))
     assert g.is_captured(4)
     assert g.run(4, **g.stage(4, src)) == "recorded"
     assert (forwards, replays) == ([4], [1]), "recorded: must replay, not re-run"
 
 
-def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
+def test_a_replay_hands_back_a_value_not_the_recordings_own_storage(
+    req_graph_recordings,
+):
     """What `run` returns has to survive the next replay of any other size.
 
     The recording's tensors are allocated inside the capture, so they live in
@@ -302,14 +304,10 @@ def test_a_replay_hands_back_a_value_not_the_recordings_own_storage():
     gathered on those floats and faulted all eight ranks.
     """
 
-    class _Graph:
-        def replay(self):
-            pass
-
     ids = torch.full((4, 3), 9, dtype=torch.int32)
     conf = torch.zeros(4, 3)
     g = _graph(epilogue=lambda out, running_bs, **rows: out, capture_epilogue=True)
-    g._cuda_graphs[4] = (_Graph(), (ids, conf))
+    req_graph_recordings.add(4, (ids, conf))
 
     got_ids, got_conf = g.run(
         4, **g.stage(4, {"row": torch.zeros(4, dtype=torch.int32)})
@@ -340,7 +338,7 @@ def test_the_eager_path_hands_back_what_it_allocated():
     assert g.run(2, **g.stage(2, {"row": torch.zeros(2, dtype=torch.int32)})) is made
 
 
-def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
+def test_a_dummy_replays_in_lockstep_with_the_real_ranks(req_graph_recordings):
     """`is_dummy_run` is per-rank, so no decision that feeds a collective may
     read it.
 
@@ -358,12 +356,8 @@ def test_a_dummy_replays_in_lockstep_with_the_real_ranks():
     """
     replays, forwards = [], []
 
-    class _Graph:
-        def replay(self):
-            replays.append(1)
-
     g = _graph(forward=lambda running_bs, **rows: forwards.append(running_bs))
-    g._cuda_graphs[1] = (_Graph(), "recorded")
+    req_graph_recordings.add(1, "recorded", on_replay=lambda: replays.append(1))
     src = {"row": torch.zeros(1, dtype=torch.int32)}
 
     for _dummy in (False, True):
@@ -417,6 +411,6 @@ def test_unsupported_capture_still_warms_both_halves(monkeypatch):
         capture_supported=False,
     )
     assert not g.will_capture
-    assert g.warmup(2, pool=None, stream=None) is None
+    assert g.warmup(2) is None
     assert calls == ["backbone", "head"]
     assert not g.is_captured(2)

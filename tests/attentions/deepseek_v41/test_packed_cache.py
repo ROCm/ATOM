@@ -44,9 +44,9 @@ def test_native_byte_accounting():
         128,
         512,
         128,
-        packed=True,
+        kv_dtype="fp4",
     )
-    bf16 = replace(geo, packed=False)
+    bf16 = replace(geo, kv_dtype="bf16")
     assert (geo.main_row_bytes, geo.index_row_bytes, geo.window_row_bytes) == (
         288,
         132,  # 128 B of data, one fp32 scale
@@ -160,7 +160,9 @@ def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
 
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 
-    geo = V41PoolGeometry(3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, packed=True)
+    geo = V41PoolGeometry(
+        3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, kv_dtype="fp4"
+    )
     cache = PagedAttentionCache(geo, 6, 2, "cuda")
     owner = 1 if ratio == 1 else 0
     pages = cache.pages.view(f"main_{owner}")[0]
@@ -215,7 +217,9 @@ def test_packed_window_keeps_rows_below_cached_until():
     from atom.model_ops.blockscale import quantize_fp8
     from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
-    geo = V41PoolGeometry(3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, packed=True)
+    geo = V41PoolGeometry(
+        3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, kv_dtype="fp4"
+    )
     requests = (
         PagedRequest(1, 32, 0, 40, 0, (0, 1, 2)),
         PagedRequest(2, 0, 40, 10, 1, (3,)),

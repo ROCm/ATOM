@@ -11,7 +11,7 @@ import atom.model_ops.moe as moe_module
 import atom.model_ops.topK as topK_module
 from atom.model_ops.fused_moe import shared_expert_dispatch as dispatch_module
 from atom.model_ops.fused_moe.expert_layout import MoEExpertLayout
-from atom.model_ops.moe import FusedMoE, FusedMoEMethodBase, FusedMoEParallelConfig
+from atom.model_ops.moe import FusedMoE, FusedMoEParallelConfig, Mxfp4MoEMethod
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,
 )
@@ -44,6 +44,16 @@ def _dispatch_layer(*, ep_rank: int = 1) -> _FakeMoELayer:
         use_ep=True,
         expert_map=torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3, 4, -1]),
         expert_mask=torch.empty(0, dtype=torch.int32),
+        # routing parameters `select_experts` reads off the layer
+        top_k=2,
+        renormalize=True,
+        use_grouped_topk=False,
+        topk_group=None,
+        num_expert_group=None,
+        custom_routing_function=None,
+        scoring_func="softmax",
+        e_score_correction_bias=None,
+        shared_expert_scoring_func=None,
     )
     return ns
 
@@ -55,14 +65,15 @@ def test_to_dispatch_space_is_backend_neutral(monkeypatch):
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: False
     )
     # No GPU here; pin to the torch reference.
-    routed_ids = torch.tensor([[0, 4], [3, -1]], dtype=torch.int32)
-    routed_weights = torch.tensor([[0.7, 0.3], [0.6, 0.0]])
+    # The last row is a pad row: routed to -1 throughout, so no shared expert.
+    routed_ids = torch.tensor([[0, 4], [3, -1], [-1, -1]], dtype=torch.int32)
+    routed_weights = torch.tensor([[0.7, 0.3], [0.6, 0.0], [0.0, 0.0]])
 
     weights, ids = FusedMoE.to_dispatch_space(layer, routed_weights, routed_ids)
 
-    assert ids.tolist() == [[0, 5, 9], [3, -1, 9]]
+    assert ids.tolist() == [[0, 5, 9], [3, -1, 9], [-1, -1, -1]]
     assert torch.equal(weights[:, :2], routed_weights)
-    assert weights[:, 2].tolist() == [0.5, 0.5]
+    assert weights[:, 2].tolist() == [0.5, 0.5, 0.0]
 
 
 def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
@@ -76,14 +87,16 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
         captured["num_fused_shared_experts"] = kwargs["num_fused_shared_experts"]
         return routed_weights, routed_ids
 
-    def fake_map_and_record(received_layer, received_ids):
+    def fake_map_and_record(received_layer, received_ids, gathered):
         # EPLB must see routed ids only.
         assert received_layer is layer
         assert received_ids.shape[1] == 2
+        captured["eplb_mapped"] = gathered
         return received_ids
 
     monkeypatch.setattr(FusedMoE, "select_experts", fake_select_experts)
-    monkeypatch.setattr(eplb_module, "eplb_map_and_record_fused", fake_map_and_record)
+    # moe.py binds the name at import: patch it where it is called.
+    monkeypatch.setattr(moe_module, "eplb_map_and_record_fused", fake_map_and_record)
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
@@ -92,16 +105,15 @@ def test_select_experts_keeps_shared_out_of_router_and_eplb(monkeypatch):
         layer, weights, ids
     )
 
-    weights, ids = FusedMoEMethodBase.select_experts_with_record(
-        object(),
-        layer=layer,
-        hidden_states=torch.empty(1, 4),
-        router_logits=torch.empty(1, 8),
-        top_k=2,
-        renormalize=True,
+    method = object()
+    weights, ids = Mxfp4MoEMethod.select_experts(
+        method, layer, torch.empty(1, 4), torch.empty(1, 8)
     )
+    weights, ids = Mxfp4MoEMethod.place_experts(method, layer, weights, ids)
 
     assert captured["num_fused_shared_experts"] == 0
+    # Rows no gather moved: the replica spread mixes in this rank.
+    assert captured["eplb_mapped"] is False
     assert ids.tolist() == [[0, 5, 9]]
     assert weights.tolist() == [[0.75, 0.25, 1.0]]
 
@@ -117,31 +129,30 @@ def test_eplb_appends_unscaled_shared_weight(monkeypatch):
         use_all2all=True,
         eplb_enabled=True,
     )
-    layer.append_shared_logical_column = lambda weights, ids: (
-        FusedMoE.append_shared_logical_column(layer, weights, ids)
-    )
 
     def fake_select_experts(**kwargs):
         captured["scale"] = kwargs["routed_scaling_factor"]
-        return torch.tensor([[1.5, 0.5]]), torch.tensor([[0, 4]])
+        # The second row is a pad row: routed to -1 throughout.
+        return (
+            torch.tensor([[1.5, 0.5], [0.0, 0.0]]),
+            torch.tensor([[0, 4], [-1, -1]], dtype=torch.int32),
+        )
 
     monkeypatch.setattr(FusedMoE, "select_experts", fake_select_experts)
-    monkeypatch.setattr(eplb_module, "eplb_map_and_record_fused", lambda _, ids: ids)
+    # The CPU twin of the Triton kernel; no EPLB metadata, so no remap.
+    monkeypatch.setattr(eplb_module, "_EPLB_HAS_TRITON", False)
     monkeypatch.setattr(
         moe_module, "is_rocm_aiter_fuse_routed_scaling_factor", lambda: True
     )
 
-    weights, ids = FusedMoEMethodBase.select_experts_with_record(
-        object(),
-        layer=layer,
-        hidden_states=torch.empty(1, 4),
-        router_logits=torch.empty(1, 8),
-        top_k=2,
-        renormalize=True,
+    method = object()
+    weights, ids = Mxfp4MoEMethod.select_experts(
+        method, layer, torch.empty(2, 4), torch.empty(2, 8)
     )
+    weights, ids = Mxfp4MoEMethod.place_experts(method, layer, weights, ids)
 
-    assert weights.tolist() == [[1.5, 0.5, 1.0]]
-    assert ids.tolist() == [[0, 4, 8]]
+    assert weights.tolist() == [[1.5, 0.5, 1.0], [0.0, 0.0, 0.0]]
+    assert ids.tolist() == [[0, 4, 8], [-1, -1, -1]]
     assert captured["scale"] == 2.0
 
 

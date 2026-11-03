@@ -32,7 +32,7 @@ if _atom_config_stub is not None:
 
         _atom_config_stub.CUDAGraphMode = _enum.Enum(
             "CUDAGraphMode",
-            {"NONE": 0, "PIECEWISE": 1, "FULL": 2, "FULL_AND_PIECEWISE": 3},
+            {"NONE": 0, "TR_HYBRID": 1, "FULL": 2, "FULL_AND_TR_HYBRID": 3},
         )
     if not hasattr(_atom_config_stub, "DSparkConfig"):
         # arg_utils imports DSparkConfig and calls DSparkConfig.from_dict() to
@@ -43,6 +43,16 @@ if _atom_config_stub is not None:
 
 from atom.model_engine.arg_utils import EngineArgs
 from atom.utils.arg_parser import FlexibleArgumentParser
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_context_metrics_cli_reaches_engine_kwargs(enabled):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(["--enable-request-context-metrics"] if enabled else [])
+    )
+    assert args.enable_request_context_metrics is enabled
+    assert args._get_engine_kwargs()["enable_request_context_metrics"] is enabled
 
 
 class TestFlexibleArgumentParser:
