@@ -1,43 +1,16 @@
 """The probability-ratio verify: lossless acceptance of sampled drafts.
 
-Accept draft x at a position iff `u * q(x) < p(x)`, and on the first rejection
-draw the replacement from the residual `relu(p - q)` (normalized). p is the
-target's `softmax(logits / T)`, q the distribution the draft drew x from.
-
-Nothing `[rows, V]` is materialized for p. Every (draft row, V tile) program
-reduces its tile of the row to the softmax statistics plus the row's
-raw-logit argmax (`ratio_target_p`); the accept walk then needs p at one id
-per position, `exp(l(x) / T - max) / Z`, and only a rejecting row is read
-across V again, by the residual race.
-
-q arrives sparse (`SparseQStore`: each draft row's stored ids, their
-probabilities and the slot of the id it emitted), and is 0 off the stored
-set. The accept walk reads q(x) at the emitted slot. The residual needs q at
-every id, so each rejecting request's one row is first spread into a dense
-scratch row of its own (zeroed, then the stored entries written at their
-ids); the race and its fallback then read that row as they would a dense q.
-
-Residual: an exponential race rather than a CDF walk. `argmax_v r(v) / E_v`
-with i.i.d. `E_v ~ Exp(1)` selects v with probability `r(v) / sum r`, so the
-residual needs no normalizer, no prefix sum, and no agreement between two
-reductions' rounding; tiles race in parallel and a cross-tile max decides.
-
-Top-k / top-p: a filtered request is served `Sampler`'s filtered p, p_f, at
-every position -- its bonus token is `Sampler`'s own draw. p_f is p over
-every id at or above one logit per row, the row's floor, renormalized;
-`sampling_filter` finds the floor on the device, and the accept, the race
-and its fallback all read p as 0 below it.
-
-Greedy rows (temperature at or below SAMPLER_EPS) take exact match inside the
-same launch: accept iff the draft is the target's lowest-id argmax, emit that
-argmax on rejection. That is `rejection_greedy_sample_kernel`'s rule
-(`rejection_sampler`), so a greedy request's tokens do not depend on whether
-sampled requests share its batch. The ratio rule would not give that: on a
-bf16 logit tie p is 0.5/0.5, not a delta.
-
-`rejection_sampler.rejection_sample` dispatches here when the drafter hands
-it a `RatioVerifyInputs`; the exact-match, synthetic and relaxed rules stay
-there.
+Accept draft x iff ``u * q(x) < p(x)``; on the first rejection draw from
+``relu(p - q)``. p is the target's ``softmax(logits / T)``, or for a filtered
+request `Sampler`'s p_f (0 below the row's floor, `sampling_filter`); q is the
+distribution the draft drew x from, sparse (`SparseQStore`) and 0 off its set.
+p is never materialized: per-tile statistics (`ratio_target_p`) give p(x), and
+only a rejecting row is read across V again, with its q densified first.
+The residual is an exponential race, ``argmax r(v) / E_v``: no normalizer, and
+no two reductions whose rounding must agree.
+Greedy rows take exact match in the same launch, the rule of
+`rejection_greedy_sample_kernel`, so their tokens do not depend on the batch
+(under the ratio rule a bf16 tie is 0.5/0.5, not a delta).
 """
 
 from typing import NamedTuple
@@ -54,15 +27,9 @@ from atom.model_ops.softmax_tiles import argmax_lowest_id, race_key
 from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 from atom.model_ops.verify_kernels import _draft_token, _finish_request
 
-# Randomness: Philox via `tl.rand`, keyed on a per-step SPMD counter, so every
-# TP rank draws the same uniforms. The key's high word names the purpose --
-# 0 is the draft's noise (`dspark_markov_sample`), and the two below are the
-# accept coins and the residual race -- so no two consumers can ever share a
-# stream, whatever their step counters do. That holds for 64-bit offsets too:
-# `tl.rand` goes through `randint4x`, which always splits the offset into two
-# 32-bit Philox counters, so `philox` keeps the seed's high word as the second
-# key word (only a direct 64-bit-counter `philox` call would drop it). Pinned by
-# `test_the_key_purpose_word_separates_streams_at_any_offset_width`.
+# Philox via `tl.rand` on a per-step SPMD counter, so every TP rank draws alike.
+# The key's high word names the purpose (0: the draft's noise), so no two
+# consumers share a stream at any offset width (`randint4x` keeps that word).
 _RATIO_ACCEPT_KEY = 1 << 32
 _RATIO_RESIDUAL_KEY = 2 << 32
 

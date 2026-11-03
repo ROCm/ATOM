@@ -29,11 +29,11 @@ import triton
 import triton.language as tl
 from spec_lossless_reference import dspark_markov_sample_reference, sparse_q_reference
 
-from atom.model_ops.dspark_markov_sample import (
-    dspark_markov_argmax,
+from atom.model_ops.dspark_markov_draw import (
     dspark_markov_sample,
     dspark_markov_sample_scratch,
 )
+from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
 from atom.model_ops.ratio_target_p import (
     _RATIO_BLOCK_V,
     _ratio_stats_kernel,
@@ -54,12 +54,12 @@ from atom.model_ops.ratio_verify import (
 )
 from atom.model_ops.rejection_sampler import rejection_sample
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.model_ops.sampling_filter import (
-    _ratio_filter_count_kernel,
+from atom.model_ops.sampling_filter import _request_of_row
+from atom.model_ops.sampling_filter_count import _ratio_filter_count_kernel
+from atom.model_ops.sampling_filter_descent import (
     _ratio_filter_cut_kernel,
     _ratio_filter_floor_kernel,
     _ratio_filter_pass_kernel,
-    _request_of_row,
 )
 from atom.model_ops.sampling_scratch import SamplingScratch, take
 from atom.model_ops.softmax_tiles import (

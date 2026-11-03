@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """The host half of a lossless draft step.
 
-``DSparkProposer`` owns a `DraftQStaging`, which owns the `DraftQSlots` and
+`DSparkLossless` owns a `DraftQStaging`, which owns the `DraftQSlots` and
 writes the row bases the draft head writes through and the accept kernel reads
 through.
 """

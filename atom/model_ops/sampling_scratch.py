@@ -1,18 +1,10 @@
 """Fixed device scratch for the lossless sampling kernels.
 
-The sampled draft (`dspark_markov_sample`) and the ratio verify
-(`ratio_verify`) each need a handful of small fp32/int32 tensors per call,
-sized by the batch. Allocated once at the largest batch and carved into
-per-call views, they exist before the KV cache is sized -- so the profiling run
-sees them like any other buffer -- and no step allocates.
-
-Every view starts where `entry_arena.plan_regions` places it, on a 256-byte
-boundary. What the kernels need is 16: Triton specializes a kernel on whether
-each pointer argument is 16-byte aligned, so views packed back to back -- at
-offsets that move with the batch -- would compile the same kernel once per
-alignment pattern the batch sizes happen to produce, each the first time a
-batch of that pattern arrives. The coarser boundary costs at most 252 bytes a
-view.
+The sampled draft and the ratio verify carve their small per-call fp32/int32
+tensors from buffers allocated once at the largest batch, before the KV cache
+is sized, so no step allocates. Views start on 256-byte boundaries
+(`entry_arena.plan_regions`): Triton specializes on 16-byte pointer alignment,
+so offsets that move with the batch would recompile mid-serve.
 """
 
 from collections.abc import Sequence

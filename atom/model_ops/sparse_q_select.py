@@ -2,50 +2,18 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Stages 3-6 of the sampled DSpark draft (`dspark_markov_sample`): choose the
-top of each row's q from the dense score scratch, store it, and draw the row's
-token from exactly what was stored.
+top of each row's q from the dense score scratch, store it (`SparseQStore`),
+and draw the row's token from exactly what was stored.
 
-The store (`sparse_q_store.SparseQStore`) holds, per draft row
-R = q_row_base[b] + position, the stored ids in ascending order (as
-compaction emits them), their q and the slot of the token the draft emitted.
-A row that drafts a deterministic token (greedy, a non-finite or otherwise
-degenerate row) stores the delta on it: n = 1, ids[0] = x, probs[0] = 1.
-A negative base writes nothing -- pad rows, a dummy forward, an align-only
-propose, and rows whose q nobody reads (greedy requests, requests still
-mid-prompt) -- and such a row drafts its logits' argmax, as a greedy row does.
-
-Which K. A top-K by exact value would need a sort or a radix select over V
-per row; instead every id gets a level, its gap below the row max in 1/8
-nats (0 for the max itself), and the cut is made by level: everything below
-the boundary level, then the boundary level's lowest ids until exactly
-n = min(K, the request's top-k, ids within 19 nats of the max) are taken.
-Ids more than 19 nats down (q < 6e-9 of the max) are never stored. The
-set is not the exact top-K -- within one level the lowest ids win rather than
-the largest values -- which, like the level-granular top-p, only moves
-acceptance: the draft samples from what is stored, whatever that is. At the
-Kimi-K3 serving widths (V = 163840, K = 1024, up to 64 rows) stages 3-5 time
-15-47 us per block position on MI355X, against 36-41 us for
-``aiter.topk_select(s, K, tie="low")`` alone, before any top-k/top-p cut.
-
-Four launches, after `dspark_markov_sample`'s GEMV and row max:
-  3. histogram: per (row, V tile), how many ids sit at each level;
-  4. cut: per row, the boundary level and each tile's output slot range;
-  5. compact: per (row, V tile), write the chosen ids and exp(s - max);
-  6. finalize: per row, normalize, run the exponential race over the stored
-     entries, emit x and its slot.
-Levels come from one helper (`_q_level`) in 3 and 5, so the counts the cut
-is made on and the lanes compaction selects cannot disagree. Every reduction
-is a fixed-order tree, with no atomics: TP ranks run this redundantly and
-must store, and draw, bit for bit the same.
-
-Arithmetic of the draw: dividing a categorical by i.i.d. Exp(1) and taking
-the argmax is a multinomial draw (the exponential race / Gumbel-max trick),
-so this and `torch.multinomial` over the stored probabilities are one
-sampler. A greedy row is one whose temperature was at or below `SAMPLER_EPS`
-before the caller clamped it; `greedy_mask` carries that.
-
-The noise is drawn in-kernel from Philox rather than handed in, at the same
-counter per (position, batch row, vocab id) as a full-vocab race would use.
+A deterministic row (greedy, non-finite, degenerate) stores the delta on its
+token; a negative row base writes nothing and drafts the logits' argmax.
+The cut is by level, the gap below the row max in 1/8 nats, not by exact value:
+the boundary level's lowest ids fill n = min(K, top-k, ids within 19 nats).
+That only moves acceptance: the draft samples from what is stored.
+Launches: histogram, cut, compact, finalize (normalize, then the exponential
+race over the stored entries). Both 3 and 5 level through `_q_level`.
+Fixed-order reductions, no atomics: TP ranks must store and draw alike.
+Philox noise in-kernel, at a full-vocab race's counter per (position, row, id).
 """
 
 import torch

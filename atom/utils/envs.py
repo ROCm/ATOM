@@ -691,17 +691,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # regression is suspected -- the fastest way to rule this kernel in or out,
     # since the two paths are not bit-identical by construction. Read once when
     # the Markov head is built, so it must be set before the server starts.
-    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3's draft takes the
-    # lossless sampled block for every row, greedy rows included, whatever
-    # this says: "0" no longer selects the reference there. Turn that flag
-    # off too to compare against the reference.
+    # Once ATOM_SPEC_LOSSLESS_SAMPLING arms, Kimi-K3 drafts every row through
+    # the sampled block whatever this says.
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
     # Lossless speculative sampling: the DSpark draft samples its block from q
     # and the verify accepts by the probability ratio (u * q < p). Off by
-    # default; needs an aiter with ROCm/aiter#6954 under TP, and DSparkProposer
-    # refuses ATOM_ENABLE_RELAXED_MTP where it arms. See docs/model_ops_guide.md.
+    # default; needs an aiter with ROCm/aiter#6954 under TP; where it arms,
+    # ATOM_ENABLE_RELAXED_MTP is refused. See docs/model_ops_guide.md.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: _flag_env("ATOM_SPEC_LOSSLESS_SAMPLING"),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding

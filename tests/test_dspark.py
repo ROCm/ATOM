@@ -22,7 +22,7 @@ pytest.importorskip(
 
 import torch
 
-import atom.model_ops.dspark_markov_sample as dspark_markov_sample_mod
+import atom.model_ops.dspark_markov_draw as dspark_markov_draw_mod
 import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (
@@ -134,7 +134,7 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
         assert torch.equal(base, base_logits[:, position])
         out.copy_(prev + 1)
 
-    monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
+    monkeypatch.setattr(dspark_markov_draw_mod, "dspark_markov_sample", sample)
     base_logits = torch.randn(bs, steps, V)
     anchors = torch.tensor([0, 3, 5])
     drafts = head.sample_block_q(base_logits, anchors, sampling)
@@ -887,7 +887,7 @@ def _proposer_with_graph_bs(
     )
     p.device = torch.device("cpu")
     p.mtp_k = mtp_k
-    p.draft_sampling = None  # lossless sampling off: the greedy draft
+    p._lossless = None  # lossless sampling off: the greedy draft
     p.model = types.SimpleNamespace(
         vocab_size=1024, window_size=window, supports_block_graph=True
     )

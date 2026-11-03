@@ -3402,21 +3402,10 @@ class ModelRunner:
             channel = self._constrain_required_channel(
                 batch, bonus_logits, spec_decode_metadata, target_logits
             )
-            # Lossless acceptance: compare against the q the draft actually drew
-            # from (`u * q < p`) instead of requiring the draft token to equal
-            # the target's own draw. Resolved before the verification sample
-            # below, because it decides whether that sample is needed at all.
-            # An all-greedy batch always verifies by exact match, so it never
-            # asks. A filtered batch is verified against the p_f `Sampler`
-            # draws its bonus from, given the same `top_ks`/`top_ps`.
-            #
-            # The ratio verify spreads a rejecting request's q into the draft's
-            # score scratch, which the draft head rewrites on every propose.
-            # Safe because both run here, in `postprocess`, on the one current
-            # stream -- this verify after the previous step's propose, and
-            # before this step's (`propose_draft_token_ids` below) -- and the
-            # forward that may run on another stream (the disaggregated decode
-            # runner's) touches neither. Keep the two on one stream.
+            # Lossless (`u * q < p`) inputs, asked first: they decide whether the
+            # verification sample below runs. All-greedy batches keep exact match.
+            # The verify borrows the draft's score scratch: it must stay on this
+            # stream, between the previous step's propose and this step's.
             ratio = None
             if drafter is not None and not all_greedy:
                 ratio = drafter.lossless_verify_inputs(

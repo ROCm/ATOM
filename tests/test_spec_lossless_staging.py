@@ -18,7 +18,7 @@ from torch import nn
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
 from atom.model_ops.sampler import Sampler
-from atom.spec_decode import dspark_proposer
+from atom.spec_decode import dspark_lossless, dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
 
@@ -52,10 +52,10 @@ class FakeDraftModel:
 
 def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1" if lossless else "0")
-    monkeypatch.setattr(dspark_proposer, "get_pcp_world_size", lambda: pcp)
+    monkeypatch.setattr(dspark_lossless, "get_pcp_world_size", lambda: pcp)
     # CPU stand-in weights; the GPU arming check has its own test below.
     monkeypatch.setattr(
-        dspark_proposer, "dspark_markov_sample_unsupported", lambda w1, w2: None
+        dspark_lossless, "dspark_markov_sample_unsupported", lambda w1, w2: None
     )
     prop = DSparkProposer.__new__(DSparkProposer)
     prop.config = SimpleNamespace(
@@ -145,7 +145,7 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
 @pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
 def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk, width):
     if topk is not None:
-        monkeypatch.setattr(dspark_proposer, "Q_WIDTH", topk)
+        monkeypatch.setattr(dspark_lossless, "Q_WIDTH", topk)
     sampling = proposer(monkeypatch).model.bound
     store = sampling.q_store
     assert store.ids.shape == store.probs.shape == (2 * MAX_BS * T, width)
@@ -177,7 +177,7 @@ def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk,
 )
 def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
-    assert prop.draft_sampling is None
+    assert prop._lossless is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is None
     # Staging is a no-op rather than an error.
@@ -193,13 +193,13 @@ def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, cap
     model.window_size = T - 1
     with caplog.at_level("WARNING", logger="atom"):
         prop = proposer(monkeypatch, model=model)
-    assert prop.draft_sampling is None
+    assert prop._lossless is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert f"draft_tokens_per_seq={T - 1}, mtp_k={T}" in caplog.text
     # A window at least as wide as the block arms.
     model = FakeDraftModel()
     model.window_size = T
-    assert proposer(monkeypatch, model=model).draft_sampling is not None
+    assert proposer(monkeypatch, model=model)._lossless is not None
 
 
 @pytest.mark.parametrize(
@@ -211,19 +211,19 @@ def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, cap
     ids=["pd-consumer", "rapidserve-decode"],
 )
 def test_the_verifying_side_of_a_disaggregated_pair_still_arms(monkeypatch, config):
-    assert proposer(monkeypatch, **config).draft_sampling is not None
+    assert proposer(monkeypatch, **config)._lossless is not None
 
 
 def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
     prop = proposer(monkeypatch, lossless=False)
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
     monkeypatch.setattr(
-        dspark_proposer,
+        dspark_lossless,
         "dspark_markov_sample_unsupported",
         lambda w1, w2: "markov weights are torch.float32/torch.float32",
     )
     prop._init_lossless_sampling()
-    assert prop.draft_sampling is None and prop.model.bound is None
+    assert prop._lossless is None and prop.model.bound is None
 
 
 def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
@@ -231,9 +231,9 @@ def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
     would draw the bonus from another one."""
     prop = proposer(monkeypatch, lossless=False)
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
-    monkeypatch.setattr(dspark_proposer, "AITER_TOPK_TOPP_AVAILABLE", False)
+    monkeypatch.setattr(dspark_lossless, "AITER_TOPK_TOPP_AVAILABLE", False)
     prop._init_lossless_sampling()
-    assert prop.draft_sampling is None and prop.model.bound is None
+    assert prop._lossless is None and prop.model.bound is None
 
 
 @pytest.mark.parametrize(
@@ -271,8 +271,8 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     """Next to the q store, before the KV cache is sized: the profiling run
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
-    assert prop.draft_sampling.scratch.f32.numel()
-    assert prop._verify_scratch.f32.numel()
+    assert prop._lossless.sampling.scratch.f32.numel()
+    assert prop._lossless.verify_scratch.f32.numel()
 
 
 @pytest.mark.parametrize("lossless", [True, False], ids=["armed", "not-armed"])
@@ -283,7 +283,7 @@ def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossl
     prop = proposer(monkeypatch, lossless=lossless)
     calls = []
     monkeypatch.setattr(
-        dspark_proposer, "warmup_ratio_verify", lambda *args: calls.append(args)
+        dspark_lossless, "warmup_ratio_verify", lambda *args: calls.append(args)
     )
     prop.warmup_lossless_verify(torch.bfloat16)
     if not lossless:
@@ -293,17 +293,17 @@ def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch, lossl
     assert (steps, vocab, width, dtype) == (
         T,
         VOCAB,
-        prop.draft_sampling.q_store.ids.shape[1],
+        prop._lossless.sampling.q_store.ids.shape[1],
         torch.bfloat16,
     )
-    assert scratch is prop._verify_scratch
+    assert scratch is prop._lossless.verify_scratch
 
 
 def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
     """A verify on another logits dtype would JIT every ratio kernel
     mid-serving, so it is refused instead."""
     prop = proposer(monkeypatch)
-    monkeypatch.setattr(dspark_proposer, "warmup_ratio_verify", lambda *args: None)
+    monkeypatch.setattr(dspark_lossless, "warmup_ratio_verify", lambda *args: None)
     prop.warmup_lossless_verify(torch.bfloat16)
     stage(prop, batch(["a", "b"]))
     assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is not None
@@ -369,7 +369,7 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     prop.warmup_draft_graphs(None)
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
     # The slot map is untouched: those requests still own their q rows.
-    assert {"a", "b", "c"} <= set(prop._staging.slots._slot_of)
+    assert {"a", "b", "c"} <= set(prop._lossless.staging.slots._slot_of)
 
 
 def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
@@ -430,10 +430,13 @@ def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     ratio = prop.lossless_verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
     # The sparse store itself, and the draft's score scratch to spread a
     # rejecting request's row into: one dense row per batch row, V wide.
-    assert ratio.q.store is prop.draft_sampling.q_store
-    assert ratio.q.dense is prop.draft_sampling.s_scratch
+    assert ratio.q.store is prop._lossless.sampling.q_store
+    assert ratio.q.dense is prop._lossless.sampling.s_scratch
     assert ratio.q.dense.shape == (MAX_BS, VOCAB)
-    assert ratio.q_row_base.shape == (2,) and ratio.scratch is prop._verify_scratch
+    assert (
+        ratio.q_row_base.shape == (2,)
+        and ratio.scratch is prop._lossless.verify_scratch
+    )
     # The batch's own temperatures and filters, as `Sampler` gets them.
     assert ratio.temperatures is temps
     assert ratio.top_ks is top_ks and ratio.top_ps is top_ps
@@ -460,7 +463,7 @@ def test_dspark_refuses_relaxed_mtp_where_lossless_sampling_arms(
             proposer(monkeypatch)
     else:
         prop = proposer(monkeypatch, lossless=bool(lossless))
-        assert (prop.draft_sampling is not None) is bool(lossless)
+        assert (prop._lossless is not None) is bool(lossless)
 
 
 def test_a_plain_drafter_starts_with_both_flags_set(monkeypatch):

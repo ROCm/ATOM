@@ -1,5 +1,4 @@
 import logging
-from typing import NamedTuple
 
 import torch
 import triton
@@ -8,76 +7,17 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
-from atom.distributed.pcp_utils import get_pcp_world_size
-from atom.kv_transfer.disaggregation import kv_config_has_producer
-from atom.model_ops.dspark_markov_sample import (
-    dspark_markov_sample_scratch,
-    dspark_markov_sample_unsupported,
-)
-from atom.model_ops.ratio_verify import (
-    RatioVerifyInputs,
-    ratio_verify_scratch,
-    warmup_ratio_verify,
-)
-from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
-from atom.model_ops.sparse_q_store import Q_WIDTH, RatioDraftQ, SparseQStore
-from atom.models.dspark_draft import DraftSampling
+from atom.model_ops.ratio_verify import RatioVerifyInputs
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_q_slots import DraftQSlots
-from atom.spec_decode.draft_q_staging import DraftQStaging
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
+from atom.spec_decode.dspark_lossless import DSparkLossless
 from atom.spec_decode.dspark_verify import VerifyScheduler
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
-
-#: Persistent q slots, as a multiple of `max_num_seqs`; one slot holds one
-#: request's block of T rows. Slots are reclaimed by expiry (`DraftQSlots`), and
-#: the headroom above the live set is what makes the expired entry usually a
-#: finished request rather than a running one.
-_Q_SLOT_OVERSUBSCRIBE = 2
-
-
-class _LosslessInput(NamedTuple):
-    """One staged input of the sampled draft or the ratio verify."""
-
-    #: The `DraftQStaging` keyword its numpy view is passed as, the key
-    #: `DraftQStaging.stage` reports its row count under, and, if `drafted`,
-    #: the `DraftSampling` field its device tensor binds to.
-    name: str
-    #: One entry per batch row (`max_num_seqs`), or a single scalar.
-    per_row: bool
-    dtype: torch.dtype
-    #: What rows past the staged batch hold; None leaves the zeros.
-    idle: float | int | None
-    #: Whether the draft reads it; False when only the verify does.
-    drafted: bool = True
-
-    @property
-    def key(self) -> str:
-        """The `metadata_buffers` key, a member of the `sampling` publication;
-        prefixed because it shares `forward_vars` with the runner's."""
-        return "draft_" + self.name
-
-
-#: Every per-step input of lossless speculative sampling, in publication order.
-#: Pad rows idle at temperature 1.0 rather than a 0 the kernel would divide by,
-#: no filter, and row base -1, so a pad row writes no q.
-_LOSSLESS_INPUTS = (
-    _LosslessInput("temperatures", True, torch.float32, 1.0),
-    _LosslessInput("greedy_mask", True, torch.int32, 1),
-    _LosslessInput("seed", False, torch.int32, None),
-    # The request's own top-k / top-p, for the draft to sample within.
-    _LosslessInput("top_k", True, torch.int32, 0),
-    _LosslessInput("top_p", True, torch.float32, 1.0),
-    # First q row each batch row drafts into; -1 writes nothing.
-    _LosslessInput("q_row_base", True, torch.int32, -1),
-    # First q row each request's drafts were drawn into; -1 means none.
-    _LosslessInput("verify_q_row_base", True, torch.int32, -1, drafted=False),
-)
 
 
 @triton.jit(do_not_specialize=["scheduled_bs", "vocab_max"])
@@ -133,237 +73,35 @@ class DSparkProposer(Drafter):
         # the binding in python, so whichever side is bound here is recorded.
         self._init_lossless_sampling()
 
-    # ---- lossless speculative sampling --------------------------------------
+    # ---- lossless speculative sampling (`DSparkLossless`) -------------------
 
     def _init_lossless_sampling(self) -> None:
-        """Bind the draft's sampling buffers, or leave the greedy path in place.
-
-        See `ATOM_SPEC_LOSSLESS_SAMPLING` in `docs/model_ops_guide.md` for what
-        this buys and costs, why it defaults off, and why it arms both halves
-        of the feature at once.
-        """
-        self.draft_sampling = None
-        # The host-side staging policy and slot map (`DraftQStaging`).
-        self._staging = None
-        if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
-            return
-        if not self.model.supports_lossless_draft:
-            # This flavor's block sampler has no sampled entry point. Silent,
-            # because "not ported yet" is not an operator error.
-            return
-        reason = self._lossless_unsupported_reason()
-        if reason is not None:
-            logger.warning(
-                "ATOM_SPEC_LOSSLESS_SAMPLING %s Falling back to greedy proposal "
-                "with exact-match acceptance.",
-                reason,
-            )
-            return
-        if envs.ATOM_ENABLE_RELAXED_MTP:
-            # Relaxed top-N accepts tokens the target would not have drawn.
-            raise ValueError(
-                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
-                "mutually exclusive: relaxed top-N acceptance is approximate "
-                "by construction and the probability-ratio rule is exact, so "
-                "there is no defensible way to apply both. Turn one off."
-            )
-        max_bs = self.config.max_num_seqs
-        t = self.draft_tokens_per_seq
-        vocab = int(self.model.vocab_size)
-        self._verify_scratch = ratio_verify_scratch(max_bs, t, vocab, self.device)
-        # Set by `warmup_lossless_verify`; checked against every verify's logits.
-        self._verify_logits_dtype = None
-        self.draft_sampling, self._staging = self._build_lossless_sampling()
-        self.model.bind_draft_sampling(self.draft_sampling)
-        if self.runner.rank == 0:
-            store = self.draft_sampling.q_store
-            q_rows, q_width = store.ids.shape
-            logger.info(
-                "Lossless speculative sampling armed: draft q store %d slots x "
-                "[%d, top %d of %d] (%.1f MiB) + %.1f MiB draft scores + %.1f "
-                "MiB draft scratch + %.1f MiB verify scratch",
-                q_rows // t,
-                t,
-                q_width,
-                vocab,
-                store.nbytes() / 2**20,
-                self.draft_sampling.s_scratch.numel() * 4 / 2**20,
-                self.draft_sampling.scratch.nbytes() / 2**20,
-                self._verify_scratch.nbytes() / 2**20,
-            )
-
-    def _lossless_unsupported_reason(self) -> str | None:
-        """Why this engine cannot arm the feature it was asked for, or None.
-
-        The text completes "ATOM_SPEC_LOSSLESS_SAMPLING ..."; the caller warns
-        with it and keeps the greedy pair.
-        """
-        if self.draft_tokens_per_seq != self.mtp_k:
-            # The store holds `draft_tokens_per_seq` rows per slot, while the
-            # verify (and `warmup_lossless_verify`) walks `mtp_k` positions: a
-            # windowed flavor drafting fewer rows than it verifies would read
-            # past its slot into the next one.
-            return (
-                "needs the draft block to be as wide as the verify "
-                f"(draft_tokens_per_seq={self.draft_tokens_per_seq}, "
-                f"mtp_k={self.mtp_k}): the verify would read q rows past each "
-                "request's slot."
-            )
-        if not AITER_TOPK_TOPP_AVAILABLE:
-            # The verify serves a filtered request aiter's kept set (whole tie
-            # groups, top-p over the unfiltered mass), the one `Sampler` draws
-            # the bonus token from with aiter. Without aiter's sampling ops
-            # `Sampler` cuts its own way, and the bonus and the verified
-            # tokens would follow two different p.
-            return (
-                "needs aiter's top-k/top-p sampling ops, which this build "
-                "lacks: the ratio verify filters as they do, and Sampler's "
-                "native fallback filters differently."
-            )
-        head = self.model.markov_head
-        unsupported = dspark_markov_sample_unsupported(
-            head.markov_w1.weight, head.markov_w2.weight
-        )
-        if unsupported is not None:
-            # Checked once here so the sampled op never has to fail mid-serve.
-            return f"cannot run the fused sampled draft ({unsupported})."
-        if kv_config_has_producer(self.config.kv_transfer_config) or (
-            self.config.enable_rapidserve and not self.config.disagg_is_decode
-        ):
-            # A P/D producer (or RapidServe's prefill process) drafts only to
-            # hand the drafts off; it never verifies, and the consumer has no
-            # q for a handed-off request anyway. Armed, it would allocate the
-            # q store, reserve scratch off its KV budget and run the de-fused
-            # draft every step for nothing.
-            return (
-                "is not used on a P/D producer (prefill) engine: it drafts for "
-                "handoff and verifies nothing. The decode engine still arms."
-            )
-        if self.config.pipeline_parallel_size > 1:
-            # The draft's sampling inputs ride the runner's `sampling`
-            # publication group, and PP gives that group a ring (one cloned
-            # buffer set per in-flight microbatch), while the block head binds
-            # one address. PP has no use for the feature anyway:
-            # `spec_decode_local = pp_size == 1`, so such an engine drafts for
-            # handoff and never reaches the ratio accept rule.
-            return (
-                "is not implemented under pipeline parallelism "
-                f"(pp={self.config.pipeline_parallel_size}): such an engine "
-                "drafts for handoff and verifies nothing, so the ratio accept "
-                "rule it pairs with is never reached."
-            )
-        if get_pcp_world_size() > 1:
-            # PCP decodes redundantly and aligns by broadcasting the draft ids,
-            # because the ranks' kernels do not agree bit-for-bit. q would have
-            # to be broadcast with them -- K ids, K probabilities and (n,
-            # xslot) per draft row, every step -- or rank>0 tests `q(x)` for
-            # an `x` it did not draw.
-            return (
-                f"is not implemented under PCP (pcp={get_pcp_world_size()}): "
-                "the draft ids are broadcast across PCP ranks but the "
-                "distribution they were drawn from is not."
-            )
-        return None
-
-    def _build_lossless_sampling(self) -> tuple[DraftSampling, DraftQStaging]:
-        """Allocate the draft's q store, scratch and staged inputs.
-
-        Everything is allocated once, here, before the KV cache is sized, so
-        the budget and the profiling run see it and no step allocates. The
-        staged inputs are listed once, in `_LOSSLESS_INPUTS`.
-        """
-        max_bs = self.config.max_num_seqs
-        t = self.draft_tokens_per_seq
-        vocab = int(self.model.vocab_size)
-        q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
-        # [slots * T, K]; past V there is nothing more to store. One row block
-        # per live request rather than per batch slot: the verify that reads a
-        # request's q runs a step after the propose that wrote it, with the
-        # batch reordered in between and possibly prefill-only steps proposing
-        # for other requests.
-        q_store = SparseQStore.allocate(q_slots * t, min(Q_WIDTH, vocab), self.device)
-        # The draft's dense scores and the sampled op's per-step partials,
-        # sized by max_num_seqs and V alone. The verify borrows the score
-        # scratch to spread a rejecting request's q across V: the draft that
-        # writes it never runs while a verify does (`ModelRunner.postprocess`).
-        s_scratch = torch.empty(
-            (max_bs, vocab), dtype=torch.float32, device=self.device
-        )
-        draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, self.device)
-        # Everything the captured block head reads, plus the verify's row base,
-        # as members of the runner's `sampling` publication: staged on the host
-        # by `stage_draft_sampling_host` inside the forward's preparation window
-        # and uploaded by the batched H2D `prepare_sample` already issues. The
-        # owner's `begin()` waits out the previous upload before any of them is
-        # rewritten, so a host running a step ahead cannot change a row base
-        # the GPU has yet to read.
-        pin = torch.device(self.device).type != "cpu"
-        buffers = {}
-        for spec in _LOSSLESS_INPUTS:
-            buf = CpuGpuBuffer(
-                max_bs if spec.per_row else 1,
-                dtype=spec.dtype,
-                device=self.device,
-                pin_memory=pin,
-                publication_group="sampling",
-            )
-            # Rows past the staged batch are never published, so they must
-            # already hold a harmless value.
-            if spec.idle is not None:
-                buf.np[:] = spec.idle
-                buf.gpu.fill_(spec.idle)
-            buffers[spec.name] = buf
-        self.metadata_buffers.update({s.key: buffers[s.name] for s in _LOSSLESS_INPUTS})
-        staging = DraftQStaging(
-            DraftQSlots(q_slots, t, log=self.runner.rank == 0),
-            greedy_threshold=SAMPLER_EPS,
-            **{name: buf.np for name, buf in buffers.items()},
-        )
-        sampling = DraftSampling(
-            q_store=q_store,
-            s_scratch=s_scratch,
-            scratch=draft_scratch,
-            **{s.name: buffers[s.name].gpu for s in _LOSSLESS_INPUTS if s.drafted},
-        )
-        return sampling, staging
+        """Arm lossless sampling, or keep the greedy pair (`DSparkLossless.arm`)."""
+        self._lossless = DSparkLossless.arm(self)
 
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
     ) -> None:
-        """Stage this step's draft sampling inputs and both q row bases.
-
-        Called from `ModelRunner.prepare_sample`, inside the forward's
-        preparation window, so every member rides that function's `sampling`
-        H2D. The block head is captured and bakes these buffers' addresses;
-        only their contents change, and only here. What goes in each row is
-        `DraftQStaging.stage`'s policy (see there for ``drafts_verifiable``
-        and ``verifies``); this method only publishes it.
-        """
-        if self.draft_sampling is None:
+        """`DSparkLossless.stage`, from `ModelRunner.prepare_sample`, so every
+        member rides that function's `sampling` H2D."""
+        if self._lossless is None:
             return
-        rows = self._staging.stage(
+        self._lossless.stage(
             batch,
             bs,
+            group,
             drafts_verifiable=drafts_verifiable,
             verifies=verifies,
             step=self.runner.forward_step,
         )
-        for spec in _LOSSLESS_INPUTS:
-            group.counts[group.indices[spec.key]] = rows[spec.name]
 
     def _before_propose(self) -> None:
-        """Claim this forward's staging for the propose about to run, or refuse.
-
-        This step's temperatures / greedy mask / Philox key / q row bases are
-        already in the buffers the captured block head baked the addresses of,
-        carried by `prepare_sample`'s `sampling` H2D, so there is nothing to
-        launch -- provided that staging happened for this propose. A propose
-        reached without it (one that skipped `prepare_sample`) would draft
-        through the previous step's row bases, so it is refused.
-        """
-        if self.draft_sampling is None:
+        """Claim this forward's staging for the propose about to run; a propose
+        that skipped `prepare_sample` would draft through stale row bases, so
+        it is refused (`DraftQStaging.consume`)."""
+        if self._lossless is None:
             return
-        self._staging.consume(self.runner.forward_step)
+        self._lossless.staging.consume(self.runner.forward_step)
 
     def lossless_verify_inputs(
         self,
@@ -373,68 +111,27 @@ class DSparkProposer(Drafter):
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
     ) -> RatioVerifyInputs | None:
-        """The verify step's `RatioVerifyInputs`, around the batch's own
-        temperatures and `Sampler` filters.
-
-        None keeps exact-match verification; anything else selects the
-        probability-ratio rule in `rejection_sampler.rejection_sample`
-        (`ratio_verify`).
-        Asked only for a batch that is not all greedy: an all-greedy batch
-        keeps the exact-match kernel, so its accept rule is the flag-off one
-        (its draft still runs the sampled block, in greedy mode). A greedy row
-        inside a mixed batch is matched exactly by the ratio kernel itself,
-        and a row with top-k or top-p is verified against `Sampler`'s
-        filtered p (`ratio_target_p._ratio_target_p`).
-        """
-        if self.draft_sampling is None:
+        """`DSparkLossless.verify_inputs`, or None for exact match. Asked only
+        for a batch that is not all greedy."""
+        if self._lossless is None:
             return None
-        warmed = self._verify_logits_dtype
-        if warmed is not None and logits_dtype != warmed:
-            # The kernels were compiled for another logits dtype; this verify
-            # would JIT them mid-serving while the TP/DP peers wait.
-            raise RuntimeError(
-                f"ratio verify was warmed up for {warmed} "
-                f"logits but the LM head emits {logits_dtype}"
-            )
-        return RatioVerifyInputs(
-            RatioDraftQ(self.draft_sampling.q_store, self.draft_sampling.s_scratch),
-            self.metadata_buffers["draft_verify_q_row_base"].gpu[:bs],
-            temperatures,
-            top_ks,
-            top_ps,
-            self._verify_scratch,
+        return self._lossless.verify_inputs(
+            bs, logits_dtype, temperatures, top_ks, top_ps
         )
 
     def warmup_lossless_verify(self, logits_dtype: torch.dtype) -> None:
-        """Compile the ratio verify at the widths serving gives it: the store's,
-        the vocab's and ``mtp_k`` drafts (`warmup_ratio_verify`)."""
-        if self.draft_sampling is None:
+        """`DSparkLossless.warmup_verify`."""
+        if self._lossless is None:
             return
-        self._verify_logits_dtype = logits_dtype
-        warmup_ratio_verify(
-            self.mtp_k,
-            self.draft_sampling.s_scratch.shape[1],
-            self.draft_sampling.q_store.ids.shape[1],
-            logits_dtype,
-            self._verify_scratch,
-        )
+        self._lossless.warmup_verify(logits_dtype)
 
     def _before_draft_warmup(self) -> None:
-        """Point every draft row at no q row, on the host and the device.
-
-        The warmup runs the captured block directly, not through `propose`, so
-        it drafts through whatever destination row bases are staged. At startup
-        those are -1, but a recapture after a rollout sleep/wake finds the last
-        served step's bases there, and the synthetic batch would overwrite the
-        q of requests that still own those slots.
-
-        The device fill goes on the current stream, the one the warmup that
-        follows runs on, so it lands before the block reads the bases.
-        """
-        if self.draft_sampling is None:
+        """Point every draft row at no q row: the warmup runs the captured block
+        directly, and after a sleep/wake recapture the last served step's row
+        bases would overwrite live requests' q."""
+        if self._lossless is None:
             return
-        self._staging.clear_destinations()
-        self.draft_sampling.q_row_base.fill_(-1)
+        self._lossless.clear_destinations()
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

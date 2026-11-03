@@ -1,23 +1,13 @@
 """Tiled, max-subtracted softmax statistics shared by the sampling kernels.
 
-A full-vocab softmax over ``[rows, V]`` is computed in two launches: every
-(row, V tile) program reduces its tile to ``(max, sum exp(x - max))``, and one
-program per row combines the tiles into the row's max and ``1/Z``. Consumers
-then evaluate ``exp(x - max) * inv_z`` for exactly the entries they need.
-
-The probability-ratio verify (`ratio_verify`) builds the target's p this
-way. The sampled DSpark draft (`dspark_markov_sample`) takes only the row max
-(and the raw argmax) from the combine: its q is normalized over the entries it
-stores, not by a full-vocab 1/Z, so it skips the sum (``WITH_INV_Z=False``).
-
-Both also draw by the same exponential race: `race_key` keys every id on its
-mass over Exp(1) noise from Philox, and `argmax_lowest_id` takes the winner,
-the lowest id on a tie. The verify's residual race, its p fallback and the
-draft's draw over its stored q all go through these two, so they are one
-sampler by construction and cannot drift apart bit by bit.
-
-`argmax_lowest_id` is also every greedy pick: the verify's per-tile raw
-argmax, the ``WITH_ARGMAX`` combine here, and the DSpark draft's greedy stage 2.
+Every (row, V tile) program reduces its tile to ``(max, sum exp(x - max))``
+and one program per row combines them into the row's max and ``1/Z``. The
+ratio verify builds p this way; the sampled draft takes only the max
+(``WITH_INV_Z=False``), as its q is normalized over the stored entries.
+`race_key` and `argmax_lowest_id` (lowest id on a tie) are the one exponential
+race every draw goes through, so the draws cannot drift apart bit by bit;
+`argmax_lowest_id` is also the draft's greedy argmax and the verify's
+per-tile raw argmax.
 """
 
 import triton

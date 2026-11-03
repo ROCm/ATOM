@@ -194,7 +194,7 @@ class DSparkMarkovHead(nn.Module):
         this one publishes the q the other exists not to materialize.
         """
         # Imported here for the reason `sample_next` gives.
-        from atom.model_ops.dspark_markov_sample import dspark_markov_sample
+        from atom.model_ops.dspark_markov_draw import dspark_markov_sample
 
         bs, num_draft, vocab = base_logits.shape
         assert sampling.s_scratch.shape[1] == vocab, (

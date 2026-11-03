@@ -16,13 +16,15 @@ from atom.model_ops.sampling_filter import (
     _BATCH_COUNTS,
     _FILTER_COUNT_GROUPS,
     _FILTER_COUNT_MAX_K,
+    RowFilters,
     _counted_row,
     _logit_key,
     _request_filter,
     _request_of_row,
-    filter_floor,
     row_filters,
 )
+from atom.model_ops.sampling_filter_count import count_floor
+from atom.model_ops.sampling_filter_descent import descend_floor
 from atom.model_ops.softmax_tiles import (
     argmax_lowest_id,
     softmax_combine_kernel,
@@ -117,6 +119,49 @@ def _ratio_stats_kernel(
             tl.store(group_at_max_ptr + runs, at_max)
 
 
+def filter_floor(
+    target_logits: torch.Tensor,  # [num_tokens, V] raw
+    cu_num_draft_tokens: torch.Tensor,
+    temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
+    filters: RowFilters,
+    rows: tuple[torch.Tensor, ...],
+    parts: tuple[torch.Tensor, ...],
+    stats_block_v: int,
+) -> None:
+    """Each filtered draft row's floor, and its p's normalizer renormalized
+    over the survivors.
+
+    Fills ``row_floor`` and rewrites ``row_inv_z`` of ``rows = (row_max,
+    row_inv_z, row_floor)``, through the work buffers ``parts = (filter_f32,
+    floor_mass, filter_i32, floor_counts, run_max, run_at_max)``, shaped by
+    `sampling_filter.filter_scratch_shapes`. The last two are the run maxima,
+    and the ids at each, that the stats pass kept per ``stats_block_v`` tile
+    in a ``COUNT`` launch; ``row_max`` and ``row_inv_z`` are its combined
+    statistics."""
+    *descent_parts, run_max, run_at_max = parts
+    if filters.counts:
+        count_floor(
+            target_logits,
+            cu_num_draft_tokens,
+            temperatures,
+            filters,
+            rows,
+            (run_max, run_at_max),
+            stats_block_v,
+            _FILTER_COUNT_MAX_K,
+        )
+    if filters.descends:
+        descend_floor(
+            target_logits,
+            cu_num_draft_tokens,
+            temperatures,
+            filters,
+            rows,
+            tuple(descent_parts),
+            _FILTER_COUNT_MAX_K if filters.counts else 0,
+        )
+
+
 def _ratio_target_p(
     target_logits: torch.Tensor,  # [num_tokens, V] raw
     cu_num_draft_tokens: torch.Tensor,
@@ -133,8 +178,7 @@ def _ratio_target_p(
     work buffers ``parts = (part_max, part_sum, part_amax_val, part_amax_idx)``
     and ``filter_parts``, `filter_floor`'s own: p(v) is
     ``exp(l(v) / T - row_max) * row_inv_z``, and on a filtered row 0 below
-    ``row_floor`` with ``row_inv_z`` renormalized over what is left
-    (`sampling_filter.filter_floor`).
+    ``row_floor`` with ``row_inv_z`` renormalized over what is left.
     ``top_ks``/``top_ps`` are what `Sampler` is given: None (no row filters),
     one value for the batch, or one per request, a top-k of -1 meaning none.
     Returns whether the batch filters at all; ``row_floor`` is written only
