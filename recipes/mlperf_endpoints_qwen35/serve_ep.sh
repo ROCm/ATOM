@@ -67,6 +67,15 @@ if [ "$MODE" = dp ]; then
   # state copies, or turning off the cached launch paths above, also clears it: a race that needs
   # the host far ahead of the GPU, still open.
   export ATOM_GDN_PREFILL_IN_GRAPH=${ATOM_GDN_PREFILL_IN_GRAPH:-0}
+  # GDN prefill region: shared-expert gate + routed add folded into the next norm, SiLU-and-mul in
+  # the shared gate_up GEMM, the gates inside the KKT kernel, the Gluon inverse/WY, chunk_h paired
+  # TDM loads and the chunk_o in-wave gated norm
+  export ATOM_FUSED_MOE_TAIL_NORM=${ATOM_FUSED_MOE_TAIL_NORM:-1}
+  export ATOM_SHARED_EXPERT_GATED_GEMM=${ATOM_SHARED_EXPERT_GATED_GEMM:-1}
+  export ATOM_GDN_KKT_GATING=${ATOM_GDN_KKT_GATING:-1}
+  export ATOM_GDN_GLUON_INVERSE=${ATOM_GDN_GLUON_INVERSE:-1}
+  export ATOM_GDN_CHUNK_H_PAIRED_LOADS=${ATOM_GDN_CHUNK_H_PAIRED_LOADS:-1}
+  export ATOM_GDN_CHUNK_O_FAST_NORM=${ATOM_GDN_CHUNK_O_FAST_NORM:-1}
 fi
 # keep Triton autotune results across server starts: the GDN chunk kernels otherwise re-tune on the
 # first eager multi-request prefill, a ~35 s stall a fresh server
