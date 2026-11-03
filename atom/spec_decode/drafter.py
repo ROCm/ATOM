@@ -329,6 +329,8 @@ class Drafter(abc.ABC):
         cfg.hf_config = self.speculative_config.draft_model_hf_config
         cfg.compilation_config = copy.copy(self.config.compilation_config)
         cfg.compilation_config.level = CompilationLevel.NO_COMPILATION
+        # A quantized standalone draft is not supported yet: it would also need
+        # its model's packed-module remap (remap_layer_name), not applied here.
         cfg.quant_config = QuantizationConfig(
             cfg.hf_config,
             self.config.online_quant_config,
