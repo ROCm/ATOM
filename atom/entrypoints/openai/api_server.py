@@ -1330,6 +1330,9 @@ def _cut_prompt(prompt: str, prompt_cap: _PromptCap) -> tuple[str | list[int], s
     token_ids = tokenizer.encode(prompt)
     if len(token_ids) <= prompt_cap.tokens:
         return prompt, prompt
+    logger.warning(
+        "Prompt too long (%d > %d), truncating", len(token_ids), prompt_cap.tokens
+    )
     token_ids = token_ids[: prompt_cap.tokens]
     return token_ids, tokenizer.decode(token_ids, skip_special_tokens=False)
 

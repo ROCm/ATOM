@@ -224,3 +224,41 @@ class TestBothLegsTruncateAlike:
             self._sent_prompt(server, endpoint, 4096, None)
             == f"<{MAX_CTX - MAX_CTX // 8}>"
         )
+
+
+class TestStructuredResponsesCutFirst:
+    """A structured /v1/responses request builds its reasoning channel into the
+    sampling params before the engine call, so an over-long prompt is cut
+    first and the channel is seeded from the kept text."""
+
+    def test_over_the_cap_the_engine_gets_the_kept_ids(self, server, monkeypatch):
+        server.template = "<long prompt>"
+        configured = []
+        seeds = []
+
+        async def configure(_sampling, schema, channel, **_kw):
+            configured.append(schema)
+
+        monkeypatch.setattr(api_server, "_configure_structured_output", configure)
+        monkeypatch.setattr(
+            api_server,
+            "prompt_starts_in_reasoning",
+            lambda text: seeds.append(text) or False,
+        )
+        monkeypatch.setattr(api_server, "validate_output", lambda *a, **kw: None)
+        _responses(
+            {
+                "model": "m",
+                "input": "hi",
+                "max_output_tokens": 4096,
+                "text": {"format": {"type": "json_object"}},
+            }
+        )
+
+        sent, kwargs = server.generate[0]
+        kept = kwargs["prompt_cap"].tokens
+        assert configured == ['{"type": "object"}']
+        # The engine is handed the kept ids, already under the cap.
+        assert sent == [0] * kept
+        # The channel was seeded from the cut text, before the engine call.
+        assert seeds[0] == f"<{kept}>"
