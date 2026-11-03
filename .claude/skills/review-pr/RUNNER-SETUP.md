@@ -351,6 +351,25 @@ bash .claude/skills/review-pr/selftest.sh
 
 ## 7. Reading what comes out, and what a red gate means
 
+### Do not edit the skill while a run is using it
+
+Hit for real on 2026-11-03: a review was running from this checkout, the
+scripts were edited mid-run, and the job died with
+
+    run_one.sh: line 195: e: command not found
+    run_one exited unexpectedly (code 127)
+
+Nothing was wrong with line 195. Bash reads a script incrementally by byte
+offset; growing the file under a running shell leaves it resuming in the
+middle of a different line. The error names a line that never failed, which
+is the expensive part -- an hour can go into debugging code that is correct.
+
+CI is safe from this: a job runs against a checkout pinned to one commit, and
+a push during the run does not touch it. This is a hazard for hand-runs on a
+dev box only. If you need to edit while something is running, run it from a
+second checkout.
+
+
 ### The card
 
 Three things to check by hand:
