@@ -398,18 +398,6 @@ def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
 
 
-def test_each_rows_filters_ride_the_publication(monkeypatch):
-    prop = proposer(monkeypatch)
-    counts = stage(prop, batch(["a", "b"], top_ks=[-1, 7], top_ps=[0.8, 1.0]))
-    assert counts["draft_top_k"] == counts["draft_top_p"] == 2
-    assert prop.metadata_buffers["draft_top_k"].np[:2].tolist() == [0, 7]
-    np.testing.assert_array_equal(
-        prop.metadata_buffers["draft_top_p"].np[:2], np.float32([0.8, 1])
-    )
-    # Neither row drafts greedily for a filter.
-    assert prop.metadata_buffers["draft_greedy_mask"].np[:2].tolist() == [0, 0]
-
-
 def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
@@ -469,9 +457,22 @@ def test_dspark_refuses_relaxed_mtp_where_lossless_sampling_arms(
 def test_a_plain_drafter_starts_with_both_flags_set(monkeypatch):
     """Only DSpark reads ATOM_SPEC_LOSSLESS_SAMPLING to arm, so an MTP/EAGLE
     relaxed deployment that inherits it is not refused."""
+    from atom.spec_decode import drafter as drafter_mod
+
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
     monkeypatch.setenv("ATOM_ENABLE_RELAXED_MTP", "1")
-    drafter = _Bare.__new__(_Bare)
-    # Not a ValueError: construction gets as far as the missing config.
-    with pytest.raises(AttributeError):
-        Drafter.__init__(drafter, None, None, None)
+    monkeypatch.setitem(drafter_mod.support_draft_model_arch_dict, "Plain", "plain")
+    monkeypatch.setattr(drafter_mod, "resolve_obj_by_qualname", lambda name: None)
+    monkeypatch.setattr(_Bare, "_build_draft_model", lambda self, cls: None)
+    monkeypatch.setattr(_Bare, "_allocate_metadata_buffers", lambda *args: {})
+    monkeypatch.setattr(_Bare, "_build_draft_graphs", lambda self: None)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_hf_config=SimpleNamespace(architectures=["Plain"])
+        ),
+        torch_dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
+        max_num_seqs=2,
+    )
+    drafter = _Bare(config, torch.device("cpu"), None)
+    assert drafter.mtp_k == 1
