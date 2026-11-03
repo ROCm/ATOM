@@ -7,6 +7,9 @@
    the target autoregressive distribution: the first L emitted tokens of each
    request, completed on the host with fresh target samples, must follow the
    joint target law (chi-square), including top-p and rows without q.
+3. The vocab-split kernels (row statistics, top-p search, residual mass and
+   draw split over vocab chunks) emit the per-row kernels' tokens and verdicts,
+   on every top-p path.
 
 Needs one GPU; skipped without triton / a device.
 """
@@ -475,6 +478,107 @@ def test_acceptance_gain(V=50, n=5, R=2048, T=1.0, top_p=0.95):
         f"[accept] V={V} n={n}: greedy-draft/match={tot / R:.3f} "
         f"prob/standard={na_std.mean():.3f} prob/block={na_blk.mean():.3f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 3. vocab-split kernels == per-row kernels
+# ---------------------------------------------------------------------------
+
+
+def _split_case(bs, n, V, flat, seed, T=1.0, top_p=0.95, greedy_frac=0.0):
+    """Decode-step-shaped inputs: bs requests of n drafted tokens over a V-wide
+    vocab. Rows are LLM-like (a peak 10..28 nats over an N(0, 3^2) body) or,
+    with ``flat``, keep much of the body inside the top-p search's bracket,
+    which drives the split search into its second level. Drafts are drawn from
+    q, so every row has a usable q."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    N = bs * n
+    top = torch.randint(0, V, (N, 8), generator=g, device=DEV)
+    if flat:
+        logits = torch.randn(N, V, generator=g, device=DEV) * 2.0
+        boost = torch.rand(N, 8, generator=g, device=DEV) * 10.0 + 6.0
+    else:
+        logits = torch.randn(N, V, generator=g, device=DEV) * 3.0
+        h = torch.rand(N, 1, generator=g, device=DEV) * 18.0 + 10.0
+        boost = h - torch.rand(N, 8, generator=g, device=DEV) * 6.0
+    logits.scatter_(1, top, boost)
+    qlog = 0.8 * logits + 0.6 * torch.randn(N, V, generator=g, device=DEV)
+    drafts = torch.multinomial(torch.softmax(qlog / T, -1), 1, generator=g)
+    drafts = drafts.view(bs, n).to(torch.int32)
+    per = n + 1
+    input_ids = torch.zeros(bs * per, dtype=torch.int32, device=DEV)
+    input_ids.view(bs, per)[:, 1:] = drafts
+    req = torch.arange(bs, dtype=torch.int32, device=DEV)
+    tli = (req[:, None] * per + torch.arange(n, device=DEV)).flatten().to(torch.int32)
+    bli = req * per + n
+    temps = torch.full((bs,), T, dtype=torch.float32, device=DEV)
+    temps[torch.rand(bs, generator=g, device=DEV) < greedy_frac] = 1e-10
+    return {
+        "args": (
+            input_ids,
+            tli,
+            n,
+            (req + 1) * n,
+            logits,
+            logits.view(bs, n, V)[:, -1].argmax(-1).to(torch.int32),
+            bli,
+            temps,
+            top_p,
+            req.clone(),
+        ),
+        "qlog": qlog.view(bs, n, V),
+        "drafts": drafts,
+        "temps": temps,
+    }
+
+
+def _split_run(case, steps, use_block):
+    bs, n = case["drafts"].shape
+    V = case["qlog"].shape[-1]
+    st = ProbDraftState.allocate(bs, n, V, DEV)
+    st.q[:bs] = case["qlog"]
+    st.ids[:bs] = case["drafts"]
+    st.temps[:bs] = case["temps"]
+    st.set_layout(0, V, 1)
+    outs = []
+    for step in range(steps):
+        st.verify_step = step
+        out, verdict = prob_rejection_sample(*case["args"], st, use_block=use_block)
+        outs.append((out.clone(), verdict.clone()))
+    return outs
+
+
+@pytest.mark.parametrize("flat", [False, True])
+@pytest.mark.parametrize("use_block", [False, True])
+def test_split_matches_per_row(flat, use_block, monkeypatch, bs=16, n=4, V=50000):
+    """Tokens and verdicts of the vocab-split kernels match the per-row ones
+    (one chunk per row, per-row statistics and top-p search) on the same
+    inputs and seeds: on every top-p path (the final interval fitting the
+    register budget, the level-2 refinement of flat rows, the per-row fallback
+    a tiny budget forces) and with greedy rows mixed in."""
+    from atom.model_ops import dspark_prob_sample as dps
+
+    case = _split_case(bs, n, V, flat, seed=7 + flat, greedy_frac=0.25)
+    rb, chunk = dps._TOPP_RB, dps._CHUNK
+
+    def run(split_stats, split_topp, rb, chunk):
+        monkeypatch.setattr(dps, "_SPLIT_STATS", split_stats)
+        monkeypatch.setattr(dps, "_SPLIT_TOPP", split_topp)
+        monkeypatch.setattr(dps, "_TOPP_RB", rb)
+        monkeypatch.setattr(dps, "_CHUNK", chunk)
+        return _split_run(case, 12, use_block)
+
+    per_row = run(False, False, rb, 1 << 20)
+    for cfg in [
+        (True, False, rb, chunk),
+        (True, True, rb, chunk),
+        (True, True, 64, chunk),
+        (True, True, 16, chunk),
+    ]:
+        got = run(*cfg)
+        for step, ((o1, v1), (o2, v2)) in enumerate(zip(per_row, got)):
+            assert torch.equal(o1, o2) and torch.equal(v1, v2), (cfg, step)
+    print(f"[split] flat={flat} block={use_block}: split == per-row, 4 configs")
 
 
 if __name__ == "__main__":
