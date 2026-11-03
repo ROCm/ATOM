@@ -32,7 +32,9 @@ at load, before capture, or at exit. A release that would have to synchronize
 during a capture is skipped, with a warning, rather than breaking it.
 """
 
+import contextlib
 import ctypes
+import fcntl
 import functools
 import logging
 import os
@@ -545,6 +547,36 @@ def _read_only(lo: int, hi: int) -> bool:
     return False
 
 
+# One cudaHostRegister of a whole Engram table is 90 GiB or more. Four DP
+# ranks doing that together never return (the thread sits in D state inside
+# the ioctl, and the "registered N GiB" log never prints). Default to 1 GiB
+# pieces. ATOM_ENGRAM_REG_CHUNK_MB=0 keeps the old one-BO-per-gap behavior.
+_REG_CHUNK = (
+    (int(os.environ.get("ATOM_ENGRAM_REG_CHUNK_MB", "1024") or "0") << 20)
+    // _PAGE
+    * _PAGE
+)
+_REG_LOCK_PATH = os.environ.get(
+    "ATOM_ENGRAM_REG_LOCK", "/dev/shm/engram-uva-register.lock"
+)
+
+
+@contextlib.contextmanager
+def _engram_register_lock():
+    """Hold an exclusive lock so one process at a time page-locks Engram tables.
+
+    The tables are one shared read-only checkpoint mapping. Concurrent
+    cudaHostRegister calls on it deadlock in the HIP/KFD ioctl.
+    """
+    os.makedirs(os.path.dirname(_REG_LOCK_PATH) or ".", exist_ok=True)
+    with open(_REG_LOCK_PATH, "a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 class _PageRuns:
     """This process's in-place page-locked runs, reference-counted.
 
@@ -574,12 +606,30 @@ class _PageRuns:
             for base in [*overlapping, None]:
                 gap_end = hi if base is None else base
                 if cursor < gap_end:
-                    if int(rt.cudaHostRegister(cursor, gap_end - cursor, flags)):
-                        _clear_hip_error()
-                        self.release(rt, held)
-                        return None
-                    self._runs[cursor] = [gap_end, 1]
-                    held.append(cursor)
+                    # Register in _REG_CHUNK pieces (ATOM_ENGRAM_REG_CHUNK_MB).
+                    step = _REG_CHUNK if _REG_CHUNK > 0 else gap_end - cursor
+                    c = cursor
+                    while c < gap_end:
+                        e = min(gap_end, c + step)
+                        nbytes = e - c
+                        if nbytes >= (1 << 30):
+                            logger.info(
+                                "engram: cudaHostRegister %.2f GiB",
+                                nbytes / 2**30,
+                            )
+                        if int(rt.cudaHostRegister(c, nbytes, flags)):
+                            _clear_hip_error()
+                            self.release(rt, held)
+                            return None
+                        self._runs[c] = [e, 1]
+                        held.append(c)
+                        c = e
+                    if gap_end - cursor >= (1 << 30):
+                        logger.info(
+                            "engram: registered %.2f GiB in-place as %d userptr BO(s)",
+                            (gap_end - cursor) / 2**30,
+                            -(-(gap_end - cursor) // step),
+                        )
                 if base is None:
                     break
                 self._runs[base][1] += 1
@@ -631,15 +681,42 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
+# ATOM_ENGRAM_MLOCK=1 pins the faulted-in table before registering it, so
+# the kernel cannot reclaim its pages between _populate and cudaHostRegister
+# (a cold reclaim makes registration fault the table back in from disk). The
+# process needs an unlimited (or table-sized) RLIMIT_MEMLOCK.
+_MLOCK = os.environ.get("ATOM_ENGRAM_MLOCK", "0") == "1"
+
+
+def _mlock(lo: int, hi: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    if libc.mlock(lo, hi - lo) != 0:
+        logger.warning(
+            "engram: mlock of %d bytes failed: errno %d", hi - lo, ctypes.get_errno()
+        )
+    elif hi - lo >= (1 << 30):
+        logger.info("engram: mlocked %.2f GiB", (hi - lo) / 2**30)
+
+
 def _register(sources, leases):
     """Register the mapping in place; each range is widened to page
     boundaries, which registration requires (the extra bytes are neighbouring
     rows the kernel never addresses), and shares any page another range of
     this process already holds (`_PageRuns`). A read-only mapping (the shared
     checkpoint mapping) is faulted in on several threads first and registered
-    read-only."""
-    rt = torch.cuda.cudart()
+    read-only.
 
+    The whole function holds a cross-process lock. DP attention registers the
+    same checkpoint pages on every rank, and overlapping cudaHostRegister
+    calls hang.
+    """
+    rt = torch.cuda.cudart()
+    with _engram_register_lock():
+        return _register_locked(rt, sources, leases)
+
+
+def _register_locked(rt, sources, leases):
     out = []
     for src in sources:
         base = src.data_ptr()
@@ -649,6 +726,8 @@ def _register(sources, leases):
         flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
         if flags:
             _populate(lo, hi)
+        if _MLOCK:
+            _mlock(lo, hi)
         runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
         if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
