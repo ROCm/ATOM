@@ -344,6 +344,14 @@ t "every id derive() emits is in ALL_RULES" "$(_rule_ids_consistent)" "ok"
 t "rejected validation evidence degrades instead of aborting" \
   "$(bash "$S/_degrade_test.sh" "$S" 2>&1 | tail -1)" "ok"
 
+# A fetch that dies must say why, in the log, in terms the runner can act on. The live run
+# this pins: a spent GitHub API quota ended the log mid-sentence after "fetch..." -- errexit
+# aborted inside the pipeline before the classification could run, and the exit trap wrote a
+# status file while printing nothing. "Check gh auth/token" would also have been the wrong
+# advice: the token was fine and a quota was empty, which resets on a clock.
+t "a dead fetch names the cause the runner can act on" \
+  "$(bash "$S/_fetchfail_test.sh" "$S" 2>&1 | tail -1)" "ok"
+
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
 # anchoring rule (span anchors and the permalinks for what cannot be anchored included), and
