@@ -130,14 +130,14 @@ class SparseMoeLayer:
             f"layer {layer_id}: sparse selection config",
         )
         impl = attn.attn.impl
-        _need(
-            impl.kv_cache_dtype == "fp8" and impl.index_cache is not None,
-            f"layer {layer_id}: caches",
-        )
-        _need(
-            impl.index_cache.dtype == dtypes.fp8,
-            f"layer {layer_id}: index cache {impl.index_cache.dtype}",
-        )
+        index_topk = not attn.skip_index_topk
+        _need(impl.kv_cache_dtype == "fp8", f"layer {layer_id}: KV cache dtype")
+        if index_topk:
+            _need(impl.index_cache is not None, f"layer {layer_id}: index cache")
+            _need(
+                impl.index_cache.dtype == dtypes.fp8,
+                f"layer {layer_id}: index cache {impl.index_cache.dtype}",
+            )
         w_qkv, s_qkv = _ptpc_fp8(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
@@ -191,7 +191,7 @@ class SparseMoeLayer:
         return SparseMoeLayer(
             layer_id=layer_id,
             attn_impl=impl,
-            index_topk=not attn.skip_index_topk,
+            index_topk=index_topk,
             g_in=_bf16_vec(layer.input_layernorm.weight, HIDDEN, "input_layernorm"),
             w_qkv=w_qkv,
             s_qkv=s_qkv,

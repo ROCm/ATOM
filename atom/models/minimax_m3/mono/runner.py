@@ -322,11 +322,13 @@ class MonoDecodeRunner:
         # each layer's K1 pointers that do not change per step (K1_ARGS order)
         self.k1_args = []
         for i, lw in enumerate(self.sparse):
+            # The reuse variant never reads index storage; compact pools omit it.
+            index_cache = _ptr(lw.attn_impl.index_cache) if lw.index_topk else 0
             ptrs = {
                 "ar": _ptr(self.ars[i % 2]), "g_in": _ptr(lw.g_in), "w_qkv": _ptr(lw.w_qkv),
                 "s_qkv": _ptr(lw.s_qkv), "g_q": _ptr(lw.g_q), "g_k": _ptr(lw.g_k),
                 "g_iq": _ptr(lw.g_iq), "g_ik": _ptr(lw.g_ik), "cos_sin": _ptr(lw.cos_sin),
-                "index_cache": _ptr(lw.attn_impl.index_cache), "iq_out": _ptr(self.iq),
+                "index_cache": index_cache, "iq_out": _ptr(self.iq),
                 "scratch": _ptr(self.scratch1),
             }  # fmt: skip
             self.k1_args.append(

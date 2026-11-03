@@ -118,11 +118,13 @@ def forward_probed(
     for i, lw in enumerate(runner.sparse):
         # the history this layer reads, before this step inserts
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        sums[f"cache{lw.layer_id}"] = (
-            _fingerprint(kv.k_cache[blocks])
-            + _fingerprint(kv.v_cache[blocks])
-            + _fingerprint(lw.attn_impl.index_cache[blocks])
+        sums[f"cache{lw.layer_id}"] = _fingerprint(kv.k_cache[blocks]) + _fingerprint(
+            kv.v_cache[blocks]
         )
+        if lw.index_topk:
+            sums[f"cache{lw.layer_id}"] += _fingerprint(
+                lw.attn_impl.index_cache[blocks]
+            )
         res = runner.run_sparse_layer(i, lw, fwd, positions, res, rows)
         sums[f"L{lw.layer_id}"] = _fingerprint(
             runner.ars[(i + 1) % 2][:n]
