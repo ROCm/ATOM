@@ -62,6 +62,7 @@ from atom.models.dspark_draft import (
 from atom.models.qwen3 import Qwen3MLP
 from atom.spec_decode.draft_kv import DraftKvPoolSpec
 from atom.spec_decode.drafter import AuxCaptureSpec
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -135,10 +136,73 @@ class KimiK3DSparkGQAAttention(nn.Module):
         )
 
         self.kv = KVCacheBinding(layer_num)
+        # `ATOM_K3_DRAFT_QKROPE`: q/k norm, rope and the pool write in one
+        # launch (`draft_qk_rope_cache`). Read once, so it must be set before
+        # the server starts. `_qkrope_scales` is its host copy of the pool's
+        # per-tensor scales, read on first use.
+        self.qkrope = envs.ATOM_K3_DRAFT_QKROPE
+        self._qkrope_scales = None
 
-    def _qkv(self, hidden_states: torch.Tensor):
-        qkv = linear_out(self.qkv_proj(hidden_states))
-        return qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    def _qkrope_cache(
+        self, packed, num_q_heads, positions, slot_mapping, k_cache, v_cache
+    ) -> bool:
+        """`ATOM_K3_DRAFT_QKROPE`: norm + rope and the pool write in one launch.
+        False (nothing done) when the operands are ones the kernel is not
+        proven on; the caller then runs the unfused chain.
+
+        `packed` is the fused projection's output: `q | k | v` on the block pass
+        (`num_q_heads` = this rank's heads; q and k are normed and roped in
+        place, the views the read takes), or `k | v` on the context write
+        (`num_q_heads` = 0; k is cached normed and roped but not written back,
+        since only the pool needs it).
+        """
+        from atom.model_ops.draft_qk_rope_cache import (
+            draft_qk_norm_rope_cache,
+            qkrope_supported,
+        )
+
+        if not qkrope_supported(
+            packed,
+            k_cache,
+            v_cache,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            eps_q=self.q_norm.eps,
+            eps_k=self.k_norm.eps,
+            rope=self.rotary_emb,
+        ):
+            return False
+        if self._qkrope_scales is None:
+            # The kernel takes one scalar a tensor, as a host float it divides
+            # by (`reshape_and_cache_flash`'s `*k_scale`): the pool's
+            # per-tensor scale, read once. A scale plane keeps the chain.
+            ks, vs = self.kv.k_scale, self.kv.v_scale
+            if any(x is not None and x.numel() != 1 for x in (ks, vs)):
+                return False
+            self._qkrope_scales = tuple(
+                1.0 if x is None else float(x.item()) for x in (ks, vs)
+            )
+        k_scale, v_scale = self._qkrope_scales
+        with_q = num_q_heads > 0
+        draft_qk_norm_rope_cache(
+            packed,
+            self.q_norm.weight if with_q else None,
+            self.k_norm.weight,
+            self.k_norm.eps,
+            positions,
+            self.rotary_emb.cos_cache,
+            self.rotary_emb.sin_cache,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            write_k=with_q,
+        )
+        return True
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
         """One block pass: write this block's own K/V, then attend non-causally.
@@ -149,7 +213,23 @@ class KimiK3DSparkGQAAttention(nn.Module):
         fwd_ctx = get_forward_context()
         attn_metadata = fwd_ctx.attn_metadata
 
-        q, k, v = self._qkv(hidden_states)
+        qkv = linear_out(self.qkv_proj(hidden_states))
+        if self.qkrope:
+            k_cache, v_cache = self._caches()
+            if k_cache is not None and self._qkrope_cache(
+                qkv,
+                self.num_heads,
+                positions,
+                attn_metadata.slot_mapping[: qkv.shape[0]],
+                k_cache,
+                v_cache,
+            ):
+                # q is now a normed and roped view of `qkv`, and the pool holds
+                # this block's K/V: what `_write_kv` would have done.
+                q = qkv[:, : self.q_size]
+                o = self._attend_non_causal(q, attn_metadata, k_cache, v_cache)
+                return linear_out(self.o_proj(o))
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.qk_norm(q, k)
         # Norm, then rope: the reference's order.
         q, k = self.rotary_emb(positions, q, k)
@@ -235,6 +315,12 @@ class KimiK3DSparkGQAAttention(nn.Module):
         contiguous view of exactly the k and v shards.
         """
         kv = tgemm.mm(ctx_hidden, self.qkv_proj.weight[self.q_size :], None)
+        if self.qkrope:
+            k_cache, v_cache = self._caches()
+            if k_cache is not None and self._qkrope_cache(
+                kv, 0, positions, slot_mapping, k_cache, v_cache
+            ):
+                return
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         # v is not normed, matching the reference.
         k = self.k_norm(k)
