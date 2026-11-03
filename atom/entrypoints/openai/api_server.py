@@ -1256,7 +1256,7 @@ class _PromptCap:
     ``cut_text`` is the text the engine runs if the prompt was cut, for the
     readers that seed from the prompt's end (the reasoning channel)."""
 
-    __slots__ = ("tokens", "cut_text")
+    __slots__ = ("cut_text", "tokens")
 
     def __init__(self, tokens: int):
         self.tokens = tokens
