@@ -56,8 +56,6 @@ class PPAuxRelay:
             )
 
         self.spec = spec
-        self.layer_ids = spec.layer_ids
-        self.hidden_size = spec.hidden_size
         self.own_ids = tuple(lid for lid in taps if resident(lid))
         # Every tap below this stage's first layer was captured upstream, which
         # is exactly what the previous stage sent, even if it owned none itself.
@@ -77,8 +75,6 @@ class PPAuxRelay:
         # this holds only while PP stages run their target eagerly.
         self._send: torch.Tensor | None = None
         self._col = {lid: col for col, lid in enumerate(self.outgoing_ids)}
-
-        self._armed = False
 
     @classmethod
     def build(cls, config, target_model) -> "PPAuxRelay | None":
@@ -101,9 +97,8 @@ class PPAuxRelay:
     def arm(self, target_model: torch.nn.Module) -> None:
         """Install capture hooks for this stage's taps (no-op on the last stage,
         whose taps the drafter's own ``arm_aux_capture`` hooks)."""
-        if self._armed or get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank:
             return
-        self._armed = True
         install_aux_taps(
             target_model,
             self.spec,
@@ -117,7 +112,7 @@ class PPAuxRelay:
         )
 
     def _capture_into(self, lid):
-        h, col = self.hidden_size, self._col[lid]
+        h, col = self.spec.hidden_size, self._col[lid]
         width = len(self.outgoing_ids) * h
 
         opens = lid == self.own_ids[0]
@@ -137,12 +132,7 @@ class PPAuxRelay:
         if not self.outgoing_ids:
             return None
         if self.incoming_ids:
-            if received is None:
-                raise RuntimeError(
-                    f"PPAuxRelay expected aux rows for target layers "
-                    f"{list(self.incoming_ids)} from the previous stage, got none."
-                )
-            self._check_width(received)
+            self._check_received(received)
             if not self.own_ids:
                 return received[:num_tokens]
         # Hand the step's buffer over: the send path owns it from here.
@@ -154,8 +144,13 @@ class PPAuxRelay:
             send[:, : received.shape[-1]].copy_(received[:num_tokens])
         return send
 
-    def _check_width(self, received: torch.Tensor) -> None:
-        expected = len(self.incoming_ids) * self.hidden_size
+    def _check_received(self, received: torch.Tensor | None) -> None:
+        if received is None:
+            raise RuntimeError(
+                f"PPAuxRelay expected aux rows for target layers "
+                f"{list(self.incoming_ids)} from the previous stage, got none."
+            )
+        expected = len(self.incoming_ids) * self.spec.hidden_size
         if received.shape[-1] != expected:
             raise RuntimeError(
                 f"PPAuxRelay expected {expected} aux columns for target layers "
@@ -166,10 +161,5 @@ class PPAuxRelay:
         """Hand the relayed block to the drafter, which reads it in place."""
         if not self.incoming_ids:
             return
-        if received is None:
-            raise RuntimeError(
-                f"PPAuxRelay expected aux rows for target layers "
-                f"{list(self.incoming_ids)} from the previous stage, got none."
-            )
-        self._check_width(received)
+        self._check_received(received)
         drafter.take_relayed_aux(received)

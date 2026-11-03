@@ -394,7 +394,7 @@ class Drafter(abc.ABC):
         no capture). What a drafterless PP stage taps and relays on."""
         return None
 
-    def _aux_capture_spec(self, target_model: nn.Module) -> AuxCaptureSpec | None:
+    def _aux_capture_spec(self) -> AuxCaptureSpec | None:
         """Declare which target layers to tap for aux hidden states and how to
         extract them. Default: the config-only ``aux_capture_spec``. The base
         ``arm_aux_capture`` turns the spec into forward hooks."""
@@ -449,7 +449,7 @@ class Drafter(abc.ABC):
         this drafter's ``_aux_capture_spec``, writing each tapped layer's aux
         tensor into a preallocated buffer in-place (cudagraph-safe). Called once
         after ``load_model``. No-op when the drafter declares no spec."""
-        spec = self._aux_capture_spec(target_model)
+        spec = self._aux_capture_spec()
         if spec is None:
             return
         self._aux_buffers = [
