@@ -265,6 +265,17 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
 
+    def lookup_ready(self, seq: Any) -> bool:
+        ready = getattr(self._require_impl(), "lookup_ready", None)
+        return bool(ready(seq)) if callable(ready) else False
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        cancel = getattr(self._require_impl(), "cancel_preadmission", None)
+        if callable(cancel):
+            cancel(seq)
+        else:
+            self._require_impl().cancel_pending_load(seq)
+
     def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
         check = getattr(self._require_impl(), "can_detach_lookup", None)
         return bool(check(seq, num_hbm_tokens)) if callable(check) else False
