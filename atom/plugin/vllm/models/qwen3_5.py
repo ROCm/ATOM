@@ -50,12 +50,18 @@ class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):
         quant_config=None,
         speculative_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
+        # `reduce_results` is the decoder layer's call: False when the next
+        # norm fuses the TP all-reduce, so out_proj hands back partial sums.
+        # allreduce_norm_fusion_enabled() keeps that fusion off in plugin
+        # mode, so the layer passes True here.
         super().__init__(
             atom_config=atom_config,
             quant_config=quant_config,
             speculative_config=speculative_config,
             prefix=prefix,
+            reduce_results=reduce_results,
         )
         self.model_config = atom_config.plugin_config.vllm_config.model_config
         self.cache_config = atom_config.plugin_config.vllm_config.cache_config

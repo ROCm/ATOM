@@ -57,7 +57,11 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.rotary_embedding import NoPositionalRotaryEmbedding
 from atom.model_ops.triton_fused_sigmoid_mul_quant import fused_sigmoid_mul_maybe_quant
 from atom.model_ops.utils import atom_parameter
-from atom.models.deepseek_v2 import Indexer
+from atom.models.deepseek_v2 import (
+    FusedIndexerProjection,
+    Indexer,
+    indexer_projection_fusable,
+)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -148,35 +152,6 @@ def _kimi_packed_modules_mapping(config) -> dict[str, tuple[str, int]]:
         mapping[f"{prefix}indexer.wk"] = (f"{prefix}fused_qkv_a_proj", 2)
         mapping[f"{prefix}indexer.weights_proj"] = (f"{prefix}fused_qkv_a_proj", 3)
     return mapping
-
-
-class K3FusedIndexerProjection(MergedReplicatedLinear):
-    """Pack four original BF16 projections and require all four checkpoint slices."""
-
-    def __init__(self, *args, require_checkpoint_shards: bool = True, **kwargs):
-        self._checkpoint_shards: set[int] = set()
-        self._require_checkpoint_shards = require_checkpoint_shards
-        super().__init__(*args, **kwargs)
-        if len(self.output_sizes) != 4:
-            raise ValueError(
-                "Fused indexer projection requires q_a, kv_a, wk and weights_proj"
-            )
-
-    def weight_loader(self, param, loaded_weight, loaded_shard_id=None):
-        if param is not self.weight or loaded_shard_id not in (0, 1, 2, 3):
-            raise ValueError("Unexpected fused indexer projection checkpoint slice")
-        if loaded_weight.dtype != torch.bfloat16 or param.dtype != torch.bfloat16:
-            raise ValueError("Fused indexer projection requires original BF16 weights")
-        super().weight_loader(param, loaded_weight, loaded_shard_id)
-        self._checkpoint_shards.add(loaded_shard_id)
-
-    def process_weights_after_loading(self):
-        if self._require_checkpoint_shards and self._checkpoint_shards != {0, 1, 2, 3}:
-            raise RuntimeError(
-                "Incomplete fused indexer projection: missing checkpoint slices "
-                f"{sorted({0, 1, 2, 3} - self._checkpoint_shards)}"
-            )
-        super().process_weights_after_loading()
 
 
 def _extract_layer_idx(prefix: str) -> int:
@@ -287,9 +262,6 @@ class KimiMLP(nn.Module):
         super().__init__()
         hidden_size = hidden_size or config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
-        down_type, down_dtype = effective_layer_quant(
-            quant_config, f"{prefix}.down_proj"
-        )
         # An MXFP4 down_proj's K is the per-rank intermediate (33792 / TP8 = 4224
         # on the dense layer), which the MXFP4 GEMMs cannot take unaligned. The
         # pair pads it together (gate_up zero rows, down zero columns); situ(0) *
@@ -317,6 +289,9 @@ class KimiMLP(nn.Module):
         # Fuse SiTUv2 + activation quant when down_proj is a8w8 per-token FP8
         # (ptpc_fp8): the fused kernel emits (fp8, scale) so down_proj skips its
         # standalone quant. gate_up/down share a scheme, so probe down_proj.
+        down_type, down_dtype = effective_layer_quant(
+            quant_config, f"{prefix}.down_proj"
+        )
         self._fuse_act_quant = (
             down_type == QuantType.per_Token and down_dtype == dtypes.fp8
         )
@@ -754,18 +729,13 @@ class KimiFullAttention(nn.Module):
             self.qk_rope_head_dim,
         ]
         if has_indexer:
-            for name in ("fused_qkv_a_proj", "indexer.wk", "indexer.weights_proj"):
-                if (
-                    effective_layer_quant(quant_config, f"{prefix}.{name}")[0]
-                    != QuantType.No
-                ):
-                    raise ValueError(
-                        "Indexer projection fusion requires unquantized BF16 "
-                        "projections"
-                    )
+            if not indexer_projection_fusable(quant_config, prefix):
+                raise ValueError(
+                    "Indexer projection fusion requires unquantized BF16 projections"
+                )
             projection_sizes += [config.index_head_dim, config.index_n_heads]
             self.projection_split_sizes += [config.index_head_dim, config.index_n_heads]
-            self.fused_qkv_a_proj = K3FusedIndexerProjection(
+            self.fused_qkv_a_proj = FusedIndexerProjection(
                 self.hidden_size,
                 projection_sizes,
                 bias=False,
@@ -885,6 +855,8 @@ class KimiFullAttention(nn.Module):
         self.qknorm_quant_type_value = (
             qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
         )
+        if self.indexer is not None:
+            self.indexer.quantized_q = self.fuse_qknorm_quant
         # input_layernorm fuses its activation quant only when BOTH consumers of
         # the normed hidden state -- fused_qkv_a_proj and g_proj -- run with the
         # same fusable RMSNorm quant scheme (else a mismatched consumer mis-GEMMs).
@@ -2135,7 +2107,8 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 f"Kimi-K3 got {vision_embeds.shape[0]} image embeddings for "
                 f"{num_placeholders} placeholder tokens. The prompt's "
                 "`<|media_pad|>` runs must be expanded to (h//2)*(w//2) tokens "
-                "per image, and multimodal prefills must not be chunked."
+                "per image, and an image prefill without embedding spans must "
+                "not be chunked."
             )
         inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
         return inputs_embeds

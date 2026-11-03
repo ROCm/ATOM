@@ -11,6 +11,7 @@ import os
 HIP_IPC_HANDLE_BYTES = 64
 HIP_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 HIP_DEVICE_MALLOC_UNCACHED = 0x3
+_UNCACHED_PAGE = 4096
 _RANGE_START_ADDR = 11
 
 
@@ -161,8 +162,14 @@ class HipRuntime:
         self.check(error, operation="hipIpcCloseMemHandle")
 
     def allocate_uncached(self, size: int) -> int:
-        """Allocate and zero uncached device memory, returning its raw pointer."""
+        """Allocate and zero uncached device memory, returning its raw pointer.
 
+        The size is rounded up to whole 4 KiB pages: ``hipIpcGetMemHandle``
+        refuses an uncached allocation under 2 MiB that is not."""
+
+        if size < 1:
+            raise ValueError(f"allocation size must be positive, got {size}")
+        size = -(-int(size) // _UNCACHED_PAGE) * _UNCACHED_PAGE
         buffer = ctypes.c_void_p()
         error = self.library().hipExtMallocWithFlags(
             ctypes.byref(buffer),
@@ -185,12 +192,6 @@ class HipRuntime:
                 raise
         self.check(error, operation="hipMemset")
         return int(buffer.value)
-
-    def free_device_memory(self, device_pointer: int) -> None:
-        """Free a raw device allocation."""
-
-        error = self.library().hipFree(ctypes.c_void_p(int(device_pointer)))
-        self.check(error, operation="hipFree")
 
 
 _DEFAULT_RUNTIME = HipRuntime()
@@ -226,12 +227,6 @@ def allocate_uncached(size: int) -> int:
     return _DEFAULT_RUNTIME.allocate_uncached(size)
 
 
-def free_device_memory(device_pointer: int) -> None:
-    """Free a raw HIP device allocation."""
-
-    _DEFAULT_RUNTIME.free_device_memory(device_pointer)
-
-
 def load_runtime():
     """Return the process-wide configured HIP ctypes library."""
 
@@ -252,7 +247,6 @@ __all__ = [
     "allocate_uncached",
     "check_hip_error",
     "close_ipc_handle",
-    "free_device_memory",
     "get_allocation_base",
     "get_ipc_handle",
     "load_runtime",

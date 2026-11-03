@@ -389,11 +389,19 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
+            # hf download writes lock files even when the model is fully cached,
+            # so skip it for completed models to stay robust to shared-NFS write failures.
+            if $CONTAINER_ENGINE exec -e MODEL_DIR="$model_dir" "$CONTAINER_NAME" bash -lc '[ -f "$MODEL_DIR/config.json" ] && { [ -f "$MODEL_DIR/.atom_download_complete" ] || [ -f "$MODEL_DIR/.download-complete" ]; }'; then
+              echo "Model already exists under ${model_dir}; skip download"
+              exit 0
+            fi
             echo "/models directory found, downloading model to ${model_dir}"
             if ! $CONTAINER_ENGINE exec -e HF_TOKEN="${HF_TOKEN:-}" "$CONTAINER_NAME" bash -lc "hf download \"${MODEL_SOURCE_PATH}\" --local-dir \"$model_dir\""; then
               echo "Model download failed for '${MODEL_SOURCE_PATH}'. Aborting."
               exit 1
             fi
+            $CONTAINER_ENGINE exec -e MODEL_DIR="$model_dir" "$CONTAINER_NAME" bash -lc 'touch "$MODEL_DIR/.download-complete"' \
+              || echo "WARNING: failed to write ${model_dir}/.download-complete; later runs will re-run hf download"
           else
             echo "/models directory not mounted; skipping model download"
           fi

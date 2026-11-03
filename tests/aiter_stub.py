@@ -8,8 +8,11 @@ from unittest.mock import MagicMock
 
 
 @contextmanager
-def stubbed_aiter():
+def stubbed_aiter(*extra: str):
     """Import engine modules against a fake ``aiter``, then drop the fake.
+
+    ``extra`` names more modules to fake the same way, for import chains that
+    reach past the ones below.
 
     ``async_proc`` needs a real AITER build at import time, which a CPU runner
     does not have. Leaving the stub in ``sys.modules`` would also make
@@ -47,6 +50,7 @@ def stubbed_aiter():
         # Bound at import by the P/D connectors; the real module probes the
         # GPU arch through `rocminfo` on the way in.
         "aiter.dist.parallel_state",
+        *extra,
     ):
         if name in sys.modules:
             continue

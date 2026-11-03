@@ -64,14 +64,22 @@ source atom/plugin/vllm/vllm-version.env
 source .github/scripts/plugin_ci/cache_model.sh
 
 REBUILD_ATOM_BASE=false
+REBUILD_VLLM=false
 if [[ -n "${PR_BASE_SHA}" && -n "${PR_HEAD_SHA}" ]]; then
   git fetch --no-tags --depth=1 origin "${PR_BASE_SHA}" "${PR_HEAD_SHA}" || true
   set +e
   git diff --quiet "${PR_BASE_SHA}" "${PR_HEAD_SHA}" -- docker/atom_release.dockerfile
   diff_rc=$?
+  # The nightly vLLM image was built from main's recipe and patches; a PR
+  # that changes either is only tested if it builds its own image.
+  git diff --quiet "${PR_BASE_SHA}" "${PR_HEAD_SHA}" -- docker/vllm_release.dockerfile docker/patches
+  vllm_diff_rc=$?
   set -e
   if [[ "${diff_rc}" -eq 1 ]]; then
     REBUILD_ATOM_BASE=true
+  fi
+  if [[ "${vllm_diff_rc}" -eq 1 ]]; then
+    REBUILD_VLLM=true
   fi
 fi
 
@@ -121,7 +129,7 @@ docker rmi "atom_oot:ci" 2>/dev/null || true
 BUILD_MODE="full"
 if docker pull "${NIGHTLY_OOT_IMAGE_TAG}"; then
   LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
-  if [[ -n "${LATEST_VLLM_COMMIT}" && "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" && "${REBUILD_ATOM_BASE}" != "true" ]]; then
+  if [[ -n "${LATEST_VLLM_COMMIT}" && "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" && "${REBUILD_ATOM_BASE}" != "true" && "${REBUILD_VLLM}" != "true" ]]; then
     BUILD_MODE="fast"
   fi
 fi
