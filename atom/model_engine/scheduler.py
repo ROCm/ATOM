@@ -1904,7 +1904,7 @@ class Scheduler:
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(multimodal prompts are never chunked)."
+                "(multimodal prompts without embedding spans are never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
