@@ -171,7 +171,8 @@ def _ema(avg: float, sample: float) -> float:
 # and the per-tick waiting counts ride the existing SUM all_reduce, and every
 # rank decides from the identical reduced means.
 # --------------------------------------------------------------------------
-_ADMIT_POLICIES = ("interval", "adaptive")
+# --prefill-admit-policy values; Config and the CLI take them from here.
+PREFILL_ADMIT_POLICIES = ("interval", "adaptive")
 # decode / prefill fit half-lives in samples, and identifiability guards
 _DEC_HALF_LIFE = 2000.0
 _PF_HALF_LIFE = 200.0
@@ -377,7 +378,7 @@ class PrefillDelayer:
                 "prefill_decode_interval must be non-negative; "
                 f"got {prefill_decode_interval}"
             )
-        if admit_policy not in _ADMIT_POLICIES:
+        if admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(f"unknown admit_policy={admit_policy!r}")
         self.admit_policy = admit_policy
         if admit_policy == "adaptive" and prefill_decode_interval:

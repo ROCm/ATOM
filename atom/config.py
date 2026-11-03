@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
     unquantized_layer_keys,
@@ -2299,9 +2300,9 @@ class Config:
             self.enable_tbo_decode = False
 
         self.prefill_admit_policy = self.prefill_admit_policy.strip().lower()
-        if self.prefill_admit_policy not in ("interval", "adaptive"):
+        if self.prefill_admit_policy not in PREFILL_ADMIT_POLICIES:
             raise ValueError(
-                "prefill_admit_policy must be one of {'interval', 'adaptive'}, "
+                f"prefill_admit_policy must be one of {PREFILL_ADMIT_POLICIES}, "
                 f"got {self.prefill_admit_policy!r}"
             )
 

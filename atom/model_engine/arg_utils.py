@@ -18,6 +18,7 @@ from atom.config import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -687,7 +688,7 @@ class EngineArgs:
         )
         parser.add_argument(
             "--prefill-admit-policy",
-            choices=["interval", "adaptive"],
+            choices=list(PREFILL_ADMIT_POLICIES),
             default="interval",
             help="When the prefill delayer admits new prefills. 'interval' "
             "(default) keeps ATOM_PREFILL_DECODE_INTERVAL and the coalescer. "
