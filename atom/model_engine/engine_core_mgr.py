@@ -191,11 +191,6 @@ class CoreManager:
     # to 0 (backpressure disabled).
     _bp_depth = 0
     _bp_offline_batch = False
-    # Whether something drains ``outputs_queue`` (offline ``LLMEngine.step`` /
-    # ``generate`` and the asyncio path do). An online front end that delivers
-    # every output through the per-sequence callbacks clears it, or each
-    # finished Sequence stays on the queue for the life of the process.
-    consumes_outputs_queue = True
     _bp_dispatch_paused = False
     _input_send_lock = Lock()
 
@@ -236,6 +231,10 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        # Off for online front ends, which read every output through the
+        # per-sequence callbacks: nothing would drain the queue
+        # (`Config.keep_finished_outputs`).
+        self.keep_finished_outputs = getattr(config, "keep_finished_outputs", True)
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
@@ -838,7 +837,7 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        if self.consumes_outputs_queue:
+                        if self.keep_finished_outputs:
                             self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to

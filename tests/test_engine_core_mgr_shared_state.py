@@ -76,6 +76,7 @@ def _bare_manager(cls, **kwargs):
             dp_load_balance="round_robin",
             tp_world_size=1,
             prefill_context_parallel_size=1,
+            keep_finished_outputs=kwargs.get("keep_finished_outputs", True),
         ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
@@ -130,14 +131,13 @@ class OutputThreadStateTest(unittest.TestCase):
         finally:
             sender.close(linger=0)
 
-    def test_finished_sequences_reach_the_outputs_queue_only_if_consumed(self):
-        # Online front ends deliver through the callbacks and clear the flag;
-        # otherwise every finished Sequence would stay queued for the life of
-        # the process.
-        for consumes in (True, False):
-            mgr = _bare_manager(CoreManager)
+    def test_finished_sequences_are_queued_only_if_the_config_keeps_them(self):
+        # Online front ends build the engine with keep_finished_outputs=False
+        # and take outputs through the callbacks; otherwise every finished
+        # Sequence would stay queued for the life of the process.
+        for keep in (True, False):
+            mgr = _bare_manager(CoreManager, keep_finished_outputs=keep)
             self.addCleanup(mgr.ctx.term)
-            mgr.consumes_outputs_queue = consumes
             mgr._deliver_terminal_output = lambda seq: False
             mgr._release_seq_load = lambda seq_id: None
             mgr._shutdown_engine_core_rank = lambda rank: None
@@ -154,7 +154,7 @@ class OutputThreadStateTest(unittest.TestCase):
                 sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())
-                self.assertEqual(mgr.outputs_queue.qsize(), 1 if consumes else 0)
+                self.assertEqual(mgr.outputs_queue.qsize(), 1 if keep else 0)
             finally:
                 sender.close(linger=0)
 
@@ -217,3 +217,28 @@ class SharedInitialiserIsTheOnlyPathTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_online_front_ends_build_the_engine_without_kept_outputs(monkeypatch):
+    # Decided at construction: create_engine hands the choice to Config, and
+    # the default keeps the offline / asyncio behaviour.
+    import dataclasses
+
+    from atom.config import Config
+    from atom.model_engine import arg_utils
+
+    default = {f.name: f.default for f in dataclasses.fields(Config)}
+    assert default["keep_finished_outputs"] is True
+    seen = {}
+
+    def fake_engine(model, tokenizer=None, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(arg_utils, "LLMEngine", fake_engine)
+    monkeypatch.setattr(arg_utils.EngineArgs, "_get_engine_kwargs", lambda self: {})
+    args = arg_utils.EngineArgs.__new__(arg_utils.EngineArgs)
+    args.model = "m"
+    args.create_engine(keep_finished_outputs=False)
+    assert seen == {"keep_finished_outputs": False}
+    args.create_engine()
+    assert seen == {"keep_finished_outputs": True}

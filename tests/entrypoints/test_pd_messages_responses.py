@@ -49,19 +49,34 @@ def server(monkeypatch):
     """Stub the engine and record what each endpoint hands to it."""
     calls = SimpleNamespace(generate=[], setup=[], template="<rendered prompt>")
 
+    def encode(text, **_kw):
+        return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
+
+    def engine_prompt(prompt, kwargs):
+        # What preprocess builds: the prompt, cut to `max_prompt_tokens`
+        # (shown as `<n>` for an n-token cut) when it is longer.
+        limit = kwargs.get("max_prompt_tokens")
+        n = len(encode(prompt))
+        return (f"<{limit}>", limit) if limit is not None and n > limit else (prompt, n)
+
     async def fake_generate_async(prompt, _sampling, _request_id, **kwargs):
-        calls.generate.append((prompt, kwargs))
-        output = {"text": "hello", "finish_reason": "eos", "num_cached_tokens": 0}
+        sent, n = engine_prompt(prompt, kwargs)
+        calls.generate.append((sent, kwargs))
+        output = {
+            "text": "hello",
+            "finish_reason": "eos",
+            "num_cached_tokens": 0,
+            "num_tokens_input": n,
+            "num_tokens_output": 1,
+        }
         if kwargs.get("kv_transfer_params") is not None:
             output["kv_transfer_output_meta_info"] = PREFILL_OUTPUT
         yield output
 
     async def fake_setup_streaming_request(prompt, _sampling, _request_id, **kwargs):
-        calls.setup.append((prompt, kwargs))
-        return 1, _FinishedCollector(), 2
-
-    def encode(text, **_kw):
-        return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
+        sent, n = engine_prompt(prompt, kwargs)
+        calls.setup.append((sent, kwargs))
+        return 1, _FinishedCollector(), n
 
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(api_server, "_request_logger", None)

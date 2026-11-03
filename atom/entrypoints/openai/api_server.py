@@ -19,8 +19,6 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
-import contextvars
-import functools
 import json
 import logging
 import os
@@ -801,8 +799,12 @@ async def generate_async(
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
     return_token_ids: bool = False,
+    max_prompt_tokens: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate non-streaming output, optionally echoing local prompt token IDs."""
+    """Generate non-streaming output, optionally echoing local prompt token IDs.
+
+    ``max_prompt_tokens`` truncates, in the preprocess call
+    (``_preprocess_prompt``)."""
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -841,14 +843,18 @@ async def generate_async(
         )
 
     def do_preprocess():
-        return engine.io_processor.preprocess(
+        return _preprocess_prompt(
+            lambda prompt: engine.io_processor.preprocess(
+                prompt,
+                sampling_params,
+                stream_callback=completion_callback,
+                kv_transfer_params=kv_transfer_params,
+                data_parallel_rank=data_parallel_rank,
+                dp_session_id=dp_session_id,
+                dp_parent_session_id=dp_parent_session_id,
+            ),
             prompt_or_tokens,
-            sampling_params,
-            stream_callback=completion_callback,
-            kv_transfer_params=kv_transfer_params,
-            data_parallel_rank=data_parallel_rank,
-            dp_session_id=dp_session_id,
-            dp_parent_session_id=dp_parent_session_id,
+            max_prompt_tokens,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -1245,6 +1251,34 @@ def _prompt_headroom(
     return headroom
 
 
+def _max_prompt_tokens(
+    max_tokens: int, kv_transfer_params: dict[str, Any] | None
+) -> int:
+    """Longest prompt ``/v1/messages`` and ``/v1/responses`` keep; a longer one
+    is cut to this many tokens rather than refused."""
+    max_ctx = int(_get_engine_max_model_len() or 30720)
+    return max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+
+
+def _preprocess_prompt(preprocess, prompt_or_tokens, max_prompt_tokens):
+    """``preprocess(prompt)`` on the executor, cutting a prompt over
+    ``max_prompt_tokens`` to that many tokens.
+
+    The prompt is tokenized once, by ``preprocess``, and checked by its
+    ``num_prompt_tokens``; only an over-long one is built a second time, from
+    its own first ``max_prompt_tokens`` ids."""
+    seq = preprocess(prompt_or_tokens)
+    if max_prompt_tokens is None or seq.num_prompt_tokens <= max_prompt_tokens:
+        return seq
+    logger.warning(
+        "Prompt too long (%d > %d), truncating",
+        seq.num_prompt_tokens,
+        max_prompt_tokens,
+    )
+    engine.io_processor.requests.pop(seq.id, None)
+    return preprocess(list(seq.prompt_token_ids[:max_prompt_tokens]))
+
+
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
     """Return the prefill's KV location to the PD router, as chat does."""
     if "kv_transfer_output_meta_info" in final_output:
@@ -1261,8 +1295,12 @@ async def setup_streaming_request(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    max_prompt_tokens: int | None = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
+
+    ``max_prompt_tokens`` truncates, in the preprocess call
+    (``_preprocess_prompt``).
 
     Returns ``(seq_id, stream_collector, num_prompt_tokens)``.
     ``num_prompt_tokens`` is the engine-computed prompt length so the stream
@@ -1287,15 +1325,19 @@ async def setup_streaming_request(
     executor_loop = asyncio.get_event_loop()
 
     def do_preprocess():
-        seq = engine.io_processor.preprocess(
+        seq = _preprocess_prompt(
+            lambda prompt: engine.io_processor.preprocess(
+                prompt,
+                sampling_params,
+                stream_callback=stream_callback,
+                kv_transfer_params=kv_transfer_params,
+                multimodal_data=multimodal_data,
+                data_parallel_rank=data_parallel_rank,
+                dp_session_id=dp_session_id,
+                dp_parent_session_id=dp_parent_session_id,
+            ),
             prompt_or_tokens,
-            sampling_params,
-            stream_callback=stream_callback,
-            kv_transfer_params=kv_transfer_params,
-            multimodal_data=multimodal_data,
-            data_parallel_rank=data_parallel_rank,
-            dp_session_id=dp_session_id,
-            dp_parent_session_id=dp_parent_session_id,
+            max_prompt_tokens,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1743,29 +1785,6 @@ def _effective_thinking_enabled(kwargs):
     return effective.get(name, on_value) != off_value
 
 
-async def _render_chat_template(messages, *, tools, **kwargs):
-    """``apply_chat_template`` on a worker thread.
-
-    Rendering grows with the conversation (an agentic turn resends the whole
-    history), and on the event loop it holds up reading every other request:
-    under long agentic load the loop fell behind and requests waited unread in
-    the socket while the engine ran short of work. Context variables (request
-    id, tracing) follow the call.
-    """
-    return await asyncio.get_running_loop().run_in_executor(
-        None,
-        contextvars.copy_context().run,
-        functools.partial(
-            apply_chat_template,
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=tools,
-            **kwargs,
-        ),
-    )
-
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1850,8 +1869,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            prompt_or_tokens = await _render_chat_template(
-                messages, tools=request.tools, **merged_kwargs
+            # Off the loop: rendering grows with the conversation, and on the
+            # loop it holds up reading every other request.
+            prompt_or_tokens = await asyncio.to_thread(
+                apply_chat_template,
+                tokenizer,
+                custom_message_encoder,
+                messages,
+                tools=request.tools,
+                **merged_kwargs,
             )
 
         # The K3 template may open the reasoning channel in text or token IDs.
@@ -2243,8 +2269,15 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        prompt = await _render_chat_template(
-            messages, tools=anthropic_to_openai_tools(request.tools), **merged_kwargs
+        # Off the loop, like the length check and truncation below, which
+        # happen in the preprocess call (`max_prompt_tokens`).
+        prompt = await asyncio.to_thread(
+            apply_chat_template,
+            tokenizer,
+            custom_message_encoder,
+            messages,
+            tools=anthropic_to_openai_tools(request.tools),
+            **merged_kwargs,
         )
 
         generation_config = engine.config.generation_config
@@ -2274,45 +2307,16 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        input_tokens = len(tokenizer.encode(prompt))
-
-        max_ctx = None
-        for _path in (
-            lambda: engine.config.max_model_len,
-            lambda: engine.model_config.max_model_len,
-            lambda: engine.scheduler.max_model_len,
-            lambda: engine.max_model_len,
-        ):
-            try:
-                _v = _path()
-                if _v:
-                    max_ctx = int(_v)
-                    break
-            except Exception:
-                logger.debug("max_ctx candidate rejected", exc_info=True)
-                continue
-        if not max_ctx:
-            max_ctx = 30720
-        logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = _prompt_headroom(request.max_tokens, max_ctx, kv_transfer_params)
-        max_input = max_ctx - headroom
-        if input_tokens > max_input:
-            logger.warning(
-                f"Prompt too long ({input_tokens} > {max_input}), truncating"
-            )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
-            input_tokens = max_input
+        max_input = _max_prompt_tokens(request.max_tokens, kv_transfer_params)
 
         if request.stream:
             # Streaming response
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=kv_transfer_params,
-                )
+            seq_id, stream_collector, input_tokens = await setup_streaming_request(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
+                max_prompt_tokens=max_input,
             )
 
             async def generate_anthropic_stream():
@@ -2488,12 +2492,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                max_prompt_tokens=max_input,
             ),
             raw_request,
             request_id,
         )
         if final_output is None:
             raise RuntimeError("No output generated")
+        input_tokens = final_output["num_tokens_input"]
 
         raw_text = final_output["text"]
         # Separating is unconditional -- the same call the chat path makes,
@@ -2517,7 +2523,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if drop_reasoning:
             events = [e for e in events if e[0] != "reasoning"]
         _, tool_calls = flatten_tool_events(events)
-        output_tokens = len(tokenizer.encode(raw_text))
+        output_tokens = final_output["num_tokens_output"]
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_anthropic_response(
             request_id=request_id,
@@ -2666,8 +2672,15 @@ async def responses_create(raw_request: Request):
             rules=rules,
         )
 
-        prompt = await _render_chat_template(
-            messages, tools=openai_tools, **merged_kwargs
+        # Off the loop, like the length check and truncation below, which
+        # happen in the preprocess call (`max_prompt_tokens`).
+        prompt = await asyncio.to_thread(
+            apply_chat_template,
+            tokenizer,
+            custom_message_encoder,
+            messages,
+            tools=openai_tools,
+            **merged_kwargs,
         )
 
         generation_config = engine.config.generation_config
@@ -2701,38 +2714,16 @@ async def responses_create(raw_request: Request):
 
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        input_tokens = len(tokenizer.encode(prompt))
-
-        max_ctx = 30720
-        for obj in (
-            getattr(engine, "config", None),
-            getattr(engine, "model_config", None),
-            getattr(engine, "scheduler", None),
-            engine,
-        ):
-            value = getattr(obj, "max_model_len", None) if obj is not None else None
-            if value:
-                max_ctx = int(value)
-                break
-        headroom = _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
-        max_input = max_ctx - headroom
-        if input_tokens > max_input:
-            logger.warning(
-                f"Prompt too long ({input_tokens} > {max_input}), truncating"
-            )
-            token_ids = tokenizer.encode(prompt)[:max_input]
-            prompt = tokenizer.decode(token_ids, skip_special_tokens=False)
-            input_tokens = max_input
+        max_input = _max_prompt_tokens(max_tokens, kv_transfer_params)
 
         created_at = int(time.time())
         if request.stream:
-            seq_id, stream_collector, _num_prompt_tokens = (
-                await setup_streaming_request(
-                    prompt,
-                    sampling_params,
-                    request_id,
-                    kv_transfer_params=kv_transfer_params,
-                )
+            seq_id, stream_collector, input_tokens = await setup_streaming_request(
+                prompt,
+                sampling_params,
+                request_id,
+                kv_transfer_params=kv_transfer_params,
+                max_prompt_tokens=max_input,
             )
 
             async def generate_responses_stream():
@@ -2831,12 +2822,14 @@ async def responses_create(raw_request: Request):
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
+                max_prompt_tokens=max_input,
             ),
             raw_request,
             request_id,
         )
         if final_output is None:
             raise RuntimeError("No output generated")
+        input_tokens = final_output["num_tokens_input"]
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
@@ -2849,7 +2842,7 @@ async def responses_create(raw_request: Request):
             openai_tools,
             suppress_calls=forbids_tool_calls(request.tool_choice),
         )
-        output_tokens = len(tokenizer.encode(raw_text))
+        output_tokens = final_output["num_tokens_output"]
         cache_read_input_tokens = final_output.get("num_cached_tokens", 0)
         response = build_responses_response(
             request_id=request_id,
@@ -3216,10 +3209,8 @@ def main():
     )
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
-    engine = engine_args.create_engine(tokenizer=tokenizer)
-    # Every output reaches its request through the per-sequence callbacks;
-    # nothing here reads the offline outputs queue.
-    engine.core_mgr.consumes_outputs_queue = False
+    # Every output reaches its request through the per-sequence callbacks.
+    engine = engine_args.create_engine(tokenizer=tokenizer, keep_finished_outputs=False)
     # Forced acceptance emits draft tokens that nothing verified, and once the
     # context is long enough those degenerate into the dialect's own channel
     # framing and nothing else -- read as structure, correctly, that leaves a

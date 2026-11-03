@@ -1014,6 +1014,8 @@ def test_responses_engine_failure_is_not_success(
             "text": "partial" if partial else "",
             "finish_reason": reason,
             "num_cached_tokens": 0,
+            "num_tokens_input": 2,
+            "num_tokens_output": 1 if partial else 0,
         }
 
     monkeypatch.setattr(api_server, "generate_async", generate)

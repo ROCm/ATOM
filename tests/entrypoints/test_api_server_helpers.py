@@ -75,7 +75,7 @@ def _install_api_server_stubs() -> list[str]:
         def from_cli_args(cls, args):
             return cls()
 
-        def create_engine(self, tokenizer=None):
+        def create_engine(self, tokenizer=None, **kwargs):
             return None
 
     _try_import_else_stub(
@@ -876,45 +876,41 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
     assert events == ["initialize", "serving", "shutdown"]
 
 
-def test_chat_template_renders_off_the_event_loop(monkeypatch):
-    # Rendering grows with the conversation; on the event loop it holds up
-    # reading every other request. It runs on a worker thread and keeps the
-    # caller's context variables.
-    import contextvars
-
-    marker = contextvars.ContextVar("marker", default=None)
-    seen = {}
-
-    def fake_apply(tokenizer, encoder, messages, *, tools=None, **kwargs):
-        seen["thread"] = threading.get_ident()
-        seen["marker"] = marker.get()
-        seen["kwargs"] = kwargs
-        return "prompt"
-
-    monkeypatch.setattr(api_server, "apply_chat_template", fake_apply)
-
-    async def go():
-        marker.set("req-1")
-        loop_thread = threading.get_ident()
-        out = await api_server._render_chat_template(
-            [{"role": "user", "content": "hi"}], tools=None, thinking=True
-        )
-        return out, loop_thread
-
-    out, loop_thread = asyncio.run(go())
-    assert out == "prompt"
-    assert seen["thread"] != loop_thread
-    assert seen["marker"] == "req-1"
-    assert seen["kwargs"] == {"thinking": True}
+class _FakeSeq:
+    def __init__(self, seq_id, token_ids):
+        self.id = seq_id
+        self.prompt_token_ids = list(token_ids)
+        self.num_prompt_tokens = len(token_ids)
 
 
-def test_online_servers_do_not_keep_finished_sequences():
-    # Only offline callers read CoreManager.outputs_queue; both online front
-    # ends clear the flag (the queue behaviour itself is tested in
-    # test_engine_core_mgr_shared_state.py).
-    from atom.entrypoints.atomesh import server as atomesh_server
-    from atom.model_engine.engine_core_mgr import CoreManager
+def test_prompt_is_checked_and_truncated_in_the_preprocess_call(monkeypatch):
+    # /v1/messages and /v1/responses: no encode on the event loop. The length
+    # check reads the engine's own token count from the one preprocess call,
+    # and only an over-long prompt is built again, from its first ids.
+    requests = {}
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(io_processor=SimpleNamespace(requests=requests)),
+    )
+    built = []
 
-    assert CoreManager.consumes_outputs_queue is True
-    for fn in (api_server.main, atomesh_server.initialize_engine):
-        assert "consumes_outputs_queue = False" in inspect.getsource(fn)
+    def preprocess(prompt):
+        tokens = list(range(10)) if isinstance(prompt, str) else prompt
+        seq = _FakeSeq(len(built), tokens)
+        built.append(prompt)
+        requests[seq.id] = seq
+        return seq
+
+    seq = api_server._preprocess_prompt(preprocess, "short", 16)
+    assert built == ["short"] and seq.num_prompt_tokens == 10
+    seq = api_server._preprocess_prompt(preprocess, "short", None)
+    assert seq.num_prompt_tokens == 10
+
+    built.clear()
+    requests.clear()
+    seq = api_server._preprocess_prompt(preprocess, "long prompt", 4)
+    assert built == ["long prompt", [0, 1, 2, 3]]
+    assert seq.prompt_token_ids == [0, 1, 2, 3]
+    # The discarded first build is not left registered.
+    assert list(requests) == [seq.id]
