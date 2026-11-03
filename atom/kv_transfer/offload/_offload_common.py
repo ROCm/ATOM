@@ -1065,8 +1065,9 @@ class OffloadSchedulerMixin(ABC):
         seq.offload_loaded_tokens = self._claim_after_load(seq, hbm, lmc)
         return True
 
-    def _save_frontier(self, seq) -> int:
-        computed = min(
+    def _save_computed_tokens(self, seq) -> int:
+        """Prompt tokens whose KV a save emitted now may read."""
+        return min(
             int(
                 getattr(
                     seq,
@@ -1076,7 +1077,9 @@ class OffloadSchedulerMixin(ABC):
             ),
             int(getattr(seq, "num_prompt_tokens", 0)),
         )
-        return self._chunk_floor(computed)
+
+    def _save_frontier(self, seq) -> int:
+        return self._chunk_floor(self._save_computed_tokens(seq))
 
     def _has_pending_save(self, seq) -> bool:
         sid = str(seq.id)

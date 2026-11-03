@@ -215,6 +215,8 @@ class SpurDispatchTest(unittest.TestCase):
             interface = "eno0" if rank == 0 else "enp5s0"
             self.assertIn(f"NCCL_SOCKET_IFNAME=={interface}", runs[0])
             self.assertIn(f"MORI_SOCKET_IFNAME={interface}", runs[0])
+            # Otherwise gloo advertises the hostname's 127.0.1.1 to its peers.
+            self.assertIn(f"GLOO_SOCKET_IFNAME={interface}", runs[0])
             # MoRI reads neither NCCL_IB_HCA nor NCCL_IB_GID_INDEX.
             hcas = ",".join(f"ionic_{index}" for index in range(8))
             self.assertIn(f"MORI_RDMA_DEVICES={hcas}", runs[0])
@@ -387,6 +389,14 @@ class SpurDispatchTest(unittest.TestCase):
         run = next(call for call in self.docker_calls(0) if call[0] == "run")
         self.assertIn("NCCL_SOCKET_IFNAME==eno0", run)
         self.assertIn("MORI_SOCKET_IFNAME=custom0", run)
+        self.assertIn("GLOO_SOCKET_IFNAME=custom0", run)
+
+    def test_explicit_gloo_interface_override_is_preserved(self):
+        self.run_job("--spur-worker", GLOO_SOCKET_IFNAME="custom2")
+        run = next(call for call in self.docker_calls(0) if call[0] == "run")
+        self.assertIn("NCCL_SOCKET_IFNAME==eno0", run)
+        self.assertIn("MORI_SOCKET_IFNAME=eno0", run)
+        self.assertIn("GLOO_SOCKET_IFNAME=custom2", run)
 
     def test_explicit_interfaces_skip_address_lookup(self):
         self.run_job(
@@ -398,6 +408,7 @@ class SpurDispatchTest(unittest.TestCase):
         run = next(call for call in self.docker_calls(0) if call[0] == "run")
         self.assertIn("NCCL_SOCKET_IFNAME==custom0", run)
         self.assertIn("MORI_SOCKET_IFNAME=custom1", run)
+        self.assertIn("GLOO_SOCKET_IFNAME=custom1", run)
 
     def test_flydsl_aot_cache_is_extracted_once_and_mounted(self):
         aot_root = self.root / "flydsl-aot"

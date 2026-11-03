@@ -479,7 +479,12 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _release_multimodal_requests(self, sequences):
+    def _release_request_resources(self, sequences):
+        structured_ids = [
+            seq.id for seq in sequences if getattr(seq, "json_schema", None) is not None
+        ]
+        if structured_ids:
+            self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -497,7 +502,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self._release_multimodal_requests(rejected)
+            self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -566,7 +571,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
-            self._release_multimodal_requests(finished_seqs)
+            self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
     def has_pending_kv_work(self) -> bool:
@@ -745,6 +750,23 @@ class EngineCore:
             self.scheduler.extend(recv_reqs)
         return False
 
+    def _offer_tier_lookups(self, reqs) -> None:
+        """Let an offload connector start tier lookups for arrived requests.
+
+        Runs on this IO thread, so a lookup is sent while the engine thread is
+        still inside a forward instead of when it next schedules. Only a
+        connector with a lookup thread defines `offer_lookups`.
+        """
+        connector = getattr(getattr(self, "scheduler", None), "kv_connector", None)
+        offer = getattr(connector, "offer_lookups", None)
+        if not callable(offer):
+            return
+        try:
+            offer(reqs)
+        except Exception:
+            # The scheduler's own prefetch still sends these lookups.
+            logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
+
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
 
@@ -802,6 +824,7 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")

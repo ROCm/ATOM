@@ -227,3 +227,25 @@ def test_build_takes_the_drafters_spec_and_arms_only_under_pp(world_size, with_d
         return
     assert relay.spec is spec and relay.own_ids == (-1, 2)
     assert target.embed_tokens._forward_hooks, "build must arm the relay"
+
+
+def test_relay_hook_compiles_without_an_in_place_update():
+    # Regression: `_filled.add` inside the compiled backbone made Dynamo replay
+    # the set via `update`, which trips the cudagraph bytecode hook's depyf
+    # import on images without depyf (PP2 server warmup crashed).
+    from torch._dynamo.convert_frame import register_bytecode_hook
+
+    names = []
+    handle = register_bytecode_hook(lambda old, new: names.extend(new.co_names))
+    try:
+        relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
+        fwd = torch.compile(
+            lambda x: target.layers[2](target.embed_tokens(x) + 1), backend="eager"
+        )
+        for _ in range(2):
+            fwd(torch.randn(3, 8))
+            assert relay.pack(None, 3).shape == (3, 16)
+    finally:
+        handle.remove()
+        torch._dynamo.reset()
+    assert "update" not in names

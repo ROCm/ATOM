@@ -63,6 +63,7 @@ from atom.model_ops.fused_moe.modular_kernel import (
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
+    use_mori_low_latency,
 )
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.routed_rows import (
@@ -523,9 +524,6 @@ def _select_logical(
         num_fused_shared_experts=num_fused_shared_experts,
         fused_shared_experts_scoring_func=layer.shared_expert_scoring_func,
         routed_scaling_factor=layer.routed_scaling_factor,
-        # TODO: a -1 route faults the TP a16w4 MoE; until that consumer is
-        # found, pure TP routes and runs its pad rows like real ones.
-        mask_pad_rows=layer.use_ep,
     )
 
 
@@ -691,7 +689,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
             tbo_is_enabled = tbo_enabled()
-            low_latency = moe.moe_parallel_config.low_latency
+            low_latency = use_mori_low_latency(
+                moe.moe_parallel_config.low_latency, all2all_manager.internode
+            )
             if all2all_manager.internode and mori_combine_quant_type != "none":
                 # MoRI registers no blockwise combine kernel for these; without
                 # this it fails later, at kernel lookup.
@@ -5202,7 +5202,6 @@ class FusedMoE(torch.nn.Module):
         num_fused_shared_experts: int = 0,
         fused_shared_experts_scoring_func: str | None = None,
         routed_scaling_factor: float = 1.0,
-        mask_pad_rows: bool = True,
     ):
 
         # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
@@ -5220,9 +5219,7 @@ class FusedMoE(torch.nn.Module):
 
         # Every kernel below routes the rows at or past the pass's real row
         # count to -1, which dispatch and the experts skip.
-        num_valid_rows = (
-            pass_scheduled_tokens_gpu(router_logits.shape[0]) if mask_pad_rows else None
-        )
+        num_valid_rows = pass_scheduled_tokens_gpu(router_logits.shape[0])
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
             assert topk_group is not None

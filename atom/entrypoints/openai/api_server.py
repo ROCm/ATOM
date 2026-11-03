@@ -49,7 +49,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     producer_endpoint,
 )
 from atom.model_engine.arg_utils import EngineArgs
-from atom.model_engine.llm_engine import InputOutputProcessor, _load_tokenizer
+from atom.model_engine.llm_engine import InputOutputProcessor, load_tokenizer
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
@@ -58,6 +58,14 @@ from atom.observability.tracing import TraceMiddleware, set_request_id
 from atom.observability.tracing import initialize as initialize_tracing
 from atom.observability.tracing import shutdown as shutdown_tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output.validation import (
+    configure_request,
+    schema_from_format,
+    structured_response_channel,
+    validate_chat_stream,
+    validate_output,
+    validate_responses_output,
+)
 from atom.utils import envs
 from atom.utils.arg_parser import FlexibleArgumentParser
 from atom.utils.gc_utils import (
@@ -562,12 +570,26 @@ def _build_sampling_params(
     top_p: float = 1.0,
     n: int = 1,
     required_channel: RequiredChannel | None = None,
+    max_tokens_is_default: bool = False,
 ) -> SamplingParams:
+    from .model_capabilities import deployment_metadata
+
+    output_limit = deployment_metadata(
+        _get_engine_config(), custom_message_encoder
+    ).get("max_output_tokens")
+    if output_limit is not None and max_tokens > output_limit:
+        if max_tokens_is_default:
+            max_tokens = output_limit
+        else:
+            raise ValueError(
+                f"max_tokens must be <= {output_limit} for this deployment"
+            )
     return SamplingParams(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
         max_tokens=max_tokens,
+        max_tokens_is_default=max_tokens_is_default,
         stop_strings=stop_strings,
         ignore_eos=ignore_eos,
         n=n,
@@ -665,7 +687,13 @@ def _validate_pool_capacity(
     )
 
 
-def _validate_sequence_context_length(seq) -> None:
+def _validate_sequence_context_length(seq, sampling_params=None) -> None:
+    limit = _get_engine_max_model_len()
+    if getattr(sampling_params, "max_tokens_is_default", False) and limit is not None:
+        remaining = limit - seq.num_prompt_tokens
+        if remaining <= 0:
+            raise ValueError("The prompt leaves no context space for output tokens")
+        seq.max_tokens = min(seq.max_tokens, remaining)
     _validate_context_length(
         seq.num_prompt_tokens,
         seq.max_tokens,
@@ -790,6 +818,28 @@ def _send_stream_chunk_tagged(
     )
 
 
+async def _submit_engine_requests(seqs):
+    if not any(getattr(seq, "json_schema", None) is not None for seq in seqs):
+        engine.core_mgr.add_request(seqs)
+        return
+    # Admission RPCs must not block the API event loop. If the client cancels,
+    # settle the in-flight submission before aborting so it cannot enqueue later.
+    submission = asyncio.create_task(
+        asyncio.to_thread(engine.core_mgr.add_request, seqs)
+    )
+    try:
+        await asyncio.shield(submission)
+    except BaseException:
+        try:
+            await submission
+        finally:
+            for seq in seqs:
+                engine.core_mgr.abort_request(seq.id)
+                engine.io_processor.requests.pop(seq.id, None)
+                _seq_id_to_request_id.pop(seq.id, None)
+        raise
+
+
 async def generate_async(
     prompt_or_tokens: str | list[int],
     sampling_params: SamplingParams,
@@ -851,11 +901,11 @@ async def generate_async(
 
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
-        _validate_sequence_context_length(seq)
+        _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
-    engine.core_mgr.add_request([seq])
+    await _submit_engine_requests([seq])
 
     _finished_ok = False
     try:
@@ -974,11 +1024,11 @@ async def generate_async_multimodal(
 
     seq = await loop.run_in_executor(None, do_preprocess)
     try:
-        _validate_sequence_context_length(seq)
+        _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         engine.io_processor.requests.pop(seq.id, None)
         raise
-    engine.core_mgr.add_request([seq])
+    await _submit_engine_requests([seq])
 
     _finished_ok = False
     try:
@@ -1100,12 +1150,13 @@ async def generate_async_fanout(
 
     seqs = await loop.run_in_executor(None, do_preprocess)
     try:
-        _validate_sequence_context_length(seqs[0])
+        for seq in seqs:
+            _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         for seq in seqs:
             engine.io_processor.requests.pop(seq.id, None)
         raise
-    engine.core_mgr.add_request(seqs)
+    await _submit_engine_requests(seqs)
     num_tokens_input = seqs[0].num_prompt_tokens
 
     _all_finished = False
@@ -1312,7 +1363,7 @@ async def setup_streaming_request(
     seq = None
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
-        _validate_sequence_context_length(seq)
+        _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
@@ -1331,7 +1382,7 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
-    engine.core_mgr.add_request([seq])
+    await _submit_engine_requests([seq])
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1534,7 +1585,8 @@ async def setup_streaming_request_fanout(
     seqs = []
     try:
         seqs = await executor_loop.run_in_executor(None, do_preprocess)
-        _validate_sequence_context_length(seqs[0])
+        for seq in seqs:
+            _validate_sequence_context_length(seq, sampling_params)
     except Exception:
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
@@ -1548,7 +1600,7 @@ async def setup_streaming_request_fanout(
     logger.debug(
         f"API: Created fan-out request_id={request_id}, n={n}, seq_ids={seq_ids}"
     )
-    engine.core_mgr.add_request(seqs)
+    await _submit_engine_requests(seqs)
     return seq_ids, shared_collector, seqs[0].num_prompt_tokens
 
 
@@ -1752,6 +1804,35 @@ def _effective_thinking_enabled(kwargs):
     return effective.get(name, on_value) != off_value
 
 
+async def _configure_structured_output(
+    sampling_params,
+    schema,
+    channel,
+    *,
+    tools=None,
+    tool_choice=None,
+    kv_transfer=None,
+    multimodal=False,
+):
+    if schema is None:
+        return
+    await configure_request(
+        engine,
+        tokenizer,
+        _get_engine_config(),
+        sampling_params,
+        schema,
+        channel,
+        parser_cls=tool_call_parser_cls,
+        tools=tools,
+        tool_choice=tool_choice,
+        kv_transfer=kv_transfer,
+        multimodal=multimodal,
+        relaxed_mtp=envs.ATOM_ENABLE_RELAXED_MTP,
+        synthetic=synthetic_token_text is not None,
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
@@ -1793,6 +1874,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
+            max_tokens_is_default=not any(
+                name in request.model_fields_set and getattr(request, name) is not None
+                for name in ("max_tokens", "max_completion_tokens")
+            ),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -1802,6 +1887,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 required_tool_channel, request.tool_choice, request.tools
             ),
         )
+
+        schema = schema_from_format(request.response_format)
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         set_request_id(request_id)
@@ -1855,6 +1942,18 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             ),
             template_kwargs=merged_kwargs,
         )
+
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            _reasoning,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            kv_transfer=request.kv_transfer_params,
+            multimodal=_has_multimodal_content(messages),
+        )
+
+        _reasoning = structured_response_channel(_reasoning, schema)
 
         # Streaming
         if request.stream:
@@ -1916,6 +2015,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         (request.stream_options or {}).get("include_usage")
                     ),
                 )
+            if schema is not None:
+
+                gen = validate_chat_stream(gen, schema)
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
@@ -2021,6 +2123,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
             )
+        if schema is not None:
+
+            for choice in resp.choices:
+                validate_output(
+                    schema,
+                    choice["message"].get("content") or "",
+                    choice.get("finish_reason"),
+                    tool_calls=bool(choice["message"].get("tool_calls")),
+                )
         _log_request_model("response", request_id, resp)
         # Bypass FastAPI's recursive conversion of the token ID list.
         return JSONResponse(content=resp.model_dump(mode="json"))
@@ -2049,6 +2160,10 @@ async def completions(request: CompletionRequest, raw_request: Request):
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
             max_tokens=request.get_max_tokens(),
+            max_tokens_is_default=not any(
+                name in request.model_fields_set and getattr(request, name) is not None
+                for name in ("max_tokens", "max_completion_tokens")
+            ),
             stop_strings=request.stop,
             ignore_eos=request.ignore_eos,
             top_k=request.top_k,
@@ -2259,6 +2374,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 else model_temperature
             ),
             max_tokens=request.max_tokens,
+            max_tokens_is_default="max_tokens" not in request.model_fields_set,
             stop_strings=request.stop_sequences,
             ignore_eos=False,
             top_k=(request.top_k if request.top_k is not None else model_top_k),
@@ -2288,7 +2404,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if not max_ctx:
             max_ctx = 30720
         logger.warning(f"[anthropic] resolved max_ctx={max_ctx}")
-        headroom = _prompt_headroom(request.max_tokens, max_ctx, kv_transfer_params)
+        headroom = _prompt_headroom(
+            sampling_params.max_tokens, max_ctx, kv_transfer_params
+        )
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -2691,12 +2809,17 @@ async def responses_create(raw_request: Request):
                 else model_temperature
             ),
             max_tokens=max_tokens,
+            max_tokens_is_default=request.max_output_tokens is None,
             stop_strings=request.stop,
             ignore_eos=False,
             top_k=(request.top_k if request.top_k is not None else model_top_k),
             top_p=(request.top_p if request.top_p is not None else model_top_p),
         )
 
+        text_config = getattr(request, "text", None)
+        if text_config is not None and not isinstance(text_config, dict):
+            raise ValueError("text must be an object")
+        schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
         input_tokens = len(tokenizer.encode(prompt))
@@ -2712,7 +2835,9 @@ async def responses_create(raw_request: Request):
             if value:
                 max_ctx = int(value)
                 break
-        headroom = _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+        headroom = _prompt_headroom(
+            sampling_params.max_tokens, max_ctx, kv_transfer_params
+        )
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -2723,6 +2848,20 @@ async def responses_create(raw_request: Request):
             input_tokens = max_input
 
         created_at = int(time.time())
+        _reasoning = reasoning_channel(
+            prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
+        )
+        await _configure_structured_output(
+            sampling_params,
+            schema,
+            _reasoning,
+            tools=openai_tools,
+            tool_choice=request.tool_choice,
+            kv_transfer=kv_transfer_params,
+        )
+
+        _reasoning = structured_response_channel(_reasoning, schema)
+
         if request.stream:
             seq_id, stream_collector, _num_prompt_tokens = (
                 await setup_streaming_request(
@@ -2734,10 +2873,7 @@ async def responses_create(raw_request: Request):
             )
 
             async def generate_responses_stream():
-                reasoning_filter = reasoning_channel(
-                    prompt_starts_in_reasoning(prompt),
-                    template_kwargs=merged_kwargs,
-                ).stream()
+                reasoning_filter = _reasoning.stream()
                 tool_parser = ToolCallStreamParser(
                     parser_cls=tool_call_parser_cls,
                     suppress_calls=forbids_tool_calls(request.tool_choice),
@@ -2754,6 +2890,7 @@ async def responses_create(raw_request: Request):
                 output_tokens = 0
                 opened = False
                 aborted = True
+                structured_text = []
                 try:
                     while True:
                         chunk_data = await stream_collector.get()
@@ -2779,6 +2916,12 @@ async def responses_create(raw_request: Request):
                                     yield _frame
                             else:
                                 events = tool_parser.process(text)
+                                if schema is not None:
+                                    structured_text.extend(
+                                        value
+                                        for kind, value in events
+                                        if kind == "content"
+                                    )
                                 has_tool_calls = has_tool_calls or (
                                     completes_a_tool_call(events)
                                 )
@@ -2787,11 +2930,21 @@ async def responses_create(raw_request: Request):
 
                         if finished:
                             events = tool_parser.flush()
+                            if schema is not None:
+                                structured_text.extend(
+                                    value for kind, value in events if kind == "content"
+                                )
                             has_tool_calls = has_tool_calls or (
                                 completes_a_tool_call(events)
                             )
                             for _frame in emitter.frames_for_events(events):
                                 yield _frame
+                            validate_output(
+                                schema,
+                                "".join(structured_text),
+                                chunk_data.get("finish_reason"),
+                                tool_calls=has_tool_calls,
+                            )
                             aborted = False
                             cache_read = chunk_data.get("num_cached_tokens", 0)
                             usage = {
@@ -2838,10 +2991,7 @@ async def responses_create(raw_request: Request):
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
-            reasoning_channel(
-                prompt_starts_in_reasoning(prompt),
-                template_kwargs=merged_kwargs,
-            ),
+            _reasoning,
             tool_call_parser_cls,
             raw_text,
             openai_tools,
@@ -2861,6 +3011,11 @@ async def responses_create(raw_request: Request):
             created_at=created_at,
             finish_reason=final_output.get("finish_reason"),
         )
+        if schema is not None:
+
+            validate_responses_output(
+                schema, response, final_output.get("finish_reason")
+            )
         return _with_kv_transfer_params(response, final_output)
 
     except _ClientDisconnected:
@@ -2884,7 +3039,16 @@ async def responses_create(raw_request: Request):
 @app.get("/v1/models")
 async def list_models():
     """List available models."""
-    return ModelList(data=[ModelCard(id=model_name)])
+    from .model_capabilities import deployment_metadata
+
+    return ModelList(
+        data=[
+            ModelCard(
+                id=model_name,
+                **deployment_metadata(_get_engine_config(), custom_message_encoder),
+            )
+        ]
+    ).model_dump(exclude_none=True)
 
 
 @app.get("/health")
@@ -3146,7 +3310,7 @@ def main():
         logger.info(f"Default chat template kwargs: {default_chat_template_kwargs}")
 
     logger.info(f"Loading tokenizer from {args.model}...")
-    tokenizer = _load_tokenizer(args.model, args.trust_remote_code)
+    tokenizer = load_tokenizer(args.model, args.trust_remote_code)
     if args.chat_template:
         if os.path.isfile(args.chat_template):
             with open(args.chat_template, "r", encoding="utf-8") as f:

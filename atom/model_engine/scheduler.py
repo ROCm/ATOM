@@ -66,6 +66,7 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
+from atom.structured_output import StructuredRequest
 from atom.utils import envs, get_hf_text_config
 from atom.utils.selector import attn_family
 
@@ -243,6 +244,11 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        self.structured_requests = {}
+        for i, seq in enumerate(seqs.values()):
+            if seq.json_schema is None:
+                continue
+            self.structured_requests[i] = StructuredRequest.capture(seq)
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.
@@ -610,8 +616,10 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        structured_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
+        self.structured_errors = structured_errors or {}
         self.token_ids = token_ids
         self.draft_token_ids = self._copy_array_view(draft_token_ids)
         self.num_rejected = self._copy_array_view(num_rejected)
@@ -1938,7 +1946,7 @@ class Scheduler:
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(multimodal prompts are never chunked)."
+                "(multimodal prompts without embedding spans are never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
@@ -2729,6 +2737,9 @@ class Scheduler:
             if self.kv_connector is not None:
                 self._publish_state_loads()
                 self._publish_state_stores()
+                self._note_connector_scheduled_tokens(
+                    scheduled_seqs, num_scheduled_tokens
+                )
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk is the last one this prefill
@@ -2912,6 +2923,7 @@ class Scheduler:
         if self.kv_connector is not None:
             self._publish_state_loads()
             self._publish_state_stores()
+            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
@@ -3040,6 +3052,20 @@ class Scheduler:
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
         return True
+
+    def _note_connector_scheduled_tokens(
+        self,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+    ) -> None:
+        """Tell the connector how many tokens this step's forward computes.
+
+        Lets lmcache_mp emit a prefill chunk's save in the step that computes
+        it (`note_scheduled_tokens`); other connectors do not define it.
+        """
+        note = getattr(self.kv_connector, "note_scheduled_tokens", None)
+        if callable(note):
+            note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
@@ -4253,6 +4279,30 @@ class Scheduler:
         num_placeholder = self.mtp_k + 1
 
         for seq in self.running:
+            error = getattr(fwd_output, "structured_errors", {}).get(seq.id)
+            if error is not None:
+                logger.error(
+                    "Structured decoding failed for request %s: %s", seq.id, error
+                )
+                self._mark_finished(
+                    seq,
+                    "structured_output_error",
+                    seq.num_tokens - seq.num_placeholder_tokens,
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="structured_output_error",
+                            ),
+                        )
+                    )
+                continue
             # Cancellation does not require sampled output. Middle prefill
             # chunks and the first deferred step may have none; waiting for
             # one keeps an aborted request alive without advancing its tokens.

@@ -6,10 +6,10 @@
 The drafter lives only on the last PP stage, so hooks on taps owned by earlier
 stages land on ``PPMissingLayer`` and never fire, leaving zero aux buffers and
 garbage drafts. Earlier stages capture their own taps and forward them in the
-intermediate-tensor payload, concatenated along the hidden axis in ascending
-tap order (-1, the embedding, first). Stages own contiguous ascending layer
-ranges, so every stage derives the same order from ``layer_ids`` alone,
-whatever order the drafter lists them in.
+intermediate-tensor payload, concatenated along the hidden axis in the
+spec's ``layer_ids`` order, which ``install_aux_taps`` requires strictly
+increasing (-1, the embedding, first). Stages own contiguous ascending layer
+ranges, so every stage derives the same columns from ``layer_ids`` alone.
 """
 
 import logging
@@ -75,7 +75,9 @@ class PPAuxRelay:
         # shortcut: a recorded graph would bake the capture-time buffer, so
         # this holds only while PP stages run their target eagerly.
         self._send: torch.Tensor | None = None
-        self._filled: set[int] = set()  # own taps captured into `_send`
+        # own taps captured into `_send`; rebound, never mutated: an in-place
+        # add inside the compiled forward makes Dynamo replay it via `update`
+        self._filled: frozenset[int] = frozenset()
         self._col = {lid: col for col, lid in enumerate(self.outgoing_ids)}
 
         self._armed = False
@@ -128,7 +130,7 @@ class PPAuxRelay:
             # A tap already captured firing at row 0 starts a new forward:
             # drop whatever an unsent forward left behind.
             if off == 0 and lid in self._filled:
-                self._send, self._filled = None, set()
+                self._send, self._filled = None, frozenset()
             # Whichever tap fires first allocates, so a skipped tap cannot
             # leave the next one writing into a stale or missing buffer.
             if self._send is None or self._send.shape[0] < end:
@@ -139,7 +141,7 @@ class PPAuxRelay:
                     grown[: self._send.shape[0]].copy_(self._send)
                 self._send = grown
             self._send[off:end, col * h : (col + 1) * h].copy_(tensor)
-            self._filled.add(lid)
+            self._filled = self._filled | {lid}
 
         return write
 

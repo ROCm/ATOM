@@ -437,6 +437,7 @@ def test_cache_policy_forward_dispatch(monkeypatch, mode):
         spec_state_indices_tensor=None,
         non_spec_state_indices_tensor=idx,
         non_spec_state_indices_in_tensor=idx,
+        has_state_fork=False,
         num_actual_tokens=3,
         num_accepted_tokens=None,
         num_prefills=0,
