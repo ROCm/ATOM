@@ -157,6 +157,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if callable(callback):
             callback(req_ids)
 
+    def after_forward(self) -> None:
+        """Pass the post-forward hook on to an impl that has one (lmcache_mp)."""
+        callback = getattr(self._impl, "after_forward", None)
+        if callable(callback):
+            callback()
+
     def close(self) -> None:
         """Join the impl's save/load executors at worker teardown.
 
@@ -202,6 +208,11 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         callback = getattr(self._impl, "prefetch_lookups", None)
         if callable(callback):
             callback(seqs)
+
+    def note_scheduled_tokens(self, scheduled_seqs, num_scheduled_tokens) -> None:
+        callback = getattr(self._impl, "note_scheduled_tokens", None)
+        if callable(callback):
+            callback(scheduled_seqs, num_scheduled_tokens)
 
     def lookup_pending(self, seq) -> bool:
         callback = getattr(self._impl, "lookup_pending", None)

@@ -87,6 +87,10 @@ class SpecDecodeMetadata:
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
+    # Optional host mirrors for CPU grammar matching. GPU input_ids remain the
+    # authority for deferred tokens; their CPU staging mirror can be stale.
+    target_logits_indices_np: np.ndarray | None = None
+    bonus_logits_indices_np: np.ndarray | None = None
 
 
 _uncaptured_decode_shape_warned = False
