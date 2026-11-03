@@ -98,6 +98,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
+from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
@@ -1039,6 +1040,7 @@ class ModelRunner:
         world_size = dp_size * pp_size * stage_span
         dp_rank = config.parallel_config.data_parallel_rank
         global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+        raise_timeout_if_dp_spans_nodes(config.parallel_config)
         if (
             config.parallel_config._managed_distributed_store
             and not torch.distributed.is_initialized()

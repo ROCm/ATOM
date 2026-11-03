@@ -20,13 +20,16 @@ def expand_media_placeholders(
     input_ids: Sequence[int],
     tokens_per_media: Sequence[int],
     placeholder_token_id: int,
-) -> list[int]:
+) -> tuple[list[int], tuple[tuple[int, int], ...]]:
     """Repeat each single placeholder token into its media item's token run.
 
     Processors that leave the expansion to the model (Kimi-K3) emit exactly one
     placeholder per image, but ATOM needs one token per image embedding: the
     scheduler allocates KV blocks and positions from the token count, and the
     prefill scatter matches embeddings against placeholder positions.
+
+    Also returns each run as ``(start, count)`` in the expanded ids, in media
+    order: the ``embedding_spans`` that let an image prefill be chunked.
     """
     num_placeholders = sum(1 for token in input_ids if token == placeholder_token_id)
     if num_placeholders != len(tokens_per_media):
@@ -36,14 +39,17 @@ def expand_media_placeholders(
         )
 
     expanded: list[int] = []
+    spans: list[tuple[int, int]] = []
     media_index = 0
     for token in input_ids:
         if token == placeholder_token_id:
-            expanded.extend([token] * tokens_per_media[media_index])
+            count = int(tokens_per_media[media_index])
+            spans.append((len(expanded), count))
+            expanded.extend([token] * count)
             media_index += 1
         else:
             expanded.append(token)
-    return expanded
+    return expanded, tuple(spans)
 
 
 def _bind_images_to_messages(
