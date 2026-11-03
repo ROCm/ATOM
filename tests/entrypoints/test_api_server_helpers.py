@@ -893,6 +893,11 @@ def test_prompt_is_checked_and_truncated_in_the_preprocess_call(monkeypatch):
         "engine",
         SimpleNamespace(io_processor=SimpleNamespace(requests=requests)),
     )
+    monkeypatch.setattr(
+        api_server,
+        "tokenizer",
+        SimpleNamespace(decode=lambda ids, **_kw: f"<{len(ids)} ids>"),
+    )
     built = []
 
     def preprocess(prompt):
@@ -902,15 +907,20 @@ def test_prompt_is_checked_and_truncated_in_the_preprocess_call(monkeypatch):
         requests[seq.id] = seq
         return seq
 
-    seq = api_server._preprocess_prompt(preprocess, "short", 16)
+    cap = api_server._PromptCap(16)
+    seq = api_server._preprocess_prompt(preprocess, "short", cap)
     assert built == ["short"] and seq.num_prompt_tokens == 10
+    assert cap.cut_text is None
     seq = api_server._preprocess_prompt(preprocess, "short", None)
     assert seq.num_prompt_tokens == 10
 
     built.clear()
     requests.clear()
-    seq = api_server._preprocess_prompt(preprocess, "long prompt", 4)
+    cap = api_server._PromptCap(4)
+    seq = api_server._preprocess_prompt(preprocess, "long prompt", cap)
     assert built == ["long prompt", [0, 1, 2, 3]]
     assert seq.prompt_token_ids == [0, 1, 2, 3]
+    # The text the engine runs, for the reasoning channel's seed.
+    assert cap.cut_text == "<4 ids>"
     # The discarded first build is not left registered.
     assert list(requests) == [seq.id]

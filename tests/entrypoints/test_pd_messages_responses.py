@@ -53,9 +53,10 @@ def server(monkeypatch):
         return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
 
     def engine_prompt(prompt, kwargs):
-        # What preprocess builds: the prompt, cut to `max_prompt_tokens`
+        # What preprocess builds: the prompt, cut to `prompt_cap.tokens`
         # (shown as `<n>` for an n-token cut) when it is longer.
-        limit = kwargs.get("max_prompt_tokens")
+        cap = kwargs.get("prompt_cap")
+        limit = None if cap is None else cap.tokens
         n = len(encode(prompt))
         return (f"<{limit}>", limit) if limit is not None and n > limit else (prompt, n)
 

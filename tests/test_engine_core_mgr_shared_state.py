@@ -219,7 +219,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_online_front_ends_build_the_engine_without_kept_outputs(monkeypatch):
+def test_create_engine_hands_keep_finished_outputs_to_the_config(monkeypatch):
     # Decided at construction: create_engine hands the choice to Config, and
     # the default keeps the offline / asyncio behaviour.
     import dataclasses
@@ -242,3 +242,29 @@ def test_online_front_ends_build_the_engine_without_kept_outputs(monkeypatch):
     assert seen == {"keep_finished_outputs": False}
     args.create_engine()
     assert seen == {"keep_finished_outputs": True}
+
+
+def test_atomesh_front_end_builds_the_engine_without_kept_outputs(monkeypatch):
+    # An online front end: every output reaches its request through the
+    # callbacks, so it must not ask the engine to keep finished sequences.
+    from atom.entrypoints.atomesh import server as atomesh_server
+    from atom.model_engine import arg_utils, llm_engine
+
+    seen = {}
+
+    class FakeArgs:
+        @classmethod
+        def from_cli_args(cls, args):
+            return cls()
+
+        def create_engine(self, **kwargs):
+            seen.update(kwargs)
+            return "engine"
+
+    monkeypatch.setattr(arg_utils, "EngineArgs", FakeArgs)
+    monkeypatch.setattr(llm_engine, "_load_tokenizer", lambda *a: "tok")
+    engine, _ = atomesh_server.initialize_engine(
+        SimpleNamespace(model="m", trust_remote_code=False)
+    )
+    assert engine == "engine"
+    assert seen == {"tokenizer": "tok", "keep_finished_outputs": False}

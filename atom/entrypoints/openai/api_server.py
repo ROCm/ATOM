@@ -799,12 +799,11 @@ async def generate_async(
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
     return_token_ids: bool = False,
-    max_prompt_tokens: int | None = None,
+    prompt_cap: "_PromptCap | None" = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate non-streaming output, optionally echoing local prompt token IDs.
 
-    ``max_prompt_tokens`` truncates, in the preprocess call
-    (``_preprocess_prompt``)."""
+    ``prompt_cap`` truncates, in the preprocess call (``_preprocess_prompt``)."""
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -854,7 +853,7 @@ async def generate_async(
                 dp_parent_session_id=dp_parent_session_id,
             ),
             prompt_or_tokens,
-            max_prompt_tokens,
+            prompt_cap,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -1251,32 +1250,47 @@ def _prompt_headroom(
     return headroom
 
 
-def _max_prompt_tokens(
+class _PromptCap:
+    """The longest prompt ``/v1/messages`` and ``/v1/responses`` keep: a longer
+    one is cut to ``tokens`` rather than refused. After the preprocess call,
+    ``cut_text`` is the text the engine runs if the prompt was cut, for the
+    readers that seed from the prompt's end (the reasoning channel)."""
+
+    __slots__ = ("tokens", "cut_text")
+
+    def __init__(self, tokens: int):
+        self.tokens = tokens
+        self.cut_text: str | None = None
+
+
+def _prompt_cap(
     max_tokens: int, kv_transfer_params: dict[str, Any] | None
-) -> int:
-    """Longest prompt ``/v1/messages`` and ``/v1/responses`` keep; a longer one
-    is cut to this many tokens rather than refused."""
+) -> _PromptCap:
     max_ctx = int(_get_engine_max_model_len() or 30720)
-    return max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+    return _PromptCap(
+        max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+    )
 
 
-def _preprocess_prompt(preprocess, prompt_or_tokens, max_prompt_tokens):
-    """``preprocess(prompt)`` on the executor, cutting a prompt over
-    ``max_prompt_tokens`` to that many tokens.
+def _preprocess_prompt(preprocess, prompt_or_tokens, prompt_cap):
+    """``preprocess(prompt)`` on the executor, cutting a prompt longer than
+    ``prompt_cap.tokens``.
 
     The prompt is tokenized once, by ``preprocess``, and checked by its
     ``num_prompt_tokens``; only an over-long one is built a second time, from
-    its own first ``max_prompt_tokens`` ids."""
+    its own first ids."""
     seq = preprocess(prompt_or_tokens)
-    if max_prompt_tokens is None or seq.num_prompt_tokens <= max_prompt_tokens:
+    if prompt_cap is None or seq.num_prompt_tokens <= prompt_cap.tokens:
         return seq
     logger.warning(
         "Prompt too long (%d > %d), truncating",
         seq.num_prompt_tokens,
-        max_prompt_tokens,
+        prompt_cap.tokens,
     )
     engine.io_processor.requests.pop(seq.id, None)
-    return preprocess(list(seq.prompt_token_ids[:max_prompt_tokens]))
+    token_ids = list(seq.prompt_token_ids[: prompt_cap.tokens])
+    prompt_cap.cut_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    return preprocess(token_ids)
 
 
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
@@ -1295,12 +1309,11 @@ async def setup_streaming_request(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
-    max_prompt_tokens: int | None = None,
+    prompt_cap: "_PromptCap | None" = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
-    ``max_prompt_tokens`` truncates, in the preprocess call
-    (``_preprocess_prompt``).
+    ``prompt_cap`` truncates, in the preprocess call (``_preprocess_prompt``).
 
     Returns ``(seq_id, stream_collector, num_prompt_tokens)``.
     ``num_prompt_tokens`` is the engine-computed prompt length so the stream
@@ -1337,7 +1350,7 @@ async def setup_streaming_request(
                 dp_parent_session_id=dp_parent_session_id,
             ),
             prompt_or_tokens,
-            max_prompt_tokens,
+            prompt_cap,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -2270,7 +2283,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
         # Off the loop, like the length check and truncation below, which
-        # happen in the preprocess call (`max_prompt_tokens`).
+        # happen in the preprocess call (`prompt_cap`).
         prompt = await asyncio.to_thread(
             apply_chat_template,
             tokenizer,
@@ -2307,7 +2320,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        max_input = _max_prompt_tokens(request.max_tokens, kv_transfer_params)
+        prompt_cap = _prompt_cap(request.max_tokens, kv_transfer_params)
 
         if request.stream:
             # Streaming response
@@ -2316,8 +2329,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                max_prompt_tokens=max_input,
+                prompt_cap=prompt_cap,
             )
+            # What the engine runs, if the prompt was cut.
+            prompt = prompt_cap.cut_text or prompt
 
             async def generate_anthropic_stream():
                 # Unconditional, like the chat path and like both upstreams:
@@ -2492,7 +2507,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                max_prompt_tokens=max_input,
+                prompt_cap=prompt_cap,
             ),
             raw_request,
             request_id,
@@ -2500,6 +2515,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if final_output is None:
             raise RuntimeError("No output generated")
         input_tokens = final_output["num_tokens_input"]
+        prompt = prompt_cap.cut_text or prompt
 
         raw_text = final_output["text"]
         # Separating is unconditional -- the same call the chat path makes,
@@ -2673,7 +2689,7 @@ async def responses_create(raw_request: Request):
         )
 
         # Off the loop, like the length check and truncation below, which
-        # happen in the preprocess call (`max_prompt_tokens`).
+        # happen in the preprocess call (`prompt_cap`).
         prompt = await asyncio.to_thread(
             apply_chat_template,
             tokenizer,
@@ -2714,7 +2730,7 @@ async def responses_create(raw_request: Request):
 
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        max_input = _max_prompt_tokens(max_tokens, kv_transfer_params)
+        prompt_cap = _prompt_cap(max_tokens, kv_transfer_params)
 
         created_at = int(time.time())
         if request.stream:
@@ -2723,8 +2739,10 @@ async def responses_create(raw_request: Request):
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                max_prompt_tokens=max_input,
+                prompt_cap=prompt_cap,
             )
+            # What the engine runs, if the prompt was cut.
+            prompt = prompt_cap.cut_text or prompt
 
             async def generate_responses_stream():
                 reasoning_filter = reasoning_channel(
@@ -2822,7 +2840,7 @@ async def responses_create(raw_request: Request):
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                max_prompt_tokens=max_input,
+                prompt_cap=prompt_cap,
             ),
             raw_request,
             request_id,
@@ -2830,6 +2848,7 @@ async def responses_create(raw_request: Request):
         if final_output is None:
             raise RuntimeError("No output generated")
         input_tokens = final_output["num_tokens_input"]
+        prompt = prompt_cap.cut_text or prompt
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
