@@ -16475,6 +16475,8 @@ models:
         ATOMESH_M31_AGENTX_VERSION: 1.0.12
         # Split over the 4 prefill TP ranks; the nodes have ~3.17 TB RAM and no cgroup limit.
         ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
+        # rocprofiler-register deadlocks MoRIIO WRITE under load (local 1P1D C64 hangs in warmup without it).
+        ROCPROFILER_REGISTER_ENABLED: "0"
         MORI_IO_SQ_BACKOFF_TIMEOUT_US: "50000"
         MORI_IO_QP_MAX_SEND_WR: "16384"
         MORI_IO_QP_MAX_CQE: "32768"
