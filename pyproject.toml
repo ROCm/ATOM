@@ -71,10 +71,10 @@ atom_sglang = "atom.plugin.sglang.register:register_plugin"
 # confirm vendored logic was changed only where intended, across ten
 # deliberate ATOM couplings. Reformatting these files destroys that
 # comparison permanently. The exemption follows the FILES, not the directory
-# they happen to sit in: review-pr/tests/ is ATOM's own and stays linted, and
-# so does _notify.py, whose owner-resolution was substantially rewritten for
-# ATOM (a repo-variable-backed CLASSES dict became a file-backed owners.txt
-# lookup) rather than carried over with renames. Drop this exemption once
+# they happen to sit in: ATOM's own additions stay linted -- check_citations.py,
+# _publish_test.py and the two shell-region tests -- and so does _notify.py,
+# whose owner map was rewritten for ATOM against a different set of failure
+# classes rather than carried over with renames. Drop this exemption once
 # review-pr re-vendors against a newer aiter commit and the delta is re-
 # audited, or once a file here is deliberately rewritten past recognition.
 ".claude/skills/review-pr/triage.py" = ["ALL"]

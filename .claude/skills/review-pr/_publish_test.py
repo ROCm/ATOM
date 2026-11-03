@@ -364,7 +364,7 @@ def range_report(tmp_path, monkeypatch):
 
 def test_a_cited_span_anchors_the_span_not_its_first_line(range_report):
     pl = _publish.review_payload("8888")
-    c = [x for x in pl["comments"] if x.get("start_line") == 101][0]
+    c = next(x for x in pl["comments"] if x.get("start_line") == 101)
     assert (c["path"], c["start_line"], c["line"]) == (
         "atom/model_ops/layernorm.py",
         101,
