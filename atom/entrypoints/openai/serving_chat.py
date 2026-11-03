@@ -140,15 +140,17 @@ def _validate_history_tool_calls(messages: Any) -> None:
         if tool_calls is None:
             continue
         if not isinstance(tool_calls, list):
-            raise ValueError(f"messages[{i}].tool_calls must be an array")
+            raise ValueError(  # noqa: TRY004
+                f"messages[{i}].tool_calls must be an array"
+            )
         for j, tc in enumerate(tool_calls):
             where = f"messages[{i}].tool_calls[{j}]"
             if not isinstance(tc, dict):
-                raise ValueError(f"{where} must be an object")
+                raise ValueError(f"{where} must be an object")  # noqa: TRY004
             # Kimi-K3's encoder also takes the flat {"name", "arguments"} form.
             fn = tc.get("function", tc)
             if not isinstance(fn, dict):
-                raise ValueError(f"{where}.function must be an object")
+                raise ValueError(f"{where}.function must be an object")  # noqa: TRY004
             name = fn.get("name")
             if not isinstance(name, str) or not name:
                 raise ValueError(f"{where}.function.name must be a non-empty string")
