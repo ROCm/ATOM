@@ -43,7 +43,7 @@ class PdAdmissionController:
         if unknown:
             raise ValueError(f"Unknown pd_admission options: {sorted(unknown)}")
         if not getattr(connector, "supports_pd_admission", False):
-            raise ValueError("pd_admission requires a non-chunked Mooncake consumer")
+            raise ValueError("pd_admission requires a Mooncake consumer")
         if any(
             getattr(config, name, 1) != 1
             for name in (

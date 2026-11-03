@@ -522,7 +522,7 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
 
     @property
     def supports_pd_admission(self) -> bool:
-        return not self.is_producer and not self.enable_chunked_transfer
+        return not self.is_producer
 
     def _receive_prefix(self, seq, num_cached_blocks: int) -> tuple[int, int]:
         geometry = self._remote_page_geometry(seq.kv_transfer_params or {})
@@ -534,11 +534,18 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
         params = seq.kv_transfer_params or {}
         if self.is_producer or not params.get("do_remote_prefill"):
             return None
-        if params.get("chunked_transfer") or seq.has_per_req_cache:
-            raise ValueError("PD admission supports non-chunked paged KV receives only")
+        if seq.has_per_req_cache:
+            raise ValueError("PD admission supports paged KV receives only")
         cached, factor = self._receive_prefix(seq, num_cached_blocks)
+        # Chunked P has not allocated its source table when D reserves the
+        # full prompt destination. Match worker dispatch: a missing source
+        # table does not invalidate a compatible local prefix in this mode.
         return _receive_block_offset(
-            num_blocks, len(params.get("remote_block_ids") or []), cached, factor, False
+            num_blocks,
+            len(params.get("remote_block_ids") or []),
+            cached,
+            factor,
+            bool(params.get("chunked_transfer")),
         )
 
     def _remote_page_geometry(self, params: dict[str, Any]) -> tuple[int, int] | None:

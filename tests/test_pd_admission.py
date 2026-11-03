@@ -7,6 +7,7 @@ import pytest
 from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 
+from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput
 from atom.model_engine.pd_admission import PdAdmissionController
 from atom.model_engine.scheduler import Scheduler
@@ -24,7 +25,14 @@ def mooncake_module(monkeypatch):
 
 @pytest.fixture
 def build(monkeypatch, mooncake_module, seq_factory):
-    def make(*, options=None, prefix=False, connector_wrapper=None, **overrides):
+    def make(
+        *,
+        options=None,
+        prefix=False,
+        connector_wrapper=None,
+        chunked=False,
+        **overrides,
+    ):
         config = MockConfig(
             num_kvcache_blocks=64,
             pd_admission_block_bytes=1024,
@@ -38,6 +46,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
             kv_transfer_config={
                 "kv_connector": "mooncake",
                 "kv_role": "kv_consumer",
+                "enable_chunked_transfer": chunked,
                 "pd_admission": (
                     options
                     if options is not None
@@ -59,7 +68,7 @@ def build(monkeypatch, mooncake_module, seq_factory):
         )
         scheduler = Scheduler(config)
 
-        def request(tokens=8):
+        def request(tokens=8, *, chunked_transfer=chunked):
             seq = seq_factory(list(range(tokens)))
             seq.kv_transfer_params = {
                 "do_remote_prefill": True,
@@ -69,10 +78,16 @@ def build(monkeypatch, mooncake_module, seq_factory):
                 "dcp_size": 1,
                 "remote_host": "127.0.0.1",
                 "remote_port": 30000,
+                "remote_handshake_port": 30000,
                 "tp_size": 1,
                 "remote_pp_size": 4,
                 "first_token_id": 42,
             }
+            if chunked_transfer:
+                seq.kv_transfer_params["chunked_transfer"] = True
+                # D reserves before P computes: source IDs and T0 do not exist.
+                del seq.kv_transfer_params["remote_block_ids"]
+                del seq.kv_transfer_params["first_token_id"]
             return seq
 
         return scheduler, request
@@ -80,8 +95,21 @@ def build(monkeypatch, mooncake_module, seq_factory):
     return make
 
 
-def test_count_limit_holds_ready_credit_until_first_batch(build):
-    sched, request = build()
+def receive_success(seq, *, as_str=False):
+    """A terminal worker report; chunked handoff follows the real wire contract."""
+    return KVConnectorOutput(
+        finished_recving={str(seq.id) if as_str else seq.id},
+        received_handoffs=(
+            {seq.id: PrefillHandoff(seq.id, 42)}
+            if seq.kv_transfer_params.get("chunked_transfer")
+            else {}
+        ),
+    )
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_count_limit_holds_ready_credit_until_first_batch(build, chunked):
+    sched, request = build(chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
     batch, _ = sched.schedule()
@@ -91,7 +119,7 @@ def test_count_limit_holds_ready_credit_until_first_batch(build):
     assert len(sched.pd_admission.pending) == 1
     assert sched.pd_admission.pending_bytes == 2048
 
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={str(a.id)}))
+    sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
     assert len(sched.pd_admission.pending) == 1
     assert sched.pd_admission.pending[str(a.id)].ready_at is not None
     batch, _ = sched.schedule()
@@ -104,20 +132,22 @@ def test_count_limit_holds_ready_credit_until_first_batch(build):
     assert a.id in batch.req_ids  # Decode progresses while B receives.
 
 
-def test_bytes_limit_and_isolated_large_request(build):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_bytes_limit_and_isolated_large_request(build, chunked):
     sched, request = build(
+        chunked=chunked,
         options={
             "enabled": True,
             "max_pending_requests": 4,
             "max_pending_kv_bytes": 3072,
-        }
+        },
     )
     a, b = request(), request(16)
     sched.extend([a, b])
     sched.schedule()
     assert a.block_table and not b.block_table
     assert sched.pd_admission.rejected["bytes"] > 0
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={a.id}))
+    sched._update_from_kv_xfer_finished(receive_success(a))
     sched.schedule()
     sched.schedule()
     assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
@@ -126,8 +156,12 @@ def test_bytes_limit_and_isolated_large_request(build):
 
 
 @pytest.mark.parametrize("keep_referenced", [False, True])
-def test_prefix_hits_charge_only_receive_targets(build, seq_factory, keep_referenced):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_prefix_hits_charge_only_receive_targets(
+    build, seq_factory, keep_referenced, chunked
+):
     sched, request = build(
+        chunked=chunked,
         prefix=True,
         options={
             "enabled": True,
@@ -153,8 +187,9 @@ def test_prefix_hits_charge_only_receive_targets(build, seq_factory, keep_refere
         assert meta.num_computed_blocks == 1
 
 
-def test_incompatible_geometry_charges_full_receive(build, seq_factory):
-    sched, request = build(prefix=True)
+@pytest.mark.parametrize("chunked", [False, True])
+def test_incompatible_geometry_charges_full_receive(build, seq_factory, chunked):
+    sched, request = build(prefix=True, chunked=chunked)
     seed = seq_factory(list(range(8)))
     bm = sched.block_manager
     bm.allocate(seed, bm.can_allocate(seed))
@@ -168,8 +203,9 @@ def test_incompatible_geometry_charges_full_receive(build, seq_factory):
     assert sched.pd_admission.pending_bytes == 2048
 
 
-def test_cancel_keeps_credit_until_safe_terminal_and_ignores_duplicate(build):
-    sched, request = build()
+@pytest.mark.parametrize("chunked", [False, True])
+def test_cancel_keeps_credit_until_safe_terminal_and_ignores_duplicate(build, chunked):
+    sched, request = build(chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
     sched.schedule()
@@ -186,16 +222,17 @@ def test_cancel_keeps_credit_until_safe_terminal_and_ignores_duplicate(build):
     sched.schedule()
     assert b.block_table
     # A late success for A must not retire B's newly acquired credit.
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={str(a.id)}))
+    sched._update_from_kv_xfer_finished(receive_success(a, as_str=True))
     assert set(sched.pd_admission.pending) == {str(b.id)}
 
 
-def test_ready_without_compute_room_keeps_credit(build):
-    sched, request = build()
+@pytest.mark.parametrize("chunked", [False, True])
+def test_ready_without_compute_room_keeps_credit(build, chunked):
+    sched, request = build(chunked=chunked)
     a = request()
     sched.add(a)
     sched.schedule()
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={a.id}))
+    sched._update_from_kv_xfer_finished(receive_success(a))
     # Admission can promote A, but no token fits the speculative decode width.
     sched.mtp_k = 4
     sched.spec_decode_local = True
@@ -210,8 +247,9 @@ def test_ready_without_compute_room_keeps_credit(build):
     assert not sched.pd_admission.pending
 
 
-def test_disabled_preserves_admission(build):
-    sched, request = build(options={"enabled": False})
+@pytest.mark.parametrize("chunked", [False, True])
+def test_disabled_preserves_admission(build, chunked):
+    sched, request = build(options={"enabled": False}, chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
     batch, _ = sched.schedule()
@@ -219,18 +257,20 @@ def test_disabled_preserves_admission(build):
     assert sched.pd_admission is None
 
 
-def test_speculative_first_decode_uses_existing_lookahead(build):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_speculative_first_decode_uses_existing_lookahead(build, chunked):
     sched, request = build(
+        chunked=chunked,
         speculative_config=SimpleNamespace(
             num_speculative_tokens=3, use_dspark=lambda: True
-        )
+        ),
     )
     a, b = request(), request()
     sched.extend([a, b])
     sched.schedule()
     assert len(a.block_table) == 2  # Only the prompt is a receive target.
     assert sched.pd_admission.pending_bytes == 2048
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={a.id}))
+    sched._update_from_kv_xfer_finished(receive_success(a))
     batch, _ = sched.schedule()
     assert batch.req_ids == [a.id]
     assert batch.num_spec_step == 3
@@ -239,8 +279,9 @@ def test_speculative_first_decode_uses_existing_lookahead(build):
     assert not b.block_table
 
 
-def test_failed_receive_releases_credits_without_local_recompute(build):
-    sched, request = build()
+@pytest.mark.parametrize("chunked", [False, True])
+def test_failed_receive_releases_credits_without_local_recompute(build, chunked):
+    sched, request = build(chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
     sched.schedule()
@@ -253,7 +294,8 @@ def test_failed_receive_releases_credits_without_local_recompute(build):
     assert set(batch.connector_meta_output.reqs_to_recv) == {b.id}
 
 
-def test_multi_pd_ready_resume_releases_only_on_batch(build, monkeypatch):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_multi_pd_ready_resume_releases_only_on_batch(build, monkeypatch, chunked):
     from test_multi_connector import FakeSchedSub
 
     from atom.kv_transfer.disaggregation.multi import multi_connector
@@ -269,13 +311,13 @@ def test_multi_pd_ready_resume_releases_only_on_batch(build, monkeypatch):
         )
         return multi_connector.MultiConnectorScheduler(SimpleNamespace())
 
-    sched, request = build(connector_wrapper=wrap)
+    sched, request = build(connector_wrapper=wrap, chunked=chunked)
     a, b = request(), request()
     sched.extend([a, b])
     batch, _ = sched.schedule()
     assert set(batch.connector_meta_output.metas[0].reqs_to_recv) == {a.id}
     assert not b.block_table
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={a.id}))
+    sched._update_from_kv_xfer_finished(receive_success(a))
     assert sched.pd_admission.pending[str(a.id)].ready_at is not None
     batch, _ = sched.schedule()
     assert a.id in batch.req_ids  # The existing Multi suffix-resume path runs.
@@ -283,12 +325,13 @@ def test_multi_pd_ready_resume_releases_only_on_batch(build, monkeypatch):
     assert not sched.pd_admission.pending
 
 
-def test_ready_preempted_before_first_forward_releases_credit(build):
-    sched, request = build(num_kvcache_blocks=2)
+@pytest.mark.parametrize("chunked", [False, True])
+def test_ready_preempted_before_first_forward_releases_credit(build, chunked):
+    sched, request = build(num_kvcache_blocks=2, chunked=chunked)
     a = request()
     sched.add(a)
     sched.schedule()
-    sched._update_from_kv_xfer_finished(KVConnectorOutput(finished_recving={a.id}))
+    sched._update_from_kv_xfer_finished(receive_success(a))
     # The inherited decode capacity check needs another block for T0. There is
     # no G reservation in this change, so it may safely preempt the ready row.
     batch, _ = sched.schedule()
@@ -309,8 +352,10 @@ def test_fraction_uses_physical_pool_bytes(build):
     assert sched.pd_admission.max_bytes == 64 * 1024 // 4
 
 
-def test_hard_capacity_still_rejects_oversized_request(build):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_hard_capacity_still_rejects_oversized_request(build, chunked):
     sched, request = build(
+        chunked=chunked,
         num_kvcache_blocks=2,
         options={
             "enabled": True,
@@ -323,6 +368,121 @@ def test_hard_capacity_still_rejects_oversized_request(build):
     assert sched.take_rejected() == [a]
     assert not a.block_table
     assert not sched.pd_admission.pending
+
+
+@pytest.mark.parametrize("first_chunked", [False, True])
+def test_chunked_and_nonchunked_requests_share_one_budget(build, first_chunked):
+    sched, request = build(chunked=True)
+    a = request(chunked_transfer=first_chunked)
+    b = request(chunked_transfer=not first_chunked)
+    sched.extend([a, b])
+    sched.schedule()
+    assert a.block_table and not b.block_table
+    sched._update_from_kv_xfer_finished(receive_success(a))
+    sched.schedule()
+    sched.schedule()
+    assert set(sched.pd_admission.pending) == {str(b.id)}
+
+
+@pytest.mark.parametrize("geometry_matches", [False, True])
+def test_chunked_charge_matches_dispatched_targets_without_source_ids(
+    build, seq_factory, monkeypatch, geometry_matches
+):
+    import ctypes
+
+    import msgpack
+    from test_pd_chunked_transfer import decode_worker, post_write_requests
+
+    # The consumer flag is intentionally off: the router's per-request mode
+    # controls the transfer, including on a D service receiving both modes.
+    sched, request = build(prefix=True, pd_admission_block_bytes=4)
+    seed = seq_factory(list(range(8)))
+    bm = sched.block_manager
+    bm.allocate(seed, bm.can_allocate(seed))
+    bm.hash_blocks(seed, seed.num_tokens)
+    bm.deallocate(seed)
+    a = request(chunked_transfer=True)
+    if not geometry_matches:
+        a.kv_transfer_params["block_size"] = 8
+    sched.add(a)
+    batch, _ = sched.schedule()
+    buf = (ctypes.c_ubyte * (64 * 4))()
+    worker = decode_worker(buf)
+    worker.tp_size = 4
+    worker.start_load_kv(batch.connector_meta_output)
+    post_write_requests(worker, monkeypatch)
+    assert worker._send_on_socket.call_count == 4  # P PP4, one D rank.
+    offset = 1 if geometry_matches else 0
+    for call in worker._send_on_socket.call_args_list:
+        payload = msgpack.loads(call.args[1][1])
+        assert payload["src_block_ids"] == []
+        assert payload["num_computed_blocks"] == offset
+        assert payload["dst_block_ids"] == list(a.block_table[offset:])
+        assert sched.pd_admission.pending_bytes == len(payload["dst_block_ids"]) * 4
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed_stage", "bad_handoff"])
+def test_chunked_pp4_tp4_credits_wait_for_terminal_handoff(build, monkeypatch, outcome):
+    import ctypes
+
+    from test_pd_chunked_transfer import decode_worker, post_write_requests
+
+    from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
+
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
+    sched, request = build(chunked=True)
+    a, b = request(12), request(12)
+    sched.extend([a, b])
+    batch, _ = sched.schedule()
+    workers = []
+    # Keep the CPU destination buffers alive through receive completion.
+    buffers = [(ctypes.c_ubyte * (64 * 4))() for _ in range(4)]
+    for rank, buf in enumerate(buffers):
+        worker = decode_worker(buf)
+        worker.tp_size, worker.tp_rank = 4, rank
+        worker.start_load_kv(batch.connector_meta_output)
+        post_write_requests(worker, monkeypatch)
+        assert worker._pending_recv_expected[a.id] == 4
+        workers.append(worker)
+    aggregate = KVOutputAggregator(4)
+    for stage in range(4):
+        for rank, worker in enumerate(workers):
+            handoff = {"first_token_id": 42, "draft_token_ids": [43]}
+            last = stage == rank == 3
+            if last and outcome == "bad_handoff":
+                handoff = {"first_token_id": -1}
+            worker._record_write_done(
+                a.id,
+                stage,
+                0,
+                worker._pending_recv_nonce[a.id],
+                success=not (stage == rank == 0 and outcome == "failed_stage"),
+                handoff=handoff,
+            )
+            sched._update_from_kv_xfer_finished(
+                aggregate.aggregate([w.get_finished() for w in workers])
+            )
+            if not last:
+                assert sched.pd_admission.pending_bytes == 3072
+                assert sched.pd_admission.pending[str(a.id)].ready_at is None
+                assert "first_token_id" not in a.kv_transfer_params
+                _, scheduled = sched.schedule()
+                assert not scheduled and not b.block_table
+
+    if outcome == "success":
+        assert a.kv_transfer_params["first_token_id"] == 42
+        assert a.kv_transfer_params["draft_token_ids"] == [43]
+        assert sched.pd_admission.pending[str(a.id)].ready_at is not None
+        assert sched.pd_admission.pending_bytes == 3072
+        _, scheduled = sched.schedule()
+        assert list(scheduled) == [a.id]
+        assert not sched.pd_admission.pending and a.block_table
+    else:
+        assert not sched.pd_admission.pending and not a.block_table
+        assert sched.take_rejected() == [a]
+        batch, scheduled = sched.schedule()
+        assert not scheduled
+        assert set(batch.connector_meta_output.reqs_to_recv) == {b.id}
 
 
 def test_multiconnector_uses_load_winner(build):
