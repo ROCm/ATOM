@@ -55,7 +55,7 @@ def test_decoder_reuses_one_registered_alias_for_o_proj_and_dense_down(monkeypat
     layer = _decoder(monkeypatch)
     hidden = torch.randn(5, 16)
     residual = torch.randn_like(hidden)
-    arena = torch.empty(4096, dtype=torch.uint8)
+    arena = torch.empty(2048, dtype=hidden.dtype)
 
     output, _ = layer(
         torch.arange(5),
@@ -82,7 +82,7 @@ def test_unsupported_producer_keeps_its_ordinary_allocation(
         torch.arange(3),
         hidden,
         torch.randn_like(hidden),
-        registered_ar_input=torch.empty(1024, dtype=torch.uint8),
+        registered_ar_input=torch.empty(512, dtype=hidden.dtype),
     )
     actual = (layer.self_attn.outs[0] is not None, layer.mlp.outs[0] is not None)
     assert actual == expected
@@ -95,7 +95,20 @@ def test_too_small_arena_falls_back_without_partial_alias(monkeypatch):
         torch.arange(4),
         hidden,
         torch.randn_like(hidden),
-        registered_ar_input=torch.empty(8, dtype=torch.uint8),
+        registered_ar_input=torch.empty(4, dtype=hidden.dtype),
+    )
+    assert layer.self_attn.outs == [None]
+    assert layer.mlp.outs == [None]
+
+
+def test_arena_dtype_mismatch_falls_back_without_cross_dtype_view(monkeypatch):
+    layer = _decoder(monkeypatch)
+    hidden = torch.randn(4, 32)
+    layer(
+        torch.arange(4),
+        hidden,
+        torch.randn_like(hidden),
+        registered_ar_input=torch.empty(1024, dtype=torch.uint8),
     )
     assert layer.self_attn.outs == [None]
     assert layer.mlp.outs == [None]
@@ -143,7 +156,7 @@ def test_model_offers_the_arena_only_to_prefill(monkeypatch, prefill):
     model.start_layer, model.end_layer = 0, 1
     model.aux_hidden_state_layers = ()
     model.norm = _IdentityNorm()
-    model._registered_ar_input = torch.empty(1024, dtype=torch.uint8)
+    model._registered_ar_input = torch.empty(256, dtype=torch.float32)
     model._registered_ar_input_lease = object()
     pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
     monkeypatch.setattr(m3, "get_pp_group", lambda: pp_group)
