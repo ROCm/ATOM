@@ -27,7 +27,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
-from atom.config import Config, set_current_atom_config
+from atom.config import Config, _is_minimax_m3_config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     get_pcp_world_size,
@@ -3005,8 +3005,7 @@ class ModelRunner:
         return torch.cat(outs)
 
     def _setup_pp_shared_indexer(self):
-        """Cache per-rank predicates for GLM-5.2 DSA IndexShare PP-boundary
-        top-k transfer. Computed once.
+        """Cache PP-boundary top-k transfer predicates for shared indexers.
 
         A "shared" attention layer reuses the prior "full" layer's sparse top-k
         via the per-rank scratch buffer ``_sparse_kv_indices_gpu``. When a PP
@@ -3021,17 +3020,61 @@ class ModelRunner:
         self._pp_send_needs_sparse = False
         self._pp_recv_needs_sparse = False
         self._pp_index_topk = 0
-        if not self.has_mla_indexer:
+        self._pp_rank_local_keys = ()
+        hf = self.config.hf_config
+        hf = getattr(hf, "text_config", hf)
+        m3 = _is_minimax_m3_config(hf) and getattr(hf, "use_index_cache", False)
+        if not (self.has_mla_indexer or m3):
             return
         pp = get_pp_group()
         if pp.world_size <= 1:
             return
         # Unwrap to the module exposing the PP layer range (make_layers sets
-        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap it).
+        # start_layer/end_layer on the inner model; UBatchWrapper/CausalLM wrap
+        # it with .model, and conditional-generation models use .language_model).
         inner = self.model
-        while not hasattr(inner, "start_layer") and hasattr(inner, "model"):
-            inner = inner.model
+        while not hasattr(inner, "start_layer"):
+            if hasattr(inner, "model"):
+                inner = inner.model
+            elif hasattr(inner, "language_model"):
+                inner = inner.language_model
+            else:
+                break
         if not hasattr(inner, "start_layer"):
+            return
+
+        if m3:
+            from atom.models.minimax_m3.model import (
+                _should_skip_minimax_m3_index_topk,
+                _sparse_attention_layer_ids,
+            )
+
+            sparse_layers = sorted(_sparse_attention_layer_ids(hf))
+            if not sparse_layers:
+                return
+
+            def needs_topk(boundary):
+                # Dense-only stages relay until the next sparse layer.
+                return next(
+                    (
+                        _should_skip_minimax_m3_index_topk(hf, i)[0]
+                        for i in sparse_layers
+                        if i >= boundary
+                    ),
+                    False,
+                )
+
+            self._pp_recv_needs_sparse = not pp.is_first_rank and needs_topk(
+                inner.start_layer
+            )
+            self._pp_send_needs_sparse = not pp.is_last_rank and needs_topk(
+                inner.end_layer
+            )
+            self._pp_rank_local_keys = (
+                "sparse_kv_indices",
+                "sparse_kv_block_table",
+                "sparse_kv_context_lens",
+            )
             return
 
         # Replicate the model's per-layer shared/full classification
@@ -3084,6 +3127,43 @@ class ModelRunner:
                 inner.start_layer,
                 inner.end_layer,
                 self._pp_index_topk,
+            )
+
+    def _load_pp_shared_indexer(self, intermediate_tensors):
+        if self._pp_rank_local_keys:
+            # The head schedules the same block IDs and layout on every stage,
+            # so M3's indices, sparse page table and lengths can travel together.
+            md = get_forward_context().attn_metadata.sparse_attention_metadata
+            md._index_topk_cache_state = {}
+            if self._pp_recv_needs_sparse:
+                md._index_topk_cache_state["pp_topk"] = tuple(
+                    intermediate_tensors.tensors.pop(k)
+                    for k in self._pp_rank_local_keys
+                )
+        elif intermediate_tensors is not None:
+            recv_sparse = intermediate_tensors.tensors.pop("sparse_kv_indices", None)
+            if recv_sparse is not None and self._pp_recv_needs_sparse:
+                tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
+                tgt[: recv_sparse.numel()].copy_(recv_sparse)
+
+    def _store_pp_shared_indexer(self, model_output):
+        if not self._pp_send_needs_sparse:
+            return
+        if self._pp_rank_local_keys:
+            fwd_ctx = get_forward_context()
+            if fwd_ctx.context.is_dummy_run:
+                # Dummy forwards skip attention and produce no top-k memo.
+                value = (None,) * len(self._pp_rank_local_keys)
+            else:
+                md = fwd_ctx.attn_metadata.sparse_attention_metadata
+                state = md._index_topk_cache_state
+                value = state["topk"]["value"] if "topk" in state else state["pp_topk"]
+            model_output.tensors.update(zip(self._pp_rank_local_keys, value))
+        else:
+            # Use the physical producer row width and the PCP-local token count.
+            n = model_output.tensors["hidden_states"].shape[0] * self._pp_index_topk
+            model_output.tensors["sparse_kv_indices"] = (
+                self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
             )
 
     def _padded_inputs(self, forward_mode: ForwardMode):
@@ -3239,17 +3319,18 @@ class ModelRunner:
 
                 intermediate_tensors = None
                 if pp_enabled and not pp_group.is_first_rank:
-                    intermediate_tensors = recv_intermediate_tensors()
-                    # GLM-5.2 IndexShare: load prior rank's top-k for leading
-                    # shared layers. Pop so compiled model sees only hidden_states.
-                    recv_sparse = intermediate_tensors.tensors.pop(
-                        "sparse_kv_indices", None
+                    intermediate_tensors = recv_intermediate_tensors(
+                        rank_local_keys=(
+                            self._pp_rank_local_keys
+                            if self._pp_recv_needs_sparse
+                            else ()
+                        )
                     )
-                    if recv_sparse is not None and self._pp_recv_needs_sparse:
-                        tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
-                        tgt[: recv_sparse.numel()].copy_(recv_sparse)
                     if self._pp_aux_relay is not None:
                         self._pp_aux_relay.take_received(intermediate_tensors)
+
+                if pp_enabled:
+                    self._load_pp_shared_indexer(intermediate_tensors)
 
                 # Time only the chunk computation between PP receive and send.
                 chunk_sample = self._dynamic_chunking.start_sample(batch)
@@ -3272,18 +3353,16 @@ class ModelRunner:
                 elif self._pp_aux_relay is not None:
                     self._pp_aux_relay.attach(model_output)
                 if pp_enabled and not pp_group.is_last_rank:
-                    # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
-                    if self._pp_send_needs_sparse:
-                        # Use hidden_states rows (correct under PCP shard).
-                        running_tokens = model_output.tensors["hidden_states"].shape[0]
-                        n = running_tokens * self._pp_index_topk
-                        model_output.tensors["sparse_kv_indices"] = (
-                            self.attn_metadata_builder._sparse_kv_indices_gpu[:n]
-                        )
+                    self._store_pp_shared_indexer(model_output)
                     if self._pp_pending_send:
                         commit_pp_send_work(self._pp_pending_send)
                     self._pp_pending_send = async_send_intermediate_tensors(
-                        model_output
+                        model_output,
+                        rank_local_keys=(
+                            self._pp_rank_local_keys
+                            if self._pp_send_needs_sparse
+                            else ()
+                        ),
                     )
                     hidden_states = None
                     logits = None

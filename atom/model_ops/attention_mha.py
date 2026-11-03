@@ -1593,6 +1593,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         state = self._topk_cache_state(sparse_metadata)
         if state is None:
             return None
+        # PP imports the current forward's cache value; bind its local key once.
+        if "pp_topk" in state:
+            state["topk"] = {"key": key, "value": state.pop("pp_topk")}
         entry = state.get("topk")
         if entry is None or entry.get("key") != key:
             return None
