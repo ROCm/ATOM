@@ -1415,7 +1415,7 @@ class GDNStateMixin(PoolRowsMixin):
             no_initial_state=no_initial_state,
             non_spec_state_indices_i64=non_spec_state_indices_i64,
             non_spec_state_indices_in_i64=non_spec_state_indices_in_i64,
-            has_state_fork=getattr(self, "_has_state_fork", False),
+            has_state_fork=self._has_state_fork,
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,

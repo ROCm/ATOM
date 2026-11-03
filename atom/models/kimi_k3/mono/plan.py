@@ -51,7 +51,7 @@ def step_shape(metadata, rows: int) -> tuple[int | None, str]:
         return None, "no KDA metadata"
     if metadata.num_prefills:
         return None, f"{metadata.num_prefills} prefills in the batch"
-    if getattr(metadata, "has_state_fork", False):
+    if metadata.has_state_fork:
         # A forked step reads one slot and writes another. The production
         # kernels take that read-side index; K1 reads `st_idx` only, so it
         # would run on the unseeded write slot.
