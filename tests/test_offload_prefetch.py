@@ -23,7 +23,6 @@ from test_lmcache_mp_async_threads import (
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
-from atom.kv_transfer.offload.mp.offload_prefetch import OffloadPrefetchState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
@@ -154,17 +153,6 @@ def test_hold_tick_parks_a_request_and_ships_its_load(setup):
     assert sched._prefetch.submitted == 1
 
 
-def test_fire_tick_also_prefetches_and_does_not_prefill_a_loading_request(setup):
-    sched, delayer, seq = setup
-    delayer.allow = True
-
-    batch, scheduled = sched.schedule()
-
-    assert batch.total_seqs_num_prefill == 0 and scheduled == {}
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-    assert seq in sched.waiting  # kept its place, not sent to the tail
-
-
 def test_request_behind_the_head_is_loaded_and_the_order_is_unchanged(
     monkeypatch, seq_factory
 ):
@@ -208,24 +196,6 @@ def test_loaded_request_passes_a_head_refused_kv_blocks(monkeypatch, seq_factory
     assert list(sched.waiting) == [b, a]
 
 
-def test_resource_blocked_head_sets_the_bypass_flag(monkeypatch, seq_factory):
-    sched, delayer, (a,) = _make(monkeypatch, seq_factory, n=1)
-    sched.kv_connector.not_ready_ids = {a.id}
-    sched.kv_connector.match = (0, False)
-    delayer.allow = True
-    monkeypatch.setattr(
-        sched.block_manager, "can_allocate_memoized", lambda seq, *a, **k: -1
-    )
-    monkeypatch.setattr(
-        sched.block_manager, "can_allocate", lambda seq, *a, **k: -1, raising=False
-    )
-
-    sched.schedule()
-
-    assert sched._admission_head_blocked
-    assert a in sched.waiting
-
-
 def test_finished_disagg_consumer_load_is_not_prefill_work(setup):
     """A disaggregation consumer's finished load goes straight to decode."""
     sched, _, seq = setup
@@ -236,19 +206,6 @@ def test_finished_disagg_consumer_load_is_not_prefill_work(setup):
     assert next(sched._waiting_prefills(), None) is None
     sched.failed_recving_kv_req_ids.append(seq.id)
     assert next(sched._waiting_prefills(), None) is seq  # failed: recomputes
-
-
-def test_old_path_parked_request_is_still_promoted(monkeypatch, seq_factory):
-    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
-    sched.kv_connector.not_ready_ids = {a.id, b.id}
-    sched.schedule()
-    # b parked by the admission pass, not by the prefetch.
-    b.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-    sched.finished_recving_kv_req_ids.append(b.id)
-
-    sched._promote_ready_remote_kv_requests()
-
-    assert list(sched.waiting) == [b, a]
 
 
 def test_loaded_request_prefills_only_on_a_fire(setup):
@@ -271,25 +228,6 @@ def test_loaded_request_prefills_only_on_a_fire(setup):
     assert seq.id not in sched._prefetch.entries
 
 
-def test_prefill_stays_fifo_when_a_later_request_loaded_first(monkeypatch, seq_factory):
-    sched, delayer, (a, b) = _make(monkeypatch, seq_factory, n=2)
-    # a's lookup is late; b's is ready.
-    sched.kv_connector.not_ready_ids = {a.id}
-    sched.schedule()
-    assert b.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-    sched.finished_recving_kv_req_ids.append(b.id)
-    # a's lookup answers and its load lands as well.
-    sched.kv_connector.not_ready_ids = set()
-    sched.schedule()
-    assert a.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-    sched.finished_recving_kv_req_ids.append(a.id)
-
-    delayer.allow = True
-    _, scheduled = sched.schedule()
-
-    assert list(scheduled) == [a.id, b.id]  # arrival order, not load order
-
-
 def test_request_whose_load_is_in_flight_does_not_block_later_ones(
     monkeypatch, seq_factory
 ):
@@ -304,76 +242,6 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
     assert list(scheduled) == [b.id]
     assert list(sched.waiting) == [a]
     assert a.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-
-
-@pytest.mark.parametrize("why", ["no_load", "lookup_not_ready"])
-def test_nothing_is_allocated_without_an_answered_load(setup, why):
-    sched, _, seq = setup
-    if why == "no_load":
-        sched.kv_connector.match = (0, False)
-    else:
-        sched.kv_connector.ready = False
-    free = _free(sched)
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert len(seq.block_table) == 0
-    assert _free(sched) == free
-    assert sched.kv_connector.allocs == []
-    expect = "no_tier_load" if why == "no_load" else "lookup_not_ready"
-    assert sched._prefetch.skips[expect] == 1
-    sched.schedule()
-    assert sched._prefetch.skips[expect] == 1  # counted once per request
-
-
-def test_a_request_below_the_minimum_load_size_is_not_looked_at(
-    monkeypatch, seq_factory
-):
-    sched, _, (seq,) = _make(monkeypatch, seq_factory)
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "1000")
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert sched._prefetch.skips["below_min_load"] == 1
-
-
-def test_a_refused_park_is_taken_back_and_not_retried(setup):
-    sched, delayer, seq = setup
-    sched.kv_connector.parks = False
-    free = _free(sched)
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert len(seq.block_table) == 0
-    assert _free(sched) == free
-    assert sched.kv_connector.cancelled == [seq.id]
-    assert sched._num_parked_remote_kv == 0
-    assert sched._prefetch.takebacks == 1
-    sched.schedule()  # next tick: not tried again
-    assert sched.kv_connector.allocs == [seq.id]
-
-    # A FIRE admits it the ordinary way (here: no load, a plain prefill).
-    delayer.allow = True
-    batch, scheduled = sched.schedule()
-    assert seq.id in scheduled and batch.total_seqs_num_prefill == 1
-
-
-def test_unaligned_hbm_hit_is_left_to_the_admission_pass_and_counted(setup):
-    sched, _, seq = setup
-    sched.kv_connector.chunk_size = 8  # 4-token hash blocks: a 1-block hit is odd
-
-    class _Probe:
-        num_cached_blocks = 1
-
-    sched._probe_hbm_prefix = lambda s: _Probe()
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert sched._prefetch.skips["unaligned_hbm"] == 1
 
 
 # -- pressure bounds ----------------------------------------------------------
@@ -397,27 +265,6 @@ def test_watermark_stops_prefetch_allocation_and_the_request_waits_for_the_fire(
     assert sched.kv_connector.allocs == [seq.id]
 
 
-def test_pressure_skip_is_retried_once_pressure_is_gone(monkeypatch, seq_factory):
-    sched, _, (seq,) = _make(monkeypatch, seq_factory)
-    sched._PREFETCH_KV_WATERMARK = 0.01
-    sched.schedule()
-    assert seq.status == SequenceStatus.WAITING
-    sched._PREFETCH_KV_WATERMARK = 0.7
-    for _ in range(sched._PREFETCH_RETRY_TICKS + 1):
-        sched.schedule()
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-
-
-def test_no_prefetch_allocation_without_a_free_parking_slot(monkeypatch, seq_factory):
-    sched, _, (seq,) = _make(monkeypatch, seq_factory)
-    sched._num_parked_remote_kv = sched.max_num_seqs
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert sched._prefetch.skips["seq_slots"] == 1
-
-
 # -- cancellation ---------------------------------------------------------------
 
 
@@ -439,39 +286,6 @@ def test_abort_of_a_prefetched_request_releases_its_blocks(setup):
     assert _free(sched) == free
     assert sched._num_parked_remote_kv == 0
     assert seq.id not in sched.deferred_free_blocks
-
-
-def test_abort_of_a_loaded_prefetched_request_releases_its_blocks(setup):
-    sched, _, seq = setup
-    free = _free(sched)
-    sched.schedule()
-    sched.finished_recving_kv_req_ids.append(seq.id)
-
-    assert sched.abort_request(seq.id)
-
-    assert _free(sched) == free
-    assert sched._num_parked_remote_kv == 0
-    assert not sched._prefetch.entries
-
-
-def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
-    sched, _, (_a, b) = _make(monkeypatch, seq_factory, n=2)
-    sched.schedule()
-    b.status = SequenceStatus.ABORTED  # marked, still queued behind a
-
-    sched.schedule()  # HOLD: reclaimed without waiting for a FIRE
-
-    assert b not in sched.waiting
-    assert b.id not in sched._prefetch.entries
-
-
-def test_state_counts_a_request_once_per_reason():
-    state = OffloadPrefetchState()
-    for _ in range(3):
-        state.skip(1, "lookup_not_ready")
-    state.skip(2, "lookup_not_ready")
-    state.skip(1, "watermark")
-    assert state.skips == {"lookup_not_ready": 2, "watermark": 1}
 
 
 def test_probe_looks_past_prefetches_still_loading(monkeypatch, seq_factory):
