@@ -33,6 +33,9 @@ giving scheduler and worker different connector names. MiniMax-M3 cannot be
 overridden away from `m3`, because the other codecs do not preserve its NSA
 index cache. A GDN or K3 model cannot be overridden onto a layout that owns
 no state tier (`dense`), because that would restore KV over a stale slot.
+DeepSeek-V4.1 resolves to `dsv41` (its PAGE+STATE pool, offloaded over
+`lmcache_mp` only), cannot be overridden onto any other layout, and no other
+model may name `dsv41`.
 
 It is the **ATOM-native, in-engine** offload path: the connector plugs straight
 into ATOM's scheduler/worker via the shared
@@ -200,6 +203,12 @@ python -m atom.entrypoints.openai_server \
   }'
 ```
 
+`tp_rank_collapse: auto` decides from the config alone, before any backend is
+built, and leaves every state-owning layout (`kimi_k3`, `qwen`, `dsv41`) one
+copy per rank. DeepSeek-V4.1's backend declares its PAGE and STATE identical
+across TP, so `true` stores one copy for the TP group; the worker still refuses
+to register a collapse its backend does not declare.
+
 ATOM's configured chunk size must equal the MP server chunk size, and both must
 align to ATOM's PAGE/hash block size. A native prefix is loadable only where
 PAGE KV and a complete STATE checkpoint exist at the same boundary on every TP
@@ -247,7 +256,10 @@ The model namespace includes PAGE/model geometry, TP and speculation settings,
 native layout/image sizes, the Hugging Face commit when available, and the
 optional `lmcache.mp.model_revision`. Set that revision when weights are
 replaced in an existing local model directory; a directory name alone cannot
-identify changed contents.
+identify changed contents. DeepSeek-V4.1 resolved to `hybrid` before it had a
+layout of its own; its namespace now names `dsv41` and hashes its
+`sliding_window` and `candidate_block_size`, so a tier an earlier build filled
+misses on every object: expect a cold tier once after upgrading.
 
 ### MP lifetime and representation
 

@@ -3,11 +3,10 @@
 
 """Native PAGE-backed checkpoint transport over standalone LMCache.
 
-Transfers go through the base connector's `_transfers`, which native ATOM
-runs on the step thread (`InlineTransfers`): a submit before the forward and a
-poll at the report. A load whose retrieve succeeded is then restored into its
-Active SLOT, ordered after the compute stream, and reported once that restore
-is done.
+Transfers are submitted on the step thread before the forward and polled in
+`get_finished`, the timing native's save admission (`max_pending_saves`) is
+sized to. A load whose retrieve succeeded is then restored into its Active
+SLOT, ordered after the compute stream, and reported once that restore is done.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
+from atom.kv_transfer.offload.mp.deployment import _mp_session_id
 from atom.kv_transfer.offload.mp.step_events import PendingStepEvent
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
@@ -35,30 +35,27 @@ from atom.kv_transfer.offload.mp.transfer import (
     _transfer_operation_id,
     _UnprovableSubmission,
 )
-from atom.kv_transfer.offload.mp.worker import LMCacheMPConnector, _QueuedTransfer
+from atom.kv_transfer.offload.mp.worker import LMCacheMPConnector
 from atom.model_engine.page_unit_checkpoint import CheckpointRestoreOp
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
-_NATIVE_LOAD = "native_load"
-_NATIVE_SAVE = "native_save"
 
 
 @dataclass
 class _NativePending:
     request: LMCacheReqMeta
-    future: Any = None
-    # Handed to `_transfers` and not yet submitted.
-    queued: bool = False
-    # The retrieve or store reached a terminal state; `result` is its result.
-    terminal: bool = False
-    result: Any = None
+    # None: settled without the server, as a failure (a refusal, an invalid
+    # descriptor) unless `immediate_success`.
+    future: Any
     restore_event: Any = None
     restore_succeeded: bool = False
     # A restore whose GPU progress cannot be proven; only the deadline ends it.
     restore_unprovable: bool = False
     descriptor_slot: int | None = None
+    # A collapsed-TP non-writer's save: the writer stores the shared bytes.
+    immediate_success: bool = False
     started_at: float = field(default_factory=lambda: time.monotonic())
 
 
@@ -132,7 +129,9 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                     f"duplicate native-state LMCache MP operation {operation_id!r}"
                 )
             if not loading and not self._is_kv_writer:
-                pending[operation_id] = _NativePending(req, terminal=True, result=True)
+                pending[operation_id] = _NativePending(
+                    req, None, immediate_success=True
+                )
                 return
             if not loading and len(pending) >= self._max_pending_saves:
                 # Unreachable while the scheduler enforces the same bound: every
@@ -144,7 +143,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                     operation_id,
                     self._max_pending_saves,
                 )
-                pending[operation_id] = _NativePending(req, terminal=True)
+                pending[operation_id] = _NativePending(req, None)
                 return
         end = len(req.token_ids)
         start = (
@@ -165,121 +164,43 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 "Invalid native-state LMCache MP descriptor %s", operation_id
             )
             with self._lock:
-                pending[operation_id] = _NativePending(req, terminal=True)
+                pending[operation_id] = _NativePending(req, None)
             return
-        # Installed before the submit: once it is queued, the server may have
-        # the request whatever the submit later raises, so the lease stays
-        # until a terminal report or the transfer deadline.
+        # Installed before the transport call: if it raises, the server may
+        # still have taken the request, so the lease stays until the transfer
+        # deadline.
         with self._lock:
-            pending[operation_id] = _NativePending(
-                req, _UnprovableSubmission(), queued=True
+            entry = _NativePending(req, _UnprovableSubmission())
+            pending[operation_id] = entry
+            index, step_event = event.hold_locked()
+            self._step_event_of[operation_id] = index
+        submit = (
+            self._adapter.submit_retrieve_request
+            if loading
+            else getattr(
+                self._adapter,
+                "submit_store_request_with_chunk_events",
+                self._adapter.submit_store_request,
             )
-        self._queue_transfer(
-            _NATIVE_LOAD if loading else _NATIVE_SAVE,
-            operation_id,
-            completion,
-            req,
-            spec,
-            event,
         )
+        try:
+            future = submit(_mp_session_id(self._config, req.req_id), spec, step_event)
+        except Exception:
+            # Retain the exact source/destination lease. The server might have
+            # received the request before the connection raised an exception.
+            logger.exception(
+                "Native-state LMCache MP submission unprovable; retaining lease %s",
+                operation_id,
+            )
+            return
+        with self._lock:
+            entry.future = future
 
     def _submit_load(self, req: LMCacheReqMeta, event: PendingStepEvent) -> None:
         self._submit_native(req, event, loading=True)
 
     def _submit_save(self, req: LMCacheReqMeta, event: PendingStepEvent) -> None:
         self._submit_native(req, event, loading=False)
-
-    def _perform_submit(self, item: _QueuedTransfer) -> None:
-        if item.kind not in (_NATIVE_LOAD, _NATIVE_SAVE):
-            super()._perform_submit(item)
-            return
-        loading = item.kind == _NATIVE_LOAD
-        try:
-            if loading:
-                submit = self._adapter.submit_retrieve_request
-            else:
-                submit = getattr(
-                    self._adapter,
-                    "submit_store_request_with_chunk_events",
-                    self._adapter.submit_store_request,
-                )
-            future = submit(item.request_id, item.spec, item.event)
-        except Exception:
-            # Retain the exact source/destination lease. The server might have
-            # received the request before the connection raised an exception.
-            logger.exception(
-                "Native-state LMCache MP submission unprovable; retaining lease %s",
-                item.operation_id,
-            )
-            future = _UnprovableSubmission()
-        with self._lock:
-            self._submitting_owner.pop(item.operation_id, None)
-            pending = self._native_loads if loading else self._native_saves
-            entry = pending.get(item.operation_id)
-            if entry is not None:
-                entry.future = future
-                entry.queued = False
-
-    def _poll_round(self) -> None:
-        super()._poll_round()
-        self._poll_native_saves()
-        self._poll_native_loads()
-
-    def _submitted_native(self, pending: dict[str, _NativePending]):
-        with self._lock:
-            return [
-                (operation_id, entry)
-                for operation_id, entry in pending.items()
-                if not entry.queued and not entry.terminal
-            ]
-
-    def _poll_native_saves(self) -> None:
-        """Advance every submitted save, in a round."""
-        completions: set[ConnectorCompletion] = set()
-        terminal_ops = []
-        for operation_id, entry in self._submitted_native(self._native_saves):
-            take_ranges = getattr(entry.future, "take_completed_ranges", None)
-            if callable(take_ranges):
-                try:
-                    completions |= self._page_source_safe(entry, tuple(take_ranges()))
-                except Exception:
-                    logger.warning(
-                        "LMCache MP source-safe event polling failed", exc_info=True
-                    )
-            terminal, result = _terminal_future_result(entry.future)
-            if not terminal:
-                _enforce_transfer_deadline(
-                    operation_id, entry.started_at, self._transfer_deadline_s
-                )
-                continue
-            terminal_ops.append((operation_id, entry, result))
-        with self._lock:
-            for operation_id, entry, result in terminal_ops:
-                self._finish_native_save(operation_id, entry, result, completions)
-            self._drained_completions |= completions
-
-    def _poll_native_loads(self) -> None:
-        """Advance every submitted retrieve, in a round.
-
-        A finished retrieve is only marked: the restore it may need runs on
-        the step thread (`_advance_native_load`).
-        """
-        terminal_ops = []
-        for operation_id, entry in self._submitted_native(self._native_loads):
-            terminal, result = _terminal_future_result(entry.future)
-            if not terminal:
-                _enforce_transfer_deadline(
-                    operation_id, entry.started_at, self._transfer_deadline_s
-                )
-                continue
-            terminal_ops.append((operation_id, entry, result))
-        with self._lock:
-            for operation_id, entry, result in terminal_ops:
-                entry.terminal = True
-                entry.result = result
-                self._release_step_event(operation_id)
-                self._owned_futures.add_locked(entry.future)
-                entry.future = None
 
     @staticmethod
     def _page_source_safe(
@@ -291,36 +212,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if operation is None or not ranges:
             return set()
         return _source_safe_completions(operation, ranges)
-
-    def _finish_native_save(
-        self,
-        operation_id: str,
-        pending: _NativePending,
-        result: Any,
-        completions: set[ConnectorCompletion],
-    ) -> None:
-        """Report a terminal save into `completions`; `_lock` is held."""
-        save_spec = pending.request.save_spec
-        start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
-        end = len(pending.request.token_ids)
-        completions |= self._page_source_safe(
-            pending, _chunk_ranges(start, end, self.chunk_size)
-        )
-        completions.add(
-            ConnectorCompletion(
-                NATIVE_STATE_MP_STORE_CHANNEL,
-                pending.request.save_operation,
-                succeeded=result is True,
-            )
-        )
-        del self._native_saves[operation_id]
-        self._release_step_event(operation_id)
-        self._owned_futures.add_locked(pending.future)
-        _remember_operation_tombstone(
-            operation_id,
-            self._completed_save_operations,
-            self._completed_save_operation_order,
-        )
 
     def _begin_restore(self, pending: _NativePending) -> bool:
         if not self._restore_descriptor_slots:
@@ -373,50 +264,61 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 compute.wait_event(event)
         super().start_load_kv(metadata)
 
-    def _transfers_in_flight_locked(self) -> bool:
-        return super()._transfers_in_flight_locked() or any(
-            not entry.terminal
-            for pending in (self._native_saves, self._native_loads)
-            for entry in pending.values()
-        )
-
-    def _outstanding_locked(self, wanted: set[str]) -> list[str]:
-        outstanding = super()._outstanding_locked(wanted)
-        for pending in (self._native_saves, self._native_loads):
-            for operation_id, entry in pending.items():
-                if str(entry.request.req_id) not in wanted:
-                    continue
-                if entry.restore_unprovable or (
-                    not entry.queued
-                    and not entry.terminal
-                    and isinstance(entry.future, _UnprovableSubmission)
-                ):
-                    raise RuntimeError(
-                        f"LMCache MP: cannot release {sorted(wanted)}: "
-                        f"{operation_id} may still use its blocks"
-                    )
-                outstanding.append(operation_id)
-        return outstanding
-
     def get_finished(self) -> KVConnectorOutput:
-        output = super().get_finished()
+        output = KVConnectorOutput()
         if self._adapter is None:
             return output
         with self._lock:
-            # Saves that never reached `_transfers`: a collapsed-TP non-writer's
-            # immediate success, a refusal, an invalid descriptor.
             for operation_id, pending in list(self._native_saves.items()):
-                if pending.terminal:
-                    self._finish_native_save(
-                        operation_id,
-                        pending,
-                        pending.result,
-                        output.connector_completions,
-                    )
+                self._poll_native_save(output, operation_id, pending)
             for operation_id, pending in list(self._native_loads.items()):
                 if self._advance_native_load(operation_id, pending):
                     self._finish_native_load(output, operation_id, pending)
         return output
+
+    def _poll_native_save(
+        self, output: KVConnectorOutput, operation_id: str, pending: _NativePending
+    ) -> None:
+        take_ranges = getattr(pending.future, "take_completed_ranges", None)
+        if callable(take_ranges):
+            try:
+                output.connector_completions |= self._page_source_safe(
+                    pending, tuple(take_ranges())
+                )
+            except Exception:
+                logger.warning(
+                    "LMCache MP source-safe event polling failed", exc_info=True
+                )
+        if pending.immediate_success:
+            terminal, result = True, True
+        else:
+            terminal, result = _terminal_future_result(pending.future)
+        if not terminal:
+            _enforce_transfer_deadline(
+                operation_id, pending.started_at, self._transfer_deadline_s
+            )
+            return
+        save_spec = pending.request.save_spec
+        start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
+        end = len(pending.request.token_ids)
+        output.connector_completions |= self._page_source_safe(
+            pending, _chunk_ranges(start, end, self.chunk_size)
+        )
+        output.connector_completions.add(
+            ConnectorCompletion(
+                NATIVE_STATE_MP_STORE_CHANNEL,
+                pending.request.save_operation,
+                succeeded=result is True,
+            )
+        )
+        del self._native_saves[operation_id]
+        self._release_step_event(operation_id)
+        self._owned_futures.add_locked(pending.future)
+        _remember_operation_tombstone(
+            operation_id,
+            self._completed_save_operations,
+            self._completed_save_operation_order,
+        )
 
     def _finish_native_load(
         self, output: KVConnectorOutput, operation_id: str, pending: _NativePending
@@ -432,6 +334,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         target.add(pending.request.load_operation)
         del self._native_loads[operation_id]
         self._release_step_event(operation_id)
+        self._owned_futures.add_locked(pending.future)
         _remember_operation_tombstone(
             operation_id,
             self._completed_load_operations,
@@ -439,26 +342,31 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         )
 
     def _advance_native_load(self, operation_id: str, pending: _NativePending) -> bool:
-        """Move a load toward its outcome, on the step thread; True once final.
+        """Move a load toward its outcome; True once that outcome is final.
 
-        A retrieve a round found failed is final at once. One that succeeded
-        starts the native restore, and is final only once the restore's event
-        is done.
+        A retrieve that fails is final at once. One that succeeds starts the
+        native restore, and is final only once the restore's event is done.
         """
-        if not pending.terminal:
-            return False  # a round polls the retrieve
         if pending.restore_unprovable:
             _enforce_transfer_deadline(
                 operation_id, pending.started_at, self._transfer_deadline_s
             )
             return False
-        if pending.result is not True:
-            return True
-        if pending.request.native_state.kv_only:
-            # PAGE alone: nothing to restore; the replay rebuilds the state.
-            pending.restore_succeeded = True
-            return True
         if pending.restore_event is None:
+            terminal, result = _terminal_future_result(pending.future)
+            if not terminal:
+                _enforce_transfer_deadline(
+                    operation_id, pending.started_at, self._transfer_deadline_s
+                )
+                return False
+            # The server no longer waits on the step's event.
+            self._release_step_event(operation_id)
+            if result is not True:
+                return True
+            if pending.request.native_state.kv_only:
+                # PAGE alone: nothing to restore; the replay rebuilds the state.
+                pending.restore_succeeded = True
+                return True
             try:
                 if not self._begin_restore(pending):
                     return False  # every descriptor slot is busy; retry

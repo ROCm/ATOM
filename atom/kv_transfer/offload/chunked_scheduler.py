@@ -693,11 +693,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 still_read.update(
                     self._save_operation_blocks.get(operation, {}).values()
                 )
-        free = leased - still_read
-        if free:
-            leased.difference_update(free)
-            self._pending_source_safe_releases.append(frozenset(free))
-            self.total_source_safe_released_blocks += len(free)
+        self._return_leased_blocks(lease_key, leased - still_read)
+
+    def _return_leased_blocks(self, lease_key, blocks) -> None:
+        """Give `blocks` back from the request lease `lease_key` names.
+
+        The ones the lease still holds go to the next source-safe release, and
+        the lease is dropped once nothing is left in it. The one sequence every
+        lease release runs.
+        """
+        leased = self._save_lease_blocks.get(lease_key)
+        releasable = set(blocks) & leased if leased is not None else set()
+        if not releasable:
+            return
+        leased.difference_update(releasable)
+        self._pending_source_safe_releases.append(frozenset(releasable))
+        self.total_source_safe_released_blocks += len(releasable)
         if not leased:
             self._save_lease_blocks.pop(lease_key, None)
             self._save_lease_at.pop(lease_key, None)
@@ -1257,17 +1268,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return
         sid = str(operation.req_id)
         owner = self._save_operation_owner.get(operation)
-        lease_key = id(owner) if owner is not None else None
-        leased = self._save_lease_blocks.get(lease_key)
-        releasable = newly_safe & leased if leased is not None else set()
-        if releasable:
-            leased.difference_update(releasable)
-            self._pending_source_safe_releases.append(frozenset(releasable))
-            self.total_source_safe_released_blocks += len(releasable)
-            if not leased:
-                self._save_lease_blocks.pop(lease_key, None)
-                self._save_lease_at.pop(lease_key, None)
-                self._save_lease_owner.pop(lease_key, None)
+        self._return_leased_blocks(id(owner) if owner is not None else None, newly_safe)
         all_safe = set(block_map.values()).issubset(safe)
         if all_safe:
             # Every rank has finished reading every source block of this save,
@@ -1368,17 +1369,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         block_map = self._save_operation_blocks.pop(operation, {})
         self._save_operation_safe.pop(operation, None)
         owner = self._save_operation_owner.pop(operation, None)
-        lease_key = id(owner) if owner is not None else None
-        leased = self._save_lease_blocks.get(lease_key)
-        releasable = set(block_map.values()) & leased if leased is not None else set()
-        if releasable:
-            leased.difference_update(releasable)
-            self._pending_source_safe_releases.append(frozenset(releasable))
-            self.total_source_safe_released_blocks += len(releasable)
-            if not leased:
-                self._save_lease_blocks.pop(lease_key, None)
-                self._save_lease_at.pop(lease_key, None)
-                self._save_lease_owner.pop(lease_key, None)
+        self._return_leased_blocks(
+            id(owner) if owner is not None else None, block_map.values()
+        )
 
     def _finish_retired_request(self, sid: str) -> None:
         if sid in self._save_retry_blocked:

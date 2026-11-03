@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import types
 from collections import deque
 from dataclasses import dataclass, replace
@@ -729,7 +730,8 @@ def test_mp_lookup_rejects_retrieve_beyond_lookup_hit(monkeypatch):
 
 
 def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
-    monkeypatch.setattr(transfer.time, "monotonic", iter([0.0, 0.0, 2.0]).__next__)
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
     client = mp_lookup._MPLookupClient(
@@ -749,7 +751,8 @@ def test_mp_lookup_timeout_defers_cleanup_until_result(monkeypatch):
 
 
 def test_mp_lookup_pending_cleanup_drops_adapter_bookkeeping(monkeypatch):
-    monkeypatch.setattr(transfer.time, "monotonic", iter([0.0, 0.0, 2.0]).__next__)
+    ticks = iter([0.0, 0.0, 2.0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(transfer.time, "sleep", lambda _seconds: None)
     adapter = _LookupAdapter([None, None])
     client = mp_lookup._MPLookupClient(
@@ -880,7 +883,8 @@ def test_mp_lookup_timeout_is_not_recorded_as_a_tier_miss(monkeypatch):
     held long enough to keep a dead tier from costing a timeout every step.
     """
 
-    monkeypatch.setattr(transfer.time, "monotonic", iter([0.0, 0.0, 2.0, 0.0]).__next__)
+    ticks = iter([0.0, 0.0, 2.0, 0.0])
+    monkeypatch.setattr(transfer.time, "monotonic", lambda: next(ticks))
     scheduler, lookup = _full_prompt_hit_scheduler(monkeypatch, chunk_size=4)
     adapter = lookup._adapter
     adapter.results.clear()
@@ -1264,26 +1268,40 @@ def test_inline_transfer_deadline_raises_from_the_report(
     assert len(worker._pending_saves) == 1
 
 
-def test_inline_fence_polls_until_the_transfer_settles(fake_lmcache_modules):
-    adapter = _WorkerAdapter()
-    worker = _inline_worker(adapter)
-    worker._submit_save(_unprovable_request("save"), _step_event(worker))
-    *_, future = adapter.saves[0]
-    worker.fence(["8"])  # someone else's transfer: no wait
-    landing = threading.Timer(0.05, setattr, (future, "ready", True))
-    landing.start()
-    worker.fence(["16"])
-    landing.join()
-    assert not worker._pending_saves
-    assert worker.get_finished().finished_saving == {SaveOperationId(16, 1)}
-
-    worker._submit_save(
-        replace(_unprovable_request("save"), save_operation=SaveOperationId(16, 2)),
-        _step_event(worker),
-    )
-    worker._transfer_deadline_s = 0.05
-    with pytest.raises(RuntimeError, match="transfer deadline|still not terminal"):
+def test_inline_transfers_have_no_fence(fake_lmcache_modules):
+    """Only the vLLM plugin hands a preempted request's blocks on before its
+    transfers end, and it runs them on a drain thread."""
+    worker = _inline_worker(_WorkerAdapter())
+    with pytest.raises(NotImplementedError, match="transfer_thread=True"):
         worker.fence(["16"])
+
+
+@pytest.mark.parametrize("transfer_thread", [False, True])
+def test_close_keeps_the_step_events_until_shutdown_drained(
+    fake_lmcache_modules, transfer_thread
+):
+    """A transfer still in flight at close waits on its step event, and only
+    `shutdown` drains it; a failed shutdown leaves the events alone."""
+    for fails in (False, True):
+        adapter = _WorkerAdapter()
+        worker = mp_worker.LMCacheMPConnector(
+            _config(), transfer_thread=transfer_thread
+        )
+        worker._adapter = adapter
+        worker.chunk_size = 8
+        seen = []
+
+        def shutdown(worker=worker, seen=seen, fails=fails):
+            seen.append(len(worker._step_events))
+            if fails:
+                raise RuntimeError("server gone")
+
+        adapter.shutdown = shutdown
+        worker._submit_save(_unprovable_request("save"), _step_event(worker))
+        _settle(worker)
+        worker.close()
+        assert seen == [1]
+        assert len(worker._step_events) == (1 if fails else 0)
 
 
 def test_inline_close_shuts_the_client_down_and_refuses_new_transfers(
@@ -1325,14 +1343,12 @@ def test_worker_uses_transfer_boundary_and_exact_completion(fake_lmcache_modules
     assert worker.get_finished().finished_loading == {operation}
 
 
-def test_a_load_landing_after_the_drain_round_is_reported_that_step(
-    fake_lmcache_modules,
+def test_a_load_landing_during_the_forward_is_reported_that_step(
+    fake_lmcache_modules, monkeypatch
 ):
-    """The step's drain round ran before the forward; `get_finished` looks again.
-
-    Otherwise the request waits a whole step in WAITING_FOR_REMOTE_KVS, which
-    base, polling there, did not.
-    """
+    """With the drain idle, `get_finished` waits for one pure poll round, so
+    the request does not wait a whole step in WAITING_FOR_REMOTE_KVS."""
+    monkeypatch.setattr(mp_worker, "_LAST_LOOK_WAIT_S", 5.0)
     adapter = _WorkerAdapter()
     worker = _worker(adapter)
     operation = LoadOperationId(req_id=7, generation=1)
@@ -1344,11 +1360,39 @@ def test_a_load_landing_after_the_drain_round_is_reported_that_step(
         load_operation=operation,
     )
     worker._submit_load(request, _step_event(worker))
-    _settle(worker)
     future = worker._pending_loads["load:7:1"].future
     future.value, future.ready = True, True
-    # No drain round in between.
     assert worker.get_finished().finished_loading == {operation}
+
+
+def test_the_last_look_never_waits_behind_a_submit(fake_lmcache_modules, monkeypatch):
+    """A round that has to submit first outlasts any wait short enough for a
+    step, so `get_finished` does not wait on one."""
+    monkeypatch.setattr(mp_worker, "_LAST_LOOK_WAIT_S", 5.0)
+    released, entered = threading.Event(), threading.Event()
+    adapter = _WorkerAdapter()
+    real_submit = adapter.submit_store_request
+
+    def blocking_submit(request_id, op, event):
+        entered.set()
+        released.wait(5.0)
+        return real_submit(request_id, op, event)
+
+    adapter.submit_store_request = blocking_submit
+    # Not `_worker`, which would settle the blocked submit.
+    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
+    worker._adapter = adapter
+    worker.chunk_size = 8
+    worker._pending_loads["load:5:1"] = mp_worker._PendingLoad(
+        completion=LoadOperationId(req_id=5, generation=1), future=_WorkerFuture()
+    )
+    worker._submit_save(_unprovable_request("save"), _step_event(worker))
+    assert entered.wait(5.0), "the drain thread never picked the save up"
+    started = time.monotonic()
+    worker.get_finished()
+    waited = time.monotonic() - started
+    released.set()
+    assert waited < 1.0
 
 
 def test_worker_reports_failed_load_from_future(fake_lmcache_modules):

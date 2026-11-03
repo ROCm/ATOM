@@ -17,6 +17,7 @@ import pytest
 
 from atom.kv_transfer.offload.mp import step_events as mp_step_events
 from atom.kv_transfer.offload.mp import worker as mp_worker
+from atom.kv_transfer.offload.mp.drain import TransferDrain
 
 
 class FakeCudaEvent:
@@ -67,9 +68,10 @@ def settle(worker) -> None:
     """Wait for a drain round that started after this call, if one runs.
 
     A transfer that settles without the server (an invalid descriptor, a
-    collapsed-TP non-writer's save) starts no drain thread.
+    collapsed-TP non-writer's save) starts no drain thread, and an inline
+    worker (native ATOM's) runs nothing between steps.
     """
-    if worker._transfers.alive:
+    if isinstance(worker._transfers, TransferDrain) and worker._transfers.alive:
         finished = worker._transfers.wait_round(5.0)
         # A round that failed (a deadline, say) ends the thread; the step's
         # next `get_finished` raises what it recorded.

@@ -69,10 +69,10 @@ from atom.kv_transfer.offload.mp.transfer import (
 
 logger = logging.getLogger("atom")
 
-# How long `get_finished` waits for a drain thread's round to report a
-# transfer that landed during the forward (`_wants_last_look_locked`). Bounded,
-# so the step never waits out an IPC import or a submit in progress: what
-# misses it is reported on the next step.
+# How long `get_finished` waits, while a load is in flight, for a drain round
+# that is a pure poll: a load that lands during the forward and misses it
+# keeps its request in WAITING_FOR_REMOTE_KVS a step longer. Without it, the
+# plugin's c16 TTFT p50 rose from 302 to 324 ms.
 _LAST_LOOK_WAIT_S = 0.001
 # How long `close` lets the drain finish its last round.
 _CLOSE_TIMEOUT_S = 30.0
@@ -354,15 +354,19 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             return
         adapter, self._adapter = self._adapter, None
-        with self._lock:
-            self._step_events.clear()
         if adapter is None:
             return
         try:
             adapter.shutdown()
         except Exception:
-            # Teardown continues; the server's reaper is the backstop.
+            # Teardown continues; the server's reaper is the backstop. A
+            # transfer may still wait on a step event, so the events stay.
             logger.warning("LMCache MP worker shutdown failed", exc_info=True)
+            return
+        # Only now: `shutdown` drained the in-flight operations, so no
+        # transfer waits on a step event any more.
+        with self._lock:
+            self._step_events.clear()
 
     def start_load_kv(self, metadata: Any) -> None:
         if not isinstance(metadata, LMCacheOffloadMetadata):
@@ -757,12 +761,6 @@ class LMCacheMPConnector(KVConnectorBase):
             self._drained_done_save |= done_save
             self._drained_completions |= completions
 
-    def _wants_last_look_locked(self) -> bool:
-        """Whether a transfer still pending would delay a request if reported
-        a step late: a load, which keeps its request in WAITING_FOR_REMOTE_KVS.
-        A save reported a step later delays no request here."""
-        return bool(self._pending_loads)
-
     def _transfers_in_flight_locked(self) -> bool:
         return bool(
             self._pending_loads or self._pending_saves or self._submitting_owner
@@ -796,11 +794,11 @@ class LMCacheMPConnector(KVConnectorBase):
         """Block until no transfer for these requests still uses their blocks.
 
         For a frontend that hands a preempted request's blocks to the next
-        allocation at once: a save still reading them would store the next
-        occupant's bytes under the preempted request's tokens. Waits on
-        `_transfers`' rounds, up to the transfer deadline, and fail-stops past
-        it.
-        The completions stay for `get_finished`, which releases their leases.
+        allocation at once (the vLLM plugin): a save still reading them would
+        store the next occupant's bytes under the preempted request's tokens.
+        Waits on the drain thread's rounds, up to the transfer deadline, and
+        fail-stops past it. The completions stay for `get_finished`, which
+        releases their leases.
         """
         wanted = {str(req_id) for req_id in req_ids}
         if not wanted:
@@ -817,19 +815,15 @@ class LMCacheMPConnector(KVConnectorBase):
         # The drain thread cannot stop the engine; the step can.
         self._transfers.raise_if_failed()
         with self._lock:
-            look = self._transfers.inline or self._wants_last_look_locked()
-        if look:
-            # Inline, the step's poll of every pending transfer. On the drain
-            # thread, one bounded last look before reporting.
-            self._transfers.wait_round(_LAST_LOOK_WAIT_S)
-            self._transfers.raise_if_failed()
+            in_flight = self._transfers_in_flight_locked()
+            wait_s = _LAST_LOOK_WAIT_S if self._pending_loads else 0.0
+        if in_flight:
+            # Inline, the step's own poll, reported below. On the drain thread,
+            # a wake -- a step that queues nothing (an idle engine waiting on a
+            # load) raises none of its own -- and a last look at a load.
+            self._transfers.report_round(wait_s)
         output = KVConnectorOutput()
         with self._lock:
-            # A step that queues nothing (an idle engine waiting on a load)
-            # raises no wake of its own; without this the result waits for
-            # the drain thread's backstop.
-            if self._transfers_in_flight_locked():
-                self._transfers.wake()
             # Heartbeat health is a control-plane signal, not proof that GPU
             # work has quiesced, so a save is only reported once its device
             # event is terminal -- that check lives in `_poll_pending_saves`.
