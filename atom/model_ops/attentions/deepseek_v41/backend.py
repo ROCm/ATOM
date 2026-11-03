@@ -16,6 +16,9 @@ from atom.model_ops.attentions.backends import AttentionBackend, CommonAttention
 from atom.model_ops.attentions.deepseek_v4_attn import (
     DeepseekV4AttentionMetadataBuilder,
 )
+from atom.model_ops.attentions.deepseek_v41.decoder_buckets import (
+    decoder_graph_sizes,
+)
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import page_pool, state_pool
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
@@ -1379,19 +1382,22 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     @property
     def prefill_req_graph_sizes(self):
         """The decoder's request buckets (`DecoderGraph`,
-        `ATOM_DECODER_GRAPH_SIZES`) a step can hold: no more requests than a
-        batch, one window each within the token buffer
+        `ATOM_DECODER_GRAPH_SIZES`, by default the capture ladder's sizes up to
+        16 -- see `decoder_graph_sizes`) a step can hold: no more requests than
+        a batch, one window each within the token buffer
         (`build_for_req_graph_capture`); a larger step's tail runs eagerly.
-        Not on an FP8 index plane, whose tile tables follow each request's
-        context (`PagedAttentionCache.unit_tiles`), which a recording would
-        fix."""
+        Read after the decode graphs are captured, so the ladder is the one
+        `ForwardMode.decide` rounds `running_bs` up. Not on an FP8 index plane,
+        whose tile tables follow each request's context
+        (`PagedAttentionCache.unit_tiles`), which a recording would fix."""
         if not (self._decoder_replays and self.geometry.index_fp4):
             return ()
-        window = self.geometry.window_size
-        return tuple(
-            n
-            for n in envs.ATOM_DECODER_GRAPH_SIZES
-            if n <= self.max_bs and n * window <= self.max_num_batched_tokens
+        return decoder_graph_sizes(
+            envs.ATOM_DECODER_GRAPH_SIZES,
+            self.model_runner.capture_sizes,
+            max_bs=self.max_bs,
+            max_tokens=self.max_num_batched_tokens,
+            window=self.geometry.window_size,
         )
 
     def build_for_token_graph_capture(self, tokens):

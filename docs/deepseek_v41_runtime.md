@@ -347,7 +347,9 @@ requests and rows no request owns, which repeat a real row
 (`lay_out_tail`, `DeepseekV41MetadataBuilder._publish_decoder`). Every step of
 a `running_bs` publishes at the same addresses, so the decoder -- layer 20's
 attention and FFN through layer 39 -- records once per bucket as a `ReqGraph`
-(`decoder_graph.DecoderGraph`, at `ATOM_DECODER_GRAPH_SIZES`) and replays
+(`decoder_graph.DecoderGraph`, at `ATOM_DECODER_GRAPH_SIZES`; unset, every
+cudagraph capture size up to 16, since `ForwardMode.decide` rounds a step's
+`running_bs` up that ladder -- `decoder_buckets.decoder_graph_sizes`) and replays
 with no Python; any other `running_bs`, a step with image rows, an FP8 index
 plane, or a decoder reading a selection carried off the encoder runs the same
 layout eagerly. The runner records the buckets after the token graphs
