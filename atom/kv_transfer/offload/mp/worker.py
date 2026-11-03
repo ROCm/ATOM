@@ -147,7 +147,7 @@ class LMCacheMPConnector(KVConnectorBase):
         self._step_events = StepEventRing()
         # The ring index each queued or pending transfer holds.
         self._step_event_of: dict[str, int] = {}
-        self._owned_futures = OwnedFutures(self._lock)
+        self._owned_futures = OwnedFutures(self._lock, hold=drain_thread)
         # With OFFLOAD_MP_TRANSFER_THREAD (native ATOM): the submitting thread
         # and the reused producer fences it needs (see `transfer_thread`).
         self._transfer: _TransferThread | None = None

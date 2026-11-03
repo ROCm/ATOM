@@ -1254,6 +1254,18 @@ def test_inline_transfers_settle_on_the_step_thread(fake_lmcache_modules, kind):
     assert threading.active_count() == threads
 
 
+def test_inline_drops_a_finished_future_where_it_finished(fake_lmcache_modules):
+    """As main does. Held until the stream was idle, native's steps ran faster
+    but its saves fell behind."""
+    adapter = _WorkerAdapter()
+    worker = _inline_worker(adapter)
+    worker._submit_save(_unprovable_request("save"), _step_event(worker))
+    *_, future = adapter.saves[0]
+    future.ready = True
+    assert worker.get_finished().finished_saving == {SaveOperationId(16, 1)}
+    assert len(worker._owned_futures) == 0
+
+
 def test_inline_transfer_deadline_raises_from_the_report(
     fake_lmcache_modules, monkeypatch
 ):

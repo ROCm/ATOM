@@ -66,18 +66,28 @@ class OwnedFutures:
     LMCache keeps each future until its next submission, and a drain thread's
     locals hold some between rounds; letting go first would leave the destroy
     to whichever of them lets go last, on the drain thread.
+
+    Only the drain needs this (``hold``). Native ATOM, all on the step thread,
+    drops a future where it finished, as main does: held until the stream was
+    idle, its steps ran 6% faster but its saves fell behind, and a GSM8K
+    two-pass loaded 7% fewer tier tokens.
     """
 
-    def __init__(self, lock: threading.Lock) -> None:
+    def __init__(self, lock: threading.Lock, *, hold: bool = True) -> None:
         self._lock = lock
+        self._hold = hold
         self._owned: deque[Any] = deque()
 
     def __len__(self) -> int:
         return len(self._owned)
 
     def add_locked(self, future: Any) -> None:
-        """Take ownership; the caller holds the connector's `_lock`."""
-        if future is not None:
+        """Take ownership; the caller holds the connector's `_lock`.
+
+        Without ``hold`` the caller's reference is the last, and its drop
+        destroys the future.
+        """
+        if future is not None and self._hold:
             self._owned.append(future)
 
     def release(self) -> None:
