@@ -142,7 +142,10 @@ def common_refusals(
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
-        (not atom_config.enable_return_routed_experts, "routed-expert capture"),
+        (
+            not getattr(atom_config, "enable_return_routed_experts", False),
+            "routed-expert capture",
+        ),
         (
             not _takes_weight_updates(atom_config),
             "rollout weight updates (mono caches copies a sync cannot reach)",

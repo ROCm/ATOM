@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import os
+import re
 import time
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
@@ -2362,8 +2363,6 @@ class ModelRunner:
             return None
         if not hasattr(self, "model"):
             return None
-        import re
-
         moes: list = fused_moe_modules(self.model)
         if not moes:
             raise ValueError(

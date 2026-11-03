@@ -2,8 +2,8 @@
 """GPU e2e: native LLM.generate() routed-expert capture.
 
 Covers tensor-parallel, CUDA-graph decode, a prefix-cache hit, concurrent
-requests in one batch, and chunked prefill. Dummy Qwen3-MoE weights keep the
-run small; tokenizer comes from a real Qwen3 checkpoint so token ids stay
+requests in one batch, chunked prefill, and MTP verify on a GDN model. Dummy
+weights keep the run small; tokenizer comes from a real Qwen3 checkpoint so token ids stay
 in-vocab.
 
 Usage (ATOM Docker image, 2+ GPUs)::
@@ -80,6 +80,49 @@ def _write_tiny_qwen3_moe(model_dir: Path, vocab_size: int) -> None:
     (model_dir / "config.json").write_text(json.dumps(config, indent=2))
 
 
+_NEXT_NUM_LAYERS = 4
+
+
+def _write_tiny_qwen3_next(model_dir: Path, vocab_size: int) -> None:
+    """Three GDN layers then one full-attention layer, every layer MoE, plus
+    the one MTP layer the drafter reuses."""
+    config = {
+        "architectures": ["Qwen3NextForCausalLM"],
+        "model_type": "qwen3_next",
+        "hidden_act": "silu",
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "partial_rotary_factor": 0.25,
+        "attention_bias": False,
+        "num_hidden_layers": _NEXT_NUM_LAYERS,
+        "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+        "full_attention_interval": 4,
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "num_experts": _NUM_EXPERTS,
+        "num_experts_per_tok": _TOP_K,
+        "moe_intermediate_size": 128,
+        "shared_expert_intermediate_size": 128,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [],
+        "norm_topk_prob": True,
+        "num_nextn_predict_layers": 1,
+        "max_position_embeddings": 2048,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 10000000.0,
+        "torch_dtype": "bfloat16",
+        "vocab_size": vocab_size,
+        "tie_word_embeddings": False,
+    }
+    (model_dir / "config.json").write_text(json.dumps(config, indent=2))
+
+
 def _generate_tracked(engine, prompts, sampling_params):
     """Like LLMEngine.generate, plus the largest prefix-cache hit seen."""
     engine.core_mgr.reset_dp_router()
@@ -101,11 +144,11 @@ def _generate_tracked(engine, prompts, sampling_params):
     return ordered, max_cached
 
 
-def _assert_routes(routes, seq_len: int) -> None:
+def _assert_routes(routes, seq_len: int, num_layers: int = _NUM_LAYERS) -> None:
     assert routes is not None
     arr = np.asarray(routes)
     assert arr.dtype == np.int16
-    assert arr.shape == (seq_len - 1, _NUM_LAYERS, _TOP_K)
+    assert arr.shape == (seq_len - 1, num_layers, _TOP_K)
     assert arr.min() >= 0
     assert arr.max() < _NUM_EXPERTS
 
@@ -113,8 +156,8 @@ def _assert_routes(routes, seq_len: int) -> None:
 _PROMPT = "Count from 1 to 40: " + " ".join(str(i) for i in range(1, 41))
 
 
-def _tp_engine(tmp_path, **overrides):
-    """A TP=2, FULL-cudagraph engine on the tiny dummy Qwen3-MoE."""
+def _tp_engine(tmp_path, write_model=_write_tiny_qwen3_moe, **overrides):
+    """A TP=2, FULL-cudagraph engine on a tiny dummy model."""
     n_gpu = torch.cuda.device_count()
     if n_gpu < 2:
         pytest.skip(f"TP e2e needs 2 GPUs, found {n_gpu}")
@@ -128,9 +171,9 @@ def _tp_engine(tmp_path, **overrides):
     vocab_size = int(getattr(tokenizer, "vocab_size", 0) or len(tokenizer))
     # VocabParallelEmbedding requires vocab % tp == 0.
     vocab_size = ((vocab_size + 63) // 64) * 64
-    model_dir = tmp_path / "tiny_qwen3_moe"
+    model_dir = tmp_path / "tiny_model"
     model_dir.mkdir()
-    _write_tiny_qwen3_moe(model_dir, vocab_size)
+    write_model(model_dir, vocab_size)
 
     engine_args = EngineArgs(
         model=str(model_dir),
@@ -157,10 +200,12 @@ def _greedy():
     return SamplingParams(temperature=0.0, max_tokens=_MAX_NEW, ignore_eos=True)
 
 
-def _assert_output_routes(out) -> None:
+def _assert_output_routes(out, num_layers: int = _NUM_LAYERS) -> None:
     assert out["num_tokens_output"] == _MAX_NEW
     _assert_routes(
-        out["routed_experts"], out["num_tokens_input"] + out["num_tokens_output"]
+        out["routed_experts"],
+        out["num_tokens_input"] + out["num_tokens_output"],
+        num_layers,
     )
 
 
@@ -222,5 +267,56 @@ def test_chunked_prefill_then_prefix_hit_routes(tmp_path):
         _assert_output_routes(out1)
         np.testing.assert_array_equal(out0["routed_experts"], out1["routed_experts"])
         assert out0["token_ids"] == out1["token_ids"]
+    finally:
+        engine.close()
+
+
+def _route_disagreement(a: np.ndarray, b: np.ndarray) -> float:
+    """Fraction of (token, layer) cells whose top-k expert sets differ."""
+    return float(np.mean(np.any(np.sort(a, -1) != np.sort(b, -1), axis=-1)))
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_mtp_verify_routes_align_with_a_prefill_of_the_same_tokens(
+    tmp_path, num_speculative_tokens
+):
+    """GDN + MTP under FULL graphs. Dummy weights make the drafter mostly
+    wrong, so most verify steps reject drafts. Re-prefilling prompt + output
+    computes every token's route directly; the verify-built routes must line
+    up with it row for row, where a misplaced verify start would shift them."""
+    max_new = 32
+    engine = _tp_engine(
+        tmp_path,
+        write_model=_write_tiny_qwen3_next,
+        method="mtp",
+        num_speculative_tokens=num_speculative_tokens,
+        enable_prefix_caching=False,
+    )
+    from atom.sampling_params import SamplingParams
+
+    try:
+        prompt_ids = list(engine.tokenizer.encode(_PROMPT))
+        n_in = len(prompt_ids)
+        params = SamplingParams(temperature=0.0, max_tokens=max_new, ignore_eos=True)
+        (out,), _ = _generate_tracked(engine, [prompt_ids], params)
+        assert out["num_tokens_output"] == max_new
+        verify = np.asarray(out["routed_experts"])
+        _assert_routes(verify, n_in + max_new, _NEXT_NUM_LAYERS)
+
+        replay = SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True)
+        (ref_out,), _ = _generate_tracked(
+            engine, [prompt_ids + list(out["token_ids"])], replay
+        )
+        ref = np.asarray(ref_out["routed_experts"])[: len(verify)]
+
+        decode = slice(n_in, len(verify))
+        aligned = _route_disagreement(verify[decode], ref[decode])
+        shifted = min(
+            _route_disagreement(verify[n_in + 1 :], ref[n_in:-1]),
+            _route_disagreement(verify[n_in:-1], ref[n_in + 1 :]),
+        )
+        assert _route_disagreement(verify[:n_in], ref[:n_in]) <= 0.05
+        assert aligned <= 0.1
+        assert shifted >= 0.4, "routes must be position-specific for this check"
     finally:
         engine.close()
