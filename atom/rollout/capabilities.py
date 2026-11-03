@@ -47,6 +47,8 @@ class CapabilityProviderMixin:
         # Engine-side (AsyncLLMEngine.pause_generation), reported here so a
         # caller has one place to ask what this ATOM supports.
         features.add("pause_generation")
+        if "receive_weights_rdma" in methods and self._rdma_reload_refusal() is None:
+            features.add("rdma_weight_receive")
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {
