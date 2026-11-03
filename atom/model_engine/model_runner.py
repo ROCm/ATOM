@@ -3070,11 +3070,7 @@ class ModelRunner:
             self._pp_send_needs_sparse = not pp.is_last_rank and needs_topk(
                 inner.end_layer
             )
-            self._pp_rank_local_keys = (
-                "sparse_kv_indices",
-                "sparse_kv_block_table",
-                "sparse_kv_context_lens",
-            )
+            self._pp_rank_local_keys = ("sparse_kv_indices",)
             return
 
         # Replicate the model's per-layer shared/full classification
@@ -3131,14 +3127,12 @@ class ModelRunner:
 
     def _load_pp_shared_indexer(self, intermediate_tensors):
         if self._pp_rank_local_keys:
-            # The head schedules the same block IDs and layout on every stage,
-            # so M3's indices, sparse page table and lengths can travel together.
+            # Only logical selections cross PP; attention owns local page metadata.
             md = get_forward_context().attn_metadata.sparse_attention_metadata
             md._index_topk_cache_state = {}
             if self._pp_recv_needs_sparse:
-                md._index_topk_cache_state["pp_topk"] = tuple(
-                    intermediate_tensors.tensors.pop(k)
-                    for k in self._pp_rank_local_keys
+                md._index_topk_cache_state["pp_topk"] = (
+                    intermediate_tensors.tensors.pop("sparse_kv_indices")
                 )
         elif intermediate_tensors is not None:
             recv_sparse = intermediate_tensors.tensors.pop("sparse_kv_indices", None)
@@ -3153,12 +3147,14 @@ class ModelRunner:
             fwd_ctx = get_forward_context()
             if fwd_ctx.context.is_dummy_run:
                 # Dummy forwards skip attention and produce no top-k memo.
-                value = (None,) * len(self._pp_rank_local_keys)
+                indices = None
             else:
                 md = fwd_ctx.attn_metadata.sparse_attention_metadata
                 state = md._index_topk_cache_state
-                value = state["topk"]["value"] if "topk" in state else state["pp_topk"]
-            model_output.tensors.update(zip(self._pp_rank_local_keys, value))
+                indices = (
+                    state["topk"]["value"][0] if "topk" in state else state["pp_topk"]
+                )
+            model_output.tensors["sparse_kv_indices"] = indices
         else:
             # Use the physical producer row width and the PCP-local token count.
             n = model_output.tensors["hidden_states"].shape[0] * self._pp_index_topk

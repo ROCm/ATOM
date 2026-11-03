@@ -563,3 +563,53 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+@gpu
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("heads", [1, 4])
+@pytest.mark.parametrize("pages,stride", [(1, 1), (8, 8), (8, 16)])
+def test_received_indices_rebuild_local_pages(decode, heads, pages, stride):
+    from tests.test_minimax_m3_pp_topk import reference_pages
+
+    starts = torch.tensor([0, 2, 6], dtype=torch.int32)
+    prefix = torch.tensor([643, 900] if decode else [641, 896], dtype=torch.int32)
+    max_q = 3 if decode else 4
+    table = torch.arange(32, dtype=torch.int32).reshape(2, 16) * 7 + 3
+    indices = torch.empty(heads, 6, 4, dtype=torch.int32)
+    for req in range(2):
+        start = req * max_q if decode else int(starts[req])
+        end = start + max_q if decode else int(starts[req + 1])
+        base = int(prefix[req]) - max_q if decode else int(prefix[req])
+        for row in range(start, end):
+            tail = (base + row - start) // 128
+            for head in range(heads):
+                # Deliberately unsorted, padded, and different for each KV head.
+                indices[head, row] = torch.tensor(
+                    [tail, head % tail, -1, (head + 1) % tail]
+                )
+    expected = reference_pages(
+        indices,
+        table,
+        starts,
+        prefix,
+        max_q,
+        decode=decode,
+        pages_per_block=pages,
+        block_page_stride=stride,
+    )
+    # The helper must respect received tensor strides as well as head order.
+    received = torch.empty(heads, 6, 8, dtype=torch.int32, device="cuda")[:, :, ::2]
+    received.copy_(indices)
+    actual = m.minimax_m3_emit_sparse_block_table(
+        received,
+        table.cuda(),
+        starts.cuda(),
+        prefix.cuda(),
+        max_q,
+        decode=decode,
+        pages_per_block=pages,
+        block_page_stride=stride,
+    )
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)

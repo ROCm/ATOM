@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Exercise the shared runner hooks and M3 memo, replacing only GPU scoring."""
+"""Exercise the shared runner hooks and M3 memo, replacing GPU scoring and page emission."""
 
 import logging
 import sys
@@ -11,6 +11,122 @@ import torch
 from atom.config import _is_minimax_m3_config
 from atom.models.utils import IntermediateTensors
 from tests.test_minimax_m3_index_cache_rows import definitions
+
+
+def reference_pages(
+    indices,
+    table,
+    starts,
+    prefix,
+    max_q,
+    *,
+    decode=False,
+    pages_per_block=8,
+    block_page_stride=8,
+):
+    heads, rows, topk = indices.shape
+    bt = torch.zeros(rows * heads, topk * pages_per_block, dtype=torch.int32)
+    ctx = torch.zeros(rows * heads, dtype=torch.int32)
+    for req in range(table.shape[0]):
+        start = req * max_q if decode else int(starts[req])
+        end = start + max_q if decode else int(starts[req + 1])
+        base = int(prefix[req]) - max_q if decode else int(prefix[req])
+        for row in range(start, end):
+            length = base + row - start + 1
+            tail = (length - 1) // 128
+            for head in range(heads):
+                selected = indices[head, row].tolist()
+                full = [b for b in selected if 0 <= b < tail]
+                chosen = full + ([tail] if tail in selected else [])
+                pages = [
+                    (int(table[req, b]) * block_page_stride + j) * heads + head
+                    for b in chosen
+                    for j in range(pages_per_block)
+                ]
+                out_row = row * heads + head
+                bt[out_row, : len(pages)] = torch.tensor(pages, dtype=torch.int32)
+                ctx[out_row] = len(full) * 128 + (
+                    length - tail * 128 if tail in selected else 0
+                )
+    return bt, ctx
+
+
+@pytest.fixture(autouse=True)
+def emitter(monkeypatch):
+    # Exercise the production allocation/launch wrapper with a CPU kernel oracle.
+    mod = ModuleType("atom.model_ops.minimax_m3.index_topk")
+    mod.torch = torch
+    mod.PAGES_PER_SPARSE_BLOCK = 8
+    mod.SPARSE_BLOCK_SIZE = 128
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(
+                indices,
+                starts,
+                prefix,
+                topk,
+                sh,
+                sr,
+                sk,
+                table,
+                bt,
+                ctx,
+                stride_b,
+                stride_out,
+                interval,
+                block_size,
+                **kw,
+            ):
+                assert (sh, sr, sk) == indices.stride()
+                assert stride_b == table.stride(0)
+                assert stride_out == bt.stride(0)
+                assert interval == 1 and block_size == 128
+                assert grid[1:] == (table.shape[0], indices.shape[0])
+                assert topk == indices.shape[-1]
+                assert kw["NUM_KV_HEADS"] == indices.shape[0]
+                assert kw["DECODE_MAX_Q"] in (0, grid[0])
+                calls.append((grid, kw))
+                expected = reference_pages(
+                    indices,
+                    table,
+                    starts,
+                    prefix,
+                    grid[0],
+                    decode=kw["DECODE_MAX_Q"] > 0,
+                    pages_per_block=kw["pages_per_block"],
+                    block_page_stride=kw["block_page_stride"],
+                )
+                bt.copy_(expected[0])
+                ctx.copy_(expected[1])
+
+            return launch
+
+    mod._emit_sparse_block_table_kernel = Kernel()
+    definitions(
+        "atom/model_ops/minimax_m3/index_topk.py",
+        {"_alloc_emit", "minimax_m3_emit_sparse_block_table"},
+        mod.__dict__,
+    )
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    return calls
+
+
+def attention_metadata():
+    return SimpleNamespace(
+        prefill=SimpleNamespace(
+            block_table=torch.arange(32, dtype=torch.int32).reshape(2, 16),
+            cu_seqlens_q=torch.tensor([0, 2, 6], dtype=torch.int32),
+            context_lens=torch.tensor([641, 896], dtype=torch.int32),
+            max_query_len=4,
+        ),
+        decode=SimpleNamespace(
+            block_table=torch.arange(32, dtype=torch.int32).reshape(2, 16),
+            seq_lens=torch.tensor([643, 900], dtype=torch.int32),
+            max_query_len=3,
+        ),
+    )
 
 
 @pytest.fixture
@@ -46,7 +162,7 @@ def config(**overrides):
 
 
 def runner(start, end, cfg, *, mla=False, wrappers=(), dummy=False):
-    md = SimpleNamespace()
+    md = attention_metadata()
     context = SimpleNamespace(is_dummy_run=dummy)
     ns = {
         "get_pp_group": lambda: SimpleNamespace(
@@ -86,7 +202,7 @@ def runner(start, end, cfg, *, mla=False, wrappers=(), dummy=False):
     return obj, md
 
 
-def memo(layer, reuse):
+def memo(layer, reuse, layout="nvfp4"):
     ns = {"torch": torch}
     names = {"_topk_cache_state", "_load_cached_topk", "_store_cached_topk"}
     definitions(
@@ -95,6 +211,8 @@ def memo(layer, reuse):
     obj = type("Memo", (), {n: ns[n] for n in names})()
     obj.index_topk_cache_state = {}
     obj.skip_index_topk = reuse
+    obj.kv_nvfp4 = layout == "nvfp4"
+    obj.kv_mxfp4 = layout == "mxfp4"
     obj.layer_num = obj.sparse_layer_ordinal = layer
     return obj
 
@@ -106,31 +224,42 @@ def stage(obj, md, cfg, schedule, incoming, layout, mode, seed=0):
         if layer not in obj._test_layer_range:
             continue
         reuse, _ = schedule._should_skip_minimax_m3_index_topk(cfg, layer)
-        impl = memo(layer, reuse)
+        impl = memo(layer, reuse, layout)
         key = (mode, obj._test_layer_range.start)  # Key belongs to this stage.
         value = impl._load_cached_topk(md, key)
         if value is None:
             assert not reuse, f"layer {layer} missed its incoming top-k"
             ids = torch.arange(36, dtype=torch.int32).reshape(2, 6, 3) + layer + seed
-            # Same scheduler block IDs and physical page layout on every stage.
-            value = (
-                (ids, None, None)
-                if layout == "nvfp4"
-                else (
+            if layout == "nvfp4":
+                value = (ids, None, None)
+            else:
+                ids = ids % 8
+                meta = getattr(md, mode)
+                decode = mode == "decode"
+                pages = 1 if layout == "mxfp4" else 8
+                value = (
                     ids,
-                    torch.full(
-                        (12, 3 if layout == "mxfp4" else 24),
-                        layer + seed,
-                        dtype=torch.int32,
+                    *reference_pages(
+                        ids,
+                        meta.block_table,
+                        meta.seq_lens if decode else meta.cu_seqlens_q,
+                        meta.seq_lens if decode else meta.context_lens,
+                        meta.max_query_len,
+                        decode=decode,
+                        pages_per_block=pages,
+                        block_page_stride=pages,
                     ),
-                    torch.arange(12, dtype=torch.int32),
                 )
-            )
             impl._store_cached_topk(md, key, value)
         assert impl._load_cached_topk(md, key) is value if reuse else True
         traces[layer] = value
     out = IntermediateTensors({"hidden_states": torch.zeros(6, 8)})
     obj._store_pp_shared_indexer(out)
+    assert set(out.tensors) == (
+        {"hidden_states", "sparse_kv_indices"}
+        if obj._pp_send_needs_sparse
+        else {"hidden_states"}
+    )
     return out, traces
 
 
@@ -179,11 +308,8 @@ def test_dummy_forward_relays_empty_values_then_real_forward_refreshes(model_sch
         incoming = IntermediateTensors({"hidden_states": torch.zeros(6, 8)})
         obj._store_pp_shared_indexer(incoming)
         if obj._pp_send_needs_sparse:
-            assert tuple(incoming.tensors[k] for k in obj._pp_rank_local_keys) == (
-                None,
-                None,
-                None,
-            )
+            assert obj._pp_rank_local_keys == ("sparse_kv_indices",)
+            assert incoming.tensors["sparse_kv_indices"] is None
     incoming = None
     for obj, md in stages:
         obj._test_context.is_dummy_run = False
@@ -276,3 +402,39 @@ def test_no_index_reuse_needs_no_sparse_metadata(model_schedule, overrides):
         IntermediateTensors({"hidden_states": torch.zeros(6, 8)})
     )
     assert not hasattr(md, "_index_topk_cache_state")
+
+
+@pytest.mark.parametrize("layout", ["fp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_import_rebuilds_once_with_local_pages(emitter, layout, mode):
+    md = attention_metadata()
+    meta = getattr(md, mode)
+    meta.block_table.add_(100)
+    indices = torch.arange(36, dtype=torch.int32).reshape(2, 6, 3) % 8
+    md._index_topk_cache_state = {"pp_topk": indices}
+    impl = memo(15, True, layout)
+    value = impl._load_cached_topk(md, (mode,))
+    assert value[0] is indices
+    if layout == "nvfp4":
+        assert value[1:] == (None, None)
+        assert not emitter
+    else:
+        decode = mode == "decode"
+        pages = 1 if layout == "mxfp4" else 8
+        expected = reference_pages(
+            indices,
+            meta.block_table,
+            meta.seq_lens if decode else meta.cu_seqlens_q,
+            meta.seq_lens if decode else meta.context_lens,
+            meta.max_query_len,
+            decode=decode,
+            pages_per_block=pages,
+            block_page_stride=pages,
+        )
+        torch.testing.assert_close(value[1:], expected)
+        assert len(emitter) == 1
+    assert "pp_topk" not in md._index_topk_cache_state
+    count = len(emitter)
+    assert impl._load_cached_topk(md, (mode,)) is value
+    assert memo(16, True, layout)._load_cached_topk(md, (mode,)) is value
+    assert len(emitter) == count

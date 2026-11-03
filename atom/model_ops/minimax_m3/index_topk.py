@@ -737,6 +737,47 @@ def _alloc_emit(
     return (sparse_bt, sparse_ctx), args
 
 
+def minimax_m3_emit_sparse_block_table(
+    topk_idx,
+    block_table,
+    row_starts,
+    row_prefix,
+    max_query_len,
+    *,
+    decode=False,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
+    block_page_stride=PAGES_PER_SPARSE_BLOCK,
+):
+    """Build local attention metadata from an existing per-head selection.
+
+    Prefill supplies cu_seqlens_q and prefix_lens; decode supplies seq_lens
+    for both row arguments. Reuse the selector's emit kernel, including its
+    causal tail ordering and head-encoded pages, without scoring or selection.
+    """
+    heads, rows, topk = topk_idx.shape
+    result, args = _alloc_emit(
+        rows, heads, topk, block_table, True, topk_idx.device, pages_per_block
+    )
+    if rows:
+        _emit_sparse_block_table_kernel[(max_query_len, block_table.shape[0], heads)](
+            topk_idx,
+            row_starts,
+            row_prefix,
+            topk,
+            *topk_idx.stride(),
+            block_table,
+            *args,
+            1,  # sample_interval
+            SPARSE_BLOCK_SIZE,
+            NUM_KV_HEADS=heads,
+            DECODE_MAX_Q=max_query_len if decode else 0,
+            pages_per_block=pages_per_block,
+            block_page_stride=block_page_stride,
+            num_warps=1,
+        )
+    return result
+
+
 # Row widths (in 128-blocks) from which aiter's selector is the cheaper way to
 # serve the call; under them the fused Triton kernel is, being one launch that
 # also emits. Device us, MI355X, topk=16, rows 1..512, rocprofv3-attributed

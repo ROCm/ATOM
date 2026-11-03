@@ -22,13 +22,7 @@ logger = logging.getLogger("atom")
 
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
-_PP_PROXY_KEYS = (
-    "hidden_states",
-    "residual",
-    "sparse_kv_indices",
-    "sparse_kv_block_table",
-    "sparse_kv_context_lens",
-)
+_PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
 # And a drafter's taps on their way to the last stage (`pp_aux_relay`).
 PP_DRAFT_AUX_PREFIX = "draft_aux_"
 

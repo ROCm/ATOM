@@ -1593,9 +1593,33 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         state = self._topk_cache_state(sparse_metadata)
         if state is None:
             return None
-        # PP imports the current forward's cache value; bind its local key once.
+        # Resolve received logical indices against this stage's metadata once.
         if "pp_topk" in state:
-            state["topk"] = {"key": key, "value": state.pop("pp_topk")}
+            indices = state.pop("pp_topk")
+            sparse_bt = sparse_ctx = None
+            if not self.kv_nvfp4:
+                from atom.model_ops.minimax_m3.index_topk import (
+                    minimax_m3_emit_sparse_block_table,
+                )
+
+                decode = key[0] == "decode"
+                md = sparse_metadata.decode if decode else sparse_metadata.prefill
+                sparse_bt, sparse_ctx = minimax_m3_emit_sparse_block_table(
+                    indices,
+                    md.block_table,
+                    md.seq_lens if decode else md.cu_seqlens_q,
+                    md.seq_lens if decode else md.context_lens,
+                    getattr(md, "max_query_len", 1),
+                    decode=decode,
+                    **(
+                        {"pages_per_block": 1, "block_page_stride": 1}
+                        if self.kv_mxfp4
+                        else {}
+                    ),
+                )
+            self._store_cached_topk(
+                sparse_metadata, key, (indices, sparse_bt, sparse_ctx)
+            )
         entry = state.get("topk")
         if entry is None or entry.get("key") != key:
             return None
