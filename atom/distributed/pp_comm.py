@@ -23,11 +23,21 @@ logger = logging.getLogger("atom")
 # Keys carried between pipeline stages. `sparse_kv_indices` is optional: present
 # only when a PP boundary splits a DSA IndexShare group (see model_runner).
 _PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
+# And a drafter's taps on their way to the last stage (`pp_aux_relay`).
+PP_DRAFT_AUX_PREFIX = "draft_aux_"
+
+
+def _stage_payload(it: IntermediateTensors) -> dict:
+    return {
+        k: v
+        for k, v in it.tensors.items()
+        if k in _PP_PROXY_KEYS or k.startswith(PP_DRAFT_AUX_PREFIX)
+    }
 
 
 def _stage_payloads(it: IntermediateTensors, rank_local_keys: tuple[str, ...]):
     """Keep head-sharded tensors out of the replicated-activation all-gather."""
-    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
+    tensors = _stage_payload(it)
     local = {k: tensors.pop(k) for k in rank_local_keys}
     payloads = [(tensors, pp_send_allgather_group())]
     if local:
