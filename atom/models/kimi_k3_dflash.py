@@ -141,6 +141,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.models.dspark_draft import (
+    AllocationCap,
     DSparkDraftModel,
     DSparkMarkovHead,
     KVCacheBinding,
@@ -609,16 +610,10 @@ class KimiK3DFlash(DSparkDraftModel):
         self.embed_tokens = None
         self.lm_head = None
 
-        # `prepare_paged_block`'s per-request allocation. Pinned host staging;
-        # the event guards its reuse.
-        max_bs = int(atom_config.max_num_seqs)
-        self._alloc = torch.zeros(
-            max_bs, dtype=torch.int32, device=torch.get_default_device()
+        # `prepare_paged_block`'s per-request allocation.
+        self._alloc_cap = AllocationCap(
+            int(atom_config.max_num_seqs), torch.get_default_device()
         )
-        self._alloc_host = torch.zeros(
-            max_bs, dtype=torch.int32, device="cpu", pin_memory=True
-        )
-        self._alloc_copied = torch.cuda.Event()
 
     def prepare_paged_block(
         self,
@@ -637,22 +632,14 @@ class KimiK3DFlash(DSparkDraftModel):
         request's entry. Such positions are neither written (slot -1) nor read
         (the context is capped at the allocation), as MiniMax-M3.1's draft does.
         """
-        running_bs = block_positions.shape[0]
-        # The host can run a step ahead of the device: the previous copy must
-        # have read the pinned buffer before it is rewritten.
-        self._alloc_copied.synchronize()
-        pages = self._alloc_host.numpy()[:running_bs]
-        n = min(len(allocated_pages), scheduled_bs)
-        pages[:n] = allocated_pages[:n]
-        # Pad rows address block 0 by convention and read one entry.
-        pages[n:] = 1
-        pages.clip(min=1, out=pages)
-        alloc = self._alloc[:running_bs]
-        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
-        self._alloc_copied.record()
         # One block id spans one pool entry; the bound FLASH page is that wide.
-        alloc.mul_(self.layers[0].self_attn.kv.k_cache.shape[1])
-        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        alloc = self._alloc_cap.apply(
+            allocated_pages,
+            scheduled_bs,
+            block_positions,
+            slots,
+            self.layers[0].self_attn.kv.k_cache.shape[1],
+        )
         torch.minimum(ctx_lens, alloc, out=ctx_lens)
 
     # -- the target feature this draft was trained on ----------------------

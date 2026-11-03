@@ -1377,9 +1377,9 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     k_cache = torch.empty(1, vblock, 1, 1, device="cuda")
     kv = types.SimpleNamespace(k_cache=k_cache)
     draft.layers = [types.SimpleNamespace(self_attn=types.SimpleNamespace(kv=kv))]
-    draft._alloc = torch.zeros(4, dtype=torch.int32, device="cuda")
-    draft._alloc_host = torch.zeros(4, dtype=torch.int32, pin_memory=True)
-    draft._alloc_copied = torch.cuda.Event()
+    draft._alloc_cap = _gpu_stack_import("atom.models.dspark_draft").AllocationCap(
+        4, "cuda"
+    )
     # Row 0 holds one block and its block crosses into a second; row 1 holds
     # two and stays inside; row 2 is a pad row.
     pos = torch.tensor(

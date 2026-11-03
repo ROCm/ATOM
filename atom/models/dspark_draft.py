@@ -197,6 +197,54 @@ class KVCacheBinding(nn.Module):
         self.k_scale = self.v_scale = None
 
 
+class AllocationCap:
+    """Each request's allocation, in tokens, for a paged block draft.
+
+    The block writes up to T positions past the anchor, which can run past the
+    pages the scheduler allocated; a table column that was never allocated
+    reads as block 0, another request's entry. ``apply`` drops those positions'
+    writes (slot -1) and returns the allocation so the caller can cap what the
+    block reads. Buffers are sized at ``max_bs`` and only sliced, so a captured
+    block replays against each step's numbers.
+    """
+
+    def __init__(self, max_bs: int, device) -> None:
+        self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._alloc_host = torch.zeros(
+            max_bs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        # Recorded after each copy out of `_alloc_host`; a fresh event has
+        # nothing to wait for.
+        self._alloc_copied = torch.cuda.Event()
+
+    def apply(
+        self,
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        block_positions: torch.Tensor,  # [running_bs, T]
+        slots: torch.Tensor,  # [running_bs, T] the block's KV write slots
+        unit: int,  # tokens one allocated page id spans
+    ) -> torch.Tensor:
+        """Mask ``slots`` past each row's allocation; return it in tokens."""
+        running_bs = block_positions.shape[0]
+        # The host can run a step ahead of the device: the previous copy must
+        # have read the pinned buffer before it is rewritten.
+        self._alloc_copied.synchronize()
+        pages = self._alloc_host.numpy()[:running_bs]
+        n = min(len(allocated_pages), scheduled_bs)
+        pages[:n] = allocated_pages[:n]
+        # Pad rows and the warmup batch address page 0 by convention and read
+        # one page.
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
+        alloc = self._alloc[:running_bs]
+        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
+        self._alloc_copied.record()
+        alloc.mul_(unit)
+        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        return alloc
+
+
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
