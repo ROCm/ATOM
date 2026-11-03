@@ -2276,6 +2276,19 @@ class Config:
         )
         self.throughput_log_interval_steps = 0
 
+    @property
+    def end_token_ids(self) -> tuple[int, ...]:
+        """Every token ID that terminates generation on this deployment."""
+        return tuple(
+            sorted(
+                {
+                    i
+                    for i in (self.eos_token_id, *self.stop_token_ids)
+                    if i is not None and i >= 0
+                }
+            )
+        )
+
     def __post_init__(self):
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()

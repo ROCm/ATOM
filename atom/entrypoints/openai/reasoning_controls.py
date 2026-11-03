@@ -9,6 +9,12 @@ from typing import Any
 
 from .reasoning import VALID_TEMPLATE_EFFORTS
 
+# Shared named-effort profile for API metadata and request normalization.
+# Adapters explicitly select this profile; it does not override other models'
+# accepted effort levels or integer budgets.
+SUPPORTED_EFFORT_LEVELS = ("low", "high", "max")
+DEFAULT_EFFORT_LEVEL = "high"
+
 
 def _legacy_chat_effort(effort: Any) -> str | int | None:
     if isinstance(effort, (int, float)):

@@ -1683,6 +1683,11 @@ class AtomStandaloneService:
         *,
         chat: bool = False,
     ) -> SamplingParams:
+        response_format = self._request_field(request, "response_format")
+        if response_format is not None and response_format.get("type") != "text":
+            raise ValueError(
+                "Structured response_format requires the native OpenAI entrypoint"
+            )
         # Only a chat request can be held to the tools channel, as on the
         # OpenAI server: a completion's prompt is not in the chat format.
         required_channel = (

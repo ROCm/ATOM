@@ -164,6 +164,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             raise
         self._adapter = adapter
         self.chunk_size = chunk_size
+        self._start_transfer_thread(rank)
         self._native_layout = layout
         self._native_copy = native_copy
         self._restore_stream = torch.cuda.Stream(device=torch.cuda.current_device())
@@ -303,7 +304,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         )
         try:
-            future = submit(_mp_session_id(self._config, req.req_id), spec, event)
+            future = submit(
+                _mp_session_id(self._config, req.req_id),
+                spec,
+                event,
+                **self._submit_kwargs(),
+            )
         except Exception:
             # Retain the exact source/destination lease. The server might have
             # received the request before the connection raised an exception.
@@ -385,6 +391,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         super().start_load_kv(metadata)
 
     def get_finished(self) -> KVConnectorOutput:
+        if self._adapter is not None:
+            self._finished_housekeeping()
         output = KVConnectorOutput()
         with self._lock:
             for operation_id, pending in list(self._native_saves.items()):

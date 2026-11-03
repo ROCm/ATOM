@@ -44,6 +44,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    mxfp4_k_pad_align,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     uses_mxfp4_n32k4_scale,
@@ -261,12 +262,18 @@ class KimiMLP(nn.Module):
         super().__init__()
         hidden_size = hidden_size or config.hidden_size
         intermediate_size = intermediate_size or config.intermediate_size
+        # An MXFP4 down_proj's K is the per-rank intermediate (33792 / TP8 = 4224
+        # on the dense layer), which the MXFP4 GEMMs cannot take unaligned. The
+        # pair pads it together (gate_up zero rows, down zero columns); situ(0) *
+        # 0 == 0, so the activation's padded tail is exactly zero.
+        intermediate_pad = mxfp4_k_pad_align(quant_config, f"{prefix}.down_proj")
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            output_pad_align=intermediate_pad,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -275,6 +282,7 @@ class KimiMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
+            input_pad_align=intermediate_pad,
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
@@ -2118,7 +2126,8 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 f"Kimi-K3 got {vision_embeds.shape[0]} image embeddings for "
                 f"{num_placeholders} placeholder tokens. The prompt's "
                 "`<|media_pad|>` runs must be expanded to (h//2)*(w//2) tokens "
-                "per image, and multimodal prefills must not be chunked."
+                "per image, and an image prefill without embedding spans must "
+                "not be chunked."
             )
         inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
         return inputs_embeds

@@ -46,6 +46,7 @@ Key entry points:
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
 - Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
+- Structured output: `atom/structured_output/` — request validation, schema compilation, grammar state and asynchronous token/mask transfers
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
 - Pipeline parallel: `atom/model_engine/pp_engine_core.py` (head / downstream stage
@@ -143,6 +144,7 @@ Key entry points:
 | Environment variables | `docs/environment_variables.md` |
 | Compilation & CUDAGraph | `docs/compilation_cudagraph_guide.md` |
 | Model support | `docs/model_support_guide.md` |
+| Structured output | `docs/structured_output_capabilities.md` |
 | Model ops (AITER kernels) | `docs/model_ops_guide.md` |
 | Scheduling & KV cache | `docs/scheduling_kv_cache_guide.md` |
 | Serving & benchmarking | `docs/serving_benchmarking_guide.md` |
