@@ -2420,7 +2420,7 @@ def qsa_sparse_paged_gqa(
             qsa_sparse_paged_gqa_gfx1250,
         )
 
-        if qsa_gfx1250_supports(q, k_cache, v_cache):
+        if qsa_gfx1250_supports(q, k_cache, v_cache, k_scale, v_scale):
             return qsa_sparse_paged_gqa_gfx1250(
                 q,
                 k_cache,
@@ -2431,6 +2431,8 @@ def qsa_sparse_paged_gqa(
                 scale,
                 _table_width_bucket(block_table.shape[1]),
                 get_cu_num(),
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
     # Split-K reduction requires contiguous output head dimensions.
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
