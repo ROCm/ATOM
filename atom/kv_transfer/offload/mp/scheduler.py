@@ -465,6 +465,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             super().has_pending_work()
             or bool(self._pending_session_ends())
             or bool(callable(orphans) and orphans())
+            # Worker token-cache drops go out with the next metadata build;
+            # an idle engine must still build it.
+            or bool(self.__dict__.get("_shipped_drops"))
         )
 
     def _pending_session_ends(self) -> dict[str, Any]:
