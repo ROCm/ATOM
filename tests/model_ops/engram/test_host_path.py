@@ -852,6 +852,34 @@ def test_lock_wait_is_bounded(tmp_path, monkeypatch):
         assert not thread.is_alive()
 
 
+def test_a_progressing_holder_is_waited_on_past_the_timeout(tmp_path, monkeypatch):
+    """The timeout bounds a holder's silence, not its hold time: a cold-cache
+    rank holding the lock for minutes, chunk by chunk, must not send the
+    ranks behind it to the copy path."""
+    from atom.model_ops.engram import host_memory
+
+    monkeypatch.setattr(host_memory, "_REG_LOCK_TIMEOUT_S", 0.3)
+    path = str(tmp_path / "register.lock")
+    held = threading.Event()
+
+    def holder():
+        with host_memory._register_lock_file(path):
+            held.set()
+            for _ in range(10):  # ~1 s of chunks, three timeouts long
+                time.sleep(0.1)
+                host_memory._lock_heartbeat()
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert held.wait(5)
+    started = time.monotonic()
+    with host_memory._register_lock_file(path):
+        waited = time.monotonic() - started
+    thread.join(5)
+    assert waited > 0.6
+    assert path not in host_memory._timed_out_lock_paths
+
+
 def test_release_after_a_lock_timeout_still_unregisters(monkeypatch, tmp_path):
     from atom.model_ops.engram import host_memory
 

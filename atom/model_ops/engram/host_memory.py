@@ -88,11 +88,21 @@ _MAX_COPY_THREADS = 16
 # Largest single cudaHostRegister. One ioctl covering a whole Engram table
 # does not return when several ranks issue it together.
 _REG_CHUNK_BYTES = 1 << 30
-# How long a rank waits for the registration lock before giving up. Once a
-# path has timed out it is not waited on again in this process.
+# How long a waiter tolerates a registration lock whose holder shows no
+# progress (the holder touches the file after every chunk) before giving up.
+# Once a path has timed out it is never waited on again in this process.
 _REG_LOCK_TIMEOUT_S = 600
 _logged_lock_paths: set[str] = set()
 _timed_out_lock_paths: set[str] = set()
+# Descriptors of the registration lock files this process holds.
+_held_lock_fds: list[int] = []
+
+
+def _lock_heartbeat() -> None:
+    """Touch the held registration lock file, so waiters see progress."""
+    for fd in _held_lock_fds:
+        with contextlib.suppress(OSError):
+            os.utime(fd)
 
 
 @functools.cache
@@ -623,8 +633,10 @@ def _registration_lock_path(sources) -> str:
 def _flock_logging_wait(fd: int, path: str) -> None:
     """Exclusive `flock` on `fd`.
 
-    A wait is logged. Past `_REG_LOCK_TIMEOUT_S` this raises `TimeoutError`
-    (an `OSError` subclass; callers must not swallow it with `except OSError`).
+    A wait is logged. It is bounded by the holder's progress, not by its
+    total hold time: the holder touches the file after every chunk, and only
+    `_REG_LOCK_TIMEOUT_S` without a touch raises `TimeoutError` (an `OSError`
+    subclass; callers must not swallow it with `except OSError`).
     """
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -633,21 +645,22 @@ def _flock_logging_wait(fd: int, path: str) -> None:
         pass
     logger.info("engram: waiting for %s; another process is page-locking", path)
     start = time.monotonic()
-    deadline = start + _REG_LOCK_TIMEOUT_S
+    wait_from = time.time()
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            if time.monotonic() >= deadline:
+            last = max(wait_from, os.fstat(fd).st_mtime)
+            if time.time() - last >= _REG_LOCK_TIMEOUT_S:
                 logger.error(
-                    "engram: gave up on %s after %d s; the holder is still "
-                    "page-locking",
+                    "engram: gave up on %s: its holder made no progress for "
+                    "%d s; not waiting on it again in this process",
                     path,
                     _REG_LOCK_TIMEOUT_S,
                 )
                 raise TimeoutError(
-                    f"engram registration lock {path} still held after "
-                    f"{_REG_LOCK_TIMEOUT_S}s"
+                    f"engram registration lock {path}: holder made no progress "
+                    f"for {_REG_LOCK_TIMEOUT_S}s"
                 )
             time.sleep(0.05)
         else:
@@ -661,8 +674,9 @@ def _register_lock_file(path: str):
 
     A file that cannot be opened or locked is logged and skipped. The `yield`
     is outside the `except`, so an error during registration is not chained
-    onto that failure. A wait past `_REG_LOCK_TIMEOUT_S` raises `TimeoutError`,
-    and so does every later call for that path, without waiting.
+    onto that failure. A holder that makes no progress for
+    `_REG_LOCK_TIMEOUT_S` raises `TimeoutError`, and after that the path is
+    never waited on again in this process: every later call raises at once.
     """
     if path in _timed_out_lock_paths:
         raise TimeoutError(f"engram registration lock {path} timed out earlier")
@@ -697,10 +711,13 @@ def _register_lock_file(path: str):
             )
         else:
             held = True
+            _held_lock_fds.append(fd)
+            _lock_heartbeat()
     try:
         yield
     finally:
         if held:
+            _held_lock_fds.remove(fd)
             fcntl.flock(fd, fcntl.LOCK_UN)
         if fd is not None:
             os.close(fd)
@@ -775,6 +792,7 @@ class _PageRuns:
                         held.append(c)
                         created += 1
                         created_bytes += e - c
+                        _lock_heartbeat()
                         c = e
                 if base is None:
                     break
@@ -819,6 +837,7 @@ class _PageRuns:
                 if int(rt.cudaHostUnregister(base) or 0):
                     _clear_hip_error()
                     logger.warning("engram: cudaHostUnregister failed")
+                _lock_heartbeat()
 
     def __len__(self) -> int:
         return len(self._runs)
