@@ -1278,6 +1278,11 @@ class CoreManager:
         ``LLMEngine.generate`` waits while the engine is alive and any request
         is unfinished. A dropped seq never finishes, so that wait never ends.
         The seqs are still in ``_bp_pending``; this only surfaces the error.
+
+        Only offline seqs are ever in the pool (``add_request`` keeps online
+        requests out of it), and offline ``generate`` reads ``outputs_queue``.
+        If online seqs could wait there, this error would have to reach them
+        through their callbacks instead.
         """
         pending = len(getattr(self, "_bp_pending", ()))
         logger.error(
