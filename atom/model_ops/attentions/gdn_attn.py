@@ -2208,12 +2208,19 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     _CHUNK_INDEX_SIZES = (16, 64)
 
     def _prime_chunk_indices(self, query_start_loc, num_prefills: int) -> None:
-        from atom.model_ops.fla_ops.index import prepare_chunk_indices
+        from atom.model_ops.fla_ops.index import (
+            prepare_chunk_indices,
+            prepare_max_chunks,
+        )
 
         cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
         lens = np.diff(cu)
         for chunk_size in self._CHUNK_INDEX_SIZES:
             counts = -(-lens // chunk_size)
+            if len(counts):
+                prepare_max_chunks.prime(
+                    int(counts.max()), query_start_loc, chunk_size
+                )
             total = int(counts.sum())
             flat = np.empty(2 * total, dtype=np.int64)
             flat[0::2] = np.repeat(np.arange(len(lens)), counts)

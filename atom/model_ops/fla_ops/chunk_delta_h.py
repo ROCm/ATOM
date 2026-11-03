@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .index import prepare_chunk_indices, prepare_chunk_offsets
+from .index import prepare_chunk_indices, prepare_chunk_offsets, prepare_max_chunks
 from .op import exp
 
 # The Triton kernel's launch configuration, fixed: an autotuner would time its
@@ -441,6 +441,13 @@ def chunk_gated_delta_rule_fwd_h(
     ):
         from .chunk_delta_h_gfx1250 import chunk_h_gfx1250
 
+        # chunks of the longest walk; a planned (graph) launch knows only its capacity
+        if plan is not None:
+            longest_chunks = triton.cdiv(NT, N)
+        elif cu_seqlens is not None:
+            longest_chunks = prepare_max_chunks(cu_seqlens, BT)
+        else:
+            longest_chunks = NT
         chunk_h_gfx1250(
             k,
             w,
@@ -460,6 +467,7 @@ def chunk_gated_delta_rule_fwd_h(
             N,
             # every chunk of h, of all B batch rows: the h store's bound
             h.shape[0] * h.shape[1],
+            longest_chunks,
             H,
             Hg,
             K,

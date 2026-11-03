@@ -297,23 +297,30 @@ def _layouts(K, BT, BV, num_warps, split="M"):
     return wmma, op_a, op_b, smem_a_row, smem_a_col, smem_tile, smem_state, smem_g
 
 
-def launch_config(N, H, num_cus):
+# Per BV: the time of one chunk on a walk (us), and the time of one program-chunk
+# spread over the CUs (us per CU); measured on gfx1250 (256 CUs) at K = V = 128.
+_CHUNK_LATENCY = {128: 1.13, 64: 0.83, 32: 0.71}
+_CHUNK_COST = {128: 2.1, 64: 1.82, 32: 1.39}
+
+
+def launch_config(H, V, total_chunks, longest_chunks, num_cus):
     """(BV, operand buffers, warps) from host-known shapes alone.
 
     A (sequence, head) is one serial walk over its chunks; its V blocks are
-    independent programs that re-read the same w and k tiles. With enough walks
-    to give every CU two programs, the widest block wins (no re-reads, the GPU
-    is throughput-bound). With fewer, the step is as long as its longest walk:
-    narrower blocks shorten the per-chunk chain, and a third operand buffer keeps
-    the copies further ahead of it. Measured on gfx1250 (256 CUs) at T = 16384,
-    K = V = 128, H = 32 / 8, 1 to 52 sequences.
+    independent programs that re-read the same w and k tiles. A step takes the
+    longer of its longest walk (narrower blocks shorten the per-chunk chain) and
+    its total work over the CUs (wider blocks re-read less), so the BV with the
+    smaller of the two estimates wins. A third operand buffer keeps the copies
+    further ahead of a walk; at BV 128 only two fit in LDS.
     """
-    walks = N * H
-    if walks >= 2 * num_cus:
-        return 128, 2, 4
-    if walks >= num_cus // 2:
-        return 64, 3, 4
-    return 32, 3, 4
+
+    def step_estimate(bv):
+        walk = longest_chunks * _CHUNK_LATENCY[bv]
+        work = total_chunks * H * triton.cdiv(V, bv) * _CHUNK_COST[bv] / num_cus
+        return max(walk, work)
+
+    bv = min((128, 64, 32), key=step_estimate)
+    return bv, 2 if bv == 128 else 3, 4
 
 
 def chunk_h_gfx1250(
@@ -334,6 +341,7 @@ def chunk_h_gfx1250(
     T,
     N,
     NT_ALL,
+    longest_chunks,
     H,
     Hg,
     K,
@@ -345,7 +353,7 @@ def chunk_h_gfx1250(
     num_buffers=None,
     split="M",
 ):
-    bv, nb, nw = launch_config(N, H, _num_cus(k.device.index))
+    bv, nb, nw = launch_config(H, V, NT_ALL, longest_chunks, _num_cus(k.device.index))
     BV = BV or bv
     num_buffers = num_buffers or nb
     num_warps = num_warps or nw
