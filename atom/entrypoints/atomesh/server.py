@@ -101,8 +101,7 @@ def initialize_engine(args: argparse.Namespace) -> tuple[Any, Any]:
 
     logger.info("Initializing engine with model %s...", args.model)
     engine_args = EngineArgs.from_cli_args(args)
-    # Outputs reach requests through the per-sequence callbacks.
-    engine = engine_args.create_engine(tokenizer=tokenizer, keep_finished_outputs=False)
+    engine = engine_args.create_engine(tokenizer=tokenizer)
     return engine, tokenizer
 
 

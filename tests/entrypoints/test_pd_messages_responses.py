@@ -52,22 +52,15 @@ def server(monkeypatch):
     def encode(text, **_kw):
         return [0] * (LONG_PROMPT_TOKENS if text == "<long prompt>" else 2)
 
-    def engine_prompt(prompt, kwargs):
-        # What preprocess builds: the prompt, cut to `prompt_cap.tokens`
-        # (shown as `<n>` for an n-token cut) when it is longer.
-        cap = kwargs.get("prompt_cap")
-        limit = None if cap is None else cap.tokens
-        n = len(encode(prompt))
-        return (f"<{limit}>", limit) if limit is not None and n > limit else (prompt, n)
-
+    # Only what the engine does: count what it is handed. Any cut is the
+    # production code's (`_prepare_prompt`).
     async def fake_generate_async(prompt, _sampling, _request_id, **kwargs):
-        sent, n = engine_prompt(prompt, kwargs)
-        calls.generate.append((sent, kwargs))
+        calls.generate.append((prompt, kwargs))
         output = {
             "text": "hello",
             "finish_reason": "eos",
             "num_cached_tokens": 0,
-            "num_tokens_input": n,
+            "num_tokens_input": len(prompt),
             "num_tokens_output": 1,
         }
         if kwargs.get("kv_transfer_params") is not None:
@@ -75,9 +68,8 @@ def server(monkeypatch):
         yield output
 
     async def fake_setup_streaming_request(prompt, _sampling, _request_id, **kwargs):
-        sent, n = engine_prompt(prompt, kwargs)
-        calls.setup.append((sent, kwargs))
-        return 1, _FinishedCollector(), n
+        calls.setup.append((prompt, kwargs))
+        return 1, _FinishedCollector(), len(prompt)
 
     monkeypatch.setattr(api_server, "model_name", "m")
     monkeypatch.setattr(api_server, "_request_logger", None)
@@ -99,7 +91,8 @@ def server(monkeypatch):
         SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=MAX_CTX
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=encode),
         ),
     )
     monkeypatch.setattr(api_server, "generate_async", fake_generate_async)
@@ -211,7 +204,7 @@ class TestBothLegsTruncateAlike:
         prefill = self._sent_prompt(server, endpoint, 1, HANDOFF)
         decode = self._sent_prompt(server, endpoint, 4096, HANDOFF)
 
-        assert prefill == decode == f"<{MAX_CTX - MAX_CTX // 8}>"
+        assert len(prefill) == len(decode) == MAX_CTX - MAX_CTX // 8
 
     @pytest.mark.parametrize("endpoint", ["messages", "responses"])
     def test_without_handoff_truncation_still_follows_max_tokens(
@@ -219,17 +212,28 @@ class TestBothLegsTruncateAlike:
     ):
         server.template = "<long prompt>"
 
-        assert self._sent_prompt(server, endpoint, 1, None) == "<long prompt>"
+        # max_tokens=1 leaves room for the whole prompt; 4096 does not.
+        assert len(self._sent_prompt(server, endpoint, 1, None)) == LONG_PROMPT_TOKENS
         assert (
-            self._sent_prompt(server, endpoint, 4096, None)
-            == f"<{MAX_CTX - MAX_CTX // 8}>"
+            len(self._sent_prompt(server, endpoint, 4096, None))
+            == MAX_CTX - MAX_CTX // 8
         )
+
+    @pytest.mark.parametrize("endpoint", ["messages", "responses"])
+    def test_input_tokens_are_the_engine_count_of_what_it_ran(self, server, endpoint):
+        server.template = "<long prompt>"
+        if endpoint == "messages":
+            usage = _messages(max_tokens=4096)["usage"]
+        else:
+            body = {"model": "m", "input": "hi", "max_output_tokens": 4096}
+            usage = _responses(body).json()["usage"]
+        assert usage["input_tokens"] == MAX_CTX - MAX_CTX // 8
 
 
 class TestStructuredResponsesCutFirst:
     """A structured /v1/responses request builds its reasoning channel into the
-    sampling params before the engine call, so an over-long prompt is cut
-    first and the channel is seeded from the kept text."""
+    sampling params before the engine call; both are seeded from the text the
+    engine runs."""
 
     def test_over_the_cap_the_engine_gets_the_kept_ids(self, server, monkeypatch):
         server.template = "<long prompt>"
@@ -259,10 +263,10 @@ class TestStructuredResponsesCutFirst:
         )
 
         assert response.status_code == 200, response.text
-        sent, kwargs = server.generate[0]
-        kept = kwargs["prompt_cap"].tokens
+        sent, _kwargs = server.generate[0]
+        kept = MAX_CTX - MAX_CTX // 8
         assert configured == ['{"type": "object"}']
-        # The engine is handed the kept ids, already under the cap.
+        # The engine is handed the kept ids, and does not tokenize again.
         assert sent == [0] * kept
         # The channel was seeded from the cut text, before the engine call.
         assert seeds[0] == f"<{kept}>"

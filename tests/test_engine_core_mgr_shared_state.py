@@ -76,7 +76,8 @@ def _bare_manager(cls, **kwargs):
             dp_load_balance="round_robin",
             tp_world_size=1,
             prefill_context_parallel_size=1,
-            keep_finished_outputs=kwargs.get("keep_finished_outputs", True),
+            keep_finished_outputs=kwargs.get("keep_finished_outputs", False),
+            asyncio_mode=kwargs.get("asyncio_mode", False),
         ),
         label=cls.__name__,
         local_engine_count=kwargs.get("local_engine_count", 2),
@@ -132,11 +133,13 @@ class OutputThreadStateTest(unittest.TestCase):
             sender.close(linger=0)
 
     def test_finished_sequences_are_queued_only_if_the_config_keeps_them(self):
-        # Online front ends build the engine with keep_finished_outputs=False
-        # and take outputs through the callbacks; otherwise every finished
-        # Sequence would stay queued for the life of the process.
-        for keep in (True, False):
-            mgr = _bare_manager(CoreManager, keep_finished_outputs=keep)
+        # Off by default: online front ends take every output through the
+        # callbacks, and a queued Sequence would stay for the process's life.
+        # asyncio_mode reads the queue, so it keeps them too.
+        for keep, asyncio_mode in ((True, False), (False, True), (False, False)):
+            mgr = _bare_manager(
+                CoreManager, keep_finished_outputs=keep, asyncio_mode=asyncio_mode
+            )
             self.addCleanup(mgr.ctx.term)
             mgr._deliver_terminal_output = lambda seq: False
             mgr._release_seq_load = lambda seq_id: None
@@ -154,7 +157,9 @@ class OutputThreadStateTest(unittest.TestCase):
                 sender.send(pickle.dumps((EngineCoreRequestType.SHUTDOWN, None)))
                 thread.join(timeout=3)
                 self.assertFalse(thread.is_alive())
-                self.assertEqual(mgr.outputs_queue.qsize(), 1 if keep else 0)
+                self.assertEqual(
+                    mgr.outputs_queue.qsize(), 1 if keep or asyncio_mode else 0
+                )
             finally:
                 sender.close(linger=0)
 
@@ -217,54 +222,3 @@ class SharedInitialiserIsTheOnlyPathTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-def test_create_engine_hands_keep_finished_outputs_to_the_config(monkeypatch):
-    # Decided at construction: create_engine hands the choice to Config, and
-    # the default keeps the offline / asyncio behaviour.
-    import dataclasses
-
-    from atom.config import Config
-    from atom.model_engine import arg_utils
-
-    default = {f.name: f.default for f in dataclasses.fields(Config)}
-    assert default["keep_finished_outputs"] is True
-    seen = {}
-
-    def fake_engine(model, tokenizer=None, **kwargs):
-        seen.update(kwargs)
-
-    monkeypatch.setattr(arg_utils, "LLMEngine", fake_engine)
-    monkeypatch.setattr(arg_utils.EngineArgs, "_get_engine_kwargs", lambda self: {})
-    args = arg_utils.EngineArgs.__new__(arg_utils.EngineArgs)
-    args.model = "m"
-    args.create_engine(keep_finished_outputs=False)
-    assert seen == {"keep_finished_outputs": False}
-    args.create_engine()
-    assert seen == {"keep_finished_outputs": True}
-
-
-def test_atomesh_front_end_builds_the_engine_without_kept_outputs(monkeypatch):
-    # An online front end: every output reaches its request through the
-    # callbacks, so it must not ask the engine to keep finished sequences.
-    from atom.entrypoints.atomesh import server as atomesh_server
-    from atom.model_engine import arg_utils, llm_engine
-
-    seen = {}
-
-    class FakeArgs:
-        @classmethod
-        def from_cli_args(cls, args):
-            return cls()
-
-        def create_engine(self, **kwargs):
-            seen.update(kwargs)
-            return "engine"
-
-    monkeypatch.setattr(arg_utils, "EngineArgs", FakeArgs)
-    monkeypatch.setattr(llm_engine, "load_tokenizer", lambda *a: "tok")
-    engine, _ = atomesh_server.initialize_engine(
-        SimpleNamespace(model="m", trust_remote_code=False)
-    )
-    assert engine == "engine"
-    assert seen == {"tokenizer": "tok", "keep_finished_outputs": False}

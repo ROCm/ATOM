@@ -72,7 +72,8 @@ def server(monkeypatch):
         "engine": SimpleNamespace(
             config=SimpleNamespace(
                 generation_config=SimpleNamespace(), max_model_len=8192
-            )
+            ),
+            io_processor=SimpleNamespace(encode_prompt=lambda text: [1, 2]),
         ),
     }.items():
         monkeypatch.setattr(api_server, name, value)

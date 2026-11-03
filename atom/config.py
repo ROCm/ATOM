@@ -2108,12 +2108,9 @@ class Config:
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
-    # Whether CoreManager also queues finished sequences on ``outputs_queue``
-    # for ``LLMEngine.step`` / ``generate`` and the asyncio path to read. Online
-    # front ends deliver every output through per-sequence callbacks and build
-    # the engine with this off; left on there, every finished Sequence stays
-    # on a queue nothing reads, for the life of the process.
-    keep_finished_outputs: bool = True
+    # Queue finished sequences on outputs_queue; only its readers turn it on
+    # (LLMEngine.add_request for step / generate, and asyncio_mode).
+    keep_finished_outputs: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False

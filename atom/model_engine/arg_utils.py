@@ -958,17 +958,6 @@ class EngineArgs:
 
         return kwargs
 
-    def create_engine(
-        self, tokenizer=None, *, keep_finished_outputs: bool = True
-    ) -> LLMEngine:
-        """Create and return an LLMEngine instance with the configured parameters.
-
-        ``keep_finished_outputs=False`` is for online front ends, which take
-        every output through per-sequence callbacks (``Config.keep_finished_outputs``).
-        """
-        return LLMEngine(
-            self.model,
-            tokenizer=tokenizer,
-            keep_finished_outputs=keep_finished_outputs,
-            **self._get_engine_kwargs(),
-        )
+    def create_engine(self, tokenizer=None) -> LLMEngine:
+        """Create and return an LLMEngine instance with the configured parameters."""
+        return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())

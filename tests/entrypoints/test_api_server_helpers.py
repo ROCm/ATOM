@@ -876,83 +876,82 @@ def test_tracing_initializes_off_event_loop_before_lifespan_yields(monkeypatch):
     assert events == ["initialize", "serving", "shutdown"]
 
 
-class _FakeSeq:
-    def __init__(self, seq_id, token_ids):
-        self.id = seq_id
-        self.prompt_token_ids = list(token_ids)
-        self.num_prompt_tokens = len(token_ids)
+class TestPreparePrompt:
+    """`_prepare_prompt`: render, tokenize the engine's way, cut to the
+    context, on the executor, for /v1/messages and /v1/responses."""
 
+    @pytest.fixture
+    def prepare(self, monkeypatch):
+        from atom.model_engine.segment_tokenizer import PrefixEncoding
 
-def test_prompt_is_checked_and_truncated_in_the_preprocess_call(monkeypatch):
-    # /v1/messages and /v1/responses: no encode on the event loop. The length
-    # check reads the engine's own token count from the one preprocess call,
-    # and only an over-long prompt is built again, from its first ids.
-    requests = {}
-    monkeypatch.setattr(
-        api_server,
-        "engine",
-        SimpleNamespace(io_processor=SimpleNamespace(requests=requests)),
-    )
-    monkeypatch.setattr(
-        api_server,
-        "tokenizer",
-        SimpleNamespace(decode=lambda ids, **_kw: f"<{len(ids)} ids>"),
-    )
-    built = []
+        encoded = {}
 
-    def preprocess(prompt):
-        tokens = list(range(10)) if isinstance(prompt, str) else prompt
-        seq = _FakeSeq(len(built), tokens)
-        built.append(prompt)
-        requests[seq.id] = seq
-        return seq
+        def encode_prompt(text):
+            # One id per character; with a block-hash chain when asked.
+            ids = list(range(len(text)))
+            return PrefixEncoding(ids, "chain") if encoded.get("chain") else ids
 
-    cap = api_server._PromptCap(16)
-    seq = api_server._preprocess_prompt(preprocess, "short", cap)
-    assert built == ["short"] and seq.num_prompt_tokens == 10
-    assert cap.cut_text is None
-    seq = api_server._preprocess_prompt(preprocess, "short", None)
-    assert seq.num_prompt_tokens == 10
+        monkeypatch.setattr(
+            api_server,
+            "engine",
+            SimpleNamespace(
+                config=SimpleNamespace(max_model_len=100),
+                io_processor=SimpleNamespace(encode_prompt=encode_prompt),
+            ),
+        )
+        monkeypatch.setattr(
+            api_server,
+            "tokenizer",
+            SimpleNamespace(decode=lambda ids, **_kw: "k" * len(ids)),
+        )
+        monkeypatch.setattr(api_server, "custom_message_encoder", None)
+        rendered = {}
+        monkeypatch.setattr(
+            api_server,
+            "apply_chat_template",
+            lambda _tok, _enc, messages, **kwargs: rendered.setdefault(
+                "text", messages
+            ),
+        )
 
-    built.clear()
-    requests.clear()
-    cap = api_server._PromptCap(4)
-    seq = api_server._preprocess_prompt(preprocess, "long prompt", cap)
-    assert built == ["long prompt", [0, 1, 2, 3]]
-    assert seq.prompt_token_ids == [0, 1, 2, 3]
-    # The text the engine runs, for the reasoning channel's seed.
-    assert cap.cut_text == "<4 ids>"
-    # The discarded first build is not left registered.
-    assert list(requests) == [seq.id]
+        def run(prompt, max_tokens, chain=False, kv=None):
+            encoded["chain"] = chain
+            rendered.clear()
+            return api_server._prepare_prompt(
+                prompt,
+                {},
+                tools=None,
+                preserve_tool_call_arguments=False,
+                max_tokens=max_tokens,
+                kv_transfer_params=kv,
+            )
 
+        return run
 
-def test_responses_channel_follows_the_text_the_engine_runs(monkeypatch):
-    # Structured: cut before the engine call (off the loop), so the channel
-    # the sampling params are built from reads the kept text. Unstructured:
-    # re-seeded from `cut_text` after the preprocess call cut it.
-    monkeypatch.setattr(
-        api_server,
-        "tokenizer",
-        SimpleNamespace(
-            encode=lambda text, **_kw: list(range(len(text))),
-            decode=lambda ids, **_kw: "x" * len(ids),
-        ),
-    )
-    cap = api_server._PromptCap(4)
-    assert api_server._cut_prompt("abc", cap) == ("abc", "abc")
-    assert api_server._cut_prompt("abcdefgh", cap) == ([0, 1, 2, 3], "xxxx")
+    def test_a_prompt_that_fits_goes_to_the_engine_as_encoded(self, prepare):
+        engine_input, text = prepare("x" * 50, max_tokens=10, chain=True)
+        # The engine's own encoding, chain included, so preprocess reuses it.
+        assert engine_input.token_ids == list(range(50))
+        assert engine_input.block_hashes == "chain"
+        assert text == "x" * 50
 
-    seeds = []
-    monkeypatch.setattr(
-        api_server, "prompt_starts_in_reasoning", lambda text: seeds.append(text)
-    )
-    monkeypatch.setattr(
-        api_server, "reasoning_channel", lambda start, **_kw: ("reseeded", start)
-    )
-    assert api_server._reseed_after_cut("orig", cap, {}) == "orig"
-    cap.cut_text = "kept"
-    assert api_server._reseed_after_cut("orig", cap, {})[0] == "reseeded"
-    assert seeds == ["kept"]
+    def test_an_over_long_prompt_is_cut_to_the_context(self, prepare):
+        # 100-token context, 10 reserved for output: 90 kept.
+        engine_input, text = prepare("x" * 150, max_tokens=10, chain=True)
+        assert engine_input == list(range(90))
+        assert text == "k" * 90
+
+    @pytest.mark.parametrize("max_tokens", [100, 1024])
+    def test_no_room_for_a_prompt_is_refused(self, prepare, max_tokens):
+        with pytest.raises(ValueError, match="no room for a prompt"):
+            prepare("x" * 5, max_tokens=max_tokens)
+
+    def test_an_empty_cut_is_refused(self, prepare, monkeypatch):
+        monkeypatch.setattr(
+            api_server, "tokenizer", SimpleNamespace(decode=lambda ids, **_kw: "")
+        )
+        with pytest.raises(ValueError, match="empty after truncation"):
+            prepare("x" * 150, max_tokens=10)
 
 
 class TestDeploymentDefaultOutputCap:

@@ -231,10 +231,7 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
-        # Off for online front ends, which read every output through the
-        # per-sequence callbacks: nothing would drain the queue
-        # (`Config.keep_finished_outputs`).
-        self.keep_finished_outputs = getattr(config, "keep_finished_outputs", True)
+        self.keep_finished_outputs = config.keep_finished_outputs or config.asyncio_mode
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
@@ -1311,12 +1308,23 @@ class CoreManager:
         ``LLMEngine.generate`` waits while the engine is alive and any request
         is unfinished. A dropped seq never finishes, so that wait never ends.
         The seqs are still in ``_bp_pending``; this only surfaces the error.
-
-        Only offline seqs are ever in the pool (``add_request`` keeps online
-        requests out of it), and offline ``generate`` reads ``outputs_queue``.
-        If online seqs could wait there, this error would have to reach them
-        through their callbacks instead.
+        A pending seq with a stream callback is not reading that queue, so it
+        is taken out and ended through its callback, as abort does.
         """
+        with self._lb_lock:
+            waiting = [s for s in self._bp_pending if s.id in self._seq_id_to_callback]
+            for seq in waiting:
+                self._bp_pending.remove(seq)
+        delivered = False
+        for seq in waiting:
+            if not getattr(seq, "leave_reason", None):
+                seq.leave_reason = "aborted"
+            delivered |= self._deliver_terminal_output(seq)
+        if delivered and self._flush_stream_batch_fn is not None:
+            try:
+                self._flush_stream_batch_fn()
+            except Exception as e:  # noqa: BLE001 - the error below must still go out
+                logger.warning("%s: flush_stream_batch failed: %s", self.label, e)
         pending = len(getattr(self, "_bp_pending", ()))
         logger.error(
             "%s: backpressure send failed with nothing in flight; "

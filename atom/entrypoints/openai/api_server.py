@@ -51,6 +51,7 @@ from atom.kv_transfer.disaggregation.mooncake.endpoint import (
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import load_tokenizer
 from atom.model_engine.request import RequestOutput
+from atom.model_engine.segment_tokenizer import PrefixEncoding
 from atom.model_engine.sequence import new_token_ids
 from atom.multimodal.processing import prepare_multimodal_inputs
 from atom.multimodal.registry import get_native_multimodal_processor
@@ -861,11 +862,8 @@ async def generate_async(
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
     return_token_ids: bool = False,
-    prompt_cap: "_PromptCap | None" = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate non-streaming output, optionally echoing local prompt token IDs.
-
-    ``prompt_cap`` truncates, in the preprocess call (``_preprocess_prompt``)."""
+    """Generate non-streaming output, optionally echoing local prompt token IDs."""
     token_queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -904,18 +902,14 @@ async def generate_async(
         )
 
     def do_preprocess():
-        return _preprocess_prompt(
-            lambda prompt: engine.io_processor.preprocess(
-                prompt,
-                sampling_params,
-                stream_callback=completion_callback,
-                kv_transfer_params=kv_transfer_params,
-                data_parallel_rank=data_parallel_rank,
-                dp_session_id=dp_session_id,
-                dp_parent_session_id=dp_parent_session_id,
-            ),
+        return engine.io_processor.preprocess(
             prompt_or_tokens,
-            prompt_cap,
+            sampling_params,
+            stream_callback=completion_callback,
+            kv_transfer_params=kv_transfer_params,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -1313,72 +1307,48 @@ def _prompt_headroom(
     return headroom
 
 
-class _PromptCap:
-    """The longest prompt ``/v1/messages`` and ``/v1/responses`` keep: a longer
-    one is cut to ``tokens`` rather than refused. After the preprocess call,
-    ``cut_text`` is the text the engine runs if the prompt was cut, for the
-    readers that seed from the prompt's end (the reasoning channel)."""
+def _prepare_prompt(
+    messages,
+    template_kwargs: dict[str, Any],
+    *,
+    tools,
+    preserve_tool_call_arguments: bool,
+    max_tokens: int,
+    kv_transfer_params: dict[str, Any] | None,
+):
+    """Render, tokenize the engine's way and cut to the context, in one
+    executor step for ``/v1/messages`` and ``/v1/responses``.
 
-    __slots__ = ("cut_text", "tokens")
-
-    def __init__(self, tokens: int):
-        self.tokens = tokens
-        self.cut_text: str | None = None
-
-
-def _prompt_cap(
-    max_tokens: int, kv_transfer_params: dict[str, Any] | None
-) -> _PromptCap:
+    Returns ``(engine_input, text)``: what preprocess takes in place of the
+    prompt (no second tokenize), and the text the engine runs, which seeds the
+    reasoning channel. A prompt longer than the context minus the output
+    headroom is cut from the end; a context with no room for any prompt is
+    refused (ValueError, a 400)."""
+    prompt = apply_chat_template(
+        tokenizer,
+        custom_message_encoder,
+        messages,
+        tools=tools,
+        preserve_tool_call_arguments=preserve_tool_call_arguments,
+        **template_kwargs,
+    )
+    encoded = engine.io_processor.encode_prompt(prompt)
     max_ctx = int(_get_engine_max_model_len() or 30720)
-    return _PromptCap(
-        max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
-    )
-
-
-def _cut_prompt(prompt: str, prompt_cap: _PromptCap) -> tuple[str | list[int], str]:
-    """For a caller that needs the cut text before the engine call: returns
-    what to send (the prompt, or the kept ids when it is over the cap) and the
-    text the engine will run. Tokenizes, so run it off the event loop."""
-    token_ids = tokenizer.encode(prompt)
-    if len(token_ids) <= prompt_cap.tokens:
-        return prompt, prompt
-    logger.warning(
-        "Prompt too long (%d > %d), truncating", len(token_ids), prompt_cap.tokens
-    )
-    token_ids = token_ids[: prompt_cap.tokens]
-    return token_ids, tokenizer.decode(token_ids, skip_special_tokens=False)
-
-
-def _reseed_after_cut(channel, prompt_cap: _PromptCap, template_kwargs):
-    """The reasoning channel for the text the engine ran, when the preprocess
-    call cut the prompt (only the unstructured path gets there)."""
-    if prompt_cap.cut_text is None:
-        return channel
-    return reasoning_channel(
-        prompt_starts_in_reasoning(prompt_cap.cut_text),
-        template_kwargs=template_kwargs,
-    )
-
-
-def _preprocess_prompt(preprocess, prompt_or_tokens, prompt_cap):
-    """``preprocess(prompt)`` on the executor, cutting a prompt longer than
-    ``prompt_cap.tokens``.
-
-    The prompt is tokenized once, by ``preprocess``, and checked by its
-    ``num_prompt_tokens``; only an over-long one is built a second time, from
-    its own first ids."""
-    seq = preprocess(prompt_or_tokens)
-    if prompt_cap is None or seq.num_prompt_tokens <= prompt_cap.tokens:
-        return seq
-    logger.warning(
-        "Prompt too long (%d > %d), truncating",
-        seq.num_prompt_tokens,
-        prompt_cap.tokens,
-    )
-    engine.io_processor.requests.pop(seq.id, None)
-    token_ids = list(seq.prompt_token_ids[: prompt_cap.tokens])
-    prompt_cap.cut_text = tokenizer.decode(token_ids, skip_special_tokens=False)
-    return preprocess(token_ids)
+    cap = max_ctx - _prompt_headroom(max_tokens, max_ctx, kv_transfer_params)
+    if cap < 1:
+        raise ValueError(
+            f"max_tokens={max_tokens} leaves no room for a prompt in this "
+            f"model's {max_ctx}-token context"
+        )
+    token_ids = encoded.token_ids if isinstance(encoded, PrefixEncoding) else encoded
+    if len(token_ids) <= cap:
+        return encoded, prompt
+    logger.warning("Prompt too long (%d > %d), truncating", len(token_ids), cap)
+    token_ids = list(token_ids[:cap])
+    text = tokenizer.decode(token_ids, skip_special_tokens=False)
+    if not text:
+        raise ValueError("The prompt is empty after truncation to the context")
+    return token_ids, text
 
 
 def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
@@ -1397,11 +1367,8 @@ async def setup_streaming_request(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
-    prompt_cap: "_PromptCap | None" = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
-
-    ``prompt_cap`` truncates, in the preprocess call (``_preprocess_prompt``).
 
     Returns ``(seq_id, stream_collector, num_prompt_tokens)``.
     ``num_prompt_tokens`` is the engine-computed prompt length so the stream
@@ -1426,19 +1393,15 @@ async def setup_streaming_request(
     executor_loop = asyncio.get_event_loop()
 
     def do_preprocess():
-        seq = _preprocess_prompt(
-            lambda prompt: engine.io_processor.preprocess(
-                prompt,
-                sampling_params,
-                stream_callback=stream_callback,
-                kv_transfer_params=kv_transfer_params,
-                multimodal_data=multimodal_data,
-                data_parallel_rank=data_parallel_rank,
-                dp_session_id=dp_session_id,
-                dp_parent_session_id=dp_parent_session_id,
-            ),
+        seq = engine.io_processor.preprocess(
             prompt_or_tokens,
-            prompt_cap,
+            sampling_params,
+            stream_callback=stream_callback,
+            kv_transfer_params=kv_transfer_params,
+            multimodal_data=multimodal_data,
+            data_parallel_rank=data_parallel_rank,
+            dp_session_id=dp_session_id,
+            dp_parent_session_id=dp_parent_session_id,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -2006,8 +1969,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
-            # Off the loop: rendering grows with the conversation, and on the
-            # loop it holds up reading every other request.
             prompt_or_tokens = await asyncio.to_thread(
                 apply_chat_template,
                 tokenizer,
@@ -2436,18 +2397,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # no such spelling, and are not answered here or on the chat path.
         if forbids_tool_calls(request.tool_choice):
             merged_kwargs["tool_choice"] = "none"
-        # Off the loop, like the length check and truncation below, which
-        # happen in the preprocess call (`prompt_cap`).
-        prompt = await asyncio.to_thread(
-            apply_chat_template,
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=anthropic_to_openai_tools(request.tools),
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            **merged_kwargs,
-        )
-
         generation_config = engine.config.generation_config
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
@@ -2476,19 +2425,24 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         request_id = uuid.uuid4().hex[:24]
         set_request_id(request_id)
         kv_transfer_params = _engine_kv_transfer_params(request.kv_transfer_params)
-        prompt_cap = _prompt_cap(sampling_params.max_tokens, kv_transfer_params)
+        engine_input, prompt = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            merged_kwargs,
+            tools=anthropic_to_openai_tools(request.tools),
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=sampling_params.max_tokens,
+            kv_transfer_params=kv_transfer_params,
+        )
 
         if request.stream:
             # Streaming response
             seq_id, stream_collector, input_tokens = await setup_streaming_request(
-                prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                prompt_cap=prompt_cap,
             )
-            # What the engine runs, if the prompt was cut.
-            prompt = prompt_cap.cut_text or prompt
 
             async def generate_anthropic_stream():
                 # Unconditional, like the chat path and like both upstreams:
@@ -2659,11 +2613,10 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # Non-streaming response
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                prompt_cap=prompt_cap,
             ),
             raw_request,
             request_id,
@@ -2671,7 +2624,6 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         if final_output is None:
             raise RuntimeError("No output generated")
         input_tokens = final_output["num_tokens_input"]
-        prompt = prompt_cap.cut_text or prompt
 
         raw_text = final_output["text"]
         # Separating is unconditional -- the same call the chat path makes,
@@ -2845,18 +2797,6 @@ async def responses_create(raw_request: Request):
             rules=rules,
         )
 
-        # Off the loop, like the length check and truncation below, which
-        # happen in the preprocess call (`prompt_cap`).
-        prompt = await asyncio.to_thread(
-            apply_chat_template,
-            tokenizer,
-            custom_message_encoder,
-            messages,
-            tools=openai_tools,
-            preserve_tool_call_arguments=preserve_tool_call_arguments,
-            **merged_kwargs,
-        )
-
         generation_config = engine.config.generation_config
         model_temperature = getattr(generation_config, "temperature", None)
         model_top_p = getattr(generation_config, "top_p", None)
@@ -2893,19 +2833,17 @@ async def responses_create(raw_request: Request):
         schema = schema_from_format((text_config or {}).get("format"), responses=True)
         request_id = f"resp_{uuid.uuid4().hex[:24]}"
         set_request_id(request_id)
-        prompt_cap = _prompt_cap(sampling_params.max_tokens, kv_transfer_params)
+        engine_input, prompt = await asyncio.to_thread(
+            _prepare_prompt,
+            messages,
+            merged_kwargs,
+            tools=openai_tools,
+            preserve_tool_call_arguments=preserve_tool_call_arguments,
+            max_tokens=sampling_params.max_tokens,
+            kv_transfer_params=kv_transfer_params,
+        )
 
         created_at = int(time.time())
-        engine_prompt = prompt
-        if schema is not None:
-            # Structured output builds the channel into the sampling params
-            # before the engine call, so the cut has to come first here:
-            # tokenized off the loop, and the engine gets the kept ids.
-            engine_prompt, prompt = await asyncio.to_thread(
-                _cut_prompt, prompt, prompt_cap
-            )
-        # Without a schema the cut happens in the preprocess call, and the
-        # channel is re-seeded from `cut_text` after it (below).
         _reasoning = reasoning_channel(
             prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
         )
@@ -2922,13 +2860,11 @@ async def responses_create(raw_request: Request):
 
         if request.stream:
             seq_id, stream_collector, input_tokens = await setup_streaming_request(
-                engine_prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                prompt_cap=prompt_cap,
             )
-            _reasoning = _reseed_after_cut(_reasoning, prompt_cap, merged_kwargs)
 
             async def generate_responses_stream():
                 reasoning_filter = _reasoning.stream()
@@ -3036,11 +2972,10 @@ async def responses_create(raw_request: Request):
 
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                engine_prompt,
+                engine_input,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
-                prompt_cap=prompt_cap,
             ),
             raw_request,
             request_id,
@@ -3048,7 +2983,6 @@ async def responses_create(raw_request: Request):
         if final_output is None:
             raise RuntimeError("No output generated")
         input_tokens = final_output["num_tokens_input"]
-        _reasoning = _reseed_after_cut(_reasoning, prompt_cap, merged_kwargs)
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
@@ -3443,8 +3377,7 @@ def main():
     preserve_tool_call_arguments = template_keeps_tool_call_arguments(tools_probe)
     required_tool_channel = required_call_channel(tool_call_parser_cls, tokenizer)
 
-    # Every output reaches its request through the per-sequence callbacks.
-    engine = engine_args.create_engine(tokenizer=tokenizer, keep_finished_outputs=False)
+    engine = engine_args.create_engine(tokenizer=tokenizer)
     # Forced acceptance emits draft tokens that nothing verified, and once the
     # context is long enough those degenerate into the dialect's own channel
     # framing and nothing else -- read as structure, correctly, that leaves a
