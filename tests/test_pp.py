@@ -1180,8 +1180,13 @@ def _held_after_first_chunk(prompt=400, bs=16):
     sched.add(seq)
     batch, seqs = sched.schedule()
     assert seq.id in batch.req_ids and seq.is_partial_prefill
-    sched._pp_checkpoint_hold.add(seq.id)
+    sched._pp_checkpoint_hold[seq.id] = _chunk_end(batch, seq.id)
     return sched, seq, batch, seqs
+
+
+def _chunk_end(batch, req_id):
+    i = list(batch.req_ids).index(req_id)
+    return int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
 
 
 def _prefill_ids(sched):
@@ -1207,6 +1212,23 @@ def test_hold_is_released_when_its_batch_files_its_hashes():
     assert seq.id not in sched._pp_checkpoint_hold
     assert not sched.holds_checkpoint_hostage(batch)
     assert seq.id in _prefill_ids(sched)
+
+
+def test_hold_is_released_only_by_the_chunk_that_holds_it():
+    # An earlier chunk of the same seq, in flight when the held one was
+    # scheduled, files first: the held chunk's checkpoint is not filed yet.
+    sched, seq, first, first_seqs = _held_after_first_chunk()
+    del sched._pp_checkpoint_hold[seq.id]
+    held, held_seqs = sched.schedule()
+    assert seq.id in held.req_ids and seq.is_partial_prefill
+    sched._pp_checkpoint_hold[seq.id] = _chunk_end(held, seq.id)
+    assert not sched.holds_checkpoint_hostage(first)
+    sched.register_prefill_hashes(first, first_seqs.values())
+    assert seq.id in sched._pp_checkpoint_hold
+    assert seq.id not in _prefill_ids(sched)
+    assert sched.holds_checkpoint_hostage(held)
+    sched.register_prefill_hashes(held, held_seqs.values())
+    assert seq.id not in sched._pp_checkpoint_hold
 
 
 @pytest.mark.parametrize("acked", [False, True])
@@ -1282,7 +1304,9 @@ def test_hold_is_released_even_if_hashing_raises():
         sched.add(seq)
     batch, by_id = sched.schedule()
     assert all(seq.id in batch.req_ids for seq in seqs)
-    sched._pp_checkpoint_hold.update(batch.req_ids)
+    sched._pp_checkpoint_hold.update(
+        {req_id: _chunk_end(batch, req_id) for req_id in batch.req_ids}
+    )
     sched.block_manager.hash_blocks = MagicMock(side_effect=RuntimeError("boom"))
     with pytest.raises(RuntimeError, match="boom"):
         sched.register_prefill_hashes(batch, by_id.values())
