@@ -229,8 +229,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefix's rank has over twice that; then the request goes to an idle rank
     # -- with more than two ranks, among those within IDLE_TOKENS / 2 load of
     # the lightest, the one holding the most of its prefix -- and loads the
-    # prefix from the offload tier (LMCache). New prefixes go to the lightest
-    # rank (`least_tokens` score).
+    # prefix from the offload tier (LMCache), prefetched while it waits (see
+    # `Scheduler._offload_prefetch`). New prefixes go to the lightest rank
+    # (`least_tokens` score).
     "ATOM_DP_PREFIX_SPREAD": lambda: os.getenv("ATOM_DP_PREFIX_SPREAD", "0") == "1",
     "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _int_env("ATOM_DP_PREFIX_IDLE_TOKENS", 32768),
     # Place a new agent session on the lightest DP rank, then keep every later
@@ -1337,14 +1338,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum external-tier hit worth loading, in tokens. And the shortest
     # prefix native lmcache_mp stores: an absolute boundary, for normal and
     # late saves alike (other connectors ignore it).
-    # Early tier load: a waiting request whose async lookup answered and that
-    # must load its prefix from the external tier gets its blocks and its load
-    # on any tick (prefill-delayer HOLD or FIRE), wherever it sits in `waiting`,
-    # while the KV pool stays under 80% full. Its prefill still waits for its
-    # turn and a FIRE. 1 (default): on, and a moved prefix-spread request is not
-    # queued first. 0: the old path (a moved request is queued first; allocate
-    # and load only in the admission pass).
-    "ATOM_OFFLOAD_EARLY_LOAD": lambda: _flag_env("ATOM_OFFLOAD_EARLY_LOAD", "1"),
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
     ),

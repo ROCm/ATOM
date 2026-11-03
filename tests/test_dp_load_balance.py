@@ -590,12 +590,11 @@ def test_prefix_spread_keeps_prefix_owner_without_a_backlog():
     second = _chain_seq(2, 110_000, session="s")
     assert _route(mgr, [second]) == [owner]
     assert mgr._dp_route_counters["prefix_owner_total"] == 1
-    assert not getattr(second, "dp_prefetch_priority", False)
     # Only the uncached extension is charged as prefill debt.
     assert mgr._seq_load[2][2] == 110_000 - 98_304
 
 
-def test_prefix_spread_moves_a_backlog_to_an_idle_rank_and_flags_prefetch():
+def test_prefix_spread_moves_a_backlog_to_an_idle_rank():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
     mgr._mark_seq_prefill_complete(1)
@@ -606,7 +605,6 @@ def test_prefix_spread_moves_a_backlog_to_an_idle_rank_and_flags_prefetch():
     (rank,) = _route(mgr, [moved])
     mgr._mark_seq_prefill_complete(2)
     assert rank != owner
-    assert moved.dp_prefetch_priority is True
     assert mgr._dp_route_counters["prefix_moved_total"] == 1
     assert mgr._dp_route_counters["prefix_moved_tokens"] == 98_304
     # The prefix now names its new rank.
@@ -705,7 +703,6 @@ def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded(
     small = _chain_seq(2, 5_000)
     (rank,) = _route(mgr, [small])
     assert rank != owner
-    assert not getattr(small, "dp_prefetch_priority", False)
     assert mgr._seq_load[2][2] == 5_000
     # Staying on the owner credits the prefix whatever its size.
     mgr._mark_seq_prefill_complete(2)

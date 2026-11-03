@@ -451,7 +451,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
         True when the answer is already held (`_lookup_results`) or its async
         lookup has answered and waits to be consumed (submitted, no longer in
-        flight). `Scheduler._early_load_tier_prefixes` asks this so that it
+        flight). `Scheduler._offload_prefetch` asks this so that it
         never blocks the scheduler thread -- and with it every DP rank -- on a
         synchronous lookup. It does not advance the lookup: call it after
         `lookup_pending`, or after a lookup driver thread answered.
@@ -470,7 +470,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     def cancel_preadmission(self, seq) -> None:
         """Forget an admission the scheduler takes back before any dispatch.
 
-        `Scheduler._early_load_tier_prefixes` allocates and notifies this
+        `Scheduler._offload_prefetch` allocates and notifies this
         connector like a normal admission, then hands the request back to
         `waiting` when the outcome is not a load it can park for. Cancel its
         pending load -- which also gives the lookup's read locks back

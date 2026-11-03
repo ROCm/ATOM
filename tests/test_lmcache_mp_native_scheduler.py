@@ -1044,7 +1044,7 @@ def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
     assert list(batch.num_cached_tokens) == [12 - _REPLAY]
 
 
-# -- early tier load (ATOM_OFFLOAD_EARLY_LOAD) on the native-state engine ------
+# -- offload prefetch on the native-state engine ----------------------------
 
 
 class _EarlyDelayer:
@@ -1092,10 +1092,9 @@ def _async_adapter(chunks, base=Adapter):
 
 
 def _holding_engine(monkeypatch, adapter, **overrides):
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", "1")
     engine, connector, _ = engine_scheduler(monkeypatch, adapter=adapter, **overrides)
     # A 40-block pool: the default watermark would not fit one prompt.
-    engine._EARLY_LOAD_KV_WATERMARK = 0.95
+    engine._PREFETCH_KV_WATERMARK = 0.95
     delayer = _EarlyDelayer()
     engine.set_prefill_delayer(delayer)
     return engine, connector, delayer
@@ -1107,11 +1106,11 @@ def _until_parked(engine, seq, ticks=6):
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return batch, scheduled
     raise AssertionError(
-        f"never parked {dict(engine._early_load.skips)} {engine._early_load.settled}"
+        f"never parked {dict(engine._prefetch.skips)} {engine._prefetch.settled}"
     )
 
 
-def test_early_load_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
+def test_prefetch_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     monkeypatch,
 ):
     """PAGE-only + bounded replay (DeepSeek-V4): the KV-only load is submitted on
@@ -1137,7 +1136,7 @@ def test_early_load_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     [request] = batch.connector_meta_output.requests  # shipped with this tick
     assert request.native_state.kv_only and not request.native_state.unit_ids
     assert request.native_state.boundary_tokens == 32
-    assert engine._early_load.submitted == 1
+    assert engine._prefetch.submitted == 1
 
     engine._update_from_kv_xfer_finished(
         KVConnectorOutput(finished_loading={request.load_operation})
@@ -1152,10 +1151,10 @@ def test_early_load_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
     assert list(batch.num_cached_tokens) == [32 - _REPLAY]
     assert engine._num_parked_remote_kv == 0
-    assert seq.id not in engine._early_load.entries
+    assert seq.id not in engine._prefetch.entries
 
 
-def test_early_load_waits_for_an_answered_lookup(monkeypatch):
+def test_prefetch_waits_for_an_answered_lookup(monkeypatch):
     """No answer yet (the server has not acked): nothing is allocated, and the
     engine does not block on a synchronous lookup."""
     adapter = _async_adapter(4, _ReachAdapter)(32)
@@ -1168,13 +1167,13 @@ def test_early_load_waits_for_an_answered_lookup(monkeypatch):
         engine.schedule()
 
     assert seq.status == SequenceStatus.WAITING and not seq.block_table
-    assert engine._early_load.skips["lookup_not_ready"] == 1
+    assert engine._prefetch.skips["lookup_not_ready"] == 1
     assert len(adapter._client.lookups) == 1  # one async lookup, no sync ones
     adapter._client.lookup_future.done = True
     _until_parked(engine, seq)
 
 
-def test_early_load_parks_a_state_image_load(monkeypatch):
+def test_prefetch_parks_a_state_image_load(monkeypatch):
     """Without a replay the load carries a state image; it is parked early
     exactly as the admission pass would."""
     adapter = _async_adapter(2)()
@@ -1187,7 +1186,7 @@ def test_early_load_parks_a_state_image_load(monkeypatch):
     assert seq.state_slot >= 0 and len(seq.block_table) == 6
 
 
-def test_early_load_abort_gives_the_native_load_back(monkeypatch):
+def test_prefetch_abort_gives_the_native_load_back(monkeypatch):
     adapter = _async_adapter(4, _ReachAdapter)(32)
     engine, _, _ = _holding_engine(monkeypatch, adapter, state_replay_tokens=_REPLAY)
     free = engine.block_manager.kv.num_free
@@ -1203,5 +1202,5 @@ def test_early_load_abort_gives_the_native_load_back(monkeypatch):
     engine.schedule()
 
     assert engine._num_parked_remote_kv == 0
-    assert not engine._early_load.entries
+    assert not engine._prefetch.entries
     assert engine.block_manager.kv.num_free == free

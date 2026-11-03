@@ -407,7 +407,7 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
         return 0
 
     def lookup_ready(self, seq: Any) -> bool:
-        """Never: the early tier load (`Scheduler._early_load_tier_prefixes`)
+        """Never: the offload prefetch (`Scheduler._offload_prefetch`)
         is not offered under `multi`, where a P/D sub shares the admission."""
         return False
 

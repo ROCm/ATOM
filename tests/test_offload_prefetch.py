@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Scheduler._early_load_tier_prefixes (ATOM_OFFLOAD_EARLY_LOAD).
+"""Scheduler._offload_prefetch.
 
 A waiting request whose tier lookup answered gets its blocks and its load on any
 tick -- delayer HOLD or FIRE, wherever it waits -- while its prefill still waits
@@ -24,10 +24,10 @@ from test_lmcache_mp_async_threads import (
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.kv_transfer.offload.mp.offload_prefetch import OffloadPrefetchState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
-from atom.model_engine.tier_prefetch import TierPrefetchState
 
 META = object()
 
@@ -152,10 +152,10 @@ def test_hold_tick_parks_a_request_and_ships_its_load(setup):
     # The load leaves with this HOLD tick's (empty) batch.
     assert batch.connector_meta_output is META
     assert seq in sched.waiting
-    assert sched._early_load.submitted == 1
+    assert sched._prefetch.submitted == 1
 
 
-def test_fire_tick_also_loads_early_and_does_not_prefill_a_loading_request(setup):
+def test_fire_tick_also_prefetches_and_does_not_prefill_a_loading_request(setup):
     sched, delayer, seq = setup
     delayer.allow = True
 
@@ -191,15 +191,15 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     sched._promote_ready_remote_kv_requests()
 
     assert list(sched.waiting) == [a, b]  # a parked-and-loaded old-path request
-    # would have moved up; an early-loaded one keeps its place
+    # would have moved up; an prefetched one keeps its place
 
 
 def test_loaded_request_passes_a_head_refused_kv_blocks(monkeypatch, seq_factory):
-    """A head that cannot allocate must not wait forever on an early-loaded
+    """A head that cannot allocate must not wait forever on an prefetched
     request behind it that holds blocks and could run and release them."""
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id}
-    sched.schedule()  # b parks with its early load, a waits
+    sched.schedule()  # b parks with its prefetch, a waits
     sched.finished_recving_kv_req_ids.append(b.id)
     # The last admission pass found the head refused KV blocks.
     sched._admission_head_blocked = True
@@ -243,7 +243,7 @@ def test_old_path_parked_request_is_still_promoted(monkeypatch, seq_factory):
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id, b.id}
     sched.schedule()
-    # b parked by the admission pass, not by the early load.
+    # b parked by the admission pass, not by the prefetch.
     b.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     sched.finished_recving_kv_req_ids.append(b.id)
 
@@ -268,9 +268,9 @@ def test_loaded_request_prefills_only_on_a_fire(setup):
     assert sched._num_parked_remote_kv == 0
     # One admission only: the FIRE did not allocate or notify again.
     assert sched.kv_connector.allocs == [seq.id]
-    # Its early-load record closed when it went onto the prefill batch.
-    assert seq.id not in sched._early_load.entries
-    assert sched._early_load.wait_n == 1
+    # Its prefetch record closed when it went onto the prefill batch.
+    assert seq.id not in sched._prefetch.entries
+    assert sched._prefetch.wait_n == 1
 
 
 def test_prefill_stays_fifo_when_a_later_request_loaded_first(monkeypatch, seq_factory):
@@ -308,30 +308,6 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
     assert a.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_flag_off_is_the_old_behaviour(monkeypatch, seq_factory):
-    sched, _, (first, moved) = _make(
-        monkeypatch, seq_factory, n=2, ATOM_OFFLOAD_EARLY_LOAD="0"
-    )
-
-    sched.schedule()
-
-    assert first.status == moved.status == SequenceStatus.WAITING
-    assert sched.kv_connector.allocs == []
-    assert len(first.block_table) == len(moved.block_table) == 0
-    assert sched._early_load.submitted == 0
-
-
-def test_moved_request_jumps_the_queue_only_with_the_flag_off(monkeypatch, seq_factory):
-    for flag, jumps in (("0", True), ("1", False)):
-        monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", flag)
-        sched = Scheduler(MockConfig(num_kvcache_blocks=100))
-        first, moved = seq_factory(list(range(16))), seq_factory(list(range(16)))
-        moved.dp_prefetch_priority = True
-        sched.add(first)
-        sched.add(moved)
-        assert (list(sched.waiting) == [moved, first]) is jumps
-
-
 @pytest.mark.parametrize("why", ["no_load", "lookup_not_ready"])
 def test_nothing_is_allocated_without_an_answered_load(setup, why):
     sched, _, seq = setup
@@ -348,9 +324,9 @@ def test_nothing_is_allocated_without_an_answered_load(setup, why):
     assert _free(sched) == free
     assert sched.kv_connector.allocs == []
     expect = "no_tier_load" if why == "no_load" else "lookup_not_ready"
-    assert sched._early_load.skips[expect] == 1
+    assert sched._prefetch.skips[expect] == 1
     sched.schedule()
-    assert sched._early_load.skips[expect] == 1  # counted once per request
+    assert sched._prefetch.skips[expect] == 1  # counted once per request
 
 
 def test_a_request_below_the_minimum_load_size_is_not_looked_at(
@@ -362,7 +338,7 @@ def test_a_request_below_the_minimum_load_size_is_not_looked_at(
     sched.schedule()
 
     assert seq.status == SequenceStatus.WAITING
-    assert sched._early_load.skips["below_min_load"] == 1
+    assert sched._prefetch.skips["below_min_load"] == 1
 
 
 def test_a_refused_park_is_taken_back_and_not_retried(setup):
@@ -377,7 +353,7 @@ def test_a_refused_park_is_taken_back_and_not_retried(setup):
     assert _free(sched) == free
     assert sched.kv_connector.cancelled == [seq.id]
     assert sched._num_parked_remote_kv == 0
-    assert sched._early_load.takebacks == 1
+    assert sched._prefetch.takebacks == 1
     sched.schedule()  # next tick: not tried again
     assert sched.kv_connector.allocs == [seq.id]
 
@@ -399,23 +375,23 @@ def test_unaligned_hbm_hit_is_left_to_the_admission_pass_and_counted(setup):
     sched.schedule()
 
     assert seq.status == SequenceStatus.WAITING
-    assert sched._early_load.skips["unaligned_hbm"] == 1
+    assert sched._prefetch.skips["unaligned_hbm"] == 1
 
 
 # -- pressure bounds ----------------------------------------------------------
 
 
-def test_watermark_stops_early_allocation_and_the_request_waits_for_the_fire(
+def test_watermark_stops_prefetch_allocation_and_the_request_waits_for_the_fire(
     monkeypatch, seq_factory
 ):
     sched, delayer, (seq,) = _make(monkeypatch, seq_factory)
-    sched._EARLY_LOAD_KV_WATERMARK = 0.01
+    sched._PREFETCH_KV_WATERMARK = 0.01
 
     sched.schedule()
 
     assert seq.status == SequenceStatus.WAITING
     assert len(seq.block_table) == 0
-    assert sched._early_load.skips["watermark"] == 1
+    assert sched._prefetch.skips["watermark"] == 1
     # Back to the old path: the FIRE's admission parks it as before.
     delayer.allow = True
     sched.schedule()
@@ -425,29 +401,29 @@ def test_watermark_stops_early_allocation_and_the_request_waits_for_the_fire(
 
 def test_pressure_skip_is_retried_once_pressure_is_gone(monkeypatch, seq_factory):
     sched, _, (seq,) = _make(monkeypatch, seq_factory)
-    sched._EARLY_LOAD_KV_WATERMARK = 0.01
+    sched._PREFETCH_KV_WATERMARK = 0.01
     sched.schedule()
     assert seq.status == SequenceStatus.WAITING
-    sched._EARLY_LOAD_KV_WATERMARK = 0.7
-    for _ in range(sched._EARLY_LOAD_RETRY_TICKS + 1):
+    sched._PREFETCH_KV_WATERMARK = 0.7
+    for _ in range(sched._PREFETCH_RETRY_TICKS + 1):
         sched.schedule()
     assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
 
 
-def test_no_early_allocation_without_a_free_parking_slot(monkeypatch, seq_factory):
+def test_no_prefetch_allocation_without_a_free_parking_slot(monkeypatch, seq_factory):
     sched, _, (seq,) = _make(monkeypatch, seq_factory)
     sched._num_parked_remote_kv = sched.max_num_seqs
 
     sched.schedule()
 
     assert seq.status == SequenceStatus.WAITING
-    assert sched._early_load.skips["seq_slots"] == 1
+    assert sched._prefetch.skips["seq_slots"] == 1
 
 
 # -- cancellation ---------------------------------------------------------------
 
 
-def test_abort_of_an_early_loaded_request_releases_its_blocks(setup):
+def test_abort_of_an_prefetched_request_releases_its_blocks(setup):
     sched, _, seq = setup
     free = _free(sched)
     sched.schedule()
@@ -455,8 +431,8 @@ def test_abort_of_an_early_loaded_request_releases_its_blocks(setup):
 
     assert sched.abort_request(seq.id)
 
-    assert seq.id not in sched._early_load.entries
-    assert sched._early_load.aborted == 1
+    assert seq.id not in sched._prefetch.entries
+    assert sched._prefetch.aborted == 1
     assert seq not in sched.waiting
     # The load is still in flight: the blocks go back once it reports (the
     # existing aborted-load protocol), never before.
@@ -468,7 +444,7 @@ def test_abort_of_an_early_loaded_request_releases_its_blocks(setup):
     assert seq.id not in sched.deferred_free_blocks
 
 
-def test_abort_of_a_loaded_early_request_releases_its_blocks(setup):
+def test_abort_of_a_loaded_prefetched_request_releases_its_blocks(setup):
     sched, _, seq = setup
     free = _free(sched)
     sched.schedule()
@@ -478,7 +454,7 @@ def test_abort_of_a_loaded_early_request_releases_its_blocks(setup):
 
     assert _free(sched) == free
     assert sched._num_parked_remote_kv == 0
-    assert not sched._early_load.entries
+    assert not sched._prefetch.entries
 
 
 def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
@@ -489,7 +465,7 @@ def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
     sched.schedule()  # HOLD: reclaimed without waiting for a FIRE
 
     assert b not in sched.waiting
-    assert b.id not in sched._early_load.entries
+    assert b.id not in sched._prefetch.entries
 
 
 # -- reporting ------------------------------------------------------------------
@@ -498,14 +474,16 @@ def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
 def test_one_info_line_per_interval(setup, caplog):
     sched, _, _seq = setup
     sched.schedule()
-    state = sched._early_load
+    state = sched._prefetch
     state.skip(77, "watermark")
     state.skip(78, "unaligned_hbm")
     state._last_log -= 61.0
     with caplog.at_level(logging.INFO, logger="atom"):
         sched.schedule()
         sched.schedule()
-    lines = [r.getMessage() for r in caplog.records if "[EARLY-LOAD]" in r.getMessage()]
+    lines = [
+        r.getMessage() for r in caplog.records if "[OFFLOAD-PREFETCH]" in r.getMessage()
+    ]
     assert len(lines) == 1
     line = lines[0]
     assert "submitted=1" in line
@@ -515,7 +493,7 @@ def test_one_info_line_per_interval(setup, caplog):
 
 
 def test_state_counts_a_request_once_per_reason():
-    state = TierPrefetchState()
+    state = OffloadPrefetchState()
     for _ in range(3):
         state.skip(1, "lookup_not_ready")
     state.skip(2, "lookup_not_ready")
