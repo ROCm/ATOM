@@ -1053,9 +1053,9 @@ class _EarlyDelayer:
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9
-    rank_prefill_costs = []
 
     def __init__(self):
+        self.rank_prefill_costs = []
         self.allow = False
 
     def protects_decode(self, running_decode_batch):
