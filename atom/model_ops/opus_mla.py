@@ -9,10 +9,10 @@ a host planner that packs each request's rows (``token * H + head``) into
 128-row chunks and balances their KV over the XCDs, a stage-1 kernel and a
 bf16 merge. Taken only with 96 gathered heads, ``float8_e4m3fn`` Q / KV
 (gfx950), ``page_size`` 1, query length above 1, a KV cache below 4 GiB and
-running batches of ``ATOM_OPUS_MLA_MIN_BATCH`` to ``ATOM_OPUS_MLA_MAX_BS``
-requests, without decode TBO. The draft model, non-causal blocks, query
-length 1, sparse attention, and an aiter without ``OpusMlaFlatDecode``
-(logged once) stay on ``mla_decode_fwd``. The kernel feeds the softmax
+running batches of up to ``ATOM_OPUS_MLA_MAX_BS`` requests, without decode
+TBO. The draft model, non-causal blocks, query length 1, sparse attention,
+and an aiter without ``OpusMlaFlatDecode`` (logged once) stay on
+``mla_decode_fwd``. The kernel feeds the softmax
 probabilities to the PV product as fp8, so its output sits further from an
 fp32 reference than ``mla_decode_fwd``'s; its LSE matches as closely.
 
@@ -81,7 +81,7 @@ def enabled() -> bool:
 
 def uses_opus_for_batch(batch_size: int) -> bool:
     """Whether a running / captured-graph batch of this size uses the kernel."""
-    return envs.ATOM_OPUS_MLA_MIN_BATCH <= batch_size <= envs.ATOM_OPUS_MLA_MAX_BS
+    return 1 <= batch_size <= envs.ATOM_OPUS_MLA_MAX_BS
 
 
 def _get_decoder():
@@ -89,8 +89,7 @@ def _get_decoder():
     if _decoder is None:
         _decoder = OpusMlaFlatDecode(max_batch=envs.ATOM_OPUS_MLA_MAX_BS)
         logger.info(
-            "opus MLA decode: ready for batches %d to %d",
-            envs.ATOM_OPUS_MLA_MIN_BATCH,
+            "opus MLA decode: ready for batches of up to %d",
             envs.ATOM_OPUS_MLA_MAX_BS,
         )
     return _decoder

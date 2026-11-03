@@ -194,7 +194,7 @@ def _new_decoder(monkeypatch, max_bs: int):
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 6])
-@pytest.mark.parametrize("bs", [11, 32, 128])
+@pytest.mark.parametrize("bs", [1, 4, 11, 32, 128])
 def test_matches_default_decode_and_reference(monkeypatch, bs, q_len):
     _new_decoder(monkeypatch, 128)
     ctxs = _contexts(bs, seed=bs * 10 + q_len)

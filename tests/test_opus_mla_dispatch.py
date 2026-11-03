@@ -38,7 +38,6 @@ class _Decoder:
 @pytest.fixture
 def decoder(monkeypatch):
     monkeypatch.setenv("ATOM_OPUS_MLA", "1")
-    monkeypatch.delenv("ATOM_OPUS_MLA_MIN_BATCH", raising=False)
     monkeypatch.delenv("ATOM_OPUS_MLA_MAX_BS", raising=False)
     monkeypatch.setattr(opus_mla, "OpusMlaFlatDecode", _Decoder)
     monkeypatch.setattr(opus_mla, "_decoder", None)
@@ -91,14 +90,13 @@ def test_defaults(decoder):
     assert opus_mla.enabled()
     assert decoder.max_batch == 128
     assert [b for b in range(140) if opus_mla.uses_opus_for_batch(b)] == list(
-        range(11, 129)
+        range(1, 129)
     )
 
 
-def test_batch_bounds_follow_env(monkeypatch, decoder):
-    monkeypatch.setenv("ATOM_OPUS_MLA_MIN_BATCH", "4")
+def test_max_batch_follows_env(monkeypatch, decoder):
     monkeypatch.setenv("ATOM_OPUS_MLA_MAX_BS", "64")
-    assert [b for b in (3, 4, 64, 65) if opus_mla.uses_opus_for_batch(b)] == [4, 64]
+    assert [b for b in (1, 64, 65) if opus_mla.uses_opus_for_batch(b)] == [1, 64]
 
 
 @pytest.mark.parametrize("q_len", [2, 4, 6, 8, 10])
@@ -210,7 +208,7 @@ def test_builder_gate(decoder):
     uses = AiterMLAMetadataBuilder._uses_opus_mla
     assert uses(_builder(), 32, True)
     assert not uses(_builder(), 32, False)
-    assert not uses(_builder(), 10, True)
+    assert uses(_builder(), 1, True)
     assert not uses(_builder(), 129, True)
     assert not uses(_builder(is_sparse=True), 32, True)
     assert not uses(_builder(tbo_decode=True), 32, True)

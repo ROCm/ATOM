@@ -928,8 +928,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MLA DCP + MTP target decode on aiter's opus flat-row kernel
     # (OpusMlaFlatDecode) instead of mla_decode_fwd. Off by default.
     "ATOM_OPUS_MLA": lambda: _flag_env("ATOM_OPUS_MLA"),
-    # Running batches below it stay on mla_decode_fwd, which is faster there.
-    "ATOM_OPUS_MLA_MIN_BATCH": lambda: _int_env("ATOM_OPUS_MLA_MIN_BATCH", 11),
     # Largest running batch that uses it (sizes its plan buffers); larger
     # batches stay on mla_decode_fwd.
     "ATOM_OPUS_MLA_MAX_BS": lambda: _int_env("ATOM_OPUS_MLA_MAX_BS", 128),
