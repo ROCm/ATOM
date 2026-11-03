@@ -33,10 +33,23 @@ class FakeCudaEvent:
         return True
 
 
+class FakeStream:
+    """The forward thread's stream: idle unless a test makes it busy."""
+
+    def __init__(self) -> None:
+        self.idle = True
+
+    def query(self) -> bool:
+        return self.idle
+
+
 @pytest.fixture(autouse=True)
 def cpu_step_events(monkeypatch):
     """Producer events on CPU torch, which has no interprocess events."""
-    cuda = SimpleNamespace(Event=FakeCudaEvent, current_stream=lambda: None)
+    stream = FakeStream()
+    cuda = SimpleNamespace(
+        Event=FakeCudaEvent, current_stream=lambda: stream, stream=stream
+    )
     for module in (mp_worker, transfer_thread):
         monkeypatch.setattr(module, "torch", SimpleNamespace(cuda=cuda))
 

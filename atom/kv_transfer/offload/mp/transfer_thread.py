@@ -22,9 +22,10 @@ pending transfers: whenever its queue runs dry, when the forward thread wakes it
 (`look`), and every `_IDLE_POLL_S` otherwise. A conc16 step probe of the plugin
 priced the forward thread's share at 18.7 ms per submit and 13.8 ms per
 terminal poll (the IPC handle import) under its own launch pressure. A future a
-poll finished is handed back (`hand_back`) and dropped on the forward thread
-once nothing else holds it (`take_returned`): LMCache keeps each future until
-its next submission, on this thread. Native ATOM polls on its forward thread.
+poll finished holds the server's imported IPC event, so it is handed back
+(`hand_back`) for the forward thread to drop once nothing else holds it
+(`take_returned`): LMCache keeps each future until its next submission, on
+this thread. Native ATOM polls on its forward thread.
 """
 
 from __future__ import annotations
@@ -163,8 +164,13 @@ class _TransferThread:
             with self._spent_lock:
                 self._returned.append(future)
 
-    def take_returned(self) -> list[Any]:
-        """Handed-back futures nothing else holds any more.
+    @property
+    def returned(self) -> int:
+        """Handed-back futures not yet taken."""
+        return len(self._returned)
+
+    def take_returned(self, limit: int | None = None) -> list[Any]:
+        """Up to ``limit`` handed-back futures nothing else holds any more.
 
         One LMCache still holds waits for its next submission rather than
         leave the drop to that submission, on this thread.
@@ -172,6 +178,8 @@ class _TransferThread:
         unshared = []
         with self._spent_lock:
             for _ in range(len(self._returned)):
+                if limit is not None and len(unshared) >= limit:
+                    break
                 future = self._returned.popleft()
                 if sys.getrefcount(future) <= _SOLE_OWNER_REFCOUNT:
                     unshared.append(future)

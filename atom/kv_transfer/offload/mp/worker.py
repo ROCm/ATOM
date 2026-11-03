@@ -78,6 +78,13 @@ _TRANSFER_DRAIN_TIMEOUT_S = 60.0
 # forward and misses it keeps its request in WAITING_FOR_REMOTE_KVS a step
 # longer. Without it, the plugin's c16 TTFT p50 rose from 302 to 324 ms.
 _LAST_LOOK_WAIT_S = 0.001
+# A handed-back future holds the server's imported IPC event, and on ROCm 7.2.x
+# destroying one synchronises every stream of the device, so the forward
+# thread drops them while its stream is idle: dropped mid-forward, the
+# plugin's c16 ITL p50 rose from 23.0 to 23.8 ms. A stream that is never idle
+# (async scheduling) drops a batch per call once this many are held.
+_RETURNED_FUTURES_CAP = 8192
+_RETURNED_FUTURES_BATCH = 64
 
 
 def _req_id_of(completion: Any) -> str:
@@ -513,14 +520,18 @@ class LMCacheMPConnector(KVConnectorBase):
         """Forward-thread housekeeping for the submission thread.
 
         Drops the events finished submissions referenced (an interprocess
-        event must not be destroyed on that thread) and surfaces a
-        submission that raised.
+        event must not be destroyed on that thread) and the futures its polls
+        finished, and surfaces a submission that raised.
         """
         transfer = self._transfer
         if transfer is None:
             return
         transfer.take_spent()
-        transfer.take_returned()
+        if transfer.returned:
+            if torch.cuda.current_stream().query():
+                transfer.take_returned()
+            elif transfer.returned > _RETURNED_FUTURES_CAP:
+                transfer.take_returned(_RETURNED_FUTURES_BATCH)
         transfer.raise_error()
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:

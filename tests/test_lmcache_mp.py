@@ -2540,6 +2540,28 @@ def test_off_step_transfers_tell_a_capable_adapter_its_fence_is_recorded(
     assert adapter.kwargs == [{"producer_event_recorded": True}]
 
 
+def test_handed_back_futures_are_dropped_while_the_stream_is_idle(
+    fake_lmcache_modules, monkeypatch
+):
+    """Each holds the server's imported IPC event, whose destruction
+    synchronises the device: never mid-forward, unless too many are held."""
+    monkeypatch.setattr(mp_worker, "_RETURNED_FUTURES_CAP", 2)
+    monkeypatch.setattr(mp_worker, "_RETURNED_FUTURES_BATCH", 1)
+    worker = _worker(_WorkerAdapter())
+    stream = mp_worker.torch.cuda.stream
+    stream.idle = False
+    for _ in range(2):
+        worker._transfer.hand_back(object())
+    worker._settle_transfer_thread()
+    assert worker._transfer.returned == 2
+    worker._transfer.hand_back(object())
+    worker._settle_transfer_thread()
+    assert worker._transfer.returned == 2
+    stream.idle = True
+    worker._settle_transfer_thread()
+    assert worker._transfer.returned == 0
+
+
 def test_the_fence_covers_queued_transfers_and_fails_stop(fake_lmcache_modules):
     """A queued save reaches the server after the fence; it must hold it.
 
