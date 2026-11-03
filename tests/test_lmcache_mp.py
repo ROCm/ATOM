@@ -1057,36 +1057,6 @@ def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
     return worker
 
 
-def test_completed_device_event_survives_adapter_future_pruning():
-    import gc
-
-    from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
-
-    destroyed = []
-
-    class Event:
-        def __del__(self):
-            destroyed.append(True)
-
-    adapter = _WorkerAdapter()
-    worker = _worker(adapter)
-    worker._event_reclaimer = IPCEventReclaimer()
-    future = _WorkerFuture()
-    future.ready = True
-    future.event_ = Event()
-    worker._pending_loads["load:test"] = transfer._PendingLoad(
-        completion="test", future=future
-    )
-    assert worker.get_finished().finished_loading == {"test"}
-    # LMCache may retain a finished future until the next submission; its
-    # destruction there must enqueue the IPC event, not synchronize the GPU.
-    del future
-    gc.collect()
-    assert destroyed == []
-    worker._event_reclaimer.release()
-    assert destroyed == [True]
-
-
 def test_close_unregisters_the_worker_once(monkeypatch):
     """`ModelRunner.exit` closes the connector before the KV pool is freed.
 
@@ -1288,11 +1258,9 @@ def test_worker_unhealthy_preserves_pending_until_device_futures_are_terminal(
     assert worker._pending_saves == {}
 
 
-@pytest.mark.parametrize("ipc_reclamation", [False, True])
 def test_worker_pre_submit_drops_are_immediately_terminal(
     fake_lmcache_modules,
     monkeypatch,
-    ipc_reclamation,
 ):
     adapter = _WorkerAdapter()
     monkeypatch.setattr(
@@ -1307,11 +1275,6 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     )
     worker = _worker(adapter)
     ready_event = object()
-    if ipc_reclamation:
-        from atom.kv_transfer.offload.mp.event_reclaimer import IPCEventReclaimer
-
-        worker._event_reclaimer = IPCEventReclaimer()
-        ready_event = worker._event_reclaimer.acquire_ready_event(object)
     load_operation = LoadOperationId(req_id=14, generation=1)
     save_operation = SaveOperationId(req_id=15, generation=1)
     worker._submit_load(
@@ -1341,10 +1304,6 @@ def test_worker_pre_submit_drops_are_immediately_terminal(
     assert output.finished_saving == {save_operation}
     assert worker._pending_loads == {}
     assert worker._pending_saves == {}
-    if ipc_reclamation:
-        # Both transfers are terminal: the next batch retires the event.
-        worker._event_reclaimer.acquire_ready_event(object)
-        assert ready_event in worker._event_reclaimer._retired
 
 
 def _unprovable_request(kind: str) -> LMCacheReqMeta:

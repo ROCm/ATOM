@@ -86,7 +86,6 @@ class _NativePending:
     descriptor_slot: int | None = None
     immediate_success: bool = False
     started_at: float = field(default_factory=lambda: time.monotonic())
-    completion_event_retained: bool = False
 
 
 class NativeStateLMCacheMPConnector(LMCacheMPConnector):
@@ -295,10 +294,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             # transfer deadline.
             entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
-            if self._event_reclaimer is not None:
-                # An exception after transport accepts the operation cannot
-                # make this producer fence available to the next batch.
-                self._event_reclaimer.track_ready_event(event, entry.future)
         submit = (
             self._adapter.submit_retrieve_request
             if loading
@@ -324,8 +319,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
             return
         with self._lock:
-            if self._event_reclaimer is not None:
-                self._event_reclaimer.track_ready_event(event, future)
             entry.future = future
 
     def _submit_load(self, req: LMCacheReqMeta, event: Any) -> None:
@@ -428,7 +421,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 operation_id, pending.started_at, self._transfer_deadline_s
             )
             return
-        self._retain_native_completion_event(pending)
         save_spec = pending.request.save_spec
         start = 0 if save_spec is None else int(save_spec.skip_leading_tokens)
         end = len(pending.request.token_ids)
@@ -483,7 +475,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                     operation_id, pending.started_at, self._transfer_deadline_s
                 )
                 return False
-            self._retain_native_completion_event(pending)
             if result is not True:
                 return True
             if pending.request.native_state.kv_only:
@@ -512,14 +503,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 operation_id, pending.started_at, self._transfer_deadline_s
             )
         return restored
-
-    def _retain_native_completion_event(self, pending: _NativePending) -> None:
-        # Descriptor-slot backpressure can revisit a terminal retrieve many
-        # times. Register one cleanup before a failed restore can replace the
-        # transport future with an unprovable-restore sentinel.
-        if not pending.completion_event_retained:
-            self._retain_completion_event(pending.future)
-            pending.completion_event_retained = True
 
     @staticmethod
     def _hold_unprovable_restore(pending: _NativePending) -> None:
