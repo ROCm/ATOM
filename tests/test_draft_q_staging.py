@@ -128,6 +128,52 @@ def test_only_a_step_that_verifies_looks_q_up_or_counts():
     assert (st.slots.verifies, st.slots.live_expiries) == (1, 0)
 
 
+def test_an_all_greedy_verify_looks_nothing_up_and_publishes_the_same_rows():
+    """The runner passes ``verifies`` False for an all-greedy batch, whose
+    exact-match verify reads no q. Its members never claimed, so a lookup
+    would only have found -1 for each and counted nothing."""
+    st, a = staging()
+    stage(st, batch(["s", "g", "h"], [1.0, 0.0, 0.0]))
+    greedy = batch(["g", "h"], [0.0, 0.0])
+    a.verify_q_row_base[:] = 7
+    stage(st, greedy)
+    looked_up = a.verify_q_row_base.copy()
+    assert looked_up[:2].tolist() == [-1, -1]
+    assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
+
+    def no_lookup(*args):
+        raise AssertionError("an all-greedy verify looked q up")
+
+    st.slots.verify_bases = no_lookup
+    a.verify_q_row_base[:] = 7
+    rows = stage(st, greedy, verifies=False)
+    np.testing.assert_array_equal(a.verify_q_row_base, looked_up)
+    assert rows["verify_q_row_base"] == 2
+    assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
+
+
+def test_a_mid_prompt_member_expired_by_its_own_batch_loses_nothing():
+    """A skipped member keeps its map entry through the claims, so a new
+    request in the same batch may expire it. Its drafts are dropped until its
+    final chunk, which claims again before its first verify reads."""
+    st, a = staging(slots=2)
+    stage(st, batch(["m"]))
+    stage(st, batch(["b"]))
+    stage(
+        st,
+        batch(["m", "c"], final_chunk=[False, True]),
+        verifies=False,
+    )
+    assert "m" not in st.slots and st.slots.evictions == 1
+    assert a.q_row_base[0] == -1
+    stage(st, batch(["m"], final_chunk=[True]), verifies=False)
+    claimed = a.q_row_base[0]
+    assert claimed >= 0
+    stage(st, batch(["m"]))
+    assert a.verify_q_row_base[0] == claimed
+    assert (st.slots.verifies, st.slots.live_expiries) == (1, 0)
+
+
 def test_a_greedy_request_claims_no_slot_and_writes_no_q():
     """Its verify is exact match and never reads q; a sampled request beside
     it, filtered or not, still gets the rows its q is read from."""

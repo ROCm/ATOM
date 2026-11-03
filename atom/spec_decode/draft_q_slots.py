@@ -38,11 +38,11 @@ class DraftQSlots:
     sentinel. ``verifies`` counts the lookups that found their rows, so
     ``live_expiries / (verifies + live_expiries)`` is the fraction of lookups
     that lost their q. Only lookups a verify reads count: `DraftQStaging`
-    asks for none on a step that verifies nothing (prefill, align-only), so a
-    preempted request re-prefilled in chunks adds nothing until its first
-    verify, which reads the slot its final chunk claimed. Expired ids are
-    remembered for the last ``_EXPIRED_MEMORY * num_slots`` expiries only; a
-    request that waits out more than that is missed, so under extreme churn
+    asks for none on a step whose verify reads no q (prefill, align-only, all
+    greedy), so a preempted request re-prefilled in chunks adds nothing until
+    its first verify, which reads the slot its final chunk claimed. Expired ids
+    are remembered for the last ``_EXPIRED_MEMORY * num_slots`` expiries only;
+    a request that waits out more than that is missed, so under extreme churn
     the count is a lower bound.
 
     ``log``: whether this instance reports the counters. Every TP rank keeps
@@ -81,9 +81,11 @@ class DraftQSlots:
     def verify_bases(self, req_ids, out) -> None:
         """Write each request's first q row into ``out``, or -1 if it has none.
 
-        Only for a step whose verify reads them: every call is counted. Must
-        run before `claim_bases` for the same batch, which may hand the slot
-        of a request outside the batch to a new one. Both run on the host
+        Only for a step whose verify reads them. A found row counts in
+        ``verifies``, a miss only if the id expired, so a request that never
+        claimed (a greedy one) counts nowhere. Must run before `claim_bases`
+        for the same batch, which may hand the slot of a request outside the
+        batch to a new one. Both run on the host
         before the forward; the verify's read is ordered before the propose
         that rewrites a slot because both run on the one compute stream.
         """
@@ -120,12 +122,15 @@ class DraftQSlots:
         never read; they claim nothing and get -1.
 
         A request that already owns a slot keeps it and becomes the most
-        recently drafted. The batch's own entries are taken out of the map
-        before anything is claimed, so a new request can only expire a request
-        outside this batch: every member keeps its slot, and the slots handed
-        out are distinct. That always leaves enough to claim from, since the
-        free list plus the entries left in the map hold ``num_slots`` minus the
-        members' own slots, and ``num_slots`` is at least the batch size.
+        recently drafted. The claiming members' entries are taken out of the
+        map before anything is claimed, so a new request cannot expire one of
+        them, and the slots handed out are distinct. A skipped member is not
+        taken out and may be expired: harmless, since a greedy member owns no
+        slot and a mid-chunk member's slot holds no q a verify reads (its
+        final chunk claims again before its first verify). There is always
+        enough to claim from, since the free list plus the entries left in the
+        map hold ``num_slots`` minus the claiming members' own slots, and
+        ``num_slots`` is at least the batch size.
         """
         rows = self.rows_per_slot
         slots = self._slot_of

@@ -5,6 +5,7 @@ import weakref
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -222,6 +223,47 @@ def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
     else:
         assert type(top_ks) is int and top_ks == ks[0]
         assert group.counts[group.indices["top_ks"]] is None
+
+
+@pytest.mark.parametrize("temps, verifies", [([0.0, 0.0], False), ([0.0, 0.7], True)])
+def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, verifies):
+    """`postprocess` asks for the ratio verify's q only when the batch is not
+    all greedy; staging looks q up under the same gate."""
+    bs = len(temps)
+    buffers = {
+        name: SimpleNamespace(np=np.zeros(4, dtype), gpu=torch.zeros(4))
+        for name, dtype in (
+            ("temperatures", np.float32),
+            ("top_ks", np.int32),
+            ("top_ps", np.float32),
+        )
+    }
+    names = [*buffers, "required_channel_states"]
+    group = SimpleNamespace(
+        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
+    )
+    staged = mock.Mock()
+    runner = SimpleNamespace(
+        forward_vars=buffers,
+        sampler=SimpleNamespace(keep_top_k_ties=False),
+        drafter=SimpleNamespace(stage_draft_sampling_host=staged),
+        _verifies_drafts=lambda batch, is_prefill: not is_prefill,
+        _is_pure_middle_chunk=lambda batch: False,
+    )
+    batch = SimpleNamespace(
+        total_seqs_num=bs,
+        temperatures=np.array(temps, np.float32),
+        top_ks=np.full(bs, -1, np.int32),
+        top_ps=np.ones(bs, np.float32),
+        required_channel=None,
+        is_dummy_run=False,
+        total_tokens_num_prefill=0,
+    )
+    *_, all_greedy, _ = runner_module.ModelRunner.prepare_sample(
+        runner, batch, publication_group=group
+    )
+    assert all_greedy == (not verifies)
+    assert staged.call_args.kwargs["verifies"] is verifies
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 64])

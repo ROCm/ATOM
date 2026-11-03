@@ -121,6 +121,18 @@ def test_skipped_requests_claim_nothing():
     assert "g" not in slots and len(slots) == 2
 
 
+def test_a_skipped_member_may_be_expired_and_then_reads_only_the_sentinel():
+    """Only claiming members leave the map before the claims, so a new request
+    can expire a skipped one; that member then reads -1, never another's q."""
+    slots = DraftQSlots(2, T)
+    (m,) = bases(slots, ["m"], claim=True)
+    bases(slots, ["b"], claim=True)
+    out = [None] * 2
+    slots.claim_bases(["m", "c"], out, [True, False])
+    assert out == [-1, m] and "m" not in slots and slots.evictions == 1
+    assert bases(slots, ["m"], claim=False) == [-1]
+
+
 def test_only_an_expired_request_that_comes_back_counts_as_a_live_expiry():
     """A finished request's slot being reused is free; one still running that
     finds the sentinel lost a step. New ids missing a slot cost nothing."""

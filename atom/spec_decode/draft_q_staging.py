@@ -63,10 +63,10 @@ class DraftQStaging:
         those claim no slot and write no q, so their ids (warmup's 0..n-1, the
         DP dummy's -1) never enter the slot map.
 
-        ``verifies``: this forward's verify scores drafts and so may read q
-        (`ModelRunner._verifies_drafts`), the only gate on the lookup. False
-        for a prefill, align-only or dummy forward: no lookup is made, so none
-        is counted.
+        ``verifies``: this forward's verify reads q: it scores drafts
+        (`ModelRunner._verifies_drafts`) and the batch is not all greedy. The
+        only gate on the lookup. False for a prefill, align-only, dummy or
+        all-greedy forward: no lookup is made, so none is counted.
 
         ``step``: the forward this staging is for (`ModelRunner.forward_step`),
         which `consume` checks.
