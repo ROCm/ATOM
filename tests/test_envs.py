@@ -45,6 +45,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_USE_ASM_FP8_PREFILL_ATTN",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -154,6 +155,9 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
+
+    def test_use_asm_fp8_prefill_attn_default(self):
+        assert _get_envs().ATOM_USE_ASM_FP8_PREFILL_ATTN is True
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -327,9 +331,15 @@ def test_parallel_config_applies_explicit_dp_endpoint_env(monkeypatch):
     assert config.data_parallel_base_port == 29800
 
 
-def test_mla_fp8_prefill_flag(monkeypatch):
-    name = "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN"
-    assert getattr(_get_envs(), name) is False
+@pytest.mark.parametrize(
+    "name, default",
+    [
+        ("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", False),
+        ("ATOM_USE_ASM_FP8_PREFILL_ATTN", True),
+    ],
+)
+def test_mla_fp8_prefill_flag(monkeypatch, name, default):
+    assert getattr(_get_envs(), name) is default
     for value, expected in [("0", False), ("1", True), ("true", False)]:
         monkeypatch.setenv(name, value)
         assert getattr(_get_envs(), name) is expected

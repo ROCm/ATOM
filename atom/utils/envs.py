@@ -413,6 +413,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
+    # gfx1250 ASM FP8 MLA prefill attention (D192x128) with the same fused QKV
+    # quantization; takes precedence over FlyDSL. Other devices and head dims
+    # keep their usual prefill attention. Added 2026-11-03.
+    "ATOM_USE_ASM_FP8_PREFILL_ATTN": lambda: (
+        os.getenv("ATOM_USE_ASM_FP8_PREFILL_ATTN", "1") == "1"
+    ),
     # FlyDSL FP8 prefill with fused QKV quantization and direct FP8 gather output
     # where supported. Unsupported attention inputs raise. Added 2026-09-10.
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN": lambda: (
