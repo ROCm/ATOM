@@ -147,6 +147,10 @@ class GDNAttentionMetadata:
     ssm_chunk_offsets: torch.Tensor | None = None
     # Conv tokens a checkpoint holds, `conv_kernel - 1`; see `_conv_state_len`.
     ssm_conv_state_len: int = 0
+    # Keep the chunk kernel's per-chunk states for a caller that places its own
+    # checkpoints after the forward (the SGLang plugin's mamba radix cache),
+    # read back with `pop_last_intermediate_states`. `ssm_checkpoints` implies it.
+    keep_intermediate_states: bool = False
     # Qwen4Exp-only optional AITER schedule, built once outside the layer loop.
     flydsl_prefill_metadata: object | None = None
     # --- ReplaySSM ---------------------------------------------------------
