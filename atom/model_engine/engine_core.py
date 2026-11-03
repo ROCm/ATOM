@@ -67,6 +67,10 @@ class EngineCore:
     # attribute because it is per-process state and each engine is spawned into
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
+    # pause_generation .. resume_generation: nothing is scheduled, so a weight
+    # update in between lands on an engine that is not decoding. A class
+    # default, so that an engine built without __init__ reads it too.
+    _generation_paused = False
 
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
@@ -413,12 +417,17 @@ class EngineCore:
                 engine.exit()
 
     def _is_idle_rl_weights_offloaded(self) -> bool:
-        """Check if weights are offloaded for RL training.
+        """Check if weights are offloaded for RL training, a weight sync is
+        fenced, or generation is paused.
 
         When offloaded, busy-wait with a short delay to avoid CPU spin.
         Returns True if the caller should skip model execution this tick.
         """
-        if self._is_rl_weights_offloaded or self._weight_sync_fenced:
+        if (
+            self._is_rl_weights_offloaded
+            or self._weight_sync_fenced
+            or self._generation_paused
+        ):
             time.sleep(0.01)
             return True
         return False
@@ -952,16 +961,15 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = not self.scheduler.is_finished() and not (
-                    self._is_rl_weights_offloaded or self._weight_sync_fenced
+                held = (
+                    self._is_rl_weights_offloaded
+                    or self._weight_sync_fenced
+                    or self._generation_paused
                 )
+                local_unfinished = not self.scheduler.is_finished() and not held
 
                 global_has_unfinished, global_shutdown, global_offloaded = (
-                    self._sync_dp_state(
-                        local_unfinished,
-                        shutdown,
-                        self._is_rl_weights_offloaded or self._weight_sync_fenced,
-                    )
+                    self._sync_dp_state(local_unfinished, shutdown, held)
                 )
 
                 if global_shutdown and not global_has_unfinished:

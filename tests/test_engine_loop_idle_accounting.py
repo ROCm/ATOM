@@ -98,6 +98,7 @@ class _Engine:
         self.engines_running = True
         self._is_rl_weights_offloaded = False
         self._weight_sync_fenced = False
+        self._generation_paused = False
         self.forwards = 0
         self.dummies = 0
 

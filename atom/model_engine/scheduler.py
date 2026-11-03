@@ -3946,6 +3946,39 @@ class Scheduler:
             self.running.insert(index, candidate)
         return False
 
+    def preempt_running(self) -> int:
+        """Preempt every running sequence; return how many.
+
+        For a weight update mid-generation: the update clears the KV cache, so
+        each sequence recomputes its prompt and the tokens it has so far once
+        scheduling resumes, and goes on from there on the new weights. Raises,
+        preempting none, if a KV connector holds one's blocks, or under
+        pipeline parallelism if one's token is still in flight through the
+        stages: left running it would decode on the cleared cache, and
+        preempted its token would land on a sequence no longer running.
+        """
+        in_pipeline = self._pp_inflight_token_block
+        held = [
+            seq.id
+            for seq in self.running
+            if not self._is_preemptable(seq) or seq.id in in_pipeline
+        ]
+        if held:
+            raise RuntimeError(
+                f"cannot preempt {len(held)} running sequence(s) whose KV a "
+                f"connector holds or whose token is in the pipeline: {held[:8]}"
+            )
+        preempted = 0
+        # preempt() puts each one at the head of the waiting queue, so taking
+        # them from the back keeps their order.
+        while self.running:
+            seq = self.running.pop()
+            if not self.preempt(seq):
+                self.running.append(seq)
+                raise RuntimeError(f"sequence {seq.id} could not be preempted")
+            preempted += 1
+        return preempted
+
     def preempt(self, seq: Sequence) -> bool:
         if not self._is_preemptable(seq):
             return False
