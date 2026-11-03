@@ -7,8 +7,8 @@ ARG GPU_ARCH="gfx942;gfx950"
 ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 # ROCm 10 flavor: pass --build-arg BASE_IMAGE=rocm10-base to build the whole
 # image on the pip-installed ROCm 10 SDK below instead of the rocm/pytorch
-# apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking
-# line only changes build-args (see ROCM_INDEX_URL / ROCM_SDK_VERSION).
+# apt image. All ROCm 10 component versions are ARGs so a later ROCm 10
+# release only changes build-args (see ROCM_INDEX_URL / ROCM_SDK_VERSION).
 ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 
 # ====================================================================
@@ -32,15 +32,13 @@ ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
 # wheels, installed into site-packages rather than /opt/rocm). Ported from
 # sglang's docker/rocm.Dockerfile rocm1000-base stage.
 #
-# Version policy (ticket: ATOM v0.1.7 for ROCm 10.1, GA 2026-10-05):
-#   - Main line: stable channel 10.0.0 (the combination sglang validated).
-#   - 10.1 tracking line: nightly channel with 10.1.0a<date> versions
-#     (rc.repo.amd.com has no 10.1 artifacts yet). NOT a release artifact;
-#     it exists to surface 10.1 breaks early. Once 10.1 RC/GA lands on the
-#     stable channel, flip these ARGs and re-run the golden test.
+# Version policy: stable channel 10.1.0, the first ROCm 10 release whose HIP
+# runtime is 7.16 (10.0.0 ships HIP 7.15). The channel builds torch for 10.1.0
+# only at 2.12 and later; 2.13.0 matches the gfx1250 bring-up image. torchaudio
+# stops at 2.11.0.x there, and its abi3 libraries do not pin a torch version.
 #
 # Python 3.12 (Ubuntu 24.04 default): the wheel channel publishes cp312 for
-# the whole stack; torch 2.11+rocm10.0.0 is the version sglang validated.
+# the whole stack.
 # --------------------------------------------------------------------
 FROM ${BASE_IMAGE_ROCM10} AS rocm10-base
 
@@ -50,17 +48,17 @@ ARG GPU_ARCH
 
 # ROCM_TRITON_VERSION rather than TRITON_VERSION to leave room for a
 # stage-local TRITON_VERSION without a --build-arg landing on both.
-ARG ROCM_SDK_VERSION="10.0.0"
-ARG ROCM_TORCH_VERSION="2.11.0"
-ARG ROCM_TORCHVISION_VERSION="0.26.0"
-ARG ROCM_TORCHAUDIO_VERSION="2.11.0"
-ARG ROCM_TRITON_VERSION="3.8.0+git4cff872c"
+ARG ROCM_SDK_VERSION="10.1.0"
+ARG ROCM_TORCH_VERSION="2.13.0"
+ARG ROCM_TORCHVISION_VERSION="0.28.0"
+ARG ROCM_TORCHAUDIO_VERSION="2.11.0.3"
+ARG ROCM_TRITON_VERSION="3.8.0+git669b31ac"
 ARG ROCM_INDEX_URL="https://stable.repo.amd.com/rocm/whl-next/"
 # ENV (not just ARG) so downstream stages (base, atom_image, ...) can pass it
 # as --extra-index-url when resolving packages whose only home is the AMD
 # channel (e.g. torch's Requires-Dist: triton==<local rocm version>).
 ENV ROCM_INDEX_URL=${ROCM_INDEX_URL}
-# Every ROCm component above is an ARG, so a future ROCm line (10.1 and on)
+# Every ROCm component above is an ARG, so a future ROCm line (10.2 and on)
 # is a set of --build-arg values -- a base version, an index URL -- and not a
 # new stage. The nightly channel prunes old date-stamped builds, so such a
 # line has to resolve its versions at build time rather than pin them.
@@ -163,15 +161,15 @@ RUN ln -s ${ROCM_HOME} /opt/rocm
 
 # amdsmi: the pip SDK (unlike the rocm/pytorch apt images) does not preinstall
 # the AMD SMI python package; ATOM's numa_utils imports it. The SDK's
-# share/amd_smi dir carries a pip-installable package on the stable channel,
-# but the 10.1 nightly SDK dropped it (no setup.py/pyproject.toml), and the
-# PyPI amdsmi wheel (7.0.2) is ABI-incompatible with the 10.1 nightly SDK's
+# share/amd_smi dir carried a pip-installable package up to 10.0.0, but the
+# 10.1 SDKs (nightly and 10.1.0 stable) dropped it (no setup.py/pyproject.toml),
+# and the PyPI amdsmi wheel (7.0.2) is ABI-incompatible with the 10.1 SDK's
 # libamd_smi.so (undefined symbol amdsmi_set_gpu_clk_range). amdsmi only backs
 # numa_utils' NUMA topology detection — an optional path — so a failed import
-# is a warning, never a build failure. The stable line still installs and
+# is a warning, never a build failure. The ROCm 7 line still installs and
 # imports it cleanly.
 # Do NOT fall back to the PyPI amdsmi wheel when the SDK package is absent:
-# PyPI amdsmi 7.0.2 is ABI-incompatible with the 10.1 nightly SDK's
+# PyPI amdsmi 7.0.2 is ABI-incompatible with the 10.1 SDK's
 # libamd_smi.so (undefined symbol amdsmi_set_gpu_clk_range), and once
 # installed it poisons every import that touches amdsmi — including torch's
 # own import chain (the base tripwire died on it). Absent SDK package = no
@@ -184,7 +182,7 @@ RUN if [ -f /opt/rocm/share/amd_smi/setup.py ] || [ -f /opt/rocm/share/amd_smi/p
     if python3 -c "import amdsmi" 2>/dev/null; then \
         echo "amdsmi ok"; \
     else \
-        echo "amdsmi absent on this SDK (expected on 10.1 nightly)"; \
+        echo "amdsmi absent on this SDK (expected on 10.1)"; \
     fi
 
 # Keep pip from resolving the ROCm torch stack away to PyPI CUDA builds in any
@@ -350,13 +348,16 @@ FROM base AS build_rccl
 ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
 ARG RCCL_BRANCH="29e1567b95e28823b0beb1a988adc587bfab5b4f"
 # BUILD_RCCL=0 skips the source build and keeps whatever RCCL the base image
-# already provides. Required on the ROCm 10.1 nightly line for two reasons:
+# already provides. Required on the ROCm 10.1 line (docker-release.yaml
+# passes it) for three reasons:
 #   1. the ROCm SDK wheels already ship a matching librccl (2.30.7, built
 #      against the same ROCm, with gfx942 + gfx950), so rebuilding is redundant;
 #   2. ROCm/rccl no longer builds at all -- RCCL development moved into the
 #      ROCm/rocm-systems monorepo (projects/rccl), and the standalone
 #      ROCm/rccl mirror is missing commits, so its develop tip references
-#      ncclComm::forcePatEnable and rcclUseAinic without declaring them.
+#      ncclComm::forcePatEnable and rcclUseAinic without declaring them;
+#   3. even the pinned RCCL_BRANCH fails to configure on the 10.1 SDK, which
+#      ships no rocm_smi headers (CMakeLists.txt reads rocm_smi/rocm_smi.h).
 # The default stays 1 so every existing line keeps building RCCL from source.
 ARG BUILD_RCCL=1
 
@@ -398,7 +399,7 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
 
-# torch 2.11 (the ROCm 10 stack) Dynamo may pass a base torch.Stream where
+# torch 2.11+ (the ROCm 10 stack) Dynamo may pass a base torch.Stream where
 # older torch passed torch.cuda.Stream; AITER's ctypes bridge then reads
 # .cuda_stream off a stream that does not carry it. Backport the torch.Stream
 # branch from ROCm/aiter#4817 until AITER_COMMIT contains it upstream.
@@ -678,7 +679,7 @@ ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45e
 # backend predicate is overridden only in the validation process below.
 # Two install paths, because the published wheel targets one ABI: its filename
 # pins rocm7.2.4 / torch 2.10, which is what the apt base image ships but not
-# the pip SDK's (torch 2.11 on ROCm 10.0, 2.13 on the 10.1 nightly), and the
+# the pip SDK's (torch 2.13 on ROCm 10.1), and the
 # validation below asserts that exact version string. LMCache publishes no
 # ROCm 10 wheel today -- every rocm asset on their releases, up to v0.5.5rc7,
 # is built for ROCm 7.2 -- so the ROCm 10 line keeps building the HIP c_ops
@@ -820,7 +821,7 @@ print('final stack: torch', torch.__version__, '| triton', version('triton'), \
         # (rocminfo) and there is no GPU during a docker build, so the import
         # dies on CalledProcessError — an environment limit, not a stack
         # problem. aiter imports fine at runtime (the golden test covers it).
-        # amdsmi is likewise optional: on the 10.1 nightly SDK neither the
+        # amdsmi is likewise optional: on the 10.1 SDK neither the
         # SDK's share/amd_smi nor the ABI-incompatible PyPI wheel can import
         # (see the rocm10-base amdsmi step); numa_utils degrades gracefully.
         python -c "import mori, atom; \

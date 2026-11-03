@@ -13,6 +13,7 @@ AITER build, and `loader.py` imports AITER at module level.
 import concurrent.futures
 import contextlib
 import ctypes
+import functools
 import json
 import logging
 import os
@@ -89,11 +90,31 @@ def verify_shard_files_present(model_name_or_path: str) -> None:
     )
 
 
+@functools.cache
+def _omp_runtime() -> ctypes.CDLL | None:
+    """The OpenMP runtime torch already loaded. The ROCm 7.2 wheels make it
+    global (``libtorch_global_deps`` links libgomp and is loaded RTLD_GLOBAL);
+    the ROCm pip SDK wheels load it only as ``libtorch_cpu``'s dependency, so
+    the global namespace has no ``omp_*`` and the library must be named.
+    RTLD_NOLOAD returns a library only if it is already loaded, so this never
+    brings up a second runtime that torch's threads would not see."""
+    for name in (None, "libgomp.so.1", "libomp.so", "libiomp5.so"):
+        try:
+            lib = ctypes.CDLL(name, mode=os.RTLD_NOLOAD if name else 0)
+        except OSError:
+            continue
+        if hasattr(lib, "omp_set_num_threads"):
+            return lib
+    return None
+
+
 def _one_omp_thread() -> None:
     """A loader thread's own OpenMP team: one thread (``omp_set_num_threads``
-    sets the calling thread's count only; torch's OpenMP runtime is loaded,
-    so the process resolves it)."""
-    ctypes.CDLL(None).omp_set_num_threads(1)
+    sets the calling thread's count only). No-op when no OpenMP runtime is
+    loaded: there is no team to cap."""
+    lib = _omp_runtime()
+    if lib is not None:
+        lib.omp_set_num_threads(1)
 
 
 def load_weights_into_model(

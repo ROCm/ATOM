@@ -10,7 +10,7 @@ on:
         type: boolean
         default: true
       build_rocm10:
-        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.0 + :nightly_<ts>-rocm10.0, and the plugin image sglang-latest-rocm10.0 (scheduled nightly runs always build every live line; default enabled)"
+        description: "Build the ROCm 10 line -> rocm/atom-dev:latest-rocm10.1 + :nightly_<ts>-rocm10.1, and the plugin image sglang-latest-rocm10.1 (scheduled nightly runs always build every live line; default enabled)"
         type: boolean
         default: true
       base_image_override:
@@ -89,7 +89,7 @@ on:
 # `latest` follows, and the line that used to be stable simply stops being built.
 env:
   LINE_STABLE: rocm7
-  LINE_NEXT: rocm10.0
+  LINE_NEXT: rocm10.1
 
 jobs:
   # Which lines this run builds. A separate job because `strategy.matrix` is
@@ -231,11 +231,14 @@ jobs:
             rocm7)
               BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
               ;;
-            rocm10.0)
+            rocm10.1)
               # rocm10-base is a stage inside atom_release.dockerfile, not an
               # image to pull: the ROCm 10 stack is assembled from the AMD
               # stable wheel channel on plain ubuntu:24.04.
               BASE_IMAGE="rocm10-base"
+              # The 10.1 SDK has no rocm_smi headers, which the RCCL source
+              # build requires; it ships its own librccl instead.
+              EXTRA_BUILD_ARGS="--build-arg BUILD_RCCL=0"
               ;;
             */*|*:*)
               # A literal image reference, for a one-off build on something
@@ -658,7 +661,7 @@ jobs:
         timeout-minutes: 180
         run: |
           # Built from this line's native image. The push step appends
-          # TAG_SUFFIX, so the ROCm 10 image is sglang-latest-rocm10.0 and
+          # TAG_SUFFIX, so the ROCm 10 image is sglang-latest-rocm10.1 and
           # does not replace sglang-latest.
           SGLANG_BASE_IMAGE="${CI_IMAGE}"
           echo "Using SGLang+ATOM base image: ${SGLANG_BASE_IMAGE}"
