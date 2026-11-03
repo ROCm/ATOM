@@ -2307,13 +2307,15 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 
     # Chunk index tables for the GDN prefill kernels (`prepare_chunk_indices`:
     # [(sequence, chunk-in-sequence)] per chunk, for the 16- and 64-token
-    # chunkings), built here from the host copy of the query prefix and sent
-    # up without a sync. Pinned staging, one GPU table per chunking.
+    # chunkings) and their per-sequence chunk offsets (`prepare_chunk_offsets`),
+    # built here from the host copy of the query prefix and sent up without a
+    # sync. Pinned staging, one GPU table per chunking.
     _CHUNK_INDEX_SIZES = (16, 64)
 
     def _prime_chunk_indices(self, query_start_loc, num_prefills: int) -> None:
         from atom.model_ops.fla_ops.index import (
             prepare_chunk_indices,
+            prepare_chunk_offsets,
             prepare_max_chunks,
         )
 
@@ -2334,6 +2336,16 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             if gpu is None:
                 return  # the kernels compute their own (with the sync)
             prepare_chunk_indices.prime(gpu.view(total, 2), query_start_loc, chunk_size)
+            # chunk prefix sums [0, n0, n0 + n1, ...], int64 like the device cumsum
+            offsets = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
+            gpu = self._stage_upload(
+                f"chunk_off_{chunk_size}",
+                offsets,
+                self.model_runner.max_bs + 1,
+                torch.int64,
+            )
+            if gpu is not None:
+                prepare_chunk_offsets.prime(gpu, query_start_loc, chunk_size)
 
     def _checkpoint_chunk_capacity(self) -> int:
         """Entries of the per-chunk checkpoint slot table: every 64-token chunk
