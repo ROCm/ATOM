@@ -1336,6 +1336,8 @@ def minimax_m3_sparse_attn_decode_asm(
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,  # [batch, num_heads, head_dim]
+    quantized_output: torch.Tensor | None = None,  # optional FP8, same shape
+    output_scale: torch.Tensor | None = None,  # optional FP32 [batch, 1]
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
@@ -1380,6 +1382,8 @@ def minimax_m3_sparse_attn_decode_asm(
         output,
         k_scale,
         v_scale,
+        quantized_output=quantized_output,
+        output_scale=output_scale,
         plan_step_owner=plan_step_owner,
     )
 
@@ -1396,6 +1400,8 @@ def sparse_pa_per_row(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
     plan_step_owner=None,
     plan_cache_owner=None,
 ) -> None:
@@ -1414,6 +1420,11 @@ def sparse_pa_per_row(
     from atom.model_ops.base_attention import run_pa_decode
 
     assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError(
+            "quantized_output and output_scale must either both be provided or both "
+            "be None"
+        )
     # Collapse (token, kv_head) -> row so PA decode sees num_kv_heads_view == 1.
     # sparse_bt/ctx already carry kv-head-encoded page ids (page = phys16*Hkv +
     # kvh), matching the collapsed cache view. Zero-copy; Hkv == 1 is identity.
@@ -1422,13 +1433,20 @@ def sparse_pa_per_row(
     g = num_q_heads_total // num_kv_heads
     q_view = q.view(T * num_kv_heads, g, head_size)
     out_view = output.view(T * num_kv_heads, g, head_size)
+    quantized_view = None
+    if quantized_output is not None:
+        assert num_kv_heads == 1, (
+            "per-token o_proj quantization requires one KV head per rank so one "
+            "PA sequence covers the token's complete attention row"
+        )
+        quantized_view = quantized_output.view_as(q_view)
     # .view, not .reshape: the SHUFFLE slices are contiguous so this is always
     # zero-copy, and a copy would silently break the page-id encoding alignment.
     nph16, _hkv = k_cache.shape[0], k_cache.shape[1]
     k_cache_view = k_cache.view(nph16 * _hkv, 1, *k_cache.shape[2:])
     v_cache_view = v_cache.view(nph16 * _hkv, 1, *v_cache.shape[2:])
 
-    if _sparse_pa_ran_on_asm(
+    if quantized_output is None and _sparse_pa_ran_on_asm(
         q_view,
         k_cache_view,
         v_cache_view,
@@ -1443,6 +1461,13 @@ def sparse_pa_per_row(
     num_seqs = T * num_kv_heads
     num_kv_heads_view = 1
     max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads_view)
+    if quantized_output is not None and max_context_partition_num != 8:
+        # The fused epilogue is intentionally implemented only in the traced
+        # cluster8 decode and direct prefill kernels. Once the row count is too
+        # large to need eight splits, one CTA per token still fills the device
+        # and selects `_direct` instead of an unsupported cluster2/4 or
+        # last-arriver merge specialization.
+        max_context_partition_num = 1
     context_partition_size = 256
     # compute_type / scales follow the actual KV-cache dtype (this helper serves
     # both bf16 and fp8); the scale tensor collapses like the cache.
@@ -1473,6 +1498,8 @@ def sparse_pa_per_row(
         sinks=None,
         sliding_window=-1,
         ps=True,
+        quantized_output=quantized_view,
+        output_scale=output_scale,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
         # Bounded topk window per row: keep the static split cap.
@@ -1497,6 +1524,8 @@ def minimax_m3_sparse_attn_prefill_asm(
     num_kv_heads: int,
     sm_scale: float,
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    quantized_output: torch.Tensor | None = None,  # optional FP8, same shape
+    output_scale: torch.Tensor | None = None,  # optional FP32 [total_q, 1]
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
     cu_seqlens_q: torch.Tensor | None = None,  # [batch+1] int32, for the fallback
@@ -1567,6 +1596,8 @@ def minimax_m3_sparse_attn_prefill_asm(
         output,
         k_scale,
         v_scale,
+        quantized_output=quantized_output,
+        output_scale=output_scale,
         plan_step_owner=plan_step_owner,
         plan_cache_owner=plan_cache_owner,
     )
