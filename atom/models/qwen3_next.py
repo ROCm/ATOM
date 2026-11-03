@@ -43,6 +43,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.qwen_mono_moe.integration import mono_moe_forward
 from atom.model_ops.moe_tail_norm import (
     CombineTailRequest,
     MoEGatedSum,
@@ -228,6 +229,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     # by the MoE combine itself, and whether its new residual is read.
     combine_tail_norm = None
     combine_tail_writes_residual = True
+    # ATOM_QWEN_MONO_MOE (`enable_mono_moe`): the norm that reads this block's
+    # output (not a registered submodule), which the fused MoE kernel runs on
+    # decode steps of up to 128 rows; the alternating output buffer and the
+    # layer index.
+    mono_norm = None
+    mono_parity = 0
+    mono_layer = -1
 
     def __init__(
         self, config, quant_config, prefix: str = "", reduce_results: bool = True
@@ -418,6 +426,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             ATOM_FUSED_SIGMOID_GATE,
         )
 
+    def native_moe_forward(self, hidden_states: torch.Tensor):
+        """Routed + gated shared experts of 2-D rows, before any all-reduce."""
+        if self._use_dual_stream:
+            return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
+        return self.single_stream_moe_forward(hidden_states)
+
     def forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -433,12 +447,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             and not torch.compiler.is_compiling()
         ):
             return self.combine_tail_forward(hidden_states, residual)
-        if self._use_dual_stream:
-            final_hidden_states = torch.ops.aiter.maybe_dual_stream_forward(
-                hidden_states, self.prefix
-            )
-        else:
-            final_hidden_states = self.single_stream_moe_forward(hidden_states)
+        if residual is not None and self.mono_norm is not None:
+            normed = mono_moe_forward(self, hidden_states, residual)
+            if normed is not None:
+                return normed
+        final_hidden_states = self.native_moe_forward(hidden_states)
         if isinstance(final_hidden_states, MoEGatedSum):
             # TP1 (see `defer_moe_gated_sums`): nothing to reduce, and the rows
             # stay 2-D for the norm that sums them.
@@ -1137,8 +1150,12 @@ class Qwen3NextDecoderLayer(nn.Module):
         if select_rows is not None:
             hidden_states = torch.index_select(hidden_states, 0, select_rows)
             residual = torch.index_select(residual, 0, select_rows)
-        if getattr(self.mlp, "combine_tail_norm", None) is not None:
-            # The MoE combine runs the next norm too (ATOM_MEGA_COMBINE_TAIL).
+        if (
+            getattr(self.mlp, "combine_tail_norm", None) is not None
+            or getattr(self.mlp, "mono_norm", None) is not None
+        ):
+            # The MoE combine (ATOM_MEGA_COMBINE_TAIL) or the fused MoE kernel
+            # (ATOM_QWEN_MONO_MOE) runs the next norm too.
             hidden_states = self.mlp(hidden_states, residual)
         else:
             hidden_states = self.mlp(hidden_states)

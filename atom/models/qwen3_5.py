@@ -23,6 +23,7 @@ from atom.model_config.qwen3_5_moe import (
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops import gdn_fused_decode
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from atom.utils import envs
 from atom.model_ops.layernorm import (
     fused_ar_gemma_per_group_supported,
     gluon_gemm_ar_init,
@@ -595,6 +596,10 @@ class Qwen3_5Model(Qwen3NextModel):
             fused_allreduce=fuse_allreduce_norm,
         )
         defer_moe_gated_sums(self.layers, self.norm)
+        if envs.ATOM_QWEN_MONO_MOE:
+            from atom.model_ops.qwen_mono_moe.integration import enable_mono_moe
+
+            enable_mono_moe(self.layers, self.norm)
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {
