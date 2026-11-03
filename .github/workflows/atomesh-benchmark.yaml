@@ -29,6 +29,11 @@ on:
     - cron: '10 16 * * *'
   workflow_dispatch:
     inputs:
+      inspect_run_ids:
+        description: 'Read bounded log snapshots for existing run IDs (comma separated); allocates no GPUs'
+        required: false
+        default: ''
+        type: string
       suite:
         description: 'Benchmark suite'
         required: false
@@ -277,8 +282,26 @@ permissions:
   contents: write
 
 jobs:
+  inspect-runs:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.inspect_run_ids != '' }}
+    name: Inspect existing experiment logs
+    runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Snapshot existing logs and Slurm states
+        env:
+          SOURCE_RUN_IDS: ${{ inputs.inspect_run_ids }}
+        run: python3 tools/issue382/inspect_runs.py --run-ids "$SOURCE_RUN_IDS" --output inspection
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: issue382-inspection-${{ github.run_id }}
+          path: inspection/
+          retention-days: 7
+
   load-config:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ inputs.inspect_run_ids == '' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     name: Load ATOMesh benchmark config
     runs-on: ubuntu-latest
     outputs:
