@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Token and head transport over one process group.
+"""Head transport for Ulysses SP, and the custom all-gather admission it
+shares with other row gathers.
 
-Shared by Ulysses SP and the MoE token gathers.
 Every choice below depends only on the payload shape and the group, which are
 the same on every rank, so all ranks pick the same collective.
 """
@@ -28,11 +28,6 @@ def _ca_comm(group):
     return None if ca is None or ca.disabled else ca
 
 
-def _pynccl(group):
-    comm = getattr(getattr(group, "device_communicator", None), "pynccl_comm", None)
-    return None if comm is None or comm.disabled else comm
-
-
 def custom_gather_ok(
     payload: torch.Tensor, group, max_bytes: int | None = None
 ) -> bool:
@@ -47,58 +42,75 @@ def custom_gather_ok(
     return ca is not None and bool(ca.should_custom_ag(payload))
 
 
-def gather_tokens(x: torch.Tensor, group) -> torch.Tensor:
-    """Concatenate every rank's rows, rank-major."""
-    x = x.contiguous()
-    if custom_gather_ok(x, group):
-        return group.all_gather(x, use_custom=True, dim=0)
-    pynccl = _pynccl(group)
-    if pynccl is not None:
-        out = x.new_empty((x.shape[0] * group.world_size, *x.shape[1:]))
-        pynccl.all_gather(out, x)
-        return out
-    return group.all_gather(x, dim=0)
+def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
+    """``x`` followed by zero rows up to ``rows``."""
+    if x.shape[0] == rows:
+        return x
+    out = x.new_empty((rows, *x.shape[1:]))
+    out[: x.shape[0]].copy_(x)
+    out[x.shape[0] :].zero_()
+    return out
 
 
-def gather_heads(x: torch.Tensor, group) -> torch.Tensor:
-    """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads."""
+def gather_heads(x: torch.Tensor, group, rows: int | None = None) -> torch.Tensor:
+    """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads.
+
+    ``x`` may hold only the leading rows of S = ``rows``; the rest are sent as
+    zeros, padded inside the send buffer.
+    """
     w = group.world_size
     if w <= 1:
         return x
     x = x.reshape(x.shape[0], -1)
-    s_local = x.shape[0] // w
+    rows = x.shape[0] if rows is None else rows
+    s_local = rows // w
+    row_bytes = x.shape[1] * x.element_size()
     # AITER's last-dimension gather requires 16-byte alignment.
-    if x.shape[1] * x.element_size() % 16 == 0 and custom_gather_ok(
-        x, group, ALLGATHER_MAX_PAYLOAD_BYTES
-    ):
+    small = row_bytes % 16 == 0 and rows * row_bytes <= ALLGATHER_MAX_PAYLOAD_BYTES
+    ca = None if small else head_exchange_communicator(x, group, rows)
+    if ca is not None:
+        if x.shape[0] == rows:
+            return ca.head_exchange(x)
+        # Pad in the registered pool: this copy replaces the exchange's own.
+        staged = ca.registered_input_view((rows, x.shape[1]), x.dtype)
+        staged[: x.shape[0]].copy_(x)
+        staged[x.shape[0] :].zero_()
+        return ca.head_exchange(staged, registered=True)
+    x = _pad_rows(x, rows)
+    if small and custom_gather_ok(x, group):
         start = group.rank_in_group * s_local
         return group.all_gather(x, use_custom=True, dim=1)[start : start + s_local]
-    ca = head_exchange_communicator(x, group)
-    if ca is not None:
-        return ca.head_exchange(x)
-    from atom.distributed.sp_kernels import all_to_all_into
-
     send = x.reshape(w, s_local, x.shape[1]).contiguous()
     recv = torch.empty_like(send)
-    all_to_all_into(recv, send, group)
+    group.device_communicator.all_to_all(recv, send)
     # recv[i] is head-group i for our token chunk -> concatenate on heads.
     return recv.permute(1, 0, 2).reshape(s_local, -1)
 
 
-def head_exchange_communicator(x, group):
-    """Select the four-rank prefill exchange; decode uses the regular gather."""
+def takes_head_exchange(rows: int, world: int) -> bool:
+    """Whether an attention output of ``rows`` rows is a prefill one."""
+    return rows >= world * HEAD_EXCHANGE_MIN_LOCAL_ROWS
+
+
+def head_exchange_communicator(x, group, rows: int | None = None):
+    """Select the four-rank prefill exchange for ``x`` padded to ``rows``;
+    decode uses the regular gather."""
+    rows = x.shape[0] if rows is None else rows
     if (
         not x.is_cuda
-        or x.shape[0] < 4 * HEAD_EXCHANGE_MIN_LOCAL_ROWS
+        or not takes_head_exchange(rows, group.world_size)
         or x.dtype != torch.bfloat16
     ):
         return None
-    from atom.plugin.prepare import is_plugin_mode
-
-    if is_plugin_mode() or not custom_gather_ok(x, group):
-        return None
     ca = _ca_comm(group)
-    if not ca.should_head_exchange(x):
+    if ca is None:
+        return None
+    if rows != x.shape[0]:
+        # A padded input is exchanged from the registered pool.
+        x = ca.registered_input_view((rows, x.shape[1]), x.dtype)
+        if x is None:
+            return None
+    if not custom_gather_ok(x, group) or not ca.should_head_exchange(x):
         return None
     from aiter.jit.utils.chip_info import get_gfx_runtime
 

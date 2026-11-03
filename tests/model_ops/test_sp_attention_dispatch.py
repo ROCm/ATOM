@@ -11,17 +11,16 @@ aiter = pytest.importorskip("aiter")
 from aiter.jit.utils import chip_info
 
 from atom import config
-from atom.distributed import fp8_head_exchange, token_transport
-from atom.plugin import prepare
+from atom.distributed import token_transport, ulysses_sp
+from atom.model_ops import sp_attention
 
 
 @pytest.fixture
 def supported(monkeypatch):
     settings = SimpleNamespace(torch_dtype=torch.bfloat16)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 4)
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "atom")
-    monkeypatch.setattr(fp8_head_exchange.dtypes, "fp8", torch.float8_e4m3fn)
+    monkeypatch.setattr(sp_attention.dtypes, "fp8", torch.float8_e4m3fn)
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     with config.use_custom_atom_config(settings):
         yield settings
@@ -41,24 +40,18 @@ def _head_input(**overrides):
 
 
 def test_validated_layout_selects_fp8_without_opt_in(supported):
-    assert fp8_head_exchange.token_fp8_supported()
+    assert sp_attention.sp_fp8_attention_output_supported()
 
 
-@pytest.mark.parametrize("case", ["cpu", "dtype", "gfx", "plugin"])
+@pytest.mark.parametrize("case", ["sp_off", "dtype", "gfx"])
 def test_unsupported_runtime_keeps_existing_kernels(monkeypatch, supported, case):
-    if case == "cpu":
-        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setattr(config, "_current_atom_config", None)
-        group = SimpleNamespace(world_size=4)
-        head = _head_input(is_cuda=False)
-        assert token_transport.head_exchange_communicator(head, group) is None
+    if case == "sp_off":
+        monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1)
     elif case == "dtype":
         supported.torch_dtype = torch.float16
-    elif case == "gfx":
-        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
     else:
-        monkeypatch.setattr(prepare, "_CURRENT_FRAMEWORK", "vllm")
-    assert not fp8_head_exchange.token_fp8_supported()
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
+    assert not sp_attention.sp_fp8_attention_output_supported()
 
 
 def test_head_exchange_requires_usable_collective(supported):

@@ -12,7 +12,7 @@ from aiter.ops.cache import (
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_world_size
-from atom.distributed.pcp_utils import pcp_is_enabled
+from atom.distributed.pcp_utils import pcp_stripes_tokens
 from atom.model_ops.attention_mla import (
     triton_convert_req_index_to_global_index,
     triton_convert_req_index_to_global_index_dsa_prefill,
@@ -140,7 +140,7 @@ def _sparse_attn_indexer_kpool(
     if context.is_dummy_run:
         return result
 
-    if get_dcp_world_size() > 1 or pcp_is_enabled():
+    if get_dcp_world_size() > 1 or pcp_stripes_tokens():
         raise NotImplementedError(
             "GLM-5.3 kpool does not support DCP/PCP; use dcp=pcp=1"
         )

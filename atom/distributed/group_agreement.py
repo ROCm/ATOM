@@ -18,6 +18,11 @@ def group_max(value: int, group) -> int:
     return int(flag.item())
 
 
+def group_min(value: int, group) -> int:
+    """The smallest ``value`` any rank of ``group`` passed."""
+    return -group_max(-value, group)
+
+
 def group_agree(ok: bool, group) -> bool:
     """True when every rank of ``group`` passed ``ok`` true."""
     return not group_max(int(not ok), group)

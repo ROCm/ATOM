@@ -27,7 +27,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_rank
-from atom.distributed.pcp_utils import pcp_is_enabled
+from atom.distributed.pcp_utils import pcp_stripes_tokens
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.plan import (
     IndexerShape,
@@ -136,7 +136,7 @@ def _static_refusal(cfg, tp: int, rank: int, indexers: dict) -> str:
         return "DCP rank is not the TP rank: the peer exchange runs on the TP group"
     if dcp > 1 and cfg.dcp_config.interleave_size != 1:
         return f"DCP interleave {cfg.dcp_config.interleave_size}, the kernel's is 1"
-    if pcp_is_enabled():
+    if pcp_stripes_tokens():
         return "prefill context parallel"
     for layer_id, m in indexers.items():
         why = _operand_refusal(m, shape)

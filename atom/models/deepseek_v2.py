@@ -53,7 +53,7 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
-    pcp_is_enabled,
+    pcp_stripes_tokens,
     pcp_pad_dense,
     pcp_pad_len,
     pcp_round_robin_split,
@@ -179,7 +179,7 @@ def _pcp_active() -> bool:
     reindex) keys off the SAME batch-global condition so they agree within a
     forward.
     """
-    if not pcp_is_enabled():
+    if not pcp_stripes_tokens():
         return False
     ctx = get_forward_context()
     context = getattr(ctx, "context", None)
@@ -377,7 +377,7 @@ def _fold_indexer_projection(
         config, "index_topk"
     ):
         return False
-    if pcp_is_enabled():
+    if pcp_stripes_tokens():
         return False
     attns = (
         f"{model_prefix}.layers.{i}.self_attn" for i in range(config.num_hidden_layers)
@@ -1536,13 +1536,13 @@ class Indexer(nn.Module):
             not self._indexer_fp4
             and self.rope_dim == 0
             and self.head_dim == 128
-            and not pcp_is_enabled()
+            and not pcp_stripes_tokens()
         )
         self.external_k_weights = external_k_weights
         # the q latent it is handed comes quantized with a scale (the owner's
         # fused q norm + quant for q_b_proj); set by the owning attention
         self.quantized_q = False
-        if external_k_weights and pcp_is_enabled():
+        if external_k_weights and pcp_stripes_tokens():
             raise ValueError(
                 "External indexer projections require PCP1: the PCP op "
                 "(sparse_attn_indexer_pcp) projects k from the hidden states"
@@ -1602,7 +1602,7 @@ class Indexer(nn.Module):
         if self._indexer_fp4:
             assert_fp4_indexer_supported(
                 fused_writer=self.use_qk_rope_cache_fusion,
-                prefill_context_parallel=pcp_is_enabled(),
+                prefill_context_parallel=pcp_stripes_tokens(),
                 prefill_ubatching=get_current_atom_config().enable_tbo,
             )
 
@@ -1655,11 +1655,11 @@ class Indexer(nn.Module):
         # Under PCP, route the whole indexer through the Dynamo-opaque
         # `sparse_attn_indexer_pcp` op so the runtime `_pcp_active()` branch
         # (round-robin k all-gather + separate q/k rope) evaluates live instead of
-        # being baked to its warmup value by torch.compile. `pcp_is_enabled()` is
+        # being baked to its warmup value by torch.compile. `pcp_stripes_tokens()` is
         # a run-level constant (pcp world size is fixed for the process), so this
         # guard is compile-safe and a no-op — a direct `forward_impl` call, graph
         # unchanged — for non-PCP and plugin (SGLang / vLLM / RTP) backends.
-        if pcp_is_enabled():
+        if pcp_stripes_tokens():
             torch.ops.aiter.sparse_attn_indexer_pcp(
                 hidden_states,
                 qr,

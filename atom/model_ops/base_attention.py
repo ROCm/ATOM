@@ -17,12 +17,13 @@ from aiter.ops.triton.gluon.pa_decode_gluon import (
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.distributed.ulysses_sp import sp_is_enabled, ulysses_attention
+from atom.distributed.ulysses_sp import sp_is_enabled
 from atom.utils import envs, mark_spliting_op
 from atom.utils.region_graph import eager_region
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules, _mla_output_width
+from .sp_attention import ulysses_attention
 
 logger = logging.getLogger("atom")
 

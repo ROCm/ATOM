@@ -332,7 +332,7 @@ def test_shared_nope_dispatch_writes_real_fp8_pool_bytes(monkeypatch):
     )
     monkeypatch.setattr(config_module, "_current_atom_config", cfg)
     monkeypatch.setattr(indexer_forward, "get_dcp_world_size", lambda: 1)
-    monkeypatch.setattr(indexer_forward, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(indexer_forward, "pcp_stripes_tokens", lambda: False)
     md = AttentionMetaData(slot_mapping=slots, max_seqlen_k=rows, max_seqlen_q=rows)
     ctx = Context(
         positions,

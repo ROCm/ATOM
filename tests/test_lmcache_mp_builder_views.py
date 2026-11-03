@@ -137,7 +137,7 @@ def mla_builder_cls():
             "atom.distributed.pcp_utils",
             get_pcp_rank=lambda: 0,
             get_pcp_world_size=lambda: 1,
-            pcp_is_enabled=lambda: False,
+            pcp_stripes_tokens=lambda: False,
             pcp_owned_rows_by_request=noop,
             pcp_pad_dense=noop,
             pcp_pad_len=noop,

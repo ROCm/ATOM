@@ -168,11 +168,12 @@ class SPMegaMoE:
             self.launches = 0
 
     def runs(self, rows):
-        """Keep the native path whenever MegaMoE would change activation precision.
+        """Whether MegaMoE takes a step: only where the native MoE quantizes
+        activations to FP4 too. Small decode batches keep BF16 activations,
+        which this MegaMoE kernel cannot produce.
 
         Use the padded global row count, exactly as the native SP gather does.
-        Small decode batches use BF16 activations, which this MegaMoE kernel
-        cannot produce. All ranks make the same shape decision.
+        All ranks make the same shape decision.
         """
         runs = self._runs.get(rows)
         if runs is None:
@@ -229,14 +230,6 @@ def _model_layers(model):
     ]
 
 
-# MegaMoeTP setup failures that AITER gathers and raises on every rank.
-_AGREED_SETUP_FAILURES = (
-    "SdmaComm: MORI SDMA setup failed on ranks",
-    "SymmetricArena: mapping failed on ranks",
-    "MegaMoeTP.prepare: warmup launches timed out",
-)
-
-
 def _plan(config, layers):
     """`(hidden, inter, experts, top_k, activation, swiglu_limit)` when this rank
     can run every layer through MegaMoeTP, else why not."""
@@ -267,17 +260,6 @@ def _plan(config, layers):
     return shapes.pop()
 
 
-def _probe_mori():
-    """Why MORI cannot be imported, or None."""
-    try:
-        from aiter.ops.communication import _mori
-
-        _mori()
-    except ImportError as exc:
-        return f"MORI unavailable for the big-M kernel: {exc}"
-    return None
-
-
 def initialize_sp_mega_moe(model, config):
     """After weight processing, before warmup/capture.
 
@@ -302,11 +284,13 @@ def initialize_sp_mega_moe(model, config):
     if not group_agree(not isinstance(plan, str), group.cpu_group):
         return skip(plan if isinstance(plan, str) else "another SP rank refused it")
     hidden, inter, experts, top_k, activation, swiglu_limit = plan
-    from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
+    from aiter.ops.flydsl.mega_moe_tp import (
+        MegaMoeSetupError,
+        MegaMoeTP,
+        MegaMoeTPConfig,
+    )
 
     max_local_rows = local_token_tile(config.max_num_batched_tokens, group.world_size)
-    # Prefill needs larger row tiles than AITER's default.
-    lb_mt = "6"
     runtime = None
     try:
         runtime = MegaMoeTP(
@@ -322,32 +306,19 @@ def initialize_sp_mega_moe(model, config):
                 swiglu_limit=swiglu_limit,
                 comm_mode="ag_rs",
                 comm_dtype="fp8",
-                lb_mt=lb_mt,
                 fit_max_local=True,
             ),
             **_weights(layers[0]),
             group=group.cpu_group,
             device=layers[0].w13_weight.device,
         )
-        tile = runtime.max_local_tokens
-        # MORI's SDMA queues serve the big-M kernel only.
-        if 0 < runtime.bigm_m <= tile:
-            mori = _probe_mori()
-            if not group_agree(mori is None, group.cpu_group):
-                runtime.close()
-                return skip(mori or "another SP rank cannot import MORI")
-        # Prepare each distinct launch variant once. Cover every possible
-        # remainder of a local tile so an unseen graph bucket cannot compile
-        # during capture.
-        representatives = {}
-        for rows in range(1, tile + 1):
-            representatives.setdefault(runtime.launch_config(rows), rows)
-        runtime.prepare(sorted(representatives.values()))
-    except RuntimeError as exc:
-        # Any other failure (OOM, a compile error) may hit one rank while its
-        # peers wait in a collective; falling back there alone desyncs them.
-        if not str(exc).startswith(_AGREED_SETUP_FAILURES):
-            raise
+        # Every remainder of a local tile, so no graph bucket compiles during
+        # capture.
+        runtime.prepare_all()
+    except MegaMoeSetupError as exc:
+        # AITER raises it on every rank alike. Any other failure (OOM, a
+        # compile error) may hit one rank while its peers wait in a collective;
+        # falling back there alone would desync them.
         if runtime is not None:
             runtime.close()
         return skip(f"MegaMoeTP setup failed on every rank: {exc}")
@@ -360,10 +331,8 @@ def initialize_sp_mega_moe(model, config):
     for layer in layers:
         layer.sp_mega_moe = backend
     logger.info(
-        "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens, "
-        "lb_mt=%s.",
+        "SP MegaMoE enabled: %d layers, one shared runtime, tile=%d local tokens.",
         len(layers),
-        tile,
-        lb_mt,
+        runtime.max_local_tokens,
     )
     return backend

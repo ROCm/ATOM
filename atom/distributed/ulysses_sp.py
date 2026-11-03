@@ -3,9 +3,10 @@
 """Ulysses sequence parallelism for the native ATOM LLM path.
 
 Ranks own contiguous token chunks outside attention. Two all-to-alls trade
-``[T/W, H, D]`` for ``[T, H/W, D]`` around attention, which retains global
-sequence metadata. Dense weights are replicated; MoE weights remain sharded.
-SP uses AITER's PCP rank dimension and runs with ``-tp 1 -sp W``.
+``[T/W, H, D]`` for ``[T, H/W, D]`` around attention
+(`atom.model_ops.sp_attention`), which retains global sequence metadata.
+Dense weights are replicated; MoE weights remain sharded. SP uses AITER's PCP
+rank dimension and runs with ``-tp 1 -sp W``.
 """
 
 from functools import partial
@@ -15,8 +16,6 @@ import torch
 from atom.distributed.token_transport import (
     ALLGATHER_MAX_PAYLOAD_BYTES,
     custom_gather_ok,
-    gather_heads,
-    gather_tokens,
 )
 
 # AITER is imported where used: `forward_context` imports this module on CPU.
@@ -43,6 +42,18 @@ def attn_head_shard_size() -> int:
     from aiter.dist.parallel_state import get_tp_group
 
     return get_tp_group().world_size * _SP_WORLD_SIZE
+
+
+def local_num_kv_heads(num_kv_heads: int) -> int:
+    """KV heads one rank holds: its share of ``num_kv_heads``, or a single
+    replicated head when the heads are fewer than the attention head shards."""
+    shards = attn_head_shard_size()
+    if num_kv_heads % shards and shards % num_kv_heads:
+        raise ValueError(
+            f"{num_kv_heads} KV heads neither shard nor replicate evenly over "
+            f"{shards} attention head shards."
+        )
+    return max(1, num_kv_heads // shards)
 
 
 def check_sp_attention_layer(sp, name, sinks, alibi_slopes, rotary_emb, index_heads):
@@ -84,7 +95,8 @@ def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
 
     if _SP_WORLD_SIZE <= 1:
         return x
-    return gather_tokens(x, get_pcp_group())[:total_tokens]
+    communicator = get_pcp_group().device_communicator
+    return communicator.all_gatherv(x.contiguous())[:total_tokens]
 
 
 def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -100,27 +112,25 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     local, n = x.shape[0], rows.numel()
     picked = x[(rows - group.rank_in_group * local).clamp(0, local - 1)]
     owner = rows.long() // local
-    gathered = gather_tokens(picked, group)
+    gathered = group.device_communicator.all_gatherv(picked)
     return gathered[owner * n + torch.arange(n, device=x.device)]
 
 
-_SCATTER = 0  # zero means one head shard per rank
-_REPLICATE = 1  # one shard, replicated on every rank
+SCATTER = 0  # zero means one head shard per rank
+REPLICATE = 1  # one shard, replicated on every rank
 # Other positive values specify how many head shards a field has. For GQA
 # with fewer KV heads than ranks, consecutive query-head owners share a shard.
 
 
 def _exchange(send, group):
     """All-to-all a ``[W, S/W, width]`` send buffer into global token order."""
-    from atom.distributed.sp_kernels import all_to_all_into
-
     recv = torch.empty_like(send)
-    all_to_all_into(recv, send, group)
+    group.device_communicator.all_to_all(recv, send)
     # Rank-major receive order is global token order for contiguous shards.
     return recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
 
 
-def _exchange_tensors(tensors, shards, group):
+def exchange_tensors(tensors, shards, group):
     """Exchange separate fields into one packed tensor with all sequence rows."""
     w = _SP_WORLD_SIZE
     widths = [t.shape[-1] // n for t, n in zip(tensors, shards)]
@@ -137,101 +147,27 @@ def _exchange_tensors(tensors, shards, group):
     return _exchange(send, group)
 
 
-def _exchange_columns(source, spec, owner, group):
-    """Exchange fused fields described by (column offset, width, head shards)."""
+def send_columns(spec, group, device) -> torch.Tensor:
+    """This rank's source columns of the fused fields in ``spec``, packed."""
     w = _SP_WORLD_SIZE
+    # Device aranges also support first use during graph capture.
+    arange = partial(torch.arange, device=device)
+    ranges = []
+    for offset, width, mode in spec:
+        shards = mode or w
+        local = width // shards
+        start = offset + (group.rank_in_group // (w // shards)) * local
+        ranges.append(arange(local) + start)
+    return torch.cat(ranges)
+
+
+def exchange_columns(source, spec, group, columns):
+    """Exchange fused fields described by (column offset, width, head shards).
+
+    ``columns`` is ``send_columns(spec, ...)``, read by the all-gather path.
+    """
     if not custom_gather_ok(source, group, ALLGATHER_MAX_PAYLOAD_BYTES):
         from atom.distributed.sp_kernels import pack_fields
 
-        return _exchange(pack_fields(source, tuple(spec), w), group)
-    columns = getattr(owner, "_sp_send_columns", None)
-    if columns is None or columns.device != source.device:
-        # Device aranges also support first use during graph capture.
-        arange = partial(torch.arange, device=source.device)
-        ranges = []
-        for offset, width, mode in spec:
-            shards = mode or w
-            local = width // shards
-            start = offset + (group.rank_in_group // (w // shards)) * local
-            ranges.append(arange(local) + start)
-        columns = torch.cat(ranges)
-        owner._sp_send_columns = columns
-
+        return _exchange(pack_fields(source, tuple(spec), _SP_WORLD_SIZE), group)
     return group.custom_all_gather(source).index_select(1, columns)
-
-
-def ulysses_attention(
-    attn, query, key, value, positions, q_scale, qkv, output_transform=None
-):
-    """Run this rank's head slice over the full sequence, then restore tokens.
-
-    Called inside the attention custom op, keeping collectives and padding
-    slices opaque to Dynamo.
-    """
-    from aiter.dist.parallel_state import get_pcp_group
-
-    w = _SP_WORLD_SIZE
-    group = get_pcp_group()
-    kv_shards = min(w, key.shape[-1] // attn.head_dim)
-    if qkv is None:
-        packed = _exchange_tensors(
-            [query, key, value], [w, kv_shards, kv_shards], group
-        )
-    else:
-        # Fused kernels may also read indexer fields by column offset.
-        q_size, kv_size = query.shape[-1], key.shape[-1]
-        spec = [
-            (0, q_size, _SCATTER),
-            (q_size, kv_size, kv_shards),
-            (q_size + kv_size, kv_size, kv_shards),
-        ]
-        if any(
-            t.untyped_storage().data_ptr() != qkv.untyped_storage().data_ptr()
-            or t.storage_offset() != qkv.storage_offset() + offset
-            for t, (offset, _, _) in zip((query, key, value), spec)
-        ):
-            raise ValueError(
-                "Ulysses SP: q/k/v must be the leading column ranges of the "
-                "fused qkv tensor when one is supplied."
-            )
-        tail = qkv.shape[-1] - (q_size + 2 * kv_size)
-        if tail > 0:
-            idx_dim = getattr(attn.impl, "index_head_dim", 0)
-            if not idx_dim:
-                raise ValueError(
-                    f"Ulysses SP: fused qkv has {tail} trailing columns but "
-                    f"{type(attn.impl).__name__} declares no indexer layout."
-                )
-            index_q_width = tail - idx_dim
-            index_q_start = qkv.shape[-1] - (index_q_width + idx_dim)
-            index_shards = min(w, index_q_width // idx_dim)
-            spec.append((index_q_start, index_q_width, index_shards))
-            spec.append((index_q_start + index_q_width, idx_dim, _REPLICATE))
-        packed = _exchange_columns(qkv, spec, attn, group)
-
-    # Global positions and attention metadata exclude the divisibility pad.
-    real_tokens = positions.shape[-1]
-    padded_tokens = packed.shape[0]
-    if real_tokens < padded_tokens:
-        packed = packed[:real_tokens]
-
-    # Attention accepts column views, so avoid another Q/K/V copy.
-    q_width = query.shape[-1] // w
-    kv_width = key.shape[-1] // kv_shards
-    out = attn.impl.forward(
-        query=packed[:, :q_width],
-        key=packed[:, q_width : q_width + kv_width],
-        value=packed[:, q_width + kv_width : q_width + 2 * kv_width],
-        position=positions,
-        q_scale=q_scale,
-        # Preserve the caller's choice of fused or separate Q/K/V kernels.
-        qkv=packed if qkv is not None else None,
-    )
-
-    if real_tokens < padded_tokens:
-        out = torch.cat(
-            [out, out.new_zeros(padded_tokens - real_tokens, *out.shape[1:])], dim=0
-        )
-    if output_transform is not None:
-        return output_transform(out)
-    return gather_heads(out, group)

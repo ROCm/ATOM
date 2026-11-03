@@ -40,8 +40,12 @@ def _layer(moe):
     )
 
 
-@pytest.mark.parametrize("rows,use_mega", [(16, False), (63, False), (64, True)])
-def test_small_batches_keep_the_native_moe(monkeypatch, sp_modules, rows, use_mega):
+@pytest.mark.parametrize("use_mega", [False, True])
+def test_mega_moe_runs_where_aiter_picks_fp4_activations(
+    monkeypatch, sp_modules, use_mega
+):
+    """AITER's resolver decides, asked about the padded global batch exactly
+    as the native MoE would ask it."""
     from importlib import import_module
 
     moe = sp_modules.moe
@@ -57,8 +61,16 @@ def test_small_batches_keep_the_native_moe(monkeypatch, sp_modules, rows, use_me
     )
     runtime = SimpleNamespace(cfg=SimpleNamespace(world_size=4), forward=Mock())
     backend = SPMegaMoE(runtime, layer, 1, None)
+    rows = 64
     assert backend.runs(rows) is use_mega
-    assert resolver.call_args.kwargs["M"] == rows * 4
+    resolver.assert_called_once_with(
+        moe.QuantType.per_1x32,
+        moe.dtypes.fp4x2,
+        activation=moe.ActivationType.Swiglu,
+        gate_mode=moe.GateMode.SEPARATED,
+        M=rows * 4,
+        gate_up_interleave=None,
+    )
     if not use_mega:
         return
     layer.sp_mega_moe = SimpleNamespace(runs=backend.runs, forward=Mock())
@@ -175,15 +187,17 @@ def test_layer_shapes_follow_the_model_and_ineligible_layers_stay_native(
     assert getattr(layer, "sp_mega_moe", None) is None
 
 
-def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, **stubs):
+class MegaMoeSetupError(RuntimeError):
+    pass
+
+
+def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
     layer = _servable_layer(sp_modules.moe)
     mega = ModuleType("aiter.ops.flydsl.mega_moe_tp")
     mega.MegaMoeTPConfig = dict
     mega.MegaMoeTP = runtime
-    comm = ModuleType("aiter.ops.communication")
-    comm._mori = stubs.get("mori", Mock())
-    for module in (mega, comm):
-        monkeypatch.setitem(sys.modules, module.__name__, module)
+    mega.MegaMoeSetupError = MegaMoeSetupError
+    monkeypatch.setitem(sys.modules, mega.__name__, mega)
     monkeypatch.setattr(fusion, "get_sp_world_size", lambda: 4)
     _pcp_group(
         monkeypatch, SimpleNamespace(world_size=4, rank_in_group=0, cpu_group=None)
@@ -196,7 +210,7 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024, **stubs):
 @pytest.mark.parametrize(
     "error,falls_back",
     [
-        (RuntimeError("SdmaComm: MORI SDMA setup failed on ranks [0, 1, 2, 3]"), True),
+        (MegaMoeSetupError("SdmaComm: MORI unavailable on ranks {2: ...}"), True),
         # One rank's compile error, lazy import or OOM leaves its peers inside
         # a collective.
         (RuntimeError("compile failed"), False),
@@ -220,7 +234,7 @@ def test_runtime_setup_failure_keeps_the_native_moe(
 
 def test_agreed_prepare_failure_closes_the_runtime(monkeypatch, sp_modules):
     runtime = Mock(max_local_tokens=256, bigm_m=0)
-    runtime.prepare.side_effect = RuntimeError(
+    runtime.prepare_all.side_effect = MegaMoeSetupError(
         "MegaMoeTP.prepare: warmup launches timed out"
     )
     _, initialize = _initialize(monkeypatch, sp_modules, Mock(return_value=runtime))
@@ -245,29 +259,6 @@ def test_a_refusing_peer_keeps_every_rank_native(monkeypatch, sp_modules):
     runtime.assert_not_called()
 
 
-# A 256-row tile: big-M is unreachable, reachable, or past the tile.
-@pytest.mark.parametrize("bigm_m,probed", [(0, False), (128, True), (512, False)])
-def test_mori_is_required_only_where_big_m_runs(
-    monkeypatch, sp_modules, bigm_m, probed
-):
-    mori = Mock(side_effect=ImportError("no MORI"))
-    runtime = Mock(max_local_tokens=256, bigm_m=bigm_m)
-    runtime.poll_errors.return_value = 0
-    runtime.launch_config.side_effect = lambda rows: rows > 64
-    layer, initialize = _initialize(
-        monkeypatch, sp_modules, Mock(return_value=runtime), mori=mori
-    )
-    backend = initialize()
-    assert mori.called is probed
-    if probed:
-        assert backend is None
-        runtime.close.assert_called_once_with()
-        runtime.prepare.assert_not_called()
-    else:
-        assert layer.sp_mega_moe is backend
-        runtime.prepare.assert_called_once_with([1, 65])
-
-
 def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modules):
     # 65536 tokens over SP4 are 16384 local rows: eight 2048-row launches.
     runtime = Mock(
@@ -278,6 +269,7 @@ def test_epoch_count_covers_every_tile_of_the_largest_shard(monkeypatch, sp_modu
     layer, initialize = _initialize(monkeypatch, sp_modules, runtime, mnbt=65536)
     backend = initialize()
     assert runtime.call_args.args[0]["max_local_tokens"] == 8192
+    runtime.return_value.prepare_all.assert_called_once_with()
     assert layer.sp_mega_moe is backend
     backend.runs = lambda rows: True
     backend.count_step(16384)

@@ -29,6 +29,7 @@ from torch.profiler import record_function
 
 from atom import structured_output
 from atom.config import Config, set_current_atom_config
+from atom.distributed.group_agreement import group_min
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
     get_pcp_group,
@@ -36,6 +37,7 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_round_robin_split,
+    pcp_stripe_count,
 )
 from atom.distributed.pp_comm import (
     async_send_intermediate_tensors,
@@ -44,13 +46,11 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import (
-    attn_head_shard_size,
     get_sp_world_size,
+    local_num_kv_heads,
     set_sp_world_size,
-    sp_gather_tokens,
     sp_is_enabled,
     sp_local_len,
-    sp_local_slice,
 )
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
@@ -124,6 +124,7 @@ from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.h2d import h2d_producer
 from atom.utils.region_graph import ReqGraph, TokenGraph
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
+from atom.utils.sp_wrapper import SPModelWrapper
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
@@ -910,8 +911,12 @@ class ModelRunner:
             model_runner=self
         )
         # SP attention ops are recorded inline in token graphs
-        # (`fp8_head_exchange.sp_attention_fp8`): only decode buckets may hold them.
-        assert not (sp_is_enabled() and self.attn_metadata_builder.supports_token_graph)
+        # (`sp_attention.sp_attention_fp8`): only decode buckets may hold them.
+        if sp_is_enabled() and self.attn_metadata_builder.supports_token_graph:
+            raise ValueError(
+                f"Ulysses SP does not support {type(self.attn_metadata_builder).__name__}"
+                ", which records prefill token graphs."
+            )
         # Sub-pool sizing needs a memory profile, so it cannot run until after
         # warmup. Install the empty plan now: `warmup_model` below drives the
         # builder through paths that ask for their entry counts, and those must
@@ -947,6 +952,8 @@ class ModelRunner:
                 dp_gather_scatter=dp_gather_scatter,
             )
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
+        if sp_is_enabled():
+            self.model = SPModelWrapper(self.model)
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
         installer = mono_decode_installers.get(hf_config.architectures[0])
@@ -1385,7 +1392,7 @@ class ModelRunner:
         max_tokens = self.config.max_num_batched_tokens
         if not self.config.enable_dp_attention:
             max_tokens //= get_dp_group().world_size
-        pcp_size = self.config.pcp_striping_size
+        pcp_size = pcp_stripe_count()
         if pcp_size > 1:
             max_tokens = max(1, max_tokens // pcp_size)
         return max_tokens
@@ -1706,21 +1713,9 @@ class ModelRunner:
             self.h2d_owner.fail()
             raise
 
-    def sp_input_ids(self, num_tokens: int) -> torch.Tensor:
-        """This rank's token range, a view of the global ids, which graphs
-        capture at a fixed address (`max_num_batched_tokens` divides by SP)."""
-        return self.forward_vars["input_ids"].gpu[sp_local_slice(num_tokens)]
-
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
-        hf_config = self.config.hf_config
-        shards = attn_head_shard_size()
-        if hf_config.num_key_value_heads >= shards:
-            assert hf_config.num_key_value_heads % shards == 0
-            return hf_config.num_key_value_heads // shards
-        else:
-            assert shards % hf_config.num_key_value_heads == 0
-            return 1
+        return local_num_kv_heads(self.config.hf_config.num_key_value_heads)
 
     def _mrope_positions_view(self, running_tokens: int) -> torch.Tensor:
         return self.forward_vars["mrope_positions"].gpu.as_strided(
@@ -2222,17 +2217,9 @@ class ModelRunner:
 
         config = self.config
         config.num_kvcache_blocks = num_kvcache_blocks
-        hf_config = config.hf_config
-        shards = attn_head_shard_size()
-        if hf_config.num_key_value_heads >= shards:
-            assert hf_config.num_key_value_heads % shards == 0
-            num_kv_heads = hf_config.num_key_value_heads // shards
-        else:
-            assert shards % hf_config.num_key_value_heads == 0
-            num_kv_heads = 1
         # Promote to self so attention builders' build_kv_cache_tensor()
         # hooks can access it without re-deriving from hf_config.
-        self.num_kv_heads = num_kv_heads
+        self.num_kv_heads = self._get_num_kv_heads()
         self.aligned_index_dim = None  # set below for DeepSeek-V3.2
 
         # Primary KV cache allocation: one buffer, one region per builder, each
@@ -2429,7 +2416,7 @@ class ModelRunner:
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
         # request subset". Requires num_reqs >= 2 (request-boundary split needs
         # two non-empty groups); bs=1 falls back to non-TBO.
-        pcp_size = self.config.pcp_striping_size
+        pcp_size = pcp_stripe_count()
         # Read by build_ubatch / run_model / prepare_prefill to route the
         # per-group path; reset every step so a stale value cannot route one.
         self._pcp_tbo_balanced_active = False
@@ -2656,7 +2643,7 @@ class ModelRunner:
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
-        pcp_size = self.config.pcp_striping_size
+        pcp_size = pcp_stripe_count()
         _pcp_tbo_balanced = (
             is_prefill
             and pcp_size > 1
@@ -3117,7 +3104,7 @@ class ModelRunner:
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
-        _pcp_size = self.config.pcp_striping_size
+        _pcp_size = pcp_stripe_count()
         _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
         _pcp_tbo_balanced = (
             _pcp_size > 1
@@ -3142,11 +3129,6 @@ class ModelRunner:
             with record_function(label):
                 if forward_mode.running_tokens > forward_mode.scheduled_tokens:
                     input_ids, positions = self._padded_inputs(forward_mode)
-                # Pad globally before SP shards the input; attention retains
-                # global positions to identify real sequence rows.
-                sp_total_tokens = input_ids.shape[0]
-                if sp_is_enabled():
-                    input_ids = self.sp_input_ids(sp_total_tokens)
                 # The multimodal runtime owns request leases and span scatter.
                 # Only the first PP stage embeds tokens; later stages receive
                 # hidden states.
@@ -3257,12 +3239,11 @@ class ModelRunner:
                             model_output, _pcp_bal_groups, _pcp_size
                         )
                     if sp_is_enabled() and is_prefill:
-                        # The LM head gathers only each prompt's last row.
+                        # SP prefill keeps this rank's token range; the LM head
+                        # gathers only each prompt's last row.
                         hidden_states = None
                         logits = self.model.compute_logits(model_output)
                     else:
-                        # Restore global token order before selecting rows.
-                        model_output = sp_gather_tokens(model_output, sp_total_tokens)
                         # PP carries the full run between stages. Only the last
                         # stage returns scheduled rows to sampling/draft consumers.
                         hidden_states = model_output[: context.scheduled_tokens]
@@ -3279,10 +3260,7 @@ class ModelRunner:
                     # Replays its token graph when the step settled on one
                     # (`ForwardContext.tr_graph`).
                     _ids, _pos = self._padded_inputs(forward_mode)
-                    if sp_is_enabled():
-                        _ids = self.sp_input_ids(running_tokens)
                     model_output = self.model(_ids, _pos)
-                    model_output = sp_gather_tokens(model_output, running_tokens)
                     # model_output is always a plain Tensor; drafter aux capture
                     # (if any) already wrote its own buffers inside the forward.
                     # Spec keeps the padded layout (postprocess/draft re-gather to
@@ -4067,15 +4045,10 @@ class ModelRunner:
         slope = _GUARD_BYTES_PER_TOKEN_PER_DIM * self.config.hf_config.hidden_size
         if dp_size > 1:
             slope *= float(dp_size) ** 0.6
-        free_t = torch.tensor(
-            [torch.cuda.mem_get_info()[0]], device="cpu", dtype=torch.int64
-        )
+        free = torch.cuda.mem_get_info()[0]
         for group in (get_dp_group(), get_tp_group(), get_pcp_group()):
             if group.world_size > 1:
-                torch.distributed.all_reduce(
-                    free_t, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
-                )
-        free = int(free_t.item())
+                free = group_min(free, group.cpu_group)
         need = slope * running_tokens * 1.25 + (4 << 30)
         if (free >> 30) < (int(need) >> 30):
             if self.rank == 0:
@@ -4262,11 +4235,7 @@ class ModelRunner:
             # made by the drafter and ragged bucket builder.
             return self._build_capture(stage_and_build, *args, **kwargs)
 
-        with (
-            pause_gc(),
-            graph_capture(),
-            self.capture_profiler as prof,
-        ):
+        with pause_gc(), graph_capture(), self.capture_profiler as prof:
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)
@@ -4337,16 +4306,8 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:running_tokens]
                     )
-                    # Ulysses runs the model on this rank's token chunk while
-                    # positions stay whole; the graph gathers the chunks back.
-                    model_ids = (
-                        self.sp_input_ids(running_tokens)
-                        if sp_is_enabled()
-                        else input_ids[:running_tokens]
-                    )
-                    outputs[:running_tokens] = sp_gather_tokens(
-                        self.model(model_ids, model_positions), running_tokens
-                    )
+                    model_ids = input_ids[:running_tokens]
+                    outputs[:running_tokens] = self.model(model_ids, model_positions)
                     if logits_in_graph:
                         self.model.compute_logits(outputs[:running_tokens])
 
@@ -4378,7 +4339,7 @@ class ModelRunner:
                         def full_forward(
                             n=running_tokens, ids=model_ids, pos=model_positions
                         ):
-                            outputs[:n] = sp_gather_tokens(self.model(ids, pos), n)
+                            outputs[:n] = self.model(ids, pos)
                             if logits_in_graph:
                                 return self.model.compute_logits(outputs[:n])
                             return None

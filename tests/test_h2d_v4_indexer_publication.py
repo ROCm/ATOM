@@ -129,7 +129,7 @@ def set_pcp(monkeypatch, size, rank):
     from atom.distributed.pcp_utils import pcp_round_robin_query_indices
     from atom.model_ops.attentions import deepseek_v4_attn as module
 
-    monkeypatch.setattr(module, "pcp_is_enabled", lambda: True)
+    monkeypatch.setattr(module, "pcp_stripes_tokens", lambda: True)
     monkeypatch.setattr(module, "get_pcp_world_size", lambda: size)
     monkeypatch.setattr(
         module,

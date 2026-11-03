@@ -16,15 +16,17 @@ if not torch.cuda.is_available():
 from aiter import dtypes
 from aiter.ops.quant import per_token_quant_hip
 
-from atom.distributed.fp8_head_exchange import head_amax, quantize_with_gathered_amax
+from atom.model_ops.sp_attention import head_amax, quantize_with_gathered_amax
 
 if dtypes.fp8 != torch.float8_e4m3fn:
     pytest.skip("FP8 head exchange requires E4M3FN", allow_module_level=True)
 
 
+@pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("world", [2, 4, 8])
-def test_shard_quantization_matches_full_row_quantization(world):
+def test_shard_quantization_matches_full_row_quantization(world, padded):
     tokens, width = 64 * world, 96
+    real = tokens - (world - 1 if padded else 0)
     torch.manual_seed(world)
     full = torch.randn(tokens, world * width, device="cuda").mul_(
         torch.logspace(-3, 3, tokens, device="cuda")[:, None]
@@ -34,9 +36,11 @@ def test_shard_quantization_matches_full_row_quantization(world):
     peaks = torch.arange(tokens, device="cuda")
     full[peaks, (peaks % world) * width] = full.abs().amax(1) * 2
     full[1] = 0
+    # The divisibility pad, which the shards omit, quantizes as zero rows.
+    full[real:] = 0
     expected_q, expected_scale = per_token_quant_hip(full, quant_dtype=dtypes.fp8)
-    shards = [s.contiguous() for s in full.chunk(world, dim=1)]
-    amax = torch.cat([head_amax(s) for s in shards])
+    shards = [s[:real].contiguous() for s in full.chunk(world, dim=1)]
+    amax = torch.cat([head_amax(s, tokens) for s in shards])
     local = tokens // world
     for rank, shard in enumerate(shards):
         q, scale = quantize_with_gathered_amax(shard, amax, world, rank)

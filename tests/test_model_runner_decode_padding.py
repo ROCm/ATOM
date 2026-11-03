@@ -11,6 +11,7 @@ parallel_state = pytest.importorskip("aiter.dist.parallel_state")
 
 from atom.distributed import ulysses_sp
 from atom.model_engine import model_runner as runner_module
+from atom.utils import sp_wrapper
 from atom.utils.forward_context import ForwardMode
 from atom.utils.tbo.ubatching import sync_dp_metadata
 
@@ -49,7 +50,7 @@ def test_runner_model_height_and_sampling_rows(
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.sp_mega_moe = Mock()
-    runner.config = SimpleNamespace(pcp_striping_size=1)
+    runner.config = SimpleNamespace(prefill_context_parallel_size=1)
     runner._detailed_label_suffix = lambda batch: ""
     runner._tr_hybrid_active = lambda: token_graph
     runner._dynamic_chunking = runner_module.DynamicChunkingWorker(runner)
@@ -155,9 +156,10 @@ def test_runner_model_height_and_sampling_rows(
             torch.testing.assert_close(local, local_rows())
             return global_ids()[:, None].float()
 
-        monkeypatch.setattr(runner_module, "sp_gather_tokens", gather_shards)
+        monkeypatch.setattr(sp_wrapper, "sp_gather_tokens", gather_shards)
+        monkeypatch.setattr(sp_wrapper, "get_forward_context", lambda: ctx)
 
-    runner.model = Model()
+    runner.model = Model() if sp_rank is None else sp_wrapper.SPModelWrapper(Model())
     logits, hidden = runner.run_model(ids[:scheduled])
     # MegaMoE epochs advance on graph replays as well as eager steps, by this
     # rank's share of the step's padded rows.

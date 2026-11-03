@@ -731,7 +731,7 @@ def _maybe_apply_pcp_prefill_reindex(
     try:
         from atom.distributed.pcp_utils import (
             get_pcp_world_size,
-            pcp_is_enabled,
+            pcp_stripes_tokens,
             pcp_pad_dense,
             pcp_pad_len,
             pcp_round_robin_query_indices,
@@ -739,7 +739,7 @@ def _maybe_apply_pcp_prefill_reindex(
     except ImportError:
         return
 
-    if not pcp_is_enabled():
+    if not pcp_stripes_tokens():
         return
 
     device = md.slot_mapping.device

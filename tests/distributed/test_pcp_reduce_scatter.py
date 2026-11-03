@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+"""Only SP takes AITER's lossy INT4 reduce-scatter."""
+
+from types import SimpleNamespace
+from unittest.mock import Mock, sentinel
+
+import pytest
+import torch
+from import_guard import skip_if_dependency_missing
+
+
+@pytest.mark.parametrize("sp", [False, True])
+def test_pcp_merge_alone_keeps_the_exact_reduce_scatter(monkeypatch, sp):
+    try:
+        from atom.distributed import pcp_utils
+    except ImportError as e:
+        skip_if_dependency_missing(e, "pcp_utils imports aiter")
+
+    qr_comm = Mock(**{"should_quick_reduce_scatter.return_value": True})
+    qr_comm.quick_reduce_scatter.return_value = sentinel.int4
+    group = SimpleNamespace(
+        device_communicator=SimpleNamespace(qr_comm=qr_comm),
+        reduce_scatter=Mock(return_value=sentinel.exact),
+    )
+    monkeypatch.setattr(pcp_utils, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(pcp_utils, "sp_is_enabled", lambda: sp)
+    out = pcp_utils.pcp_reduce_scatter(torch.zeros(4, 8), pcp_size=4)
+    assert out is (sentinel.int4 if sp else sentinel.exact)
+    assert qr_comm.quick_reduce_scatter.call_count == int(sp)

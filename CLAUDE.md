@@ -55,10 +55,12 @@ Key entry points:
   `dynamic_chunking_worker.py` (startup sweep and runtime timing in the runner),
   sized by `Scheduler._dynamic_chunk_limit`
 - Ulysses sequence parallel (`-sp`, on the PCP rank dimension):
-  `atom/distributed/ulysses_sp.py` (the SP group and the token shard / gather),
-  `token_transport.py` (row and head collectives), `group_agreement.py`
-  (verdicts every rank of a CPU group takes alike); the prefill MoE through
-  AITER MegaMoE in `atom/model_ops/sp_mega_moe.py`
+  `atom/distributed/ulysses_sp.py` (the SP group, the token shard / gather and
+  the QKV exchange), `token_transport.py` (the head collectives),
+  `group_agreement.py` (verdicts every rank of a CPU group takes alike); the
+  model runs on a rank's token range through `atom/utils/sp_wrapper.py`; the
+  attention around them in `atom/model_ops/sp_attention.py`, and the prefill MoE
+  through AITER MegaMoE in `atom/model_ops/sp_mega_moe.py`
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),

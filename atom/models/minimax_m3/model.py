@@ -18,9 +18,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from atom.config import Config, QuantizationConfig
-from atom.distributed.fp8_head_exchange import token_fp8_supported
 from atom.distributed.indexer_cp import indexer_cp_enabled
-from atom.distributed.ulysses_sp import attn_head_shard_size, sp_is_enabled
+from atom.distributed.ulysses_sp import local_num_kv_heads, sp_is_enabled
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 from atom.model_ops.base_attention import (
@@ -48,6 +47,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.sp_attention import sp_fp8_attention_output_supported
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -105,7 +105,7 @@ def _validate_sparse_flydsl_config(
             "MiniMax-M3 sparse paged attention requires aiter's FlyDSL "
             "explicit-plan API (#5809) because there is no gluon fallback"
         )
-    local_kv_heads = max(1, int(config.num_key_value_heads) // attn_head_shard_size())
+    local_kv_heads = local_num_kv_heads(int(config.num_key_value_heads))
     max_tokens = int(atom_config.max_num_batched_tokens)
     max_rows = max_tokens * local_kv_heads
     plan_limit = _flydsl_plan_max_batch()
@@ -462,7 +462,7 @@ class MiniMaxM3Attention(nn.Module):
             k_norm=self.k_norm,
             prefix=f"{prefix}.attn",
         )
-        self._fp8_head_exchange = sp_is_enabled() and token_fp8_supported()
+        self._fp8_head_exchange = sp_fp8_attention_output_supported()
 
     def forward(
         self,
@@ -612,7 +612,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             sparse_layer_ordinal=self.sparse_layer_ordinal,
             index_cache_dtype=index_cache_config,
         )
-        self._fp8_head_exchange = sp_is_enabled() and token_fp8_supported()
+        self._fp8_head_exchange = sp_fp8_attention_output_supported()
 
     def forward(
         self,
@@ -708,12 +708,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        # SP rows are whole tokens on TP 1; plain TP keeps the BF16-rounded
-        # quantization that mono matches.
-        self._quantize_fp32_norm = sp_is_enabled()
-        assert (
-            not self._quantize_fp32_norm or get_tensor_model_parallel_world_size() == 1
-        )
+        # SP runs on TP 1 (Config); the fused FP32-norm quant takes OCP FP8 only.
+        # Plain TP keeps the BF16-rounded quantization that mono matches.
+        self._quantize_fp32_norm = sp_is_enabled() and dtypes.fp8 == torch.float8_e4m3fn
 
     def forward(
         self,

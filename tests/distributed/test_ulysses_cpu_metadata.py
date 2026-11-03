@@ -10,12 +10,15 @@ import torch
 from atom.distributed import ulysses_sp as sp
 
 
-def _on_each_rank(monkeypatch, world, fn):
+def _on_each_rank(monkeypatch, world, fn, all_gatherv=None):
     parallel_state = ModuleType("aiter.dist.parallel_state")
     monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
     out = []
     for rank in range(world):
-        group = SimpleNamespace(rank_in_group=rank)
+        group = SimpleNamespace(
+            rank_in_group=rank,
+            device_communicator=SimpleNamespace(all_gatherv=all_gatherv),
+        )
         parallel_state.get_pcp_group = lambda g=group: g
         out.append(fn(rank))
     return out
@@ -38,17 +41,18 @@ def test_gather_rows_matches_full_gather(monkeypatch, world):
     hidden = buffer[:13]
     monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
 
-    def on_each_rank(fn):
-        return _on_each_rank(monkeypatch, world, fn)
+    def on_each_rank(fn, all_gatherv=None):
+        return _on_each_rank(monkeypatch, world, fn, all_gatherv)
 
     shards = on_each_rank(lambda _: buffer[sp.sp_local_slice(13)])
     sent = []
-    monkeypatch.setattr(
-        sp, "gather_tokens", lambda x, group: sent.append(x) or x.repeat(world, 1)
+    on_each_rank(
+        lambda rank: sp.sp_gather_rows(shards[rank], rows),
+        lambda x: sent.append(x) or x.repeat(world, 1),
     )
-    on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows))
-    monkeypatch.setattr(sp, "gather_tokens", lambda x, group: torch.cat(sent))
-    for out in on_each_rank(lambda rank: sp.sp_gather_rows(shards[rank], rows)):
+    for out in on_each_rank(
+        lambda rank: sp.sp_gather_rows(shards[rank], rows), lambda x: torch.cat(sent)
+    ):
         assert torch.equal(out, hidden[rows])
 
 

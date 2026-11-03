@@ -63,7 +63,7 @@ from atom.distributed.dcp_utils import (
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
-    pcp_is_enabled,
+    pcp_stripes_tokens,
 )
 from atom.model_ops.attentions.sparse_mla_head_groups import (
     MLA_WORK_NAMES,
@@ -3068,7 +3068,7 @@ class MLAAttention(nn.Module):
             # afterwards from the all-gathered k. Gather the raw (un-roped) k and
             # key positions BEFORE the fused kernel ropes k in place.
             pcp = (
-                pcp_is_enabled()
+                pcp_stripes_tokens()
                 and context.is_prefill
                 and not context.is_dummy_run
                 and use_prefill_mla

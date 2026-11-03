@@ -22,11 +22,11 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
     source = torch.randn(12, offsets[-1] + 32, device="cuda").bfloat16()[:, :-32]
     kv_shards, index_shards = min(world, kv_heads), min(world, index_heads)
     spec = (
-        (offsets[0], widths[0], ulysses_sp._SCATTER),
+        (offsets[0], widths[0], ulysses_sp.SCATTER),
         (offsets[1], widths[1], kv_shards),
         (offsets[2], widths[2], kv_shards),
         (offsets[3], widths[3], index_shards),
-        (offsets[4], widths[4], ulysses_sp._REPLICATE),
+        (offsets[4], widths[4], ulysses_sp.REPLICATE),
     )
     packed = pack_fields(source, spec, world)
 
@@ -52,5 +52,6 @@ def test_rank_receives_its_query_heads_kv_groups_and_indexer(monkeypatch, world)
         )
         assert torch.equal(packed[rank], expected)
         group = SimpleNamespace(rank_in_group=rank, custom_all_gather=lambda x: x)
-        gathered = ulysses_sp._exchange_columns(source, spec, SimpleNamespace(), group)
+        columns = ulysses_sp.send_columns(spec, group, source.device)
+        gathered = ulysses_sp.exchange_columns(source, spec, group, columns)
         assert torch.equal(gathered, expected)

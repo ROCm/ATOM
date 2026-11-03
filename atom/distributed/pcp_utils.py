@@ -57,10 +57,15 @@ def get_pcp_rank() -> int:
     return get_prefill_context_model_parallel_rank()
 
 
-def pcp_is_enabled() -> bool:
+def pcp_stripes_tokens() -> bool:
     """Whether prefill tokens are striped over the PCP group. SP shares the
     group with contiguous token shards."""
     return get_pcp_world_size() > 1 and not sp_is_enabled()
+
+
+def pcp_stripe_count() -> int:
+    """Ranks the runner stripes a prefill's tokens over, round-robin."""
+    return get_pcp_world_size() if pcp_stripes_tokens() else 1
 
 
 def pcp_pad_len(
@@ -159,7 +164,8 @@ def pcp_reduce_scatter(
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
     stripe via a plain reduce_scatter (dim=0). Inverse of the rank-major gather
     (FusedMoE._run_experts gathers its routed rows that way). Only SP may take
-    the INT4 QuickReduce reduce-scatter; PCP merge alone stays exact."""
+    AITER's QuickReduce reduce-scatter, lossy INT4 under
+    AITER_QUICK_REDUCE_QUANTIZATION=INT4; PCP merge alone stays exact."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:
@@ -167,11 +173,9 @@ def pcp_reduce_scatter(
     group = get_pcp_group()
     input_ = input_.contiguous()
     if sp_is_enabled():
-        from atom.distributed.quick_reduce_scatter import try_quick_reduce_scatter
-
-        out = try_quick_reduce_scatter(input_, group)
-        if out is not None:
-            return out
+        qr_comm = group.device_communicator.qr_comm
+        if qr_comm is not None and qr_comm.should_quick_reduce_scatter(input_):
+            return qr_comm.quick_reduce_scatter(input_)
     return group.reduce_scatter(input_, dim=0)
 
 

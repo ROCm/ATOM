@@ -15,7 +15,7 @@ from aiter import cp_gather_indexer_k_quant_cache, dtypes, indexer_k_quant_and_c
 
 from atom.config import get_current_atom_config
 from atom.distributed.dcp_utils import get_dcp_group, get_dcp_rank, get_dcp_world_size
-from atom.distributed.pcp_utils import pcp_is_enabled
+from atom.distributed.pcp_utils import pcp_stripes_tokens
 from atom.model_ops.attention_mla import (
     indexer_qk_rope_quant_and_cache,
     triton_convert_req_index_to_global_index,
@@ -193,7 +193,7 @@ def sparse_attn_indexer(
     # slot_mapping length, so trim the round-robin padding here. Gated on the
     # same condition as the caller's PCP path (a sparse prefill); no-op
     # otherwise.
-    if pcp_is_enabled() and context.is_prefill and attn_metadata.run_sparse:
+    if pcp_stripes_tokens() and context.is_prefill and attn_metadata.run_sparse:
         n_real = slot_mapping.shape[0]
         k = k[:n_real]
         if positions is not None:

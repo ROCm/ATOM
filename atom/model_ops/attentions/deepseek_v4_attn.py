@@ -57,7 +57,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from atom.distributed.pcp_utils import (
     get_pcp_rank,
     get_pcp_world_size,
-    pcp_is_enabled,
+    pcp_stripes_tokens,
     pcp_owned_rows_by_request,
     pcp_pad_dense,
     pcp_pad_indptr,
@@ -2905,7 +2905,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         # Under PCP the rows are this rank's share, published after the query
         # reindex below (`_apply_pcp_reindex`); the whole batch's have no reader.
-        if not (pcp_is_enabled() and not batch.is_dummy_run):
+        if not (pcp_stripes_tokens() and not batch.is_dummy_run):
             self._attach_v4_index_rows(
                 attn_metadata,
                 scheduled_bs,
@@ -2943,7 +2943,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # independently on its own pcp pad). Keep the FULL un-reindexed metadata
         # here so build_ubatch can slice it per group.
         _bal = getattr(self.model_runner, "_pcp_tbo_balanced_active", False)
-        if pcp_is_enabled() and not batch.is_dummy_run and not _bal:
+        if pcp_stripes_tokens() and not batch.is_dummy_run and not _bal:
             # Gate on `not is_dummy_run`: ForCausalLM.forward's round-robin-split is
             # skipped on dummy/warmup runs (_pcp_active() returns False there),
             # so reindexing metadata to 1/W here would pair full-size
@@ -3946,7 +3946,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # BEFORE the builder kernel writes the SWA section, so SWA stays real and
         # unwritten cells stay -1 through reindex until csa_translate_pack
         # overwrites the CSA head. pcp=1 keeps the original zero-fill fast path.
-        if pcp_is_enabled():
+        if pcp_stripes_tokens():
             csa_indices.fill_(-1)
 
         # ----- Single Triton kernel: scatter SWA-prefix / extend / HCA-compress -----

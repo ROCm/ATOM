@@ -120,7 +120,7 @@ def test_an_indexer_projecting_its_own_k_is_never_routed(monkeypatch):
     """GLM-5-FP8: its FP8 fused_qkv_a_proj keeps wk / weights_proj inside the
     indexer (``projected_k_weights=None``), so the routed op could not unpack
     them: refused before any layer is hooked."""
-    monkeypatch.setattr(bind, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(bind, "pcp_stripes_tokens", lambda: False)
     monkeypatch.setattr(bind, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(bind, "get_tensor_model_parallel_rank", lambda: 0)
     why = bind.routing_refusal(_cfg(), {3: _module(external_k_weights=False)})
@@ -130,7 +130,7 @@ def test_an_indexer_projecting_its_own_k_is_never_routed(monkeypatch):
 
 
 def test_the_wrapper_leaves_a_refused_models_indexers_unrouted(monkeypatch):
-    monkeypatch.setattr(bind, "pcp_is_enabled", lambda: False)
+    monkeypatch.setattr(bind, "pcp_stripes_tokens", lambda: False)
     monkeypatch.setattr(dispatch, "config_refusal", lambda cfg: None)
     monkeypatch.setattr(bind, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(bind, "get_tensor_model_parallel_rank", lambda: 0)

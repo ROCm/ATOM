@@ -95,6 +95,8 @@ class Attention(BaseAttention):
         self.kv_cache = torch.tensor([])
         self.indexer = mla_modules.indexer if mla_modules is not None else None
         self.sinks = sinks
+        # Ulysses SP: this rank's qkv columns in the custom all-gather.
+        self.sp_send_columns: torch.Tensor | None = None
 
         atom_config = get_current_atom_config()
         dtype = atom_config.torch_dtype
