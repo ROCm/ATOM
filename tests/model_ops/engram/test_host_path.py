@@ -1763,39 +1763,6 @@ def test_uva_is_the_groups_decision_not_this_ranks(monkeypatch):
     rt.shutdown()
 
 
-@pytest.mark.parametrize("agree, copy", [(True, "0"), (False, "0"), (True, "1")])
-def test_in_place_shard_is_mlocked_only_once_the_group_keeps_it(
-    monkeypatch, agree, copy
-):
-    """The lock comes after the vote: an outvoted rank (or any fallback) must
-    not leave the layers it registered locked; copies are never mlocked."""
-    from atom.model_ops.engram import host as engram_host
-    from atom.model_ops.engram import host_memory
-
-    monkeypatch.setenv("ATOM_ENGRAM_UVA_COPY", copy)
-    allocator = FakeHostAllocator()
-    cudart = FakeCudart()
-    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
-    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
-    locked = []
-    monkeypatch.setattr(host_memory, "_mlock", lambda ranges: locked.extend(ranges))
-    patch_tp_group(monkeypatch, FakeGroup(world_size=2))
-
-    def vote(tensor, op=None, group=None):
-        if not agree:
-            tensor.fill_(0)
-
-    monkeypatch.setattr(engram_host.dist, "all_reduce", vote)
-    rt = make_runtime()
-    heads = rt.prefetcher._hash_mapping.config.num_hash_heads
-    assert rt._enable_uva(rt.prefetcher, heads) is agree
-    in_place = agree and copy == "0"
-    assert bool(locked) == in_place
-    if in_place:
-        assert len(locked) == sum(len(t.shard_tensors()) for t in rt._pinned_tables)
-    rt.shutdown()
-
-
 def test_a_table_that_raises_votes_no_instead_of_leaving_the_vote(monkeypatch):
     """An exception from one table's `enable_uva` (a table already holding
     another range, a bad range) must reach the group vote as a refusal: a

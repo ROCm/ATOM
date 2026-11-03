@@ -114,10 +114,6 @@ def main():
         )
         assert table.enable_uva(start, end, shared=shared), "page-locking refused"
         pinned += (end - start) * (table.head_dim + table._scale.shape[1])
-    # As `EngramHost._enable_uva` does once the group keeps the shard.
-    host_memory.mlock_in_place(
-        t for table in tables.values() for t in table.shard_tensors()
-    )
     seconds = time.perf_counter() - t0
     after = memory()
 
