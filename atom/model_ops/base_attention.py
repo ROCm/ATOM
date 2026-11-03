@@ -257,6 +257,23 @@ def _flydsl_explicit_plan_api() -> bool:
     return ok
 
 
+@functools.cache
+def _flydsl_output_quant_api() -> bool:
+    """Whether gfx1250 aiter exposes paired FP8 + scale PA outputs."""
+    import inspect
+
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250":
+        return False
+    try:
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    except ImportError:
+        return False
+    params = inspect.signature(mod.pa_decode).parameters
+    return "quantized_output" in params and "output_scale" in params
+
+
 def _flydsl_pa_decode_num_seqs(
     *,
     output: torch.Tensor,
@@ -643,6 +660,8 @@ def run_pa_decode(
     exp_sums: torch.Tensor | None = None,
     max_logits: torch.Tensor | None = None,
     temporary_output: torch.Tensor | None = None,
+    quantized_output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
     alibi_slopes: torch.Tensor | None = None,
     sinks: torch.Tensor | None = None,
     sliding_window: int = -1,
@@ -667,7 +686,16 @@ def run_pa_decode(
     ``exp_sums`` / ``max_logits`` / ``temporary_output`` are gluon scratch.
     Omitted, ``pa_decode_gluon`` sizes and allocates its own, so a FlyDSL
     call, which uses its plan's cached scratch, allocates none.
+
+    ``quantized_output`` / ``output_scale`` are a paired FlyDSL-only output:
+    OCP FP8 in the attention layout plus contiguous FP32 ``[tokens, 1]``
+    descales. Omitting both preserves the existing return/output contract.
     """
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError(
+            "quantized_output and output_scale must either both be provided or both "
+            "be None"
+        )
     flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
@@ -779,6 +807,14 @@ def run_pa_decode(
 
         # Slice off ATOM's sequence-axis padding so the rectangle FlyDSL
         # requires holds. Views, no copy: dim 0 is the outermost axis of each.
+        output_quant_args = (
+            {}
+            if quantized_output is None
+            else {
+                "quantized_output": quantized_output,
+                "output_scale": output_scale,
+            }
+        )
         return _flydsl_pa_decode(
             output,
             q,
@@ -801,8 +837,13 @@ def run_pa_decode(
             sliding_window=0,
             work_plan=work_plan,
             max_context_length=context_bound,
+            **output_quant_args,
         )
 
+    if quantized_output is not None or output_scale is not None:
+        raise RuntimeError(
+            "quantized paged-attention output requires the FlyDSL sparse path"
+        )
     if not pa_decode_gluon_supports_arch():
         raise RuntimeError(
             "This GPU has no gluon paged decode: set ATOM_PA_FLYDSL=1"
@@ -1097,6 +1138,84 @@ def unified_attention_with_output_base(
         )
 
     return on_scheduled_rows(attend, rows, q, q_scale, k, v, qkv)
+
+
+def unified_attention_with_output_quant_base_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    return None
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=unified_attention_with_output_quant_base_fake,
+    mutates_args=["quantized_output", "output_scale"],
+)
+@eager_region()
+def unified_attention_with_output_quant_base(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    use_mla: bool,
+    qkv: torch.Tensor,
+    quantized_output: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    """Sparse-M3 attention writing prequantized o_proj input in place.
+
+    Keeping both results as caller-owned mutable buffers lets token-graph replay
+    retain stable addresses while the eager region itself continues to return
+    only ``None``. The generic attention custom op and all non-requesting paths
+    remain unchanged.
+    """
+    if use_mla:
+        raise ValueError("quantized attention output is only defined for sparse MHA")
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    if not getattr(self.impl, "supports_output_quant", False):
+        raise RuntimeError(f"{layer_name} does not support quantized attention output")
+
+    rows = padded_prefill_rows(q.shape[0])
+    if rows is not None:
+        positions = positions[..., :rows]
+
+    def narrow(value):
+        if (
+            rows is not None
+            and isinstance(value, torch.Tensor)
+            and value.shape[0] == q.shape[0]
+        ):
+            return value[:rows]
+        return value
+
+    self.impl.forward(
+        query=narrow(q),
+        key=narrow(k),
+        value=narrow(v),
+        position=positions,
+        q_scale=narrow(q_scale),
+        qkv=narrow(qkv),
+        quantized_output=narrow(quantized_output),
+        output_scale=narrow(output_scale),
+    )
+    if rows is not None:
+        # The following o_proj consumes the full token bucket. Zero FP8 values
+        # make padded rows inert; a unit descale avoids exposing uninitialized
+        # scale bytes to the GEMM.
+        quantized_output[rows:].zero_()
+        output_scale[rows:].fill_(1.0)
 
 
 def linear_attention_with_output_base_fake(

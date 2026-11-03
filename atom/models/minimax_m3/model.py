@@ -26,6 +26,7 @@ from atom.model_ops.base_attention import (
     Attention,
     _flydsl_arch_supported,
     _flydsl_explicit_plan_api,
+    _flydsl_output_quant_api,
     _flydsl_plan_max_batch,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -662,6 +663,15 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.qkv_proj,
             not self.skip_index_topk and _rope_cache_claims_splitk_partials(self.attn),
         )
+        self.fuse_sparse_pa_output_quant = (
+            _linear_consumes_per_token_fp8(self.o_proj)
+            and envs.ATOM_PA_FLYDSL
+            and self.num_kv_heads == 1
+            and self.num_heads == 16
+            and self.head_dim == 128
+            and callable(getattr(self.attn, "forward_quantized", None))
+            and _flydsl_output_quant_api()
+        )
 
     def forward(
         self,
@@ -682,6 +692,11 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
+        if self.fuse_sparse_pa_output_quant:
+            attn_output, attn_scale = self.attn.forward_quantized(
+                q, k, v, positions, qkv=qkv
+            )
+            return self.o_proj(attn_output, x_scale=attn_scale)
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
         if isinstance(attn_output, tuple):
             return self.o_proj(*attn_output)
