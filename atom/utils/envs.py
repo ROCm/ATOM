@@ -706,9 +706,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 30 s `varlen verify:` interval summary is always logged.
     "ATOM_VARLEN_DEBUG": lambda: os.getenv("ATOM_VARLEN_DEBUG", "0") == "1",
     # With ATOM_VARLEN_DEBUG=1, print one line per this many varlen steps.
-    "ATOM_VARLEN_DEBUG_EVERY": lambda: int(
-        os.getenv("ATOM_VARLEN_DEBUG_EVERY", "1")
-    ),
+    "ATOM_VARLEN_DEBUG_EVERY": lambda: int(os.getenv("ATOM_VARLEN_DEBUG_EVERY", "1")),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft

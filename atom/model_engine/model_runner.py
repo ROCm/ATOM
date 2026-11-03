@@ -2439,9 +2439,9 @@ class ModelRunner:
         assert (
             self.config.parallel_config.data_parallel_size == 1
         ), "varlen verify plans one rank's batch; it does not support DP attention"
-        assert not self.config.enable_tbo_decode, (
-            "varlen verify does not plan TBO micro-batches over a ragged step"
-        )
+        assert (
+            not self.config.enable_tbo_decode
+        ), "varlen verify does not plan TBO micro-batches over a ragged step"
         from atom.spec_decode.mtp_varlen import ConfidenceFeedback, StepTimer
 
         n = int(self.config.max_num_seqs)
@@ -2639,9 +2639,9 @@ class ModelRunner:
         """One request graph per total-token count on DeepInfer's grid."""
         from atom.spec_decode.mtp_varlen import build_graph_batch_sizes
 
-        assert not self.use_mrope and not self._tr_hybrid_active(), (
-            "varlen verify records whole-forward request graphs only"
-        )
+        assert (
+            not self.use_mrope and not self._tr_hybrid_active()
+        ), "varlen verify records whole-forward request graphs only"
         full_q = self.drafter.mtp_k + 1
         max_tokens = min(
             self.config.max_num_seqs * full_q, self.config.max_num_batched_tokens

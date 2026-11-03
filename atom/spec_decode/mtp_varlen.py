@@ -399,16 +399,16 @@ class ChunkCostModel:
     def ms_per_token(self) -> float:
         if len(self._pairs) < self.MIN_PAIRS:
             return self.seed
-        return float(
-            np.clip(np.median(self._pairs), 0.0, self.MAX_FACTOR * self.seed)
-        )
+        return float(np.clip(np.median(self._pairs), 0.0, self.MAX_FACTOR * self.seed))
 
     def units(self, max_q: int | None, ctx_tokens: int | None) -> float:
         if not max_q or not ctx_tokens:
             return 0.0
         return float(ctx_tokens) * float(self.cost.excess(int(max_q)))
 
-    def update(self, graph_size: int, residual_ms: float, units: float, slope_ms: float):
+    def update(
+        self, graph_size: int, residual_ms: float, units: float, slope_ms: float
+    ):
         g, r, x = float(graph_size), float(residual_ms), float(units)
         last = self._last
         self._last = (g, r, x)

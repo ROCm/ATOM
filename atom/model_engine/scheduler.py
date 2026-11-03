@@ -1151,7 +1151,9 @@ class Scheduler:
         plan = [
             SeqDraftRates(
                 num_drafts=int(drafts[i]),
-                rates=cumulative_rates(calibrated[i, : drafts[i]]) if known[i] else None,
+                rates=(
+                    cumulative_rates(calibrated[i, : drafts[i]]) if known[i] else None
+                ),
             )
             for i in range(n)
         ]
