@@ -414,8 +414,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
     ),
     # gfx1250 ASM FP8 MLA prefill attention (D192x128) with the same fused QKV
-    # quantization; takes precedence over FlyDSL when both are set. Unsupported
-    # configurations use FlyDSL (if set) or BF16. Added 2026-11-03.
+    # quantization. Exclusive with ATOM_USE_FLYDSL_FP8_PREFILL_ATTN: with both
+    # set, ASM is used and a warning is logged. Unsupported configurations use
+    # BF16. Added 2026-11-03.
     "ATOM_USE_ASM_FP8_PREFILL_ATTN": lambda: (
         os.getenv("ATOM_USE_ASM_FP8_PREFILL_ATTN", "0") == "1"
     ),

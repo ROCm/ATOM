@@ -646,8 +646,9 @@ class MLAAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.use_asm_fp8_prefill_attn = bool(envs.ATOM_USE_ASM_FP8_PREFILL_ATTN)
-        self.use_flydsl_fp8_prefill_attn = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        self.use_asm_fp8_prefill_attn, self.use_flydsl_fp8_prefill_attn = (
+            self._fp8_prefill_attn_flags()
+        )
         self._fp8_mha_ok: bool | None = None
         self._fp8_mha_backend: str | None = None
         self.num_heads = num_heads
@@ -1119,15 +1120,34 @@ class MLAAttention(nn.Module):
         out = tuple(t[..., : self.qk_nope_head_dim] for t in tensors)
         return out if len(out) > 1 else out[0]
 
-    def _check_fp8_prefill_mha(self, q: torch.Tensor) -> None:
-        """Pick the FP8 prefill attention backend before any FP8 preparation.
+    @staticmethod
+    def _fp8_prefill_attn_flags() -> tuple[bool, bool]:
+        """The (ASM, FlyDSL) FP8 prefill attention flags. They are exclusive:
+        with both set, ASM is used and the FlyDSL flag is ignored."""
+        asm = bool(envs.ATOM_USE_ASM_FP8_PREFILL_ATTN)
+        flydsl = bool(envs.ATOM_USE_FLYDSL_FP8_PREFILL_ATTN)
+        if asm and flydsl:
+            if not getattr(MLAAttention, "_fp8_prefill_both_flags_logged", False):
+                MLAAttention._fp8_prefill_both_flags_logged = True
+                logger.warning(
+                    "ATOM_USE_ASM_FP8_PREFILL_ATTN=1 and "
+                    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1 are both set; set only one. "
+                    "Using ASM FP8 prefill attention and ignoring "
+                    "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN."
+                )
+            flydsl = False
+        return asm, flydsl
 
-        The first enabled backend that serves this layer wins: ASM (gfx1250
-        D192x128), then FlyDSL (gfx1250 a8w8, or gfx950). Like
-        `_flydsl_gather_ok`, this is cached per layer: projected Q's device,
-        dtype and head layout do not change with sequence lengths. Choosing
-        BF16 here also prevents cached gather from overwriting BF16 workspaces
-        with FP8, so the fallback retains the original Q/K/V.
+    def _check_fp8_prefill_mha(self, q: torch.Tensor) -> None:
+        """Resolve the selected FP8 kernel's support before any FP8 preparation.
+
+        ATOM_USE_ASM_FP8_PREFILL_ATTN selects the ASM kernel (gfx1250
+        D192x128), ATOM_USE_FLYDSL_FP8_PREFILL_ATTN the FlyDSL one (gfx1250
+        a8w8, or gfx950); a layer the selected kernel cannot serve uses BF16.
+        Like `_flydsl_gather_ok`, this is cached per layer: projected Q's
+        device, dtype and head layout do not change with sequence lengths.
+        Choosing BF16 here also prevents cached gather from overwriting BF16
+        workspaces with FP8, so the fallback retains the original Q/K/V.
         """
         if self._fp8_mha_ok is not None:
             return
@@ -1135,47 +1155,42 @@ class MLAAttention(nn.Module):
             self._fp8_mha_ok = False
             return
         head_dim = self.qk_nope_head_dim if self.rope_is_zero_pad else q.shape[-1]
-        asm = self.use_asm_fp8_prefill_attn and _ASM_FP8_MHA_AVAILABLE
-        flydsl_gfx1250 = (
-            self.use_flydsl_fp8_prefill_attn and _FLYDSL_FP8_MHA_GFX1250_AVAILABLE
-        )
-        gfx1250 = (asm or flydsl_gfx1250) and get_gfx_runtime() == "gfx1250"
-        candidates = []
-        if asm and gfx1250:
-            candidates.append(("asm", _asm_fp8_mha_supported))
-        if flydsl_gfx1250 and gfx1250:
-            candidates.append(("flydsl_gfx1250", _flydsl_fp8_mha_gfx1250_supported))
-        elif self.use_flydsl_fp8_prefill_attn and _FLYDSL_FP8_MHA_AVAILABLE:
-            candidates.append(
-                (
-                    "flydsl_gfx950",
-                    functools_partial(flydsl_flash_attn_fp8_supported, q.device),
-                )
+        if self.use_asm_fp8_prefill_attn:
+            kernel, backend = "ASM", "asm"
+            supported = (
+                _asm_fp8_mha_supported
+                if _ASM_FP8_MHA_AVAILABLE and get_gfx_runtime() == "gfx1250"
+                else None
             )
-        # Cached FP8 gather currently retains the synthetic RoPE padding.
-        # Until that tuple is trimmed too, NoPE models use the BF16 path.
-        eligible = q.dtype == torch.bfloat16 and not self.rope_is_zero_pad
-        self._fp8_mha_backend = next(
-            (
-                name
-                for name, supported in candidates
-                if eligible
-                and supported(q.shape[-2], self.num_heads, head_dim, self.v_head_dim)
-            ),
-            None,
+        elif _FLYDSL_FP8_MHA_GFX1250_AVAILABLE and get_gfx_runtime() == "gfx1250":
+            kernel, backend = "FlyDSL", "flydsl_gfx1250"
+            supported = _flydsl_fp8_mha_gfx1250_supported
+        else:
+            kernel, backend = "FlyDSL", "flydsl_gfx950"
+            supported = (
+                functools_partial(flydsl_flash_attn_fp8_supported, q.device)
+                if _FLYDSL_FP8_MHA_AVAILABLE
+                else None
+            )
+        self._fp8_mha_ok = (
+            supported is not None
+            and q.dtype == torch.bfloat16
+            # Cached FP8 gather currently retains the synthetic RoPE padding.
+            # Until that tuple is trimmed too, NoPE models use the BF16 path.
+            and not self.rope_is_zero_pad
+            and supported(q.shape[-2], self.num_heads, head_dim, self.v_head_dim)
         )
-        self._fp8_mha_ok = self._fp8_mha_backend is not None
+        self._fp8_mha_backend = backend if self._fp8_mha_ok else None
         if not self._fp8_mha_ok and not getattr(
             MLAAttention, "_fp8_prefill_fallback_logged", False
         ):
             MLAAttention._fp8_prefill_fallback_logged = True
             logger.warning(
-                "FP8 prefill attention requested (ATOM_USE_ASM_FP8_PREFILL_ATTN=%d, "
-                "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=%d), but no enabled backend is "
-                "available or supports device=%s, dtype=%s, heads=%d, qk_dim=%d, "
-                "v_dim=%d. Falling back to BF16 attention.",
-                self.use_asm_fp8_prefill_attn,
-                self.use_flydsl_fp8_prefill_attn,
+                "ATOM_USE_%s_FP8_PREFILL_ATTN=1 requested, but %s FP8 prefill "
+                "attention is unavailable or unsupported for device=%s, dtype=%s, "
+                "heads=%d, qk_dim=%d, v_dim=%d. Falling back to BF16 attention.",
+                kernel.upper(),
+                kernel,
                 q.device,
                 q.dtype,
                 q.shape[-2],

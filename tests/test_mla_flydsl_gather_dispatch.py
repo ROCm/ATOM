@@ -284,8 +284,23 @@ def _asm_gfx1250(monkeypatch, device_ok=True):
     return gate
 
 
-@pytest.mark.parametrize("flydsl", [False, True])
-def test_asm_fp8_mha_takes_precedence_on_gfx1250(monkeypatch, flydsl):
+@pytest.mark.parametrize("asm", ["0", "1"])
+@pytest.mark.parametrize("flydsl", ["0", "1"])
+def test_fp8_prefill_attn_flags_are_exclusive(monkeypatch, caplog, asm, flydsl):
+    """Both set means ASM, and every layer reads the flags: warn once, not per layer."""
+    monkeypatch.setenv("ATOM_USE_ASM_FP8_PREFILL_ATTN", asm)
+    monkeypatch.setenv("ATOM_USE_FLYDSL_FP8_PREFILL_ATTN", flydsl)
+    monkeypatch.setattr(
+        mla.MLAAttention, "_fp8_prefill_both_flags_logged", False, raising=False
+    )
+    both = asm == flydsl == "1"
+    for _ in range(3):
+        flags = mla.MLAAttention._fp8_prefill_attn_flags()
+        assert flags == (asm == "1", flydsl == "1" and not both)
+    assert caplog.text.count("set only one") == int(both)
+
+
+def test_asm_fp8_mha_serves_k3_on_gfx1250(monkeypatch):
     """K3's D192x128 heads go to ASM, asked once, without consulting FlyDSL."""
     gate = _asm_gfx1250(monkeypatch)
     for name in ("flash_attn_a8w8_m32x8_supported", "flydsl_flash_attn_fp8_supported"):
@@ -293,7 +308,7 @@ def test_asm_fp8_mha_takes_precedence_on_gfx1250(monkeypatch, flydsl):
             mla, name, Mock(side_effect=AssertionError(name)), raising=False
         )
     impl = _prefill_impl(
-        use_asm_fp8_prefill_attn=True, use_flydsl_fp8_prefill_attn=flydsl
+        use_asm_fp8_prefill_attn=True, use_flydsl_fp8_prefill_attn=False
     )
     for tokens in (1, 70, 1024):
         impl._check_fp8_prefill_mha(torch.empty(tokens, 12, 192, dtype=torch.bfloat16))
@@ -303,26 +318,26 @@ def test_asm_fp8_mha_takes_precedence_on_gfx1250(monkeypatch, flydsl):
 
 
 @pytest.mark.parametrize("reason", ["gfx950", "a0", "head_dim"])
-@pytest.mark.parametrize("flydsl", [False, True])
-def test_asm_fp8_mha_declined_falls_through(monkeypatch, caplog, reason, flydsl):
-    """Where ASM does not apply, FlyDSL serves the layer if it is also set;
-    otherwise BF16 attention does, and the request's fallback is logged."""
+def test_asm_fp8_mha_declined_uses_bf16(monkeypatch, caplog, reason):
+    """Where ASM does not apply, the layer runs BF16 attention, not FlyDSL, and
+    the fallback is logged."""
     gate = _asm_gfx1250(monkeypatch, device_ok=reason != "a0")
     if reason == "gfx950":
         monkeypatch.setattr(mla, "get_gfx_runtime", lambda: "gfx950")
         monkeypatch.setattr(mla, "_FLYDSL_FP8_MHA_AVAILABLE", True)
     for name in ("flash_attn_a8w8_m32x8_supported", "flydsl_flash_attn_fp8_supported"):
-        monkeypatch.setattr(mla, name, Mock(return_value=True), raising=False)
+        monkeypatch.setattr(
+            mla, name, Mock(side_effect=AssertionError(name)), raising=False
+        )
     impl = _prefill_impl(
-        use_asm_fp8_prefill_attn=True, use_flydsl_fp8_prefill_attn=flydsl
+        use_asm_fp8_prefill_attn=True, use_flydsl_fp8_prefill_attn=False
     )
     head_dim = 128 if reason == "head_dim" else 192
     impl._check_fp8_prefill_mha(torch.empty(4, 12, head_dim, dtype=torch.bfloat16))
-    flydsl_backend = "flydsl_gfx950" if reason == "gfx950" else "flydsl_gfx1250"
-    assert impl._fp8_mha_backend == (flydsl_backend if flydsl else None)
-    assert impl._fp8_mha_ok is flydsl
+    assert impl._fp8_mha_ok is False
+    assert impl._fp8_mha_backend is None
     assert gate.call_count == int(reason == "a0")
-    assert caplog.text.count("Falling back to BF16 attention") == int(not flydsl)
+    assert caplog.text.count("ATOM_USE_ASM_FP8_PREFILL_ATTN=1 requested") == 1
 
 
 @pytest.mark.parametrize("return_lse", [False, True])
