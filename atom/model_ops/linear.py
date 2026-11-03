@@ -186,16 +186,23 @@ def padded_partition_size(size: int, align: int | None) -> int:
 
 
 def _zero_k_pad(layer: nn.Module, quant_config, prefix: str) -> None:
-    """Like MoE's intermediate_pad: only a half that is MXFP4 (or unquantized) in
-    the checkpoint is padded, zeroed at allocation (byte 0 is finite in e8m0);
-    loads fill the front. Online requant into a padded layer is refused."""
+    """Like MoE's intermediate_pad: a half that is MXFP4 or bf16 in the
+    checkpoint is padded, zeroed at allocation (byte 0 is finite in e8m0); loads
+    fill the front. A bf16 half may be requantized online (zero rows quantize to
+    zero); other sources would need their scales padded and are refused."""
     qt, dt = layer.quant_type, layer.params_dtype
-    static = not will_online_requant(quant_config, prefix, qt, dt)
-    if not (static and (_is_mxfp4(qt, dt) or qt.value == QuantType.No.value)):
+    if qt.value == QuantType.No.value:
+        pass
+    elif will_online_requant(quant_config, prefix, qt, dt):
         raise NotImplementedError(
-            f"{prefix}: MXFP4 K padding needs the MLP pair to be MXFP4 (or "
-            "unquantized) in the checkpoint, not online requant; list this MLP "
-            "in exclude_layer of --online_quant_config."
+            f"{prefix}: MXFP4 K padding can't pad a {qt.name} checkpoint that is "
+            "requantized online; list this MLP in exclude_layer of "
+            "--online_quant_config."
+        )
+    elif not _is_mxfp4(qt, dt):
+        raise NotImplementedError(
+            f"{prefix}: MXFP4 K padding needs both halves of the MLP pair to be "
+            f"MXFP4 or unquantized in the checkpoint; got {qt.name}."
         )
     for name in ("weight", "weight_scale", "bias"):
         p = getattr(layer, name, None)

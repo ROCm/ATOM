@@ -294,12 +294,12 @@ def online_build(monkeypatch):
 
 @pytest.mark.parametrize(
     "source",
-    [NVFP4_SRC, FP8_BLOCK_SRC, FP8_PER_TOKEN_SRC, BF16_SRC],
-    ids=["nvfp4", "fp8_block", "fp8_per_token", "bf16"],
+    [NVFP4_SRC, FP8_BLOCK_SRC, FP8_PER_TOKEN_SRC],
+    ids=["nvfp4", "fp8_block", "fp8_per_token"],
 )
 def test_online_requant_into_a_padded_layer_is_refused(tp_rank, online_build, source):
-    """Padding a source scheme before requant is what MoE never does either;
-    an unaligned pair that only becomes MXFP4 online is refused, loudly."""
+    """A quantized source would need its scales padded before requant, which
+    MoE never does either; an unaligned pair from one is refused, loudly."""
     qc = _online_to_mxfp4(source)
     align = mxfp4_k_pad_align(qc, "mlp.down_proj")
     assert align == MXFP4_PRESHUFFLE_K_ALIGN
@@ -334,6 +334,46 @@ def test_an_aligned_online_requant_pair_is_built_unpadded(tp_rank, online_build)
         input_pad_align=align,
     )
     assert not down._k_padded
+
+
+def test_a_static_mixed_scheme_pair_is_refused_without_exclude_advice(tp_rank):
+    """A static FP8 gate_up beside an MXFP4 down has no online config to
+    exclude it from; the message says what the pair needs instead."""
+    with pytest.raises(NotImplementedError, match="both halves") as err:
+        MergedColumnParallelLinear(
+            HIDDEN,
+            [INTER, INTER],
+            quant_config=_qc(QuantType.per_Token, dtypes.fp8),
+            prefix="mlp.gate_up_proj",
+            output_pad_align=MXFP4_PRESHUFFLE_K_ALIGN,
+        )
+    assert "exclude_layer" not in str(err.value)
+
+
+def test_a_bf16_pair_requantized_online_is_padded(tp_rank, online_build):
+    """The common online case: a bf16 checkpoint quantized online to MXFP4.
+    bf16 has no scales to pad; its zero rows quantize to zero."""
+    qc = _online_to_mxfp4(BF16_SRC)
+    align = mxfp4_k_pad_align(qc, "mlp.down_proj")
+    gate_up = MergedColumnParallelLinear(
+        HIDDEN,
+        [INTER, INTER],
+        quant_config=qc,
+        prefix="mlp.gate_up_proj",
+        output_pad_align=align,
+    )
+    down = RowParallelLinear(
+        INTER,
+        HIDDEN,
+        quant_config=qc,
+        reduce_results=False,
+        prefix="mlp.down_proj",
+        input_pad_align=align,
+    )
+    assert gate_up.weight.shape == (2 * PADDED, HIDDEN)
+    assert down.weight.shape == (HIDDEN, PADDED)
+    for layer in (gate_up, down):
+        assert (_u8(layer.weight) == 0).all()
 
 
 def test_an_unquantized_gate_up_half_is_padded_with_zeros(tp_rank):
@@ -537,6 +577,65 @@ def test_padded_pair_forward_matches_the_real_math(monkeypatch, tp_rank):
     # The padded tail is exactly zero, so down's padded K contributes nothing.
     assert (gate[:, REAL:] == 0).all() and (up[:, REAL:] == 0).all()
     assert (act[:, REAL:] == 0).all()
+    y_ref = act[:, :REAL].float() @ d_ref.T
+    assert torch.isfinite(y).all()
+    assert cos(y, y_ref) > 0.98, f"rank {tp_rank} down: {cos(y, y_ref):.4f}"
+
+
+def test_bf16_pair_requantized_online_runs_forward_like_the_real_math(
+    monkeypatch, tp_rank, online_build
+):
+    """bf16 checkpoint -> online MXFP4 through the padded pair at TP8: load the
+    real bf16 shards, requantize in process_weights_after_loading, run
+    gate_up -> silu(gate) * up -> down; each stage against bf16 float math."""
+    qc = _online_to_mxfp4(BF16_SRC)
+    align = mxfp4_k_pad_align(qc, "mlp.down_proj")
+    torch.manual_seed(0)
+    w_gu = torch.randn(2 * INTER, HIDDEN, dtype=torch.bfloat16) * 0.05
+    w_d = torch.randn(HIDDEN, INTER, dtype=torch.bfloat16) * 0.05
+    with torch.device("cuda"):
+        gate_up = MergedColumnParallelLinear(
+            HIDDEN,
+            [INTER, INTER],
+            quant_config=qc,
+            prefix="mlp.gate_up_proj",
+            output_pad_align=align,
+        )
+        down = RowParallelLinear(
+            INTER,
+            HIDDEN,
+            quant_config=qc,
+            reduce_results=False,
+            prefix="mlp.down_proj",
+            input_pad_align=align,
+        )
+    for shard_id in (0, 1):
+        rows = slice(shard_id * INTER, (shard_id + 1) * INTER)
+        gate_up.weight_loader(gate_up.weight, w_gu[rows], shard_id)
+    down.weight_loader(down.weight, w_d)
+    for layer in (gate_up, down):
+        layer.process_weights_after_loading()
+    assert gate_up.weight.dtype == dtypes.fp4x2 and down.weight.dtype == dtypes.fp4x2
+
+    x = torch.randn(64, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    gate, up = gate_up(x).float().chunk(2, -1)
+    act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+    y = down(act).float()
+
+    def cos(a, b):
+        return torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), 0)
+
+    r = slice(tp_rank * REAL, (tp_rank + 1) * REAL)
+    g_ref = w_gu[:INTER][r].float().cuda()
+    u_ref = w_gu[INTER:][r].float().cuda()
+    d_ref = w_d[:, r].float().cuda()
+    assert gate.shape[-1] == PADDED
+    for name, got, ref in (
+        ("gate", gate[:, :REAL], x.float() @ g_ref.T),
+        ("up", up[:, :REAL], x.float() @ u_ref.T),
+    ):
+        assert cos(got, ref) > 0.98, f"rank {tp_rank} {name}: {cos(got, ref):.4f}"
+    assert (gate[:, REAL:] == 0).all() and (act[:, REAL:] == 0).all()
     y_ref = act[:, :REAL].float() @ d_ref.T
     assert torch.isfinite(y).all()
     assert cos(y, y_ref) > 0.98, f"rank {tp_rank} down: {cos(y, y_ref):.4f}"
