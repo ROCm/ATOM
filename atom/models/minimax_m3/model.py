@@ -7,7 +7,10 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_lease_registered_input_buffer,
+)
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -60,11 +63,40 @@ from atom.models.utils import (
 from atom.quant_spec import effective_layer_quant
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import token_graph
 
 
 def _get_text_config(config: PretrainedConfig) -> PretrainedConfig:
     return config.text_config if hasattr(config, "text_config") else config
+
+
+def _registered_ar_output(
+    registered_buffer: torch.Tensor | None,
+    like: torch.Tensor,
+    producer: nn.Module,
+) -> torch.Tensor | None:
+    """Byte-zero view for an ``out=`` producer, or the ordinary-path sentinel.
+
+    The shared buffer is offered only to producers that explicitly promise
+    ``out=`` support.  Any capability/size miss returns ``None`` so the
+    producer allocates exactly as it did before F5.
+    """
+    supports_out = getattr(producer, "supports_out", None)
+    if (
+        registered_buffer is None
+        or supports_out is None
+        or not supports_out()
+    ):
+        return None
+    nbytes = like.numel() * like.element_size()
+    if nbytes > registered_buffer.numel():
+        return None
+    return (
+        registered_buffer.narrow(0, 0, nbytes)
+        .view(like.dtype)
+        .view(like.shape)
+    )
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -279,7 +311,10 @@ class MiniMaxM3MLP(nn.Module):
         self.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
 
     def forward(
-        self, x: torch.Tensor, x_scale: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        x_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
         x = swiglu_oai_split(
@@ -288,7 +323,10 @@ class MiniMaxM3MLP(nn.Module):
             beta=self.swiglu_beta,
             limit=self.swiglu_limit,
         )
-        return self.down_proj(x)
+        return self.down_proj(x, out=out)
+
+    def supports_out(self) -> bool:
+        return self.down_proj.supports_out()
 
 
 class MiniMaxM3MoE(nn.Module):
@@ -364,15 +402,33 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def supports_out(self) -> bool:
+        return (
+            self.shared_experts is None
+            and (self.fuse_shared_experts or self.routed_scaling_factor == 1.0)
+            and self.experts.supports_out()
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if out is not None and not self.supports_out():
+            raise ValueError("MiniMax-M3 MoE cannot honor out= on this backend")
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = self.gate(hidden_states)
 
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-        )
+        if out is None:
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+        else:
+            routed_output = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                out=out.view(-1, out.shape[-1]),
+            )
         if not self.fuse_shared_experts and self.routed_scaling_factor != 1.0:
             routed_output = routed_output * self.routed_scaling_factor
 
@@ -454,13 +510,17 @@ class MiniMaxM3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         attn_output = self.attn(q, k, v, positions=positions, qkv=qkv)
         if isinstance(attn_output, tuple):
-            return self.o_proj(*attn_output)
-        return self.o_proj(attn_output)
+            return self.o_proj(*attn_output, out=out)
+        return self.o_proj(attn_output, out=out)
+
+    def supports_out(self) -> bool:
+        return self.o_proj.supports_out()
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -616,6 +676,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
@@ -634,11 +695,17 @@ class MiniMaxM3SparseAttention(nn.Module):
             attn_output, attn_scale = self.attn.forward_quantized(
                 q, k, v, positions, qkv=qkv
             )
-            return self.o_proj(attn_output, x_scale=attn_scale)
+            # Keep F5's registered custom-AR alias on the F4 prequantized path:
+            # the o_proj consumes the PA-produced scale and writes to the same
+            # caller-owned destination as the ordinary attention path.
+            return self.o_proj(attn_output, x_scale=attn_scale, out=out)
         attn_output = self.attn(q, k, v, positions, qkv=qkv)
         if isinstance(attn_output, tuple):
-            return self.o_proj(*attn_output)
-        return self.o_proj(attn_output)
+            return self.o_proj(*attn_output, out=out)
+        return self.o_proj(attn_output, out=out)
+
+    def supports_out(self) -> bool:
+        return self.o_proj.supports_out()
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -696,6 +763,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         capture_aux: bool = False,
+        registered_ar_input: torch.Tensor | None = None,
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -728,11 +796,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
         # TP-partial / NaN-prone under CUDAGraph.
         aux_hidden_state = residual.clone() if capture_aux else None
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            hidden_states_scale=hidden_states_scale,
+        attention_out = _registered_ar_output(
+            registered_ar_input, residual, self.self_attn
         )
+        if attention_out is None:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+            )
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                hidden_states_scale=hidden_states_scale,
+                out=attention_out,
+            )
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if fuse_post_attention_ar_rmsnorm_quant:
             hidden_states, hidden_states_scale, residual = (
@@ -740,12 +819,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     hidden_states, residual, self.post_attention_layernorm
                 )
             )
-            hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+            ffn_out = _registered_ar_output(registered_ar_input, residual, ffn)
+            if ffn_out is None:
+                hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+            else:
+                hidden_states = ffn(
+                    hidden_states, x_scale=hidden_states_scale, out=ffn_out
+                )
         else:
             hidden_states, residual = fused_allreduce_gemma_rms_norm(
                 hidden_states, residual, self.post_attention_layernorm
             )
-            hidden_states = ffn(hidden_states)
+            ffn_out = _registered_ar_output(registered_ar_input, residual, ffn)
+            hidden_states = (
+                ffn(hidden_states)
+                if ffn_out is None
+                else ffn(hidden_states, out=ffn_out)
+            )
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
@@ -815,6 +905,19 @@ class MiniMaxM3Model(nn.Module):
         # registers them via MiniMaxM3SparseForCausalLM.set_aux_hidden_state_layers.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
+        # One long-lived lease keeps custom AR's registered input arena stable
+        # across eager calls and every token-graph bucket. All decoder layers
+        # view the same tensor so Dynamo sees the true alias; producer custom
+        # ops and the following AR therefore remain ordered. A capability miss
+        # leaves both fields empty and every call follows the old allocation path.
+        self._registered_ar_input_lease = None
+        self._registered_ar_input = None
+        if get_tensor_model_parallel_world_size() > 1:
+            lease = tensor_model_parallel_lease_registered_input_buffer()
+            if lease is not None:
+                self._registered_ar_input_lease = lease
+                self._registered_ar_input = lease.buffer
+
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -841,16 +944,37 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        context = get_forward_context().context
+        registered_ar_input = (
+            self._registered_ar_input
+            if context is not None and context.is_prefill
+            else None
+        )
         aux_hidden_states: list[torch.Tensor] = []
         for idx in range(self.start_layer, self.end_layer):
+            # A non-last PP stage hands its final partial output to another
+            # process instead of consuming it in a fused AR. Do not leave the
+            # shared arena live across that boundary.
+            layer_ar_input = (
+                registered_ar_input
+                if idx + 1 < self.end_layer or get_pp_group().is_last_rank
+                else None
+            )
             if idx in self.aux_hidden_state_layers:
                 hidden_states, residual, aux_hidden_state = self.layers[idx](
-                    positions, hidden_states, residual, capture_aux=True
+                    positions,
+                    hidden_states,
+                    residual,
+                    capture_aux=True,
+                    registered_ar_input=layer_ar_input,
                 )
                 aux_hidden_states.append(aux_hidden_state)
             else:
                 hidden_states, residual = self.layers[idx](
-                    positions, hidden_states, residual
+                    positions,
+                    hidden_states,
+                    residual,
+                    registered_ar_input=layer_ar_input,
                 )
 
         if not get_pp_group().is_last_rank:
