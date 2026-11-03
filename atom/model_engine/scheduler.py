@@ -866,8 +866,10 @@ class Scheduler:
         # Seqs whose last chunk ended on a state-checkpoint rung not yet filed,
         # by that chunk's end; prefill skips them. Under PP the next chunk would
         # otherwise overwrite the state slot before it is filed under the rung's
-        # hash.
-        self._pp_checkpoint_hold: dict[int, int] = {}
+        # hash. Keyed on advance_on_schedule, which only PP sets.
+        # shortcut: holds prefill until the rung's chunk completes; #2709 files
+        # the checkpoint at schedule time and drops the hold for most requests.
+        self._checkpoint_holds: dict[int, int] = {}
 
         from atom.utils.forward_context import get_kvconnector
 
@@ -1062,7 +1064,7 @@ class Scheduler:
                 if not seq.is_partial_prefill:
                     continue
                 # Phase 1 skips a held seq, so its chunk is not pending work.
-                if seq.id in self._pp_checkpoint_hold:
+                if seq.id in self._checkpoint_holds:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -2176,7 +2178,7 @@ class Scheduler:
                     break
                 if not seq.is_partial_prefill:
                     continue
-                if seq.id in self._pp_checkpoint_hold:
+                if seq.id in self._checkpoint_holds:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
@@ -3632,7 +3634,7 @@ class Scheduler:
         # checkpoint is filed. PP refuses PAGE checkpoints, so a rung here is
         # strictly inside the prompt and there always is a next chunk.
         if on_rung and self.advance_on_schedule and bm.enable_prefix_caching:
-            self._pp_checkpoint_hold[seq.id] = start + chunk
+            self._checkpoint_holds[seq.id] = start + chunk
         return chunk
 
     def _checkpoint_room(self, seq: Sequence, finished: bool) -> int:
@@ -4114,7 +4116,7 @@ class Scheduler:
         # Before any bail-out or hashing that can raise, so no seq of this
         # batch (preempted, or after a failing one) is held forever.
         for req_id in self._checkpoint_holds_owned_by(batch):
-            del self._pp_checkpoint_hold[req_id]
+            del self._checkpoint_holds[req_id]
         if not self.block_manager.enable_prefix_caching:
             return
         if batch.is_final_chunk is None:
@@ -4138,8 +4140,8 @@ class Scheduler:
                 replay_until=_scheduled_replay_until(batch, i),
             )
 
-    def holds_checkpoint_hostage(self, batch: ScheduledBatch) -> bool:
-        """Whether any seq in `batch` is waiting on this batch's checkpoint.
+    def carries_held_checkpoint(self, batch: ScheduledBatch) -> bool:
+        """Whether `batch` carries the chunk a held seq waits on.
 
         If so, its prefix hashes must be filed now rather than deferred: a held
         seq is out of the prefill scan until then and would stall.
@@ -4149,14 +4151,14 @@ class Scheduler:
     def _checkpoint_holds_owned_by(self, batch: ScheduledBatch) -> list[int]:
         """Held seqs whose held chunk is in `batch`; an earlier chunk of the
         same seq, still in flight, must not release the hold."""
-        if not self._pp_checkpoint_hold:
+        if not self._checkpoint_holds:
             return []
         return [
             req_id
             for i, req_id in enumerate(batch.req_ids)
-            if req_id in self._pp_checkpoint_hold
+            if req_id in self._checkpoint_holds
             and int(batch.num_cached_tokens[i]) + int(batch.num_scheduled_tokens[i])
-            >= self._pp_checkpoint_hold[req_id]
+            >= self._checkpoint_holds[req_id]
         ]
 
     def postprocess(
@@ -4209,7 +4211,7 @@ class Scheduler:
             final = batch.is_final_chunk
             # Before the loop; see register_prefill_hashes.
             for req_id in self._checkpoint_holds_owned_by(batch):
-                del self._pp_checkpoint_hold[req_id]
+                del self._checkpoint_holds[req_id]
             for i, req_id in enumerate(batch.req_ids):
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
