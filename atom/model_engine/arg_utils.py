@@ -14,6 +14,7 @@ from atom.config import (
     DSparkConfig,
     EPLBConfig,
     ParallelConfig,
+    QSAIndexScorerConfig,
     SpeculativeConfig,
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -185,6 +186,8 @@ class EngineArgs:
     eplb_enable: bool = False
     eplb_config: dict | None = None
     dcp_config: dict | None = None
+    qsa_index_scorer_profile: str = ""
+    qsa_index_scorer_capture: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -828,6 +831,32 @@ class EngineArgs:
                 """"biased"}'"""
             ),
         )
+        qsa_group = parser.add_argument_group("QSA index scorer options")
+        qsa_group.add_argument(
+            "--qsa-index-scorer-profile",
+            type=str,
+            default="",
+            help=(
+                "Route the Qwen QSA index scorer to aiter's fused kernel "
+                "(aiter.ops.qsa_index_scorer) under this profile name or JSON "
+                "path, e.g. qsa_page4_gfx1250_v1. Calls the profile does not "
+                "cover run ATOM's native scorer with a logged reason. Default "
+                "empty = OFF (nothing imported, stock behaviour). See "
+                "docs/qsa_index_scorer.md."
+            ),
+        )
+        qsa_group.add_argument(
+            "--qsa-index-scorer-capture",
+            type=str,
+            default="",
+            help=(
+                "Write every QSA index scorer call class (shapes, dtypes, "
+                "strides, buckets, cache layouts, rank, decision) to this JSON "
+                "path ({rank}/{pid} placeholders allowed) for the coverage "
+                "matrix and aiter gen_profile --plan-file. Works with or "
+                "without --qsa-index-scorer-profile."
+            ),
+        )
 
         return parser
 
@@ -926,6 +955,14 @@ class EngineArgs:
         # --dcp-config (JSON dict) → DCPConfig object, passed through as
         # Config.dcp_config.
         kwargs["dcp_config"] = DCPConfig.from_dict(kwargs.pop("dcp_config"))
+        # --qsa-index-scorer-{profile,capture} → QSAIndexScorerConfig, passed
+        # through as Config.qsa_index_scorer (default OFF).
+        kwargs["qsa_index_scorer"] = QSAIndexScorerConfig.from_dict(
+            {
+                "profile": kwargs.pop("qsa_index_scorer_profile", ""),
+                "capture": kwargs.pop("qsa_index_scorer_capture", ""),
+            }
+        )
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
         # too: LLMEngine still reads the loose kwarg on the legacy path.
