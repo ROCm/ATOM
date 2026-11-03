@@ -37,10 +37,16 @@ THREADS, PER_THREAD = 256, 32
 LATE_PTRS=('icand','table','ilog','ibmax','isel','irow','icout','kmeta')
 LATE_WORDS=('rows_per_page','page_rows','main_off','ilift','iprod','lstride','bstride')
 
-def late_pointer(c,offset):
-    low=scalar_word(fx.ptr_load(c['late_meta']+offset))
-    high=scalar_word(fx.ptr_load(c['late_meta']+offset+1))
-    return (fx.Int64(low)&fx.Int64(0xffffffff))|(fx.Int64(high)<<32)
+def late_pointer(c, offset):
+    if not (isinstance(offset, int) and offset % 2 == 0):
+        low = scalar_word(fx.ptr_load(c['late_meta'] + offset))
+        high = scalar_word(fx.ptr_load(c['late_meta'] + offset + 1))
+        return (fx.Int64(low) & fx.Int64(0xffffffff)) | (fx.Int64(high) << 32)
+    pair = fx.Vector(fx.ptr_load(c['late_meta'] + offset, result_type=fx.Vector.make_type(2, fx.Int32)))
+    value = (fx.Int64(pair[0]) & fx.Int64(0xffffffff)) | (fx.Int64(pair[1]) << 32)
+    lane = fx.Int64(rocdl.readfirstlane(T.i64, value.ir_value()))
+    return fx.Int64(llvm.inline_asm(T.i64, [lane.ir_value()], "s_mov_b64 $0, $1", "=s,s", has_side_effects=False))
+
 
 def late_word(c,name):
     return scalar_word(fx.ptr_load(c['late_meta']+2*len(LATE_PTRS)+LATE_WORDS.index(name)))
@@ -86,13 +92,13 @@ def mhtjstest_plan_wide_scores(c, t0, n):
         row = n - 1 - reverse
         bound = fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,0)+row))
         own = ip.score_chunks(bound)
-        owner = sel(reindex,t0+row,ld_i32(c['args']['kmeta'],(t0+row)*KMETA+2))
+        owner = sel(reindex,t0+row,fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,1)+row)))
         same_next = (reverse != 0) & (owner == next_owner)
         run = sel(same_next,run+1,fx.Int32(1))
         widest = sel(same_next,fx.max(own,widest),own)
         previous_row = fx.max(row-1,0)
         previous_owner = sel(reindex,t0+previous_row,
-                             ld_i32(c['args']['kmeta'],(t0+previous_row)*KMETA+2))
+                             fx.Int32(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,1)+previous_row)))
         shared = sel((row == 0) | (owner != previous_owner),widest,fx.Int32(0))
         fx.ptr_store(shared,c['late_meta']+mhtjstest_index_row_offset(c,1)+row)
         fx.ptr_store(run,c['late_meta']+mhtjstest_index_row_offset(c,2)+row)
@@ -118,6 +124,7 @@ def mhtjstest_plan_wide_scores(c, t0, n):
     fx.ptr_store(width_log2,c['late_meta']+273+3*c['S'])
 
 
+
 @traced
 def mhtjstest_wide_flat_task(c,n,task):
     row,start,running = task*0,task*0,fx.Int32(0)
@@ -140,8 +147,10 @@ def mhtjstest_plan_wide_tree(c,n,kind,level,k):
     fx.ptr_store(total,c['late_meta']+272+3*c['S'])
 
 def scalar_word(value):
-    lane=rocdl.readfirstlane(T.i32,fx.Int32(value).ir_value())
-    return fx.Int32(llvm.inline_asm(T.i32,[lane],"s_mov_b32 $0, $1","=s,s",has_side_effects=True))
+    lane = rocdl.readfirstlane(T.i32, fx.Int32(value).ir_value())
+    return fx.Int32(llvm.inline_asm(T.i32, [lane], "s_mov_b32 $0, $1", "=s,s", has_side_effects=False))
+
+
 def plane_ptr(plane, tile, byte):
     return fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
                       plane + fx.Int64(tile)*TILE_BYTES + fx.Int64(byte))
@@ -283,6 +292,9 @@ def stage_iscore(c,lead,span,ch0,width,max_chunks):
             publish_plain(c["put"],c["isf"],mhtjstest_row*max_chunks+ch0+mhtjstest_m,1,who)
 
 
+SMALL_PER_THREAD = 8
+
+
 @traced
 def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
     """List j of ``level`` for token t (``raw`` its column bound); see the
@@ -374,6 +386,9 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
             if to_final:
                 if const_expr(kind == "sel"):
                     fx.ptr_store(ident, win + pos)
+                elif const_expr(fin_rsrc is not None):
+                    # One restored icout descriptor for every winner/padding store
+                    bo.buffer_store(Int32(ident), fin_rsrc, t * ip.TOPK_BLOCKS + pos, cache_modifier=CM_DEV)
                 else:
                     _final(c, kind, t, pos, ident, picked)
             else:
@@ -381,7 +396,19 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                     c[f"i{kind}{level}"], ((t * slots + j) * k + pos) * 2, [bits, ident]
                 )
 
-        lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
+        fin_rsrc = None
+        if const_expr(kind == "blk" and not c["tok_par"]):
+            c_fin = restore_late(c, pointers=('icout',), words=(), scratch=False)
+            fin_rsrc = rsrc(c_fin["args"]["icout"])
+        if const_expr(level == 0 and kind == "sel"):
+            # A level-0 sel list of n <= 2048 keys ranks them 8 a thread (same index order,
+            # same winners and places); the 32-a-thread form scanned 8192 slots every radix pass.
+            if n <= THREADS * SMALL_PER_THREAD:
+                lds_topk(n, k, load, emit, c["sel_lds"], tid, SMALL_PER_THREAD, None)
+            else:
+                lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
+        else:
+            lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
         if const_expr(kind == "sel"):
             if to_final:
                 c_sel=restore_late(c,pointers=('icand','table','kmeta'),
@@ -398,7 +425,6 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         if const_expr(region is not None):
             if final:
                 _publish_all(c, region, t)
-
 
 def _final(c, kind, t, pos, ident, rows=None):
     c=restore_late(c,pointers=('isel','irow') if kind=='sel' else ('icout',),words=(),scratch=False)
@@ -495,6 +521,13 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
     c=restore_late(c,pointers=('kmeta',),words=('ilift',),scratch=False)
     a = c["args"]
     if const_expr(c['S'] > 24):
+        # Every row's owner (kmeta word 2, a global load) fetched by its own thread into the
+        # plan's part-1 row array before lane 0's serial reverse pass (which read two a row).
+        lt = fresh(c['tid'])
+        if lt < n:
+            fx.ptr_store(ld_i32(a["kmeta"], (t0 + lt) * KMETA + 2),
+                         c['late_meta'] + mhtjstest_index_row_offset(c, 1) + lt)
+        gpu.barrier()
         if fresh(c['tid'])==0:
             mhtjstest_plan_wide_scores(c,t0,n)
         gpu.barrier()
@@ -523,7 +556,6 @@ def run_scores(c, t0, n, bid, bounds, max_chunks):
         stage_iscore(
             c, t0 + lead, scalar_word(fx.ptr_load(c['late_meta']+fresh(mhtjstest_index_row_offset(c,2))+lead)), i << width_log2, width, max_chunks
         )
-
 
 @traced
 def _run_tree(c, t0, n, bid, kind, bounds, bound_max, max_chunks):

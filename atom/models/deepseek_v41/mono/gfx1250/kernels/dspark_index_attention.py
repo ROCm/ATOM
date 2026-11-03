@@ -37,10 +37,16 @@ THREADS, PER_THREAD = 256, 32
 LATE_PTRS=('icand','table','ilog','ibmax','isel','irow','icout','kmeta')
 LATE_WORDS=('rows_per_page','page_rows','main_off','ilift','iprod','lstride','bstride')
 
-def late_pointer(c,offset):
-    low=scalar_word(fx.ptr_load(c['late_meta']+offset))
-    high=scalar_word(fx.ptr_load(c['late_meta']+offset+1))
-    return (fx.Int64(low)&fx.Int64(0xffffffff))|(fx.Int64(high)<<32)
+def late_pointer(c, offset):
+    if not (isinstance(offset, int) and offset % 2 == 0):
+        low = scalar_word(fx.ptr_load(c['late_meta'] + offset))
+        high = scalar_word(fx.ptr_load(c['late_meta'] + offset + 1))
+        return (fx.Int64(low) & fx.Int64(0xffffffff)) | (fx.Int64(high) << 32)
+    pair = fx.Vector(fx.ptr_load(c['late_meta'] + offset, result_type=fx.Vector.make_type(2, fx.Int32)))
+    value = (fx.Int64(pair[0]) & fx.Int64(0xffffffff)) | (fx.Int64(pair[1]) << 32)
+    lane = fx.Int64(rocdl.readfirstlane(T.i64, value.ir_value()))
+    return fx.Int64(llvm.inline_asm(T.i64, [lane.ir_value()], "s_mov_b64 $0, $1", "=s,s", has_side_effects=False))
+
 
 def late_word(c,name):
     return scalar_word(fx.ptr_load(c['late_meta']+2*len(LATE_PTRS)+LATE_WORDS.index(name)))
@@ -140,8 +146,10 @@ def mhtjstest_plan_wide_tree(c,n,kind,level,k):
     fx.ptr_store(total,c['late_meta']+272+3*c['S'])
 
 def scalar_word(value):
-    lane=rocdl.readfirstlane(T.i32,fx.Int32(value).ir_value())
-    return fx.Int32(llvm.inline_asm(T.i32,[lane],"s_mov_b32 $0, $1","=s,s",has_side_effects=True))
+    lane = rocdl.readfirstlane(T.i32, fx.Int32(value).ir_value())
+    return fx.Int32(llvm.inline_asm(T.i32, [lane], "s_mov_b32 $0, $1", "=s,s", has_side_effects=False))
+
+
 def plane_ptr(plane, tile, byte):
     return fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
                       plane + fx.Int64(tile)*TILE_BYTES + fx.Int64(byte))
