@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tier prefetch: bookkeeping of the scheduler's early tier loads.
+"""Tier prefetch: bookkeeping of the scheduler's offload prefetches.
 
-`Scheduler._early_load_tier_prefixes` allocates blocks for a waiting request and
+`Scheduler._offload_prefetch` allocates blocks for a waiting request and
 submits its LMCache load before the request's turn to prefill. This module keeps
 what it needs to bound that (the requests holding such blocks) and to report on
 it (one INFO line per interval).
@@ -23,8 +23,8 @@ logger = logging.getLogger("atom")
 LIMIT_REASONS = ("watermark",)
 
 
-class TierPrefetchState:
-    """Requests holding early-loaded blocks, per-request skip memory, counters."""
+class OffloadPrefetchState:
+    """Requests holding prefetched blocks, per-request skip memory, counters."""
 
     LOG_INTERVAL_S = 60.0
     # Forget skip memory of requests that left `waiting` this often (in ticks).
@@ -66,7 +66,7 @@ class TierPrefetchState:
         self.submitted_total += 1
 
     def note_prefill(self, seq_id: Any) -> None:
-        """`seq_id` was put on a prefill batch: its early-load wait is over."""
+        """`seq_id` was put on a prefill batch: its prefetch wait is over."""
         entry = self.entries.pop(seq_id, None)
         if entry is not None:
             self.wait_sum_s += time.monotonic() - entry[1]
@@ -100,7 +100,7 @@ class TierPrefetchState:
         frac = held / total_blocks if total_blocks > 0 else 0.0
         wait_ms = 1e3 * self.wait_sum_s / self.wait_n if self.wait_n else 0.0
         logger.info(
-            "[EARLY-LOAD] last %.0fs: submitted=%d (total %d) "
+            "[OFFLOAD-PREFETCH] last %.0fs: submitted=%d (total %d) "
             "skipped_by_limit=%s skipped_by_condition=%s taken_back=%d aborted=%d "
             "| held_blocks=%d (%.1f%% of %d) held_requests=%d "
             "| to_prefill n=%d avg_wait=%.0fms",

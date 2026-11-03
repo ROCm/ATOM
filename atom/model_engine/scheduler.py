@@ -34,6 +34,7 @@ import numpy as np
 
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.offload.mp.offload_prefetch import OffloadPrefetchState
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import (
     AdmissionProbe,
@@ -64,7 +65,6 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
 )
-from atom.model_engine.tier_prefetch import TierPrefetchState
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
 from atom.structured_output import StructuredRequest
@@ -1655,7 +1655,7 @@ class Scheduler:
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self._register_connector_admission(seq)
-        self._enqueue_waiting(seq)
+        self.waiting.append(seq)
         self._arrived_requests += 1
 
     def extend(self, seqs: list[Sequence]):
@@ -1665,20 +1665,8 @@ class Scheduler:
             self._warn_if_unschedulable(seq)
             self._register_connector_admission(seq)
         for seq in seqs:
-            self._enqueue_waiting(seq)
-        self._arrived_requests += len(seqs)
-
-    def _enqueue_waiting(self, seq: Sequence) -> None:
-        if getattr(seq, "dp_prefetch_priority", False) and not (
-            envs.ATOM_OFFLOAD_EARLY_LOAD
-        ):
-            # Routed away from the rank holding its prefix: admit it first so
-            # the tier load of that prefix into this rank starts now. With the
-            # early tier load on, `_early_load_tier_prefixes` starts that load
-            # wherever the request waits, so nothing jumps the queue.
-            self.waiting.appendleft(seq)
-        else:
             self.waiting.append(seq)
+        self._arrived_requests += len(seqs)
 
     def _register_connector_admission(self, seq: Sequence) -> None:
         # Register every logical P request, including those behind a capacity
@@ -2162,7 +2150,7 @@ class Scheduler:
         # whose load is in flight is not counted as prefillable work (and so a
         # FIRE is not spent on nothing). Local to this rank: no collective, and
         # nothing is scheduled for prefill here.
-        self._early_load_tier_prefixes()
+        self._offload_prefetch()
 
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
@@ -2291,7 +2279,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = min(16, self.max_num_seqs)
-        # Early-loading requests held in `prefix_waiters` (they keep their place
+        # Prefetching requests held in `prefix_waiters` (they keep their place
         # but bound nothing: they are not waiting on a lookup).
         early_waiting = 0
         if delayer_allows:
@@ -2353,8 +2341,8 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
-            if seq.id in self._early_load.entries and self._still_loading(seq):
-                # Its early load is in flight: nothing to prefill yet. Keep its
+            if seq.id in self._prefetch.entries and self._still_loading(seq):
+                # Its prefetch is in flight: nothing to prefill yet. Keep its
                 # place in line (the tail would let later arrivals pass it once
                 # it lands) and let the requests behind it go first.
                 prefix_waiters.append(seq)
@@ -3177,7 +3165,7 @@ class Scheduler:
             note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
-        self._early_load.note_gone(seq.id, aborted=True)
+        self._prefetch.note_gone(seq.id, aborted=True)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
@@ -3834,7 +3822,7 @@ class Scheduler:
         num_batched_tokens: int,
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
-        self._early_load.note_prefill(seq.id)
+        self._prefetch.note_prefill(seq.id)
         self._record_cache_reuse(seq)
         self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
         num_batched_tokens += chunk
@@ -4047,26 +4035,26 @@ class Scheduler:
             self.block_manager.abandon_state_load(req_id)
             self.failed_recving_kv_req_ids.append(req_id)
 
-    # How deep into `waiting` the early tier load looks, and how many requests it
+    # How deep into `waiting` the offload prefetch looks, and how many requests it
     # may admit in one tick (each runs an HBM probe and an allocation).
-    _EARLY_LOAD_SCAN = 64
-    _EARLY_LOAD_PER_TICK = 8
+    _PREFETCH_SCAN = 64
+    _PREFETCH_PER_TICK = 8
     # Ticks before a request skipped for KV pressure is looked at again.
-    _EARLY_LOAD_RETRY_TICKS = 8
-    # No early allocation once the KV pool would be fuller than this.
-    _EARLY_LOAD_KV_WATERMARK = 0.8
+    _PREFETCH_RETRY_TICKS = 8
+    # No prefetch allocation once the KV pool would be fuller than this.
+    _PREFETCH_KV_WATERMARK = 0.8
 
     @property
-    def _early_load(self) -> TierPrefetchState:
-        """Early-load bookkeeping. Created on first use, so schedulers built
+    def _prefetch(self) -> OffloadPrefetchState:
+        """Prefetch bookkeeping. Created on first use, so schedulers built
         without `__init__` (test doubles) work."""
-        state = self.__dict__.get("_early_load_state")
+        state = self.__dict__.get("_offload_prefetch_state")
         if state is None:
-            state = self.__dict__["_early_load_state"] = TierPrefetchState()
+            state = self.__dict__["_offload_prefetch_state"] = OffloadPrefetchState()
         return state
 
-    def _early_load_sweep(self, state: TierPrefetchState) -> None:
-        """Drop early-load entries whose request is gone from `waiting`, and
+    def _prefetch_sweep(self, state: OffloadPrefetchState) -> None:
+        """Drop prefetch entries whose request is gone from `waiting`, and
         reclaim an aborted one at once: Phase 2 only pops it on a FIRE tick, and
         until then it would hold its blocks."""
         for seq_id, (seq, _) in list(state.entries.items()):
@@ -4083,8 +4071,8 @@ class Scheduler:
             ):
                 state.note_gone(seq_id)
 
-    def _early_load_candidate(self, seq: Sequence, state: TierPrefetchState) -> bool:
-        """Cheap filters before `_early_load_tier_prefixes` touches the connector.
+    def _prefetch_candidate(self, seq: Sequence, state: OffloadPrefetchState) -> bool:
+        """Cheap filters before `_offload_prefetch` touches the connector.
 
         A request that fails one for good is remembered (`settled`) so the next
         ticks do not look at it again.
@@ -4125,7 +4113,7 @@ class Scheduler:
             return False
         return True
 
-    def _early_load_tier_prefixes(self) -> int:
+    def _offload_prefetch(self) -> int:
         """Admit-and-park waiting requests that must load a prefix from the
         tier, as soon as their lookup answers. Returns how many parked.
 
@@ -4146,38 +4134,34 @@ class Scheduler:
             and once loaded it prefills only when a FIRE admits it;
           - no collective runs and no step type changes, so DP lockstep holds.
 
-        Bounded by KV pressure: no early allocation once the pool would pass
-        `_EARLY_LOAD_KV_WATERMARK` of its blocks.
+        Bounded by KV pressure: no prefetch allocation once the pool would pass
+        `_PREFETCH_KV_WATERMARK` of its blocks.
         Such a request is left to Phase 2, as before. So is anything the park
         path cannot take (an unaligned HBM hit, a multimodal prompt, a load the
         connector refuses after `allocate`, which is handed back unadmitted).
         """
-        state = self._early_load
+        state = self._prefetch
         bm = getattr(self, "block_manager", None)
         total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
         state.maybe_log(total_blocks)
-        if (
-            not envs.ATOM_OFFLOAD_EARLY_LOAD
-            or self.kv_connector is None
-            or not self._connector_flag("is_offload")
-        ):
+        if self.kv_connector is None or not self._connector_flag("is_offload"):
             return 0
         state.tick += 1
         if state.entries:
-            self._early_load_sweep(state)
+            self._prefetch_sweep(state)
         if state.tick % state.PRUNE_TICKS == 0:
             state.prune({seq.id for seq in self.waiting})
         if not self.waiting:
             return 0
 
-        watermark = self._EARLY_LOAD_KV_WATERMARK
+        watermark = self._PREFETCH_KV_WATERMARK
         chunk = int(getattr(self.kv_connector, "chunk_size", 0) or 0)
         hbs = bm.hash_block_size
         parked = 0
-        for seq in list(itertools.islice(self.waiting, 0, self._EARLY_LOAD_SCAN)):
-            if parked >= self._EARLY_LOAD_PER_TICK:
+        for seq in list(itertools.islice(self.waiting, 0, self._PREFETCH_SCAN)):
+            if parked >= self._PREFETCH_PER_TICK:
                 break
-            if not self._early_load_candidate(seq, state):
+            if not self._prefetch_candidate(seq, state):
                 continue
             if len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs:
                 state.skip(seq.id, "seq_slots")
@@ -4207,17 +4191,17 @@ class Scheduler:
             need = bm.num_pool_blocks(len(seq))
             if total_blocks > 0 and (bm.kv.num_used + need) / total_blocks > watermark:
                 state.skip(seq.id, "watermark")
-                state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
+                state.retry_at[seq.id] = state.tick + self._PREFETCH_RETRY_TICKS
                 continue
-            if self._early_load_admit(seq, hbm_probe, needs_remote_load):
+            if self._prefetch_admit(seq, hbm_probe, needs_remote_load):
                 parked += 1
             else:
                 break  # the pool refused the allocation
         if parked:
-            logger.debug("[EARLY-LOAD] parked %d tier load(s)", parked)
+            logger.debug("[OFFLOAD-PREFETCH] parked %d tier load(s)", parked)
         return parked
 
-    def _early_load_admit(
+    def _prefetch_admit(
         self,
         seq: Sequence,
         hbm_probe: AdmissionProbe,
@@ -4230,7 +4214,7 @@ class Scheduler:
         The steps and their order are Phase 2's; what differs is that a result
         that would prefill locally (a refused load) is undone instead.
         """
-        state = self._early_load
+        state = self._prefetch
         prev_hit = seq.prefix_cache_hit_tokens
         self.block_manager.record_allocation(seq, hbm_probe)
         if not self.block_manager.allocate(seq, hbm_probe.num_cached_blocks):
@@ -4259,12 +4243,12 @@ class Scheduler:
                 and not oj.boundary_tokens
                 and not self.block_manager.cancel_state_load(seq)
             ):
-                self._early_load_take_back(seq, prev_hit, cancel_state=False)
+                self._prefetch_take_back(seq, prev_hit, cancel_state=False)
                 return True
         elif oj.boundary_tokens or oj.load_hash == -1:
             # Nothing to wait for, or a joint boundary Phase 2 resolves by
             # prefilling: this request prefills locally, at its turn.
-            self._early_load_take_back(seq, prev_hit)
+            self._prefetch_take_back(seq, prev_hit)
             return True
         # else: a state-only load, which parks like a KV load (as in Phase 2).
         # Stays where it is in `waiting`.
@@ -4274,7 +4258,7 @@ class Scheduler:
         state.retry_at.pop(seq.id, None)
         return True
 
-    def _early_load_take_back(
+    def _prefetch_take_back(
         self, seq: Sequence, prev_hit: int, *, cancel_state: bool = True
     ) -> None:
         """Undo `allocate` and the connector notification of an early admission
@@ -4289,7 +4273,7 @@ class Scheduler:
             self.block_manager.cancel_state_load(seq)
         self.block_manager.deallocate(seq)
         seq.prefix_cache_hit_tokens = prev_hit
-        state = self._early_load
+        state = self._prefetch
         state.settled.add(seq.id)
         state.takebacks += 1
         state.skip(seq.id, "taken_back")
@@ -5313,16 +5297,16 @@ class Scheduler:
 
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
-        # An early-loaded request keeps its place in line: it was not parked by
+        # An prefetched request keeps its place in line: it was not parked by
         # the head of the queue, and moving it up would let it prefill ahead of
         # earlier arrivals. Unless the last admission pass found the head
-        # refused slots or KV blocks: then the finished early loads, which hold
+        # refused slots or KV blocks: then the finished prefetches, which hold
         # blocks of their own, must be able to run and release them, or a head
         # that cannot allocate would wait on them forever.
         early = (
             ()
             if getattr(self, "_admission_head_blocked", False)
-            else self._early_load.entries
+            else self._prefetch.entries
         )
         while self.waiting:
             seq = self.waiting.popleft()

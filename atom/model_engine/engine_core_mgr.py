@@ -1694,10 +1694,6 @@ class CoreManager:
             self._dp_route_counters["prefix_moved_tokens"] += max(0, hit - local)
             if local > 0:
                 self._dp_route_counters["prefix_moved_partial_total"] += 1
-            # Without the early tier load its rank queues it first, so the
-            # load starts on arrival (see `Scheduler._enqueue_waiting`).
-            if loaded:
-                seq.dp_prefetch_priority = True
         self._prefix_owner_record(chain, rank, seq.id)
         return self._record_dp_route_locked(decision, rank)
 
