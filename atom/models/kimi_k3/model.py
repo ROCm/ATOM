@@ -2099,7 +2099,8 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 f"Kimi-K3 got {vision_embeds.shape[0]} image embeddings for "
                 f"{num_placeholders} placeholder tokens. The prompt's "
                 "`<|media_pad|>` runs must be expanded to (h//2)*(w//2) tokens "
-                "per image, and multimodal prefills must not be chunked."
+                "per image, and an image prefill without embedding spans must "
+                "not be chunked."
             )
         inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
         return inputs_embeds
