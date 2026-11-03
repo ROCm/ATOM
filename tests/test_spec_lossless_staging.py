@@ -409,15 +409,6 @@ def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
 
 
-def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
-    prop = proposer(monkeypatch)
-    stage(prop, batch(["a", "b"]))
-    counts = stage(prop, batch([]))
-    assert counts["draft_seed"] == 1
-    assert counts["draft_verify_q_row_base"] is None
-    assert counts["draft_q_row_base"] == 2 and dest(prop)[:2] == [-1, -1]
-
-
 # ---- verify policy ----------------------------------------------------------
 
 

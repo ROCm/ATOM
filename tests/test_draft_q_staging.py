@@ -215,6 +215,14 @@ def test_the_philox_key_advances_once_per_step():
     assert keys == [0, 1, 2]
 
 
+def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail():
+    st, a = staging()
+    stage(st, batch(["a", "b"]))
+    rows = stage(st, batch([]))
+    assert rows["seed"] == 1 and rows["verify_q_row_base"] is None
+    assert rows["q_row_base"] == 2 and a.q_row_base[:2].tolist() == [-1, -1]
+
+
 def test_a_propose_needs_a_staging_of_its_own():
     """Same batch size twice in a row is not enough: each propose must consume
     a staging of its own, or it would draft through stale row bases."""
