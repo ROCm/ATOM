@@ -1165,15 +1165,8 @@ class MLAAttention(nn.Module):
             None,
         )
         self._fp8_mha_ok = self._fp8_mha_backend is not None
-        # ASM is on by default; only an explicit request warns when nothing serves it.
-        requested = self.use_flydsl_fp8_prefill_attn or (
-            self.use_asm_fp8_prefill_attn
-            and envs.is_set("ATOM_USE_ASM_FP8_PREFILL_ATTN")
-        )
-        if (
-            requested
-            and not self._fp8_mha_ok
-            and not getattr(MLAAttention, "_fp8_prefill_fallback_logged", False)
+        if not self._fp8_mha_ok and not getattr(
+            MLAAttention, "_fp8_prefill_fallback_logged", False
         ):
             MLAAttention._fp8_prefill_fallback_logged = True
             logger.warning(
