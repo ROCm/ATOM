@@ -487,7 +487,7 @@ jobs:
                   "model_path": "amd/Qwen3.5-35B-A3B-PTPC-FP8",
                   "extra_args": "--tensor-parallel-size 1 --mem-fraction-static 0.9 --reasoning-parser qwen3 --disable-radix-cache",
                   "accuracy_test_threshold": 0.76,
-                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0",
+                  "env_vars": "SGLANG_DEFAULT_SERVER_ARGS=\nSGLANG_EXTERNAL_MODEL_PACKAGE=atom.plugin.sglang.models\nATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=0\nAITER_BYPASS_TUNE_CONFIG=1",
                   "runner": "atom-mi308-8gpu-plugins-accuracy",
               },
               {
