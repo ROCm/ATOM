@@ -308,6 +308,21 @@ def main():
                             f"run={rid} progress={json.dumps(log.read_text(errors='replace').splitlines()[-12:])}",
                             flush=True,
                         )
+                    # lm-eval uses carriage-return progress bars in this log.
+                    # Keep counters in job stdout when artifact upload fails.
+                    for log in sorted(target.rglob("container-eval.log")):
+                        lines = re.split(r"[\r\n]+", log.read_text(errors="replace"))
+                        progress = [
+                            line[:300]
+                            for line in lines
+                            if line.startswith("Requesting API:")
+                            or re.match(r"\[eval\] concurrent=\d+ gsm8k exact_match", line)
+                        ]
+                        info = {
+                            "path": str(log.relative_to(target)),
+                            "progress": progress[-4:],
+                        }
+                        print(f"run={rid} accuracy_progress={json.dumps(info)}", flush=True)
                     for job_dir in source.glob("slurm_job-*"):
                         job_id = job_dir.name.removeprefix("slurm_job-")
                         if job_id.isdigit():
