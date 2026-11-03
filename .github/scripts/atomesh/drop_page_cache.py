@@ -13,41 +13,22 @@ from __future__ import annotations
 
 import argparse
 import os
-import stat
 import time
 
 
 def drop_page_cache(root: str) -> None:
-    files_advised = bytes_advised = errors = 0
     for directory, _, files in os.walk(root):
         for name in files:
             try:
-                fd = os.open(
-                    os.path.join(directory, name), os.O_RDONLY | os.O_NONBLOCK
-                )
+                fd = os.open(os.path.join(directory, name), os.O_RDONLY)
             except OSError:
-                errors += 1
                 continue
             try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode):
-                    continue
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                files_advised += 1
-                bytes_advised += info.st_size
             except OSError:
-                errors += 1
+                pass
             finally:
                 os.close(fd)
-    tag = (
-        "[page-cache]" if files_advised and not errors else "[page-cache][WARN]"
-    )
-    print(
-        f"{tag} root={root} files_advised={files_advised} "
-        f"file_bytes_advised={bytes_advised} errors={errors}; "
-        "advice covers clean file pages only; bytes reclaimed are not measured",
-        flush=True,
-    )
 
 
 def main() -> None:

@@ -2704,7 +2704,7 @@ models:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             MOONCAKE_STORE: '1'
             MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
-            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
             MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
             OFFLOAD_PROFILE: '1'
             OFFLOAD_MIN_LOAD_TOKENS: '0'
@@ -2769,7 +2769,7 @@ models:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             MOONCAKE_STORE: '1'
             MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
-            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
             MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
             OFFLOAD_PROFILE: '1'
             OFFLOAD_MIN_LOAD_TOKENS: '0'
@@ -2835,7 +2835,7 @@ models:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             MOONCAKE_STORE: '1'
             MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
-            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
             MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
             OFFLOAD_PROFILE: '1'
             OFFLOAD_MIN_LOAD_TOKENS: '0'
@@ -2893,7 +2893,7 @@ models:
             HIP_VISIBLE_DEVICES: 0,1,2,3
             MOONCAKE_STORE: '1'
             MOONCAKE_STORE_OWNERS: 0:512:rdma4;0:512:rdma5;1:512:rdma6;1:512:rdma7
-            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}
+            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: ${ATOMESH_MODEL_ROOT}/.huggingface/hub/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/0a00e0e39fc00499b23efccc18a8ea63fce5c44c
             MOONCAKE_STORE_COMPACT_TIMEOUT: '1800'
             OFFLOAD_PROFILE: '1'
             OFFLOAD_MIN_LOAD_TOKENS: '0'

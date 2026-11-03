@@ -1,7 +1,7 @@
 # Issue #382: first experiment round
 
 Inference source: `1fb68bb34f0f32e24ffc26e813c2740cd5126d49` (PR #2941).
-This branch changes experiment configuration, startup helpers, and metrics collection.
+This branch changes only experiment configuration and metrics collection.
 Original workload: `Jasen/m31-mxfp4-stack-agentx-20261031`, issue #380 C140.
 
 Use `atomesh-benchmark.yaml`, mounted source, image
@@ -16,19 +16,6 @@ privileged container, which `spur-authz` rejects on managed nodes. Keep the
 existing unprivileged model-file cache eviction, NUMA capacity checks, huge-page
 preparation, and the full 2 TiB Store. Check actual Store registration and ready
 capacity in the runtime logs before treating a run as valid.
-
-The first retry on g08 reached Store startup but failed RDMA registration after
-both NUMA compactions timed out. Each NUMA node still held about 1.2 TiB of file
-cache after advising only the selected model snapshot. Set
-`MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS=${ATOMESH_MODEL_ROOT}` for all four cases,
-matching other Store recipes, so clean cached files from other model snapshots
-under the mounted model root can also be evicted. This uses unprivileged
-`posix_fadvise(DONTNEED)`; the host-wide cache-drop helper stays disabled.
-The cache helper reports advised file counts, logical sizes and errors; these
-sizes do not measure reclaimed memory. Verify subsequent NUMA free memory,
-huge-page preparation and full Store registration in the actual retry.
-Container log chunks are written without file buffering so a short startup
-message remains visible during long preparation steps.
 
 | Stage | Case | Client concurrency | N | W | Acceptance | Workload |
 | --- | --- | ---: | ---: | --- | --- | --- |

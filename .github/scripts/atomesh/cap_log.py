@@ -19,9 +19,7 @@ def main() -> int:
     written = 0
     killed = False
     source = sys.stdin.buffer
-    # Startup can emit only a few lines before a long memory preparation or
-    # model load. Publish each chunk so live readers can see that stage.
-    with open(path, "wb", buffering=0) as log:
+    with open(path, "wb") as log:
         while True:
             chunk = source.read1(1 << 20)
             if not chunk:
