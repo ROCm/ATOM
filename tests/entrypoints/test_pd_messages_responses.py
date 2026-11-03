@@ -245,8 +245,11 @@ class TestStructuredResponsesCutFirst:
             "prompt_starts_in_reasoning",
             lambda text: seeds.append(text) or False,
         )
-        monkeypatch.setattr(api_server, "validate_output", lambda *a, **kw: None)
-        _responses(
+        # The fake engine answers "hello", which is not JSON.
+        monkeypatch.setattr(
+            api_server, "validate_responses_output", lambda *a, **kw: None
+        )
+        response = _responses(
             {
                 "model": "m",
                 "input": "hi",
@@ -255,6 +258,7 @@ class TestStructuredResponsesCutFirst:
             }
         )
 
+        assert response.status_code == 200, response.text
         sent, kwargs = server.generate[0]
         kept = kwargs["prompt_cap"].tokens
         assert configured == ['{"type": "object"}']
