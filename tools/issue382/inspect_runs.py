@@ -87,6 +87,7 @@ def main():
     report = {
         "collected_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "collector_host": socket.gethostname(),
+        "sbatch_help": command(["sbatch", "--help"]),
         "queue": queue,
         "runs": [],
     }

@@ -11,11 +11,12 @@ Do not pin a host or supply a candidate node list. Each allocation requests excl
 8 MI355X GPUs. Do not cancel other users' jobs to obtain the node.
 Do not publish these smoke/experimental results to the dashboard.
 
-Set `ATOMESH_DROP_HOST_CACHES=0`: the global cache-drop helper requires a
-privileged container, which `spur-authz` rejects on managed nodes. Keep the
-existing unprivileged model-file cache eviction, NUMA capacity checks, huge-page
-preparation, and the full 2 TiB Store. Check actual Store registration and ready
-capacity in the runtime logs before treating a run as valid.
+Keep `ATOMESH_DROP_HOST_CACHES=1` and the cache helper's required privileged
+mode. Per the user's updated direction, exclude `pit2-p03-g08` through
+`runner.exclude_nodes`; leave node selection automatic for every other host.
+The submitter passes `--exclude` to Slurm without setting a candidate pool.
+The full 2 TiB Store, snapshot-specific file cache advice, compaction, and
+inference/workload parameters remain unchanged.
 
 | Stage | Case | Client concurrency | N | W | Acceptance | Workload |
 | --- | --- | ---: | ---: | --- | --- | --- |

@@ -2697,7 +2697,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2725,6 +2725,7 @@ models:
           wait_router_timeout: 600
         run_eval: true
         runner:
+          exclude_nodes: pit2-p03-g08
           time_limit: 02:00:00
         eval_concurrency:
         - 16
@@ -2762,7 +2763,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2790,6 +2791,7 @@ models:
           wait_router_timeout: 600
         run_eval: true
         runner:
+          exclude_nodes: pit2-p03-g08
           time_limit: 02:00:00
         eval_concurrency:
         - 16
@@ -2828,7 +2830,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2856,6 +2858,7 @@ models:
           wait_router_timeout: 600
         run_eval: false
         runner:
+          exclude_nodes: pit2-p03-g08
           time_limit: 04:00:00
       - name: issue382-a2-c140
         topology: 1p1d
@@ -2886,7 +2889,7 @@ models:
             PYTHONNOUSERSITE: '1'
             PYTHONHASHSEED: '0'
             ATOMESH_TORCH_PROFILE_DURATION: '0'
-            ATOMESH_DROP_HOST_CACHES: '0'
+            ATOMESH_DROP_HOST_CACHES: '1'
             ATOMESH_ISSUE382_METRICS: '1'
             ATOMESH_HOST_CACHE_DROP_TIMEOUT: '900'
           prefill:
@@ -2914,6 +2917,7 @@ models:
           wait_router_timeout: 600
         run_eval: false
         runner:
+          exclude_nodes: pit2-p03-g08
           time_limit: 04:00:00
     accuracy:
       task: gsm8k
