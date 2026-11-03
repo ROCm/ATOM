@@ -477,6 +477,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
+    # Kimi-K3 PAGE checkpoints taken inside the forward instead of at its end.
+    # Off (0): a prefill chunk is cut onto every checkpoint position (the
+    # prompt-end anchor under --state-checkpoint-interval-tokens -1), so a turn
+    # whose new tokens cross a hash block prefills in two steps. On (1): the
+    # chunk runs to its budget, the FlashKDA recurrence stores the state at each
+    # position into its own scratch state slot, the layer copies the conv window
+    # beside it, and the PAGE image is stored from that slot -- the same image,
+    # filed under the same hash, one forward earlier. Needs the FlashKDA path.
+    "ATOM_K3_KDA_MIDSTEP_CKPT": lambda: (
+        os.getenv("ATOM_K3_KDA_MIDSTEP_CKPT", "0") == "1"
+    ),
     # Tokens kept between the prompt-end state checkpoint and the prompt end,
     # at least; the backend's own successor room still applies when it is
     # larger. A chat template rewrites the tail of an assistant turn when the
