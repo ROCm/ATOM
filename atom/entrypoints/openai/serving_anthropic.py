@@ -65,6 +65,14 @@ class AnthropicMessagesRequest(BaseModel):
 # ── Format Conversion ──────────────────────────────────────────────────
 
 
+def _block_field(block: dict, key: str) -> Any:
+    """A field the Anthropic spec requires on this block type. A missing one is
+    the client's error (HTTP 400), not a ``KeyError``."""
+    if key not in block:
+        raise ValueError(f"{block.get('type')} block requires '{key}'")
+    return block[key]
+
+
 def anthropic_to_openai_messages(
     messages: list[AnthropicMessage],
     system: Any | None = None,
@@ -80,7 +88,7 @@ def anthropic_to_openai_messages(
             text_parts = []
             for b in system:
                 if b.get("type") == "text":
-                    text = b["text"]
+                    text = _block_field(b, "text")
                     if text.startswith("x-anthropic-billing-header"):
                         continue
                     text_parts.append(text)
@@ -101,7 +109,7 @@ def anthropic_to_openai_messages(
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "thinking":
                             thinking = block.get("thinking")
                             if isinstance(thinking, str) and thinking:
@@ -109,7 +117,7 @@ def anthropic_to_openai_messages(
                         elif block.get("type") == "tool_use":
                             tool_calls.append(
                                 {
-                                    "id": block["id"],
+                                    "id": _block_field(block, "id"),
                                     "type": "function",
                                     "function": {
                                         "name": block.get("name"),
@@ -135,7 +143,7 @@ def anthropic_to_openai_messages(
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "tool_result":
                             tool_content = block.get("content", "")
                             if isinstance(tool_content, list):
@@ -147,7 +155,7 @@ def anthropic_to_openai_messages(
                             tool_results.append(
                                 {
                                     "role": "tool",
-                                    "tool_call_id": block["tool_use_id"],
+                                    "tool_call_id": _block_field(block, "tool_use_id"),
                                     "content": str(tool_content),
                                 }
                             )

@@ -4,14 +4,19 @@
 """Kimi-K3 serving: request validation that turns malformed tool history into
 HTTP 400, and verbatim tool-call arguments."""
 
+import asyncio
 import json
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
+from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoders import apply_chat_template
 from atom.entrypoints.openai.protocol import ChatCompletionRequest, ChatMessage
 from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
+    AnthropicMessagesRequest,
     anthropic_to_openai_messages,
 )
 from atom.entrypoints.openai.serving_chat import (
@@ -34,6 +39,7 @@ from atom.entrypoints.openai.tool_parser.registry import (
     resolve_tool_call_parser,
     template_keeps_tool_call_arguments,
 )
+from atom.sampling_params import RequiredChannel
 
 TOOL = {
     "type": "function",
@@ -303,3 +309,136 @@ def test_responses_function_call_without_name_rejected():
     )
     with pytest.raises(ValueError):
         validate_history_tool_calls(responses_to_openai_messages(request))
+
+
+# Endpoint level: drive the real handlers with generation stubbed out, so a
+# revert at the call sites in api_server fails here, not only in the helpers.
+
+CHANNEL = RequiredChannel(after=(10,), opening=(20, 21), opens_at=1, end_ids=(2,))
+
+
+@pytest.fixture
+def server(monkeypatch):
+    calls = SimpleNamespace(sampling=[], template_kwargs=[])
+
+    def record_template(*_args, **kwargs):
+        calls.template_kwargs.append(kwargs)
+        return "<rendered prompt>"
+
+    async def fake_generate_async(_prompt, sampling, _request_id, **_kwargs):
+        calls.sampling.append(sampling)
+        yield {
+            "text": "hello",
+            "finish_reason": "eos",
+            "num_tokens_input": 4,
+            "num_tokens_output": 1,
+            "num_cached_tokens": 0,
+        }
+
+    monkeypatch.setattr(api_server, "model_name", "m")
+    monkeypatch.setattr(api_server, "_request_logger", None)
+    monkeypatch.setattr(api_server, "default_chat_template_kwargs", {})
+    monkeypatch.setattr(api_server, "reasoning_toggle", None)
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+    monkeypatch.setattr(api_server, "tool_call_parser_cls", None)
+    monkeypatch.setattr(api_server, "required_tool_channel", CHANNEL)
+    monkeypatch.setattr(api_server, "preserve_tool_call_arguments", True)
+    monkeypatch.setattr(
+        api_server,
+        "tokenizer",
+        SimpleNamespace(encode=lambda _t, **_kw: [1, 2], decode=lambda *_a, **_kw: ""),
+    )
+    monkeypatch.setattr(api_server, "apply_chat_template", record_template)
+    monkeypatch.setattr(
+        api_server,
+        "engine",
+        SimpleNamespace(
+            config=SimpleNamespace(
+                generation_config=SimpleNamespace(), max_model_len=8192
+            )
+        ),
+    )
+    monkeypatch.setattr(api_server, "generate_async", fake_generate_async)
+    return calls
+
+
+def _chat(**kwargs):
+    request = ChatCompletionRequest(model="m", temperature=1.0, **kwargs)
+    return asyncio.run(api_server.chat_completions(request, None))
+
+
+def test_chat_arms_required_channel_for_message_declared_tools(server):
+    system = {"role": "system", "content": "", "tools": [TOOL]}
+    _chat(messages=[system, USER], tool_choice="required")
+    assert server.sampling[-1].required_channel is CHANNEL
+
+
+def test_chat_render_receives_preserve_flag(server):
+    _chat(
+        messages=_history(
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"},
+            }
+        )
+    )
+    assert server.template_kwargs[-1]["preserve_tool_call_arguments"] is True
+
+
+def test_messages_endpoint_rejects_nameless_tool_use(server):
+    request = AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(
+                role="assistant",
+                content=[{"type": "tool_use", "id": "c1", "input": {}}],
+            ),
+        ],
+    )
+    response = asyncio.run(api_server.anthropic_messages(request, None))
+    assert response.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "text"},
+        {"type": "tool_use", "name": "f", "input": {}},
+        {"type": "tool_result", "content": "ok"},
+    ],
+    ids=["text-without-text", "tool-use-without-id", "tool-result-without-id"],
+)
+def test_messages_endpoint_rejects_missing_required_block_field(server, block):
+    role = "assistant" if block["type"] == "tool_use" else "user"
+    request = AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[
+            AnthropicMessage(role="user", content="hi"),
+            AnthropicMessage(role=role, content=[block]),
+        ],
+    )
+    response = asyncio.run(api_server.anthropic_messages(request, None))
+    assert response.status_code == 400
+
+
+def test_responses_endpoint_rejects_nameless_function_call(server):
+    async def post():
+        transport = httpx.ASGITransport(app=api_server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            return await client.post(
+                "/v1/responses",
+                json={
+                    "model": "m",
+                    "input": [
+                        {"type": "function_call", "call_id": "c1", "arguments": "{}"}
+                    ],
+                },
+            )
+
+    assert asyncio.run(post()).status_code == 400
