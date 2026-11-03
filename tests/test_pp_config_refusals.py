@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""What `Config` refuses under PP: TBO, P/D consumers, and speculation beyond
-Kimi-K3 with DSpark."""
+"""What `Config` refuses under PP: TBO, P/D consumers, and speculation an
+architecture does not declare in `registry.pp_speculative_methods`."""
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
 from atom.config import Config
+from atom.models.registry import pp_speculative_methods
 
 
 def _cfg(pp=2, arch="KimiK3ForConditionalGeneration", method="dspark", **kw):
@@ -48,8 +50,13 @@ def test_pp_without_speculation_is_allowed_for_any_model():
     ],
 )
 def test_unwired_spec_pairs_under_pp_are_refused(arch, method):
-    with pytest.raises(ValueError, match="only Kimi-K3 with DSpark"):
+    with pytest.raises(ValueError, match="pp_speculative_methods declares"):
         _check(_cfg(arch=arch, method=method))
+
+
+def test_a_declared_architecture_is_allowed_without_a_config_edit():
+    with mock.patch.dict(pp_speculative_methods, {"Qwen3NextForCausalLM": ("mtp",)}):
+        _check(_cfg(arch="Qwen3NextForCausalLM", method="mtp"))
 
 
 def test_confidence_schedule_under_pp_is_refused():

@@ -2805,10 +2805,9 @@ class Config:
 
     def _check_pp_support(self) -> None:
         """Refuse what PP does not wire yet: TBO, P/D consumers, and speculation
-        beyond Kimi-K3 with DSpark (a P/D producer does not speculate).
-
-        Only Kimi-K3 with DSpark relays the target's aux taps across stages;
-        anything else fails mid-serving or drafts from zero buffers.
+        an architecture does not declare in ``pp_speculative_methods`` (a P/D
+        producer does not speculate); anything else fails mid-serving or drafts
+        from zero buffers.
         """
         if self.pipeline_parallel_size <= 1:
             return
@@ -2833,14 +2832,16 @@ class Config:
         # draft layer's KV.
         if self.speculative_config is None or role == "kv_producer":
             return
+        from atom.models.registry import pp_speculative_methods
+
         archs = getattr(self.hf_config, "architectures", None) or ()
-        if "KimiK3ForConditionalGeneration" not in archs or not (
-            self.speculative_config.use_dspark()
-        ):
+        spec = self.speculative_config
+        method = "dspark" if spec.use_dspark() else spec.method
+        if not any(method in pp_speculative_methods.get(a, ()) for a in archs):
             raise ValueError(
                 "pipeline_parallel_size > 1 with speculative decoding supports "
-                f"only Kimi-K3 with DSpark, got architectures={list(archs)}, "
-                f"method={self.speculative_config.method!r}."
+                "only the methods registry.pp_speculative_methods declares, got "
+                f"architectures={list(archs)}, method={method!r}."
             )
         if self.dspark.confidence_schedule:
             raise ValueError(

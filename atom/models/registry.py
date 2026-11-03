@@ -64,3 +64,8 @@ mono_decode_installers = {
         "atom.models.minimax_m3.mono.dispatch.install_mono_decode"
     ),
 }
+# Speculative methods each architecture serves under pipeline_parallel_size > 1
+# (its drafts verified per stage, its drafter's aux taps relayed across stages).
+pp_speculative_methods = {
+    "KimiK3ForConditionalGeneration": ("dspark",),
+}
