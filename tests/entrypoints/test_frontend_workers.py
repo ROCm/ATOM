@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+from concurrent.futures import TimeoutError as FuturesTimeout
 
 import pytest
 
@@ -357,7 +358,7 @@ def test_hub_close_does_not_wait_for_a_reply_in_flight():
     worker = fw.RemoteCoreManager(hub.connection_info(0))
     caller = threading.Thread(
         target=lambda: pytest.raises(
-            TimeoutError, worker.prepare_structured_request, _Params("{}")
+            FuturesTimeout, worker.prepare_structured_request, _Params("{}")
         ),
         daemon=True,
     )

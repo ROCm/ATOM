@@ -5401,10 +5401,12 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
+            # Pure-TP padded graphs require ROCm/aiter#7294: its FlyDSL,
+            # FlyDSL-v2, and native-MXFP4 stage2 paths reject the sorting
+            # sentinel at the real token count instead of scattering every
+            # padded expert slot into that row.
             scheduled_tokens_gpu=(
-                None
-                if gathered or not self.use_ep
-                else pass_scheduled_tokens_gpu(topk_ids.shape[0])
+                None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
         )
         if split:
