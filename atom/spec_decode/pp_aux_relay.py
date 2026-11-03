@@ -66,18 +66,16 @@ class PPAuxRelay:
         )
         self.outgoing_ids = () if pp.is_last_rank else self.incoming_ids + self.own_ids
 
-        # The send payload, allocated per step at the forward's row count (a
-        # resident max_num_batched_tokens buffer is ~0.5 GB per rank): the
-        # first own tap to fire allocates it,
-        # every own tap captures into its columns and pack() copies the
-        # received taps into the leading ones. The last stage's hooks write
-        # into the drafter's own buffers instead.
+        # The send payload, allocated per forward at its row count (a resident
+        # max_num_batched_tokens buffer is ~0.5 GB per rank) by the lowest own
+        # tap, which fires first; every own tap captures into its columns and
+        # pack() copies the received taps into the leading ones. The last
+        # stage's hooks write into the drafter's own buffers instead.
+        # The write reads no bookkeeping: inside the compiled forward Dynamo
+        # freezes it to the warmup trace.
         # shortcut: a recorded graph would bake the capture-time buffer, so
         # this holds only while PP stages run their target eagerly.
         self._send: torch.Tensor | None = None
-        # own taps captured into `_send`; rebound, never mutated: an in-place
-        # add inside the compiled forward makes Dynamo replay it via `update`
-        self._filled: frozenset[int] = frozenset()
         self._col = {lid: col for col, lid in enumerate(self.outgoing_ids)}
 
         self._armed = False
@@ -125,20 +123,15 @@ class PPAuxRelay:
         h, col = self.hidden_size, self._col[lid]
         width = len(self.outgoing_ids) * h
 
-        def write(tensor, off):
-            end = off + tensor.shape[0]
-            # A tap already captured firing at row 0 starts a new forward:
-            # drop whatever an unsent forward left behind.
-            if off == 0 and lid in self._filled:
-                self._send, self._filled = None, frozenset()
-            # Whichever tap fires first allocates, so a skipped tap cannot
-            # leave the next one writing into a stale or missing buffer.
-            if self._send is None:
+        opens = lid == self.own_ids[0]
+
+        def write(tensor, _off):
+            # TBO is refused under PP, so a forward is never split into ubatches.
+            if opens:
                 self._send = torch.empty(
-                    end, width, device=tensor.device, dtype=tensor.dtype
+                    tensor.shape[0], width, device=tensor.device, dtype=tensor.dtype
                 )
-            self._send[off:end, col * h : (col + 1) * h].copy_(tensor)
-            self._filled = self._filled | {lid}
+            self._send[:, col * h : (col + 1) * h].copy_(tensor)
 
         return write
 
@@ -160,8 +153,6 @@ class PPAuxRelay:
         assert (
             send is not None and send.shape[0] == num_tokens
         ), f"PPAuxRelay: no capture of {num_tokens} rows to send"
-        missing = set(self.own_ids) - self._filled
-        assert not missing, f"PPAuxRelay: target layers {sorted(missing)} not captured"
         if self.incoming_ids:
             send[:, : received.shape[-1]].copy_(received[:num_tokens])
         return send

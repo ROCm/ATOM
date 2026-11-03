@@ -179,14 +179,6 @@ def test_relay_send_is_sized_to_the_forward_rows():
         assert relay._send is None, "pack must hand the buffer over"
 
 
-def test_relay_a_skipped_first_tap_is_caught_not_written_around():
-    # Only layer 2 fires: it must allocate on its own, and pack() must name -1.
-    relay, target = _relay([-1, 2], 8, (0, 4), first=True, last=False)
-    target.layers[2](torch.zeros(3, 8))
-    with pytest.raises(AssertionError, match=r"\[-1\] not captured"):
-        relay.pack(None, 3)
-
-
 @pytest.mark.parametrize("world_size", [1, 2])
 @pytest.mark.parametrize("with_drafter", [True, False])
 def test_build_takes_the_drafters_spec_and_arms_only_under_pp(world_size, with_drafter):
