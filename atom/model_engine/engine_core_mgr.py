@@ -305,6 +305,9 @@ class CoreManager:
         self._prefix_margin_rel = envs.ATOM_DP_PREFIX_OWNER_MARGIN_REL
         self._prefix_req_gap_rel = envs.ATOM_DP_PREFIX_MAX_REQ_GAP_REL
         self._prefix_policy = envs.ATOM_DP_PREFIX_POLICY
+        self._prefix_idle_tokens = envs.ATOM_DP_PREFIX_IDLE_TOKENS
+        self._prefix_owner_backlog_tokens = envs.ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS
+        self._prefix_ratio = envs.ATOM_DP_PREFIX_RATIO
         if self._prefix_policy not in ("margin", "cost"):
             raise ValueError(
                 f"ATOM_DP_PREFIX_POLICY must be margin or cost, not {self._prefix_policy!r}"
@@ -1574,6 +1577,26 @@ class CoreManager:
                 best_rank, best_score = r, score
         return best_rank
 
+    def _prefix_stays_idle_ratio(self, owner: int, lightest: int) -> bool:
+        """The "idle_ratio" rule: leave the prefix's rank only to use idle
+        prefill capacity or to cut a severe backlog imbalance.
+
+        Moving a request does not add prefill capacity while both ranks have
+        queued prefill to run in lockstep; it only reorders who waits. So move
+        (A) when the lightest rank is about to run out of prefill work (below
+        IDLE_TOKENS queued) while the owner has a backlog (above
+        OWNER_BACKLOG_TOKENS), or (B) when the owner's queued prefill exceeds
+        RATIO x the lightest rank's, which caps the tail without a fixed token
+        gap that would mean different things at different concurrency.
+        """
+        if owner == lightest:
+            return True
+        q_owner = self._rank_tokens[owner]
+        q_light = self._rank_tokens[lightest]
+        if q_light < self._prefix_idle_tokens:
+            return q_owner <= self._prefix_owner_backlog_tokens
+        return q_owner <= self._prefix_ratio * q_light
+
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
         """Least-loaded rank, unless the prefix's last rank is within the margin.
 
@@ -1605,6 +1628,11 @@ class CoreManager:
             self._dp_route_counters["prefix_source_busy_total"] += 1
         elif owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
             rank = self._prefix_cost_rank(seq, owner, hit)
+        elif (
+            owner is not None
+            and getattr(self, "_prefix_policy", "margin") == "idle_ratio"
+        ):
+            rank = owner if self._prefix_stays_idle_ratio(owner, lightest) else lightest
         elif (
             owner is not None
             and load(owner)

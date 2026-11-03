@@ -800,3 +800,31 @@ def test_prefix_spread_margins_scale_with_queue_depth():
     mgr._rank_tokens[owner] = 200_000
     (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
     assert rank != owner
+
+
+def test_prefix_spread_idle_ratio_policy():
+    """Move only to use an idle rank or to cut a severe backlog imbalance."""
+    mgr = _make_spread_mgr()
+    mgr._prefix_policy = "idle_ratio"
+    mgr._prefix_idle_tokens = 32768
+    mgr._prefix_owner_backlog_tokens = 65536
+    mgr._prefix_ratio = 2.0
+
+    def place(case, q_owner, q_other):
+        base = 100_000 * case
+        mgr._rank_tokens = [0, 0]
+        mgr._rank_reqs = [0, 0]
+        (owner,) = _route(mgr, [_chain_seq(base, 100_000, first_block=base)])
+        mgr._mark_seq_prefill_complete(base)
+        other = 1 - owner
+        mgr._rank_tokens = [0, 0]
+        mgr._rank_reqs = [0, 0]
+        mgr._rank_tokens[owner], mgr._rank_tokens[other] = q_owner, q_other
+        (rank,) = _route(mgr, [_chain_seq(base + 1, 110_000, first_block=base)])
+        mgr._mark_seq_prefill_complete(base + 1)
+        return "owner" if rank == owner else "other"
+
+    assert place(1, 100_000, 10_000) == "other"  # A: other about to idle
+    assert place(2, 50_000, 10_000) == "owner"  # owner has no real backlog
+    assert place(3, 300_000, 200_000) == "owner"  # both busy, 1.5x: stay
+    assert place(4, 500_000, 200_000) == "other"  # B: 2.5x imbalance
