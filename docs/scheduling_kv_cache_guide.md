@@ -75,6 +75,15 @@ delayer whether this tick allows prefill. It then selects work in three phases:
    their completion; ready offload resumes retain their existing allocations.
    Local checkpoint waiters permit a bounded scan for independent work and
    retain their relative FIFO order. See the [delayer settings](environment_variables.md#prefill-delayer-tpdcp-and-dp-attention).
+   The per-request decision before `allocate` is one function,
+   `_decide_waiting_seq`. The local coalescer's fill probe and the DP chunk-cost
+   estimate run it as a dry pass (`_dry_admission_pass`) over the same loop
+   bounds, asking each fit against the pool the requests admitted before it
+   would leave (`PoolReservation`: their blocks, the hit blocks they claim, the
+   cached blocks their fresh blocks evict, their state slots). A dry pass does
+   not query the connector, start a checkpoint wait or allocate; it reads the
+   request's last connector answer and stops, reporting prefill, where only a
+   query could decide.
 3. If no prefill was selected, schedule decode from `running`. `can_append`
    checks extension capacity; pressure can preempt a running request back to
    `waiting`. `may_append` reserves the selected tokens, including speculative
@@ -456,8 +465,10 @@ def can_allocate(self, seq: Sequence, record: bool = True, *,
                  block_hashes: list[int] | None = None) -> int:
     """Return cache-hit hash blocks (>=0) if seq fits, else -1."""
 
-def can_allocate_memoized(self, seq: Sequence) -> int:
-    """can_allocate(seq, record=False) over a walk memoised per seq."""
+def can_allocate_memoized(self, seq: Sequence, probe: AdmissionProbe | None = None,
+                          reserved: PoolReservation | None = None) -> int:
+    """can_allocate(seq, record=False) over a walk memoised per seq,
+    asked of the pool left after `reserved`."""
 
 def record_allocation(self, seq: Sequence, num_cached_blocks: int,
                       block_hashes: list[int]) -> None:

@@ -3,6 +3,7 @@
 
 
 import logging
+import random
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -11,12 +12,14 @@ from unittest import mock
 import numpy as np
 import pytest
 from conftest import MockConfig
+from test_state_checkpoint import ckpt_config, make_scheduler, stateful_seq
 
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     SaveOperationId,
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
+from atom.model_engine import scheduler as scheduler_module
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
@@ -1298,6 +1301,512 @@ class TestPartialPrefillRemainingTokens:
         sched.running = deque([big])
         sched._partial_prefill_count = 1
         assert sched._partial_prefill_remaining_tokens() == 16  # capped
+
+
+class _LocalDelayer:
+    """A local coalescer (`is_local`) that releases prefill every tick."""
+
+    is_local = True
+    max_queue_ms = None
+    ttft_max_ticks = 5
+    rank_prefill_costs = ()
+
+    def protects_decode(self, running_decode_batch: int) -> bool:
+        return False
+
+    def should_allow_prefill(self, prefillable, pending_tokens, **kwargs):
+        return PrefillDecision(allow=True, prefillable_ranks=1)
+
+
+class _LookupConnector:
+    """A connector whose tier lookup is still in flight for `pending` seqs and
+    that finds nothing remote for the others."""
+
+    is_offload = False
+    is_producer = False
+
+    def __init__(self, pending=()):
+        self.pending = set(pending)
+        self.matched = []
+
+    def lookup_pending(self, seq) -> bool:
+        return seq.id in self.pending
+
+    def get_num_new_matched_tokens(self, seq):
+        self.matched.append(seq.id)
+        return 0, False
+
+    def update_state_after_alloc(self, seq, *args, **kwargs) -> None: ...
+
+    def build_connector_meta(self, *args, **kwargs):
+        return None
+
+
+# The admission hints `_evaluate` writes on every probe, dry or real; the real
+# admission rewrites each before it reads it.
+_ADMISSION_HINTS = frozenset(
+    {
+        "num_compressed_hit_blocks",
+        "num_wanted_hit_blocks",
+        "checkpoint_demand_pos",
+        "checkpoint_end_pos",
+        "checkpoint_demand_declined",
+        "checkpoint_demand_counted",
+        "replays_hit",
+        "replay_kv_load",
+        "block_hashes",
+    }
+)
+
+
+def _plain(value, depth=0):
+    """`value` as nested builtins, for an equality snapshot."""
+    if depth > 4 or callable(value):
+        return type(value).__name__
+    if isinstance(value, (int, float, str, bytes, bool, type(None))):
+        return value
+    if isinstance(value, np.ndarray):
+        return (value.dtype.str, value.shape, value.tobytes())
+    if isinstance(value, (bytearray, memoryview)) or hasattr(value, "tobytes"):
+        return bytes(value)
+    if isinstance(value, dict):
+        return [(_plain(k, depth + 1), _plain(v, depth + 1)) for k, v in value.items()]
+    if isinstance(value, (set, frozenset)):
+        return sorted(map(repr, value))
+    if isinstance(value, (list, tuple, deque)):
+        return [_plain(v, depth + 1) for v in value]
+    if hasattr(value, "__dict__") or hasattr(value, "__slots__"):
+        names = list(getattr(value, "__dict__", {})) or list(
+            getattr(value, "__slots__", ())
+        )
+        return {
+            n: _plain(getattr(value, n, None), depth + 1)
+            for n in names
+            if not n.startswith("__")
+        }
+    return repr(value)
+
+
+class TestLocalPrefillProbe:
+    """The delayer's fill probe (`_local_prefill_pending_work`) reports the
+    prefill admission would schedule if released now: the same per-seq decision
+    (`_decide_waiting_seq`), asked of the pool the seqs admitted before it
+    leave. Each case compares the probe with the batch admission then builds."""
+
+    @staticmethod
+    def _sched(num_blocks=200, **overrides):
+        config = {
+            "enable_prefix_caching": True,
+            "enable_chunked_prefill": True,
+            "kv_cache_block_size": 4,
+            "num_kvcache_blocks": num_blocks,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 32,
+            "max_model_len": 128,
+        }
+        config.update(overrides)
+        return Scheduler(MockConfig(**config))
+
+    @staticmethod
+    def _step(sched, batch, req_ids=()):
+        sched.postprocess(
+            list(sched.running),
+            ScheduledBatchOutput(
+                req_ids=list(req_ids),
+                token_ids=[(999,)] * len(req_ids),
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+
+    @classmethod
+    def _run_to_finish(cls, sched, seq):
+        """Run `seq` to the end, leaving its blocks free and cached."""
+        sched.add(seq)
+        while not seq.is_finished:
+            batch, _ = sched.schedule()
+            cls._step(sched, batch, [seq.id])
+
+    @staticmethod
+    def _probe_and_admit(sched):
+        """The probe's rows, then the rows admission schedules."""
+        _, probed = sched._local_prefill_pending_work()
+        batch, _ = sched.schedule()
+        return probed, batch.total_tokens_num_prefill if batch is not None else 0
+
+    def _two_hits_waiting(self, seq_factory, num_blocks, *, shared):
+        """One or two 36-token prefixes cached and freed, then two 40-token
+        prompts hitting them (4 uncached rows each), both waiting."""
+        sched = self._sched(num_blocks)
+        p1 = list(range(1, 37))
+        p2 = p1 if shared else list(range(1001, 1037))
+        sp = SamplingParams(max_tokens=1)
+        self._run_to_finish(
+            sched, seq_factory(p1 + [500, 501, 502, 503], sampling_params=sp)
+        )
+        if not shared:
+            self._run_to_finish(
+                sched, seq_factory(p2 + [510, 511, 512, 513], sampling_params=sp)
+            )
+        assert not sched.running
+        sched.add(seq_factory(p1 + [600, 601, 602, 603]))
+        sched.add(seq_factory(p2 + [700, 701, 702, 703]))
+        return sched
+
+    @staticmethod
+    def _hybrid(**overrides):
+        config = {
+            "state_checkpoint_interval_tokens": -1,
+            "enable_chunked_prefill": True,
+            "max_num_batched_tokens": 64,
+            "max_num_seqs": 8,
+            "pool_entries": {"state": 8},
+        }
+        config.update(overrides)
+        return make_scheduler(ckpt_config(**config))
+
+    def test_long_cached_prompts_do_not_end_the_scan(self, seq_factory):
+        sched = self._sched()
+        prefix = list(range(1, 37))  # 9 whole blocks
+        self._run_to_finish(
+            sched,
+            seq_factory(
+                prefix + [500, 501, 502, 503],
+                sampling_params=SamplingParams(max_tokens=1),
+            ),
+        )
+        # Two 40-token prompts (each over the 32-token budget) sharing the
+        # 36-token prefix: 4 uncached rows each.
+        for tail in ([600, 601, 602, 603], [700, 701, 702, 703]):
+            sched.add(seq_factory(prefix + tail))
+
+        assert sched._local_prefill_pending_work() == (True, 8)
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 8
+
+    def test_the_budget_still_caps_the_fill(self, seq_factory):
+        sched = self._sched()
+        prefix = list(range(1, 37))
+        self._run_to_finish(
+            sched,
+            seq_factory(
+                prefix + [500, 501, 502, 503],
+                sampling_params=SamplingParams(max_tokens=1),
+            ),
+        )
+        for i in range(6):
+            sched.add(seq_factory(prefix + [600 + 8 * i + j for j in range(8)]))
+
+        # 6 x 8 uncached rows, cut at the 32-token budget, as admission is.
+        assert sched._local_prefill_pending_work() == (True, 32)
+        batch, _ = sched.schedule()
+        assert batch.total_tokens_num_prefill == 32
+
+    def test_a_checkpoint_cut_leaves_its_room_to_the_next_request(self, seq_factory):
+        # A state-checkpoint cut pulls the first chunk back to a rung; admission
+        # hands the room it leaves to the next waiting request.
+        sched = self._sched(
+            enable_prefix_caching=False, max_num_batched_tokens=64, max_model_len=256
+        )
+        long_seq = seq_factory(list(range(1, 101)))
+        short_seq = seq_factory(list(range(200, 230)))
+
+        def cut(seq, start, end, record=True):
+            return start + 24 if seq is long_seq and end - start > 24 else 0
+
+        sched.block_manager.checkpoint_cut = cut
+        sched.add(long_seq)
+        sched.add(short_seq)
+
+        assert sched._local_prefill_pending_work() == (True, 54)
+        batch, _ = sched.schedule()
+        assert list(batch.num_scheduled_tokens) == [24, 30]
+
+    def test_the_prompt_end_anchor_cut_on_a_hybrid_model(self):
+        # Each 44-token prompt's first chunk ends at its prompt-end anchor (36),
+        # which the probe reads from the seq as admission does.
+        sched = self._hybrid()
+        a = stateful_seq(list(range(1000, 1044)))
+        b = stateful_seq(list(range(2000, 2044)))
+        sched.add(a)
+        sched.add(b)
+        probed = sched._local_prefill_pending_work()
+        assert (a.checkpoint_end_pos, b.checkpoint_end_pos) == (36, 36)
+        batch, _ = sched.schedule()
+        assert probed == (True, batch.total_tokens_num_prefill) == (True, 36)
+
+    @pytest.mark.parametrize("num_blocks", [17, 18, 19, 20, 21])
+    def test_each_seq_fits_in_what_the_earlier_ones_leave(
+        self, seq_factory, num_blocks
+    ):
+        sched = self._two_hits_waiting(seq_factory, num_blocks, shared=False)
+        probed, admitted = self._probe_and_admit(sched)
+        # The simplified PoolReservation sets `spilled` once fresh blocks
+        # exceed the vacant count, conservatively refusing later seqs whose
+        # hits would survive the real allocator.  probe <= admitted is fine.
+        assert probed <= admitted
+
+    @pytest.mark.parametrize("num_blocks", range(12, 26))
+    def test_a_shared_free_prefix_is_reserved_once(self, seq_factory, num_blocks):
+        # Both seqs hit the same free cached prefix: the first `allocate` holds
+        # it, so the second takes only its own tail block from the pool.
+        sched = self._two_hits_waiting(seq_factory, num_blocks, shared=True)
+        assert self._probe_and_admit(sched) == (8, 8)
+
+    @pytest.mark.parametrize("num_blocks", range(18, 26))
+    def test_an_earlier_seq_evicting_a_later_hit(self, seq_factory, num_blocks):
+        # `a` has no hit and takes the vacant blocks, then the least recently
+        # freed cached ones: `b`'s prefix. `b`'s hit ends where the eviction
+        # starts, so it prefills more rows.
+        sched = self._sched(num_blocks, max_num_batched_tokens=128)
+        prefix = list(range(2001, 2025))
+        sp = SamplingParams(max_tokens=1)
+        self._run_to_finish(
+            sched, seq_factory(prefix + [1, 2, 3, 4], sampling_params=sp)
+        )
+        self._run_to_finish(
+            sched, seq_factory(list(range(4001, 4029)), sampling_params=sp)
+        )
+        sched.add(seq_factory(list(range(3001, 3041))))
+        sched.add(seq_factory(prefix + [7, 8, 9, 10]))
+        probed, admitted = self._probe_and_admit(sched)
+        assert probed <= admitted
+        if num_blocks < 23:
+            assert admitted > 44  # `b` lost part of its 24-token hit
+
+    def test_a_pending_tier_lookup_is_passed_over_before_the_fit(self, seq_factory):
+        # `big` fits an empty pool but not beside the running seq. Its lookup is
+        # pending, so admission parks it without asking whether it fits and
+        # admits `small` behind it.
+        sched = self._sched(20, max_num_batched_tokens=64)
+        running = seq_factory(
+            list(range(5000, 5040)), sampling_params=SamplingParams(max_tokens=50)
+        )
+        sched.add(running)
+        batch, _ = sched.schedule()
+        self._step(sched, batch, [running.id])
+        big = seq_factory(list(range(100, 148)))
+        small = seq_factory(list(range(300, 312)))
+        sched.kv_connector = _LookupConnector(pending={big.id})
+        sched.add(big)
+        sched.add(small)
+        assert self._probe_and_admit(sched) == (12, 12)
+        # Only admission queries the connector.
+        assert sched.kv_connector.matched == [small.id]
+
+    def test_the_prefix_bypass_budget_bounds_the_scan(self, seq_factory):
+        # After the first passed-over seq admission looks at most
+        # `min(16, max_num_seqs)` more: four here, all passed over too.
+        sched = self._sched(max_num_seqs=4, max_num_batched_tokens=256)
+        seqs = [seq_factory(list(range(1000 * i, 1000 * i + 8))) for i in range(1, 7)]
+        sched.kv_connector = _LookupConnector(pending=[s.id for s in seqs[:5]])
+        for seq in seqs:
+            sched.add(seq)
+        assert self._probe_and_admit(sched) == (0, 0)
+
+    def _producer_and_consumer(self, *, admit_producer):
+        """A 200-token hybrid prompt and one resending it with 8 more tokens,
+        under the local coalescer, and an unrelated 20-token prompt."""
+        sched = self._hybrid(long_prefill_token_threshold=16)
+        sched.set_prefill_delayer(_LocalDelayer())
+        producer = stateful_seq(list(range(3, 203)))
+        sched.add(producer)
+        if admit_producer:
+            batch, _ = sched.schedule()
+            assert list(batch.num_scheduled_tokens) == [16]
+            self._step(sched, batch)
+            assert producer.is_partial_prefill
+        consumer = stateful_seq(list(range(3, 203)) + list(range(900, 908)))
+        other = stateful_seq(list(range(5000, 5020)))
+        sched.add(consumer)
+        sched.add(other)
+        return sched, producer, consumer
+
+    def test_a_seq_waiting_for_a_running_producer_is_not_fill(self):
+        sched, _, consumer = self._producer_and_consumer(admit_producer=True)
+        probed = sched._local_prefill_pending_work()
+        # The probe does not start the consumer's wait; admission does.
+        assert sched._inflight_prefix_wait == {}
+        batch, _ = sched.schedule()
+        assert probed == (True, batch.total_tokens_num_prefill) == (True, 28)
+        assert consumer.id in sched._inflight_prefix_wait
+        assert consumer not in sched.running
+
+    def test_a_producer_admitted_in_the_same_pass(self):
+        # Nothing runs yet: admission admits the producer first, and the
+        # consumer then waits for its prompt-end checkpoint.
+        sched, producer, consumer = self._producer_and_consumer(admit_producer=False)
+        probed = sched._local_prefill_pending_work()
+        batch, _ = sched.schedule()
+        assert probed == (True, batch.total_tokens_num_prefill)
+        assert producer in sched.running and consumer not in sched.running
+
+    @staticmethod
+    def _offload_connector():
+        """An offload tier with nothing more to load for a new request."""
+        return SimpleNamespace(
+            is_offload=True,
+            is_producer=False,
+            build_connector_meta=lambda: None,
+            get_num_new_matched_tokens=lambda seq: (0, False),
+            update_state_after_alloc=lambda seq: None,
+        )
+
+    def test_an_offload_resume_is_a_producer_for_later_seqs(self):
+        # The resume goes to `running` in admission, so the consumer behind it
+        # waits for its prompt-end checkpoint; the probe must not count it.
+        sched = self._hybrid(
+            long_prefill_token_threshold=16, max_num_batched_tokens=160
+        )
+        sched.set_prefill_delayer(_LocalDelayer())
+        sched.kv_connector = self._offload_connector()
+        producer = stateful_seq(list(range(3, 203)))
+        bm = sched.block_manager
+        assert bm.can_allocate(producer) == 0
+        assert bm.allocate(producer, 0)
+        # As the connector leaves it: blocks held from before it parked, the
+        # load reported, back in `waiting`.
+        producer.num_cached_tokens = 16
+        producer.offload_loaded = True
+        sched.waiting.append(producer)
+        consumer = stateful_seq(list(range(3, 203)) + list(range(900, 908)))
+        sched.add(consumer)
+        sched.add(stateful_seq(list(range(5000, 5020))))
+        probed = sched._local_prefill_pending_work()
+        batch, _ = sched.schedule()
+        assert probed == (True, batch.total_tokens_num_prefill) == (True, 140)
+        assert producer in sched.running and consumer not in sched.running
+
+    def test_an_offload_resume_does_not_commit_the_calibration_arm(
+        self, monkeypatch, seq_factory
+    ):
+        # Admission moves on from a resume without committing the arm an
+        # earlier, requeued sizing drew, so the next first chunk takes the arm
+        # the last admitted request did not. Today chunk sizing draws an arm
+        # only with at most one prefill source in the window, which a resume
+        # and a seq behind it are not: the window is forced here.
+        monkeypatch.setattr(scheduler_module, "has_sole_prefill", lambda recent: True)
+        sched = self._sched(
+            max_num_batched_tokens=256, max_num_seqs=4, max_model_len=256
+        )
+        sched.kv_connector = self._offload_connector()
+        sched.enable_dynamic_chunking = True
+        sched._calibrating = True
+        sched.dynamic_chunking_min_chunk_size = 4
+        resumed = seq_factory(list(range(8)))
+        for token in range(100, 112):
+            resumed.append_token(token)
+        resumed.block_table = [90, 91, 92, 93, 94]
+        resumed.offload_loaded = True
+        resumed.num_cached_tokens = 12
+        sched.waiting.append(resumed)
+        sched.add(seq_factory(list(range(500, 700))))
+        sched._calibration_arm_drawn = True
+        probed, admitted = self._probe_and_admit(sched)
+        assert (probed, admitted) == (72, 72)  # 8 resumed rows + the small arm
+
+    @pytest.mark.parametrize("seed", range(24))
+    def test_random_traffic(self, seq_factory, seed):
+        # Prompts sharing a few prefixes arrive over 25 ticks into a small pool;
+        # every tick the probe must count what admission then schedules.
+        rng = random.Random(seed)
+        budget = rng.choice([16, 32, 64, 128])
+        sched = self._sched(
+            rng.randint(14, 60),
+            max_num_seqs=rng.choice([2, 4, 8]),
+            max_num_batched_tokens=budget,
+            max_model_len=256,
+        )
+        prefixes = [
+            [rng.randint(10, 10**6) for _ in range(rng.choice([8, 16, 24, 36]))]
+            for _ in range(3)
+        ]
+        for _ in range(25):
+            for _ in range(rng.randint(0, 3)):
+                tokens = rng.choice([*prefixes, []]) + [
+                    rng.randint(10, 10**6) for _ in range(rng.randint(1, 30))
+                ]
+                sp = SamplingParams(max_tokens=rng.randint(1, 6))
+                sched.add(seq_factory(tokens, sampling_params=sp))
+            _, probed = sched._local_prefill_pending_work()
+            scheduled = sched.schedule()
+            if scheduled is None:
+                assert probed == 0
+                continue
+            batch, _ = scheduled
+            assert probed <= min(batch.total_tokens_num_prefill, budget)
+            self._step(sched, batch, [seq.id for seq in sched.running])
+
+    def test_the_cost_estimate_prices_the_probed_chunks(self, seq_factory):
+        sched = self._two_hits_waiting(seq_factory, 40, shared=True)
+        cost = sched._estimate_prefill_chunk_cost()
+        batch, _ = sched.schedule()
+        assert cost == sum(
+            sched._chunk_cost(36, rows) for rows in batch.num_scheduled_tokens
+        )
+
+    def _snapshot(self, sched):
+        bm = sched.block_manager
+        seqs = list(sched.waiting) + list(sched.running)
+        return {
+            "scheduler": _plain(
+                {
+                    name: getattr(sched, name)
+                    for name in (
+                        "_inflight_prefix_wait",
+                        "_dynamic_chunking_counts",
+                        "_calibration_small_arm",
+                        "_calibration_arm_drawn",
+                        "_num_parked_remote_kv",
+                        "_partial_prefill_count",
+                        "_rejected",
+                        "_tick_cost",
+                        "_tick_cost_limit",
+                        "deferred_free_blocks",
+                    )
+                }
+            ),
+            "queues": [[s.id for s in sched.waiting], [s.id for s in sched.running]],
+            "kv": _plain(bm.kv),
+            "state": _plain(bm.state),
+            "seqs": [
+                {k: v for k, v in _plain(s).items() if k not in _ADMISSION_HINTS}
+                for s in seqs
+            ],
+            "hints": [
+                {k: v for k, v in _plain(s).items() if k in _ADMISSION_HINTS}
+                for s in seqs
+            ],
+        }
+
+    def test_a_dry_pass_writes_nothing_but_admission_hints(self):
+        sched, *_ = self._producer_and_consumer(admit_producer=True)
+        before = self._snapshot(sched)
+        sched._local_prefill_pending_work()
+        after = self._snapshot(sched)
+        assert {k: v for k, v in after.items() if k != "hints"} == {
+            k: v for k, v in before.items() if k != "hints"
+        }
+        # And they are a function of the pool: a second pass rewrites the same.
+        sched._estimate_prefill_chunk_cost()
+        assert self._snapshot(sched) == after
+
+    def test_a_dry_pass_does_not_change_the_batch(self):
+        probed, plain = (
+            self._producer_and_consumer(admit_producer=True)[0] for _ in "ab"
+        )
+        probed._local_prefill_pending_work()
+        probed._estimate_prefill_chunk_cost()
+        a, _ = probed.schedule()
+        b, _ = plain.schedule()
+        assert list(a.num_scheduled_tokens) == list(b.num_scheduled_tokens)
+        assert self._snapshot(probed)["kv"] == self._snapshot(plain)["kv"]
+        # Seq ids differ between the two; the deadlines are the same.
+        assert list(probed._inflight_prefix_wait.values()) == list(
+            plain._inflight_prefix_wait.values()
+        )
 
 
 class TestOldestWaitingPrefillAge:

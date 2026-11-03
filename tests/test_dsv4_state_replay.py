@@ -406,8 +406,11 @@ def test_the_pending_work_probe_counts_a_replay_wider_than_the_budget():
 
 def test_the_cost_estimate_starts_a_replayed_head_where_admission_does():
     engine, _ = _engine_with_a_replayed_head(budget=64)
-    # 15 rows from the replay's start (25), not 8 from the hit (32).
-    assert engine._estimate_prefill_chunk_cost() == engine._chunk_cost(32 - REPLAY, 15)
+    cost = engine._estimate_prefill_chunk_cost()
+    batch, _ = engine.schedule()
+    # From the replay's start (25), not from the hit (32), over the rows
+    # admission schedules there.
+    assert cost == engine._chunk_cost(32 - REPLAY, batch.total_tokens_num_prefill)
 
 
 def test_a_late_publish_keeps_to_the_replay_it_was_scheduled_with():

@@ -422,6 +422,14 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return True
         return False
 
+    def lookup_is_pending(self, seq) -> bool:
+        """Side-effect-free: whether a lookup for `seq` is in flight, without
+        polling the connector or starting the deferral clock."""
+        client = self._lookup_client
+        if getattr(client, "is_pending", None) is None:
+            return False
+        return bool(client.is_pending(str(seq.id)))
+
     def lookup_pending(self, seq) -> bool:
         """True while admission should pass over `seq`: its lookup is in flight.
 
