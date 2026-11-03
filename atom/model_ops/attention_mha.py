@@ -84,9 +84,17 @@ class PagedAttentionImpl(nn.Module):
         self.k_scale = self.v_scale = None
         self.device = "cuda:" + str(torch.cuda.current_device())
         self.layer_num = layer_num
+        # A8K4V8 (--kv_cache_dtype fp8_k4v8): NVFP4 K + fp8 V, read only by
+        # unified_attention with fp8 Q; V keeps the fp8 cache's per-tensor scale
+        self.k4v8 = self.kv_cache_dtype == "fp8_k4v8"
+        if self.k4v8 and not envs.ATOM_USE_UNIFIED_ATTN:
+            raise ValueError(
+                "--kv_cache_dtype fp8_k4v8 is read only by aiter's unified "
+                "attention: set ATOM_USE_UNIFIED_ATTN=1"
+            )
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
-            if self.kv_cache_dtype == "fp8"
+            if self.kv_cache_dtype in ("fp8", "fp8_k4v8")
             else 1.0
         )
         self.kv_scale = torch.tensor(
@@ -274,6 +282,11 @@ class PagedAttentionImpl(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
+
+        if self.k4v8:
+            return self._k4v8_rope_cache(
+                q, k, v, qkv, position, k_cache, v_cache, fwd_ctx
+            )
 
         # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
         use_triton_attn = (
@@ -525,6 +538,147 @@ class PagedAttentionImpl(nn.Module):
         # sees q/k with matching token counts (sq == sk).
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
+    def _gemma_norm_rope(self, q, k, v, position, one_launch: bool = False):
+        """Gemma q/k norm in one launch, then the Qwen3.5 MRoPE Triton kernel (or
+        the module's own rotary when that declines); no cache write. Returns
+        `(q, k, v)` as `[tokens, heads, head_dim]`. `one_launch`: first try aiter's
+        gfx1250 Gluon kernel that does both (try_fused_qk_norm_mrope)."""
+        from atom.model_ops.layernorm import DualRMSNorm
+        from atom.model_ops.triton_mrope import (
+            try_fused_qk_norm_mrope,
+            try_mrope_qk_fused,
+        )
+
+        if getattr(self, "_dual_qk_norm", None) is None:
+            self._dual_qk_norm = DualRMSNorm(
+                self.q_norm,
+                self.k_norm,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                prefix=f"layer_{self.layer_num}.qk_norm",
+            )
+        fused = (
+            try_fused_qk_norm_mrope(
+                self._dual_qk_norm,
+                self.rotary_emb,
+                position,
+                q,
+                k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            if one_launch
+            else None
+        )
+        if fused is not None:
+            q, k = fused
+        else:
+            q, k = self._dual_qk_norm(q, k)
+            roped = try_mrope_qk_fused(
+                self.rotary_emb,
+                position,
+                q,
+                k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            q, k = roped if roped is not None else self.rotary_emb(position, q, k)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        return q, k, v
+
+    def _k4v8_rope_cache(self, q, k, v, qkv, position, k_cache, v_cache, fwd_ctx):
+        """`rope_cache` for an A8K4V8 cache: Q/K norm + RoPE as the model asks,
+        then K and V into the NVFP4-K / fp8-V cache (aiter reshape_and_cache_k4v8,
+        K descale 1, V by the per-tensor kv_scale), and Q cast to fp8 for
+        unified attention (clamped, unscaled, as the fp8 cache's fused writer
+        hands it). No per-token scales: the returned k_scale / v_scale are None.
+        """
+        from aiter.ops.triton.fusions.fused_kv_cache import reshape_and_cache_k4v8
+
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
+        if (
+            self.rotary_emb is not None
+            and self.q_norm is not None
+            and self.k_norm is not None
+        ):
+            if not isinstance(self.q_norm, GemmaRMSNorm):
+                # the fused norm + rope + cache kernel of that path has no NVFP4 K
+                raise NotImplementedError(
+                    "--kv_cache_dtype fp8_k4v8 supports Gemma Q/K norm (Qwen3.5) "
+                    "or norm / rope applied by the model, not "
+                    f"{type(self.q_norm).__name__} fused into rope_cache"
+                )
+            q_size = self.num_heads * self.head_dim
+            kv_size = self.num_kv_heads * self.head_dim
+            q_raw, k_raw, v_raw = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+            # one aiter Gluon kernel: norm, MRoPE, NVFP4 K + fp8 V into the cache, Q out in fp8
+            from atom.model_ops.triton_mrope import try_fused_qk_norm_mrope_cache
+
+            fused = try_fused_qk_norm_mrope_cache(
+                self.q_norm,
+                self.k_norm,
+                self.rotary_emb,
+                position,
+                q_raw,
+                k_raw,
+                v_raw,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                k_cache,
+                v_cache,
+                fwd_ctx.attn_metadata.slot_mapping,
+                kv_scale=self.kv_scale_float,
+            )
+            if fused is not None:
+                self.per_token_quant = False
+                self._cache_format = "SHUFFLE"
+                return (
+                    fused[0].view(-1, self.num_heads, self.head_dim),
+                    fused[1].view(-1, self.num_kv_heads, self.head_dim),
+                    v_raw.view(-1, self.num_kv_heads, self.head_dim),
+                    k_cache,
+                    v_cache,
+                    None,
+                    None,
+                )
+            q, k, v = self._gemma_norm_rope(
+                q_raw, k_raw, v_raw, position, one_launch=True
+            )
+        else:
+            # as the generic path: the module's rotary, then any norms
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+            if self.k_norm is not None:
+                k = self.k_norm(k)
+            q = q.view(-1, self.num_heads, self.head_dim)
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+        reshape_and_cache_k4v8(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            fwd_ctx.attn_metadata.slot_mapping,
+            k_scale=None,
+            v_scale=self._pa_decode_bf16_asm_scale,
+        )
+        fp8 = aiter.dtypes.fp8
+        fp8_max = torch.finfo(fp8).max
+        q = q.clamp(-fp8_max, fp8_max).to(fp8)
+        self.per_token_quant = False
+        self._cache_format = "SHUFFLE"
+        return q, k, v, k_cache, v_cache, None, None
+
     def _gemma_norm_rope_then_cache(
         self, q, k, v, position, k_cache, v_cache, k_scale, v_scale, attn_metadata
     ):
@@ -538,32 +692,7 @@ class PagedAttentionImpl(nn.Module):
         FP8 for an fp8 cache, a plain copy otherwise. Same SHUFFLE layout and
         scales the fused kernel writes.
         """
-        from atom.model_ops.layernorm import DualRMSNorm
-        from atom.model_ops.triton_mrope import try_mrope_qk_fused
-
-        if getattr(self, "_dual_qk_norm", None) is None:
-            self._dual_qk_norm = DualRMSNorm(
-                self.q_norm,
-                self.k_norm,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                prefix=f"layer_{self.layer_num}.qk_norm",
-            )
-        q, k = self._dual_qk_norm(q, k)
-        roped = try_mrope_qk_fused(
-            self.rotary_emb,
-            position,
-            q,
-            k,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        q, k = roped if roped is not None else self.rotary_emb(position, q, k)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        q, k, v = self._gemma_norm_rope(q, k, v, position)
         # Only an fp8 cache has scales: a bf16 one leaves k_scale None.
         if self.kv_cache_dtype == "fp8":
             aiter.reshape_and_cache_with_pertoken_quant(
@@ -726,7 +855,7 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale,
+            k_descale=None if self.k4v8 else self.kv_scale,
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
@@ -1193,7 +1322,7 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale,
+            k_descale=None if self.k4v8 else self.kv_scale,
             v_descale=self.kv_scale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
@@ -1247,6 +1376,8 @@ class PagedAttentionImpl(nn.Module):
         if envs.ATOM_USE_UNIFIED_ATTN:
             if envs.ATOM_FORCE_ATTN_TRITON:
                 return self.paged_attention_unified
+            if self.k4v8:
+                return self.paged_attention_unified
             if atom_config.kv_cache_block_size == 256:
                 return self.paged_attention_persistent_asm
             return self.paged_attention_unified
@@ -1276,7 +1407,7 @@ class PagedAttentionImpl(nn.Module):
             # q/k/v here still hold only the new tokens (the prefix gather happens
             # inside prefill_attention), so the q.shape[0] == k.shape[0] check in
             # _can_use_prefill_sink_asm is valid.
-            if self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
+            if not self.k4v8 and self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
                 return self.prefill_attention
             if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton

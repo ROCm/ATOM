@@ -24,18 +24,21 @@ def draft_kv_builder(model_runner, draft_hf):
     Which is why speculative decoding imports no attention anywhere: adding a
     flavor is a flag and a `make_kv_pool` on that backend.
     """
-    from aiter import dtypes
 
     from atom.utils.selector import attn_family, get_attn_backend
 
     backend = get_attn_backend(attn_family(draft_hf))
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
+    from atom.model_ops.attentions.mha_kv_pool import mha_kv_dtypes
+
+    kv_dtype, k_nvfp4 = mha_kv_dtypes(model_runner.config.kv_cache_dtype)
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
         world_size=model_runner.world_size,
-        kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
+        kv_dtype=kv_dtype,
+        k_nvfp4=k_nvfp4,
     )
     # A way to build it, not the pool: how many rows it has is the walk's to
     # say, and this runs from the proposer's `__init__` -- `build_drafter`

@@ -303,10 +303,12 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp8_k4v8"],
             type=str,
             default="bf16",
-            help="KV cache type. Default is 'bf16'.",
+            help="KV cache type. Default is 'bf16'. 'fp8_k4v8' (A8K4V8, gfx1250, "
+            "needs ATOM_USE_UNIFIED_ATTN=1): NVFP4 K + fp8 V, fp8 Q into aiter's "
+            "unified attention; MHA layers only.",
         )
         parser.add_argument(
             "--index-cache-dtype",

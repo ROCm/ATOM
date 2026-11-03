@@ -301,6 +301,20 @@ def try_fused_qk_norm_mrope(
 
 
 @functools.cache
+def _gfx1250_fused_qk_norm_mrope_cache_k4v8() -> bool:
+    """Whether aiter's kernel also writes an A8K4V8 cache (NVFP4 K, fp8 V: its K_NVFP4 mode)."""
+    if _gfx1250_aiter_op("fused_qk_norm_mrope_cache") is None:
+        return False
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx1250.fusions import (
+            fused_qk_norm_mrope as k,
+        )
+    except ImportError:
+        return False
+    return hasattr(k, "_store_k_nvfp4")
+
+
+@functools.cache
 def _gfx1250_fused_qk_norm_mrope_cache_fp8() -> bool:
     """Whether aiter's kernel also writes an fp8 cache (its ``kv_scale`` argument)."""
     op = _gfx1250_aiter_op("fused_qk_norm_mrope_cache")
@@ -321,9 +335,15 @@ def gfx1250_fused_qk_norm_mrope_cache_applies(
         and envs.ATOM_USE_UNIFIED_ATTN
         and _gfx1250_fused_qk_norm_mrope_cache_fp8()
     )
+    # A8K4V8 (NVFP4 K, fp8 V): the kernel's K_NVFP4 mode
+    k4v8_ok = (
+        kv_cache_dtype == "fp8_k4v8"
+        and envs.ATOM_USE_UNIFIED_ATTN
+        and _gfx1250_fused_qk_norm_mrope_cache_k4v8()
+    )
     return (
         _gfx1250_aiter_op("fused_qk_norm_mrope_cache") is not None
-        and (not kv_cache_dtype.startswith("fp8") or fp8_ok)
+        and (not kv_cache_dtype.startswith("fp8") or fp8_ok or k4v8_ok)
         and _mrope_rotary_supported(rotary_emb, head_size)
     )
 
@@ -362,10 +382,16 @@ def try_fused_qk_norm_mrope_cache(
         k_cache.element_size() != 1 or not _gfx1250_fused_qk_norm_mrope_cache_fp8()
     ):
         return None
+    # A8K4V8: a uint8 [blocks, heads, block, 256 // 2 + 256 // 16] NVFP4 K page and the fp8 5-D V
+    k_nvfp4 = k_cache.dtype == torch.uint8 and k_cache.dim() == 4
+    if k_nvfp4 and not (
+        fp8 and v_cache.dim() == 5 and _gfx1250_fused_qk_norm_mrope_cache_k4v8()
+    ):
+        return None
     if (
         fused_qk_norm_mrope_cache is None
         or (not fp8 and k_cache.dtype != q.dtype)
-        or k_cache.dim() != 5
+        or (k_cache.dim() != 5 and not k_nvfp4)
         or not _mrope_qk_supported(
             rotary_emb, positions, q, k, num_q_heads, num_k_heads, head_size
         )

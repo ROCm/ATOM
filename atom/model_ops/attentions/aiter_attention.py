@@ -24,7 +24,7 @@ from atom.utils.forward_context import AttentionMetaData, Context, get_forward_c
 from atom.utils.tbo import TokenSplitPrefillState, decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
-from .mha_kv_pool import MhaKvPool
+from .mha_kv_pool import KV_CACHE_DTYPE_K4V8, MhaKvPool, mha_kv_dtypes
 from .pool_layout.entry_arena import EntryField, carve
 from .pool_layout.pool_rows import KvGeometry
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
@@ -178,6 +178,7 @@ class AiterBackend(AttentionBackend):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        k_nvfp4: bool = False,
     ):
         """An MHA pool, which is the one this backend's kernels read."""
         return MhaKvPool.from_hf_config(
@@ -186,6 +187,7 @@ class AiterBackend(AttentionBackend):
             block_size=target_block_size,
             layers=layers,
             kv_dtype=kv_dtype,
+            k_nvfp4=k_nvfp4,
         )
 
 
@@ -234,6 +236,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # The two coincide there, and only one scheduler block reads well:
             # fp8 packs x=16 -> 128, bf16 x=8 -> 64, both a 128 B physical page.
             expected = 128 if model_runner.kv_cache_dtype in ("fp8",) else 64
+            if model_runner.kv_cache_dtype == KV_CACHE_DTYPE_K4V8:
+                # A8K4V8's tuned configs run 64- and 128-token pages
+                expected = (
+                    model_runner.block_size
+                    if model_runner.block_size in (64, 128)
+                    else 64
+                )
             if model_runner.block_size != expected:
                 logger.warning(
                     "ATOM_USE_UNIFIED_ATTN=1 expects --block-size %s for %s KV "
@@ -558,7 +567,6 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         a second geometry sharing one block-id space, which is what sizing
         summed for it all along. Nothing here asks which model it is.
         """
-        from aiter import dtypes
 
         runner = self.model_runner
         # `INDEX_ROWS` is a row space, not a pool: the indexer keys ride the
@@ -570,6 +578,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # multiply it out.
         entry_tokens = self.block_size * self.block_ratio
         extra_fields = self._index_cache_fields(entry_tokens)
+        kv_dtype, k_nvfp4 = mha_kv_dtypes(runner.config.kv_cache_dtype)
         pools = {}
         for geometry, count in self.row_counts().items():
             if not isinstance(geometry, KvGeometry):
@@ -585,8 +594,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 blocks_per_entry=self.block_ratio,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim,
-                kv_dtype=dtypes.d_dtypes[runner.config.kv_cache_dtype],
+                kv_dtype=kv_dtype,
                 extra_fields=extra_fields,
+                k_nvfp4=k_nvfp4,
             )
             extra_fields = ()
         return pools

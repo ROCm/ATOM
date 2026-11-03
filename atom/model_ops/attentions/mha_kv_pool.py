@@ -40,6 +40,28 @@ def shuffle_pack(kv_dtype: torch.dtype) -> int:
     return _TILE_BYTES // kv_dtype.itemsize
 
 
+# A8K4V8: NVFP4 K, fp8 V (aiter unified attention on gfx1250).
+KV_CACHE_DTYPE_K4V8 = "fp8_k4v8"
+
+
+def mha_kv_dtypes(kv_cache_dtype: str) -> tuple[torch.dtype, bool]:
+    """The pool's `(kv_dtype, k_nvfp4)` for a --kv_cache_dtype string.
+
+    "fp8_k4v8" keeps V in fp8 -- the pool's `kv_dtype` -- and K in NVFP4; every
+    other string names the one dtype of both.
+    """
+    from aiter import dtypes
+
+    if kv_cache_dtype == KV_CACHE_DTYPE_K4V8:
+        return dtypes.fp8, True
+    return dtypes.d_dtypes[kv_cache_dtype], False
+
+
+def nvfp4_k_row_bytes(head_dim: int) -> int:
+    """One token's NVFP4 K row of one head: e2m1 pairs, then an e4m3 scale per 16."""
+    return head_dim // 2 + head_dim // 16
+
+
 def mha_kv_fields(
     *,
     layers: int,
@@ -47,15 +69,22 @@ def mha_kv_fields(
     num_kv_heads: int,
     head_dim: int,
     kv_dtype: torch.dtype,
+    k_nvfp4: bool = False,
 ) -> list[EntryField]:
     """What K and V of one entry cost, K first as allocated.
 
     Bytes and not the SHUFFLE shape: the price is the same whichever way the
-    tokens lie, and the layout is one expression in `kv_views`.
+    tokens lie, and the layout is one expression in `kv_views`. An NVFP4 K
+    (A8K4V8) costs `nvfp4_k_row_bytes` a token and head, V stays `kv_dtype`.
     """
     per_entry = num_kv_heads * head_dim * entry_tokens * kv_dtype.itemsize
+    per_entry_k = (
+        num_kv_heads * nvfp4_k_row_bytes(head_dim) * entry_tokens
+        if k_nvfp4
+        else per_entry
+    )
     return [
-        EntryField("k", layers, (per_entry,), torch.uint8),
+        EntryField("k", layers, (per_entry_k,), torch.uint8),
         EntryField("v", layers, (per_entry,), torch.uint8),
     ]
 
@@ -106,6 +135,7 @@ class MhaKvPool:
         kv_dtype: torch.dtype,
         blocks_per_entry: int = 1,
         extra_fields: Sequence[EntryField] = (),
+        k_nvfp4: bool = False,
     ):
         # `block_size` is the caller's block, the only token count the pool
         # shapes anything by. `blocks_per_entry` is how many of them the entry
@@ -125,9 +155,23 @@ class MhaKvPool:
                 f"{_TILE_BYTES}B tile, which has to divide both head_dim "
                 f"{head_dim} and block_size {block_size}"
             )
+        if k_nvfp4 and not (
+            block_size >= 64 and (block_size <= 128 or block_size % 128 == 0)
+        ):
+            # the NVFP4 scales are preshuffled in min(128, page)-row groups
+            raise ValueError(
+                f"an NVFP4 K cache (A8K4V8) needs block_size 64, 128 or a multiple "
+                f"of 128, got {block_size}"
+            )
+        if k_nvfp4 and (head_dim < 64 or head_dim & (head_dim - 1)):
+            raise ValueError(
+                f"an NVFP4 K cache (A8K4V8) needs a power-of-2 head_dim >= 64, got {head_dim}"
+            )
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_dtype = kv_dtype
+        # A8K4V8: K in NVFP4, V in `kv_dtype` (fp8)
+        self.k_nvfp4 = k_nvfp4
         # Every field is priced per entry, and an entry is `blocks_per_entry`
         # blocks. Charging per block instead would multiply `entry_bytes_for`'s
         # 256 B field alignment by the same factor -- 9% of the pool at 8
@@ -139,12 +183,18 @@ class MhaKvPool:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             kv_dtype=kv_dtype,
+            k_nvfp4=k_nvfp4,
         )
-        self.scale_fields = mha_kv_scale_fields(
-            layers=layers,
-            entry_tokens=entry_tokens,
-            num_kv_heads=num_kv_heads,
-            kv_dtype=kv_dtype,
+        # A8K4V8 reads one per-tensor V scale and K's own NVFP4 scales: no planes
+        self.scale_fields = (
+            []
+            if k_nvfp4
+            else mha_kv_scale_fields(
+                layers=layers,
+                entry_tokens=entry_tokens,
+                num_kv_heads=num_kv_heads,
+                kv_dtype=kv_dtype,
+            )
         )
         self.extra_fields = [f for f in extra_fields if f.layers]
         # The regions an entry is charged for, in layout order. One list, walked
@@ -168,6 +218,7 @@ class MhaKvPool:
         layers: int,
         blocks_per_entry: int = 1,
         kv_dtype: torch.dtype,
+        k_nvfp4: bool = False,
     ) -> MhaKvPool:
         """A pool at the geometry a model config declares, for `layers` of them.
 
@@ -201,6 +252,7 @@ class MhaKvPool:
             num_kv_heads=per_rank,
             head_dim=hf_config.head_dim,
             kv_dtype=kv_dtype,
+            k_nvfp4=k_nvfp4,
         )
 
     def pool_bytes(self, entries: int) -> int:
@@ -259,8 +311,16 @@ class MhaKvPool:
         collapsing V's outer half to one.
         """
         x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
+        if self.k_nvfp4:
+            # A8K4V8: K is a page of NVFP4 rows, [blocks, nh, bs, hd // 2 + hd // 16]
+            # (data then scales, shuffled inside the page by the writer); V as below
+            k = self.field_view(
+                "k", layer, torch.uint8, (-1, nh, bs, nvfp4_k_row_bytes(hd))
+            )
+        else:
+            k = self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x))
         return (
-            self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
+            k,
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
         )
 

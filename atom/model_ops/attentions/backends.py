@@ -88,6 +88,7 @@ class AttentionBackend(ABC):
         target_block_size: int,
         layers: int,
         kv_dtype,
+        k_nvfp4: bool = False,
     ):
         """A pool of `layers` rows at this config's geometry.
 
