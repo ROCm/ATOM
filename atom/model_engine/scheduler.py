@@ -40,6 +40,7 @@ from atom.model_engine.block_manager import (
     BlockManager,
     draft_kv_lookahead,
 )
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -1611,9 +1612,15 @@ class Scheduler:
         self._arrived_requests += len(seqs)
 
     def _enqueue_waiting(self, seq: Sequence) -> None:
-        if getattr(seq, "dp_prefetch_priority", False):
+        if getattr(seq, "dp_prefetch_priority", False) and not (
+            envs.ATOM_OFFLOAD_EARLY_LOAD
+        ):
             # Routed away from the rank holding its prefix: admit it first so
-            # the tier load of that prefix into this rank starts now.
+            # the tier load of that prefix into this rank starts now. With the
+            # early tier load on, `_early_load_tier_prefixes` starts that load
+            # wherever the request waits, so nothing jumps the queue (and
+            # ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE, which only decides who jumps,
+            # has no effect).
             self.waiting.appendleft(seq)
         else:
             self.waiting.append(seq)
@@ -2095,6 +2102,13 @@ class Scheduler:
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
 
+        # Start tier loads for waiting requests whose lookup answered, on this
+        # tick whatever the delayer decides. Before the delayer so a request
+        # whose load is in flight is not counted as prefillable work (and so a
+        # FIRE is not spent on nothing). Local to this rank: no collective, and
+        # nothing is scheduled for prefill here.
+        self._early_load_tier_prefixes()
+
         # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
         # every tick on every rank for lockstep — hence before the early-return.
         if self.prefill_delayer is not None:
@@ -2213,6 +2227,9 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = min(16, self.max_num_seqs)
+        # Early-loading requests held in `prefix_waiters` (they keep their place
+        # but bound nothing: they are not waiting on a lookup).
+        early_waiting = 0
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
@@ -2221,7 +2238,7 @@ class Scheduler:
             and num_batched_tokens < self.max_num_batched_tokens
             and self._tick_cost < self._tick_cost_limit
         ):
-            if prefix_waiters:
+            if len(prefix_waiters) > early_waiting:
                 if prefix_bypass_left == 0:
                     break
                 prefix_bypass_left -= 1
@@ -2266,6 +2283,14 @@ class Scheduler:
             if len(self.running) >= self.max_num_seqs:
                 self.waiting.appendleft(seq)
                 break
+
+            if seq.id in self._early_load.entries and self._still_loading(seq):
+                # Its early load is in flight: nothing to prefill yet. Keep its
+                # place in line (the tail would let later arrivals pass it once
+                # it lands) and let the requests behind it go first.
+                prefix_waiters.append(seq)
+                early_waiting += 1
+                continue
 
             admission_ready = getattr(self.kv_connector, "admission_ready", None)
             if callable(admission_ready) and not admission_ready(seq):
@@ -3078,6 +3103,7 @@ class Scheduler:
             note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
+        self._early_load.note_gone(seq.id, aborted=True)
         self._inflight_prefix_wait.pop(seq.id, None)
         self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
@@ -3730,6 +3756,7 @@ class Scheduler:
         num_batched_tokens: int,
     ) -> tuple[int, int]:
         num_seqs_prefill += 1
+        self._early_load.note_prefill(seq.id)
         self._record_cache_reuse(seq)
         self._tick_cost += self._chunk_cost(seq.num_cached_tokens, chunk)
         num_batched_tokens += chunk
@@ -3941,6 +3968,264 @@ class Scheduler:
         for req_id, _h, _group in loads:
             self.block_manager.abandon_state_load(req_id)
             self.failed_recving_kv_req_ids.append(req_id)
+
+    # How deep into `waiting` the early tier load looks, and how many requests it
+    # may admit in one tick (each runs an HBM probe and an allocation).
+    _EARLY_LOAD_SCAN = 64
+    _EARLY_LOAD_PER_TICK = 8
+    # Ticks before a request skipped for KV pressure is looked at again.
+    _EARLY_LOAD_RETRY_TICKS = 8
+
+    @property
+    def _early_load(self) -> EarlyLoadState:
+        """Early-load bookkeeping. Created on first use, so schedulers built
+        without `__init__` (test doubles) work."""
+        state = self.__dict__.get("_early_load_state")
+        if state is None:
+            state = self.__dict__["_early_load_state"] = EarlyLoadState()
+        return state
+
+    def _early_load_sweep(self, state: EarlyLoadState) -> None:
+        """Drop early-load entries whose request is gone from `waiting`, and
+        reclaim an aborted one at once: Phase 2 only pops it on a FIRE tick, and
+        until then it would hold its blocks."""
+        for seq_id, (seq, _) in list(state.entries.items()):
+            if seq.status == SequenceStatus.ABORTED:
+                try:
+                    self.waiting.remove(seq)
+                except ValueError:
+                    state.note_gone(seq_id, aborted=True)
+                else:
+                    self._reject_aborted_waiting(seq)
+            elif seq.status not in (
+                SequenceStatus.WAITING,
+                SequenceStatus.WAITING_FOR_REMOTE_KVS,
+            ):
+                state.note_gone(seq_id)
+
+    def _early_load_candidate(self, seq: Sequence, state: EarlyLoadState) -> bool:
+        """Cheap filters before `_early_load_tier_prefixes` touches the connector.
+
+        A request that fails one for good is remembered (`settled`) so the next
+        ticks do not look at it again.
+        """
+        if seq.status != SequenceStatus.WAITING or seq.id in state.settled:
+            return False
+        retry = state.retry_at.get(seq.id)
+        if retry is not None and state.tick < retry:
+            return False
+        if seq.multimodal_data is not None:
+            state.skip(seq.id, "multimodal")
+            state.settled.add(seq.id)
+            return False
+        if seq.num_tokens < envs.OFFLOAD_MIN_LOAD_TOKENS:
+            # No tier hit can be worth loading (`_load_ruled_out`).
+            state.skip(seq.id, "below_min_load")
+            state.settled.add(seq.id)
+            return False
+        if self._is_offload_prefill_resume(seq):
+            state.settled.add(seq.id)
+            return False
+        if self._unschedulable_reason(seq) is not None:
+            return False
+        admission_ready = getattr(self.kv_connector, "admission_ready", None)
+        if callable(admission_ready) and not admission_ready(seq):
+            state.skip(seq.id, "admission_not_ready")
+            return False
+        # Never block the scheduler thread -- and every DP rank with it -- on a
+        # synchronous lookup: only an answered async lookup qualifies. (With a
+        # lookup driver thread the answer shows up between ticks.)
+        lookup_ready = getattr(self.kv_connector, "lookup_ready", None)
+        if not callable(lookup_ready):
+            state.skip(seq.id, "connector_has_no_lookup_ready")
+            state.settled.add(seq.id)
+            return False
+        if self._offload_lookup_pending(seq) or not lookup_ready(seq):
+            state.skip(seq.id, "lookup_not_ready")
+            return False
+        return True
+
+    def _early_load_tier_prefixes(self) -> int:
+        """Admit-and-park waiting requests that must load a prefix from the
+        tier, as soon as their lookup answers. Returns how many parked.
+
+        Without this the only admission is Phase 2, which runs on the prefill
+        delayer's FIRE ticks, and only at the head of `waiting`: a request that
+        needs a tier load spends one FIRE parking (that is when its load is
+        issued) and prefills at a later one, a whole delayer cycle on, although
+        the load takes milliseconds.
+
+        Here the blocks are allocated and the load submitted on any tick (HOLD
+        or FIRE), wherever the request waits; its load leaves with this tick's
+        batch (`build_connector_meta`) or the idle-dispatch path. Nothing else
+        moves earlier:
+          - the request stays where it is in `waiting`, and Phase 2 reaches it
+            in arrival order (`_promote_ready_remote_kv_requests` does not move
+            it up, a load in flight does not push it to the tail);
+          - it is not prefillable while its load is in flight (`_still_loading`),
+            and once loaded it prefills only when a FIRE admits it;
+          - no collective runs and no step type changes, so DP lockstep holds.
+
+        Bounded by KV pressure: no early allocation once the pool would pass
+        `ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK`, nor once early-loaded requests
+        would hold more than `ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC` of the pool.
+        Such a request is left to Phase 2, as before. So is anything the park
+        path cannot take (an unaligned HBM hit, a multimodal prompt, a load the
+        connector refuses after `allocate`, which is handed back unadmitted).
+        """
+        state = self._early_load
+        bm = getattr(self, "block_manager", None)
+        total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
+        state.maybe_log(total_blocks)
+        if (
+            not envs.ATOM_OFFLOAD_EARLY_LOAD
+            or self.kv_connector is None
+            or not self._connector_flag("is_offload")
+        ):
+            return 0
+        state.tick += 1
+        if state.entries:
+            self._early_load_sweep(state)
+        if state.tick % state.PRUNE_TICKS == 0:
+            state.prune({seq.id for seq in self.waiting})
+        if not self.waiting:
+            return 0
+
+        watermark = envs.ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK
+        max_frac = envs.ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC
+        allow_state = envs.ATOM_OFFLOAD_EARLY_LOAD_STATE
+        chunk = int(getattr(self.kv_connector, "chunk_size", 0) or 0)
+        hbs = bm.hash_block_size
+        parked = 0
+        for seq in list(itertools.islice(self.waiting, 0, self._EARLY_LOAD_SCAN)):
+            if parked >= self._EARLY_LOAD_PER_TICK:
+                break
+            if not self._early_load_candidate(seq, state):
+                continue
+            if len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs:
+                state.skip(seq.id, "seq_slots")
+                break
+            if self._lookup_detach_enabled(seq) and self._can_detach_tier_lookup(
+                seq, self._probe_hbm_prefix(seq)
+            ):
+                state.skip(seq.id, "detach_no_load")
+                state.settled.add(seq.id)
+                continue  # no load possible: it prefills when a FIRE admits it
+            needs_remote_load = self._query_connector_prefill_match(seq, skip=False)
+            hbm_probe = self._probe_hbm_prefix(seq)
+            if hbm_probe.num_cached_blocks < 0:
+                state.skip(seq.id, "pool_full")
+                break  # the pool cannot take it now; neither could Phase 2
+            if not (needs_remote_load or seq.replay_kv_load):
+                state.skip(seq.id, "no_tier_load")
+                state.settled.add(seq.id)
+                continue
+            if chunk and (hbm_probe.num_cached_blocks * hbs) % chunk:
+                # Hand-off prefill runs first (`_maybe_start_unaligned_handoff`).
+                state.skip(seq.id, "unaligned_hbm")
+                state.settled.add(seq.id)
+                continue
+            if not allow_state and seq.has_per_req_cache and not seq.replays_hit:
+                state.skip(seq.id, "state_leg")
+                state.settled.add(seq.id)
+                continue
+            # KV pressure. Counted only for a request that would load: one that
+            # would not never reached here.
+            need = bm.num_pool_blocks(len(seq))
+            if total_blocks > 0:
+                if (bm.kv.num_used + need) / total_blocks > watermark:
+                    state.skip(seq.id, "watermark")
+                    state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
+                    continue
+                if (state.held_blocks() + need) / total_blocks > max_frac:
+                    state.skip(seq.id, "max_frac")
+                    state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
+                    continue
+            if self._early_load_admit(seq, hbm_probe, needs_remote_load, allow_state):
+                parked += 1
+            else:
+                break  # the pool refused the allocation
+        if parked:
+            logger.debug("[EARLY-LOAD] parked %d tier load(s)", parked)
+        return parked
+
+    def _early_load_admit(
+        self,
+        seq: Sequence,
+        hbm_probe: AdmissionProbe,
+        needs_remote_load: bool,
+        allow_state: bool,
+    ) -> bool:
+        """Phase 2's admission up to the park, for a request not at its turn.
+
+        Returns False when the pool could not take the request (nothing is
+        changed); True otherwise, whether the request parked or was taken back.
+        The steps and their order are Phase 2's; what differs is that a result
+        that would prefill locally (a refused load) is undone instead.
+        """
+        state = self._early_load
+        prev_hit = seq.prefix_cache_hit_tokens
+        self.block_manager.record_allocation(seq, hbm_probe)
+        if not self.block_manager.allocate(seq, hbm_probe.num_cached_blocks):
+            self.block_manager.deallocate(seq)
+            seq.prefix_cache_hit_tokens = prev_hit
+            return False
+        self._allocate_prefill_draft_lookahead(seq)
+        if not seq.prefix_cache_hit_tokens:
+            recorded = seq.num_cached_tokens
+            if (
+                seq.offload_joint.boundary_tokens
+                and seq.offload_joint.hbm_hit_tokens > recorded
+            ):
+                recorded = seq.offload_joint.hbm_hit_tokens
+            seq.prefix_cache_hit_tokens = recorded
+        self._lookup_detach_declined.discard(seq.id)
+        self._notify_connector_after_prefill_alloc(seq)
+        parks = self._confirm_remote_load_after_alloc(
+            seq, needs_remote_load or seq.replay_kv_load
+        )
+        oj = seq.offload_joint
+        if parks:
+            if oj.load_hash != -1 and not oj.boundary_tokens:
+                # Two transfers, one report (see Phase 2): drop the state one.
+                if not self.block_manager.cancel_state_load(seq):
+                    self._early_load_take_back(seq, prev_hit, cancel_state=False)
+                    return True
+        elif oj.boundary_tokens or oj.load_hash == -1:
+            # Nothing to wait for, or a joint boundary Phase 2 resolves by
+            # prefilling: this request prefills locally, at its turn.
+            self._early_load_take_back(seq, prev_hit)
+            return True
+        # else: a state-only load, which parks like a KV load (as in Phase 2).
+        if not allow_state and (oj.load_hash != -1 or oj.boundary_tokens):
+            self._early_load_take_back(seq, prev_hit)
+            return True
+        # Stays where it is in `waiting`.
+        self._park_for_remote_load(seq, deque())
+        self._inflight_prefix_wait.pop(seq.id, None)
+        state.note_submitted(seq)
+        state.retry_at.pop(seq.id, None)
+        return True
+
+    def _early_load_take_back(
+        self, seq: Sequence, prev_hit: int, *, cancel_state: bool = True
+    ) -> None:
+        """Undo `allocate` and the connector notification of an early admission
+        that turned out not to park; the request is back in `waiting` exactly as
+        unadmitted, and is not tried again."""
+        cancel = getattr(self.kv_connector, "cancel_preadmission", None)
+        if callable(cancel):
+            cancel(seq)
+        else:
+            self.kv_connector.cancel_pending_load(seq)
+        if cancel_state and seq.offload_joint.load_hash != -1:
+            self.block_manager.cancel_state_load(seq)
+        self.block_manager.deallocate(seq)
+        seq.prefix_cache_hit_tokens = prev_hit
+        state = self._early_load
+        state.settled.add(seq.id)
+        state.takebacks += 1
+        state.skip(seq.id, "taken_back")
 
     def _park_for_remote_load(
         self, seq: Sequence, skipped_waiting_requests: deque[Sequence]
@@ -4904,11 +5189,22 @@ class Scheduler:
 
         ready: deque[Sequence] = deque()
         blocked: deque[Sequence] = deque()
+        # An early-loaded request keeps its place in line: it was not parked by
+        # the head of the queue, and moving it up would let it prefill ahead of
+        # earlier arrivals. (The deadlock this function guards against -- a
+        # fresh head that cannot allocate while a finished waiter behind it
+        # holds the blocks -- needs the waiters to hold most of the pool; the
+        # early ones are capped at ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC of it.)
+        early = self._early_load.entries
         while self.waiting:
             seq = self.waiting.popleft()
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and (
-                self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
-                or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+            if (
+                seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+                and seq.id not in early
+                and (
+                    self._has_req_id(self.finished_recving_kv_req_ids, seq.id)
+                    or self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
+                )
             ):
                 ready.append(seq)
             else:
