@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import gc
 import itertools
-from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import os
 import pickle
@@ -44,6 +43,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import zmq
 
@@ -94,7 +94,7 @@ def worker_seq_id_base(index: int) -> int:
     return (index + 1) << _SEQ_ID_SHIFT
 
 
-class worker_seq_ids:  # noqa: N801 - used as ``Sequence.counter``
+class worker_seq_ids:
     """Worker ``index``'s sequence ids, wrapping inside its own window.
 
     ``next()`` is safe from several threads (preprocessing runs on a pool): it
