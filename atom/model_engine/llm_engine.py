@@ -9,13 +9,12 @@ from collections import Counter
 from dataclasses import fields
 from typing import Any
 
-from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.tokenizer_loader import load_tokenizer
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
@@ -23,17 +22,8 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
-def _load_tokenizer(model: str, trust_remote_code: bool = False):
-    tokenizer = AutoTokenizer.from_pretrained(
-        model, use_fast=True, trust_remote_code=trust_remote_code
-    )
-    probe = "Hello world 你好"
-    if tokenizer.decode(tokenizer.encode(probe), skip_special_tokens=True) != probe:
-        logger.warning(
-            "AutoTokenizer round-trip failed, falling back to PreTrainedTokenizerFast"
-        )
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(model)
-    return tokenizer
+# Kept under its old name: the API servers import it from here.
+_load_tokenizer = load_tokenizer
 
 
 class LLMEngine:
