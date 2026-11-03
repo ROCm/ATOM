@@ -339,3 +339,38 @@ def test_hub_without_an_engine_admission_refuses_structured_requests():
     finally:
         worker.close()
         hub.close()
+
+
+def test_hub_close_does_not_wait_for_a_reply_in_flight():
+    # A grammar preflight still running at shutdown must not hold close(),
+    # and its late reply is dropped instead of touching a closed socket.
+    started = threading.Event()
+    release = threading.Event()
+
+    def prepare(params, kv_transfer, multimodal):
+        started.set()
+        release.wait(5)
+
+    core = _FakeCoreManager()
+    hub = fw.FrontendHub(core, num_workers=1, prepare_structured=prepare)
+    hub.start()
+    worker = fw.RemoteCoreManager(hub.connection_info(0))
+    caller = threading.Thread(
+        target=lambda: pytest.raises(
+            Exception, worker.prepare_structured_request, _Params("{}")
+        ),
+        daemon=True,
+    )
+    fw._STRUCTURED_TIMEOUT_S, saved = 1.0, fw._STRUCTURED_TIMEOUT_S
+    try:
+        caller.start()
+        assert started.wait(5)
+        t0 = time.monotonic()
+        hub.close()
+        assert time.monotonic() - t0 < 2.0
+        release.set()  # the late reply finds the sockets closed
+        caller.join(5)
+    finally:
+        fw._STRUCTURED_TIMEOUT_S = saved
+        release.set()
+        worker.close()

@@ -161,6 +161,7 @@ class FrontendHub:
         self._local = threading.local()
         self._callbacks = [self._make_callback(i) for i in range(num_workers)]
         self._closing = threading.Event()
+        self._sockets_closed = False
         self._thread = threading.Thread(
             target=self._serve_requests, name="FrontendHub", daemon=True
         )
@@ -239,6 +240,10 @@ class FrontendHub:
 
     def _send_to_worker(self, worker_index: int, *parts) -> None:
         with self._output_locks[worker_index]:
+            # close() takes this lock before closing the socket; nothing is
+            # sent after that, from any thread.
+            if self._sockets_closed:
+                return
             self._output_sockets[worker_index].send_multipart(parts, copy=False)
 
     def _answer_structured(self, worker_index: int, call_id: bytes, frame) -> None:
@@ -324,17 +329,26 @@ class FrontendHub:
         self._send_to_worker(worker_index, _OUT_STEP, frame)
 
     def close(self) -> None:
-        """Stop the workers and the request thread. Call after the engine has
-        stopped calling ``flush``."""
-        for proc in self._processes:
-            if proc.exitcode is None:
-                proc.terminate()
+        """Stop taking requests, then the structured-admission pool, then the
+        workers, then the sockets. Call after the engine has stopped calling
+        ``flush``. Never blocks on a worker: a reply still being prepared is
+        dropped once the sockets are closed."""
         self._closing.set()
         if self._thread.is_alive():
             self._thread.join()
-        self._structured_pool.shutdown(wait=True, cancel_futures=True)
-        for sock in (self._request_socket, *self._output_sockets):
-            sock.close(linger=0)
+        self._structured_pool.shutdown(wait=False, cancel_futures=True)
+        for proc in self._processes:
+            if proc.exitcode is None:
+                proc.terminate()
+        for lock in self._output_locks:
+            lock.acquire()
+        try:
+            self._sockets_closed = True
+            for sock in (self._request_socket, *self._output_sockets):
+                sock.close(linger=0)
+        finally:
+            for lock in self._output_locks:
+                lock.release()
 
 
 # --------------------------------------------------------------------------
