@@ -18,6 +18,8 @@ with stubbed_aiter(
     "aiter.ops.shuffle",
     "aiter.ops.triton.quant",
     "aiter.utility.fp4_utils",
+    "triton",
+    "triton.language",
 ):
     from atom.model_ops import eplb, moe, topK
     from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
