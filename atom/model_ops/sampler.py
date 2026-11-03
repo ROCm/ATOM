@@ -62,6 +62,17 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     )
 
 
+def get_per_row_exponential(num_tokens: int, vocab_size: int, device) -> torch.Tensor:
+    """Fresh Exp(1) noise of shape (num_tokens, vocab_size), one row per token.
+
+    The one draw both per-row-noise paths take (`_temperature_sample` and the
+    `ATOM_SPEC_BONUS_FUSED` draw), so they consume the RNG identically.
+    """
+    return torch.empty(
+        (num_tokens, vocab_size), dtype=torch.float, device=device
+    ).exponential_(1)
+
+
 class Sampler(nn.Module):
 
     def __init__(self):
@@ -157,9 +168,9 @@ class Sampler(nn.Module):
                 # The same noise draw as `_temperature_sample`, then the race
                 # and the greedy override in two vocab-tiled launches.
                 num_tokens, vocab_size = logits.shape
-                exponential = torch.empty(
-                    (num_tokens, vocab_size), dtype=torch.float, device=logits.device
-                ).exponential_(1)
+                exponential = get_per_row_exponential(
+                    num_tokens, vocab_size, logits.device
+                )
                 return self._fused_temperature_sample(
                     logits, temperatures, exponential, self.eps, SAMPLER_EPS
                 )
@@ -207,9 +218,7 @@ class Sampler(nn.Module):
         num_tokens, vocab_size = logits.shape
         sampled_tokens = torch.empty(num_tokens, dtype=torch.int, device=logits.device)
         if needs_independent_noise:
-            exponential = torch.empty(
-                (num_tokens, vocab_size), dtype=torch.float, device=logits.device
-            ).exponential_(1)
+            exponential = get_per_row_exponential(num_tokens, vocab_size, logits.device)
         else:
             exponential = get_per_token_exponential(vocab_size, logits.device).expand(
                 num_tokens, vocab_size
