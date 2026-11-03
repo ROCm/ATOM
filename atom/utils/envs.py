@@ -1027,7 +1027,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # race keys sit within ~1e-7 relative of each other (fp32 rounding order).
     # Rows with top-k/top-p, and batches without per-row noise, keep the aiter
     # path. Read when the `Sampler` is built, so it must be set before the
-    # server starts.
+    # server starts. Off by default: sampling rows are not bit-exact with the
+    # aiter kernel (above), and the gain shrinks with the verify-row count --
+    # on MI355X about -25% at <= 128 rows but none at 256 (~Kimi-K3 DSpark at
+    # concurrency 64) -- so it stays opt-in until that shape gains too.
     "ATOM_SPEC_BONUS_FUSED": lambda: os.getenv("ATOM_SPEC_BONUS_FUSED", "0") == "1",
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
