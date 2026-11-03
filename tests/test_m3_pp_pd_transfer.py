@@ -390,7 +390,6 @@ def _producer(tt, mem, blocks, heads):
         _block_head_major_runs=[runs for _, runs, _ in layout],
         _block_region_consumer_indices=tt.block_region_consumer_indices,
         tp_size=4 // heads,
-        tp_rank=0,
         dcp_size=1,
         pp_size=4,
         block_size=BLOCK,

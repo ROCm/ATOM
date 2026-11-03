@@ -43,10 +43,7 @@ from atom.kv_transfer.disaggregation.chunked_prefill import (
     PrefillHandoff,
     chunked_topology_supported,
 )
-from atom.kv_transfer.disaggregation.mha_head_transfer import (
-    consumer_head_group,
-    consumer_head_slices,
-)
+from atom.kv_transfer.disaggregation.mha_head_transfer import consumer_head_slices
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -1801,9 +1798,10 @@ class MooncakeConnector(KVConnectorBase):
                 with self._completion_lock:
                     self.failed_recving.add(req_id)
                 continue
-            remote_tp_rank = self._producer_tp_rank(
-                self.tp_rank, self.tp_size, remote_tp_size
-            )
+            if remote_tp_size != self.tp_size:
+                remote_tp_rank = self.tp_rank % remote_tp_size
+            else:
+                remote_tp_rank = self.tp_rank
 
             # Under PP-prefill the producer is one stage process per pipeline
             # rank, each owning a contiguous slice of layers on its own port.
@@ -2361,11 +2359,10 @@ class MooncakeConnector(KVConnectorBase):
         """Count a consumer-rank release; free the shared page after all ranks.
 
         PP-prefill only. Each decode rank sends one release once it has received
-        the KV from every stage. Each stage-0 TP rank waits for the consumers
-        routed to it; the existing TP completion quorum then permits reuse of
-        the page table. Marks the request in ``done_sending`` for the scheduler.
+        the KV from every stage, so ``consumer_tp_size`` releases mean all
+        stage×rank writes for this request are done and stage-0 may reuse the
+        page table. Marks the request in ``done_sending`` for the scheduler.
         """
-        consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
         with self._completion_lock:
             if transfer_id in self._released_transfers:
                 # Already released once; a duplicate/late release must not
@@ -2373,7 +2370,7 @@ class MooncakeConnector(KVConnectorBase):
                 # scheduler would assert on a missing deferred block).
                 return
             count = self._release_count.get(transfer_id, 0) + 1
-            if count < consumers_per_rank:
+            if count < consumer_tp_size:
                 self._release_count[transfer_id] = count
                 return
             self._release_count.pop(transfer_id, None)
@@ -2384,7 +2381,7 @@ class MooncakeConnector(KVConnectorBase):
             self._kv_cache_ready_events.pop(transfer_id, None)
         logger.debug(
             "[PRODUCER] All %d decode ranks released transfer_id=%s; page freed",
-            consumers_per_rank,
+            consumer_tp_size,
             transfer_id,
         )
 
@@ -2664,10 +2661,7 @@ class MooncakeConnector(KVConnectorBase):
             rank = data.get("consumer_tp_rank", 0)
             if size < self.tp_size or size % self.tp_size:
                 continue
-            if (
-                not 0 <= rank < size
-                or self._producer_tp_rank(rank, size, self.tp_size) != self.tp_rank
-            ):
+            if not 0 <= rank < size or rank % self.tp_size != self.tp_rank:
                 continue
             destinations.setdefault(data["transfer_id"], set()).add((size, rank))
         for req_id, transfer_id in list(self._chunked_admissions.items()):
@@ -2675,11 +2669,7 @@ class MooncakeConnector(KVConnectorBase):
             ranks = destinations.get(transfer_id, set())
             ready = any(
                 ranks
-                == {
-                    (size, rank)
-                    for rank in range(size)
-                    if self._producer_tp_rank(rank, size, self.tp_size) == self.tp_rank
-                }
+                == {(size, rank) for rank in range(self.tp_rank, size, self.tp_size)}
                 for size, _ in ranks
             )
             if ready or retired:
@@ -2907,30 +2897,26 @@ class MooncakeConnector(KVConnectorBase):
             )
         return cmap
 
-    def _producer_tp_rank(self, rank: int, consumer_tp: int, producer_tp: int):
-        if any(self._block_head_major_runs):
-            return consumer_head_group(producer_tp, consumer_tp, rank)[0]
-        return rank % producer_tp
-
     def _consumer_head_cut(self, request_data: dict, consumer_dcp_size: int):
-        """Consumer head runs and rank/fan-out within this producer's TP shard."""
+        """``(consumer head runs, consumer rank, consumer TP)`` when a consumer
+        at another TP size needs per-head units cut, else None. Only a TP1
+        producer holds every head (and is the rank every consumer is sent to)."""
         if not any(self._block_head_major_runs):
             return None
         consumer_tp = int(request_data.get("consumer_tp_size", self.tp_size))
         if consumer_tp == self.tp_size:
             return None
-        if self.dcp_size != 1 or consumer_dcp_size != 1:
+        if self.tp_size != 1 or self.dcp_size != 1 or consumer_dcp_size != 1:
             raise RuntimeError(
-                "Cutting KV heads between TP sizes requires no "
+                "Cutting KV heads between TP sizes needs a TP1 producer and no "
                 f"DCP; got producer TP {self.tp_size} DCP {self.dcp_size}, "
                 f"consumer TP {consumer_tp} DCP {consumer_dcp_size}"
             )
-        producer_rank, local_rank, fanout = consumer_head_group(
-            self.tp_size, consumer_tp, int(request_data["consumer_tp_rank"])
+        return (
+            request_data["consumer_head_major_runs"],
+            int(request_data["consumer_tp_rank"]),
+            consumer_tp,
         )
-        if producer_rank != self.tp_rank:
-            raise RuntimeError("KV head transfer reached the wrong producer TP rank")
-        return request_data["consumer_head_major_runs"], local_rank, fanout
 
     def _execute_block_transfer(
         self,
