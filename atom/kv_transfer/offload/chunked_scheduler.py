@@ -446,6 +446,45 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._perf_bump("lookup_deferred")
         return True
 
+    def lookup_ready(self, seq) -> bool:
+        """Whether `seq`'s tier answer can be consumed without a round trip.
+
+        True when the answer is already held (`_lookup_results`) or its async
+        lookup has answered and waits to be consumed (submitted, no longer in
+        flight). `Scheduler._early_load_tier_prefixes` asks this so that it
+        never blocks the scheduler thread -- and with it every DP rank -- on a
+        synchronous lookup. It does not advance the lookup: call it after
+        `lookup_pending`, or after a lookup driver thread answered.
+        """
+        sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if held is not None:
+            return held[0] is seq
+        client = self._lookup_client
+        is_pending = getattr(client, "is_pending", None)
+        pending_ids = getattr(client, "pending_ids", None)
+        if not callable(is_pending) or not callable(pending_ids):
+            return False
+        return sid in pending_ids() and not is_pending(sid)
+
+    def cancel_preadmission(self, seq) -> None:
+        """Forget an admission the scheduler takes back before any dispatch.
+
+        `Scheduler._early_load_tier_prefixes` allocates and notifies this
+        connector like a normal admission, then hands the request back to
+        `waiting` when the outcome is not a load it can park for. Cancel its
+        pending load -- which also gives the lookup's read locks back
+        (`_clear_pending_load`) -- and drop the held answer, so the next
+        admission asks the tier again instead of reusing an answer nothing pins
+        (`_ensure_lookup_pin` trusts a held answer).
+        """
+        self.cancel_pending_load(seq)
+        sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if held is not None and held[0] is seq:
+            del self._lookup_results[sid]
+        self._forget_tier_hit(sid)
+
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
 
