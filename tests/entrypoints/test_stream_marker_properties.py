@@ -740,6 +740,11 @@ def reasoning_shapes(dialect) -> list[str]:
         out.add(a + open_m + b)  # truncated mid-block
         out.add(a + end_m + c)  # end marker with no opener
         out.add(a + open_m + b + end_m + c + open_m + b + end_m + c)  # two blocks
+        for answer_m in dialect.answer_end_markers:
+            for after in ("", *dialect.content_framing):
+                out.add(a + answer_m + after + c)  # answer closed in the channel
+                out.add(a + open_m + b + answer_m + after + c)  # a self-opened one
+            out.add(a + answer_m + b + end_m + c)  # and the channel then closes
     return sorted(out)
 
 

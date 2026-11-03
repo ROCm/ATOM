@@ -4,12 +4,14 @@
 """Reasoning/thinking content separation for thinking models.
 
 A dialect-agnostic engine: it separates the reasoning channel from the final
-answer, both for a complete response (``separate_reasoning``) and for a token
-stream (``ReasoningFilter``), emitting the standard ``reasoning_content`` field.
+answer for a token stream (``ReasoningFilter``), and for a complete response
+(``separate_reasoning``) by running that same filter over it in one chunk,
+emitting the standard ``reasoning_content`` field.
 All model-specific marker knowledge lives in ``reasoning_dialects.DIALECTS``;
 this module contains no per-model conditions. Add a model there, not here.
 """
 
+import io
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -136,54 +138,30 @@ def separate_reasoning(
 ) -> tuple[str | None, str]:
     """Separate reasoning content from the final answer.
 
+    The streaming filter run over the whole output as one chunk, not a second
+    reader: a hand-written split per dialect had to be kept in step with the
+    filter, and every rule added to one of them drifted from the other. The
+    filter is chunk-invariant, so this is exactly what any chunking of the
+    same output streams, and every endpoint and delivery mode agrees by
+    construction.
+
     ``dialect`` is the one this model speaks, resolved from its chat template
-    at startup (:func:`~.reasoning_dialects.resolve_dialect`). One, not each in
-    turn: trying them in order let any model's answer be split by a dialect it
-    does not speak, so an answer *about* Kimi's wire format lost the text
-    before a quoted channel token -- and the streaming filter, which used a
-    different rule again, kept it. Callers should go through
-    :class:`ReasoningChannel`, which carries this and ``starts_thinking``
-    together so the two paths cannot be given different ones.
+    at startup (:func:`~.reasoning_dialects.resolve_dialect`); trying every
+    dialect in turn let a model's answer be split by one it does not speak.
+    ``starts_thinking`` says the prompt already opened the channel, which
+    nothing in the output can. Callers should go through
+    :class:`ReasoningChannel`, which carries the two together.
 
-    ``starts_thinking`` is the same answer :class:`ReasoningFilter` takes, and
-    for the same reason: an output that begins inside the reasoning channel
-    carries no opening marker, so nothing in the text says so. Both paths have
-    to be told, or the same response is split one way when streamed and
-    another when not -- measured, a reasoning model truncated at ``max_tokens``
-    returned its whole trace as ``content`` here and as ``reasoning_content``
-    when streamed.
-
-    Returns:
-        Tuple of (reasoning_content, content). reasoning_content is None if no
-        thinking block was found.
+    Returns ``(reasoning_content, content)``, each byte-for-byte what the
+    model wrote minus the markers the dialect declares; ``reasoning_content``
+    is ``None`` when there is none.
     """
-    speaking = dialect or FALLBACK_DIALECT
-    result = speaking.split(text, starts_thinking)
-    if result is not None:
-        # Framing removed here and not inside the dialect's split, because the
-        # two fallbacks below are splits too and they were missing it -- so a
-        # channel-format answer with no closer, or one on a stream that never
-        # opened the channel, kept its tokens on this path while the streaming
-        # filter dropped them. One place, applied to whatever comes back.
-        reasoning, content = result
-        return (
-            speaking.strip_framing(reasoning or "") or None,
-            speaking.strip_framing(content),
-        )
-    if starts_thinking:
-        # The prompt opened the channel and the model never closed it, which
-        # is what a reasoning model stopped at `max_tokens` looks like. It
-        # produced reasoning and no answer; the streaming filter says exactly
-        # that from state 1, and this has to agree.
-        #
-        # `or None` because it has to agree on the empty case too: the filter
-        # emits no segment at all for an empty output, so a bare `text` here
-        # put `reasoning_content: ""` in the non-streaming body and nothing in
-        # the streamed one. Every other return in this function spells absence
-        # as `None`.
-        return (speaking.strip_framing(text) or None, "")
-    # No reasoning markers — return content as-is (tool calls parsed separately).
-    return (None, speaking.strip_framing(text))
+    reader = ReasoningFilter(starts_thinking=starts_thinking, dialect=dialect)
+    reasoning: list[str] = []
+    content: list[str] = []
+    for field, segment in reader.process(text) + reader.flush():
+        (reasoning if field == "reasoning_content" else content).append(segment)
+    return "".join(reasoning) or None, "".join(content)
 
 
 class ReasoningFilter:
@@ -226,19 +204,21 @@ class ReasoningFilter:
         self._end_markers = frozenset(speaking.end_markers)
         self._answer_end_markers = frozenset(speaking.answer_end_markers)
         self._framing = frozenset(speaking.content_framing)
-        # What state 1 has released, kept only while it might turn out to have
-        # been the answer -- see the `_answer_end_markers` branch in `process`.
-        # Empty for a dialect with no answer-end markers, and dropped the
-        # moment the channel closes the ordinary way.
-        self._released_in_channel: list[str] = []
         self._open_markers = frozenset(
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
         self.state = 1 if starts_thinking else (2 if literal_answer else 0)
         # Nothing has been released yet, so an end marker arriving now sits at
-        # offset 0 -- which is the only place it means "I did not think this
-        # turn". See `_split_inline_tag`, whose answer this has to match.
+        # offset 0 -- the only place it means "I did not think this turn"
+        # (MiniMax-M3's trained form for a no-thinking turn). Anywhere else it
+        # is the model's own words.
         self._at_offset_zero = not starts_thinking
+        # The channel's text so far, kept only by a dialect whose answer can
+        # close inside the channel, in case the channel turns out to have been
+        # the reply. One string, dropped when the channel ends.
+        self._channel_text = io.StringIO() if self._answer_end_markers else None
+        # The channel's last words, framing aside, were the answer's closer.
+        self._answer_closed = False
         self._scanner = (
             None
             if literal_answer and not starts_thinking
@@ -279,31 +259,17 @@ class ReasoningFilter:
                 out.append((self._field, scan.released))
                 if self.state == 0:
                     self._at_offset_zero = False
-                elif self.state == 1 and self._answer_end_markers:
-                    self._released_in_channel.append(scan.released)
+                elif self.state == 1:
+                    # More channel text, so an answer closer before it did
+                    # not end the reply.
+                    self._answer_closed = False
+                    if self._channel_text is not None:
+                        self._channel_text.write(scan.released)
             if scan.hit is None:
                 return out
             if self.state == 1 and scan.hit in self._answer_end_markers:
-                # The answer's closer inside the reasoning channel: the model
-                # skipped the channel and everything it held was the reply.
-                # Above the framing branch, which would otherwise drop the
-                # marker as framing and leave the reply in reasoning.
-                #
-                # What already went out as `reasoning_content` cannot be
-                # recalled, so it is sent again as `content`. The answer then
-                # agrees with `separate_reasoning` on every chunking; the
-                # reasoning field keeps a copy the split does not have. That
-                # is the one divergence, and the alternative -- holding state
-                # 1 back until the channel is decided -- withholds every byte
-                # of an ordinary chain of thought, the stall that long
-                # reasoning turns into a client timeout. SGLang makes the same
-                # trade (sgl-project/sglang#37743).
-                replay = "".join(self._released_in_channel)
-                self._released_in_channel = []
-                if replay:
-                    out.append(("content", replay))
-                self.state = 2
-                self._scanner = self._scanner_for(self.state)
+                # Decided by what follows: see `_close_channel`.
+                self._answer_closed = True
                 text = scan.rest
                 continue
             if scan.hit in self._framing and not (
@@ -331,16 +297,36 @@ class ReasoningFilter:
             # end marker. A dialect that opens the channel from the prompt has
             # no opener to see, so it starts in state 1 and only ever takes
             # the second of these.
+            if self.state == 1:
+                out.extend(self._close_channel())
             self.state = 1 if self.state == 0 else 2
-            self._released_in_channel = []
             self._scanner = self._scanner_for(self.state)
             text = scan.rest
+
+    def _close_channel(self) -> list:
+        """The channel has ended, at an end marker or at the end of the output.
+
+        If its last words, framing aside, were the answer's closer, the model
+        skipped the channel and wrote its reply there (Kimi-K3 does this on
+        ~1M-token prompts). That text already went out as reasoning and cannot
+        be recalled, so it goes out again as `content`; the non-streaming
+        split is this filter, so every path returns it twice.
+        """
+        kept, self._channel_text = self._channel_text, None  # never reopens
+        reply = kept.getvalue() if kept is not None and self._answer_closed else ""
+        self._answer_closed = False
+        return [("content", reply)] if reply else []
 
     def flush(self) -> list:
         """End of stream: whatever is held never became a marker."""
         rest = self._scanner.flush() if self._scanner is not None else ""
         self._scanner = None
-        return [(self._field, rest)] if rest else []
+        out = [(self._field, rest)] if rest else []
+        if self.state == 1:
+            if rest:
+                self._answer_closed = False
+            out.extend(self._close_channel())
+        return out
 
 
 @dataclass(frozen=True)

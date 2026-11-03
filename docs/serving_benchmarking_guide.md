@@ -152,6 +152,18 @@ its end marker — not a stall: it is reasoning, and it is delivered as
 region* appears, everything from it onward belongs to the format until it can
 parse the region.
 
+One case is sent twice instead of held. A format can declare its answer's own
+closer (`answer_end_markers`; Kimi-K3's `<|close|>response<|sep|>`), and a
+think channel whose last words, framing aside, are that closer — followed by
+the end of the output or the next channel — was the reply: the model skipped
+the channel and wrote its answer there, which K3 does on ~1M-token prompts.
+That is only known when the channel ends, after the reply has streamed as
+`reasoning_content`, so it is sent again as `content`. Every endpoint and both
+delivery modes return the reply in both fields. The costs are that copy and
+the channel's text, kept as one string until the channel ends. Holding the
+channel back instead would stream no reasoning at all until it closed. A
+closer the channel goes on past (quoted, say) changes nothing.
+
 ##### What is held, and for how long
 
 The rule is that a byte is buffered only while its **destination field** is
@@ -343,6 +355,11 @@ bug above, in the stage before it. A model writes `</think>\n\nThe answer.`;
 chunking) comparisons, the two agreed byte-for-byte on 50% of them; they now
 agree on all of them, and the property that says so is byte-exact rather than
 word-level.
+
+Both are now one reader: the non-streaming split is the streaming filter run
+over the whole output as one chunk, and the filter is chunk-invariant, so the
+two cannot disagree. The per-dialect split functions that had to be kept in
+step with it are gone.
 
 The streaming filter also stopped eating the newline after its end marker. It
 only ever saw what happened to be buffered when the marker arrived, so the

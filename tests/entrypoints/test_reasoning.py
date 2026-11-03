@@ -15,6 +15,7 @@ from atom.entrypoints.openai.reasoning import (
     separate_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
+from atom.entrypoints.openai.serving_anthropic import read_whole_blocks
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
@@ -292,7 +293,7 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         text = f"The K3 format uses {marker} to open the answer."
         reasoning, content = self.K3_CLOSED.split(text)
         assert reasoning is None
-        assert content == self.K3_CLOSED.dialect.strip_framing(text)
+        assert content == text.replace(self.RESPONSE, "")  # framing, removed
         assert "The K3 format uses" in content and "to open the answer." in content
 
     @pytest.mark.parametrize("chunk", [1, 3, 999])
@@ -308,6 +309,51 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         segs += f.flush()
         assert "".join(s for k, s in segs if k == "content") == "Hello world"
         assert "".join(s for k, s in segs if k == "reasoning_content") == ""
+
+    ANSWER_END = "<|close|>response<|sep|>"
+    MESSAGE_END = "<|close|>message<|sep|>"
+    REPLY = "To find it:\n\n1. **Convert** the coordinates.\n2. Apply the formula."
+    CALL = (
+        '<|open|>tools<|sep|><|open|>call tool="get_weather"<|sep|>'
+        '<|open|>argument key="city"<|sep|>Paris<|close|>argument'
+        "<|close|>call<|close|>tools<|sep|>"
+    )
+
+    @pytest.mark.parametrize("ending", ["", MESSAGE_END], ids=["cut-short", "whole"])
+    def test_a_channel_that_ends_on_the_answer_closer_was_the_reply(self, ending):
+        """Kimi-K3 sometimes skips its think channel (~1M-token prompts) and
+        writes the reply there. Streamed, it went out as reasoning before the
+        closer said otherwise, so every path returns it in both fields."""
+        text = self.REPLY + self.ANSWER_END + ending
+        assert self.K3.split(text) == (self.REPLY, self.REPLY)
+
+    def test_an_answer_closer_the_channel_goes_on_past_is_not_the_end(self):
+        """Only the channel's last words count: a quoted closer leaves the
+        reasoning where it was."""
+        text = (
+            f"closes with {self.ANSWER_END} so{self.THINK_END}"
+            f"{self.RESPONSE}ok{self.ANSWER_END}"
+        )
+        assert self.K3.split(text) == ("closes with  so", "ok")
+
+    def test_a_channel_the_model_opened_itself_reads_the_same(self):
+        text = f"Note. <|open|>think<|sep|>{self.REPLY}{self.ANSWER_END}"
+        assert self.K3_CLOSED.split(text) == (self.REPLY, "Note. " + self.REPLY)
+
+    def test_a_call_after_the_reply_reaches_the_tool_parser(self):
+        text = self.REPLY + self.ANSWER_END + self.CALL + self.MESSAGE_END
+        reasoning, content = self.K3.split(text)
+        answer, calls = parse_tool_calls(content, None, KimiK3Parser)
+        assert (reasoning, answer) == (self.REPLY, self.REPLY)
+        assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    def test_the_messages_and_responses_bodies_read_it_the_same(self):
+        """They build the non-streaming body with `read_whole_blocks`."""
+        text = self.REPLY + self.ANSWER_END + self.MESSAGE_END
+        events = read_whole_blocks(self.K3, KimiK3Parser, text)
+        reasoning = "".join(d for k, d in events if k == "reasoning")
+        content = "".join(d for k, d in events if k == "content")
+        assert (reasoning, content) == self.K3.split(text)
 
 
 class TestTheDialectIsReadFromWhicheverEvidenceExists:
