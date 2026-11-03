@@ -176,6 +176,14 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+def fork_read_table(write: torch.Tensor, read: torch.Tensor) -> torch.Tensor:
+    """The spec read table: a forked row (its read slot differs from its
+    committed one) reads the source in EVERY column, since the kernel resumes
+    from column `num_accepted - 1`; other rows read what they write."""
+    forked = (read != write[:, 0]).unsqueeze(1)
+    return torch.where(forked, read.unsqueeze(1), write)
+
+
 class GDNStateMixin(PoolRowsMixin):
     def __init__(self, model_runner, **kwargs):
         super().__init__(model_runner=model_runner, **kwargs)
@@ -1328,15 +1336,15 @@ class GDNStateMixin(PoolRowsMixin):
                 self.non_spec_state_indices_tensor.copy_to_gpu(num_reqs)
             non_spec_state_indices_tensor = None
             # Only when forked: every other spec step ships None, as before.
-            # A fork runs eagerly (pp>1), so a fresh read-side table is fine:
-            # the write table with the fork source in the resume column.
+            # A fork runs eagerly (pp>1), so a fresh read-side table is fine.
             non_spec_state_indices_in_tensor = spec_state_indices_in_tensor = None
             if self._has_state_fork:
                 non_spec_state_indices_in_tensor = (
                     self.non_spec_state_indices_in_tensor.copy_to_gpu(num_reqs)
                 )
-                spec_state_indices_in_tensor = spec_state_indices_tensor.clone()
-                spec_state_indices_in_tensor[:, 0] = non_spec_state_indices_in_tensor
+                spec_state_indices_in_tensor = fork_read_table(
+                    spec_state_indices_tensor, non_spec_state_indices_in_tensor
+                )
             spec_query_start_loc = query_start_loc
             non_spec_query_start_loc = None
             num_accepted_tokens = self.num_accepted_tokens[:num_reqs]

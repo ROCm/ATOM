@@ -26,7 +26,11 @@ pytest.importorskip(
 
 import torch
 
-from atom.model_ops.attentions.gdn_attn import PAD_SLOT_ID, GDNStateMixin
+from atom.model_ops.attentions.gdn_attn import (
+    PAD_SLOT_ID,
+    GDNStateMixin,
+    fork_read_table,
+)
 from atom.model_ops.fla_ops.replayssm import seed_forked_slots
 
 WIDTH = 4  # mtp_k + 1 reserved slots per request
@@ -72,6 +76,18 @@ def test_spec_fork_publishes_the_source_too():
     np.testing.assert_array_equal(b.non_spec_state_indices_in_tensor.np[:2], [0, 30])
     # ReplaySSM parks the forked write slot's record cursor.
     assert b._fork_dst_slots == [4]
+
+
+def test_spec_fork_reads_the_source_whatever_was_accepted():
+    # The kernel resumes from column `num_accepted - 1`, so a bonus on a forked
+    # verify must still land on the source, not a recycled write slot.
+    b = _builder()
+    GDNStateMixin.prepare_state_indices(b, _batch([-1, 30], _slots(2)), with_spec=True)
+    table = fork_read_table(
+        torch.from_numpy(b.spec_state_indices_tensor.np[:2]),
+        torch.from_numpy(b.non_spec_state_indices_in_tensor.np[:2]),
+    )
+    assert table.tolist() == [[0, 1, 2, 3], [30, 30, 30, 30]]
 
 
 def test_no_fork_reads_the_slot_it_writes_on_both_paths():
