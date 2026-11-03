@@ -39,6 +39,52 @@ def _store(ip: str, port: int, timeout_s: float):
     return TCPStore(ip, port, is_master=False, timeout=timedelta(seconds=timeout_s))
 
 
+def managed_store_client(config):
+    """A model-runner rank's client of the TCPStore that CoreManager serves.
+
+    Every NCCL communicator created on first use takes its unique id from this
+    store. When the TP group spans nodes, its trays reach such a collective
+    apart by as much as their checkpoint loads differ (13 minutes on a tray
+    that cannot page-cache the checkpoint), so torch's default 300 s wait aborts
+    the start. Such a rank waits as long as the rest of the cross-node TP setup
+    does instead.
+    """
+    from torch.distributed import TCPStore
+
+    pc = config.parallel_config
+    kwargs = {}
+    if config.is_multinode_tp:
+        kwargs["timeout"] = timedelta(seconds=envs.ATOM_MULTINODE_TP_TIMEOUT_S)
+    return TCPStore(
+        pc.data_parallel_master_ip,
+        pc.data_parallel_base_port,
+        is_master=False,
+        **kwargs,
+    )
+
+
+def raise_timeout_if_tp_spans_nodes(config) -> None:
+    """Apply ATOM_MULTINODE_TP_TIMEOUT_S to the process groups created without a
+    timeout when the TP group spans nodes.
+
+    The default group and aiter's TP groups are. Across nodes their first
+    collectives wait for the slowest node's load, which torch's defaults (30
+    minutes for gloo, 10 for NCCL) need not cover. Raises those defaults and
+    never lowers them.
+    """
+    if not config.is_multinode_tp:
+        return
+    from torch.distributed import distributed_c10d
+
+    from atom.utils.distributed.utils import raise_default_group_timeout
+
+    seconds = envs.ATOM_MULTINODE_TP_TIMEOUT_S
+    raise_default_group_timeout(seconds)
+    nccl = distributed_c10d.default_pg_nccl_timeout
+    if nccl is not None:
+        distributed_c10d.default_pg_nccl_timeout = max(nccl, timedelta(seconds=seconds))
+
+
 def publish_bootstrap(config, info: dict) -> None:
     """Engine side: hand the other nodes what their workers are built from."""
     pc = config.parallel_config
@@ -103,15 +149,17 @@ def serve_remote_tp_ranks(engine_args) -> int:
     """
     from atom.model_engine.async_proc import AsyncIOProc
 
-    start = engine_args.tensor_parallel_rank
-    local = engine_args.tensor_parallel_size_local
-    ip = engine_args.data_parallel_master_ip
-    port = engine_args.data_parallel_base_port
+    pc = engine_args.parallel_config()
+    start = pc.tensor_parallel_rank
+    local = pc.tensor_parallel_size_local
+    ip = pc.data_parallel_master_ip
+    port = pc.data_parallel_base_port
     if not local or start % local or not port or ip in ("127.0.0.1", "localhost"):
         raise ValueError(
             "a node that runs only TP workers needs --tensor-parallel-size-local, "
             "a --tensor-parallel-rank that is a multiple of it, and the engine "
-            "node's --data-parallel-master-ip and --data-parallel-base-port"
+            "node's --data-parallel-master-ip and --data-parallel-base-port (or "
+            "ATOM_DP_MASTER_IP and ATOM_DP_BASE_PORT)"
         )
     ranks = range(start, start + local)
     logger.info(

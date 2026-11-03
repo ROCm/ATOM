@@ -2259,12 +2259,16 @@ class Config:
 
     def _check_multinode_tp(self) -> None:
         pc = self.parallel_config
+        if pc.tensor_parallel_size_local is None and pc.tensor_parallel_rank == 0:
+            return
         local, start, tp = self.tp_size_local, self.tp_rank_start, self.tp_world_size
         if local < 1 or tp % local or start % local or not 0 <= start < tp:
             raise ValueError(
                 f"--tensor-parallel-size-local {local} and --tensor-parallel-rank "
                 f"{start} must cut -tp {tp} into whole, equal per-node slices"
             )
+        if not self.is_multinode_tp:
+            return
         unsupported = [
             name
             for name, used in (
@@ -2472,8 +2476,7 @@ class Config:
             )
 
         assert 1 <= self.tensor_parallel_size <= 8
-        if self.is_multinode_tp:
-            self._check_multinode_tp()
+        self._check_multinode_tp()
         if self.decode_context_parallel_size > 1:
             assert self.tensor_parallel_size % self.decode_context_parallel_size == 0, (
                 f"tp_size ({self.tensor_parallel_size}) must be divisible by "

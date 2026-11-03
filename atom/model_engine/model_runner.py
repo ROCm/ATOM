@@ -10,7 +10,6 @@ import os
 import time
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
-from datetime import timedelta
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
 
@@ -77,6 +76,10 @@ from atom.model_engine.token_logprobs import (
     pack_token_logprobs,
     unpack_token_logprobs,
 )
+from atom.model_engine.tp_multinode import (
+    managed_store_client,
+    raise_timeout_if_tp_spans_nodes,
+)
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -140,21 +143,6 @@ from atom.utils.tbo import (
 )
 
 logger = logging.getLogger("atom")
-
-
-def managed_store_client_kwargs(config) -> dict:
-    """Extra arguments for a rank's client of the CoreManager's TCPStore.
-
-    Every NCCL communicator created on first use takes its unique id from this
-    store. When the TP group spans nodes, its trays reach such a collective
-    apart by as much as their checkpoint loads differ (13 minutes on a tray
-    that cannot page-cache the checkpoint), so torch's default 300 s wait aborts
-    the start. Such a rank waits as long as the rest of the cross-node TP setup
-    does instead.
-    """
-    if config.is_multinode_tp:
-        return {"timeout": timedelta(seconds=envs.ATOM_MULTINODE_TP_TIMEOUT_S)}
-    return {}
 
 
 def max_schedulable_decode_bs(
@@ -1101,6 +1089,7 @@ class ModelRunner:
         dp_rank = config.parallel_config.data_parallel_rank
         global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
         raise_timeout_if_dp_spans_nodes(config.parallel_config)
+        raise_timeout_if_tp_spans_nodes(config)
         if (
             config.parallel_config._managed_distributed_store
             and not torch.distributed.is_initialized()
@@ -1110,12 +1099,7 @@ class ModelRunner:
             os.environ.setdefault(
                 "HIP_VISIBLE_DEVICES", ",".join(map(str, range(visible)))
             )
-            store = torch.distributed.TCPStore(
-                config.parallel_config.data_parallel_master_ip,
-                config.parallel_config.data_parallel_base_port,
-                is_master=False,
-                **managed_store_client_kwargs(config),
-            )
+            store = managed_store_client(config)
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=global_rank, world_size=world_size
             )

@@ -966,24 +966,46 @@ class EngineArgs:
 
         # DP topology -> ParallelConfig. `data_parallel_size` stays in kwargs
         # too: LLMEngine still reads the loose kwarg on the legacy path.
-        parallel_config_kwargs = {
-            "data_parallel_size": kwargs["data_parallel_size"],
-            "data_parallel_size_local": kwargs.pop("data_parallel_size_local"),
-            "data_parallel_rank": kwargs.pop("data_parallel_rank"),
-            "data_parallel_master_ip": kwargs.pop("data_parallel_master_ip"),
-            "data_parallel_master_port": kwargs.pop("data_parallel_master_port"),
-            "tensor_parallel_size_local": kwargs.pop("tensor_parallel_size_local"),
-            "tensor_parallel_rank": kwargs.pop("tensor_parallel_rank"),
-        }
-        base_port = kwargs.pop("data_parallel_base_port")
-        if base_port is not None:
-            parallel_config_kwargs["data_parallel_base_port"] = base_port
-        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
+        for name in self._PARALLEL_CONFIG_FIELDS:
+            if name != "data_parallel_size":
+                kwargs.pop(name)
+        kwargs["parallel_config"] = self.parallel_config()
 
         logger.info(f"Engine kwargs: {kwargs}")
 
         return kwargs
 
+    _PARALLEL_CONFIG_FIELDS = (
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_rank",
+        "data_parallel_master_ip",
+        "data_parallel_master_port",
+        "data_parallel_base_port",
+        "tensor_parallel_size_local",
+        "tensor_parallel_rank",
+    )
+
+    def parallel_config(self) -> ParallelConfig:
+        """This node's ParallelConfig, with the ATOM_DP_* environment applied.
+
+        A node that runs only TP workers reads the engine's address from it as
+        well, so both nodes resolve that address the same way.
+        """
+        kwargs = {name: getattr(self, name) for name in self._PARALLEL_CONFIG_FIELDS}
+        if kwargs["data_parallel_base_port"] is None:
+            del kwargs["data_parallel_base_port"]
+        return ParallelConfig(**kwargs)
+
     def create_engine(self, tokenizer=None) -> LLMEngine:
-        """Create and return an LLMEngine instance with the configured parameters."""
+        """Create and return an LLMEngine instance with the configured parameters.
+
+        A node whose TP slice starts past rank 0 (--tensor-parallel-rank) has no
+        engine to create: it runs its TP workers for the engine on another node
+        and exits the process with their status once they stop.
+        """
+        if self.tensor_parallel_rank > 0:
+            from atom.model_engine.tp_multinode import serve_remote_tp_ranks
+
+            raise SystemExit(serve_remote_tp_ranks(self))
         return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
