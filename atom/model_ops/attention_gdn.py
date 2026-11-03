@@ -489,10 +489,18 @@ class GatedDeltaNet(nn.Module):
                     ssm_state,
                     non_spec_query_start_loc,
                     flydsl_metadata,
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=(
+                        ckpt is not None or gdn_metadata.keep_intermediate_states
+                    ),
                     state_indices=non_spec_state_indices_in_tensor,
                     has_initial_state=has_initial_state,
                 )
+                if gdn_metadata.keep_intermediate_states:
+                    from atom.model_ops.fla_ops.chunk import (
+                        publish_intermediate_states,
+                    )
+
+                    publish_intermediate_states(flydsl_h)
             else:
                 # Slots and mask come per step from the metadata builder, so
                 # this is one gather and one masked fill per layer.
@@ -525,7 +533,9 @@ class GatedDeltaNet(nn.Module):
                     ),
                     # Only when there is somewhere to put them; `h` is large and is
                     # dropped on return otherwise.
-                    keep_intermediate_states=ckpt is not None,
+                    keep_intermediate_states=(
+                        ckpt is not None or gdn_metadata.keep_intermediate_states
+                    ),
                 )
             # Init cache
             ssm_state.index_copy_(

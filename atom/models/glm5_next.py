@@ -24,8 +24,8 @@ Three decisions worth knowing about, each exact rather than approximate:
    tokens, and each selected pool expands back to its ``index_kpool`` token
    positions. At or below 2048 tokens top-k selects every pool, so the expansion
    yields every position and dense causal MLA is numerically identical -- which
-   is what ATOM's own gate relies on
-   (``deepseek_v2._pcp_sparse_active``: ``max_seqlen_k > index_topk``). Past that
+   is what ATOM's own gate relies on (the MLA builder's
+   ``attn_metadata.run_sparse``: ``max_seqlen_k > index_topk``). Past that
    threshold the pooled path decides what is attended to; dispatch lives in
    ``model_ops.glm5_next.indexer`` and its kernels in
    ``model_ops.glm5_next.kpool``.
@@ -55,7 +55,6 @@ from typing import Any, ClassVar
 import aiter
 import torch
 import torch.nn.functional as F
-from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_ep_group,
@@ -560,10 +559,8 @@ class Glm5NextIndexer(Indexer):
 
     Two differences from the DeepSeek-V3.2 / GLM-5.2 indexer this extends:
 
-    **NoPE.**  ``qk_rope_head_dim == 0``, so there is no rope component to split
-    off and rotate.  ``forward_impl`` is overridden to skip the split/rotate
-    entirely -- splitting to a 0-wide ``q_pe`` and calling the rope kernel on it
-    is at best a no-op and at worst an out-of-bounds read.
+    **NoPE.**  ``qk_rope_head_dim == 0`` uses the shared indexer's NoPE path
+    when pooling is disabled. The override only handles pooled keys/queries.
 
     **kpool.**  The indexer K cache stores one *pooled* entry per
     ``index_kpool`` tokens: a per-dimension softmax over the pool's slots,
@@ -646,14 +643,26 @@ class Glm5NextIndexer(Indexer):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
+        *,
+        projected_k_weights=None,
     ) -> None:
+        if not self.use_kpool():
+            # Unpooled NoPE shares the standard indexer's projection, norm,
+            # quantization and cache dispatch. Only kpool needs a custom path.
+            return super().forward_impl(
+                hidden_states,
+                qr,
+                qr_scale,
+                positions,
+                rotary_emb,
+                projected_k_weights=projected_k_weights,
+            )
+
         from atom.utils.forward_context import get_forward_context
 
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        if rotary_emb is None:
-            rotary_emb = self.rotary_emb
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
         k = self.wk(hidden_states)
@@ -662,119 +671,82 @@ class Glm5NextIndexer(Indexer):
         # NoPE: no rope split, no rotation -- q and k are entirely "nope".
         k = self.k_norm(k)
         q = q.view(-1, self.head_dim)
-        kpool = self.use_kpool()
-        if kpool:
-            # The pooled keys are cached Hadamard-rotated, so the query has to
-            # be rotated by the same orthonormal transform or the dot products
-            # mean nothing. Fused with the FP8 quant to avoid a round trip.
-            q_fp8, q_scale = kpool_ops.fwht128_quant_fp8(q)
-        else:
-            q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
+        # Pooled keys and queries use the same orthonormal Hadamard transform.
+        q_fp8, q_scale = kpool_ops.fwht128_quant_fp8(q)
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
         weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(-1)
 
-        if kpool:
-            # The memory-profiling forward runs BEFORE the KV cache (and the
-            # tail buffer with it) exists, so "unbound" is expected there and
-            # only there -- the op discards dummy runs before touching either.
-            # Anywhere else it means this model is on a builder that never
-            # allocated the buffer, which must not be papered over.
-            tail_cache = self.kpool_tail_cache
-            if tail_cache is None:
-                if not forward_context.context.is_dummy_run:
-                    raise RuntimeError("kpool tail cache is unbound on a real forward")
-                tail_cache = torch.zeros(
-                    1,
-                    2,
-                    self.index_kpool,
-                    self.head_dim,
-                    dtype=torch.bfloat16,
-                    device=hidden_states.device,
-                )
-            gdn = getattr(attn_metadata, "gdn_metadata", None)
-            state_slot_idx = None if gdn is None else gdn.non_spec_state_indices_tensor
-            state_slot_idx_in = (
-                None if gdn is None else gdn.non_spec_state_indices_in_tensor
-            )
-            if state_slot_idx is None and gdn is not None:
-                # ReplaySSM retains one committed request slot during verify.
-                state_slot_idx = gdn.slot_idx
-                if state_slot_idx is None and gdn.spec_state_indices_tensor is not None:
-                    state_slot_idx = gdn.spec_state_indices_tensor[:, 0]
-            if state_slot_idx is None:
-                # The profile/warmup forward carries no block tables, so the
-                # builder leaves gdn_metadata unset. That forward is a dummy
-                # run and the op discards it before touching any state; the
-                # placeholder only has to exist. CUDAGraph capture DOES get
-                # real slots (`_build_gdn_capture_metadata`), and it must --
-                # capture bakes this pointer in, so a zeros stand-in there
-                # would send every request's tail to slot 0 on replay.
-                if not forward_context.context.is_dummy_run:
-                    raise RuntimeError(
-                        "kpool state-slot metadata is missing on a real forward"
-                    )
-                state_slot_idx = torch.zeros(
-                    hidden_states.shape[0],
-                    dtype=torch.int32,
-                    device=hidden_states.device,
-                )
-            if state_slot_idx_in is None:
-                state_slot_idx_in = state_slot_idx
-            torch.ops.aiter.sparse_attn_indexer_kpool(
-                hidden_states,
-                self.k_cache.kv_cache[0],
-                q_fp8,
-                k,
-                # The gate that drives the pooling softmax comes from the same
-                # hidden states that produced k, so it stays token-aligned.
-                self.index_kpool_compress_gate(hidden_states),
-                weights,
-                self.index_kpool_compress_ape,
-                tail_cache,
-                state_slot_idx_in,
-                state_slot_idx,
-                positions - int(self.is_mtp),
-                self.sparse_kv_indices_buffer,
-                self.topk_tokens,
+        # The memory-profiling forward runs BEFORE the KV cache (and the
+        # tail buffer with it) exists, so "unbound" is expected there and
+        # only there -- the op discards dummy runs before touching either.
+        # Anywhere else it means this model is on a builder that never
+        # allocated the buffer, which must not be papered over.
+        tail_cache = self.kpool_tail_cache
+        if tail_cache is None:
+            if not forward_context.context.is_dummy_run:
+                raise RuntimeError("kpool tail cache is unbound on a real forward")
+            tail_cache = torch.zeros(
+                1,
+                2,
                 self.index_kpool,
                 self.head_dim,
-                self.is_mtp,
-                self.topk_out_width,
-                self.scale_fmt,
-                self.stable_topk,
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
             )
-            return
-
-        self.sparse_attn_indexer_impl(
+        gdn = getattr(attn_metadata, "gdn_metadata", None)
+        state_slot_idx = None if gdn is None else gdn.non_spec_state_indices_tensor
+        state_slot_idx_in = (
+            None if gdn is None else gdn.non_spec_state_indices_in_tensor
+        )
+        if state_slot_idx is None and gdn is not None:
+            # ReplaySSM retains one committed request slot during verify.
+            state_slot_idx = gdn.slot_idx
+            if state_slot_idx is None and gdn.spec_state_indices_tensor is not None:
+                state_slot_idx = gdn.spec_state_indices_tensor[:, 0]
+        if state_slot_idx is None:
+            # The profile/warmup forward carries no block tables, so the
+            # builder leaves gdn_metadata unset. That forward is a dummy
+            # run and the op discards it before touching any state; the
+            # placeholder only has to exist. CUDAGraph capture DOES get
+            # real slots (`_build_gdn_capture_metadata`), and it must --
+            # capture bakes this pointer in, so a zeros stand-in there
+            # would send every request's tail to slot 0 on replay.
+            if not forward_context.context.is_dummy_run:
+                raise RuntimeError(
+                    "kpool state-slot metadata is missing on a real forward"
+                )
+            state_slot_idx = torch.zeros(
+                hidden_states.shape[0],
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+        if state_slot_idx_in is None:
+            state_slot_idx_in = state_slot_idx
+        torch.ops.aiter.sparse_attn_indexer_kpool(
             hidden_states,
-            self.k_cache.prefix,
             self.k_cache.kv_cache[0],
             q_fp8,
             k,
+            # The gate that drives the pooling softmax comes from the same
+            # hidden states that produced k, so it stays token-aligned.
+            self.index_kpool_compress_gate(hidden_states),
             weights,
-            self.quant_block_size,
-            self.scale_fmt,
-            self.topk_tokens,
-            self.head_dim,
-            self.max_model_len,
-            self.max_total_seq_len,
+            self.index_kpool_compress_ape,
+            tail_cache,
+            state_slot_idx_in,
+            state_slot_idx,
+            positions - int(self.is_mtp),
             self.sparse_kv_indices_buffer,
-            self.dcp_sparse_kv_indptr_buffer,
-            self.dcp_owned_counts_buffer,
-            self.k_norm.weight,
-            self.k_norm.bias,
-            self.k_norm.eps,
-            positions,
-            rotary_emb.cos_cache.squeeze(-2).squeeze(-2),
-            rotary_emb.sin_cache.squeeze(-2).squeeze(-2),
-            self._weights_scale,
-            rotary_emb.is_neox_style,
-            # NoPE always takes the unfused path; the cos/sin caches above are
-            # passed only to satisfy the op signature and are never read.
-            False,
+            self.topk_tokens,
+            self.index_kpool,
+            self.head_dim,
+            self.is_mtp,
+            self.topk_out_width,
+            self.scale_fmt,
             self.stable_topk,
         )
+        return
 
 
 class _ZeroRopePad:

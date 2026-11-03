@@ -314,6 +314,13 @@ class MultiConnector(KVConnectorBase):
             if callable(callback):
                 callback(req_ids)
 
+    def after_forward(self) -> None:
+        """Forward the post-forward hook (lmcache_mp same-step saves)."""
+        for connector in self._connectors:
+            callback = getattr(connector, "after_forward", None)
+            if callable(callback):
+                callback()
+
     def get_finished(self) -> KVConnectorOutput:
         recv: set = set()
         failed: set = set()
@@ -419,6 +426,23 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             prefetch = getattr(connector, "prefetch_lookups", None)
             if callable(prefetch):
                 prefetch(seqs)
+
+    def offer_lookups(self, seqs: Any) -> None:
+        """Let each sub start lookups for arrived requests (input IO thread)."""
+        seqs = list(seqs)
+        for connector in self._connectors:
+            offer = getattr(connector, "offer_lookups", None)
+            if callable(offer):
+                offer(seqs)
+
+    def note_scheduled_tokens(
+        self, scheduled_seqs: Any, num_scheduled_tokens: Any
+    ) -> None:
+        """Tell each sub how far this step's forward computes each sequence."""
+        for connector in self._connectors:
+            note = getattr(connector, "note_scheduled_tokens", None)
+            if callable(note):
+                note(scheduled_seqs, num_scheduled_tokens)
 
     def __init__(self, config: Any) -> None:
         self._connectors = _build_subconnectors(config, role="scheduler")
