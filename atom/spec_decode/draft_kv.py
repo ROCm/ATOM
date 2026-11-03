@@ -76,7 +76,7 @@ def draft_ctx_slots(out, positions, cu_ends, block_tables, tok_ramp, vblock):
     return entry_slots(out, block_tables, req, positions, vblock)
 
 
-def draft_kv_builder(model_runner, draft_hf, model=None):
+def draft_kv_builder(model_runner, draft_hf, model):
     """The KV builder a draft needs of its own, or None if it needs none.
 
     A draft is not an attention flavor; it is a model that has one. So the
@@ -89,7 +89,8 @@ def draft_kv_builder(model_runner, draft_hf, model=None):
     flavor is a flag and a `make_kv_pool` on that backend.
 
     `model` is the built draft; one that declares `owns_flash_pool` gets the
-    DFlash pool.
+    DFlash pool (a draft that is not a `DSparkDraftModel`, e.g. Eagle3, does
+    not declare it).
     """
     from aiter import dtypes
 

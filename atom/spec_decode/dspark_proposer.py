@@ -421,7 +421,7 @@ class DSparkProposer(Drafter):
         # latent binds into the target's pool and answers None. ModelRunner
         # keys its draft-pool allocation and per-module binding off the
         # presence of this attribute, so None simply never sets it.
-        builder = draft_kv_builder(self.runner, draft_hf, model=model)
+        builder = draft_kv_builder(self.runner, draft_hf, model)
         if builder is not None:
             self.runner.draft_kv_builder = builder
         return model
