@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import gc
 import itertools
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import os
 import pickle
@@ -67,20 +68,40 @@ _WORKER_READY_TIMEOUT_S = 600.0
 # closed by the thread that last used it once that thread has stopped.
 _POLL_MS = 200
 
+# Structured-output admission compiles the grammar on the engine workers; a
+# cold schema can take tens of seconds (the engine's own preflight allows 60).
+_STRUCTURED_TIMEOUT_S = 120.0
+
 # worker -> hub
 _MSG_ADD = b"A"
 _MSG_ABORT = b"X"
 _MSG_HELLO = b"H"
+_MSG_STRUCTURED = b"S"
+# hub -> worker (first frame)
+_OUT_STEP = b"O"
+_OUT_REPLY = b"R"
 
 
 def worker_seq_id_base(index: int) -> int:
     return (index + 1) << _SEQ_ID_SHIFT
 
 
-def worker_seq_ids(index: int, start: int = 0):
-    """Worker ``index``'s sequence ids, wrapping inside its own window."""
-    base = worker_seq_id_base(index)
-    return (base | (n & _SEQ_ID_MASK) for n in itertools.count(start))
+class worker_seq_ids:  # noqa: N801 - used as ``Sequence.counter``
+    """Worker ``index``'s sequence ids, wrapping inside its own window.
+
+    ``next()`` is safe from several threads (preprocessing runs on a pool): it
+    is one ``next`` on an ``itertools.count`` plus local arithmetic, where a
+    generator would raise "generator already executing"."""
+
+    def __init__(self, index: int, start: int = 0):
+        self._base = worker_seq_id_base(index)
+        self._count = itertools.count(start)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> int:
+        return self._base | (next(self._count) & _SEQ_ID_MASK)
 
 
 def bind_shared_listener(host: str, port: int) -> socket.socket:
@@ -103,9 +124,16 @@ class FrontendHub:
     """Takes requests from the workers into ``core_mgr`` and returns each
     step's outputs to the worker that sent the request."""
 
-    def __init__(self, core_mgr, num_workers: int):
+    def __init__(self, core_mgr, num_workers: int, prepare_structured=None):
         self.core_mgr = core_mgr
         self.num_workers = num_workers
+        # ``LLMEngine.prepare_structured_request``: structured-output admission
+        # (option checks, grammar preflight) needs the engine, so workers ask
+        # the hub. Off the request thread, which every worker's traffic uses.
+        self._prepare_structured = prepare_structured
+        self._structured_pool = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="FrontendHubStructured"
+        )
         self.ctx = zmq.Context.instance()
         self.request_address = get_open_zmq_ipc_path()
         self.output_addresses = [get_open_zmq_ipc_path() for _ in range(num_workers)]
@@ -207,8 +235,26 @@ class FrontendHub:
         self._local.pending = None
         for worker_index, outputs in pending.items():
             frame = pickle.dumps(outputs, protocol=pickle.HIGHEST_PROTOCOL)
-            with self._output_locks[worker_index]:
-                self._output_sockets[worker_index].send(frame, copy=False)
+            self._send_to_worker(worker_index, _OUT_STEP, frame)
+
+    def _send_to_worker(self, worker_index: int, *parts) -> None:
+        with self._output_locks[worker_index]:
+            self._output_sockets[worker_index].send_multipart(parts, copy=False)
+
+    def _answer_structured(self, worker_index: int, call_id: bytes, frame) -> None:
+        try:
+            params, kv_transfer, multimodal = pickle.loads(frame)
+            if self._prepare_structured is None:
+                raise ValueError("Structured output requires engine admission")
+            self._prepare_structured(params, kv_transfer, multimodal)
+            error = None
+        except Exception as exc:  # noqa: BLE001 - goes back to the request
+            error = exc
+        try:
+            reply = pickle.dumps(error, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:  # noqa: BLE001 - an unpicklable error still answers
+            reply = pickle.dumps(ValueError(str(error)))
+        self._send_to_worker(worker_index, _OUT_REPLY, call_id, reply)
 
     # worker requests -------------------------------------------------------
     def _serve_requests(self) -> None:
@@ -234,6 +280,13 @@ class FrontendHub:
                         self._reject(worker_index, seqs)
                 elif kind == _MSG_ABORT:
                     self.core_mgr.abort_request(int(bytes(parts[1].buffer)))
+                elif kind == _MSG_STRUCTURED:
+                    self._structured_pool.submit(
+                        self._answer_structured,
+                        int(bytes(parts[1].buffer)),
+                        bytes(parts[2].buffer),
+                        bytes(parts[3].buffer),
+                    )
                 elif kind == _MSG_HELLO:
                     worker_index = int(bytes(parts[1].buffer))
                     logger.info(
@@ -268,8 +321,7 @@ class FrontendHub:
                 )
             )
         frame = pickle.dumps(outputs, protocol=pickle.HIGHEST_PROTOCOL)
-        with self._output_locks[worker_index]:
-            self._output_sockets[worker_index].send(frame, copy=False)
+        self._send_to_worker(worker_index, _OUT_STEP, frame)
 
     def close(self) -> None:
         """Stop the workers and the request thread. Call after the engine has
@@ -280,6 +332,7 @@ class FrontendHub:
         self._closing.set()
         if self._thread.is_alive():
             self._thread.join()
+        self._structured_pool.shutdown(wait=True, cancel_futures=True)
         for sock in (self._request_socket, *self._output_sockets):
             sock.close(linger=0)
 
@@ -305,6 +358,8 @@ class RemoteCoreManager:
         self._seq_id_to_callback: dict = {}
         self._flush_stream_batch_fn = None
         self._index_bytes = str(self.index).encode()
+        self._call_ids = itertools.count()
+        self._calls: dict[bytes, Future] = {}
         self._closing = threading.Event()
         self._thread = threading.Thread(
             target=self._receive_outputs,
@@ -332,6 +387,30 @@ class RemoteCoreManager:
         self._seq_id_to_callback.pop(req_id, None)
         self._send(_MSG_ABORT, str(int(req_id)).encode())
 
+    def prepare_structured_request(self, params, kv_transfer=None, multimodal=False):
+        """``LLMEngine.prepare_structured_request``, answered by the hub's
+        engine; its error, if any, is raised here as the engine raised it."""
+        if params.json_schema is None:
+            return
+        call_id = str(next(self._call_ids)).encode()
+        reply: Future = Future()
+        self._calls[call_id] = reply
+        try:
+            self._send(
+                _MSG_STRUCTURED,
+                self._index_bytes,
+                call_id,
+                pickle.dumps(
+                    (params, kv_transfer, multimodal),
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                ),
+            )
+            error = reply.result(timeout=_STRUCTURED_TIMEOUT_S)
+        finally:
+            self._calls.pop(call_id, None)
+        if error is not None:
+            raise error
+
     def is_healthy(self) -> bool:
         return self._thread.is_alive()
 
@@ -340,9 +419,14 @@ class RemoteCoreManager:
         while not self._closing.is_set():
             if not sock.poll(_POLL_MS):
                 continue
-            frame = sock.recv(copy=False)
+            parts = sock.recv_multipart(copy=False)
             try:
-                outputs = pickle.loads(frame.buffer)
+                if bytes(parts[0].buffer) == _OUT_REPLY:
+                    reply = self._calls.get(bytes(parts[1].buffer))
+                    if reply is not None:
+                        reply.set_result(pickle.loads(parts[2].buffer))
+                    continue
+                outputs = pickle.loads(parts[1].buffer)
             except Exception:
                 logger.exception("Frontend worker %d: undecodable output", self.index)
                 continue
@@ -389,6 +473,10 @@ class FrontendEngine:
             config, tokenizer, config.kv_cache_block_size
         )
         self.core_mgr = RemoteCoreManager(info)
+        # Structured output is admitted by the hub's engine, here and in
+        # preprocess (``InputOutputProcessor.structured_admission``).
+        self.prepare_structured_request = self.core_mgr.prepare_structured_request
+        self.io_processor.structured_admission = self.prepare_structured_request
         Sequence.counter = worker_seq_ids(info["index"])
 
     def close(self) -> None:

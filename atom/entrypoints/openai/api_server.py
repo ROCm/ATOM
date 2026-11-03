@@ -3548,7 +3548,11 @@ def _start_frontend_workers(args) -> None:
 
     from .frontend_workers import FrontendHub
 
-    hub = FrontendHub(engine.core_mgr, args.api_server_count)
+    hub = FrontendHub(
+        engine.core_mgr,
+        args.api_server_count,
+        prepare_structured=engine.prepare_structured_request,
+    )
     hub.start()
     _frontend_hub = hub
     _metrics_exporter.attach_frontend_board(hub.stats)

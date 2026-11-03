@@ -147,9 +147,9 @@ def test_hub_flush_sends_one_message_per_worker_per_step(hub_and_worker):
         def __init__(self, sock):
             self.sock, self.frames = sock, 0
 
-        def send(self, frame, copy=False):
+        def send_multipart(self, parts, copy=False):
             self.frames += 1
-            return self.sock.send(frame, copy=copy)
+            return self.sock.send_multipart(parts, copy=copy)
 
     counting = _Counting(hub._output_sockets[1])
     hub._output_sockets[1] = counting
@@ -264,3 +264,78 @@ def test_hub_close_stops_the_workers():
     hub._processes = [proc]
     hub.close()
     assert proc.terminated
+
+
+def test_sequence_ids_are_safe_to_draw_from_several_threads():
+    # Preprocessing runs on a pool; a generator raised "generator already
+    # executing" when two threads drew at once.
+    ids = fw.worker_seq_ids(3)
+    drawn = []
+    lock = threading.Lock()
+
+    def draw():
+        local = [next(ids) for _ in range(5000)]
+        with lock:
+            drawn.extend(local)
+
+    threads = [threading.Thread(target=draw) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(drawn) == len(set(drawn)) == 40000
+    base = fw.worker_seq_id_base(3)
+    assert all(base <= i < base + (1 << 24) for i in drawn)
+
+
+class _Params:
+    def __init__(self, schema):
+        self.json_schema = schema
+
+
+def test_structured_admission_is_answered_by_the_hub_engine():
+    # --api-server-count > 1: a worker has no engine, so json_schema /
+    # json_object admission goes to the hub's prepare_structured_request,
+    # and its error comes back to the request as the engine raised it.
+    seen = []
+
+    def prepare(params, kv_transfer, multimodal):
+        seen.append((params.json_schema, kv_transfer, multimodal))
+        if params.json_schema == "bad":
+            raise ValueError("Invalid JSON Schema: bad")
+
+    core = _FakeCoreManager()
+    hub = fw.FrontendHub(core, num_workers=1, prepare_structured=prepare)
+    core.hub = hub
+    hub.start()
+    worker = fw.RemoteCoreManager(hub.connection_info(0))
+    try:
+        worker.prepare_structured_request(_Params('{"type": "object"}'), None, False)
+        with pytest.raises(ValueError, match="Invalid JSON Schema"):
+            worker.prepare_structured_request(_Params("bad"), {"k": 1}, True)
+        # Plain requests never leave the worker.
+        worker.prepare_structured_request(_Params(None))
+        assert seen == [('{"type": "object"}', None, False), ("bad", {"k": 1}, True)]
+        assert worker._calls == {}
+        # Outputs still flow on the same socket after replies.
+        got = []
+        seq = _Seq(fw.worker_seq_id_base(0) + 1)
+        seq.stream_callback = got.append
+        worker.add_request([seq])
+        assert _wait(lambda: len(got) == 2)
+    finally:
+        worker.close()
+        hub.close()
+
+
+def test_hub_without_an_engine_admission_refuses_structured_requests():
+    core = _FakeCoreManager()
+    hub = fw.FrontendHub(core, num_workers=1)
+    hub.start()
+    worker = fw.RemoteCoreManager(hub.connection_info(0))
+    try:
+        with pytest.raises(ValueError, match="requires engine admission"):
+            worker.prepare_structured_request(_Params("{}"))
+    finally:
+        worker.close()
+        hub.close()
