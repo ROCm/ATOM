@@ -6,7 +6,7 @@ from typing import NamedTuple
 import pytest
 import torch
 
-from atom.model_ops.sampling_scratch import (
+from atom.model_ops.spec_sampling.sampling_scratch import (
     SCRATCH_ALIGN,
     Region,
     SamplingScratch,

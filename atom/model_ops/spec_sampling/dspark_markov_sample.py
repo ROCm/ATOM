@@ -32,9 +32,9 @@ from atom.model_ops.dspark_markov_argmax import (
     markov_weights_unsupported,
 )
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.sampling_scratch import Region, SamplingScratch, carve
-from atom.model_ops.softmax_tiles import softmax_combine_kernel
-from atom.model_ops.sparse_q_select import (
+from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch, carve
+from atom.model_ops.spec_sampling.softmax_tiles import softmax_combine_kernel
+from atom.model_ops.spec_sampling.sparse_q_select import (
     QSelectScratch,
     q_select_scratch,
     select_and_draw_q,

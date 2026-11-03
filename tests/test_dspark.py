@@ -22,7 +22,7 @@ pytest.importorskip(
 
 import torch
 
-import atom.model_ops.dspark_markov_sample as dspark_markov_sample_mod
+import atom.model_ops.spec_sampling.dspark_markov_sample as dspark_markov_sample_mod
 import atom.spec_decode.drafter as mod_drafter
 from atom.model_ops.v4_kernels.dspark_fp8_indices import DSparkIndexBuffers
 from atom.models.deepseek_v4_dspark import (

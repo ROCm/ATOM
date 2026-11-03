@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.sampling_scratch import Region
+from atom.model_ops.spec_sampling.sampling_scratch import Region
 
 # Logit-key bits one filter pass resolves, so each pass bins by this many. The
 # last 8 bits are resolved apart (`_ratio_filter_floor_kernel` counts them,

@@ -30,17 +30,19 @@ import triton.language as tl
 from spec_lossless_reference import dspark_markov_sample_reference, sparse_q_reference
 
 from atom.model_ops.dspark_markov_argmax import dspark_markov_argmax
-from atom.model_ops.dspark_markov_sample import (
+from atom.model_ops.rejection_sampler import rejection_sample
+from atom.model_ops.sampler import SAMPLER_EPS, Sampler
+from atom.model_ops.spec_sampling.dspark_markov_sample import (
     dspark_markov_sample,
     dspark_markov_sample_scratch,
 )
-from atom.model_ops.ratio_target_p import (
+from atom.model_ops.spec_sampling.ratio_target_p import (
     _RATIO_BLOCK_V,
     _ratio_stats_kernel,
     _ratio_target_p,
     target_p_scratch,
 )
-from atom.model_ops.ratio_verify import (
+from atom.model_ops.spec_sampling.ratio_verify import (
     _RATIO_ACCEPT_KEY,
     _RATIO_RESIDUAL_KEY,
     RatioVerifyInputs,
@@ -52,23 +54,23 @@ from atom.model_ops.ratio_verify import (
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
-from atom.model_ops.rejection_sampler import rejection_sample
-from atom.model_ops.sampler import SAMPLER_EPS, Sampler
-from atom.model_ops.sampling_filter import _request_of_row
-from atom.model_ops.sampling_filter_count import _ratio_filter_count_kernel
-from atom.model_ops.sampling_filter_descent import (
+from atom.model_ops.spec_sampling.sampling_filter import _request_of_row
+from atom.model_ops.spec_sampling.sampling_filter_count import (
+    _ratio_filter_count_kernel,
+)
+from atom.model_ops.spec_sampling.sampling_filter_descent import (
     _ratio_filter_cut_kernel,
     _ratio_filter_floor_kernel,
     _ratio_filter_pass_kernel,
 )
-from atom.model_ops.sampling_scratch import SamplingScratch
-from atom.model_ops.softmax_tiles import (
+from atom.model_ops.spec_sampling.sampling_scratch import SamplingScratch
+from atom.model_ops.spec_sampling.softmax_tiles import (
     argmax_lowest_id,
     race_key,
     softmax_combine_kernel,
 )
-from atom.model_ops.sparse_q_store import SparseQStore
-from atom.model_ops.verify_kernels import _draft_token, _finish_request
+from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
+from atom.model_ops.spec_sampling.verify_kernels import _draft_token, _finish_request
 
 DEV = "cuda"
 ANCHOR = 0
@@ -904,7 +906,7 @@ def test_the_key_purpose_word_separates_streams_at_any_offset_width(wide):
     """Draft noise, accept coins and residual race differ only in the key's
     high word (0, 1, 2); that word must reach Philox whether the offset is
     32-bit (the coins) or 64-bit (the draft noise and the residual race)."""
-    from atom.model_ops.ratio_verify import (
+    from atom.model_ops.spec_sampling.ratio_verify import (
         _RATIO_ACCEPT_KEY,
         _RATIO_RESIDUAL_KEY,
     )
@@ -1857,8 +1859,8 @@ def test_a_counted_top_k_keeps_what_the_descent_keeps(monkeypatch, dtype):
     per request, at the real vocab and at one whose last tile is ragged. A
     top_p that is off (1.0, scalar or per request) changes nothing, the
     +inf row included: it gets its top-k floor whatever its batch passes."""
-    import atom.model_ops.ratio_target_p as rtp
-    import atom.model_ops.sampling_filter as sf
+    import atom.model_ops.spec_sampling.ratio_target_p as rtp
+    import atom.model_ops.spec_sampling.sampling_filter as sf
 
     for vocab in (163840, 3 * _RATIO_BLOCK_V + 123):
         rows = 40

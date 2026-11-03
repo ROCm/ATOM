@@ -63,11 +63,11 @@ def test_shapes_are_checked_against_each_other():
 def test_the_sampled_op_checks_its_tables_as_the_greedy_one_does():
     """Both ops index W2 by the logits' column: a table of another vocab must
     raise in the sampled op too, not read the wrong rows."""
-    from atom.model_ops.dspark_markov_sample import (
+    from atom.model_ops.spec_sampling.dspark_markov_sample import (
         dspark_markov_sample,
         dspark_markov_sample_scratch,
     )
-    from atom.model_ops.sparse_q_store import SparseQStore
+    from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
 
     rows, vocab = 5, 64
     base, prev, w1, w2 = _tables(rows, vocab, 16, "cpu")

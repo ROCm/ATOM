@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.sampling_filter import (
+from atom.model_ops.spec_sampling.sampling_filter import (
     _BATCH_COUNTS,
     _FILTER_COUNT_GROUPS,
     _FILTER_COUNT_MAX_K,
@@ -28,10 +28,10 @@ from atom.model_ops.sampling_filter import (
     filter_scratch,
     row_filters,
 )
-from atom.model_ops.sampling_filter_count import count_floor
-from atom.model_ops.sampling_filter_descent import descend_floor
-from atom.model_ops.sampling_scratch import Region
-from atom.model_ops.softmax_tiles import (
+from atom.model_ops.spec_sampling.sampling_filter_count import count_floor
+from atom.model_ops.spec_sampling.sampling_filter_descent import descend_floor
+from atom.model_ops.spec_sampling.sampling_scratch import Region
+from atom.model_ops.spec_sampling.softmax_tiles import (
     argmax_lowest_id,
     softmax_combine_kernel,
     tile_max_sumexp,

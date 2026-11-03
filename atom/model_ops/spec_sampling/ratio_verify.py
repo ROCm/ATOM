@@ -19,18 +19,18 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.ratio_target_p import (
+from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.spec_sampling.ratio_target_p import (
     _RATIO_BLOCK_V,
     TargetPScratch,
     _ratio_target_p,
     target_p_scratch,
 )
-from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.sampling_filter import _FILTER_COUNT_MAX_K
-from atom.model_ops.sampling_scratch import Region, SamplingScratch
-from atom.model_ops.softmax_tiles import argmax_lowest_id, race_key
-from atom.model_ops.sparse_q_store import SparseQStore
-from atom.model_ops.verify_kernels import _draft_token, _finish_request
+from atom.model_ops.spec_sampling.sampling_filter import _FILTER_COUNT_MAX_K
+from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch
+from atom.model_ops.spec_sampling.softmax_tiles import argmax_lowest_id, race_key
+from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
+from atom.model_ops.spec_sampling.verify_kernels import _draft_token, _finish_request
 
 # Philox via `tl.rand` on a per-step SPMD counter, so every TP rank draws alike.
 # The key's high word names the purpose (0: the draft's noise), so no two

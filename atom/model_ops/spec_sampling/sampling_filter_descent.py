@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.sampling_filter import (
+from atom.model_ops.spec_sampling.sampling_filter import (
     _BATCH_COUNTS,
     _FILTER_BLOCK_V,
     _FILTER_DIGIT_BITS,

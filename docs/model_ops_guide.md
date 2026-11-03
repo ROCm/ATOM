@@ -25,7 +25,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
-| `RejectionSampler` | `rejection_sampler.py`, `verify_kernels.py`, `ratio_verify.py`, `ratio_target_p.py` | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
+| `RejectionSampler` | `rejection_sampler.py`, `spec_sampling/` (`verify_kernels.py`, `ratio_verify.py`, `ratio_target_p.py`) | Triton `rejection_greedy_sample_kernel`, `_ratio_*`, `rejection_relaxed_sample_kernel`, `rejection_synthetic_sample_kernel` | Speculative decoding |
 | `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
@@ -596,18 +596,18 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling; dispatches between the accept rules |
-| `verify_kernels.py` | `_draft_token`, `_finish_request` — the Triton helpers every verify kernel shares |
-| `ratio_verify.py` | `RatioVerifyInputs`, `ratio_verify_scratch`, `warmup_ratio_verify` — the probability-ratio accept rule: accept and a residual race that reads each rejecting row's `q` from the store |
-| `ratio_target_p.py` | `_ratio_target_p`, `filter_floor` — the ratio verify's target p: per-row softmax statistics and raw argmax, then the filter floor |
+| `spec_sampling/verify_kernels.py` | `_draft_token`, `_finish_request` — the Triton helpers every verify kernel shares |
+| `spec_sampling/ratio_verify.py` | `RatioVerifyInputs`, `ratio_verify_scratch`, `warmup_ratio_verify` — the probability-ratio accept rule: accept and a residual race that reads each rejecting row's `q` from the store |
+| `spec_sampling/ratio_target_p.py` | `_ratio_target_p`, `filter_floor` — the ratio verify's target p: per-row softmax statistics and raw argmax, then the filter floor |
 | `dspark_markov_argmax.py` | `dspark_markov_argmax` / `dspark_markov_argmax_tp` — the default greedy DSpark draft (full-vocab and vocab-sharded head) |
-| `dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
-| `sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |
-| `sparse_q_store.py` | `SparseQStore` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
-| `sampling_filter.py` | `row_filters`, `FilterScratch` — the ratio verify's top-k/top-p floor: shared row helpers and work buffers (`ratio_target_p.filter_floor` dispatches) |
-| `sampling_filter_descent.py` | `descend_floor` — the floor by a radix descent over the logit bits |
-| `sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
-| `softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
-| `sampling_scratch.py` | `SamplingScratch`, `Region` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) on its own `SCRATCH_ALIGN` boundary |
+| `spec_sampling/dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
+| `spec_sampling/sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |
+| `spec_sampling/sparse_q_store.py` | `SparseQStore` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
+| `spec_sampling/sampling_filter.py` | `row_filters`, `FilterScratch` — the ratio verify's top-k/top-p floor: shared row helpers and work buffers (`ratio_target_p.filter_floor` dispatches) |
+| `spec_sampling/sampling_filter_descent.py` | `descend_floor` — the floor by a radix descent over the logit bits |
+| `spec_sampling/sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
+| `spec_sampling/softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
+| `spec_sampling/sampling_scratch.py` | `SamplingScratch`, `Region` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) on its own `SCRATCH_ALIGN` boundary |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |

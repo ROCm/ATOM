@@ -28,7 +28,7 @@ from atom.utils.forward_context import (
 from atom.utils.h2d import h2d_producer
 
 if TYPE_CHECKING:
-    from atom.model_ops.ratio_verify import RatioVerifyInputs
+    from atom.model_ops.spec_sampling import RatioVerifyInputs
 
 logger = logging.getLogger("atom")
 
