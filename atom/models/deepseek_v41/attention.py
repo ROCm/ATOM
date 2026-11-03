@@ -17,7 +17,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_prefill,
 )
 from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
-from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR
+from atom.model_ops.blockscale_kernels.quantization import AMAX_FLOOR, FP8_DTYPE
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import (
     quantize_query_fp4,
@@ -483,13 +483,14 @@ class Attention(nn.Module):
         join_stream(self.index_stream, self.compress_stream)
         if fused:
             rows = query.shape[:-2].numel()
+            group_dim = 8 * self.head_dim
             x_fp8 = torch.empty(
-                (rows, self.groups, 4096),
-                dtype=torch.float8_e4m3fn,
+                (rows, self.groups, group_dim),
+                dtype=FP8_DTYPE,
                 device=query.device,
             )
             x_scale = torch.empty(
-                (rows, self.groups, 128),
+                (rows, self.groups, group_dim // 32),
                 dtype=torch.float8_e8m0fnu,
                 device=query.device,
             )

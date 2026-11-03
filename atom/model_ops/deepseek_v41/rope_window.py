@@ -348,7 +348,14 @@ def _norm_rope_window_kernel(
 ):
     """One program per token: Q's RMSNorm to MXFP8, and the KV row's RMSNorm
     through `_rope_window_kernel`'s KV chain. `SPLIT_Q` holds Q as a
-    `BLOCK_KQ` head and a power-of-two tail rather than one padded tile."""
+    `BLOCK_KQ` head and a power-of-two tail rather than one padded tile.
+
+    This extends AITER's dual latent RMSNorm with ATOM's window address and
+    byte-layout contract. AITER's QK norm/RoPE/SWA op instead normalizes
+    projected per-head Q and emits BF16 rows: it cannot consume Q's latent
+    width or emit this MXFP8 ring. Quantization reuses `_mxfp8_quant_op`;
+    the KV chain reuses the shared `_quantized_values` and `_store_ring` helpers.
+    """
     groups: tl.constexpr = BLOCK_KQ // 32
     cols = tl.arange(0, BLOCK_KQ)
     mask = cols < KQ
@@ -465,7 +472,15 @@ def norm_rope_quant_window(
     # 1280-wide Q; a decode bucket is too short to notice them.
     block_kq = triton.next_power_of_2(q_dim)
     tail = q_dim - block_kq // 2
-    split_q = tokens >= 768 and 0 < tail and tail & (tail - 1) == 0
+    # Both pieces are reshaped into group-32 rows. In particular, a 32-wide
+    # Q must stay unsplit: two 16-wide pieces contain no quantization group.
+    split_q = (
+        tokens >= 768
+        and block_kq // 2 % 32 == 0
+        and tail > 0
+        and tail % 32 == 0
+        and tail & (tail - 1) == 0
+    )
     if split_q:
         block_kq //= 2
     _norm_rope_window_kernel[(tokens,)](

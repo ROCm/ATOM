@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Fused FP8 attention through ATOM's cache and output projections."""
 
+import os
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -10,6 +11,9 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.deepseek_v41.fp8_attention import (
+    fused_attention_available,
+)
 from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.model_ops.blockscale import quantize_fp8
@@ -29,10 +33,11 @@ from tests.attentions.deepseek_v41.helpers import (
 
 @pytest.fixture
 def fused_factory(single_rank):
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx950":
-        pytest.skip("Fused V4.1 attention requires gfx950")
+    available = torch.cuda.is_available() and fused_attention_available()
+    if os.environ.get("ATOM_REQUIRE_FUSED_ATTENTION_TESTS") == "1":
+        assert available, "Required fused V4.1 attention is unavailable"
+    elif not available:
+        pytest.skip("Fused V4.1 attention requires gfx950 and the AITER fused op")
 
     def build(
         heads=64,
@@ -211,16 +216,19 @@ def assert_output(actual, expected):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("stage", ["decode", "prefill", "long_prefill"])
-def test_norm_rope_quant_window_matches_two_launches(fused_factory, stage):
-    # 1280 is V4.1's q_lora_rank, a long prefill's split-tile Q
+@pytest.mark.parametrize("q_lora_rank", [32, 64, 96, 1280])
+def test_norm_rope_quant_window_matches_two_launches(fused_factory, stage, q_lora_rank):
+    # 32 must stay unsplit; 64/96 and V4.1's 1280 exercise full-group splits.
     lengths = {"decode": (1, 1), "prefill": (3, 5), "long_prefill": (800,)}[stage]
     case = fused_factory(
-        64, slots=2, max_tokens=sum(lengths), q_lora_rank=1280, hidden_size=256
+        64, slots=2, max_tokens=sum(lengths), q_lora_rank=q_lora_rank, hidden_size=256
     )
     model, cache, rope = case.model, case.cache, case.rope
     step, _ = make_step(case, lengths, prefill=stage != "decode")
-    latent = torch.randn(1, step.width, 1280 + 512, device="cuda", dtype=torch.bfloat16)
-    q, kv = latent[..., :1280], latent[..., 1280:]
+    latent = torch.randn(
+        1, step.width, q_lora_rank + 512, device="cuda", dtype=torch.bfloat16
+    )
+    q, kv = latent[..., :q_lora_rank], latent[..., q_lora_rank:]
     layer = model.spec.layer_id
 
     cache.backing.copy_(case.initial)
@@ -466,3 +474,30 @@ def test_fused_attention_conditions(fused_factory, heads):
     assert not model._use_fused_attention(query, cache, rope)
     groups = SimpleNamespace(**{**vars(case.config), "o_groups": heads // 4})
     assert not Attention(groups, model.spec).fused_attn
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("stage", ["decode", "prefill", "continued", "bounded"])
+def test_vllm_fused_region_matches_native(fused_factory, monkeypatch, stage):
+    from atom.plugin.vllm.v41_core_overrides import _attend_block, _forward
+
+    case = fused_factory(64)
+    lengths = (1, 1) if stage == "decode" else (3, 5)
+    step, queries = make_step(
+        case,
+        lengths,
+        prefill=stage != "decode",
+        position=0 if stage == "prefill" else None,
+        bounded=stage == "bounded",
+    )
+    hidden = torch.randn(1, step.width, 256, device="cuda", dtype=torch.bfloat16)
+    case.cache.backing.copy_(case.initial)
+    expected = case.model(hidden, None, case.cache, step, case.rope, queries)
+    expected_ring = case.cache.backing.clone()
+    monkeypatch.setattr(
+        Attention, "_atom_v41_attend_block", _attend_block, raising=False
+    )
+    case.cache.backing.copy_(case.initial)
+    actual = _forward(case.model, hidden, None, case.cache, step, case.rope, queries)
+    assert_output(actual, expected)
+    assert torch.equal(case.cache.backing, expected_ring)
