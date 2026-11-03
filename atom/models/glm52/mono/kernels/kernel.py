@@ -157,6 +157,7 @@ from atom.mono.device.ops import (
     wave_umax_dpp,
     write_lane_i32,
 )
+from atom.mono.device import dcp_merge
 from atom.mono.device.ops import exp as _exp
 from atom.mono.device.ops import fp8_roundtrip as _fp8_roundtrip
 from atom.mono.device.ops import fp8_to_bf16x8 as _fp8_to_bf16x8
@@ -1571,20 +1572,18 @@ def build_glm5_monokernel(
                     valid = lane < D
                     m = valid.select(values[0][0].bitcast(fx.Float32), fx.Float32(NEG))
                     local_sum = valid.select(values[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                    m_all = wave_max(m)
-                    z = local_sum * _exp(m - m_all)
-                    den = wave_sum(z)
+                    weight = dcp_merge.maxsum_weight(m, local_sum, wave_max, wave_sum)
                     if valid:
-                        lds_st(misc, lane, z * (den > 0.0).select(_rcp(den), fx.Float32(0.0)))
+                        lds_st(misc, lane, weight)
                 gpu.barrier()
                 if tid < KV_LORA // 2:
                     parts = poll([(own, dcp_summary_index(src, s, t, tid, S, N_UV), 1) for src in range(D)], "one-as")
-                    o0, o1 = fx.Float32(0.0), fx.Float32(0.0)
+                    o = [fx.Float32(0.0), fx.Float32(0.0)]
                     for src in range_constexpr(D):
                         a0, a1 = bf2_f32(parts[src][0])
                         weight = lds_ld(misc, src)
-                        o0, o1 = o0 + a0 * weight, o1 + a1 * weight
-                    lds_st(xs, tid, bf16_pair(o0, o1))
+                        o = dcp_merge.maxsum_accumulate(o, [a0, a1], weight)
+                    lds_st(xs, tid, bf16_pair(o[0], o[1]))
                 gpu.barrier()
             return owner
 

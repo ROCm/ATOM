@@ -30,15 +30,14 @@ o_proj, which waited for that peer's merge.
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
-from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.config import TOKEN_GROUP, group_rows, groups
 from atom.models.kimi_k3.mono.kernels.attention.back import TP
 from atom.models.kimi_k3.mono.kernels.attention.kda import HD, NH, PROJ, sigmoid
-from atom.mono.device.ops import CM_DEV, bf16_round, hw_exp2, rsrc, traced
+from atom.mono.device import dcp_merge as merge
+from atom.mono.device.ops import CM_DEV, bf16_round, rsrc, traced
 from atom.mono.device.sync import publish
 from atom.mono.plan.execution import BLOCKS, THREADS
 
@@ -46,9 +45,6 @@ HEADS = TP * NH  # 96: a rank's decode heads under DCP = TP
 WORDS = HD // 2  # bf16 pair words a head row
 SLOT = WORDS + 1  # pairs a (source, token, head): o, then the LSE
 QUADS = HD // 4  # threads a merged (token, head) row: 4 columns each
-NEG_INF = float("-inf")
-LOG2E = 1.4426950408889634
-LN2 = 0.6931471805599453
 MERGE_BATCH = 4  # sources whose rows a merge thread polls at once
 
 
@@ -64,23 +60,6 @@ def crdy_pairs(s):
 
 def merge_tasks(s):
     return groups(s) * NH
-
-
-def _f32(name, x):
-    return fx.Float32(
-        llvm.call_intrinsic(T.f32, name, [fx.Float32(x).ir_value()], [], [])
-    )
-
-
-# What Triton 3.8 lowers ``tl.exp2`` / ``tl.log2`` to on gfx950 (checked on its
-# LLVM IR): ``llvm.amdgcn.exp2.f32`` (no denormal fix-up, ``ops.hw_exp2``) and
-# ``llvm.log2.f32``. Another Triton could lower them otherwise; the check mode
-# (``ATOM_MONO_CHECK``) compares the two paths bit for bit.
-exp2 = hw_exp2
-
-
-def log2(x):
-    return _f32("llvm.log2.f32", x)
 
 
 def _slot(c, src, t, h):
@@ -139,18 +118,11 @@ def stage_push(c, bid):
                     dtype=T.f32,
                 )
             )
-            lse = (cnt == 0).select(fx.Float32(NEG_INF), lse)
+            lse = (cnt == 0).select(fx.Float32(merge.NEG_INF), lse)
             lses.append((e, d, _slot(c, c["rank"], t, h) + WORDS, lse))
     for e, d, at, lse in lses:
         if e < n_l:
             c["put"](c["dcp_peer"][d], at, lse)
-
-
-def _clean_lse(w):
-    """A polled LSE word -> f32, -inf for a non-finite one."""
-    lse = w.bitcast(fx.Float32)
-    bad = (lse != lse) | (lse == fx.Float32(float("inf")))  # noqa: PLR0124
-    return bad.select(fx.Float32(NEG_INF), lse)
 
 
 @traced
@@ -168,16 +140,8 @@ def stage_merge(c, g, h):
         got = c["poll"](
             [(c["dcp_own"], _slot(c, src, t, h) + WORDS, 1) for src in range(TP)]
         )
-        lses = [_clean_lse(got[src][0]) for src in range(TP)]
-        # ``_dcp_a2a_unpack_combine_rank_order_kernel``: one source at a time
-        m = fx.Float32(NEG_INF)
-        for src in range_constexpr(TP):
-            m = fx.max(m, lses[src])
-        m = (m == fx.Float32(NEG_INF)).select(fx.Float32(0.0), m)
-        total = fx.Float32(0.0)
-        for src in range_constexpr(TP):
-            total = total + exp2((lses[src] - m) * fx.Float32(LOG2E))
-        glse = fx.Float32(fmath.fma(log2(total), fx.Float32(LN2), m))
+        lses = [merge.clean_lse(got[src][0].bitcast(fx.Float32)) for src in range(TP)]
+        total = merge.lse_total(lses)
         acc = [fx.Float32(0.0)] * 4
         rows = []
         for src in range_constexpr(TP):
@@ -188,8 +152,7 @@ def stage_merge(c, g, h):
                         for b in range(src, src + MERGE_BATCH)
                     ]
                 )
-            f = exp2((lses[src] - glse) * fx.Float32(LOG2E))
-            f = (f != f).select(fx.Float32(0.0), f)  # noqa: PLR0124
+            f = merge.lse_factor(lses[src], total)
             w0, w1 = rows[src % MERGE_BATCH]
             vals = [
                 (w0 << 16).bitcast(fx.Float32),
@@ -197,9 +160,7 @@ def stage_merge(c, g, h):
                 (w1 << 16).bitcast(fx.Float32),
                 (w1 & fx.Int32(-65536)).bitcast(fx.Float32),
             ]
-            for j in range_constexpr(4):
-                v = (f == fx.Float32(0.0)).select(fx.Float32(0.0), vals[j])
-                acc[j] = fx.Float32(fmath.fma(v, f, acc[j]))
+            acc = merge.lse_accumulate(acc, vals, f)
         # aiter's ``_fused_sigmoid_mul_kernel`` on the bf16 merged row
         at = t * (PROJ // 2) + h * WORDS + 2 * q
         gw = fx.Vector(bo.buffer_load(rsrc(a["gate"]), at, vec_width=2, dtype=T.i32))
