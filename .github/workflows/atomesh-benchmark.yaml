@@ -201,12 +201,12 @@ on:
           - pit2-p03-g27
           - pit2-p03-g42
       atomesh_1p1d_nodes:
-        description: 'Comma-separated nodes for 1P1D. auto lets Slurm select idle nodes; an explicit list pins those nodes. Spur MI350 auto still uses its fabric nodelist'
+        description: 'Comma-separated nodes for 1P1D and single-node cells. auto lets Slurm select idle nodes; an explicit list is a candidate pool Slurm picks from (list exactly as many as a cell needs to pin them). Spur MI350 auto still uses its fabric nodelist'
         required: false
         default: auto
         type: string
       atomesh_2p1d_nodes:
-        description: 'Comma-separated nodes for 2P1D. auto lets Slurm select idle nodes; an explicit list pins those nodes. Spur MI350 auto still uses its fabric nodelist'
+        description: 'Comma-separated nodes for 2P1D. auto lets Slurm select idle nodes; an explicit list is a candidate pool Slurm picks from (list exactly as many as a cell needs to pin them). Spur MI350 auto still uses its fabric nodelist'
         required: false
         default: auto
         type: string

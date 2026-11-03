@@ -342,7 +342,6 @@ def build_cell(
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs at least one node"
             )
-        nodes = nodes[:1]
     elif prefill_single_node_pd:
         if nodes and len(nodes) < required_nodes:
             raise ValueError(
@@ -354,15 +353,14 @@ def build_cell(
                 f"{suite_cfg.get('name', model_name)} needs at least "
                 f"{required_nodes} node(s)"
             )
-        nodes = nodes[:required_nodes]
     elif nodes and len(nodes) < required_nodes or not nodes and not allow_auto_nodes:
         raise ValueError(
             f"{suite_cfg.get('name', model_name)} needs at least "
             f"{required_nodes} node(s)"
         )
-    num_nodes = (
-        required_nodes if not nodes or requires_explicit_candidate_nodes else len(nodes)
-    )
+    # An explicit list is a candidate pool: Slurm picks required_nodes of them
+    # (pd_submit excludes the rest), so listing exactly that many pins them.
+    num_nodes = required_nodes
 
     server_args = deep_merge(
         model_cfg.get("server", {}).get("common_args", {}),

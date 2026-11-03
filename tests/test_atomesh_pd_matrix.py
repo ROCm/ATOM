@@ -72,11 +72,23 @@ class NodeSelectionTest(unittest.TestCase):
                 self.assertEqual(cell["nodes"], [])
                 self.assertEqual(cell["num_nodes"], expected)
 
-    def test_tw_explicit_nodes_are_preserved(self):
+    def test_tw_explicit_nodes_are_a_candidate_pool(self):
         nodes = ["mia1-p02-g42", "mia1-p02-g44", "mia1-p02-g47"]
-        cell = expand_cell(nodes=",".join(nodes))
-        self.assertEqual(cell["nodes"], nodes)
-        self.assertEqual(cell["num_nodes"], 3)
+        for layout, prefill, decode, expected in (
+            ("single_node", 1, 1, 1),
+            ("multi_node", 1, 1, 2),
+            ("multi_node", 2, 1, 3),
+            ("prefill_single_node", 2, 1, 2),
+        ):
+            with self.subTest(layout=layout, prefill=prefill, decode=decode):
+                cell = expand_cell(
+                    nodes=",".join(nodes),
+                    layout=layout,
+                    prefill_workers=prefill,
+                    decode_workers=decode,
+                )
+                self.assertEqual(cell["nodes"], nodes)
+                self.assertEqual(cell["num_nodes"], expected)
         cell = expand_cell(
             nodes=",".join(nodes), layout="single_node", single_node="mia1-p01-g36"
         )
