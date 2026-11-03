@@ -797,6 +797,54 @@ def test_registration_and_unregistration_take_the_lock(monkeypatch):
     assert cudart.registered == []
 
 
+def pin_recorder(monkeypatch):
+    """Record `_mlock` / `_munlock` ranges instead of calling libc."""
+    from atom.model_ops.engram import host_memory
+
+    locked, unlocked = [], []
+    monkeypatch.setenv("ATOM_ENGRAM_MLOCK", "1")
+    monkeypatch.setattr(
+        host_memory, "_mlock", lambda lo, hi: locked.append((lo, hi)) or True
+    )
+    monkeypatch.setattr(
+        host_memory, "_munlock", lambda lo, hi: unlocked.append((lo, hi))
+    )
+    return locked, unlocked
+
+
+def covered_bytes(ranges) -> int:
+    return sum(hi - lo for lo, hi in ranges)
+
+
+def test_mlocked_runs_are_munlocked_with_their_last_reference(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
+    locked, unlocked = pin_recorder(monkeypatch)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is True
+    assert covered_bytes(locked) == registered_pages(WIDE_VALUES) * host_memory._PAGE
+    assert unlocked == []
+    table.disable_uva()
+    assert cudart.registered == []
+    assert covered_bytes(unlocked) == covered_bytes(locked)
+
+
+def test_refused_mlocked_registration_unpins_its_pages(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart(refuse_call=3)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
+    locked, unlocked = pin_recorder(monkeypatch)
+    table = wide_table()
+    assert table.enable_uva(0, 4) is False
+    assert cudart.registered == []
+    assert covered_bytes(unlocked) == covered_bytes(locked)
+
+
 class FakeHostAllocator:
     """Page-locked allocations backed by ctypes buffers kept alive here."""
 

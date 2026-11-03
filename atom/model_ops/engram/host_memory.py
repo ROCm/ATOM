@@ -563,6 +563,7 @@ def _reg_chunk_bytes() -> int:
 # registration unregisters what it already took while still holding it.
 _REG_LOCK_THREADS = threading.RLock()
 _reg_lock_depth = 0
+_reg_lock_path_logged = False
 
 
 def _flock_logging_wait(fd: int, path: str) -> None:
@@ -587,6 +588,7 @@ def _register_lock_file():
     registration as it was before the lock, while raising here would read as a
     refused registration and send every rank to the ~183 GiB-per-rank copy.
     """
+    global _reg_lock_path_logged
     path = envs.ATOM_ENGRAM_REG_LOCK
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -599,6 +601,9 @@ def _register_lock_file():
         )
         yield
         return
+    if not _reg_lock_path_logged:
+        _reg_lock_path_logged = True
+        logger.info("engram: page-locking serialized on %s", path)
     try:
         try:
             _flock_logging_wait(fd, path)
@@ -645,22 +650,28 @@ class _PageRuns:
     shard, and a rank holding every hash head (one DP-attention rank per GPU)
     registers both whole -- so each range takes a reference on the runs that
     cover it and registers only the gaps between them. A run is unregistered
-    with its last reference.
+    with its last reference, and munlocked then if it was mlocked: the runs
+    partition the registered pages, so no live range still needs them.
     """
 
     def __init__(self):
-        self._runs: dict[int, list[int]] = {}  # base -> [end, references]
+        # base -> [end, references, mlocked]
+        self._runs: dict[int, list] = {}
         self._lock = threading.RLock()
 
-    def acquire(self, rt, lo: int, hi: int, flags: int = 0) -> list[int] | None:
+    def acquire(
+        self, rt, lo: int, hi: int, flags: int = 0, mlock: bool = False
+    ) -> list[int] | None:
         """References on the runs covering `[lo, hi)` (page-aligned), the
         uncovered gaps registered first; None, holding nothing, if HIP
-        refuses one."""
+        refuses one. `mlock` pins the whole range first (`_mlock`); on a
+        refusal the pages no live run covers are unpinned again."""
         with self._lock:
+            locked = mlock and _mlock(lo, hi)
             held: list[int] = []
             cursor = lo
             overlapping = sorted(
-                b for b, (e, _) in self._runs.items() if b < hi and e > lo
+                b for b, (e, *_) in self._runs.items() if b < hi and e > lo
             )
             for base in [*overlapping, None]:
                 gap_end = hi if base is None else base
@@ -678,8 +689,10 @@ class _PageRuns:
                         if int(rt.cudaHostRegister(c, nbytes, flags)):
                             _clear_hip_error()
                             self.release(rt, held)
+                            if locked:
+                                self._munlock_uncovered(lo, hi)
                             return None
-                        self._runs[c] = [e, 1]
+                        self._runs[c] = [e, 1, False]
                         held.append(c)
                         c = e
                     if gap_end - cursor >= (1 << 30):
@@ -693,11 +706,16 @@ class _PageRuns:
                 self._runs[base][1] += 1
                 held.append(base)
                 cursor = max(cursor, self._runs[base][0])
+            # Marked only once the whole range holds its runs, so a refusal
+            # leaves the unpinning to `_munlock_uncovered` alone.
+            for base in held:
+                self._runs[base][2] = self._runs[base][2] or locked
             return held
 
     def release(self, rt, bases) -> None:
-        # The node-wide lock first, as in `_register`, so the two locks are
-        # always taken in the same order.
+        # Every path takes the node-wide lock before `self._lock`: `_register`
+        # holds it around `acquire`, so acquire's rollback arrives here with
+        # both already held (both are reentrant), and teardown takes it here.
         with _engram_register_lock(), self._lock:
             for base in bases:
                 run = self._runs[base]
@@ -707,6 +725,18 @@ class _PageRuns:
                     if int(rt.cudaHostUnregister(base) or 0):
                         _clear_hip_error()
                         logger.warning("engram: cudaHostUnregister failed")
+                    if run[2]:
+                        _munlock(base, run[0])
+
+    def _munlock_uncovered(self, lo: int, hi: int) -> None:
+        """Unpin the pages of `[lo, hi)` that no live run covers."""
+        cursor = lo
+        for base in sorted(b for b, (e, *_) in self._runs.items() if b < hi and e > lo):
+            if cursor < base:
+                _munlock(cursor, base)
+            cursor = max(cursor, self._runs[base][0])
+        if cursor < hi:
+            _munlock(cursor, hi)
 
     def __len__(self) -> int:
         return len(self._runs)
@@ -741,19 +771,30 @@ def _populate(lo: int, hi: int) -> None:
         list(pool.map(fault, pieces))
 
 
-def _mlock(lo: int, hi: int) -> None:
+def _mlock(lo: int, hi: int) -> bool:
     """Pin `[lo, hi)` (`ATOM_ENGRAM_MLOCK`) so the pages `_populate` faulted in
     cannot be reclaimed before `cudaHostRegister`, which would otherwise fault
     them back in from disk. Needs an unlimited or table-sized RLIMIT_MEMLOCK;
-    a failure only warns."""
+    a failure only warns. True if the range is pinned."""
     libc = ctypes.CDLL(None, use_errno=True)
     libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     if libc.mlock(lo, hi - lo) != 0:
         logger.warning(
             "engram: mlock of %d bytes failed: errno %d", hi - lo, ctypes.get_errno()
         )
-    elif hi - lo >= (1 << 30):
+        return False
+    if hi - lo >= (1 << 30):
         logger.info("engram: mlocked %.2f GiB", (hi - lo) / 2**30)
+    return True
+
+
+def _munlock(lo: int, hi: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    if libc.munlock(lo, hi - lo) != 0:
+        logger.warning(
+            "engram: munlock of %d bytes failed: errno %d", hi - lo, ctypes.get_errno()
+        )
 
 
 def _register(sources, leases):
@@ -782,9 +823,7 @@ def _register_locked(rt, sources, leases):
         flags = _HOST_REGISTER_READ_ONLY if _read_only(lo, hi) else 0
         if flags:
             _populate(lo, hi)
-        if envs.ATOM_ENGRAM_MLOCK:
-            _mlock(lo, hi)
-        runs = _PAGE_RUNS.acquire(rt, lo, hi, flags)
+        runs = _PAGE_RUNS.acquire(rt, lo, hi, flags, mlock=envs.ATOM_ENGRAM_MLOCK)
         if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", hi - lo)
             return None

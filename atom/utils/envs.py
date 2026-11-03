@@ -1267,6 +1267,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Lock file that serializes in-place registration and unregistration
     # across the processes of a node. Unopenable means "register without it".
+    # /dev/shm is per container unless it is shared (docker --ipc=host uses
+    # the host's), so ranks in separate containers need a path they share.
     "ATOM_ENGRAM_REG_LOCK": lambda: os.getenv("ATOM_ENGRAM_REG_LOCK", "")
     or "/dev/shm/engram-uva-register.lock",
     # mlock each faulted-in range before registering it, so a cold reclaim
