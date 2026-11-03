@@ -1624,7 +1624,10 @@ class CoreManager:
         else:
             decision = "prefix_moved_total"
             self._dp_route_counters["prefix_moved_tokens"] += hit
-            if loaded:
+            # Queue it first only while the rank's prefill queue is short:
+            # with a long queue every jump delays all requests behind it.
+            cap = envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE
+            if loaded and (cap < 0 or self._rank_tokens[rank] <= cap):
                 seq.dp_prefetch_priority = True
         self._prefix_owner_record(chain, rank, seq.id)
         return self._record_dp_route_locked(decision, rank)
