@@ -299,26 +299,11 @@ class CoreManager:
         # block hash, sampled every `_prefix_stride_tokens`, -> the rank that
         # last ran it. A bounded LRU of routing history, not KV residency.
         self._prefix_spread = envs.ATOM_DP_PREFIX_SPREAD
-        self._prefix_owner_margin = envs.ATOM_DP_PREFIX_OWNER_MARGIN
-        self._prefix_max_req_gap = envs.ATOM_DP_PREFIX_MAX_REQ_GAP
-        # Both margins scale with the lighter rank's load: a fixed gap that
-        # marks a real imbalance at low concurrency is noise once queues grow.
-        self._prefix_margin_rel = envs.ATOM_DP_PREFIX_OWNER_MARGIN_REL
-        self._prefix_req_gap_rel = envs.ATOM_DP_PREFIX_MAX_REQ_GAP_REL
-        self._prefix_policy = envs.ATOM_DP_PREFIX_POLICY
+        # A request leaves its prefix's rank only for a rank with under
+        # IDLE_TOKENS queued prefill (about to idle), and only if its prefix's
+        # rank has over twice that (a real backlog). See
+        # `_prefix_stays_on_owner`.
         self._prefix_idle_tokens = envs.ATOM_DP_PREFIX_IDLE_TOKENS
-        self._prefix_owner_backlog_tokens = envs.ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS
-        self._prefix_ratio = envs.ATOM_DP_PREFIX_RATIO
-        self._prefix_similar_tokens = envs.ATOM_DP_PREFIX_SIMILAR_TOKENS
-        if self._prefix_policy not in ("margin", "cost", "idle_ratio"):
-            raise ValueError(
-                f"ATOM_DP_PREFIX_POLICY must be margin, cost or idle_ratio, not "
-                f"{self._prefix_policy!r}"
-            )
-        self._prefix_imbalance_s = envs.ATOM_DP_PREFIX_IMBALANCE_S
-        self._prefix_work_per_s = envs.ATOM_DP_PREFIX_PREFILL_WORK_PER_S
-        self._prefix_load_tok_per_s = envs.ATOM_DP_PREFIX_LOAD_TOKENS_PER_S
-        self._prefill_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
         # Sampled prompt-block hash -> {rank: request that ran it there}.
         self._prefix_owner: OrderedDict[int, dict] = OrderedDict()
         self._prefix_owner_cap = 1 << 19
@@ -1608,66 +1593,32 @@ class CoreManager:
         while len(index) > self._prefix_owner_cap:
             index.popitem(last=False)
 
-    def _prefix_cost_rank(self, seq: Sequence, owner: int, hit: int) -> int:
-        """The "cost" rule: minimum estimated TTFT plus decode-imbalance penalty.
+    def _prefix_stays_on_owner(self, owner: int, lightest: int) -> bool:
+        """Whether a request stays on the rank holding its prefix.
 
-        A rank's queued prefill is its charged tokens (each with the
-        per-token weight of `prefill_cost`); the request's own prefill is its
-        uncached suffix attending to the prefix; a rank other than the
-        prefix's pays the tier load of the prefix. The penalty prices, in
-        seconds, each request of in-flight imbalance the placement leaves.
-        """
-        weight = self._prefill_token_weight
-        prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
-        n = self._routable_engine_count
-        best_rank, best_score = owner, None
-        for r in range(n):
-            prefix = hit if r == owner else 0
-            loaded = 0 if r == owner else hit
-            new = max(0, prompt - prefix - loaded)
-            queued = self._rank_tokens[r] * weight / self._prefix_work_per_s
-            own = new * (weight + prefix + loaded + new / 2) / self._prefix_work_per_s
-            load_s = loaded / self._prefix_load_tok_per_s if loaded else 0.0
-            reqs = list(self._rank_reqs)
-            reqs[r] += 1
-            imbalance = max(reqs) - min(reqs)
-            score = queued + own + load_s + self._prefix_imbalance_s * imbalance
-            if best_score is None or score < best_score:
-                best_rank, best_score = r, score
-        return best_rank
-
-    def _prefix_stays_idle_ratio(self, owner: int, lightest: int) -> bool:
-        """The "idle_ratio" rule: leave the prefix's rank only to use idle
-        prefill capacity or to cut a severe backlog imbalance.
-
-        Moving a request does not add prefill capacity while both ranks have
-        queued prefill to run in lockstep; it only reorders who waits. So move
-        (A) when the lightest rank is about to run out of prefill work (below
-        IDLE_TOKENS queued) while the owner has a backlog (above
-        OWNER_BACKLOG_TOKENS), or (B) when the owner's queued prefill exceeds
-        RATIO x the lightest rank's (RATIO <= 0, the default, disables B: once
-        both ranks have queued prefill, moving only reorders who waits).
+        Moving a request adds no prefill capacity while both ranks have queued
+        prefill to run in lockstep; it only reorders who waits, and the moved
+        request pays a tier load. So it moves only when the lightest rank is
+        about to run out of prefill work (under IDLE_TOKENS queued) while its
+        prefix's rank has a backlog (over 2 x IDLE_TOKENS).
         """
         if owner == lightest:
             return True
-        q_owner = self._rank_tokens[owner]
-        q_light = self._rank_tokens[lightest]
-        if q_light < self._prefix_idle_tokens:
-            return q_owner <= self._prefix_owner_backlog_tokens
-        if self._prefix_ratio <= 0:
+        idle = self._prefix_idle_tokens
+        if self._rank_tokens[lightest] >= idle:
             return True
-        return q_owner <= self._prefix_ratio * q_light
+        return self._rank_tokens[owner] <= 2 * idle
 
     def _prefix_idle_target(self, lightest: int, hits: dict[int, int], load) -> int:
         """Which rank a request leaving its prefix's rank goes to.
 
         Load first: only ranks about to idle (under IDLE_TOKENS queued) whose
-        load is within SIMILAR_TOKENS of the lightest are candidates. Among them, the one holding the longest part
+        load is within IDLE_TOKENS / 2 of the lightest are candidates. Among them, the one holding the longest part
         of the prefix, which then loads only the rest from the tier; the
         lightest on a tie. With two ranks this is the lightest rank.
         """
-        similar = getattr(self, "_prefix_similar_tokens", 0)
-        if similar <= 0 or not hits:
+        similar = self._prefix_idle_tokens // 2
+        if not hits:
             return lightest
         floor = load(lightest)
         best, best_hit = lightest, hits.get(lightest, 0)
@@ -1684,12 +1635,14 @@ class CoreManager:
         return best
 
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
-        """Least-loaded rank, unless the prefix's last rank is within the margin.
+        """The rank holding the prompt's prefix, unless another is about to idle.
 
-        No session stickiness: the frontend prompt-hash chain names the rank
-        that last ran this prefix. A request sent elsewhere carrying a loadable
-        prefix is flagged so its rank queues it first and the tier load into
-        that rank's HBM starts on arrival, not when it reaches the queue head.
+        No session stickiness: the frontend prompt-hash chain names the ranks
+        that ran this prefix. A request stays on its prefix's rank unless
+        `_prefix_stays_on_owner` says another rank is about to run out of
+        prefill work; then it goes to an idle rank (`_prefix_idle_target`) and
+        loads its prefix from the offload tier. A prompt with no known prefix
+        goes to the lightest rank.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
         hits, owner, source = self._prefix_rank_hits(chain)
@@ -1713,35 +1666,11 @@ class CoreManager:
             # what the tier cannot supply. Share the prefix's rank instead.
             rank = owner
             self._dp_route_counters["prefix_source_busy_total"] += 1
-        elif owner is not None and getattr(self, "_prefix_policy", "margin") == "cost":
-            rank = self._prefix_cost_rank(seq, owner, hit)
-        elif (
-            owner is not None
-            and getattr(self, "_prefix_policy", "margin") == "idle_ratio"
-        ):
-            if self._prefix_stays_idle_ratio(owner, lightest):
+        elif owner is not None:
+            if self._prefix_stays_on_owner(owner, lightest):
                 rank = owner
             else:
                 rank = self._prefix_idle_target(lightest, hits, load)
-        elif (
-            owner is not None
-            and load(owner)
-            <= load(lightest)
-            + max(
-                self._prefix_owner_margin,
-                getattr(self, "_prefix_margin_rel", 0.0) * load(lightest),
-            )
-            and (
-                getattr(self, "_prefix_max_req_gap", -1) < 0
-                or self._rank_reqs[owner] - self._rank_reqs[lightest]
-                <= max(
-                    self._prefix_max_req_gap,
-                    getattr(self, "_prefix_req_gap_rel", 0.0)
-                    * self._rank_reqs[lightest],
-                )
-            )
-        ):
-            rank = owner
         # The prefix is not prefill on the owner, nor on a rank that loads it
         # from the tier. A moved request whose hit is below the load threshold
         # is not loaded (the connector skips it), so that rank recomputes it
@@ -1765,10 +1694,9 @@ class CoreManager:
             self._dp_route_counters["prefix_moved_tokens"] += max(0, hit - local)
             if local > 0:
                 self._dp_route_counters["prefix_moved_partial_total"] += 1
-            # Queue it first only while the rank's prefill queue is short:
-            # with a long queue every jump delays all requests behind it.
-            cap = envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE
-            if loaded and (cap < 0 or self._rank_tokens[rank] <= cap):
+            # Without the early tier load its rank queues it first, so the
+            # load starts on arrival (see `Scheduler._enqueue_waiting`).
+            if loaded:
                 seq.dp_prefetch_priority = True
         self._prefix_owner_record(chain, rank, seq.id)
         return self._record_dp_route_locked(decision, rank)

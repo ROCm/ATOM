@@ -20,7 +20,7 @@ logger = logging.getLogger("atom")
 
 # Skips that are about KV pressure; every other skip is a condition the request
 # does not meet.
-LIMIT_REASONS = ("watermark", "max_frac")
+LIMIT_REASONS = ("watermark",)
 
 
 class EarlyLoadState:

@@ -1675,9 +1675,7 @@ class Scheduler:
             # Routed away from the rank holding its prefix: admit it first so
             # the tier load of that prefix into this rank starts now. With the
             # early tier load on, `_early_load_tier_prefixes` starts that load
-            # wherever the request waits, so nothing jumps the queue (and
-            # ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE, which only decides who jumps,
-            # has no effect).
+            # wherever the request waits, so nothing jumps the queue.
             self.waiting.appendleft(seq)
         else:
             self.waiting.append(seq)
@@ -4055,6 +4053,8 @@ class Scheduler:
     _EARLY_LOAD_PER_TICK = 8
     # Ticks before a request skipped for KV pressure is looked at again.
     _EARLY_LOAD_RETRY_TICKS = 8
+    # No early allocation once the KV pool would be fuller than this.
+    _EARLY_LOAD_KV_WATERMARK = 0.8
 
     @property
     def _early_load(self) -> EarlyLoadState:
@@ -4147,8 +4147,7 @@ class Scheduler:
           - no collective runs and no step type changes, so DP lockstep holds.
 
         Bounded by KV pressure: no early allocation once the pool would pass
-        `ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK`, nor once early-loaded requests
-        would hold more than `ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC` of the pool.
+        `_EARLY_LOAD_KV_WATERMARK` of its blocks.
         Such a request is left to Phase 2, as before. So is anything the park
         path cannot take (an unaligned HBM hit, a multimodal prompt, a load the
         connector refuses after `allocate`, which is handed back unadmitted).
@@ -4171,9 +4170,7 @@ class Scheduler:
         if not self.waiting:
             return 0
 
-        watermark = envs.ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK
-        max_frac = envs.ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC
-        allow_state = envs.ATOM_OFFLOAD_EARLY_LOAD_STATE
+        watermark = self._EARLY_LOAD_KV_WATERMARK
         chunk = int(getattr(self.kv_connector, "chunk_size", 0) or 0)
         hbs = bm.hash_block_size
         parked = 0
@@ -4205,23 +4202,14 @@ class Scheduler:
                 state.skip(seq.id, "unaligned_hbm")
                 state.settled.add(seq.id)
                 continue
-            if not allow_state and seq.has_per_req_cache and not seq.replays_hit:
-                state.skip(seq.id, "state_leg")
-                state.settled.add(seq.id)
-                continue
             # KV pressure. Counted only for a request that would load: one that
             # would not never reached here.
             need = bm.num_pool_blocks(len(seq))
-            if total_blocks > 0:
-                if (bm.kv.num_used + need) / total_blocks > watermark:
-                    state.skip(seq.id, "watermark")
-                    state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
-                    continue
-                if (state.held_blocks() + need) / total_blocks > max_frac:
-                    state.skip(seq.id, "max_frac")
-                    state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
-                    continue
-            if self._early_load_admit(seq, hbm_probe, needs_remote_load, allow_state):
+            if total_blocks > 0 and (bm.kv.num_used + need) / total_blocks > watermark:
+                state.skip(seq.id, "watermark")
+                state.retry_at[seq.id] = state.tick + self._EARLY_LOAD_RETRY_TICKS
+                continue
+            if self._early_load_admit(seq, hbm_probe, needs_remote_load):
                 parked += 1
             else:
                 break  # the pool refused the allocation
@@ -4234,7 +4222,6 @@ class Scheduler:
         seq: Sequence,
         hbm_probe: AdmissionProbe,
         needs_remote_load: bool,
-        allow_state: bool,
     ) -> bool:
         """Phase 2's admission up to the park, for a request not at its turn.
 
@@ -4280,9 +4267,6 @@ class Scheduler:
             self._early_load_take_back(seq, prev_hit)
             return True
         # else: a state-only load, which parks like a KV load (as in Phase 2).
-        if not allow_state and (oj.load_hash != -1 or oj.boundary_tokens):
-            self._early_load_take_back(seq, prev_hit)
-            return True
         # Stays where it is in `waiting`.
         self._park_for_remote_load(seq, deque())
         self._inflight_prefix_wait.pop(seq.id, None)
