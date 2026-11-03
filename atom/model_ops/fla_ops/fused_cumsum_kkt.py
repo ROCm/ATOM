@@ -9,6 +9,10 @@ program stores g_cumsum the same way. For `fused_inverse_recompute` it also
 stores beta and beta exp(g_cumsum) head-major, so that kernel reads each as one
 contiguous run.
 
+With ``gating`` the kernel computes the gates itself from the in_proj rows a
+and b, only for its key head's value heads: g = -exp(A_log) softplus(a +
+dt_bias), beta = sigmoid(b) rounded to bf16 as `fused_gdn_gating` stores it.
+
 The launch configuration is fixed: no autotuning.
 """
 
@@ -38,6 +42,11 @@ def _fused_cumsum_kkt_kernel(
     chunk_indices,
     nt_ptr,
     T,
+    a_ptr,
+    b_ptr,
+    A_log,
+    dt_bias,
+    stride_ab,
     H: tl.constexpr,
     Hg: tl.constexpr,
     HP: tl.constexpr,
@@ -45,6 +54,7 @@ def _fused_cumsum_kkt_kernel(
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HAS_NT: tl.constexpr,
+    GATING: tl.constexpr,
 ):
     i_t, i_bk = tl.program_id(0), tl.program_id(1)
     if IS_VARLEN and HAS_NT:
@@ -64,19 +74,39 @@ def _fused_cumsum_kkt_kernel(
     o = tl.arange(0, BT)
     r = i_t * BT + o
     m = r < T_seq
-    hh = tl.arange(0, HP)
-    m_tile = m[:, None] & (hh < H)[None, :]
-    tile_off = (bos + r[:, None]) * H + hh[None, :]
-    gc_tile = tl.cumsum(
-        tl.load(g_ptr + tile_off, mask=m_tile, other=0.0).to(tl.float32), axis=0
-    )
-    if i_hk == 0:
+    if GATING:
+        # the gates of the key head's value heads only, from a and b
+        hh = i_hk * (H // Hg) + tl.arange(0, H // Hg)
+        m_tile = m[:, None]
+        ab_off = (bos + r[:, None]).to(tl.int64) * stride_ab + hh[None, :]
+        x = (
+            tl.load(a_ptr + ab_off, mask=m_tile, other=0.0).to(tl.float32)
+            + tl.load(dt_bias + hh).to(tl.float32)[None, :]
+        )
+        softplus = tl.where(x <= 20.0, tl.log(1 + tl.exp(x)), x)
+        g = -tl.exp(tl.load(A_log + hh).to(tl.float32))[None, :] * softplus
+        gc_tile = tl.cumsum(tl.where(m_tile, g, 0.0), axis=0)
         tl.store(
-            g_cumsum_ptr + tile_off,
+            g_cumsum_ptr + (bos + r[:, None]) * H + hh[None, :],
             gc_tile.to(g_cumsum_ptr.dtype.element_ty),
             mask=m_tile,
         )
-    beta_tile = tl.load(beta_ptr + tile_off, mask=m_tile, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + ab_off, mask=m_tile, other=0.0).to(tl.float32)
+        beta_tile = tl.where(m_tile, tl.sigmoid(b).to(tl.bfloat16).to(tl.float32), 0.0)
+    else:
+        hh = tl.arange(0, HP)
+        m_tile = m[:, None] & (hh < H)[None, :]
+        tile_off = (bos + r[:, None]) * H + hh[None, :]
+        gc_tile = tl.cumsum(
+            tl.load(g_ptr + tile_off, mask=m_tile, other=0.0).to(tl.float32), axis=0
+        )
+        if i_hk == 0:
+            tl.store(
+                g_cumsum_ptr + tile_off,
+                gc_tile.to(g_cumsum_ptr.dtype.element_ty),
+                mask=m_tile,
+            )
+        beta_tile = tl.load(beta_ptr + tile_off, mask=m_tile, other=0.0).to(tl.float32)
 
     b_k = tl.load(
         k_ptr + ((bos + r[:, None]) * Hg + i_hk) * K + tl.arange(0, K)[None, :],
@@ -112,16 +142,21 @@ def _fused_cumsum_kkt_kernel(
 
 
 def fused_cumsum_kkt(
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     k: torch.Tensor,
-    beta: torch.Tensor,
+    beta: torch.Tensor | None,
     chunk_size: int = 64,
     cu_seqlens: torch.Tensor | None = None,
     plan=None,
+    gating=None,
 ):
     """
     Fused cumsum + KKT. ``plan`` (`varlen_plan.VarlenPlan`) launches the
     bucket's grid and lets the kernel read the step's chunk count.
+
+    ``gating`` = (a, b, A_log, dt_bias), with ``g`` and ``beta`` None: a and b
+    are [T, H] (unit column stride, the same row stride), and the kernel
+    computes the gates of `fused_gdn_gating` itself (B = 1).
 
     Args:
         g: [B, T, H]
@@ -133,8 +168,17 @@ def fused_cumsum_kkt(
         A: [B, T, H, chunk_size] fp32, strictly lower triangular
         beta_hm, scale_hm: [B, H, T] fp32, beta and beta * exp(g_cumsum) head-major
     """
-    B, T, H = g.shape
+    if gating is not None:
+        a, b, A_log, dt_bias = gating
+        assert k.shape[0] == 1 and a.stride(1) == 1 and b.stride(1) == 1
+        assert a.stride(0) == b.stride(0)
+        B, T, H = 1, a.shape[0], a.shape[1]
+        gating_args = (a, b, A_log, dt_bias, a.stride(0))
+    else:
+        B, T, H = g.shape
+        gating_args = (None, None, None, None, 0)
     Hg, K = k.shape[2], k.shape[3]
+    assert gating is None or H % Hg == 0 and (H // Hg) & (H // Hg - 1) == 0
 
     nt_ptr = None
     if plan is not None:
@@ -146,10 +190,10 @@ def fused_cumsum_kkt(
         chunk_indices = None
         NT = triton.cdiv(T, chunk_size)
 
-    g_cumsum = torch.empty(B, T, H, device=g.device, dtype=torch.float32)
+    g_cumsum = torch.empty(B, T, H, device=k.device, dtype=torch.float32)
     A = torch.empty(B, T, H, chunk_size, device=k.device, dtype=torch.float32)
-    beta_hm = torch.empty(B, H, T, device=g.device, dtype=torch.float32)
-    scale_hm = torch.empty(B, H, T, device=g.device, dtype=torch.float32)
+    beta_hm = torch.empty(B, H, T, device=k.device, dtype=torch.float32)
+    scale_hm = torch.empty(B, H, T, device=k.device, dtype=torch.float32)
 
     # gfx1250 sweep (T = 16k, 30 sequences, 16 key heads; cold caches): 2 warps
     # 24.4 us, 4 warps 28.2 us, 8 warps 30.8 us
@@ -165,11 +209,13 @@ def fused_cumsum_kkt(
         chunk_indices,
         nt_ptr,
         T,
+        *gating_args,
         H=H,
         Hg=Hg,
         HP=triton.next_power_of_2(H),
         K=K,
         BT=chunk_size,
+        GATING=gating is not None,
         num_warps=2,
         num_stages=1,
     )
