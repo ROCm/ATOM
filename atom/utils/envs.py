@@ -1311,6 +1311,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
+    # lmcache_mp: a scheduler-process thread sends and advances tier lookups
+    # as requests arrive, instead of only when the scheduler runs a pass.
+    "OFFLOAD_MP_LOOKUP_THREAD": lambda: _flag_env("OFFLOAD_MP_LOOKUP_THREAD"),
+    # Lookups that thread keeps in flight or answered but not yet consumed.
+    # Each answered one holds tier read locks until it is consumed.
+    "OFFLOAD_MP_LOOKUP_WINDOW": lambda: max(
+        1, _int_env_or_default("OFFLOAD_MP_LOOKUP_WINDOW", 64)
+    ),
+    # lmcache_mp: TP workers submit transfers from a thread instead of the
+    # forward thread, fenced by reused producer events.
+    "OFFLOAD_MP_TRANSFER_THREAD": lambda: _flag_env("OFFLOAD_MP_TRANSFER_THREAD"),
+    # lmcache_mp: a prefill chunk's save is emitted in the step that computes
+    # it and submitted once that step's forward has finished, instead of at the
+    # next step.
+    "OFFLOAD_MP_SAVE_SAME_STEP": lambda: _flag_env("OFFLOAD_MP_SAVE_SAME_STEP"),
     # Admit a prefill without waiting for its external-tier lookup when the HBM
     # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
     # could be loaded. The lookup is still sent to refresh the tier's LRU.
