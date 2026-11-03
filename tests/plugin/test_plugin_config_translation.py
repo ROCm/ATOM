@@ -65,6 +65,32 @@ def test_generate_from_vllm_translates_core_fields(monkeypatch):
     assert cfg.plugin_config.is_sglang is False
 
 
+@pytest.mark.parametrize(
+    "moe_prefill_limit,expected_tokens",
+    [(None, 8192), (4096, 8192), (16384, 16384)],
+)
+def test_generate_from_rtpllm_covers_moe_prefill_capacity(
+    monkeypatch, moe_prefill_limit, expected_tokens
+):
+    _patch_atom_config_module(monkeypatch)
+    model_config = _Obj(
+        ckpt_path="qwen4-exp",
+        max_seq_len=8192,
+        moe_prefill_max_tokens_per_rank=moe_prefill_limit,
+    )
+    rtp_config = _Obj(
+        model_config=model_config,
+        parallelism_config=_Obj(tp_size=2, tp_rank=0, ep_size=2),
+        max_generate_batch_size=16,
+    )
+
+    cfg = plugin_config._generate_atom_config_from_rtpllm_config(rtp_config)
+
+    assert cfg.max_num_batched_tokens == expected_tokens
+    assert cfg.max_model_len == 8192
+    assert cfg.max_num_seqs == 16
+
+
 def _vllm_cfg(additional_config=None):
     return _Obj(
         model_config=_Obj(model="m1", max_model_len=4096),

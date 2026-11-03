@@ -53,6 +53,18 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    stride_q_b: tl.constexpr,
+    stride_q_t: tl.constexpr,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_k_b: tl.constexpr,
+    stride_k_t: tl.constexpr,
+    stride_k_h: tl.constexpr,
+    stride_k_d: tl.constexpr,
+    stride_v_b: tl.constexpr,
+    stride_v_t: tl.constexpr,
+    stride_v_h: tl.constexpr,
+    stride_v_d: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
@@ -85,9 +97,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
+    if IS_VARLEN:
+        p_q = q + bos * stride_q_t + i_h * stride_q_h + o_k * stride_q_d
+        p_k = k + bos * stride_k_t + i_h * stride_k_h + o_k * stride_k_d
+        p_v = v + bos * stride_v_t + i_hv * stride_v_h + o_v * stride_v_d
+    else:
+        p_q = q + i_n * stride_q_b + i_h * stride_q_h + o_k * stride_q_d
+        p_k = k + i_n * stride_k_b + i_h * stride_k_h + o_k * stride_k_d
+        p_v = v + i_n * stride_v_b + i_hv * stride_v_h + o_v * stride_v_d
     if IS_BETA_HEADWISE:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
     else:
@@ -172,10 +189,10 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             p_ht = p_ht + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q_t
+        p_k += stride_k_t
         p_o += HV * V
-        p_v += HV * V
+        p_v += stride_v_t
         if not IS_KDA:
             p_g += HV
         else:
@@ -197,6 +214,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     ssm_state_indices_in: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -207,7 +225,19 @@ def fused_recurrent_gated_delta_rule_fwd(
     num_stages = 3
     num_warps = 1
 
-    o = q.new_empty(NK, *v.shape)
+    if out is not None:
+        if (
+            out.shape != v.shape
+            or out.dtype != v.dtype
+            or out.device != v.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be contiguous and match the value shape, dtype and device"
+            )
+        o = out.unsqueeze(0)
+    else:
+        o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
         final_state = initial_state
     else:
@@ -236,6 +266,9 @@ def fused_recurrent_gated_delta_rule_fwd(
         ), "ssm_state_indices_in must match ssm_state_indices in shape and stride"
 
     grid = (NK, NV, N * HV)
+    stride_q_b, stride_q_t, stride_q_h, stride_q_d = q.stride()
+    stride_k_b, stride_k_t, stride_k_h, stride_k_d = k.stride()
+    stride_v_b, stride_v_t, stride_v_h, stride_v_d = v.stride()
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
         k=k,
@@ -263,6 +296,18 @@ def fused_recurrent_gated_delta_rule_fwd(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_q_b=stride_q_b,
+        stride_q_t=stride_q_t,
+        stride_q_h=stride_q_h,
+        stride_q_d=stride_q_d,
+        stride_k_b=stride_k_b,
+        stride_k_t=stride_k_t,
+        stride_k_h=stride_k_h,
+        stride_k_d=stride_k_d,
+        stride_v_b=stride_v_b,
+        stride_v_t=stride_v_t,
+        stride_v_h=stride_v_h,
+        stride_v_d=stride_v_d,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         INPLACE_FINAL_STATE=inplace_final_state,
@@ -504,11 +549,12 @@ class FusedRecurrentFunction(torch.autograd.Function):
         ssm_state_indices_in: torch.Tensor | None = None,
         num_accepted_tokens: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        out: torch.Tensor | None = None,
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
+            q=q,
+            k=k,
+            v=v,
             g=g.contiguous(),
             beta=beta.contiguous(),
             scale=scale,
@@ -519,6 +565,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
             ssm_state_indices_in=ssm_state_indices_in,
             num_accepted_tokens=num_accepted_tokens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            out=out,
         )
 
         return o, final_state
@@ -538,6 +585,7 @@ def fused_recurrent_gated_delta_rule(
     ssm_state_indices_in: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -574,6 +622,9 @@ def fused_recurrent_gated_delta_rule(
             forward. Defaults to `ssm_state_indices` (in-place update).
         num_accepted_tokens (Optional[torch.Tensor]):
             Number of accepted tokens for each sequence during decoding.
+        out (Optional[torch.Tensor]):
+            Contiguous output buffer with the same shape, dtype and device as
+            `v`. When provided, write the recurrent output into this buffer.
 
     Returns:
         o (torch.Tensor):
@@ -633,5 +684,6 @@ def fused_recurrent_gated_delta_rule(
         ssm_state_indices_in,
         num_accepted_tokens,
         use_qk_l2norm_in_kernel,
+        out,
     )
     return o, final_state

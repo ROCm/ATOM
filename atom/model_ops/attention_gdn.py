@@ -447,6 +447,12 @@ class GatedDeltaNet(nn.Module):
                         ssm_state_indices_in=gdn_metadata.spec_state_indices_in_tensor,
                         num_accepted_tokens=num_accepted_tokens,
                         use_qk_l2norm_in_kernel=True,
+                        out=(
+                            core_attn_out[: query_spec.shape[1]].unsqueeze(0)
+                            if gdn_metadata.num_prefills == 0
+                            and gdn_metadata.num_decodes == 0
+                            else None
+                        ),
                     )
                 )
         else:
