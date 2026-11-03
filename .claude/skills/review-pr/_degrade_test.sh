@@ -14,7 +14,10 @@ printf 'diff --git a/x b/x\n' > "$WORK/pr.diff"
 printf '{"repo":{"head":"OTHERSHA","base":"BASESHA","patch_sha256":"z"}}' > "$WORK/stale.json"
 printf '{"required":true,"families":["runtime"],"blocking_reason":null}' > "$WORK/validation_requirement.json"
 
-export WORK SCHEMA="$S/../validate-atom-pr/report_schema.json" VALIDATION_REPORT="$WORK/stale.json"
+# The schema lives under a differently-named validator in each repo; find it rather than
+# hard-code a path that is right in one checkout and silently wrong in the other.
+SCHEMA=$(find "$S/.." -maxdepth 2 -name report_schema.json | head -1)
+export WORK SCHEMA VALIDATION_REPORT="$WORK/stale.json"
 out=$(bash "$T/region.sh" 2>&1); rc=$?
 fails=0
 [ "$rc" -eq 0 ] || { echo "  ❌ region exited $rc — a rejected report still aborts the run"; fails=1; }
