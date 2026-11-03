@@ -284,6 +284,14 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
 
                 metadata = SGLangForwardBatchMetadata.build(runtime.forward_batch)
                 with SGLangForwardBatchMetadata.bind(metadata):
+                    from atom.plugin.sglang.deepseek_v4_bridge import (
+                        refresh_v4_decode_graph_window,
+                    )
+
+                    attn_metadata = getattr(
+                        get_forward_context(), "attn_metadata", None
+                    )
+                    refresh_v4_decode_graph_window(attn_metadata, runtime.positions)
                     hidden_states = self.model(
                         input_ids=runtime.input_ids,
                         positions=runtime.positions,
