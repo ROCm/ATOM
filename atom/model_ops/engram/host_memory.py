@@ -12,6 +12,9 @@ In-place registrations go through a process-wide, reference-counted set of
 page runs (`_PageRuns`): ranges are widened to page boundaries, so ranges
 stored back to back (a layer's scales right before its values) share a page,
 and HIP refuses to register a range overlapping one already registered.
+Gaps are registered in 1 GiB pieces, and a table every DP-attention rank
+shares registers and unregisters under a per-checkpoint file lock
+(`_register_lock_file`), one process at a time.
 
 Every refused or failed HIP call clears HIP's last error (`_clear_hip_error`):
 HIP also leaves it as the runtime's sticky last error, which torch raises at
@@ -85,9 +88,11 @@ _MAX_COPY_THREADS = 16
 # Largest single cudaHostRegister. One ioctl covering a whole Engram table
 # does not return when several ranks issue it together.
 _REG_CHUNK_BYTES = 1 << 30
-# How long a rank waits for the registration lock before giving up.
+# How long a rank waits for the registration lock before giving up. Once a
+# path has timed out it is not waited on again in this process.
 _REG_LOCK_TIMEOUT_S = 600
 _logged_lock_paths: set[str] = set()
+_timed_out_lock_paths: set[str] = set()
 
 
 @functools.cache
@@ -656,8 +661,11 @@ def _register_lock_file(path: str):
 
     A file that cannot be opened or locked is logged and skipped. The `yield`
     is outside the `except`, so an error during registration is not chained
-    onto that failure. A wait past `_REG_LOCK_TIMEOUT_S` raises `TimeoutError`.
+    onto that failure. A wait past `_REG_LOCK_TIMEOUT_S` raises `TimeoutError`,
+    and so does every later call for that path, without waiting.
     """
+    if path in _timed_out_lock_paths:
+        raise TimeoutError(f"engram registration lock {path} timed out earlier")
     fd = None
     held = False
     open_error = None
@@ -679,6 +687,7 @@ def _register_lock_file(path: str):
         try:
             _flock_logging_wait(fd, path)
         except TimeoutError:
+            _timed_out_lock_paths.add(path)
             os.close(fd)
             fd = None
             raise
@@ -782,11 +791,21 @@ class _PageRuns:
 
     def release(self, rt, bases, lock_path: str | None = None) -> None:
         """Drop references taken by `acquire`. Lock order: the registration
-        lock file `lock_path` (a shared registration), then `self._lock`."""
-        with (
-            _register_lock_file(lock_path) if lock_path else contextlib.nullcontext(),
-            self._lock,
-        ):
+        lock file `lock_path` (a shared registration), then `self._lock`.
+
+        Best effort: if the lock file times out the runs are released without
+        it, so they never stay registered and locked for the process's life.
+        """
+        if lock_path:
+            try:
+                with _register_lock_file(lock_path), self._lock:
+                    self._release_locked(rt, bases)
+                return
+            except TimeoutError:
+                logger.warning(
+                    "engram: unregistering without %s, which timed out", lock_path
+                )
+        with self._lock:
             self._release_locked(rt, bases)
 
     def _release_locked(self, rt, bases) -> None:

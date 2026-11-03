@@ -624,6 +624,7 @@ def _no_real_host_allocator(monkeypatch, tmp_path):
     monkeypatch.delenv("ATOM_ENGRAM_UVA_COPY", raising=False)
     # A per-test registration lock file, so tests never share /dev/shm.
     monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", str(tmp_path / "register.lock"))
+    monkeypatch.setattr(host_memory, "_timed_out_lock_paths", set())
 
 
 class FakeCudart:
@@ -839,10 +840,32 @@ def test_lock_wait_is_bounded(tmp_path, monkeypatch):
         with pytest.raises(TimeoutError), host_memory._register_lock_file(path):
             pass
         assert time.monotonic() - started < 2
+        # Latched: the next table does not wait out the timeout again.
+        monkeypatch.setattr(host_memory, "_REG_LOCK_TIMEOUT_S", 30)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError), host_memory._register_lock_file(path):
+            pass
+        assert time.monotonic() - started < 1
     finally:
         release.set()
         thread.join(5)
         assert not thread.is_alive()
+
+
+def test_release_after_a_lock_timeout_still_unregisters(monkeypatch, tmp_path):
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    path = str(tmp_path / "register.lock")
+    monkeypatch.setenv("ATOM_ENGRAM_REG_LOCK", path)
+    table = wide_table()
+    assert table.enable_uva(0, 4, shared=True) is True
+    assert cudart.registered
+    host_memory._timed_out_lock_paths.add(path)
+    table.disable_uva()
+    assert cudart.registered == []
+    assert len(host_memory._PAGE_RUNS) == 0
 
 
 def test_lock_path_uses_the_override_or_the_mapped_file(monkeypatch, tmp_path):
