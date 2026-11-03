@@ -127,6 +127,7 @@ class MhaKvPool:
         kv_dtype: torch.dtype,
         blocks_per_entry: int = 1,
         per_tensor_scales: bool = False,
+        flash_layout: bool = False,
         extra_fields: Sequence[EntryField] = (),
     ):
         # `block_size` is the caller's block, the only token count the pool
@@ -151,6 +152,11 @@ class MhaKvPool:
         self.head_dim = head_dim
         self.kv_dtype = kv_dtype
         self.per_tensor_scales = bool(per_tensor_scales)
+        # Which order every writer and reader of this pool uses: FLASH
+        # (`fa_views`) or SHUFFLE (`kv_views`). Explicit, not inferred from
+        # `blocks_per_entry`: at one block an entry the shapes match while the
+        # element orders still differ.
+        self.flash_layout = bool(flash_layout)
         # Every field is priced per entry, and an entry is `blocks_per_entry`
         # blocks. Charging per block instead would multiply `entry_bytes_for`'s
         # 256 B field alignment by the same factor -- 9% of the pool at 8
@@ -197,6 +203,7 @@ class MhaKvPool:
         layers: int,
         blocks_per_entry: int = 1,
         per_tensor_scales: bool = False,
+        flash_layout: bool = False,
         kv_dtype: torch.dtype,
     ) -> MhaKvPool:
         """A pool at the geometry a model config declares, for `layers` of them.
@@ -229,6 +236,7 @@ class MhaKvPool:
             block_size=block_size,
             blocks_per_entry=blocks_per_entry,
             per_tensor_scales=per_tensor_scales,
+            flash_layout=flash_layout,
             num_kv_heads=per_rank,
             head_dim=hf_config.head_dim,
             kv_dtype=kv_dtype,
@@ -328,6 +336,10 @@ class MhaKvPool:
             self.field_view("k", layer, self.kv_dtype, (-1, et, nh, hd)),
             self.field_view("v", layer, self.kv_dtype, (-1, et, nh, hd)),
         )
+
+    def reader_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's `(k, v)` in the order this pool was declared in."""
+        return self.fa_views(layer) if self.flash_layout else self.kv_views(layer)
 
     def scale_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's `(k_scale, v_scale)`, one fp32 per (kv head, token).

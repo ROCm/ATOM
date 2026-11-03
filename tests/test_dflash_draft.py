@@ -356,6 +356,10 @@ def test_dflash_uses_dflash_pool():
     assert dk.uses_dflash_pool(types.SimpleNamespace(num_hidden_layers=1)) is False
 
 
+# What `draft_kv_builder` reads off a built draft that owns the DFlash pool.
+_FLASH_DRAFT = types.SimpleNamespace(owns_flash_pool=True)
+
+
 def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
     """The draft caches fp8 beside an fp8 target, at ONE per-tensor scale.
 
@@ -399,7 +403,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
         mock.patch.object(selector, "attn_family", lambda _c: None),
     ):
-        builder = dk.draft_kv_builder(runner, hf)
+        builder = dk.draft_kv_builder(runner, hf, model=_FLASH_DRAFT)
 
     assert builder is not None
     builder._make_pool(layers=5, target_block_size=128)
@@ -410,6 +414,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         f"got {seen['kv_dtype']}"
     )
     assert seen["per_tensor_scales"] is True
+    assert seen["flash_layout"] is True
 
     # ... and the pool it describes really has no scale region.
     from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
@@ -443,6 +448,7 @@ def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
     """
     return types.SimpleNamespace(
         world_size=tp,
+        block_size=128,
         config=types.SimpleNamespace(
             kv_cache_dtype=kv_cache_dtype,
             tensor_parallel_size=tp,
@@ -484,7 +490,9 @@ def test_dflash_pool_is_built_at_full_tp(tp, dcp):
         mock.patch.object(selector, "get_attn_backend", lambda _f: _Backend),
         mock.patch.object(selector, "attn_family", lambda _c: None),
     ):
-        builder = dk.draft_kv_builder(_stub_runner(tp=tp, dcp=dcp), hf)
+        builder = dk.draft_kv_builder(
+            _stub_runner(tp=tp, dcp=dcp), hf, model=_FLASH_DRAFT
+        )
 
     builder._make_pool(layers=5, target_block_size=128)
     assert seen["world_size"] == tp
@@ -820,34 +828,46 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 # --------------------------------------------------------------------------- #
 
 
-def _entry_tokens(block_size, dcp, dflash_pool):
-    """Call the real property against a minimal stub."""
+@pytest.mark.parametrize("dcp", [1, 2, 8])
+def test_the_proposer_reads_the_entry_span_off_the_draft_pool(dcp):
+    """One number: the span the proposer addresses in, the pool's
+    `entry_tokens`, and the page width of the FLASH view a layer is bound to,
+    which `KimiK3DFlash.prepare_paged_block` reads."""
+    import torch
+
     proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
-    DSparkProposer = proposer.DSparkProposer
+    from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 
-    stub = types.SimpleNamespace(
-        runner=types.SimpleNamespace(block_size=block_size),
-        dcp_world_size=dcp,
-        _draft_uses_dflash_pool=dflash_pool,
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.bfloat16,
+        blocks_per_entry=dcp,
+        per_tensor_scales=True,
+        flash_layout=True,
     )
-    return DSparkProposer._draft_entry_tokens.fget(stub)
+    pool.allocate(2, "cpu")
+    stub = types.SimpleNamespace(
+        runner=types.SimpleNamespace(
+            block_size=128,
+            draft_kv_builder=types.SimpleNamespace(kv_pool=pool),
+        ),
+        model=types.SimpleNamespace(owns_flash_pool=True),
+    )
+    span = proposer.DSparkProposer._draft_entry_tokens.fget(stub)
+    assert span == pool.entry_tokens == pool.reader_views(0)[0].shape[1]
 
 
-@pytest.mark.parametrize("dcp", [1, 2, 8])
-def test_draft_entry_spans_the_global_block_for_the_gqa_draft(dcp):
-    """A draft outside the dcp group stores all `block_size * dcp` positions.
-
-    The target's block id addresses `block_size` LOCAL tokens per rank. The
-    DFlash draft is not in the dcp group, so one id has to cover the whole
-    virtual block `dcp_prefill_slot_mapping` writes.
-    """
-    assert _entry_tokens(128, dcp, dflash_pool=True) == 128 * dcp
-
-
-@pytest.mark.parametrize("dcp", [1, 2, 8])
-def test_draft_entry_is_the_plain_block_for_the_mla_draft(dcp):
-    """A DCP-sharded draft addresses in LOCAL terms -- one id, one block."""
-    assert _entry_tokens(128, dcp, dflash_pool=False) == 128
+def test_a_draft_without_a_flash_pool_addresses_by_the_scheduler_block():
+    """The MLA draft has no pool of its own and addresses in LOCAL terms."""
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    stub = types.SimpleNamespace(
+        runner=types.SimpleNamespace(block_size=128),
+        model=types.SimpleNamespace(owns_flash_pool=False),
+    )
+    assert proposer.DSparkProposer._draft_entry_tokens.fget(stub) == 128
 
 
 def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
@@ -873,9 +893,11 @@ def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
         runner=types.SimpleNamespace(
             block_size=block_size,
             forward_vars={"block_tables": bt, "cu_seqlens_q": cu},
+            draft_kv_builder=types.SimpleNamespace(
+                kv_pool=types.SimpleNamespace(entry_tokens=block_size * dcp)
+            ),
         ),
-        dcp_world_size=dcp,
-        _draft_uses_dflash_pool=True,
+        model=types.SimpleNamespace(owns_flash_pool=True),
         _blk_ctx_slots=torch.full((n_tok,), 7, dtype=torch.int64, device=dev),
         _blk_tok_ramp=torch.arange(n_tok, dtype=torch.int32, device=dev),
     )
@@ -1264,7 +1286,9 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(is_mla):
     )
     p.device = torch.device("cpu")
     p.mtp_k = 7
-    p.model = types.SimpleNamespace(block_attention_is_mla=is_mla)
+    p.model = types.SimpleNamespace(
+        block_attention_is_mla=is_mla, owns_flash_pool=not is_mla
+    )
     p._init_draft_block_buffers()
 
     if is_mla:
@@ -1349,7 +1373,10 @@ def test_block_writes_and_reads_stay_inside_the_allocated_blocks():
     m = _gpu_stack_import("atom.models.kimi_k3_dflash")
     draft = m.KimiK3DFlash.__new__(m.KimiK3DFlash)
     vblock, T = 1024, 3
-    draft._entry_tokens = vblock
+    # The bound FLASH page is one entry wide.
+    k_cache = torch.empty(1, vblock, 1, 1, device="cuda")
+    kv = types.SimpleNamespace(k_cache=k_cache)
+    draft.layers = [types.SimpleNamespace(self_attn=types.SimpleNamespace(kv=kv))]
     draft._alloc = torch.zeros(4, dtype=torch.int32, device="cuda")
     draft._alloc_host = torch.zeros(4, dtype=torch.int32, pin_memory=True)
     draft._alloc_copied = torch.cuda.Event()

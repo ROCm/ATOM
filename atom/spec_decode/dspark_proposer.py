@@ -47,20 +47,6 @@ class DSparkProposer(Drafter):
     driven by a confidence schedule (variable-length, Level B) verification.
     """
 
-    #: The draft's own context slot mapping and the token ramp that builds it.
-    #: CLASS defaults because `_init_draft_block_buffers` is reached only on
-    #: the standalone-draft path, while `compute_draft_kv` -- which reads these
-    #: -- runs for EVERY flavor, V4's inline draft included. None is what
-    #: `_publish_draft_ctx_slots` returns on: a draft without a pool of its own
-    #: writes through the target's mapping and never reads this one.
-    _blk_ctx_slots = None
-    _blk_tok_ramp = None
-    #: Whether the draft owns the DFlash pool (`uses_dflash_pool`): FLASH
-    #: layout, outside the DCP group, read straight off `block_tables`. A CLASS
-    #: default for proposers assembled by `__new__`; `__init__` resolves it once
-    #: from the draft config, the same function `draft_kv_builder` asks.
-    _draft_uses_dflash_pool: bool = False
-
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
         # Confidence-scheduled verification (Level B, variable-length verify) is
@@ -80,12 +66,13 @@ class DSparkProposer(Drafter):
         # (`_draft_is_dcp_sharded`). 1 when -dcp is unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        # The draft's own context slot mapping and the token ramp that builds
+        # it. Set for EVERY flavor because `compute_draft_kv`, which reads
+        # them, runs for V4's inline draft too; None means the draft writes
+        # through the target's mapping.
+        self._blk_ctx_slots = None
+        self._blk_tok_ramp = None
         if self._with_draft:
-            from atom.spec_decode.draft_kv import uses_dflash_pool
-
-            self._draft_uses_dflash_pool = uses_dflash_pool(
-                self.speculative_config.draft_model_hf_config
-            )
             self._init_draft_block_buffers()
 
     def _declare_draft_graphs(self):
@@ -262,7 +249,7 @@ class DSparkProposer(Drafter):
             **i32,
         )
 
-        if self._draft_uses_dflash_pool:
+        if self.model.owns_flash_pool:
             # The DRAFT's own context slot mapping, one slot per token of the
             # TARGET forward -- see `_publish_draft_ctx_slots`. Sized at the
             # widest token axis the scheduler can hand over, because a prefill
@@ -274,9 +261,6 @@ class DSparkProposer(Drafter):
             # `searchsorted` that resolves each token's request. int32 to match
             # `cu_seqlens_q`'s dtype -- `searchsorted` will not mix them.
             self._blk_tok_ramp = torch.arange(n_tok, **i32)
-        else:
-            self._blk_ctx_slots = None
-            self._blk_tok_ramp = None
 
         self._blk_dtype_q = None
 
@@ -444,7 +428,7 @@ class DSparkProposer(Drafter):
         # latent binds into the target's pool and answers None. ModelRunner
         # keys its draft-pool allocation and per-module binding off the
         # presence of this attribute, so None simply never sets it.
-        builder = draft_kv_builder(self.runner, draft_hf)
+        builder = draft_kv_builder(self.runner, draft_hf, model=model)
         if builder is not None:
             self.runner.draft_kv_builder = builder
         return model
@@ -493,7 +477,7 @@ class DSparkProposer(Drafter):
         every rank holds the whole token axis. The target is still at DCP8 -- see
         `_draft_entry_tokens` for what that costs.
         """
-        return self.dcp_world_size > 1 and not self._draft_uses_dflash_pool
+        return self.dcp_world_size > 1 and self.model.in_dcp_group
 
     @property
     def _draft_entry_tokens(self) -> int:
@@ -502,17 +486,19 @@ class DSparkProposer(Drafter):
         The draft is handed the TARGET's block tables, and under DCP one of
         those ids addresses `block_size` LOCAL tokens -- `block_size *
         dcp_world_size` GLOBAL positions, the virtual block
-        `dcp_prefill_slot_mapping` writes in (`dcp_ops.py:1059`). A draft that
-        is NOT in the dcp group stores all of them, so its entry has to be that
-        wide; `draft_kv_builder` builds the pool at
-        `blocks_per_entry = dcp_size` to match, and `MhaKvPool.fa_views` shapes
-        by the same number.
+        `dcp_prefill_slot_mapping` writes in. A draft that is NOT in the dcp
+        group stores all of them in its own pool, so the span is the pool's
+        `entry_tokens`, the one number its views are shaped by.
 
-        For the DCP-sharded (MLA) draft this is the plain block: it addresses
-        in local terms, where one id really is `block_size` of its own tokens.
+        For any other draft this is the plain block: the DCP-sharded (MLA)
+        draft addresses in local terms, where one id really is `block_size` of
+        its own tokens.
+
+        Read only after the draft pool can be built (the runner reaches the
+        drafter), never from `__init__`.
         """
-        if self._draft_uses_dflash_pool:
-            return self.runner.block_size * self.dcp_world_size
+        if self.model.owns_flash_pool:
+            return self.runner.draft_kv_builder.kv_pool.entry_tokens
         return self.runner.block_size
 
     def _bound_draft_k_cache(self, forward_context) -> "torch.Tensor | None":
@@ -1045,21 +1031,9 @@ class DSparkProposer(Drafter):
             slots.masked_fill_(~in_table, -1)
             ctx_lens.copy_(global_lens)
 
-        # `kv_indptr` is a cumsum of these, and it must not promise more
-        # indices than the generator writes: `kv_indices_generate_kernel` masks
-        # its store with `block_cols < n_cols` (block_convert.py), so entries
-        # past the block table's width are simply skipped and the decode would
-        # read whatever the previous step left in `_blk_kv_indices`. A read that
-        # builds no CSR (the DFlash draft's) walks `block_tables` up to
-        # `ctx_lens` itself, so the same bound keeps it inside the table. The
-        # bound is each branch's own unit: `block_size` of THIS rank's tokens per
-        # entry when the draft is DCP-sharded (a rank packs its round-robin
-        # share of a virtual block densely into one page), the full
-        # `entry_tokens` when it is not.
-        ctx_lens.clamp_(
-            max=block_tables.shape[1]
-            * (block_size if self._draft_is_dcp_sharded else entry_tokens)
-        )
+        # The CSR generator skips entries past the block table's width, so
+        # `kv_indptr` must not promise more than the table holds.
+        ctx_lens.clamp_(max=block_tables.shape[1] * entry_tokens)
 
         if running_bs > scheduled_bs:
             # See the docstring for why this tail reads a page rather than

@@ -2166,7 +2166,12 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
         kv_cache_dtype="auto",
     )
     p.dtype = torch.bfloat16
-    p.model = types.SimpleNamespace(window_size=None, block_attention_is_mla=True)
+    p.model = types.SimpleNamespace(
+        window_size=None,
+        block_attention_is_mla=True,
+        in_dcp_group=True,
+        owns_flash_pool=False,
+    )
     n_cols = max_model_len // block_size
     block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
     p.runner = types.SimpleNamespace(

@@ -179,9 +179,8 @@ class KimiK3DFlashAttention(nn.Module):
         # PLAIN TP, no DCP anywhere in this module (see the module docstring):
         # ONE head count, `o_proj` consumes the same slice the read produces,
         # and no LSE merge exists to get wrong. The target's DCP survives only
-        # as the draft POOL's `blocks_per_entry` (`draft_kv_builder`) and as
-        # the virtual block the PROPOSER addresses it in
-        # (`DSparkProposer._draft_entry_tokens`).
+        # as the draft POOL's `blocks_per_entry` (`draft_kv_builder`), whose
+        # `entry_tokens` everything addressing the pool reads.
         tp_full = get_tensor_model_parallel_world_size()
         if self.total_num_heads % tp_full != 0:
             raise ValueError(
@@ -527,6 +526,9 @@ class KimiK3DFlash(DSparkDraftModel):
     # GQA, read through `unified_attention` straight off `block_tables` /
     # `context_lens`: no MLA decode plan and no CSR to build.
     block_attention_is_mla = False
+    # Plain TP, outside the target's DCP group, on its own FLASH pool.
+    in_dcp_group = False
+    owns_flash_pool = True
 
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
         "q_proj": ("qkv_proj", "q"),
@@ -607,12 +609,8 @@ class KimiK3DFlash(DSparkDraftModel):
         self.embed_tokens = None
         self.lm_head = None
 
-        # `prepare_paged_block`'s per-request allocation, in tokens. One block
-        # id is `block_size * dcp` tokens of this pool (the draft is outside the
-        # dcp group). Pinned host staging; the event guards its reuse.
-        self._entry_tokens = int(atom_config.kv_cache_block_size) * int(
-            atom_config.decode_context_parallel_size
-        )
+        # `prepare_paged_block`'s per-request allocation. Pinned host staging;
+        # the event guards its reuse.
         max_bs = int(atom_config.max_num_seqs)
         self._alloc = torch.zeros(
             max_bs, dtype=torch.int32, device=torch.get_default_device()
@@ -652,7 +650,8 @@ class KimiK3DFlash(DSparkDraftModel):
         alloc = self._alloc[:running_bs]
         alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
         self._alloc_copied.record()
-        alloc.mul_(self._entry_tokens)
+        # One block id spans one pool entry; the bound FLASH page is that wide.
+        alloc.mul_(self.layers[0].self_attn.kv.k_cache.shape[1])
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         torch.minimum(ctx_lens, alloc, out=ctx_lens)
 

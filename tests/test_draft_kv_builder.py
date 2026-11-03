@@ -115,7 +115,7 @@ def test_the_dflash_pool_takes_the_schedulers_block():
     builder = DraftKvBuilder(
         _runner(draft_layers=2, block_size=128, builder_block_size=1),
         make,
-        dflash_pool=True,
+        block_size=128,
     )
 
     assert builder.kv_pool is not None
@@ -274,11 +274,12 @@ def test_dflash_layers_share_one_bound_unit_scale_tensor():
         head_dim=64,
         kv_dtype=torch.bfloat16,
         per_tensor_scales=True,
+        flash_layout=True,
     )
     pool.allocate(2, "cpu")
     runner = _runner(draft_layers=2)
     runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype="fp8")
-    builder = DraftKvBuilder(runner, lambda **_: pool, dflash_pool=True)
+    builder = DraftKvBuilder(runner, lambda **_: pool)
     builder._kv_pool = pool
 
     layers = [m for m in runner.drafter.model if isinstance(m, _PagedAttention)]
@@ -289,3 +290,61 @@ def test_dflash_layers_share_one_bound_unit_scale_tensor():
     scale = layers[0].k_scale
     assert torch.is_tensor(scale) and scale.numel() == 1 and float(scale) == 1.0
     assert all(m.k_scale is scale and m.v_scale is scale for m in layers)
+
+
+def _bind_first_layer(pool, kv_cache_dtype):
+    """Bind one paged layer through the builder; return the module."""
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(max_model_len=4096, kv_cache_dtype=kv_cache_dtype)
+    builder = DraftKvBuilder(runner, lambda **_: pool)
+    builder._kv_pool = pool
+    module = next(m for m in runner.drafter.model if isinstance(m, _PagedAttention))
+    module.layer_num = 0
+    builder.build_kv_cache_tensor(module)
+    return module
+
+
+def test_a_default_pool_binds_shuffle_views_and_its_own_scale_planes():
+    """MiniMax-M3.1 DSpark and Eagle3: the pool's defaults bind what they
+    always did, `kv_views` and the per-token `scale_views`."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.float8_e4m3fnuz,
+    )
+    module = _bind_first_layer(pool, "fp8")
+
+    k, v = pool.kv_views(0)
+    k_scale, v_scale = pool.scale_views(0)
+    assert module.k_cache.shape == k.shape and module.v_cache.shape == v.shape
+    assert module.k_cache.data_ptr() == k.data_ptr()
+    assert module.k_scale.shape == k_scale.shape
+    assert module.k_scale.data_ptr() == k_scale.data_ptr()
+    assert module.v_scale.data_ptr() == v_scale.data_ptr()
+
+
+@pytest.mark.parametrize("blocks_per_entry", [1, 8])
+def test_a_flash_pool_binds_entry_wide_flash_views_and_a_unit_scale(
+    blocks_per_entry,
+):
+    """The FLASH order is the pool's own declaration, not inferred from the
+    entry width: at one block an entry it still binds `fa_views`."""
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=2,
+        head_dim=64,
+        kv_dtype=torch.float8_e4m3fnuz,
+        blocks_per_entry=blocks_per_entry,
+        per_tensor_scales=True,
+        flash_layout=True,
+    )
+    module = _bind_first_layer(pool, "fp8")
+
+    assert module.k_cache.shape == (2, 128 * blocks_per_entry, 2, 64)
+    assert module.k_cache.shape[1] == pool.entry_tokens
+    assert module.v_cache.shape == pool.fa_views(0)[1].shape
+    assert module.k_scale.numel() == 1 and float(module.k_scale) == 1.0

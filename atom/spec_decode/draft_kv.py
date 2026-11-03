@@ -24,8 +24,8 @@ _DFLASH_POOL_ARCHS = frozenset({K3_DFLASH_ARCH})
 def uses_dflash_pool(draft_hf) -> bool:
     """Whether this draft owns the DFlash pool rather than the generic one.
 
-    Asked of the config rather than the model because this runs from the
-    proposer's `__init__`, before the draft model exists.
+    Asked of the config for the config-time checks, which run before any draft
+    model is built. Once the model exists, read its `owns_flash_pool` instead.
 
     Keyed on the architecture, NOT on "a non-MLA block drafter": MiniMax-M3.1's
     DSpark draft is one of those too, and it binds a 5-D SHUFFLE pool with
@@ -68,7 +68,7 @@ def draft_ctx_slots(out, positions, cu_ends, block_tables, tok_ramp, vblock):
     return out
 
 
-def draft_kv_builder(model_runner, draft_hf):
+def draft_kv_builder(model_runner, draft_hf, model=None):
     """The KV builder a draft needs of its own, or None if it needs none.
 
     A draft is not an attention flavor; it is a model that has one. So the
@@ -79,6 +79,9 @@ def draft_kv_builder(model_runner, draft_hf):
 
     Which is why speculative decoding imports no attention anywhere: adding a
     flavor is a flag and a `make_kv_pool` on that backend.
+
+    `model` is the built draft; one that declares `owns_flash_pool` gets the
+    DFlash pool.
     """
     from aiter import dtypes
 
@@ -88,14 +91,18 @@ def draft_kv_builder(model_runner, draft_hf):
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
 
-    dflash_pool = uses_dflash_pool(draft_hf)
     # The DFlash draft runs outside the target's DCP group, so one target block
-    # id spans `dcp` of its entries. Its scales are per-tensor because
+    # id spans `dcp` of its blocks. Its scales are per-tensor because
     # `reshape_and_cache_flash` and `unified_attention` each take one scale.
+    # It sits beside an MLA target, whose builder pages at ATOM_MLA_PAGE_SIZE
+    # (a kernel page, not a block id), so it takes the SCHEDULER's block, the
+    # unit the target's block tables count in.
+    dflash_pool = getattr(model, "owns_flash_pool", False)
     dflash_kwargs = (
         {
             "blocks_per_entry": model_runner.config.decode_context_parallel_size,
             "per_tensor_scales": True,
+            "flash_layout": True,
         }
         if dflash_pool
         else {}
@@ -107,7 +114,11 @@ def draft_kv_builder(model_runner, draft_hf):
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
         **dflash_kwargs,
     )
-    return DraftKvBuilder(model_runner, make_pool, dflash_pool=dflash_pool)
+    return DraftKvBuilder(
+        model_runner,
+        make_pool,
+        block_size=model_runner.block_size if dflash_pool else None,
+    )
 
 
 class DraftKvBuilder(PoolRowsMixin):
@@ -120,19 +131,19 @@ class DraftKvBuilder(PoolRowsMixin):
     piggybacks on the target builder's metadata flow during propose.
 
     The caller that resolved the draft's flavor hands over a way to build the
-    pool; `dflash_pool` picks the block, the views and the scale binding for
-    the DFlash pool. What is left is the part that is genuinely about being a
-    draft -- its blocks are the target's blocks.
+    pool, and the pool's own construction decides the views and the scale
+    binding. What is left is the part that is genuinely about being a draft --
+    its blocks are the target's blocks.
+
+    `block_size` is the block the pool is built at; None takes the target
+    builder's, which does not exist yet when this is constructed.
     """
 
-    def __init__(self, model_runner, make_pool, dflash_pool: bool = False):
+    def __init__(self, model_runner, make_pool, block_size: int | None = None):
         self.model_runner = model_runner
         self._make_pool = make_pool
-        # The DFlash pool binds FLASH views (`MhaKvPool.fa_views`) and one
-        # shared per-tensor scale; any other pool binds SHUFFLE views and its
-        # own scale planes. See `uses_dflash_pool`.
-        self._dflash_pool = dflash_pool
-        # The DFlash pool's one per-tensor scale, shared by every layer: a
+        self._block_size = block_size
+        # A per-tensor-scale pool's one scale, shared by every layer: a
         # one-element fp32 tensor because both `reshape_and_cache_flash` and
         # `unified_attention` take it as a device pointer. Built at the first
         # bind, never in a forward.
@@ -144,10 +155,11 @@ class DraftKvBuilder(PoolRowsMixin):
     def kv_pool(self):
         """The pool, built at the row count the walk found.
 
-        On demand because the draft model does not exist at `__init__`; every
-        reader is a sizing or binding step, which all run after it does. The
-        count is the walk's and not `num_hidden_layers`, or the pool is sized
-        off one number and addressed by another.
+        On demand because the runner cannot reach the draft model
+        (`runner.drafter`) at `__init__`; every reader is a sizing or binding
+        step, which all run after it can. The count is the walk's and not
+        `num_hidden_layers`, or the pool is sized off one number and addressed
+        by another.
 
         Indexed and not `.get(..., 0)`: this builder exists because the flavor
         owns a pool, so no rows is a contradiction, and a pool of none prices
@@ -159,21 +171,14 @@ class DraftKvBuilder(PoolRowsMixin):
         draft's kernels take the block off the cache they were bound to, so a
         block of its own would address one page with an id that counted
         another. There is nowhere in a draft to convert between the two -- it
-        has no metadata of its own. The builder is constructed after
-        `build_drafter`, which is why this is read here and not bound earlier.
+        has no metadata of its own. The builder is constructed before the
+        target builder, which is why this is read here and not bound earlier.
         """
         if self._kv_pool is None:
             layers = self.row_counts()[DRAFT_KV_ROWS]
-            runner = self.model_runner
-            # The DFlash pool sits beside an MLA target, whose builder pages at
-            # ATOM_MLA_PAGE_SIZE (a kernel page, 1 by default), not at a block
-            # id; it takes the SCHEDULER's block, the unit the target's block
-            # tables count in.
-            block_size = (
-                runner.block_size
-                if self._dflash_pool
-                else runner.attn_metadata_builder.block_size
-            )
+            block_size = self._block_size
+            if block_size is None:
+                block_size = self.model_runner.attn_metadata_builder.block_size
             self._kv_pool = self._make_pool(
                 layers=layers,
                 target_block_size=block_size,
@@ -261,30 +266,22 @@ class DraftKvBuilder(PoolRowsMixin):
         if DRAFT_KV_ROWS not in self._module_kinds(module):
             return None
         runner = self.model_runner
+        pool = self.kv_pool
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
-        # The layout the DRAFT's reader needs, which is not always the target's.
-        # The DFlash read takes the 4-D FLASH page at the entry's width, which
-        # is `block_size * dcp` tokens; SHUFFLE would need a power-of-two page
-        # and its x-pack splits head_dim across two axes. Same bytes either
-        # way.
-        k_cache, v_cache = (
-            self.kv_pool.fa_views(idx)
-            if self._dflash_pool
-            else self.kv_pool.kv_views(idx)
-        )
+        k_cache, v_cache = pool.reader_views(idx)
         module.max_model_len = runner.config.max_model_len
-        if self._dflash_pool:
-            # One per-tensor scale of 1.0: the pool declares no scale planes
-            # (`per_tensor_scales`), and the DFlash checkpoint ships no KV
-            # scales (all tensors BF16, no `quantization_config`), so 1.0 is
-            # the value both ends must agree on, as SGLang defaults it.
+        if pool.per_tensor_scales:
+            # One per-tensor scale of 1.0: the pool declares no scale planes,
+            # and the only such draft's checkpoint ships no KV scales (all
+            # tensors BF16, no `quantization_config`), so 1.0 is the value both
+            # ends must agree on, as SGLang defaults it.
             if self._unit_scale is None:
                 self._unit_scale = torch.ones(
                     1, dtype=torch.float32, device=k_cache.device
                 )
             module.k_scale = module.v_scale = self._unit_scale
         elif runner.config.kv_cache_dtype == "fp8":
-            module.k_scale, module.v_scale = self.kv_pool.scale_views(idx)
+            module.k_scale, module.v_scale = pool.scale_views(idx)
         module.k_cache = k_cache
         module.v_cache = v_cache
         return KVCacheTensor(

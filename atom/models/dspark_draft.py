@@ -205,6 +205,12 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+    # Whether the draft's KV is split across the target's DCP group. A draft
+    # outside it stores every position a target block id covers.
+    in_dcp_group = True
+    # Whether the draft's own pool is entry-granular, FLASH-layout and read at
+    # one per-tensor scale, rather than the generic SHUFFLE pool.
+    owns_flash_pool = False
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
