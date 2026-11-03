@@ -408,8 +408,18 @@ def test_messages_endpoint_rejects_nameless_tool_use(server):
         {"type": "text"},
         {"type": "tool_use", "name": "f", "input": {}},
         {"type": "tool_result", "content": "ok"},
+        {"type": "text", "text": None},
+        {"type": "tool_use", "id": None, "name": "f", "input": {}},
+        {"type": "tool_result", "tool_use_id": None, "content": "ok"},
     ],
-    ids=["text-without-text", "tool-use-without-id", "tool-result-without-id"],
+    ids=[
+        "text-without-text",
+        "tool-use-without-id",
+        "tool-result-without-id",
+        "null-text",
+        "null-tool-use-id",
+        "null-tool-result-id",
+    ],
 )
 def test_messages_endpoint_rejects_missing_required_block_field(server, block):
     role = "assistant" if block["type"] == "tool_use" else "user"
@@ -442,3 +452,25 @@ def test_responses_endpoint_rejects_nameless_function_call(server):
             )
 
     assert asyncio.run(post()).status_code == 400
+
+
+def test_messages_render_receives_preserve_flag(server):
+    request = AnthropicMessagesRequest(
+        model="m", max_tokens=16, messages=[AnthropicMessage(role="user", content="hi")]
+    )
+    asyncio.run(api_server.anthropic_messages(request, None))
+    assert server.template_kwargs[-1]["preserve_tool_call_arguments"] is True
+
+
+def test_responses_render_receives_preserve_flag(server):
+    async def post():
+        transport = httpx.ASGITransport(app=api_server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            return await client.post(
+                "/v1/responses", json={"model": "m", "input": "hi"}
+            )
+
+    assert asyncio.run(post()).status_code == 200
+    assert server.template_kwargs[-1]["preserve_tool_call_arguments"] is True

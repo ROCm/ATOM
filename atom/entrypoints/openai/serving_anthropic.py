@@ -68,9 +68,10 @@ class AnthropicMessagesRequest(BaseModel):
 def _block_field(block: dict, key: str) -> Any:
     """A field the Anthropic spec requires on this block type. A missing one is
     the client's error (HTTP 400), not a ``KeyError``."""
-    if key not in block:
+    value = block.get(key)
+    if value is None:
         raise ValueError(f"{block.get('type')} block requires '{key}'")
-    return block[key]
+    return value
 
 
 def anthropic_to_openai_messages(
