@@ -270,3 +270,17 @@ def test_failed_lookup_warns_its_locks_are_left_to_the_ttl(caplog):
 
     assert not client.is_pending("req")
     assert "read TTL" in caplog.text and "phase status" in caplog.text
+
+
+def test_failed_lookup_has_no_answer():
+    """A failed lookup leaves the in-flight set without an answer: it must not
+    read as answered, or a prefetch would consume it with a blocking retry."""
+    fake = _Client(chunks=2)
+    fake.query_prefetch_status = lambda _rid: _RaisingFuture()
+    client = _client(_Adapter(fake))
+    client.submit(list(range(8)), "req")
+    client.pump()
+
+    assert not client.is_pending("req")
+    assert "req" in client.pending_ids()
+    assert not client.has_answer("req")

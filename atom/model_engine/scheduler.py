@@ -1072,8 +1072,8 @@ class Scheduler:
             and not self._has_req_id(self.failed_recving_kv_req_ids, seq.id)
         )
 
-    def _waiting_prefills(self):
-        for seq in self.waiting:
+    def _waiting_prefills(self, limit: int | None = None):
+        for seq in itertools.islice(self.waiting, limit):
             if (
                 seq.status != SequenceStatus.ABORTED
                 and not self._no_prefill_work(seq)
@@ -1434,13 +1434,12 @@ class Scheduler:
             return True
         if not self.waiting:
             return False
-        for i, seq in enumerate(self.waiting):
-            if i >= 4:
-                break
-            if self._unschedulable_reason(seq) is not None:
-                continue
-            if seq.status == SequenceStatus.ABORTED or self._no_prefill_work(seq):
-                continue
+        # Requests with no prefill work this tick (a load in flight, aborted,
+        # unschedulable) do not use up the peek of 4: admission skips them
+        # too. The scan itself stays bounded, like the prefetch pass's.
+        for seq in itertools.islice(
+            self._waiting_prefills(limit=self._PREFETCH_SCAN), 4
+        ):
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
                 # Its load finished: it already holds its blocks and resumes
                 # this tick. A probe would recompute its hit flags.
@@ -4057,7 +4056,7 @@ class Scheduler:
         """Drop prefetch entries whose request is gone from `waiting`, and
         reclaim an aborted one at once: Phase 2 only pops it on a FIRE tick, and
         until then it would hold its blocks."""
-        for seq_id, (seq, _) in list(state.entries.items()):
+        for seq_id, seq in list(state.entries.items()):
             if seq.status == SequenceStatus.ABORTED:
                 try:
                     self.waiting.remove(seq)
@@ -4143,7 +4142,6 @@ class Scheduler:
         state = self._prefetch
         bm = getattr(self, "block_manager", None)
         total_blocks = int(bm.kv.num_blocks) if bm is not None else 0
-        state.maybe_log(total_blocks)
         if self.kv_connector is None or not self._connector_flag("is_offload"):
             return 0
         state.tick += 1

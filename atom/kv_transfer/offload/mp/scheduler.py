@@ -9,7 +9,6 @@ import functools
 import logging
 import threading
 import time
-import weakref
 from typing import Any
 
 from atom.kv_transfer.disaggregation.types import (
@@ -44,16 +43,6 @@ from atom.model_engine.sequence import SequenceStatus
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
-
-
-class _StrongRef:
-    """`weakref.ref`'s call interface for objects that refuse weak references."""
-
-    def __init__(self, obj: Any) -> None:
-        self._obj = obj
-
-    def __call__(self) -> Any:
-        return self._obj
 
 
 class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
@@ -255,17 +244,15 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         entry = shipped.get(seq.id)
         base = 0
         if entry is not None:
-            if entry[0]() is seq:
+            if entry[0] is seq:
                 base = entry[1]
             else:
                 self._drop_shipped_tokens(seq.id)
         new = max(base, end)
         delta = list(seq.token_ids[base:new]) if new > base else []
-        try:
-            ref = weakref.ref(seq)
-        except TypeError:  # test doubles without weakref support
-            ref = _StrongRef(seq)
-        shipped[seq.id] = (ref, new)
+        # The request itself, to tell a reused id from it; dropped when it
+        # finishes (`request_finished`, `_finish_retired_request`).
+        shipped[seq.id] = (seq, new)
         return base, delta
 
     def _drop_shipped_tokens(self, req_id: Any) -> None:

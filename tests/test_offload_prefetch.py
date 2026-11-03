@@ -8,7 +8,6 @@ tick -- delayer HOLD or FIRE, wherever it waits -- while its prefill still waits
 for its turn and for a FIRE.
 """
 
-import logging
 from types import SimpleNamespace
 
 import pytest
@@ -270,7 +269,6 @@ def test_loaded_request_prefills_only_on_a_fire(setup):
     assert sched.kv_connector.allocs == [seq.id]
     # Its prefetch record closed when it went onto the prefill batch.
     assert seq.id not in sched._prefetch.entries
-    assert sched._prefetch.wait_n == 1
 
 
 def test_prefill_stays_fifo_when_a_later_request_loaded_first(monkeypatch, seq_factory):
@@ -423,7 +421,7 @@ def test_no_prefetch_allocation_without_a_free_parking_slot(monkeypatch, seq_fac
 # -- cancellation ---------------------------------------------------------------
 
 
-def test_abort_of_an_prefetched_request_releases_its_blocks(setup):
+def test_abort_of_a_prefetched_request_releases_its_blocks(setup):
     sched, _, seq = setup
     free = _free(sched)
     sched.schedule()
@@ -432,7 +430,6 @@ def test_abort_of_an_prefetched_request_releases_its_blocks(setup):
     assert sched.abort_request(seq.id)
 
     assert seq.id not in sched._prefetch.entries
-    assert sched._prefetch.aborted == 1
     assert seq not in sched.waiting
     # The load is still in flight: the blocks go back once it reports (the
     # existing aborted-load protocol), never before.
@@ -468,30 +465,6 @@ def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
     assert b.id not in sched._prefetch.entries
 
 
-# -- reporting ------------------------------------------------------------------
-
-
-def test_one_info_line_per_interval(setup, caplog):
-    sched, _, _seq = setup
-    sched.schedule()
-    state = sched._prefetch
-    state.skip(77, "watermark")
-    state.skip(78, "unaligned_hbm")
-    state._last_log -= 61.0
-    with caplog.at_level(logging.INFO, logger="atom"):
-        sched.schedule()
-        sched.schedule()
-    lines = [
-        r.getMessage() for r in caplog.records if "[OFFLOAD-PREFETCH]" in r.getMessage()
-    ]
-    assert len(lines) == 1
-    line = lines[0]
-    assert "submitted=1" in line
-    assert "'watermark': 1" in line and "'unaligned_hbm': 1" in line
-    assert "held_blocks=4" in line and "held_requests=1" in line
-    assert "avg_wait=" in line
-
-
 def test_state_counts_a_request_once_per_reason():
     state = OffloadPrefetchState()
     for _ in range(3):
@@ -499,6 +472,18 @@ def test_state_counts_a_request_once_per_reason():
     state.skip(2, "lookup_not_ready")
     state.skip(1, "watermark")
     assert state.skips == {"lookup_not_ready": 2, "watermark": 1}
+
+
+def test_probe_looks_past_prefetches_still_loading(monkeypatch, seq_factory):
+    """Four in-flight prefetches ahead of a finished fifth one: the delayer
+    probe must still report prefill work, as admission will prefill the fifth."""
+    sched, _, seqs = _make(monkeypatch, seq_factory, n=5)
+    sched.schedule()  # all five park
+    assert all(s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS for s in seqs)
+    assert not sched._can_admit_head_prefill()
+    sched.finished_recving_kv_req_ids.append(seqs[4].id)
+
+    assert sched._can_admit_head_prefill()
 
 
 # -- lookup driver thread -------------------------------------------------------
