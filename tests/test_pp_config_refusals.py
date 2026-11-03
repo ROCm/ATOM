@@ -60,3 +60,10 @@ def test_kv_consumer_under_pp_is_refused():
     kv = {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
     with pytest.raises(ValueError, match="kv_consumer"):
         _check(_cfg(spec=None, kv=kv))
+
+
+def test_kv_producer_under_pp_drafts_with_any_method():
+    # P/D prefill with `--method mtp` on PP (GLM-5.2's Atomesh cells): the
+    # producer never speculates, so the Kimi-K3 + DSpark gate does not apply.
+    kv = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    _check(_cfg(arch="Glm5ForCausalLM", method="mtp", kv=kv))

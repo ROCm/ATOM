@@ -2805,7 +2805,7 @@ class Config:
 
     def _check_pp_support(self) -> None:
         """Refuse what PP does not wire yet: P/D consumers, and speculation
-        beyond Kimi-K3 with DSpark.
+        beyond Kimi-K3 with DSpark (a P/D producer does not speculate).
 
         Only Kimi-K3 with DSpark relays the target's aux taps across stages;
         anything else fails mid-serving or drafts from zero buffers.
@@ -2819,11 +2819,14 @@ class Config:
         # A consumer's first decode leaves T0 plus mtp_k placeholders, not the
         # mtp_k + 1 the PP verify window assumes, and the PP loop has no
         # remote-KV path at all.
-        if disaggregated_kv_role(self) == "kv_consumer":
+        role = disaggregated_kv_role(self)
+        if role == "kv_consumer":
             raise ValueError(
                 "A P/D kv_consumer is not supported with pipeline_parallel_size > 1."
             )
-        if self.speculative_config is None:
+        # A producer never speculates; it loads the drafter only to write the
+        # draft layer's KV.
+        if self.speculative_config is None or role == "kv_producer":
             return
         archs = getattr(self.hf_config, "architectures", None) or ()
         if "KimiK3ForConditionalGeneration" not in archs or not (
