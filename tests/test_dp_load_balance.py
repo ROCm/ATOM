@@ -746,3 +746,31 @@ def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded(
     stay = _chain_seq(3, 5_000)
     assert _route(mgr, [stay]) == [rank]
     assert mgr._seq_load[3][2] == 5_000 - 4_096
+
+
+def test_prefix_spread_queues_moved_requests_first_only_on_a_short_queue(
+    monkeypatch,
+):
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "50000")
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    other = 1 - owner
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    mgr._rank_tokens[other] = 10_000  # short queue: jump it
+    moved = _chain_seq(2, 110_000)
+    assert _route(mgr, [moved]) == [other]
+    assert moved.dp_prefetch_priority is True
+    mgr._mark_seq_prefill_complete(2)
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[other] = 300_000
+    mgr._rank_tokens[owner] = 60_000  # long queue on the lighter rank
+    late = _chain_seq(3, 120_000)
+    assert _route(mgr, [late]) == [owner]
+    assert not getattr(late, "dp_prefetch_priority", False)
+    assert envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE == 50000
