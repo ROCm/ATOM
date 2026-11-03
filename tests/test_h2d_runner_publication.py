@@ -32,6 +32,7 @@ def runner_with_buffers(monkeypatch, transport, pp_size=1, speculative=False):
         hf_config=SimpleNamespace(hidden_size=8),
         torch_dtype=torch.float32,
     )
+    runner.attn_family = SimpleNamespace(has_recurrent_state=False)
     runner.model = SimpleNamespace()
     runner.use_mrope = True
     runner.enforce_eager = True
