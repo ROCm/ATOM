@@ -235,7 +235,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFIX_OWNER_MARGIN": lambda: int(
         os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN", "65536")
     ),
-    # Prefix-spread rule "margin" (default): also leave the prefix's rank
+    # Prefix-spread rule "margin": also leave the prefix's rank
     # when it runs more than this many requests over the lightest rank, so
     # decode stays balanced across the lockstep DP ranks. -1 disables.
     "ATOM_DP_PREFIX_MAX_REQ_GAP": lambda: int(
@@ -251,23 +251,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFIX_MAX_REQ_GAP_REL": lambda: float(
         os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP_REL", "0.1")
     ),
-    # Prefix-spread rule: "margin" (above) or "cost". "cost" places each
+    # Prefix-spread rule: "idle_ratio" (default, below), "margin" (above) or
+    # "cost". "cost" places each
     # request on the rank minimizing its estimated time to first token (the
     # rank's queued prefill, its own uncached prefill, a tier load where the
     # prefix is not resident) plus ATOM_DP_PREFIX_IMBALANCE_S seconds per
     # request of in-flight imbalance the placement leaves between the ranks.
-    "ATOM_DP_PREFIX_POLICY": lambda: os.getenv("ATOM_DP_PREFIX_POLICY", "margin"),
+    "ATOM_DP_PREFIX_POLICY": lambda: os.getenv("ATOM_DP_PREFIX_POLICY", "idle_ratio"),
     # "idle_ratio" policy: leave the prefix's rank when the lightest rank has
     # under IDLE_TOKENS queued prefill (about to idle) and the owner over
     # OWNER_BACKLOG_TOKENS, or when the owner's queued prefill exceeds RATIO x
-    # the lightest rank's.
+    # the lightest rank's. RATIO <= 0 (default) disables the ratio rule.
     "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: int(
         os.getenv("ATOM_DP_PREFIX_IDLE_TOKENS", "32768")
     ),
     "ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS": lambda: int(
         os.getenv("ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS", "65536")
     ),
-    "ATOM_DP_PREFIX_RATIO": lambda: float(os.getenv("ATOM_DP_PREFIX_RATIO", "2.0")),
+    "ATOM_DP_PREFIX_RATIO": lambda: float(os.getenv("ATOM_DP_PREFIX_RATIO", "0")),
     "ATOM_DP_PREFIX_IMBALANCE_S": lambda: float(
         os.getenv("ATOM_DP_PREFIX_IMBALANCE_S", "0.1")
     ),
@@ -1392,16 +1393,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD": lambda: _flag_env("ATOM_OFFLOAD_EARLY_LOAD", "1"),
     # No early allocation once the KV pool would be fuller than this fraction.
     "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK": lambda: _finite_float_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.7, allow_zero=True
+        "ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", 0.8, allow_zero=True
     ),
-    # Cap on the blocks held by early-loaded requests, as a fraction of the pool.
+    # Cap on the blocks held by early-loaded requests, as a fraction of the pool
+    # (1.0, default: only the watermark limits early loads).
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
+        "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 1.0, allow_zero=True
     ),
     # Also load early when the load carries a state leg (state images / joint
-    # boundary). Off: only plain KV and PAGE-only (replay) loads go early.
+    # boundary), the default. 0: only plain KV and PAGE-only (replay) loads go
+    # early.
     "ATOM_OFFLOAD_EARLY_LOAD_STATE": lambda: _flag_env(
-        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "0"
+        "ATOM_OFFLOAD_EARLY_LOAD_STATE", "1"
     ),
     # Prefix-spread: queue a moved request first only while its rank's queued
     # prefill is at most this many tokens; -1 always queues it first. Only with

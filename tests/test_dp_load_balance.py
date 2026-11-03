@@ -828,4 +828,6 @@ def test_prefix_spread_idle_ratio_policy():
     assert place(2, 50_000, 10_000) == "owner"  # owner has no real backlog
     assert place(3, 300_000, 200_000) == "owner"  # both busy, 1.5x: stay
     assert place(4, 500_000, 200_000) == "other"  # B: 2.5x imbalance
-
+    mgr._prefix_ratio = 0  # default: B off
+    assert place(5, 500_000, 200_000) == "owner"  # both busy: stay
+    assert place(6, 100_000, 10_000) == "other"  # A still applies

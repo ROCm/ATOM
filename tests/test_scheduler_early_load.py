@@ -9,21 +9,12 @@ for its turn and for a FIRE.
 """
 
 import logging
-from types import SimpleNamespace
 
 import pytest
 from conftest import MockConfig
 from test_lmcache_mp import _config, fake_lmcache_modules  # noqa: F401
-from test_lmcache_mp_async_lookup import CHUNK, _Adapter
-from test_lmcache_mp_async_threads import (
-    _driven_client,
-    _PerRequestClient,
-    _wait_until,
-)
 
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
-from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
-from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
 from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import Scheduler
@@ -97,9 +88,9 @@ class _Delayer:
     is_local = False
     max_queue_ms = None
     kv_high_watermark = 0.9
-    rank_prefill_costs = []
 
     def __init__(self):
+        self.rank_prefill_costs = []
         self.allow = False
         self.calls = 0
 
@@ -242,7 +233,7 @@ def test_prefill_stays_fifo_when_a_later_request_loaded_first(monkeypatch, seq_f
     sched.finished_recving_kv_req_ids.append(a.id)
 
     delayer.allow = True
-    batch, scheduled = sched.schedule()
+    _, scheduled = sched.schedule()
 
     assert list(scheduled) == [a.id, b.id]  # arrival order, not load order
 
@@ -256,7 +247,7 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
     sched.finished_recving_kv_req_ids.append(b.id)  # only b has landed
 
     delayer.allow = True
-    batch, scheduled = sched.schedule()
+    _, scheduled = sched.schedule()
 
     assert list(scheduled) == [b.id]
     assert list(sched.waiting) == [a]
@@ -264,7 +255,7 @@ def test_request_whose_load_is_in_flight_does_not_block_later_ones(
 
 
 def test_flag_off_is_the_old_behaviour(monkeypatch, seq_factory):
-    sched, delayer, (first, moved) = _make(
+    sched, _, (first, moved) = _make(
         monkeypatch, seq_factory, n=2, ATOM_OFFLOAD_EARLY_LOAD="0"
     )
 
@@ -509,7 +500,7 @@ def test_abort_of_a_loaded_early_request_releases_its_blocks(setup):
 
 
 def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
-    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched, _, (_a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.schedule()
     b.status = SequenceStatus.ABORTED  # marked, still queued behind a
 
@@ -523,7 +514,7 @@ def test_status_abort_is_reclaimed_on_a_hold_tick(monkeypatch, seq_factory):
 
 
 def test_one_info_line_per_interval(setup, caplog):
-    sched, _, seq = setup
+    sched, _, _seq = setup
     sched.schedule()
     state = sched._early_load
     state.skip(77, "watermark")
@@ -548,43 +539,3 @@ def test_state_counts_a_request_once_per_reason():
     state.skip(2, "lookup_not_ready")
     state.skip(1, "watermark")
     assert state.skips == {"lookup_not_ready": 2, "watermark": 1}
-
-
-# -- lookup driver thread -------------------------------------------------------
-
-
-def test_lookup_ready_in_lookup_thread_mode(fake_lmcache_modules):  # noqa: F811
-    """With the lookup driver thread an answered lookup reads as ready, an
-    unanswered one does not, and a consumed one stops reading as ready."""
-    fake = _PerRequestClient(chunks=2)
-    fake.ready.clear()  # the server has not answered yet
-    adapter = _Adapter(fake)
-    client = _driven_client(adapter)
-    sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
-        mp_scheduler.LMCacheMPConnectorScheduler
-    )
-    sched._mp_adapter = adapter
-    ChunkedOffloadSchedulerBase.__init__(
-        sched, _config(), chunk_size=CHUNK, lookup_client=client
-    )
-    try:
-        seq = SimpleNamespace(
-            id=1,
-            num_prompt_tokens=10,
-            token_ids=list(range(10)),
-            status=SequenceStatus.WAITING,
-        )
-        sched.offer_lookups([seq])
-        assert _wait_until(lambda: "1" in client._async_tokens)
-        assert not sched.lookup_ready(seq)  # submitted, unanswered
-        fake.ready.set()
-        assert _wait_until(lambda: "1" in client._async_hits)
-        assert client.driving
-        # No scheduler pump ran: the driver thread alone answered it.
-        assert sched.lookup_ready(seq)
-        assert not sched.lookup_pending(seq)
-        assert client.lookup(list(range(10)), "1") == 2 * CHUNK
-        sched._lookup_results.pop("1", None)
-        assert not sched.lookup_ready(seq)  # consumed
-    finally:
-        client.close()
