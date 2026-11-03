@@ -287,17 +287,44 @@ jobs:
     name: Inspect existing experiment logs
     runs-on: ${{ inputs.atomesh_slurm_submit_runner }}
     timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      ISSUE382_INSPECTION_DIR: /tmp/issue382-inspection-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - uses: actions/checkout@v6
+      # Surviving Slurm workers may still mount the runner's default checkout.
+      # Fetch only the inspector at this run's commit, outside that checkout.
+      - name: Fetch inspector without touching the worker source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from urllib.request import Request, urlopen
+
+          target = Path(os.environ["ISSUE382_INSPECTION_DIR"])
+          target.mkdir(parents=True, exist_ok=True)
+          url = (
+              f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+              f"/contents/tools/issue382/inspect_runs.py?ref={os.environ['GITHUB_SHA']}"
+          )
+          request = Request(url, headers={
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github.raw+json",
+          })
+          with urlopen(request, timeout=60) as response:
+              (target / "inspect_runs.py").write_bytes(response.read())
+          PY
       - name: Snapshot existing logs and Slurm states
         env:
           SOURCE_RUN_IDS: ${{ inputs.inspect_run_ids }}
-        run: python3 tools/issue382/inspect_runs.py --run-ids "$SOURCE_RUN_IDS" --output inspection
+        run: python3 "$ISSUE382_INSPECTION_DIR/inspect_runs.py" --run-ids "$SOURCE_RUN_IDS" --output "$ISSUE382_INSPECTION_DIR/snapshot"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: issue382-inspection-${{ github.run_id }}
-          path: inspection/
+          path: ${{ env.ISSUE382_INSPECTION_DIR }}/snapshot/
           retention-days: 7
 
   load-config:
