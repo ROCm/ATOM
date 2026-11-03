@@ -630,17 +630,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DeepSeek-V4.1's decoder on a bounded-replay prefill's tail, recorded as a
     # request graph (`models/deepseek_v41/decoder_graph.py`): the comma-separated
     # `running_bs` to record at. Any other runs the same tail eagerly; empty
-    # records none. Unset (None) records every cudagraph capture size up to 16,
-    # the `running_bs` a prefill step can settle on
-    # (`model_ops/attentions/deepseek_v41/decoder_buckets.py`).
-    "ATOM_DECODER_GRAPH_SIZES": lambda: (
-        None
-        if os.getenv("ATOM_DECODER_GRAPH_SIZES") is None
-        else tuple(
-            int(s)
-            for s in os.environ["ATOM_DECODER_GRAPH_SIZES"].split(",")
-            if s.strip()
+    # records none. `ForwardMode.decide` rounds a step's batch up the cudagraph
+    # capture ladder, so `running_bs` is always a capture size: the default is
+    # the usual ladder (1..8, 12, 16, ...) up to 16. Without 5, 6, 7 and 12,
+    # steps of 5-7 and 9-12 requests ran the decoder eagerly.
+    "ATOM_DECODER_GRAPH_SIZES": lambda: tuple(
+        int(s)
+        for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,5,6,7,8,12,16").split(
+            ","
         )
+        if s.strip()
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
