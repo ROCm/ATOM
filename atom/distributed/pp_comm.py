@@ -25,6 +25,16 @@ logger = logging.getLogger("atom")
 _PP_PROXY_KEYS = ("hidden_states", "residual", "sparse_kv_indices")
 
 
+def _stage_payloads(it: IntermediateTensors, rank_local_keys: tuple[str, ...]):
+    """Keep head-sharded tensors out of the replicated-activation all-gather."""
+    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
+    local = {k: tensors.pop(k) for k in rank_local_keys}
+    payloads = [(tensors, pp_send_allgather_group())]
+    if local:
+        payloads.append((local, None))
+    return payloads
+
+
 def pp_send_allgather_group():
     """TP group for PP send-allgather, or None if disabled/tp=1."""
     if not envs.ATOM_PP_SEND_ALLGATHER:
@@ -93,19 +103,25 @@ def init_pp_aware_dist_env(
     )
 
 
-def send_intermediate_tensors(it: IntermediateTensors) -> None:
-    """Blocking send of hidden_states/residual to the next PP stage."""
+def send_intermediate_tensors(
+    it: IntermediateTensors, *, rank_local_keys: tuple[str, ...] = ()
+) -> None:
+    """Send activations and optional rank-local tensors to the next PP stage."""
     pp = get_pp_group()
-    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
     dst = (pp.rank_in_group + 1) % pp.world_size
-    pp.send_tensor_dict(tensors, dst=dst, all_gather_group=pp_send_allgather_group())
+    for tensors, ag_group in _stage_payloads(it, rank_local_keys):
+        pp.send_tensor_dict(tensors, dst=dst, all_gather_group=ag_group)
 
 
-def recv_intermediate_tensors() -> IntermediateTensors:
-    """Receive hidden_states/residual from the previous PP stage."""
+def recv_intermediate_tensors(
+    *, rank_local_keys: tuple[str, ...] = ()
+) -> IntermediateTensors:
+    """Receive the payloads selected by the caller's static PP boundary policy."""
     pp = get_pp_group()
     src = (pp.rank_in_group - 1) % pp.world_size
     tensors = pp.recv_tensor_dict(src=src, all_gather_group=pp_send_allgather_group())
+    if rank_local_keys:
+        tensors.update(pp.recv_tensor_dict(src=src, all_gather_group=None))
     return IntermediateTensors(tensors)
 
 
@@ -124,20 +140,15 @@ def _async_send_object(
     return works
 
 
-def async_send_intermediate_tensors(
-    it: IntermediateTensors,
-) -> list[P2PWork]:
-    """Non-blocking send of hidden_states/residual to the next PP stage."""
+def _async_send_tensor_dict(tensors: dict, ag_group) -> list[P2PWork]:
     pp = get_pp_group()
     dst_local = (pp.rank_in_group + 1) % pp.world_size
     dst_global = pp.ranks[dst_local]
 
-    tensors = {k: it.tensors[k] for k in _PP_PROXY_KEYS if k in it.tensors}
     metadata_list, tensor_list = _split_tensor_dict(tensors)
 
     works = _async_send_object(metadata_list, dst_global, pp.cpu_group)
 
-    ag_group = pp_send_allgather_group()
     ag_size = 1 if ag_group is None else ag_group.world_size
     ag_rank = 0 if ag_group is None else ag_group.rank_in_group
 
@@ -153,6 +164,16 @@ def async_send_intermediate_tensors(
             w = torch.distributed.isend(buf, dst=dst_global, group=pp.device_group)
         works.append(P2PWork(w, buf))
 
+    return works
+
+
+def async_send_intermediate_tensors(
+    it: IntermediateTensors, *, rank_local_keys: tuple[str, ...] = ()
+) -> list[P2PWork]:
+    """Non-blocking send with owned buffers for both payload classes."""
+    works = []
+    for tensors, ag_group in _stage_payloads(it, rank_local_keys):
+        works.extend(_async_send_tensor_dict(tensors, ag_group))
     return works
 
 
