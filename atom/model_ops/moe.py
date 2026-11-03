@@ -2114,7 +2114,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.fused_experts is None
             and self.is_gfx1250
             and self.is_guinterleave
-            and self.quant_type == QuantType.per_1x32
+            # Compare the primitive enum payload: Dynamo cannot constant-fold
+            # QuantType object equality when this method is reached through an
+            # nn.Module attribute, and splits the model at the first MoE layer.
+            and self.quant_type.value == QuantType.per_1x32.value
             and os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") != "1"
             and not self.use_triton
             and not self.use_triton_ep
