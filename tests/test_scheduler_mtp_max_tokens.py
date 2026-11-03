@@ -173,10 +173,11 @@ class TestUndeferredSpecPlaceholders:
 
     mtp_k = 3
 
-    def _scheduler(self):
+    def _scheduler(self, **config):
         sched = Scheduler(
             MockConfig(
                 pipeline_parallel_size=2,
+                **config,
                 speculative_config=SimpleNamespace(
                     num_speculative_tokens=self.mtp_k,
                     use_dspark=lambda: True,
@@ -252,3 +253,35 @@ class TestUndeferredSpecPlaceholders:
         assert finished[0].num_completion_tokens == 3
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]
+
+    def test_middle_chunk_gets_no_placeholders_once_its_final_chunk_is_scheduled(
+        self, seq_factory
+    ):
+        # pp=2: the final chunk is scheduled while the middle one is in flight,
+        # flipping the live `is_partial_prefill`. The middle chunk's
+        # postprocess must still leave the seq without placeholders.
+        sched = self._scheduler(max_num_batched_tokens=16)
+        assert sched.advance_on_schedule
+        seq = seq_factory(
+            list(range(1, 33)),
+            sampling_params=SamplingParams(max_tokens=64, ignore_eos=True),
+        )
+        sched.add(seq)
+        middle, middle_seqs = sched.schedule()
+        assert not middle.is_final_chunk[0]
+        sched.schedule()
+        assert not seq.is_partial_prefill
+        sched.postprocess(
+            list(middle_seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=[seq.id],
+                token_ids=[(5,)],
+                num_rejected=np.asarray([0]),
+                num_bonus=np.asarray([0]),
+                draft_token_ids=np.asarray([[7] * self.mtp_k]),
+                is_deferred_out=False,
+            ),
+            batch=middle,
+        )
+        assert seq.num_placeholder_tokens == 0
+        assert seq.num_tokens == 32

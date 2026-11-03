@@ -4641,7 +4641,13 @@ class Scheduler:
         if need_placeholder:
             # placeholder for the each decode step
             for seq in seqs:
-                if seq.status == SequenceStatus.RUNNING and not seq.is_partial_prefill:
+                # Frozen chunk state under schedule-time advancement, as above.
+                mid_prefill = (
+                    seq.id in pp_middle_chunk_ids
+                    if self.advance_on_schedule
+                    else seq.is_partial_prefill
+                )
+                if seq.status == SequenceStatus.RUNNING and not mid_prefill:
                     # Clamped because `preempt()` strips exactly this many:
                     # `range()` on a negative width appends nothing, so storing
                     # one unclamped would claim placeholders that are not there.
