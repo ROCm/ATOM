@@ -537,8 +537,6 @@ class MoRIIOConnector(KVConnectorBase):
             )
         descs = self.layer_name_to_remote_kv_cache_metadata[engine_id]
         for local, peer in zip(self._regions, remote):
-            # total is the local pool size. Prefill and decode allocate
-            # different amounts, so only the layout identity is compared.
             if (local.name, local.kind, local.unit, local.reverse, local.chunk_bytes) != (
                 peer.name,
                 peer.kind,
@@ -641,7 +639,7 @@ class MoRIIOConnector(KVConnectorBase):
         engine_id: EngineId,
         state_writes: list[tuple[Any, int, int, int]],
     ) -> list[Any]:
-        """Push a request's PAGE blocks, SLOT units, and state; return statuses."""
+        """Push a request's PAGE blocks and SLOT units; return the statuses."""
         plan = self._region_plan(request, engine_id)
         statuses: list[Any] = []
         try:

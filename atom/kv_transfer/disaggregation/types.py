@@ -205,7 +205,6 @@ class KVTransferRegion:
     def unit_offset(
         index: int, total_bytes: int, unit_bytes: int, reverse_indexed: bool
     ) -> int:
-        """Byte offset of one unit inside its region."""
         if reverse_indexed:
             return total_bytes - (index + 1) * unit_bytes
         return index * unit_bytes

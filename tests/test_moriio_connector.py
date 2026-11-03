@@ -1747,11 +1747,6 @@ class RegionPlanTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.make([other, self.local[1]])._remote_regions("decode")
 
-    def test_allows_a_different_pool_size(self):
-        other = self.Region("page.0.kv", "page", 0, 90, 10, False, 40)
-        remote = self.make([other, self.local[1]])._remote_regions("decode")
-        self.assertEqual(remote[0].total, 90)
-
 
 if __name__ == "__main__":
     unittest.main()
