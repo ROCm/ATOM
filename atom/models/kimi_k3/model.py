@@ -1238,9 +1238,18 @@ class KimiKDAAttention(nn.Module):
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         output_final_state: bool,
+        snapshot_targets: tuple[tuple[int, int], ...] | None = None,
+        snapshot_out: torch.Tensor | None = None,
     ):
         from aiter.ops.triton.kimi_delta_attn import chunk_kimi_delta_attn
 
+        # Only passed when there are snapshots, so an image without them (or a
+        # step without any) calls the kernel exactly as before.
+        snap = (
+            {"snapshot_targets": snapshot_targets, "snapshot_out": snapshot_out}
+            if snapshot_targets
+            else {}
+        )
         return chunk_kimi_delta_attn(
             q=q,
             k=k,
@@ -1267,6 +1276,7 @@ class KimiKDAAttention(nn.Module):
             # fused decode kernel writes. Without it the state comes back
             # K-first and decode reads it transposed.
             state_v_first=True,
+            **snap,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1403,6 +1413,12 @@ class KimiKDAAttention(nn.Module):
             initial = gather_kda_initial_state(
                 ssm_state, state_indices_in, kda_metadata.has_initial_state
             )
+            snaps = getattr(kda_metadata, "kda_snapshots", None)
+            snap_out = None
+            if snaps is not None and snaps.targets:
+                # In the final state's dtype and layout, so a snapshot is the
+                # bits a forward ending at its position leaves in the slot.
+                snap_out = initial.new_empty((len(snaps.targets), *initial.shape[1:]))
             kda_out, last_state = self._run_kda(
                 q,
                 k,
@@ -1412,11 +1428,15 @@ class KimiKDAAttention(nn.Module):
                 initial,
                 query_start_loc,
                 True,
+                snapshot_targets=None if snap_out is None else snaps.targets,
+                snapshot_out=snap_out,
             )
             # last_state already has ssm_state's dtype (fla preserves the
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
+            if snaps is not None:
+                snaps.write(ssm_state, conv_state, snap_out, mixed_qkv)
             # o_norm only reads this tensor, so keep the contiguous KDA output
             # instead of materializing an identical copy into `out`.
             assert kda_out.dtype == fused_in.dtype, (

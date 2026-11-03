@@ -6,6 +6,7 @@ import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -15,6 +16,12 @@ from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     pooled_path_enabled,
     speculative_kpool_history_size,
+)
+from atom.models.kimi_k3.midstep import (
+    KdaSnapshots,
+    kda_midstep_enabled,
+    kda_midstep_transfer,
+    kda_snapshots,
 )
 from atom.utils import CpuGpuBuffer, envs
 
@@ -231,6 +238,7 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         """
         if not self._uses_paged_checkpoints():
             return StateTransfer.fork(1)
+        midstep = kda_midstep_enabled()
         shape_k, shape_v = self._state_shape_for_runner()
         dt_k, dt_v = self._state_dtypes()
         # Everything a reader needs to reassemble the image at the same byte
@@ -263,7 +271,11 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id)
+        if not midstep:
+            return StateTransfer.copy(layout_id)
+        return kda_midstep_transfer(
+            layout_id, self.model_runner.config.hf_config.linear_conv_kernel_dim
+        )
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
@@ -579,6 +591,38 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         else:
             buf.np[:n] = -1
         group.set_count(buf, rows)
+
+    def finish_prefill(self, batch, attn_metadata, running_bs, running_tokens):
+        super().finish_prefill(batch, attn_metadata, running_bs, running_tokens)
+        # `GDNStateMixin.finish_prefill` has built the GDN metadata, or left
+        # None for a prefill without block tables.
+        if attn_metadata.gdn_metadata is not None:
+            attn_metadata.gdn_metadata.kda_snapshots = self._kda_snapshots(batch)
+
+    def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
+        """None: KDA writes its midstep checkpoints through `kda_snapshots`.
+
+        `GDNStateMixin`'s targets are for the GDN chunk kernel's `h`, on its
+        64-token grid, which FlashKDA's 32-token positions can miss, and no
+        layer of this backend reads `ssm_checkpoints`.
+        """
+        return None
+
+    def _kda_snapshots(self, batch: ScheduledBatch) -> KdaSnapshots | None:
+        """The midstep checkpoints this prefill writes (`kda_snapshots`)."""
+        saves = getattr(batch, "state_save_all", None)
+        if not saves or not any(saves):
+            return None
+        return kda_snapshots(
+            saves,
+            batch.state_rows,
+            batch.num_cached_tokens,
+            batch.num_scheduled_tokens,
+            batch.state_slots_committed,
+            num_slots=self.model_runner.mamba_k_cache.shape[1],
+            conv_len=self.model_runner.config.hf_config.linear_conv_kernel_dim - 1,
+            device=self.device,
+        )
 
     def build_for_cudagraph_capture(self, bs: int, *, decode_ubatch_slices=None):
         attn_metadata, context = super().build_for_cudagraph_capture(
