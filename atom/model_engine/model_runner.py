@@ -650,7 +650,11 @@ class tokenIDProcessor:
         # sits between two captured buckets on most steps -- a 65-request batch
         # replays the 128 graph. The kernel zeroes the difference.
         fill_to = total_tokens_decode
-        if not self.runner.enforce_eager:
+        varlen_fill = getattr(self.runner, "_varlen_fill_tokens", 0)
+        if varlen_fill:
+            # A varlen graph's height is its token count, not a ladder product.
+            fill_to = max(fill_to, varlen_fill)
+        elif not self.runner.enforce_eager:
             gbs = next(
                 (g for g in reversed(self.runner.capture_sizes) if g >= bs), None
             )
@@ -716,6 +720,13 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # DSpark varlen verify (`_init_varlen_verify`). Class defaults so a runner
+    # built without `__init__` reads the feature as off.
+    varlen_enabled: bool = False
+    varlen_req_graph = None
+    varlen_graph_sizes: list[int] | None = None
+    _varlen_fill_tokens: int = 0
+
     def __init__(self, rank: int, config: Config):
         self.config = config
         self.structured_output = None
@@ -930,6 +941,7 @@ class ModelRunner:
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
+        self._init_varlen_verify()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -1161,6 +1173,7 @@ class ModelRunner:
             destroy_dist_env()
             # 2. Release CUDA graphs
             self.req_graph = None
+            self.varlen_req_graph = None
             # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
             # scales and any indexer cache are regions of it, not attributes.
             for attr in (
@@ -2405,6 +2418,328 @@ class ModelRunner:
             self._pcp_tbo_balanced_active = eligible
         return local_tbo
 
+    # ---- varlen verify (DeepInfer adaptive ragged verify) -------------------
+
+    def _init_varlen_verify(self) -> None:
+        dspark = getattr(self.config, "dspark", None)
+        drafter = getattr(self, "drafter", None)
+        self.varlen_enabled = bool(
+            dspark is not None
+            and dspark.varlen_verify
+            and drafter is not None
+            and drafter.is_block_drafter
+        )
+        # Token-count graphs (`build_graph_batch_sizes`), keyed by the count.
+        self.varlen_req_graph: ReqGraph | None = None
+        self.varlen_graph_sizes: list[int] | None = None
+        self.varlen_perf_curve: list[tuple[int, float]] = []
+        self._varlen_fill_tokens = 0
+        if not self.varlen_enabled:
+            return
+        assert (
+            self.config.parallel_config.data_parallel_size == 1
+        ), "varlen verify plans one rank's batch; it does not support DP attention"
+        assert not self.config.enable_tbo_decode, (
+            "varlen verify does not plan TBO micro-batches over a ragged step"
+        )
+        from atom.spec_decode.mtp_varlen import ConfidenceFeedback, StepTimer
+
+        n = int(self.config.max_num_seqs)
+        k = int(drafter.mtp_k)
+        self._varlen_gpu_alloc = bool(dspark.varlen_gpu_alloc)
+        # Last propose's per-position confidence, in that batch's row order --
+        # the `prev_confidence_rates` the GPU allocation gathers through the
+        # deferred-row remap.
+        self._varlen_conf = torch.zeros(n, k, dtype=torch.float32, device=self.device)
+        self._varlen_remap = torch.empty(n, dtype=torch.int32, device=self.device)
+        self._varlen_fallback = torch.empty(
+            n, k, dtype=torch.float32, device=self.device
+        )
+        self._varlen_lens_dev = torch.empty(n, dtype=torch.int32, device=self.device)
+        # device="cpu": this runs under a GPU default device, and an unqualified
+        # pin_memory=True then allocates on GPU ("Only dense CPU tensors can be
+        # pinned").
+        self._varlen_remap_host = torch.empty(
+            n, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._varlen_fallback_host = torch.empty(
+            n, k, dtype=torch.float32, device="cpu", pin_memory=True
+        )
+        self._varlen_lens_host = torch.empty(
+            n, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        self._varlen_lens_event = torch.cuda.Event()
+        # Only TP rank 0's step output reaches the scheduler.
+        self._varlen_feedback = ConfidenceFeedback(n, k) if self.rank == 0 else None
+        self._varlen_timer = StepTimer() if self.rank == 0 else None
+        if not getattr(drafter.model, "emits_confidence", False):
+            logger.warning(
+                "varlen verify: the draft emits no confidence; every draft "
+                "position is treated as certain, so the planner can only trade "
+                "verify width against measured step time."
+            )
+
+    def get_varlen_perf_curve(self) -> list[tuple[int, float]]:
+        return list(self.varlen_perf_curve)
+
+    def _varlen_apply(self, batch: ScheduledBatch) -> None:
+        """Adopt the scheduler's per-request split, refined on the GPU.
+
+        The scheduler fixed `total_q` (hence the graph) from confidence one
+        step old. The previous propose's confidence is already on the device,
+        so -- like DeepInfer's GPU-side `seqlens_q` -- the split is recomputed
+        from it at the same total. ATOM builds attention metadata on the host,
+        so the result comes back before that build rather than after replay.
+        """
+        n = int(batch.total_seqs_num_decode)
+        lens = np.asarray(batch.varlen_lens, dtype=np.int32)
+        assert lens.shape == (n,), (lens.shape, n)
+        tp = self.tokenID_processor
+        if (
+            self._varlen_gpu_alloc
+            and n > 0
+            and tp.is_deferred_out
+            and tp.prev_batch is not None
+            and getattr(self.drafter.model, "emits_confidence", False)
+        ):
+            from atom.spec_decode.mtp_varlen import (
+                compute_seqlens_q_by_confidence_rates,
+            )
+
+            locs = tp.get_token_locations(batch)
+            remap = self._varlen_remap_host.numpy()[:n]
+            remap.fill(-1)
+            remap[locs.deferred_curr] = locs.deferred_prev
+            fb = getattr(batch, "varlen_conf", None)
+            k = self._varlen_conf.shape[1]
+            fallback = self._varlen_fallback_host.numpy()[:n]
+            if fb is None:
+                fallback.fill(1.0)
+            else:
+                fallback[:] = fb
+            self._varlen_remap[:n].copy_(self._varlen_remap_host[:n], non_blocking=True)
+            self._varlen_fallback[:n].copy_(
+                self._varlen_fallback_host[:n], non_blocking=True
+            )
+            compute_seqlens_q_by_confidence_rates(
+                int(lens.sum()),
+                self._varlen_remap[:n],
+                self._varlen_conf[:, :k],
+                self._varlen_lens_dev[:n],
+                fallback_rates=self._varlen_fallback[:n],
+                max_num_seqs=self._varlen_conf.shape[0],
+            )
+            self._varlen_lens_host[:n].copy_(
+                self._varlen_lens_dev[:n], non_blocking=True
+            )
+            self._varlen_lens_event.record()
+            self._varlen_lens_event.synchronize()
+            refined = self._varlen_lens_host.numpy()[:n].copy()
+            assert int(refined.sum()) == int(lens.sum()), (refined, lens)
+            lens = refined
+            batch.varlen_lens = lens
+
+        from atom.spec_decode.mtp_varlen import repack_decode_batch
+
+        repack_decode_batch(batch, lens)
+
+    def _varlen_debug(self, batch: ScheduledBatch, forward_mode) -> None:
+        """Host-only line: the lengths actually forwarded, and the confidence
+        the planner scored them with. No device copy.
+
+        Off unless ``ATOM_VARLEN_DEBUG=1``; ``ATOM_VARLEN_DEBUG_EVERY=N`` prints
+        one line per N varlen steps.
+        """
+        if self.rank != 0 or not envs.ATOM_VARLEN_DEBUG:
+            return
+        every = envs.ATOM_VARLEN_DEBUG_EVERY
+        if every <= 0:
+            return
+        nseen = getattr(self, "_varlen_debug_n", 0) + 1
+        self._varlen_debug_n = nseen
+        if nseen % every:
+            return
+        lens = np.asarray(batch.varlen_lens, dtype=np.int32)
+        full_q = int(batch.num_spec_step) + 1
+        conf = getattr(batch, "varlen_conf", None)
+        if conf is None:
+            conf_txt = "conf=none"
+        else:
+            conf = np.asarray(conf, dtype=np.float32)
+            means = ", ".join(f"{v:.3f}" for v in conf.mean(axis=0))
+            head = np.array2string(
+                conf[:2], precision=3, separator=",", max_line_width=10_000
+            )
+            conf_txt = (
+                f"conf_shape={conf.shape} conf_min={float(conf.min()):.3f} "
+                f"conf_max={float(conf.max()):.3f} conf_mean_pos=[{means}] "
+                f"first_rows={head}"
+            )
+        print(
+            "[VARLEN-DEBUG verify] "
+            f"step={nseen} bs={len(lens)} full_q={full_q} "
+            f"total_q={int(lens.sum())} rectangular_q={len(lens) * full_q} "
+            f"ragged={len(set(lens.tolist())) > 1} "
+            f"graph_tokens={forward_mode.varlen_graph_tokens} "
+            f"use_cudagraph={forward_mode.use_cudagraph} "
+            f"lens={lens.tolist()} {conf_txt}",
+            flush=True,
+        )
+
+    def _varlen_record_confidence(self, batch: ScheduledBatch) -> None:
+        """Keep this propose's confidence for the next step's GPU split, and
+        ship a copy to the scheduler."""
+        conf = getattr(self.drafter, "last_confidence", None)
+        n = int(batch.total_seqs_num)
+        if conf is None or n == 0:
+            return
+        k = self._varlen_conf.shape[1]
+        rows = self._varlen_conf[:n]
+        rows.copy_(conf[:n, :k])
+        if self._varlen_gpu_alloc and get_tp_group().world_size > 1:
+            # Every rank must split the step identically; rank 0's draft decides.
+            rows.copy_(get_tp_group().broadcast(rows.contiguous(), src=0))
+        if self._varlen_feedback is not None:
+            self._varlen_feedback.push(rows, batch.req_ids[:n])
+
+    def _varlen_draft_running_bs(self, scheduled_bs: int, target_bs: int) -> int:
+        """The draft pass runs on the request ladder, not the graph's width.
+
+        Capped at the target's width: the per-sequence buffers the block reads
+        were published that wide and no wider.
+        """
+        sizes = self.capture_sizes_np
+        rung = int(np.searchsorted(sizes, scheduled_bs))
+        ladder = int(sizes[rung]) if rung < len(sizes) else scheduled_bs
+        return min(ladder, target_bs)
+
+    def _build_varlen_capture(self, graph_tokens: int):
+        """Synthetic metadata for the G-token graph, staged in its own window
+        (`_build_capture`, which also publishes the step's `batch_info`)."""
+        from atom.spec_decode.mtp_varlen import capture_seqlens_q, graph_num_seqs
+
+        full_q = self.drafter.mtp_k + 1
+        num_seqs = graph_num_seqs(graph_tokens, self.config.max_num_seqs)
+        lens = capture_seqlens_q(graph_tokens, num_seqs, full_q)
+
+        def stage_and_build(seqlens_q):
+            cu = self.forward_vars["cu_seqlens_q"]
+            cu.np[0] = 0
+            np.cumsum(seqlens_q, out=cu.np[1 : num_seqs + 1])
+            cu.copy_to_gpu(num_seqs + 1)
+            starts = np.repeat(cu.np[:num_seqs].astype(np.int64), seqlens_q)
+            self.forward_vars["positions"].np[:graph_tokens] = (
+                np.arange(graph_tokens, dtype=np.int64) - starts
+            )
+            return self.attn_metadata_builder.build_for_varlen_capture(seqlens_q)
+
+        return self._build_capture(stage_and_build, lens)
+
+    def _capture_varlen_graphs(self, prof, logits_in_graph: bool) -> None:
+        """One request graph per total-token count on DeepInfer's grid."""
+        from atom.spec_decode.mtp_varlen import build_graph_batch_sizes
+
+        assert not self.use_mrope and not self._tr_hybrid_active(), (
+            "varlen verify records whole-forward request graphs only"
+        )
+        full_q = self.drafter.mtp_k + 1
+        max_tokens = min(
+            self.config.max_num_seqs * full_q, self.config.max_num_batched_tokens
+        )
+        sizes = build_graph_batch_sizes(
+            max_tokens, int(self.config.dspark.varlen_graph_interval)
+        )
+        self.varlen_req_graph = ReqGraph()
+        input_ids = self.forward_vars["input_ids"].gpu
+        positions = self.forward_vars["positions"].gpu
+        outputs = self.forward_vars["outputs"]
+        it = tqdm.tqdm(sizes[::-1]) if self.rank == 0 else sizes[::-1]
+        for graph_tokens in it:
+            if self.rank == 0:
+                it.set_description(f"Capturing varlen tokens={graph_tokens}")
+            self._capture_trace_tag = f"varlen_{graph_tokens}"
+            attn_metadata, context = self._build_varlen_capture(graph_tokens)
+            self.running_tokens_per_dp_rank.fill(graph_tokens)
+            set_forward_context(
+                attn_metadata=attn_metadata,
+                atom_config=self.config,
+                context=context,
+                running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
+                in_hipgraph=True,
+            )
+            # Warmup, then record.
+            ids, pos = input_ids[:graph_tokens], positions[:graph_tokens]
+            outputs[:graph_tokens] = self.model(ids, pos)
+            if logits_in_graph:
+                self.model.compute_logits(outputs[:graph_tokens])
+
+            def full_forward(n=graph_tokens, ids=ids, pos=pos):
+                outputs[:n] = self.model(ids, pos)
+                if logits_in_graph:
+                    return self.model.compute_logits(outputs[:n])
+                return None
+
+            self.varlen_req_graph.record(full_forward, key=graph_tokens)
+            torch.cuda.synchronize()
+            if prof is not None:
+                prof.step()
+                self._capture_trace_tag = None
+        self.varlen_graph_sizes = sorted(self.varlen_req_graph.keys())
+
+    @torch.inference_mode()
+    def _profile_varlen_decode_curve(self) -> None:
+        """DeepInfer `profile_decode_perf`: time every graph at startup.
+
+        One warmup and five timed replays per graph, trimmed mean of the middle
+        three, averaged across TP ranks so every rank holds the same curve.
+        Runs before serving, so the synthetic KV writes land in blocks no
+        request owns yet.
+        """
+        if not self.varlen_graph_sizes:
+            return
+        num_warmup, num_measure, num_trim = 1, 5, 1
+        group = get_tp_group()
+        start_time = time.time()
+        curve: list[tuple[int, float]] = []
+        for graph_tokens in reversed(self.varlen_graph_sizes):
+            # Replays read the metadata buffers this rewrites.
+            self._build_varlen_capture(graph_tokens)
+            replay = partial(self.varlen_req_graph.replay, key=graph_tokens)
+            for _ in range(num_warmup):
+                replay()
+                if group.world_size > 1:
+                    group.all_reduce(torch.zeros(1, device=self.device))
+            events = []
+            for _ in range(num_measure):
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
+                s.record()
+                replay()
+                e.record()
+                if group.world_size > 1:
+                    group.all_reduce(torch.zeros(1, device=self.device))
+                events.append((s, e))
+            torch.cuda.synchronize()
+            times = sorted(s.elapsed_time(e) for s, e in events)
+            trimmed = times[num_trim : num_measure - num_trim]
+            avg = torch.full(
+                (1,),
+                sum(trimmed) / len(trimmed),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if group.world_size > 1:
+                avg = group.all_reduce(avg) / group.world_size
+            curve.append((graph_tokens, float(avg.item())))
+        curve.reverse()
+        self.varlen_perf_curve = curve
+        if self.rank == 0:
+            logger.info(
+                "varlen decode curve profiled in %.1fs: %s",
+                time.time() - start_time,
+                ", ".join(f"(tokens={g} ms={ms:.3f})" for g, ms in curve),
+            )
+
     def _dspark_apply_q_bucket(self, batch: ScheduledBatch) -> int | None:
         """Shrink this decode step's verify length to one CUDA-graph bucket q,
         and return it -- or None when nothing shrank and the step keeps the
@@ -2726,6 +3061,16 @@ class ModelRunner:
     @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
         shrunk_q = self._dspark_apply_q_bucket(batch)
+        varlen_step = (
+            self.varlen_enabled
+            and getattr(batch, "varlen_lens", None) is not None
+            and batch.total_tokens_num_prefill == 0
+            and not batch.is_dummy_run
+        )
+        if varlen_step:
+            self._varlen_apply(batch)
+        elif getattr(batch, "varlen_lens", None) is not None:
+            batch.varlen_lens = None
         # The step's shape, settled once. Here rather than in prepare_inputs
         # because DSpark under DP needs the reduced query length BEFORE
         # prepare_input_ids sizes the buffer, and because one call site is the
@@ -2747,7 +3092,14 @@ class ModelRunner:
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
             tbo_decode_graphs=self.tbo_decode_graphs,
+            varlen_graph_sizes=(self.varlen_graph_sizes or []) if varlen_step else None,
+            max_num_seqs=self.config.max_num_seqs,
         )
+        self._varlen_fill_tokens = (
+            forward_mode.running_tokens if forward_mode.varlen_graph_tokens else 0
+        )
+        if varlen_step:
+            self._varlen_debug(batch, forward_mode)
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
         self._eplb_any_rank_has_prefill = forward_mode.sync.any_rank_has_prefill
@@ -3241,10 +3593,33 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
-                graph_key = request_bucket(
-                    running_bs, forward_context.attn_metadata.max_seqlen_q
-                )
-                logits = self.req_graph.replay(key=graph_key)
+                graph_tokens = forward_mode.varlen_graph_tokens
+                if graph_tokens:
+                    # Varlen verify: the graph is keyed by its token count.
+                    timer = self._varlen_timer
+                    if timer is not None:
+                        bs = int(context.scheduled_bs)
+                        # The step's widest request and context: what the
+                        # planner's opus row-chunk price is read against.
+                        max_q = (
+                            int(np.max(batch.num_scheduled_tokens[:bs]))
+                            if batch is not None and bs > 0
+                            else 0
+                        )
+                        timer.start(
+                            bs,
+                            graph_tokens,
+                            max_q,
+                            int(getattr(batch, "varlen_ctx_tokens", 0) or 0),
+                        )
+                    logits = self.varlen_req_graph.replay(key=graph_tokens)
+                    if timer is not None:
+                        timer.forward_done()
+                else:
+                    graph_key = request_bucket(
+                        running_bs, forward_context.attn_metadata.max_seqlen_q
+                    )
+                    logits = self.req_graph.replay(key=graph_key)
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -3551,6 +3926,15 @@ class ModelRunner:
         if verify_scheduler is not None:
             dspark_ell = verify_scheduler.ell_nonblocking()
 
+        varlen_conf = varlen_runtime = varlen_accept = None
+        if self.varlen_enabled:
+            if self._varlen_timer is not None:
+                self._varlen_timer.finish()
+                varlen_runtime = self._varlen_timer.poll() or None
+            if self._varlen_feedback is not None:
+                varlen_conf = self._varlen_feedback.poll()
+                varlen_accept = self._varlen_acceptance(prev_batch, token_id_dict)
+
         return ScheduledBatchOutput(
             req_ids=req_ids_out,
             token_ids=token_ids_out,
@@ -3560,6 +3944,9 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
+            varlen_conf=varlen_conf,
+            varlen_runtime=varlen_runtime,
+            varlen_accept=varlen_accept,
             structured_errors=(
                 dict(structured.errors) if structured is not None else None
             ),
@@ -3574,6 +3961,35 @@ class ModelRunner:
         callback = getattr(connector, "after_forward", None)
         if callable(callback):
             callback()
+
+    def _varlen_acceptance(self, batch, token_id_dict):
+        """Bin a finished varlen step's accepted drafts by its planned confidence.
+
+        In deferred-output mode ``token_id_dict`` holds ``batch``'s emitted
+        tokens: one more than the drafts it accepted.
+        """
+        if (
+            batch is None
+            or not self.tokenID_processor.is_deferred_out
+            or getattr(batch, "varlen_lens", None) is None
+            or getattr(batch, "varlen_conf_known", None) is None
+        ):
+            return None
+        from atom.spec_decode.mtp_varlen import acceptance_trials
+
+        lens = np.asarray(batch.varlen_lens, dtype=np.int32)
+        n = int(lens.shape[0])
+        known = np.asarray(batch.varlen_conf_known, dtype=bool)[:n].copy()
+        accepted = np.zeros(n, dtype=np.int64)
+        for i, rid in enumerate(batch.req_ids[:n]):
+            toks = token_id_dict.get(rid)
+            if toks is None or len(toks) == 0:
+                known[i] = False
+            else:
+                accepted[i] = len(toks) - 1
+        if not known.any():
+            return None
+        return acceptance_trials(batch.varlen_conf[:n], known, lens, accepted)
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish completed chunk snapshots and the legacy final-ready event."""
@@ -3739,7 +4155,12 @@ class ModelRunner:
         so the lookup comes out the same on each and the group goes eager
         together. Anywhere else a missing key is a capture gap, and it stays a
         `KeyError` at replay.
+
+        Varlen verify records only token-count graphs, so a decode step the
+        planner did not size finds no `(bs, q)` key and runs eagerly.
         """
+        if self.varlen_enabled:
+            return self.req_graph
         if (
             not self.tokenID_processor.is_pd_producer
             or not hasattr(self, "drafter")
@@ -3802,6 +4223,11 @@ class ModelRunner:
         the scheduler is not expecting a draft for a seq that produced no token.
         """
         forward_context = get_forward_context()
+        forward_mode = forward_context.context.forward_mode
+        if forward_mode is not None and forward_mode.varlen_graph_tokens:
+            forward_context.context.running_bs = self._varlen_draft_running_bs(
+                batch.total_seqs_num, forward_mode.running_bs
+            )
 
         # A sequence still mid-prompt samples nothing usable, so its anchor is
         # the scheduler's successor token instead. Per SEQUENCE, not per batch:
@@ -3847,6 +4273,8 @@ class ModelRunner:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
         if align_only:
             return None
+        if self.varlen_enabled:
+            self._varlen_record_confidence(batch)
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
@@ -4151,7 +4579,11 @@ class ModelRunner:
         # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
         # scheduling expands to the smaller q-buckets a decode step may replay.
         q_buckets = self._dspark_capture_q_buckets(full_q_len)
-        if q_buckets != [full_q_len]:
+        if self.varlen_enabled:
+            # Varlen verify replays token-count graphs only; a decode step the
+            # planner did not size runs eagerly.
+            q_buckets = []
+        elif q_buckets != [full_q_len]:
             logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
         elif hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
             # resolve_q_buckets always folds full_q in, so a spec naming only
@@ -4319,6 +4751,8 @@ class ModelRunner:
                     if prof is not None:
                         prof.step()
                         self._capture_trace_tag = None
+            if self.varlen_enabled:
+                self._capture_varlen_graphs(prof, logits_in_graph)
             # Inside the `with`: graph_capture() arms the custom all-reduce for
             # capture and pause_gc() keeps the collector from aborting one. The
             # drafter gets the capture builder already bound to this backend's
@@ -4355,6 +4789,8 @@ class ModelRunner:
         # captured target graphs (each is a B = bs*max_q_len token forward, i.e.
         # exactly one verification step at batch B). Cheap, GPU-only, one-shot.
         self._maybe_calibrate_dspark_sps(full_q_len)
+        if self.varlen_enabled:
+            self._profile_varlen_decode_curve()
 
         # How much GPU memory the CUDA graph capture consumed (pool = reserved
         # delta; the allocated delta is what the graphs pin live).

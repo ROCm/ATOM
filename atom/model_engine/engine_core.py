@@ -152,6 +152,7 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
+            varlen_curve = None
             # Config has already turned the feature off wherever it cannot act,
             # so every stage of a pipeline takes this branch or none does: the
             # sweep's dummy forwards cross stages and must run in lockstep.
@@ -186,6 +187,10 @@ class EngineCore:
                     f"{self.label}: cudagraph capture{decode_sizes} cost: {cap_cost:.2f} "
                     f"seconds, pool: {pool_bytes / (1 << 30):.2f}GB"
                 )
+                if getattr(getattr(config, "dspark", None), "varlen_verify", False):
+                    varlen_curve = self.runner_mgr.call_func(
+                        "get_varlen_perf_curve", wait_out=True
+                    )
             good = True
         finally:
             logger.info(
@@ -207,6 +212,8 @@ class EngineCore:
                     "prefill_token_graphs", wait_out=True
                 ),
             )
+            if varlen_curve is not None:
+                self.scheduler.set_varlen_perf_curve(varlen_curve)
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1

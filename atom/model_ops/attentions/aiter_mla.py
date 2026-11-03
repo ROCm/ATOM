@@ -95,7 +95,7 @@ from atom.utils.tbo import decode_ubatch_request_ranges
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mla_kv_pool import MlaKvPool
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool
-from .token_layout.decode import decode_positions
+from .token_layout.decode import decode_positions, ragged_decode_positions
 from .token_layout.slots import slot_mapping
 
 logger = logging.getLogger("atom")
@@ -1086,7 +1086,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         num_reject_tokens: torch.Tensor = None,
         sparse_decode: bool = False,
         is_cp_round_robin: bool = False,
+        varlen: bool = False,
     ):
+        """`varlen`: per-request query lengths differ (each at most
+        `max_q_len`), so the planner reads them from `cu_seqlens_q`
+        (`uni_seqlen_qo=-1`) and tiles only the rows that exist."""
         if self.kv_shuffled:
             return {}
         assert num_reject_tokens is None or num_reject_tokens.shape[0] >= bs, (
@@ -1094,10 +1098,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             f"but this asks for {bs}; the update kernel loads one per work item "
             f"below `cu_num`, unconditionally"
         )
+        assert not (varlen and only_update), "varlen needs the full metadata build"
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
-            "uni_seqlen_qo": max_q_len,
+            "uni_seqlen_qo": -1 if varlen else max_q_len,
             "fast_mode": 1,
             "max_split_per_batch": _MLA_SPLIT_BUDGET_AUTO,
         }
@@ -2879,7 +2884,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 context_lens -= num_rejected
                 num_blocks = cdiv(context_lens, self.model_runner.block_size)
                 block_tables = [bt[:n] for bt, n in zip(block_tables, num_blocks)]
-        positions = decode_positions(context_lens, max_seqlen_q)
+        # Varlen verify: request i forwards the first `seqlens_q[i]` tokens of
+        # the `max_seqlen_q` rectangle, so its span starts where the rectangle
+        # does and its KV ends `max_seqlen_q - seqlens_q[i]` earlier.
+        ragged_q = None
+        if (
+            not batch.is_dummy_run
+            and max_seqlen_q > 1
+            and getattr(batch, "varlen_lens", None) is not None
+        ):
+            ragged_q = np.asarray(
+                batch.num_scheduled_tokens[:scheduled_bs], dtype=np.int32
+            )
+            if self.is_sparse or self._publishes_dcp_local_lens:
+                raise NotImplementedError(
+                    "varlen verify supports dense MLA only (no sparse indexer)"
+                )
+        if ragged_q is None:
+            positions = decode_positions(context_lens, max_seqlen_q)
+        else:
+            span_starts = context_lens - max_seqlen_q
+            positions = ragged_decode_positions(span_starts, ragged_q)
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
         # DCP still walks the trimmed ragged rows -- its slot is a per-rank
@@ -2887,7 +2912,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.prepare_block_tables(batch, running_bs)
 
         if not batch.is_dummy_run:
-            if max_seqlen_q > 1:
+            if ragged_q is not None:
+                if self.dcp_world_size > 1:
+                    slots = [
+                        self._dcp_round_robin_slot(block_table, pos)
+                        for block_table, start, q in zip(
+                            block_tables, span_starts, ragged_q
+                        )
+                        for pos in range(int(start), int(start) + int(q))
+                    ]
+                else:
+                    slots = slot_mapping(
+                        positions,
+                        ragged_q,
+                        var["block_tables"].np,
+                        self.model_runner.block_size,
+                        scratch=self.token_axis_scratch,
+                    )
+                # From here on every per-sequence length is the KV this step
+                # actually ends at.
+                context_lens = span_starts + ragged_q
+            elif max_seqlen_q > 1:
                 if self.dcp_world_size > 1:
                     # DCP round-robin + MTP: each of the max_seqlen_q new (draft)
                     # tokens is written only on the rank owning its global pos.
@@ -2923,7 +2968,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     ]
 
         # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
-        scheduled_tokens = scheduled_bs * max_seqlen_q
+        scheduled_tokens = (
+            scheduled_bs * max_seqlen_q if ragged_q is None else int(ragged_q.sum())
+        )
         var["slot_mapping"].np[:running_tokens] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:scheduled_tokens] = slots
@@ -2997,6 +3044,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 np.where(local_context_lens > 0, self.block_size, 0),
                 local_last,
             )
+        elif ragged_q is not None and self.block_size != 1:
+            var["kv_last_page_lens"].np[:scheduled_bs] = (
+                context_lens - 1
+            ) % self.block_size + 1
         else:
             var["kv_last_page_lens"].np[:scheduled_bs] = (
                 batch.last_block_num_tokens if self.block_size != 1 else 1
@@ -3115,9 +3166,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # that padded nothing reaches here with the two equal, and then this
             # is a no-op -- but eager no longer implies that, since a DP-unified
             # batch pads off the graph path too.
-            meta_bs = scheduled_bs if cp_round_robin else running_bs
+            # A varlen step plans over its real requests too: the padded tail
+            # carries no query rows (`uni_seqlen_qo=-1` reads them as such).
+            meta_bs = (
+                scheduled_bs if cp_round_robin or ragged_q is not None else running_bs
+            )
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
+                meta_bs,
+                max_seqlen_q,
+                is_cp_round_robin=cp_round_robin,
+                varlen=ragged_q is not None,
             )
             ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
@@ -3172,7 +3230,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         # running_bs, not scheduled_bs: the padded rows have to be split into the
         # ubatches too, or accuracy drifts.
-        if self.model_runner.config.enable_tbo_decode and running_bs >= 2:
+        if (
+            self.model_runner.config.enable_tbo_decode
+            and running_bs >= 2
+            and ragged_q is None
+        ):
             self._prepare_ubatch_decode(
                 scheduled_bs,
                 running_bs,
@@ -3493,6 +3555,59 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # A capture runs a full synthetic batch: nothing is padded.
             scheduled_tokens=scheduled_tokens,
             running_tokens=scheduled_tokens,
+        )
+        return attn_metadata, context
+
+    def build_for_varlen_capture(self, seqlens_q: np.ndarray):
+        """Capture metadata for one varlen-verify graph: `len(seqlens_q)`
+        sequences holding `seqlens_q.sum()` query tokens, each 1..mtp_k+1.
+
+        The caller has already written `cu_seqlens_q` and positions. Like the
+        rectangular capture, every sequence gets one KV page so the split-KV
+        loop terminates; replay overwrites all of it.
+        """
+        if self.is_sparse or self._indexer_fp4 or self._publishes_dcp_local_lens:
+            raise NotImplementedError("varlen verify capture: dense MLA only")
+        self._check_metadata_writable("mla_csr")
+        var = self.model_runner.forward_vars
+        max_q_len = var["mtp_k"] + 1
+        bs = len(seqlens_q)
+        num_tokens = int(seqlens_q.sum())
+        var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
+        var["kv_indptr"].copy_to_gpu(bs + 1)
+        var["kv_indices"].gpu[:bs].zero_()
+        var["kv_last_page_lens"].gpu[:bs].fill_(1)
+        cp_round_robin = self.dcp_world_size > 1
+        if cp_round_robin:
+            var["g_kv_indptr"].np[: bs + 1] = (
+                np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
+            )
+            var["g_kv_indptr"].copy_to_gpu(bs + 1)
+        ctx_mla_ps = self.set_mla_persistent_worker_buffers(
+            bs, max_q_len, is_cp_round_robin=cp_round_robin, varlen=True
+        )
+        attn_metadata = AttentionMetaData(
+            slot_mapping=var["slot_mapping"].gpu[:num_tokens],
+            context_lens=var["context_lens"].gpu[:bs],
+            block_tables=var["block_tables"].gpu[:bs],
+            max_seqlen_q=max_q_len,
+            cu_seqlens_q=var["cu_seqlens_q"].gpu[: bs + 1],
+            kv_indptr=var["kv_indptr"].gpu[: bs + 1],
+            kv_indices=var["kv_indices"].gpu,
+            kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
+            **ctx_mla_ps,
+        )
+        attn_metadata.dtype_q = self.dtype_q
+        attn_metadata.g_kv_indptr = (
+            var["g_kv_indptr"].gpu[: bs + 1] if cp_round_robin else None
+        )
+        context = Context(
+            positions=var["positions"].copy_to_gpu(num_tokens),
+            is_prefill=False,
+            scheduled_bs=bs,
+            running_bs=bs,
+            scheduled_tokens=num_tokens,
+            running_tokens=num_tokens,
         )
         return attn_metadata, context
 

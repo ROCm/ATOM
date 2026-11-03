@@ -1662,6 +1662,36 @@ class DSparkConfig:
         graphs at warmup). Without an explicit profile, use the synthetic stub.
       - calibration_profile: JSON file containing model/runtime-bound SPS and
         STS measurements. Takes precedence over automatic calibration.
+      - varlen_verify: DeepInfer-style adaptive ragged verify. The scheduler
+        picks the step's total query tokens from the draft confidence and a
+        measured decode cost curve, splits them across requests, and the step
+        replays a CUDA graph keyed by that token count.
+      - varlen_graph_interval: spacing of the token-count graph grid above the
+        power-of-two warmup sizes (DeepInfer `build_graph_batch_sizes`).
+      - varlen_gpu_alloc: re-split the planned total on the GPU from the
+        previous step's confidence, which the scheduler only sees a step late.
+        ATOM builds attention metadata on the host, so the split is copied
+        back before that build: the host waits for the previous step's GPU
+        work, giving up CPU/GPU overlap for fresher rates. Off by default.
+      - varlen_explore_interval: every this many varlen plans, verify every
+        draft. Those steps feed the forward-cost model at large token counts
+        and the confidence calibrator at low-confidence positions. 0 disables.
+      - varlen_calibrate: map the confidence head's output to the acceptance
+        actually observed, per draft position, before planning.
+      - varlen_chunk_aware: price the opus MLA decode's row chunks in the plan.
+        Its work plan lays every XCD out in columns as deep as the batch's
+        widest request (``ceil(q * 96 / 128)`` chunks), so ONE request past
+        ``varlen_chunk_free_q`` slows the attention of the whole step. The
+        planner then compares capping the step's widest request at each chunk
+        boundary against verifying wider. None (default): on when
+        ``ATOM_OPUS_MLA`` is.
+      - varlen_chunk_cost: seed of that price, ms per million context tokens
+        of the batch per unit of 1/columns (learned online from the explore
+        steps; 8.0 is the C128 Kimi-K3 measurement).
+      - varlen_chunk_free_q: widest request priced as now (q=4: the k=3
+        rectangle's 3 chunks). Plans never wider than this are unchanged.
+      - varlen_max_q: hard cap on any request's verify width (0: off), e.g. 4
+        to draft k=5 but verify at most 3 drafts.
     """
 
     confidence_schedule: bool = False
@@ -1671,8 +1701,32 @@ class DSparkConfig:
     disable_sps_calib: bool = False
     # Explicit offline measurements; compatibility is checked before use.
     calibration_profile: str | None = None
+    varlen_verify: bool = False
+    varlen_graph_interval: int = 8
+    varlen_gpu_alloc: bool = False
+    varlen_explore_interval: int = 16
+    varlen_calibrate: bool = True
+    varlen_chunk_aware: bool | None = None
+    varlen_chunk_cost: float = 8.0
+    varlen_chunk_free_q: int = 4
+    varlen_max_q: int = 0
 
     def __post_init__(self):
+        if self.varlen_verify and (self.confidence_schedule or self.ragged):
+            raise ValueError(
+                "DSpark varlen_verify replaces confidence_schedule/ragged; "
+                "enable one verify scheduler, not both"
+            )
+        if int(self.varlen_graph_interval) < 1:
+            raise ValueError("DSpark varlen_graph_interval must be >= 1")
+        if int(self.varlen_explore_interval) < 0:
+            raise ValueError("DSpark varlen_explore_interval must be >= 0")
+        if float(self.varlen_chunk_cost) < 0 or int(self.varlen_chunk_free_q) < 1:
+            raise ValueError(
+                "DSpark varlen_chunk_cost must be >= 0, varlen_chunk_free_q >= 1"
+            )
+        if int(self.varlen_max_q) < 0:
+            raise ValueError("DSpark varlen_max_q must be >= 0 (0: no cap)")
         if self.calibration_profile is not None and (
             not isinstance(self.calibration_profile, str)
             or not self.calibration_profile
@@ -2367,7 +2421,7 @@ class Config:
         if (
             self.speculative_config is not None
             and self.speculative_config.synthetic_acceptance_rates is not None
-            and self.dspark.confidence_schedule
+            and (self.dspark.confidence_schedule or self.dspark.varlen_verify)
         ):
             raise ValueError(
                 "Forced speculative acceptance (--spec-decode-acceptance-length "

@@ -34,3 +34,6 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         # is correct, and pinning the exact signature only breaks the Triton
         # path whenever the aiter side adds a keyword.
         return {}
+
+    def build_for_varlen_capture(self, seqlens_q):
+        raise NotImplementedError("varlen verify needs the aiter MLA decode path")

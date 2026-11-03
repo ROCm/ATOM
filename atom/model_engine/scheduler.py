@@ -23,6 +23,7 @@ import enum
 import itertools
 import logging
 import math
+import os
 import struct
 import threading
 import time
@@ -66,6 +67,13 @@ from atom.model_engine.state_runtime import (
 )
 from atom.observability import tracing
 from atom.sampling_params import RequiredChannel
+from atom.spec_decode.mtp_varlen import (
+    ChunkCost,
+    ChunkCostModel,
+    MTPVarlen,
+    SeqDraftRates,
+    cumulative_rates,
+)
 from atom.structured_output import StructuredRequest
 from atom.utils import envs
 
@@ -440,6 +448,16 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+        # Varlen verify plan for a pure-decode batch: per-request query lengths
+        # (anchor + verified drafts) and the per-position draft confidence they
+        # were planned from, 1.0 where the scheduler has none. Set after
+        # construction by the scheduler; None means verify every draft.
+        self.varlen_lens: np.ndarray | None = None
+        self.varlen_conf: np.ndarray | None = None
+        # Rows whose varlen_conf came from the confidence head (not filled).
+        self.varlen_conf_known: np.ndarray | None = None
+        # Sum of the planned requests' context tokens (the chunk price's scale).
+        self.varlen_ctx_tokens: int = 0
         # Set by the PP head on a batch whose completion it waits for although
         # the batch produces no output. It travels with the metadata, so the
         # last stage acks exactly the batches the head waits on.
@@ -588,6 +606,9 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        varlen_conf: dict[int, np.ndarray] | None = None,
+        varlen_runtime: list[tuple[int, int, float, float]] | None = None,
+        varlen_accept: tuple[np.ndarray, np.ndarray] | None = None,
         structured_errors: dict[int, str] | None = None,
     ):
         self.req_ids = req_ids
@@ -604,6 +625,15 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        # Varlen verify feedback, both from steps already finished on the GPU:
+        # {req_id: per-position draft confidence [mtp_k]} of a recent propose,
+        # and (num_seqs, graph_tokens, forward_ms, sampler_ms) per timed step.
+        self.varlen_conf = varlen_conf
+        self.varlen_runtime = varlen_runtime
+        # (trials, accepts), each [mtp_k, bins]: a finished varlen step's
+        # verified draft positions binned by the confidence they were planned
+        # from (`mtp_varlen.acceptance_trials`).
+        self.varlen_accept = varlen_accept
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -620,6 +650,122 @@ class ScheduledBatchOutput:
         if self._req_id_to_idx is None:
             self._req_id_to_idx = {rid: i for i, rid in enumerate(self.req_ids)}
         return self._req_id_to_idx.get(req_id)
+
+
+def _varlen_chunk_model(dspark) -> ChunkCostModel | None:
+    """The opus row-chunk price of the varlen plan, when it applies."""
+    aware = dspark.varlen_chunk_aware
+    if aware is None:
+        # The kernel whose plan it prices; read where the kernel reads it.
+        aware = os.environ.get("ATOM_OPUS_MLA", "0").strip().lower() in (
+            "1",
+            "true",
+            "on",
+        )
+    if not aware:
+        return None
+    return ChunkCostModel(
+        ChunkCost(free_q=int(dspark.varlen_chunk_free_q)),
+        float(dspark.varlen_chunk_cost),
+    )
+
+
+class _VarlenStats:
+    """Interval summary of varlen verify, from host-side state only."""
+
+    INTERVAL_S = 30.0
+
+    def __init__(self, mtp_k: int) -> None:
+        self._mtp_k = int(mtp_k)
+        self._reset(time.monotonic())
+
+    def _reset(self, now: float) -> None:
+        self._t0 = now
+        self._plans = 0
+        self._explores = 0
+        self._capped = 0
+        self._tokens = 0
+        self._rows = 0
+        self._lens_hist = np.zeros(self._mtp_k + 2, dtype=np.int64)
+        self._fwd_ms = 0.0
+        self._sampler_ms = 0.0
+        self._timed = 0
+        self._ctx = 0
+        # graph-size bucket -> [forward ms sum, steps]
+        self._fwd_by_graph: dict[int, list[float]] = {}
+
+    def plan(
+        self,
+        lens: np.ndarray,
+        explore: bool,
+        context_tokens: int = 0,
+        cap: int | None = None,
+    ) -> None:
+        self._plans += 1
+        self._explores += int(explore)
+        self._capped += int(cap is not None)
+        self._tokens += int(lens.sum())
+        self._rows += int(lens.size)
+        self._ctx += int(context_tokens)
+        np.add.at(self._lens_hist, np.clip(lens, 0, self._mtp_k + 1), 1)
+
+    def runtime(self, fwd_ms: float, sampler_ms: float, graph_size: int = 0) -> None:
+        self._fwd_ms += float(fwd_ms)
+        self._sampler_ms += float(sampler_ms)
+        self._timed += 1
+        acc = self._fwd_by_graph.setdefault(int(graph_size) // 64 * 64, [0.0, 0])
+        acc[0] += float(fwd_ms)
+        acc[1] += 1
+
+    def maybe_log(self, planner: MTPVarlen) -> None:
+        now = time.monotonic()
+        if now - self._t0 < self.INTERVAL_S or self._plans == 0:
+            return
+        rows = max(self._rows, 1)
+        hist = {
+            q: round(100.0 * c / rows, 1)
+            for q, c in enumerate(self._lens_hist.tolist())
+            if c
+        }
+        timed = max(self._timed, 1)
+        cal = planner.calibrator
+        observed = (
+            "off"
+            if cal is None
+            else "[" + ", ".join(f"{v:.2f}" for v in cal.observed()) + "]"
+        )
+        by_graph = ", ".join(
+            f"{g}+: {s / c:.1f}ms x{c}"
+            for g, (s, c) in sorted(self._fwd_by_graph.items())
+        )
+        chunk = planner.chunk
+        chunk_txt = (
+            "off"
+            if chunk is None
+            else f"{chunk.ms_per_token * 1e6:.2f}ms/Mtok, {self._capped} capped"
+        )
+        logger.info(
+            "varlen verify: %d plans (%d explore) in %.0fs, %.1f q/req, "
+            "q%% %s, ctx %.0f tok/req, fwd %.1fms sampler %.1fms "
+            "(fwd by graph tokens {%s}), model offset %.1fms "
+            "slope %.3fms/tok step overhead %.1fms, chunk price %s, "
+            "observed accept/pos %s",
+            self._plans,
+            self._explores,
+            now - self._t0,
+            self._tokens / rows,
+            hist,
+            self._ctx / rows,
+            self._fwd_ms / timed,
+            self._sampler_ms / timed,
+            by_graph,
+            planner.offset_ms(),
+            planner.slope_ms(),
+            planner.overhead_ms(),
+            chunk_txt,
+            observed,
+        )
+        self._reset(now)
 
 
 class Scheduler:
@@ -642,6 +788,10 @@ class Scheduler:
 
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
+    # DSpark varlen verify. Class defaults so a scheduler built without
+    # `__init__` reads the feature as off.
+    mtp_varlen: MTPVarlen | None = None
+    _schedule_calls = 0
 
     def __init__(
         self,
@@ -933,6 +1083,28 @@ class Scheduler:
         # own: EngineCore runs a dummy prefill instead of a decode.
         self.dummy_prefill = False
 
+        dspark = getattr(config, "dspark", None)
+        self.mtp_varlen: MTPVarlen | None = (
+            MTPVarlen(
+                explore_interval=dspark.varlen_explore_interval,
+                chunk=_varlen_chunk_model(dspark),
+                max_q=dspark.varlen_max_q,
+            )
+            if self.spec_decode_local
+            and dspark is not None
+            and dspark.varlen_verify
+            and self.mtp_k > 0
+            else None
+        )
+        if self.mtp_varlen is not None and dspark.varlen_calibrate:
+            self.mtp_varlen.enable_calibration(self.mtp_k)
+        # req_id -> latest per-position draft confidence the workers reported.
+        self._varlen_conf: dict[int, np.ndarray] = {}
+        self._varlen_stats = _VarlenStats(self.mtp_k)
+        self._schedule_calls = 0
+        # (schedule call, monotonic time) of the last varlen plan.
+        self._varlen_last_plan: tuple[int, float] | None = None
+
     def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
         """Whether some DP rank prefills this tick, from the delayer's reduce.
         Only with token graphs recorded: without them a rank's decode beside a
@@ -944,6 +1116,73 @@ class Scheduler:
             and decision.prefillable_ranks > 0
             and not self.prefill_delayer.is_local
         )
+
+    def set_varlen_perf_curve(self, curve: list[tuple[int, float]]) -> None:
+        if self.mtp_varlen is not None and curve:
+            self.mtp_varlen.set_decode_perf_curve(curve)
+
+    def _plan_varlen(self, decode_batch: ScheduledBatch, seqs) -> None:
+        """DeepInfer `scheduler.hpp`: size this step's verify and split it."""
+        n = int(decode_batch.total_seqs_num)
+        if (
+            self.mtp_varlen is None
+            or n == 0
+            or decode_batch.total_seqs_num_prefill > 0
+            or decode_batch.num_spec_step == 0
+        ):
+            return
+        now = time.monotonic()
+        last = self._varlen_last_plan
+        if last is not None and last[0] == self._schedule_calls - 1:
+            self.mtp_varlen.update_step_wall((now - last[1]) * 1e3)
+        self._varlen_last_plan = (self._schedule_calls, now)
+        nst = np.asarray(decode_batch.num_scheduled_tokens, dtype=np.int32)
+        k = self.mtp_k
+        conf = np.ones((n, k), dtype=np.float32)
+        known = np.zeros(n, dtype=bool)
+        drafts = np.maximum(nst[:n] - 1, 0)
+        for i, seq in enumerate(seqs):
+            c = self._varlen_conf.get(seq.id)
+            if c is not None and drafts[i] > 0:
+                m = min(len(c), k)
+                conf[i, :m] = c[:m]
+                known[i] = True
+        calibrated = self.mtp_varlen.calibrate(conf)
+        plan = [
+            SeqDraftRates(
+                num_drafts=int(drafts[i]),
+                rates=cumulative_rates(calibrated[i, : drafts[i]]) if known[i] else None,
+            )
+            for i in range(n)
+        ]
+        ctx_tokens = sum(int(s.num_tokens) for s in seqs[:n])
+        lens = self.mtp_varlen.schedule(plan, ctx_tokens=ctx_tokens)
+        decode_batch.varlen_lens = lens
+        # Echoed back with the step's timing: the chunk price scales with it.
+        decode_batch.varlen_ctx_tokens = ctx_tokens
+        # Raw head output: the calibrator bins outcomes by what the head said.
+        decode_batch.varlen_conf = conf
+        decode_batch.varlen_conf_known = known
+        self._varlen_stats.plan(
+            lens, self.mtp_varlen.last_explore, ctx_tokens, self.mtp_varlen.last_cap
+        )
+        self._varlen_conf = {
+            s.id: self._varlen_conf[s.id] for s in seqs if s.id in self._varlen_conf
+        }
+
+    def _absorb_varlen_feedback(self, fwd_output: ScheduledBatchOutput) -> None:
+        if self.mtp_varlen is None:
+            return
+        if fwd_output.varlen_conf:
+            self._varlen_conf.update(fwd_output.varlen_conf)
+        for sample in fwd_output.varlen_runtime or ():
+            # (num_seqs, graph_size, fwd_ms, sampler_ms[, max_q, ctx_tokens])
+            self.mtp_varlen.update_runtime(*sample)
+            self._varlen_stats.runtime(sample[2], sample[3], sample[1])
+        accept = getattr(fwd_output, "varlen_accept", None)
+        if accept is not None and self.mtp_varlen.calibrator is not None:
+            self.mtp_varlen.calibrator.update(*accept)
+        self._varlen_stats.maybe_log(self.mtp_varlen)
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
@@ -2006,6 +2245,7 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
+        self._schedule_calls += 1
         result = self._schedule()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
@@ -2921,6 +3161,7 @@ class Scheduler:
                 else None
             ),
         )
+        self._plan_varlen(decode_batch, list(scheduled_seqs.values()))
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
 
@@ -4126,6 +4367,7 @@ class Scheduler:
         # batch.is_final_chunk (a later schedule() may have already flipped the
         # live seq.is_partial_prefill while this batch was in flight).
         pp_middle_chunk_ids: set[int] = set()
+        self._absorb_varlen_feedback(fwd_output)
         running_by_id = {seq.id: seq for seq in self.running} if batch else {}
         if batch is not None:
             for request_id, data in getattr(batch, "multimodal_data", {}).items():

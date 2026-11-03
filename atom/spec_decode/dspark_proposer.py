@@ -60,6 +60,11 @@ class DSparkProposer(Drafter):
         self._verify_scheduler = (
             VerifyScheduler(runner) if self._confidence_schedule else None
         )
+        # Per-position draft confidence of the last propose, `[scheduled_bs,
+        # mtp_k]` in batch order, for the varlen verify scheduler
+        # (`ModelRunner._varlen_record_confidence`). None when the draft has no
+        # confidence head.
+        self.last_confidence: torch.Tensor | None = None
         # The draft shares the target's block tables and its KV lives in the same
         # paged pool, so it inherits the pool's DCP sharding: the block pass must
         # address and size itself in LOCAL (per-rank) terms. 1 when -dcp is unset.
@@ -733,6 +738,9 @@ class DSparkProposer(Drafter):
             # compute_ell takes its batch size from confidence.shape and zips the
             # resulting ell against batch.req_ids by position.
             confidence = confidence[:scheduled_bs]
+        self.last_confidence = (
+            None if confidence is None else confidence[:, : self.mtp_k]
+        )
         # Confidence-scheduled verification. The hardware-aware prefix scheduler
         # consumes the confidence head to pick a per-request verify length
         # ell_r. We compute ell here and stash it; the actual variable-length
@@ -1106,6 +1114,9 @@ class DSparkProposer(Drafter):
         with record_function(f"propose_dspark[{label} T={T}]"):
             draft_token_ids, confidence = self.block.run(running_bs, **staged)
 
+        self.last_confidence = (
+            None if confidence is None else confidence[:scheduled_bs, : self.mtp_k]
+        )
         if self.verify_scheduler is not None:
             self.verify_scheduler.set_last_ell(
                 self.verify_scheduler.compute_ell(confidence[:scheduled_bs, :T])

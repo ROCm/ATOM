@@ -699,6 +699,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # DSpark varlen verify (`--dspark-config {"varlen_verify": true}`): print
+    # one `[VARLEN-DEBUG verify]` line per varlen decode step on TP rank 0 --
+    # per-request lengths, total vs rectangular tokens, the graph replayed and
+    # the planning confidence. Host-only, no device copy. Off by default; the
+    # 30 s `varlen verify:` interval summary is always logged.
+    "ATOM_VARLEN_DEBUG": lambda: os.getenv("ATOM_VARLEN_DEBUG", "0") == "1",
+    # With ATOM_VARLEN_DEBUG=1, print one line per this many varlen steps.
+    "ATOM_VARLEN_DEBUG_EVERY": lambda: int(
+        os.getenv("ATOM_VARLEN_DEBUG_EVERY", "1")
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft

@@ -37,3 +37,18 @@ def decode_positions(
         out=out.reshape(bs, max_seqlen_q),
     )
     return out
+
+
+def ragged_decode_positions(starts: np.ndarray, seqlens_q: np.ndarray) -> np.ndarray:
+    """`[starts[i], starts[i] + seqlens_q[i])` concatenated in sequence order.
+
+    The varlen verify layout: every sequence's span starts where the full
+    rectangle would and stops after its own `seqlens_q[i]` tokens.
+    """
+    seqlens_q = np.asarray(seqlens_q, dtype=np.int64)
+    total = int(seqlens_q.sum())
+    seq_first = np.cumsum(seqlens_q) - seqlens_q
+    ramp = np.arange(total, dtype=np.int64) - np.repeat(seq_first, seqlens_q)
+    return (np.repeat(np.asarray(starts, dtype=np.int64), seqlens_q) + ramp).astype(
+        np.int32
+    )
