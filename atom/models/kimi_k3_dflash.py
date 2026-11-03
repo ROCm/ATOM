@@ -469,6 +469,20 @@ def _draft_rope_kwargs(config) -> dict:
     }
 
 
+def _check_rope_covers(max_model_len: int, rope_rows: int) -> None:
+    """Refuse a `max_model_len` past the draft's rope cache.
+
+    The context write ropes its positions unclamped, and rows past the cache
+    read out of bounds rather than fail.
+    """
+    if max_model_len > rope_rows:
+        raise ValueError(
+            f"max_model_len {max_model_len} exceeds the DFlash draft's rope "
+            f"cache of {rope_rows} positions; lower --max-model-len to at "
+            f"most {rope_rows}"
+        )
+
+
 def _draft_quant_config(config) -> QuantizationConfig:
     """The draft's own quantization: none.
 
@@ -574,6 +588,7 @@ class KimiK3DFlash(DSparkDraftModel):
         self._rope_max_row = (
             int(self.layers[0].self_attn.rotary_emb.cos_cache.shape[0]) - 1
         )
+        _check_rope_covers(int(atom_config.max_model_len), self._rope_max_row + 1)
         self.markov_head = DSparkMarkovHead(
             self.vocab_size, int(config.dspark_markov_rank)
         )
@@ -771,8 +786,10 @@ class KimiK3DFlash(DSparkDraftModel):
         draft_ids = input_ids.new_full((bs, num_draft), self.noise_token_id)
         draft_ids[:, 0] = input_ids
         hidden = self.embed_tokens(draft_ids.view(-1))
-        # Positions past the cache only occur in the last T of a max-length
-        # context, whose drafts cannot be verified anyway.
+        # Block positions run T past `max_model_len`, so they pass the cache in
+        # the last T of a max-length context, whose drafts cannot be verified
+        # anyway. Context positions stay below it, which `_check_rope_covers`
+        # holds inside the cache.
         positions = positions.clamp(max=self._rope_max_row)
         residual = None
         for layer in self.layers:

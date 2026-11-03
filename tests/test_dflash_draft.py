@@ -173,11 +173,12 @@ def _inferact_rope_cfg(**overrides):
     return cfg
 
 
-def _draft_rope_kwargs_fn(module_file):
-    """A draft module's `_draft_rope_kwargs`, runnable without the aiter stack.
+def _lift_fn(module_file, name, ns):
+    """A draft module's top-level function `name`, runnable without the aiter
+    stack.
 
     The draft modules import aiter at load, so the one function is lifted from
-    the source and bound to the CPU-importable shared parser it calls.
+    the source and bound to the CPU-importable names in `ns` it calls.
     """
     import ast
     import pathlib
@@ -186,16 +187,31 @@ def _draft_rope_kwargs_fn(module_file):
 
     path = pathlib.Path(dspark_draft.__file__).with_name(module_file)
     tree = ast.parse(path.read_text())
-    (fn,) = [
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_draft_rope_kwargs"
-    ]
-    ns = {"draft_rope_scaling": dspark_draft.draft_rope_scaling}
+    (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
     exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns
     )
-    return ns["_draft_rope_kwargs"]
+    return ns[name]
+
+
+def _draft_rope_kwargs_fn(module_file):
+    """A draft module's `_draft_rope_kwargs`, bound to the shared parser."""
+    from atom.models import dspark_draft
+
+    ns = {"draft_rope_scaling": dspark_draft.draft_rope_scaling}
+    return _lift_fn(module_file, "_draft_rope_kwargs", ns)
+
+
+def test_dflash_refuses_a_max_model_len_past_the_rope_cache():
+    """The context write ropes unclamped positions, all below `max_model_len`.
+    A length equal to the cache rows -- the shipped pair's default -- fits;
+    one more row is refused at startup."""
+    check = _lift_fn("kimi_k3_dflash.py", "_check_rope_covers", {})
+    rows = 65536 * 16
+    check(rows, rows)
+    check(4096, rows)
+    with pytest.raises(ValueError, match="lower --max-model-len"):
+        check(rows + 1, rows)
 
 
 def test_k3_dspark_mla_rope_kwargs_are_unchanged():
