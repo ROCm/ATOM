@@ -169,6 +169,8 @@ class GDNAttentionMetadata:
     replayssm_cache_len: int = 0
     replayssm_route: str = "auto"
     replayssm_max_query_len: int = 1
+    # A state fork's (write slot, source slot) rows, int64 [2, F]; None unforked.
+    replayssm_fork_slots: torch.Tensor | None = None
 
     # The following attributes are for triton implementation of causal_conv1d
     nums_dict: dict | None = None
@@ -1212,9 +1214,11 @@ class GDNStateMixin(PoolRowsMixin):
         assert not (
             with_spec and self._has_state_fork and not self.spec_honours_state_fork()
         ), "state fork on the spec-decode path, which this model does not read"
-        # Write slots of the forked rows: ReplaySSM parks their record cursors.
-        self._fork_dst_slots = [
-            slots[0] for slots, src in zip(batch.state_slots, fork_srcs) if src >= 0
+        # (write slot, source slot) of the forked rows, for ReplaySSM.
+        self._fork_slots = [
+            (slots[0], src)
+            for slots, src in zip(batch.state_slots, fork_srcs)
+            if src >= 0
         ]
         num_state_rows = len(batch.state_slots)
         non_spec_state_indices[num_state_rows:] = PAD_SLOT_ID
@@ -1461,15 +1465,15 @@ class GDNStateMixin(PoolRowsMixin):
             write_pos.index_fill_(0, live, -1)
             return
 
-        if getattr(self, "_fork_dst_slots", None):
+        if self._fork_slots:
             # A fork's write slot starts from the source checkpoint alone (the
             # kernel wrapper seeds it), so park its cursor like a prefill's:
             # otherwise it folds the slot's previous tenant's records.
             # Pinned: a pageable H2D syncs the stream.
-            dst = torch.tensor(self._fork_dst_slots, pin_memory=True).to(
-                write_pos.device, non_blocking=True
-            )
-            write_pos.index_fill_(0, dst, -1)
+            fork = torch.tensor(list(zip(*self._fork_slots)), pin_memory=True)
+            fork = fork.to(write_pos.device, non_blocking=True)
+            write_pos.index_fill_(0, fork[0], -1)
+            md.replayssm_fork_slots = fork
 
         # Decode: apply the PREVIOUS step's accepted counts.  For non-spec
         # decode `num_accepted_tokens` stays at its initialised value of 1,

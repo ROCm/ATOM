@@ -75,8 +75,8 @@ def test_spec_fork_publishes_the_source_too():
     np.testing.assert_array_equal(b.spec_state_indices_tensor.np[:2, 0], [0, 4])
     # ...and the builder reads the source published here in its place.
     np.testing.assert_array_equal(b.non_spec_state_indices_in_tensor.np[:2], [0, 30])
-    # ReplaySSM parks the forked write slot's record cursor.
-    assert b._fork_dst_slots == [4]
+    # ReplaySSM parks the forked write slot's cursor and seeds it from 30.
+    assert b._fork_slots == [(4, 30)]
 
 
 def test_spec_fork_reads_the_source_whatever_was_accepted():
@@ -121,6 +121,5 @@ def test_rows_past_the_batch_are_padded_on_every_table():
 
 def test_replayssm_seeds_only_the_forked_write_slots():
     ckpt = torch.arange(6.0).view(6, 1)
-    slot = torch.tensor([0, 4, PAD_SLOT_ID], dtype=torch.int32)
-    seed_forked_slots(ckpt, slot, torch.tensor([0, 2, PAD_SLOT_ID], dtype=torch.int32))
+    seed_forked_slots(ckpt, torch.tensor([[4], [2]]))
     torch.testing.assert_close(ckpt.view(-1), torch.tensor([0.0, 1, 2, 3, 2, 5]))
