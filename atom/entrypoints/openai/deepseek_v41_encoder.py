@@ -9,43 +9,7 @@ ATOM's common controls and attach top-level tool schemas to the system turn.
 
 from typing import Any
 
-from .api_compatibility import APICompatibility
-from .reasoning_controls import ReasoningRules
-
-SUPPORTED_EFFORT_LEVELS = ("low", "high", "max")
-DEFAULT_EFFORT_LEVEL = "high"
-
-API_COMPATIBILITY = APICompatibility(
-    display_name="DeepSeek-V4.1-Flash",
-    output_token_limit=393216,
-    effort_levels=SUPPORTED_EFFORT_LEVELS,
-    default_effort=DEFAULT_EFFORT_LEVEL,
-    chat_usage_on_finish=True,
-    chat_forced_tools_with_thinking=False,
-    anthropic_output_effort=True,
-    # Explicit unsupported/ignored fields from DeepSeek's Responses support table.
-    # Unknown extension fields are not globally stripped.
-    responses_ignored_fields=frozenset(
-        {
-            "background",
-            "previous_response_id",
-            "conversation",
-            "store",
-            "parallel_tool_calls",
-            "max_tool_calls",
-            "metadata",
-            "include",
-            "prompt",
-            "truncation",
-            "service_tier",
-            "safety_identifier",
-            "prompt_cache_key",
-            "prompt_cache_retention",
-            "context_management",
-            "stream_options",
-        }
-    ),
-)
+from .reasoning_controls import SUPPORTED_EFFORT_LEVELS, ReasoningRules
 
 
 def normalize_effort(effort: Any) -> str | int | None:

@@ -1,6 +1,5 @@
 from types import SimpleNamespace as NS
 
-from atom.entrypoints.openai.chat_encoder_adapters import build_message_encoder_adapter
 from atom.entrypoints.openai.model_capabilities import deployment_metadata
 
 
@@ -13,7 +12,7 @@ def test_dspark_reports_runtime_context_and_text_only():
                 text_config=NS(max_position_embeddings=1048576), vision_config=NS()
             ),
         ),
-        build_message_encoder_adapter("encoding_dsv41", lambda messages: ""),
+        NS(name="encoding_dsv41"),
     )
     assert result["context_window"] == 32768
     assert result["max_output_tokens"] == 32768
@@ -27,7 +26,7 @@ def test_dspark_reports_runtime_context_and_text_only():
 def test_checkpoint_limit_and_output_cap():
     result = deployment_metadata(
         NS(max_model_len=2097152, hf_config=NS(max_position_embeddings=1048576)),
-        build_message_encoder_adapter("encoding_dsv41", lambda messages: ""),
+        NS(name="encoding_dsv41"),
     )
     assert result["context_window"] == 1048576
     assert result["max_output_tokens"] == 393216
@@ -41,9 +40,7 @@ def test_unknown_model_does_not_invent_capabilities():
 def test_metadata_effort_levels_share_the_request_contract():
     from atom.entrypoints.openai.deepseek_v41_encoder import normalize_effort
 
-    caps = deployment_metadata(
-        None, build_message_encoder_adapter("encoding_dsv41", lambda messages: "")
-    )
+    caps = deployment_metadata(None, NS(name="encoding_dsv41"))
     for level in caps["effort"]["supported_levels"]:
         assert normalize_effort(level) == level
     assert normalize_effort(caps["effort"]["default_level"]) == "high"
@@ -61,31 +58,18 @@ def test_unknown_encoder_only_reports_deployment_limits():
     }
 
 
-def test_generic_contract_import_does_not_load_model_modules():
+def test_shared_effort_contract_does_not_import_deepseek_encoder():
     import subprocess
     import sys
 
     code = """
 import sys
-from atom.entrypoints.openai.api_compatibility import APICompatibility, api_compatibility_for
-assert api_compatibility_for(None) == APICompatibility()
-assert not any('deepseek' in name for name in sys.modules)
+from atom.entrypoints.openai.api_compatibility import DEEPSEEK_API_COMPATIBILITY
+from atom.entrypoints.openai.reasoning_controls import DEFAULT_EFFORT_LEVEL, SUPPORTED_EFFORT_LEVELS
+assert DEEPSEEK_API_COMPATIBILITY.effort_levels == SUPPORTED_EFFORT_LEVELS
+assert DEEPSEEK_API_COMPATIBILITY.default_effort == DEFAULT_EFFORT_LEVEL
+assert 'atom.entrypoints.openai.deepseek_v41_encoder' not in sys.modules
 """
     subprocess.run(
         [sys.executable, "-c", code], check=True, capture_output=True, text=True
     )
-
-
-def test_contract_selection_uses_metadata_not_encoder_name():
-    from atom.entrypoints.openai.api_compatibility import (
-        DEFAULT_API_COMPATIBILITY,
-        APICompatibility,
-        api_compatibility_for,
-    )
-
-    contract = APICompatibility(display_name="Custom model", effort_levels=("custom",))
-    assert (
-        api_compatibility_for(NS(name="unregistered", api_compatibility=contract))
-        is contract
-    )
-    assert api_compatibility_for(NS(name="encoding_dsv41")) is DEFAULT_API_COMPATIBILITY

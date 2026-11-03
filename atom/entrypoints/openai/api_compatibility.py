@@ -5,6 +5,8 @@
 
 from dataclasses import dataclass
 
+from .reasoning_controls import DEFAULT_EFFORT_LEVEL, SUPPORTED_EFFORT_LEVELS
+
 
 @dataclass(frozen=True)
 class APICompatibility:
@@ -32,9 +34,42 @@ class APICompatibility:
 
 
 DEFAULT_API_COMPATIBILITY = APICompatibility()
+DEEPSEEK_API_COMPATIBILITY = APICompatibility(
+    display_name="DeepSeek-V4.1-Flash",
+    output_token_limit=393216,
+    effort_levels=SUPPORTED_EFFORT_LEVELS,
+    default_effort=DEFAULT_EFFORT_LEVEL,
+    chat_usage_on_finish=True,
+    chat_forced_tools_with_thinking=False,
+    anthropic_output_effort=True,
+    # Explicit unsupported/ignored fields from DeepSeek's Responses support table.
+    # Unknown extension fields are not globally stripped.
+    responses_ignored_fields=frozenset(
+        {
+            "background",
+            "previous_response_id",
+            "conversation",
+            "store",
+            "parallel_tool_calls",
+            "max_tool_calls",
+            "metadata",
+            "include",
+            "prompt",
+            "truncation",
+            "service_tier",
+            "safety_identifier",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "context_management",
+            "stream_options",
+        }
+    ),
+)
 
 
 def api_compatibility_for(encoder) -> APICompatibility:
-    # Model adapters carry their wire contract; unknown adapters retain the
-    # generic defaults without importing or recognizing a particular model.
-    return getattr(encoder, "api_compatibility", DEFAULT_API_COMPATIBILITY)
+    # Preserve the current deployment selection in one place. Wire behavior is
+    # a frontend contract, not an encoder operation or a served-model alias.
+    return {"encoding_dsv41": DEEPSEEK_API_COMPATIBILITY}.get(
+        getattr(encoder, "name", None), DEFAULT_API_COMPATIBILITY
+    )
