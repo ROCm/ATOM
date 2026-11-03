@@ -892,3 +892,12 @@ def test_partial_prefix_with_a_small_rest_is_recomputed_not_loaded():
     (rank,) = _route(mgr, [seq])
     assert rank == 2
     assert seq._dp_est_hit == 94_208
+
+
+def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
+    mgr = _dp4_idle_ratio_mgr()
+    mgr._seq_prefilling.add(2)  # rank2's 48k part is still being prefilled
+    hits, owner, _ = mgr._prefix_rank_hits(_chain_seq(3, 110_000).prompt_hash_chain)
+    assert owner == 0 and 2 not in hits
+    (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
+    assert rank == 1  # no partial credit: the lightest idle rank
