@@ -17,6 +17,7 @@ fails if the optimized profiler region contains a device-to-device memcpy.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -58,17 +59,44 @@ def _dtod_events(prof) -> list[str]:
             "dtod" in normalized or "devicetodevice" in normalized
         ):
             names.append(name)
-    return sorted(set(names))
+    return names
 
 
-def _profile(step):
+def _profile(step, *, require_dtod: bool) -> tuple[Any, dict[str, Any]]:
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         result = step()
         torch.cuda.synchronize()
     copied = _dtod_events(prof)
-    if copied:
+    if require_dtod and not copied:
+        raise AssertionError("ordinary copy path did not contain a DtoD memcpy")
+    if not require_dtod and copied:
         raise AssertionError(f"optimized region still contains DtoD memcpy: {copied}")
-    return result
+    kernels = [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and "memcpy" not in event.name.lower()
+        and "memset" not in event.name.lower()
+    ]
+    return result, {
+        "kernels": len(kernels),
+        "dtod": len(copied),
+        "dtod_names": sorted(set(copied)),
+    }
+
+
+def _time_us(step, *, warmup: int = 2, iterations: int = 10) -> float:
+    for _ in range(warmup):
+        step()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        step()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iterations
 
 
 def _assert_bitwise(label: str, expected, actual):
@@ -83,7 +111,7 @@ def _assert_bitwise(label: str, expected, actual):
             )
 
 
-def _case(rank: int, m: int, lease, graphs: list):
+def _case(rank: int, m: int, lease, graphs: list) -> dict[str, Any]:
     device = torch.device("cuda", rank)
     local_gen = torch.Generator(device=device).manual_seed(0xF500 + 17 * m + rank)
     common_gen = torch.Generator(device=device).manual_seed(0x393 + m)
@@ -119,11 +147,16 @@ def _case(rank: int, m: int, lease, graphs: list):
             gemma_norm=True,
         )
 
-    ordinary_input = gemm_a8w8_bpreshuffle(
-        xq, wq, x_scale, w_scale, dtype=dtypes.bf16
-    )
-    expected = fused(ordinary_input)
+    def ordinary_step():
+        ordinary_input = gemm_a8w8_bpreshuffle(
+            xq, wq, x_scale, w_scale, dtype=dtypes.bf16
+        )
+        return fused(ordinary_input)
+
+    expected = ordinary_step()
     torch.cuda.synchronize()
+    _, ordinary_profile = _profile(ordinary_step, require_dtod=True)
+    ordinary_us = _time_us(ordinary_step)
 
     def eager_step():
         gemm_a8w8_bpreshuffle_out(
@@ -131,7 +164,8 @@ def _case(rank: int, m: int, lease, graphs: list):
         )
         return fused(registered_input)
 
-    eager = _profile(eager_step)
+    eager, eager_profile = _profile(eager_step, require_dtod=False)
+    eager_us = _time_us(eager_step)
     _assert_bitwise(f"M={m} eager", expected, eager)
 
     graph = torch.cuda.CUDAGraph()
@@ -157,7 +191,14 @@ def _case(rank: int, m: int, lease, graphs: list):
     graph.replay()
     torch.cuda.synchronize()
     _assert_bitwise(f"M={m} graph", expected, graph_result)
-    _profile(graph.replay)
+    _, graph_profile = _profile(graph.replay, require_dtod=False)
+    graph_us = _time_us(graph.replay)
+    return {
+        "m": m,
+        "ordinary": {**ordinary_profile, "us": ordinary_us},
+        "direct_eager": {**eager_profile, "us": eager_us},
+        "direct_graph": {**graph_profile, "us": graph_us},
+    }
 
 
 def main():
@@ -178,15 +219,25 @@ def main():
     initialize_model_parallel(tensor_model_parallel_size=world)
     lease = None
     graphs = []
+    metrics = []
     try:
         lease = tensor_model_parallel_lease_registered_input_buffer()
         if lease is None:
             raise RuntimeError("custom AR registered input-buffer lease is unavailable")
+        if tensor_model_parallel_lease_registered_input_buffer() is not None:
+            raise AssertionError("registered input-buffer lease is not exclusive")
         for m in _MS:
             get_tp_group().barrier()
-            _case(local_rank, m, lease, graphs)
+            metrics.append(_case(local_rank, m, lease, graphs))
         get_tp_group().barrier()
         if rank == 0:
+            for item in metrics:
+                print(
+                    f"METRIC rank=0 M={item['m']} "
+                    f"ordinary={item['ordinary']} "
+                    f"direct_eager={item['direct_eager']} "
+                    f"direct_graph={item['direct_graph']}"
+                )
             print(
                 "PASS: M=2517,4536 eager+graph bitwise; "
                 "optimized profiler regions contain no Memcpy DtoD"
