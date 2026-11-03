@@ -745,6 +745,23 @@ class EngineCore:
             self.scheduler.extend(recv_reqs)
         return False
 
+    def _offer_tier_lookups(self, reqs) -> None:
+        """Let an offload connector start tier lookups for arrived requests.
+
+        Runs on this IO thread, so a lookup is sent while the engine thread is
+        still inside a forward instead of when it next schedules. Only a
+        connector with a lookup thread defines `offer_lookups`.
+        """
+        connector = getattr(getattr(self, "scheduler", None), "kv_connector", None)
+        offer = getattr(connector, "offer_lookups", None)
+        if not callable(offer):
+            return
+        try:
+            offer(reqs)
+        except Exception:
+            # The scheduler's own prefetch still sends these lookups.
+            logger.warning(f"{self.label}: offering tier lookups failed", exc_info=True)
+
     def process_input_sockets(self, input_address: str, control_address: str):
         """Input IO thread, serving both the request and control sockets.
 
@@ -802,6 +819,7 @@ class EngineCore:
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
                         self.input_queue.put_nowait(reqs)
+                        self._offer_tier_lookups(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")

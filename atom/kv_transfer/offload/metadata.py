@@ -176,6 +176,9 @@ class LMCacheReqMeta:
     # reclaim it.
     dispatched_at: float | None = None
     dispatch_clock: str | None = None
+    # A save covering KV this step's forward computes: the worker submits it
+    # behind that forward (`after_forward`) instead of before it.
+    after_forward: bool = False
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

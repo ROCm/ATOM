@@ -1925,7 +1925,7 @@ class Scheduler:
         ) and num_tokens > self.max_num_batched_tokens:
             remedy = (
                 "Increase --max-num-batched-tokens or shorten the prompt "
-                "(multimodal prompts are never chunked)."
+                "(multimodal prompts without embedding spans are never chunked)."
                 if is_multimodal
                 else "Increase --max-num-batched-tokens, enable chunked "
                 "prefill, or shorten the prompt."
@@ -2735,6 +2735,9 @@ class Scheduler:
             if self.kv_connector is not None:
                 self._publish_state_loads()
                 self._publish_state_stores()
+                self._note_connector_scheduled_tokens(
+                    scheduled_seqs, num_scheduled_tokens
+                )
                 connector_meta_output = self.kv_connector.build_connector_meta()
 
             # Freeze, per seq, whether this chunk is the last one this prefill
@@ -2918,6 +2921,7 @@ class Scheduler:
         if self.kv_connector is not None:
             self._publish_state_loads()
             self._publish_state_stores()
+            self._note_connector_scheduled_tokens(scheduled_seqs, num_scheduled_tokens)
             connector_meta_output = self.kv_connector.build_connector_meta()
 
         self._check_draft_writes_allocated(scheduled_seqs.values())
@@ -3045,6 +3049,20 @@ class Scheduler:
         seq.offload_load_start_tokens = None
         seq.offload_load_failed = True
         return True
+
+    def _note_connector_scheduled_tokens(
+        self,
+        scheduled_seqs: dict[int, Sequence],
+        num_scheduled_tokens: list[int],
+    ) -> None:
+        """Tell the connector how many tokens this step's forward computes.
+
+        Lets lmcache_mp emit a prefill chunk's save in the step that computes
+        it (`note_scheduled_tokens`); other connectors do not define it.
+        """
+        note = getattr(self.kv_connector, "note_scheduled_tokens", None)
+        if callable(note):
+            note(scheduled_seqs, num_scheduled_tokens)
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
