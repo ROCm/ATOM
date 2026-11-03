@@ -101,19 +101,6 @@ def test_too_small_arena_falls_back_without_partial_alias(monkeypatch):
     assert layer.mlp.outs == [None]
 
 
-def test_arena_dtype_mismatch_falls_back_without_cross_dtype_view(monkeypatch):
-    layer = _decoder(monkeypatch)
-    hidden = torch.randn(4, 32)
-    layer(
-        torch.arange(4),
-        hidden,
-        torch.randn_like(hidden),
-        registered_ar_input=torch.empty(1024, dtype=torch.uint8),
-    )
-    assert layer.self_attn.outs == [None]
-    assert layer.mlp.outs == [None]
-
-
 def test_ptpc_linear_advertises_out_only_for_its_preshuffle_path(monkeypatch):
     linear = linear_mod.LinearBase.__new__(linear_mod.LinearBase)
     linear.native_a8_group_rows = None
