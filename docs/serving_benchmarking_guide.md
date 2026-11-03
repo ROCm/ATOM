@@ -153,16 +153,19 @@ region* appears, everything from it onward belongs to the format until it can
 parse the region.
 
 One case is sent twice instead of held. A format can declare its answer's own
-closer (`answer_end_markers`; Kimi-K3's `<|close|>response<|sep|>`), and a
-think channel whose last words, framing aside, are that closer — followed by
-the end of the output or the next channel — was the reply: the model skipped
-the channel and wrote its answer there, which K3 does on ~1M-token prompts.
-That is only known when the channel ends, after the reply has streamed as
-`reasoning_content`, so it is sent again as `content`. Every endpoint and both
-delivery modes return the reply in both fields. The costs are that copy and
+closer (`answer_end_markers`; Kimi-K3's `<|close|>response<|sep|>`). A think
+channel whose last words, whitespace and framing aside, are that closer, and
+that ends at the end of the output or at a channel other than the answer's own
+(tools, say), was the reply: the model skipped the channel and wrote its
+answer there, which K3 does on ~1M-token prompts. That is only known when the
+channel ends, after the reply has streamed as `reasoning_content`, so it is
+sent again as `content`, and both delivery modes return the reply in both
+fields (on `/v1/messages`, in `content` alone unless thinking was requested,
+since that endpoint drops reasoning otherwise). The costs are that copy and
 the channel's text, kept as one string until the channel ends. Holding the
 channel back instead would stream no reasoning at all until it closed. A
-closer the channel goes on past (quoted, say) changes nothing.
+closer the channel goes on past (quoted, say), or one followed by the think
+exit into the answer's own channel, changes nothing.
 
 ##### What is held, and for how long
 
@@ -356,10 +359,10 @@ chunking) comparisons, the two agreed byte-for-byte on 50% of them; they now
 agree on all of them, and the property that says so is byte-exact rather than
 word-level.
 
-Both are now one reader: the non-streaming split is the streaming filter run
-over the whole output as one chunk, and the filter is chunk-invariant, so the
-two cannot disagree. The per-dialect split functions that had to be kept in
-step with it are gone.
+There is one reader: the non-streaming split is the streaming filter run over
+the whole output, fed in bounded pieces so that the cost stays linear in the
+output however many markers it carries, and the filter is chunk-invariant, so
+the two delivery modes cannot disagree.
 
 The streaming filter also stopped eating the newline after its end marker. It
 only ever saw what happened to be buffered when the marker arrived, so the

@@ -118,6 +118,9 @@ def server(monkeypatch):
         def flush(self):
             return []
 
+        def read_whole(self, text):
+            return self.process(text) + self.flush()
+
         def split(self, text):
             return "", text
 

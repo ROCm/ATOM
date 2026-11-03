@@ -3,8 +3,9 @@
 
 """Reasoning-channel dialects (model-specific data for the general engine).
 
-The engine in ``reasoning.py`` is dialect-agnostic: it iterates ``DIALECTS`` to
-detect/split the reasoning channel. All model-specific marker knowledge lives
+The engine in ``reasoning.py`` is dialect-agnostic: ``resolve_dialect`` picks
+a model's entry from ``DIALECTS`` once, at startup, and the one reader reads
+the reasoning channel with it. All model-specific marker knowledge lives
 here. Adding a model = add one ``ReasoningDialect`` entry.
 
 Two dialects today, named by format rather than model:
@@ -33,11 +34,6 @@ from . import kimi_k3_tokens as k3
 CHANNEL_THINK_START = "<|open|>think<|sep|>"
 CHANNEL_THINK_END = "<|close|>think<|sep|>"
 CHANNEL_RESPONSE_START = "<|open|>response<|sep|>"
-CHANNEL_RESPONSE_END = "<|close|>response<|sep|>"
-CHANNEL_MESSAGE_END = "<|close|>message<|sep|>"
-CHANNEL_END_OF_MSG = "<|end_of_msg|>"
-CHANNEL_TOOLS_START = "<|open|>tools<|sep|>"
-CHANNEL_CALL_PREFIX = '<|open|>call tool="'
 
 
 @dataclass(frozen=True)
@@ -69,18 +65,16 @@ class ReasoningDialect:
     # to be resolved -- the tool parser removes the same tokens, and a K3
     # deployment whose template refused the tools probe has none.
     content_framing: tuple[str, ...] = ()
-    # Every marker that ends the reasoning channel, `think_end_marker`
-    # included. A channel format can leave the think channel by *opening*
-    # another one, and the streaming filter knew only the explicit close: a
-    # K3 answer that goes straight to `<|open|>response<|sep|>` -- which its
-    # own docs call the common path -- was streamed entirely as
-    # `reasoning_content` with an empty `content`, while the non-streaming
-    # split read it correctly.
+    # Every marker that ends the reasoning channel besides `think_end_marker`.
+    # A channel format can leave the think channel by *opening* another one:
+    # a K3 answer that goes straight to `<|open|>response<|sep|>` -- which its
+    # own docs call the common path -- would otherwise be read entirely as
+    # `reasoning_content` with an empty `content`.
     extra_end_markers: tuple[str, ...] = ()
-    # Markers that close the *answer*. A channel whose last words, framing
-    # aside, are one of these -- before the end of the output or the next
-    # channel -- was the reply, written where reasoning goes; see
-    # `ReasoningFilter._close_channel`.
+    # Markers that close the *answer*. A channel whose last words, whitespace
+    # and framing aside, are one of these, and that ends at the end of the
+    # output or at a channel other than the answer's own, was the reply,
+    # written where reasoning goes; see `ReasoningFilter._close_channel`.
     answer_end_markers: tuple[str, ...] = ()
 
     @property
@@ -147,7 +141,7 @@ _CHANNEL_DIALECT = ReasoningDialect(
     extra_end_markers=(CHANNEL_RESPONSE_START, k3.TOOLS_START),
     # The answer's closer, which the trained format writes only after
     # `<|open|>response<|sep|>`.
-    answer_end_markers=(CHANNEL_RESPONSE_END,),
+    answer_end_markers=(k3.RESPONSE_END,),
     template_efforts=frozenset({"low", "high", "max"}),  # Kimi-K3
     template_markers=(CHANNEL_THINK_START, CHANNEL_THINK_END),
     content_framing=_CHANNEL_CONTENT_FRAMING,

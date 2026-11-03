@@ -15,7 +15,6 @@ from atom.entrypoints.openai.reasoning import (
     separate_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
-from atom.entrypoints.openai.serving_anthropic import read_whole_blocks
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser, parse_tool_calls
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import KimiK3Parser
 
@@ -319,13 +318,43 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         "<|close|>call<|close|>tools<|sep|>"
     )
 
-    @pytest.mark.parametrize("ending", ["", MESSAGE_END], ids=["cut-short", "whole"])
-    def test_a_channel_that_ends_on_the_answer_closer_was_the_reply(self, ending):
+    def _every_way(self, channel, text):
+        """The split, and the stream at 1- and 7-character chunks."""
+        out = [channel.split(text)]
+        for chunk in (1, 7):
+            f = channel.stream()
+            segs = []
+            for i in range(0, len(text), chunk):
+                segs += f.process(text[i : i + chunk])
+            segs += f.flush()
+            reasoning = "".join(s for k, s in segs if k == "reasoning_content")
+            content = "".join(s for k, s in segs if k == "content")
+            out.append((reasoning or None, content))
+        return out
+
+    @pytest.mark.parametrize(
+        "ending, reply",
+        [
+            ("", REPLY),
+            (MESSAGE_END, REPLY),
+            ("\n" + MESSAGE_END, REPLY + "\n"),
+            (MESSAGE_END + "\n", REPLY + "\n"),
+            ("<|close|>mes", REPLY),
+        ],
+        ids=["cut-short", "whole", "space-between", "space-after", "cut-mid-marker"],
+    )
+    def test_a_channel_that_ends_on_the_answer_closer_was_the_reply(
+        self, ending, reply
+    ):
         """Kimi-K3 sometimes skips its think channel (~1M-token prompts) and
         writes the reply there. Streamed, it went out as reasoning before the
-        closer said otherwise, so every path returns it in both fields."""
+        closer said otherwise, so every path returns it in both fields.
+        Whitespace after the closer, and a marker cut off by `max_tokens`, are
+        not words after it."""
         text = self.REPLY + self.ANSWER_END + ending
-        assert self.K3.split(text) == (self.REPLY, self.REPLY)
+        reasoning = self.REPLY + ending.replace(self.MESSAGE_END, "")
+        for got in self._every_way(self.K3, text):
+            assert got == (reasoning, reply)
 
     def test_an_answer_closer_the_channel_goes_on_past_is_not_the_end(self):
         """Only the channel's last words count: a quoted closer leaves the
@@ -334,26 +363,37 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
             f"closes with {self.ANSWER_END} so{self.THINK_END}"
             f"{self.RESPONSE}ok{self.ANSWER_END}"
         )
-        assert self.K3.split(text) == ("closes with  so", "ok")
+        for got in self._every_way(self.K3, text):
+            assert got == ("closes with  so", "ok")
+
+    @pytest.mark.parametrize("exit_", ["THINK_END", "RESPONSE"])
+    def test_a_closer_then_the_exit_into_the_answer_is_not_the_reply(self, exit_):
+        """A draft that ends on the closer, followed by the think exit: the
+        model answered in its own channel, so the draft stays reasoning."""
+        text = (
+            f"draft{self.ANSWER_END}{getattr(self, exit_)}{self.RESPONSE}"
+            f"Final answer.{self.ANSWER_END}{self.MESSAGE_END}"
+        )
+        for got in self._every_way(self.K3, text):
+            assert got == ("draft", "Final answer.")
 
     def test_a_channel_the_model_opened_itself_reads_the_same(self):
         text = f"Note. <|open|>think<|sep|>{self.REPLY}{self.ANSWER_END}"
-        assert self.K3_CLOSED.split(text) == (self.REPLY, "Note. " + self.REPLY)
+        for got in self._every_way(self.K3_CLOSED, text):
+            assert got == (self.REPLY, "Note. " + self.REPLY)
 
     def test_a_call_after_the_reply_reaches_the_tool_parser(self):
         text = self.REPLY + self.ANSWER_END + self.CALL + self.MESSAGE_END
-        reasoning, content = self.K3.split(text)
-        answer, calls = parse_tool_calls(content, None, KimiK3Parser)
-        assert (reasoning, answer) == (self.REPLY, self.REPLY)
-        assert [c.function["name"] for c in calls] == ["get_weather"]
+        for reasoning, content in self._every_way(self.K3, text):
+            answer, calls = parse_tool_calls(content, None, KimiK3Parser)
+            assert (reasoning, answer) == (self.REPLY, self.REPLY)
+            assert [c.function["name"] for c in calls] == ["get_weather"]
 
-    def test_the_messages_and_responses_bodies_read_it_the_same(self):
-        """They build the non-streaming body with `read_whole_blocks`."""
-        text = self.REPLY + self.ANSWER_END + self.MESSAGE_END
-        events = read_whole_blocks(self.K3, KimiK3Parser, text)
-        reasoning = "".join(d for k, d in events if k == "reasoning")
-        content = "".join(d for k, d in events if k == "content")
-        assert (reasoning, content) == self.K3.split(text)
+    def test_with_thinking_off_a_leading_call_keeps_its_opener(self):
+        """Only the think exit at offset 0 means "declined to think"; the
+        tools opener there is a channel switch, and the call stays whole."""
+        for got in self._every_way(self.K3_CLOSED, self.CALL):
+            assert got == (None, self.CALL)
 
 
 class TestTheDialectIsReadFromWhicheverEvidenceExists:

@@ -745,6 +745,8 @@ def reasoning_shapes(dialect) -> list[str]:
                 out.add(a + answer_m + after + c)  # answer closed in the channel
                 out.add(a + open_m + b + answer_m + after + c)  # a self-opened one
             out.add(a + answer_m + b + end_m + c)  # and the channel then closes
+            out.add(a + answer_m + end_m + c)  # or closes right after it
+            out.add(a + answer_m + "\n" + c)  # whitespace after the closer
     return sorted(out)
 
 
@@ -852,48 +854,32 @@ class TestWhatTheReaderDoesWithAChannelThePromptDidNotOpen:
             )
 
 
-class TestTheReasoningSplitAgreesWithItself:
+class TestTheReasoningReadIsChunkInvariant:
     """The same rule as the class below, one stage earlier.
 
-    That class holds the *tool parser* to stream/non-stream agreement. Nothing
-    held the *reasoning* split to it, and it diverged: a model that answers,
-    opens a `<think>` block and answers again had the block extracted when
-    streamed, and handed to the client as literal tags with the chain of
-    thought inside `content` when not.
+    That class holds the *tool parser* to stream/non-stream agreement. Both
+    reasoning delivery modes are one reader -- the split is the filter run
+    over the whole output -- so what is left to hold is that the filter
+    answers the same however the output is chunked: the split's own bounded
+    pieces against 1-, 3- and 11-character chunks. What the answer *is* is
+    pinned elsewhere (`TestWhatTheReaderDoesWithAChannelThePromptDidNotOpen`
+    here, the K3 shapes in `test_reasoning.py`).
 
     One test per dialect rather than per shape. The corpus is a few thousand
     strings and pytest ids for each would outnumber the rest of this suite ten
     to one; the loop reports every divergence at once, which is also what you
     want when a change breaks a whole class of them.
 
-    Judged byte-for-byte. It could not be, until the two things stopping it
-    were removed: this path stripped, and the filter's own `lstrip("\n")`
-    after the end marker saw only what happened to be buffered, so the same
-    answer kept its newlines at one chunk size and lost them at another.
-    Neither survived the question of what it was for -- the newline a model
-    writes before its answer is not a marker, and only markers may be
-    removed. Across this corpus that took content agreement from 50% to 100%.
+    Judged byte-for-byte: the newline a model writes before its answer is not
+    a marker, and only markers may be removed.
     """
 
-    CHUNKS = (1, 3, 11, 10_000)
+    CHUNKS = (1, 3, 11)
 
     def _divergences(self, dialect, starts_thinking, field: int):
-        """Both readers through one `ReasoningChannel`, which is the point.
-
-        They used to be built here by hand -- `separate_reasoning(text,
-        starts_thinking=...)` and `ReasoningFilter(starts_thinking=...)`, both
-        without a dialect -- while the corpus was generated from the
-        *parametrised* dialect's markers. So for eight of the twelve cases
-        neither reader ever saw a marker, both returned the whole string as
-        one undifferentiated blob, and the two "agreed" about nothing.
-        Measured: a mutant that leaks an entire MiniMax chain of thought into
-        `content` passed the whole 3755-test suite.
-
-        `ReasoningChannel`'s own docstring names this failure -- "the
-        streaming filter got the second and never the first, and answered with
-        the union of every dialect's markers instead" -- so going through it
-        is not a workaround, it is the thing that was meant to be tested.
-        """
+        """Through one `ReasoningChannel`, with the corpus generated from the
+        same dialect's markers -- built by hand, the two once disagreed about
+        which dialect they were reading, and "agreed" about nothing."""
         channel = ReasoningChannel(dialect=dialect, starts_open=starts_thinking)
         out = []
         for text in reasoning_shapes(dialect):

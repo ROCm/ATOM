@@ -213,8 +213,8 @@ def read_whole_blocks(
 ) -> list:
     """One complete output as ordered events, reasoning included.
 
-    The streaming branch's own loop over a single chunk: the reasoning filter
-    first, the tool parser on the content segments it yields. `split()`
+    The streaming branch's own loop over the whole output: the reasoning
+    filter first, the tool parser on the content segments it yields. `split()`
     returns `(reasoning, content)` and loses the interleaving at that line, so
     blocks rebuilt from the pair put a whole answer in one block ahead of a
     `thinking` that belonged in the middle of it -- two blocks where streaming
@@ -228,7 +228,7 @@ def read_whole_blocks(
         tools=tools, parser_cls=parser_cls, suppress_calls=suppress_calls
     )
     out: list = []
-    for field, segment in reader.process(text) + reader.flush():
+    for field, segment in reader.read_whole(text):
         if not segment:
             continue
         if field == "reasoning_content":
