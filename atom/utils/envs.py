@@ -323,7 +323,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with aiter's FlyDSL kernel (gfx942, BF16 D256, one KV head per rank)
     # instead of qsa_sparse_paged_gqa. Other steps keep the native kernel.
     "ATOM_QSA_FLYDSL_ATTN": lambda: os.getenv("ATOM_QSA_FLYDSL_ATTN", "0") == "1",
-    # AITER MegaMoeTP (ROCm/aiter#6514) for Ulysses SP MoE layers. All or
+    # AITER MegaMoeTP (ROCm/aiter#7346) for Ulysses SP MoE layers. All or
     # nothing: one layer or rank it cannot serve keeps the native MoE everywhere.
     "ATOM_SP_MOE_MEGA": lambda: os.getenv("ATOM_SP_MOE_MEGA", "1") == "1",
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton

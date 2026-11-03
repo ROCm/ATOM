@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from atom.distributed.ulysses_sp import sp_gather_tokens, sp_local_slice
@@ -20,7 +21,12 @@ class SPModelWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
         num_tokens = input_ids.shape[0]
         rows = sp_local_slice(num_tokens)
         # Every range has the same length, so the last one may run past the
@@ -29,7 +35,15 @@ class SPModelWrapper(nn.Module):
         local_ids = input_ids.as_strided(
             (rows.stop - rows.start,), (1,), input_ids.storage_offset() + rows.start
         )
-        hidden_states = self.model(local_ids, positions)
+        if inputs_embeds is None:
+            hidden_states = self.model(local_ids, positions)
+        else:
+            # A multimodal prefill embeds the whole batch; zero-fill past its end.
+            local_embeds = inputs_embeds[rows]
+            local_embeds = F.pad(
+                local_embeds, (0, 0, 0, local_ids.shape[0] - local_embeds.shape[0])
+            )
+            hidden_states = self.model(local_ids, positions, inputs_embeds=local_embeds)
         if get_forward_context().context.is_prefill:
             return hidden_states
         return sp_gather_tokens(hidden_states, num_tokens)

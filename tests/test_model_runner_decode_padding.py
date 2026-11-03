@@ -6,14 +6,20 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from aiter_stubs import atom_without_aiter
 
-parallel_state = pytest.importorskip("aiter.dist.parallel_state")
 
-from atom.distributed import ulysses_sp
-from atom.model_engine import model_runner as runner_module
-from atom.utils import sp_wrapper
-from atom.utils.forward_context import ForwardMode
-from atom.utils.tbo.ubatching import sync_dp_metadata
+@pytest.fixture(scope="module")
+def modules():
+    with atom_without_aiter() as load:
+        yield SimpleNamespace(
+            parallel_state=load("aiter.dist.parallel_state"),
+            ulysses_sp=load("atom.distributed.ulysses_sp"),
+            runner=load("atom.model_engine.model_runner"),
+            sp_wrapper=load("atom.utils.sp_wrapper"),
+            forward_context=load("atom.utils.forward_context"),
+            ubatching=load("atom.utils.tbo.ubatching"),
+        )
 
 
 @pytest.mark.parametrize("sp_rank", [None, 0, 3])
@@ -33,6 +39,7 @@ from atom.utils.tbo.ubatching import sync_dp_metadata
 )
 def test_runner_model_height_and_sampling_rows(
     monkeypatch,
+    modules,
     sp_rank,
     mrope,
     dummy,
@@ -44,9 +51,13 @@ def test_runner_model_height_and_sampling_rows(
     prefill,
     token_graph,
 ):
-    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1 if sp_rank is None else 4)
+    ulysses_sp, sp_wrapper = modules.ulysses_sp, modules.sp_wrapper
+    runner_module = modules.runner
+    sp = SimpleNamespace(sequence_parallel_size=1 if sp_rank is None else 4)
+    monkeypatch.setattr(ulysses_sp, "get_current_atom_config", lambda: sp)
     group = SimpleNamespace(rank_in_group=sp_rank)
-    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(modules.parallel_state, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(runner_module, "pcp_stripe_count", lambda: 1)
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.sp_mega_moe = Mock()
@@ -69,7 +80,7 @@ def test_runner_model_height_and_sampling_rows(
         positions[:, :scheduled] = pos[:scheduled]
     else:
         positions = pos[:scheduled]
-    mode = ForwardMode(
+    mode = modules.forward_context.ForwardMode(
         use_cudagraph=token_graph,
         is_prefill=prefill,
         scheduled_bs=seqs,
@@ -79,7 +90,7 @@ def test_runner_model_height_and_sampling_rows(
         running_tokens_are_unified=unified,
         max_seqlen_q=q,
         tbo_collective_active=False,
-        sync=sync_dp_metadata(
+        sync=modules.ubatching.sync_dp_metadata(
             dp_group=None,
             dp_size=1,
             scheduled_tokens=scheduled,
@@ -166,7 +177,7 @@ def test_runner_model_height_and_sampling_rows(
     world = 1 if sp_rank is None else 4
     runner.sp_mega_moe.count_step.assert_called_once_with(-(-running // world))
     if sp_prefill:
-        assert hidden is None
+        torch.testing.assert_close(hidden, local_rows())
     else:
         assert hidden.shape == (scheduled, 1)
     torch.testing.assert_close(logits[:, 0], torch.arange(2, scheduled + 2).float())

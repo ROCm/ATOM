@@ -9,55 +9,78 @@ Dense weights are replicated; MoE weights remain sharded. SP uses AITER's PCP
 rank dimension and runs with ``-tp 1 -sp W``.
 """
 
-from functools import partial
-
 import torch
 
+from atom.config import get_current_atom_config
 from atom.distributed.token_transport import (
     ALLGATHER_MAX_PAYLOAD_BYTES,
     custom_gather_ok,
 )
 
 # AITER is imported where used: `forward_context` imports this module on CPU.
-# Set by ModelRunner.
-_SP_WORLD_SIZE: int = 1
-
-
-def set_sp_world_size(world_size: int) -> None:
-    """Record the configured SP width (called once per worker at startup)."""
-    global _SP_WORLD_SIZE
-    _SP_WORLD_SIZE = max(1, int(world_size))
 
 
 def get_sp_world_size() -> int:
-    return _SP_WORLD_SIZE
+    try:
+        config = get_current_atom_config()
+    except AssertionError:  # No config is set: layers built alone, as on CPU.
+        return 1
+    return config.sequence_parallel_size
 
 
 def sp_is_enabled() -> bool:
-    return _SP_WORLD_SIZE > 1
+    return get_sp_world_size() > 1
+
+
+def check_aiter_sp_api() -> None:
+    """Refuse an AITER without ROCm/aiter#7346 at startup, not at first use."""
+    from aiter.dist.device_communicators import (
+        communicator_cuda,
+        custom_all_reduce,
+        quick_all_reduce,
+    )
+    from aiter.ops import communication
+
+    needs = {
+        communicator_cuda.CudaCommunicator: ["all_to_all"],
+        custom_all_reduce.CustomAllreduce: ["registered_input_view", "head_exchange"],
+        quick_all_reduce.QuickAllReduce: ["quick_reduce_scatter"],
+        communication: ["MegaMoeSetupError"],
+    }
+    missing = [
+        name for api, names in needs.items() for name in names if not hasattr(api, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "Ulysses SP needs AITER with ROCm/aiter#7346; this AITER lacks "
+            + ", ".join(missing)
+        )
 
 
 def attn_head_shard_size() -> int:
     """Head-sharding factor used by attention, metadata, and KV-cache geometry."""
     from aiter.dist.parallel_state import get_tp_group
 
-    return get_tp_group().world_size * _SP_WORLD_SIZE
+    return get_tp_group().world_size * get_sp_world_size()
+
+
+def sp_head_shards(heads: int, shards: int) -> tuple[int, int]:
+    """(heads one rank holds, distinct head shards) of ``heads`` split over
+    ``shards`` ranks; when fewer, each head replicates to consecutive ranks."""
+    if heads % shards and shards % heads:
+        raise ValueError(
+            f"{heads} heads neither shard nor replicate evenly over {shards} ranks."
+        )
+    return max(1, heads // shards), min(heads, shards)
 
 
 def local_num_kv_heads(num_kv_heads: int) -> int:
-    """KV heads one rank holds: its share of ``num_kv_heads``, or a single
-    replicated head when the heads are fewer than the attention head shards."""
-    shards = attn_head_shard_size()
-    if num_kv_heads % shards and shards % num_kv_heads:
-        raise ValueError(
-            f"{num_kv_heads} KV heads neither shard nor replicate evenly over "
-            f"{shards} attention head shards."
-        )
-    return max(1, num_kv_heads // shards)
+    """KV heads one rank holds over the attention head shards."""
+    return sp_head_shards(num_kv_heads, attn_head_shard_size())[0]
 
 
-def check_sp_attention_layer(sp, name, sinks, alibi_slopes, rotary_emb, index_heads):
-    """Refuse what the config cannot see: per-layer features and indexer heads."""
+def check_sp_attention_layer(name, sinks, alibi_slopes, rotary_emb):
+    """Refuse the per-layer features the config cannot see."""
     if sinks is not None or alibi_slopes is not None:
         raise ValueError("Ulysses SP does not support attention sinks or ALiBi slopes.")
     # The model body sees only this rank's token shard, so RoPE must run in the
@@ -66,17 +89,11 @@ def check_sp_attention_layer(sp, name, sinks, alibi_slopes, rotary_emb, index_he
         raise ValueError(
             f"Ulysses SP requires RoPE inside the attention impl; {name} has none."
         )
-    # Indexer query heads shard or replicate like KV heads.
-    if index_heads % sp and sp % index_heads:
-        raise ValueError(
-            f"--sequence-parallel-size {sp} cannot shard the {index_heads} "
-            f"indexer query heads of {name}."
-        )
 
 
 def sp_local_len(total_tokens: int) -> int:
     """Rows of a ``total_tokens`` sequence each rank owns."""
-    return -(-total_tokens // _SP_WORLD_SIZE)
+    return -(-total_tokens // get_sp_world_size())
 
 
 def sp_local_slice(total_tokens: int) -> slice:
@@ -93,7 +110,7 @@ def sp_gather_tokens(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
     """All-gather every rank's token range and drop the rows past the sequence."""
     from aiter.dist.parallel_state import get_pcp_group
 
-    if _SP_WORLD_SIZE <= 1:
+    if not sp_is_enabled():
         return x
     communicator = get_pcp_group().device_communicator
     return communicator.all_gatherv(x.contiguous())[:total_tokens]
@@ -106,7 +123,7 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     """
     from aiter.dist.parallel_state import get_pcp_group
 
-    if _SP_WORLD_SIZE <= 1:
+    if not sp_is_enabled():
         return x[rows].contiguous()
     group = get_pcp_group()
     local, n = x.shape[0], rows.numel()
@@ -114,12 +131,6 @@ def sp_gather_rows(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     owner = rows.long() // local
     gathered = group.device_communicator.all_gatherv(picked)
     return gathered[owner * n + torch.arange(n, device=x.device)]
-
-
-SCATTER = 0  # zero means one head shard per rank
-REPLICATE = 1  # one shard, replicated on every rank
-# Other positive values specify how many head shards a field has. For GQA
-# with fewer KV heads than ranks, consecutive query-head owners share a shard.
 
 
 def _exchange(send, group):
@@ -130,44 +141,26 @@ def _exchange(send, group):
     return recv.reshape(recv.shape[0] * recv.shape[1], recv.shape[2])
 
 
-def exchange_tensors(tensors, shards, group):
-    """Exchange separate fields into one packed tensor with all sequence rows."""
-    w = _SP_WORLD_SIZE
-    widths = [t.shape[-1] // n for t, n in zip(tensors, shards)]
-    proto = tensors[0]
-    # Copy directly into the send buffer, replicating shared KV head shards.
-    send = proto.new_empty((w, proto.shape[0], sum(widths)))
-    col = 0
-    for tensor, width, n in zip(tensors, widths, shards):
-        field = tensor.view(tensor.shape[0], n, width).permute(1, 0, 2)
-        send[:, :, col : col + width].view(n, w // n, tensor.shape[0], width).copy_(
-            field[:, None]
-        )
-        col += width
-    return _exchange(send, group)
+def send_columns(fields, device) -> torch.Tensor:
+    """``[W, columns]``: the fused-qkv columns each rank receives, in order.
 
-
-def send_columns(spec, group, device) -> torch.Tensor:
-    """This rank's source columns of the fused fields in ``spec``, packed."""
-    w = _SP_WORLD_SIZE
-    # Device aranges also support first use during graph capture.
-    arange = partial(torch.arange, device=device)
-    ranges = []
-    for offset, width, mode in spec:
-        shards = mode or w
-        local = width // shards
-        start = offset + (group.rank_in_group // (w // shards)) * local
-        ranges.append(arange(local) + start)
-    return torch.cat(ranges)
-
-
-def exchange_columns(source, spec, group, columns):
-    """Exchange fused fields described by (column offset, width, head shards).
-
-    ``columns`` is ``send_columns(spec, ...)``, read by the all-gather path.
+    ``fields`` are the (heads, head dim) column ranges of the fused qkv; each
+    shards or replicates its heads as `sp_head_shards` says.
     """
-    if not custom_gather_ok(source, group, ALLGATHER_MAX_PAYLOAD_BYTES):
-        from atom.distributed.sp_kernels import pack_fields
+    w = get_sp_world_size()
+    columns, offset = [], 0
+    for heads, dim in fields:
+        local, shards = sp_head_shards(heads, w)
+        first = torch.arange(w) // (w // shards) * local * dim + offset
+        columns.append(first[:, None] + torch.arange(local * dim))
+        offset += heads * dim
+    return torch.cat(columns, 1).to(device=device, dtype=torch.int32)
 
-        return _exchange(pack_fields(source, tuple(spec), _SP_WORLD_SIZE), group)
-    return group.custom_all_gather(source).index_select(1, columns)
+
+def exchange_columns(source, group, columns):
+    """Give each rank its ``columns`` row of ``source`` for every token."""
+    if not custom_gather_ok(source, group, ALLGATHER_MAX_PAYLOAD_BYTES):
+        from atom.distributed.sp_kernels import pack_columns
+
+        return _exchange(pack_columns(source, columns), group)
+    return group.custom_all_gather(source).index_select(1, columns[group.rank_in_group])

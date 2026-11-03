@@ -7,7 +7,7 @@ import torch
 from conftest import atom_config_double
 
 from atom.config import Config
-from atom.distributed.ulysses_sp import check_sp_attention_layer
+from atom.distributed.ulysses_sp import check_sp_attention_layer, sp_head_shards
 from atom.models.minimax_m3.image_processing import image_input_refusal
 
 
@@ -37,7 +37,7 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
             num_attention_heads=query_heads, num_key_value_heads=kv_heads
         ),
     )
-    with pytest.raises(ValueError, match="incompatible"):
+    with pytest.raises(ValueError, match="evenly"):
         Config._init_sequence_parallel(config)
 
 
@@ -92,18 +92,18 @@ def test_dp_isolated_rlhf_workers_refuse_sp(monkeypatch):
 def test_sp_attention_needs_rope_in_the_impl():
     # A model that ropes before attention sees only its token shard there.
     with pytest.raises(ValueError, match="RoPE inside the attention impl"):
-        check_sp_attention_layer(4, "layers.0.attn", None, None, None, 0)
+        check_sp_attention_layer("layers.0.attn", None, None, None)
 
 
 @pytest.mark.parametrize(
-    "index_heads,world,ok", [(0, 4, True), (4, 8, True), (8, 4, True), (6, 4, False)]
+    "heads,world,split", [(8, 4, (2, 4)), (4, 8, (1, 4)), (1, 4, (1, 1)), (6, 4, None)]
 )
-def test_sp_indexer_heads_shard_or_replicate(index_heads, world, ok):
-    expect = nullcontext() if ok else pytest.raises(ValueError, match="cannot shard")
+def test_heads_shard_or_replicate(heads, world, split):
+    expect = (
+        pytest.raises(ValueError, match="evenly") if split is None else nullcontext()
+    )
     with expect:
-        check_sp_attention_layer(
-            world, "layers.0.attn", None, None, object(), index_heads
-        )
+        assert sp_head_shards(heads, world) == split
 
 
 def test_sp_does_not_share_compiled_artifacts():

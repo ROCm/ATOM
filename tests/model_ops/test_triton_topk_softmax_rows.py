@@ -2,27 +2,18 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Which layers take `triton_topk_softmax` and up to how many rows, on the
-GPU-less CI (through `test_comm_fused_moe`'s AITER / Triton stubs)."""
+GPU-less CI (through `tests/aiter_stubs.py`)."""
 
-import importlib
-import sys
 from types import SimpleNamespace
 
 import pytest
-from test_comm_fused_moe import _stubbed_external_kernel_modules
+from aiter_stubs import atom_under_stubs
 
 
 @pytest.fixture(scope="module")
 def topK():
-    saved = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "atom"}
-    with _stubbed_external_kernel_modules():
-        try:
-            yield importlib.import_module("atom.model_ops.topK")
-        finally:
-            for name in list(sys.modules):
-                if name.split(".")[0] == "atom" and name not in saved:
-                    sys.modules.pop(name)
-            sys.modules.update(saved)
+    with atom_under_stubs() as load:
+        yield load("atom.model_ops.topK")
 
 
 @pytest.fixture

@@ -172,8 +172,9 @@ class SPMegaMoE:
         activations to FP4 too. Small decode batches keep BF16 activations,
         which this MegaMoE kernel cannot produce.
 
-        Use the padded global row count, exactly as the native SP gather does.
-        All ranks make the same shape decision.
+        ``rows`` is this rank's share of the padded tokens; the decision is
+        on the global count, as the native SP gather sees it, so every rank
+        makes the same one.
         """
         runs = self._runs.get(rows)
         if runs is None:

@@ -18,18 +18,10 @@ from aiter.ops.quant import per_token_quant_hip
 from atom.config import get_current_atom_config
 from atom.distributed.token_transport import (
     gather_heads,
-    head_exchange_communicator,
+    head_exchange_view,
     takes_head_exchange,
 )
-from atom.distributed.ulysses_sp import (
-    REPLICATE,
-    SCATTER,
-    exchange_columns,
-    exchange_tensors,
-    get_sp_world_size,
-    send_columns,
-    sp_is_enabled,
-)
+from atom.distributed.ulysses_sp import exchange_columns, sp_is_enabled
 from atom.utils import mark_spliting_op
 
 
@@ -41,45 +33,10 @@ def ulysses_attention(
     Called inside the attention custom op, keeping collectives and padding
     slices opaque to Dynamo.
     """
-    w = get_sp_world_size()
     group = get_pcp_group()
-    kv_shards = min(w, key.shape[-1] // attn.head_dim)
-    if qkv is None:
-        packed = exchange_tensors([query, key, value], [w, kv_shards, kv_shards], group)
-    else:
-        # Fused kernels may also read indexer fields by column offset.
-        q_size, kv_size = query.shape[-1], key.shape[-1]
-        spec = [
-            (0, q_size, SCATTER),
-            (q_size, kv_size, kv_shards),
-            (q_size + kv_size, kv_size, kv_shards),
-        ]
-        if any(
-            t.untyped_storage().data_ptr() != qkv.untyped_storage().data_ptr()
-            or t.storage_offset() != qkv.storage_offset() + offset
-            for t, (offset, _, _) in zip((query, key, value), spec)
-        ):
-            raise ValueError(
-                "Ulysses SP: q/k/v must be the leading column ranges of the "
-                "fused qkv tensor when one is supplied."
-            )
-        tail = qkv.shape[-1] - (q_size + 2 * kv_size)
-        if tail > 0:
-            idx_dim = getattr(attn.impl, "index_head_dim", 0)
-            if not idx_dim:
-                raise ValueError(
-                    f"Ulysses SP: fused qkv has {tail} trailing columns but "
-                    f"{type(attn.impl).__name__} declares no indexer layout."
-                )
-            index_q_width = tail - idx_dim
-            index_q_start = qkv.shape[-1] - (index_q_width + idx_dim)
-            index_shards = min(w, index_q_width // idx_dim)
-            spec.append((index_q_start, index_q_width, index_shards))
-            spec.append((index_q_start + index_q_width, idx_dim, REPLICATE))
-        columns = attn.sp_send_columns
-        if columns is None or columns.device != qkv.device:
-            columns = attn.sp_send_columns = send_columns(spec, group, qkv.device)
-        packed = exchange_columns(qkv, spec, group, columns)
+    # The impl's declared fields cover the fused qkv, indexer columns included.
+    source = torch.cat([query, key, value], -1) if qkv is None else qkv
+    packed = exchange_columns(source, group, attn.sp_columns)
 
     # Global positions and attention metadata exclude the divisibility pad.
     real_tokens = positions.shape[-1]
@@ -88,8 +45,8 @@ def ulysses_attention(
         packed = packed[:real_tokens]
 
     # Attention accepts column views, so avoid another Q/K/V copy.
-    q_width = query.shape[-1] // w
-    kv_width = key.shape[-1] // kv_shards
+    q_width = attn.num_heads * attn.head_dim
+    kv_width = attn.num_kv_heads * attn.head_dim
     out = attn.impl.forward(
         query=packed[:, :q_width],
         key=packed[:, q_width : q_width + kv_width],
@@ -103,7 +60,7 @@ def ulysses_attention(
     # The head exchange restores the pad in its own send buffer.
     if output_transform is not None:
         return output_transform(out, padded_tokens)
-    return gather_heads(out, group, padded_tokens)
+    return gather_heads(out, group, padded_tokens, attn.sp_head_exchange)
 
 
 def sp_fp8_attention_output_supported() -> bool:
@@ -136,7 +93,7 @@ def _head_amax_kernel(X, AMAX, ROWS, STRIDE, WIDTH: tl.constexpr, BLOCK: tl.cons
 
 
 # One build for every rank.
-@triton.jit(do_not_specialize=["ROWS", "RANK"])
+@triton.jit(do_not_specialize=["ROWS", "TOKENS", "RANK"])
 def _quantize_global_amax_kernel(
     X,
     AMAX,
@@ -237,7 +194,7 @@ def quantize_with_gathered_amax(
 
 
 def gather_heads_fp8(
-    x: torch.Tensor, group, rows: int | None = None
+    x: torch.Tensor, group, rows: int | None = None, ca=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Replace BF16 head all-to-all followed by o_proj's FP8 quantizer.
 
@@ -256,10 +213,8 @@ def gather_heads_fp8(
         payload = gather_heads(x, group, rows)
         return per_token_quant_hip(payload, quant_dtype=dtypes.fp8)
     amax = group.device_communicator.all_gatherv(head_amax(x, rows))
-    # The FP8 payload has half the row bytes of x; the exchange needs 16B rows.
-    ca = head_exchange_communicator(x, group, rows) if x.shape[1] % 16 == 0 else None
-    shape = (rows, x.shape[1])
-    scratch = ca.registered_input_view(shape, dtypes.fp8) if ca is not None else None
+    # Quantize straight into the exchange's registered pool when it takes it.
+    scratch = head_exchange_view(ca, x, rows, dtypes.fp8)
     q, scale = quantize_with_gathered_amax(
         x,
         amax,
@@ -316,5 +271,7 @@ def sp_attention_fp8(
         positions,
         None,
         qkv,
-        output_transform=lambda out, rows: gather_heads_fp8(out, group, rows),
+        output_transform=lambda out, rows: gather_heads_fp8(
+            out, group, rows, attn.sp_head_exchange
+        ),
     )

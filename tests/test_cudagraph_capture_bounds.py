@@ -14,31 +14,41 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from aiter_stubs import atom_without_aiter
 
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
-from atom.model_engine import model_runner
-from atom.model_engine.model_runner import (
-    max_schedulable_decode_bs,
-    split_rows_graph_ladder,
-)
+@pytest.fixture(scope="module")
+def model_runner():
+    with atom_without_aiter() as load:
+        yield load("atom.model_engine.model_runner")
+
+
+@pytest.fixture
+def max_schedulable_decode_bs(model_runner):
+    return model_runner.max_schedulable_decode_bs
 
 
 class TestMaxSchedulableDecodeBs:
-    def test_sequence_count_binds_when_the_token_budget_is_ample(self):
+    def test_sequence_count_binds_when_the_token_budget_is_ample(
+        self, max_schedulable_decode_bs
+    ):
         # Default serving shape: 16384 // 4 = 4096 sequences' worth of budget,
         # far past max_num_seqs, so the sequence cap is what's left.
         assert max_schedulable_decode_bs(256, 16384, 4) == 256
 
-    def test_token_budget_binds_under_speculation(self):
+    def test_token_budget_binds_under_speculation(self, max_schedulable_decode_bs):
         # The regression: 256 sequences * (mtp_k=3 + 1) = 1024 > 512.
         assert max_schedulable_decode_bs(256, 512, 4) == 128
 
-    def test_no_speculation_charges_one_token_per_sequence(self):
+    def test_no_speculation_charges_one_token_per_sequence(
+        self, max_schedulable_decode_bs
+    ):
         assert max_schedulable_decode_bs(256, 512, 1) == 256
 
     @pytest.mark.parametrize("full_q_len", [1, 2, 4, 8])
-    def test_bound_is_never_exceeded_by_the_bucket_it_admits(self, full_q_len):
+    def test_bound_is_never_exceeded_by_the_bucket_it_admits(
+        self, max_schedulable_decode_bs, full_q_len
+    ):
         # The property the capture loop relies on: every admitted bs, at the
         # full speculative width, fits the token budget. Smaller q buckets fit
         # a fortiori, which is why one filter covers them all.
@@ -46,12 +56,14 @@ class TestMaxSchedulableDecodeBs:
         bs = max_schedulable_decode_bs(1024, budget, full_q_len)
         assert bs * full_q_len <= budget
 
-    def test_budget_below_one_sequence_yields_zero_not_a_partial_bucket(self):
+    def test_budget_below_one_sequence_yields_zero_not_a_partial_bucket(
+        self, max_schedulable_decode_bs
+    ):
         # Caller turns this into an actionable assert rather than capturing a
         # bucket it cannot fill.
         assert max_schedulable_decode_bs(256, 2, 4) == 0
 
-    def test_matches_the_scheduler_admission_loop(self):
+    def test_matches_the_scheduler_admission_loop(self, max_schedulable_decode_bs):
         # Mirrors `schedule_decode`: charge `tokens_per_decode_seq` per seq and
         # stop at either bound. Pins the two to each other rather than to a
         # comment — if the scheduler ever charges the replayed q instead of the
@@ -73,17 +85,21 @@ class TestMaxSchedulableDecodeBs:
 
 @pytest.mark.parametrize("sp", [2, 4, 8])
 @pytest.mark.parametrize("max_bs", [1, 2, 6, 12, 250, 512])
-def test_split_rows_graph_ladder_covers_every_schedulable_batch(sp, max_bs):
+def test_split_rows_graph_ladder_covers_every_schedulable_batch(
+    model_runner, sp, max_bs
+):
     # Rounding to SP multiples used to run past `max_bs` and get filtered out,
     # leaving the top batch sizes eager (or no ladder at all).
-    ladder = split_rows_graph_ladder(
+    ladder = model_runner.split_rows_graph_ladder(
         list(range(1, 9)) + list(range(16, 513, 16)), sp, max_bs
     )
     assert max(ladder) == max_bs
     assert len({-(-r // sp) for r in ladder}) == len(ladder)
 
 
-def test_memory_guard_skips_a_bucket_any_tp_or_pcp_rank_cannot_fit(monkeypatch):
+def test_memory_guard_skips_a_bucket_any_tp_or_pcp_rank_cannot_fit(
+    monkeypatch, model_runner
+):
     # A rank with ample free memory must still skip the bucket a peer skips,
     # or the peers' captured collectives pair mismatched buckets.
     groups = {"get_dp_group": 1, "get_tp_group": 1, "get_pcp_group": 4}

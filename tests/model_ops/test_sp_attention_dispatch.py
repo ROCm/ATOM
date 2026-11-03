@@ -5,84 +5,84 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-aiter = pytest.importorskip("aiter")
-
-from aiter.jit.utils import chip_info
+from aiter_stubs import atom_without_aiter
 
 from atom import config
-from atom.distributed import token_transport, ulysses_sp
-from atom.model_ops import sp_attention
+
+
+@pytest.fixture(scope="module")
+def modules():
+    with atom_without_aiter() as load:
+        yield SimpleNamespace(
+            aiter=load("aiter"),
+            chip_info=load("aiter.jit.utils.chip_info"),
+            norm_ops=load("aiter.ops.fused_qk_rmsnorm_group_quant"),
+            dtypes=load("aiter.utility.dtypes"),
+            token_transport=load("atom.distributed.token_transport"),
+            sp_attention=load("atom.model_ops.sp_attention"),
+            layernorm=load("atom.model_ops.layernorm"),
+        )
 
 
 @pytest.fixture
-def supported(monkeypatch):
-    settings = SimpleNamespace(torch_dtype=torch.bfloat16)
-    monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 4)
-    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(sp_attention.dtypes, "fp8", torch.float8_e4m3fn)
+def supported(monkeypatch, modules):
+    settings = SimpleNamespace(torch_dtype=torch.bfloat16, sequence_parallel_size=4)
+    monkeypatch.setattr(modules.chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(modules.sp_attention.dtypes, "fp8", torch.float8_e4m3fn)
     monkeypatch.setenv("ATOM_USE_CUSTOM_ALL_GATHER", "1")
     with config.use_custom_atom_config(settings):
         yield settings
 
 
-def _head_input(**overrides):
-    fields = {
-        "is_cuda": True,
-        "ndim": 2,
-        "shape": (8192, 2048),
-        "dtype": torch.bfloat16,
-        "element_size": lambda: 2,
-        "is_contiguous": lambda: True,
-    }
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
-def test_validated_layout_selects_fp8_without_opt_in(supported):
-    assert sp_attention.sp_fp8_attention_output_supported()
+def test_validated_layout_selects_fp8_without_opt_in(modules, supported):
+    assert modules.sp_attention.sp_fp8_attention_output_supported()
 
 
 @pytest.mark.parametrize("case", ["sp_off", "dtype", "gfx"])
-def test_unsupported_runtime_keeps_existing_kernels(monkeypatch, supported, case):
+def test_unsupported_runtime_keeps_existing_kernels(
+    monkeypatch, modules, supported, case
+):
     if case == "sp_off":
-        monkeypatch.setattr(ulysses_sp, "_SP_WORLD_SIZE", 1)
+        supported.sequence_parallel_size = 1
     elif case == "dtype":
         supported.torch_dtype = torch.float16
     else:
-        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
-    assert not sp_attention.sp_fp8_attention_output_supported()
+        monkeypatch.setattr(modules.chip_info, "get_gfx_runtime", lambda: "gfx942")
+    assert not modules.sp_attention.sp_fp8_attention_output_supported()
 
 
-def test_head_exchange_requires_usable_collective(supported):
+def test_head_exchange_requires_usable_collective(monkeypatch, modules, supported):
+    transport = modules.token_transport
     ca = SimpleNamespace(
         disabled=False,
         should_custom_ag=lambda x: True,
         should_head_exchange=lambda x: True,
+        registered_input_view=lambda shape, dtype: torch.empty(shape, dtype=dtype),
     )
-    group = SimpleNamespace(
-        world_size=4, device_communicator=SimpleNamespace(ca_comm=ca)
-    )
+    group = SimpleNamespace(device_communicator=SimpleNamespace(ca_comm=ca))
+    x = torch.ones(8, 16, dtype=torch.bfloat16)
 
-    def communicator(**overrides):
-        return token_transport.head_exchange_communicator(
-            _head_input(**overrides), group
-        )
+    def view(*args):
+        return transport.head_exchange_view(ca, x, *args)
 
-    assert communicator() is ca
-    for overrides in (
-        {"is_cuda": False},
-        {"shape": (4, 2048)},
-        {"dtype": torch.float16},
-    ):
-        assert communicator(**overrides) is None
-    ca.disabled = True
-    assert communicator() is None
-    ca.disabled = False
+    assert transport.head_exchange_comm(group) is ca
+    assert view(8) is x
+    # Padded rows, or the FP8 payload, are staged in the registered pool.
+    assert view(12).shape == (12, 16)
+    assert view(8, torch.float8_e4m3fn).dtype == torch.float8_e4m3fn
+    assert transport.head_exchange_view(None, x, 8) is None
+    assert transport.head_exchange_view(ca, x.half(), 8) is None
     for check in ("should_custom_ag", "should_head_exchange"):
         setattr(ca, check, lambda x: False)
-        assert communicator() is None
+        assert view(8) is None
         setattr(ca, check, lambda x: True)
+    ca.registered_input_view = lambda shape, dtype: None
+    assert view(12) is None and view(8) is x
+    ca.disabled = True
+    assert transport.head_exchange_comm(group) is None
+    ca.disabled = False
+    monkeypatch.setattr(modules.chip_info, "get_gfx_runtime", lambda: "gfx942")
+    assert transport.head_exchange_comm(group) is None
 
 
 class _Norm:
@@ -93,13 +93,9 @@ class _Norm:
         return hidden_states, residual
 
 
-def test_fp32_norm_quant_only_when_asked(monkeypatch):
+def test_fp32_norm_quant_only_when_asked(monkeypatch, modules):
     """Plain TP keeps the BF16-rounded quantization that mono matches."""
-    from aiter.ops import fused_qk_rmsnorm_group_quant as norm_ops
-    from aiter.utility import dtypes
-
-    from atom.model_ops import layernorm  # its Triton import needs a GPU
-
+    norm_ops, dtypes, layernorm = modules.norm_ops, modules.dtypes, modules.layernorm
     calls = []
     monkeypatch.setattr(layernorm, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
@@ -113,7 +109,7 @@ def test_fp32_norm_quant_only_when_asked(monkeypatch):
         calls.append("bf16")
         return x, x
 
-    monkeypatch.setattr(aiter, "get_hip_quant", lambda quant_type: quant)
+    monkeypatch.setattr(modules.aiter, "get_hip_quant", lambda quant_type: quant)
     x = torch.ones(2, 8, dtype=torch.bfloat16)
     layernorm.fused_allreduce_gemma_rms_norm_quant(x, x, _Norm())
     layernorm.gemma_rms_norm_quant(x, x, _Norm())
@@ -127,13 +123,9 @@ def test_fp32_norm_quant_only_when_asked(monkeypatch):
 
 
 @pytest.mark.parametrize("rows", [0, 2])
-def test_empty_rows_launch_no_norm_kernel(monkeypatch, rows):
+def test_empty_rows_launch_no_norm_kernel(monkeypatch, modules, rows):
     """An SP rank can hold no rows; an empty grid fails the next launch."""
-    from aiter.ops import fused_qk_rmsnorm_group_quant as norm_ops
-    from aiter.utility import dtypes
-
-    from atom.model_ops import layernorm
-
+    norm_ops, dtypes, layernorm = modules.norm_ops, modules.dtypes, modules.layernorm
     calls = []
     monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
     monkeypatch.setattr(
@@ -149,7 +141,7 @@ def test_empty_rows_launch_no_norm_kernel(monkeypatch, rows):
         calls.append("quant")
         return x, x[:, :1]
 
-    monkeypatch.setattr(aiter, "get_hip_quant", lambda quant_type: quant)
+    monkeypatch.setattr(modules.aiter, "get_hip_quant", lambda quant_type: quant)
     x = torch.ones(rows, 8, dtype=torch.bfloat16)
     out, res = layernorm.GemmaRMSNorm(8).forward_cuda(x, x)
     assert out.shape == res.shape == x.shape

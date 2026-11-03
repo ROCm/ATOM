@@ -59,8 +59,8 @@ Key entry points:
   the QKV exchange), `token_transport.py` (the head collectives),
   `group_agreement.py` (verdicts every rank of a CPU group takes alike); the
   model runs on a rank's token range through `atom/utils/sp_wrapper.py`; the
-  attention around them in `atom/model_ops/sp_attention.py`, and the prefill MoE
-  through AITER MegaMoE in `atom/model_ops/sp_mega_moe.py`
+  attention around them in `atom/model_ops/sp_attention.py`, and the MXFP4 MoE
+  through AITER MegaMoE in `atom/model_ops/fused_moe/sp_mega_moe.py`
 - Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
   (`runtime/`: TP consensus and a runner's bind-then-agree construction
   (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),

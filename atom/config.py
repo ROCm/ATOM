@@ -2336,7 +2336,8 @@ class Config:
             raise ValueError("Ulysses SP is not validated with pipeline parallelism.")
         if self.enable_expert_parallel:
             raise ValueError("Ulysses SP is not validated with expert parallelism.")
-        if self.prefill_context_parallel_size not in (1, sp):
+        # SP takes over this field below; a user-set one would be striped PCP.
+        if self.prefill_context_parallel_size != 1:
             raise ValueError(
                 "--sequence-parallel-size and --prefill-context-parallel-size "
                 "both claim the same rank dimension; set only one."
@@ -2372,19 +2373,15 @@ class Config:
                 "Ulysses SP supports MHA models only; MLA and recurrent "
                 "attention do not exchange SP token shards."
             )
-        for name in ("num_attention_heads", "num_key_value_heads"):
-            heads = getattr(hf_text, name, None)
-            if heads is None:
-                continue
-            valid = heads % sp == 0
-            if name == "num_key_value_heads" and heads < sp:
-                valid = sp % heads == 0
-            if not valid:
-                raise ValueError(
-                    f"--sequence-parallel-size {sp} is incompatible with "
-                    f"{name} ({heads}): heads must divide evenly across ranks, "
-                    "or KV heads must replicate evenly to query-head owners."
-                )
+        from atom.distributed.ulysses_sp import sp_head_shards
+
+        heads = hf_text.num_attention_heads
+        if heads % sp:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} does not shard the {heads} "
+                "query heads evenly."
+            )
+        sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
         self.prefill_context_parallel_size = sp
 
     def __post_init__(self):

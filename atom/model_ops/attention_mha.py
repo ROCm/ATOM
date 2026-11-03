@@ -44,6 +44,11 @@ class PagedAttentionImpl(nn.Module):
     Attention paged implementation
     """
 
+    @staticmethod
+    def qkv_fields(num_heads, num_kv_heads, head_dim, **kwargs):
+        """(heads, head dim) of each column range of the fused qkv, in order."""
+        return [(num_heads, head_dim)] + [(num_kv_heads, head_dim)] * 2
+
     def __init__(
         self,
         num_heads,
@@ -1217,6 +1222,14 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
     is_indexed_sparse_attention = True
 
+    @staticmethod
+    def qkv_fields(num_heads, num_kv_heads, head_dim, index_head_dim=0, **kwargs):
+        # The indexer's queries (one head per kv head), then its one key head.
+        return PagedAttentionImpl.qkv_fields(num_heads, num_kv_heads, head_dim) + [
+            (num_kv_heads, index_head_dim),
+            (1, index_head_dim),
+        ]
+
     def __init__(
         self,
         num_heads,
@@ -1239,7 +1252,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         index_q_norm: torch.nn.Module | None = None,
         index_k_norm: torch.nn.Module | None = None,
         index_rotary_emb: torch.nn.Module | None = None,
-        index_q_size: int = 0,
         index_head_dim: int = 0,
         topk: int = 0,
         init_blocks: int = 0,
@@ -1297,11 +1309,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         self.num_idx_heads = (
             self.indexer_cp_world if self.indexer_cp_group is not None else num_kv_heads
         )
-        self.index_q_size = (
-            self.num_idx_heads * index_head_dim
-            if self.indexer_cp_group is not None
-            else index_q_size
-        )
+        self.index_q_size = self.num_idx_heads * index_head_dim
         self.topk = topk
         self.init_blocks = init_blocks
         self.local_blocks = local_blocks

@@ -52,11 +52,14 @@ def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     return out
 
 
-def gather_heads(x: torch.Tensor, group, rows: int | None = None) -> torch.Tensor:
+def gather_heads(
+    x: torch.Tensor, group, rows: int | None = None, ca=None
+) -> torch.Tensor:
     """``[S, H/W*D] -> [S/W, H*D]``: give up the sequence, regain all heads.
 
     ``x`` may hold only the leading rows of S = ``rows``; the rest are sent as
-    zeros, padded inside the send buffer.
+    zeros, padded inside the send buffer. ``ca`` is the layer's
+    `head_exchange_comm`.
     """
     w = group.world_size
     if w <= 1:
@@ -67,15 +70,16 @@ def gather_heads(x: torch.Tensor, group, rows: int | None = None) -> torch.Tenso
     row_bytes = x.shape[1] * x.element_size()
     # AITER's last-dimension gather requires 16-byte alignment.
     small = row_bytes % 16 == 0 and rows * row_bytes <= ALLGATHER_MAX_PAYLOAD_BYTES
-    ca = None if small else head_exchange_communicator(x, group, rows)
-    if ca is not None:
-        if x.shape[0] == rows:
-            return ca.head_exchange(x)
+    view = None
+    if not small and takes_head_exchange(rows, w):
+        view = head_exchange_view(ca, x, rows)
+    if view is x:
+        return ca.head_exchange(x)
+    if view is not None:
         # Pad in the registered pool: this copy replaces the exchange's own.
-        staged = ca.registered_input_view((rows, x.shape[1]), x.dtype)
-        staged[: x.shape[0]].copy_(x)
-        staged[x.shape[0] :].zero_()
-        return ca.head_exchange(staged, registered=True)
+        view[: x.shape[0]].copy_(x)
+        view[x.shape[0] :].zero_()
+        return ca.head_exchange(view, registered=True)
     x = _pad_rows(x, rows)
     if small and custom_gather_ok(x, group):
         start = group.rank_in_group * s_local
@@ -88,30 +92,35 @@ def gather_heads(x: torch.Tensor, group, rows: int | None = None) -> torch.Tenso
 
 
 def takes_head_exchange(rows: int, world: int) -> bool:
-    """Whether an attention output of ``rows`` rows is a prefill one."""
+    """Whether an attention output of ``rows`` rows is long enough for the
+    four-rank head exchange."""
     return rows >= world * HEAD_EXCHANGE_MIN_LOCAL_ROWS
 
 
-def head_exchange_communicator(x, group, rows: int | None = None):
-    """Select the four-rank prefill exchange for ``x`` padded to ``rows``;
-    decode uses the regular gather."""
-    rows = x.shape[0] if rows is None else rows
-    if (
-        not x.is_cuda
-        or not takes_head_exchange(rows, group.world_size)
-        or x.dtype != torch.bfloat16
-    ):
-        return None
-    ca = _ca_comm(group)
-    if ca is None:
-        return None
-    if rows != x.shape[0]:
-        # A padded input is exchanged from the registered pool.
-        x = ca.registered_input_view((rows, x.shape[1]), x.dtype)
-        if x is None:
-            return None
-    if not custom_gather_ok(x, group) or not ca.should_head_exchange(x):
+def head_exchange_comm(group):
+    """The communicator of the four-rank head exchange, if the env and GPU
+    allow it. Static: a layer decides it once, when built."""
+    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
         return None
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return ca if get_gfx_runtime() == "gfx950" else None
+    return _ca_comm(group) if get_gfx_runtime() == "gfx950" else None
+
+
+def head_exchange_view(ca, x: torch.Tensor, rows: int, dtype=None):
+    """The ``[rows, x.shape[1]]`` buffer of ``dtype`` that ``ca`` exchanges
+    from: ``x`` itself when it fits as is, else a registered staging view.
+    None when the exchange does not take it."""
+    dtype = x.dtype if dtype is None else dtype
+    if ca is None or x.dtype != torch.bfloat16:
+        return None
+    if (rows, dtype) == (x.shape[0], x.dtype):
+        view = x
+    else:
+        view = ca.registered_input_view((rows, x.shape[1]), dtype)
+        if view is None:
+            return None
+    wire = view.view(torch.bfloat16)
+    if ca.should_custom_ag(wire) and ca.should_head_exchange(wire):
+        return view
+    return None

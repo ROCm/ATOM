@@ -603,7 +603,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             index_q_norm=self.index_q_norm,
             index_k_norm=self.index_k_norm,
             index_rotary_emb=self.index_rotary_emb,
-            index_q_size=self.index_q_size,
             index_head_dim=self.idx_head_dim,
             topk=self.topk_blocks,
             init_blocks=self.init_blocks,

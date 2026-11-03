@@ -162,10 +162,10 @@ def pcp_reduce_scatter(
     input_: torch.Tensor, pcp_size: int | None = None
 ) -> torch.Tensor:
     """Sum the pcp-half across ranks and scatter dim0 back to this rank's 1/W
-    stripe via a plain reduce_scatter (dim=0). Inverse of the rank-major gather
-    (FusedMoE._run_experts gathers its routed rows that way). Only SP may take
-    AITER's QuickReduce reduce-scatter, lossy INT4 under
-    AITER_QUICK_REDUCE_QUANTIZATION=INT4; PCP merge alone stays exact."""
+    stripe. Inverse of the rank-major gather (FusedMoE._run_experts gathers its
+    routed rows that way). PCP merge alone takes the exact reduce_scatter; SP
+    may take AITER's QuickReduce one, lossy INT4 under
+    AITER_QUICK_REDUCE_QUANTIZATION=INT4."""
     if pcp_size is None:
         pcp_size = get_pcp_world_size()
     if pcp_size <= 1:

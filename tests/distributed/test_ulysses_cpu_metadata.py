@@ -6,11 +6,26 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from aiter_stubs import atom_without_aiter
 
 from atom.distributed import ulysses_sp as sp
 
 
+@pytest.fixture(scope="module")
+def embed_head():
+    with atom_without_aiter() as load:
+        yield load("atom.model_ops.embed_head")
+
+
+@pytest.fixture(scope="module")
+def sp_wrapper():
+    with atom_without_aiter() as load:
+        yield load("atom.utils.sp_wrapper")
+
+
 def _on_each_rank(monkeypatch, world, fn, all_gatherv=None):
+    settings = SimpleNamespace(sequence_parallel_size=world)
+    monkeypatch.setattr(sp, "get_current_atom_config", lambda: settings)
     parallel_state = ModuleType("aiter.dist.parallel_state")
     monkeypatch.setitem(sys.modules, parallel_state.__name__, parallel_state)
     out = []
@@ -27,7 +42,6 @@ def _on_each_rank(monkeypatch, world, fn, all_gatherv=None):
 @pytest.mark.parametrize("world", [2, 4])
 @pytest.mark.parametrize("total", [1, 3, 5, 17])
 def test_rank_ranges_tile_the_sequence_in_order(monkeypatch, world, total):
-    monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
     ranges = _on_each_rank(monkeypatch, world, lambda _: sp.sp_local_slice(total))
     rows = [row for r in ranges for row in range(r.start, r.stop)]
     assert rows == list(range(len(rows))) and total <= len(rows) < total + world
@@ -39,7 +53,6 @@ def test_gather_rows_matches_full_gather(monkeypatch, world):
     # rank, on a range's first and last row, and next to the rows past the end.
     buffer, rows = torch.randn(16, 8), torch.tensor([0, 3, 6, 7, 9, 12])
     hidden = buffer[:13]
-    monkeypatch.setattr(sp, "_SP_WORLD_SIZE", world)
 
     def on_each_rank(fn, all_gatherv=None):
         return _on_each_rank(monkeypatch, world, fn, all_gatherv)
@@ -57,8 +70,27 @@ def test_gather_rows_matches_full_gather(monkeypatch, world):
 
 
 @pytest.mark.parametrize("world", [2, 4])
-def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, world):
-    embed_head = pytest.importorskip("atom.model_ops.embed_head", exc_type=ImportError)
+def test_multimodal_embeddings_follow_the_token_range(monkeypatch, sp_wrapper, world):
+    ids, embeds = torch.arange(16), torch.randn(5, 8)
+    ctx = SimpleNamespace(context=SimpleNamespace(is_prefill=True))
+    monkeypatch.setattr(sp_wrapper, "get_forward_context", lambda: ctx)
+
+    def model(input_ids, positions, inputs_embeds):
+        assert inputs_embeds.shape[0] == input_ids.shape[0]
+        return inputs_embeds
+
+    wrapper = sp_wrapper.SPModelWrapper(model)
+    shards = _on_each_rank(
+        monkeypatch, world, lambda _: wrapper(ids[:5], ids[:5], inputs_embeds=embeds)
+    )
+    local = -(-5 // world)
+    torch.testing.assert_close(
+        torch.cat(shards), torch.cat([embeds, embeds.new_zeros(world * local - 5, 8)])
+    )
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_vocab_sharded_lm_head_matches_the_full_head(monkeypatch, embed_head, world):
     x, weight = torch.randn(3, 8), torch.randn(4 * world, 8)
     head = embed_head.ParallelLMHead.__new__(embed_head.ParallelLMHead)
     torch.nn.Module.__init__(head)

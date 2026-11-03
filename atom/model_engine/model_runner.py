@@ -46,9 +46,9 @@ from atom.distributed.pp_comm import (
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
 from atom.distributed.ulysses_sp import (
+    check_aiter_sp_api,
     get_sp_world_size,
     local_num_kv_heads,
-    set_sp_world_size,
     sp_is_enabled,
     sp_local_len,
 )
@@ -866,7 +866,7 @@ class ModelRunner:
         self._build_and_load_model(model_class)
         # After weight processing, before warmup and capture. Here rather than in
         # the loader so a runner that builds its model differently still sets it.
-        from atom.model_ops.sp_mega_moe import initialize_sp_mega_moe
+        from atom.model_ops.fused_moe.sp_mega_moe import initialize_sp_mega_moe
 
         self.sp_mega_moe = initialize_sp_mega_moe(self.model, config)
 
@@ -1043,8 +1043,8 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
-        # Attention layers, KV pools and metadata need the SP head count.
-        set_sp_world_size(config.sequence_parallel_size)
+        if sp_is_enabled():
+            check_aiter_sp_api()
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
         # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
@@ -3230,24 +3230,17 @@ class ModelRunner:
                             model_output, _pcp_bal_groups, _pcp_size
                         )
                     # Middle chunk: no logits, but drafter needs hidden states.
-                    # SP refuses drafters, so its token shards stay local.
-                    hidden_states = None if sp_is_enabled() else model_output
+                    hidden_states = model_output
                     logits = None
                 else:
                     if _pcp_tbo_balanced:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    if sp_is_enabled() and is_prefill:
-                        # SP prefill keeps this rank's token range; the LM head
-                        # gathers only each prompt's last row.
-                        hidden_states = None
-                        logits = self.model.compute_logits(model_output)
-                    else:
-                        # PP carries the full run between stages. Only the last
-                        # stage returns scheduled rows to sampling/draft consumers.
-                        hidden_states = model_output[: context.scheduled_tokens]
-                        logits = self.model.compute_logits(hidden_states)
+                    # PP carries the full run between stages. Only the last
+                    # stage returns scheduled rows to sampling/draft consumers.
+                    hidden_states = model_output[: context.scheduled_tokens]
+                    logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
