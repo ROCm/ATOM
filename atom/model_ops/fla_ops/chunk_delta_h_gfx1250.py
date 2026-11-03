@@ -213,8 +213,16 @@ def _chunk_h_gfx1250_kernel(
         c = gl.minimum(i, NT - 1) * BT
         if PAIRED:
             _load_pairs(
-                w_desc, k_desc, u_desc, g_desc, w_smem.index(i), k_smem.index(i),
-                u_smem.index(i), g_smem.index(i), c, v0,
+                w_desc,
+                k_desc,
+                u_desc,
+                g_desc,
+                w_smem.index(i),
+                k_smem.index(i),
+                u_smem.index(i),
+                g_smem.index(i),
+                c,
+                v0,
             )
         else:
             gl.amd.gfx1250.tdm.async_load(w_desc, [c, 0], w_smem.index(i))
@@ -266,8 +274,16 @@ def _chunk_h_gfx1250_kernel(
         nbuf = (i_t + NB - 1) % NB
         if PAIRED:
             _load_pairs(
-                w_desc, k_desc, u_desc, g_desc, w_smem.index(nbuf), k_smem.index(nbuf),
-                u_smem.index(nbuf), g_smem.index(nbuf), nxt, v0,
+                w_desc,
+                k_desc,
+                u_desc,
+                g_desc,
+                w_smem.index(nbuf),
+                k_smem.index(nbuf),
+                u_smem.index(nbuf),
+                g_smem.index(nbuf),
+                nxt,
+                v0,
             )
         else:
             gl.amd.gfx1250.tdm.async_load(w_desc, [nxt, 0], w_smem.index(nbuf))

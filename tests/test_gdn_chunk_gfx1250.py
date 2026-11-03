@@ -192,7 +192,9 @@ def test_fused_gate_matches_layer_norm(monkeypatch):
     assert torch.equal(fused, raw)
 
 
-@pytest.mark.parametrize("lens,H,Hg", [([3000, 700, 5], 32, 16), ([900, 2100, 30], 8, 4)])
+@pytest.mark.parametrize(
+    "lens,H,Hg", [([3000, 700, 5], 32, 16), ([900, 2100, 30], 8, 4)]
+)
 def test_fast_norm_close_to_exact(lens, H, Hg, monkeypatch):
     """ATOM_GDN_CHUNK_O_FAST_NORM: within a bf16 rounding step of the exact norm."""
     x = _inputs(lens, H, Hg)
