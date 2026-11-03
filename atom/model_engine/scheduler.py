@@ -40,7 +40,6 @@ from atom.model_engine.block_manager import (
     BlockManager,
     draft_kv_lookahead,
 )
-from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -48,6 +47,7 @@ from atom.model_engine.dynamic_chunking import (
     chunk_alignment,
     has_sole_prefill,
 )
+from atom.model_engine.early_load import EarlyLoadState
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.prefill_delayer import PrefillDecision
@@ -4186,11 +4186,14 @@ class Scheduler:
         )
         oj = seq.offload_joint
         if parks:
-            if oj.load_hash != -1 and not oj.boundary_tokens:
-                # Two transfers, one report (see Phase 2): drop the state one.
-                if not self.block_manager.cancel_state_load(seq):
-                    self._early_load_take_back(seq, prev_hit, cancel_state=False)
-                    return True
+            # Two transfers, one report (see Phase 2): drop the state one.
+            if (
+                oj.load_hash != -1
+                and not oj.boundary_tokens
+                and not self.block_manager.cancel_state_load(seq)
+            ):
+                self._early_load_take_back(seq, prev_hit, cancel_state=False)
+                return True
         elif oj.boundary_tokens or oj.load_hash == -1:
             # Nothing to wait for, or a joint boundary Phase 2 resolves by
             # prefilling: this request prefills locally, at its turn.

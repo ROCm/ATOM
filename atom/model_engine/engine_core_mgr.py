@@ -1587,8 +1587,8 @@ class CoreManager:
         (A) when the lightest rank is about to run out of prefill work (below
         IDLE_TOKENS queued) while the owner has a backlog (above
         OWNER_BACKLOG_TOKENS), or (B) when the owner's queued prefill exceeds
-        RATIO x the lightest rank's, which caps the tail without a fixed token
-        gap that would mean different things at different concurrency.
+        RATIO x the lightest rank's (RATIO <= 0, the default, disables B: once
+        both ranks have queued prefill, moving only reorders who waits).
         """
         if owner == lightest:
             return True
@@ -1596,6 +1596,8 @@ class CoreManager:
         q_light = self._rank_tokens[lightest]
         if q_light < self._prefix_idle_tokens:
             return q_owner <= self._prefix_owner_backlog_tokens
+        if self._prefix_ratio <= 0:
+            return True
         return q_owner <= self._prefix_ratio * q_light
 
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
