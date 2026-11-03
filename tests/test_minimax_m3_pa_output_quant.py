@@ -22,9 +22,9 @@ class _OProj:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, values, x_scale=None):
-        self.calls.append((values, x_scale))
-        return values
+    def __call__(self, values, x_scale=None, out=None):
+        self.calls.append((values, x_scale, out))
+        return values if out is None else out
 
 
 class _QuantAttention:
@@ -65,11 +65,32 @@ def test_sparse_model_hands_fused_fp8_and_token_scale_to_o_proj():
 
     assert not layer.attn.plain_calls
     assert len(layer.attn.quant_calls) == 1
-    values, scale = layer.o_proj.calls[0]
+    values, scale, out = layer.o_proj.calls[0]
     assert result is values
+    assert out is None
     assert values.dtype == torch.uint8
     assert scale.shape == (3, 1)
     assert scale.dtype == torch.float32
+
+
+def test_sparse_model_fused_quant_preserves_registered_output_alias():
+    layer = _sparse_layer(fused=True)
+    packed = torch.randn(3, 12)
+    destination = torch.empty(3, 12)
+
+    result = MiniMaxM3SparseAttention.forward(
+        layer,
+        torch.arange(3),
+        packed,
+        hidden_states_scale=None,
+        out=destination,
+    )
+
+    values, scale, out = layer.o_proj.calls[0]
+    assert values.dtype == torch.uint8
+    assert scale.shape == (3, 1)
+    assert out is destination
+    assert result.data_ptr() == destination.data_ptr()
 
 
 def test_sparse_model_default_path_keeps_o_proj_api_unchanged():
@@ -81,8 +102,9 @@ def test_sparse_model_default_path_keeps_o_proj_api_unchanged():
 
     assert not layer.attn.quant_calls
     assert len(layer.attn.plain_calls) == 1
-    _, scale = layer.o_proj.calls[0]
+    _, scale, out = layer.o_proj.calls[0]
     assert scale is None
+    assert out is None
 
 
 def test_sparse_runner_forces_flydsl_and_preserves_token_scale_layout(monkeypatch):

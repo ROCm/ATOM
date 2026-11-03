@@ -16,6 +16,7 @@ from aiter import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
+    gemm_a8w8_bpreshuffle_out,
     get_hip_quant,
 )
 
@@ -1456,8 +1457,8 @@ class LinearBase(nn.Module):
 
     def supports_out(self) -> bool:
         """Whether `forward(out=...)` is wired for this Linear: the unquantised
-        GEMM (`tgemm.mm`) and the per_1x128 preshuffle GEMM write into a
-        caller-owned destination.
+        GEMM (`tgemm.mm`), PTPC-FP8 preshuffle GEMM, and per_1x128 preshuffle
+        GEMM write into a caller-owned destination.
 
         Computed on access rather than cached at construction -- `quant_type` is
         rewritten when online quantisation is configured, well after __init__.
@@ -1466,6 +1467,13 @@ class LinearBase(nn.Module):
             return False
         if self.quant_type.value == QuantType.No.value:
             return True
+        if self.quant_type.value == QuantType.per_Token.value:
+            return (
+                self.params_dtype == dtypes.fp8
+                and not use_triton_gemm()
+                and self.bias is None
+                and not self.is_output_padded
+            )
         return (
             self.quant_type.value == QuantType.per_1x128.value
             and bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
@@ -1572,13 +1580,23 @@ class LinearBase(nn.Module):
                         dtype=otype,
                     )
                 else:
-                    y = gemm_a8w8_bpreshuffle(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        dtype=otype,
-                    )
+                    if out is None:
+                        y = gemm_a8w8_bpreshuffle(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            dtype=otype,
+                        )
+                    else:
+                        gemm_a8w8_bpreshuffle_out(
+                            out,
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                        )
+                        y = out
                     if self.bias is not None:
                         y += self.bias
             elif self.quant_type.value == QuantType.per_1x128.value:
