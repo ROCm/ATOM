@@ -28,8 +28,11 @@ def main_thread_omp_guard():
     to ``pytest.skip`` ("one intra-op thread already").
     """
     default = torch.get_num_threads()
+    # The tests patch loading_core._omp_set_num_threads, so keep the real one.
+    real_set = loading_core._omp_set_num_threads
     yield default
-    loading_core._omp_set_num_threads(default)
+    if real_set is not None:
+        real_set(default)
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +42,17 @@ def test_omp_resolved_from_torch_extension():
     """The module-level symbol comes from the same library torch uses."""
     assert loading_core._omp_set_num_threads is not None
     assert callable(loading_core._omp_set_num_threads)
+
+
+@pytest.mark.parametrize("error", [AttributeError, OSError, TypeError])
+def test_resolve_returns_none_when_the_symbol_is_unavailable(monkeypatch, error):
+    """A torch without the symbol must not break the import of loading_core."""
+
+    def _fail(path):
+        raise error("unavailable")
+
+    monkeypatch.setattr(loading_core.ctypes, "CDLL", _fail)
+    assert loading_core._resolve_omp_set_num_threads() is None
 
 
 def test_one_omp_thread_succeeds_on_first_attempt(monkeypatch, main_thread_omp_guard):

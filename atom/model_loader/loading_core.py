@@ -100,13 +100,22 @@ def verify_shard_files_present(model_name_or_path: str) -> None:
 # make the entire module unimportable — the failure surfaces later, when
 # _one_omp_thread is actually called, with a clear message.
 # ---------------------------------------------------------------------------
-_omp_set_num_threads = None
-try:
-    _omp_set_num_threads = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
-    _omp_set_num_threads.argtypes = [ctypes.c_int]
-    _omp_set_num_threads.restype = None
-except (OSError, TypeError):
-    pass
+def _resolve_omp_set_num_threads():
+    """``omp_set_num_threads`` from torch's OpenMP runtime, or None.
+
+    None when torch._C cannot be opened (OSError), has no file (TypeError),
+    or its runtime has no such symbol (AttributeError).
+    """
+    try:
+        setter = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
+    except (AttributeError, OSError, TypeError):
+        return None
+    setter.argtypes = [ctypes.c_int]
+    setter.restype = None
+    return setter
+
+
+_omp_set_num_threads = _resolve_omp_set_num_threads()
 
 
 def _one_omp_thread() -> None:
