@@ -36,6 +36,16 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
 
+## Tensor parallelism across nodes
+
+One TP group over several nodes (`--tensor-parallel-size-local`, `--tensor-parallel-rank`): the node that runs TP rank 0 runs the engine and the API server, the others only their workers.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | How many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, the engine waits this long for every remote rank to subscribe to its broadcast queue, and a rank waits this long on the model-runner store (for the NCCL id of a communicator created on first use). It is also the floor for the timeout of the process groups created without one, the default group and aiter's TP groups: it raises torch's defaults (30 minutes for gloo, 10 for NCCL) and never lowers them. Must be finite and positive. |
+
+Every node reads its own environment, so a variable that changes what a rank computes must have the same value on every node. In particular, on gfx1250 `AITER_MLA_DECODE_PS1_FLYDSL` decides whether DCP decode runs persistent. Nodes that disagree size the gathered heads and the work metadata differently, and the DCP all-gather and merge then disagree across the group: it hangs, returns wrong output, or aborts on half the ranks with `only support page_size == 64`. Nothing checks this at startup.
+
 ## Prefill delayer (TP/DCP and DP attention)
 
 Coalesces waiting prefills while decode continues. DP attention enables it by
@@ -478,7 +488,6 @@ the host, give each its own endpoints.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_SHUTDOWN_TIMEOUT_S** | float | 5 | Seconds that shutdown waits for child processes to exit on their own before terminating them (SIGTERM, then SIGKILL): the server process waits this long for its EngineCores, and each EngineCore for its ModelRunner workers. All the children of one process share the same deadline. Must be finite and positive. Raise it when workers need longer to finish on exit, for example to write a profiler's output (`rocprofv3` writing a thread trace can take minutes). Set it before starting the server; every process reads it. |
-| **ATOM_MULTINODE_TP_TIMEOUT_S** | float | 1800 | When one TP group spans nodes (`--tensor-parallel-size-local`), how many seconds the nodes wait for each other at startup: a node that runs only workers waits this long for the engine's endpoints, and the engine waits this long for every remote rank to subscribe to its broadcast queue. Must be finite and positive. |
 
 ## Profiling & debugging
 
