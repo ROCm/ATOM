@@ -116,7 +116,16 @@ percentiles. Prefill and decode request contexts are exact gauges.
 KV block partition counts are maintained as blocks change state; snapshot
 collection does not scan the free block pool.
 
-Both request context gauges replace the former histograms of the same names;
+Both request context gauges are **disabled by default**. For a short diagnostic
+capture, pass `--enable-request-context-metrics` when starting the server.
+For PD deployments, pass it separately to each P/D service to be diagnosed.
+The option is disabled by default for both roles and standalone serving.
+Python callers can set `enable_request_context_metrics=True` on `LLM(...)`.
+When disabled, these gauges are not registered and no per-request samples are
+written. Aggregate context histograms, queue and batch
+metrics, cache counters and the independent GPU timing option are unaffected.
+
+These gauges replace the former histograms of the same names;
 their `_bucket`, `_count`, and `_sum` series are no longer emitted. Reports show
 exact request points, a table, and CSV rows instead of P50/P99 curves. The
 `started_at` label records the first dispatch time for that phase, not scrape time.
@@ -128,16 +137,13 @@ regardless of prefix cache hits. The per-batch context histogram continues to
 measure context through each chunk end.
 For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
-These are intentionally per-request metrics, but the API server exports each
-one only for `ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S` (default 120 s) after
-its first dispatch, at most 1024 per scheduler. Samples remain after request
-completion, so a scrape interval shorter than the window still sees even short
-requests; use `max_over_time` over the run to collect them all. The scheduler
-publishes them in its metrics snapshot, not in native multiprocess files,
-which can never drop a series: kept there, every scrape re-read one series per
-request ever served (0.43 s of the API server's Python after about 9.5K
-requests). Remote DP nodes therefore export them from the head API server,
-not their own metrics port.
+When enabled, these are per-request metrics: series count grows with requests.
+Samples remain after request completion so even short requests can be scraped.
+Native multiprocess files retain them until the service's metrics directory is
+cleaned; there is no automatic per-request expiry. Keep this option disabled
+for sustained serving and throughput benchmarks. Disabling it does not remove
+old samples from an existing metrics directory: restart the service with a fresh
+metrics directory, without deleting storage used by live workers.
 
 ### GPU forward timing
 

@@ -66,6 +66,9 @@ RUN echo "========== [OOT 2/7] Verify base packages (atom/aiter/mori) ==========
     ls /tmp/triton-base-backup/
 
 COPY docker/patches/vllm-torch210-compat.patch /tmp/vllm-torch210-compat.patch
+# Backport of vllm-project/vllm#60446: Triton >= 3.8 rejects the invalid NC
+# autotune key at import, which fails Kimi-K3 model inspection.
+COPY docker/patches/vllm-kimi-k3-kda-autotune-key.patch /tmp/vllm-kimi-k3-kda-autotune-key.patch
 
 RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
     test -n "${VLLM_COMMIT}" && \
@@ -75,6 +78,8 @@ RUN echo "========== [OOT 3/7] Clone and patch vLLM ==========" && \
     git checkout "${VLLM_COMMIT}" && \
     git apply --check /tmp/vllm-torch210-compat.patch && \
     git apply /tmp/vllm-torch210-compat.patch && \
+    git apply --check /tmp/vllm-kimi-k3-kda-autotune-key.patch && \
+    git apply /tmp/vllm-kimi-k3-kda-autotune-key.patch && \
     git submodule update --init --recursive && \
     echo "vLLM commit:" && \
     git rev-parse HEAD

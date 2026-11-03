@@ -6,7 +6,7 @@ K3's registered class (``KimiK3ForConditionalGeneration``) is an uncompiled
 wrapper, but the routing still cannot sit in its forward without editing a file
 whose layer stack is ``@support_torch_compile``-decorated. So the installer
 wraps the loaded model after load, the way V4.1's does
-(``model_runner.mono_decode_installers``), and every other attribute passes
+(``models.registry.mono_decode_installers``), and every other attribute passes
 through to it. Nothing in ``atom/models/kimi_k3/model.py`` changes.
 
 The configuration is checked once (``config.config_refusal``). A step is then

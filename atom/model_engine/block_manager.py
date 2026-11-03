@@ -5,7 +5,7 @@ import array
 import logging
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
@@ -119,6 +119,23 @@ class JointBoundaryDecision:
     claim_tokens: int = 0
     state_from_hbm: bool = False
     skip_reason: str | None = None
+
+
+@dataclass
+class AdmissionProbe:
+    """One `can_allocate` answer, carried to the `record_allocation` that
+    commits it.
+
+    `num_cached_blocks` is the hit (-1 if the seq did not fit) and
+    `block_hashes` the chain the probe walked. `num_new_blocks` is the
+    free-pool demand the probe's fit check passed, `None` when the probe
+    returned before that check. `_fit_joint` re-checks a joint against it and
+    skips the joint without it.
+    """
+
+    num_cached_blocks: int = -1
+    block_hashes: list[int] = field(default_factory=list)
+    num_new_blocks: int | None = None
 
 
 # Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
@@ -599,15 +616,18 @@ class BlockManager:
         The raise is unreachable through `Scheduler` and the checkpoint cache
         cannot make it reachable: a READY unpinned checkpoint counts as
         available, and both callers sit behind a pin-aware check in the same
-        pass. `allocate` protects the one checkpoint it is about to pin and
-        sees the pins taken before it; `may_append` runs only in a pass that
-        scheduled no prefill (`scheduler.py`, `if num_seqs_prefill > 0` returns
-        first), so every pin was already released at the top of that pass --
-        except for the draft lookahead an admission allocates right after its
-        `allocate`, which `can_allocate` charged in the same units check
-        (`draft_lookahead_blocks`), against the same protected checkpoint.
-        Under contention the reachable outcome is a refused admission, not
-        this.
+        pass. `allocate` protects the checkpoint it is about to pin -- the
+        joint boundary when that image is in HBM, otherwise the HBM-hit
+        checkpoint -- and sees the pin taken before the fresh blocks.
+        `may_append` runs only in a pass that scheduled no prefill
+        (`scheduler.py`, `if num_seqs_prefill > 0` returns first), so every
+        pin was already released at the top of that pass -- except for the
+        draft lookahead an admission allocates right after its `allocate`.
+        `can_allocate` charged those blocks (`draft_lookahead_blocks`) against
+        the HBM-hit checkpoint; when a joint needs more, `_fit_joint` charges
+        that same demand plus the private tail against the checkpoint
+        `allocate` will pin. Under contention the reachable outcome is a
+        refused admission, not this.
 
         That second half rests on prefill and decode never sharing a pass. If
         the mixed batch that `scheduler.py` has a TODO for lands, `may_append`
@@ -1003,12 +1023,16 @@ class BlockManager:
         # luck. (`get_num_new_matched_tokens` withholds one token on a
         # full-prompt hit, which takes the lookup off the grid.)
         lmc_tokens = (lmc_tokens // chunk) * chunk
-        if lmc_tokens <= hbm_boundary * hbs:
+        hbm_tokens = hbm_boundary * hbs
+        if lmc_tokens <= hbm_tokens:
             return self._no_joint("lmcache_within_hbm")
-        # The KV leg moves whole chunks and the blocks below the HBM prefix are
-        # shared, so an unaligned start cannot be rounded down.
-        if (hbm_boundary * hbs) % chunk != 0:
-            return self._no_joint("hbm_off_chunk_grid")
+        # The KV leg moves whole chunks. A legal start is the compressed hit's
+        # chunk floor when that floor is already at or above the gated hit, and
+        # the gated hit itself when the hit is on the grid. An unaligned hit
+        # cannot be rounded down onto shared blocks, and rounding the start
+        # *up* would leave a hole the forward then skips. The start then stays
+        # on the hit's own chunk floor; `allocate` reloads that partial chunk
+        # into private blocks and keeps the rung above the real HBM hit.
         cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
         if cap <= hbm_boundary:
             return self._no_joint("no_room_above_hbm")
@@ -1037,10 +1061,14 @@ class BlockManager:
         # hit and this min is always the compressed hit. Written as a min
         # anyway: the invariant belongs to `_gated_hit`, not here.
         claim_blocks = min(len(block_hashes), candidate)
-        # Floored to the chunk grid so the KV leg starts aligned and writes
-        # only into blocks below it that nobody else can be reading.
+        # Chunk floor of the compressed hit. `claim_blocks >= hbm_boundary`,
+        # so this is already >= the chunk floor of the gated hit: when it
+        # sits below `hbm_tokens` it equals `(hbm_tokens // chunk) * chunk`,
+        # and an aligned hit never needs lifting. Not `max(..., hbm_tokens)`:
+        # that would pull an unaligned hit up off the grid and either refuse
+        # the joint or refetch KV the pool still holds. A floor still below
+        # the hit is the partial chunk `allocate` refills privately.
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
-        claim_tokens = max(claim_tokens, hbm_boundary * hbs)
         # `allocate` claims the boundary in whole hash blocks --
         # `claim_tokens // hbs` -- but the value above is floored to
         # the *chunk* grid, not the hash-block grid. When `hbs` does not divide
@@ -1138,6 +1166,7 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
+        probe: AdmissionProbe | None = None,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1145,9 +1174,11 @@ class BlockManager:
         joint-load fields or joint-boundary counters. Checkpoint demand/end,
         hit instrumentation and `Sequence.replays_hit` (whether the hit it
         returns replays, which `replay_start` reads for it) still refresh;
-        demand counters deduplicate per request. An optional `block_hashes` output
-        lets the scheduler defer `record_allocation` until after its wait and
-        token-budget checks, reusing this probe's chain without another walk.
+        demand counters deduplicate per request. An optional `block_hashes`
+        output receives the chain this probe walked. An optional `probe` output
+        receives the hit, the chain and the fit's demand, so the scheduler can
+        defer `record_allocation(seq, probe)` until after its wait and
+        token-budget checks without another walk.
         `_admission_walk` then `_evaluate`; `can_allocate_memoized` evaluates a
         memoised walk the same way.
 
@@ -1161,7 +1192,14 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
-        return self._evaluate(seq, self._admission_walk, record, block_hashes)
+        if probe is None:
+            return self._evaluate(seq, self._admission_walk, record, block_hashes)
+        assert block_hashes is None, "the probe carries its own chain"
+        probe.num_new_blocks = None
+        probe.num_cached_blocks = self._evaluate(
+            seq, self._admission_walk, record, probe.block_hashes, probe
+        )
+        return probe.num_cached_blocks
 
     def _evaluate(
         self,
@@ -1169,9 +1207,11 @@ class BlockManager:
         walk_of: Callable[[Sequence], _PrefixWalk],
         record: bool,
         block_hashes: list[int] | None,
+        probe: AdmissionProbe | None = None,
     ) -> int:
         """`can_allocate` over the walk `walk_of(seq)` returns; everything but
-        the walk is asked afresh on every call."""
+        the walk is asked afresh on every call. `probe.num_new_blocks` is set
+        once the fit passes."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
@@ -1246,11 +1286,17 @@ class BlockManager:
         self._record_checkpoint_end(seq)
         if not self._has_page_units(num_new_blocks, protected_hash):
             return -1
+        # `record_allocation` re-checks a joint against this demand instead of
+        # walking the hit again.
+        if probe is not None:
+            probe.num_new_blocks = num_new_blocks
         # A direct admission commits its joint boundary here. The scheduler
         # probes first and calls record_allocation only after dependency and
         # budget checks; refused probes avoid the extra LMCache hash walk.
         if record:
-            self.record_allocation(seq, num_cached_blocks, block_hashes)
+            self.record_allocation(
+                seq, AdmissionProbe(num_cached_blocks, block_hashes, num_new_blocks)
+            )
         # After the refusal, not before it. The chain is O(prompt) xxhash plus
         # two temporaries per block, and a refused admission discards it — a
         # 128k prompt queued behind a full pool paid ~2000 rounds per waiting
@@ -1264,6 +1310,63 @@ class BlockManager:
         # `ATOM_GDN_STATE_MIDSTEP=1`, and then every admission pays it.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
+
+    def _fit_joint(
+        self, decision: JointBoundaryDecision, probe: AdmissionProbe
+    ) -> JointBoundaryDecision:
+        """Drop a joint `allocate` cannot back without spending the state it pins.
+
+        `can_allocate` protected the HBM-hit checkpoint and subtracted every
+        in-use block in `[0, hbm)`. Two ways that under-counts what `allocate`
+        then does:
+
+        * A partial chunk `[claim, hbm)` is refilled privately, so each in-use
+          block there is one more unit. A cached-free tail block is not:
+          claiming it and allocating a fresh one cost the same unit.
+        * When the boundary image is in HBM, `allocate` pins that image
+          (`begin_restore`) before `_fresh_block`. The hit checkpoint is not
+          the one pinned, and a tier load pins nothing in HBM at all.
+
+        Demand is the probe's `num_new_blocks` plus the in-use tail, which is
+        `n - used[0, min(claim, hbm))`. The protected hash is the boundary
+        when `state_from_hbm`, and none otherwise: the hit image can be spent
+        to fund a tier joint. A miss skips the joint before it is counted, so
+        the request keeps the HBM hit. The check does not evict.
+
+        A probe without demand never passed that fit, so its joint is skipped
+        too (`no_probe_demand`).
+        """
+        if decision.skip_reason is not None:
+            return decision
+        num_new_blocks = probe.num_new_blocks
+        if num_new_blocks is None:
+            return self._no_joint("no_probe_demand")
+        num_cached_blocks = probe.num_cached_blocks
+        block_hashes = probe.block_hashes
+        hbs = self._hash_block_size()
+        hbm_tokens = num_cached_blocks * hbs
+        claim_tokens = decision.claim_tokens
+        extra = 0
+        if claim_tokens < hbm_tokens:
+            claim_blocks = claim_tokens // hbs
+            for i in range(claim_blocks, num_cached_blocks):
+                block_id = self.kv.lookup(block_hashes[i])
+                if block_id != -1 and self.kv.is_used(block_id):
+                    extra += 1
+        # Same demand as `can_allocate`, and that check already passed with a
+        # protected hit image. A tier joint that does not add a private tail
+        # has nothing new to reject.
+        if not decision.state_from_hbm and extra == 0:
+            return decision
+        protected = decision.boundary_hash if decision.state_from_hbm else None
+        if self._has_page_units(num_new_blocks + extra, protected):
+            return decision
+        reason = (
+            "partial_chunk_no_room"
+            if claim_tokens < hbm_tokens
+            else "state_hbm_no_room"
+        )
+        return self._no_joint(reason)
 
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
@@ -1433,13 +1536,98 @@ class BlockManager:
             or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
         )
 
-    def record_allocation(
-        self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
-    ) -> None:
+    def record_allocation(self, seq: Sequence, probe: AdmissionProbe) -> None:
         """Commit the fit probe before any allocation changes the pool."""
         if self.enable_prefix_caching:
-            decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+            decision = self._joint_kv_boundary(
+                seq, probe.num_cached_blocks, probe.block_hashes
+            )
+            decision = self._fit_joint(decision, probe)
             self._commit_joint_boundary(seq, decision)
+
+    def retreat_joint_to_hbm(self, seq: Sequence) -> bool:
+        """Drop a failed unaligned joint and resume at the HBM hit it lowered.
+
+        `allocate` refilled `[floor, hbm)` with private blocks so the KV leg
+        could write them. A failure of either leg used to disown the whole
+        prefix. The blocks and the state of the gated hit are usually still
+        there: put those shared blocks back, bind that hit's state into the
+        slot this admission already holds, and clear the joint.
+
+        ``False`` when there was no lowered hit, or a shared block or the
+        hit's state can no longer be recovered. The caller then disowns to
+        token 0.
+        """
+        hbm_tokens = int(seq.offload_joint.hbm_hit_tokens or 0)
+        hbs = self._hash_block_size()
+        if hbm_tokens <= 0 or hbm_tokens % hbs != 0:
+            return False
+        hbm_blocks = hbm_tokens // hbs
+        if seq.state_slot < 0 and seq.has_per_req_cache:
+            return False
+        # The chain `can_allocate` walked, which may be the frontend's
+        # (`_adopt_shipped_chain`). Tokens are compared as the collision check.
+        prompt = self._prompt_hashes(seq)
+        wanted: list[int] = []
+        h = seq.cache_seed
+        for i in range(hbm_blocks):
+            h = self._block_hash(seq, prompt, i, h)
+            block_id = self.kv.lookup(h)
+            if block_id < 0 or self.kv.block(block_id).token_ids != (
+                self._hash_block_tokens(seq, i)
+            ):
+                logger.debug(
+                    "[JOINT-RETREAT] seq %s: HBM hit block %d of %d is gone",
+                    seq.id,
+                    i,
+                    hbm_blocks,
+                )
+                return False
+            wanted.append(block_id)
+        hit_hash = h
+        # Bind before swapping blocks. A miss leaves the table alone; the
+        # caller disowns. The boundary restore has to be dropped first or a
+        # second `begin_restore` would queue two writers into one slot.
+        self._drop_boundary_state(seq)
+        if seq.has_per_req_cache and not self._bind_existing_slot(seq, hit_hash):
+            return False
+        table = seq.block_table
+        for i, block_id in enumerate(wanted):
+            if i < len(table) and table[i] == block_id:
+                continue
+            if i < len(table):
+                self.kv.free(table[i])
+                self.kv.claim(block_id)
+                table[i] = block_id
+            else:
+                self.kv.claim(block_id)
+                table.append(block_id)
+        seq.num_cached_tokens = hbm_tokens
+        seq.offload_joint.reset_joint()
+        return True
+
+    def _drop_boundary_state(self, seq: Sequence) -> None:
+        """Release a joint's state restore or load without touching KV."""
+        if seq.offload_joint.load_hash != -1:
+            self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
+            if self.state_offload is not None:
+                self.state_offload.abandon_load(seq.id)
+            seq.offload_joint.load_hash = -1
+        if (
+            self.paged_state_checkpoints is not None
+            and getattr(seq, "state_slot", -1) >= 0
+        ):
+            self.paged_state_checkpoints.store.cancel_queued_restore(seq.state_slot)
+
+    def _bind_existing_slot(self, seq: Sequence, hit_hash: int) -> bool:
+        """Point the slot `allocate` already took at `hit_hash`'s state."""
+        if hit_hash == -1:
+            return True
+        if self.paged_state_checkpoints is not None:
+            if self.paged_state_checkpoints.begin_restore(hit_hash, seq.state_slot):
+                return True
+            return self._request_state_load(seq, hit_hash)
+        return self._request_state_load(seq, hit_hash)
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
         """Allocate blocks for `seq`. `num_cached_blocks` is the hit count
@@ -1471,10 +1659,30 @@ class BlockManager:
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
         hbs = self._hash_block_size()
+        hbm_tokens = num_cached_blocks * hbs
+        claim_tokens = int(seq.offload_joint.claim_tokens or 0)
+        # Unaligned HBM hit whose private tail already cleared `_fit_joint`.
+        # Stop the shared claim at the chunk floor. The tail is filled with
+        # fresh blocks only after the restore is pinned. `hbm_hit_tokens`
+        # is where a failed leg resumes. `claim_tokens % hbs == 0` holds
+        # because `_joint_kv_boundary` returns `claim_off_hash_grid`
+        # otherwise; the assert states that precondition.
+        if (
+            int(seq.offload_joint.boundary_tokens or 0) > hbm_tokens
+            and claim_tokens < hbm_tokens
+        ):
+            assert (
+                claim_tokens % hbs == 0
+            ), "a joint claim below the HBM hit is hash-block aligned"
+            seq.offload_joint.hbm_hit_tokens = hbm_tokens
+            num_cached_blocks = claim_tokens // hbs
+        # After the partial-chunk reload above, which lowers the hit on
+        # purpose: what follows compares against this to catch only the claim
+        # loop's own eviction clamp.
         requested_blocks = num_cached_blocks
         claim_blocks = max(
             num_cached_blocks,
-            int(seq.offload_joint.claim_tokens or 0) // hbs,
+            claim_tokens // hbs,
         )
         h = seq.cache_seed
         hit_hash = -1
@@ -1604,11 +1812,15 @@ class BlockManager:
             state_holds = False
         if not state_holds:
             # No state behind the boundary means it is not this request's
-            # history. Disown it -- the forward recomputes from 0. Privatise the
-            # claimed prefix first (finding #2): recomputing over the shared
-            # canonical blocks would tear another sequence's decode. Keeping the
-            # boundary is silent wrong output too, since `has_initial_state`
-            # (`gdn_attn.py`) is `num_cached_tokens > 0`.
+            # history. An unaligned joint can still resume at the HBM hit it
+            # lowered away from. Otherwise disown -- the forward recomputes
+            # from 0. Privatise the claimed prefix first (finding #2):
+            # recomputing over the shared canonical blocks would tear another
+            # sequence's decode. Keeping the boundary is silent wrong output
+            # too, since `has_initial_state` (`gdn_attn.py`) is
+            # `num_cached_tokens > 0`.
+            if self.retreat_joint_to_hbm(seq):
+                return True
             if not self.disown_claimed_prefix(seq):
                 # Pool cannot back the private copies; signal the caller to
                 # deallocate and requeue for a clean recompute next pass.
@@ -1618,6 +1830,7 @@ class BlockManager:
             # partial reset, not a full `reset_joint`.
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
+            seq.offload_joint.hbm_hit_tokens = 0
         return True
 
     def tier_resume_replays(self, seq: Sequence) -> bool:

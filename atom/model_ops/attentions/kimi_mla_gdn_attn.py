@@ -143,14 +143,15 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         config = self.model_runner.config
         model_type = config.hf_config.model_type
 
-        if connector != "mooncake":
+        # Mooncake moves the slot regions published below; MoRIIO registers the
+        # same pools itself, from the `per_request_state` tensors in kv_caches.
+        if connector not in ("mooncake", "moriio"):
             raise NotImplementedError(
-                f"{model_type} disaggregated serving requires the mooncake "
-                f"connector, but kv_connector={connector!r} is configured. Only "
-                "mooncake transfers the slot-indexed regions the KDA recurrent "
-                "state lives in; every other connector would move the "
-                "full-attention layers and silently drop the state of the "
-                'KDA layers. Set kv_transfer_config["kv_connector"] = "mooncake".'
+                f"{model_type} disaggregated serving requires the mooncake or "
+                f"moriio connector, but kv_connector={connector!r} is configured. "
+                "Only those two move the slot-indexed KDA recurrent state; any "
+                "other connector would move the full-attention layers and "
+                "silently drop the state of the KDA layers."
             )
 
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()

@@ -60,6 +60,7 @@ class MockConfig:
             "enable_prefix_caching": False,
             "enable_log_stats": True,
             "throughput_log_interval": 10.0,
+            "throughput_log_interval_steps": 0,
             "cache_hit_rate_window": 1000,
             "enable_chunked_prefill": True,
             "enable_dynamic_chunking": False,

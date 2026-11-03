@@ -156,6 +156,8 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch):
         activation=None,
         apply_router_weight_on_input=False,
         prefix="t",
+        # Only an expert-parallel layer hands its experts the row count.
+        use_ep=True,
     )
     count = torch.tensor([2], dtype=torch.int32)
     context = SimpleNamespace(

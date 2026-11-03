@@ -791,7 +791,7 @@ def kda_norm(c, req, h, ch):
         y = (
             fx.ptr_load(c["ol"] + (j * VCH + e))
             * r
-            * ld_bf(a["on_w"], vr)
+            * ld_f32(a["on_w"], vr)
             * sigmoid(f32_of(got[NVCH][0]))
         )
         bo.buffer_store(

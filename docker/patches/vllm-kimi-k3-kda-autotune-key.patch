@@ -1,0 +1,26 @@
+diff --git a/vllm/models/kimi_k3/amd/ops/third_party/kda/chunk_intra.py b/vllm/models/kimi_k3/amd/ops/third_party/kda/chunk_intra.py
+index 8b9aa86..07b4a38 100644
+--- a/vllm/models/kimi_k3/amd/ops/third_party/kda/chunk_intra.py
++++ b/vllm/models/kimi_k3/amd/ops/third_party/kda/chunk_intra.py
+@@ -451,7 +451,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
+         for num_warps in [1, 2, 4, 8]
+         for num_stages in [2, 3, 4]
+     ],
+-    key=["BK", "NC", "BT", "HV"],
++    key=["BK", "BT", "HV"],
+ )
+ @triton.jit(do_not_specialize=["B", "T"])
+ def chunk_kda_fwd_kernel_intra_sub_chunk(
+diff --git a/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra.py b/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra.py
+index 8b9aa86..07b4a38 100644
+--- a/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra.py
++++ b/vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk_intra.py
+@@ -451,7 +451,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
+         for num_warps in [1, 2, 4, 8]
+         for num_stages in [2, 3, 4]
+     ],
+-    key=["BK", "NC", "BT", "HV"],
++    key=["BK", "BT", "HV"],
+ )
+ @triton.jit(do_not_specialize=["B", "T"])
+ def chunk_kda_fwd_kernel_intra_sub_chunk(

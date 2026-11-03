@@ -255,7 +255,7 @@ def _publish_selected_indices(
     readers attend to the wrong (past the first request, another REQUEST's)
     KV: fluent, silently wrong output.
 
-    ATOM's own producer (``deepseek_v2.py``'s ``sparse_attn_indexer``)
+    ATOM's own producer (``indexer_forward.py``'s ``sparse_attn_indexer``)
     branches on ``max_seqlen_q`` because ``sparse_kv_indptr`` itself changes
     indexing domain with it (``aiter_mla.py``): per-REQUEST
     (``running_bs + 1`` entries) at ``max_seqlen_q == 1`` -- this step's

@@ -23,6 +23,70 @@ from atom.model_ops.indexer import fp8_rows
 from atom.model_ops.indexer import score as shared
 
 
+def test_unpooled_nope_preserves_normalized_keys_query_scales_and_output_buffer(
+    monkeypatch,
+):
+    """Unpooled GLM retains the unfused NoPE ABI, including scaled q_lora."""
+    from atom.models import deepseek_v2
+
+    monkeypatch.setattr(deepseek_v2, "_pcp_active", lambda: False)
+    indexer = GLM5.Glm5NextIndexer.__new__(GLM5.Glm5NextIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.use_kpool = lambda: False
+    indexer.n_head, indexer.head_dim, indexer.rope_dim = 2, 4, 0
+    indexer.use_wk_weights_proj_fusion = False
+    indexer.use_qk_rope_cache_fusion = False
+    indexer.use_nope_cache_fusion = False
+    indexer.external_k_weights = False
+    indexer._indexer_bf16 = False
+    indexer.rotary_emb = None  # NoPE must work without rotary tables.
+    indexer._empty_rope_cache = torch.empty(0)
+    indexer._weights_scale = 0.125
+    hidden = torch.arange(8).float().reshape(2, 4) / 8
+    qr = torch.arange(6).float().reshape(2, 3) / 6
+    qr_scale = torch.tensor([[0.5], [2.0]])
+    projection = torch.arange(24).float().reshape(8, 3) / 24
+    indexer.wq_b = lambda q, scale: torch.nn.functional.linear(q * scale, projection)
+    indexer.wk = lambda h: h * 2
+    indexer.weights_proj = lambda h: h[:, :2] + 1
+    indexer.k_norm = torch.nn.LayerNorm(4, eps=1e-6)
+    scales = torch.tensor([[0.5], [1.0], [2.0], [4.0]])
+    indexer.quant_func = lambda q, quant_dtype: (q / scales, scales)
+    indexer.k_cache = SimpleNamespace(
+        prefix="indexer.k_cache", kv_cache=[torch.empty(1)]
+    )
+    indexer.quant_block_size = 128
+    indexer.scale_fmt = "ue8m0"
+    indexer.topk_tokens = 2048
+    indexer.max_model_len = 4096
+    indexer.max_total_seq_len = 8192
+    indexer.sparse_kv_indices_buffer = torch.full((2, 4), -9, dtype=torch.int32)
+    indexer.dcp_sparse_kv_indptr_buffer = torch.empty(0, dtype=torch.int32)
+    indexer.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32)
+    indexer.stable_topk = False
+    calls = []
+
+    def dispatch(*args):
+        calls.append(args)
+        args[12].fill_(7)
+
+    indexer.sparse_attn_indexer_impl = dispatch
+    positions = torch.tensor([1024, 2049])
+    indexer.forward_impl(hidden, qr, qr_scale, positions)
+    assert len(calls) == 1
+    args = calls[0]
+    expected_q = torch.nn.functional.linear(qr * qr_scale, projection).view(4, 4)
+    torch.testing.assert_close(args[3], (expected_q / scales).view(2, 2, 4))
+    torch.testing.assert_close(
+        args[4], torch.nn.functional.layer_norm(hidden * 2, (4,), eps=1e-6)
+    )
+    torch.testing.assert_close(args[5], (hidden[:, :2] + 1) * scales.view(2, 2) * 0.125)
+    assert args[18] is positions
+    assert args[19].numel() == args[20].numel() == 0
+    assert args[23] is False  # No fused rotary/cache path.
+    assert (indexer.sparse_kv_indices_buffer == 7).all()
+
+
 def _config_for_normalize(**overrides):
     values = {
         "num_hidden_layers": 3,
@@ -317,7 +381,8 @@ def _run_speculative_verify(monkeypatch, positions, max_model_len):
     def top_k(_logits, _next_n, lens, *_args, **_kwargs):
         seen["topk_lens"] = lens.tolist()
 
-    monkeypatch.setattr(shared, "deepgemm_fp8_paged_mqa_logits", paged_logits)
+    # The per-arch kernel `score.py` bound at import, not the AITER name.
+    monkeypatch.setattr(shared, "_fp8_paged_mqa_logits", paged_logits)
     monkeypatch.setattr(shared, "top_k_per_row_decode", top_k)
     monkeypatch.setattr(
         SPEC.kpool, "expand_pools_and_append_tail", lambda *_a, **_k: None

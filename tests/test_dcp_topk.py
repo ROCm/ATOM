@@ -709,6 +709,16 @@ def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
         assert torch.equal(seen[name], token_bt), name
 
 
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize("interleave", [1, 16, 128])
+def test_local_logits_width_covers_partial_interleave_groups(world, interleave):
+    for length in (1, interleave - 1, interleave + 1, world * interleave + 3, 131073):
+        counts = [
+            _owned_before(length, rank, world, interleave) for rank in range(world)
+        ]
+        assert dcp_ops.dcp_local_logits_width(length, world, interleave) == max(counts)
+
+
 # ---------------------------------------------------------------------------
 # Regression guards for the fusions themselves.
 #

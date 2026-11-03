@@ -1,21 +1,19 @@
 """Scheduler-owned Prometheus observations.
 
-Only the scheduler owner updates these metrics. Per-request contexts are kept
-for a bounded window and published in the metrics snapshot. No GPU
-synchronization is needed, and scrapes never consume observations.
+Only the scheduler owner updates these metrics. Diagnostic request context
+gauges carry per-request labels and are opt-in. No GPU synchronization is
+needed, and scrapes never consume observations.
 """
 
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
-from prometheus_client import Histogram
+from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
-from atom.utils import envs
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -41,11 +39,6 @@ TOKEN_BUCKETS = (
 # A batch sums many contexts. Keep fixed bounds across schedulers so their
 # histograms can be pooled, covering up to 1024 rows of 8M tokens each.
 BATCH_CONTEXT_BUCKETS = (*TOKEN_BUCKETS, *(2**power for power in range(24, 34)))
-# Bounds the retained contexts at high request rates. Each one costs every
-# scrape about 13 us of the API server's Python (copied, then rendered), so
-# the cap holds that to ~14 ms; 2.4 requests/s over the default 120 s window
-# keeps about 300, and 20 requests/s still keeps each one for ~50 s.
-REQUEST_CONTEXT_CAP = 1024
 
 
 @dataclass
@@ -58,9 +51,18 @@ class RequestQueueTiming:
 
 
 class SchedulerMetrics:
-    def __init__(self, dp_rank=0, engine_role="default", *, registry=None):
+    def __init__(
+        self,
+        dp_rank=0,
+        engine_role="default",
+        *,
+        request_context_enabled=False,
+        registry=None,
+    ):
         labels = {"dp_rank": str(dp_rank), "engine_role": engine_role}
         self._labels = labels
+        # Do not allocate request-label children
+        # by default: native multiprocess storage retains them after completion.
         self.queue_time = Histogram(
             "atom:request_queue_time_seconds",
             "Time from engine receipt to first real forward dispatch, including KV loading waits.",
@@ -103,6 +105,12 @@ class SchedulerMetrics:
             buckets=BATCH_CONTEXT_BUCKETS,
             registry=registry,
         ).labels(**labels)
+        self.prefill_request_context_tokens = self._request_context_gauge(
+            "atom:prefill_request_context_tokens",
+            "Full prompt length including cached prefixes at first real prefill dispatch, once per request sequence; retained until metrics storage is cleaned.",
+            enabled=request_context_enabled,
+            registry=registry,
+        )
         self.decode_context_tokens = Histogram(
             "atom:decode_context_tokens",
             "Sum of logical decode sequence lengths per real forward, without padding or TP multiplication.",
@@ -110,19 +118,26 @@ class SchedulerMetrics:
             buckets=BATCH_CONTEXT_BUCKETS,
             registry=registry,
         ).labels(**labels)
-        self._request_context_retention_s = (
-            envs.ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S
-        )
-        # (monotonic time, phase, request_id, sequence_id, started_at, tokens),
-        # oldest first. Not multiprocess gauges: mmap storage can never drop a
-        # label set, so a series per request served piles up there and every
-        # scrape of the API server re-reads all of them.
-        self._request_contexts: deque[tuple[float, str, str, str, str, int]] = deque(
-            maxlen=REQUEST_CONTEXT_CAP
+        self.decode_request_context_tokens = self._request_context_gauge(
+            "atom:decode_request_context_tokens",
+            "Logical context length at first real decode dispatch, once per request sequence; retained until metrics storage is cleaned.",
+            enabled=request_context_enabled,
+            registry=registry,
         )
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
+
+    def _request_context_gauge(self, name, description, *, enabled, registry):
+        if not enabled:
+            return None
+        return Gauge(
+            name,
+            description,
+            [*self._labels, "request_id", "sequence_id", "started_at"],
+            multiprocess_mode="max",
+            registry=registry,
+        )
 
     @staticmethod
     def enqueue(seq, *, received_at: float | None = None) -> None:
@@ -158,31 +173,20 @@ class SchedulerMetrics:
         if timing is not None and succeeded and timing.is_pd:
             self.pd_transfer.observe(now - started)
 
-    def _record_request_context(self, phase, req_id, seq, tokens):
-        self._request_contexts.append(
-            (
-                time.monotonic(),
-                phase,
+    def _record_request_context(self, metric, req_id, seq, tokens):
+        if metric is None:
+            return
+        # Retain completed requests so a scrape can still see short requests.
+        metric.labels(
+            **self._labels,
+            request_id=(
                 getattr(seq, "external_request_id", None)
                 or getattr(seq, "parent_request_id", None)
-                or str(req_id),
-                str(req_id),
-                str(time.time()),
-                int(tokens),
-            )
-        )
-
-    def request_contexts(self) -> list[tuple[str, str, str, str, str, str, int]]:
-        """First-dispatch contexts recorded within the retention window, as
-        (phase, dp_rank, engine_role, request_id, sequence_id, started_at,
-        tokens). Completed requests stay for the whole window, so a scrape
-        every few seconds still sees even short ones."""
-        horizon = time.monotonic() - self._request_context_retention_s
-        contexts = self._request_contexts
-        while contexts and contexts[0][0] < horizon:
-            contexts.popleft()
-        rank, role = self._labels["dp_rank"], self._labels["engine_role"]
-        return [(phase, rank, role, *rest) for _, phase, *rest in contexts]
+                or str(req_id)
+            ),
+            sequence_id=str(req_id),
+            started_at=str(time.time()),
+        ).set(int(tokens))
 
     def record_forward(self, batch, seqs) -> None:
         if batch.is_dummy_run or not batch.req_ids:
@@ -204,7 +208,9 @@ class SchedulerMetrics:
             ):
                 # The marker survives preemption.
                 timing.decode_context_observed = True
-                self._record_request_context("decode", req_id, seq, context_lens[i])
+                self._record_request_context(
+                    self.decode_request_context_tokens, req_id, seq, context_lens[i]
+                )
         # Count real request rows, not MTP tokens or a padded graph size.
         if batch.total_seqs_num_decode > 0:
             self.decode_batch_size.observe(batch.total_seqs_num_decode)
@@ -230,7 +236,10 @@ class SchedulerMetrics:
                     # Full input length, independent of chunk size or prefix
                     # reuse. The same marker survives chunks and preemption.
                     self._record_request_context(
-                        "prefill", req_id, seq, seq.num_prompt_tokens
+                        self.prefill_request_context_tokens,
+                        req_id,
+                        seq,
+                        seq.num_prompt_tokens,
                     )
                     timing.prefill_observed = True
             if context_lens is not None:
