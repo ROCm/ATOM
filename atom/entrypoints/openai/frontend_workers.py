@@ -77,6 +77,10 @@ _MSG_ADD = b"A"
 _MSG_ABORT = b"X"
 _MSG_HELLO = b"H"
 _MSG_STRUCTURED = b"S"
+# A hub send to a worker that stopped reading is dropped after this, so no
+# hub thread (engine output, structured replies, close) can block on it.
+_SEND_TIMEOUT_MS = 5000
+
 # hub -> worker (first frame)
 _OUT_STEP = b"O"
 _OUT_REPLY = b"R"
@@ -152,9 +156,9 @@ class FrontendHub:
         self._output_sockets = []
         self._output_locks = []
         for address in self.output_addresses:
-            self._output_sockets.append(
-                make_zmq_socket(self.ctx, address, zmq.PUSH, bind=True)
-            )
+            sock = make_zmq_socket(self.ctx, address, zmq.PUSH, bind=True)
+            sock.setsockopt(zmq.SNDTIMEO, _SEND_TIMEOUT_MS)
+            self._output_sockets.append(sock)
             self._output_locks.append(threading.Lock())
         # The engine's output threads buffer here between a step's callbacks
         # and its flush: one list per worker, per thread.
@@ -244,7 +248,14 @@ class FrontendHub:
             # sent after that, from any thread.
             if self._sockets_closed:
                 return
-            self._output_sockets[worker_index].send_multipart(parts, copy=False)
+            try:
+                self._output_sockets[worker_index].send_multipart(parts, copy=False)
+            except zmq.Again:
+                logger.warning(
+                    "Frontend hub: worker %d not reading for %d ms; message dropped",
+                    worker_index,
+                    _SEND_TIMEOUT_MS,
+                )
 
     def _answer_structured(self, worker_index: int, call_id: bytes, frame) -> None:
         try:

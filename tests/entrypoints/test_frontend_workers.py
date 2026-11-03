@@ -370,7 +370,33 @@ def test_hub_close_does_not_wait_for_a_reply_in_flight():
         assert time.monotonic() - t0 < 2.0
         release.set()  # the late reply finds the sockets closed
         caller.join(5)
+        # The drop half: a send after close neither raises nor touches the
+        # closed socket (without the guard this is a ZMQError).
+        hub._send_to_worker(0, b"R", b"0", b"x")
     finally:
         fw._STRUCTURED_TIMEOUT_S = saved
         release.set()
         worker.close()
+
+
+def test_a_send_to_a_worker_that_stopped_reading_is_dropped(caplog):
+    # SNDTIMEO bounds every hub send; on timeout the message is dropped and
+    # logged instead of blocking an engine output thread.
+    import zmq
+
+    core = _FakeCoreManager()
+    hub = fw.FrontendHub(core, num_workers=1)
+    try:
+        assert hub._output_sockets[0].getsockopt(zmq.SNDTIMEO) == fw._SEND_TIMEOUT_MS
+
+        class _Stuck:
+            def send_multipart(self, parts, copy=False):
+                raise zmq.Again()
+
+        real, hub._output_sockets[0] = hub._output_sockets[0], _Stuck()
+        with caplog.at_level("WARNING"):
+            hub._send_to_worker(0, b"O", b"frame")
+        assert "message dropped" in caplog.text
+        hub._output_sockets[0] = real
+    finally:
+        hub.close()
