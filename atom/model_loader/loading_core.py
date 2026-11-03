@@ -89,27 +89,55 @@ def verify_shard_files_present(model_name_or_path: str) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Resolve omp_set_num_threads once from the OpenMP runtime torch uses.
+#
+# PyTorch can load its shared libraries with RTLD_LOCAL, so CDLL(None) cannot
+# see the symbol even though it is loaded.  Looking it up from torch._C
+# searches that extension's dependency graph and picks the same runtime.
+#
+# Guarded so a broken torch install (e.g. torch._C.__file__ is None) does not
+# make the entire module unimportable — the failure surfaces later, when
+# _one_omp_thread is actually called, with a clear message.
+# ---------------------------------------------------------------------------
+_omp_set_num_threads = None
+try:
+    _omp_set_num_threads = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
+    _omp_set_num_threads.argtypes = [ctypes.c_int]
+    _omp_set_num_threads.restype = None
+except (OSError, TypeError):
+    pass
+
+
 def _one_omp_thread() -> None:
-    """A loader thread's own OpenMP team: one thread (``omp_set_num_threads``
-    sets the calling thread's count only; torch's OpenMP runtime is loaded,
-    so resolve the symbol through torch's extension and its dependencies).
+    """Set the calling thread's OpenMP team to one thread.
 
-    PyTorch can load its shared libraries with ``RTLD_LOCAL``. In that case
-    ``CDLL(None)`` cannot see ``omp_set_num_threads`` even though torch's own
-    OpenMP runtime is already loaded. Looking the symbol up from ``torch._C``
-    searches that extension's dependency graph and selects the same runtime
-    torch uses instead of loading a second OpenMP implementation.
+    ``omp_set_num_threads`` is per-thread, which is exactly what the loader
+    pool needs: each worker copies one tensor at a time, so a full
+    machine-wide OpenMP team per worker wastes scheduling overhead.
 
-    torch initializes each thread's OpenMP count lazily, on that thread's
-    first call into ATen, by setting it to the process default. Run that
-    initialization first, or it overwrites the 1 as soon as the loader thread
-    touches a tensor.
+    torch may lazily initialize a thread's OpenMP count (overwriting ours)
+    on any ATen entry point — which entry point depends on the torch version.
+    A set-verify-retry loop handles every ordering: the verify call
+    (``torch.get_num_threads``) itself is an ATen entry point, so if lazy
+    init fires it will have fired by the time we check, and the retry lands
+    on clean ground.
     """
-    torch.get_num_threads()
-    set_num_threads = ctypes.CDLL(torch._C.__file__).omp_set_num_threads
-    set_num_threads.argtypes = [ctypes.c_int]
-    set_num_threads.restype = None
-    set_num_threads(1)
+    if _omp_set_num_threads is None:
+        logger.warning(
+            "omp_set_num_threads could not be resolved from torch._C; "
+            "loader threads will use the process-wide OpenMP default"
+        )
+        return
+    for _attempt in range(2):
+        _omp_set_num_threads(1)
+        if torch.get_num_threads() == 1:
+            return
+    logger.warning(
+        "loader thread OMP: wanted 1, torch reports %d; the "
+        "workaround may need updating for this torch version",
+        torch.get_num_threads(),
+    )
 
 
 def load_weights_into_model(
