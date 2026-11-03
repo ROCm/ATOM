@@ -57,6 +57,31 @@ def shared_sparse_buffer(layers) -> torch.Tensor:
     return shared
 
 
+def shared_dcp_indptr(layers, rows: int) -> torch.Tensor:
+    """The DCP decode's rank-local sparse indptr (``aiter_mla``'s builder binds
+    one buffer to every layer's impl): ``rows + 1`` int32 prefix sums over the
+    compacted rank-local slots in the shared sparse index buffer."""
+    shared = None
+    for layer in layers:
+        current = getattr(attention_impl(layer), "dcp_sparse_kv_indptr_buffer", None)
+        need(
+            current is not None
+            and current.dtype is torch.int32
+            and current.is_contiguous()
+            and current.numel() >= rows + 1,
+            "DCP sparse indptr buffer",
+        )
+        if shared is None:
+            shared = current
+        else:
+            need(
+                current.data_ptr() == shared.data_ptr(),
+                "layers do not share the DCP sparse indptr",
+            )
+    need(shared is not None, "no DCP sparse indptr buffer")
+    return shared
+
+
 def step_refusal(
     *, fwd, context, metadata, samples, positions, inputs_embeds, hidden_size
 ) -> str | None:

@@ -95,5 +95,11 @@ def maxsum_weight(m, local_sum, wave_max, wave_sum):
 
 
 def maxsum_accumulate(acc, vals, weight):
-    """``acc`` + one source's ``vals`` times ``weight``, elementwise."""
-    return [a + v * weight for a, v in zip(acc, vals, strict=True)]
+    """``acc`` + one source's ``vals`` times ``weight``, elementwise. A source
+    with weight 0 adds an exact 0: an empty rank's partial is read from whatever
+    its padding slot holds, and NaN * 0 is NaN."""
+    out = []
+    for a, v in zip(acc, vals, strict=True):
+        v = (weight == fx.Float32(0.0)).select(fx.Float32(0.0), v)
+        out.append(a + v * weight)
+    return out

@@ -201,7 +201,7 @@ def _atom_byte_view(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def layer_weights(
-    layer, rank: int, npes: int, *, with_indexer: bool = False
+    layer, rank: int, npes: int, *, with_indexer: bool = False, dcp_size: int = 1
 ) -> LayerWeights:
     cfg = glm5_tp_config(npes)
     attn = layer.self_attn
@@ -284,11 +284,22 @@ def layer_weights(
     )
 
     impl = attention_impl(layer)
+    # Under DCP every rank decodes the DCP group's heads (query replication:
+    # the widened q_proj and the group's W_K), and keeps its own for W_V / o.
+    heads = cfg.local_heads * dcp_size
+    if dcp_size > 1:
+        need(
+            bool(getattr(impl, "qrep_enabled", False)),
+            "DCP without query replication on this layer",
+        )
+        w_k, w_k_scale = impl.W_K_qrep, impl.W_K_qrep_scale
+    else:
+        w_k, w_k_scale = impl.W_K, impl.W_K_scale
     w_uk, s_uk = _batched_fp8(
-        impl.W_K,
-        impl.W_K_scale,
+        w_k,
+        w_k_scale,
         name="W_K",
-        shape=(cfg.local_heads, cfg.kv_lora, cfg.nope_dim),
+        shape=(heads, cfg.kv_lora, cfg.nope_dim),
     )
     w_uv, s_uv = _batched_fp8(
         impl.W_V,
@@ -305,7 +316,7 @@ def layer_weights(
     w_q_b, s_q_b = linear_ptpc_fp8(
         attn.q_b_proj,
         name="q_b_proj",
-        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
+        logical_rows=heads * (cfg.nope_dim + cfg.pe_dim),
         logical_cols=cfg.q_lora,
     )
     w_o, s_o = linear_ptpc_fp8(
@@ -364,7 +375,7 @@ def layer_weights(
     if with_indexer:
         tensors.update(indexer_weights(layer, cfg))
     return LayerWeights(
-        cfg.local_heads,
+        heads,
         tensors,
         cfg,
         rank,

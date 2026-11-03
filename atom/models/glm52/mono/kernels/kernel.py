@@ -1431,6 +1431,19 @@ def build_glm5_monokernel(
             if lane % 2 == 0:
                 lds_st(xs, k // 4, (w | (nb << 16)).bitcast(fx.Float32))
 
+        def ptpc_latent(uv_valid, uv0, uv1):
+            """The bf16 latent (uv0, uv1 a thread's pair) -> PTPC: a scale per
+            128 columns in ``misc``, the FP8 pairs in ``xs``. Ends at a barrier."""
+            uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
+            if (lane == 0) & (wave < KV_LORA // 128):
+                lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
+            gpu.barrier()
+            if uv_valid:
+                uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
+                uv_rcp = 1.0 / uv_scale
+                st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
+            gpu.barrier()
+
         def st_ptpc(k, q0, q1):
             """Store one wave's PTPC FP8 pairs in the AITER GEMM's linear K order."""
             word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
@@ -3138,18 +3151,13 @@ def build_glm5_monokernel(
                     o0 = o0 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2)
                     o1 = o1 + lds_ld(red, (q * (KV_LORA // 2) + tid) * 2 + 1)
                 uv0, uv1 = bf16_round(o0), bf16_round(o1)
-                if const_expr(not attention_ptpc):
+                # under DCP the latent is merged across the ranks as bf16
+                # first (``dcp_merge_latent``); PTPC quantizes the merged one
+                if const_expr(not attention_ptpc or D > 1):
                     lds_st(xs, tid, bf16_pair(uv0, uv1))
-            if const_expr(attention_ptpc):
-                uv_max = wave_max(uv_valid.select(fx.max(fmath.absf(uv0), fmath.absf(uv1)), fx.Float32(0.0)))
-                if (lane == 0) & (wave < KV_LORA // 128):
-                    lds_st(misc, N_SPLIT + 2 + wave, (uv_max == 0.0).select(fx.Float32(1.0), uv_max * (1.0 / FP8_MAX)))
-            gpu.barrier()
-            if const_expr(attention_ptpc):
-                if uv_valid:
-                    uv_scale = lds_ld(misc, N_SPLIT + 2 + tid // 64)
-                    uv_rcp = 1.0 / uv_scale
-                    st_ptpc(tid * 2, div_rn(uv0, uv_scale, uv_rcp), div_rn(uv1, uv_scale, uv_rcp))
+            if const_expr(attention_ptpc and D == 1):
+                ptpc_latent(uv_valid, uv0, uv1)
+            else:
                 gpu.barrier()
             # Debug stamp placed HERE, not after the per-split weights where it
             # used to sit, so ``timeline_report``'s "stage" and "compute" cut
@@ -3165,6 +3173,11 @@ def build_glm5_monokernel(
             stamp("uv", tt, 2)
             owner = dcp_merge_latent(s, t)
             if owner:
+                if const_expr(attention_ptpc and D > 1):
+                    uv_valid = tid < KV_LORA // 2
+                    uv0, uv1 = bf2_f32(lds_ld(xs, fx.min(tid, KV_LORA // 2 - 1)).bitcast(fx.Int32))
+                    gpu.barrier()
+                    ptpc_latent(uv_valid, uv0, uv1)
                 acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
                 if const_expr(attention_ptpc):
                     reduce_rows(UV_R, acc, emit_ptpc_scalar(UV_TILE, ld_f32(r_suv, 0)))

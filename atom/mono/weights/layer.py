@@ -115,7 +115,15 @@ def linear_ptpc_fp8(
     )
     _need(
         weight.ndim == 2
-        and weight.shape[0] >= logical_rows
+        # more rows only through output padding, checked below: a wider
+        # weight would hand the kernel its first rows silently
+        and (
+            weight.shape[0] == logical_rows
+            or (
+                weight.shape[0] > logical_rows
+                and getattr(linear, "is_output_padded", False)
+            )
+        )
         and weight.shape[1] == logical_cols,
         f"{name} weight shape {tuple(weight.shape)}",
     )

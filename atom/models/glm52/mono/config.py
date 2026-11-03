@@ -260,9 +260,21 @@ def config_refusal(atom_config) -> str | None:
         query_length=query_length,
     )
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
+    dcp = atom_config.decode_context_parallel_size
     checks += common_refusals(
-        atom_config, Dims, SUPPORTED_TP, refuse_tr_hybrid=False
+        atom_config, Dims, SUPPORTED_TP, refuse_tr_hybrid=False, refuse_decode_cp=False
     ) + [
+        # DCP: the kernel decodes every head of the DCP group on each rank and
+        # merges the latent across them (``kernels.kernel.dcp_merge_latent``)
+        (dcp == 1 or (dcp == tp_size == 4), f"DCP {dcp} with TP {tp_size}"),
+        (
+            dcp == 1 or atom_config.dcp_config.interleave_size == 1,
+            "DCP interleave size above 1",
+        ),
+        (
+            dcp == 1 or atom_config.dcp_config.enable_query_replication,
+            "DCP without query replication",
+        ),
         (geometry is not None, "native geometry"),
         (getattr(hf, "model_type", None) == "glm_moe_dsa", "model type"),
         (not atom_config.enable_dp_attention, "DP attention"),
@@ -352,6 +364,10 @@ def fused_indexer_refusal(atom_config) -> str | None:
                 f"kv_cache_block_size={FUSED_INDEX_PAGE_SIZE}, got "
                 f"{atom_config.kv_cache_block_size}"
             ),
+        ),
+        (
+            atom_config.decode_context_parallel_size == 1,
+            "fused indexer under DCP (it writes the global sparse indices)",
         ),
     ]
     return first_refusal(checks)

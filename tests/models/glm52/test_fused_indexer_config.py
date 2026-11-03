@@ -19,6 +19,7 @@ def _servable_atom_config(**overrides):
         "index_cache_dtype": "fp8",
         "max_model_len": FUSED_INDEX_MAX_SEQ,
         "kv_cache_block_size": FUSED_INDEX_PAGE_SIZE,
+        "decode_context_parallel_size": 1,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
