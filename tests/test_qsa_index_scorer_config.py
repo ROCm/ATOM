@@ -8,6 +8,7 @@ import argparse
 import ast
 import dataclasses
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,8 +59,36 @@ def test_compute_hash_extends_only_hash_factors():
         if isinstance(n, ast.FunctionDef) and n.name == "compute_hash"
     )
     body = ast.unparse(fn)
-    assert "factors.extend(self.qsa_index_scorer.hash_factors())" in body
-    assert body.count("qsa_index_scorer") == 1
+    assert "factors.extend(qsa_index_scorer.hash_factors())" in body
+
+
+def _hash(**overrides):
+    fields = {
+        "quant_config": None,
+        "compilation_config": None,
+        "parallel_config": None,
+        "tensor_parallel_size": 4,
+        "prefill_context_parallel_size": 1,
+        "dcp_config": None,
+        "enable_dp_attention": False,
+        "index_cache_dtype": None,
+        "hf_config": SimpleNamespace(),
+        "max_model_len": 4096,
+        "max_num_seqs": 256,
+        "speculative_config": None,
+    }
+    fields.update(overrides)
+    return Config.compute_hash(SimpleNamespace(**fields))
+
+
+def test_hash_unchanged_when_off_keyed_when_on():
+    base = _hash()  # a config without the field, i.e. the pre-feature hash
+    assert _hash(qsa_index_scorer=QSAIndexScorerConfig()) == base
+    assert _hash(qsa_index_scorer=QSAIndexScorerConfig(capture="/tmp/c.json")) == base
+    on = _hash(qsa_index_scorer=QSAIndexScorerConfig(profile="qsa_page4_gfx1250_v1"))
+    assert on != base
+    other = _hash(qsa_index_scorer=QSAIndexScorerConfig(profile="other_profile"))
+    assert other not in (on, base)
 
 
 def test_cli_flags_round_trip():

@@ -3014,7 +3014,9 @@ class Config:
         factors.append(self.max_num_seqs)
         # The fused QSA index scorer swaps the scorer kernel. Keyed only while
         # ON, so every hash computed with the feature off is unchanged.
-        factors.extend(self.qsa_index_scorer.hash_factors())
+        qsa_index_scorer = getattr(self, "qsa_index_scorer", None)
+        if qsa_index_scorer is not None:
+            factors.extend(qsa_index_scorer.hash_factors())
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3
