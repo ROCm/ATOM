@@ -78,7 +78,7 @@ def _registered_ar_output(
     The shared buffer is offered only to producers that explicitly promise
     ``out=`` support. The model stores a dtype-stable view of the arena: making
     a uint8 -> bf16 view inside the compiled forward causes AOTAutograd to reject
-    the mutated alias. Any capability/dtype/size miss returns ``None`` so the
+    the mutated alias. Any capability/size miss returns ``None`` so the
     producer allocates exactly as it did before F5.
     """
     supports_out = getattr(producer, "supports_out", None)
@@ -86,11 +86,9 @@ def _registered_ar_output(
         registered_buffer is None
         or supports_out is None
         or not supports_out()
-        or registered_buffer.dtype != like.dtype
     ):
         return None
-    nbytes = like.numel() * like.element_size()
-    if nbytes > registered_buffer.numel() * registered_buffer.element_size():
+    if like.numel() > registered_buffer.numel():
         return None
     return registered_buffer.narrow(0, 0, like.numel()).view(like.shape)
 
