@@ -2453,25 +2453,6 @@ class Config:
                     "decode and DCP is unverified. Use --enable-tbo (prefill "
                     "only), or drop DCP or speculative decode."
                 )
-                # A draft that owns its own GQA/MHA pool would be sharded on the
-                # head axis (TP) and the token axis (DCP) at once, which cannot
-                # be reassembled and shows only as lost acceptance. The DFlash
-                # draft avoids it by staying out of the DCP group; MLA, MTP and
-                # built-in DSpark drafts build no pool of their own.
-                from atom.spec_decode.draft_kv import draft_kv_conflicts_with_dcp
-
-                draft_hf = self.speculative_config.draft_model_hf_config
-                if draft_kv_conflicts_with_dcp(self.speculative_config):
-                    raise ValueError(
-                        "Decode context parallel (--decode-context-parallel-size "
-                        f"{self.decode_context_parallel_size}) with a non-MLA "
-                        "draft that owns its own KV pool is only supported for the "
-                        "DFlash block drafter, which stays out of the DCP "
-                        "group so its tokens are never DCP-sharded. This draft "
-                        f"({(getattr(draft_hf, 'architectures', None) or ['?'])[0]}) "
-                        "would be sharded on BOTH the head and the token axis, "
-                        "which is unreconstructible. Disable DCP for this draft."
-                    )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups

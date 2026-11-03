@@ -68,27 +68,6 @@ def draft_ctx_slots(out, positions, cu_ends, block_tables, tok_ramp, vblock):
     return out
 
 
-def draft_kv_conflicts_with_dcp(spec) -> bool:
-    """Whether DCP > 1 would shard this draft's own KV pool on both axes.
-
-    A draft that owns a GQA/MHA pool is head-sharded by TP; DCP would shard its
-    tokens too. Only the DFlash pool (`uses_dflash_pool`) stays out of the DCP
-    group. A pool is built only for a draft built from its own config (eagle3,
-    a standalone DSpark draft) -- the condition the proposers call
-    `draft_kv_builder` under; MTP and V4's built-in DSpark reuse the target's
-    rows and own none.
-    """
-    if spec is None or not (spec.method == "eagle3" or spec.use_dspark_with_draft()):
-        return False
-    draft_hf = spec.draft_model_hf_config
-    if draft_hf is None:
-        return False
-    from atom.utils.selector import attn_family, get_attn_backend
-
-    owns_pool = bool(get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL)
-    return owns_pool and not uses_dflash_pool(draft_hf)
-
-
 def draft_kv_builder(model_runner, draft_hf):
     """The KV builder a draft needs of its own, or None if it needs none.
 
