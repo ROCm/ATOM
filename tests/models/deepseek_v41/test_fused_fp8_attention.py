@@ -210,6 +210,37 @@ def assert_output(actual, expected):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("stage", ["decode", "prefill", "long_prefill"])
+def test_norm_rope_quant_window_matches_two_launches(fused_factory, stage):
+    # 1280 is V4.1's q_lora_rank, a long prefill's split-tile Q
+    lengths = {"decode": (1, 1), "prefill": (3, 5), "long_prefill": (800,)}[stage]
+    case = fused_factory(
+        64, slots=2, max_tokens=sum(lengths), q_lora_rank=1280, hidden_size=256
+    )
+    model, cache, rope = case.model, case.cache, case.rope
+    step, _ = make_step(case, lengths, prefill=stage != "decode")
+    latent = torch.randn(1, step.width, 1280 + 512, device="cuda", dtype=torch.bfloat16)
+    q, kv = latent[..., :1280], latent[..., 1280:]
+    layer = model.spec.layer_id
+
+    cache.backing.copy_(case.initial)
+    qr, qr_scale, normed = model.qk_norm(q, kv)
+    rows, window = cache.rope_quant_window(layer, None, normed, rope, step)
+    ring = cache.backing.clone()
+
+    cache.backing.copy_(case.initial)
+    actual = cache.norm_rope_quant_window(layer, model.qk_norm, q, kv, rope, step)
+    assert torch.equal(actual[0].view(torch.uint8), qr.view(torch.uint8))
+    assert torch.equal(actual[1].view(torch.uint8), qr_scale.view(torch.uint8))
+    assert torch.equal(cache.backing, ring)
+    if stage == "decode":
+        assert not torch.equal(ring, case.initial)
+        assert actual[2:] == (None, None) == (rows, window)
+    else:
+        assert torch.equal(actual[2], rows)
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("stage", ["decode", "prefill", "continued", "bounded"])
 def test_fused_forward_matches_unfused(fused_factory, heads, stage, record_property):

@@ -370,16 +370,17 @@ class Attention(nn.Module):
         )
         return self.wo_b(y.view(*leading_shape, -1))
 
-    def _use_fused_attention(self, query, cache, rope):
+    def _use_fused_attention(self, activation, cache, rope):
         """Whether this forward attends through `fused_sparse_attn_v41_paged_2src`:
         the layer qualifies (`fused_attn`), the pool holds unpacked MXFP8 rows
-        and Q and the 64-dimension RoPE tables are BF16. A BF16 or packed
-        pool, and every other case, keeps the unfused path."""
+        and the activations (Q follows `wq_a`'s) and the 64-dimension RoPE
+        tables are BF16. A BF16 or packed pool, and every other case, keeps
+        the unfused path."""
         return (
             self.fused_attn
             and cache.kv_fp8
             and not cache.packed
-            and query.dtype == torch.bfloat16
+            and activation.dtype == torch.bfloat16
             and rope.cos_cache.dtype == torch.bfloat16
             and rope.sin_cache.dtype == torch.bfloat16
             and rope.cos_cache.shape[-1] == 32
@@ -439,7 +440,17 @@ class Attention(nn.Module):
         q_lora, kv_pre = self.project_qkv(
             hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
         )
-        qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
+        # The fused kernel rotates and quantizes Q itself, which leaves the
+        # KV row alone on `rope_quant_window`; it rides on the dual RMSNorm
+        # instead. A decode's window store moving ahead of the scorer is
+        # safe: the scorer reads the index plane, the compressor its arena.
+        fused = self._use_fused_attention(kv_pre, cache, rope)
+        if fused:
+            qr, qr_scale, kv, window_kv = cache.norm_rope_quant_window(
+                self.spec.layer_id, self.qk_norm, q_lora, kv_pre, rope, step
+            )
+        else:
+            qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
@@ -448,23 +459,22 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        # The fused kernel rotates and quantizes Q itself, so only the KV row
-        # goes through `rope_quant_window` then; otherwise one launch does
-        # both rotations, the KV row's FP8 bytes and, where a decode allows
-        # it, the window write, and attention reads Q as MXFP8 (`query_fp8`).
-        # `window_kv` is what is left for `write_window` below, which is
-        # nothing when that fold happened.
-        fused = self._use_fused_attention(query, cache, rope)
-        query_fp8 = None if fused else cache.query_fp8(query)
-        if queries is None and not fused:
-            kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, query, kv_normed, rope, step, query_fp8
-            )
-        else:
-            kv, window_kv = cache.rope_quant_window(
-                self.spec.layer_id, None, kv_normed, rope, step
-            )
-            if not fused:
+        # Unfused: one launch for both rotations, the KV row's FP8 bytes and,
+        # where a decode allows it, the window write. `window_kv` is what is
+        # left for `write_window` below, which is nothing when that fold
+        # happened. The FP8 pool's attention reads the query as MXFP8
+        # (`query_fp8`).
+        query_fp8 = None
+        if not fused:
+            query_fp8 = cache.query_fp8(query)
+            if queries is None:
+                kv, window_kv = cache.rope_quant_window(
+                    self.spec.layer_id, query, kv_normed, rope, step, query_fp8
+                )
+            else:
+                kv, window_kv = cache.rope_quant_window(
+                    self.spec.layer_id, None, kv_normed, rope, step
+                )
                 cache.rotate_query(query, rope, queries.positions, query_fp8)
         # A forked compressor was already waited at the scorer; it is named
         # too because a TR recording holds every forked stream until it is
