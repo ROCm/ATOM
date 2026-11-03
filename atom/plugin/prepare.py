@@ -134,10 +134,18 @@ def _prepare_model_atom_rtpllm(
             atom_config.hf_config, "quantization_config", None
         )
         ple_module = "ple.ple_embedding.ngram_embedding"
+        # ``ple_layer_ids`` is 1-based.  Match only PLE layers that this
+        # checkpoint actually builds; a conversion entry for another layer
+        # must not change the dtype of the real PLE table.
+        ple_names = {ple_module}
+        for layer_id in getattr(hf, "ple_layer_ids", ()) or ():
+            layer_index = int(layer_id) - 1
+            ple_names.add(f"model.layers.{layer_index}.{ple_module}")
+            ple_names.add(f"model.language_model.layers.{layer_index}.{ple_module}")
         ple_is_fp8 = isinstance(quantization, dict) and any(
-            QuantizationConfig._matches_exclude(ple_module, item, check_contains=True)
-            or QuantizationConfig._matches_exclude(f"model.layers.0.{ple_module}", item)
+            QuantizationConfig._matches_exclude(name, item)
             for item in (quantization.get("modules_to_convert") or ())
+            for name in ple_names
         )
         if (
             getattr(hf, "ple_embedding_dtype", None) is None

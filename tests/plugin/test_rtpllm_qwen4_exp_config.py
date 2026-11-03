@@ -623,6 +623,26 @@ quant_config.remap_layer_name.assert_called_once()
                 ],
             },
             None,
+            "bfloat16",
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "model.layers.1.ple.ple_embedding.ngram_embedding"
+                ],
+            },
+            None,
+            None,
+        ),
+        (
+            {
+                "weight_block_size": [128, 128],
+                "modules_to_convert": [
+                    "re:^model\\.layers\\.1\\.ple\\.ple_embedding\\.ngram_embedding$"
+                ],
+            },
+            None,
             None,
         ),
         (
@@ -654,6 +674,7 @@ def test_qwen4_exp_rtp_block_fp8_ple_dtype_selection(
 
     hf = SimpleNamespace(
         split_ngram_parts=1,
+        ple_layer_ids=[2],
         quantization_config=quantization,
         ple_embedding_dtype=explicit_dtype,
     )
