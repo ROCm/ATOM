@@ -635,7 +635,9 @@ class Scheduler:
             getattr(config, "parallel_config", None), "data_parallel_size", 1
         )
         self.cost_balance = (
-            getattr(config, "enable_dp_attention", False) and dp_size > 1
+            getattr(config, "enable_dp_attention", False)
+            and dp_size > 1
+            and not envs.ATOM_DP_INDEPENDENT
         )
         self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
         self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK

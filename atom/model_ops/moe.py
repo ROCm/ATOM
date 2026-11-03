@@ -238,6 +238,8 @@ class FusedMoEParallelConfig:
     # ATOM_PCP_MOE_MERGE folded the PCP group into the expert sharding above:
     # every PCP rank must run the experts over the same rows.
     pcp_merge: bool = False
+    # ATOM_DP_REPLICATE_EXPERTS: all experts on every DP rank, no DP gather
+    replicate_experts: bool = False
 
     @property
     def selected_all2all_backend(self) -> str | None:
@@ -292,7 +294,14 @@ class FusedMoEParallelConfig:
 
         # When EP shards across the flattened DP * TP space (vLLM plugin under
         # EP), the ep rank must be computed in that flattened group space.
-        flatten_tp_across_dp_for_moe = (
+        # ATOM_DP_REPLICATE_EXPERTS (DP-attention, no EP): each DP rank keeps the
+        # whole expert set, so the MoE stays per rank: no flattening, no EP.
+        replicate_experts = (
+            enable_dp_attention
+            and envs.ATOM_DP_REPLICATE_EXPERTS
+            and not parallel_config.enable_expert_parallel
+        )
+        flatten_tp_across_dp_for_moe = not replicate_experts and (
             enable_dp_attention or parallel_config.moe_ep_flatten_tp_across_dp
         )
 
@@ -349,6 +358,7 @@ class FusedMoEParallelConfig:
                 requested_all2all_backend=requested_all2all_backend,
                 low_latency=low_latency,
                 pcp_merge=pcp_merge,
+                replicate_experts=replicate_experts,
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
@@ -5445,6 +5455,7 @@ class FusedMoE(torch.nn.Module):
             self.dp_size > 1
             and not self.moe_parallel_config.use_all2all_kernels
             and get_current_atom_config().enable_dp_attention
+            and not self.moe_parallel_config.replicate_experts
         )
         # Routed on the rank that owns the rows, before any gather: each rank's
         # routing masks its own pad rows, and the gather then moves top-k

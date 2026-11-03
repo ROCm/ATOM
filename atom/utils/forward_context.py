@@ -1102,9 +1102,12 @@ def set_forward_context(
     this rank's included (`DPMetadata.gather_running_tokens` when only that
     one is known)."""
     global _forward_context
+    from atom.utils import envs  # lazy, as elsewhere in this module
+
     dp_metadata = (
         DPMetadata(running_tokens_per_dp_rank)
         if atom_config.parallel_config.data_parallel_size > 1
+        and not envs.ATOM_DP_INDEPENDENT
         else None
     )
 

@@ -23,7 +23,8 @@ EP=${EP:-/app/mlcommons-endpoints}; VENV=${VENV:-$EP/venv}; BASE=$EP/examples/10
 
 valid() { local m=$1; [ "$m" -ge 1 ] && [ "$m" -le 2048 ] || return 1
   while [ $((m % 2)) -eq 0 ]; do m=$((m / 2)); done; [ $m -eq 1 ] || [ $m -eq 3 ]; }
-[[ "$C" =~ ^[0-9]+$ ]] && valid "$C" || { echo "usage: run_ep.sh <c>, c in 1-2048, 2^k or 3*2^k (got '$C')"; exit 2; }
+# ANY_CONCURRENCY=1 accepts any c in 1-2048 (an off-grid point, e.g. between two sweep points)
+[[ "$C" =~ ^[0-9]+$ ]] && { valid "$C" || { [ "${ANY_CONCURRENCY:-0}" = 1 ] && [ "$C" -ge 1 ] && [ "$C" -le 2048 ]; }; } || { echo "usage: run_ep.sh <c>, c in 1-2048, 2^k or 3*2^k, or any with ANY_CONCURRENCY=1 (got '$C')"; exit 2; }
 MODE=${MODE:-$([ "$C" -le 16 ] && echo tp || echo dp)}
 # TP (c16): 4 drafts accept 3.57 tokens a step against 3.14 for 3, and a 5th costs more than it accepts
 export SPEC=${SPEC:-$([ "$MODE" = tp ] && echo 4 || echo 3)}

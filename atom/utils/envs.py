@@ -219,6 +219,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sessions own (the cost of their next turns, and its decode attention). A
     # session is live while it was seen in the last SESSION_IDLE_S seconds.
     "ATOM_DP_PLACE_BY_CONTEXT": lambda: _flag_env("ATOM_DP_PLACE_BY_CONTEXT", "0"),
+    # DP-attention without expert parallel: every DP rank holds all the routed
+    # experts and runs its own tokens through them (no cross-rank gather /
+    # reduce-scatter), instead of cutting the experts TP-wise across the DP x TP
+    # device space. The DP scheduler (session affinity, placement, prefill
+    # balance, lockstep) is unchanged.
+    "ATOM_DP_REPLICATE_EXPERTS": lambda: _flag_env("ATOM_DP_REPLICATE_EXPERTS", "0"),
+    # With ATOM_DP_REPLICATE_EXPERTS (no cross-rank collective left in a
+    # forward): the DP engines step independently -- no per-iteration DP state
+    # all_reduce or dummy batches, a per-rank prefill delayer and step shape
+    # (no cross-rank padding or prefill cost exchange), no DP metadata in the
+    # forward (so no DP-sharded LM head / draft argmax). The router (session
+    # affinity, placement) still spreads requests over the ranks.
+    "ATOM_DP_INDEPENDENT": lambda: _flag_env("ATOM_DP_INDEPENDENT", "0")
+    and _flag_env("ATOM_DP_REPLICATE_EXPERTS", "0"),
     "ATOM_DP_PLACE_TOKEN_WEIGHT": lambda: float(
         os.getenv("ATOM_DP_PLACE_TOKEN_WEIGHT", "53000")
     ),

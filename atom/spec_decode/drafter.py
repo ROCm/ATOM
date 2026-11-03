@@ -13,7 +13,7 @@ from torch import nn
 from atom.config import Config
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
-from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
+from atom.utils import CpuGpuBuffer, envs, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
     SpecDecodeMetadata,
@@ -649,7 +649,7 @@ class Drafter(abc.ABC):
         context.pcp_split = False
         parallel_config = self.config.parallel_config
         # A group of one is uniform whatever it runs; only the table needs peers.
-        if parallel_config.data_parallel_size <= 1:
+        if parallel_config.data_parallel_size <= 1 or envs.ATOM_DP_INDEPENDENT:
             return
         context.running_tokens_are_unified = running_tokens_are_unified
         # Stating it is what spares the all_reduce: a unified height is every

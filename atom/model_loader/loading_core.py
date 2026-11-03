@@ -323,6 +323,13 @@ def load_weights_into_model(
         # at all -- so report it while the (slot, shard) detail is still around.
         _t0 = time.perf_counter()
         staging_report = staging_pool.flush_pending()
+        # The staging buffers are freed now, but torch's caching host allocator
+        # keeps their pages pinned (16 GiB a rank with every expert local), which
+        # starves later pinned allocations (the profiler's activity buffers
+        # among them). Hand them back.
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch.cuda.synchronize()
+            torch._C._host_emptyCache()
         t_flush = time.perf_counter() - _t0
         if staging_report.incomplete:
             detail = "\n  ".join(staging_report.incomplete)
