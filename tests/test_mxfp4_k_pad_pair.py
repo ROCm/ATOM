@@ -8,8 +8,8 @@ MLP's down_proj K is its per-rank intermediate (Kimi-K3's dense MLP: 33792 / TP8
 = 4224), so the pair pads it together, like MoE's intermediate_pad:
 MergedColumnParallelLinear(output_pad_align=) gives each per-rank output shard
 zero rows, RowParallelLinear(input_pad_align=) zero columns. Only a pair that is
-MXFP4 (or unquantized) in the checkpoint is padded, zeroed at allocation; online
-requant into a padded layer is refused at construction.
+MXFP4 or bf16 in the checkpoint is padded, zeroed at allocation; a bf16 pair may
+be quantized online, while online requant from a quantized source is refused.
 
 Every load path has to write each rank's real shard at the front of its padded
 slot -- including a gate_up merged on disk, and the module-level weight_loader
@@ -255,7 +255,7 @@ def test_an_unpadded_mxfp4_down_is_refused(monkeypatch, tp_rank):
         _process(monkeypatch, down)
 
 
-# ── online requant into a padded layer is refused at construction ────────
+# ── online requant: bf16 sources pad, quantized sources are refused ─────
 
 
 def _online_to_mxfp4(source):
