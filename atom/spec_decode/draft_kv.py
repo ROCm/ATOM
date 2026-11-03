@@ -110,83 +110,25 @@ def draft_kv_builder(model_runner, draft_hf):
         return None
 
     dflash_pool = uses_dflash_pool(draft_hf)
-    kv_cache_dtype = model_runner.config.kv_cache_dtype
-
-    if not dflash_pool:
-        # Every other pool-owning draft (Eagle3-llama, MiniMax-M3.1 DSpark)
-        # keeps the geometry
-        # and the fp8 scale planes it already had. Everything below this point
-        # is specific to a non-causal block draft that sits OUTSIDE the target's
-        # DCP group, and none of it is a no-op for a draft that does not.
-        make_pool = partial(
-            backend.make_kv_pool,
-            draft_hf,
-            world_size=model_runner.world_size,
-            kv_dtype=dtypes.d_dtypes[kv_cache_dtype],
-        )
-        return DraftKvBuilder(model_runner, make_pool)
-
-    # FULL TP, and a DCP group this pool is not in, as in SGLang (see the
-    # `kimi_k3_dflash` module docstring): the draft's KV heads are sharded
-    # normally and every rank holds the WHOLE token axis for its slice.
-    # The model builds its QKV at the same `tp_full`; the two must be one number
-    # or the pool and the projections describe different geometries over the same
-    # bytes, with nothing to catch it (`reshape_and_cache_flash` takes the head
-    # count from the key tensor and the stride from the cache, and stripes).
-    #
-    # Read off `model_runner.config` and NOT `get_dcp_world_size()`: this runs
-    # from the proposer's `__init__`, where the global ATOM config may not
-    # exist yet (`atom/distributed/dcp_utils.py`).
-    tp_full = model_runner.config.tensor_parallel_size
-    dcp_size = model_runner.config.decode_context_parallel_size
-    # Raised, not asserted: `python -O` drops asserts.
-    if tp_full % dcp_size:
-        raise ValueError(
-            f"draft KV pool needs TP ({tp_full}) divisible by DCP ({dcp_size})"
-        )
-    # ONE TARGET BLOCK ID, `dcp_size` BLOCKS. The draft rides the target's block
-    # ids (that is what `allocate_kv_cache_tensors` enforces), and under DCP a
-    # target block id addresses `block_size` LOCAL tokens, i.e.
-    # `block_size * dcp_size` GLOBAL positions -- the virtual block
-    # `dcp_prefill_slot_mapping` is written in (`dcp_ops.py:1059`). A DCP1 draft
-    # stores every one of those positions, so its entry has to be that wide or
-    # the id space it is handed overruns the id space it owns.
-    #
-    # Per rank this is the byte count a DCP-sharded draft would take:
-    # `dcp_size` times the tokens, and `tp_full` rather than
-    # `tp_full // dcp_size` gives `dcp_size` times fewer KV heads
-    # (`test_dflash_pool_footprint_is_dcp_invariant`). It is still a large
-    # share of each paged block; `allocate_kv_cache_tensors` logs the bytes.
-    if dcp_size > 1:
-        logger.info(
-            "Draft KV pool built at full TP %d with %d blocks per entry "
-            "(tp=%d / target dcp=%d): the DRAFT runs at DCP1 -- KV heads are "
-            "TP-sharded and every rank holds the whole token axis",
-            tp_full,
-            dcp_size,
-            tp_full,
-            dcp_size,
-        )
+    # The DFlash draft runs outside the target's DCP group, so one target block
+    # id spans `dcp` of its entries. Its scales are per-tensor because
+    # `reshape_and_cache_flash` and `unified_attention` each take one scale.
+    dflash_kwargs = (
+        {
+            "blocks_per_entry": model_runner.config.decode_context_parallel_size,
+            "per_tensor_scales": True,
+        }
+        if dflash_pool
+        else {}
+    )
     make_pool = partial(
         backend.make_kv_pool,
         draft_hf,
-        world_size=tp_full,
-        kv_dtype=dtypes.d_dtypes[kv_cache_dtype],
-        blocks_per_entry=dcp_size,
-        # PER-TENSOR, which is what makes the fp8 pool possible at all. The
-        # draft's read is aiter `unified_attention`, which loads one
-        # `k_descale`/`v_descale` per program; its write is
-        # `aiter.reshape_and_cache_flash`, whose HIP kernel dereferences
-        # `*k_scale` once per launch. Neither can read a per-(kv head, token)
-        # plane, and SGLang stores none (see `MhaKvPool`). So the planes are not
-        # declared rather than declared and ignored: `scale_views` then raises
-        # the `KeyError` it promises if a binder ever asks for them.
-        per_tensor_scales=True,
+        world_size=model_runner.world_size,
+        kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
+        **dflash_kwargs,
     )
-    # A way to build it, not the pool: how many rows it has is the walk's to
-    # say, and this runs from the proposer's `__init__` -- `build_drafter`
-    # still running, `runner.drafter` not yet set, nothing to walk.
-    return DraftKvBuilder(model_runner, make_pool, dflash_pool=True)
+    return DraftKvBuilder(model_runner, make_pool, dflash_pool=dflash_pool)
 
 
 class DraftKvBuilder(PoolRowsMixin):

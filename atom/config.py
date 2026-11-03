@@ -1270,9 +1270,7 @@ def _check_dflash_draft_target(
         )
 
 
-def _normalize_draft_dspark_config(
-    hf_config: PretrainedConfig, *, dflash: bool = False
-) -> None:
+def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
     DSpark checkpoints come in two shapes and name the same quantities
@@ -1286,7 +1284,7 @@ def _normalize_draft_dspark_config(
       lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
     - SpecForge-trained (DFlash) drafts are standalone too, but nest the first
       two under ``dflash_config`` (an alias above) and record the trained block
-      width as ``block_size``, which only ``dflash=True`` promotes. SpecForge
+      width as ``block_size``, which ``hf_config_override`` promotes. SpecForge
       builds them on a plain ``Qwen3Config``, so the backbone is GQA rather
       than MLA -- which this function does not care about, but the log line
       below does.
@@ -1317,30 +1315,6 @@ def _normalize_draft_dspark_config(
     # Synthesized marker, not a checkpoint field: the flavor discriminator the
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
-
-    # The trained block width, where the checkpoint records one. K3-DSpark does
-    # not: its draft is width-agnostic in its weights and the block is sized by
-    # --num-speculative-tokens (7 in that checkpoint's own serving recipe), so
-    # `dspark_block_size` stays unset and DSparkProposer._resolve_mtp_k falls
-    # back to the flag. SpecForge DFlash checkpoints DO record it, as a
-    # `block_size`. Recording it does not pin the verify horizon --
-    # `_resolve_mtp_k` still returns --num-speculative-tokens -- it
-    # only lets Config.__post_init__ warn when the horizon runs past the
-    # trained width.
-    #
-    # Read ONLY on the DFlash path. `block_size` is a loose generic HF key that
-    # another checkpoint may carry meaning something else entirely (a paging or
-    # windowing width), and this function also normalizes the MLA K3-DSpark
-    # shape, which must keep falling through to --num-speculative-tokens.
-    # `dflash` is the caller's assertion that this checkpoint's `block_size` is
-    # the SpecForge-trained verify width; nothing else promotes one.
-    if dflash:
-        dflash_config = getattr(hf_config, "dflash_config", None) or {}
-        block_size = dflash_config.get("block_size") or getattr(
-            hf_config, "block_size", None
-        )
-        if block_size:
-            hf_config.dspark_block_size = int(block_size)
 
     # The backbone is the draft's own business, but say which one so a
     # mis-detected flavor is visible in the log rather than only in acceptance.
@@ -1595,7 +1569,18 @@ class SpeculativeConfig:
         # bare dict index keyed on this string.
         if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
             hf_config.architectures = [K3_DFLASH_ARCH]
-            _normalize_draft_dspark_config(hf_config, dflash=True)
+            # The SpecForge-trained verify width. Read only here: `block_size`
+            # is a generic HF key another checkpoint may use for something else.
+            block_size = hf_config.dflash_config.get("block_size") or getattr(
+                hf_config, "block_size", None
+            )
+            if block_size:
+                hf_config.dspark_block_size = int(block_size)
+            _normalize_draft_dspark_config(hf_config)
+            return
+        # Already normalized: the `dspark_block_size` set above must not route
+        # it to the V4 DSpark draft below.
+        if arch == K3_DFLASH_ARCH:
             return
         if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)

@@ -116,6 +116,21 @@ def test_dflash_config_normalize():
     assert len(hf.dspark_target_layer_ids) == 5
 
 
+def test_dflash_config_normalize_is_idempotent():
+    """A second override keeps the DFlash draft rather than routing it, by its
+    `dspark_block_size`, to the V4 DSpark draft."""
+    from atom.config import SpeculativeConfig
+
+    hf = _radixark_cfg()
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+    model_type = hf.model_type
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+
+    assert hf.architectures == ["K3DFlashModel"]
+    assert hf.dspark_block_size == 7
+    assert hf.model_type == model_type != "deepseek_v4_dspark"
+
+
 def test_dflash_rope_is_the_drafts_own():
     """The rope the draft attention builds comes from the draft's config:
     theta 10000 / YaRN x16 from 65536, neox-style -- not the target's theta
