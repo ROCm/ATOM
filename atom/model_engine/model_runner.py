@@ -218,6 +218,22 @@ class TopKCandidates(NamedTuple):
     ids: torch.Tensor
 
 
+class GatheredCandidates(NamedTuple):
+    """`TopKCandidates` as the candidate all-gather delivered them: `[tp * rows, 2k]`
+    f32 packs, rank-major (rank r's rows, each k values then k ids), for the step
+    kernel (ATOM_GLUE_STEP_SAMPLE) to index in place."""
+
+    gathered: torch.Tensor
+    rows: int
+    tp: int
+    k: int
+
+    def as_topk(self) -> "TopKCandidates":
+        g = self.gathered.view(self.tp, -1, 2, self.k).permute(1, 2, 0, 3)
+        g = g.reshape(g.shape[0], 2, self.tp * self.k)
+        return TopKCandidates(g[:, 0], g[:, 1].long())
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -3422,8 +3438,21 @@ class ModelRunner:
     ) -> torch.Tensor | GreedyTokenIds | TopKCandidates:
         step = self._presence_step
         if topk_cands:
+            head = self._greedy_lm_head()
+            if envs.ATOM_GLUE_STEP_SAMPLE:
+                return GatheredCandidates(
+                    head.compute_topk_candidates(
+                        hidden_states,
+                        topk_cands,
+                        logits_hook=None if step is None else step.apply,
+                        raw=True,
+                    ),
+                    hidden_states.shape[0],
+                    head.tp_size,
+                    topk_cands,
+                )
             return TopKCandidates(
-                *self._greedy_lm_head().compute_topk_candidates(
+                *head.compute_topk_candidates(
                     hidden_states,
                     topk_cands,
                     logits_hook=None if step is None else step.apply,
@@ -3522,6 +3551,45 @@ class ModelRunner:
             tokens = broadcast_from_rank0(tokens, get_tp_group())
         return tokens[:rows], tokens[rows:]
 
+    _glue_sampler = None
+
+    def _glue_step_sample(self, cands, metadata, temperatures, top_k, top_ps):
+        """ATOM_GLUE_STEP_SAMPLE: (sampled tokens, verdict, next anchors) of a verify
+        from the gathered candidates, as `_sample_verify_and_bonus` + rejection +
+        presence marks + the next-anchor gather (atom/model_ops/step_glue.py)."""
+        from atom.model_ops.sampler import SAMPLER_EPS
+        from atom.model_ops.step_glue import StepSampler
+
+        if self._glue_sampler is None:
+            self._glue_sampler = StepSampler(cands.gathered.device)
+        step = self._presence_step
+        out, verdict, nxt = self._glue_sampler.sample(
+            cands.gathered,
+            cands.rows,
+            cands.tp,
+            cands.k,
+            top_k,
+            metadata,
+            metadata.input_ids,
+            temperatures,
+            top_ps,
+            step,
+            SAMPLER_EPS,
+        )
+        if envs.ATOM_GLUE_CHECK and get_tp_group().world_size > 1:
+            # every rank must have drawn the same tokens: compare, else take rank 0's
+            mine = torch.stack([out.to(torch.int64).sum(), verdict.to(torch.int64).sum()])
+            ref = broadcast_from_rank0(mine.contiguous(), get_tp_group())
+            if not torch.equal(mine, ref):
+                logger.error(
+                    "ATOM_GLUE_CHECK: rank %d sampled differently from rank 0 "
+                    "(%s vs %s); taking rank 0's tokens", self.rank, mine.tolist(), ref.tolist()
+                )
+                out = broadcast_from_rank0(out.contiguous(), get_tp_group())
+                verdict = broadcast_from_rank0(verdict.contiguous(), get_tp_group())
+                nxt = torch.gather(out, 1, verdict[0].view(-1, 1).long()).view(-1).to(torch.int32)
+        return out, verdict, nxt
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3539,6 +3607,10 @@ class ModelRunner:
         bs = batch.total_seqs_num
         # Set when the sampled tokens are already identical on every TP rank.
         tokens_tp_synced = False
+        # ATOM_GLUE_STEP_SAMPLE's kernel: the next anchors it wrote, and whether it
+        # already marked the presence mask
+        glue_next = None
+        glue = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3573,7 +3645,19 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            if isinstance(logits, GreedyTokenIds):
+            if isinstance(logits, GatheredCandidates):
+                if isinstance(top_ks, int) and top_ks <= logits.k:
+                    # Sampler, rejection, presence marks and next anchors in one
+                    # kernel, identical on every TP rank (ATOM_GLUE_STEP_SAMPLE).
+                    glue = self._glue_step_sample(
+                        logits, spec_decode_metadata, temperatures, top_ks, top_ps
+                    )
+                else:
+                    logits = logits.as_topk()
+            if glue is not None:
+                sampled_tokens, verdict, glue_next = glue
+                tokens_tp_synced = True
+            elif isinstance(logits, GreedyTokenIds):
                 # All-greedy: the head already reduced every row to its argmax,
                 # which is what the greedy sampler and verify would take.
                 bonus_token_ids = torch.index_select(logits.ids, 0, bonus_logits_indices)
@@ -3625,12 +3709,13 @@ class ModelRunner:
                     all_greedy=all_greedy,
                     needs_independent_noise=needs_independent_noise or not all_greedy,
                 )
-            sampled_tokens, verdict = self.rejection_sampler.forward(
-                spec_decode_metadata,
-                target_logits,
-                bonus_token_ids,
-                target_token_ids=target_token_ids,
-            )
+            if glue is None:
+                sampled_tokens, verdict = self.rejection_sampler.forward(
+                    spec_decode_metadata,
+                    target_logits,
+                    bonus_token_ids,
+                    target_token_ids=target_token_ids,
+                )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
             # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
@@ -3651,7 +3736,7 @@ class ModelRunner:
             and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
         ):
             sampled_tokens = broadcast_from_rank0(sampled_tokens, get_tp_group())
-        if self._presence_step is not None:
+        if self._presence_step is not None and glue is None:
             self._presence_step.mark(sampled_tokens.view(bs, -1))
 
         # Compute logprobs if any sequence requested them
@@ -3684,9 +3769,12 @@ class ModelRunner:
                 self.tokenID_processor.spec_status_queue.send(
                     spec_counts, ready=self.forward_done_event
                 )
-                next_token_ids = torch.gather(
-                    sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
-                ).view(bs)
+                if glue_next is not None:
+                    next_token_ids = glue_next
+                else:
+                    next_token_ids = torch.gather(
+                        sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
+                    ).view(bs)
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
