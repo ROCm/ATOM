@@ -1,56 +1,75 @@
 # SPDX-License-Identifier: MIT
-"""`sampling_scratch`: per-call views carved from buffers allocated once."""
+"""`sampling_scratch`: named per-call views carved from one buffer allocated once."""
+
+from typing import NamedTuple
 
 import pytest
 import torch
 
-from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
-from atom.model_ops.sampling_scratch import SamplingScratch, take
+from atom.model_ops.sampling_scratch import (
+    SCRATCH_ALIGN,
+    Region,
+    SamplingScratch,
+    scratch_bytes,
+)
 
 
-def test_views_are_laid_out_in_order_with_the_requested_shapes():
-    scratch = SamplingScratch.for_shapes([(2, 3), (4,)], [(5,)], "cpu")
-    (a, b), (c,) = take([(2, 3), (4,)], [(5,)], scratch.f32, scratch.i32)
-    assert a.shape == (2, 3) and b.shape == (4,) and c.shape == (5,)
-    assert a.dtype is torch.float32 and c.dtype is torch.int32
-    assert a.data_ptr() == scratch.f32.data_ptr()
-    # 6 elements, then up to the next boundary `plan_regions` places.
-    offsets, _ = plan_regions([6 * 4, 4 * 4])
-    assert b.data_ptr() == scratch.f32.data_ptr() + offsets[1]
-    assert a.is_contiguous() and b.is_contiguous()
+class Inner(NamedTuple):
+    c: object
 
 
-def test_the_views_are_where_plan_regions_puts_them():
-    """One definition of a region's start, shared with the cache pools."""
-    shapes = [(3,), (0,), (5, 7), (1,)]
-    scratch = SamplingScratch.for_shapes(shapes, [], "cpu")
-    offsets, total = plan_regions([4 * 3, 0, 4 * 35, 4])
-    assert scratch.f32.numel() * 4 == total
-    views, _ = take(shapes, [], scratch.f32, scratch.i32)
-    # Byte offsets in the buffer; an empty view's data_ptr means nothing.
-    assert [v.storage_offset() * 4 for v in views] == offsets
-    assert [v.shape for v in views] == [torch.Size(s) for s in shapes]
+class Spec(NamedTuple):
+    a: object
+    b: object
+    inner: Inner
+
+
+def spec(rows=2):
+    return Spec(
+        Region((rows, 3), torch.float32),
+        Region((4,), torch.int32),
+        Inner(Region((5,), torch.float32)),
+    )
+
+
+def test_views_come_back_named_in_field_order_with_their_shapes_and_dtypes():
+    scratch = SamplingScratch.for_spec(spec(), "cpu")
+    views = scratch.carve(spec())
+    assert isinstance(views, Spec) and isinstance(views.inner, Inner)
+    assert views.a.shape == (2, 3) and views.a.dtype is torch.float32
+    assert views.b.shape == (4,) and views.b.dtype is torch.int32
+    assert views.inner.c.shape == (5,)
+    base = scratch.buf.data_ptr()
+    assert views.a.data_ptr() == base
+    assert views.b.data_ptr() == base + SCRATCH_ALIGN
+    assert views.inner.c.data_ptr() == base + 2 * SCRATCH_ALIGN
+    assert all(v.is_contiguous() for v in (views.a, views.b, views.inner.c))
+
+
+def test_regions_are_whole_alignment_units():
+    s = Spec(
+        Region((SCRATCH_ALIGN // 4 + 1,), torch.float32),
+        Region((0,), torch.int32),
+        Inner(Region((1,), torch.int32)),
+    )
+    assert scratch_bytes(s) == 2 * SCRATCH_ALIGN + 0 + SCRATCH_ALIGN
 
 
 @pytest.mark.parametrize("rows", range(1, 9))
-def test_every_view_is_16_byte_aligned_whatever_the_batch(rows):
+def test_every_view_is_aligned_whatever_the_batch(rows):
     # Triton specializes on each pointer's 16-byte alignment: views whose
     # alignment moved with the batch would compile a kernel per pattern.
-    f32 = [(rows,), (3, rows), (rows, 5)]
-    i32 = [(rows,), (rows, 7), (2,)]
-    scratch = SamplingScratch.for_shapes(
-        [(8,), (3, 8), (8, 5)], [(8,), (8, 7), (2,)], "cpu"
-    )
-    fv, iv = take(f32, i32, scratch.f32, scratch.i32)
-    for view, base in [(v, scratch.f32) for v in fv] + [(v, scratch.i32) for v in iv]:
-        assert (view.data_ptr() - base.data_ptr()) % 16 == 0
+    scratch = SamplingScratch.for_spec(spec(8), "cpu")
+    views = scratch.carve(spec(rows))
+    for view in (views.a, views.b, views.inner.c):
+        assert (view.data_ptr() - scratch.buf.data_ptr()) % SCRATCH_ALIGN == 0
 
 
 def test_a_batch_larger_than_the_scratch_is_refused():
-    scratch = SamplingScratch(5, 5, "cpu")
+    scratch = SamplingScratch.for_spec(spec(2), "cpu")
     with pytest.raises(ValueError, match="sized for a smaller batch"):
-        take([(2, 3)], [], scratch.f32, scratch.i32)
+        scratch.carve(spec(200))
 
 
-def test_nbytes_counts_both_buffers():
-    assert SamplingScratch(5, 3, "cpu").nbytes() == (5 + 3) * 4
+def test_nbytes_is_the_buffer():
+    assert SamplingScratch.for_spec(spec(), "cpu").nbytes() == scratch_bytes(spec())

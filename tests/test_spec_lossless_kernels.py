@@ -38,6 +38,7 @@ from atom.model_ops.ratio_target_p import (
     _RATIO_BLOCK_V,
     _ratio_stats_kernel,
     _ratio_target_p,
+    target_p_scratch,
 )
 from atom.model_ops.ratio_verify import (
     _RATIO_ACCEPT_KEY,
@@ -48,7 +49,6 @@ from atom.model_ops.ratio_verify import (
     _ratio_densify_scatter_kernel,
     _ratio_residual_pick_kernel,
     _ratio_residual_race_kernel,
-    _ratio_scratch_shapes,
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
@@ -61,7 +61,7 @@ from atom.model_ops.sampling_filter_descent import (
     _ratio_filter_floor_kernel,
     _ratio_filter_pass_kernel,
 )
-from atom.model_ops.sampling_scratch import SamplingScratch, take
+from atom.model_ops.sampling_scratch import SamplingScratch
 from atom.model_ops.softmax_tiles import (
     argmax_lowest_id,
     race_key,
@@ -154,8 +154,7 @@ def sample(
         top_p,
         seed,
         noise_offset,
-        scratch.f32,
-        scratch.i32,
+        scratch.buf,
     )
     return out, s
 
@@ -446,8 +445,7 @@ def test_two_runs_and_a_graph_replay_store_and_draft_bit_for_bit_alike():
             top_p,
             seed,
             rows * vocab,
-            scratch.f32,
-            scratch.i32,
+            scratch.buf,
         )
 
     snapshots = []
@@ -1036,8 +1034,8 @@ def test_a_reused_scratch_verifies_exactly_what_a_fresh_one_does(dtype, filters)
     plain = verify(**args, q=q, ratio_step=11, top_ks=ks, top_ps=ps)
     scratch = ratio_verify_scratch(64, width, vocab, DEV)  # sized above the batch
     for garbage in (float("nan"), -1.0):
-        scratch.f32.fill_(garbage)
-        scratch.i32.random_(-(2**31), 2**31 - 1)
+        scratch.buf.view(torch.float32).fill_(garbage)
+        scratch.buf[::7].random_(0, 256)
         reused = verify(
             **{**args, "ratio_scratch": scratch},
             q=q,
@@ -1652,23 +1650,11 @@ def filtered_p(logits, temps, top_ks=None, top_ps=None, widths=None):
     widths = torch.ones(rows, dtype=torch.int64) if widths is None else widths
     cu = widths.cumsum(0).to(device=DEV, dtype=torch.int32)
     assert int(cu[-1]) == rows
-    shapes = _ratio_scratch_shapes(rows, len(widths), vocab)
-    scratch = SamplingScratch.for_shapes(*shapes, DEV)
-    (
-        (row_max, row_inv_z, row_floor, part_max, part_sum, part_val, _, *filt_f32),
-        (row_argmax, part_idx, _, _, *filt_i32),
-    ) = take(*shapes, scratch.f32, scratch.i32)
+    spec = target_p_scratch(rows, vocab)
+    work = SamplingScratch.for_spec(spec, DEV).carve(spec)
     temps = temps.float().contiguous()
-    assert _ratio_target_p(
-        logits,
-        cu,
-        temps,
-        top_ks,
-        top_ps,
-        (row_max, row_inv_z, row_argmax, row_floor),
-        (part_max, part_sum, part_val, part_idx),
-        (*filt_f32, *filt_i32),
-    )
+    assert _ratio_target_p(logits, cu, temps, top_ks, top_ps, work)
+    row_max, row_inv_z, row_floor = work.row_max, work.row_inv_z, work.row_floor
     x = logits.float()
     kept = x >= row_floor[:, None]
     temps = temps.repeat_interleave(widths.to(DEV))

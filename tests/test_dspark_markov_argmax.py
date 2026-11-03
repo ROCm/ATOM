@@ -85,8 +85,7 @@ def test_the_sampled_op_checks_its_tables_as_the_greedy_one_does():
         torch.ones(rows),
         torch.zeros(1, **i32),
         0,
-        scratch.f32,
-        scratch.i32,
+        scratch.buf,
     )
     with pytest.raises(ValueError, match="markov_w2"):
         dspark_markov_sample(base, prev, w1, w2[:-1], _ids(rows, "cpu"), *rest)

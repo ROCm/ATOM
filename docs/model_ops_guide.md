@@ -603,11 +603,11 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
 | `sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |
 | `sparse_q_store.py` | `SparseQStore`, `RatioDraftQ` — the sparse draft `q` a drafter writes and the ratio verify reads, independent of any drafter |
-| `sampling_filter.py` | `row_filters`, `filter_scratch_shapes` — the ratio verify's top-k/top-p floor: shared row helpers and scratch shapes (`ratio_target_p.filter_floor` dispatches) |
+| `sampling_filter.py` | `row_filters`, `FilterScratch` — the ratio verify's top-k/top-p floor: shared row helpers and work buffers (`ratio_target_p.filter_floor` dispatches) |
 | `sampling_filter_descent.py` | `descend_floor` — the floor by a radix descent over the logit bits |
 | `sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
 | `softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
-| `sampling_scratch.py` | `SamplingScratch`, `take` — the draft's and the ratio verify's per-step scratch, allocated once before KV sizing and carved into views where `entry_arena.plan_regions` places them |
+| `sampling_scratch.py` | `SamplingScratch`, `Region` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) on its own `SCRATCH_ALIGN` boundary |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |

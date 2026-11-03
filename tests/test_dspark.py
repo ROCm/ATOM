@@ -124,7 +124,7 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
         top_k=per_row,
         top_p=per_row,
         seed=None,
-        scratch=types.SimpleNamespace(f32=None, i32=None),
+        scratch=types.SimpleNamespace(buf=None),
     )
     calls = []
 

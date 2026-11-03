@@ -271,8 +271,8 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     """Next to the q store, before the KV cache is sized: the profiling run
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
-    assert prop._lossless.sampling.scratch.f32.numel()
-    assert prop._lossless.verify_scratch.f32.numel()
+    assert prop._lossless.sampling.scratch.nbytes()
+    assert prop._lossless.verify_scratch.nbytes()
 
 
 @pytest.mark.parametrize("lossless", [True, False], ids=["armed", "not-armed"])

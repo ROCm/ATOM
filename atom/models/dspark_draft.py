@@ -224,8 +224,7 @@ class DSparkMarkovHead(nn.Module):
                 sampling.top_p[:bs],
                 sampling.seed,
                 k * position_stride,
-                sampling.scratch.f32,
-                sampling.scratch.i32,
+                sampling.scratch.buf,
             )
         return out_ids[:, 1:]
 

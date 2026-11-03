@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.sampling_scratch import Region
+
 # Logit-key bits one filter pass resolves, so each pass bins by this many. The
 # last 8 bits are resolved apart (`_ratio_filter_floor_kernel` counts them,
 # `_ratio_filter_cut_kernel` picks the floor among them): each of their
@@ -209,20 +211,32 @@ def _count_run_cells(num_tokens: int, vocab_size: int, stats_block_v: int) -> in
     return num_tokens * triton.cdiv(vocab_size, stats_block_v) * _FILTER_COUNT_GROUPS
 
 
-def filter_scratch_shapes(num_tokens: int, vocab_size: int, stats_block_v: int):
-    """fp32 and int32 shapes `ratio_target_p.filter_floor`'s ``parts`` take,
-    in that order, for rows whose stats pass walks ``stats_block_v`` tiles."""
+class FilterScratch(NamedTuple):
+    """`ratio_target_p.filter_floor`'s work buffers."""
+
+    filter_f32: torch.Tensor  # [2, rows, _FILTER_F32_WIDTH] fp32
+    floor_mass: torch.Tensor  # [mass tiles, rows] fp32
+    filter_i32: torch.Tensor  # [2, rows, _FILTER_I32_WIDTH] int32
+    #: A row of last-digit counts per (row, split) of the last count.
+    floor_counts: torch.Tensor
+    #: The counted top-k's run maxima, and the ids at each, that the stats
+    #: pass keeps per stats tile.
+    run_max: torch.Tensor
+    run_at_max: torch.Tensor
+
+
+def filter_scratch(
+    num_tokens: int, vocab_size: int, stats_block_v: int
+) -> FilterScratch:
+    """The regions `ratio_target_p.filter_floor` needs, for rows whose stats
+    pass walks ``stats_block_v`` tiles."""
     run_cells = _count_run_cells(num_tokens, vocab_size, stats_block_v)
-    f32 = [
-        (2, num_tokens, _FILTER_F32_WIDTH),  # filter_f32
-        (triton.cdiv(vocab_size, _FILTER_BLOCK_V), num_tokens),  # floor_mass
-    ]
-    i32 = [
-        (2, num_tokens, _FILTER_I32_WIDTH),  # filter_i32
-        # floor_counts: a row of last-digit counts per (row, split) of the
-        # last count.
-        (max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS,),
-        (run_cells,),  # run_max
-        (run_cells,),  # run_at_max
-    ]
-    return f32, i32
+    f32, i32 = torch.float32, torch.int32
+    return FilterScratch(
+        Region((2, num_tokens, _FILTER_F32_WIDTH), f32),
+        Region((triton.cdiv(vocab_size, _FILTER_BLOCK_V), num_tokens), f32),
+        Region((2, num_tokens, _FILTER_I32_WIDTH), i32),
+        Region((max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS,), i32),
+        Region((run_cells,), i32),
+        Region((run_cells,), i32),
+    )

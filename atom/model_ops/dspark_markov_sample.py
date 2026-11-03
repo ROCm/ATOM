@@ -16,6 +16,8 @@ Philox key high word 0; the verify's draws use other words (`ratio_verify`).
 int64 addressing: ``[max_bs, T, V]`` logits and the store pass 2**31 elements.
 """
 
+from typing import NamedTuple
+
 import torch
 import triton
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -29,9 +31,13 @@ from atom.model_ops.dspark_markov_argmax import (
     check_markov_inputs,
     markov_weights_unsupported,
 )
-from atom.model_ops.sampling_scratch import SamplingScratch, take
+from atom.model_ops.sampling_scratch import Region, SamplingScratch, carve
 from atom.model_ops.softmax_tiles import softmax_combine_kernel
-from atom.model_ops.sparse_q_select import q_select_scratch_shapes, select_and_draw_q
+from atom.model_ops.sparse_q_select import (
+    QSelectScratch,
+    q_select_scratch,
+    select_and_draw_q,
+)
 
 
 def _dspark_markov_sample_fake(
@@ -52,8 +58,7 @@ def _dspark_markov_sample_fake(
     top_p: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
-    scratch_f32: torch.Tensor,
-    scratch_i32: torch.Tensor,
+    scratch: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty(
         base_logits.shape[0],
@@ -63,20 +68,29 @@ def _dspark_markov_sample_fake(
     )
 
 
-def _sample_scratch_shapes(num_rows: int, vocab_size: int):
-    """fp32 and int32 shapes one `dspark_markov_sample` call needs, in order."""
+class SampleScratch(NamedTuple):
+    """One `dspark_markov_sample` call's work buffers."""
+
+    part_max: torch.Tensor  # [gemv tiles, B] fp32, each tile's max of s
+    part_amax_val: torch.Tensor  # [gemv tiles, B] fp32, raw max
+    part_amax_idx: torch.Tensor  # [gemv tiles, B] int32, its lowest id
+    row_max: torch.Tensor  # [B] fp32
+    row_argmax: torch.Tensor  # [B] int32
+    select: QSelectScratch
+
+
+def _sample_scratch(num_rows: int, vocab_size: int) -> SampleScratch:
+    """The regions one `dspark_markov_sample` call of ``num_rows`` needs."""
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    f32 = [
-        (gemv_tiles, num_rows),  # part_max
-        (gemv_tiles, num_rows),  # part_amax_val
-        (num_rows,),  # row_max
-    ]
-    i32 = [
-        (gemv_tiles, num_rows),  # part_amax_idx
-        (num_rows,),  # row_argmax
-        *q_select_scratch_shapes(num_rows, vocab_size),
-    ]
-    return f32, i32
+    f32, i32 = torch.float32, torch.int32
+    return SampleScratch(
+        Region((gemv_tiles, num_rows), f32),
+        Region((gemv_tiles, num_rows), f32),
+        Region((gemv_tiles, num_rows), i32),
+        Region((num_rows,), f32),
+        Region((num_rows,), i32),
+        q_select_scratch(num_rows, vocab_size),
+    )
 
 
 def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
@@ -84,8 +98,7 @@ def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
     allocated once. One call runs at a time, so a block's positions share it.
     The dense ``s`` scratch is not part of it: it is the caller's, sized
     ``[max_rows, V]``."""
-    f32, i32 = _sample_scratch_shapes(max_rows, vocab_size)
-    return SamplingScratch.for_shapes(f32, i32, device)
+    return SamplingScratch.for_spec(_sample_scratch(max_rows, vocab_size), device)
 
 
 def _check_rows(name, t, rows, dtype):
@@ -103,8 +116,7 @@ def _check_rows(name, t, rows, dtype):
         "q_probs",
         "q_meta",
         "s_scratch",
-        "scratch_f32",
-        "scratch_i32",
+        "scratch",
     ],
 )
 def dspark_markov_sample(
@@ -125,8 +137,7 @@ def dspark_markov_sample(
     top_p: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
-    scratch_f32: torch.Tensor,
-    scratch_i32: torch.Tensor,
+    scratch: torch.Tensor,
 ) -> torch.Tensor:
     """Draw ``x_k`` from the top of ``softmax((base_logits + W1[prev_ids] @
     W2^T) / T)`` and publish exactly the q it was drawn from.
@@ -157,8 +168,9 @@ def dspark_markov_sample(
         noise_offset:         host int, the Philox counter base for this block
                               position. Static (position * max_B * V), so it
                               does not make the launch data-dependent.
-        scratch_f32, scratch_i32: flat buffers the call's partials are carved
-                              from (`dspark_markov_sample_scratch`).
+        scratch:              the byte buffer of a
+                              `dspark_markov_sample_scratch`, which the call's
+                              partials are carved from.
 
     Returns:
         ``[B, r]`` ``W1[prev_ids]``, for the same reason the greedy op returns it.
@@ -219,11 +231,7 @@ def dspark_markov_sample(
     # Stage 1's GEMV keeps the greedy op's narrow V tile (its accumulator is the
     # MFMA one); the q stages tile wide, because they only stream.
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    f32_shapes, i32_shapes = _sample_scratch_shapes(num_rows, vocab_size)
-    (
-        (part_max, part_amax_val, row_max),
-        (part_amax_idx, row_argmax, *select_scratch),
-    ) = take(f32_shapes, i32_shapes, scratch_f32, scratch_i32)
+    work = carve(scratch, _sample_scratch(num_rows, vocab_size))
 
     _markov_stage1[(gemv_tiles, row_tiles)](
         base_logits,
@@ -231,12 +239,12 @@ def dspark_markov_sample(
         markov_w1,
         markov_w2,
         markov_embed,
-        part_amax_val,
-        part_amax_idx,
+        work.part_amax_val,
+        work.part_amax_idx,
         temperatures,
         q_row_base,
         s_scratch,
-        part_max,
+        work.part_max,
         num_rows,
         vocab_size,
         rank,
@@ -255,13 +263,13 @@ def dspark_markov_sample(
         num_stages=2,
     )
     softmax_combine_kernel[(num_rows,)](
-        part_max,
+        work.part_max,
         None,
-        row_max,
+        work.row_max,
         None,
-        part_amax_val,
-        part_amax_idx,
-        row_argmax,
+        work.part_amax_val,
+        work.part_amax_idx,
+        work.row_argmax,
         num_rows,
         gemv_tiles,
         BLOCK_TILE=triton.next_power_of_2(gemv_tiles),
@@ -272,8 +280,8 @@ def dspark_markov_sample(
     )
     select_and_draw_q(
         s_scratch,
-        row_max,
-        row_argmax,
+        work.row_max,
+        work.row_argmax,
         q_row_base,
         greedy_mask,
         top_k,
@@ -283,7 +291,7 @@ def dspark_markov_sample(
         q_ids,
         q_probs,
         q_meta,
-        select_scratch,
+        work.select,
         position,
         noise_offset,
     )

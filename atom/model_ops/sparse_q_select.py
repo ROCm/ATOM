@@ -18,10 +18,13 @@ Fixed-order reductions, no atomics: TP ranks must store and draw alike.
 Philox noise in-kernel, at a full-vocab race's counter per (position, row, id).
 """
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.sampling_scratch import Region
 from atom.model_ops.softmax_tiles import argmax_lowest_id, race_key
 
 # Stages 3 and 5 tile V identically (the cut hands each tile a slot range).
@@ -312,16 +315,27 @@ def _dspark_q_finalize(
     tl.store(out_ptr + row * stride_out, x.to(out_ptr.dtype.element_ty))
 
 
-def q_select_scratch_shapes(num_rows: int, vocab_size: int):
-    """int32 shapes `select_and_draw_q` needs, in its ``scratch`` order."""
+class QSelectScratch(NamedTuple):
+    """`select_and_draw_q`'s work buffers, all int32."""
+
+    hist: torch.Tensor  # [B, tiles, bins]
+    tile_off: torch.Tensor  # [B, tiles]
+    tile_quota: torch.Tensor  # [B, tiles]
+    row_cut: torch.Tensor  # [B]
+    row_n: torch.Tensor  # [B]
+
+
+def q_select_scratch(num_rows: int, vocab_size: int) -> QSelectScratch:
+    """The regions `select_and_draw_q` needs for ``num_rows`` rows."""
     q_tiles = triton.cdiv(vocab_size, _Q_BLOCK_V)
-    return [
-        (num_rows, q_tiles, _Q_BINS),  # hist
-        (num_rows, q_tiles),  # tile_off
-        (num_rows, q_tiles),  # tile_quota
-        (num_rows,),  # row_cut
-        (num_rows,),  # row_n
-    ]
+    i32 = torch.int32
+    return QSelectScratch(
+        Region((num_rows, q_tiles, _Q_BINS), i32),
+        Region((num_rows, q_tiles), i32),
+        Region((num_rows, q_tiles), i32),
+        Region((num_rows,), i32),
+        Region((num_rows,), i32),
+    )
 
 
 def select_and_draw_q(
@@ -337,7 +351,7 @@ def select_and_draw_q(
     q_ids: torch.Tensor,
     q_probs: torch.Tensor,
     q_meta: torch.Tensor,
-    scratch,
+    scratch: QSelectScratch,
     position: int,
     noise_offset: int,
 ) -> None:
@@ -345,7 +359,7 @@ def select_and_draw_q(
     row's q at ``q_row_base[b] + position`` and write its token to ``out``.
 
     ``row_max`` / ``row_argmax`` are the row's max score and lowest-id raw
-    argmax; ``scratch`` is the tensors of `q_select_scratch_shapes`. Arguments
+    argmax; ``scratch`` is carved from `q_select_scratch`. Arguments
     are as `dspark_markov_sample` documents them, which checks them.
     """
     num_rows = q_row_base.shape[0]

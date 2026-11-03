@@ -7,6 +7,8 @@ stats pass also keeps the run maxima a counted top-k reads, so it fuses the
 filter's run-maxima pass. `ratio_verify` reads p from what this leaves.
 """
 
+from typing import NamedTuple
+
 import torch
 import triton
 import triton.language as tl
@@ -16,15 +18,18 @@ from atom.model_ops.sampling_filter import (
     _BATCH_COUNTS,
     _FILTER_COUNT_GROUPS,
     _FILTER_COUNT_MAX_K,
+    FilterScratch,
     RowFilters,
     _counted_row,
     _logit_key,
     _request_filter,
     _request_of_row,
+    filter_scratch,
     row_filters,
 )
 from atom.model_ops.sampling_filter_count import count_floor
 from atom.model_ops.sampling_filter_descent import descend_floor
+from atom.model_ops.sampling_scratch import Region
 from atom.model_ops.softmax_tiles import (
     argmax_lowest_id,
     softmax_combine_kernel,
@@ -119,26 +124,53 @@ def _ratio_stats_kernel(
             tl.store(group_at_max_ptr + runs, at_max)
 
 
+class TargetPScratch(NamedTuple):
+    """`_ratio_target_p`'s outputs and work buffers, per draft row."""
+
+    row_max: torch.Tensor  # [rows] fp32
+    row_inv_z: torch.Tensor  # [rows] fp32
+    row_argmax: torch.Tensor  # [rows] int32, lowest id
+    row_floor: torch.Tensor  # [rows] fp32, the lowest logit p_f keeps
+    part_max: torch.Tensor  # [tiles, rows] fp32
+    part_sum: torch.Tensor  # [tiles, rows] fp32
+    part_amax_val: torch.Tensor  # [tiles, rows] fp32
+    part_amax_idx: torch.Tensor  # [tiles, rows] int32
+    filter: FilterScratch
+
+
+def target_p_scratch(num_tokens: int, vocab_size: int) -> TargetPScratch:
+    """The regions `_ratio_target_p` needs for ``num_tokens`` draft rows."""
+    tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
+    f32, i32 = torch.float32, torch.int32
+    return TargetPScratch(
+        Region((num_tokens,), f32),
+        Region((num_tokens,), f32),
+        Region((num_tokens,), i32),
+        Region((num_tokens,), f32),
+        Region((tiles, num_tokens), f32),
+        Region((tiles, num_tokens), f32),
+        Region((tiles, num_tokens), f32),
+        Region((tiles, num_tokens), i32),
+        filter_scratch(num_tokens, vocab_size, _RATIO_BLOCK_V),
+    )
+
+
 def filter_floor(
     target_logits: torch.Tensor,  # [num_tokens, V] raw
     cu_num_draft_tokens: torch.Tensor,
     temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
     filters: RowFilters,
     rows: tuple[torch.Tensor, ...],
-    parts: tuple[torch.Tensor, ...],
+    work: FilterScratch,
     stats_block_v: int,
 ) -> None:
     """Each filtered draft row's floor, and its p's normalizer renormalized
     over the survivors.
 
     Fills ``row_floor`` and rewrites ``row_inv_z`` of ``rows = (row_max,
-    row_inv_z, row_floor)``, through the work buffers ``parts = (filter_f32,
-    floor_mass, filter_i32, floor_counts, run_max, run_at_max)``, shaped by
-    `sampling_filter.filter_scratch_shapes`. The last two are the run maxima,
-    and the ids at each, that the stats pass kept per ``stats_block_v`` tile
-    in a ``COUNT`` launch; ``row_max`` and ``row_inv_z`` are its combined
-    statistics."""
-    *descent_parts, run_max, run_at_max = parts
+    row_inv_z, row_floor)``, through ``work``. Its run maxima are what the
+    stats pass kept per ``stats_block_v`` tile in a ``COUNT`` launch;
+    ``row_max`` and ``row_inv_z`` are its combined statistics."""
     if filters.counts:
         count_floor(
             target_logits,
@@ -146,7 +178,7 @@ def filter_floor(
             temperatures,
             filters,
             rows,
-            (run_max, run_at_max),
+            (work.run_max, work.run_at_max),
             stats_block_v,
             _FILTER_COUNT_MAX_K,
         )
@@ -157,7 +189,7 @@ def filter_floor(
             temperatures,
             filters,
             rows,
-            tuple(descent_parts),
+            (work.filter_f32, work.floor_mass, work.filter_i32, work.floor_counts),
             _FILTER_COUNT_MAX_K if filters.counts else 0,
         )
 
@@ -168,15 +200,12 @@ def _ratio_target_p(
     temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
     top_ks: int | torch.Tensor | None,
     top_ps: float | torch.Tensor | None,
-    rows: tuple[torch.Tensor, ...],
-    parts: tuple[torch.Tensor, ...],
-    filter_parts: tuple[torch.Tensor, ...],
+    work: TargetPScratch,
 ) -> bool:
     """Each draft row's p, and p_f where its request filters.
 
-    Fills ``rows = (row_max, row_inv_z, row_argmax, row_floor)`` through the
-    work buffers ``parts = (part_max, part_sum, part_amax_val, part_amax_idx)``
-    and ``filter_parts``, `filter_floor`'s own: p(v) is
+    Fills ``work``'s ``row_max``, ``row_inv_z``, ``row_argmax`` and
+    ``row_floor`` through its partials and `filter_floor`'s buffers: p(v) is
     ``exp(l(v) / T - row_max) * row_inv_z``, and on a filtered row 0 below
     ``row_floor`` with ``row_inv_z`` renormalized over what is left.
     ``top_ks``/``top_ps`` are what `Sampler` is given: None (no row filters),
@@ -189,10 +218,6 @@ def _ratio_target_p(
     n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
     stride = target_logits.stride(0)
     search_steps = batch_size.bit_length() + 1
-    row_max, row_inv_z, row_argmax, row_floor = rows
-    part_max, part_sum, part_amax_val, part_amax_idx = parts
-    # The stats pass fills the filter's run maxima itself.
-    *_, run_max, run_at_max = filter_parts
     filtered = top_ks is not None or top_ps is not None
     if not num_tokens:
         return filtered
@@ -201,10 +226,10 @@ def _ratio_target_p(
         target_logits,
         cu_num_draft_tokens,
         temperatures,
-        part_max,
-        part_sum,
-        part_amax_val,
-        part_amax_idx,
+        work.part_max,
+        work.part_sum,
+        work.part_amax_val,
+        work.part_amax_idx,
         num_tokens,
         vocab_size,
         stride,
@@ -213,8 +238,9 @@ def _ratio_target_p(
         _RATIO_BLOCK_V,
         SAMPLER_EPS,
         *filters.args,
-        run_max,
-        run_at_max,
+        # The stats pass fills the filter's run maxima itself.
+        work.filter.run_max,
+        work.filter.run_at_max,
         COUNT=filters.counts,
         KEY_BITS=filters.key_bits,
         GROUPS=_FILTER_COUNT_GROUPS,
@@ -224,13 +250,13 @@ def _ratio_target_p(
         num_warps=8,
     )
     softmax_combine_kernel[(num_tokens,)](
-        part_max,
-        part_sum,
-        row_max,
-        row_inv_z,
-        part_amax_val,
-        part_amax_idx,
-        row_argmax,
+        work.part_max,
+        work.part_sum,
+        work.row_max,
+        work.row_inv_z,
+        work.part_amax_val,
+        work.part_amax_idx,
+        work.row_argmax,
         num_tokens,
         n_tiles,
         BLOCK_TILE=triton.next_power_of_2(n_tiles),
@@ -244,8 +270,8 @@ def _ratio_target_p(
         cu_num_draft_tokens,
         temperatures,
         filters,
-        (row_max, row_inv_z, row_floor),
-        filter_parts,
+        (work.row_max, work.row_inv_z, work.row_floor),
+        work.filter,
         _RATIO_BLOCK_V,
     )
     return True

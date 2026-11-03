@@ -19,10 +19,15 @@ import torch
 import triton
 import triton.language as tl
 
-from atom.model_ops.ratio_target_p import _RATIO_BLOCK_V, _ratio_target_p
+from atom.model_ops.ratio_target_p import (
+    _RATIO_BLOCK_V,
+    TargetPScratch,
+    _ratio_target_p,
+    target_p_scratch,
+)
 from atom.model_ops.sampler import SAMPLER_EPS
-from atom.model_ops.sampling_filter import _FILTER_COUNT_MAX_K, filter_scratch_shapes
-from atom.model_ops.sampling_scratch import SamplingScratch, take
+from atom.model_ops.sampling_filter import _FILTER_COUNT_MAX_K
+from atom.model_ops.sampling_scratch import Region, SamplingScratch
 from atom.model_ops.softmax_tiles import argmax_lowest_id, race_key
 from atom.model_ops.sparse_q_store import RatioDraftQ, SparseQStore
 from atom.model_ops.verify_kernels import _draft_token, _finish_request
@@ -54,30 +59,25 @@ class RatioVerifyInputs(NamedTuple):
     scratch: SamplingScratch
 
 
-def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
-    """fp32 and int32 shapes one ratio verify needs, in `_ratio_sample` order."""
+class VerifyScratch(NamedTuple):
+    """One ratio verify's work buffers."""
+
+    target: TargetPScratch
+    part_key: torch.Tensor  # [tiles, batch] fp32, best residual key
+    part_idx: torch.Tensor  # [tiles, batch] int32, its lowest id
+    residual_row: torch.Tensor  # [batch] int32, the row to resample, or -1
+
+
+def _verify_scratch(num_tokens: int, batch_size: int, vocab_size: int) -> VerifyScratch:
+    """The regions one ratio verify of ``batch_size`` requests and
+    ``num_tokens`` draft rows needs."""
     tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
-    filter_f32, filter_i32 = filter_scratch_shapes(
-        num_tokens, vocab_size, _RATIO_BLOCK_V
+    return VerifyScratch(
+        target_p_scratch(num_tokens, vocab_size),
+        Region((tiles, batch_size), torch.float32),
+        Region((tiles, batch_size), torch.int32),
+        Region((batch_size,), torch.int32),
     )
-    f32 = [
-        (num_tokens,),  # row_max
-        (num_tokens,),  # row_inv_z
-        (num_tokens,),  # row_floor
-        (tiles, num_tokens),  # part_max
-        (tiles, num_tokens),  # part_sum
-        (tiles, num_tokens),  # part_amax_val
-        (tiles, batch_size),  # part_key
-        *filter_f32,
-    ]
-    i32 = [
-        (num_tokens,),  # row_argmax
-        (tiles, num_tokens),  # part_amax_idx
-        (batch_size,),  # residual_row
-        (tiles, batch_size),  # part_idx
-        *filter_i32,
-    ]
-    return f32, i32
 
 
 def ratio_verify_scratch(
@@ -85,8 +85,8 @@ def ratio_verify_scratch(
 ) -> SamplingScratch:
     """Scratch for any ratio verify of up to ``max_bs`` requests of
     ``num_spec_steps`` drafts each, allocated once."""
-    f32, i32 = _ratio_scratch_shapes(max_bs * num_spec_steps, max_bs, vocab_size)
-    return SamplingScratch.for_shapes(f32, i32, device)
+    spec = _verify_scratch(max_bs * num_spec_steps, max_bs, vocab_size)
+    return SamplingScratch.for_spec(spec, device)
 
 
 @triton.jit
@@ -538,29 +538,22 @@ def _ratio_sample(
     q_row_base = ratio.q_row_base.contiguous()
     q_width = store.ids.shape[1]
 
-    f32_shapes, i32_shapes = _ratio_scratch_shapes(num_tokens, batch_size, vocab_size)
-    (
-        (
-            row_max,
-            row_inv_z,
-            row_floor,
-            part_max,
-            part_sum,
-            part_amax_val,
-            part_key,
-            *filter_f32,
-        ),
-        (row_argmax, part_amax_idx, residual_row, part_idx, *filter_i32),
-    ) = take(f32_shapes, i32_shapes, ratio.scratch.f32, ratio.scratch.i32)
+    work = ratio.scratch.carve(_verify_scratch(num_tokens, batch_size, vocab_size))
+    target = work.target
+    row_max, row_inv_z = target.row_max, target.row_inv_z
+    row_argmax, row_floor = target.row_argmax, target.row_floor
+    residual_row, part_key, part_idx = (
+        work.residual_row,
+        work.part_key,
+        work.part_idx,
+    )
     filtered = _ratio_target_p(
         target_logits,
         cu_num_draft_tokens,
         temperatures,
         ratio.top_ks,
         ratio.top_ps,
-        (row_max, row_inv_z, row_argmax, row_floor),
-        (part_max, part_sum, part_amax_val, part_amax_idx),
-        (*filter_f32, *filter_i32),
+        target,
     )
     _ratio_accept_kernel[(batch_size,)](
         output_token_ids,
@@ -680,7 +673,7 @@ def warmup_ratio_verify(
     verify. It has no collective and takes no input from the device, so every
     rank runs it alike.
     """
-    device = scratch.f32.device
+    device = scratch.buf.device
     num_tokens = num_spec_steps
 
     def ints(values, dtype=torch.int32):
