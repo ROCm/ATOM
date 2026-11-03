@@ -5,8 +5,9 @@ This branch changes only experiment configuration and metrics collection.
 Original workload: `Jasen/m31-mxfp4-stack-agentx-20261031`, issue #380 C140.
 
 Use `atomesh-benchmark.yaml`, mounted source, image
-`rocm/atom-dev:m31-mxfp4-stack-20261031`, runner `atomesh-cicd`, and single node
-`pit2-p03-g42` for all four cases. Each allocation requests exclusive access to
+`rocm/atom-dev:m31-mxfp4-stack-20261031`, runner `atomesh-cicd`, and
+`atomesh_single_node=auto`, `atomesh_1p1d_nodes=auto` for all four cases.
+Do not pin a host or supply a candidate node list. Each allocation requests exclusive access to
 8 MI355X GPUs. Do not cancel other users' jobs to obtain the node.
 Do not publish these smoke/experimental results to the dashboard.
 
@@ -17,7 +18,7 @@ Do not publish these smoke/experimental results to the dashboard.
 | A1 | issue382-a1-c140 | 140 | 4 | disabled | fixed AL=4.04 | AgentX 1.0.12, 3600s profiling after original warmup |
 | A2 | issue382-a2-c140 | 140 | 4 | 15% | fixed AL=4.04 | identical AgentX workload |
 
-Run correctness cases in the `accuracy` suite first. Review completed sample
+Run correctness cases in the `accuracy` suite. Review completed sample
 counts, errors, output lengths, sample answers, and admission/transfer logs.
 The 0.90 score gate is a coarse short-smoke guard (at least 58/64); a 64-sample
 result cannot establish the full GSM8K accuracy of the model. The usual 0.94
@@ -25,7 +26,9 @@ full-suite threshold must not be interpreted as a statistically precise gate
 for this subset. Retried HTTP requests must still be counted as errors in the
 analysis even if lm-eval eventually succeeds.
 
-Only after correctness passes, run A1 then A2 in the `mooncake_store` suite.
+Submit A1 and A2 independently in the `mooncake_store` suite, without waiting for
+correctness jobs to finish or for a particular node. This follows the user's
+updated scheduling preference. Review correctness before interpreting performance.
 Restart the processes and Store for every case. Correctness uses the same
 280 scheduler slots and capture sizes as the performance cases to check the
 actual server configuration; only client load and synthetic acceptance differ.
@@ -41,7 +44,7 @@ Do not substitute the older `1442d09d` model/chat template or the generic NVFP4
 and 1 TiB recipe. The model root is remapped by the standard CI launcher.
 
 The launcher checks mounted ATOM import origin. Record the expanded cell,
-source SHA, image digest, node, dependency versions, actual D KV pool capacity
+source SHA, image digest, actual allocated node, dependency versions, actual D KV pool capacity
 and bytes/page from startup logs. Pinning memory utilization alone does not
 guarantee identical pool capacity across processes.
 
