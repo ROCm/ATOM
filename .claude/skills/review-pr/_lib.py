@@ -43,6 +43,9 @@ OPTIONAL = [
     # different facts about a PR, and a reader auditing the archive months later cannot
     # tell them apart from the card alone.
     "auto_validation_outcome.txt",
+    # The validator's own report. Kept because a non-PASS verdict is only diagnosable
+    # from its findings, and the scratch dir that held it is deleted on a clean run.
+    "auto_validation_report.json",
     # Which entrypoint ran each side, and whether the refutation was cross-family.
     # Optional because a run that died before the agents ran has nothing to record.
     "agents.txt",

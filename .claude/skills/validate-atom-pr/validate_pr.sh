@@ -129,6 +129,17 @@ with open(out_path, "w") as fh:
     json.dump(report, fh, indent=2, sort_keys=True)
     fh.write("\n")
 print(f"verdict: {report['verdict']} (exit {report['process_exit_code']})")
+# A bare "INCONCLUSIVE" sends the reader to a report that the caller's scratch dir may
+# already have deleted. The reason lives in findings[0].detail for every non-PASS build;
+# print it here so the run log alone explains why no evidence was produced.
+if report["verdict"] != "PASS":
+    for _f in report.get("findings") or []:
+        _d = (_f or {}).get("detail")
+        if _d:
+            print(f"  reason: {_d}")
+            break
+    else:
+        print("  reason: the report records no detail (this is a validator bug)")
 sys.exit(report["process_exit_code"])
 PY
 }

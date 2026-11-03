@@ -335,6 +335,20 @@ PYEOF
 }
 t "every id derive() emits is in ALL_RULES" "$(_rule_ids_consistent)" "ok"
 
+# Rejected validation evidence must degrade the review, not delete it. The regression this
+# pins: the consumer ran under errexit, so one stale report or one missing optional import
+# aborted fetch.sh and produced no card -- indistinguishable, to a reader, from the bot
+# being down. Three facts make the degrade real, and all three must hold together.
+_evidence_degrades() {
+  local f="$S/fetch.sh"
+  grep -q 'set +e' "$f" \
+    && grep -q '_CONSUME_RC=\$?' "$f" \
+    && grep -q 'VALIDATION_REPORT=""' "$f" \
+    && grep -q 'if \[ -z "\$VALIDATION_REPORT" \]; then' "$f" \
+    && echo ok || echo "MISSING"
+}
+t "rejected validation evidence degrades instead of aborting" "$(_evidence_degrades)" "ok"
+
 echo "[publish]"
 # The publish path's guards are pytest cases (_publish_test.py): the --post closure, the
 # anchoring rule (span anchors and the permalinks for what cannot be anchored included), and
