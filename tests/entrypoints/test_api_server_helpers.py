@@ -1062,3 +1062,44 @@ class TestDeploymentDefaultOutputCap:
                 seq, NS(max_tokens_is_default=False)
             )
         assert seq.max_tokens == 512
+
+
+def test_reasoning_and_tool_setup_publishes_every_module_global(monkeypatch):
+    # Front-end workers run this split-out part of main(); an assignment
+    # without its `global` would set a local and leave the module default.
+    names = (
+        "reasoning_dialect",
+        "model_starts_in_reasoning",
+        "reasoning_toggle",
+        "tool_call_parser_cls",
+        "preserve_tool_call_arguments",
+        "required_tool_channel",
+    )
+    for name in names:
+        monkeypatch.setattr(api_server, name, "unset", raising=False)
+    dialect = SimpleNamespace(think_end_marker="</think>")
+    stubs = {
+        "chat_template_source": lambda *_a: "template",
+        "resolve_dialect": lambda *_a: (dialect, True),
+        "render_probe_prompt": lambda *_a, **_kw: "probe",
+        "template_opens_reasoning_implicitly": lambda *_a: True,
+        "resolve_reasoning_toggle": lambda *_a: ("thinking", False, True),
+        "resolve_tool_call_parser": lambda *_a, **_kw: "parser",
+        "template_keeps_tool_call_arguments": lambda *_a: True,
+        "required_call_channel": lambda *_a: "channel",
+    }
+    for name, stub in stubs.items():
+        monkeypatch.setattr(api_server, name, stub)
+    monkeypatch.setattr(api_server, "tokenizer", object())
+    monkeypatch.setattr(api_server, "custom_message_encoder", None)
+
+    api_server._setup_reasoning_and_tools(
+        SimpleNamespace(tool_call_parser="auto", model="m")
+    )
+
+    assert api_server.reasoning_dialect is dialect
+    assert api_server.model_starts_in_reasoning is True
+    assert api_server.reasoning_toggle == ("thinking", False, True)
+    assert api_server.tool_call_parser_cls == "parser"
+    assert api_server.preserve_tool_call_arguments is True
+    assert api_server.required_tool_channel == "channel"

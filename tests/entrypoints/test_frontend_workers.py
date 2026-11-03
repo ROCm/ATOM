@@ -356,12 +356,16 @@ def test_hub_close_does_not_wait_for_a_reply_in_flight():
     hub = fw.FrontendHub(core, num_workers=1, prepare_structured=prepare)
     hub.start()
     worker = fw.RemoteCoreManager(hub.connection_info(0))
-    caller = threading.Thread(
-        target=lambda: pytest.raises(
-            FuturesTimeout, worker.prepare_structured_request, _Params("{}")
-        ),
-        daemon=True,
-    )
+    outcome = []
+
+    def call():
+        try:
+            worker.prepare_structured_request(_Params("{}"))
+            outcome.append(None)
+        except Exception as exc:  # noqa: BLE001 - asserted in the main thread
+            outcome.append(exc)
+
+    caller = threading.Thread(target=call, daemon=True)
     fw._STRUCTURED_TIMEOUT_S, saved = 1.0, fw._STRUCTURED_TIMEOUT_S
     try:
         caller.start()
@@ -371,6 +375,8 @@ def test_hub_close_does_not_wait_for_a_reply_in_flight():
         assert time.monotonic() - t0 < 2.0
         release.set()  # the late reply finds the sockets closed
         caller.join(5)
+        # The caller gave up on its own timeout; no reply ever reached it.
+        assert len(outcome) == 1 and isinstance(outcome[0], FuturesTimeout)
         # The drop half: a send after close neither raises nor touches the
         # closed socket (without the guard this is a ZMQError).
         hub._send_to_worker(0, b"R", b"0", b"x")
