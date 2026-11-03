@@ -1209,6 +1209,9 @@ class GDNStateMixin(PoolRowsMixin):
         spec_state_indices = self.spec_state_indices_tensor.np
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
         self._has_state_fork = any(s >= 0 for s in fork_srcs)
+        assert not (
+            with_spec and self._has_state_fork and not self.spec_honours_state_fork()
+        ), "state fork on the spec-decode path, which this model does not read"
         # Write slots of the forked rows: ReplaySSM parks their record cursors.
         self._fork_dst_slots = [
             slots[0] for slots, src in zip(batch.state_slots, fork_srcs) if src >= 0
@@ -1243,6 +1246,11 @@ class GDNStateMixin(PoolRowsMixin):
                     # somewhere to read it from -- the spec path otherwise
                     # fills only the 2-D one.
                     non_spec_state_indices[idx] = committed
+
+    def spec_honours_state_fork(self) -> bool:
+        """Whether the model's spec path reads `spec_state_indices_in_tensor`,
+        so a state fork may land on a verify step (pp>1). Opt in per backend."""
+        return False
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
         """Publish `num_bonus + 1` per request, 1 everywhere else, in one copy.

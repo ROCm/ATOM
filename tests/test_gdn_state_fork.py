@@ -46,6 +46,7 @@ def _builder(rows=8):
         non_spec_state_indices_in_tensor=buf(rows),
         spec_state_indices_tensor=buf((rows, WIDTH)),
         replayssm=False,
+        spec_honours_state_fork=lambda: True,
     )
 
 
@@ -88,6 +89,16 @@ def test_spec_fork_reads_the_source_whatever_was_accepted():
         torch.from_numpy(b.non_spec_state_indices_in_tensor.np[:2]),
     )
     assert table.tolist() == [[0, 1, 2, 3], [30, 30, 30, 30]]
+
+
+def test_spec_fork_is_refused_unless_the_backend_opts_in():
+    b = _builder()
+    b.spec_honours_state_fork = lambda: False
+    with pytest.raises(AssertionError):
+        GDNStateMixin.prepare_state_indices(
+            b, _batch([-1, 30], _slots(2)), with_spec=True
+        )
+    GDNStateMixin.prepare_state_indices(b, _batch([-1, 30], _slots(2)), with_spec=False)
 
 
 def test_no_fork_reads_the_slot_it_writes_on_both_paths():
