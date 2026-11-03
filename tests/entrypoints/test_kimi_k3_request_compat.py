@@ -14,14 +14,23 @@ from atom.entrypoints.openai.serving_anthropic import (
     AnthropicMessage,
     anthropic_to_openai_messages,
 )
-from atom.entrypoints.openai.serving_chat import validate_chat_request
-from atom.entrypoints.openai.serving_responses import _normalize_input_items
+from atom.entrypoints.openai.serving_chat import (
+    request_tools,
+    validate_chat_request,
+    validate_history_tool_calls,
+)
+from atom.entrypoints.openai.serving_responses import (
+    ResponsesRequest,
+    _normalize_input_items,
+    responses_to_openai_messages,
+)
 from atom.entrypoints.openai.tool_parser.kimi_k3_tool_parser import (
     KIMI_K3_TOOLS_START,
     KimiK3Parser,
 )
 from atom.entrypoints.openai.tool_parser.registry import (
     PARSERS_BY_NAME,
+    channel_for_request,
     resolve_tool_call_parser,
     template_keeps_tool_call_arguments,
 )
@@ -246,11 +255,10 @@ def test_resolve_uses_given_probe_without_rendering():
 
 
 @pytest.mark.parametrize("override", sorted(PARSERS_BY_NAME))
-def test_override_does_not_change_argument_preservation(override):
+def test_given_probe_is_reused_for_every_override(override):
     probe = f"sys {KIMI_K3_TOOLS_START} x"
     parser = resolve_tool_call_parser(override, _NeverRenders(), rendered_probe=probe)
     assert parser is PARSERS_BY_NAME[override]
-    assert template_keeps_tool_call_arguments(probe)
 
 
 def test_responses_custom_tool_call_arguments_keep_non_ascii():
@@ -260,3 +268,38 @@ def test_responses_custom_tool_call_arguments_keep_non_ascii():
     arguments = _normalize_input_items(items, [])[0]["arguments"]
     assert "修复" in arguments
     assert json.loads(arguments) == {"input": "修复"}
+
+
+def test_required_channel_armed_for_message_declared_tools():
+    channel = object()
+    system = {"role": "system", "content": "", "tools": [TOOL]}
+    request = ChatCompletionRequest(messages=[system, USER], tool_choice="required")
+    assert request_tools(request) == [TOOL]
+    assert channel_for_request(channel, "required", request_tools(request)) is channel
+
+
+def test_request_tools_prefers_top_level_list():
+    system = {"role": "system", "content": "", "tools": [{"type": "function"}]}
+    request = ChatCompletionRequest(messages=[system, USER], tools=[TOOL])
+    assert request_tools(request) == [TOOL]
+
+
+@pytest.mark.parametrize("block", [{}, {"name": ""}], ids=["no-name", "empty-name"])
+def test_anthropic_tool_use_without_name_rejected(block):
+    msgs = [
+        AnthropicMessage(role="user", content="hi"),
+        AnthropicMessage(
+            role="assistant",
+            content=[{"type": "tool_use", "id": "c1", "input": {}, **block}],
+        ),
+    ]
+    with pytest.raises(ValueError):
+        validate_history_tool_calls(anthropic_to_openai_messages(msgs))
+
+
+def test_responses_function_call_without_name_rejected():
+    request = ResponsesRequest(
+        input=[{"type": "function_call", "call_id": "c1", "arguments": "{}"}]
+    )
+    with pytest.raises(ValueError):
+        validate_history_tool_calls(responses_to_openai_messages(request))

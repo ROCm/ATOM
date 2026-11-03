@@ -133,7 +133,16 @@ def _message_field(msg: Any, key: str) -> Any:
     return msg.get(key) if isinstance(msg, dict) else getattr(msg, key, None)
 
 
-def _validate_history_tool_calls(messages: Any) -> None:
+def request_tools(request: ChatCompletionRequest) -> list:
+    """The request's tools: the top-level list, else the tools Kimi-K3 lets a
+    message declare (dynamic tools)."""
+    if request.tools:
+        return request.tools
+    messages = request.messages if request.messages is not None else request.prompt
+    return [t for m in messages or [] for t in _message_field(m, "tools") or []]
+
+
+def validate_history_tool_calls(messages: Any) -> None:
     """History tool_calls must carry a function name and renderable arguments."""
     for i, msg in enumerate(messages or []):
         tool_calls = _message_field(msg, "tool_calls")
@@ -175,7 +184,7 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
             raise ValueError("stream_options.include_usage must be a boolean")
     validate_tool_list(request.tools)
     messages = request.messages if request.messages is not None else request.prompt
-    _validate_history_tool_calls(messages)
+    validate_history_tool_calls(messages)
 
     tool_choice = request.tool_choice
     if tool_choice is not None:
@@ -184,12 +193,7 @@ def validate_chat_request(request: ChatCompletionRequest) -> None:
                 raise ValueError(
                     f"tool_choice string must be one of {sorted(TOOL_CHOICE_VALUES)}"
                 )
-            # K3 can also declare tools inside a system message.
-            if (
-                tool_choice == "required"
-                and not request.tools
-                and not any(_message_field(m, "tools") for m in messages or [])
-            ):
+            if tool_choice == "required" and not request_tools(request):
                 raise ValueError("tool_choice 'required' needs a non-empty tools list")
         elif isinstance(tool_choice, dict):
             if tool_choice.get("type") != "function":

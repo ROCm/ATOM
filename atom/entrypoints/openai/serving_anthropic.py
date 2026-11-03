@@ -112,7 +112,7 @@ def anthropic_to_openai_messages(
                                     "id": block["id"],
                                     "type": "function",
                                     "function": {
-                                        "name": block["name"],
+                                        "name": block.get("name"),
                                         "arguments": json.dumps(
                                             block.get("input", {}), ensure_ascii=False
                                         ),

@@ -134,10 +134,12 @@ from .serving_chat import (
     build_chat_response,
     build_chat_response_multi,
     normalize_chat_tools,
+    request_tools,
     resolve_thinking,
     stream_chat_response,
     stream_chat_response_fanout,
     validate_chat_request,
+    validate_history_tool_calls,
     validate_tool_list,
 )
 from .serving_completion import (
@@ -1883,7 +1885,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_p=request.top_p,
             n=effective_n,
             required_channel=channel_for_request(
-                required_tool_channel, request.tool_choice, request.tools
+                required_tool_channel, request.tool_choice, request_tools(request)
             ),
         )
 
@@ -2312,6 +2314,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     try:
         # Convert Anthropic messages to OpenAI format
         openai_messages = anthropic_to_openai_messages(request.messages, request.system)
+        validate_history_tool_calls(openai_messages)
 
         # Apply chat template
         from .protocol import ChatMessage
@@ -2757,6 +2760,7 @@ async def responses_create(raw_request: Request):
 
     try:
         openai_messages = responses_to_openai_messages(request)
+        validate_history_tool_calls(openai_messages)
         from .protocol import ChatMessage
 
         messages = [ChatMessage(**m) for m in openai_messages]
