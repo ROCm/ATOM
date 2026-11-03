@@ -5,9 +5,91 @@ import datetime
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 from pathlib import Path
+
+
+def collect_completed_results(source, destination, max_file_bytes=1 << 30):
+    """Recover full records after the single-node worker finishes successfully.
+
+    Raw records are never truncated. Missing or oversized files are reported
+    so validation can reject an incomplete recovery.
+    """
+    recovered = []
+    for job_dir in source.glob("slurm_job-*"):
+        if job_dir.is_symlink() or not job_dir.is_dir():
+            continue
+        try:
+            proof = json.loads((job_dir / "rank-workload-0.json").read_text())
+            rc = (job_dir / "rank-rc-0").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        if (
+            proof.get("job_id") != job_dir.name.removeprefix("slurm_job-")
+            or proof.get("num_ranks") != 1
+            or proof.get("rank") != 0
+            or proof.get("status") != "completed"
+            or not proof.get("run_token")
+            or rc != "0"
+        ):
+            continue
+        for directory, dirs, files in os.walk(job_dir, followlinks=False):
+            dirs[:] = [
+                d
+                for d in dirs
+                if not (Path(directory) / d).is_symlink()
+                and d not in {".cache", ".aiter", "torch_traces", "mesh-build"}
+            ]
+            for name in files:
+                path = Path(directory) / name
+                if path.is_symlink():
+                    continue
+                relative = path.relative_to(job_dir)
+                result_file = relative.parts[0] in {
+                    "benchmark_results",
+                    "eval_results",
+                } and path.suffix in {
+                    ".json",
+                    ".jsonl",
+                    ".gz",
+                    ".csv",
+                    ".txt",
+                    ".md",
+                    ".log",
+                }
+                if not (
+                    result_file
+                    or name == "issue382-metrics.jsonl.gz"
+                    or name
+                    in {"rank-workload-0.json", "rank-rc-0", "job-result.json"}
+                ):
+                    continue
+                record = {"path": str(path.relative_to(source))}
+                try:
+                    before = path.stat()
+                    record["bytes"] = before.st_size
+                    if before.st_size > max_file_bytes:
+                        record["error"] = (
+                            "exceeds full-result copy limit; not copied"
+                        )
+                    else:
+                        target = destination / path.relative_to(source)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(path, target)
+                        after = path.stat()
+                        if (before.st_size, before.st_mtime_ns) != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                        ):
+                            record["error"] = "source changed during recovery"
+                        else:
+                            record["copied_full"] = True
+                except OSError as exc:
+                    record["error"] = str(exc)
+                recovered.append(record)
+    return recovered
 
 
 def command(args):
@@ -156,6 +238,9 @@ def main():
                         {
                             "source": str(source),
                             "files": snapshot(source, target),
+                            "completed_results": collect_completed_results(
+                                source, target
+                            ),
                         }
                     )
                     for job_dir in source.glob("slurm_job-*"):

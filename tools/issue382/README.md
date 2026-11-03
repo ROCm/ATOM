@@ -78,3 +78,13 @@ rather than evidence for W's protective value. Do not tune W silently.
 
 Job time limits: 2 hours per correctness case, 4 hours per performance case,
 including startup/warmup. Profiling remains 3600 seconds. Queue time is extra.
+
+If the CI runner stops while a Slurm job survives, keep tracking the existing
+allocation before considering a retry. `inspect_runs.py` records controller
+state and current source checkout, plus bounded startup and recent logs.
+Once a single-node worker publishes its completed marker and zero exit code,
+the inspector also copies full client results and admission metrics from the
+shared log directory. Files above 1 GiB are explicitly reported as missing,
+not truncated. Check the recovery manifest, scheduler outcome, worker token,
+complete profiling window and sample records before accepting these results;
+an inspection job's status alone does not validate the experiment.
