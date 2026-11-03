@@ -655,14 +655,23 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
             assert gate_env["CI_GATE_PR_CHECK_JOB"] == "Offline inference smoke test"
             smoke = config["jobs"]["offline-smoke-test"]
             assert smoke["needs"] == ["ci-gate"]
-            assert smoke["if"].startswith("${{ !cancelled() && ")
-            assert "github.event_name != 'pull_request_review'" in smoke["if"]
-            assert "needs.ci-gate.outputs.pr_check_takeover == 'true'" in smoke["if"]
+            assert smoke["if"] == "${{ !cancelled() }}"
+            requested = (
+                "github.event_name != 'pull_request_review' || "
+                "needs.ci-gate.outputs.pr_check_takeover == 'true'"
+            )
+            assert smoke["env"]["SMOKE_REQUESTED"] == "${{ " + requested + " }}"
+            assert requested in smoke["runs-on"]
+            assert "'ubuntu-latest'" in smoke["runs-on"]
+            assert "'linux-atom-mi35x-1'" in smoke["runs-on"]
+            assert requested in smoke["name"]
+            assert all(
+                "env.SMOKE_REQUESTED == 'true'" in step["if"] for step in smoke["steps"]
+            )
             assert (
                 config["jobs"]["ci-gate"]["outputs"]["pr_check_takeover"]
                 == "${{ steps.gate.outputs.pr_check_takeover }}"
             )
-            assert "needs.ci-gate.outputs.pr_check_takeover != 'true'" in smoke["name"]
             assert "'Offline smoke not requested'" in smoke["name"]
             assert "'Offline inference smoke test'" in smoke["name"]
             assert config["jobs"]["atom-test"]["name"] == "Accuracy"
