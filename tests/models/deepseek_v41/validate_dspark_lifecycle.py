@@ -67,11 +67,16 @@ def run_scenarios(
         commit(metadata, last_indices)
         if pending is not None:
             verify_shapes.append([span.length for span in step.requests])
-            counts = (last_indices - step.cu_seqlens_q[:-1] + 1).tolist()
+            # The batch may be padded to a captured size; only the scheduled
+            # requests have a commit.
+            n = step.scheduled_bs
+            starts = step.cu_seqlens_q[:n]
+            counts = (last_indices[:n] - starts + 1).tolist()
             expected = [
                 span.position + count for span, count in zip(step.requests, counts)
             ]
-            assert metadata.cache.cursor[step.slots.long(), 0].tolist() == expected
+            slots = step.slots[:n].long()
+            assert metadata.cache.cursor[slots, 0].tolist() == expected
             accepted.extend(count - 1 for count in counts)
             last_commit.update(
                 {span.request_id: count for span, count in zip(step.requests, counts)}
@@ -240,7 +245,15 @@ def run_scenarios(
             chinese = tokenizer.encode("请用中文解释为什么天空是蓝色的。")
             ragged = episode(
                 "varying_verify_lengths",
-                [sequence(chinese, limit=96), sequence(prompts[1], limit=96)],
+                # Three requests permit a real 18 -> 12 row graph reduction
+                # even when the repetitive request accepts all five drafts.
+                # With only two requests, its six-row floor keeps a >=7-row
+                # run in graph 12, so the no-saving guard correctly retains it.
+                [
+                    sequence(chinese, limit=96),
+                    sequence(prompts[1], limit=96),
+                    sequence(chinese, limit=96),
+                ],
                 reorder=True,
             )
             assert all(len(tokens) == 96 for tokens in ragged["outputs"])

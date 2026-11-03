@@ -74,7 +74,10 @@ def calibrate_confidence(
         raise ValueError(
             f"sts_temperatures length {t.numel()} != block size {c.shape[1]}"
         )
-    if torch.any(t <= 0):
+    # Positivity is validated where temperatures are produced (profile load,
+    # online fit). Checking a device tensor here is a host sync: it blocked
+    # every decode step on the GPU and serialized the next step's host work.
+    if t.device.type == "cpu" and torch.any(t <= 0):
         raise ValueError(
             "STS temperatures must be strictly positive (order-preserving)."
         )

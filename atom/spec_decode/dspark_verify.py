@@ -37,6 +37,12 @@ class VerifyScheduler:
     it only SIZES the next verify, and a short one is re-drafted next step.
     """
 
+    # Online parts, set by `build_online_parts`; None when off.
+    runtime = None
+    sts = None
+    dp = None
+    bucket = None
+
     def __init__(self, runner):
         # runner: provides the shared async D2H stream (tokenID_processor).
         self.runner = runner
@@ -51,6 +57,13 @@ class VerifyScheduler:
             self.sps_table, self.sts_temperatures = load_calibration(
                 runner.config, runner.device
             )
+        # The optional online parts (`build_online_parts`); bucket_global's
+        # graph-priced policy.
+        from atom.spec_decode.dspark_controller import build_online_parts
+
+        build_online_parts(self, runner)
+        if self.sps_table is not None:
+            self.bind_sps(self.sps_table)
         self._last_ell: torch.Tensor | None = None
         # FIFO of in-flight async D2H copies of ell, one entry per step:
         # (event, cpu_buf, req_ids). Read by index in _resolve_ell, never popped.
@@ -95,7 +108,18 @@ class VerifyScheduler:
         from atom.spec_decode.dspark_scheduler import schedule_prefix_lengths_tensor
 
         bs, L = confidence.shape
+        if self.sts is not None:
+            self.sts.capture(confidence)
+        if self.dp is not None:
+            # The DP planner also consumes this confidence at N+2, jointly with
+            # every peer's frontier. The local budget below stays the fallback
+            # for every step the joint plan does not improve on.
+            self.dp.capture(confidence)
         sps_table = self.sps_table
+        if self.runtime is not None and sps_table is not None:
+            measured_table = self.runtime.table(sps_table, bs)
+            if not self.runner.config.dspark.online_sps_observe_only:
+                sps_table = measured_table
         if sps_table is None:
             # Synthetic monotone-decreasing SPS stub until real calibration lands.
             # The stub's slope is ~1/steps, and the prefix scheduler indexes it by
@@ -112,6 +136,8 @@ class VerifyScheduler:
             sps_table = torch.linspace(
                 1.0, 0.1, steps=dp * bs * (L + 1) + 1, device=confidence.device
             )
+        if self.bucket is not None:
+            return self.bucket.ell(confidence, sps_table, self.sts_temperatures)
         return schedule_prefix_lengths_tensor(
             confidence.detach(),
             sps_table,
@@ -172,6 +198,10 @@ class VerifyScheduler:
         The copy is queued here; ``_resolve_ell`` adopts it once it is
         ``_ELL_GENERATION`` steps old.
         """
+        if self.sts is not None:
+            self.sts.record(req_ids)
+        if self.dp is not None:
+            self.dp.record(req_ids)
         ell = self._last_ell
         if ell is None:
             self._ell_pending.clear()
@@ -205,6 +235,16 @@ class VerifyScheduler:
         self._ell_pending.append((event, cpu_buf, list(req_ids)))
         if len(self._ell_pending) > _MAX_ELL_INFLIGHT:
             del self._ell_pending[:-_MAX_ELL_INFLIGHT]
+
+    def bind_sps(self, sps_table: torch.Tensor) -> None:
+        """Adopt the measured cost curve (offline profile or startup sweep)
+        and hand it to the online estimator and the DP planner as baseline."""
+        self.sps_table = sps_table
+        values = sps_table.detach().float().cpu().tolist()
+        if self.runtime is not None:
+            self.runtime.bind(values)
+        if self.dp is not None:
+            self.dp.bind(values)
 
     def _resolve_ell(self) -> None:
         """Adopt the ell from a FIXED generation back (``_ELL_GENERATION``).
@@ -247,6 +287,8 @@ class VerifyScheduler:
         # Direct assignment (e.g. reset to {}) drops the in-flight copies too.
         self._ell_map = value
         self._ell_pending.clear()
+        if self.dp is not None:
+            self.dp.invalidate()
 
     def ell_nonblocking(self) -> dict:
         """Non-blocking read for the SAME-step postprocess path (carried back to

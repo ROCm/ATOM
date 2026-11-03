@@ -327,12 +327,22 @@ def validate_speculative_config(config):
 
     if envs.ATOM_ENABLE_RELAXED_MTP:
         raise ValueError("DeepSeek-V4.1 DSpark requires strict target verification")
-    if config.dspark.confidence_schedule and (
-        not config.dspark.ragged or not config.dspark.calibration_profile
-    ):
-        raise ValueError(
-            "DeepSeek-V4.1 dynamic DSpark requires ragged verification and a calibration_profile"
-        )
+    if config.dspark.confidence_schedule:
+        if not config.dspark.ragged:
+            raise ValueError(
+                "DeepSeek-V4.1 dynamic DSpark requires ragged verification"
+            )
+        # Without a profile the cost curve is measured at startup, on the decode
+        # token graphs; no synthetic stub is admitted for V4.1. An explicit
+        # profile needs no graph mode of its own.
+        if not config.dspark.calibration_profile:
+            mode = getattr(config.compilation_config, "cudagraph_mode", None)
+            if config.enforce_eager or mode is None or not mode.uses_tr_hybrid():
+                raise ValueError(
+                    "DeepSeek-V4.1 dynamic DSpark measures its cost curve on TR_HYBRID "
+                    "token graphs at startup; use --cudagraph-mode TR_HYBRID or supply "
+                    "a calibration_profile"
+                )
 
 
 def validate_runtime_config(config):

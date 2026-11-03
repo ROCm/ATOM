@@ -203,3 +203,30 @@ def test_final_requests_are_max_reduced_from_their_own_row(monkeypatch):
     assert r.ub_max_tokens_across_dp == (4, 7)
     alone = _sync(monkeypatch, peers=[], **_base(final_requests=3))
     assert alone.max_final_requests_across_dp == 3
+
+
+def test_an_extra_payload_rides_the_same_exchange_without_shifting_rows(monkeypatch):
+    """DSpark's DP plan payload travels in the one packed row: the int fields
+    still unpack where they did, and every rank's payload comes back whole.
+    Fractions survive, so the payload is not truncated to the int32 rows."""
+    import numpy as np
+
+    payload = np.array([1.5, -2.25, 1e6 + 0.125])
+
+    def peer(local):
+        other = local.clone()
+        other[1] = 7  # scheduled_bs
+        other[-3:] = torch.tensor([3.0, 4.0, 5.5], dtype=other.dtype)
+        return other
+
+    r = _sync(
+        monkeypatch,
+        peers=[peer],
+        extra=payload,
+        **_base(scheduled_tokens=12, max_seqlen_q=3),
+    )
+    assert r.scheduled_tokens_per_dp_rank.tolist() == [12, 12]
+    assert r.scheduled_tokens_per_dp_rank.dtype == np.int32
+    assert r.max_bs_across_dp == 7
+    assert r.max_seqlen_q_across_dp == 3
+    assert r.extra_across_dp.tolist() == [payload.tolist(), [3.0, 4.0, 5.5]]
