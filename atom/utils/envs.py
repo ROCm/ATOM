@@ -630,10 +630,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DeepSeek-V4.1's decoder on a bounded-replay prefill's tail, recorded as a
     # request graph (`models/deepseek_v41/decoder_graph.py`): the comma-separated
     # `running_bs` to record at. Any other runs the same tail eagerly; empty
-    # records none.
+    # records none. `ForwardMode.decide` rounds a step's batch up the cudagraph
+    # capture ladder, so `running_bs` is always a capture size: the default is
+    # the usual ladder (1..8, 12, 16, ...) up to 16. Without 5, 6, 7 and 12,
+    # steps of 5-7 and 9-12 requests ran the decoder eagerly.
     "ATOM_DECODER_GRAPH_SIZES": lambda: tuple(
         int(s)
-        for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,8,16").split(",")
+        for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,5,6,7,8,12,16").split(
+            ","
+        )
         if s.strip()
     ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
@@ -1314,6 +1319,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
+    # lmcache_mp: a scheduler-process thread sends and advances tier lookups
+    # as requests arrive, instead of only when the scheduler runs a pass.
+    "OFFLOAD_MP_LOOKUP_THREAD": lambda: _flag_env("OFFLOAD_MP_LOOKUP_THREAD"),
+    # Lookups that thread keeps in flight or answered but not yet consumed.
+    # Each answered one holds tier read locks until it is consumed.
+    "OFFLOAD_MP_LOOKUP_WINDOW": lambda: max(
+        1, _int_env_or_default("OFFLOAD_MP_LOOKUP_WINDOW", 64)
+    ),
+    # lmcache_mp: TP workers submit transfers from a thread instead of the
+    # forward thread, fenced by reused producer events.
+    "OFFLOAD_MP_TRANSFER_THREAD": lambda: _flag_env("OFFLOAD_MP_TRANSFER_THREAD"),
+    # lmcache_mp: a prefill chunk's save is emitted in the step that computes
+    # it and submitted once that step's forward has finished, instead of at the
+    # next step.
+    "OFFLOAD_MP_SAVE_SAME_STEP": lambda: _flag_env("OFFLOAD_MP_SAVE_SAME_STEP"),
     # Admit a prefill without waiting for its external-tier lookup when the HBM
     # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
     # could be loaded. The lookup is still sent to refresh the tier's LRU.

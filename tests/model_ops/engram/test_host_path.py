@@ -885,7 +885,6 @@ try:
     import torch
     from atom.model_ops.engram import host_memory
     from atom.model_ops.engram.tables import HostEmbeddingTable
-    host_memory._memlock_fits = lambda _n: False
     hold = float(os.environ.get("HOLD_S", "0.4"))
 
     class _Rt:
@@ -948,99 +947,60 @@ def test_two_processes_do_not_register_at_once(tmp_path):
         assert end <= nxt
 
 
-def pin_recorder(monkeypatch):
-    """Record `_mlock` / `_munlock` ranges instead of calling libc."""
-    from atom.model_ops.engram import host_memory
+class RecordingLibc:
+    """`mlock2` / `munlock` / `madvise` spans, with no effect."""
 
-    locked, unlocked = [], []
-    monkeypatch.setattr(host_memory, "_memlock_fits", lambda _n: True)
-    monkeypatch.setattr(
-        host_memory, "_mlock", lambda lo, hi: locked.append((lo, hi)) or True
-    )
-    monkeypatch.setattr(
-        host_memory, "_munlock", lambda lo, hi: unlocked.append((lo, hi))
-    )
-    return locked, unlocked
+    def __init__(self):
+        self.locked, self.unlocked = [], []
+
+    def mlock2(self, addr, n, flags):
+        self.locked.append((addr, addr + n))
+        return 0
+
+    def munlock(self, addr, n):
+        self.unlocked.append((addr, addr + n))
+        return 0
+
+    def madvise(self, addr, n, advice):
+        return 0
 
 
 def covered_bytes(ranges) -> int:
     return sum(hi - lo for lo, hi in ranges)
 
 
-def test_mlocked_runs_are_munlocked_with_their_last_reference(monkeypatch):
+def test_chunked_runs_are_unlocked_with_their_last_reference(monkeypatch):
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart()
+    libc = RecordingLibc()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_libc", lambda: libc)
     monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: 2 * host_memory._PAGE)
-    locked, unlocked = pin_recorder(monkeypatch)
     table = wide_table()
     assert table.enable_uva(0, 4) is True
-    assert covered_bytes(locked) == registered_pages(WIDE_VALUES) * host_memory._PAGE
-    assert unlocked == []
+    assert (
+        covered_bytes(libc.locked) == registered_pages(WIDE_VALUES) * host_memory._PAGE
+    )
+    assert libc.unlocked == []
     table.disable_uva()
     assert cudart.registered == []
-    assert covered_bytes(unlocked) == covered_bytes(locked)
+    assert len(libc.unlocked) == cudart.calls
+    assert covered_bytes(libc.unlocked) == covered_bytes(libc.locked)
 
 
-def test_refused_mlocked_registration_unpins_its_pages(monkeypatch):
+def test_refused_chunk_leaves_nothing_locked(monkeypatch):
     from atom.model_ops.engram import host_memory
 
     cudart = FakeCudart(refuse_call=3)
+    libc = RecordingLibc()
     monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_libc", lambda: libc)
     monkeypatch.setattr(host_memory, "_reg_chunk_bytes", lambda: host_memory._PAGE)
-    locked, unlocked = pin_recorder(monkeypatch)
     table = wide_table()
     assert table.enable_uva(0, 4) is False
     assert cudart.registered == []
-    assert covered_bytes(unlocked) == covered_bytes(locked)
-
-
-def _aligned_buffer(pages: int):
-    from atom.model_ops.engram import host_memory
-
-    page = host_memory._PAGE
-    buf = torch.empty((pages + 1) * page, dtype=torch.uint8)
-    ptr = buf.data_ptr()
-    lo = ptr + (-ptr % page)
-    assert lo + pages * page <= ptr + buf.numel()
-    return buf, lo, page
-
-
-def test_refused_overlap_unpins_pages_an_older_run_does_not_own(monkeypatch):
-    """A refused registration mlocked the whole range, including pages of an
-    older run whose own mlock failed. That run will not unpin them."""
-    from atom.model_ops.engram import host_memory
-
-    buf, lo, page = _aligned_buffer(4)
-    rt = FakeCudart()
-    runs = host_memory._PAGE_RUNS
-    assert runs.acquire(rt, lo, lo + page, mlocked=False) == [lo]
-    assert runs._runs[lo].mlocked is False
-    _, unlocked = pin_recorder(monkeypatch)
-    rt.refuse_call = rt.calls + 1
-    assert runs.acquire(rt, lo, lo + 3 * page, mlocked=True) is None
-    assert unlocked == [(lo, lo + 3 * page)]
-    assert runs._runs[lo].mlocked is False
-    assert rt.registered == [lo]
-    del buf
-
-
-def test_refused_overlap_keeps_pages_an_older_run_already_pinned(monkeypatch):
-    from atom.model_ops.engram import host_memory
-
-    buf, lo, page = _aligned_buffer(4)
-    rt = FakeCudart()
-    runs = host_memory._PAGE_RUNS
-    assert runs.acquire(rt, lo, lo + page, mlocked=True) == [lo]
-    assert runs._runs[lo].mlocked is True
-    _, unlocked = pin_recorder(monkeypatch)
-    rt.refuse_call = rt.calls + 1
-    assert runs.acquire(rt, lo, lo + 3 * page, mlocked=True) is None
-    assert unlocked == [(lo + page, lo + 3 * page)]
-    assert runs._runs[lo].mlocked is True
-    assert rt.registered == [lo]
-    del buf
+    assert covered_bytes(libc.unlocked) == covered_bytes(libc.locked)
 
 
 class FakeHostAllocator:
