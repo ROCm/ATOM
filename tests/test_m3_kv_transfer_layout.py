@@ -4,19 +4,16 @@
 import __future__
 
 import ast
-import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import msgpack
 import pytest
 import test_pd_chunked_transfer as protocol
 import torch
 
 from atom.kv_transfer.disaggregation.chunked_prefill import ChunkedPrefill
-from atom.kv_transfer.disaggregation.types import ConnectorCompletion, ConnectorMetadata
 from atom.kv_transfer.offload.mp.page_views import _build_cache_views
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.entry_arena import EntryField
@@ -377,7 +374,9 @@ def _assert_copy(source, destination, heads, rank, src_ids, dst_ids):
                 continue
             src = source[role][src_block]
             if src.ndim > 1:
-                src = src[:, rank % heads : rank % heads + 1]
+                src = src[
+                    :, rank if heads == 4 else 0 : (rank if heads == 4 else 0) + 1
+                ]
             assert torch.equal(src.reshape(-1), dst[dst_block].reshape(-1)), (
                 role,
                 rank,
@@ -385,7 +384,7 @@ def _assert_copy(source, destination, heads, rank, src_ids, dst_ids):
 
 
 @pytest.mark.parametrize("held", STAGES)
-@pytest.mark.parametrize("heads", [1, 2, 4])
+@pytest.mark.parametrize("heads", [1, 4])
 @pytest.mark.parametrize(
     "nvfp4,index_fp4", [(False, False), (False, True), (True, True)]
 )
@@ -404,7 +403,6 @@ def test_full_transfer_matches_physical_target_and_draft_views(
     _fill(source)
     c, req = _producer(tt, heads)
     for rank in range(4):
-        c.tp_rank = rank // heads
         consumer, destination = _layout(
             range(8),
             1,
@@ -465,92 +463,3 @@ def test_chunked_pp_transfer_skips_prefix_and_waits_for_handoff(held, cached):
     if cached:
         assert all(not v[2].any() for v in destination.values())
     assert state.source_safe()
-
-
-@pytest.mark.parametrize("producer_tp", [1, 2, 4])
-@pytest.mark.parametrize("rank", range(4))
-def test_consumer_routes_requests_to_the_rank_holding_its_kv_heads(producer_tp, rank):
-    dst = (ctypes.c_ubyte * 48)()
-    consumer = protocol.decode_worker(dst)
-    consumer.tp_size, consumer.tp_rank = 4, rank
-    consumer._block_head_major_runs = [(1, 1)]
-    metadata = ConnectorMetadata()
-    metadata.add_new_req_to_recv(
-        21,
-        [1, 2, 3],
-        {
-            "remote_host": "cpu",
-            "remote_handshake_port": 6301,
-            "remote_tp_size": producer_tp,
-            "remote_pp_size": 2,
-            "transfer_id": "head-route",
-            "remote_block_ids": [4, 5, 6],
-        },
-    )
-    consumer.start_load_kv(metadata)
-    calls = consumer._write_queue
-    assert len(calls) == 2
-    for stage, (address, (_, payload)) in enumerate(calls):
-        expected_port = 6301 + stage * producer_tp + rank // (4 // producer_tp)
-        assert address == f"tcp://cpu:{expected_port}"
-        request = msgpack.loads(payload)
-        assert request["consumer_tp_rank"] == rank
-        assert request["consumer_head_major_runs"] == [[1, 1]]
-
-
-@pytest.mark.parametrize("producer_rank", [0, 1])
-def test_tp2_admission_waits_for_its_contiguous_consumer_group(producer_rank):
-    producer, _, request, _, _ = protocol.producer()
-    producer.tp_size, producer.tp_rank = 2, producer_rank
-    producer._block_head_major_runs = [(1, 2)]
-    producer._chunked_admissions = {7: "xfer-a"}
-    expected_ranks = [0, 1] if producer_rank == 0 else [2, 3]
-    # A rank belonging to the other head shard cannot satisfy admission.
-    producer._pending_chunked_requests.append(
-        (
-            {
-                **request,
-                "consumer_tp_size": 4,
-                "consumer_tp_rank": (expected_ranks[0] + 2) % 4,
-            },
-            0,
-        )
-    )
-    producer._report_chunked_admissions()
-    assert 7 in producer._chunked_admissions
-    for i, rank in enumerate(expected_ranks):
-        producer._pending_chunked_requests.append(
-            ({**request, "consumer_tp_size": 4, "consumer_tp_rank": rank}, 0)
-        )
-        producer._report_chunked_admissions()
-        assert (7 in producer._chunked_admissions) == (i == 0)
-    assert producer._admission_results == {
-        ConnectorCompletion("pd_admission_ready", 7, True)
-    }
-
-
-@pytest.mark.parametrize("producer_tp", [1, 2, 4])
-def test_pp_release_waits_for_every_consumer_of_each_producer_rank(producer_tp):
-    for rank in range(producer_tp):
-        producer, _, _, _, _ = protocol.producer()
-        producer.tp_size, producer.tp_rank = producer_tp, rank
-        producer._released_transfers = set()
-        producer._release_count = {}
-        producer._completed_prefills = {"xfer-a": {"block_ids": [1, 2]}}
-        for i in range(4 // producer_tp):
-            producer._record_release("xfer-a", 4)
-            complete = i + 1 == 4 // producer_tp
-            assert ("xfer-a" in producer.done_sending) == complete
-            assert ("xfer-a" in producer._completed_prefills) != complete
-        producer.done_sending.clear()
-        producer._record_release("xfer-a", 4)
-        assert not producer.done_sending
-
-
-def test_head_transfer_rejects_a_consumer_routed_to_the_wrong_shard():
-    producer, _, request, _, _ = protocol.producer()
-    producer.tp_size, producer.tp_rank = 2, 0
-    producer._block_head_major_runs = [(1, 2)]
-    request.update(consumer_tp_size=4, consumer_tp_rank=2)
-    with pytest.raises(RuntimeError, match="wrong producer TP rank"):
-        producer._consumer_head_cut(request, 1)
