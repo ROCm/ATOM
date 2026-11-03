@@ -1600,18 +1600,21 @@ class ModelRunner:
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
 
+    def _begin_forward(self):
+        """Number this forward, then rotate to its staging slot.
+
+        `DraftQStaging.consume` relies on ``forward_step``, so this must run
+        once per forward even with a one-slot ring.
+        """
+        self.forward_step += 1
+        self._advance_forward_vars()
+
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
 
         Dummy forwards use the same staging buffers as real forwards, so they
-        participate in the ring too. The rotation is a no-op when the ring has a
-        single slot.
-
-        Called once at the start of every forward, so it also numbers them:
-        ``forward_step`` lets a consumer of host staging (the lossless draft's
-        `DraftQStaging`) check that what it reads was staged by this forward.
+        participate in the ring too. No-op when the ring has a single slot.
         """
-        self.forward_step += 1
         if len(self._fv_ring) == 1:
             return
         self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
@@ -3626,7 +3629,7 @@ class ModelRunner:
         # buffers. Excluding them here leaves no event between a dummy and the
         # following real forward, allowing that real forward's CPU writes to
         # race the dummy's still-pending H2D copies.
-        self._advance_forward_vars()
+        self._begin_forward()
         self._gate_staging_reuse()
         (
             input_ids,
@@ -4704,7 +4707,7 @@ class RapidServeModelRunner(ModelRunner):
         self._done_event.record()
         stream.wait_event(self._done_event)
         with torch.cuda.stream(stream):
-            self._advance_forward_vars()
+            self._begin_forward()
             self._gate_staging_reuse()
             (
                 input_ids,
@@ -5062,7 +5065,7 @@ class RapidServeModelRunner(ModelRunner):
         else:
             stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
-            self._advance_forward_vars()
+            self._begin_forward()
             self._gate_staging_reuse()
             (
                 input_ids,

@@ -85,7 +85,7 @@ def test_dummy_forward_participates_in_staging_lifetime():
     method = _method("forward")
     parents = _parent_map(method)
     expected_counts = {
-        "_advance_forward_vars": 1,
+        "_begin_forward": 1,
         "_gate_staging_reuse": 1,
         "_mark_staging_h2d_enqueued": 1,
         "_record_forward_vars_event": 2,

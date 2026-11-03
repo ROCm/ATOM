@@ -15,7 +15,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from atom.spec_decode.draft_q_slots import DraftQSlots, DraftQStaging
+from atom.spec_decode.draft_q_slots import DraftQSlots
+from atom.spec_decode.draft_q_staging import DraftQStaging
 
 MAX_BS = 4
 T = 3

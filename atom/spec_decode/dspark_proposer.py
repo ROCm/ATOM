@@ -22,7 +22,8 @@ from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
 from atom.model_ops.sparse_q_store import Q_WIDTH, RatioDraftQ, SparseQStore
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_q_slots import DraftQSlots, DraftQStaging
+from atom.spec_decode.draft_q_slots import DraftQSlots
+from atom.spec_decode.draft_q_staging import DraftQStaging
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import CpuGpuBuffer, envs

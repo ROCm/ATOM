@@ -608,7 +608,8 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 
 | File | Description |
 |---|---|
-| `draft_q_slots.py` | `DraftQSlots`, `DraftQStaging` — which `SparseQStore` rows each live request's draft `q` occupies across steps, and the host staging of each step's draft sampling inputs and row bases |
+| `draft_q_slots.py` | `DraftQSlots` — which `SparseQStore` rows each live request's draft `q` occupies across steps |
+| `draft_q_staging.py` | `DraftQStaging` — the host staging of each step's draft sampling inputs and row bases |
 
 ### `atom/model_ops/attentions/`
 
