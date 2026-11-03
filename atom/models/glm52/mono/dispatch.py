@@ -5,7 +5,7 @@
 ``GlmMoeDsaForCausalLM`` is an uncompiled outer class (``@support_torch_compile``
 sits on the inner ``DeepseekV2Model``), so the routing lives in its forward --
 the MiniMax-M3 arrangement, not V4.1's ``mono_decode_installers`` wrapper. See
-``model_runner.mono_decode_installers``' own note on which models take which.
+``models.registry.mono_decode_installers``' own note on which models take which.
 
 The deployment is checked once (``config.config_refusal``) and so is the built
 model's layer layout (``_layout_refusal``). A step is then routed only when it

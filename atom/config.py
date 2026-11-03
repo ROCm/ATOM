@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_loader.weight_utils import (
+    checkpoint_layer_key,
+    unquantized_layer_keys,
+)
+
 # plugin-related utilities
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
@@ -302,7 +307,12 @@ class QuantizationConfig:
         self,
         config: PretrainedConfig = None,
         online_quant_config: dict | None = None,
+        model: str | None = None,
     ):
+        # Layers the checkpoint at `model` stores in a plain float dtype.
+        self._stored_unquantized = (
+            unquantized_layer_keys(model) if model else frozenset()
+        )
         if config is None:
             self.torch_dtype = torch.bfloat16
             self.hf_quant_config = None
@@ -439,8 +449,14 @@ class QuantizationConfig:
             global_spec = self.global_spec
             exclude_layers = self.exclude_layers
 
-        # 1. Exclude list
+        # 1. Exclude list, and (checkpoint specs only) a layer stored
+        # unquantized whatever the config's patterns say.
         if self._is_excluded(layer_name, exclude_layers, check_children=check_children):
+            return LayerQuantConfig(quant_dtype=self.torch_dtype)
+        if (
+            not use_online_quant
+            and checkpoint_layer_key(layer_name) in self._stored_unquantized
+        ):
             return LayerQuantConfig(quant_dtype=self.torch_dtype)
 
         # 2. Pattern match
@@ -761,6 +777,21 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
 }
 
 
+def flatten_dsa_config(hf_config) -> None:
+    """Publish a nested ``dsa_config`` as the flat fields the shared DSA code
+    reads: its ``index_*`` entries (``index_num_heads`` as ``index_n_heads``)
+    and the zero-based ``dsa_layer_indices`` of its one-based ``dsa_layers``.
+    Done before the attention backend is chosen, which keys on ``index_topk``."""
+    dsa = getattr(hf_config, "dsa_config", None)
+    if not dsa:
+        return
+    for name, value in dsa.items():
+        if name != "dsa_layers":
+            dest = "index_n_heads" if name == "index_num_heads" else name
+            setattr(hf_config, dest, value)
+    hf_config.dsa_layer_indices = tuple(sorted(i - 1 for i in dsa["dsa_layers"]))
+
+
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
@@ -815,6 +846,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         original_arch = config_dict.get("architectures", [])
         if original_arch:
             hf_config.architectures = original_arch
+        flatten_dsa_config(hf_config)
         # Propagate top-level token IDs if missing in text config
         for field in ("bos_token_id", "eos_token_id", "pad_token_id"):
             if getattr(hf_config, field, None) is None and field in config_dict:
@@ -2389,6 +2421,7 @@ class Config:
         self.quant_config = QuantizationConfig(
             self.hf_config,
             self.online_quant_config,
+            model=self.model,
         )
         # In plugin mode, supplement exclude_layers with vLLM's ignored_layers when
         # the HF quant config didn't produce any exclusions (non-quark quant methods).

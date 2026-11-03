@@ -44,7 +44,7 @@ diffusion_server.py → DiffusionEngine → DiffusionCoreManager → DiffusionEn
 Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
-- Models: `atom/models/` — registered in `model_runner.py:support_model_arch_dict`
+- Models: `atom/models/` — registered in `atom/models/registry.py:support_model_arch_dict`
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
@@ -70,7 +70,7 @@ Key entry points:
   / math primitives), a model's
   kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
   Kimi-K3, both wrapped after load through
-  `model_runner.mono_decode_installers`; V4.1's per-step cell decisions live in
+  `models.registry.mono_decode_installers`; V4.1's per-step cell decisions live in
   `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
   kernel and its CPU I3 test. Kimi-K3 runs K1 (the attention seam through
   the KDA recurrence) and K2 (`o_proj` + the latent MoE) on its KDA layers, and

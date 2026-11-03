@@ -58,7 +58,7 @@ def _install_forward_context_stubs():
         types.ModuleType("atom.model_ops.attentions.gdn_attn"),
     )
     gdn_attn.GDNAttentionMetadata = _KwargsObject
-    gdn_attn.compute_causal_conv1d_metadata = lambda query_start_loc: (None, None, None)
+    gdn_attn.compute_causal_conv1d_metadata = lambda seqlens, device: (None, None, None)
 
     plugin_attention = stub(
         "atom.plugin.attention", types.ModuleType("atom.plugin.attention")

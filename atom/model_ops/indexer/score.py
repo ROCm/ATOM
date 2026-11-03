@@ -57,9 +57,13 @@ def score_topk(
     on_band=None,
     out: torch.Tensor | None = None,
     keys=None,
+    request_local: bool = True,
 ) -> torch.Tensor:
     """`[rows.out_rows, topk]` int32 of `rows`' query rows against `cache`,
     each band scored into the plane the rows were cut to (`rows.workspace`).
+    `request_local=False` leaves FP8 concat rows' ids as places in the
+    gathered run, for a consumer that subtracts `rows.concat.row_starts`
+    itself (MLA's prefill slot conversion).
 
     FP8: `query` [rows, heads, dim] e4m3 and `weights` [rows, heads] fp32 with
     the query scale folded in. FP4: `query` is `(values, scales)`, each
@@ -73,7 +77,9 @@ def score_topk(
     if out is None:
         out = torch.empty(rows.out_rows, topk, dtype=torch.int32, device=weights.device)
     if rows.concat is not None:
-        _score_concat(query, weights, cache, rows, topk, stable, out, keys)
+        _score_concat(
+            query, weights, cache, rows, topk, stable, out, keys, request_local
+        )
     else:
         _score_paged(
             query, weights, cache, rows, topk, weight_scale, stable, on_band, out
@@ -205,7 +211,9 @@ def _gather_concat(query, cache, keys):
     return k_fp8, k_scale
 
 
-def _score_concat(query, weights, cache, rows, topk, stable, out, gathered):
+def _score_concat(
+    query, weights, cache, rows, topk, stable, out, gathered, request_local
+):
     """FP8 prefill against the gathered keys. The top-k reports a key's place
     in the gathered run; less its request's start it is the request's own."""
     keys = rows.concat
@@ -238,7 +246,7 @@ def _score_concat(query, weights, cache, rows, topk, stable, out, gathered):
             k=topk,
             stable=stable,
         )
-    if rows.bands:
+    if request_local and rows.bands:
         scored = slice(rows.bands[0][0], rows.bands[-1][1])
         picked, base = out[scored], keys.row_starts[scored].unsqueeze(1)
         torch.where(picked < 0, picked, picked - base, out=picked)
