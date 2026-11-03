@@ -558,6 +558,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
+    # gfx1250 GDN prefill state walk (chunk_h): the four operand copies of a
+    # chunk as two fused TDM loads, k^T's operand read before the first product.
+    "ATOM_GDN_CHUNK_H_PAIRED_LOADS": lambda: (
+        os.getenv("ATOM_GDN_CHUNK_H_PAIRED_LOADS", "0") == "1"
+    ),
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
