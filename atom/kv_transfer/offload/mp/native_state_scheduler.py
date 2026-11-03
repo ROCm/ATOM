@@ -679,6 +679,15 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
         self._forget_kv_reach(seq)
         super().cancel_pending_load(seq)
 
+    def cancel_preadmission(self, seq: Any) -> None:
+        # A park this pass recorded must not reach dispatch: `build_connector_
+        # meta` would report the request's load as dropped and wake it as a
+        # failed load although it is back in `waiting`, unadmitted.
+        parked = self._parked_loads.get(str(seq.id))
+        if parked is seq:
+            del self._parked_loads[str(seq.id)]
+        super().cancel_preadmission(seq)
+
     def _forget_kv_reach(self, seq: Any) -> None:
         """Stop holding `seq`'s lookup for its reach; the base releases it."""
         entry = self._kv_reach.get(str(seq.id))
