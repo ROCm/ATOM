@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.sampling_scratch import Region
 from atom.model_ops.softmax_tiles import argmax_lowest_id, race_key
 
@@ -67,7 +68,8 @@ def _dspark_q_histogram(
     s_ptr,
     row_max_ptr,
     q_row_base_ptr,
-    greedy_mask_ptr,
+    temperatures_ptr,
+    greedy_temperature,
     hist_ptr,
     vocab_size,
     stride_s_row,
@@ -81,7 +83,9 @@ def _dspark_q_histogram(
     row = tl.program_id(0)
     tile = tl.program_id(1)
     # Rows that store nothing stop here, and in the cut and compaction too.
-    if (tl.load(q_row_base_ptr + row) < 0) | (tl.load(greedy_mask_ptr + row) != 0):
+    if (tl.load(q_row_base_ptr + row) < 0) | (
+        tl.load(temperatures_ptr + row) <= greedy_temperature
+    ):
         return
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     v_mask = offs_v < vocab_size
@@ -104,7 +108,8 @@ def _dspark_q_histogram(
 def _dspark_q_cut(
     hist_ptr,
     q_row_base_ptr,
-    greedy_mask_ptr,
+    temperatures_ptr,
+    greedy_temperature,
     top_k_ptr,
     top_p_ptr,
     tile_off_ptr,
@@ -127,7 +132,9 @@ def _dspark_q_cut(
     the tiles before it. Exactly n ids are then stored.
     """
     row = tl.program_id(0)
-    if (tl.load(q_row_base_ptr + row) < 0) | (tl.load(greedy_mask_ptr + row) != 0):
+    if (tl.load(q_row_base_ptr + row) < 0) | (
+        tl.load(temperatures_ptr + row) <= greedy_temperature
+    ):
         return
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
@@ -182,7 +189,8 @@ def _dspark_q_compact(
     s_ptr,
     row_max_ptr,
     q_row_base_ptr,
-    greedy_mask_ptr,
+    temperatures_ptr,
+    greedy_temperature,
     tile_off_ptr,
     tile_quota_ptr,
     row_cut_ptr,
@@ -203,7 +211,7 @@ def _dspark_q_compact(
     row = tl.program_id(0)
     tile = tl.program_id(1)
     q_base = tl.load(q_row_base_ptr + row)
-    if (q_base < 0) | (tl.load(greedy_mask_ptr + row) != 0):
+    if (q_base < 0) | (tl.load(temperatures_ptr + row) <= greedy_temperature):
         return
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     v_mask = offs_v < vocab_size
@@ -232,7 +240,8 @@ def _dspark_q_finalize(
     q_probs_ptr,
     q_meta_ptr,
     q_row_base_ptr,
-    greedy_mask_ptr,
+    temperatures_ptr,
+    greedy_temperature,
     row_argmax_ptr,
     row_n_ptr,
     seed_ptr,
@@ -256,7 +265,7 @@ def _dspark_q_finalize(
     row = tl.program_id(0)
     q_base = tl.load(q_row_base_ptr + row)
     has_q = q_base >= 0
-    sampled = has_q & (tl.load(greedy_mask_ptr + row) == 0)
+    sampled = has_q & (tl.load(temperatures_ptr + row) > greedy_temperature)
     n = tl.where(sampled, tl.load(row_n_ptr + row), 0)
     base = (tl.where(has_q, q_base, 0) + position).to(tl.int64) * store_width
     offs = tl.arange(0, BLOCK)
@@ -343,7 +352,7 @@ def select_and_draw_q(
     row_max: torch.Tensor,
     row_argmax: torch.Tensor,
     q_row_base: torch.Tensor,
-    greedy_mask: torch.Tensor,
+    temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     seed: torch.Tensor,
@@ -376,7 +385,8 @@ def select_and_draw_q(
         s_scratch,
         row_max,
         q_row_base,
-        greedy_mask,
+        temperatures,
+        SAMPLER_EPS,
         hist,
         vocab_size,
         s_scratch.stride(0),
@@ -388,7 +398,8 @@ def select_and_draw_q(
     _dspark_q_cut[(num_rows,)](
         hist,
         q_row_base,
-        greedy_mask,
+        temperatures,
+        SAMPLER_EPS,
         top_k,
         top_p,
         tile_off,
@@ -406,7 +417,8 @@ def select_and_draw_q(
         s_scratch,
         row_max,
         q_row_base,
-        greedy_mask,
+        temperatures,
+        SAMPLER_EPS,
         tile_off,
         tile_quota,
         row_cut,
@@ -426,7 +438,8 @@ def select_and_draw_q(
         q_probs,
         q_meta,
         q_row_base,
-        greedy_mask,
+        temperatures,
+        SAMPLER_EPS,
         row_argmax,
         row_n,
         seed,

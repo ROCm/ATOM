@@ -411,6 +411,12 @@ class Drafter(abc.ABC):
     # unreachable from any flavor that has not been ported: the runner calls
     # the hooks unconditionally and gets None back.
 
+    def bind_target_sampling(self, forward_vars) -> bool:
+        """Let the draft read the target's own per-row sampling inputs, once
+        the runner has allocated them; True if it now reads every row's
+        top-k / top-p, which `prepare_sample` must then always publish."""
+        return False
+
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
     ) -> None:

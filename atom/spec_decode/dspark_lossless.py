@@ -7,6 +7,7 @@ is set, the flavor has a sampled entry point and the engine can run it
 and staged inputs, and the proposer's lossless hooks delegate to it.
 """
 
+import dataclasses
 import logging
 from typing import NamedTuple
 
@@ -59,16 +60,12 @@ class _LosslessInput(NamedTuple):
         return "draft_" + self.name
 
 
-#: Every per-step input of lossless speculative sampling, in publication order.
-#: Pad rows idle at temperature 1.0 rather than a 0 the kernel would divide by,
-#: no filter, and row base -1, so a pad row writes no q.
+#: Every per-step input of lossless speculative sampling the target does not
+#: already stage, in publication order (temperatures and filters the draft
+#: reads from the runner: `bind_target`). Pad rows hold row base -1, so a pad
+#: row writes no q.
 _LOSSLESS_INPUTS = (
-    _LosslessInput("temperatures", True, torch.float32, 1.0),
-    _LosslessInput("greedy_mask", True, torch.int32, 1),
     _LosslessInput("seed", False, torch.int32, None),
-    # The request's own top-k / top-p, for the draft to sample within.
-    _LosslessInput("top_k", True, torch.int32, 0),
-    _LosslessInput("top_p", True, torch.float32, 1.0),
     # First q row each batch row drafts into; -1 writes nothing.
     _LosslessInput("q_row_base", True, torch.int32, -1),
     # First q row each request's drafts were drawn into; -1 means none.
@@ -242,6 +239,19 @@ class DSparkLossless:
             scratch=draft_scratch,
             **{s.name: buffers[s.name].gpu for s in _LOSSLESS_INPUTS if s.drafted},
         )
+
+    def bind_target(self, forward_vars, model) -> None:
+        """Point the draft at the target's own temperatures, top-k and top-p
+        (`ModelRunner.forward_vars`), which `prepare_sample` publishes every
+        row of while this is armed, and rebind ``model``. Before any warmup or
+        capture, so the recorded block reads them."""
+        self.sampling = dataclasses.replace(
+            self.sampling,
+            temperatures=forward_vars["temperatures"].gpu,
+            top_k=forward_vars["top_ks"].gpu,
+            top_p=forward_vars["top_ps"].gpu,
+        )
+        model.bind_draft_sampling(self.sampling)
 
     def stage(
         self,

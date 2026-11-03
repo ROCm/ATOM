@@ -879,6 +879,12 @@ class ModelRunner:
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
+        # A lossless DSpark draft reads the target's temperatures and filters
+        # rather than a copy of its own; bound before any warmup or capture.
+        drafter = getattr(self, "drafter", None)
+        self._draft_reads_filters = (
+            drafter is not None and drafter.bind_target_sampling(self.forward_vars)
+        )
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
@@ -2717,6 +2723,16 @@ class ModelRunner:
                 top_p_buffer = self.forward_vars["top_ps"]
                 top_p_buffer.np[:bs] = batch.top_ps
                 top_ps = top_p_buffer.gpu[:bs]
+                top_p_count = bs
+
+        if getattr(self, "_draft_reads_filters", False):
+            # The lossless draft samples within every row's own filters, so it
+            # needs each row's, off (-1 / 1.0) and uniform ones included.
+            if top_k_count is None:
+                self.forward_vars["top_ks"].np[:bs] = batch.top_ks
+                top_k_count = bs
+            if top_p_count is None:
+                self.forward_vars["top_ps"].np[:bs] = batch.top_ps
                 top_p_count = bs
 
         # Read back by `postprocess` through `_constrain_required_channel`.

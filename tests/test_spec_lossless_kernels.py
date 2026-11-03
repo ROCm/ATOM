@@ -111,6 +111,12 @@ def empty_store(rows, width):
     return store
 
 
+def greedy_at_eps(temps, greedy):
+    """The temperatures `ModelRunner.prepare_sample` publishes: a greedy
+    row's clamped to ``SAMPLER_EPS``."""
+    return torch.where(greedy != 0, torch.full_like(temps, SAMPLER_EPS), temps)
+
+
 def sample(
     base,
     prev,
@@ -128,8 +134,10 @@ def sample(
     scratch=None,
 ):
     """One `dspark_markov_sample` call; ``(out, s_scratch)``. Its scratch is
-    sized to ``base``'s rows unless one is given."""
+    sized to ``base``'s rows unless one is given. A ``greedy`` row drafts at
+    ``SAMPLER_EPS``, the clamped temperature the op reads as greedy."""
     rows, vocab = base.shape
+    temps = greedy_at_eps(temps, greedy)
     if scratch is None:
         scratch = dspark_markov_sample_scratch(rows, vocab, DEV)
     if top_k is None:
@@ -149,7 +157,6 @@ def sample(
         row_base,
         position,
         temps,
-        greedy,
         top_k,
         top_p,
         seed,
@@ -439,8 +446,7 @@ def test_two_runs_and_a_graph_replay_store_and_draft_bit_for_bit_alike():
             s,
             row_base,
             1,
-            temps,
-            greedy,
+            greedy_at_eps(temps, greedy),
             top_k,
             top_p,
             seed,
@@ -586,12 +592,11 @@ def test_the_block_sampler_chains_the_op_through_its_bound_buffers():
         q_store=empty_store(3 * steps, width),
         s_scratch=torch.empty(max_bs, vocab, device=DEV),
         q_row_base=row_base,
-        temperatures=temps,
-        greedy_mask=greedy,
-        top_k=top_k,
-        top_p=top_p,
         seed=seed,
         scratch=dspark_markov_sample_scratch(max_bs, vocab, DEV),
+        temperatures=greedy_at_eps(temps, greedy),
+        top_k=top_k,
+        top_p=top_p,
     )
     model = SimpleNamespace(markov_head=head, draft_sampling=sampling)
     drafts = KimiK3DSpark._sample_block(model, base, anchors)

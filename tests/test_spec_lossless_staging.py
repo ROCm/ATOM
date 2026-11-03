@@ -21,16 +21,13 @@ from atom.model_ops.sampler import Sampler
 from atom.spec_decode import dspark_lossless, dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
+from atom.utils import CpuGpuBuffer
 
 MAX_BS = 4
 T = 3
 VOCAB = 16
 LOSSLESS = (
-    "draft_temperatures",
-    "draft_greedy_mask",
     "draft_seed",
-    "draft_top_k",
-    "draft_top_p",
     "draft_q_row_base",
     "draft_verify_q_row_base",
 )
@@ -132,14 +129,28 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
         assert prop.metadata_buffers[name].publication_group == "sampling", name
     sampling = prop.model.bound
     assert sampling.q_row_base is prop.metadata_buffers["draft_q_row_base"].gpu
-    assert sampling.top_k is prop.metadata_buffers["draft_top_k"].gpu
-    assert sampling.top_p is prop.metadata_buffers["draft_top_p"].gpu
-    # Unpublished rows are harmless from the start: no destination, T=1, no
-    # filter.
+    # Unpublished rows are harmless from the start: no destination.
     assert dest(prop) == [-1] * MAX_BS and verify(prop) == [-1] * MAX_BS
-    assert prop.metadata_buffers["draft_temperatures"].np.tolist() == [1.0] * MAX_BS
-    assert prop.metadata_buffers["draft_top_k"].gpu.tolist() == [0] * MAX_BS
-    assert prop.metadata_buffers["draft_top_p"].gpu.tolist() == [1.0] * MAX_BS
+
+
+def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
+    """No copy to drift: once bound, the draft's per-row temperatures and
+    filters are the runner's `forward_vars` buffers themselves."""
+    prop = proposer(monkeypatch)
+    forward_vars = {
+        name: CpuGpuBuffer(MAX_BS, dtype=dtype, device="cpu")
+        for name, dtype in (
+            ("temperatures", torch.float32),
+            ("top_ks", torch.int32),
+            ("top_ps", torch.float32),
+        )
+    }
+    assert prop.bind_target_sampling(forward_vars)
+    sampling = prop.model.bound
+    assert sampling.temperatures is forward_vars["temperatures"].gpu
+    assert sampling.top_k is forward_vars["top_ks"].gpu
+    assert sampling.top_p is forward_vars["top_ps"].gpu
+    assert not proposer(monkeypatch, lossless=False).bind_target_sampling(forward_vars)
 
 
 @pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
@@ -403,7 +414,6 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     stage(prop, batch(["a", "b"]))
     counts = stage(prop, batch([]))
     assert counts["draft_seed"] == 1
-    assert counts["draft_temperatures"] is None
     assert counts["draft_verify_q_row_base"] is None
     assert counts["draft_q_row_base"] == 2 and dest(prop)[:2] == [-1, -1]
 

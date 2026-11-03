@@ -45,11 +45,13 @@ if TYPE_CHECKING:
 class DraftSampling:
     """Everything the block sampler needs to draw -- and publish -- a real q.
 
-    Bound once, at drafter init, and never rebound: the block head is
-    cudagraph-captured (``DSparkProposer._declare_draft_graphs``,
-    ``capture_epilogue=True``), so every address here is baked into the
-    recording. That is also why the per-step seed and row bases are device
-    tensors rather than python ints: their values are refreshed outside it.
+    Bound at drafter init and completed, with the target's own sampling
+    inputs, once the runner has allocated them (`DSparkLossless.bind_target`),
+    before any warmup or capture: the block head is cudagraph-captured
+    (``DSparkProposer._declare_draft_graphs``, ``capture_epilogue=True``), so
+    every address here is baked into the recording. That is also why the
+    per-step seed and row bases are device tensors rather than python ints:
+    their values are refreshed outside it.
 
     The per-row tensors are sized at ``max_num_seqs``; the block runs at
     ``running_bs <= max_num_seqs`` and slices.
@@ -66,22 +68,21 @@ class DraftSampling:
     #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
     #: position k goes to row ``base + k``. Negative writes nothing.
     q_row_base: torch.Tensor
-    #: [max_bs] fp32, pre-clamped away from 0 (``SAMPLER_EPS``).
-    temperatures: torch.Tensor
-    #: [max_bs] int32, nonzero where the draw is an argmax -- i.e. where the
-    #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
-    #: predicate ``Sampler`` itself tests.
-    greedy_mask: torch.Tensor
-    #: [max_bs] int32, the request's top-k the draft samples within; 0 is off.
-    top_k: torch.Tensor
-    #: [max_bs] fp32, the request's top-p, over the unfiltered q and
-    #: intersected with top-k (aiter's rule); 1.0 is off.
-    top_p: torch.Tensor
     #: [1] int32, the Philox key. Must hold the same value on every TP rank.
     seed: torch.Tensor
     #: Preallocated partials for the sampled op (`dspark_markov_sample_scratch`),
     #: so the draft step allocates nothing and the profiling run sees it.
     scratch: "SamplingScratch"
+    #: The target's own per-row sampling inputs (`ModelRunner.forward_vars`),
+    #: so draft and target cannot disagree on them. [max_bs] fp32 temperatures,
+    #: clamped to ``SAMPLER_EPS``, where a row at ``SAMPLER_EPS`` is greedy
+    #: (`Sampler`'s predicate) and drafts its argmax.
+    temperatures: torch.Tensor | None = None
+    #: [max_bs] int32, the request's top-k the draft samples within; -1 is off.
+    top_k: torch.Tensor | None = None
+    #: [max_bs] fp32, the request's top-p, over the unfiltered q and
+    #: intersected with top-k (aiter's rule); 1.0 is off.
+    top_p: torch.Tensor | None = None
 
 
 def linear_out(output):
@@ -219,7 +220,6 @@ class DSparkMarkovHead(nn.Module):
                 sampling.q_row_base[:bs],
                 k,
                 sampling.temperatures[:bs],
-                sampling.greedy_mask[:bs],
                 sampling.top_k[:bs],
                 sampling.top_p[:bs],
                 sampling.seed,

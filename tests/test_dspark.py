@@ -120,7 +120,6 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
         s_scratch=torch.empty(max_bs, V),
         q_row_base=torch.zeros(max_bs, dtype=torch.int32),
         temperatures=per_row,
-        greedy_mask=per_row,
         top_k=per_row,
         top_p=per_row,
         seed=None,
@@ -129,7 +128,7 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
     calls = []
 
     def sample(base, prev, w1, w2, out, *args):
-        row_base, position, noise_offset = args[4], args[5], args[11]
+        row_base, position, noise_offset = args[4], args[5], args[10]
         calls.append((row_base.shape[0], position, noise_offset))
         assert torch.equal(base, base_logits[:, position])
         out.copy_(prev + 1)

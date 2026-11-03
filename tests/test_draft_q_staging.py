@@ -26,10 +26,6 @@ FORWARDS = itertools.count(1)
 
 def staging(slots=2 * MAX_BS):
     arrays = {
-        "temperatures": np.ones(MAX_BS, np.float32),
-        "greedy_mask": np.ones(MAX_BS, np.int32),
-        "top_k": np.zeros(MAX_BS, np.int32),
-        "top_p": np.ones(MAX_BS, np.float32),
         "seed": np.zeros(1, np.int32),
         "q_row_base": np.full(MAX_BS, -1, np.int32),
         "verify_q_row_base": np.full(MAX_BS, -1, np.int32),
@@ -208,36 +204,6 @@ def test_a_smaller_batch_clears_the_larger_ones_pad_rows():
     assert a.q_row_base[2:].tolist() == [-1, -1]
     assert rows["q_row_base"] == 4, "the cleared tail is published too"
     assert stage(st, batch(list("ab")))["q_row_base"] == 2
-
-
-def test_each_row_drafts_within_its_own_filters():
-    """A filter on one row changes nothing about the others: no row drafts
-    greedily for it, and each row's own top-k / top-p is staged, a top-k of
-    -1 as the draft's 0."""
-    st, a = staging()
-    rows = stage(
-        st,
-        batch(
-            ["a", "b", "c"],
-            [0.7, 1.3, 0.0],
-            top_ks=[-1, 5, 1],
-            top_ps=[1.0, 0.9, 0.5],
-        ),
-    )
-    assert a.greedy_mask[:3].tolist() == [0, 0, 1]
-    np.testing.assert_allclose(a.temperatures[:2], [0.7, 1.3], rtol=1e-6)
-    assert a.top_k[:3].tolist() == [0, 5, 1]
-    np.testing.assert_array_equal(a.top_p[:3], np.float32([1.0, 0.9, 0.5]))
-    assert rows["top_k"] == rows["top_p"] == 3
-
-
-def test_an_unfiltered_batch_keeps_each_rows_temperature_and_greedy_predicate():
-    st, a = staging()
-    temps = np.array([0.0, EPS, 0.7], np.float32)
-    stage(st, batch(["a", "b", "c"], temps))
-    np.testing.assert_array_equal(a.temperatures[:3], np.maximum(temps, EPS))
-    # The predicate `Sampler` tests, so draft and target agree on greedy.
-    assert a.greedy_mask[:3].tolist() == [1, 1, 0]
 
 
 def test_the_philox_key_advances_once_per_step():

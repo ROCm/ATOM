@@ -181,6 +181,7 @@ def _markov_stage1(
     stride_w2_vocab,
     stride_s_row,
     vocab_offset,
+    min_temperature,
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -237,10 +238,13 @@ def _markov_stage1(
     tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
     if SAMPLED:
-        # Pre-clamped by the caller to SAMPLER_EPS, so no row divides by zero.
-        # A greedy row's scores are only scratch: finalize publishes the exact
-        # delta on its argmax instead.
-        temperature = tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0)
+        # Clamped here too, so a pad row's stale or zero temperature never
+        # divides by zero. A greedy row's scores are only scratch: finalize
+        # publishes the exact delta on its argmax instead.
+        temperature = tl.maximum(
+            tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0),
+            min_temperature,
+        )
         scaled = vals / temperature[:, None]
         # Only a row with a destination is read back; the rest draft the argmax.
         q_base = tl.load(q_row_base_ptr + offs_row, mask=row_mask, other=-1)
@@ -581,6 +585,7 @@ def _launch(
         stride_w2_vocab=markov_w2.stride(0),
         stride_s_row=0,
         vocab_offset=vocab_offset,
+        min_temperature=1.0,
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,

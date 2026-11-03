@@ -275,6 +275,51 @@ def test_the_draft_q_lookup_is_gated_like_its_consumer(temps, verifies):
     assert staged.call_args.kwargs["verifies"] is verifies
 
 
+@pytest.mark.parametrize(
+    "ks, ps", [([-1, -1], [1.0, 1.0]), ([4, 4], [0.9, 0.9]), ([4, -1], [1.0, 0.7])]
+)
+def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
+    """The draft samples within each row's own filters, read from the target's
+    buffers, so they are published whatever `Sampler` is handed: off and
+    uniform filters included. `Sampler` still gets its scalars."""
+    bs = len(ks)
+    buffers = {
+        name: SimpleNamespace(np=np.zeros(4, dtype), gpu=torch.zeros(4))
+        for name, dtype in (
+            ("temperatures", np.float32),
+            ("top_ks", np.int32),
+            ("top_ps", np.float32),
+        )
+    }
+    names = [*buffers, "required_channel_states"]
+    group = SimpleNamespace(
+        counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
+    )
+    runner = SimpleNamespace(
+        forward_vars=buffers,
+        sampler=SimpleNamespace(keep_top_k_ties=False),
+        _draft_reads_filters=True,
+    )
+    batch = SimpleNamespace(
+        total_seqs_num=bs,
+        temperatures=np.ones(bs, np.float32),
+        top_ks=np.array(ks, np.int32),
+        top_ps=np.array(ps, np.float32),
+        required_channel=None,
+    )
+    _, top_ks, top_ps, _, _ = runner_module.ModelRunner.prepare_sample(
+        runner, batch, publication_group=group
+    )
+    assert buffers["top_ks"].np[:bs].tolist() == ks
+    np.testing.assert_array_equal(buffers["top_ps"].np[:bs], np.float32(ps))
+    assert group.counts[group.indices["top_ks"]] == bs
+    assert group.counts[group.indices["top_ps"]] == bs
+    if len(set(ks)) == 1 and ks[0] != -1:
+        assert top_ks == ks[0]
+    if len(set(ps)) == 1 and ps[0] < 1.0:
+        assert top_ps == np.float32(ps[0])
+
+
 @pytest.mark.parametrize("max_num_seqs", [1, 64])
 def test_output_capacity_follows_server_limit_and_warmup_floor(max_num_seqs):
     runner = SimpleNamespace(

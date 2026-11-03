@@ -81,7 +81,6 @@ def test_the_sampled_op_checks_its_tables_as_the_greedy_one_does():
         0,
         torch.ones(rows),
         torch.zeros(rows, **i32),
-        torch.zeros(rows, **i32),
         torch.ones(rows),
         torch.zeros(1, **i32),
         0,

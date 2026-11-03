@@ -617,7 +617,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | File | Description |
 |---|---|
 | `draft_q_slots.py` | `DraftQSlots` — which `SparseQStore` rows each live request's draft `q` occupies across steps |
-| `draft_q_staging.py` | `DraftQStaging` — the host staging of each step's draft sampling inputs and row bases |
+| `draft_q_staging.py` | `DraftQStaging` — the host staging of each step's Philox key and q row bases (the draft reads the target's own temperatures and filters) |
 | `dspark_lossless.py` | `DSparkLossless` — arms the feature for `DSparkProposer` and owns its `q` store, scratch and staged inputs |
 
 ### `atom/model_ops/attentions/`

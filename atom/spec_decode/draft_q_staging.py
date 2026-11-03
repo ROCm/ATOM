@@ -15,9 +15,10 @@ class DraftQStaging:
     """The host half of a lossless draft step: what to stage, row by row.
 
     Writes, into numpy views of the proposer's pinned staging buffers, the
-    inputs the captured draft head and the ratio verify read: per-row draft
-    temperature, greedy mask and top-k / top-p, the Philox step, each row's q
-    destination and each request's verify q row. `stage` returns how many
+    inputs the captured draft head and the ratio verify read beyond the
+    target's own (temperatures and filters, which the draft reads from the
+    runner): the Philox step, each row's q destination and each request's
+    verify q row. `stage` returns how many
     leading rows of each buffer to publish; the proposer turns those into its
     publication counts. Free of torch and aiter, so the policy is testable on
     any host.
@@ -27,20 +28,12 @@ class DraftQStaging:
         self,
         slots: DraftQSlots,
         *,
-        temperatures,
-        greedy_mask,
-        top_k,
-        top_p,
         seed,
         q_row_base,
         verify_q_row_base,
         greedy_threshold: float,
     ):
         self.slots = slots
-        self._temps = temperatures
-        self._mask = greedy_mask
-        self._top_k = top_k
-        self._top_p = top_p
         self._seed = seed
         self._dest = q_row_base
         self._verify = verify_q_row_base
@@ -106,26 +99,9 @@ class DraftQStaging:
             self._dest_hi = 0
         counts = {
             "seed": 1,
-            "temperatures": bs or None,
-            "greedy_mask": bs or None,
-            "top_k": bs or None,
-            "top_p": bs or None,
             "verify_q_row_base": bs or None,
             "q_row_base": hi or None,
         }
-        if not bs:
-            return counts
-        # The clamp `prepare_sample` applies to the target's copy, so the two
-        # divide by the same number row for row and no row divides by zero.
-        np.maximum(batch.temperatures[:bs], self._eps, out=self._temps[:bs])
-        # The predicate `Sampler` tests, so a row cannot be greedy to the
-        # target and stochastic to the draft.
-        self._mask[:bs] = batch.temperatures[:bs] <= self._eps
-        # The request's own filters, so the draft samples about what the
-        # target keeps. Only acceptance rides on it: the verify filters p
-        # itself. The draft spells "no top-k" 0, a request -1.
-        np.maximum(batch.top_ks[:bs], 0, out=self._top_k[:bs])
-        self._top_p[:bs] = batch.top_ps[:bs]
         return counts
 
     def consume(self, step: int) -> None:

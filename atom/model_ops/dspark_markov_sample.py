@@ -31,6 +31,7 @@ from atom.model_ops.dspark_markov_argmax import (
     check_markov_inputs,
     markov_weights_unsupported,
 )
+from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.sampling_scratch import Region, SamplingScratch, carve
 from atom.model_ops.softmax_tiles import softmax_combine_kernel
 from atom.model_ops.sparse_q_select import (
@@ -53,7 +54,6 @@ def _dspark_markov_sample_fake(
     q_row_base: torch.Tensor,
     position: int,
     temperatures: torch.Tensor,
-    greedy_mask: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     seed: torch.Tensor,
@@ -132,7 +132,6 @@ def dspark_markov_sample(
     q_row_base: torch.Tensor,
     position: int,
     temperatures: torch.Tensor,
-    greedy_mask: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     seed: torch.Tensor,
@@ -157,9 +156,11 @@ def dspark_markov_sample(
         s_scratch:    [>=B, V] fp32, the scaled scores between launches.
         q_row_base:   [B]     int32; negative writes nothing.
         position:             host int, this block position.
-        temperatures: [B]     fp32, pre-clamped away from 0 by the caller.
-        greedy_mask:  [B]     int32, nonzero where the draw is an argmax.
-        top_k:        [B]     int32, the request's top-k; 0 is off.
+        temperatures: [B]     fp32, clamped to ``SAMPLER_EPS`` from below as
+                              `ModelRunner.prepare_sample` clamps it; a row
+                              at ``SAMPLER_EPS`` is greedy (`Sampler`'s
+                              predicate) and drafts its argmax.
+        top_k:        [B]     int32, the request's top-k; 0 or -1 is off.
         top_p:        [B]     fp32, the request's top-p; 1.0 is off.
         seed:         [1]     int32 device scalar. Must hold the same value on
                               every TP rank: each rank runs this op over the
@@ -212,6 +213,7 @@ def dspark_markov_sample(
             f"contiguous [>= {num_rows}, {vocab_size}] fp32"
         )
     _check_rows("q_row_base", q_row_base, num_rows, torch.int32)
+    _check_rows("temperatures", temperatures, num_rows, torch.float32)
     _check_rows("top_k", top_k, num_rows, torch.int32)
     _check_rows("top_p", top_p, num_rows, torch.float32)
     if base_logits.stride(1) != 1:
@@ -255,6 +257,7 @@ def dspark_markov_sample(
         stride_w2_vocab=markov_w2.stride(0),
         stride_s_row=s_scratch.stride(0),
         vocab_offset=0,
+        min_temperature=SAMPLER_EPS,
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,
@@ -283,7 +286,7 @@ def dspark_markov_sample(
         work.row_max,
         work.row_argmax,
         q_row_base,
-        greedy_mask,
+        temperatures,
         top_k,
         top_p,
         seed,

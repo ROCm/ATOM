@@ -79,6 +79,14 @@ class DSparkProposer(Drafter):
         """Arm lossless sampling, or keep the greedy pair (`DSparkLossless.arm`)."""
         self._lossless = DSparkLossless.arm(self)
 
+    def bind_target_sampling(self, forward_vars) -> bool:
+        """`DSparkLossless.bind_target`; True when the draft now reads the
+        target's per-row filters."""
+        if self._lossless is None:
+            return False
+        self._lossless.bind_target(forward_vars, self.model)
+        return True
+
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
     ) -> None:
