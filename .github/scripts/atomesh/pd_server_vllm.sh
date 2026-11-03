@@ -327,6 +327,8 @@ start_router() {
 
 if [[ -n "${ATOMESH_C48_CASE:-}" ]]; then
   source "${ATOMESH_SCRIPT_DIR}/pd_c48_server.sh"
+elif [[ "${ATOMESH_M31_MORIIO:-}" == 1 ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/pd_m31_moriio_server.sh"
 else
   apply_vllm_fork_overlay
 fi

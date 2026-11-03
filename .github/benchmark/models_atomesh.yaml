@@ -16438,3 +16438,79 @@ models:
             float32 --block-size 128 --attention-backend ROCM_AITER_MLA --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
             --max-num-seqs 96 --max-num-batched-tokens 512 --compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":240,"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,130,140,150,160,170,180,190,200,210,220,230,240],"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}'
             --quantization-config '{"linear":"fp8_per_channel","ignore":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
+  # vLLM 1P2D MoRIIOConnector (WRITE) over cross-node RDMA with prefill CPU offload. Server env/argv
+  # follow the local launch_pd_main.sh CONC --offload (pd_m31_moriio_server.sh); vLLM is the image's
+  # 40941f2c package with the fork's Python diff applied. One concurrency per case because
+  # max-num-seqs and the decode cudagraph sizes scale with it.
+  MiniMax-M3.1-Flash-vLLM-MoRIIO-RDMA:
+    backend: vllm
+    # amd/MiniMax-M3.1-Flash-Quark-MXFP4 at the revision of the local copy, cached on the cluster NFS.
+    model_path: /share_nfs/models/amd/.hf-vllm-m31/models--amd--MiniMax-M3.1-Flash-Quark-MXFP4/snapshots/1442d09d4926cb286fa2dc6646c83c4af2b3898c
+    precision: MXFP4
+    # Same index digest as nightly-rocm100-40941f2c...; official aiter v0.1.27, MORI v1.2.3.post1.
+    image: vllm/vllm-openai-rocm:nightly-40941f2c4ba96fba0a7e282a5355e89cd74d9ac5@sha256:5800b3b4cd79defc1cbcc66adb83b3c49e574b49ca5c6ba556e17388515dc84f
+    vllm:
+      served_model_name: MiniMaxAI/MiniMax-M3.1-Flash
+      router:
+        # MoRIIO WRITE mode needs vllm-router >= 0.1.15; 0.1.16 is the local router.
+        image: vllm/vllm-router:v0.1.16@sha256:4c9c87a7a911fd7628cf38a4c2ab65107a797778d95fa2a4d63e19f91b732e7c
+        discovery_port: 36367
+    service:
+      prefill:
+        port: 8100
+        tp: 4
+      decode:
+        port: 8200
+        tp: 4
+      router:
+        port: 8000
+        policy: consistent_hash
+    env:
+      common:
+        ATOMESH_M31_MORIIO: "1"
+        # upstream main 2173d7121 + vLLM PR 63483 (pure-TP DBO); the diff against the image commit is Python only.
+        ATOMESH_M31_VLLM_REPO: https://github.com/whx-sjtu/vllm.git
+        ATOMESH_M31_VLLM_SHA: 15c677d12f4eee248fe1692ce34577b2d7aa1ed4
+        ATOMESH_M31_VLLM_BASE_SHA: 40941f2c4ba96fba0a7e282a5355e89cd74d9ac5
+        ATOMESH_M31_AGENTX_VERSION: 1.0.12
+        # Split over the 4 prefill TP ranks; the nodes have ~3.17 TB RAM and no cgroup limit.
+        ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
+        MORI_IO_SQ_BACKOFF_TIMEOUT_US: "50000"
+        MORI_IO_QP_MAX_SEND_WR: "16384"
+        MORI_IO_QP_MAX_CQE: "32768"
+        MORI_IO_QP_MAX_SGE: "2"
+        MORI_IO_TC_DISABLE: "0"
+        MORI_RDMA_TC: "104"
+    suites:
+      vllm:
+        # P TP4 on rank 0; both D TP4 on rank 1 (GPUs 0-3 :8200, 4-7 :8201). concurrency is the
+        # total over both D.
+        - &m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c48
+          topology: 1p2d
+          pd_worker_layout: decode_single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [48]
+          prefill:
+            workers: 1
+            tp: 4
+          decode:
+            workers: 2
+            tp: 4
+          run_eval: false
+          benchmark:
+            kind: aiperf_agentic
+            benchmark_duration: 3600
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c96
+          concurrency: [96]
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c128
+          concurrency: [128]
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c192
+          concurrency: [192]
