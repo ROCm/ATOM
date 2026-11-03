@@ -632,6 +632,17 @@ def run_engine(name, spec, route, pad=0):
             "passed": True,
             "note": "explicit max_columns is not an engine bucket; covered by site mode",
         }
+    if spec.get("patch") == "bad_page_oob":
+        # The engine's block manager never hands out physical pages >= num_pages; the stock
+        # selection tail (top-k expand + page_table gather) indexes the cache with them and
+        # faults on the GPU. The scorer-level contract for such pages is covered by site mode.
+        return {
+            "name": name,
+            "mode": "engine",
+            "skipped": True,
+            "passed": True,
+            "note": "out-of-range physical page is not an engine state; covered by site mode",
+        }
     is_prefill = spec["regime"] == "prefill"
     table, t2r, pos, ctx = _engine_metadata(d)
     route.prepare(d["compressed_k_cache"], d["compressed_k_scale"])
