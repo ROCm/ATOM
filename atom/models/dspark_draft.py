@@ -39,6 +39,30 @@ def linear_out(output):
     return output[0] if isinstance(output, tuple) else output
 
 
+def draft_rope_scaling(config) -> "tuple[float, dict | None]":
+    """The rope theta and YaRN scaling dict of a standalone draft's own config.
+
+    A draft is trained with its own rope, not the target's, and the context
+    rows it writes are rotated with it, so both must be read from the draft
+    config. The scaling dict is ``None`` for a plain rope. Only the parsing is
+    shared: the rope type, neox style and any attention-scale correction are
+    the caller's, because they differ between drafts and a wrong one loads
+    clean.
+    """
+    rope_params = dict(getattr(config, "rope_parameters", None) or {})
+    rope_theta = rope_params.get("rope_theta") or getattr(config, "rope_theta", 10000.0)
+    use_yarn = rope_params.get("rope_type") in ("yarn", "deepseek_yarn") or (
+        rope_params.get("factor", 1.0) not in (1.0, None)
+    )
+    if not use_yarn:
+        return rope_theta, None
+    rope_scaling = dict(rope_params)
+    rope_scaling.setdefault(
+        "original_max_position_embeddings", config.max_position_embeddings
+    )
+    return rope_theta, rope_scaling
+
+
 class DSparkMarkovHead(nn.Module):
     """Low-rank first-order Markov transition bias over the draft logits.
 
@@ -375,3 +399,44 @@ class DSparkDraftModel(nn.Module):
         argument whose shape says how many requests there are.
         """
         raise NotImplementedError
+
+    def _sample_block(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """Markov-biased left-to-right sampling over the already-computed block.
+
+            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
+
+        Only this loop is sequential, and it is T tiny rank-256 matmuls rather
+        than T backbone passes -- which is the entire point of DSpark.
+        """
+        bs, T, _ = base_logits.shape
+        out_ids = anchor_ids.new_empty(bs, T + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(T):
+            # Greedy: temperature/sampling is applied by the target's verify.
+            # The column is the op's destination, so no id is written twice.
+            self.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+            )
+        return out_ids[:, 1:]
+
+    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
+        """Bind the embedding and LM head to the target's loaded instances.
+
+        ``target_base`` is the target ``*ForCausalLM`` (ModelRunner unwraps a
+        multimodal ``language_model`` wrapper first), whose embedding lives on
+        ``.model``. The vocabularies must agree or the shared LM head would
+        silently score the wrong rows.
+        """
+        target_vocab = int(target_base.model.embed_tokens.num_embeddings)
+        if target_vocab != self.vocab_size:
+            raise ValueError(
+                f"{type(self).__name__} draft vocab {self.vocab_size} != target "
+                f"vocab {target_vocab}. The draft shares the target's embedding "
+                "and LM head, so the two must agree."
+            )
+        self.embed_tokens = target_base.model.embed_tokens
+        self.lm_head = target_base.lm_head

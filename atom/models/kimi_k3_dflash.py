@@ -129,7 +129,6 @@ import logging
 from typing import ClassVar
 
 import torch
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
 from torch import nn
 
@@ -145,6 +144,7 @@ from atom.models.dspark_draft import (
     DSparkDraftModel,
     DSparkMarkovHead,
     KVCacheBinding,
+    draft_rope_scaling,
     linear_out,
 )
 from atom.models.qwen3 import Qwen3MLP
@@ -177,40 +177,15 @@ class KimiK3DFlashAttention(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
 
+        # The block's read, one instance shared by every layer
+        # (`KimiK3DFlash.__init__`).
+        self.block_attn = block_attn
+
         # PLAIN TP, no DCP anywhere in this module (see the module docstring):
         # ONE head count, `o_proj` consumes the same slice the read produces,
         # and no LSE merge exists to get wrong. The target's DCP survives only
         # as the draft POOL's `blocks_per_entry` (`draft_kv_builder`), whose
         # `entry_tokens` everything addressing the pool reads.
-        tp_full = get_tensor_model_parallel_world_size()
-        if self.total_num_heads % tp_full != 0:
-            raise ValueError(
-                f"DFlash draft has {self.total_num_heads} query heads, which is "
-                f"not divisible by TP size {tp_full}; `o_proj` cannot be split."
-            )
-        self.num_heads = self.total_num_heads // tp_full
-        # The GQA-tolerant form, not a bare divisibility assert: below TP the kv
-        # heads replicate rather than shard, and QKVParallelLinear already does
-        # that. With 16 kv heads this only bites past TP16. SGLang's DFlash
-        # makes the same pair of checks.
-        if self.total_num_kv_heads >= tp_full:
-            sharded = self.total_num_kv_heads % tp_full == 0
-        else:
-            sharded = tp_full % self.total_num_kv_heads == 0
-        if not sharded:
-            raise ValueError(
-                f"DFlash draft has {self.total_num_kv_heads} KV heads, which "
-                f"neither divide nor are divided by TP size {tp_full}."
-            )
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_full)
-
-        # The block's read, one instance shared by every layer
-        # (`KimiK3DFlash.__init__`).
-        self.block_attn = block_attn
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
@@ -220,6 +195,13 @@ class KimiK3DFlashAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
+        # Per-rank heads as the projection split them: kv heads shard at or
+        # above TP and replicate below it.
+        self.num_heads = self.qkv_proj.num_heads
+        self.num_kv_heads = self.qkv_proj.num_kv_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
         # No `override_tp_size` on EITHER projection. Both are sharded by the
         # one TP group, and `o_proj`'s RowParallel input column shard is
         # exactly the head slice the read above produces -- which is the whole
@@ -478,17 +460,7 @@ def _draft_rope_kwargs(config) -> dict:
     is x32 from 32768 at theta 50000. Inheriting the target's loads clean and
     only costs acceptance length.
     """
-    rope_params = dict(getattr(config, "rope_parameters", None) or {})
-    rope_theta = rope_params.get("rope_theta") or getattr(config, "rope_theta", 10000.0)
-    rope_scaling = None
-    if rope_params.get("rope_type") == "yarn" or rope_params.get("factor", 1.0) not in (
-        1.0,
-        None,
-    ):
-        rope_scaling = dict(rope_params)
-        rope_scaling.setdefault(
-            "original_max_position_embeddings", config.max_position_embeddings
-        )
+    rope_theta, rope_scaling = draft_rope_scaling(config)
     return {
         "max_position": config.max_position_embeddings,
         "base": rope_theta,
@@ -815,43 +787,3 @@ class KimiK3DFlash(DSparkDraftModel):
     def forward_spec(self, input_ids, positions, num_draft=None):
         out = self.block_backbone(input_ids, positions, num_draft)
         return self.head_and_sample(out, input_ids, num_draft)
-
-    def _sample_block(self, base_logits: torch.Tensor, anchor_ids: torch.Tensor):
-        """Markov-biased left-to-right sampling over the computed block.
-
-            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
-
-        Only this loop is sequential, and it is T rank-256 matmuls rather than T
-        backbone passes -- which is the point of DSpark.
-        """
-        bs, num_draft, _ = base_logits.shape
-        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
-        out_ids[:, 0] = anchor_ids
-        for k in range(num_draft):
-            # Greedy: temperature/sampling is applied by the target's verify.
-            # The column IS the op's destination -- `sample_next` writes ids
-            # into `out`, and returns the markov embedding, not the ids -- so
-            # no id is written twice and a strided view costs no copy.
-            self.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-            )
-        return out_ids[:, 1:]
-
-    def share_with_target(self, target_base, loaded) -> None:
-        """Bind the target's embedding and unembedding.
-
-        The checkpoint ships neither; the draft drafts in the target's token
-        space, so a vocab disagreement is a load-time error, not a runtime one.
-        """
-        # `target_base.model.embed_tokens`, not `target_base.embed_tokens`:
-        # ModelRunner unwraps the multimodal `language_model` wrapper but
-        # hands over the KimiLinearForCausalLM, whose embedding lives one
-        # level down on `.model`.
-        target_vocab = int(target_base.model.embed_tokens.num_embeddings)
-        if target_vocab != self.vocab_size:
-            raise ValueError(
-                f"DFlash draft vocab {self.vocab_size} != target vocab "
-                f"{target_vocab}; the draft samples in the target's token space."
-            )
-        self.embed_tokens = target_base.model.embed_tokens
-        self.lm_head = target_base.lm_head

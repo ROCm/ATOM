@@ -137,10 +137,10 @@ def test_dflash_rope_is_the_drafts_own():
     50000 / x32. A wrong rope loads clean and only moves acceptance."""
     from atom.config import SpeculativeConfig
 
-    m = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    kwargs_fn = _draft_rope_kwargs_fn("kimi_k3_dflash.py")
     hf = _radixark_cfg()
     SpeculativeConfig.hf_config_override(hf, model_path=None)
-    kw = m._draft_rope_kwargs(hf)
+    kw = kwargs_fn(hf)
     assert kw["base"] == 10000.0
     assert kw["is_neox_style"] is True
     assert kw["rope_scaling"]["rope_type"] == "yarn"
@@ -149,7 +149,171 @@ def test_dflash_rope_is_the_drafts_own():
 
     # No scaling in the config: a plain rope, not YaRN.
     plain = _radixark_cfg(rope_parameters={"rope_theta": 10000.0})
-    assert m._draft_rope_kwargs(plain)["rope_scaling"] is None
+    assert kwargs_fn(plain)["rope_scaling"] is None
+
+
+def _inferact_rope_cfg(**overrides):
+    """The rope fields of the Inferact MLA K3-DSpark checkpoint's config.json."""
+    cfg = types.SimpleNamespace(
+        max_position_embeddings=1048576,
+        rope_theta=50000.0,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 32.0,
+            "original_max_position_embeddings": 32768,
+            "rope_theta": 50000.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        },
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def _draft_rope_kwargs_fn(module_file):
+    """A draft module's `_draft_rope_kwargs`, runnable without the aiter stack.
+
+    The draft modules import aiter at load, so the one function is lifted from
+    the source and bound to the CPU-importable shared parser it calls.
+    """
+    import ast
+    import pathlib
+
+    from atom.models import dspark_draft
+
+    path = pathlib.Path(dspark_draft.__file__).with_name(module_file)
+    tree = ast.parse(path.read_text())
+    (fn,) = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_draft_rope_kwargs"
+    ]
+    ns = {"draft_rope_scaling": dspark_draft.draft_rope_scaling}
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
+        compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns
+    )
+    return ns["_draft_rope_kwargs"]
+
+
+def test_k3_dspark_mla_rope_kwargs_are_unchanged():
+    """The MLA draft's `get_rope` arguments, key order included (it is part of
+    aiter's rope cache key): DeepSeek YaRN, interleaved, the draft's own theta.
+    """
+    kwargs_fn = _draft_rope_kwargs_fn("kimi_k3_dspark.py")
+    kw = kwargs_fn(_inferact_rope_cfg())
+    assert kw == {
+        "max_position": 1048576,
+        "base": 50000.0,
+        "rope_scaling": {
+            "rope_type": "deepseek_yarn",
+            "factor": 32.0,
+            "original_max_position_embeddings": 32768,
+            "rope_theta": 50000.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        },
+        "is_neox_style": False,
+    }
+    assert list(kw["rope_scaling"]) == [
+        "rope_type",
+        "factor",
+        "original_max_position_embeddings",
+        "rope_theta",
+        "beta_fast",
+        "beta_slow",
+        "mscale",
+        "mscale_all_dim",
+    ]
+
+    # `rope_interleave` is the config's neox switch; a factor alone is YaRN and
+    # a missing original length falls back to the max position.
+    cfg = _inferact_rope_cfg(
+        rope_interleave=True,
+        rope_parameters={"factor": 4.0, "rope_theta": 20000.0},
+    )
+    kw = kwargs_fn(cfg)
+    assert kw["is_neox_style"] is True
+    assert kw["base"] == 20000.0
+    assert kw["rope_scaling"] == {
+        "factor": 4.0,
+        "rope_theta": 20000.0,
+        "rope_type": "deepseek_yarn",
+        "original_max_position_embeddings": 1048576,
+    }
+
+    # No rope_parameters: the top-level theta, plain rope.
+    kw = kwargs_fn(_inferact_rope_cfg(rope_parameters=None))
+    assert kw["base"] == 50000.0
+    assert kw["rope_scaling"] is None
+
+
+def test_draft_rope_scaling_leaves_the_type_to_the_caller():
+    """The shared parser copies the config's scaling dict; a caller's override
+    of the rope type never reaches the config."""
+    from atom.models.dspark_draft import draft_rope_scaling
+
+    cfg = _radixark_cfg()
+    theta, scaling = draft_rope_scaling(cfg)
+    assert theta == 10000.0
+    assert scaling == cfg.rope_parameters
+    scaling["rope_type"] = "deepseek_yarn"
+    assert cfg.rope_parameters["rope_type"] == "yarn"
+
+    assert draft_rope_scaling(_radixark_cfg(rope_parameters={}))[1] is None
+
+
+def _stub_draft(vocab_size=None):
+    """A bare `DSparkDraftModel`, to run its default methods on."""
+    from atom.models.dspark_draft import DSparkDraftModel
+
+    draft = type("StubDraft", (DSparkDraftModel,), {})()
+    draft.vocab_size = vocab_size
+    draft.embed_tokens = None
+    draft.lm_head = None
+    return draft
+
+
+def _target_base(vocab):
+    import torch
+
+    model = types.SimpleNamespace(embed_tokens=torch.nn.Embedding(vocab, 4))
+    return types.SimpleNamespace(model=model, lm_head=object())
+
+
+def test_default_share_with_target_binds_the_targets_embedding_and_head():
+    draft = _stub_draft(163840)
+    target = _target_base(163840)
+    draft.share_with_target(target, set())
+    assert draft.embed_tokens is target.model.embed_tokens
+    assert draft.lm_head is target.lm_head
+
+
+def test_default_share_with_target_refuses_a_vocab_mismatch():
+    draft = _stub_draft(163840)
+    with pytest.raises(ValueError, match="StubDraft draft vocab 163840"):
+        draft.share_with_target(_target_base(200064), set())
+    assert draft.embed_tokens is None and draft.lm_head is None
+
+
+def test_default_sample_block_chains_each_token_into_the_next():
+    """Each position samples off the previous id, starting from the anchor."""
+    import torch
+
+    class _Head:
+        def sample_next(self, prev, logits, out):
+            out.copy_(prev + logits.argmax(-1))
+
+    draft = _stub_draft()
+    draft.markov_head = _Head()
+    base_logits = torch.zeros(2, 3, 5)
+    base_logits[:, :, 1] = 1.0
+    ids = draft._sample_block(base_logits, torch.tensor([10, 20]))
+    assert ids.tolist() == [[11, 12, 13], [21, 22, 23]]
 
 
 def test_dflash_does_not_capture_the_k3_dspark_checkpoint():

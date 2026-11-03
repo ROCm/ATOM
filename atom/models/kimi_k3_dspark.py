@@ -76,7 +76,12 @@ from atom.model_ops.linear import (
     uses_mxfp4_n32k4_scale,
 )
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
-from atom.models.dspark_draft import DSparkDraftModel, DSparkMarkovHead, linear_out
+from atom.models.dspark_draft import (
+    DSparkDraftModel,
+    DSparkMarkovHead,
+    draft_rope_scaling,
+    linear_out,
+)
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES
 from atom.quant_spec import effective_layer_quant
 
@@ -93,6 +98,23 @@ def _dspark_block_width(draft_config, atom_config) -> int:
     spec_config = getattr(atom_config, "speculative_config", None)
     num_spec = getattr(spec_config, "num_speculative_tokens", None)
     return int(num_spec or getattr(draft_config, "dspark_block_size", 0) or 0)
+
+
+def _draft_rope_kwargs(config) -> dict:
+    """`get_rope` arguments from the DRAFT's own config, never the target's.
+
+    YaRN here is DeepSeek's MLA variant, and the rope is interleaved unless
+    the config says otherwise.
+    """
+    rope_theta, rope_scaling = draft_rope_scaling(config)
+    if rope_scaling is not None:
+        rope_scaling["rope_type"] = "deepseek_yarn"
+    return {
+        "max_position": config.max_position_embeddings,
+        "base": rope_theta,
+        "rope_scaling": rope_scaling,
+        "is_neox_style": bool(getattr(config, "rope_interleave", False)),
+    }
 
 
 class K3DSparkMLAAttention(nn.Module):
@@ -202,33 +224,12 @@ class K3DSparkMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        # YaRN. Unlike the Kimi-K3 target (rope_theta 50000 with its own scaling)
-        # these are the DRAFT's own rope parameters and must be read from the
-        # draft config -- the draft was trained with them and the context rows it
-        # writes are rotated with them.
-        rope_params = dict(getattr(config, "rope_parameters", None) or {})
-        rope_theta = rope_params.get("rope_theta") or getattr(
-            config, "rope_theta", 10000.0
-        )
-        use_yarn = rope_params.get("rope_type") in ("yarn", "deepseek_yarn") or (
-            rope_params.get("factor", 1.0) not in (1.0, None)
-        )
-        rope_scaling = None
-        if use_yarn:
-            rope_scaling = dict(rope_params)
-            rope_scaling["rope_type"] = "deepseek_yarn"
-            rope_scaling.setdefault(
-                "original_max_position_embeddings",
-                config.max_position_embeddings,
-            )
+        # The softmax scale takes the YaRN mscale^2 correction, as the MLA
+        # target's does.
+        rope_kwargs = _draft_rope_kwargs(config)
+        rope_scaling = rope_kwargs["rope_scaling"]
         self.rotary_emb = get_rope(
-            self.qk_rope_head_dim,
-            rotary_dim=self.qk_rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            # DeepSeek-style MLA rope is interleaved unless told otherwise.
-            is_neox_style=bool(getattr(config, "rope_interleave", False)),
+            self.qk_rope_head_dim, rotary_dim=self.qk_rope_head_dim, **rope_kwargs
         )
         if rope_scaling:
             mscale = yarn_get_mscale(
@@ -584,26 +585,6 @@ class KimiK3DSpark(DSparkDraftModel):
         # This checkpoint deliberately skips the training-only head.
         self.confidence_head = None
 
-    # ---- weight-loading hooks ---------------------------------------------
-
-    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        """Bind embed/LM head to the target's already-loaded instances.
-
-        ``target_base`` is the Kimi-K3 ``KimiLinearForCausalLM`` (ModelRunner
-        unwraps the ``language_model`` multimodal wrapper before calling this).
-        The vocabularies must agree or the shared LM head would silently score
-        the wrong rows.
-        """
-        target_vocab = target_base.model.embed_tokens.num_embeddings
-        if target_vocab != self.hf_config.vocab_size:
-            raise ValueError(
-                f"DSpark draft vocab {self.hf_config.vocab_size} != target vocab "
-                f"{target_vocab}. The draft shares the target's embedding and LM "
-                "head, so the two must agree."
-            )
-        self.embed_tokens = target_base.model.embed_tokens
-        self.lm_head = target_base.lm_head
-
     # ---- drafting entry points (called by the proposer) --------------------
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
@@ -693,26 +674,3 @@ class KimiK3DSpark(DSparkDraftModel):
         """
         base_logits = self.lm_head(hidden).view(anchor_ids.shape[0], num_draft, -1)
         return self._sample_block(base_logits, anchor_ids), None
-
-    def _sample_block(
-        self,
-        base_logits: torch.Tensor,  # [B, T, V]
-        anchor_ids: torch.Tensor,  # [B]
-    ) -> torch.Tensor:
-        """Markov-biased left-to-right sampling over the already-computed block.
-
-            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
-
-        Only this loop is sequential, and it is T tiny rank-256 matmuls rather
-        than T backbone passes -- which is the entire point of DSpark.
-        """
-        bs, T, _ = base_logits.shape
-        out_ids = anchor_ids.new_empty(bs, T + 1)
-        out_ids[:, 0] = anchor_ids
-        for k in range(T):
-            # Greedy: temperature/sampling is applied by the target's verify.
-            # The column is the op's destination, so no id is written twice.
-            self.markov_head.sample_next(
-                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
-            )
-        return out_ids[:, 1:]

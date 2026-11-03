@@ -484,19 +484,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     def first_attention_layer_num(self) -> int:
         return self.layers[0].self_attn.kv.layer_num
 
-    # ---- weight-loading hooks ---------------------------------------------
-
-    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        target_vocab = target_base.model.embed_tokens.num_embeddings
-        if target_vocab != self.vocab_size:
-            raise ValueError(
-                f"DSpark draft vocab {self.vocab_size} != target vocab "
-                f"{target_vocab}. The draft shares the target's embedding and LM "
-                "head, so the two must agree."
-            )
-        self.embed_tokens = target_base.model.embed_tokens
-        self.lm_head = target_base.lm_head
-
     # ---- drafting entry points (called by the proposer) --------------------
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
