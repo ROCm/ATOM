@@ -558,6 +558,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # A GDN prefill zeroes the speculative tail of its slots' conv window, which
     # it neither reads nor writes, so no checkpoint image carries stale bytes.
     "ATOM_GDN_ZERO_DEAD_CONV": lambda: os.getenv("ATOM_GDN_ZERO_DEAD_CONV", "1") == "1",
+    # Qwen3-Next / Qwen3.5 GDN prefill without speculative tokens (64 tokens or
+    # more): the chunk KKT kernel computes the gates g and beta of its key
+    # head's value heads from the in_proj rows, in place of the
+    # fused_gdn_gating launch. Off by default.
+    "ATOM_GDN_KKT_GATING": lambda: os.getenv("ATOM_GDN_KKT_GATING", "0") == "1",
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
