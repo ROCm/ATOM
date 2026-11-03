@@ -1832,6 +1832,10 @@ start_mooncake_store_decode_owners() {
 cleanup_processes() {
   local rc=$?
   local pid
+  if [[ -n "${issue382_metrics_pid:-}" ]]; then
+    terminate_process_group "${issue382_metrics_pid}"
+    issue382_metrics_pid=""
+  fi
   # Before the router's end reaches a decode node, which then stops its owners.
   save_mooncake_store_metrics
   for pid in "$@"; do
@@ -2773,6 +2777,17 @@ PY
 }
 
 run_benchmark_and_eval() {
+  if [[ "${ATOMESH_ISSUE382_METRICS:-0}" == "1" ]]; then
+    [[ "${SINGLE_NODE_PD}" == "1" && "${ATOMESH_ATOM_SOURCE}" == "mounted" ]] || return 2
+    local -a metrics_args=(
+      --prefill "http://${prefill_ips[0]}:${PREFILL_PORT}/metrics"
+      --decode "http://${decode_ips[0]}:${DECODE_PORT}/metrics"
+      --output "${RUNTIME_LOG_DIR}/issue382-metrics.jsonl.gz"
+    )
+    python3 tools/issue382/sample_metrics.py "${metrics_args[@]}" --check
+    start_logged_process issue382_metrics_pid "${RUNTIME_LOG_DIR}/issue382-metrics.log" \
+      python3 tools/issue382/sample_metrics.py "${metrics_args[@]}"
+  fi
   if [[ "${ATOMESH_EXECUTION_PHASE}" == "benchmark" ]]; then
     run_benchmark
     return

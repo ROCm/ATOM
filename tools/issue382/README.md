@@ -1,0 +1,70 @@
+# Issue #382: first experiment round
+
+Inference source: `1fb68bb34f0f32e24ffc26e813c2740cd5126d49` (PR #2941).
+This branch changes only experiment configuration and metrics collection.
+Original workload: `Jasen/m31-mxfp4-stack-agentx-20261031`, issue #380 C140.
+
+Use `atomesh-benchmark.yaml`, mounted source, image
+`rocm/atom-dev:m31-mxfp4-stack-20261031`, runner `atomesh-cicd`, and single node
+`pit2-p03-g42` for all four cases. Each allocation requests exclusive access to
+8 MI355X GPUs. Do not cancel other users' jobs to obtain the node.
+Do not publish these smoke/experimental results to the dashboard.
+
+| Stage | Case | Client concurrency | N | W | Acceptance | Workload |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| Correctness | issue382-a1-correctness64 | 16 | 4 | disabled | real DSpark7 | GSM8K 20-shot, first 64 samples |
+| Correctness | issue382-a2-correctness64 | 16 | 4 | 15% | real DSpark7 | same 64 samples |
+| A1 | issue382-a1-c140 | 140 | 4 | disabled | fixed AL=4.04 | AgentX 1.0.12, 3600s profiling after original warmup |
+| A2 | issue382-a2-c140 | 140 | 4 | 15% | fixed AL=4.04 | identical AgentX workload |
+
+Run correctness cases in the `accuracy` suite first. Review completed sample
+counts, errors, output lengths, sample answers, and admission/transfer logs.
+The 0.90 score gate is a coarse short-smoke guard (at least 58/64); a 64-sample
+result cannot establish the full GSM8K accuracy of the model. The usual 0.94
+full-suite threshold must not be interpreted as a statistically precise gate
+for this subset. Retried HTTP requests must still be counted as errors in the
+analysis even if lm-eval eventually succeeds.
+
+Only after correctness passes, run A1 then A2 in the `mooncake_store` suite.
+Restart the processes and Store for every case. Correctness uses the same
+280 scheduler slots and capture sizes as the performance cases to check the
+actual server configuration; only client load and synthetic acceptance differ.
+Chunk transfer is OFF for this round. Chunk ON performance and tuning wait for
+the user's review of this round.
+
+Fixed configuration: P TP1 x PP4, default PP split, eager P with 8192 token
+budget, D TP4 with graphs, GPU memory utilization 0.9, block size 128, MXFP4
+target KV/index, freq1, landing OFF, no G reservation. Store consists of
+four 512 GiB owners on rdma4/5/6/7. Use the exact model snapshot
+`0a00e0e39fc00499b23efccc18a8ea63fce5c44c` and its `dspark` subdirectory.
+Do not substitute the older `1442d09d` model/chat template or the generic NVFP4
+and 1 TiB recipe. The model root is remapped by the standard CI launcher.
+
+The launcher checks mounted ATOM import origin. Record the expanded cell,
+source SHA, image digest, node, dependency versions, actual D KV pool capacity
+and bytes/page from startup logs. Pinning memory utilization alone does not
+guarantee identical pool capacity across processes.
+
+`sample_metrics.py` saves both workers' Prometheus output every 5 seconds from
+before the workload until cleanup, including warmup. It writes compressed
+JSONL under `logs/issue382-metrics.jsonl.gz` (or the execution-phase subdirectory)
+with timestamp, role, URL and raw metrics; scrape failures are explicit records.
+The standard CI artifact includes this file alongside client records and server
+logs. A preflight rejects unreachable metrics or missing admission metric names.
+Avoid drawing conclusions from gaps in this sampled series; short excursions
+can occur between samples.
+
+Analyze per-minute request completions/output tokens, total/output tok/s/GPU
+from client records over their actual span (8 GPUs), TTFT/TPOT/e2e, failures,
+timeouts, and P/D KV use/running/waiting/prefix cache/preemptions. Report N states,
+W bytes, requests/bytes deferrals, oversized bypasses, and READY wait, plus P
+retained KV and Store loads where the existing logs expose them. Check for CQ
+errors separately from scheduler congestion. A low parked count is guaranteed
+by N and is not evidence of restored throughput by itself.
+
+No A0 is included in this round, so this cannot isolate N against a same-revision
+disabled-policy baseline. If W never binds at N=4, A2 measures compatibility
+rather than evidence for W's protective value. Do not tune W silently.
+
+Job time limits: 2 hours per correctness case, 4 hours per performance case,
+including startup/warmup. Profiling remains 3600 seconds. Queue time is extra.
