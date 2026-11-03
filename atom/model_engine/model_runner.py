@@ -3225,6 +3225,7 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        ids_synced_with_draws = False
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3256,27 +3257,90 @@ class ModelRunner:
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
             target_logits_indices = spec_decode_metadata.target_logits_indices
 
-            bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
             target_token_ids = None
-            if not all_greedy:
-                target_token_ids = self.sampler.sample_verification_tokens(
-                    target_logits,
-                    spec_decode_metadata.cu_num_draft_tokens,
-                    temperatures,
-                    top_ks,
-                    top_ps,
+            if not all_greedy and target_logits_indices.numel():
+                # One sampler pass over every logit row: each row is an
+                # independent draw from its own request's temperature/top-k/
+                # top-p distribution, as the separate target and bonus passes
+                # were. Only how rank 0 consumes the RNG stream changes.
+                cu = spec_decode_metadata.cu_num_draft_tokens
+                # Rows outside both index sets (graph padding) read request 0;
+                # their draws are never selected.
+                row_request = torch.zeros(
+                    logits.shape[0], dtype=torch.long, device=logits.device
                 )
-                if target_token_ids.numel() and get_tp_group().world_size > 1:
-                    target_token_ids = get_tp_group().broadcast(target_token_ids, src=0)
-            bonus_token_ids = self.sampler(
-                logits=bonus_logits,
-                temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
-                all_greedy=all_greedy,
-                needs_independent_noise=needs_independent_noise or not all_greedy,
-            )
+                row_request[target_logits_indices] = torch.searchsorted(
+                    cu,
+                    torch.arange(
+                        target_logits_indices.numel(),
+                        device=logits.device,
+                        dtype=cu.dtype,
+                    ),
+                    right=True,
+                )
+                row_request[bonus_logits_indices] = torch.arange(
+                    bonus_logits_indices.numel(), device=logits.device, dtype=torch.long
+                )
+
+                def expand(values):
+                    if not isinstance(values, torch.Tensor) or values.numel() == 1:
+                        return values
+                    return values[row_request]
+
+                all_token_ids = self.sampler(
+                    logits=logits,
+                    temperatures=temperatures[row_request],
+                    top_ks=expand(top_ks),
+                    top_ps=expand(top_ps),
+                    all_greedy=False,
+                    needs_independent_noise=True,
+                )
+                target_token_ids = all_token_ids[target_logits_indices]
+                bonus_token_ids = all_token_ids[bonus_logits_indices].contiguous()
+            else:
+                bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
+                if not all_greedy:
+                    target_token_ids = self.sampler.sample_verification_tokens(
+                        target_logits,
+                        spec_decode_metadata.cu_num_draft_tokens,
+                        temperatures,
+                        top_ks,
+                        top_ps,
+                    )
+                bonus_token_ids = self.sampler(
+                    logits=bonus_logits,
+                    temperatures=temperatures,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    all_greedy=all_greedy,
+                    needs_independent_noise=needs_independent_noise or not all_greedy,
+                )
+            # One TP broadcast carries rank 0's target and bonus draws. The
+            # rejection kernel is a deterministic function of these ids and the
+            # rank-identical draft ids, so sampled_tokens then agree across TP
+            # ranks without a second broadcast.
+            if (
+                target_token_ids is not None
+                and target_token_ids.numel()
+                and get_tp_group().world_size > 1
+            ):
+                ids_synced_with_draws = True
+                n_target = target_token_ids.numel()
+                packed = torch.cat(
+                    (
+                        target_token_ids.reshape(-1),
+                        bonus_token_ids.reshape(-1).to(target_token_ids.dtype),
+                    )
+                )
+                packed = get_tp_group().broadcast(packed, src=0)
+                target_token_ids = packed[:n_target].view(target_token_ids.shape)
+                bonus_token_ids = (
+                    packed[n_target:]
+                    .view(bonus_token_ids.shape)
+                    .to(bonus_token_ids.dtype)
+                    .contiguous()
+                )
             sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
@@ -3303,8 +3367,12 @@ class ModelRunner:
 
         # Drafter input must agree across TP ranks. Ids only: the verdict is
         # deterministic on TP ranks' bit-identical inputs.
-        if get_tp_group().world_size > 1 and _needs_id_sync(
-            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        if (
+            get_tp_group().world_size > 1
+            and not ids_synced_with_draws
+            and _needs_id_sync(
+                self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+            )
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
