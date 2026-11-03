@@ -388,6 +388,7 @@ def test_a_send_to_a_worker_that_stopped_reading_is_dropped(caplog):
     hub = fw.FrontendHub(core, num_workers=1)
     try:
         assert hub._output_sockets[0].getsockopt(zmq.SNDTIMEO) == fw._SEND_TIMEOUT_MS
+        assert hub._output_sockets[0].getsockopt(zmq.SNDHWM) == fw._SEND_HWM > 0
 
         class _Stuck:
             def send_multipart(self, parts, copy=False):

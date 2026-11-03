@@ -80,6 +80,10 @@ _MSG_STRUCTURED = b"S"
 # A hub send to a worker that stopped reading is dropped after this, so no
 # hub thread (engine output, structured replies, close) can block on it.
 _SEND_TIMEOUT_MS = 5000
+# The queue that timeout applies to: messages the hub buffers per worker before
+# a send waits (one per engine step, ~minutes of steps). With no limit the
+# timeout never fires and the queue grows without bound.
+_SEND_HWM = 20000
 
 # hub -> worker (first frame)
 _OUT_STEP = b"O"
@@ -157,6 +161,7 @@ class FrontendHub:
         self._output_locks = []
         for address in self.output_addresses:
             sock = make_zmq_socket(self.ctx, address, zmq.PUSH, bind=True)
+            sock.setsockopt(zmq.SNDHWM, _SEND_HWM)
             sock.setsockopt(zmq.SNDTIMEO, _SEND_TIMEOUT_MS)
             self._output_sockets.append(sock)
             self._output_locks.append(threading.Lock())
