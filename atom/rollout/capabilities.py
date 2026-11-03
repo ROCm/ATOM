@@ -44,6 +44,8 @@ class CapabilityProviderMixin:
             features.add("vocab_masking")
         if self._holds_fp8_weights():
             features.add("fp8_weight_update")
+        if "receive_weights_rdma" in methods and self._rdma_reload_refusal() is None:
+            features.add("rdma_weight_receive")
         config = getattr(self, "config", None)
         parallel = getattr(config, "parallel_config", None)
         return {
