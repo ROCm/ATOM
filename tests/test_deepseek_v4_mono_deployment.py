@@ -2,13 +2,22 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Which deployments the DeepSeek-V4 Mono decode admits."""
 
+import importlib.util
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-pytest.importorskip("aiter")
-
-from atom.models.deepseek_v4.mono.profile import ORDINARY_PROFILE, deployment_refusal
+# Loaded from its file: the module needs only dataclasses, but importing it by
+# name runs atom.models.deepseek_v4's __init__, which needs aiter.
+_spec = importlib.util.spec_from_file_location(
+    "_deepseek_v4_mono_profile",
+    Path(__file__).parents[1] / "atom/models/deepseek_v4/mono/profile.py",
+)
+profile = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = profile  # @dataclass looks its module up by name
+_spec.loader.exec_module(profile)
+ORDINARY_PROFILE = profile.ORDINARY_PROFILE
+deployment_refusal = profile.deployment_refusal
 
 
 class _Mode:

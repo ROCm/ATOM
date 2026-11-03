@@ -48,6 +48,7 @@ from atom.utils import (
     get_mp_context,
     get_open_port,
     get_open_zmq_ipc_path,
+    get_tcp_uri,
     init_exit_handler,
     make_zmq_socket,
     resolve_obj_by_qualname,
@@ -615,7 +616,7 @@ class AsyncIOProcManager:
         """Where `rank` sends its replies: IPC from this node, TCP from another."""
         if rank < self.local_proc_num:
             return get_open_zmq_ipc_path()
-        return f"tcp://{host}:{get_open_port()}"
+        return get_tcp_uri(host, get_open_port())
 
     def exit(self):
         if not self.still_running:
