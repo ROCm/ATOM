@@ -300,7 +300,7 @@ jobs:
     permissions:
       contents: read
     env:
-      ISSUE382_INSPECTION_DIR: /tmp/issue382-inspection-${{ github.run_id }}-${{ github.run_attempt }}
+      ISSUE382_INSPECTION_DIR: /share_nfs/ATOMESH_RUNNER/ATOMESH_LOG/m31-inspection-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       # Surviving Slurm workers may still mount the runner's default checkout.
       # Fetch only the inspector at this run's commit, outside that checkout.
