@@ -50,7 +50,10 @@ from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointSpec,
+    checkpoint_page_unit_bytes,
+)
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.model_engine.sequence import (
@@ -67,6 +70,7 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
     Pool,
     PoolPlan,
     SubPoolSpec,
+    page_entry_bytes,
     plan_pools,
 )
 from atom.model_ops.decode_input_ids import (
@@ -1977,24 +1981,7 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
-            # The charged entry can be larger than the bytes a transfer
-            # publishes: MHA alignment padding is not a region, and a draft
-            # pool merged into the same class is ordinary KV after the
-            # checkpoint regions. The backend names the published unit.
-            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
-            published_unit = getattr(
-                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
-            )
-            if callable(published_unit):
-                published = published_unit()
-                if published is not None:
-                    published = int(published)
-                    if published <= 0 or published > page_unit_bytes:
-                        raise RuntimeError(
-                            f"checkpoint PAGE unit is {published} B but the "
-                            f"paged pool entry is {page_unit_bytes} B"
-                        )
-                    page_unit_bytes = published
+            page_unit_bytes = checkpoint_page_unit_bytes(self.attn_metadata_builder)
             checkpoint_spec = PagedStateCheckpointSpec(
                 page_unit_bytes=page_unit_bytes,
                 slot_bytes=slot_bytes,
@@ -2125,9 +2112,7 @@ class ModelRunner:
         for builder, size in zip(builders, sizes):
             if not size:
                 continue
-            charged = blocks * sum(
-                s.entry_bytes for s in builder.sub_pool_specs() if s.pool is Pool.PAGE
-            )
+            charged = blocks * page_entry_bytes(builder.sub_pool_specs())
             if size != charged:
                 raise ValueError(
                     f"{type(builder).__name__} wants {size} B of the paged pool "
