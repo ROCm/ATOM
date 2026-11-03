@@ -123,6 +123,18 @@ def test_split_shard_reads_native_bytes_unconverted(tmp_path):
         CheckpointReader(tmp_path, corrupted)
 
 
+def _mapping_perms(tensor):
+    """Permissions of the mapping `tensor` lies in (`/proc/self/maps`)."""
+    address = tensor.data_ptr()
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            span, perms = line.split()[:2]
+            lo, hi = (int(x, 16) for x in span.split("-"))
+            if lo <= address < hi:
+                return perms
+    return None
+
+
 def test_engram_provider_maps_independent_shards_and_only_gathers_rows(tmp_path):
     prefix = "layers.1.engram.embed"
     values = (
@@ -153,9 +165,10 @@ def test_engram_provider_maps_independent_shards_and_only_gathers_rows(tmp_path)
         )
         assert torch.equal(actual[0], expected)
         assert table._tensor.device.type == "cpu" and table.dtype == torch.float8_e4m3fn
-        # Engram tables map their shards directly (a shared read-only mapping
-        # for the UVA lookup), not through safe_open handles.
+        # Shared read-only mappings, not safe_open handles (`shared_tensor`).
         assert not reader._handles
+        assert _mapping_perms(table._tensor) == "r--s"
+        assert _mapping_perms(table._scale) == "r--s"
         with pytest.raises(ValueError, match="owned by host"):
             reader.read(build_weight_manifest(specs)[0])
 

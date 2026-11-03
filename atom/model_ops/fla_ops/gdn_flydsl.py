@@ -215,8 +215,15 @@ def prefill(
     *,
     state_indices=None,
     has_initial_state=None,
+    snapshot_layout="kv",
 ):
-    """Return ATOM token-major output, FP32 final KV state and optional BF16 h."""
+    """Return token-major output, FP32 final KV state and optional BF16 h.
+
+    The default KV snapshot preserves the existing public contract. A caller
+    that writes native FlyDSL checkpoints may request its VK layout instead.
+    """
+    if snapshot_layout not in ("kv", "vk"):
+        raise ValueError(f"Unsupported GDN snapshot layout: {snapshot_layout}")
     if not prefill_supported(q, k, v, g, beta, metadata):
         raise ValueError("Unsupported AITER FlyDSL prefill shape/metadata")
     _log_dispatch("prefill K1-K5 (ATOM K6)")
@@ -253,7 +260,9 @@ def prefill(
     output = chunk_fwd_o(
         q, k, vn, h, gc, cu_seqlens=cu_seqlens, head_major_vk=True, chunk_indices=chunks
     )
-    snapshots = h.transpose(-1, -2).contiguous() if keep_intermediate_states else None
+    snapshots = None
+    if keep_intermediate_states:
+        snapshots = h if snapshot_layout == "vk" else h.transpose(-1, -2).contiguous()
     return output, ht.transpose(-1, -2), snapshots
 
 

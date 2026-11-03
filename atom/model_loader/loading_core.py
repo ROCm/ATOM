@@ -315,6 +315,7 @@ def load_weights_into_model(
 
         loaded_weights_record = dispatcher.loaded_weights_record
         dropped_ckpt_keys = dispatcher.dropped_ckpt_keys
+        dtype_mismatches = dispatcher.dtype_mismatches
 
         # Whatever the pool still holds is written back here; anything short of
         # its expected region count means the checkpoint never delivered some
@@ -377,6 +378,17 @@ def load_weights_into_model(
         prefix=prefix,
         is_rank0=is_rank0,
     )
+    if dtype_mismatches and is_rank0():
+        sample = ", ".join(
+            f"{name} ({stored} -> {param})"
+            for name, stored, param in dtype_mismatches[:8]
+        )
+        logger.warning(
+            "load_model: %d checkpoint tensors load into a parameter of another "
+            "float dtype and are converted: %s",
+            len(dtype_mismatches),
+            sample,
+        )
 
     # Avoid holding stale Parameter refs that prevent storage release.
     if online_quant_streamer is not None:
