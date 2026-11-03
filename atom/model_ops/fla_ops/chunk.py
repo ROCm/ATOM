@@ -11,7 +11,9 @@ import warnings
 import torch
 from einops import rearrange
 
-from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from atom.utils import envs
+
+from .chunk_delta_h import _use_gfx1250_kernel, chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
@@ -58,9 +60,31 @@ def chunk_gated_delta_rule_fwd(
         g, A, beta_hm, scale_hm = fused_cumsum_kkt(
             g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan, gating=gating
         )
-        w, u = fused_inverse_recompute(
-            k, v, A, beta_hm, scale_hm, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan
-        )
+        if (
+            envs.ATOM_GDN_GLUON_INVERSE
+            and cu_seqlens is not None
+            and k.shape[0] == 1
+            and _use_gfx1250_kernel(k.device.index)
+        ):
+            # the same w / u from the Gluon kernel for gfx1250
+            from .fused_inverse_recompute_gfx1250 import (
+                fused_inverse_recompute_gfx1250,
+            )
+
+            w, u = fused_inverse_recompute_gfx1250(
+                k, v, A, beta_hm, scale_hm, cu_seqlens, plan
+            )
+        else:
+            w, u = fused_inverse_recompute(
+                k,
+                v,
+                A,
+                beta_hm,
+                scale_hm,
+                chunk_size=64,
+                cu_seqlens=cu_seqlens,
+                plan=plan,
+            )
     else:
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
         # obtain WY representation. u is actually the new v.

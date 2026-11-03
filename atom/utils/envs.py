@@ -563,6 +563,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # head's value heads from the in_proj rows, in place of the
     # fused_gdn_gating launch. Off by default.
     "ATOM_GDN_KKT_GATING": lambda: os.getenv("ATOM_GDN_KKT_GATING", "0") == "1",
+    # Qwen3-Next / Qwen3.5 GDN prefill on gfx1250: the chunk inverse and WY
+    # vectors (w, u) from the Gluon kernel fused_inverse_recompute_gfx1250
+    # instead of the Triton fused_inverse_recompute. Off by default.
+    "ATOM_GDN_GLUON_INVERSE": lambda: os.getenv("ATOM_GDN_GLUON_INVERSE", "0") == "1",
     # Both zeroings above in one Triton launch each (`pool_layout/zero_spans.py`)
     # instead of an `index_fill_` per pool field -- per field AND per layer once
     # a pool passes 2 GiB, each writing a byte a lane. The same bytes zeroed,
