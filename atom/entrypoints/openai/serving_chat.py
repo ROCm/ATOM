@@ -9,6 +9,8 @@ from collections.abc import AsyncGenerator
 from functools import partial
 from typing import Any
 
+from atom.structured_output.validation import raise_for_structured_error
+
 from .protocol import (
     CHAT_COMPLETION_CHUNK_OBJECT,
     STREAM_DONE_MESSAGE,
@@ -317,6 +319,7 @@ async def stream_chat_response(
         role_sent = False
         while True:
             chunk_data = await stream_collector.get()
+            raise_for_structured_error(chunk_data.get("finish_reason"))
 
             if not role_sent:
                 yield make_chunk(
@@ -424,6 +427,7 @@ def _build_chat_choice(
     (SamplingParams.n>1) can reuse the reasoning + tool-call separation
     without duplicating the logic.
     """
+    raise_for_structured_error(finish_reason)
     reasoning_content, content_with_tools = reasoning.split(raw_text)
     content, tool_calls = parse_tool_calls(
         content_with_tools,
@@ -626,6 +630,7 @@ async def stream_chat_response_fanout(
         role_sent = [False] * n
         while not all(finished):
             idx, chunk_data = await shared_collector.get()
+            raise_for_structured_error(chunk_data.get("finish_reason"))
 
             if not role_sent[idx]:
                 yield make_chunk(
