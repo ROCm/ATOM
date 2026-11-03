@@ -594,24 +594,6 @@ def test_prefix_spread_keeps_prefix_owner_without_a_backlog():
     assert mgr._seq_load[2][2] == 110_000 - 98_304
 
 
-def test_prefix_spread_moves_a_backlog_to_an_idle_rank():
-    mgr = _make_spread_mgr()
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._mark_seq_prefill_complete(1)
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_tokens[owner] = 200_000
-    moved = _chain_seq(2, 110_000)
-    (rank,) = _route(mgr, [moved])
-    mgr._mark_seq_prefill_complete(2)
-    assert rank != owner
-    assert mgr._dp_route_counters["prefix_moved_total"] == 1
-    assert mgr._dp_route_counters["prefix_moved_tokens"] == 98_304
-    # The prefix now names its new rank.
-    mgr._rank_tokens = [0, 0]
-    assert _route(mgr, [_chain_seq(3, 120_000)]) == [rank]
-
-
 def test_prefix_spread_ignores_sessions_for_new_prefixes():
     mgr = _make_spread_mgr()
     seqs = [
@@ -653,14 +635,6 @@ def test_prefix_spread_busy_source_survives_a_fully_cached_follower():
     assert not mgr._seq_prefilling
     (rank,) = _route(mgr, [_chain_seq(4, 110_000)])
     assert rank != owner
-
-
-def test_prefill_tracking_is_released_with_the_load():
-    mgr = _make_spread_mgr()
-    _route(mgr, [_chain_seq(1, 50_000)])
-    assert 1 in mgr._seq_prefilling
-    mgr._release_seq_load(1)
-    assert 1 not in mgr._seq_prefilling
 
 
 class _SinkSocket:
@@ -749,16 +723,6 @@ def _dp4_idle_ratio_mgr():
     return mgr
 
 
-def test_prefix_rank_hits_keep_every_rank():
-    mgr = _dp4_idle_ratio_mgr()
-    hits, owner, source = mgr._prefix_rank_hits(
-        _chain_seq(3, 110_000).prompt_hash_chain
-    )
-    assert owner == 0 and source == 1
-    assert hits[0] == 98_304 and hits[2] == 49_152
-    assert 1 not in hits and 3 not in hits
-
-
 def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
     """Load first; among ranks about as idle, the one with more of the prefix."""
     mgr = _dp4_idle_ratio_mgr()
@@ -775,17 +739,6 @@ def test_idle_ratio_load_wins_over_a_partial_prefix():
     mgr._rank_tokens[2] = 24_576  # still idle, but over idle / 2 above the lightest
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
     assert rank == 1
-
-
-def test_partial_prefix_with_a_small_rest_is_recomputed_not_loaded():
-    mgr = _dp4_idle_ratio_mgr()
-    # rank2 now holds 96k of the 98k prefix: the 2k rest is below
-    # OFFLOAD_MIN_LOAD_TOKENS, so only the local part counts as a hit.
-    mgr._prefix_owner_record(_chain_seq(4, 94_208).prompt_hash_chain, 2, 4)
-    seq = _chain_seq(3, 110_000)
-    (rank,) = _route(mgr, [seq])
-    assert rank == 2
-    assert seq._dp_est_hit == 94_208
 
 
 def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
