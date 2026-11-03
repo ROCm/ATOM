@@ -42,7 +42,7 @@ from typing import Any, ClassVar
 import torch
 
 from atom.distributed.nccl_watchdog import drain_nccl_works
-from atom.utils import forward_context, weak_ref_tensor, weak_ref_tensors
+from atom.utils import envs, forward_context, weak_ref_tensor, weak_ref_tensors
 from atom.utils.graph_holders import register_graph_holder
 
 __all__ = [
@@ -580,6 +580,9 @@ def _run_token_graph(owner, forward: Callable, args, kwargs, per_phase=False):
     phase = _phase() if per_phase else None
     if graph.has(key, phase):
         if mode == "replay":
+            if envs.ATOM_TOKEN_GRAPH_EAGER_PAD:
+                # The padded step run eagerly: a debug A/B against the replay.
+                return forward(*args, **kwargs)
             return graph.replay(args, kwargs, phase=phase)
         if mode == "record":
             graph.mark_captured(key, phase)

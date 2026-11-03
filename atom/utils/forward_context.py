@@ -664,6 +664,11 @@ class AttentionMetaData:
     num_cached_tokens: torch.Tensor | None = None
     seq_starts: torch.Tensor | None = None
 
+    # A prefill padded to a token-graph bucket whose metadata covers only its
+    # real rows: how many there are, for the eager regions that cut to them
+    # (`atom/utils/token_graph_rows.py`). None on every other step.
+    prefill_real_rows: int | None = None
+
     def __init__(
         self,
         cu_seqlens_q: torch.Tensor | None = None,

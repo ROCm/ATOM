@@ -627,6 +627,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_TOKEN_GRAPH_DP_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_TOKEN_GRAPH_DP_MAX_TOKENS", "512")
     ),
+    # Debug / A-B: a step padded to a recorded token-graph bucket runs its
+    # forward eagerly instead of replaying the recording, so the padded math
+    # can be compared with and without the graphs. Off (0).
+    "ATOM_TOKEN_GRAPH_EAGER_PAD": lambda: (
+        os.getenv("ATOM_TOKEN_GRAPH_EAGER_PAD", "0") == "1"
+    ),
     # DeepSeek-V4.1's decoder on a bounded-replay prefill's tail, recorded as a
     # request graph (`models/deepseek_v41/decoder_graph.py`): the comma-separated
     # `running_bs` to record at. Any other runs the same tail eagerly; empty

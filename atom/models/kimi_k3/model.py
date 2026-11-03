@@ -74,6 +74,7 @@ from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
 from atom.utils.region_graph import eager_region, token_graph
+from atom.utils.token_graph_rows import padded_prefill_rows, to_rows
 
 
 def _text_config(config):
@@ -1003,7 +1004,12 @@ def kda_attention_with_output(
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
     ]
-    return self._forward_impl(hidden_states, hidden_states_scale)
+    out = self._forward_impl(hidden_states, hidden_states_scale)
+    # A padded prefill: `_forward_impl` ran the real rows (`num_actual_tokens`);
+    # the next recorded segment reads the bucket's.
+    if padded_prefill_rows() is None:
+        return out
+    return to_rows(out, hidden_states.shape[0])
 
 
 class KimiKDAAttention(nn.Module):

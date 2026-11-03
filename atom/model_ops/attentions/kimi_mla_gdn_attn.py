@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.sequence import (
+    Sequence,
+    SequenceStatus,
+    SequenceType,
+    new_block_table,
+)
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAAttention
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
@@ -17,6 +24,7 @@ from atom.model_ops.glm5_next.geometry import (
     speculative_kpool_history_size,
 )
 from atom.utils import envs
+from atom.utils.forward_context import Context
 
 from .aiter_mla import (
     MLA_ROWS,
@@ -47,8 +55,23 @@ class KimiMLAGDNBackend(AttentionBackend):
 
 
 class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
+    # A prefill may pad to a recorded token-graph bucket: the KDA and MLA
+    # regions run its real rows (`AttentionMetaData.prefill_real_rows`), and
+    # every launch between them is sized by the token count alone.
+    supports_token_graph = True
+
     def __init__(self, model_runner):
         super().__init__(model_runner=model_runner)
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """A prefill carrying images runs eagerly, as on DeepSeek-V4.1: its
+        embeddings are scattered from the scheduled ids, which a token-graph
+        bucket would pad."""
+        if batch.total_tokens_num_prefill > 0 and getattr(
+            batch, "multimodal_data", None
+        ):
+            return True
+        return super().step_needs_eager(batch)
 
     def _module_kinds(self, module) -> tuple:
         """Two row spaces: the MLA pool's rows, and the KDA state slots.
@@ -502,6 +525,14 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         attn_metadata, positions = super().prepare_prefill(
             batch, running_bs, running_tokens
         )
+        scheduled = batch.total_tokens_num_prefill
+        if running_tokens > scheduled:
+            # Padded to a token-graph bucket. The metadata above is the real
+            # rows', which the regions cut to; the pad rows' slots are -1, so a
+            # recorded segment that writes by slot writes nothing for them.
+            attn_metadata.prefill_real_rows = scheduled
+            slots = self.model_runner.forward_vars["slot_mapping"].gpu
+            slots[scheduled:running_tokens].fill_(-1)
         if batch.block_tables == []:
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
@@ -538,6 +569,44 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def build_for_cudagraph_capture(self, bs: int):
         attn_metadata, context = super().build_for_cudagraph_capture(bs)
         attn_metadata.gdn_metadata = self._build_gdn_capture_metadata(bs)
+        return attn_metadata, context
+
+    def build_for_token_graph_capture(self, tokens: int):
+        """A prefill of ``tokens`` rows for recording that token-graph bucket.
+
+        The request-less prefill `ModelRunner.dummy_execution(prefill=True)`
+        runs: one sequence on placeholder page 0, holding no state slot. The KDA
+        layers get no metadata, so they write no state and hand back zeros; MLA
+        writes to the placeholder page only. The segments need only its shape.
+        """
+        seq = Sequence([0] * tokens, block_size=self.model_runner.block_size, id=-1)
+        seq.status = SequenceStatus.RUNNING
+        seq.type = SequenceType.PREFILL
+        seq.block_table = new_block_table([0])
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=np.array([tokens], dtype=np.int32),
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            total_tokens_num_decode=0,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            total_seqs_num_decode=0,
+            is_dummy_run=True,
+            num_spec_step=0,
+            scheduled_spec_decode_tokens=None,
+        )
+        attn_metadata, positions = self.build(batch, 1, tokens, tokens)
+        attn_metadata.gdn_metadata = None
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=True,
+            scheduled_bs=1,
+            scheduled_tokens=tokens,
+            running_bs=1,
+            running_tokens=tokens,
+        )
         return attn_metadata, context
 
 
