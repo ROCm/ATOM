@@ -1362,6 +1362,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Minimum external-tier hit worth loading, in tokens. And the shortest
     # prefix native lmcache_mp stores: an absolute boundary, for normal and
     # late saves alike (other connectors ignore it).
+    # Prefix-spread: queue a moved request first only while its rank's queued
+    # prefill is at most this many tokens; -1 always queues it first.
+    "ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "-1")
+    ),
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: max(
         0, _int_env_or_default("OFFLOAD_MIN_LOAD_TOKENS", 8192)
     ),
