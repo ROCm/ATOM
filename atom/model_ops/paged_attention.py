@@ -4,6 +4,7 @@
 # from flash_attn import flash_attn_with_kvcache
 
 import torch
+from aiter import dtypes
 from torch import nn
 
 from atom.config import get_current_atom_config
@@ -122,3 +123,33 @@ class Attention(BaseAttention):
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )
         return output
+
+    def forward_quantized(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor = None,
+        q_scale: torch.Tensor | None = None,
+        qkv: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return OCP-FP8 attention rows and FP32 ``[tokens, 1]`` descales."""
+        if self.use_mla or not getattr(self.impl, "supports_output_quant", False):
+            raise RuntimeError("this attention implementation cannot quantize output")
+        quantized_output = torch.empty_like(query, dtype=dtypes.fp8)
+        output_scale = torch.empty(
+            (query.shape[0], 1), dtype=torch.float32, device=query.device
+        )
+        torch.ops.aiter.unified_attention_with_output_quant_base(
+            query,
+            q_scale,
+            key,
+            value,
+            positions,
+            self.layer_name,
+            self.use_mla,
+            qkv,
+            quantized_output,
+            output_scale,
+        )
+        return quantized_output, output_scale
