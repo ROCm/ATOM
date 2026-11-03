@@ -1,8 +1,8 @@
 # shellcheck shell=bash
-# MiniMax-M3.1-Flash vLLM 1P1D over MooncakeConnector RDMA, sourced by pd_server_vllm.sh when
+# MiniMax-M3.1-Flash vLLM 1P1D/1P2D over MooncakeConnector RDMA, sourced by pd_server_vllm.sh when
 # ATOMESH_M31_MC=1. Server env/argv, proxy and AgentX client follow the local recipe copied
-# verbatim into .github/benchmark/m31-mooncake-rdma; only the model path, PYTHONPATH, hosts
-# and log locations are adapted to the two-node Slurm layout.
+# into .github/benchmark/m31-mooncake-rdma; only the model path, PYTHONPATH, hosts, log
+# locations and the decode-node GPU split are adapted to the two-node Slurm layout.
 
 M31_DIR="${ATOMESH_SCRIPT_DIR}/../../benchmark/m31-mooncake-rdma"
 M31_ROOT="/tmp/atomesh-m31-${SLURM_JOB_ID:-local}-${NODE_RANK}"
@@ -108,6 +108,7 @@ m31_prepare || exit $?
 start_vllm_server() {
   local role="$1" log_name="$2" server_port="$3" node
   local rest='"kv_load_failure_policy":"fail","kv_connector_extra_config":{"mooncake_protocol":"rdma","num_workers":10}'
+  local gpus=4,5,6,7
   local -a cache_env=() role_env=() role_args=() pin=()
   build_server_cache_env "${role}" "${server_port}" cache_env
   if [[ "${role}" == prefill ]]; then
@@ -118,8 +119,10 @@ start_vllm_server() {
       --max-num-batched-tokens 32768 --long-prefill-token-threshold 4096 --prefill-schedule-interval 1
       --kv-transfer-config "{\"kv_connector\":\"MooncakeConnector\",\"kv_role\":\"kv_producer\",${rest}}")
   else
-    node=1
-    role_env=(HIP_VISIBLE_DEVICES=4,5,6,7 MC_MAX_MR_SIZE=268435456)
+    # decode_single_node: pd_server_atom.sh hands each decode worker GPUs 0-3 or 4-7; GPUs 0-3 sit on NUMA 0.
+    [[ "${DECODE_SINGLE_NODE_PD}" == 1 ]] && gpus="${HIP_VISIBLE_DEVICES}"
+    node=$(( ${gpus%%,*} / 4 ))
+    role_env=(HIP_VISIBLE_DEVICES="${gpus}" MC_MAX_MR_SIZE=268435456)
     role_args=(--port "${server_port}"
       --max-num-batched-tokens 8192 --watermark 0.05
       --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
@@ -142,20 +145,25 @@ start_vllm_server() {
 start_router() {
   local -a cmd=(python3 "${M31_DIR}/mooncake_connector_proxy.py" --host 0.0.0.0 --port "${ROUTER_PORT}"
     --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}" "${M31_BOOTSTRAP_PORT}"
-    --decode "http://${decode_ips[0]}:${decode_ports[0]}")
+    "${decode_args[@]}")
   echo "[router] $(quote "${cmd[@]}")"
   start_logged_process router_pid "${RUNTIME_LOG_DIR}/proxy.log" "${cmd[@]}"
 }
 
-m31_scrape() {  # OUT_DIR TAG: /metrics of both servers
+m31_scrape() {  # OUT_DIR TAG: /metrics of every server
+  local i
   curl -sf "http://${prefill_ips[0]}:${prefill_ports[0]}/metrics" > "$1/$2_metrics_prefill.prom" || echo "WARNING: prefill /metrics scrape failed" >&2
-  curl -sf "http://${decode_ips[0]}:${decode_ports[0]}/metrics" > "$1/$2_metrics_decode.prom" || echo "WARNING: decode /metrics scrape failed" >&2
+  for i in "${!decode_ips[@]}"; do
+    curl -sf "http://${decode_ips[i]}:${decode_ports[i]}/metrics" > "$1/$2_metrics_decode${i}.prom" || echo "WARNING: decode${i} /metrics scrape failed" >&2
+  done
 }
 
 run_aiperf_agentic_benchmark() {
   local venv="/tmp/atomesh-agentx-venv-${ATOMESH_M31_AGENTX_VERSION}"
-  local out="${RUN_DIR}/benchmark_results/m31-pd-c${m31_conc}" rc aiperf_json
+  local out="${RUN_DIR}/benchmark_results/m31-pd-c${m31_conc}" rc aiperf_json i
   local safe_model="${MODEL_NAME//\//-}"
+  local -a metrics=("http://${prefill_ips[0]}:${prefill_ports[0]}/metrics")
+  for i in "${!decode_ips[@]}"; do metrics+=("http://${decode_ips[i]}:${decode_ports[i]}/metrics"); done
   if ! python3 -m venv "${venv}"; then
     rm -rf "${venv}"
     uv venv --seed --python "$(command -v python3)" "${venv}" || return $?
@@ -168,7 +176,7 @@ run_aiperf_agentic_benchmark() {
   local -a argv=("${venv}/bin/agentx" profile --url "http://127.0.0.1:${ROUTER_PORT}"
     --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}"
     --concurrency "${m31_conc}" --benchmark-duration "${AIPERF_BENCHMARK_DURATION}" --tokenizer-trust-remote-code
-    --server-metrics "http://${prefill_ips[0]}:${prefill_ports[0]}/metrics" "http://${decode_ips[0]}:${decode_ports[0]}/metrics"
+    --server-metrics "${metrics[@]}"
     --output-artifact-dir "${out}/aiperf_artifacts")
   (( AIPERF_BENCHMARK_DURATION < 900 )) && argv+=(--unsafe-override)
   argv+=(--public-dataset semianalysis_cc_traces_weka_062126)

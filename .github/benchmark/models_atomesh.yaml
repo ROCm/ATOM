@@ -16509,3 +16509,23 @@ models:
           benchmark:
             <<: *m31_mc_benchmark
             benchmark_duration: 3600
+        # 1P2D: P TP4 on rank 0, both D TP4 on rank 1 (GPUs 0-3, 4-7); the proxy pins each
+        # AgentX session to one D. concurrency is the total over both D; no KV CPU offload.
+        - &m31_mc_1p2d_case
+          <<: *m31_mc_case
+          name: m31-flash-vllm-mc-rdma-1p2d-c24
+          topology: 1p2d
+          pd_worker_layout: decode_single_node
+          concurrency: [24]
+          decode:
+            workers: 2
+            tp: 4
+          benchmark:
+            <<: *m31_mc_benchmark
+            benchmark_duration: 3600
+        - <<: *m31_mc_1p2d_case
+          name: m31-flash-vllm-mc-rdma-1p2d-c48
+          concurrency: [48]
+        - <<: *m31_mc_1p2d_case
+          name: m31-flash-vllm-mc-rdma-1p2d-c64
+          concurrency: [64]
