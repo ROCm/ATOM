@@ -2774,6 +2774,19 @@ class Expert(nn.Module):
         # feed the bf16 GEMM output directly.
         combined = self.gate_up_proj(x)  # [num_tokens, 2*inter_dim_per_tp]
         if self.use_fused_clamp_act_mul:
+            if getattr(self.w2, "native_a8_group_rows", None) is not None:
+                # Native MX w2 (V4.1 32x32 / 1x32 E8M0) reads a row-major 1x32
+                # E8M0 x_scale, not the FP32 1x128 blockscale one.
+                x_fp8, x_scale = fused_clamp_act_mul(
+                    combined,
+                    swiglu_limit=self.swiglu_limit,
+                    activation="silu",
+                    weights=weights,
+                    dtype_quant=dtypes.fp8,
+                    quant_block_size=32,
+                    scale_dtype_fmt="ue8m0",
+                )
+                return self.w2(x_fp8, x_scale=x_scale.view(torch.float8_e8m0fnu))
             x_fp8, x_scale = fused_clamp_act_mul(
                 combined,
                 swiglu_limit=self.swiglu_limit,
