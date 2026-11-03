@@ -241,6 +241,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_PREFIX_MAX_REQ_GAP": lambda: int(
         os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP", "4")
     ),
+    # Prefix-spread margins relative to the lightest rank: the owner keeps a
+    # request while its load is within max(OWNER_MARGIN, REL * lightest load)
+    # and its in-flight requests within max(MAX_REQ_GAP, REQ_GAP_REL *
+    # lightest in-flight requests). 0 keeps the fixed margins only.
+    "ATOM_DP_PREFIX_OWNER_MARGIN_REL": lambda: float(
+        os.getenv("ATOM_DP_PREFIX_OWNER_MARGIN_REL", "0.5")
+    ),
+    "ATOM_DP_PREFIX_MAX_REQ_GAP_REL": lambda: float(
+        os.getenv("ATOM_DP_PREFIX_MAX_REQ_GAP_REL", "0.1")
+    ),
     # Prefix-spread rule: "margin" (above) or "cost". "cost" places each
     # request on the rank minimizing its estimated time to first token (the
     # rank's queued prefill, its own uncached prefill, a tier load where the

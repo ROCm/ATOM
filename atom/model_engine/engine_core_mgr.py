@@ -300,6 +300,10 @@ class CoreManager:
         self._prefix_spread = envs.ATOM_DP_PREFIX_SPREAD
         self._prefix_owner_margin = envs.ATOM_DP_PREFIX_OWNER_MARGIN
         self._prefix_max_req_gap = envs.ATOM_DP_PREFIX_MAX_REQ_GAP
+        # Both margins scale with the lighter rank's load: a fixed gap that
+        # marks a real imbalance at low concurrency is noise once queues grow.
+        self._prefix_margin_rel = envs.ATOM_DP_PREFIX_OWNER_MARGIN_REL
+        self._prefix_req_gap_rel = envs.ATOM_DP_PREFIX_MAX_REQ_GAP_REL
         self._prefix_policy = envs.ATOM_DP_PREFIX_POLICY
         if self._prefix_policy not in ("margin", "cost"):
             raise ValueError(
@@ -1603,11 +1607,20 @@ class CoreManager:
             rank = self._prefix_cost_rank(seq, owner, hit)
         elif (
             owner is not None
-            and load(owner) <= load(lightest) + self._prefix_owner_margin
+            and load(owner)
+            <= load(lightest)
+            + max(
+                self._prefix_owner_margin,
+                getattr(self, "_prefix_margin_rel", 0.0) * load(lightest),
+            )
             and (
                 getattr(self, "_prefix_max_req_gap", -1) < 0
                 or self._rank_reqs[owner] - self._rank_reqs[lightest]
-                <= self._prefix_max_req_gap
+                <= max(
+                    self._prefix_max_req_gap,
+                    getattr(self, "_prefix_req_gap_rel", 0.0)
+                    * self._rank_reqs[lightest],
+                )
             )
         ):
             rank = owner

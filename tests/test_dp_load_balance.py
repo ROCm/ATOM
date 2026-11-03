@@ -774,3 +774,29 @@ def test_prefix_spread_queues_moved_requests_first_only_on_a_short_queue(
     assert _route(mgr, [late]) == [owner]
     assert not getattr(late, "dp_prefetch_priority", False)
     assert envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE == 50000
+
+
+def test_prefix_spread_margins_scale_with_queue_depth():
+    """At deep queues a fixed token / request gap is noise: the owner keeps the
+    request while within the relative margins of the lightest rank."""
+    mgr = _make_spread_mgr()
+    mgr._prefix_max_req_gap = 4
+    mgr._prefix_margin_rel = 0.5
+    mgr._prefix_req_gap_rel = 0.1
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    other = 1 - owner
+    # Deep queues: 300k vs 400k (gap 100k < 0.5 * lightest load), 100 vs 108
+    # requests (gap 8 < 0.1 * 100): stay.
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[other], mgr._rank_tokens[owner] = 300_000, 400_000
+    mgr._rank_reqs[other], mgr._rank_reqs[owner] = 100, 108
+    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
+    mgr._mark_seq_prefill_complete(2)
+    # Shallow queues: the fixed margins still apply.
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
+    assert rank != owner
