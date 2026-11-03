@@ -230,6 +230,7 @@ def snapshot(source, destination):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-ids", required=True)
+    parser.add_argument("--job-map", type=json.loads, default={})
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--retire-replaced-runs", action="store_true")
     args = parser.parse_args()
@@ -242,6 +243,16 @@ def main():
         rid not in REPLACED_JOBS for rid in ids
     ):
         parser.error("retirement is restricted to the four replaced runs")
+    if not isinstance(args.job_map, dict) or any(
+        rid not in ids
+        or not isinstance(jobs, list)
+        or len(jobs) > 4
+        or any(not re.fullmatch(r"[0-9]+", str(job)) for job in jobs)
+        for rid, jobs in args.job_map.items()
+    ):
+        parser.error(
+            "job-map must map inspected run IDs to up to four numeric job IDs"
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     os.environ["PATH"] = "/usr/local/slurm-24.05.5.1/bin:" + os.environ.get(
         "PATH", ""
@@ -251,6 +262,7 @@ def main():
     queue["stdout"] = "\n".join(
         line for line in lines if any(f"-{rid}-" in line for rid in ids)
     )
+    print(f"queue_result={json.dumps(queue)}", flush=True)
     report = {
         "collected_at": datetime.datetime.now(
             datetime.timezone.utc
@@ -262,7 +274,7 @@ def main():
     }
     for rid in ids:
         row = {"run_id": rid, "jobs": [], "log_roots": []}
-        job_ids = set()
+        job_ids = {str(job) for job in args.job_map.get(rid, [])}
         for line in lines:
             if f"-{rid}-" not in line:
                 continue

@@ -39,6 +39,11 @@ on:
         required: false
         default: false
         type: boolean
+      inspect_job_ids:
+        description: 'Optional JSON map of inspected run IDs to known Slurm job IDs, including jobs no longer in squeue'
+        required: false
+        default: '{}'
+        type: string
       suite:
         description: 'Benchmark suite'
         required: false
@@ -324,13 +329,14 @@ jobs:
       - name: Snapshot existing logs and Slurm states
         env:
           SOURCE_RUN_IDS: ${{ inputs.inspect_run_ids }}
+          SOURCE_JOB_IDS: ${{ inputs.inspect_job_ids }}
           RETIRE_REPLACED_RUNS: ${{ inputs.retire_replaced_issue382_runs }}
         run: |
           args=()
           if [[ "$RETIRE_REPLACED_RUNS" == "true" ]]; then
             args+=(--retire-replaced-runs)
           fi
-          python3 "$ISSUE382_INSPECTION_DIR/inspect_runs.py" --run-ids "$SOURCE_RUN_IDS" --output "$ISSUE382_INSPECTION_DIR/snapshot" "${args[@]}"
+          python3 "$ISSUE382_INSPECTION_DIR/inspect_runs.py" --run-ids "$SOURCE_RUN_IDS" --job-map "$SOURCE_JOB_IDS" --output "$ISSUE382_INSPECTION_DIR/snapshot" "${args[@]}"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
