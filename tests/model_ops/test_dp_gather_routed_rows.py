@@ -8,13 +8,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from import_guard import skip_if_dependency_missing
+from aiter_stub import stubbed_aiter
 
-try:
-    # aiter/triton absent under bare non-GPU pytest
-    from atom.model_ops import moe
-except ImportError as exc:
-    skip_if_dependency_missing(exc, "requires full atom import env")
+with stubbed_aiter(
+    "aiter.fused_moe",
+    "aiter.jit.utils.chip_info",
+    "aiter.jit.utils.torch_guard",
+    "aiter.ops.flydsl.moe_common",
+    "aiter.ops.shuffle",
+    "aiter.ops.triton.quant",
+    "aiter.utility.fp4_utils",
+):
+    from atom.model_ops import eplb, moe, topK
+    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
 
 
 class _TwoRankGroup:
@@ -110,9 +116,6 @@ def test_gathered_shared_ids_split_the_rows_between_ep_ranks(monkeypatch):
     only where i % ep == r. Routed on their own ranks, the rows carry their
     owners' marks through the gather -- every rank would run the same rows'
     shared expert. Re-marked by gathered position, the ranks split the rows."""
-    from atom.model_ops import topK
-    from atom.model_ops.fused_moe.expert_layout import SharedExpertMode
-
     ep, top_k, shared, fake, local = 2, 2, 8, 9, 2
     layer = SimpleNamespace(
         expert_layout=SimpleNamespace(mode=SharedExpertMode.LEGACY_AITER),
@@ -190,8 +193,6 @@ def test_gathered_rows_are_placed_after_the_gather_and_uncounted(monkeypatch, us
 def test_gathered_rows_pick_one_replica_on_every_rank(monkeypatch):
     """The forced-remote replica hash mixes in the DP rank only for a rank's
     own rows; gathered rows are hashed by the row alone."""
-    from atom.model_ops import eplb
-
     monkeypatch.setattr(eplb, "_MANAGER", SimpleNamespace(replica_spread=(4, 3)))
     assert eplb._replica_spread() == (4, 3)
     assert eplb._replica_spread(gathered=True) == (1, 0)
