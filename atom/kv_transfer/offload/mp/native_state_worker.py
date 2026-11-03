@@ -25,7 +25,10 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.kv_transfer.offload._offload_common import max_pending_saves
 from atom.kv_transfer.offload.metadata import LMCacheReqMeta, NativeStateTransfer
 from atom.kv_transfer.offload.mp.deployment import _mp_session_id
-from atom.kv_transfer.offload.mp.step_events import PendingStepEvent
+from atom.kv_transfer.offload.mp.step_events import (
+    PendingStepEvent,
+    RecordedStepEvent,
+)
 from atom.kv_transfer.offload.mp.transfer import (
     _chunk_ranges,
     _enforce_transfer_deadline,
@@ -107,7 +110,11 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             raise ValueError("native-state save must refer to immutable PAGE units")
 
     def _submit_native(
-        self, req: LMCacheReqMeta, event: PendingStepEvent, *, loading: bool
+        self,
+        req: LMCacheReqMeta,
+        event: PendingStepEvent | RecordedStepEvent,
+        *,
+        loading: bool,
     ) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec
 
@@ -173,7 +180,8 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             entry = _NativePending(req, _UnprovableSubmission())
             pending[operation_id] = entry
             index, step_event = event.hold_locked()
-            self._step_event_of[operation_id] = index
+            if index is not None:
+                self._step_event_of[operation_id] = index
         submit = (
             self._adapter.submit_retrieve_request
             if loading
@@ -184,7 +192,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         )
         try:
-            future = submit(_mp_session_id(self._config, req.req_id), spec, step_event)
+            future = submit(
+                _mp_session_id(self._config, req.req_id),
+                spec,
+                step_event,
+                **self._submit_kwargs(),
+            )
         except Exception:
             # Retain the exact source/destination lease. The server might have
             # received the request before the connection raised an exception.
@@ -196,10 +209,14 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         with self._lock:
             entry.future = future
 
-    def _submit_load(self, req: LMCacheReqMeta, event: PendingStepEvent) -> None:
+    def _submit_load(
+        self, req: LMCacheReqMeta, event: PendingStepEvent | RecordedStepEvent
+    ) -> None:
         self._submit_native(req, event, loading=True)
 
-    def _submit_save(self, req: LMCacheReqMeta, event: PendingStepEvent) -> None:
+    def _submit_save(
+        self, req: LMCacheReqMeta, event: PendingStepEvent | RecordedStepEvent
+    ) -> None:
         self._submit_native(req, event, loading=False)
 
     @staticmethod
@@ -268,6 +285,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         output = KVConnectorOutput()
         if self._adapter is None:
             return output
+        self._finished_housekeeping()
         with self._lock:
             for operation_id, pending in list(self._native_saves.items()):
                 self._poll_native_save(output, operation_id, pending)

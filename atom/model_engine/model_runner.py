@@ -98,6 +98,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
+from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
@@ -1039,6 +1040,7 @@ class ModelRunner:
         world_size = dp_size * pp_size * stage_span
         dp_rank = config.parallel_config.data_parallel_rank
         global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+        raise_timeout_if_dp_spans_nodes(config.parallel_config)
         if (
             config.parallel_config._managed_distributed_store
             and not torch.distributed.is_initialized()
@@ -3518,6 +3520,16 @@ class ModelRunner:
             dspark_ell=dspark_ell,
         )
 
+    def _kv_after_forward(self) -> None:
+        """Let the KV connector act behind this step's enqueued KV writes.
+
+        lmcache_mp submits same-step saves here, fenced after the forward.
+        """
+        connector = get_kvconnector()
+        callback = getattr(connector, "after_forward", None)
+        if callable(callback):
+            callback()
+
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish completed chunk snapshots and the legacy final-ready event."""
         if batch.total_seqs_num_prefill <= 0:
@@ -3599,6 +3611,8 @@ class ModelRunner:
                 hidden_states,
                 batch.next_token_ids,
             )
+        # Every KV write of this forward is enqueued; sampling is not needed.
+        self._kv_after_forward()
         if pp_non_last or self._is_pure_middle_chunk(batch):
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.

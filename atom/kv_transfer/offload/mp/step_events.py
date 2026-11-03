@@ -100,4 +100,22 @@ class PendingStepEvent:
         return index, event
 
 
-__all__ = ["PendingStepEvent", "StepEventRing"]
+class RecordedStepEvent:
+    """A step's event the forward thread has already recorded.
+
+    Native ATOM's (`LMCacheMPConnector._producer_fence`): a fresh event per
+    step, or a slot of `_ProducerFences` under the transfer thread, recorded
+    before any submission can run off that thread. Nothing here tracks holds.
+    """
+
+    __slots__ = ("event",)
+
+    def __init__(self, event: Any) -> None:
+        self.event = event
+
+    def hold_locked(self) -> tuple[None, Any]:
+        """No ring index: there is no hold to release."""
+        return None, self.event
+
+
+__all__ = ["PendingStepEvent", "RecordedStepEvent", "StepEventRing"]

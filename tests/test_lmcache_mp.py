@@ -1072,7 +1072,7 @@ class _WorkerAdapter:
 
 
 def _worker(adapter: _WorkerAdapter) -> mp_worker.LMCacheMPConnector:
-    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
+    worker = mp_worker.LMCacheMPConnector(_config(), drain_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
     # The plugin's worker: both legs are submitted and polled on a drain
@@ -1193,7 +1193,7 @@ def test_worker_save_settles_off_the_step_thread(fake_lmcache_modules):
     adapter.submit_store_request = blocking_submit
     # Deliberately not `_worker`: that wrapper settles each save, which is the
     # very thing under test here.
-    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
+    worker = mp_worker.LMCacheMPConnector(_config(), drain_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
     operation = SaveOperationId(req_id=77, generation=1)
@@ -1272,21 +1272,19 @@ def test_inline_transfers_have_no_fence(fake_lmcache_modules):
     """Only the vLLM plugin hands a preempted request's blocks on before its
     transfers end, and it runs them on a drain thread."""
     worker = _inline_worker(_WorkerAdapter())
-    with pytest.raises(NotImplementedError, match="transfer_thread=True"):
+    with pytest.raises(NotImplementedError, match="drain_thread=True"):
         worker.fence(["16"])
 
 
-@pytest.mark.parametrize("transfer_thread", [False, True])
+@pytest.mark.parametrize("drain_thread", [False, True])
 def test_close_keeps_the_step_events_until_shutdown_drained(
-    fake_lmcache_modules, transfer_thread
+    fake_lmcache_modules, drain_thread
 ):
     """A transfer still in flight at close waits on its step event, and only
     `shutdown` drains it; a failed shutdown leaves the events alone."""
     for fails in (False, True):
         adapter = _WorkerAdapter()
-        worker = mp_worker.LMCacheMPConnector(
-            _config(), transfer_thread=transfer_thread
-        )
+        worker = mp_worker.LMCacheMPConnector(_config(), drain_thread=drain_thread)
         worker._adapter = adapter
         worker.chunk_size = 8
         seen = []
@@ -1380,7 +1378,7 @@ def test_the_last_look_never_waits_behind_a_submit(fake_lmcache_modules, monkeyp
 
     adapter.submit_store_request = blocking_submit
     # Not `_worker`, which would settle the blocked submit.
-    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
+    worker = mp_worker.LMCacheMPConnector(_config(), drain_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
     worker._pending_loads["load:5:1"] = mp_worker._PendingLoad(
@@ -2686,7 +2684,7 @@ def test_ipc_resources_are_destroyed_on_the_step_thread(
     idle = [False]
     monkeypatch.setattr(ipc_lifetime, "_stream_idle", lambda: idle[0])
     monkeypatch.setattr(mp_worker, "_mp_session_id", lambda _c, rid: f"s:{rid}")
-    worker = mp_worker.LMCacheMPConnector(_config())
+    worker = mp_worker.LMCacheMPConnector(_config(), drain_thread=True)
     worker._adapter = _Adapter()
     worker.chunk_size = 8
 
@@ -2751,7 +2749,7 @@ def test_close_leaves_a_stuck_drains_client_alone(fake_lmcache_modules, monkeypa
     adapter = _WorkerAdapter()
     released = threading.Event()
     adapter.submit_store_request = lambda *_a: released.wait(5.0)
-    worker = mp_worker.LMCacheMPConnector(_config(), transfer_thread=True)
+    worker = mp_worker.LMCacheMPConnector(_config(), drain_thread=True)
     worker._adapter = adapter
     worker.chunk_size = 8
     monkeypatch.setattr(mp_worker, "_CLOSE_TIMEOUT_S", 0.05)

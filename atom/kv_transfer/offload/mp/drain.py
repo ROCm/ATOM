@@ -273,7 +273,7 @@ class InlineTransfers:
         raise NotImplementedError(
             f"LMCache MP fence for {what}: only the vLLM plugin hands a "
             "preempted request's blocks on before its transfers end, and it "
-            "runs them on a drain thread (`transfer_thread=True`)"
+            "runs them on a drain thread (`drain_thread=True`)"
         )
 
     def close(self, timeout: float) -> bool:

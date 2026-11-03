@@ -465,7 +465,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # transfers run on a drain thread: on the step thread a submit
                 # cost 18.7 ms under the plugin's launch pressure.
                 self._worker = MPOffloadWorkerAdapter(
-                    LMCacheMPConnector(self._config, transfer_thread=True)
+                    LMCacheMPConnector(self._config, drain_thread=True)
                 )
             else:
                 from atom.kv_transfer.offload.dense.connector import (
