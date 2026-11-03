@@ -31,6 +31,29 @@ from .protocol import ChatMessage
 logger = logging.getLogger("atom")
 
 
+def _hyi_memo_last_user_index(raw) -> None:
+    """hyi 1102 A/B: memoize find_last_user_index per (messages list identity, length), per thread."""
+    import threading
+
+    g = getattr(raw, "__globals__", {})
+    orig = g.get("find_last_user_index")
+    if orig is None or getattr(orig, "_hyi_memo", False):
+        return
+    tls = threading.local()
+
+    def find_last_user_index(messages):
+        c = getattr(tls, "c", None)
+        if c is not None and c[0] is messages and c[1] == len(messages):
+            return c[2]
+        r = orig(messages)
+        tls.c = (messages, len(messages), r)
+        return r
+
+    find_last_user_index._hyi_memo = True
+    g["find_last_user_index"] = find_last_user_index
+    logger.info("hyi: memoized encoder find_last_user_index (ATOM_HYI_ENC_MEMO=1)")
+
+
 def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
     """Look for ``<model>/encoding/encoding_*.py`` and load ``encode_messages``.
 
@@ -63,6 +86,8 @@ def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         raw = mod.encode_messages
+        if os.environ.get("ATOM_HYI_ENC_MEMO") == "1":  # hyi 1102 A/B: O(n) instead of O(n^2) render
+            _hyi_memo_last_user_index(raw)
     except Exception:
         # Broad on purpose: this executes a file the operator supplied, so the
         # failure can be anything that module raises, and a bad encoder must

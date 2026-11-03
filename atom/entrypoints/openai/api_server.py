@@ -3227,7 +3227,10 @@ async def reset_prefix_cache():
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Prefix reset failed; some ranks may already be cleared")
-        raise HTTPException(status_code=500, detail="Prefix reset failed; some ranks may already be cleared") from exc
+        raise HTTPException(
+            status_code=500,
+            detail="Prefix reset failed; some ranks may already be cleared",
+        ) from exc
 
 
 @_engine_route("/debug/cache_stats")
@@ -3770,6 +3773,14 @@ def _serve(args) -> None:
         access_log=not args.disable_uvicorn_access_log,
         timeout_keep_alive=args.timeout_keep_alive,
     )
+
+
+# hyi 1102: env-gated request-stage tracer (diag only)
+if os.environ.get("HYI_TRACE_DIR"):
+    import hyi_trace as _hyi_trace
+    import sys as _hyi_sys
+
+    _hyi_trace.install(_hyi_sys.modules[__name__])
 
 
 if __name__ == "__main__":

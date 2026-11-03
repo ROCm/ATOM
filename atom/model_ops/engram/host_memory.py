@@ -85,6 +85,7 @@ def _libc():
     libc = ctypes.CDLL(None, use_errno=True)
     libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     libc.mlock2.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
     return libc
@@ -566,6 +567,10 @@ def _read_only(lo: int, hi: int) -> bool:
     return False
 
 
+# hyi 1101: register in-place ranges as BOs of at most this many bytes (0 = one BO per gap).
+_REG_CHUNK = (int(os.environ.get("ATOM_ENGRAM_REG_CHUNK_MB", "0") or 0) << 20) // _PAGE * _PAGE
+
+
 class _PageRuns:
     """This process's in-place page-locked runs, reference-counted, each
     `mlock`ed for as long as it is registered.
@@ -609,14 +614,25 @@ class _PageRuns:
                 gap_end = hi if base is None else base
                 if cursor < gap_end:
                     read_only = bool(flags & _HOST_REGISTER_READ_ONLY)
-                    _fault_and_lock(cursor, gap_end, read_only)
-                    if int(rt.cudaHostRegister(cursor, gap_end - cursor, flags)):
-                        _clear_hip_error()
-                        _libc().munlock(cursor, gap_end - cursor)
-                        self.release(rt, held)
-                        return None
-                    self._runs[cursor] = [gap_end, 1]
-                    held.append(cursor)
+                    step = _REG_CHUNK if _REG_CHUNK > 0 else gap_end - cursor
+                    c = cursor
+                    while c < gap_end:
+                        e = min(gap_end, c + step)
+                        _fault_and_lock(c, e, read_only)
+                        if int(rt.cudaHostRegister(c, e - c, flags)):
+                            _clear_hip_error()
+                            _libc().munlock(c, e - c)
+                            self.release(rt, held)
+                            return None
+                        self._runs[c] = [e, 1]
+                        held.append(c)
+                        c = e
+                    if gap_end - cursor >= (1 << 30):
+                        logger.info(
+                            "engram: registered %.2f GiB in-place as %d userptr BO(s)",
+                            (gap_end - cursor) / 2**30,
+                            -(-(gap_end - cursor) // step),
+                        )
                 if base is None:
                     break
                 self._runs[base][1] += 1
@@ -663,7 +679,10 @@ def _fault_and_lock(lo: int, hi: int, populate: bool) -> None:
     """
     libc = _libc()
     if libc.mlock2(lo, hi - lo, _MLOCK_ONFAULT) != 0:
-        _warn_unlocked(ctypes.get_errno(), hi - lo)
+        # Keep the image's opt-in plain-mlock fallback without bypassing the
+        # current registration lease / munlock lifecycle.
+        if os.environ.get("ATOM_ENGRAM_MLOCK", "0") != "1" or libc.mlock(lo, hi - lo) != 0:
+            _warn_unlocked(ctypes.get_errno(), hi - lo)
     if not populate:
         return
     pieces = _chunks(lo, hi - lo, _CHUNK_BYTES)

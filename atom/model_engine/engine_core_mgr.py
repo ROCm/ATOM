@@ -51,6 +51,9 @@ from atom.utils import (
     make_zmq_socket,
 )
 
+# hyi 1102 A/B: online API server never drains outputs_queue (only offline LLMEngine.step does)
+_HYI_DROP_FINISHED_SEQS = os.environ.get("ATOM_HYI_DROP_FINISHED_SEQS") == "1"
+
 logger = logging.getLogger("atom")
 _WEIGHT_SYNC_FINISH_TIMEOUT_S = 30.0
 # Only the sync that owns them sends these. A FINISH unfences every engine,
@@ -843,7 +846,7 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        if self.keep_finished_outputs:
+                        if self.keep_finished_outputs and not _HYI_DROP_FINISHED_SEQS:
                             self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
