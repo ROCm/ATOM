@@ -33,12 +33,6 @@ def prepare_chunk_indices(
 
 
 @tensor_cache
-def prepare_max_chunks(cu_seqlens: torch.LongTensor, chunk_size: int) -> int:
-    """Chunks of the longest sequence (a device sync unless the engine primed it)."""
-    return triton.cdiv(prepare_lens(cu_seqlens), chunk_size).max().item()
-
-
-@tensor_cache
 def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
