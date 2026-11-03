@@ -24,6 +24,7 @@ from atom.model_ops.sampling_filter import (
     _logit_key,
     _request_filter,
     _request_of_row,
+    count_runs,
     filter_scratch,
     row_filters,
 )
@@ -151,7 +152,7 @@ def target_p_scratch(num_tokens: int, vocab_size: int) -> TargetPScratch:
         Region((tiles, num_tokens), f32),
         Region((tiles, num_tokens), f32),
         Region((tiles, num_tokens), i32),
-        filter_scratch(num_tokens, vocab_size, _RATIO_BLOCK_V),
+        filter_scratch(num_tokens, vocab_size),
     )
 
 
@@ -162,15 +163,17 @@ def filter_floor(
     filters: RowFilters,
     rows: tuple[torch.Tensor, ...],
     work: FilterScratch,
+    runs: tuple[torch.Tensor, torch.Tensor] | None,
     stats_block_v: int,
 ) -> None:
     """Each filtered draft row's floor, and its p's normalizer renormalized
     over the survivors.
 
     Fills ``row_floor`` and rewrites ``row_inv_z`` of ``rows = (row_max,
-    row_inv_z, row_floor)``, through ``work``. Its run maxima are what the
-    stats pass kept per ``stats_block_v`` tile in a ``COUNT`` launch;
-    ``row_max`` and ``row_inv_z`` are its combined statistics."""
+    row_inv_z, row_floor)``, through ``work``. ``runs`` (`count_runs`, given
+    when the batch counts) are what the stats pass kept per ``stats_block_v``
+    tile in a ``COUNT`` launch; ``row_max`` and ``row_inv_z`` are its combined
+    statistics."""
     if filters.counts:
         count_floor(
             target_logits,
@@ -178,7 +181,7 @@ def filter_floor(
             temperatures,
             filters,
             rows,
-            (work.run_max, work.run_at_max),
+            runs,
             stats_block_v,
             _FILTER_COUNT_MAX_K,
         )
@@ -222,6 +225,11 @@ def _ratio_target_p(
     if not num_tokens:
         return filtered
     filters = row_filters(top_ks, top_ps, batch_size, target_logits.dtype)
+    runs = (
+        count_runs(num_tokens, vocab_size, _RATIO_BLOCK_V, target_logits.device)
+        if filters.counts
+        else (None, None)
+    )
     _ratio_stats_kernel[(num_tokens, n_tiles)](
         target_logits,
         cu_num_draft_tokens,
@@ -239,8 +247,7 @@ def _ratio_target_p(
         SAMPLER_EPS,
         *filters.args,
         # The stats pass fills the filter's run maxima itself.
-        work.filter.run_max,
-        work.filter.run_at_max,
+        *runs,
         COUNT=filters.counts,
         KEY_BITS=filters.key_bits,
         GROUPS=_FILTER_COUNT_GROUPS,
@@ -272,6 +279,7 @@ def _ratio_target_p(
         filters,
         (work.row_max, work.row_inv_z, work.row_floor),
         work.filter,
+        runs,
         _RATIO_BLOCK_V,
     )
     return True

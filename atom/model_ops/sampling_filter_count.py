@@ -28,6 +28,16 @@ _FILTER_COUNT_CHUNK = 32
 _FILTER_COUNT_WARPS = 4
 
 
+def count_widths(max_k: int) -> tuple[int, int, int]:
+    """The count's gather widths, ascending: the last holds every run a
+    top-k of at most ``max_k`` can leave above its bound."""
+    return (
+        _FILTER_COUNT_CHUNK,
+        4 * _FILTER_COUNT_CHUNK,
+        max(triton.next_power_of_2(max_k), 4 * _FILTER_COUNT_CHUNK),
+    )
+
+
 @triton.jit
 def _key_search(keys, weight, top_k, KEY_BITS: tl.constexpr):
     """The largest key c with at least ``top_k`` of ``keys`` at or above it
@@ -106,8 +116,7 @@ def _ratio_filter_count_kernel(
     BLOCK_RUNS: tl.constexpr,
     GROUPS: tl.constexpr,
     MAX_K: tl.constexpr,
-    CHUNK: tl.constexpr,
-    MAX_RUNS: tl.constexpr,
+    WIDTHS: tl.constexpr,
     KEY_BITS: tl.constexpr,
     K_PER_ROW: tl.constexpr,
     P_PER_ROW: tl.constexpr,
@@ -157,58 +166,30 @@ def _ratio_filter_count_kernel(
         row_base = row.to(tl.int64) * logits_row_stride
         row_max = tl.load(row_max_ptr + row)
         inv_z = tl.load(row_inv_z_ptr + row)
-        if n_runs <= CHUNK:
-            cut, mass = _count_floor(
-                logits_ptr,
-                row_base,
-                runs_ptr,
-                n_runs,
-                vocab_size,
-                low,
-                at_low,
-                top_k,
-                temp,
-                row_max,
-                inv_z,
-                RUN,
-                CHUNK,
-                KEY_BITS,
-            )
-        elif n_runs <= 4 * CHUNK:
-            cut, mass = _count_floor(
-                logits_ptr,
-                row_base,
-                runs_ptr,
-                n_runs,
-                vocab_size,
-                low,
-                at_low,
-                top_k,
-                temp,
-                row_max,
-                inv_z,
-                RUN,
-                4 * CHUNK,
-                KEY_BITS,
-            )
-        else:
-            # At most k - 1 < MAX_RUNS runs.
-            cut, mass = _count_floor(
-                logits_ptr,
-                row_base,
-                runs_ptr,
-                n_runs,
-                vocab_size,
-                low,
-                at_low,
-                top_k,
-                temp,
-                row_max,
-                inv_z,
-                RUN,
-                MAX_RUNS,
-                KEY_BITS,
-            )
+        # The smallest gather that holds every run above L: WIDTHS ascends
+        # and its last entry holds the at most k - 1 there can be.
+        cut = low
+        mass = 0.0
+        pending = n_runs >= 0
+        for w in tl.static_range(len(WIDTHS)):
+            if pending & (n_runs <= WIDTHS[w]):
+                cut, mass = _count_floor(
+                    logits_ptr,
+                    row_base,
+                    runs_ptr,
+                    n_runs,
+                    vocab_size,
+                    low,
+                    at_low,
+                    top_k,
+                    temp,
+                    row_max,
+                    inv_z,
+                    RUN,
+                    WIDTHS[w],
+                    KEY_BITS,
+                )
+                pending = n_runs < 0
         floor = _key_logit(cut, KEY_BITS)
         tl.store(row_inv_z_ptr + row, inv_z / mass)
     tl.store(row_floor_ptr + row, floor)
@@ -253,8 +234,7 @@ def count_floor(
         BLOCK_RUNS=triton.next_power_of_2(n_tiles * _FILTER_COUNT_GROUPS),
         GROUPS=_FILTER_COUNT_GROUPS,
         MAX_K=max_k,
-        CHUNK=_FILTER_COUNT_CHUNK,
-        MAX_RUNS=max(triton.next_power_of_2(max_k), 4 * _FILTER_COUNT_CHUNK),
+        WIDTHS=count_widths(max_k),
         KEY_BITS=filters.key_bits,
         K_PER_ROW=filters.k_rows,
         P_PER_ROW=filters.p_rows,

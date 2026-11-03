@@ -219,24 +219,30 @@ class FilterScratch(NamedTuple):
     filter_i32: torch.Tensor  # [2, rows, _FILTER_I32_WIDTH] int32
     #: A row of last-digit counts per (row, split) of the last count.
     floor_counts: torch.Tensor
-    #: The counted top-k's run maxima, and the ids at each, that the stats
-    #: pass keeps per stats tile.
-    run_max: torch.Tensor
-    run_at_max: torch.Tensor
 
 
-def filter_scratch(
-    num_tokens: int, vocab_size: int, stats_block_v: int
-) -> FilterScratch:
-    """The regions `ratio_target_p.filter_floor` needs, for rows whose stats
-    pass walks ``stats_block_v`` tiles."""
-    run_cells = _count_run_cells(num_tokens, vocab_size, stats_block_v)
+def filter_scratch(num_tokens: int, vocab_size: int) -> FilterScratch:
+    """The regions `ratio_target_p.filter_floor` needs. The counted top-k's
+    run maxima are not among them: they are allocated per verify, only for a
+    batch that can count (`count_runs`)."""
     f32, i32 = torch.float32, torch.int32
     return FilterScratch(
         Region((2, num_tokens, _FILTER_F32_WIDTH), f32),
         Region((triton.cdiv(vocab_size, _FILTER_BLOCK_V), num_tokens), f32),
         Region((2, num_tokens, _FILTER_I32_WIDTH), i32),
         Region((max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS,), i32),
-        Region((run_cells,), i32),
-        Region((run_cells,), i32),
+    )
+
+
+def count_runs(
+    num_tokens: int, vocab_size: int, stats_block_v: int, device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The counted top-k's run maxima and the ids at each, which the stats
+    pass keeps per ``stats_block_v`` tile: ``num_tokens * V / 8`` bytes, so
+    taken only by a batch that has a counted row rather than reserved from
+    the KV budget."""
+    cells = _count_run_cells(num_tokens, vocab_size, stats_block_v)
+    return (
+        torch.empty(cells, dtype=torch.int32, device=device),
+        torch.empty(cells, dtype=torch.int32, device=device),
     )
