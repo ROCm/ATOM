@@ -19,6 +19,7 @@ class _Producer(nn.Module):
         self.supported = supported
         self.outs = []
         self.qkv_proj = object()
+        self.gate_up_proj = object()
 
     def supports_out(self):
         return self.supported
@@ -132,6 +133,10 @@ class _Embed(nn.Module):
 def test_model_offers_the_arena_only_to_prefill(monkeypatch, prefill):
     model = m3.MiniMaxM3Model.__new__(m3.MiniMaxM3Model)
     nn.Module.__init__(model)
+    # Match the eager-mode state installed by @support_torch_compile's
+    # production constructor while keeping this call on the real __call__ and
+    # forward path.
+    model.do_not_compile = True
     layer = _Layer()
     model.embed_tokens = _Embed()
     model.layers = nn.ModuleList([layer])
