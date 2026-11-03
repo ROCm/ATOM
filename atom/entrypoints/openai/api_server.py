@@ -854,7 +854,7 @@ async def _submit_engine_requests(seqs):
 
 
 async def generate_async(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -1315,7 +1315,7 @@ def _prepare_prompt(
     preserve_tool_call_arguments: bool,
     max_tokens: int,
     kv_transfer_params: dict[str, Any] | None,
-):
+) -> tuple[PrefixEncoding | list[int], str]:
     """Render, tokenize the engine's way and cut to the context, in one
     executor step for ``/v1/messages`` and ``/v1/responses``.
 
@@ -1359,7 +1359,7 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
 
 
 async def setup_streaming_request(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
