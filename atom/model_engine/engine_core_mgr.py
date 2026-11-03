@@ -1551,7 +1551,9 @@ class CoreManager:
         longest prefix (the most recent one on a tie), source the request that
         ran it there. Each sampled hash keeps every rank that ran it, so with
         more than two ranks a rank holding part of the prefix can be preferred
-        and only the rest needs loading from the tier.
+        and only the rest needs loading from the tier. A rank other than the
+        owner counts a part only once the request that ran it there finished
+        prefilling it (the owner's busy source is handled by the caller).
         """
         if chain is None or not self._prefix_owner:
             return {}, None, None
@@ -1561,15 +1563,21 @@ class CoreManager:
         n = self._routable_engine_count
         hits: dict[int, int] = {}
         owner, source = None, None
+        busy = getattr(self, "_seq_prefilling", ())
         for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
             holders = self._prefix_owner.get(hashes[i])
             if not holders:
                 continue
             for rank, seq_id in reversed(holders.items()):
-                if 0 <= rank < n and rank not in hits:
-                    hits[rank] = (i + 1) * hbs
-                    if owner is None:
-                        owner, source = rank, seq_id
+                if not 0 <= rank < n or rank in hits:
+                    continue
+                if owner is None:
+                    owner, source = rank, seq_id
+                elif seq_id in busy:
+                    # Still prefilling there: no HBM hit yet. A shorter part
+                    # this rank finished earlier may still count below.
+                    continue
+                hits[rank] = (i + 1) * hbs
             if len(hits) == n:
                 break
         return hits, owner, source

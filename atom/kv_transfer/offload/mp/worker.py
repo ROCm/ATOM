@@ -120,16 +120,13 @@ class LMCacheMPConnector(KVConnectorBase):
         self._late_flush_logged = False
 
     def release_deferred_events(self) -> None:
-        """Called after the forward's DP metadata collective, before GPU work."""
-        if self._event_reclaimer is not None:
-            # DP metadata joins DP peers; join TP peers as well when each DP
-            # replica contains multiple workers. Every worker calls this,
-            # including workers with no retired resources and dummy batches.
-            from aiter.dist.parallel_state import get_tp_group
+        """Called after the forward's DP metadata collective, before GPU work.
 
-            tp = get_tp_group()
-            if tp.world_size > 1:
-                torch.distributed.barrier(group=tp.cpu_group)
+        Hands the retired events to the reclaimer's reaper thread, which
+        destroys them off the forward path; nothing here waits on a peer, so
+        no TP rendezvous is needed.
+        """
+        if self._event_reclaimer is not None:
             self._event_reclaimer.release()
 
     def register_kv_caches(
