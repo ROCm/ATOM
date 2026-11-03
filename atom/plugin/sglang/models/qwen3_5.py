@@ -29,11 +29,11 @@ from atom.models.qwen3_5 import (
     Qwen3_5ForCausalLMBase,
     Qwen3_5Model,
     Qwen3_5MoeForCausalLM,
+    _apply_merged_in_proj_mapping,
     detect_fused_expert_format,
     get_fused_expert_mapping,
     load_fused_expert_weights,
 )
-from atom.models.qwen3_5_gdn_in_proj import _apply_merged_in_proj_mapping
 from atom.models.utils import IntermediateTensors
 from atom.plugin.sglang.attention_backend.attention_gdn import (
     SGLangGDNForwardContext,

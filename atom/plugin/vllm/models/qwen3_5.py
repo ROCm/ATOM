@@ -38,6 +38,7 @@ from atom.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5MoeConfig,
     detect_fused_expert_format,
+    gdn_in_proj_is_merged,
     get_fused_expert_mapping,
     load_fused_expert_weights,
     maybe_prefix,
@@ -48,7 +49,6 @@ from atom.models.qwen3_5 import (
 from atom.models.qwen3_5 import (
     Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
 )
-from atom.models.qwen3_5_gdn_in_proj import gdn_in_proj_is_merged
 from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
 
 
