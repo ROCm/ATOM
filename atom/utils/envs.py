@@ -1229,6 +1229,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SAMPLER_SPLIT_SOFTMAX": lambda: (
         os.getenv("ATOM_SAMPLER_SPLIT_SOFTMAX", "0") == "1"
     ),
+    # Top-k / top-p sampling from bf16 logits in two kernels (aiter
+    # topk_topp_sample) when the sampler would take aiter's top-k-first path
+    # with the small-k top-p draw (scalar top_k <= 64, a top_p, and
+    # AITER_TOPK_FIRST_SMALL_K_TOPP=1): no fp32 softmax over the vocab, no
+    # full-vocab top-k and argmax. Verification sampling also reads the verify
+    # and bonus rows in place. Same algorithm and the same torch.rand draw a
+    # row; the k columns are the largest logits, the lowest column first on a
+    # tie (the radix top-k's tie order is not fixed).
+    "ATOM_FUSED_TOPK_TOPP_SAMPLE": lambda: (
+        os.getenv("ATOM_FUSED_TOPK_TOPP_SAMPLE", "0") == "1"
+    ),
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
     "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",

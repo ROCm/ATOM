@@ -45,6 +45,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_SAMPLER_SPLIT_SOFTMAX",
+    "ATOM_FUSED_TOPK_TOPP_SAMPLE",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
 ]
@@ -108,6 +109,9 @@ class TestEnvsDefaults:
 
     def test_sampler_split_softmax_default_disabled(self):
         assert _get_envs().ATOM_SAMPLER_SPLIT_SOFTMAX is False
+
+    def test_fused_topk_topp_sample_default_disabled(self):
+        assert _get_envs().ATOM_FUSED_TOPK_TOPP_SAMPLE is False
 
     def test_gluon_gemm_ar_default_enabled(self):
         assert _get_envs().ATOM_ENABLE_GLUON_GEMM_AR is True

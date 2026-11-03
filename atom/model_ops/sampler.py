@@ -81,6 +81,51 @@ def sample_topk_candidates(
     )
 
 
+def fused_topk_topp_applicable(
+    logits: torch.Tensor,
+    top_ks: int | torch.Tensor | None,
+    top_ps: float | torch.Tensor | None,
+) -> bool:
+    """ATOM_FUSED_TOPK_TOPP_SAMPLE: True when aiter's ``topk_topp_sample``
+    replaces the softmax + ``top_k_top_p_sampling_from_probs`` of these rows.
+
+    Only where that call takes its top-k-first path with the small-k top-p
+    draw (a CPU-scalar top_k <= 64 over a large vocab, a top_p, and
+    AITER_TOPK_FIRST_SMALL_K_TOPP=1), which is the algorithm the kernels run.
+    """
+    if not envs.ATOM_FUSED_TOPK_TOPP_SAMPLE or not AITER_TOPK_TOPP_AVAILABLE:
+        return False
+    if isinstance(top_ks, bool) or not isinstance(top_ks, int) or top_ps is None:
+        return False
+    if isinstance(top_ps, torch.Tensor) and top_ps.numel() == 1:
+        return False  # the eager path reads it back with .item()
+    import aiter.ops.sampling as aiter_sampling
+    from aiter.ops.triton.fusions.topk_topp_sample import topk_topp_sample_supported
+
+    vocab = logits.shape[-1]
+    return (
+        aiter_sampling._SMALL_K_TOPP
+        and 0 < top_ks <= aiter_sampling._SMALL_K_TOPP_MAX_K
+        and top_ks < vocab
+        and vocab >= aiter_sampling._TOPK_FIRST_FAST_MIN_VOCAB
+        and topk_topp_sample_supported(logits, top_ks)
+    )
+
+
+def fused_topk_topp_sample(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: int,
+    top_p: float | torch.Tensor,
+    **rows,
+) -> torch.Tensor:
+    """aiter ``topk_topp_sample`` with the sampler's greedy floor; ``rows``
+    are its verify_rows / bonus_rows / cu_num_draft_tokens."""
+    from aiter.ops.triton.fusions.topk_topp_sample import topk_topp_sample
+
+    return topk_topp_sample(logits, temperatures, top_k, top_p, eps=SAMPLER_EPS, **rows)
+
+
 def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
     """Returns a tensor of shape (1, vocab_size) filled with exponential random values.
     This is key to deterministic inference, as it ensures that the same random values are used for each token across different runs.
@@ -247,6 +292,10 @@ class Sampler(nn.Module):
         """
         # Accepted but unused here; see docstring.
         del needs_independent_noise
+        if fused_topk_topp_applicable(logits, top_ks, top_ps):
+            # One read of the bf16 logits: the same draw without the fp32
+            # probabilities (ATOM_FUSED_TOPK_TOPP_SAMPLE).
+            return fused_topk_topp_sample(logits, temperatures, top_ks, top_ps)
         # Apply temperature scaling
         # Temperatures are pre-clamped to eps in model_runner.prepare_sample()
         if envs.ATOM_SAMPLER_SPLIT_SOFTMAX and can_split_softmax(logits, temperatures):
