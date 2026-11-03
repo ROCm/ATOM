@@ -53,10 +53,10 @@ from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
-    pcp_stripes_tokens,
     pcp_pad_dense,
     pcp_pad_len,
     pcp_round_robin_split,
+    pcp_stripes_tokens,
 )
 
 # Side-effect import: registers `torch.ops.aiter.maybe_dual_stream_forward`,

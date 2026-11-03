@@ -28,11 +28,11 @@ from atom.distributed.dcp_utils import (
 from atom.distributed.pcp_utils import (
     get_pcp_rank,
     get_pcp_world_size,
-    pcp_stripes_tokens,
     pcp_owned_rows_by_request,
     pcp_pad_dense,
     pcp_pad_len,
     pcp_round_robin_query_indices,
+    pcp_stripes_tokens,
 )
 from atom.kv_transfer.disaggregation.index_staging import (
     gather_dcp_preshuffled_index_pages,

@@ -731,10 +731,10 @@ def _maybe_apply_pcp_prefill_reindex(
     try:
         from atom.distributed.pcp_utils import (
             get_pcp_world_size,
-            pcp_stripes_tokens,
             pcp_pad_dense,
             pcp_pad_len,
             pcp_round_robin_query_indices,
+            pcp_stripes_tokens,
         )
     except ImportError:
         return
