@@ -40,6 +40,7 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFIX_IDLE_TOKENS** | int | 32768 | `idle_ratio`: a rank with less queued prefill than this is about to idle and may take requests away from their prefix's rank. |
 | **ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS** | int | 65536 | `idle_ratio`: the prefix's rank keeps the request unless its queued prefill exceeds this. |
 | **ATOM_DP_PREFIX_RATIO** | float | 0 | `idle_ratio`: also move when the prefix's rank has more than RATIO x the lightest rank's queued prefill. `<= 0` disables (once both ranks have queued prefill, a move only reorders who waits). |
+| **ATOM_DP_PREFIX_SIMILAR_TOKENS** | int | 16384 | `idle_ratio` with more than two ranks: a request leaving its prefix's rank goes, among ranks about to idle and within this many load tokens of the lightest, to the one holding the longest part of its prefix (it loads only the rest from the tier); the lightest on a tie. `0` always picks the lightest. No effect with two ranks. |
 | **ATOM_DP_PREFIX_IMBALANCE_S** | float | 0.1 | `ATOM_DP_PREFIX_POLICY=cost`: seconds of cost per request of in-flight imbalance that a placement leaves between ranks. |
 | **ATOM_DP_PREFIX_PREFILL_WORK_PER_S** | float | 2.5e10 | `ATOM_DP_PREFIX_POLICY=cost`: prefill work rate (`prefill_cost` units per second) used to turn queued and own prefill work into seconds. |
 | **ATOM_DP_PREFIX_LOAD_TOKENS_PER_S** | float | 2e6 | `ATOM_DP_PREFIX_POLICY=cost`: tier load rate (tokens per second) used to price loading a prefix onto a rank that does not hold it. |

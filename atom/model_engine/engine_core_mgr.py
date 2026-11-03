@@ -308,6 +308,7 @@ class CoreManager:
         self._prefix_idle_tokens = envs.ATOM_DP_PREFIX_IDLE_TOKENS
         self._prefix_owner_backlog_tokens = envs.ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS
         self._prefix_ratio = envs.ATOM_DP_PREFIX_RATIO
+        self._prefix_similar_tokens = envs.ATOM_DP_PREFIX_SIMILAR_TOKENS
         if self._prefix_policy not in ("margin", "cost", "idle_ratio"):
             raise ValueError(
                 f"ATOM_DP_PREFIX_POLICY must be margin, cost or idle_ratio, not "
@@ -317,7 +318,8 @@ class CoreManager:
         self._prefix_work_per_s = envs.ATOM_DP_PREFIX_PREFILL_WORK_PER_S
         self._prefix_load_tok_per_s = envs.ATOM_DP_PREFIX_LOAD_TOKENS_PER_S
         self._prefill_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
-        self._prefix_owner: OrderedDict[int, int] = OrderedDict()
+        # Sampled prompt-block hash -> {rank: request that ran it there}.
+        self._prefix_owner: OrderedDict[int, dict] = OrderedDict()
         self._prefix_owner_cap = 1 << 19
         self._prefix_stride_tokens = 4096
         self._dp_route_counters = {
@@ -326,6 +328,7 @@ class CoreManager:
             "prefix_moved_tokens": 0,
             "prefix_cold_total": 0,
             "prefix_source_busy_total": 0,
+            "prefix_moved_partial_total": 0,
             "affinity_new_total": 0,
             "affinity_owner_hit_total": 0,
             # Kept as an explicit invariant/metric: strict affinity must leave
@@ -1523,19 +1526,43 @@ class CoreManager:
 
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
 
-    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int, object]:
-        """(rank that last ran this prompt's longest sampled prefix, its tokens,
-        the request that ran it)."""
+    def _prefix_rank_hits(self, chain) -> tuple[dict[int, int], int | None, object]:
+        """Per rank, the longest sampled prefix of this prompt it last ran.
+
+        Returns ({rank: tokens}, owner, source): the owner is the rank with the
+        longest prefix (the most recent one on a tie), source the request that
+        ran it there. Each sampled hash keeps every rank that ran it, so with
+        more than two ranks a rank holding part of the prefix can be preferred
+        and only the rest needs loading from the tier.
+        """
         if chain is None or not self._prefix_owner:
-            return None, 0, None
+            return {}, None, None
         hbs = int(chain.hash_block_size)
         stride = max(1, self._prefix_stride_tokens // hbs)
         hashes = chain.hashes
+        n = self._routable_engine_count
+        hits: dict[int, int] = {}
+        owner, source = None, None
         for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
-            entry = self._prefix_owner.get(hashes[i])
-            if entry is not None and 0 <= entry[0] < self._routable_engine_count:
-                return entry[0], (i + 1) * hbs, entry[1]
-        return None, 0, None
+            holders = self._prefix_owner.get(hashes[i])
+            if not holders:
+                continue
+            for rank, seq_id in reversed(holders.items()):
+                if 0 <= rank < n and rank not in hits:
+                    hits[rank] = (i + 1) * hbs
+                    if owner is None:
+                        owner, source = rank, seq_id
+            if len(hits) == n:
+                break
+        return hits, owner, source
+
+    def _prefix_owner_lookup(self, chain) -> tuple[int | None, int, object]:
+        """(rank that last ran this prompt's longest sampled prefix, its tokens,
+        the request that ran it)."""
+        hits, owner, source = self._prefix_rank_hits(chain)
+        if owner is None:
+            return None, 0, None
+        return owner, hits[owner], source
 
     def _prefix_owner_record(self, chain, rank: int, seq_id=None) -> None:
         if chain is None:
@@ -1545,8 +1572,13 @@ class CoreManager:
         index = self._prefix_owner
         hashes = chain.hashes
         for i in range(stride - 1, len(hashes), stride):
-            index[hashes[i]] = (rank, seq_id)
-            index.move_to_end(hashes[i])
+            holders = index.get(hashes[i])
+            if holders is None:
+                holders = index[hashes[i]] = {}
+            else:
+                index.move_to_end(hashes[i])
+                holders.pop(rank, None)
+            holders[rank] = seq_id  # last = most recent
         while len(index) > self._prefix_owner_cap:
             index.popitem(last=False)
 
@@ -1600,6 +1632,31 @@ class CoreManager:
             return True
         return q_owner <= self._prefix_ratio * q_light
 
+    def _prefix_idle_target(self, lightest: int, hits: dict[int, int], load) -> int:
+        """Which rank a request leaving its prefix's rank goes to.
+
+        Load first: only ranks about to idle (under IDLE_TOKENS queued) whose
+        load is within SIMILAR_TOKENS of the lightest are candidates. Among them, the one holding the longest part
+        of the prefix, which then loads only the rest from the tier; the
+        lightest on a tie. With two ranks this is the lightest rank.
+        """
+        similar = getattr(self, "_prefix_similar_tokens", 0)
+        if similar <= 0 or not hits:
+            return lightest
+        floor = load(lightest)
+        best, best_hit = lightest, hits.get(lightest, 0)
+        for r in range(self._routable_engine_count):
+            if (
+                r == lightest
+                or self._rank_tokens[r] >= self._prefix_idle_tokens
+                or load(r) > floor + similar
+            ):
+                continue
+            h = hits.get(r, 0)
+            if h > best_hit:
+                best, best_hit = r, h
+        return best
+
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
         """Least-loaded rank, unless the prefix's last rank is within the margin.
 
@@ -1609,7 +1666,8 @@ class CoreManager:
         that rank's HBM starts on arrival, not when it reaches the queue head.
         """
         chain = getattr(seq, "prompt_hash_chain", None)
-        owner, hit, source = self._prefix_owner_lookup(chain)
+        hits, owner, source = self._prefix_rank_hits(chain)
+        hit = hits.get(owner, 0) if owner is not None else 0
 
         def load(rank: int) -> int:
             return (
@@ -1635,7 +1693,10 @@ class CoreManager:
             owner is not None
             and getattr(self, "_prefix_policy", "margin") == "idle_ratio"
         ):
-            rank = owner if self._prefix_stays_idle_ratio(owner, lightest) else lightest
+            if self._prefix_stays_idle_ratio(owner, lightest):
+                rank = owner
+            else:
+                rank = self._prefix_idle_target(lightest, hits, load)
         elif (
             owner is not None
             and load(owner)
@@ -1659,15 +1720,25 @@ class CoreManager:
         # from the tier. A moved request whose hit is below the load threshold
         # is not loaded (the connector skips it), so that rank recomputes it
         # and is charged the full prompt.
-        loaded = hit >= envs.OFFLOAD_MIN_LOAD_TOKENS
-        seq._dp_est_hit = hit if owner is not None and (rank == owner or loaded) else 0
+        # A rank holding part of the prefix reuses that part from HBM and
+        # loads only the rest; a rest below the load threshold is recomputed.
+        local = hits.get(rank, 0)
+        loaded = hit - local >= envs.OFFLOAD_MIN_LOAD_TOKENS
+        if owner is None:
+            seq._dp_est_hit = 0
+        elif rank == owner or loaded:
+            seq._dp_est_hit = hit
+        else:
+            seq._dp_est_hit = local
         if owner is None or hit <= 0:
             decision = "prefix_cold_total"
         elif rank == owner:
             decision = "prefix_owner_total"
         else:
             decision = "prefix_moved_total"
-            self._dp_route_counters["prefix_moved_tokens"] += hit
+            self._dp_route_counters["prefix_moved_tokens"] += max(0, hit - local)
+            if local > 0:
+                self._dp_route_counters["prefix_moved_partial_total"] += 1
             # Queue it first only while the rank's prefill queue is short:
             # with a long queue every jump delays all requests behind it.
             cap = envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE

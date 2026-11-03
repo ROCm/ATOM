@@ -269,6 +269,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS", "65536")
     ),
     "ATOM_DP_PREFIX_RATIO": lambda: float(os.getenv("ATOM_DP_PREFIX_RATIO", "0")),
+    # "idle_ratio" with more than two ranks: a request leaving its prefix's
+    # rank goes to a rank within this many load tokens of the lightest that
+    # holds the longest part of its prefix (so only the rest is loaded from
+    # the tier); the lightest on a tie. 0 always picks the lightest.
+    "ATOM_DP_PREFIX_SIMILAR_TOKENS": lambda: int(
+        os.getenv("ATOM_DP_PREFIX_SIMILAR_TOKENS", "16384")
+    ),
     "ATOM_DP_PREFIX_IMBALANCE_S": lambda: float(
         os.getenv("ATOM_DP_PREFIX_IMBALANCE_S", "0.1")
     ),
