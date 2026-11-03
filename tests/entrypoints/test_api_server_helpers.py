@@ -926,6 +926,35 @@ def test_prompt_is_checked_and_truncated_in_the_preprocess_call(monkeypatch):
     assert list(requests) == [seq.id]
 
 
+def test_responses_channel_follows_the_text_the_engine_runs(monkeypatch):
+    # Structured: cut before the engine call (off the loop), so the channel
+    # the sampling params are built from reads the kept text. Unstructured:
+    # re-seeded from `cut_text` after the preprocess call cut it.
+    monkeypatch.setattr(
+        api_server,
+        "tokenizer",
+        SimpleNamespace(
+            encode=lambda text, **_kw: list(range(len(text))),
+            decode=lambda ids, **_kw: "x" * len(ids),
+        ),
+    )
+    cap = api_server._PromptCap(4)
+    assert api_server._cut_prompt("abc", cap) == ("abc", "abc")
+    assert api_server._cut_prompt("abcdefgh", cap) == ([0, 1, 2, 3], "xxxx")
+
+    seeds = []
+    monkeypatch.setattr(
+        api_server, "prompt_starts_in_reasoning", lambda text: seeds.append(text)
+    )
+    monkeypatch.setattr(
+        api_server, "reasoning_channel", lambda start, **_kw: ("reseeded", start)
+    )
+    assert api_server._reseed_after_cut("orig", cap, {}) == "orig"
+    cap.cut_text = "kept"
+    assert api_server._reseed_after_cut("orig", cap, {})[0] == "reseeded"
+    assert seeds == ["kept"]
+
+
 class TestDeploymentDefaultOutputCap:
     @pytest.mark.parametrize("explicit", [False, True])
     def test_small_deployment_distinguishes_default_from_explicit(

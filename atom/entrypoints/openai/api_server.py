@@ -1323,6 +1323,28 @@ def _prompt_cap(
     )
 
 
+def _cut_prompt(prompt: str, prompt_cap: _PromptCap) -> tuple[str | list[int], str]:
+    """For a caller that needs the cut text before the engine call: returns
+    what to send (the prompt, or the kept ids when it is over the cap) and the
+    text the engine will run. Tokenizes, so run it off the event loop."""
+    token_ids = tokenizer.encode(prompt)
+    if len(token_ids) <= prompt_cap.tokens:
+        return prompt, prompt
+    token_ids = token_ids[: prompt_cap.tokens]
+    return token_ids, tokenizer.decode(token_ids, skip_special_tokens=False)
+
+
+def _reseed_after_cut(channel, prompt_cap: _PromptCap, template_kwargs):
+    """The reasoning channel for the text the engine ran, when the preprocess
+    call cut the prompt (only the unstructured path gets there)."""
+    if prompt_cap.cut_text is None:
+        return channel
+    return reasoning_channel(
+        prompt_starts_in_reasoning(prompt_cap.cut_text),
+        template_kwargs=template_kwargs,
+    )
+
+
 def _preprocess_prompt(preprocess, prompt_or_tokens, prompt_cap):
     """``preprocess(prompt)`` on the executor, cutting a prompt longer than
     ``prompt_cap.tokens``.
@@ -2854,9 +2876,16 @@ async def responses_create(raw_request: Request):
         prompt_cap = _prompt_cap(sampling_params.max_tokens, kv_transfer_params)
 
         created_at = int(time.time())
-        # Decided before the engine call, since structured output configures
-        # the sampling params from it; so for a prompt over the cap it reads
-        # the template's ending, not the cut text the engine runs.
+        engine_prompt = prompt
+        if schema is not None:
+            # Structured output builds the channel into the sampling params
+            # before the engine call, so the cut has to come first here:
+            # tokenized off the loop, and the engine gets the kept ids.
+            engine_prompt, prompt = await asyncio.to_thread(
+                _cut_prompt, prompt, prompt_cap
+            )
+        # Without a schema the cut happens in the preprocess call, and the
+        # channel is re-seeded from `cut_text` after it (below).
         _reasoning = reasoning_channel(
             prompt_starts_in_reasoning(prompt), template_kwargs=merged_kwargs
         )
@@ -2873,12 +2902,13 @@ async def responses_create(raw_request: Request):
 
         if request.stream:
             seq_id, stream_collector, input_tokens = await setup_streaming_request(
-                prompt,
+                engine_prompt,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
                 prompt_cap=prompt_cap,
             )
+            _reasoning = _reseed_after_cut(_reasoning, prompt_cap, merged_kwargs)
 
             async def generate_responses_stream():
                 reasoning_filter = _reasoning.stream()
@@ -2986,7 +3016,7 @@ async def responses_create(raw_request: Request):
 
         final_output = await _run_nonstream_with_disconnect(
             generate_async(
-                prompt,
+                engine_prompt,
                 sampling_params,
                 request_id,
                 kv_transfer_params=kv_transfer_params,
@@ -2998,6 +3028,7 @@ async def responses_create(raw_request: Request):
         if final_output is None:
             raise RuntimeError("No output generated")
         input_tokens = final_output["num_tokens_input"]
+        _reasoning = _reseed_after_cut(_reasoning, prompt_cap, merged_kwargs)
 
         raw_text = final_output["text"]
         events = read_whole_blocks(
