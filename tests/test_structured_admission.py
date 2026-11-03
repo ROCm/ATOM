@@ -376,7 +376,7 @@ assert all(
         "backend_guidance", "utils", "schema", "validation",
     )
 )
-assert "atom.model_ops.triton_structured_output" not in sys.modules
+assert "atom.model_ops.triton_token_constraints" not in sys.modules
 assert "atom.entrypoints.openai.api_server" not in sys.modules
 """
     subprocess.run(

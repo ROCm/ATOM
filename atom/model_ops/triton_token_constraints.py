@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Apply packed grammar masks without materializing a vocabulary-sized mask."""
+"""Shared token-ID masking primitives for dense sets and GPU state machines."""
 
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def mask_token_columns(row_ptr, columns, forbidden, valid, stride=1):
+    """Deny selected columns; allow/force masks supply their complement."""
+    tl.store(row_ptr + columns * stride, -float("inf"), mask=valid & forbidden)
 
 
 @triton.jit
@@ -27,10 +33,12 @@ def _mask_logits(
         other=-1,
     )
     forbidden = ((word >> (token % 32)) & 1) == 0
-    tl.store(
-        logits + row * logits_stride + token * token_stride,
-        -float("inf"),
-        mask=(token < vocab_size) & forbidden,
+    mask_token_columns(
+        logits + row * logits_stride,
+        token,
+        forbidden,
+        token < vocab_size,
+        token_stride,
     )
 
 

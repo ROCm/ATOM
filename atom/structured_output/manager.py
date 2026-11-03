@@ -12,8 +12,10 @@ from threading import Lock
 
 import torch
 
+from atom.model_ops.token_constraints import AllowedTokenMask, TokenConstraint
+
 from . import backend_guidance as grammar
-from .utils import AsyncTokenCopy, StructuredOutputMask
+from .utils import AsyncTokenCopy
 
 
 def structured_stop_token_ids(config, tokenizer=None):
@@ -204,13 +206,8 @@ class StructuredOutput:
         self.commit_records = None
         self.draft_copy = None
         self.commit_copy = None
-        self.mask_buffer = StructuredOutputMask(vocab_size)
-        self.stop_mask = torch.zeros((1, (vocab_size + 31) // 32), dtype=torch.int32)
-        for token in self.stop_ids:
-            value = (
-                int(self.stop_mask[0, token // 32]) | (1 << (token % 32))
-            ) & 0xFFFFFFFF
-            self.stop_mask[0, token // 32] = value if value < 2**31 else value - 2**32
+        self.mask_buffer = AllowedTokenMask(vocab_size)
+        self.stop_mask = TokenConstraint.allow(self.stop_ids).to_bitmask(vocab_size)
 
     def compile(self, schema, tool_format=None, reasoning_end=""):
         key = (schema, tool_format, reasoning_end)

@@ -12,10 +12,10 @@ import torch
 from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
+from atom.model_ops.token_constraints import AllowedTokenMask
 from atom.structured_output import StructuredOutput, StructuredRequest
 from atom.structured_output import backend_guidance as xgr
 from atom.structured_output.backend_guidance import grammar_tokenizer
-from atom.structured_output.utils import StructuredOutputMask
 
 llg = pytest.importorskip("llguidance")
 
@@ -362,7 +362,7 @@ def test_large_row_stride_uses_64_bit_addresses():
         (3, 33), (stride, 1), device="cuda", dtype=torch.float16
     )
     logits.fill_(7)
-    buffer = StructuredOutputMask(33)
+    buffer = AllowedTokenMask(33)
     masks = buffer.prepare(2, logits.device)
     masks.fill_(-1)
     masks[0, 1] = 0  # mask row 2, token 32, beyond the signed-int32 offset limit
@@ -388,7 +388,7 @@ def test_packed_mask_preserves_exact_logits_and_unrequested_rows(device, dtype, 
     logits = storage[::2, ::2]
     expected = storage.clone()
     rows = [5, 0, 3]
-    buffer = StructuredOutputMask(vocab)
+    buffer = AllowedTokenMask(vocab)
     masks = buffer.prepare(len(rows), logits.device)
     masks.random_(-(2**31), 2**31 - 1)
     masks[0].zero_()
@@ -405,7 +405,7 @@ def test_packed_mask_preserves_exact_logits_and_unrequested_rows(device, dtype, 
 def test_buffer_reuse_growth_and_changing_batches(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires GPU")
-    buffer = StructuredOutputMask(65)
+    buffer = AllowedTokenMask(65)
     pointers = {}
     for size in [1, 8, 2, 0, 7, 16, 1]:
         logits = torch.ones(max(size, 1), 65, device=device)
@@ -421,7 +421,7 @@ def test_buffer_reuse_growth_and_changing_batches(device):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_async_reuse_across_streams_keeps_each_batch_mask():
-    buffer = StructuredOutputMask(4097)
+    buffer = AllowedTokenMask(4097)
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     outputs = []
     for i in range(40):

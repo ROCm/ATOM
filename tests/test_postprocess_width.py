@@ -292,11 +292,13 @@ def test_a_masked_row_still_reports_the_models_logprob(
             vocab_size=8, apply=mask_schema_rows, errors={}
         )
 
-    def force_column_zero(_batch, logits, *_args):
+    def force_column_zero(_runner, _batch, logits, *_args):
         if with_channel:
             logits[:, 1:] = float("-inf")  # the sampler samples id 0
 
-    runner._constrain_required_channel = force_column_zero
+    monkeypatch.setattr(
+        "atom.model_engine.token_constraints.apply_required_channel", force_column_zero
+    )
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
         captured.update(logprobs=lp) or ({}, {})
     )

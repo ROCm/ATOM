@@ -48,6 +48,7 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.triton_token_constraints import mask_token_columns
 from atom.sampling_params import UNCONSTRAINED, RequiredChannel
 
 BLOCK_V = 1024
@@ -151,7 +152,7 @@ def _constrain_row_block(
         # Written, not read: only the forced column keeps a value.
         for first in range(vb * BLOCK_V, vocab_size, nprog * BLOCK_V):
             col = first + tl.arange(0, BLOCK_V)
-            tl.store(row_ptr + col, neg_inf, mask=(col < vocab_size) & (col != forced))
+            mask_token_columns(row_ptr, col, col != forced, col < vocab_size)
         if (forced // BLOCK_V) % nprog == vb:
             # Its own value, unless the model ruled it out too: then 0, so the
             # row keeps a finite logit and its softmax is not NaN.
@@ -164,7 +165,7 @@ def _constrain_row_block(
         # the whole row to know, on the step a request takes every time until
         # its channel opens.
         for e in tl.static_range(END_LEN):
-            tl.store(row_ptr + tl.load(table_ptr + forced_end + e), neg_inf)
+            mask_token_columns(row_ptr, tl.load(table_ptr + forced_end + e), True, True)
 
 
 @triton.jit(do_not_specialize=["vocab_size"])
