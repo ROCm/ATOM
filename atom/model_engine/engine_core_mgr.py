@@ -308,9 +308,10 @@ class CoreManager:
         self._prefix_idle_tokens = envs.ATOM_DP_PREFIX_IDLE_TOKENS
         self._prefix_owner_backlog_tokens = envs.ATOM_DP_PREFIX_OWNER_BACKLOG_TOKENS
         self._prefix_ratio = envs.ATOM_DP_PREFIX_RATIO
-        if self._prefix_policy not in ("margin", "cost"):
+        if self._prefix_policy not in ("margin", "cost", "idle_ratio"):
             raise ValueError(
-                f"ATOM_DP_PREFIX_POLICY must be margin or cost, not {self._prefix_policy!r}"
+                f"ATOM_DP_PREFIX_POLICY must be margin, cost or idle_ratio, not "
+                f"{self._prefix_policy!r}"
             )
         self._prefix_imbalance_s = envs.ATOM_DP_PREFIX_IMBALANCE_S
         self._prefix_work_per_s = envs.ATOM_DP_PREFIX_PREFILL_WORK_PER_S
