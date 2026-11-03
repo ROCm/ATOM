@@ -1618,7 +1618,7 @@ models:
           <<: *m31_flash_gsm8k
           name: m31-index-review-tp4-freq4-gsm8k20
           nodes: []
-          runner:
+          runner: &m31_pp_review20_runner
             slurm_account: amd-atom
             slurm_partition: amd-spur
             slurm_qos: amd-atom-qos
@@ -1658,6 +1658,9 @@ models:
             extra_args: "--pipeline-parallel-size 4 --enforce-eager --max-num-batched-tokens 8192"
         - <<: *m31_pp_review20
           name: m31-index-review-pp4-aligned-freq4-gsm8k20
+          runner:
+            <<: *m31_pp_review20_runner
+            time_limit: "01:00:00"
           prefill:
             workers: 1
             tp: 1
