@@ -548,12 +548,12 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 # ── Prefix-spread routing ──────────────────────────────────────────────────
 
 
-def _make_spread_mgr(n_ranks=2, margin=65536):
+def _make_spread_mgr(n_ranks=2):
     from collections import OrderedDict
 
     mgr = _make_mgr(n_ranks)
     mgr._prefix_spread = True
-    mgr._prefix_owner_margin = margin
+    mgr._prefix_idle_tokens = 32768
     mgr._prefix_owner = OrderedDict()
     mgr._prefix_owner_cap = 1 << 19
     mgr._prefix_stride_tokens = 4096
@@ -579,14 +579,14 @@ def _chain_seq(seq_id, tokens, first_block=0, session=None):
     return seq
 
 
-def test_prefix_spread_keeps_prefix_owner_within_margin():
+def test_prefix_spread_keeps_prefix_owner_without_a_backlog():
     mgr = _make_spread_mgr()
     first = _chain_seq(1, 100_000, session="s")
     (owner,) = _route(mgr, [first])
     mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
     mgr._rank_reqs = [0, 0]
-    mgr._rank_tokens[owner] = 30_000  # busier, but within the margin
+    mgr._rank_tokens[owner] = 30_000  # busier, but no backlog (<= 2 x idle)
     second = _chain_seq(2, 110_000, session="s")
     assert _route(mgr, [second]) == [owner]
     assert mgr._dp_route_counters["prefix_owner_total"] == 1
@@ -595,7 +595,7 @@ def test_prefix_spread_keeps_prefix_owner_within_margin():
     assert mgr._seq_load[2][2] == 110_000 - 98_304
 
 
-def test_prefix_spread_moves_past_margin_and_flags_prefetch():
+def test_prefix_spread_moves_a_backlog_to_an_idle_rank_and_flags_prefetch():
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
     mgr._mark_seq_prefill_complete(1)
@@ -621,39 +621,6 @@ def test_prefix_spread_ignores_sessions_for_new_prefixes():
     ]
     assert sorted(_route(mgr, seqs)) == [0, 0, 1, 1]
     assert mgr._dp_route_counters["prefix_cold_total"] == 4
-
-
-def test_prefix_spread_req_gap_moves_off_crowded_owner():
-    mgr = _make_spread_mgr()
-    mgr._prefix_max_req_gap = 4
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._mark_seq_prefill_complete(1)
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_reqs[owner] = 6  # within the token margin, 6 requests ahead
-    (rank,) = _route(mgr, [_chain_seq(2, 110_000)])
-    assert rank != owner
-    assert mgr._dp_route_counters["prefix_moved_total"] == 1
-
-
-def test_prefix_cost_policy_prefers_owner_until_imbalance_costs_more():
-    mgr = _make_spread_mgr()
-    mgr._prefix_policy = "cost"
-    mgr._prefix_imbalance_s = 0.1
-    mgr._prefix_work_per_s = 2.5e10
-    mgr._prefix_load_tok_per_s = 2e6
-    mgr._prefill_token_weight = 360000
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._mark_seq_prefill_complete(1)
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
-    mgr._mark_seq_prefill_complete(2)
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_reqs[owner] = 20  # 20 requests ahead: 2 s of penalty
-    (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
-    assert rank != owner
 
 
 def test_prefix_spread_keeps_prefix_while_its_source_still_prefills():
@@ -749,67 +716,10 @@ def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded(
     assert mgr._seq_load[3][2] == 5_000 - 4_096
 
 
-def test_prefix_spread_queues_moved_requests_first_only_on_a_short_queue(
-    monkeypatch,
-):
-    from atom.utils import envs
-
-    monkeypatch.setenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "50000")
+def test_prefix_spread_moves_only_to_an_idle_rank():
+    """Leave the prefix's rank only for a rank about to idle, and only from a
+    real backlog; with both ranks busy, stay."""
     mgr = _make_spread_mgr()
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._mark_seq_prefill_complete(1)
-    other = 1 - owner
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_tokens[owner] = 200_000
-    mgr._rank_tokens[other] = 10_000  # short queue: jump it
-    moved = _chain_seq(2, 110_000)
-    assert _route(mgr, [moved]) == [other]
-    assert moved.dp_prefetch_priority is True
-    mgr._mark_seq_prefill_complete(2)
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_tokens[other] = 300_000
-    mgr._rank_tokens[owner] = 60_000  # long queue on the lighter rank
-    late = _chain_seq(3, 120_000)
-    assert _route(mgr, [late]) == [owner]
-    assert not getattr(late, "dp_prefetch_priority", False)
-    assert envs.ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE == 50000
-
-
-def test_prefix_spread_margins_scale_with_queue_depth():
-    """At deep queues a fixed token / request gap is noise: the owner keeps the
-    request while within the relative margins of the lightest rank."""
-    mgr = _make_spread_mgr()
-    mgr._prefix_max_req_gap = 4
-    mgr._prefix_margin_rel = 0.5
-    mgr._prefix_req_gap_rel = 0.1
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._mark_seq_prefill_complete(1)
-    other = 1 - owner
-    # Deep queues: 300k vs 400k (gap 100k < 0.5 * lightest load), 100 vs 108
-    # requests (gap 8 < 0.1 * 100): stay.
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_tokens[other], mgr._rank_tokens[owner] = 300_000, 400_000
-    mgr._rank_reqs[other], mgr._rank_reqs[owner] = 100, 108
-    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
-    mgr._mark_seq_prefill_complete(2)
-    # Shallow queues: the fixed margins still apply.
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_reqs = [0, 0]
-    mgr._rank_tokens[owner] = 200_000
-    (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
-    assert rank != owner
-
-
-def test_prefix_spread_idle_ratio_policy():
-    """Move only to use an idle rank or to cut a severe backlog imbalance."""
-    mgr = _make_spread_mgr()
-    mgr._prefix_policy = "idle_ratio"
-    mgr._prefix_idle_tokens = 32768
-    mgr._prefix_owner_backlog_tokens = 65536
-    mgr._prefix_ratio = 2.0
 
     def place(case, q_owner, q_other):
         base = 100_000 * case
@@ -825,22 +735,15 @@ def test_prefix_spread_idle_ratio_policy():
         mgr._mark_seq_prefill_complete(base + 1)
         return "owner" if rank == owner else "other"
 
-    assert place(1, 100_000, 10_000) == "other"  # A: other about to idle
+    assert place(1, 100_000, 10_000) == "other"  # other about to idle
     assert place(2, 50_000, 10_000) == "owner"  # owner has no real backlog
-    assert place(3, 300_000, 200_000) == "owner"  # both busy, 1.5x: stay
-    assert place(4, 500_000, 200_000) == "other"  # B: 2.5x imbalance
-    mgr._prefix_ratio = 0  # default: B off
-    assert place(5, 500_000, 200_000) == "owner"  # both busy: stay
-    assert place(6, 100_000, 10_000) == "other"  # A still applies
+    assert place(3, 500_000, 200_000) == "owner"  # both busy: stay
+    mgr._prefix_idle_tokens = 8192  # the one knob: a smaller idle threshold
+    assert place(4, 100_000, 10_000) == "owner"
 
 
-def _dp4_idle_ratio_mgr(similar=16384):
+def _dp4_idle_ratio_mgr():
     mgr = _make_spread_mgr(n_ranks=4)
-    mgr._prefix_policy = "idle_ratio"
-    mgr._prefix_idle_tokens = 32768
-    mgr._prefix_owner_backlog_tokens = 65536
-    mgr._prefix_ratio = 0
-    mgr._prefix_similar_tokens = similar
     # rank0 ran the whole 100k prefix, rank2 its first 48k.
     mgr._prefix_owner_record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1)
     mgr._prefix_owner_record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2)
@@ -872,13 +775,7 @@ def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
 
 def test_idle_ratio_load_wins_over_a_partial_prefix():
     mgr = _dp4_idle_ratio_mgr()
-    mgr._rank_tokens[2] = 24_576  # still idle, but 24k above the lightest
-    (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
-    assert rank == 1
-
-
-def test_idle_ratio_similar_zero_picks_the_lightest():
-    mgr = _dp4_idle_ratio_mgr(similar=0)
+    mgr._rank_tokens[2] = 24_576  # still idle, but over idle / 2 above the lightest
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
     assert rank == 1
 

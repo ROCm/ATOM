@@ -332,17 +332,6 @@ def test_moved_request_jumps_the_queue_only_with_the_flag_off(monkeypatch, seq_f
         assert (list(sched.waiting) == [moved, first]) is jumps
 
 
-def test_priority_max_queue_has_no_effect_with_early_load(monkeypatch, seq_factory):
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD", "1")
-    monkeypatch.setenv("ATOM_DP_PREFIX_PRIORITY_MAX_QUEUE", "0")
-    sched = Scheduler(MockConfig(num_kvcache_blocks=100))
-    first, moved = seq_factory(list(range(16))), seq_factory(list(range(16)))
-    moved.dp_prefetch_priority = True
-    sched.add(first)
-    sched.add(moved)
-    assert list(sched.waiting) == [first, moved]
-
-
 @pytest.mark.parametrize("why", ["no_load", "lookup_not_ready"])
 def test_nothing_is_allocated_without_an_answered_load(setup, why):
     sched, _, seq = setup
@@ -419,9 +408,8 @@ def test_unaligned_hbm_hit_is_left_to_the_admission_pass_and_counted(setup):
 def test_watermark_stops_early_allocation_and_the_request_waits_for_the_fire(
     monkeypatch, seq_factory
 ):
-    sched, delayer, (seq,) = _make(
-        monkeypatch, seq_factory, ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK="0.01"
-    )
+    sched, delayer, (seq,) = _make(monkeypatch, seq_factory)
+    sched._EARLY_LOAD_KV_WATERMARK = 0.01
 
     sched.schedule()
 
@@ -435,28 +423,12 @@ def test_watermark_stops_early_allocation_and_the_request_waits_for_the_fire(
     assert sched.kv_connector.allocs == [seq.id]
 
 
-def test_max_fraction_bounds_the_blocks_held_by_early_loads(monkeypatch, seq_factory):
-    # 16 tokens = 4 blocks each; 100 blocks; a 5% cap fits one request, not two.
-    sched, _, (a, b, c) = _make(
-        monkeypatch, seq_factory, n=3, ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC="0.05"
-    )
-
-    sched.schedule()
-
-    assert a.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
-    assert b.status == c.status == SequenceStatus.WAITING
-    assert sched._early_load.skips["max_frac"] == 2
-    held = sched._early_load.held_blocks()
-    assert held == len(a.block_table) > 0
-
-
 def test_pressure_skip_is_retried_once_pressure_is_gone(monkeypatch, seq_factory):
-    sched, _, (seq,) = _make(
-        monkeypatch, seq_factory, ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK="0.01"
-    )
+    sched, _, (seq,) = _make(monkeypatch, seq_factory)
+    sched._EARLY_LOAD_KV_WATERMARK = 0.01
     sched.schedule()
     assert seq.status == SequenceStatus.WAITING
-    monkeypatch.setenv("ATOM_OFFLOAD_EARLY_LOAD_KV_WATERMARK", "0.7")
+    sched._EARLY_LOAD_KV_WATERMARK = 0.7
     for _ in range(sched._EARLY_LOAD_RETRY_TICKS + 1):
         sched.schedule()
     assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
@@ -470,50 +442,6 @@ def test_no_early_allocation_without_a_free_parking_slot(monkeypatch, seq_factor
 
     assert seq.status == SequenceStatus.WAITING
     assert sched._early_load.skips["seq_slots"] == 1
-
-
-# -- state legs -----------------------------------------------------------------
-
-
-def test_a_state_leg_is_left_to_the_admission_pass_when_not_allowed(
-    monkeypatch, seq_factory
-):
-    sched, _, (seq,) = _make(
-        monkeypatch, seq_factory, ATOM_OFFLOAD_EARLY_LOAD_STATE="0"
-    )
-    seq.has_per_req_cache = True  # state-image mode: not a replay
-
-    class _Probe:
-        num_cached_blocks = 0
-
-    sched._probe_hbm_prefix = lambda s: _Probe()
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert sched._early_load.skips["state_leg"] == 1, dict(sched._early_load.skips)
-
-
-def test_a_joint_boundary_after_alloc_is_taken_back_when_state_is_not_allowed(
-    monkeypatch, seq_factory
-):
-    sched, _, (seq,) = _make(
-        monkeypatch, seq_factory, ATOM_OFFLOAD_EARLY_LOAD_STATE="0"
-    )
-    notify = sched.kv_connector.update_state_after_alloc
-
-    def with_joint(s):
-        notify(s)
-        s.offload_joint.boundary_tokens = 8
-
-    sched.kv_connector.update_state_after_alloc = with_joint
-    free = _free(sched)
-
-    sched.schedule()
-
-    assert seq.status == SequenceStatus.WAITING
-    assert len(seq.block_table) == 0 and _free(sched) == free
-    assert sched._early_load.takebacks == 1
 
 
 # -- cancellation ---------------------------------------------------------------
