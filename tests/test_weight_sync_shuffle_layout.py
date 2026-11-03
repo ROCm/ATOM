@@ -152,7 +152,9 @@ def _linear_double(quant_type, params_dtype, needs_preshuffled_weight, *, dim=2)
     quant config and a device allocation per row; the method under test is the
     real one.
     """
-    shape = (32, 64) if dim == 2 else (2, 32, 64)
+    # 128 bytes = K 256 for fp4x2: a smaller K is now refused at load
+    # (MXFP4_PRESHUFFLE_K_ALIGN), which is not what these tests are about.
+    shape = (32, 128) if dim == 2 else (2, 32, 128)
     return SimpleNamespace(
         weight=nn.Parameter(torch.zeros(shape, dtype=torch.uint8), requires_grad=False),
         weight_scale=nn.Parameter(torch.ones(32, 1), requires_grad=False),
@@ -200,7 +202,9 @@ def _sync_shuffles(monkeypatch, case, *, dim=2):
     calls = []
     monkeypatch.setattr(utils_mod, "shuffle_weights", lambda *a, **k: calls.append(a))
     quant_type, params_dtype, needs_preshuffled_weight = case
-    shape = (32, 64) if dim == 2 else (2, 32, 64)
+    # 128 bytes = K 256 for fp4x2: a smaller K is now refused at load
+    # (MXFP4_PRESHUFFLE_K_ALIGN), which is not what these tests are about.
+    shape = (32, 128) if dim == 2 else (2, 32, 128)
     param = nn.Parameter(torch.zeros(shape, dtype=torch.uint8), requires_grad=False)
     module = SimpleNamespace(
         quant_type=quant_type,
