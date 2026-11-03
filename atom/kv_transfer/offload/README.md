@@ -260,9 +260,9 @@ native layout/image sizes, the Hugging Face commit when available, and the
 optional `lmcache.mp.model_revision`. Set that revision when weights are
 replaced in an existing local model directory; a directory name alone cannot
 identify changed contents. DeepSeek-V4.1 resolved to `hybrid` before it had a
-layout of its own; its namespace now names `dsv41` and hashes its
-`sliding_window` and `candidate_block_size`, so a tier an earlier build filled
-misses on every object: expect a cold tier once after upgrading.
+layout of its own and keeps the namespace that gave it, so native ATOM's V4.1
+tiers stay reachable across the change. The vLLM plugin, which had no V4.1
+tiers before, also hashes V4.1's `sliding_window` and `candidate_block_size`.
 
 ### MP lifetime and representation
 

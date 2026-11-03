@@ -520,23 +520,24 @@ def test_a_state_owning_model_keeps_its_own_layout(override):
     assert offcfg.select_offload_layout(config) == "qwen"
 
 
-def test_v41_geometry_moves_only_the_v41_namespace():
-    """`sliding_window` and `candidate_block_size` are V4.1's: another model
-    that carries them keeps the namespace it had, so its stored objects stay
-    reachable after an upgrade."""
+def test_v41_keeps_the_namespace_hybrid_gave_it(monkeypatch):
+    """V4.1 resolved to `hybrid` before it had a layout of its own, and keeps
+    the namespace native ATOM's tiers were filled under. Its window and
+    candidate-block fields move no namespace here, V4.1's or another model's:
+    only the vLLM plugin, which never had such tiers, hashes them."""
     assert offcfg.PAGE_LAYOUT_VERSION == 3
 
     def namespace(model_type, **fields):
         config = _config()
         config.hf_config.model_type = model_type
-        config.hf_config.compress_ratios = None
         for name, value in fields.items():
             setattr(config.hf_config, name, value)
         return offcfg.build_page_namespace(config, _lmcache_config(), 4)
 
-    assert namespace("llama") == namespace(
-        "llama", sliding_window=4096, candidate_block_size=64
+    v41 = namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)
+    assert v41 == namespace("deepseek_v41", sliding_window=256, candidate_block_size=8)
+    assert namespace("llama", compress_ratios=None) == namespace(
+        "llama", compress_ratios=None, sliding_window=4096, candidate_block_size=64
     )
-    assert namespace(
-        "deepseek_v41", sliding_window=128, candidate_block_size=64
-    ) != namespace("deepseek_v41", sliding_window=256, candidate_block_size=64)
+    monkeypatch.setattr(offcfg, "select_offload_layout", lambda _config: "hybrid")
+    assert v41 == namespace("deepseek_v41", sliding_window=128, candidate_block_size=8)

@@ -150,6 +150,8 @@ def _v41_vllm_config(cache_dtype="nvfp4", **kw):
         num_hidden_layers=43,
         model_type="deepseek_v41",
         architectures=["DeepseekV41ForCausalLM"],
+        sliding_window=128,
+        candidate_block_size=8,
     )
     return cfg
 
@@ -198,3 +200,22 @@ def test_a_worker_hashes_the_geometry_from_before_it_built_the_model():
     unsnapshotted = _vllm_config()
     unsnapshotted.model_config.hf_config.head_dim = 192
     assert namespace(scheduler) != namespace(unsnapshotted)
+
+
+def test_v41_window_and_candidate_block_move_the_plugins_namespace():
+    """Either one moves the bytes a V4.1 object holds. Hashed by this frontend,
+    which never had V4.1 tiers to keep reachable; the worker's snapshot and
+    the scheduler's fallback hash the same."""
+    from atom.kv_transfer.offload import config as offcfg
+    from atom.plugin.vllm.kv_transfer.offload_config import remember_page_geometry
+
+    def namespace(vllm_config):
+        cfg = build_offload_config(vllm_config)
+        return offcfg.build_page_namespace(cfg, NS(chunk_size=256), 4)
+
+    narrow, wide = _v41_vllm_config(), _v41_vllm_config()
+    wide.model_config.hf_config.sliding_window = 256
+    assert namespace(narrow) != namespace(wide)
+    worker = _v41_vllm_config()
+    remember_page_geometry(worker)
+    assert namespace(worker) == namespace(narrow)

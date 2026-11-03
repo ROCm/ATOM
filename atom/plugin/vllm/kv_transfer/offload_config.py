@@ -209,11 +209,9 @@ class OffloadConfigShim:
         # What `build_page_namespace` hashes: the geometry before any model was
         # built on this config (`remember_page_geometry`), as native ATOM
         # snapshots it in `Config.__post_init__`.
-        from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
-
         self.offload_page_hf_geometry = getattr(
             vllm_config, _PAGE_GEOMETRY_ATTR, None
-        ) or snapshot_page_hf_geometry(self.hf_config)
+        ) or _page_hf_geometry(self.hf_config, v41=is_v41)
 
         self.parallel_config = parallel_config
         self.pipeline_parallel_size = int(
@@ -271,6 +269,25 @@ class OffloadConfigShim:
 
 #: Where `remember_page_geometry` leaves its snapshot on a vLLM config.
 _PAGE_GEOMETRY_ATTR = "_atom_offload_page_hf_geometry"
+# V4.1's own: `sliding_window` sizes its per-request window ring and
+# `candidate_block_size` pages its index plane, so either one moves the bytes a
+# stored object holds. Hashed by this frontend only: native ATOM's V4.1
+# namespace stays the one its tiers were filled under.
+_V41_PAGE_FIELDS = ("sliding_window", "candidate_block_size")
+
+
+def _page_hf_geometry(hf: Any, *, v41: bool) -> dict[str, Any]:
+    """`snapshot_page_hf_geometry`, plus V4.1's fields on V4.1."""
+    from atom.kv_transfer.offload.config import (
+        _strict_integer,
+        snapshot_page_hf_geometry,
+    )
+
+    geometry = snapshot_page_hf_geometry(hf)
+    if v41:
+        for name in _V41_PAGE_FIELDS:
+            geometry[name] = _strict_integer(f"PAGE {name}", getattr(hf, name))
+    return geometry
 
 
 def remember_page_geometry(vllm_config: Any) -> None:
@@ -291,11 +308,12 @@ def remember_page_geometry(vllm_config: Any) -> None:
     outer_hf = getattr(model_config, "hf_config", None)
     if outer_hf is None:
         return
-    from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+    from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
 
     view = _HFConfigView(getattr(model_config, "hf_text_config", None), outer_hf)
+    geometry = _page_hf_geometry(view, v41=is_deepseek_v41_vllm_config(vllm_config))
     try:
-        setattr(vllm_config, _PAGE_GEOMETRY_ATTR, snapshot_page_hf_geometry(view))
+        setattr(vllm_config, _PAGE_GEOMETRY_ATTR, geometry)
     except AttributeError:  # pragma: no cover - frozen config
         pass
 

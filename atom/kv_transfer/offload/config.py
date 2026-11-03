@@ -55,11 +55,6 @@ _HF_PAGE_FIELDS = (
     "indexer_dtype",
     "indexer_types",
 )
-# Hashed for the `dsv41` layout only, so no other model's namespace moves:
-# `sliding_window` sizes V4.1's per-request window ring and
-# `candidate_block_size` pages its index plane, so either one moves the bytes
-# a stored object holds while every field above stays put.
-_DSV41_PAGE_FIELDS = ("sliding_window", "candidate_block_size")
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
     "indexer_dtype",
@@ -380,16 +375,17 @@ def build_page_namespace(
     base_model_name = str(
         getattr(config, "model_tag", None) or getattr(config, "model", "atom-model")
     )
-    layout = select_offload_layout(config)
     document = {
         "schema": "atom-page-namespace",
         "layout_version": layout_version,
         "model": base_model_name,
         "page_mode": {
             "hybrid": "dsv4-page-regions",
+            # V4.1 resolved to `hybrid` before it had a layout of its own: it
+            # keeps the namespace native ATOM's tiers were filled under.
+            "dsv41": "dsv4-page-regions",
             "m3": "m3-page-regions",
-            "dsv41": "dsv41-page-state",
-        }.get(layout, "dense-opaque-block"),
+        }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
         "block_size": _strict_integer(
@@ -420,11 +416,6 @@ def build_page_namespace(
         "speculative_config": getattr(config, "offload_speculative_config", None)
         or _stable_config_value(getattr(config, "speculative_config", None)),
     }
-    if layout == "dsv41":
-        document["dsv41_geometry"] = {
-            name: _strict_integer(f"PAGE {name}", getattr(hf, name))
-            for name in _DSV41_PAGE_FIELDS
-        }
     canonical = json.dumps(
         document,
         sort_keys=True,
