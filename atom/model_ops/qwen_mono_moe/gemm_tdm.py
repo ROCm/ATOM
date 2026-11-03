@@ -9,6 +9,28 @@
 # gemm_task (persistent task ids: the tile index and the live row count are runtime values); the LDS arena is the
 # caller's (LDS_BASE[0]) instead of a per-kernel static allocation. Everything else is the native kernel.
 LDS_BASE = [None]
+# WAVE_CTA[0] (set by the fused MoE's 7-wave build): every wave of the CTA runs its own one-wave tile, so the
+# thread id is the lane and a workgroup barrier would sync unrelated waves: LDS ordering is the wave's own.
+WAVE_CTA = [False]
+
+
+def pipeline_fence(outstanding=0, use_cluster=False):
+    """aiter's READY + REUSE fence (s_wait_tensorcnt, then a workgroup barrier); in WAVE_CTA mode the wave's own: its
+    TDM loads landed (tensorcnt) and its LDS reads of the buffer to reuse returned (dscnt)."""
+    if WAVE_CTA[0]:
+        tdm_ops.tensor_wait(outstanding)
+        rocdl.s_wait_dscnt(0)
+    else:
+        _pipeline_fence_wg(outstanding=outstanding, use_cluster=use_cluster)
+
+
+def _wg_barrier():
+    """The tile's workgroup barrier; in WAVE_CTA mode the wave's own LDS wait (its LDS reads / writes are ordered in
+    program order once s_wait_dscnt drains them; TDM loads are waited by the caller's tensor_wait)."""
+    if WAVE_CTA[0]:
+        rocdl.s_wait_dscnt(0)
+    else:
+        workgroup_barrier()
 # Per-call trace-time hooks (set by the caller right before each gemm_task call):
 #   expert_fn(blk_m) -> (expert, psum[expert]): the tile's expert without the native in-kernel bisect (9 dependent
 #     global loads); same values. has_work then uses the caller's live row count (schedule_rows).
@@ -44,7 +66,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
-    pipeline_fence,
+    pipeline_fence as _pipeline_fence_wg,
     situv2_consts,
     workgroup_barrier,
 )
@@ -515,7 +537,7 @@ def build_gemm_task(
         Kp16 = (K // 2) * 16
         K4 = K // 4
 
-        tid = fx.thread_idx.x
+        tid = fx.thread_idx.x % WAVE if const_expr(WAVE_CTA[0]) else fx.thread_idx.x
         bid_x = task_id if persistent_workers else fx.block_idx.x
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -1610,7 +1632,7 @@ def build_gemm_task(
                         # Every rolled iteration reads the carry, so prime it here --
                         # outside ``dispatch_wave_job``, since every wave runs this once.
                         tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                        workgroup_barrier()
+                        _wg_barrier()
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
                         load_lds_data(
@@ -1641,7 +1663,7 @@ def build_gemm_task(
                                 ),
                                 interleaved_lds_load=interleaved_lds_load,
                             )
-                            workgroup_barrier()
+                            _wg_barrier()
                             issue(s, kt + num_buffers, my_jobs)
                             if const_expr(  # noqa: SIM102 - preserve DSL staging
                                 cluster_m > 1 and not DISABLE_CLUSTER_SYNC
@@ -2199,7 +2221,9 @@ def build_gemm_task(
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
             # in flight, so their storecnt wait moves past the store below.
-            if const_expr(stage1_quant_out and stage1_act):
+            if const_expr(WAVE_CTA[0]):
+                rocdl.s_wait_dscnt(0)
+            elif const_expr(stage1_quant_out and stage1_act):
                 rocdl.s_wait_dscnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
@@ -2395,6 +2419,6 @@ def build_gemm_task(
             # Every wave must retire the output store before another wave
             # reuses the same LDS arena for the next task's input. This also
             # covers the fused scatter's tensor_wait above.
-            workgroup_barrier()
+            _wg_barrier()
 
     return gemm_task, ARENA_B

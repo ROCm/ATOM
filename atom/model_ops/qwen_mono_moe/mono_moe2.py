@@ -88,6 +88,16 @@ ROLES = int(os.environ.get("MONO_ROLES", "63"))
 # down sub-tiles, 8 all-reduce norm stores, 16 down tiles (one issue_b / issue_a and two finish call sites, runtime
 # LDS slot, instead of three copies of each)
 ROLL = int(os.environ.get("MONO_ROLL", "0"))
+# MONO_WCTA=W (7): W waves a CTA, NCTA / W CTAs (one a CU: W x 44 KB of LDS), wave w of CTA b = virtual one-wave CTA
+# W b + w: every role range (quant, shared expert, router, tiles, gather) is contiguous a CU, so a CU executes only
+# its roles' code. 0: NCTA one-wave CTAs.
+WCTA = int(os.environ.get("MONO_WCTA", "0"))
+# With MONO_WCTA: MONO_WTILE=1 (default) gives the gate_up / down tiles an id interleaved over the CUs (wave w of CTA
+# b: w * NCTA / W + b) so every CU gets tiles (the CU-contiguous id would put all 1,192 gate_up tiles on 2/3 of the
+# CUs); MONO_GLO=1 (default) puts the gather-reduce on the lowest ids (with quant / the first shared-expert CUs)
+# instead of the top ones (the router CUs); 2: on interleaved ids (the top tbid: one gather wave on each of 2T CUs).
+WTILE = int(os.environ.get("MONO_WTILE", "1"))
+GLO = int(os.environ.get("MONO_GLO", "1"))
 
 
 def _sel(vals, i):
@@ -196,7 +206,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
     spin = _make_spin(dbg_)
     QL = _quant_layout(D, "fp4", 1)
 
-    @flyc.kernel(name="moe_mono2%s%s%s_pf%d_%d" % ("_timing" if timing else "", "_sh" if shared else "", "_ar" if ar else "", PF, int(PF_DELAY_US * 100)) + "_dm%d_gd%d_sd%d_ps%d_rk%d_dbg%d_tko%d" % (DNMAP, GUDN_, int(SH_DELAY_US * 100), POLL_SLEEP, RKS_R_, DEBUG_SPIN, TKO_) + ("_ipf%d_%d" % (IPF, IPF_STEP) if IPF else "") + ("_ip%d" % INSTPREF if INSTPREF >= 0 else "") + ("_roles%d" % ROLES if ROLES != 63 else "") + ("_rl%d" % ROLL if ROLL else ""), known_block_size=[32, 1, 1])
+    @flyc.kernel(name="moe_mono2%s%s%s_pf%d_%d" % ("_timing" if timing else "", "_sh" if shared else "", "_ar" if ar else "", PF, int(PF_DELAY_US * 100)) + "_dm%d_gd%d_sd%d_ps%d_rk%d_dbg%d_tko%d" % (DNMAP, GUDN_, int(SH_DELAY_US * 100), POLL_SLEEP, RKS_R_, DEBUG_SPIN, TKO_) + ("_ipf%d_%d" % (IPF, IPF_STEP) if IPF else "") + ("_ip%d" % INSTPREF if INSTPREF >= 0 else "") + ("_roles%d" % ROLES if ROLES != 63 else "") + ("_rl%d" % ROLL if ROLL else "") + ("_w%d%s%s" % (WCTA, "t" if WTILE else "", "g%d" % GLO) if WCTA else ""), known_block_size=[32 * max(WCTA, 1), 1, 1])
     def kernel(x: fx.Pointer, gate: fx.Pointer, w13: fx.Pointer, s13: fx.Pointer, w2: fx.Pointer, s2: fx.Pointer,
                lg: fx.Pointer, ti: fx.Pointer, tw: fx.Pointer, tsl: fx.Pointer, etok: fx.Pointer,
                a1t: fx.Pointer, a1ts: fx.Pointer, a2: fx.Pointer, a2s: fx.Pointer, gout: fx.Pointer, out: fx.Pointer,
@@ -206,15 +216,31 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
         gu_task, gu_arena = _gu_task()
         dn_task, dn_arena = _dn_task()
         assert dn_arena <= DN_SLOT and 3 * DN_SLOT <= gu_arena
-        base_ptr = fx.SharedAllocator().allocate(max(gu_arena, dn_arena))._ptr
-        gemm_tdm.LDS_BASE[0] = base_ptr
-        L0 = fx.Int32(fx.ptrtoint(base_ptr))
+        ARENA = (max(gu_arena, dn_arena) + 255) // 256 * 256
+        gemm_tdm.WAVE_CTA[0] = WCTA > 0
+        base_ptr = fx.SharedAllocator().allocate(ARENA * max(WCTA, 1))._ptr
         p8_shared = fx.PointerType.get(elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Shared, alignment=16)
+        if fx.const_expr(WCTA > 0):
+            wave_id = uniform(fx.Int32(fx.thread_idx.x) >> 5)
+            L0 = fx.Int32(fx.ptrtoint(base_ptr)) + wave_id * ARENA
+            base_ptr = fx.inttoptr(p8_shared, L0)
+            bid = fx.Int32(fx.block_idx.x) * WCTA + wave_id
+            tbid = (wave_id * (NCTA // WCTA) + fx.Int32(fx.block_idx.x)) if fx.const_expr(WTILE) else bid
+            lane = fx.Int32(fx.thread_idx.x) & 31
+        else:
+            L0 = fx.Int32(fx.ptrtoint(base_ptr))
+            bid = fx.Int32(fx.block_idx.x)
+            tbid = bid
+            lane = fx.Int32(fx.thread_idx.x)
+        gemm_tdm.LDS_BASE[0] = base_ptr
         base_i8 = fx.recast_iter(p8_shared, base_ptr)
-
-        bid = fx.Int32(fx.block_idx.x)
-        lane = fx.Int32(fx.thread_idx.x)
         T_ = fx.Int32(T_)
+
+        def _lds_sync():
+            if fx.const_expr(WCTA > 0):
+                rocdl.s_wait_dscnt(0)
+            else:
+                prims.lds_barrier()
 
         def addr(p):
             return fx.Int64(fx.ptrtoint(p))
@@ -460,7 +486,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                         nb = v.shuffle_xor(1, 32)
                         if lane % 2 == 0:
                             prims.lds_sti(LST, ((h * 8 + i) * 128 + sub * 16 + row) // 2, v | (nb << 16))
-                prims.lds_barrier()
+                _lds_sync()
                 LSD = LST
             else:
                 accs = []
@@ -471,7 +497,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                         b_ = prims.lds_ld8w(L0, (sub * 16 + row) * (SDP // 4) + 16 * s_ + 8 * h)
                         acc = wmma_bf16(a_, b_, acc)
                     accs.append(acc)
-                prims.lds_barrier()
+                _lds_sync()
                 # stage the bf16 tile [16 x 128] in LDS (pairs of lanes -> dwords), then row-contiguous stores
                 for sub in fx.range_constexpr(8):
                     for i in fx.range_constexpr(8):
@@ -479,7 +505,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                         nb = v.shuffle_xor(1, 32)
                         if lane % 2 == 0:
                             prims.lds_sti(L0, ((h * 8 + i) * 128 + sub * 16 + row) // 2, v | (nb << 16))
-                prims.lds_barrier()
+                _lds_sync()
                 LSD = L0
             orow = lane // 2
             for q in fx.range_constexpr(8):
@@ -710,7 +736,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             e_ = expert_of(blk_m)
             return e_, psum_at((e_ < E).select(e_, fx.Int32(E - 1)))
 
-        has_gu = bid < mt * 4
+        has_gu = tbid < mt * 4
         n_dn = mt * 16
         if fx.const_expr(DNMAP == 1):
             # down tiles go first to CTAs without a gate_up tile (3 slots each, weights issued at routing time),
@@ -719,10 +745,10 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             N1_ = NCTA - G_
 
             def dts_at(k):  # measured: better from T 85, worse at T 16
-                return (T_ > 64).select((bid >= G_).select((bid - G_) + k * N1_, 3 * N1_ + bid + k * G_), bid + k * NCTA)
+                return (T_ > 64).select((tbid >= G_).select((tbid - G_) + k * N1_, 3 * N1_ + tbid + k * G_), tbid + k * NCTA)
         else:
             def dts_at(k):
-                return bid + k * NCTA
+                return tbid + k * NCTA
         dts = [dts_at(k) for k in range(3)]
 
         def gemm_call(task, which, mode, tid_, slot=0, late=0, gather=None, drain_cb=None):
@@ -740,7 +766,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                 # runtime slot (MONO_ROLL 16): a 16-byte aligned LDS pointer rebuilt from the address
                 gemm_tdm.LDS_BASE[0] = fx.inttoptr(p8_shared, L0 + DN_BASE_ + slot * DN_SLOT)
             else:
-                gemm_tdm.LDS_BASE[0] = base_ptr + ((DN_BASE_ + slot * DN_SLOT) if which == "dn" else 0)
+                gemm_tdm.LDS_BASE[0] = fx.inttoptr(p8_shared, L0 + ((DN_BASE_ + slot * DN_SLOT) if which == "dn" else 0))
             if fx.const_expr(which == "gu"):
                 task(a2, a1t, w13, a1ts, s13, a1t, a1t, a2s, a2, cm, fx.Int32(2 * I), fx.Float32(float("inf")),
                      fx.Float32(1.0), fx.Float32(1.0), tid_, nrows)
@@ -766,17 +792,17 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             # always exactly 2 (GUDN_ 1) / 4 (GUDN_ 2) TDM ops (the gate_up fences count them): real tiles, clamped
             # to a valid one when this CTA has fewer
             for k in fx.range_constexpr(1 if GUDN_ == 1 else 2):
-                gemm_call(dn_task, "dn", "issue_b", (dts[k] < n_dn).select(dts[k], bid % n_dn), slot=k)
+                gemm_call(dn_task, "dn", "issue_b", (dts[k] < n_dn).select(dts[k], tbid % n_dn), slot=k)
 
         # EARLY TDM: expert weights as soon as the routing is known
         if fx.const_expr(upto < 4):
             return
         if has_gu & fx.const_expr(ROLES & 8 != 0):
-            gemm_call(gu_task, "gu", "issue_b", bid)
+            gemm_call(gu_task, "gu", "issue_b", tbid)
             if fx.const_expr(PF == 2):
                 # L2 prefetch of this tile's k tiles 2, 3 of B (the halves of its 4 preshuffled 16 KB rows that the
                 # 2-buffer pipeline loads mid-tile)
-                pm, pn = _swz(bid, nrows, 4)
+                pm, pn = _swz(tbid, nrows, 4)
                 pe_ = expert_of(pm * 16)
                 rowb = addr(w13) + (fx.Int64(pe_) * 16 + fx.Int64(pn) * 4) * 16384 + 8192
                 for i in fx.range_constexpr(8):
@@ -788,7 +814,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
 
         # ------------------------------------------------------------ gate_up: A rows gathered by token
         if has_gu & fx.const_expr(ROLES & 8 != 0):
-            gm, gn_ = _swz(bid, nrows, 4)
+            gm, gn_ = _swz(tbid, nrows, 4)
             blk_m = gm * 16
             ge = expert_of(blk_m)
             gst = start_of(ge)
@@ -801,8 +827,8 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
             gat = dict(rows=rows16, ntok=T_, a_i64=addr(a1t), sa_i64=addr(a1ts))
             wait_words(F_QFR + 32 * (bid % 64), lane == 0)
             stamp(8)
-            gemm_call(gu_task, "gu", "issue_a", bid, gather=gat)
-            gemm_call(gu_task, "gu", "rest", bid, gather=gat, drain_cb=gu_drain_cb if GUDN_ else None)
+            gemm_call(gu_task, "gu", "issue_a", tbid, gather=gat)
+            gemm_call(gu_task, "gu", "rest", tbid, gather=gat, drain_cb=gu_drain_cb if GUDN_ else None)
             publish(F_GU + gm * 4 + gn_)
             stamp(9)
             if fx.const_expr(ROLES & 16 != 0):
@@ -854,7 +880,12 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                 dn_finish(0, 0)
 
         # ------------------------------------------------------------ gather-reduce: (token, half) a CTA
-        g_id = NCTA - 1 - bid
+        if fx.const_expr(WCTA > 0 and GLO == 2):  # interleaved over the CUs, as the tiles (one gather wave a CU)
+            g_id = NCTA - 1 - tbid
+        elif fx.const_expr(WCTA > 0 and GLO == 1):
+            g_id = bid
+        else:
+            g_id = NCTA - 1 - bid
         if (g_id < T_ * 2) & fx.const_expr(ROLES & 32 != 0):
             t = g_id // 2
             hh = g_id - t * 2
@@ -1020,7 +1051,7 @@ def build(timing=False, upto=99, shared=True, ar=False, rks_r=None, gudn=None, t
                stream: fx.Stream = fx.Stream(None)):  # noqa: B008
         kernel(x, gate, w13, s13, w2, s2, lg, ti, tw, tsl, etok, a1t, a1ts, a2, a2s, gout, out, fl, stp, shgu, shdn,
                shp, act, shout, sg, res, xo, nw, pr0, pr1, pr2, pr3, rank, T_, cm).launch(
-            grid=(NCTA, 1, 1), block=(32, 1, 1), stream=stream)
+            grid=(NCTA // max(WCTA, 1), 1, 1), block=(32 * max(WCTA, 1), 1, 1), stream=stream)
 
     return launch
 
