@@ -1977,6 +1977,31 @@ class ModelRunner:
             plan = plan.with_paged_entries(num_kvcache_blocks)
 
         block_bytes = plan.entry_bytes[plan.paged_class]
+        pd_block_bytes = block_bytes if len(plan.entry_bytes) == 1 else 0
+        pd_admission = (config.kv_transfer_config or {}).get("pd_admission", {})
+        if isinstance(pd_admission, dict) and pd_admission.get("enabled"):
+            # The scheduler owns one block table across TP ranks. Reconcile
+            # capacity once at startup and refuse unlike physical page layouts.
+            if torch.distributed.is_initialized():
+                geometry = torch.tensor(
+                    [num_kvcache_blocks, pd_block_bytes, -pd_block_bytes],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                torch.distributed.all_reduce(
+                    geometry,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=get_tp_group().cpu_group,
+                )
+                num_kvcache_blocks, smallest, neg_largest = geometry.tolist()
+                if smallest != -neg_largest:
+                    raise ValueError(
+                        "pd_admission requires identical D TP page layouts"
+                    )
+                pd_block_bytes = smallest
+                plan = plan.with_paged_entries(num_kvcache_blocks)
+            if pd_block_bytes <= 0:
+                raise ValueError("pd_admission requires a single paged KV pool layout")
         # The whole plan travels to the engine process; BlockManager, the
         # sliding-window pool and the attention builder each index it by the
         # class name they declared. Nothing here needs to know those names.
@@ -2118,6 +2143,7 @@ class ModelRunner:
         draft = getattr(self, "draft_kv_builder", None)
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
+            "pd_admission_block_bytes": pd_block_bytes,
             "pool_entries": dict(plan.entries),
             "pool_entries_per_req": dict(plan.entries_per_req),
             "state_runtime": state_runtime.to_wire(),
