@@ -84,6 +84,15 @@ def test_every_reachable_fallback_reason(adapter_result):
         (r["name"], r.get("reason"), r.get("error")) for r in recs if not r["passed"]
     ]
     assert not bad, bad
+    by_name = {r["name"]: r for r in recs}
+    # A genuinely non-contiguous page table (column stride 2) is aiter's
+    # metadata refusal; ratio 8 runs native with its arguments forwarded as-is.
+    assert by_name["fallback:metadata(noncontig table)"]["reason"] == (
+        "metadata_unsupported"
+    )
+    ratio8 = by_name["fallback:compress_ratio(8)"]
+    assert ratio8["reason"] == "compress_ratio_unsupported"
+    assert ratio8["native_args_forwarded"] and ratio8["native_path"]
 
 
 def test_kernel_env_mismatch_runs_native():
@@ -98,7 +107,8 @@ a = A.scorer_args(d, row_starts=torch.empty(4, dtype=torch.int32, device="cuda")
 reason, _ = r.decision_for(*a)
 out = r(*a)
 ref = r.native(*a)
-ok = reason == "kernel_env_mismatch" and torch.equal(out[0].view(torch.int32), ref[0].view(torch.int32))
+cmp = A.native_defined_equal(out, ref)
+ok = reason == "kernel_env_mismatch" and cmp["visible_equal"] and cmp["defined_bitwise"]
 print(reason); sys.exit(0 if ok else 1)
 """
     env = dict(os.environ, QSA_PAD_BUCKET="1")

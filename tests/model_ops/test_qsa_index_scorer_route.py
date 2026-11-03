@@ -621,3 +621,38 @@ def test_contract_real_api_cpu_decisions(aiter_api, monkeypatch):
     assert route.counts[("native", "device_not_gpu")] == 1
     bogus = R.QSAScorerRoute("no_such_profile_zz", api=aiter_api, native=FakeNative())
     assert bogus.prepare(cache) == "profile_not_found"
+
+
+def test_golden_adapter_noncontig_table_is_really_noncontiguous():
+    """A row-padded table view with 1 request is contiguous to torch (size-1
+    dim): aiter accepts it. The fallback fixture must use a column stride."""
+    from atom.model_ops.qwen4_exp.qsa_index_scorer import golden_adapter as A
+
+    table = torch.arange(16, dtype=torch.int32).view(1, 16)
+    padded = torch.full((1, 32), -1, dtype=torch.int32)
+    padded[:, :16] = table
+    assert padded[:, :16].is_contiguous()  # the old, non-triggering fixture
+    cases = {c[0]: c for c in A._fallback_cases("p")}
+    for reqs in (1, 3):
+        t = torch.arange(16 * reqs, dtype=torch.int32).view(reqs, 16)
+        out = cases["metadata(noncontig table)"][2]({"page_table": t})["page_table"]
+        assert not out.is_contiguous() and torch.equal(out, t)
+
+
+def test_golden_adapter_native_defined_equal_ignores_unwritten_tail():
+    from atom.model_ops.qwen4_exp.qsa_index_scorer import golden_adapter as A
+
+    vis = torch.tensor([32, 0, 5], dtype=torch.int32)
+    a = torch.randn(3, 64)
+    b = a.clone()
+    b[:, 32:] = float("nan")  # past every row's visible count: undefined
+    b[1] = 7.0
+    b[2, 5:] = -1.0
+    r = A.native_defined_equal((a, vis), (b, vis.clone()))
+    assert r == {"visible_equal": True, "defined_bitwise": True, "full_bitwise": False}
+    b[2, 4] += 1.0
+    assert not A.native_defined_equal((a, vis), (b, vis))["defined_bitwise"]
+    other = vis.clone()
+    other[0] = 31
+    r = A.native_defined_equal((a, vis), (a.clone(), other))
+    assert not r["visible_equal"] and not r["defined_bitwise"]

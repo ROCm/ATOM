@@ -75,7 +75,14 @@ Qwen4ExpAttention._select_tokens
   reason reachable from the call site (`fallbacks`). Comparator/tolerance: the
   frozen `qsa_golden.compare_logits(rtol=1e-4, atol=1e-4)` over
   `valid_page & c < visible`, plus outside-mask bit-identical `-inf`, no NaN,
-  `visible` exact, `row_starts` zeroed.
+  `visible` exact, `row_starts` zeroed. A fallback passes when it carries its
+  reason, takes the native path with the call site's argument objects
+  forwarded unchanged, and equals a direct native call bitwise over native's
+  defined region (`visible` and `c < visible`): native's decode kernels never
+  write column tiles past the widest visible count of `torch.empty` logits
+  (e.g. `compress_ratio` 8 halves `visible`), so that tail is not compared.
+  Non-contiguous fixtures are asserted non-contiguous: a row-padded table view
+  with one request is contiguous to torch (size-1 dim) and aiter accepts it.
 * Capture: `--qsa-index-scorer-capture /out/cap_{rank}.json` writes every call
   class; merge and get the aiter plan + coverage matrix:
   `python -m atom.model_ops.qwen4_exp.qsa_index_scorer.capture merge '/out/cap_*.json' --plan plan.json --matrix matrix.json`

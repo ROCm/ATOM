@@ -36,8 +36,10 @@ aiter ``op_tests/test_qsa_index_scorer.py::CASES``) is replayed through:
 
 ``fallbacks``
     every native-fallback reason reachable from ATOM's call site, each checked
-    to have taken the native path, carried its reason, and returned the native
-    result bitwise.
+    to have taken the native path, carried its reason, forwarded the call
+    site's argument objects unchanged to ATOM's scorer, and returned a result
+    bitwise equal to a direct native call over native's defined region
+    (``visible`` and ``c < visible``; :func:`native_defined_equal`).
 
 Run (root, under gpu-lock)::
 
@@ -455,6 +457,40 @@ def golden_compare(out, vis, args):
     return res, (gold, gvis, valid)
 
 
+def native_defined_equal(out, ref) -> dict:
+    """Two ``(logits, visible)`` results equal over ATOM native's defined region.
+
+    ATOM's native scorer allocates ``logits`` with ``torch.empty`` and its
+    decode kernels only walk column tiles below the block's widest ``visible``
+    count (``_qsa_paged_mqa_logits_stacked_kernel``: ``num_tiles =
+    cdiv(min(max(visible), columns), BN)``), so columns at or past the last
+    visible tile are never written -- they hold whatever the allocator hands
+    back. The defined result is ``visible`` and ``logits[r, c]`` for
+    ``c < visible[r]`` (all top-k reads); two native calls on identical inputs
+    agree bitwise there, and nothing about the unwritten tail is a contract.
+    ``full_bitwise`` (whole buffer) is reported for information only.
+    """
+    (lo, vo), (lr, vr) = out, ref
+    vis_equal = bool(torch.equal(vo, vr))
+    full = bool(
+        vis_equal
+        and lo.shape == lr.shape
+        and torch.equal(lo.view(torch.int32), lr.view(torch.int32))
+    )
+    defined = False
+    if vis_equal and lo.shape == lr.shape:
+        colix = torch.arange(lo.shape[1], device=lo.device)
+        mask = colix[None, :] < vo.to(torch.int64)[:, None]
+        defined = bool(
+            torch.equal(lo.view(torch.int32)[mask], lr.view(torch.int32)[mask])
+        )
+    return {
+        "visible_equal": vis_equal,
+        "defined_bitwise": defined,
+        "full_bitwise": full,
+    }
+
+
 def _oob_contract(out, d):
     seg = out[d["token_to_request"] == 0][:, :4]
     return {
@@ -769,7 +805,9 @@ def _fallback_cases(profile):
             (c.shape[0], 8, 1, c.shape[3]), dtype=c.dtype, device=c.device
         )
         big[:, :4] = c
-        return _with(d, compressed_k_cache=big[:, :4])
+        view = big[:, :4]
+        assert not view.is_contiguous()
+        return _with(d, compressed_k_cache=view)
 
     def misaligned_cache(d):
         c = d["compressed_k_cache"]
@@ -782,7 +820,9 @@ def _fallback_cases(profile):
         s = d["compressed_k_scale"]
         big = torch.ones((s.shape[0], 8, 1), dtype=s.dtype, device=s.device)
         big[:, :4] = s
-        return _with(d, compressed_k_scale=big[:, :4])
+        view = big[:, :4]
+        assert not view.is_contiguous()
+        return _with(d, compressed_k_scale=view)
 
     def q_fp32(d):
         return _with(d, q=d["q"].float())
@@ -796,15 +836,24 @@ def _fallback_cases(profile):
             (q.shape[0], q.shape[1], 2 * q.shape[2]), dtype=q.dtype, device=q.device
         )
         big[..., : q.shape[2]] = q
-        return _with(d, q=big[..., : q.shape[2]])
+        view = big[..., : q.shape[2]]
+        assert not view.is_contiguous()
+        return _with(d, q=view)
 
     def table_noncontig(d):
+        # Column stride 2: genuinely non-contiguous for any shape. (A row-padded
+        # ``big[:, :width]`` view is NOT: with 1 request torch ignores the
+        # size-1 dim's stride, ``is_contiguous()`` is True, and aiter rightly
+        # accepts it.) ATOM native takes ``page_table.stride(1)``; aiter's
+        # ``decide`` requires a contiguous table -> ``metadata_unsupported``.
         t = d["page_table"]
         big = torch.full(
             (t.shape[0], 2 * t.shape[1]), -1, dtype=t.dtype, device=t.device
         )
-        big[:, : t.shape[1]] = t
-        return _with(d, page_table=big[:, : t.shape[1]])
+        big[:, ::2] = t
+        view = big[:, ::2]
+        assert not view.is_contiguous() and torch.equal(view, t)
+        return _with(d, page_table=view)
 
     def empty_rows(d):
         return _with(
@@ -898,6 +947,10 @@ def _fallback_cases(profile):
             {"max_columns": 0},
             {"max_columns_invalid"},
         ),
+        # The page-4 fixture is valid metadata at ratio 8 (visible = min((pos +
+        # 1) // 8, ctx // 8), only fewer groups visible); native then leaves
+        # the column tiles past the widest visible count unwritten, which is
+        # why fallbacks compare native's defined region (native_defined_equal).
         (
             "compress_ratio(8)",
             profile,
@@ -925,12 +978,29 @@ def _fallback_cases(profile):
 
 
 def run_fallbacks(profile):
+    """Each reachable fallback: its reason, the native path, native's result.
+
+    The route's native leg is a recorder around ATOM's scorer: it must be
+    called exactly once with the very argument objects the call site passed
+    (``is``-identical, nothing converted), and its result must equal a direct
+    native call on those same objects over native's defined region
+    (:func:`native_defined_equal`; whole-buffer equality is reported only).
+    """
+    from .route import native_qsa_paged_mqa_logits
+
+    real_native = native_qsa_paged_mqa_logits()
     recs = []
     for name, prof, build, over, expect in _fallback_cases(profile):
         fmt = over.pop("fmt", "bf16") if "fmt" in over else "bf16"
         try:
             d = build(_decode_small(fmt))
-            route = QSAScorerRoute(prof, site=f"fallback:{name}")
+            seen = []
+
+            def recorder(*na, _seen=seen):
+                _seen.append(na)
+                return real_native(*na)
+
+            route = QSAScorerRoute(prof, site=f"fallback:{name}", native=recorder)
             route.prepare(d["compressed_k_cache"], d["compressed_k_scale"])
             rows = int(d["q"].shape[0])
             a = list(
@@ -942,11 +1012,15 @@ def run_fallbacks(profile):
                 a[{"score_divisor": 7, "max_columns": 8, "compress_ratio": 6}[k]] = v
             reason, detail = route.decision_for(*a)
             out = route(*a)
-            ref = route.native(*a)
+            ref = real_native(*a)
             torch.cuda.synchronize()
-            same = torch.equal(
-                out[0].view(torch.int32), ref[0].view(torch.int32)
-            ) and torch.equal(out[1], ref[1])
+            forwarded = (
+                len(seen) == 1
+                and len(seen[0]) == len(a)
+                and all(x is y for x, y in zip(seen[0], a))
+            )
+            cmp = native_defined_equal(out, ref)
+            same = cmp["visible_equal"] and cmp["defined_bitwise"]
             native_only = all(p == "native" for p, _ in route.counts)
             recs.append(
                 {
@@ -955,9 +1029,13 @@ def run_fallbacks(profile):
                     "reason": reason,
                     "detail": detail,
                     "expected": sorted(expect),
+                    "native_args_forwarded": forwarded,
                     "native_bitwise": bool(same),
+                    "native_full_buffer_bitwise": cmp["full_bitwise"],
                     "native_path": native_only,
-                    "passed": bool(reason in expect and same and native_only),
+                    "passed": bool(
+                        reason in expect and same and native_only and forwarded
+                    ),
                 }
             )
         except Exception as exc:  # noqa: BLE001
