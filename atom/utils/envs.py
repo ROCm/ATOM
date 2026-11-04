@@ -453,6 +453,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # topk_softmax for bf16 [T, 256] logits, renormalized, no shared columns. Same
     # ids and weights, ~1.5 us less a MoE layer.
     "ATOM_MOE_TRITON_TOPK": lambda: os.getenv("ATOM_MOE_TRITON_TOPK", "0") == "1",
+    # MoE routing on gfx1250 TP decode (<= 128 rows): leave the top-k to aiter's
+    # grouped MoE, which computes it with the routing metadata and the MXFP4
+    # activation quant in one launch instead of three (topkGatingSoftmax,
+    # moe_route_psum_fused, moe_fused_quant_preshuffle_routeks). Bit-identical
+    # ids, weights and expert inputs; ~7 us less a MoE layer.
+    "ATOM_MOE_FUSED_TOPK_ROUTE_QUANT": lambda: (
+        os.getenv("ATOM_MOE_FUSED_TOPK_ROUTE_QUANT", "0") == "1"
+    ),
     "ATOM_FUSED_SIGMOID_GATE": lambda: (
         os.getenv("ATOM_FUSED_SIGMOID_GATE", "0") == "1"
     ),
