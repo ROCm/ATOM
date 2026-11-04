@@ -51,7 +51,6 @@ from atom.models.deepseek_v41.mono.kernels.dims import (
     HEAD_DIM,
     HIDDEN,
     KV_DIM,
-    KV_FP8_ROW_BYTES,
     Q_RANK,
     Dims,
 )
@@ -202,7 +201,7 @@ ABI = KernelAbi(
     (
         "res_in", "pend", "post_in", "comb_in", "pre_in",
         "hc_fn", "hc_scale", "hc_base", "attn_w", "wqkv", "wqkv_s", "qn_w", "kvn_w",
-        "wqb", "wqb_s", "cos", "sin", "pos", "ring", "ring_rows", "ring_off",
+        "wqb", "wqb_s", "cos", "sin", "pos", "ring", "ring_scale", "ring_rows", "ring_off",
         "res_out", "post_out", "comb_out", "pre_out", "q_out", "normed", "qr_out",
         "qrs_out", "aux", "iq_w", "iq_ws", "iw_w", "iq_out", "iqs_out", "iw_out",
         "scratch", "sym", "peers", "rank", "layer", "tl",
@@ -1017,11 +1016,15 @@ def _ring_row_fp8(c, t, tt, mine, rel, row, scaled, code):
     nb = [xshfl(v, 1) for v in scaled]
     word = fp8_pack4(scaled[0], scaled[1], nb[0], nb[1])
     if mine & (rel >= 0):
-        dst = rsrc(a["ring"] + fx.Int64(row) * KV_FP8_ROW_BYTES)
+        dst = rsrc(a["ring"] + fx.Int64(row) * KV_DIM)
         if tt % 2 == 0:
             bo.buffer_store(word, dst, tt // 2)
         if tt % 16 == 0:
-            bo.buffer_store(fx.Int8(code), dst, KV_DIM + tt // 16)
+            bo.buffer_store(
+                fx.Int8(code),
+                rsrc(a["ring_scale"] + fx.Int64(row) * (KV_DIM // 32)),
+                tt // 16,
+            )
     if const_expr(c["tok_par"]):  # noqa: SIM102
         if mine:
             tg = c["t0"] + t
@@ -1070,11 +1073,15 @@ def ring_row_from(c, kg, t, n):
             (w,) = c["poll"]([(kg, t * (KV_DIM // 2) + tid, 1)])
             if rel >= 0:
                 if const_expr(c["kv_fp8"]):
-                    dst = rsrc(a["ring"] + fx.Int64(row) * KV_FP8_ROW_BYTES)
+                    dst = rsrc(a["ring"] + fx.Int64(row) * KV_DIM)
                     if tid < KV_DIM // 4:
                         bo.buffer_store(w[0], dst, tid)
                     else:
-                        bo.buffer_store(fx.Int8(w[0]), dst, KV_DIM + tid - KV_DIM // 4)
+                        bo.buffer_store(
+                            fx.Int8(w[0]),
+                            rsrc(a["ring_scale"] + fx.Int64(row) * (KV_DIM // 32)),
+                            tid - KV_DIM // 4,
+                        )
                 else:
                     bo.buffer_store(
                         w[0],
@@ -1228,7 +1235,7 @@ def build_attn_pre(key: AttnPreBuild):
         res_in: Int64, pend: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64,
         hc_fn: Int64, hc_scale: Int64, hc_base: Int64, attn_w: Int64, wqkv: Int64,
         wqkv_s: Int64, qn_w: Int64, kvn_w: Int64, wqb: Int64, wqb_s: Int64,
-        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_rows: Int64, ring_off: Int32,
+        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_scale: Int64, ring_rows: Int64, ring_off: Int32,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
@@ -1252,7 +1259,7 @@ def build_attn_pre(key: AttnPreBuild):
                 "pre_in": pre_in, "hc_fn": hc_fn, "hc_scale": hc_scale, "hc_base": hc_base,
                 "attn_w": attn_w, "wqkv": wqkv, "wqkv_s": wqkv_s, "qn_w": qn_w,
                 "kvn_w": kvn_w, "wqb": wqb, "wqb_s": wqb_s, "cos": cos, "sin": sin,
-                "pos": pos, "ring": ring, "ring_rows": ring_rows, "ring_off": ring_off,
+                "pos": pos, "ring": ring, "ring_scale": ring_scale, "ring_rows": ring_rows, "ring_off": ring_off,
                 "res_out": res_out,
                 "post_out": post_out, "comb_out": comb_out, "pre_out": pre_out,
                 "q_out": q_out, "normed": normed, "qr_out": qr_out, "qrs_out": qrs_out,
@@ -1425,7 +1432,7 @@ def build_attn_pre(key: AttnPreBuild):
         res_in: Int64, pend: Int64, post_in: Int64, comb_in: Int64, pre_in: Int64,
         hc_fn: Int64, hc_scale: Int64, hc_base: Int64, attn_w: Int64, wqkv: Int64,
         wqkv_s: Int64, qn_w: Int64, kvn_w: Int64, wqb: Int64, wqb_s: Int64,
-        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_rows: Int64, ring_off: Int32,
+        cos: Int64, sin: Int64, pos: Int64, ring: Int64, ring_scale: Int64, ring_rows: Int64, ring_off: Int32,
         res_out: Int64, post_out: Int64, comb_out: Int64, pre_out: Int64,
         q_out: Int64, normed: Int64, qr_out: Int64, qrs_out: Int64, aux: Int64,
         iq_w: Int64, iq_ws: Int64, iw_w: Int64, iq_out: Int64, iqs_out: Int64,
@@ -1435,7 +1442,7 @@ def build_attn_pre(key: AttnPreBuild):
         _ = keyed
         attn_pre(
             res_in, pend, post_in, comb_in, pre_in, hc_fn, hc_scale, hc_base, attn_w,
-            wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_rows, ring_off,
+            wqkv, wqkv_s, qn_w, kvn_w, wqb, wqb_s, cos, sin, pos, ring, ring_scale, ring_rows, ring_off,
             res_out, post_out, comb_out, pre_out, q_out, normed, qr_out, qrs_out, aux,
             iq_w, iq_ws, iw_w, iq_out, iqs_out, iw_out, scratch, sym, peers, rank,
             layer, tl,

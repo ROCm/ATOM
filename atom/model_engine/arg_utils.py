@@ -307,7 +307,7 @@ class EngineArgs:
         )
         parser.add_argument(
             "--kv_cache_dtype",
-            choices=["bf16", "fp8"],
+            choices=["bf16", "fp8", "fp4"],
             type=str,
             default="bf16",
             help="KV cache type. Default is 'bf16'.",

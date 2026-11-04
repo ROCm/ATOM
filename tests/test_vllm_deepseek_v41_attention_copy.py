@@ -40,7 +40,7 @@ PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 # sha256 of core's `Attention.forward` and `_attend`, comments and blank
 # lines stripped.
 CORE_PREPARE_DIGEST = "6e6ba60ac60f4825"
-CORE_FORWARD_DIGEST = "efcc7dbf2f688954"
+CORE_FORWARD_DIGEST = "8d59451e15fcc4a9"
 
 
 @pytest.fixture
@@ -222,7 +222,7 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
 
 def _core_forward() -> str:
     """The source of the attention half the plugin copies: `Attention.forward`
-    and `_attend`, the region it attends in, by AST rather than by text
+    `_prepare_attention` and `_attend`, its live regions, by AST rather than by text
     markers.
 
     A "next def" marker would have nothing to find after the class's last
@@ -238,7 +238,7 @@ def _core_forward() -> str:
     lines = src.split("\n")
     return "\n".join(
         line.rstrip()
-        for name in ("forward", "_attend")
+        for name in ("forward", "_prepare_attention", "_attend")
         for fn in cls.body
         if isinstance(fn, ast.FunctionDef) and fn.name == name
         for line in lines[fn.lineno - 1 : fn.end_lineno]

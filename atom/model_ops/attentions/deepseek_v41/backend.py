@@ -430,7 +430,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         return {}
 
     def state_entry_views(self, slot):
-        return [self.copies.entry(slot)]
+        return self.copies.entries(slot)
 
     def relocate_state_slots(self, pairs):
         self.copies.relocate(pairs)
@@ -450,8 +450,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         order -- the order `StateCopies` cuts a checkpoint
         image into, which `build_native_state_mp_layout` aliases unit by unit.
 
-        For P/D (`slot_regions`): the request's whole STATE slot as one
-        slot-indexed region. A slot is contiguous and holds every
+        For P/D (`slot_regions`): all regions belonging to a STATE slot.
+        Quantized windows use one data/scale region per layer. Together they hold every
         layer's window ring -- the decoder's bounded-replay tail and the DSpark
         context layers included -- plus the compressor rings and the cursor, so
         it is all a consumer needs to decode and draft from the prompt's end.
@@ -470,7 +470,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 "DeepSeek-V4.1 publishes transfer regions after allocation"
             )
         names = [name for name, _ in self.cache.geometry.index_planes]
-        planes = [("dsv41.page", self.cache.page_bytes)] + [
+        planes = [(f"dsv41.{name}", view) for name, view in self.cache.page_regions] + [
             (f"dsv41.{name}_plane.{owner}", plane)
             for owner, owned in self.cache.index_planes.items()
             for name, plane in zip(names, owned)
@@ -497,8 +497,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # of the slot's previous tenant (`MooncakeConnector._post_write_requests`).
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-        state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
-        slot_unit = int(state.shape[1])
+        states = self.cache.state_regions
         p_d = (
             KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
             == "mooncake"
@@ -510,15 +509,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 [
                     KVTransferRegion(
                         state.data_ptr(),
-                        int(state.shape[0]) * slot_unit,
-                        slot_unit,
-                        semantic_role="dsv41.state_slot",
+                        state.numel(),
+                        state.shape[1],
+                        semantic_role=f"dsv41.{name}",
                     )
+                    for name, state in states
                 ]
                 if p_d
                 else []
             ),
-            num_slots=int(state.shape[0]) if p_d else 0,
+            num_slots=self.cache.num_slots if p_d else 0,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,

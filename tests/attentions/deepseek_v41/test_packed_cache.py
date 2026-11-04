@@ -58,7 +58,10 @@ def test_native_byte_accounting():
     assert sum(f.bytes_per_entry for f in geo.page_fields) == 32 * 720
     # 2.5 index rows per token -- three ratio-2 owners and one ratio-1.
     assert geo.paged_bytes == 32 * (720 + 2.5 * 132)
-    assert geo.state_fields[0].bytes_per_entry == 40 * 128 * 528
+    assert (
+        sum(f.bytes_per_entry for f in geo.state_fields if f.name.startswith("window"))
+        == 40 * 128 * 528
+    )
     assert geo.page_bytes < bf16.page_bytes / 2
     assert geo.state_bytes < bf16.state_bytes * 0.52
     assert geo.layout_id != bf16.layout_id
@@ -102,7 +105,8 @@ def test_native_main_window_rows_restore_exact_qat(magnitude):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("batch", [1, 4, 8])
-def test_packed_decode_reuses_v4_with_ragged_rows(batch):
+@pytest.mark.parametrize("planar", [False, True])
+def test_packed_decode_reuses_v4_with_ragged_rows(batch, planar):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import gather_prefix_rows
     from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
@@ -146,7 +150,19 @@ def test_packed_decode_reuses_v4_with_ragged_rows(batch):
         (indices >> 1) // 288,
     ).to(torch.int32)
     expected = sparse_attn_v4_paged_decode(q, bf16, bf16_indices, ptr, sink, 512**-0.5)
-    actual = packed_decode(q, pool.view(-1, 1), indices, ptr, sink, 512**-0.5)
+    if planar:
+        indices = torch.where(
+            (indices & 1) != 0,
+            (((indices >> 1) - main_bytes.numel()) // 528) * 2 + 1,
+            ((indices >> 1) // 288) * 2,
+        )
+        pool = (
+            tuple(v.view(torch.uint8) for v in main_values),
+            tuple(v.view(torch.uint8) for v in quantize_fp8(window)),
+        )
+    else:
+        pool = pool.view(-1, 1)
+    actual = packed_decode(q, pool, indices, ptr, sink, 512**-0.5)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     # Capacity padding contains invalid addresses; the gather must use indptr.
     scratch = torch.empty((indices.numel(), 512), device="cuda", dtype=torch.bfloat16)
@@ -165,7 +181,10 @@ def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
     )
     cache = PagedAttentionCache(geo, 6, 2, "cuda")
     owner = 1 if ratio == 1 else 0
-    pages = cache.pages.view(f"main_{owner}")[0]
+    pages = tuple(
+        plane.view(cache.num_pages, geo.rows_per_page(ratio), -1)
+        for plane in cache.main_view(owner)
+    )
     per_page = geo.rows_per_page(ratio)
     tables = torch.tensor([[3, 1], [5, 2]], device="cuda", dtype=torch.int32)
     plan = torch.full((4, 4), -1, device="cuda", dtype=torch.int32)
@@ -175,7 +194,7 @@ def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
     )
     x = torch.randn(1, 4, 512, device="cuda", dtype=torch.bfloat16)
     value = quantize_fp4(x, group_size=16, scale_dtype=torch.float8_e4m3fn)
-    packed = pack_rows(*value)[0]
+    native = tuple(v[0].view(torch.uint8) for v in value)
     # Compile and warm up before capture. All-sentinel capture must still
     # produce writes when live rows arrive later at the same plan address.
     cache._scatter_rows(pages, step, value, ratio)
@@ -187,26 +206,25 @@ def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
         [(-1, -1), (1, 3), (0, per_page - 1), (-1, -1)],
         [(-1, -1)] * 4,
     ):
-        cache.page_bytes.fill_(97)
-        before = cache.backing.clone()
-        expected = cache.page_bytes.clone()
+        source = cache.main_sources[owner]
+        source.fill_(97)
+        expected = source.clone()
         plan_cpu = torch.full((4, 4), -1, dtype=torch.int32, device="cpu")
         for i, (batch, row) in enumerate(rows):
             plan_cpu[i, 1:3] = torch.tensor([batch, row * ratio])
             if batch >= 0:
                 page = int(tables[batch, row // per_page])
-                offset = pages.storage_offset() + (row % per_page) * pages.stride(1)
-                expected[page, offset : offset + packed.shape[-1]] = packed[i]
+                for plane, vals in zip(pages, native):
+                    offset = (
+                        plane.storage_offset()
+                        + page * plane.stride(0)
+                        + (row % per_page) * plane.stride(1)
+                    )
+                    expected[offset : offset + vals.shape[-1]] = vals[i]
         plan.copy_(plan_cpu)
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(cache.page_bytes, expected, rtol=0, atol=0)
-        torch.testing.assert_close(
-            cache.backing[cache.page_bytes.numel() :],
-            before[cache.page_bytes.numel() :],
-            rtol=0,
-            atol=0,
-        )
+        torch.testing.assert_close(source, expected, rtol=0, atol=0)
 
 
 def test_packed_window_keeps_rows_below_cached_until():
@@ -237,14 +255,13 @@ def test_packed_window_keeps_rows_below_cached_until():
             cached_until=None if cached is None else np.asarray(cached, np.int32),
         )
         cache.write_window(1, rows, step)
-        caches.append(cache.backing.clone())
+        caches.append(cache.window_sources[1].clone())
     torch.cuda.synchronize()
     whole, kept = caches
-    window = geo.window(1, 8)
-    row_bytes = 512 + 512 // 32
     expected = whole.clone()
-    for pos in range(32, 48):
-        start = window.ring_start + 0 * window.slot_rows + (pos % 128) * row_bytes
-        expected[start : start + row_bytes] = 0
+    for plane in cache.ring_view(1):
+        for pos in range(32, 48):
+            start = plane.storage_offset() + (pos % 128) * plane.stride(0)
+            expected[start : start + plane.shape[-1]] = 0
     assert not torch.equal(whole, expected)
     torch.testing.assert_close(kept, expected, rtol=0, atol=0)
