@@ -11,7 +11,11 @@ import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice
 
-# from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from atom.model_ops.mamba_ops.causal_conv1d_persistent import (
+    PERSISTENT_BLOCK_M,
+    PERSISTENT_CONFIG,
+    _causal_conv1d_persistent_kernel,
+)
 
 PAD_SLOT_ID = -1
 
@@ -56,20 +60,12 @@ def _causal_conv1d_fwd_rows_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    """`_causal_conv1d_fwd_kernel` for width 4 without prefix-cache block
-    states, on the same (sequence, BLOCK_M-token chunk) programs: the chunk's
-    tokens are an unrolled loop, so every row is one independent load issued up
-    front and the window shifts in registers, and one wave covers BLOCK_N
-    channels (16 B a lane) where the reference spreads them over four.
-    QK_L2NORM L2-normalizes each HEAD_DIM-wide head of q and k after the bf16
-    rounding of the conv output, which is what `l2norm_fwd` on the stored q and
-    k computes. The taps are fp32 FMAs, oldest first after the bias, as the
-    fused GDN verify kernel's conv: the reference kernel rounds each product to
-    the input dtype, which costs ALU time and puts its outputs at 1.45x the bf16
-    rounding error of an fp64 conv, where these are the correctly rounded value.
-    SiLU takes the hardware exp and reciprocal (about 1 fp32 ulp), which moves
-    about 1 bf16 output in 10^5 by one step. The conv states match the reference
-    kernel bit for bit."""
+    """Compute width-four convolution and optional SiLU and per-head Q/K norm.
+
+    Read packed token rows and indexed initial states; return Q/K/V rows and
+    update final states. Normalize Q/K after rounding to the output dtype.
+    Prefix-cache block checkpoints use the general convolution kernel.
+    """
     state_len: tl.constexpr = KERNEL_WIDTH - 1
     tl.static_assert(KERNEL_WIDTH == 4)
     idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
@@ -748,66 +744,18 @@ def causal_conv1d_fn(
     qk_l2norm_head_dim: int | None = None,
     qk_l2norm_eps: float = 1e-6,
 ):
-    """support varlen + continuous batching when x is 2D tensor
+    """Convolve variable-length sequences and update their indexed states.
 
-    qk_l2norm_head_dim: L2-normalize each head of this width of the returned
-        query and key, as `l2norm_fwd` would after the conv (fused into the
-        width-4 kernel's epilogue).
+    x is (channels, tokens), weight is (channels, width), bias is (channels,),
+    and query_start_loc contains cumulative token counts. conv_states stores
+    each slot's channel-by-history window; cache_indices_in selects read slots
+    and cache_indices selects write slots. has_initial_state enables history.
+    Block indices and num_computed_tokens select prefix-cache checkpoints.
 
-    x: (dim,cu_seq_len)
-        cu_seq_len = total tokens of all seqs in that batch
-        sequences are concatenated from left to right for varlen
-    weight: (dim, width)
-    conv_states: (...,dim,width - 1) itype
-        updated inplace if cache_indices are not provided
-        [it use `cache_indices` to get the index to the cache of conv_state for that sequence
-
-        conv_state[cache_indices[i]] for seq-i - to be used as initial_state when has_initial_state[i] = True
-             and after that conv_state[cache_indices[i]] need to be shift-left and updated with values from 'x'
-        ]
-    query_start_loc: (batch + 1) int32
-        The cumulative sequence lengths of the sequences in
-        the batch, used to index into sequence. prepended by 0.
-        if
-        x = [5, 1, 1, 1] <- continuous batching (batch=4)
-        then
-        query_start_loc = [0, 5, 6, 7, 8] <- the starting index of the next sequence; while the last value is
-           the ending index of the last sequence
-        [length(query_start_loc)-1 == batch]
-        for example: query_start_loc = torch.Tensor([0,10,16,17]),
-        x.shape=(dim,17)
-    cache_indices: (batch)  int32
-        indicates the corresponding state index,
-        like so: conv_state = conv_states[cache_indices[batch_id]]
-    cache_indices_in: (batch) int32, optional
-        same shape as cache_indices, giving the slot the INITIAL state is READ
-        from when that differs from the slot the final state is written to — a
-        state fork, where the request resumes from a published checkpoint (or
-        publishes its current group) and must not write over it. Defaults to
-        cache_indices, i.e. the usual read-modify-write in place.
-    has_initial_state: (batch) bool
-        indicates whether should the kernel take the current state as initial
-        state for the calculations
-        [single boolean for each sequence in the batch: True or False]
-    bias: (dim,)
-    activation: either None or "silu" or "swish" or True
-    pad_slot_id: int
-        if cache_indices is passed, lets the kernel identify padded
-        entries that will not be processed,
-        for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
-        in this case, the kernel will not process entries at
-        indices 0 and 3
-    block_idx_first_scheduled_token: (batch,), dtype int32
-        The pointer into cache_indices, where the first cache block to be filled is located.
-    block_idx_last_scheduled_token: (batch,), dtype int32
-        The pointer into cache_indices, where the last cache block to be filled is located.
-    initial_state_idx: (batch,), dtype int32
-        The pointer into cache_indices, where the cache block containing the initial state is located.
-    num_computed_tokens: (batch,), dtype int32
-        The number of tokens already completed for each sequence
-    block_size_to_align: int
-        The block size to align the cached states to
-    out: same shape as `x`
+    Return token-major Q, K, V with widths k_dim_size, k_dim_size, v_dim_size.
+    activation enables SiLU; qk_l2norm_head_dim enables per-head Q/K L2 norm.
+    metadata supplies precomputed program tables; pad_slot_id marks skipped
+    slots. The persistent path requires bf16, width four, and no checkpoints.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -990,6 +938,42 @@ def causal_conv1d_fn(
         and has_initial_state is not None
         and stride_x_dim == 1
     ):
+        use_persistent = (
+            cu_seqlen >= 4096
+            and k_dim_size == 2048
+            and v_dim_size == 4096
+            and x.dtype == torch.bfloat16
+            and bias is None
+            and activation in ("silu", "swish")
+            and qk_l2norm_head_dim == 128
+            and qk_l2norm_eps == 1e-6
+            and torch.version.hip is not None
+            and torch.cuda.get_device_properties(x.device).gcnArchName.split(":")[0]
+            == "gfx1250"
+            and (metadata is None or PERSISTENT_BLOCK_M in nums_dict)
+        )
+        if use_persistent:
+            BLOCK_M = PERSISTENT_BLOCK_M
+            rows_block_n = PERSISTENT_CONFIG["BLOCK_N"]
+            kernel = _causal_conv1d_persistent_kernel
+            launch_config = PERSISTENT_CONFIG
+            if metadata is not None:
+                batch_ptr = nums_dict[BLOCK_M]["batch_ptr"]
+                token_chunk_offset_ptr = nums_dict[BLOCK_M]["token_chunk_offset_ptr"]
+        else:
+            kernel = _causal_conv1d_fwd_rows_kernel
+            launch_config = {
+                "BLOCK_M": BLOCK_M,
+                "BLOCK_N": rows_block_n,
+                "num_warps": 1,
+                "bias_ptr": bias,
+                "HAS_BIAS": bias is not None,
+                "KERNEL_WIDTH": width,
+                "SILU_ACTIVATION": activation in ("silu", "swish"),
+                "NP2_STATELEN": np2_statelen,
+                "QK_L2NORM": qk_l2norm_head_dim is not None,
+                "HEAD_DIM": qk_l2norm_head_dim or rows_block_n,
+            }
         programs = num_program(
             {
                 "BLOCK_M": BLOCK_M,
@@ -999,21 +983,22 @@ def causal_conv1d_fn(
             },
             args,
         )
-        _causal_conv1d_fwd_rows_kernel[(programs, dim // rows_block_n)](
-            x,
-            weight,
-            bias,
-            conv_states,
-            cache_indices,
-            cache_indices if cache_indices_in is None else cache_indices_in,
-            has_initial_state,
-            query_start_loc,
-            batch_ptr,
-            token_chunk_offset_ptr,
-            query,
-            key,
-            value,
-            qk_l2norm_eps,
+        kernel[(programs, dim // rows_block_n)](
+            x_ptr=x,
+            w_ptr=weight,
+            conv_states_ptr=conv_states,
+            cache_indices_ptr=cache_indices,
+            cache_indices_in_ptr=(
+                cache_indices if cache_indices_in is None else cache_indices_in
+            ),
+            has_initial_states_ptr=has_initial_state,
+            query_start_loc_ptr=query_start_loc,
+            batch_ptr=batch_ptr,
+            token_chunk_offset_ptr=token_chunk_offset_ptr,
+            query_ptr=query,
+            key_ptr=key,
+            value_ptr=value,
+            eps=qk_l2norm_eps,
             dim=dim,
             k_dim_size=k_dim_size,
             num_cache_lines=num_cache_lines,
@@ -1028,16 +1013,8 @@ def causal_conv1d_fn(
             key_token_stride=key_token_stride,
             value_token_stride=value_token_stride,
             pad_slot_id=pad_slot_id,
-            HAS_BIAS=bias is not None,
-            KERNEL_WIDTH=width,
-            SILU_ACTIVATION=activation in ["silu", "swish"],
             USE_PAD_SLOT=pad_slot_id is not None,
-            NP2_STATELEN=np2_statelen,
-            QK_L2NORM=qk_l2norm_head_dim is not None,
-            HEAD_DIM=qk_l2norm_head_dim or rows_block_n,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=rows_block_n,
-            num_warps=1,
+            **launch_config,
         )
         return query, key, value
 
