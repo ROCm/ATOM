@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import threading
 from enum import Enum
+
 import msgspec
 
 from atom.kv_transfer.disaggregation.utils import (  # noqa: F401
@@ -68,7 +69,6 @@ class MoRIIOAgentMetadata(
     num_state_slots: int = 0
     # Region-mode layout (JSON list of [name, kind, unit_bytes, total_bytes,
     # reverse_indexed, chunk_bytes]), or None for per-layer registration.
-    # DeepSeek-V4 publishes PAGE and SLOT regions and no per-layer caches.
     region_layout: str | None = None
 
 

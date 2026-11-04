@@ -1668,7 +1668,6 @@ class RegionPlanTest(unittest.TestCase):
             "_remote_regions",
             "_region_plan",
             "merge_contiguous_blocks",
-            "_source_covers",
         }
         methods = [
             n
@@ -1699,7 +1698,6 @@ class RegionPlanTest(unittest.TestCase):
 
     def make(self, remote_regions):
         conn = self.Planner()
-        conn.tp_size = 2
         conn._regions = self.local
         conn._remote_regions_checked = {}
         conn.remote_moriio_metadata = {
@@ -1712,12 +1710,6 @@ class RegionPlanTest(unittest.TestCase):
                     )
                 },
             )()
-        }
-        conn.layer_name_to_local_kv_cache_metadata = {
-            r.name: [b"local"] * r.num_chunks for r in self.local
-        }
-        conn.layer_name_to_remote_kv_cache_metadata = {
-            "decode": {r.name: [b"remote"] * r.num_chunks for r in remote_regions}
         }
         conn._region_session = lambda _engine, ri, lc, rc: (ri, lc, rc)
         return conn

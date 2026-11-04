@@ -276,11 +276,8 @@ class MoRIIOConnector(KVConnectorBase):
         # Region mode (backends that publish KVTransferTensors and no
         # per-layer block caches, e.g. DeepSeek-V4). None until registered.
         self._regions: list[_Region] | None = None
-        self._region_views: list[Any] = []
         self._region_sessions: dict[EngineId, dict[tuple[int, int, int], Any]] = {}
         self._remote_regions_checked: dict[EngineId, list[_Region]] = {}
-        self._write_digests: dict[ReqId, list[int]] = {}
-        self._verify_expected: dict[ReqId, list[int]] = {}
 
     def register_kv_caches(
         self,
@@ -311,8 +308,6 @@ class MoRIIOConnector(KVConnectorBase):
             if not getattr(cache, "per_request_state", False)
         ]
         if not block_layers:
-            for layer_name, kv_cache in kv_caches.items():
-                self._register_state(layer_name, kv_cache)
             self._start_handshake_listener(self._register_regions(transfer_tensors))
             return
         cache_tensor = None
@@ -428,15 +423,12 @@ class MoRIIOConnector(KVConnectorBase):
         """Register a backend's PAGE and full-SLOT regions for RDMA.
 
         PAGE regions (``transfer_tensors.pages``) are indexed forward by
-        scheduler block. Full per-request SLOT regions (``swa_block_regions``,
-        plus ``slot_regions`` where a backend has them) are indexed by state
-        slot and may be reverse-indexed. Each region is cut into unit-aligned
-        chunks under the ``ibv_reg_mr`` limit, so no unit straddles two
-        registrations. The compressor-only staging pool is not registered: a
-        full SLOT already carries the compressor state.
+        scheduler block. Full per-request SLOT regions (``swa_block_regions``)
+        are indexed by state slot and may be reverse-indexed. Each region is
+        cut into unit-aligned chunks under the ``ibv_reg_mr`` limit, so no unit
+        straddles two registrations. The compressor-only staging pool is not
+        registered: a full SLOT already carries the compressor state.
         """
-        import torch
-
         tt = transfer_tensors
         if tt is None or not tt.block_regions:
             raise ValueError(
@@ -448,38 +440,20 @@ class MoRIIOConnector(KVConnectorBase):
                 "MoRIIO transfer regions are only moved in write mode; set "
                 "moriio_mode=write (or ATOM_MORIIO_MODE=write) on the consumer"
             )
-        if tt.block_region_consumer_indices is not None:
+        if tt.slot_regions or self._verify_kv:
             raise NotImplementedError(
-                "MoRIIO region mode pairs regions one to one and cannot apply "
-                "block_region_consumer_indices"
-            )
-        expected = tt.expected_full_slot_region_count
-        if expected is not None and len(tt.swa_block_regions) != expected:
-            raise ValueError(
-                f"backend declares {expected} full SLOT regions but publishes "
-                f"{len(tt.swa_block_regions)}"
+                "MoRIIO region mode moves PAGE and full SLOT regions only, "
+                "without ATOM_MORIIO_VERIFY"
             )
 
-        regions: list[_Region] = []
-        views: list[Any] = []
-        for i, page in enumerate(tt.pages):
-            role = page.region.semantic_role
-            regions.append(_Region.of(f"page.{i}.{role}", "page", page.region))
-            views.append(page.view)
-        for i, region in enumerate(tt.swa_block_regions):
-            role = region.semantic_role
-            regions.append(_Region.of(f"slot.{i}.{role}", "slot", region))
-            views.append(None)
-        for i, region in enumerate(tt.slot_regions):
-            role = region.semantic_role
-            regions.append(_Region.of(f"state.{i}.{role}", "slot", region))
-            views.append(None)
-
-        device = next((v.device for v in views if v is not None), None)
-        if device is not None and device.index is not None:
-            device_id = device.index
-        else:
-            device_id = torch.cuda.current_device()
+        regions = [
+            _Region.of(f"page.{i}.{p.region.semantic_role}", "page", p.region)
+            for i, p in enumerate(tt.pages)
+        ] + [
+            _Region.of(f"slot.{i}.{r.semantic_role}", "slot", r)
+            for i, r in enumerate(tt.swa_block_regions)
+        ]
+        device_id = tt.pages[0].view.device.index
         local_meta: dict[str, list[bytes]] = {}
         for region in regions:
             local_meta[region.name] = [
@@ -488,33 +462,12 @@ class MoRIIOConnector(KVConnectorBase):
             ]
 
         self._regions = regions
-        self._region_views = views
-        self._region_tables: dict[int, Any] = {}
         self.layer_name_to_local_kv_cache_metadata = local_meta
         self.num_blocks = int(tt.num_blocks)
         self.block_len = self.kv_cache_block_size
-        logger.info(
-            "[moriio-regions] registered %d PAGE + %d SLOT regions in %d chunks "
-            "(blocks=%d, slots=%d, page_unit_bytes=%d, slot_unit_bytes=%d)",
-            sum(r.kind == "page" for r in regions),
-            sum(r.kind == "slot" for r in regions),
-            sum(len(d) for d in local_meta.values()),
-            self.num_blocks,
-            tt.num_slots,
-            sum(r.unit for r in regions if r.kind == "page"),
-            sum(r.unit for r in regions if r.kind == "slot"),
-        )
-        state = self._state_tensors
         return MoRIIOAgentMetadata(
             engine_id=self.engine_id,
             agent_metadata=self.moriio_wrapper.get_agent_metadata(),
-            kv_caches_base_addr=None,
-            num_blocks=self.num_blocks,
-            block_len=self.block_len,
-            attn_backend_name="aiter",
-            state_descs={n: d for n, (d, _, _) in state.items()} or None,
-            state_slot_bytes={n: b for n, (_, b, _) in state.items()} or None,
-            num_state_slots=self._num_state_slots,
             region_layout=json.dumps([r.layout() for r in regions]),
         )
 
@@ -535,7 +488,6 @@ class MoRIIOConnector(KVConnectorBase):
                 f"{engine_id} advertised {len(remote)} transfer regions, this "
                 f"rank has {len(self._regions)}"
             )
-        descs = self.layer_name_to_remote_kv_cache_metadata[engine_id]
         for local, peer in zip(self._regions, remote):
             if (
                 local.name,
@@ -553,19 +505,6 @@ class MoRIIOConnector(KVConnectorBase):
                 raise ValueError(
                     f"transfer region mismatch with {engine_id}: local "
                     f"{local.layout()} vs remote {peer.layout()}"
-                )
-            got = descs.get(peer.name)
-            if got is None or len(got) != peer.num_chunks:
-                raise ValueError(
-                    f"region {peer.name}: {engine_id} advertised "
-                    f"{0 if got is None else len(got)} descriptors for "
-                    f"{peer.num_chunks} chunks"
-                )
-            if got == self.layer_name_to_local_kv_cache_metadata[local.name]:
-                raise ValueError(
-                    f"region {peer.name}: {engine_id} advertised descriptors "
-                    "byte-identical to ours; every transfer would copy this "
-                    "rank's own memory and the KV would never arrive"
                 )
         self._remote_regions_checked[engine_id] = remote
         return remote
@@ -597,29 +536,13 @@ class MoRIIOConnector(KVConnectorBase):
         """Every ``(session, local_offs, remote_offs, sizes)`` batch of a push."""
         dst = [int(b) for b in request["dst_block_ids"]]
         src = [int(b) for b in request["src_block_ids"]]
-        label = f"transfer {request['transfer_id']}"
-        self._source_covers(label, dst, src)
-        remote_tp = int(request.get("decode_tp_size") or self.tp_size)
-        if remote_tp != self.tp_size:
-            raise ValueError(
-                f"{label}: region transfer needs equal TP on both ends, "
-                f"producer tp={self.tp_size}, consumer tp={remote_tp}"
-            )
         src_slot = int(request.get("src_slot_index", -1))
         dst_slot = int(request.get("dst_slot_index", -1))
-        if any(r.kind == "slot" for r in self._regions) and (
-            src_slot < 0 or dst_slot < 0
-        ):
-            raise ValueError(
-                f"{label}: backend has per-request SLOT regions but the push "
-                f"carries no state slot (src={src_slot}, dst={dst_slot}); decode "
-                "would resume from an empty window and compressor state"
-            )
         remote = self._remote_regions(engine_id)
         plan: list[tuple[Any, list[int], list[int], list[int]]] = []
         for ri, (local, peer) in enumerate(zip(self._regions, remote)):
             if local.kind == "page":
-                pairs = list(zip(src[: len(dst)], dst))
+                pairs = list(zip(src, dst))
             else:
                 pairs = [(src_slot, dst_slot)]
             groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
@@ -639,12 +562,7 @@ class MoRIIOConnector(KVConnectorBase):
                 )
         return plan
 
-    def _write_regions(
-        self,
-        request: dict[str, Any],
-        engine_id: EngineId,
-        state_writes: list[tuple[Any, int, int, int]],
-    ) -> list[Any]:
+    def _write_regions(self, request: dict[str, Any], engine_id: EngineId) -> list[Any]:
         """Push a request's PAGE blocks and SLOT units; return the statuses."""
         plan = self._region_plan(request, engine_id)
         statuses: list[Any] = []
@@ -655,12 +573,6 @@ class MoRIIOConnector(KVConnectorBase):
                         sizes, l_offs, r_offs, session
                     )
                 )
-            for session, size, local_offset, remote_offset in state_writes:
-                statuses.append(
-                    self.moriio_wrapper.write_remote_data_status(
-                        [size], [local_offset], [remote_offset], session
-                    )
-                )
         except Exception:
             if not statuses:
                 raise
@@ -668,164 +580,7 @@ class MoRIIOConnector(KVConnectorBase):
                 "transfer %s: could not post every write", request["transfer_id"]
             )
             statuses.append(_POST_FAILED)
-        logger.debug(
-            "RDMA region write issued for transfer %s: %d blocks, slot %s->%s, "
-            "%d batches, %d bytes to %s",
-            request["transfer_id"],
-            len(request["dst_block_ids"]),
-            request.get("src_slot_index"),
-            request.get("dst_slot_index"),
-            len(plan),
-            sum(sum(sizes) for _, _, _, sizes in plan),
-            engine_id,
-        )
         return statuses
-
-    def _region_table(self, region_idx: int) -> Any:
-        """``uint8 [num_units, unit_bytes]`` over a region's physical rows, or None."""
-        import torch
-
-        if region_idx in self._region_tables:
-            return self._region_tables[region_idx]
-        region = self._regions[region_idx]
-        view = self._region_views[region_idx]
-        table = None
-        if view is not None:
-            table = view.reshape(region.num_units, region.unit)
-        else:
-            for other in self._region_views:
-                if other is None:
-                    continue
-                storage = other.untyped_storage()
-                start = storage.data_ptr()
-                if start <= region.base and (
-                    region.base + region.total <= start + storage.nbytes()
-                ):
-                    table = torch.empty(0, dtype=torch.uint8, device=other.device)
-                    table.set_(
-                        storage,
-                        region.base - start,
-                        (region.num_units, region.unit),
-                        (region.unit, 1),
-                    )
-                    break
-            if table is None:
-                logger.warning(
-                    "[moriio-verify] region %s is in no published allocation; "
-                    "it cannot be digested",
-                    region.name,
-                )
-        self._region_tables[region_idx] = table
-        return table
-
-    def _region_digests(self, blocks: list[int], slot: int) -> list[int] | None:
-        """Position-weighted digest of each region's units, in pairing order."""
-        import torch
-
-        period = 65521
-        slice_bytes = period * 64
-        sums = []
-        for ri, region in enumerate(self._regions):
-            table = self._region_table(ri)
-            if table is None:
-                return None
-            if region.kind == "page":
-                units = blocks
-            else:
-                units = [slot] if slot >= 0 else []
-            device = table.device
-            if getattr(self, "_digest_weights", None) is None or (
-                self._digest_weights.device != device
-            ):
-                self._digest_weights = (
-                    torch.arange(slice_bytes, dtype=torch.int64, device=device) % period
-                    + 1
-                )
-            w = self._digest_weights
-            acc = torch.zeros((), dtype=torch.int64, device=device)
-            for k, unit in enumerate(units):
-                row = table[region.num_units - 1 - unit if region.reverse else unit]
-                for start in range(0, region.unit, slice_bytes):
-                    piece = row[start : start + slice_bytes]
-                    acc += (k + 1) * torch.sum(
-                        piece.to(torch.int64) * w[: piece.numel()]
-                    )
-            sums.append(acc)
-        return [int(x) for x in torch.stack(sums).tolist()]
-
-    def _verify_regions_landed(self, req_id: ReqId) -> None:
-        """Compare the consumer's destination digests with the producer's source."""
-        units = self._verify_rows.pop(req_id, None)
-        before = self._verify_before.pop(req_id, None)
-        expected = self._verify_expected.pop(req_id, None)
-        if units is None:
-            return
-        after = self._region_digests(*units)
-        if after is None:
-            return
-        names = [r.name for r in self._regions]
-        if expected is not None:
-            bad = [i for i, (a, e) in enumerate(zip(after, expected)) if a != e]
-            if bad or len(expected) != len(after):
-                first = bad[0] if bad else 0
-                logger.error(
-                    "[moriio-verify] req %s: %d of %d regions differ from the "
-                    "producer's source after the push (first %s: %s != %s, "
-                    "blocks=%d, slot=%d) -- decode will read KV that did not land",
-                    req_id,
-                    len(bad) or abs(len(expected) - len(after)),
-                    len(after),
-                    names[first],
-                    after[first],
-                    expected[first] if first < len(expected) else None,
-                    len(units[0]),
-                    units[1],
-                )
-            else:
-                logger.info(
-                    "[moriio-verify] req %s: all %d regions match the producer's "
-                    "source (blocks=%d, slot=%d)",
-                    req_id,
-                    len(after),
-                    len(units[0]),
-                    units[1],
-                )
-            return
-        if before is None:
-            return
-        unchanged = [
-            names[i]
-            for i, (b, a) in enumerate(zip(before, after))
-            if b == a and (self._regions[i].kind == "page" or units[1] >= 0)
-        ]
-        if unchanged:
-            logger.error(
-                "[moriio-verify] req %s: %d of %d regions unchanged after the "
-                "push reported done (first %s) and no producer digest to compare",
-                req_id,
-                len(unchanged),
-                len(after),
-                unchanged[0],
-            )
-        else:
-            logger.info(
-                "[moriio-verify] req %s: all %d regions changed", req_id, len(after)
-            )
-
-    def _source_digests(self, request: dict[str, Any]) -> list[int] | None:
-        """Digests of a settled push's source units, for the consumer to check."""
-        if not (self._verify_kv and self._regions is not None):
-            return None
-        dst = request["dst_block_ids"]
-        blocks = [int(b) for b in request["src_block_ids"][: len(dst)]]
-        try:
-            return self._region_digests(blocks, int(request.get("src_slot_index", -1)))
-        except Exception:
-            logger.exception(
-                "[moriio-verify] transfer %s: could not digest the source",
-                request["transfer_id"],
-            )
-            return None
 
     def _register_state(self, layer_name: str, kv_cache: Any) -> None:
         """Register one layer's per-request state, one slot per dim-0 row.
@@ -1102,20 +857,16 @@ class MoRIIOConnector(KVConnectorBase):
             return
 
         if self._verify_kv:
-            if self._regions is not None:
-                self._verify_rows[req_id] = (dst, dst_slot)
-                self._verify_before[req_id] = self._region_digests(dst, dst_slot)
-            else:
-                first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
-                is_mla = self.kv_caches[first_layer].v_cache is None
-                rows = self._verify_rows_for(dst, is_mla)
-                self._verify_rows[req_id] = rows
-                self._verify_before[req_id] = self._verify_digest(rows)
-                if self._state_tensors:
-                    self._verify_state_before[req_id] = (
-                        dst_slot,
-                        self._state_digest(dst_slot),
-                    )
+            first_layer = next(iter(self.layer_name_to_local_kv_cache_metadata))
+            is_mla = self.kv_caches[first_layer].v_cache is None
+            rows = self._verify_rows_for(dst, is_mla)
+            self._verify_rows[req_id] = rows
+            self._verify_before[req_id] = self._verify_digest(rows)
+            if self._state_tensors:
+                self._verify_state_before[req_id] = (
+                    dst_slot,
+                    self._state_digest(dst_slot),
+                )
         port = int(meta.remote_handshake_port) + get_port_offset(
             int(meta.remote_dp_rank or 0), self.tp_rank, remote_tp_size
         )
@@ -1679,10 +1430,7 @@ class MoRIIOConnector(KVConnectorBase):
         src = [int(b) for b in request["src_block_ids"]]
         self._source_covers(f"transfer {request['transfer_id']}", dst, src)
         if self._regions is not None:
-            # Checked before any region write is posted.
-            return self._write_regions(
-                request, engine_id, self._state_writes(request, engine_id)
-            )
+            return self._write_regions(request, engine_id)
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
         # Before any block write: a request that cannot carry its state must not
         # leave a half-filled destination behind.
@@ -1842,9 +1590,6 @@ class MoRIIOConnector(KVConnectorBase):
                 self._forget_peer(self._write_engine_id(request))
                 self._finish_write(request, ok=False)
             else:
-                digests = self._source_digests(request)
-                if digests is not None:
-                    request["region_digests"] = digests
                 self._finish_write(request, ok=True)
 
     def _accept_write_request(self, request: dict[str, Any]) -> None:
@@ -1970,8 +1715,6 @@ class MoRIIOConnector(KVConnectorBase):
             int(request.get("decode_tp_size") or self.tp_size),
         )
         report = {"decode_req_id": request["decode_req_id"], "ok": ok}
-        if ok and request.get("region_digests") is not None:
-            report["digests"] = request["region_digests"]
         if ok and "state_digest" in request:
             report["state_digest"] = request["state_digest"]
         try:
@@ -1995,15 +1738,12 @@ class MoRIIOConnector(KVConnectorBase):
         """
         with self._write_reports_lock:
             reports, self._write_reports = self._write_reports, {}
-            digests, self._write_digests = self._write_digests, {}
         for req_id, ok in reports.items():
             if self._awaiting_write.pop(req_id, None) is None:
                 logger.warning("Write report for req %s, which is not waiting", req_id)
                 continue
             if ok:
                 done_recving.add(req_id)
-                if req_id in digests:
-                    self._verify_expected[req_id] = digests[req_id]
             else:
                 self._hold_failure(req_id)
 
@@ -2110,7 +1850,6 @@ class MoRIIOConnector(KVConnectorBase):
                         report = msgpack.loads(parts[2])
                         req_id, ok = report["decode_req_id"], bool(report["ok"])
                         state_digest = report.get("state_digest")
-                        region_digests = report.get("digests")
                     except Exception:
                         logger.exception("Dropping undecodable WRITE_DONE")
                         continue
@@ -2118,8 +1857,6 @@ class MoRIIOConnector(KVConnectorBase):
                         self._write_reports[req_id] = ok
                         if state_digest is not None and self._verify_kv:
                             self._write_state_digests[req_id] = state_digest
-                        if isinstance(region_digests, list) and self._verify_kv:
-                            self._write_digests[req_id] = region_digests
 
                 else:
                     logger.error("Unexpected handshake message type: %s", msg)
@@ -2380,15 +2117,11 @@ class MoRIIOConnector(KVConnectorBase):
             # Outside _pop_done_transfers so the digests stay off the path
             # that holds the wrapper lock.
             for req_id in done_recving:
-                if self._regions is not None:
-                    self._verify_regions_landed(req_id)
-                else:
-                    self._verify_landed(req_id)
-                    self._verify_state_landed(req_id)
+                self._verify_landed(req_id)
+                self._verify_state_landed(req_id)
             for req_id in failed_recving:
                 self._verify_rows.pop(req_id, None)
                 self._verify_before.pop(req_id, None)
-                self._verify_expected.pop(req_id, None)
                 self._verify_state_before.pop(req_id, None)
                 with self._write_reports_lock:
                     self._write_state_digests.pop(req_id, None)
@@ -2607,11 +2340,6 @@ class _Region:
     def of(cls, name: str, kind: str, region: Any) -> _Region:
         unit = int(region.unit_bytes)
         total = int(region.total_bytes)
-        if unit <= 0 or total % unit:
-            raise ValueError(
-                f"region {name} does not divide into whole units: {total} B in "
-                f"units of {unit} B"
-            )
         if unit > MAX_RDMA_CHUNK_BYTES:
             raise ValueError(
                 f"region {name}: a {unit} B unit exceeds the RDMA registration "
@@ -2653,10 +2381,6 @@ class _Region:
     @property
     def num_units(self) -> int:
         return self.total // self.unit
-
-    @property
-    def num_chunks(self) -> int:
-        return -(-self.total // self.chunk_bytes)
 
     def chunks(self) -> list[tuple[int, int]]:
         return [
