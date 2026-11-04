@@ -1291,12 +1291,16 @@ class Scheduler:
         # Before the fit: a seq whose lookup is pending is passed over whether
         # or not it fits. In a dry pass, read the lookup state without polling
         # or starting the deferral clock.
-        if not lookup_detachable and self.kv_connector is not None:
-            if dry is not None:
-                if self._offload_lookup_is_pending(seq):
-                    return _WaitingSeqDecision(_Verdict.WAIT)
-            elif self._offload_lookup_pending(seq):
-                return _WaitingSeqDecision(_Verdict.WAIT)
+        if (
+            not lookup_detachable
+            and self.kv_connector is not None
+            and (
+                self._offload_lookup_is_pending(seq)
+                if dry is not None
+                else self._offload_lookup_pending(seq)
+            )
+        ):
+            return _WaitingSeqDecision(_Verdict.WAIT)
         if dry is None:
             needs_remote_load = self._query_connector_prefill_match(
                 seq, skip=lookup_detachable
@@ -1343,6 +1347,10 @@ class Scheduler:
         if num_cached_blocks < 0:
             return _WaitingSeqDecision(_Verdict.STOP)
         if seq.replay_kv_load and not needs_remote_load:
+            # A replay that loads its KV first parks for that load like any
+            # remote load, so it needs a parked slot.
+            if num_running + self._num_parked_remote_kv >= self.max_num_seqs:
+                return _WaitingSeqDecision(_Verdict.STOP)
             if dry is not None:
                 # It parks for the load once allocated, with no rows this
                 # pass but it claims blocks. Mirror _park_for_remote_load.
@@ -1351,11 +1359,6 @@ class Scheduler:
                     needs_remote_load=True,
                     hbm_probe=hbm_probe,
                 )
-            if num_running + self._num_parked_remote_kv >= self.max_num_seqs:
-                # A replay that loads its KV first parks for that load like any
-                # remote load (`needs_remote_load` knew only the state-carrying
-                # hit), so it needs a parked slot too.
-                return _WaitingSeqDecision(_Verdict.STOP)
 
         # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
         # their decoded tokens — preempt() frees their KV blocks but keeps

@@ -80,7 +80,7 @@ delayer whether this tick allows prefill. It then selects work in three phases:
    estimate run it as a dry pass (`_dry_admission_pass`) over the same loop
    bounds, asking each fit against the pool the requests admitted before it
    would leave (`PoolReservation`: the block ids they hold and a conservative
-   spill flag when the reservation exceeds what a per-id set can track). A dry pass does
+   spill flag set when reserved fresh blocks outrun the vacant pool). A dry pass does
    not query the connector, start a checkpoint wait or allocate; it reads the
    request's last connector answer and stops, reporting prefill, where only a
    query could decide.
