@@ -2348,6 +2348,11 @@ class Config:
             )
         if self.enable_tbo or self.enable_tbo_decode:
             raise ValueError("Ulysses SP does not support TBO token slicing.")
+        if self.compilation_config.level == CompilationLevel.DYNAMO_AS_IS:
+            raise ValueError(
+                "Ulysses SP does not support --level 1: fullgraph cannot trace "
+                "its decode token gather."
+            )
         # Each rank reads its token shard from the shared input buffer.
         if self.max_num_batched_tokens % sp:
             raise ValueError(

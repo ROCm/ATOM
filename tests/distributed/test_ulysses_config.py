@@ -53,6 +53,7 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
         ({"enable_expert_parallel": True}, "expert parallelism"),
         ({"prefill_context_parallel_size": 2}, "same rank dimension"),
         ({"enable_tbo": True}, "TBO token slicing"),
+        ({"compilation_config": SimpleNamespace(level=1)}, "--level 1"),
         ({"speculative_config": object()}, "speculative decoding"),
         ({"kv_transfer_config": {"kv_connector": "mooncake"}}, "KV transfer"),
         ({"hf_config": SimpleNamespace(kv_lora_rank=512)}, "MHA models only"),
