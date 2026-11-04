@@ -35,6 +35,7 @@ from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
+    kv_change,
 )
 from atom.model_engine.prefix_hash import take_shipped_chains
 from atom.model_engine.request import RequestOutput
@@ -55,6 +56,13 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
     FINISH_WEIGHT_SYNC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
 }
+
+
+def _pp_head_first(cmd: str, args: dict) -> bool:
+    """Whether the PP head empties its pipeline before *cmd*: a weight update,
+    whose sync fences the later stages, or a change to the KV pool."""
+    return cmd in WEIGHT_UPDATE_UTILITY_CMDS or kv_change(cmd, args) is not None
+
 
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
@@ -1890,12 +1898,14 @@ class CoreManager:
                 f"finishes or aborts them"
             )
 
-    def broadcast_utility_command(self, cmd: str, *, _dispatch_token=None, **kwargs):
+    def broadcast_utility_command(
+        self, cmd: str, *, _dispatch_token=None, _ranks=None, **kwargs
+    ):
         self._refuse_unowned_weight_sync_cmd(cmd, _dispatch_token)
         payload = {"cmd": cmd, **kwargs}
         # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
         serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
-        for rank in range(len(self.control_sockets)):
+        for rank in range(len(self.control_sockets)) if _ranks is None else _ranks:
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
@@ -2021,6 +2031,20 @@ class CoreManager:
             ctx.sync_id = uuid.uuid4().hex
         return responses
 
+    def _utility_phases(self, cmd: str, args: dict) -> list[range]:
+        """The engines *cmd* goes to, in the order it must reach them.
+
+        A command the PP head empties its pipeline for goes to the head first,
+        alone: the later stages forward what it sent until they run the command
+        themselves, and one the head refuses reaches none of them. Any other
+        command goes to every engine at once, as without PP.
+        """
+        engine_count = len(self.control_sockets)
+        if getattr(self, "pp_size", 1) > 1 and _pp_head_first(cmd, args):
+            # PP runs without DP, so engine 0 is the only head.
+            return [range(1), range(1, engine_count)]
+        return [range(engine_count)]
+
     def _broadcast_and_wait(self, cmd: str, timeout: float, **kwargs):
         """The round trip behind broadcast_utility_command_sync, unchecked.
 
@@ -2030,38 +2054,45 @@ class CoreManager:
         """
         timeout = checked_timeout(timeout)
         request_id = uuid.uuid4().hex
-        # The global engine count on a coordinator, as the broadcast reaches.
-        engine_count = len(self.control_sockets)
         deadline = time.monotonic() + timeout
         worker_deadline = time.time() + engine_budget(timeout)
         by_dp_rank: dict[int, object] = {}
+        sent: list[int] = []
         with self._rpc_router.register(request_id) as replies:
-            try:
-                self.broadcast_utility_command(
-                    cmd,
-                    _dispatch_token=self._weight_sync_dispatch_token,
-                    request_id=request_id,
-                    timeout=engine_budget(timeout),
-                    deadline=worker_deadline,
-                    **kwargs,
-                )
-            except Exception:
-                # The engines before the failed send already hold this update.
-                if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
-                    self._discard_failed_weight_sync(cmd)
-                raise
-            while len(by_dp_rank) < engine_count:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+            for ranks in self._utility_phases(cmd, kwargs):
                 try:
-                    dp_rank, body = replies.get(timeout=min(1.0, remaining))
-                except queue.Empty:
-                    continue
-                by_dp_rank.setdefault(dp_rank, body)
+                    self.broadcast_utility_command(
+                        cmd,
+                        _dispatch_token=self._weight_sync_dispatch_token,
+                        _ranks=ranks,
+                        request_id=request_id,
+                        timeout=engine_budget(timeout),
+                        deadline=worker_deadline,
+                        **kwargs,
+                    )
+                except Exception:
+                    # The engines before the failed send already hold this update.
+                    if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
+                        self._discard_failed_weight_sync(cmd)
+                    raise
+                sent.extend(ranks)
+                while not by_dp_rank.keys() >= set(sent):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        dp_rank, body = replies.get(timeout=min(1.0, remaining))
+                    except queue.Empty:
+                        continue
+                    by_dp_rank.setdefault(dp_rank, body)
+                if not by_dp_rank.keys() >= set(sent) or any(
+                    isinstance(by_dp_rank[r], dict) and by_dp_rank[r].get("error")
+                    for r in ranks
+                ):
+                    break
 
         responses = [by_dp_rank[dp_rank] for dp_rank in sorted(by_dp_rank)]
-        missing = sorted(set(range(engine_count)) - set(by_dp_rank))
+        missing = sorted(set(sent) - set(by_dp_rank))
         if missing:
             if cmd in WEIGHT_UPDATE_UTILITY_CMDS:
                 self._discard_failed_weight_sync(cmd)

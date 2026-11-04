@@ -319,6 +319,8 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
             result = output([seq.id], [42])
             if batch.produces_output():
                 completions.append((batch.req_ids, result))
+            elif batch.pp_completion_ack:
+                completions.append((batch.req_ids, None))
             return result
 
         core.runner_mgr = SimpleNamespace(call_func=run)
