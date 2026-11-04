@@ -25,10 +25,24 @@ def _dcp_config(dcp=4, tp=4, interleave=1, qrep=True):
     return cfg
 
 
-def test_dcp_equal_to_tp4_is_served(monkeypatch):
+@pytest.fixture
+def dcp_on(monkeypatch):
+    monkeypatch.setenv("ATOM_GLM52_MONO_DCP", "1")
     monkeypatch.setattr(
         "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
     )
+
+
+def test_dcp_is_off_unless_asked_for(monkeypatch):
+    monkeypatch.delenv("ATOM_GLM52_MONO_DCP", raising=False)
+    monkeypatch.setattr(
+        "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
+    )
+    refusal = config_refusal(_dcp_config())
+    assert refusal is not None and "ATOM_GLM52_MONO_DCP" in refusal
+
+
+def test_dcp_equal_to_tp4_is_served(dcp_on):
     assert config_refusal(_dcp_config()) is None
 
 
@@ -40,19 +54,13 @@ def test_dcp_equal_to_tp4_is_served(monkeypatch):
         ({"qrep": False}, "query replication"),
     ],
 )
-def test_any_other_dcp_deployment_is_refused_by_name(monkeypatch, over, why):
-    monkeypatch.setattr(
-        "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
-    )
+def test_any_other_dcp_deployment_is_refused_by_name(dcp_on, over, why):
     refusal = config_refusal(_dcp_config(**over))
     assert refusal is not None and why in refusal
 
 
-def test_dcp_at_tp8_is_refused(monkeypatch):
+def test_dcp_at_tp8_is_refused(dcp_on):
     """The kernel's geometry takes DCP 4 only (``glm5_attention_heads``)."""
-    monkeypatch.setattr(
-        "atom.models.glm52.mono.config._is_gfx950", lambda: True, raising=True
-    )
     refusal = config_refusal(_dcp_config(dcp=8, tp=8))
     assert refusal is not None and "DCP 8 with TP 8" in refusal
 

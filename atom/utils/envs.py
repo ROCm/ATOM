@@ -576,6 +576,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
+    # GLM-5.2 mono under DCP == TP4 (query replication on). Off by default: at
+    # 64K it measured C1 -22% but C2 +4.4% against the production DCP4 path.
+    "ATOM_GLM52_MONO_DCP": lambda: os.getenv("ATOM_GLM52_MONO_DCP", "0") == "1",
     # Kimi-K3 mono under DCP = TP: merge a full-attention layer's decode partials
     # (and apply its output gate) inside K2 instead of the production pack ->
     # all-to-all -> combine -> sigmoid-mul. 0 keeps the production merge.

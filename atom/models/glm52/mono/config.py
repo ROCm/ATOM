@@ -266,6 +266,7 @@ def config_refusal(atom_config) -> str | None:
     ) + [
         # DCP: the kernel decodes every head of the DCP group on each rank and
         # merges the latent across them (``kernels.kernel.dcp_merge_latent``)
+        (dcp == 1 or envs.ATOM_GLM52_MONO_DCP, "DCP (ATOM_GLM52_MONO_DCP=0)"),
         (dcp == 1 or (dcp == tp_size == 4), f"DCP {dcp} with TP {tp_size}"),
         (
             dcp == 1 or atom_config.dcp_config.interleave_size == 1,
