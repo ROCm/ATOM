@@ -180,7 +180,6 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     assert runner.sampler.sample_verification_tokens.called is not armed
 
 
-@pytest.mark.parametrize("keeps", [False, True])
 @pytest.mark.parametrize(
     "ks, ps",
     [
@@ -191,12 +190,9 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     ],
     ids=["uniform-p", "per-row-p", "no-p", "bs1"],
 )
-def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
-    monkeypatch, keeps, ks, ps
-):
-    """A scalar k with a top-p would take aiter's top-k-first path, which
-    splits a tie group; the published per-row buffer stands in for it, so no
-    draw allocates one."""
+def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
+    """As on the default path, whatever top-p sits beside it: keeping top-k
+    ties is `Sampler`'s rule alone (`Sampler._per_row_k`)."""
     import numpy as np
 
     bs = len(ks)
@@ -212,9 +208,7 @@ def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
     group = SimpleNamespace(
         counts=[None] * len(names), indices={n: i for i, n in enumerate(names)}
     )
-    runner = SimpleNamespace(
-        forward_vars=buffers, sampler=SimpleNamespace(keep_top_k_ties=keeps)
-    )
+    runner = SimpleNamespace(forward_vars=buffers)
     batch = SimpleNamespace(
         total_seqs_num=bs,
         temperatures=np.ones(bs, np.float32),
@@ -225,15 +219,8 @@ def test_a_sampler_that_keeps_ties_gets_a_per_row_k_beside_a_top_p(
     _, top_ks, _, _, _ = runner_module.ModelRunner.prepare_sample(
         runner, batch, publication_group=group
     )
-    per_row = keeps and min(ps) < 1.0
-    if per_row:
-        assert top_ks.data_ptr() == buffers["top_ks"].gpu.data_ptr()
-        assert top_ks.shape == (bs,)
-        assert buffers["top_ks"].np[:bs].tolist() == ks
-        assert group.counts[group.indices["top_ks"]] == bs
-    else:
-        assert type(top_ks) is int and top_ks == ks[0]
-        assert group.counts[group.indices["top_ks"]] is None
+    assert type(top_ks) is int and top_ks == ks[0]
+    assert group.counts[group.indices["top_ks"]] is None
 
 
 @pytest.mark.parametrize(
@@ -258,7 +245,6 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     )
     runner = SimpleNamespace(
         forward_vars=buffers,
-        sampler=SimpleNamespace(keep_top_k_ties=False),
         drafter=SimpleNamespace(lossless=SimpleNamespace(stage=mock.Mock())),
         _is_pure_middle_chunk=lambda batch: False,
         forward_step=0,

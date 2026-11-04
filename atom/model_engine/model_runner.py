@@ -821,7 +821,10 @@ class ModelRunner:
             use_spec,
             self.num_spec_tokens,
         )
-        self.sampler = Sampler()
+        # Every row one forward samples: a verify's drafts and bonus rows.
+        self.sampler = Sampler(
+            max_rows=self.config.max_num_seqs * (self.num_spec_tokens + 1)
+        )
         # Each `RequiredChannel` a batch has carried, as the kernels read it.
         self._device_channels: dict[RequiredChannel, DeviceChannel] = {}
         self.arange_np = np.arange(
@@ -2723,11 +2726,7 @@ class ModelRunner:
         top_ks = top_ps = None
         top_k_count = top_p_count = None
         if needs_topk:
-            uniform_k = bs == 1 or (batch.top_ks == batch.top_ks[0]).all()
-            # Except where `Sampler` keeps top-k ties with a top-p: a scalar
-            # k there would take aiter's top-k-first path, so it is handed
-            # the same k per row, from the buffer a mixed batch uses.
-            if uniform_k and not (self.sampler.keep_top_k_ties and needs_topp):
+            if bs == 1 or (batch.top_ks == batch.top_ks[0]).all():
                 top_ks = int(batch.top_ks[0])
             else:
                 top_k_buffer = self.forward_vars["top_ks"]

@@ -53,6 +53,39 @@ def test_kept_ties_take_a_per_row_k_without_readback(monkeypatch, rows, k_rows):
     assert seen["k_scalar"] == 0 and seen["p_scalar"] == 0.9
 
 
+def test_kept_ties_expand_a_scalar_k_into_the_samplers_own_buffer(monkeypatch):
+    """The runner hands a uniform k as a scalar; `Sampler` expands it per row
+    into the buffer it allocated up front, so no draw allocates."""
+    from types import SimpleNamespace
+
+    seen = []
+
+    def joint(probs, indices, k_tensor, k_scalar, p_tensor, p_scalar, **_):
+        seen.append((k_tensor.data_ptr(), k_tensor.tolist(), k_scalar))
+        return torch.zeros(probs.shape[0], 1, dtype=torch.int64)
+
+    monkeypatch.setattr(
+        sampler, "aiter_ops", SimpleNamespace(top_k_top_p_sampling_from_probs=joint)
+    )
+    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
+    instance = sampler.Sampler(max_rows=8)
+    buffer = instance._tie_k.data_ptr()
+    draws = [(torch.full((rows, 16), 1 / 16), k) for rows, k in ((8, 4), (3, 6))]
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", lambda *_: pytest.fail("filter readback"))
+        for alloc in ("empty", "full", "tensor"):
+            patch.setattr(torch, alloc, lambda *_, **__: pytest.fail("k allocated"))
+        for probs, k in draws:
+            instance._aiter_sample(probs, k, 0.9, True, True, probs[:, 0])
+    assert seen == [(buffer, [4] * 8, 0), (buffer, [6] * 3, 0)]
+
+
+def test_a_sampler_that_drops_ties_keeps_no_k_buffer(monkeypatch):
+    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0")
+    assert sampler.Sampler(max_rows=8)._tie_k is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("path", ["aiter", "native"])
 @pytest.mark.parametrize("rows", [1, 8])
@@ -96,8 +129,6 @@ def test_runner_uniform_filters_reach_sampler_without_readback(
     from tests.test_h2d_runner_publication import runner_with_buffers
 
     runner = runner_with_buffers(monkeypatch, transport)
-    # Keeping ties hands even a uniform k per row (`prepare_sample`).
-    runner.sampler.keep_top_k_ties = keep_ties
     batch = SimpleNamespace(
         total_seqs_num=bs,
         temperatures=np.ones(bs, dtype=np.float32),

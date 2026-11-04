@@ -64,7 +64,7 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
 
 class Sampler(nn.Module):
 
-    def __init__(self):
+    def __init__(self, max_rows: int = 0):
         super().__init__()
         self.eps = SAMPLER_EPS
         # Keep a tie group at the top-k cut whole, as every aiter path but one
@@ -74,6 +74,13 @@ class Sampler(nn.Module):
         # draw does, armed or not. The native fallback keeps exactly k; on
         # such builds the ratio verify does not arm.
         self.keep_top_k_ties = envs.ATOM_SPEC_LOSSLESS_SAMPLING
+        # Where a scalar or one-element k is expanded to one per row for that
+        # (`_per_row_k`), for up to ``max_rows`` rows, so no draw allocates.
+        self._tie_k = (
+            torch.empty(max_rows, dtype=torch.int32)
+            if self.keep_top_k_ties and max_rows
+            else None
+        )
 
     def sample_verification_tokens(
         self,
@@ -256,6 +263,29 @@ class Sampler(nn.Module):
             return (None, x.item())
         return (x, 0)
 
+    def _per_row_k(
+        self, top_ks: int | torch.Tensor, rows: int, device: torch.device
+    ) -> torch.Tensor:
+        """``top_ks`` as one int32 k per row, without a readback: a full
+        per-row k as is, a scalar or one-element k expanded into `_tie_k`."""
+        if (
+            isinstance(top_ks, torch.Tensor)
+            and top_ks.shape == (rows,)
+            and top_ks.dtype == torch.int32
+        ):
+            return top_ks
+        tie_k = self._tie_k
+        if tie_k is None or tie_k.numel() < rows or tie_k.device != device:
+            # Only a sampler built without room for these rows (a direct
+            # caller's) allocates; the runner's never does.
+            tie_k = self._tie_k = torch.empty(rows, dtype=torch.int32, device=device)
+        k = tie_k[:rows]
+        if isinstance(top_ks, torch.Tensor):
+            k.copy_(top_ks.expand(rows))
+        else:
+            k.fill_(top_ks)
+        return k
+
     def _aiter_sample(
         self,
         probs: torch.Tensor,
@@ -268,26 +298,17 @@ class Sampler(nn.Module):
         """Use aiter optimized ops for top-k/top-p sampling."""
         # Convert to tensor/scalar format for aiter
         keep_ties = self.keep_top_k_ties and has_topk and has_topp
-        if keep_ties and isinstance(top_ks, torch.Tensor):
-            # Stays per row even at one element (a bs=1 batch, or a verify's
-            # one k for all its rows): `_to_tensor_scalar` would read it back
-            # to a scalar, and the scalar back to a tensor below.
-            k_tensor = top_ks.to(torch.int32).expand(probs.shape[0]).contiguous()
+        if keep_ties:
+            # A per-row k never takes the joint op's top-k-first path, which
+            # keeps exactly k ids; the fused kernel keeps whole tie groups
+            # (see `__init__`).
+            k_tensor = self._per_row_k(top_ks, probs.shape[0], probs.device)
             k_scalar = 0
         else:
             k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
         p_tensor, p_scalar = self._to_tensor_scalar(top_ps)
 
         if has_topk and has_topp:
-            if keep_ties and k_tensor is None:
-                # A per-row k never takes the joint op's top-k-first path,
-                # which keeps exactly k ids; the fused kernel keeps whole tie
-                # groups (see `__init__`). The runner hands this path a
-                # per-row k already (`prepare_sample`), so only a direct
-                # caller with a scalar allocates.
-                k_tensor = torch.full(
-                    (probs.shape[0],), k_scalar, dtype=torch.int32, device=probs.device
-                )
             # Joint k+p path
             next_tokens = aiter_ops.top_k_top_p_sampling_from_probs(
                 probs,
