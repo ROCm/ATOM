@@ -45,9 +45,8 @@ if TYPE_CHECKING:
 class DraftSampling:
     """Everything the block sampler needs to draw -- and publish -- a real q.
 
-    Bound at drafter init and completed, with the target's own sampling
-    inputs, once the runner has allocated them (`DSparkLossless.bind_target`),
-    before any warmup or capture: the block head is cudagraph-captured
+    Built once, when the runner has allocated the target's own sampling
+    inputs (`DSparkLossless.bind_target`), before any warmup or capture: the block head is cudagraph-captured
     (``DSparkProposer._declare_draft_graphs``, ``capture_epilogue=True``), so
     every address here is baked into the recording. That is also why the
     per-step seed and row bases are device tensors rather than python ints:
@@ -77,12 +76,12 @@ class DraftSampling:
     #: so draft and target cannot disagree on them. [max_bs] fp32 temperatures,
     #: clamped to ``SAMPLER_EPS``, where a row at ``SAMPLER_EPS`` is greedy
     #: (`Sampler`'s predicate) and drafts its argmax.
-    temperatures: torch.Tensor | None = None
+    temperatures: torch.Tensor
     #: [max_bs] int32, the request's top-k the draft samples within; -1 is off.
-    top_k: torch.Tensor | None = None
+    top_k: torch.Tensor
     #: [max_bs] fp32, the request's top-p, over the unfiltered q and
     #: intersected with top-k (aiter's rule); 1.0 is off.
-    top_p: torch.Tensor | None = None
+    top_p: torch.Tensor
 
 
 def linear_out(output):

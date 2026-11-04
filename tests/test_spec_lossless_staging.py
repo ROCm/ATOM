@@ -47,7 +47,9 @@ class FakeDraftModel:
         self.bound = sampling
 
 
-def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
+def proposer(
+    monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, bind=True, **config
+):
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1" if lossless else "0")
     monkeypatch.setattr(dspark_lossless, "get_pcp_world_size", lambda: pcp)
     # CPU stand-in weights; the GPU arming check has its own test below.
@@ -71,7 +73,21 @@ def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
     prop.mtp_k = T
     prop.model = FakeDraftModel() if model is None else model
     prop.lossless = dspark_lossless.DSparkLossless.arm(prop)
+    if bind and prop.lossless is not None:
+        prop.lossless.bind_target(target_vars(), prop.model)
     return prop
+
+
+def target_vars():
+    """CPU stand-ins for the runner's `forward_vars` the draft reads."""
+    return {
+        name: CpuGpuBuffer(MAX_BS, dtype=dtype, device="cpu")
+        for name, dtype in (
+            ("temperatures", torch.float32),
+            ("top_ks", torch.int32),
+            ("top_ps", torch.float32),
+        )
+    }
 
 
 def group(prop):
@@ -139,16 +155,11 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
 
 def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
     """No copy to drift: once bound, the draft's per-row temperatures and
-    filters are the runner's `forward_vars` buffers themselves."""
-    prop = proposer(monkeypatch)
-    forward_vars = {
-        name: CpuGpuBuffer(MAX_BS, dtype=dtype, device="cpu")
-        for name, dtype in (
-            ("temperatures", torch.float32),
-            ("top_ks", torch.int32),
-            ("top_ps", torch.float32),
-        )
-    }
+    filters are the runner's `forward_vars` buffers themselves. Arming only
+    allocates; the model is bound once, complete."""
+    prop = proposer(monkeypatch, bind=False)
+    assert prop.model.bound is None
+    forward_vars = target_vars()
     prop.lossless.bind_target(forward_vars, prop.model)
     sampling = prop.model.bound
     assert sampling.temperatures is forward_vars["temperatures"].gpu
@@ -280,7 +291,7 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     """Next to the q store, before the KV cache is sized: the profiling run
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
-    assert prop.lossless.sampling.scratch.nbytes()
+    assert prop.lossless.draft_scratch.nbytes()
     assert prop.lossless.verify_scratch.nbytes()
 
 
@@ -297,7 +308,7 @@ def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch):
     assert (steps, vocab, width, dtype) == (
         T,
         VOCAB,
-        prop.lossless.sampling.q_store.ids.shape[1],
+        prop.lossless.q_store.ids.shape[1],
         torch.bfloat16,
     )
     assert scratch is prop.lossless.verify_scratch
@@ -411,7 +422,7 @@ def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
     temps, top_ks, top_ps = torch.ones(2), torch.tensor([5, -1]), 0.7
     ratio = prop.lossless.verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
     # The sparse store itself; the verify borrows nothing of the draft's.
-    assert ratio.q is prop.lossless.sampling.q_store
+    assert ratio.q is prop.lossless.q_store
     assert (
         ratio.q_row_base.shape == (2,) and ratio.scratch is prop.lossless.verify_scratch
     )

@@ -8,7 +8,6 @@ and staged inputs, and is the drafter's ``lossless``: the runner binds, stages
 and reads it directly.
 """
 
-import dataclasses
 import logging
 
 import torch
@@ -148,9 +147,8 @@ class DSparkLossless:
                 "there is no defensible way to apply both. Turn one off."
             )
         lossless = cls(drafter)
-        drafter.model.bind_draft_sampling(lossless.sampling)
         if drafter.runner.rank == 0:
-            store = lossless.sampling.q_store
+            store = lossless.q_store
             q_rows, q_width = store.ids.shape
             t = drafter.draft_tokens_per_seq
             logger.info(
@@ -162,8 +160,8 @@ class DSparkLossless:
                 q_width,
                 int(drafter.model.vocab_size),
                 store.nbytes() / 2**20,
-                lossless.sampling.s_scratch.numel() * 4 / 2**20,
-                lossless.sampling.scratch.nbytes() / 2**20,
+                lossless.s_scratch.numel() * 4 / 2**20,
+                lossless.draft_scratch.nbytes() / 2**20,
                 lossless.verify_scratch.nbytes() / 2**20,
             )
         return lossless
@@ -183,10 +181,12 @@ class DSparkLossless:
         q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
         # One row block per live request, not per batch slot: the verify reads
         # it a step later, after the batch may have been reordered.
-        q_store = SparseQStore.allocate(q_slots * t, min(Q_WIDTH, vocab), device)
+        self.q_store = SparseQStore.allocate(q_slots * t, min(Q_WIDTH, vocab), device)
         # The draft's own: the verify reads q from the store, not from here.
-        s_scratch = torch.empty((max_bs, vocab), dtype=torch.float32, device=device)
-        draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
+        self.s_scratch = torch.empty(
+            (max_bs, vocab), dtype=torch.float32, device=device
+        )
+        self.draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, device)
         # Members of the runner's `sampling` publication, uploaded by the H2D
         # `prepare_sample` issues; its `begin()` waits out the previous upload.
         # The Philox key, the first q row each batch row drafts into, and the
@@ -209,21 +209,21 @@ class DSparkLossless:
             verify_q_row_base=self.verify_q_row_base.np,
             greedy_threshold=SAMPLER_EPS,
         )
-        self.sampling = DraftSampling(
-            q_store=q_store,
-            s_scratch=s_scratch,
-            scratch=draft_scratch,
-            seed=self.seed.gpu,
-            q_row_base=self.q_row_base.gpu,
-        )
+        # The draft model's `DraftSampling`, built by `bind_target`.
+        self.sampling = None
 
     def bind_target(self, forward_vars, model) -> None:
-        """Point the draft at the target's own temperatures, top-k and top-p
-        (`ModelRunner.forward_vars`), which `prepare_sample` publishes every
-        row of while this is armed, and rebind ``model``. Before any warmup or
-        capture, so the recorded block reads them."""
-        self.sampling = dataclasses.replace(
-            self.sampling,
+        """Build the draft's `DraftSampling` around these buffers and the
+        target's own temperatures, top-k and top-p (`ModelRunner.forward_vars`,
+        which `prepare_sample` publishes every row of while this is armed), and
+        bind ``model`` to it. Once, before any warmup or capture, so the
+        recorded block reads them."""
+        self.sampling = DraftSampling(
+            q_store=self.q_store,
+            s_scratch=self.s_scratch,
+            q_row_base=self.q_row_base.gpu,
+            seed=self.seed.gpu,
+            scratch=self.draft_scratch,
             temperatures=forward_vars["temperatures"].gpu,
             top_k=forward_vars["top_ks"].gpu,
             top_p=forward_vars["top_ps"].gpu,
@@ -272,7 +272,7 @@ class DSparkLossless:
                 f"logits but the LM head emits {logits_dtype}"
             )
         return RatioVerifyInputs(
-            self.sampling.q_store,
+            self.q_store,
             self.verify_q_row_base.gpu[:bs],
             temperatures,
             top_ks,
@@ -286,8 +286,8 @@ class DSparkLossless:
         self._verify_logits_dtype = logits_dtype
         warmup_ratio_verify(
             self.mtp_k,
-            self.sampling.s_scratch.shape[1],
-            self.sampling.q_store.ids.shape[1],
+            self.s_scratch.shape[1],
+            self.q_store.ids.shape[1],
             logits_dtype,
             self.verify_scratch,
         )
@@ -296,4 +296,4 @@ class DSparkLossless:
         """Point every draft row at no q row, on the host and the device (on
         the current stream, the one the warmup that follows runs on)."""
         self.staging.clear_destinations()
-        self.sampling.q_row_base.fill_(-1)
+        self.q_row_base.gpu.fill_(-1)
