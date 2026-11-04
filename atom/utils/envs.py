@@ -451,6 +451,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS": lambda: int(
         os.getenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", "8192")
     ),
+    # MiniMax-M3 on gfx1250: batches of at most this many tokens may leave the
+    # split-K reduction of the per-token FP8 QKV GEMM to the q/k norm + RoPE +
+    # cache kernel that consumes it; 0 keeps the standalone reduce kernel.
+    "ATOM_SPLITK_CONSUMER_REDUCE_MAX_M": lambda: int(
+        os.getenv("ATOM_SPLITK_CONSUMER_REDUCE_MAX_M", "64")
+    ),
     "ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION", "1") == "1"
     ),
