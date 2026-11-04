@@ -222,18 +222,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
     # rank's running batch. CoreManager warns when that happens.
     "ATOM_DP_DISPATCH_DEPTH": lambda: _nonnegative_int_env("ATOM_DP_DISPATCH_DEPTH", 0),
-    # Prefix-spread DP routing (replaces sticky sessions when set). The router
-    # remembers which ranks ran each prompt prefix (frontend prompt block-hash
-    # chain) and keeps a request on its prefix's rank, unless another rank has
-    # under ATOM_DP_PREFIX_IDLE_TOKENS queued prefill (about to idle) while the
-    # prefix's rank has over twice that; then the request goes to an idle rank
-    # -- with more than two ranks, among those within IDLE_TOKENS / 2 load of
-    # the lightest, the one holding the most of its prefix -- and loads the
-    # prefix from the offload tier (LMCache), prefetched while it waits (see
-    # `Scheduler._offload_prefetch`). New prefixes go to the lightest rank
-    # (`least_tokens` score).
-    "ATOM_DP_PREFIX_SPREAD": lambda: os.getenv("ATOM_DP_PREFIX_SPREAD", "0") == "1",
-    # Must be positive; the default is two 16k prefill chunks.
+    # `--dp-load-balance prefix_spread`: a rank with less queued prefill than
+    # this is about to idle and may take requests from a prefix's rank with
+    # over twice this queued. Must be positive; the default is two 16k prefill
+    # chunks.
     "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
         "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
     )

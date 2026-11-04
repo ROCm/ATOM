@@ -61,7 +61,7 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens")
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
 DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
@@ -310,20 +310,16 @@ class CoreManager:
         # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
         # request on the rank holding its prompt's prefix unless that rank has
         # a prefill backlog and another is about to idle.
-        self._prefix_spread = envs.ATOM_DP_PREFIX_SPREAD
+        self._prefix_spread = self._dp_lb_strategy == "prefix_spread"
         self._prefix_router: PrefixSpreadRouter | None = None
         if self._prefix_spread:
-            # Prefix spread places every request without an explicit rank
-            # hint: it overrides session affinity and the dp_load_balance
-            # strategy (and the offline backpressure dispatch).
-            overridden = [f"--dp-load-balance {self._dp_lb_strategy}"]
             if self._dp_session_affinity_enabled:
-                overridden.append("ATOM_DP_SESSION_AFFINITY")
-            logger.info(
-                "%s: ATOM_DP_PREFIX_SPREAD routes requests; it overrides %s",
-                label,
-                " and ".join(overridden),
-            )
+                # Both place every request by their own rule; a session pin
+                # would undo every move.
+                raise ValueError(
+                    "--dp-load-balance prefix_spread and ATOM_DP_SESSION_AFFINITY=1 "
+                    "are two routing policies; set only one"
+                )
             if not (
                 getattr(config, "enable_prefix_caching", False)
                 and envs.ATOM_FRONTEND_PREFIX_HASH
@@ -331,8 +327,8 @@ class CoreManager:
                 # No prompt hash chain reaches the router: every request is
                 # cold and goes to the lightest rank.
                 raise ValueError(
-                    "ATOM_DP_PREFIX_SPREAD=1 needs --enable_prefix_caching and "
-                    "ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+                    "--dp-load-balance prefix_spread needs --enable_prefix_caching "
+                    "and ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
                 )
             self._prefix_router = PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS, self._dp_route_counters
@@ -1159,14 +1155,10 @@ class CoreManager:
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
             return
 
-        # round_robin normally skips load bookkeeping. Session affinity and
-        # prefix-spread routing still need the in-flight counters (prefix-spread
-        # scores ranks by them whatever the strategy), even if the fallback
-        # strategy is RR.
+        # round_robin normally skips load bookkeeping. Session affinity still
+        # needs the in-flight counters, even if the fallback strategy is RR.
         track_load = (
-            self._dp_lb_strategy != "round_robin"
-            or self._dp_session_affinity_enabled
-            or self._prefix_spread
+            self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
