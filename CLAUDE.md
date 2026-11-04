@@ -100,7 +100,10 @@ Key entry points:
   implementations rather than two copies, and merging them is a GPU behaviour
   change, not a move; both allocate through `runtime/uncached.py`, as do every
   model's step scratch buffers (uncached device memory: a hand-off's polls
-  never hit a stale cache line). Where a model ships a
+  never hit a stale cache line). Qwen3.8-Flash-Next's kernels (`qwen38/mono/`, beside
+  the single-file `qwen4_exp.py`) are whole-layer programs composed from FlyDSL stages
+  (`kernels/blocks/`, `kernels/recipe.py`); its MTP drafter is wrapped at install like
+  V4.1's (`draft_model.MonoDraftModel`). Where a model ships a
   `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
   python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
@@ -155,3 +158,4 @@ Key entry points:
 | Adding a model | `/add-model` |
 | MiniMax-H3 (video+audio diffusion) | `recipes/MiniMax-H3.md` |
 | DeepSeek-V4.1-Flash | `recipes/DeepSeek-V4.1-Flash.md` |
+| Qwen3.8-Flash-Next mono decode | `recipes/Qwen3.8-Flash-Next-Mono-Program.md` |
