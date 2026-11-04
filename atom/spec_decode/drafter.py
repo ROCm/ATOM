@@ -17,6 +17,7 @@ from atom.distributed.pcp_utils import (
     pcp_pad_len,
 )
 from atom.model_loader.loader import load_model
+from atom.models.utils import PPMissingLayer
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
@@ -452,19 +453,33 @@ class Drafter(abc.ABC):
         spec = self._aux_capture_spec()
         if spec is None:
             return
+        layers = _resolve_decoder_layers(target_model)
+
+        def relayed(lid):
+            # On an earlier PP stage: `take_relayed_aux` serves it instead.
+            # Out-of-range ids are left for install_aux_taps to reject.
+            if lid == -1:
+                module = _resolve_embedding(target_model)
+            elif 0 <= lid < len(layers):
+                module = layers[lid]
+            else:
+                return False
+            return isinstance(module, PPMissingLayer)
+
+        # A relayed tap gets no rows and no hook: its buffer is never read.
         self._aux_buffers = [
             torch.zeros(
-                self.max_num_tokens,
+                0 if relayed(lid) else self.max_num_tokens,
                 spec.hidden_size,
                 device=self.device,
                 dtype=self.dtype,
             )
-            for _ in spec.layer_ids
+            for lid in spec.layer_ids
         ]
         install_aux_taps(
             target_model,
             spec,
-            spec.layer_ids,
+            tuple(lid for lid in spec.layer_ids if not relayed(lid)),
             lambda lid, extract: self._make_aux_hook(
                 spec.layer_ids.index(lid), extract
             ),
