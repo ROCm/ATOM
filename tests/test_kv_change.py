@@ -626,6 +626,21 @@ def test_a_command_the_pp_head_refuses_reaches_no_later_stage():
         )
 
 
+def test_a_pause_the_pp_head_refuses_reaches_no_later_stage():
+    """A later stage that paused would hold, and forward nothing the head sent."""
+    sched, _ = _running(2)
+    with _pipeline(sched, stage_runs=False) as (mgr, head, stage, wire):
+        _launch(head, wire, req_id=7)
+
+        with pytest.raises(RuntimeError, match="still in the pipeline"):
+            mgr.broadcast_utility_command_sync(
+                "pause_generation", mode="keep", timeout=1
+            )
+
+        assert stage.received == []
+        assert not (head._generation_paused or stage._generation_paused)
+
+
 def test_a_command_that_leaves_weights_and_kv_alone_reaches_every_stage():
     """It went to the head first like a weight update, so one the head
     failed never reached the later stages, as a profile start would not."""

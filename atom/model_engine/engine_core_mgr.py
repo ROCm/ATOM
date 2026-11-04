@@ -33,6 +33,7 @@ from atom.model_engine.collective_rpc import (
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import (
     FIRE_AND_FORGET_UTILITY_CMDS,
+    PAUSE_GENERATION_CMD,
     WEIGHT_UPDATE_UTILITY_CMDS,
     completes_weight_sync,
     kv_change,
@@ -60,8 +61,13 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 
 def _pp_head_first(cmd: str, args: dict) -> bool:
     """Whether the PP head empties its pipeline before *cmd*: a weight update,
-    whose sync fences the later stages, or a change to the KV pool."""
-    return cmd in WEIGHT_UPDATE_UTILITY_CMDS or kv_change(cmd, args) is not None
+    whose sync fences the later stages, a change to the KV pool, or a pause,
+    which holds them."""
+    return (
+        cmd in WEIGHT_UPDATE_UTILITY_CMDS
+        or cmd == PAUSE_GENERATION_CMD
+        or kv_change(cmd, args) is not None
+    )
 
 
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
