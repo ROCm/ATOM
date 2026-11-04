@@ -215,15 +215,11 @@ class SPMegaMoE:
 
 
 def _unsupported_config(config):
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
     # Config._init_sequence_parallel refuses the rest.
     if config.eplb_enable or config.fake_eplb:
         return "needs static expert placement, without EPLB"
     if config.torch_dtype != torch.bfloat16:
         return "needs BF16 activations"
-    if get_gfx_runtime() != "gfx950":
-        return "needs gfx950"
     return None
 
 
@@ -264,9 +260,11 @@ def _plan(config, layers):
     if len(shapes) != 1:
         return "the shared runtime needs one expert shape across layers"
     try:
-        from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP  # noqa: F401
+        from aiter.ops.flydsl.mega_moe_tp import mega_moe_tp_supported
     except ImportError as exc:
         return f"MegaMoeTP unavailable: {exc}"
+    if not mega_moe_tp_supported():
+        return "MegaMoeTP does not support this GPU"
     return shapes.pop()
 
 

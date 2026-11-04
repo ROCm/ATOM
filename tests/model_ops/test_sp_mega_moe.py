@@ -214,6 +214,7 @@ def _initialize(monkeypatch, sp_modules, runtime, mnbt=1024):
     mega.MegaMoeTPConfig = dict
     mega.MegaMoeTP = runtime
     mega.MegaMoeSetupError = MegaMoeSetupError
+    mega.mega_moe_tp_supported = lambda: True
     monkeypatch.setitem(sys.modules, mega.__name__, mega)
     monkeypatch.setattr(fusion, "get_sp_world_size", lambda: 4)
     _pcp_group(
