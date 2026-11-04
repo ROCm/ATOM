@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
 
+from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.model_loader.weight_utils import (
     checkpoint_layer_key,
@@ -2238,8 +2239,7 @@ class Config:
 
     @property
     def pcp_group_size(self) -> int:
-        """Ranks in AITER's PCP process group, which Ulysses SP runs over too."""
-        return max(self.prefill_context_parallel_size, self.sequence_parallel_size)
+        return pcp_group_size_of(self)
 
     @property
     def capture_sizes(self) -> list[int]:

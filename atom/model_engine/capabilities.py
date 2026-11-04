@@ -31,6 +31,17 @@ from dataclasses import dataclass, field
 COLLECTIVE_RPC_PROTOCOL_VERSION = 1
 
 
+def pcp_group_size_of(config) -> int:
+    """Ranks in AITER's PCP process group, which Ulysses SP runs over too.
+
+    Read with defaults: also called on bare stand-in configs.
+    """
+    return max(
+        int(getattr(config, "prefill_context_parallel_size", 1) or 1),
+        int(getattr(config, "sequence_parallel_size", 1) or 1),
+    )
+
+
 @dataclass(frozen=True)
 class WorkerCapabilities:
     """One rank's view of itself."""
@@ -114,8 +125,7 @@ class EngineCapabilities:
             ),
             prefill_context_parallel_size=pcp_size,
             sequence_parallel_size=sp_size,
-            # Ulysses SP runs over the PCP group's ranks.
-            workers_per_engine=tp_world_size * max(pcp_size, sp_size),
+            workers_per_engine=tp_world_size * pcp_group_size_of(config),
             kv_cache_dtype=str(getattr(config, "kv_cache_dtype", "auto")),
             methods=methods,
             features=features,

@@ -3466,8 +3466,9 @@ class ModelRunner:
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
-        # Near-tie argmaxes differ across PCP ranks (~1 bf16 ULP) and the ids
-        # feed the next forward, whose MoE all_reduce assumes identical rows.
+        # The ids feed the next forward and must agree across the group: PCP
+        # near-tie argmaxes differ (~1 bf16 ULP), and SP samples with each
+        # process's own RNG, then embeds its rows from its own ids.
         if get_pcp_world_size() > 1 and _needs_id_sync(
             self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
