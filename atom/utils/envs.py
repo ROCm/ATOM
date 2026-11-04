@@ -605,6 +605,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # Kimi-K3 mono: on each full-attention (MLA) layer that runs K2, the v-up
+    # BMM, g_proj, sigmoid and mul become K2's first stage (kernels/stages/
+    # mla_post.py) instead of four kernels between the MLA decode and K2. Needs
+    # g_proj and kv_b_proj in the FP8 online quant (they are in the recipe).
+    # Not bit-identical to the four kernels (GEMM summation order). Off by default.
+    "ATOM_MONO_MLA_POST": lambda: os.getenv("ATOM_MONO_MLA_POST", "0") == "1",
+    # Debug: with ATOM_MONO_MLA_POST, run the production tail next to the K2 post
+    # stage on the same inputs and log how many bf16 values differ (rank 0).
+    # Use with --enforce-eager.
+    "ATOM_MONO_MLA_POST_CHECK": lambda: (
+        os.getenv("ATOM_MONO_MLA_POST_CHECK", "0") == "1"
+    ),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
