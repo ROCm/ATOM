@@ -608,7 +608,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `spec_sampling/sampling_filter_descent.py` | `descend_floor` — the floor by a radix descent over the logit bits |
 | `spec_sampling/sampling_filter_count.py` | `count_floor` — the floor of a top-k of at most 256 alone, counted |
 | `spec_sampling/softmax_tiles.py` | `tile_max_sumexp`, `softmax_combine_kernel` — the ratio verify's per-tile softmax statistics and their combine into each row's max, `1/Z` and argmax; the draft combines only the max and argmax |
-| `spec_sampling/sampling_scratch.py` | `SamplingScratch`, `Region` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) on its own `SCRATCH_ALIGN` boundary |
+| `spec_sampling/sampling_scratch.py` | `SamplingScratch`, `Region` — the draft's and the ratio verify's per-step scratch: one byte buffer allocated before KV sizing, carved into named views (a NamedTuple of `Region`s in, the same NamedTuple of tensors out) placed by the cache pools' `entry_arena.plan_regions` |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
 | `base_config.py` | `QuantizeMethodBase` abstract class |
 | `utils.py` | Helper utilities: `shuffle_weights`, `normalize_e4m3fn_to_e4m3fnuz`, `per_tensor_dequantize`, etc. |

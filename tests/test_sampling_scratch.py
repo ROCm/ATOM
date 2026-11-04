@@ -67,7 +67,7 @@ def test_every_view_is_aligned_whatever_the_batch(rows):
 
 def test_a_batch_larger_than_the_scratch_is_refused():
     scratch = SamplingScratch.for_spec(spec(2), "cpu")
-    with pytest.raises(ValueError, match="sized for a smaller batch"):
+    with pytest.raises(ValueError, match="cannot hold"):
         scratch.carve(spec(200))
 
 

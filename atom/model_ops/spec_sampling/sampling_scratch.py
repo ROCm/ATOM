@@ -3,10 +3,11 @@
 The sampled draft and the ratio verify carve their small per-call tensors
 from one byte buffer allocated at the largest batch, before the KV cache is
 sized, so no step allocates. Each consumer names its regions in a NamedTuple
-of `Region`s and gets the same NamedTuple of views back. Every view starts on
-a `SCRATCH_ALIGN` boundary this module owns: Triton specializes on 16-byte
-pointer alignment, so offsets that move with the batch would recompile
-mid-serve.
+of `Region`s and gets the same NamedTuple of views back. The bytes are placed
+by the cache pools' own carver (`entry_arena.plan_regions` / `carve`), so
+every view starts on its `SCRATCH_ALIGN` boundary: Triton specializes on
+16-byte pointer alignment, so offsets that move with the batch would
+recompile mid-serve.
 """
 
 from math import prod
@@ -14,8 +15,11 @@ from typing import NamedTuple, TypeVar
 
 import torch
 
-#: Byte alignment of every view.
-SCRATCH_ALIGN = 256
+from atom.model_ops.attentions.pool_layout.entry_arena import carve as carve_bytes
+from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
+
+#: Byte alignment of every view: `plan_regions`', not chosen here.
+SCRATCH_ALIGN = plan_regions([1])[1]
 
 Spec = TypeVar("Spec", bound=tuple)
 
@@ -39,13 +43,9 @@ def _regions(spec) -> list[Region]:
     return out
 
 
-def _align(nbytes: int) -> int:
-    return -(-nbytes // SCRATCH_ALIGN) * SCRATCH_ALIGN
-
-
 def scratch_bytes(spec) -> int:
     """Bytes a buffer needs to hold this spec's views."""
-    return sum(_align(r.nbytes) for r in _regions(spec))
+    return plan_regions([r.nbytes for r in _regions(spec)])[1]
 
 
 class SamplingScratch:
@@ -68,23 +68,14 @@ class SamplingScratch:
 
 def carve(buf: torch.Tensor, spec: Spec) -> Spec:
     """``spec`` with each `Region` replaced by its view of ``buf``, laid out in
-    field order."""
-    need = scratch_bytes(spec)
-    if need > buf.numel():
-        raise ValueError(
-            f"sampling scratch holds {buf.numel()} bytes, this call needs "
-            f"{need}; it was sized for a smaller batch"
-        )
-    offset = 0
+    field order (`entry_arena.carve`, which refuses a buffer too small)."""
+    parts = iter(carve_bytes(buf, [r.nbytes for r in _regions(spec)]))
 
     def build(node):
-        nonlocal offset
         fields = []
         for field in node:
             if isinstance(field, Region):
-                view = buf[offset : offset + field.nbytes].view(field.dtype)
-                fields.append(view.view(field.shape))
-                offset += _align(field.nbytes)
+                fields.append(next(parts).view(field.dtype).view(field.shape))
             else:
                 fields.append(build(field))
         return type(node)(*fields)
