@@ -97,10 +97,19 @@ caps() { python3 -c "
 b = [1,2,3,4,5,6,7,8,12,16,24,32,40,48,56,64,80,96,112,128,160,192,224,256]
 b += list(range(320, 1025, 64)) + list(range(1152, 2049, 128)) + list(range(2304, 8193, 256))
 print([s for s in b if s < $1] + [$1])" | tr -d ' '; }
+# KV=fp8_k4v8 (A8K4V8: NVFP4 K, fp8 V): read only by aiter's unified attention, and 128-token pages by
+# default -- over 64-token pages, 10-minute points c128 / c256: output tok/s +1.5% / +2.6%, TPOT p90
+# -0.8% / -2.5% (README.mlperf-agentic.md, "A8K4V8 KV cache"). A BLOCK_SIZE in the environment wins.
+if [ "$KV" = fp8_k4v8 ]; then
+  export ATOM_USE_UNIFIED_ATTN=${ATOM_USE_UNIFIED_ATTN:-1}
+  BLOCK_SIZE=${BLOCK_SIZE:-128}
+fi
 case $MODE in
   # MAXSEQ: run_ep.sh sets it from the concurrency (sequences an engine, at most 512)
   tp) MAXSEQ=${MAXSEQ:-64}
-      ARGS+=(--max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}") ;;
+      ARGS+=(--max-num-seqs $MAXSEQ --cudagraph-capture-sizes "${CAPS:-$(caps $MAXSEQ)}")
+      # A8K4V8 pages are 64, 128 or a multiple of 128 tokens (the TP points otherwise keep ATOM's default)
+      [ "$KV" = fp8_k4v8 ] && ARGS+=(--block-size $BLOCK_SIZE) ;;
   # as the image's scripts/qwen35/serve_qwen35_dp4ep4.sh (mori v2 dispatch: aiter's flydsl dispatch gives NaN
   # logits with uneven DP token counts) + the DSv4.1 DEP recipe's session affinity: a conversation's
   # turns stay on the DP rank that holds its prefix cache

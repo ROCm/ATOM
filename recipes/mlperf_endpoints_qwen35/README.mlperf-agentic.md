@@ -17,6 +17,39 @@ DP4 attention + EP4 MoE, MTP with 3 draft tokens, fp8 KV cache. Minutes 2-8 of 1
 100 tok/s/user is crossed between c512 and c768, at about 45k tok/s by interpolation. Above c768 most of the
 extra concurrency waits for prefill (TTFT), which TPOT does not count.
 
+## A8K4V8 KV cache
+
+`KV=fp8_k4v8` stores K in NVFP4 (e2m1 + one e4m3 scale per 16 values) and V in fp8, and hands Q to aiter's
+unified attention in fp8: 400 bytes a token and KV head against 512 for fp8, so the KV pool holds about 30%
+more tokens. It needs ATOM `dd4573b4b` and aiter `7b1d271e4` (both on `alizaidy/gfx1250-qwen-support`).
+
+```bash
+set -a; . ./agentic_20261101.env; set +a
+export KV=fp8_k4v8          # after the env file, or before it: the file keeps a KV from the environment
+STOP_S=615 ./bench_point.sh 256 /work/qwen35_ep/c256_k4v8
+```
+
+`serve_ep.sh` then sets `ATOM_USE_UNIFIED_ATTN=1` (A8K4V8 is read only by unified attention; the server
+refuses to start without it) and 128-token pages (`BLOCK_SIZE` in the environment wins; 64, 128 or a multiple
+of 128). Nothing is set on the aiter side: unified attention picks A8K4V8 from the cache dtypes, with its own
+`DT_fp8_nvfp4_fp8` configs, and Qwen3.5's fused Q/K norm + MRoPE + KV write has an A8K4V8 mode. A plain
+server: `--kv_cache_dtype fp8_k4v8 --block-size 128` with `ATOM_USE_UNIFIED_ATTN=1`.
+
+10-minute points, minutes 2-8, DP4 attention + EP4 MoE, MTP-3, measured 2026-11-03 on the 11-02 fusion image
+with these changes applied (fp8: the image as shipped, 64-token pages):
+
+| point | KV cache | pages | output tok/s | TPOT p50 / p90 (ms) | tps_per_user (1000 / p90) | requests/s |
+|---|---|---:|---:|---|---:|---:|
+| c128 | fp8 | 64 | 14,504 | 3.18 / 4.01 | 249.4 | 39.0 |
+| c128 | fp8_k4v8 | 64 | 14,787 | 3.09 / 3.89 | 256.9 | 38.8 |
+| c128 | fp8_k4v8 | 128 | **15,003** | **3.04 / 3.86** | **259.2** | 40.0 |
+| c256 | fp8 | 64 | 25,752 | 4.58 / 5.74 | 174.3 | 67.6 |
+| c256 | fp8_k4v8 | 64 | 26,007 | 4.44 / 5.56 | 179.9 | 67.7 |
+| c256 | fp8_k4v8 | 128 | **26,675** | **4.34 / 5.42** | **184.5** | 68.6 |
+
+GSM8K (3-shot, completions, DP4 + EP4, fp8_k4v8): 0.849 flexible / 0.838 strict at 256 concurrent requests
+(fp8 on this recipe: 0.8635 / 0.8499). The TP points (c <= 16) were not measured with `fp8_k4v8`.
+
 ## Code
 
 | component | where | what it is |
