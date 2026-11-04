@@ -890,6 +890,17 @@ class ModelRunner:
         lossless = _draft_lossless(self)
         if lossless is not None:
             lossless.bind_target(self.forward_vars, self.drafter.model)
+            # The bonus draws keep top-k ties as the verify's p_f does.
+            self.sampler.keep_ties(self.forward_vars["top_ks"].gpu)
+        elif envs.ATOM_SPEC_LOSSLESS_SAMPLING and not getattr(
+            getattr(self, "drafter", None), "is_block_drafter", False
+        ):
+            # A DSpark drafter says why it did not arm (`DSparkLossless.arm`).
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is set but only a DSpark drafter "
+                "arms it; this engine (%s) samples and verifies as without it.",
+                type(getattr(self, "drafter", None)).__name__,
+            )
             self.rejection_sampler.arm_ratio(
                 config.max_num_seqs,
                 self.drafter.mtp_k,

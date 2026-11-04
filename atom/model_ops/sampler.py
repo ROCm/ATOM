@@ -9,8 +9,6 @@ from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.topk import topk
 from torch import nn
 
-from atom.utils import envs
-
 # Try to import aiter top-k/top-p sampling ops
 try:
     import aiter.ops.sampling  # noqa: F401
@@ -67,13 +65,23 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.eps = SAMPLER_EPS
-        # Keep a tie group at the top-k cut whole, as every aiter path but one
-        # does: for a scalar top-k (small k, large vocab) with a top-p, aiter's
-        # joint op selects exactly k ids first, splitting such a group. The
-        # ratio verify's p_f keeps it whole, so with the flag set every aiter
-        # draw does, armed or not. The native fallback keeps exactly k; on
-        # such builds the ratio verify does not arm.
-        self.keep_top_k_ties = envs.ATOM_SPEC_LOSSLESS_SAMPLING
+        # Keep a tie group at the top-k cut whole (`keep_ties`); off unless
+        # lossless sampling arms.
+        self.keep_top_k_ties = False
+        self._tie_k = None
+
+    def keep_ties(self, per_row_k: torch.Tensor) -> None:
+        """Keep a tie group at the top-k cut whole, as every aiter path but
+        one does: for a scalar top-k (small k, large vocab) with a top-p,
+        aiter's joint op selects exactly k ids first, splitting such a group,
+        while the ratio verify's p_f keeps it whole. Called once lossless
+        sampling arms (aiter's ops only: it does not arm on the native
+        fallback, which keeps exactly k). ``per_row_k`` is the runner's
+        published per-row top-k (`ModelRunner.prepare_sample` writes every
+        row of it while armed): a uniform k's scalar is read from it, so no
+        draw allocates."""
+        self.keep_top_k_ties = True
+        self._tie_k = per_row_k
 
     def sample_verification_tokens(
         self,
@@ -259,20 +267,16 @@ class Sampler(nn.Module):
     def _per_row_k(
         self, top_ks: int | torch.Tensor, rows: int, device: torch.device
     ) -> torch.Tensor:
-        """``top_ks`` as one int32 k per row, without a readback. Armed, the
-        runner hands every row's already (`prepare_sample`), passed through
-        as is. A scalar or one-element k is expanded: it reaches here only
-        where the flag is set but lossless sampling did not arm (no drafter,
-        or one it refused), where nothing else holds a per-row copy."""
+        """``top_ks`` as one int32 k per row, without a readback: a per-row k
+        as is; a uniform one (a scalar, or one value) from the runner's
+        published rows (`keep_ties`), which hold that same k."""
         if (
             isinstance(top_ks, torch.Tensor)
             and top_ks.shape == (rows,)
             and top_ks.dtype == torch.int32
         ):
             return top_ks
-        if isinstance(top_ks, torch.Tensor):
-            return top_ks.to(torch.int32).expand(rows).contiguous()
-        return torch.full((rows,), top_ks, dtype=torch.int32, device=device)
+        return self._tie_k[:rows]
 
     def _aiter_sample(
         self,

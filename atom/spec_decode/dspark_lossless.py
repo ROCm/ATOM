@@ -126,6 +126,11 @@ class DSparkLossless:
             return None
         if not drafter.model.supports_lossless_draft:
             # Not ported to this flavor yet, which is not an operator error.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is set but %s has no sampled "
+                "draft. Keeping greedy proposal with exact-match acceptance.",
+                type(drafter.model).__name__,
+            )
             return None
         reason = lossless_unsupported_reason(drafter)
         if reason is not None:

@@ -42,7 +42,7 @@ def test_kept_ties_take_a_per_row_k_without_readback(monkeypatch, rows, k_rows):
     )
     monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
     instance = sampler.Sampler()
-    instance.keep_top_k_ties = True
+    instance.keep_ties(torch.full((8,), 4, dtype=torch.int32))
     probs, temperatures = torch.full((rows, 8), 1 / 8), torch.ones(rows)
     k = torch.full((k_rows,), 4, dtype=torch.int32)
     with monkeypatch.context() as patch:
@@ -53,29 +53,37 @@ def test_kept_ties_take_a_per_row_k_without_readback(monkeypatch, rows, k_rows):
     assert seen["k_scalar"] == 0 and seen["p_scalar"] == 0.9
 
 
-def test_kept_ties_expand_a_scalar_k_per_row(monkeypatch):
-    """Where the flag is set but nothing armed, the runner hands a uniform k
-    as a scalar; `Sampler` expands it per row, without a readback."""
+def test_kept_ties_read_a_uniform_k_from_the_published_rows(monkeypatch):
+    """The runner hands a uniform k as a scalar; `Sampler` reads it per row
+    from the runner's published buffer (`keep_ties`), so no draw allocates."""
     from types import SimpleNamespace
 
     seen = []
 
     def joint(probs, indices, k_tensor, k_scalar, p_tensor, p_scalar, **_):
-        seen.append((k_tensor.tolist(), k_scalar))
+        seen.append((k_tensor.data_ptr(), k_tensor.tolist(), k_scalar))
         return torch.zeros(probs.shape[0], 1, dtype=torch.int64)
 
     monkeypatch.setattr(
         sampler, "aiter_ops", SimpleNamespace(top_k_top_p_sampling_from_probs=joint)
     )
     monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
+    published = torch.full((8,), 6, dtype=torch.int32)
     instance = sampler.Sampler()
-    instance.keep_top_k_ties = True
-    draws = [(torch.full((rows, 16), 1 / 16), k) for rows, k in ((8, 4), (3, 6))]
+    instance.keep_ties(published)
+    draws = [(torch.full((rows, 16), 1 / 16), k) for rows, k in ((8, 6), (3, 6))]
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "item", lambda *_: pytest.fail("filter readback"))
+        for alloc in ("empty", "full", "tensor"):
+            patch.setattr(torch, alloc, lambda *_, **__: pytest.fail("k allocated"))
         for probs, k in draws:
             instance._aiter_sample(probs, k, 0.9, True, True, probs[:, 0])
-    assert seen == [([4] * 8, 0), ([6] * 3, 0)]
+    base = published.data_ptr()
+    assert seen == [(base, [6] * 8, 0), (base, [6] * 3, 0)]
+
+
+def test_a_sampler_keeps_aiters_own_law_until_armed():
+    assert not sampler.Sampler().keep_top_k_ties
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -139,7 +147,8 @@ def test_runner_uniform_filters_reach_sampler_without_readback(
     logits = torch.full((bs, 4096), -1000.0, device="cuda")
     logits[:, 7] = 0
     instance = sampler.Sampler()
-    instance.keep_top_k_ties = keep_ties
+    if keep_ties:
+        instance.keep_ties(torch.full((bs,), 3, dtype=torch.int32, device="cuda"))
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "item", lambda *_: pytest.fail("filter readback"))
         actual = instance(logits, temperatures, k, p, greedy, noise)

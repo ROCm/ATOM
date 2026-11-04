@@ -271,14 +271,13 @@ def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
         "rapidserve-prefill",
     ],
 )
-def test_every_sampler_keeps_top_k_ties_with_the_flag_set_armed_or_not(
-    monkeypatch, kwargs
-):
-    """The law is the flag's, not the drafter's: a P/D producer and its
-    consumer agree whenever both set it, whatever either armed."""
-    lossless = kwargs.get("lossless", True)
-    proposer(monkeypatch, **kwargs)
-    assert Sampler().keep_top_k_ties is lossless
+def test_only_an_armed_engine_keeps_top_k_ties(monkeypatch, kwargs):
+    """A refused or unset flag leaves `Sampler` on aiter's own law: the
+    runner keeps ties (`Sampler.keep_ties`) only where the drafter arms."""
+    prop = proposer(monkeypatch, **kwargs)
+    armed = prop.lossless is not None
+    assert armed is (kwargs == {})
+    assert not Sampler().keep_top_k_ties
 
 
 def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):

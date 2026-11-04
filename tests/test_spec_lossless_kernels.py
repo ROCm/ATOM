@@ -1986,9 +1986,8 @@ def test_the_bonus_draw_keeps_a_top_k_tie_group_whole_at_the_real_vocab():
     """For a scalar top-k (small k, large vocab) with a top-p, aiter's joint
     op takes a top-k-first path that keeps exactly k ids, splitting the tie
     group at the cut. The ratio verify's p_f keeps the group whole, and so
-    does every draw `Sampler` makes with the flag set (``keep_top_k_ties``):
-    from the scalar a direct caller passes, and from the per-row k the
-    runner hands it (`prepare_sample`)."""
+    does every draw an armed `Sampler` makes (``keep_ties``): from the
+    scalar the runner hands a uniform batch, and from a per-row k."""
     torch.manual_seed(163)
     n, vocab = 10000, 163840
     row = ((torch.randn(vocab, device=DEV) * 12).round() / 4).to(torch.bfloat16)
@@ -1997,8 +1996,8 @@ def test_the_bonus_draw_keeps_a_top_k_tie_group_whole_at_the_real_vocab():
     kept, p_f = filtered_p(logits[:1], temps[:1], 50, 0.95)
     assert kept[0].sum() > 50, "the cut is not inside a tie group"
     sampler = Sampler()
-    sampler.keep_top_k_ties = True
     per_row = torch.full((n,), 50, dtype=torch.int32, device=DEV)
+    sampler.keep_ties(per_row)
     for top_k in (50, per_row):
         draws = sampler(logits, temps, top_k, 0.95).long()
         assert_draws_are(draws, kept[0], p_f[0])
