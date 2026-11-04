@@ -26,6 +26,8 @@ half. The steps line up one for one and not one of them is the same computation
 
 The heads after the backbone are the same in every flavor, so they live here
 too: ``DSparkMarkovHead``, ``DSparkConfidenceHead`` and ``linear_out``.
+The standalone GQA drafts (Kimi-K3 DFlash, MiniMax-M3.1) also share one layer
+forward, ``DSparkGQADecoderLayer``.
 """
 
 from typing import ClassVar
@@ -272,6 +274,28 @@ class AllocationCap:
         return alloc
 
 
+class DSparkGQADecoderLayer(nn.Module):
+    """The forward of a standalone GQA draft layer: pre-norm attention, then a
+    pre-norm MLP. A subclass builds ``self_attn``, ``mlp``, ``input_layernorm``
+    and ``post_attention_layernorm``."""
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Residual add fused into the norm, as in Qwen3DecoderLayer.
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return self.mlp(hidden_states), residual
+
+
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
@@ -292,14 +316,12 @@ class DSparkDraftModel(nn.Module):
     def first_attention_layer_num(self) -> int:
         """``kv_cache_data`` key of this draft's first attention layer.
 
-        Paged MLA drafts bind that layer on ``layers[0].self_attn.mla_attn``;
-        this is the lookup ``DSparkProposer`` used before the hook existed, so
-        Kimi-K3 and every other MLA draft keep resolving without an override.
-        A draft whose attention module lives somewhere else (MiniMax-M3.1's
-        ``KVCacheBinding``) overrides this. Inline drafts that keep a private
-        KV window never reach the call site.
+        A paged draft binds that layer on ``layers[0].self_attn.kv`` (a
+        ``KVCacheBinding``); a draft whose attention module lives somewhere
+        else (Kimi-K3's MLA draft) overrides this. Inline drafts that keep a
+        private KV window never reach the call site.
         """
-        return self.layers[0].self_attn.mla_attn.layer_num
+        return self.layers[0].self_attn.kv.layer_num
 
     def prepare_paged_block(
         self,
@@ -354,13 +376,17 @@ class DSparkDraftModel(nn.Module):
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
         """Fuse the concatenated target aux hidden states into one [N, hidden]
-        context tensor, shared by every layer."""
-        raise NotImplementedError
+        context tensor, shared by every layer: ``hidden_norm(fc(aux))``.
+
+        A target layer id is that layer's output, the residual stream before
+        any final norm, which is what the standalone drafts are trained on.
+        """
+        return self.hidden_norm(linear_out(self.fc(aux_concat)))
 
     @property
     def context_layers(self):
         """The layers that hold context KV, in order."""
-        raise NotImplementedError
+        return self.layers
 
     def forward_spec(
         self,

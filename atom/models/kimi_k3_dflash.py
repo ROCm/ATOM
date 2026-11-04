@@ -53,6 +53,7 @@ from atom.model_ops.linear import (
 from atom.models.dspark_draft import (
     AllocationCap,
     DSparkDraftModel,
+    DSparkGQADecoderLayer,
     DSparkMarkovHead,
     KVCacheBinding,
     draft_rope_scaling,
@@ -242,7 +243,7 @@ class KimiK3DFlashAttention(nn.Module):
         self._write_kv(k, v, slot_mapping, self.kv.k_cache, self.kv.v_cache)
 
 
-class KimiK3DFlashDecoderLayer(nn.Module):
+class KimiK3DFlashDecoderLayer(DSparkGQADecoderLayer):
     def __init__(
         self,
         config,
@@ -271,22 +272,6 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Residual add fused into the norm, as in Qwen3DecoderLayer.
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        return self.mlp(hidden_states), residual
 
     def write_context_kv(
         self,
@@ -523,18 +508,6 @@ class KimiK3DFlash(DSparkDraftModel):
         return AuxCaptureSpec(layer_ids, hidden_size, extract)
 
     # -- DSparkDraftModel contract ----------------------------------------
-
-    @property
-    def first_attention_layer_num(self) -> int:
-        return self.layers[0].self_attn.kv.layer_num
-
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
-
-    @property
-    def context_layers(self):
-        """Every draft layer holds context rows; `layers` is already in order."""
-        return self.layers
 
     def block_backbone(self, input_ids, positions, num_draft: int):
         """One block: [anchor, MASK, ...] of width T in, T hidden rows out.

@@ -74,6 +74,7 @@ from atom.models.dspark_draft import (
     AllocationCap,
     DSparkConfidenceHead,
     DSparkDraftModel,
+    DSparkGQADecoderLayer,
     DSparkMarkovHead,
     KVCacheBinding,
     linear_out,
@@ -352,7 +353,7 @@ class M3DSparkAttention(nn.Module):
         return out.view(rows, -1)
 
 
-class M3DSparkDecoderLayer(nn.Module):
+class M3DSparkDecoderLayer(DSparkGQADecoderLayer):
     """One draft layer: pre-norm attention + pre-norm dense SwiGLU-OAI MLP."""
 
     def __init__(
@@ -392,16 +393,6 @@ class M3DSparkDecoderLayer(nn.Module):
                 : ctx_hidden.shape[0]
             ]
         self.self_attn.write_context_kv(ctx_hidden, positions, slot_mapping)
-
-    def forward(self, positions, hidden_states, residual=None):
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        return self.mlp(hidden_states), residual
 
 
 class MiniMaxM3DSpark(DSparkDraftModel):
@@ -481,25 +472,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         self.block_size = atom_config.kv_cache_block_size
         self._bt16 = None
 
-    @property
-    def first_attention_layer_num(self) -> int:
-        return self.layers[0].self_attn.kv.layer_num
-
     # ---- drafting entry points (called by the proposer) --------------------
-
-    def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
-        """``hidden_norm(fc(concat(aux)))``, once per step for every layer.
-
-        A target layer id is that layer's output, the residual stream before
-        any final norm, which is what this checkpoint was trained on: feeding
-        the last one through the target's final norm instead (the NeMo recipe's
-        post-norm feature) dropped GSM8K acceptance from 51% to 39%.
-        """
-        return self.hidden_norm(linear_out(self.fc(aux_concat)))
-
-    @property
-    def context_layers(self):
-        return self.layers
 
     def _alloc_block_rows(self, P: int, T: int, device) -> None:
         """The first call is the warmup, ahead of any capture: these addresses

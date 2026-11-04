@@ -2093,28 +2093,26 @@ def test_sparse_attention_sizes_on_the_q_not_positions():
 # ---- the paged block's metadata build (Kimi-K3) ------------------------------
 
 
-def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
-    """The proposer used to read ``layers[0].self_attn.mla_attn.layer_num``.
-
-    That lookup is the base default, so an MLA draft that does not override
-    it still resolves its paged KV. Only a different module layout overrides.
-    """
-    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
-    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+def test_first_attention_layer_num_follows_the_kv_binding():
+    """The base reads ``layers[0].self_attn.kv.layer_num``, the
+    ``KVCacheBinding`` the GQA drafts bind their pool on; the MLA draft binds
+    on ``mla_attn`` and keeps its own lookup."""
     from atom.models.dspark_draft import DSparkDraftModel
+    from atom.models.kimi_k3_dflash import KimiK3DFlash
     from atom.models.kimi_k3_dspark import KimiK3DSpark
     from atom.models.minimax_m3.dspark import MiniMaxM3DSpark
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     attn = types.SimpleNamespace(layer_num=17)
-    layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(mla_attn=attn))
+    gqa_layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(kv=attn))
+    mla_layer = types.SimpleNamespace(self_attn=types.SimpleNamespace(mla_attn=attn))
 
-    class _MlaDraft(DSparkDraftModel):
+    class _GqaDraft(DSparkDraftModel):
         def __init__(self):
             super().__init__()
-            self.layers = [layer]
+            self.layers = [gqa_layer]
 
-    draft = _MlaDraft()
+    draft = _GqaDraft()
     assert draft.first_attention_layer_num == 17
     cache = types.SimpleNamespace(k_cache=torch.zeros(2))
     proposer = DSparkProposer.__new__(DSparkProposer)
@@ -2125,22 +2123,37 @@ def test_paged_mla_drafts_keep_the_historical_layer_num_lookup():
         )
         is cache.k_cache
     )
-    # Kimi-K3 is that MLA layout. MiniMax-M3.1 binds a plain KV cache and
-    # must keep its own override; inheriting the default would look up
-    # ``mla_attn`` and fail.
-    assert (
-        KimiK3DSpark.first_attention_layer_num
-        is DSparkDraftModel.first_attention_layer_num
-    )
-    for draft_cls in (DeepseekV4DSpark, DeepseekV41DSpark):
+    for draft_cls in (KimiK3DFlash, MiniMaxM3DSpark):
         assert (
             draft_cls.first_attention_layer_num
             is DSparkDraftModel.first_attention_layer_num
         ), draft_cls.__name__
-    assert (
-        MiniMaxM3DSpark.first_attention_layer_num
-        is not DSparkDraftModel.first_attention_layer_num
-    )
+    mla = KimiK3DSpark.__new__(KimiK3DSpark)
+    torch.nn.Module.__init__(mla)
+    mla.layers = [mla_layer]
+    assert mla.first_attention_layer_num == 17
+
+
+def test_gqa_drafts_share_the_layer_forward_and_context_defaults():
+    """The two GQA drafts run one layer forward and the base's context
+    projection and layer list; the MLA and V4 drafts keep their own."""
+    from atom.models.deepseek_v4_dspark import DeepseekV4DSpark
+    from atom.models.deepseek_v41.dspark import DeepseekV41DSpark
+    from atom.models.dspark_draft import DSparkDraftModel, DSparkGQADecoderLayer
+    from atom.models.kimi_k3_dflash import KimiK3DFlash, KimiK3DFlashDecoderLayer
+    from atom.models.kimi_k3_dspark import KimiK3DSpark
+    from atom.models.minimax_m3.dspark import M3DSparkDecoderLayer, MiniMaxM3DSpark
+
+    for layer_cls in (KimiK3DFlashDecoderLayer, M3DSparkDecoderLayer):
+        assert layer_cls.forward is DSparkGQADecoderLayer.forward, layer_cls
+    for draft_cls in (KimiK3DFlash, MiniMaxM3DSpark):
+        assert draft_cls.project_context is DSparkDraftModel.project_context
+        assert draft_cls.context_layers is DSparkDraftModel.context_layers
+    assert KimiK3DSpark.context_layers is DSparkDraftModel.context_layers
+    for draft_cls in (KimiK3DSpark, DeepseekV4DSpark, DeepseekV41DSpark):
+        assert draft_cls.project_context is not DSparkDraftModel.project_context
+    for draft_cls in (DeepseekV4DSpark, DeepseekV41DSpark):
+        assert draft_cls.context_layers is not DSparkDraftModel.context_layers
 
 
 def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):

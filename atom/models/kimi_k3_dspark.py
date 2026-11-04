@@ -586,6 +586,11 @@ class KimiK3DSpark(DSparkDraftModel):
         # This checkpoint deliberately skips the training-only head.
         self.confidence_head = None
 
+    @property
+    def first_attention_layer_num(self) -> int:
+        """The MLA draft binds its pool on ``self_attn.mla_attn``."""
+        return self.layers[0].self_attn.mla_attn.layer_num
+
     # ---- drafting entry points (called by the proposer) --------------------
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
@@ -596,17 +601,6 @@ class KimiK3DSpark(DSparkDraftModel):
         projection to it.
         """
         return self.context_norm(linear_out(self.context_proj(aux_concat)))
-
-    @property
-    def context_layers(self):
-        """Every draft layer holds context rows; `layers` is already in order.
-
-        The dummy-run guard and the project-once-share-everywhere loop live in
-        :meth:`DSparkDraftModel.write_context_kv`. The specific abort this draft
-        would hit without the guard is `kv_cache.size(2) == kv_lora_rank +
-        qk_rope_head_dim` in cache_kernels, on the still-empty init tensor.
-        """
-        return self.layers
 
     def forward_spec(
         self,
