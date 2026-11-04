@@ -2932,6 +2932,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if pending is not None and pending[0] is attn_metadata:
             pending[1]()  # set_mla_persistent_worker_buffers clears it
 
+    def _opus_plan_shape(
+        self, running_bs: int, max_q_len: int, cp_round_robin: bool
+    ) -> tuple[int, int] | None:
+        """``(heads, cp_world_size)`` of the opus plan a non-sparse-MTP decode
+        step of ``running_bs`` requests takes, or None for ``mla_decode_fwd``:
+        the gathered heads under round-robin DCP, a rank's own without DCP."""
+        if self._uses_opus_mla(running_bs, cp_round_robin):
+            return opus_mla.HEADS, self.dcp_world_size
+        if heads := self._opus_mla_dcp1_heads(running_bs, max_q_len):
+            return heads, 1
+        return None
+
     def _opus_mla_dcp1_heads(self, bs: int, max_q_len: int) -> int:
         """The query heads a DCP1 (no decode context parallelism) MTP decode
         batch of ``bs`` running requests runs ``opus_mla`` with (this rank's
@@ -3074,6 +3086,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         var["kv_indptr"].np[1 : scheduled_bs + 1] = kv_indptr
         var["kv_indptr"].np[scheduled_bs + 1 : running_bs + 1] = sum_blocks
+        # The opus plan needs only the host kv_indptr: decided and started
+        # here, so with ATOM_OPUS_MLA_PLAN_ASYNC it builds while the rest of
+        # this runs (opus_mla.finish_plan below).
+        opus_shape = (
+            None
+            if self.is_sparse and max_seqlen_q > 1
+            else self._opus_plan_shape(
+                running_bs,
+                max_seqlen_q,
+                self.dcp_world_size > 1 and max_seqlen_q > 1,
+            )
+        )
+        if opus_shape is not None:
+            # Decided on running_bs (the graph's size); planned over the
+            # scheduled requests, as the cprr metadata below.
+            opus_mla.start_plan(
+                var["kv_indptr"].np,
+                scheduled_bs,
+                max_seqlen_q,
+                opus_shape[1],
+                opus_shape[0],
+            )
         if self.dcp_world_size > 1:
             # Global (un-sharded) token-level kv_indptr for the round-robin CP
             # causal mask (page_size=1 -> token granularity). context_lens is the
@@ -3213,22 +3247,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # batch pads off the graph path too.
             meta_bs = scheduled_bs if cp_round_robin else running_bs
             ctx_mla_ps_sparse = None
-            # Decided on running_bs (the graph's size); planned over the
-            # scheduled requests, as the cprr metadata below.
-            if self._uses_opus_mla(running_bs, cp_round_robin):
-                opus_mla.update_plan(
-                    var["kv_indptr"].np,
-                    scheduled_bs,
-                    max_seqlen_q,
-                    self.dcp_world_size,
+            if opus_shape is not None:
+                # the plan was started above, with the host kv_indptr
+                opus_plan = opus_mla.make_marker(
+                    running_bs, max_seqlen_q, opus_shape[0]
                 )
-                opus_plan = opus_mla.make_marker(running_bs, max_seqlen_q)
-            elif heads := self._opus_mla_dcp1_heads(running_bs, max_seqlen_q):
-                # DCP1: the same, over this rank's whole KV and its own heads
-                opus_mla.update_plan(
-                    var["kv_indptr"].np, scheduled_bs, max_seqlen_q, 1, heads
-                )
-                opus_plan = opus_mla.make_marker(running_bs, max_seqlen_q, heads)
 
             def build_meta(bs=meta_bs, cprr=cp_round_robin):
                 return self.set_mla_persistent_worker_buffers(
@@ -3309,6 +3332,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 split_bs=self._ubatch_split_bs,
             )
 
+        # the step's opus plan is published before its forward
+        opus_mla.finish_plan()
         return attn_metadata, positions
 
     def _prepare_ubatch_decode(

@@ -104,3 +104,51 @@ def test_an_mtp_drafter_without_dcp_keeps_the_build(monkeypatch, opus):
     md = _step(runner, builder, 6)
     assert md.opus_plan is not None and len(builds) == 1
     assert builder._mla_meta_pending is None
+
+
+# ---- ATOM_OPUS_MLA_PLAN_ASYNC through prepare_decode
+
+
+class _ThreadDecoder(_Decoder):
+    def plan(self, kv_indptr, q_len, num_heads, cp_world_size=1):
+        import threading
+
+        self.plans.append(
+            (
+                threading.current_thread().name,
+                torch.cuda.current_stream(),
+                list(kv_indptr),
+            )
+        )
+
+
+def test_async_plan_runs_on_the_planner_thread_and_is_joined(monkeypatch):
+    monkeypatch.setenv("ATOM_OPUS_MLA", "1")
+    monkeypatch.setenv("ATOM_OPUS_MLA_PLAN_ASYNC", "1")
+    monkeypatch.setattr(opus_mla, "OpusMlaFlatDecode", _ThreadDecoder)
+    monkeypatch.setattr(opus_mla, "_decoder", None)
+    runner, builder, _ = _runner(monkeypatch)
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        md = _step(runner, builder, 6)
+    assert opus_mla._plan_pending is None  # joined before prepare_decode returned
+    thread, stream, kv = opus_mla._decoder.plans[-1]
+    assert thread.startswith("opus-plan")
+    assert stream == side  # its copy goes on the step's stream
+    assert kv == list(runner.forward_vars["kv_indptr"].np[: 4 + 1])
+    assert md.opus_plan is not None
+
+
+def test_async_plan_errors_reach_the_step(monkeypatch):
+    class _Failing(_Decoder):
+        def plan(self, *a, **kw):
+            raise ValueError("planner says no")
+
+    monkeypatch.setenv("ATOM_OPUS_MLA", "1")
+    monkeypatch.setenv("ATOM_OPUS_MLA_PLAN_ASYNC", "1")
+    monkeypatch.setattr(opus_mla, "OpusMlaFlatDecode", _Failing)
+    monkeypatch.setattr(opus_mla, "_decoder", None)
+    runner, builder, _ = _runner(monkeypatch)
+    with pytest.raises(ValueError, match="planner says no"):
+        _step(runner, builder, 6)
+    assert opus_mla._plan_pending is None

@@ -420,3 +420,17 @@ def test_capture_that_keeps_mla_decode_fwd_stops_the_skip(decoder, monkeypatch):
     b.for_call(SimpleNamespace(work_indptr=var["work_indptr"], opus_plan=object()))
     assert not b._mla_meta_skip_ok
     assert not b.skips()
+
+
+# ---- ATOM_OPUS_MLA_PLAN_ASYNC (switch off: the plan is built in the call)
+
+
+def test_start_plan_without_the_switch_is_update_plan(decoder, monkeypatch):
+    monkeypatch.delenv("ATOM_OPUS_MLA_PLAN_ASYNC", raising=False)
+    kv_indptr = np.arange(0, 10 * 100, 100, dtype=np.int32)
+    opus_mla.start_plan(kv_indptr, 4, 6, 1, 16)
+    name, kv, q_len, heads, cp = decoder.calls[-1]
+    assert (name, q_len, heads, cp) == ("plan", 6, 16, 1)
+    np.testing.assert_array_equal(kv, kv_indptr[:5])
+    assert opus_mla._plan_pending is None
+    opus_mla.finish_plan()  # nothing in flight: a no-op

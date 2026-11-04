@@ -380,3 +380,62 @@ def test_dcp1_graph_replays_with_a_later_plan(monkeypatch):
         assert _rms_err(o, ref_o) < DCP1_RMS_TOL
         assert _err(o, ref_o) < DCP1_MAX_TOL
         torch.testing.assert_close(lse_out, ref_lse, atol=LSE_TOL, rtol=0)
+
+
+# ---- ATOM_OPUS_MLA_PLAN_ASYNC: the same plan, built on the planner thread
+
+
+@pytest.mark.parametrize(
+    "heads,world,rank", [(H, W, RANK), (16, 1, 0)], ids=["dcp8", "dcp1"]
+)
+def test_async_plan_gives_the_sync_plans_output(monkeypatch, heads, world, rank):
+    bs, q_len = 16, 6
+    _new_decoder(monkeypatch, 64)
+    ctxs = _contexts(bs, seed=11)
+    step = _Step(
+        bs, q_len, _local_tokens(ctxs, world, rank), heads=heads, world=world, rank=rank
+    )
+    step.fill(ctxs, seed=11)
+    kw = step.call_kwargs()
+    outs = []
+    for async_plan in ("0", "1"):
+        monkeypatch.setenv("ATOM_OPUS_MLA_PLAN_ASYNC", async_plan)
+        opus_mla.start_plan(step.kv_indptr_np, bs, q_len, world, heads)
+        opus_mla.finish_plan()
+        o = torch.empty((bs * q_len, heads, DV), dtype=torch.bfloat16, device=DEV)
+        _, lse = opus_mla.decode(*step.args(o), **kw)
+        torch.cuda.synchronize()
+        outs.append((o, lse))
+    assert torch.equal(outs[0][0], outs[1][0])
+    assert torch.equal(outs[0][1], outs[1][1])
+
+
+def test_async_plan_replays_a_graph_with_later_plans(monkeypatch):
+    bs, q_len = 16, 6
+    _new_decoder(monkeypatch, 64)
+    monkeypatch.setenv("ATOM_OPUS_MLA_PLAN_ASYNC", "1")
+    ctxs = {seed: _contexts(bs, seed=seed) for seed in (1, 2, 3)}
+    step = _Step(bs, q_len, max(map(_local_tokens, ctxs.values())))
+    o = torch.empty((bs * q_len, H, DV), dtype=torch.bfloat16, device=DEV)
+    lse_out = torch.empty((bs * q_len, H), dtype=torch.float32, device=DEV)
+    kw = step.call_kwargs()
+    step.fill(ctxs[1], seed=1)
+    opus_mla.capture_marker(bs, q_len)
+
+    def fwd():
+        lse_out.copy_(opus_mla.decode(*step.args(o), **kw)[1])
+
+    fwd()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fwd()
+    for seed in (2, 3):
+        step.fill(ctxs[seed], seed=seed)
+        opus_mla.start_plan(step.kv_indptr_np, bs, q_len, W)
+        opus_mla.finish_plan()
+        graph.replay()
+        torch.cuda.synchronize()
+        ref_o, ref_lse = step.reference()
+        assert _err(o, ref_o) < O_TOL
+        torch.testing.assert_close(lse_out, ref_lse, atol=LSE_TOL, rtol=0)

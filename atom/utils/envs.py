@@ -931,6 +931,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Largest running batch that uses it (sizes its plan buffers); larger
     # batches stay on mla_decode_fwd.
     "ATOM_OPUS_MLA_MAX_BS": lambda: _int_env("ATOM_OPUS_MLA_MAX_BS", 128),
+    # With ATOM_OPUS_MLA: build each step's opus plan on a planner thread while
+    # prepare_decode carries on, joined before it returns. Off by default.
+    "ATOM_OPUS_MLA_PLAN_ASYNC": lambda: _flag_env("ATOM_OPUS_MLA_PLAN_ASYNC"),
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",

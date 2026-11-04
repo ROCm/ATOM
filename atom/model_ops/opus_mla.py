@@ -49,6 +49,7 @@ head count so a call only runs the plan built for its own heads.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -76,6 +77,9 @@ KV_BYTES_LIMIT = 1 << 32
 
 _decoder = None
 _logged: set = set()
+# ATOM_OPUS_MLA_PLAN_ASYNC: the planner thread and the step's plan in flight
+_plan_pool = None
+_plan_pending = None
 
 
 def _log_once(key, msg: str, *args) -> None:
@@ -132,6 +136,46 @@ def update_plan(
     _get_decoder().plan(kv_indptr[: bs + 1], q_len, num_heads, cp_world_size)
 
 
+def start_plan(
+    kv_indptr: np.ndarray,
+    bs: int,
+    q_len: int,
+    cp_world_size: int,
+    num_heads: int = HEADS,
+) -> None:
+    """:func:`update_plan` on the planner thread (``ATOM_OPUS_MLA_PLAN_ASYNC``):
+    aiter's host planner runs there (it releases the GIL) while the caller
+    carries on, and its copy is enqueued on the caller's current stream.
+    :func:`finish_plan` must run before anything reads the plan. Without the
+    switch it is :func:`update_plan`."""
+    global _plan_pool, _plan_pending
+    if not envs.ATOM_OPUS_MLA_PLAN_ASYNC:
+        update_plan(kv_indptr, bs, q_len, cp_world_size, num_heads)
+        return
+    finish_plan()
+    dec = _get_decoder()
+    if _plan_pool is None:
+        _plan_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opus-plan")
+    stream = torch.cuda.current_stream()
+    # the host indptr is the caller's staging buffer: take this step's values
+    kv = np.array(kv_indptr[: bs + 1], copy=True)
+
+    def run():
+        with torch.cuda.stream(stream):
+            dec.plan(kv, q_len, num_heads, cp_world_size)
+
+    _plan_pending = _plan_pool.submit(run)
+
+
+def finish_plan() -> None:
+    """Waits for the plan :func:`start_plan` left in flight (its copy is then
+    on the stream it was started on) and raises what the planner raised."""
+    global _plan_pending
+    if _plan_pending is not None:
+        pending, _plan_pending = _plan_pending, None
+        pending.result()
+
+
 class PlanMarker:
     """``attn_metadata.opus_plan``: this step's / graph's decode runs the
     published plan, built for ``heads`` query heads."""
@@ -151,6 +195,7 @@ def capture_marker(bs: int, q_len: int, heads: int = HEADS) -> PlanMarker:
     """Marker for a graph capture's metadata, built outside the capture: also
     publishes an empty plan, so the eager warm-up forward before the capture
     runs no stale step plan over the synthetic capture KV."""
+    finish_plan()
     _get_decoder().clear()
     return PlanMarker(bs, q_len, heads)
 
