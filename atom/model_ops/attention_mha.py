@@ -49,6 +49,11 @@ class PagedAttentionImpl(nn.Module):
     Attention paged implementation
     """
 
+    # `forward` takes ``output``, a [tokens, heads * head_dim] buffer that the
+    # prefill unified-attention path writes into instead of allocating its own
+    # (`unified_attention_into_output`); every other path returns a fresh one.
+    accepts_output = True
+
     def __init__(
         self,
         num_heads,
@@ -217,6 +222,7 @@ class PagedAttentionImpl(nn.Module):
         position: torch.Tensor = None,
         q_scale: torch.Tensor = None,
         qkv: torch.Tensor = None,
+        output: torch.Tensor | None = None,
     ):
 
         fwd_ctx: ForwardContext = get_forward_context()
@@ -237,7 +243,16 @@ class PagedAttentionImpl(nn.Module):
         )
 
         attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
-        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        if (
+            output is not None
+            and getattr(attn_impl, "__func__", None)
+            is PagedAttentionImpl.prefill_attention_triton
+        ):
+            o = attn_impl(
+                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx, out=output
+            )
+        else:
+            o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
 
         o = o.view(-1, self.num_heads * self.head_dim)
 
@@ -1228,7 +1243,16 @@ class PagedAttentionImpl(nn.Module):
         return out
 
     def prefill_attention_triton(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        out: torch.Tensor | None = None,
     ):
         # unified_attention supports both prefill and decode, over either the 4D
         # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
@@ -1247,9 +1271,24 @@ class PagedAttentionImpl(nn.Module):
         attn_metadata = fwd_ctx.attn_metadata
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
-            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+            o_dtype = torch.bfloat16
         else:
-            o = torch.empty_like(q)
+            o_dtype = q.dtype
+        # ``out``: the caller's buffer, written in place of a fresh one. A
+        # token-graph replay then has no result to copy into the buffer the
+        # next segment reads (`unified_attention_into_output`), which also
+        # zeroes its pad rows.
+        if (
+            out is not None
+            and out.dtype == o_dtype
+            and out.device == q.device
+            and out.is_contiguous()
+            and out.numel() == q.numel()
+        ):
+            o = out.view(q.shape)
+        else:
+            out = None
+            o = torch.empty(*q.shape, dtype=o_dtype, device=q.device)
 
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
@@ -1298,12 +1337,14 @@ class PagedAttentionImpl(nn.Module):
         # the row count, and a short chunk at a large bucket would otherwise
         # take the decode split at bucket height (a 64 GiB segment buffer for
         # a 1-token chunk at 8192). The pad rows of `o` are zeroed so what
-        # follows attention reads defined values there.
+        # follows attention reads defined values there -- by the caller when
+        # it handed in ``out``.
         n_tok = fwd_ctx.context.scheduled_tokens
         q_attn, o_attn = q, o
         if 0 < n_tok < q.shape[0] and not torch.cuda.is_current_stream_capturing():
             q_attn, o_attn = q[:n_tok], o[:n_tok]
-            o[n_tok:].zero_()
+            if out is None:
+                o[n_tok:].zero_()
         unified_attention(
             q_attn,
             k_for_attn,
@@ -1436,6 +1477,7 @@ class PagedAttentionImpl(nn.Module):
             position=position,
             q_scale=q_scale,
             qkv=qkv,
+            **({} if output is None else {"output": output}),
         )
 
 

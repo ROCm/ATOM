@@ -977,6 +977,66 @@ def unified_attention_with_output_base(
         return out
 
 
+def unified_attention_into_output_fake(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
+# The MHA layer written into the caller's ``output`` ([tokens, heads *
+# head_dim], allocated in the token-graph segment before the break). The
+# region then delivers no fresh tensor, so a replay has no result to copy into
+# the next segment's input: with `unified_attention_with_output_base` that is
+# a [tokens, heads * head_dim] bf16 copy (134 MB at a 16384-token prefill
+# bucket of Qwen3.5) each full-attention layer. Bitwise the same rows as that
+# op: the impl writes the attention rows into ``output`` (or, on a path that
+# cannot, returns them and they are copied there, as the replay did), and the
+# pad rows of a padded prefill are zeroed as there.
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=unified_attention_into_output_fake,
+    mutates_args=["output"],
+)
+@eager_region()
+def unified_attention_into_output(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    qkv: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    out = self.impl.forward(
+        query=q,
+        key=k,
+        value=v,
+        position=positions,
+        q_scale=q_scale,
+        qkv=qkv,
+        output=output,
+    )
+    if out.data_ptr() != output.data_ptr():
+        output.copy_(out.reshape(output.shape))
+    context = get_forward_context().context
+    if (
+        context is not None
+        and context.is_prefill
+        and 0 < context.scheduled_tokens < output.shape[0]
+    ):
+        output[context.scheduled_tokens :].zero_()
+
+
 def linear_attention_with_output_base_fake(
     mixed_qkv: torch.Tensor,
     b: torch.Tensor,
