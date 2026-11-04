@@ -89,12 +89,19 @@ class SchedulerMetrics:
             registry=registry,
             multiprocess_mode="livesum",
         ).labels(**labels)
-        self.pd_admission_rejected = Counter(
+        self.pd_admission_deferred = Counter(
             "atom:pd_admission_deferred_total",
-            "New PD admission attempts deferred by a credit limit.",
+            "PD requests deferred by a credit limit, counted once per request and limit.",
             [*labels, "reason"],
             registry=registry,
         )
+        self.pd_admission_credit_wait = Histogram(
+            "atom:pd_admission_credit_wait_seconds",
+            "Time a PD request waited for admission credits before D reserved its receive targets; 0 when admitted on its first attempt.",
+            labels,
+            buckets=LATENCY_BUCKETS,
+            registry=registry,
+        ).labels(**labels)
         self.pd_admission_oversized = Counter(
             "atom:pd_admission_oversized_total",
             "Isolated PD requests allowed above the soft receive-byte limit.",
