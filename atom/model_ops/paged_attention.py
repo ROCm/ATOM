@@ -8,6 +8,7 @@ from torch import nn
 
 from atom.config import get_current_atom_config
 from atom.plugin.prepare import is_plugin_mode
+from atom.utils import region_graph
 from atom.utils.selector import Family, get_attn_backend
 
 from .attention_mla import MLAModules
@@ -118,6 +119,24 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
+        if (
+            not self.use_mla
+            and getattr(self.impl, "accepts_output", False)
+            and not torch.compiler.is_compiling()
+            and region_graph.recording()
+        ):
+            # A token-graph break: the attention writes the buffer the next
+            # segment reads, with no copy into it at replay. Only while
+            # recording, the one case the fresh result costs a copy.
+            output = torch.empty(
+                (query.shape[0], self.impl.num_heads * self.impl.head_dim),
+                dtype=get_current_atom_config().torch_dtype,
+                device=query.device,
+            )
+            torch.ops.aiter.unified_attention_into_output(
+                query, q_scale, key, value, positions, self.layer_name, qkv, output
+            )
+            return output
         output = torch.ops.aiter.unified_attention_with_output_base(
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
         )

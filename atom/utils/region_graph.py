@@ -52,6 +52,7 @@ __all__ = [
     "forks",
     "graph_pool",
     "join_stream",
+    "recording",
     "token_graph",
 ]
 
@@ -282,7 +283,9 @@ def eager_region(
                 return fn(*args, **kwargs)
             side = None if stream is None else stream(args[0])
             recorder = _recorder()
-            if recorder is not None and not (unless is not None and unless(*args, **kwargs)):
+            if recorder is not None and not (
+                unless is not None and unless(*args, **kwargs)
+            ):
                 return recorder.eager(fn, args, kwargs, side, live)
             with forward_context.side_stream(side):
                 return fn(*args, **kwargs)
@@ -290,6 +293,13 @@ def eager_region(
         return wrapper
 
     return decorate
+
+
+def recording() -> bool:
+    """Whether a token-graph recording is capturing this forward: an
+    `eager_region` called now becomes a break, and a tensor it allocates
+    reaches the next segment through a replay-time copy."""
+    return _recorder() is not None
 
 
 def forks(stream: torch.cuda.Stream | None) -> bool:
