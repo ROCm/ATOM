@@ -170,6 +170,29 @@ def test_aux_for_serves_the_relayed_block_uncopied_before_own_taps():
     torch.testing.assert_close(aux[1], own[:n])
 
 
+def test_last_stage_arms_only_its_own_taps():
+    from atom.spec_decode.drafter import Drafter
+
+    hidden = 8
+    target = _FakeTarget(8, (4, 8), with_embed=False)
+    target.embed_tokens = PPMissingLayer()
+    spec = AuxCaptureSpec(
+        layer_ids=(-1, 2, 5), hidden_size=hidden, extract=lambda out, mod: out
+    )
+    drafter = types.SimpleNamespace(
+        _aux_capture_spec=lambda: spec,
+        max_num_tokens=4,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    drafter._make_aux_hook = lambda i, e: Drafter._make_aux_hook(drafter, i, e)
+    Drafter.arm_aux_capture(drafter, target)
+    assert [b.shape[0] for b in drafter._aux_buffers] == [0, 0, 4]
+    assert not target.embed_tokens._forward_hooks
+    assert not target.layers[2]._forward_hooks
+    assert target.layers[5]._forward_hooks
+
+
 @pytest.mark.parametrize("layer_ids", [(47, -1, 89, 2), (-1, 2, 2), (-1, 2, 93)])
 def test_relay_rejects_the_ids_the_drafter_rejects(layer_ids):
     with pytest.raises(ValueError, match="strictly increasing|out of range"):
