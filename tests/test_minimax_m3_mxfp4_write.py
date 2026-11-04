@@ -12,7 +12,8 @@ import types
 import pytest
 import torch
 
-from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, dequantize_pages
+from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
+from atom.mono.weights.formats import dequantize_mxfp4
 
 aiter = pytest.importorskip("aiter")
 pytestmark = pytest.mark.skipif(
@@ -142,14 +143,14 @@ def test_mxfp4_pages_match_the_bf16_write():
     page, off = slots[valid] // 128, slots[valid] % 128
 
     for pages_u8, want in ((kp, rk), (vp, rv)):
-        got = dequantize_pages(pages_u8)[page, 0, off]  # [n, 128]
+        got = dequantize_mxfp4(*page_views(pages_u8))[page, 0, off]  # [n, 128]
         assert rel(got, want[page, off, 0].float()) < 0.15
-    got = dequantize_pages(ip)[page, off]
+    got = dequantize_mxfp4(*page_views(ip))[page, off]
     assert rel(got, ri[page, off].float()) < 0.15
     # padding and untouched slots stay zero-bytes
     written = torch.zeros(PAGES * 128, dtype=torch.bool, device="cuda")
     written[slots[valid]] = True
-    untouched = dequantize_pages(kp)[:, 0].reshape(-1, D)[~written]
+    untouched = dequantize_mxfp4(*page_views(kp))[:, 0].reshape(-1, D)[~written]
     assert (untouched == 0).all()
 
 
@@ -208,7 +209,7 @@ def test_kv_only_mxfp4_writes_an_fp8_index_cache():
     valid = slots >= 0
     page, off = slots[valid] // 128, slots[valid] % 128
     for pages_u8, want in ((kp, rk), (vp, rv)):
-        got = dequantize_pages(pages_u8)[page, 0, off]
+        got = dequantize_mxfp4(*page_views(pages_u8))[page, 0, off]
         assert rel(got, want[page, off, 0].float()) < 0.15
     assert rel(ip.float()[page, off], ri[page, off].float()) < 0.1  # the e4m3 cast
 
@@ -251,4 +252,7 @@ def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
     assert rel(impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()) < 0.04
     valid = slots >= 0
     page, off = slots[valid] // 128, slots[valid] % 128
-    assert rel(dequantize_pages(index)[page, off], ri[page, off].float()) < 0.15
+    assert (
+        rel(dequantize_mxfp4(*page_views(index))[page, off], ri[page, off].float())
+        < 0.15
+    )

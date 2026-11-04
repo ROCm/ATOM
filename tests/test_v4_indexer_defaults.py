@@ -268,16 +268,35 @@ def test_m3_fp4_hashes_apart_from_fp8(monkeypatch):
     assert len({fp8.compute_hash(), fp4.compute_hash(), kv_only.compute_hash()}) == 3
 
 
+def test_an_m3_export_named_only_by_model_type_gets_the_m3_mapping(monkeypatch):
+    # `_is_minimax_m3_config` (the builder's and the offload layout's test) also
+    # reads `model_type`; the MXFP4 gate must agree with it.
+    config = _make_config(
+        monkeypatch,
+        architectures=["SomeOtherForCausalLM"],
+        hf={"model_type": "minimax_m3"},
+        kv_cache_block_size=128,
+        kv_cache_dtype="fp4",
+        index_cache_dtype="fp4",
+    )[0]
+
+    assert (config.kv_cache_dtype, config.kv_mxfp4, config.index_cache_dtype) == (
+        "fp8",
+        True,
+        "fp4",
+    )
+
+
 def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
     config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
     assert (config.kv_mxfp4, config.index_cache_dtype) == (False, "fp4")
 
-    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+    with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
         _make_config(monkeypatch, kv_cache_dtype="fp4")
 
 
 def test_other_models_refuse_a_fp4_kv(monkeypatch):
-    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+    with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
         _make_config(
             monkeypatch, architectures=["Glm5NextForCausalLM"], kv_cache_dtype="fp4"
         )

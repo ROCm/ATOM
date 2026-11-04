@@ -13,7 +13,8 @@ import types
 import pytest
 import torch
 
-from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, dequantize_pages
+from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
+from atom.mono.weights.formats import dequantize_mxfp4
 
 aiter = pytest.importorskip("aiter")
 pytestmark = pytest.mark.skipif(
@@ -59,8 +60,10 @@ def make(rows, hkv, seed, pages=48):
 
 def reference(k, v, bt, ctx, q, hkv):
     rows = q.shape[0]
-    kd = dequantize_pages(k.view(-1, PAGE_BYTES))  # [pages * hkv, 128, 128]
-    vd = dequantize_pages(v.view(-1, PAGE_BYTES))
+    kd = dequantize_mxfp4(
+        *page_views(k.view(-1, PAGE_BYTES))
+    )  # [pages * hkv, 128, 128]
+    vd = dequantize_mxfp4(*page_views(v.view(-1, PAGE_BYTES)))
     out = torch.empty(rows, GROUP * hkv, 128, device="cuda")
     for r in range(rows):
         for h in range(hkv):

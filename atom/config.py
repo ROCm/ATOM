@@ -1940,12 +1940,14 @@ def _resolve_fp4_caches(
         if kv_cache_dtype == "fp4":
             kv_cache_dtype, kv_mxfp4 = "fp8", True
     elif kv_cache_dtype == "fp4" and not is_v41:
-        raise ValueError("--kv-cache-dtype fp4 is supported by MiniMax-M3 only")
+        raise ValueError(
+            "--kv-cache-dtype fp4 is supported by MiniMax-M3 and DeepSeek-V4.1 only"
+        )
     return kv_cache_dtype, kv_mxfp4
 
 
 def _check_m3_mxfp4(
-    arches,
+    is_m3: bool,
     index_cache_dtype,
     kv_mxfp4: bool,
     block_size: int,
@@ -1956,7 +1958,6 @@ def _check_m3_mxfp4(
     than in the first forward (``--kv-cache-dtype fp4``, which
     ``_resolve_fp4_caches`` maps to ``kv_mxfp4``, and ``--index-cache-dtype fp4``,
     MiniMax-M3's own layout: other models' ``fp4`` index is not checked here)."""
-    is_m3 = any("MiniMaxM3" in str(a) for a in arches)
     if not (kv_mxfp4 or (is_m3 and index_cache_dtype == "fp4")):
         return
     if not is_m3:
@@ -2735,11 +2736,15 @@ class Config:
             for a in arches
         )
         is_deepseek_v41 = self.hf_config.model_type == "deepseek_v41_text"
+        # The same test the attention builder and the offload layout use, so the
+        # MXFP4 gate cannot disagree with them on an export that names itself
+        # only in `text_config` or `model_type`.
+        is_m3 = _is_minimax_m3_config(self.hf_config)
         # Before the CP fallback and the index default, which read these.
         self.kv_cache_dtype, self.kv_mxfp4 = _resolve_fp4_caches(
             self.kv_cache_dtype,
             self.kv_mxfp4,
-            is_m3=any("MiniMaxM3" in str(a) for a in arches),
+            is_m3=is_m3,
             is_v41=is_deepseek_v41,
         )
         if is_deepseek_v4:
@@ -2865,7 +2870,7 @@ class Config:
                 self.index_cache_dtype = self.kv_cache_dtype
 
         _check_m3_mxfp4(
-            arches,
+            is_m3,
             self.index_cache_dtype,
             self.kv_mxfp4,
             self.kv_cache_block_size,

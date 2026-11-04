@@ -133,8 +133,8 @@ def _emit_sparse_block_table_row(
     topk,
     pid_h,
     block_size: tl.constexpr,
-    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
+    pages_per_block: tl.constexpr,  # pages per sparse block (8 of 16 tokens; 1 for page-128)
+    block_page_stride: tl.constexpr,  # pages between logical blocks (>= pages_per_block)
     NUM_KV_HEADS: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
 ):
@@ -157,8 +157,10 @@ def _emit_sparse_block_table_row(
     bt_slot = tl.where(bt_is_full, bt_earlier_full, bt_n_full)  # tail -> n_full
 
     bt_logical_page = tl.load(bt_row + bt_blk, mask=bt_valid, other=0).to(tl.int32)
-    # block_page_stride (16) > pages_per_block (8): consecutive logical blocks sit
-    # 16 physical pages apart because the K and V planes overlap half a block.
+    # block_page_stride > pages_per_block only for a fused-K/V cache (the vLLM
+    # plugin's 16 > 8): consecutive logical blocks then sit 16 physical pages apart
+    # because the K and V planes overlap half a block. 8 / 8 for the page-16
+    # SHUFFLE cache, 1 / 1 for a page-128 (MXFP4) one.
     bt_base_phys = bt_logical_page * block_page_stride * NUM_KV_HEADS + pid_h
     bt_dst_base = bt_slot * pages_per_block
 
@@ -932,8 +934,8 @@ def _topk_index_packed_kernel(
     DECODE_MAX_Q: tl.constexpr,  # 0 = prefill; else query rows per request
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
-    pages_per_block: tl.constexpr,  # 16-pages per sparse block (8)
-    block_page_stride: tl.constexpr,  # 16-pages between logical blocks (>= pages_per_block)
+    pages_per_block: tl.constexpr,  # pages per sparse block (8 of 16 tokens; 1 for page-128)
+    block_page_stride: tl.constexpr,  # pages between logical blocks (>= pages_per_block)
     EMIT_SPARSE_BT: tl.constexpr,  # fuse compaction (per-kv-head row + encoded page)
 ):
     tl.static_assert(BLOCK_SIZE_K >= BLOCK_SIZE_T)

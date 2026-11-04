@@ -146,7 +146,7 @@ def prefill_score_mxfp4(
     sm_scale,
 ):
     """``[H, total_q, ceil(max_seq_len / 128)]`` fp32 block scores of a ragged
-    prefill batch. The scorer stages the referenced pages as fp8 for the call."""
+    prefill batch. The pages stay MXFP4 through the scorer (scaled MFMA)."""
     k_data, k_scale = page_views(index_cache)
     return _flydsl("minimax_m3_index_score_prefill_fp4_flydsl")(
         idx_q,

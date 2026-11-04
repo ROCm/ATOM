@@ -96,7 +96,7 @@ def chip_info(monkeypatch):
 
 def check(**kw):
     args = {
-        "arches": M3,
+        "is_m3": True,
         "index_cache_dtype": "fp4",
         "kv_mxfp4": True,
         "block_size": 128,
@@ -108,7 +108,7 @@ def check(**kw):
 
 def test_refusals_name_what_is_wrong():
     with pytest.raises(ValueError, match="MiniMax-M3 only"):
-        check(arches=["LlamaForCausalLM"])
+        check(is_m3=False)
     with pytest.raises(ValueError, match="bridges"):
         check(plugin_mode=True)
     with pytest.raises(ValueError, match="128 tokens"):
@@ -133,9 +133,9 @@ def test_the_mxfp4_kv_needs_the_tail_block_selected():
 
 def test_the_baselines_are_never_refused():
     # Neither MXFP4 switch on: nothing to check, whatever else is set.
-    check(arches=["LlamaForCausalLM"], index_cache_dtype="fp8", kv_mxfp4=False)
+    check(is_m3=False, index_cache_dtype="fp8", kv_mxfp4=False)
     # another model's fp4 index is its own layout, not MiniMax-M3's
-    check(arches=["DeepseekV4ForCausalLM"], kv_mxfp4=False, block_size=64)
+    check(is_m3=False, kv_mxfp4=False, block_size=64)
 
 
 @pytest.mark.parametrize(
@@ -157,7 +157,7 @@ def test_other_models_keep_their_kv_and_refuse_a_fp4_one():
         False,
     )
     assert _resolve_fp4_caches("fp4", False, is_m3=False, is_v41=True) == ("fp4", False)
-    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+    with pytest.raises(ValueError, match="MiniMax-M3 and DeepSeek-V4.1 only"):
         _resolve_fp4_caches("fp4", False, is_m3=False, is_v41=False)
 
 

@@ -12,7 +12,8 @@ dequantized cache, not another kernel.
 import pytest
 import torch
 
-from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, dequantize_pages
+from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
+from atom.mono.weights.formats import dequantize_mxfp4
 
 aiter = pytest.importorskip("aiter")
 pytestmark = pytest.mark.skipif(
@@ -56,7 +57,7 @@ def reference(cache, table, seq, q, S):
     """scores [H, rows, blocks] in the natural-log domain (the scorers return them
     times log2(e); selection is unaffected), nan past the causal block, and the expected
     selection: set of block ids, and ctx, per row."""
-    deq = dequantize_pages(cache)  # [pages, 128, 128]
+    deq = dequantize_mxfp4(*page_views(cache))  # [pages, 128, 128]
     batch, blocks = table.shape
     rows = batch * S
     score = torch.full((HEADS, rows, blocks), float("nan"), device="cuda")
