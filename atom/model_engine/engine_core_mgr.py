@@ -330,8 +330,11 @@ class CoreManager:
         self._prefix_owner: OrderedDict[int, dict] = OrderedDict()
         # 2^17 sampled hashes, 4096 tokens apart: 512M tokens of prefix history.
         self._prefix_owner_cap = 1 << 17
-        # seq id -> (rank, sampled hashes it recorded as their producer).
+        # seq id -> (rank, sampled hashes whose entry it relies on before its
+        # prefill completes), and (hash, rank) -> unfinished requests relying
+        # on that not-yet-confirmed entry.
         self._prefix_seq_hashes: dict = {}
+        self._prefix_pending: dict = {}
         self._prefix_stride_tokens = 4096
         self._dp_route_counters = {
             "prefix_owner_total": 0,
@@ -1603,16 +1606,22 @@ class CoreManager:
         computed it -- the rank's existing holder, else `hit_source`. So a
         follower that only reuses a prefix never becomes its busy source, and
         followers sharing a prefix are not pinned to one rank while each of
-        them prefills only its suffix. What `seq_id` wrote is rolled back if it
-        leaves before its prefill completes (`_forget_prefix_record`).
+        them prefills only its suffix.
+
+        Every entry this request adds or rewrites on `rank` stays provisional
+        until some request relying on it completes its prefill: if all of them
+        leave first (abort, reject, failed send), the rank never got that KV
+        and the entry is removed (`_forget_prefix_record`). Confirmed entries
+        are never removed.
         """
         if chain is None:
             return
         hbs = int(chain.hash_block_size)
         stride = max(1, self._prefix_stride_tokens // hbs)
         index = self._prefix_owner
+        pending = self._prefix_pending
         hashes = chain.hashes
-        written = []
+        relied = []
         for i in range(stride - 1, len(hashes), stride):
             h = hashes[i]
             holders = index.get(h)
@@ -1620,31 +1629,58 @@ class CoreManager:
                 holders = index[h] = {}
             else:
                 index.move_to_end(h)
-            if (i + 1) * hbs <= hit:
+            reused = (i + 1) * hbs <= hit
+            had = rank in holders
+            if reused:
                 producer = holders.pop(rank, hit_source)
             else:
                 holders.pop(rank, None)
                 producer = seq_id
             holders[rank] = producer  # last = most recent
-            if producer == seq_id:
-                written.append(h)
-        if written:
-            self._prefix_seq_hashes[seq_id] = (rank, written)
+            key = (h, rank)
+            if not had or not reused:
+                # New on this rank, or rewritten: provisional until confirmed.
+                pending.setdefault(key, set()).add(seq_id)
+                relied.append(h)
+            elif key in pending:
+                pending[key].add(seq_id)  # relies on a still-provisional entry
+                relied.append(h)
+        if relied:
+            self._prefix_seq_hashes[seq_id] = (rank, relied)
         while len(index) > self._prefix_owner_cap:
-            index.popitem(last=False)
+            old, holders = index.popitem(last=False)
+            for r in holders:
+                pending.pop((old, r), None)
+
+    def _confirm_prefix_record(self, seq_id) -> None:
+        """`seq_id` completed its prefill: the entries it relied on are real."""
+        entry = self._prefix_seq_hashes.pop(seq_id, None)
+        if entry is None:
+            return
+        rank, hashes = entry
+        for h in hashes:
+            self._prefix_pending.pop((h, rank), None)
 
     def _forget_prefix_record(self, seq_id) -> None:
-        """Drop the prefix entries `seq_id` wrote: it left (abort, reject, a
-        failed send) before its prefill completed, so the rank does not hold
-        that part."""
+        """`seq_id` left before its prefill completed. Remove the provisional
+        entries no other unfinished request on that rank still relies on."""
         entry = self._prefix_seq_hashes.pop(seq_id, None)
         if entry is None:
             return
         rank, hashes = entry
         index = self._prefix_owner
+        pending = self._prefix_pending
         for h in hashes:
+            key = (h, rank)
+            waiters = pending.get(key)
+            if waiters is None:
+                continue  # confirmed meanwhile
+            waiters.discard(seq_id)
+            if waiters:
+                continue
+            del pending[key]
             holders = index.get(h)
-            if holders is not None and holders.get(rank) == seq_id:
+            if holders is not None and rank in holders:
                 del holders[rank]
                 if not holders:
                     del index[h]
@@ -1847,7 +1883,7 @@ class CoreManager:
                 # real.
                 self._forget_prefix_record(seq_id)
             else:
-                self._prefix_seq_hashes.pop(seq_id, None)
+                self._confirm_prefix_record(seq_id)
         self._seq_prefilling.discard(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
@@ -1871,7 +1907,7 @@ class CoreManager:
         with self._lb_lock:
             self._seq_prefilling.discard(seq_id)
             if self._prefix_spread:
-                self._prefix_seq_hashes.pop(seq_id, None)
+                self._confirm_prefix_record(seq_id)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1911,6 +1947,7 @@ class CoreManager:
             if self._prefix_spread:
                 self._prefix_owner.clear()
                 self._prefix_seq_hashes.clear()
+                self._prefix_pending.clear()
             pending = getattr(self, "_bp_pending", None)
             if pending:
                 logger.warning(

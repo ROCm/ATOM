@@ -558,6 +558,7 @@ def _make_spread_mgr(n_ranks=2):
     mgr._prefix_owner = OrderedDict()
     mgr._prefix_owner_cap = 1 << 17
     mgr._prefix_seq_hashes = {}
+    mgr._prefix_pending = {}
     mgr._prefix_stride_tokens = 4096
     mgr._dp_route_counters.update(
         prefix_owner_total=0,
@@ -787,3 +788,33 @@ def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
     mgr._mark_seq_prefill_complete(2)
     mgr._release_seq_load(2)  # finished normally: the record stays
     assert mgr._prefix_owner
+
+
+def test_an_aborted_move_leaves_no_hit_on_its_destination():
+    """A moved request records the reused prefix on its destination only
+    provisionally: aborted before its load and prefill, the destination does
+    not keep a hit for KV that never arrived. A later request that completes
+    there confirms the entry for good."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    other = 1 - owner
+
+    def moved(seq_id):
+        mgr._rank_tokens = [0, 0]
+        mgr._rank_reqs = [0, 0]
+        mgr._rank_tokens[owner] = 200_000
+        seq = _chain_seq(seq_id, 100_000)
+        assert _route(mgr, [seq]) == [other]
+        return seq
+
+    moved(2)
+    mgr._release_seq_load(2)  # aborted before its load
+    hits, _, _ = mgr._prefix_rank_hits(_chain_seq(9, 100_000).prompt_hash_chain)
+    assert other not in hits
+
+    moved(3)
+    mgr._mark_seq_prefill_complete(3)
+    mgr._release_seq_load(3)
+    hits, _, _ = mgr._prefix_rank_hits(_chain_seq(9, 100_000).prompt_hash_chain)
+    assert hits.get(other) == 98_304

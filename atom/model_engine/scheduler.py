@@ -5287,15 +5287,23 @@ class Scheduler:
         return True
 
     def _prefetch_must_pass_head(self) -> bool:
-        """Whether finished prefetches must be let past the head of `waiting`:
-        nothing is running (so nothing else will free blocks) and the first
-        request that is not a prefetch cannot allocate."""
+        """Whether finished prefetches must be let past the head of `waiting`.
+
+        Only when nothing is running (so nothing else will free blocks or
+        slots) and the first request that is not a prefetch is stuck: it
+        cannot allocate, or every parked-load slot is taken (by prefetches
+        that hold their slot until they run), so Phase 2 would stop at it if
+        it needs a load. In that state the GPU is idle, so letting the
+        finished prefetches run first costs the head nothing.
+        """
         entries = self._prefetch.entries
         if not entries or self.running:
             return False
         for seq in self.waiting:
             if seq.id in entries or seq.status != SequenceStatus.WAITING:
                 continue
+            if self._num_parked_remote_kv >= self.max_num_seqs:
+                return True
             return self.block_manager.can_allocate_memoized(seq) < 0
         return False
 
