@@ -98,7 +98,9 @@ Examples of bad findings (too vague, missing action verb):
 each is **one sentence** stating the problem, a short clause stating the impact, and one
 `**Author must**` clause stating the action. Your findings must take the same shape. If you
 hold more than one piece of evidence, **put the strongest one in the body**; fold the rest into
-the same finding's sentence or drop them — `at most 5 findings` already forces the trade-off.
+the same finding's sentence or drop them — the shape above is what forces that trade-off, one
+sentence per finding. There is no cap on how many findings a card may carry: report every one
+that meets the bar. Dropping a real finding to hit a number is the one trade this never asks for.
 
 ---
 

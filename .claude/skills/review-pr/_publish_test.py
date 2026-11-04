@@ -66,6 +66,16 @@ _Independent refutation: 3 judged, 0 killed, 3 defended — cross-family._
 """
 
 
+@pytest.fixture(autouse=True)
+def _configured_token(monkeypatch):
+    """Default posture: ATOM_BOT_TOKEN is configured, so the fallback identity check
+    does not apply. Without this every post test runs as if someone had hand-run it off
+    ~/.git-credentials, which is the one path that is supposed to be refused -- and the
+    refusal would be read as the post machinery being broken. The fallback itself is
+    covered by its own test below."""
+    monkeypatch.setattr(_publish, "TOK_IS_FALLBACK", False)
+
+
 @pytest.fixture
 def report(tmp_path, monkeypatch):
     d = tmp_path / "PR-9999"
@@ -229,6 +239,35 @@ def test_the_degraded_body_does_not_claim_anchors_it_no_longer_has(
     ), "the degraded review still claims findings are inline"
     # and the findings themselves are still in it, exactly once
     assert "could not be attached to their lines" in degraded
+
+
+def test_a_hand_run_under_the_wrong_identity_refuses_to_post(
+    report, monkeypatch, capsys
+):
+    """Posting off ~/.git-credentials as someone other than ATOM_BOT_LOGIN is refused.
+
+    preflight.sh checks identity only when ATOM_BOT_TOKEN(_FILE) is set, so this path
+    has no other guard. The damage is not just a wrong author: the review carries a
+    dedup marker naming ATOM_BOT_LOGIN's account, so the bot later SKIPs a head that
+    account never posted for -- a review that is silently never published.
+    """
+    monkeypatch.setattr(_publish, "TOK_IS_FALLBACK", True)
+    monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+    posted = []
+
+    def _api(path, method="GET", body=None):
+        if path == "user":
+            return {"login": "someone-else"}
+        if method == "POST":
+            posted.append(body)
+        return {"state": "open", "merged_at": None, "head": {"sha": "f" * 40}}
+
+    monkeypatch.setattr(_publish, "_api", _api)
+    rc = _publish.main(["9999", "--post"])
+    assert posted == [], "a mismatched identity must not post at all"
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "someone-else" in out and _publish.BOT in out
 
 
 def test_a_refused_post_exits_non_zero(report, monkeypatch, capsys):

@@ -82,6 +82,15 @@ def _token():
 
 
 TOK = _token()
+# True when the token came from ~/.git-credentials rather than ATOM_BOT_TOKEN(_FILE).
+# preflight.sh checks the configured path's identity and skips this one entirely, so a
+# hand-run --post on the runner would publish as the credentials' owner while the dedup
+# marker and the identity line name ATOM_BOT_LOGIN's account. The review lands under the
+# wrong name AND the marker claims a head was reviewed by an account that never posted,
+# so the bot later SKIPs that head -- a review silently never published.
+TOK_IS_FALLBACK = bool(TOK) and not (
+    os.environ.get("ATOM_BOT_TOKEN") or os.environ.get("ATOM_BOT_TOKEN_FILE")
+)
 
 
 def _api(path, method="GET", body=None):
@@ -538,8 +547,31 @@ def decide(pr):
     return "POST", "postable"
 
 
+def post_identity_ok():
+    """-> (ok, message). Whether the token about to post belongs to BOT.
+
+    Only enforced on the ~/.git-credentials fallback, because that is the path
+    preflight.sh does not cover. Fail-closed: posting under a mismatched identity
+    is not recoverable -- the marker it writes makes the bot skip that head later.
+    """
+    if not TOK_IS_FALLBACK:
+        return True, ""
+    who = (_api("user") or {}).get("login") or ""
+    if who.lower() == BOT.lower():
+        return True, ""
+    return False, (
+        f"the token came from ~/.git-credentials and belongs to {who or '<unknown>'}, "
+        f"but ATOM_BOT_LOGIN says {BOT}. Posting would publish under the wrong account "
+        f"and write a {BOT} dedup marker for a review {BOT} never made, so the bot would "
+        f"skip this head later. Set ATOM_BOT_TOKEN, or set ATOM_BOT_LOGIN={who}."
+    )
+
+
 def do_post(pr):
     """Post the card as a review. Only ever reached from main() under --post."""
+    ok, why = post_identity_ok()
+    if not ok:
+        return False, why
     payload = review_payload(pr)
     assert payload["event"] == "COMMENT", "this bot never approves or requests changes"
     # A review is all-or-nothing: GitHub rejects the whole call -- summary included -- if
