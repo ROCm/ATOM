@@ -1,24 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The chunked Gated DeltaNet state recurrence (`chunk_delta_h`) as a Gluon kernel
-for gfx1250.
+"""Serial chunked gated delta-rule state update for gfx1250.
 
-One program walks one (sequence, value head, V block) over its chunks; the
-recurrence is serial in the chunks, so the program is a chain of two dependent
-GEMMs a chunk:
-
-    v_new = u - w @ h                    [BT, BV]  (stored, before the gate)
-    h     = exp(g_last) h + k^T @ (exp(g_last - g) v_new)
-
-The state stays fp32 in WMMA accumulator registers for the whole walk. The
-chunk's operands do not depend on the state, so the tensor data mover loads the
-w, k and u tiles of the next chunks into LDS while the current chunk computes,
-and stores the per-chunk state and v_new tiles from LDS without the waves
-waiting on them. Out-of-sequence rows of a partial last chunk read as zero (the
-descriptors are bounded at the sequence end) and are not stored.
-
-The launch configuration is a function of the shapes alone; nothing is tuned at
-run time.
+Each chunk writes its incoming bf16 state and v_new = u - w @ bf16(state),
+then updates the fp32 state with exp(g_last) * state +
+k.T @ bf16(exp(g_last - g) * v_new). TDM buffers overlap operand loads and stores.
 """
 
 import functools
@@ -30,31 +16,55 @@ from triton.experimental.gluon import language as gl
 
 from atom.utils import envs
 
-_BT = 64
-_TDM_MAX_PAD_INTERVAL_DWORDS = 256
-
-
-def _pad_interval(extent, elem_bits=16):
-    return min(extent, _TDM_MAX_PAD_INTERVAL_DWORDS * 32 // elem_bits)
+_NUM_WARPS = 4
+_CONFIGS = {
+    128: {
+        "buffers": 2,
+        "warp_bases": [[0, 1], [1, 0]],
+        "k_padding": 8,
+        "latency": 1.13,
+        "cost": 2.1,
+    },
+    64: {
+        "buffers": 3,
+        "warp_bases": [[1, 0], [2, 0]],
+        "k_padding": 8,
+        "latency": 0.83,
+        "cost": 1.82,
+    },
+    32: {
+        "buffers": 4,
+        "warp_bases": [[1, 0], [2, 0]],
+        "k_padding": 16,
+        "latency": 0.71,
+        "cost": 1.39,
+    },
+}
 
 
 @gluon.jit
-def _at(desc, row, col):
-    # the descriptor of the tile at (row, col), bounded at the tensor's end
+def _tile_descriptor(desc, row, col):
     return gl.amd.gfx1250.tdm.update_tensor_descriptor(
         desc, add_offsets=[row, col], clamp_bounds=True
     )
 
 
 @gluon.jit
-def _load_pairs(w_desc, k_desc, u_desc, g_desc, w_dst, k_dst, u_dst, g_dst, c, v0):
-    # the operands of the chunk at row c in two fused copies: waves 0-1 move w
-    # then u, waves 2-3 k then the gates
+def _load_pairs(
+    w_desc, k_desc, u_desc, g_desc, w_dst, k_dst, u_dst, g_dst, start_m, start_n
+):
+    # Waves 0-1 load w/u; waves 2-3 load k/g.
     gl.amd.gfx1250.tdm.async_load_fused(
-        [(_at(w_desc, c, 0), w_dst, 3), (_at(k_desc, c, 0), k_dst, 12)]
+        [
+            (_tile_descriptor(w_desc, start_m, 0), w_dst, 3),
+            (_tile_descriptor(k_desc, start_m, 0), k_dst, 12),
+        ]
     )
     gl.amd.gfx1250.tdm.async_load_fused(
-        [(_at(u_desc, c, v0), u_dst, 3), (_at(g_desc, c, 0), g_dst, 12)]
+        [
+            (_tile_descriptor(u_desc, start_m, start_n), u_dst, 3),
+            (_tile_descriptor(g_desc, start_m, 0), g_dst, 12),
+        ]
     )
 
 
@@ -82,14 +92,13 @@ def _chunk_h_gfx1250_kernel(
     Hg: gl.constexpr,
     K: gl.constexpr,
     V: gl.constexpr,
-    BT: gl.constexpr,
-    BV: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     USE_G: gl.constexpr,
     USE_INITIAL_STATE: gl.constexpr,
     STORE_FINAL_STATE: gl.constexpr,
     SAVE_NEW_VALUE: gl.constexpr,
-    STORE_H: gl.constexpr,
     IS_VARLEN: gl.constexpr,
     HAS_N: gl.constexpr,
     USE_STATE_IDX: gl.constexpr,
@@ -104,113 +113,109 @@ def _chunk_h_gfx1250_kernel(
     SMEM_STATE: gl.constexpr,
     SMEM_G: gl.constexpr,
 ):
-    i_v = gl.program_id(0)
-    i_nh = gl.program_id(1)
-    i_n = i_nh // H
-    i_h = i_nh % H
+    pid_n = gl.program_id(0)
+    pid_m = gl.program_id(1)
+    sequence = pid_m // H
+    head = pid_m % H
     if IS_VARLEN and HAS_N:  # noqa: SIM102 (a constexpr, then a device load)
-        # a bucket-shaped grid: programs past the step's sequence count have no work
-        if i_n >= gl.load(n_ptr):
+        if sequence >= gl.load(n_ptr):
             return
     if IS_VARLEN:
-        bos = gl.load(cu_seqlens + i_n).to(gl.int32)
-        eos = gl.load(cu_seqlens + i_n + 1).to(gl.int32)
-        T = eos - bos
-        boh = gl.load(chunk_offsets + i_n).to(gl.int32)
+        start_token = gl.load(cu_seqlens + sequence).to(gl.int32)
+        end_token = gl.load(cu_seqlens + sequence + 1).to(gl.int32)
+        T = end_token - start_token
+        first_chunk = gl.load(chunk_offsets + sequence).to(gl.int32)
     else:
-        bos = i_n * T
-        boh = i_n * gl.cdiv(T, BT)
-    NT = gl.cdiv(T, BT)
-    v0 = i_v * BV
+        start_token = sequence * T
+        first_chunk = sequence * gl.cdiv(T, BLOCK_M)
+    num_chunks = gl.cdiv(T, BLOCK_M)
+    start_n = pid_n * BLOCK_N
 
-    # ---- descriptors, bounded at the sequence end ----
+    # Bound operand descriptors at the sequence end.
     w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=w + (bos.to(gl.int64) * H + i_h) * K,
+        base=w + (start_token.to(gl.int64) * H + head) * K,
         shape=(T, K),
         strides=(H * K, 1),
-        block_shape=(BT, K),
+        block_shape=(BLOCK_M, K),
         layout=SMEM_A_ROW,
     )
     k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=k + (bos.to(gl.int64) * Hg + i_h // (H // Hg)) * K,
+        base=k + (start_token.to(gl.int64) * Hg + head // (H // Hg)) * K,
         shape=(T, K),
         strides=(Hg * K, 1),
-        block_shape=(BT, K),
+        block_shape=(BLOCK_M, K),
         layout=SMEM_A_COL,
     )
     u_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=u + (bos.to(gl.int64) * H + i_h) * V,
+        base=u + (start_token.to(gl.int64) * H + head) * V,
         shape=(T, V),
         strides=(H * V, 1),
-        block_shape=(BT, BV),
+        block_shape=(BLOCK_M, BLOCK_N),
         layout=SMEM_TILE,
     )
     if USE_G:
-        # the gates of the chunk ride with its operands: one fp32 column of [T, H]
         g_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=g + bos.to(gl.int64) * H + i_h,
+            base=g + start_token.to(gl.int64) * H + head,
             shape=(T, 1),
             strides=(H, 1),
-            block_shape=(BT, 1),
+            block_shape=(BLOCK_M, 1),
             layout=SMEM_G,
         )
     NB: gl.constexpr = NUM_BUFFERS
-    w_smem = gl.allocate_shared_memory(w.type.element_ty, [NB, BT, K], SMEM_A_ROW)
-    k_smem = gl.allocate_shared_memory(k.type.element_ty, [NB, BT, K], SMEM_A_COL)
-    u_smem = gl.allocate_shared_memory(u.type.element_ty, [NB, BT, BV], SMEM_TILE)
+    w_smem = gl.allocate_shared_memory(w.type.element_ty, [NB, BLOCK_M, K], SMEM_A_ROW)
+    k_smem = gl.allocate_shared_memory(k.type.element_ty, [NB, BLOCK_M, K], SMEM_A_COL)
+    u_smem = gl.allocate_shared_memory(
+        u.type.element_ty, [NB, BLOCK_M, BLOCK_N], SMEM_TILE
+    )
     if USE_G:
-        g_smem = gl.allocate_shared_memory(gl.float32, [NB, BT, 1], SMEM_G)
-    # the state entering a chunk, bf16: the B operand of w @ h and the h[i_t]
-    # store; v_new, bf16, for its store. NB of each, so the store of a chunk can
-    # drain while the next chunks write the others: a buffer is written again only
-    # after the wait that covers its store.
-    h_smem = gl.allocate_shared_memory(k.type.element_ty, [NB, K, BV], SMEM_STATE)
+        g_smem = gl.allocate_shared_memory(gl.float32, [NB, BLOCK_M, 1], SMEM_G)
+    # Ring buffers keep bf16 states and residuals live until their stores drain.
+    h_smem = gl.allocate_shared_memory(k.type.element_ty, [NB, K, BLOCK_N], SMEM_STATE)
     if SAVE_NEW_VALUE:
-        vn_smem = gl.allocate_shared_memory(k.type.element_ty, [NB, BT, BV], SMEM_TILE)
-    # the gated v_new, bf16: the B operand of k^T @ v
-    vg_smem = gl.allocate_shared_memory(k.type.element_ty, [BT, BV], SMEM_TILE)
-    if STORE_H:
-        h_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=h,
-            shape=(NT_ALL * H * K, V),
-            strides=(V, 1),
-            block_shape=(K, BV),
-            layout=SMEM_STATE,
+        vn_smem = gl.allocate_shared_memory(
+            k.type.element_ty, [NB, BLOCK_M, BLOCK_N], SMEM_TILE
         )
+    vg_smem = gl.allocate_shared_memory(
+        k.type.element_ty, [BLOCK_M, BLOCK_N], SMEM_TILE
+    )
+    h_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=h,
+        shape=(NT_ALL * H * K, V),
+        strides=(V, 1),
+        block_shape=(K, BLOCK_N),
+        layout=SMEM_STATE,
+    )
     if SAVE_NEW_VALUE:
         vn_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=v_new + (bos.to(gl.int64) * H + i_h) * V,
+            base=v_new + (start_token.to(gl.int64) * H + head) * V,
             shape=(T, V),
             strides=(H * V, 1),
-            block_shape=(BT, BV),
+            block_shape=(BLOCK_M, BLOCK_N),
             layout=SMEM_TILE,
         )
-    # Tensor-data-mover operations of a chunk, in issue order: the h store, the
-    # loads of a later chunk's operands, the v_new store. Every chunk issues the
-    # same count (loads past the last chunk re-read the last chunk), so each wait
-    # below is a fixed count of the operations issued after the chunk's loads.
+    # Every chunk issues the same TDM count, including prefetches past the end.
     LOADS: gl.constexpr = 2 if PAIRED else 3 + USE_G
-    PER_CHUNK: gl.constexpr = STORE_H + LOADS + SAVE_NEW_VALUE
+    PER_CHUNK: gl.constexpr = 1 + LOADS + SAVE_NEW_VALUE
 
-    # ---- the initial state ----
-    rows_k = gl.arange(0, K, layout=gl.SliceLayout(1, WMMA))
-    cols_v = gl.arange(0, BV, layout=gl.SliceLayout(0, WMMA))
-    state_off = rows_k[:, None] * V + (v0 + cols_v)[None, :]
+    offs_k = gl.arange(0, K, layout=gl.SliceLayout(1, WMMA))
+    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA))
+    # The nonnegative-offset masks preserve pointer-width inference.
+    offs_state = offs_k[:, None] * V + (start_n + offs_n)[None, :]
     if USE_STATE_IDX:
         if USE_INITIAL_STATE:
-            h0 = h0 + (gl.load(h0_idx + i_n).to(gl.int64) * H + i_h) * K * V
+            h0 = h0 + (gl.load(h0_idx + sequence).to(gl.int64) * H + head) * K * V
         if STORE_FINAL_STATE:
-            ht = ht + (gl.load(ht_idx + i_n).to(gl.int64) * H + i_h) * K * V
-        use_h0 = gl.load(h0_flag + i_n) != 0
+            ht = ht + (gl.load(ht_idx + sequence).to(gl.int64) * H + head) * K * V
+        use_h0 = gl.load(h0_flag + sequence) != 0
     else:
         if USE_INITIAL_STATE:
-            h0 = h0 + i_nh.to(gl.int64) * K * V
+            h0 = h0 + pid_m.to(gl.int64) * K * V
         if STORE_FINAL_STATE:
-            ht = ht + i_nh.to(gl.int64) * K * V
+            ht = ht + pid_m.to(gl.int64) * K * V
         use_h0 = True
-    # the first chunks' operands
+    # Prefetch operands before loading the initial state.
     for i in gl.static_range(NB - 1):
-        c = gl.minimum(i, NT - 1) * BT
+        start_m = gl.minimum(i, num_chunks - 1) * BLOCK_M
         if PAIRED:
             _load_pairs(
                 w_desc,
@@ -221,93 +226,102 @@ def _chunk_h_gfx1250_kernel(
                 k_smem.index(i),
                 u_smem.index(i),
                 g_smem.index(i),
-                c,
-                v0,
+                start_m,
+                start_n,
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(w_desc, [c, 0], w_smem.index(i))
-            gl.amd.gfx1250.tdm.async_load(k_desc, [c, 0], k_smem.index(i))
-            gl.amd.gfx1250.tdm.async_load(u_desc, [c, v0], u_smem.index(i))
+            gl.amd.gfx1250.tdm.async_load(w_desc, [start_m, 0], w_smem.index(i))
+            gl.amd.gfx1250.tdm.async_load(k_desc, [start_m, 0], k_smem.index(i))
+            gl.amd.gfx1250.tdm.async_load(u_desc, [start_m, start_n], u_smem.index(i))
             if USE_G:
-                gl.amd.gfx1250.tdm.async_load(g_desc, [c, 0], g_smem.index(i))
+                gl.amd.gfx1250.tdm.async_load(g_desc, [start_m, 0], g_smem.index(i))
     if USE_INITIAL_STATE:
-        state = gl.load(h0 + state_off, mask=(state_off >= 0) & use_h0, other=0.0).to(
+        state = gl.load(h0 + offs_state, mask=(offs_state >= 0) & use_h0, other=0.0).to(
             gl.float32
         )
     else:
-        state = gl.zeros([K, BV], gl.float32, layout=WMMA)
-    # the state entering chunk 0, bf16; each chunk writes the next one's
+        state = gl.zeros([K, BLOCK_N], gl.float32, layout=WMMA)
     h_smem.index(0).store(state.to(h_smem.dtype))
 
-    rows_t = gl.arange(0, BT, layout=gl.SliceLayout(1, WMMA))
-    zero_v = gl.zeros([BT, BV], gl.float32, layout=WMMA)
+    offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA))
+    zero_v = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, layout=WMMA)
 
-    for i_t in range(NT):
-        buf = i_t % NB
-        if i_t == 0:
+    for chunk in range(num_chunks):
+        buf = chunk % NB
+        if chunk == 0:
             gl.amd.gfx1250.tdm.async_wait(LOADS * (NB - 2))
-        elif NB == 3 and i_t == 1:
-            gl.amd.gfx1250.tdm.async_wait(PER_CHUNK)
+        elif NB >= 3 and chunk == 1:
+            gl.amd.gfx1250.tdm.async_wait(PER_CHUNK + LOADS * (NB - 3))
+        elif NB == 4 and chunk == 2:
+            gl.amd.gfx1250.tdm.async_wait(2 * PER_CHUNK)
         else:
             gl.amd.gfx1250.tdm.async_wait(SAVE_NEW_VALUE + PER_CHUNK * (NB - 2))
-        # every wave's share of the copies has landed and its state rows are in
-        # h_smem, and every wave is done with the buffers the next copies overwrite
+        # Wait for all waves before reading or reusing shared buffers.
         gl.barrier()
         if STORE_CKPT:
-            # A state checkpoint at this chunk's first token: the fp32 state
-            # entering the chunk, straight into its slot of the pool. `h` holds
-            # the same state only rounded to bf16 for the w @ h operand.
-            cslot = gl.load(ckpt_slot + boh + i_t)
+            # Checkpoints preserve the incoming fp32 state before bf16 rounding.
+            cslot = gl.load(ckpt_slot + first_chunk + chunk)
             gl.store(
                 ckpt_pool
-                + (gl.maximum(cslot, 0).to(gl.int64) * H + i_h) * K * V
-                + state_off,
+                + (gl.maximum(cslot, 0).to(gl.int64) * H + head) * K * V
+                + offs_state,
                 state.to(ckpt_pool.dtype.element_ty),
-                mask=(state_off >= 0) & (cslot >= 0),
+                mask=(offs_state >= 0) & (cslot >= 0),
             )
         h_cur = h_smem.index(buf)
-        if STORE_H:
-            gl.amd.gfx1250.tdm.async_store(
-                h_desc, [((boh + i_t) * H + i_h) * K, v0], h_cur
-            )
-        nxt = gl.minimum(i_t + NB - 1, NT - 1) * BT
-        nbuf = (i_t + NB - 1) % NB
+        gl.amd.gfx1250.tdm.async_store(
+            h_desc, [((first_chunk + chunk) * H + head) * K, start_n], h_cur
+        )
+        next_m = gl.minimum(chunk + NB - 1, num_chunks - 1) * BLOCK_M
+        next_buf = (chunk + NB - 1) % NB
         if PAIRED:
             _load_pairs(
                 w_desc,
                 k_desc,
                 u_desc,
                 g_desc,
-                w_smem.index(nbuf),
-                k_smem.index(nbuf),
-                u_smem.index(nbuf),
-                g_smem.index(nbuf),
-                nxt,
-                v0,
+                w_smem.index(next_buf),
+                k_smem.index(next_buf),
+                u_smem.index(next_buf),
+                g_smem.index(next_buf),
+                next_m,
+                start_n,
             )
         else:
-            gl.amd.gfx1250.tdm.async_load(w_desc, [nxt, 0], w_smem.index(nbuf))
-            gl.amd.gfx1250.tdm.async_load(k_desc, [nxt, 0], k_smem.index(nbuf))
-            gl.amd.gfx1250.tdm.async_load(u_desc, [nxt, v0], u_smem.index(nbuf))
+            gl.amd.gfx1250.tdm.async_load(w_desc, [next_m, 0], w_smem.index(next_buf))
+            gl.amd.gfx1250.tdm.async_load(k_desc, [next_m, 0], k_smem.index(next_buf))
+            gl.amd.gfx1250.tdm.async_load(
+                u_desc, [next_m, start_n], u_smem.index(next_buf)
+            )
             if USE_G:
-                gl.amd.gfx1250.tdm.async_load(g_desc, [nxt, 0], g_smem.index(nbuf))
-        t0 = i_t * BT
-        m_t = (t0 + rows_t) < T
+                gl.amd.gfx1250.tdm.async_load(
+                    g_desc, [next_m, 0], g_smem.index(next_buf)
+                )
+        start_m = chunk * BLOCK_M
+        mask_m = (start_m + offs_m) < T
 
         b_h = h_cur.load(OP_B)
         b_w = w_smem.index(buf).load(OP_A)
         if PAIRED:
-            # k^T's operand is ready: read it while the first product runs
+            # Read k while the first dependent product runs.
             b_k = k_smem.index(buf).permute([1, 0]).load(OP_A)
         b_v = gl.amd.gfx1250.wmma(b_w, b_h, zero_v)
         b_u = u_smem.index(buf).load(WMMA).to(gl.float32)
         b_v = b_u - b_v
         if USE_G:
-            b_g = g_smem.index(buf).reshape([BT]).load(gl.SliceLayout(1, WMMA))
-            b_g_last = gl.sum(
-                gl.where(rows_t == gl.minimum(BT, T - t0) - 1, b_g, 0.0), 0
+            b_g = g_smem.index(buf).reshape([BLOCK_M]).load(gl.SliceLayout(1, WMMA))
+            last = gl.minimum(BLOCK_M, T - start_m) - 1
+            last_index = gl.full(
+                [1, 1],
+                last,
+                gl.int32,
+                gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]),
             )
-            b_vg = b_v * gl.where(m_t, gl.exp(b_g_last - b_g), 0.0)[:, None]
+            # Preserve the reduction's positive zero for a last gate of -0.0.
+            b_g_last = (
+                gl.sum(gl.sum(g_smem.index(buf).gather(last_index, 0), 0), 0) + 0.0
+            )
+            b_vg = b_v * gl.where(mask_m, gl.exp(b_g_last - b_g), 0.0)[:, None]
             state = state * gl.exp(b_g_last)
         else:
             b_vg = b_v
@@ -317,18 +331,17 @@ def _chunk_h_gfx1250_kernel(
         vg_smem.store(b_vg.to(vg_smem.dtype))
         gl.barrier()
         if SAVE_NEW_VALUE:
-            gl.amd.gfx1250.tdm.async_store(vn_desc, [t0, v0], vn_cur)
+            gl.amd.gfx1250.tdm.async_store(vn_desc, [start_m, start_n], vn_cur)
         if not PAIRED:
             b_k = k_smem.index(buf).permute([1, 0]).load(OP_A)
         b_vgb = vg_smem.load(OP_B)
-        # accumulate into the decayed state, as Triton folds `h += dot(k, v)`
+        # Accumulate directly into the decayed state to preserve rounding.
         state = gl.amd.gfx1250.wmma(b_k, b_vgb, state)
-        # the state entering the next chunk
-        h_smem.index((i_t + 1) % NB).store(state.to(h_smem.dtype))
+        h_smem.index((chunk + 1) % NB).store(state.to(h_smem.dtype))
 
     gl.amd.gfx1250.tdm.async_wait(0)
     if STORE_FINAL_STATE:
-        gl.store(ht + state_off, state.to(ht.dtype.element_ty))
+        gl.store(ht + offs_state, state.to(ht.dtype.element_ty))
 
 
 @functools.cache
@@ -337,60 +350,46 @@ def _num_cus(device_index):
 
 
 @functools.cache
-def _layouts(K, BT, BV, num_warps, split="M"):
-    if split == "M":
-        warp_bases = [[1, 0], [2, 0], [4, 0]][: num_warps.bit_length() - 1]
-    else:
-        # each wave owns BV / num_warps columns of the state and of v_new, so both
-        # GEMMs of a chunk are wave-local; every wave reads all of w and k
-        warp_bases = [[0, 1], [0, 2], [0, 4]][: num_warps.bit_length() - 1]
+def _layouts(K, BLOCK_M, BLOCK_N):
+    config = _CONFIGS[BLOCK_N]
     wmma = gl.amd.AMDWMMALayout(
-        version=3, transposed=True, warp_bases=warp_bases, instr_shape=[16, 16, 32]
+        version=3,
+        transposed=True,
+        warp_bases=config["warp_bases"],
+        instr_shape=[16, 16, 32],
     )
     op_a = gl.DotOperandLayout(operand_index=0, parent=wmma, k_width=8)
     op_b = gl.DotOperandLayout(operand_index=1, parent=wmma, k_width=8)
-    # [BT, K] row-major tiles: w is read as the A operand ([M=BT, K]); k is read
-    # transposed as the A operand of k^T @ v ([M=K, BT]).
-    smem_a_row = gl.PaddedSharedLayout.with_identity_for(
-        [[_pad_interval(K), 8]], [BT, K], [1, 0]
-    )
+    smem_a_row = gl.PaddedSharedLayout.with_identity_for([[K, 8]], [BLOCK_M, K], [1, 0])
     smem_a_col = gl.PaddedSharedLayout.with_identity_for(
-        [[_pad_interval(K), 8]], [BT, K], [1, 0]
+        [[K, config["k_padding"]]], [BLOCK_M, K], [1, 0]
     )
     smem_tile = gl.PaddedSharedLayout.with_identity_for(
-        [[_pad_interval(BV), 16]], [BT, BV], [1, 0]
+        [[BLOCK_N, 16]], [BLOCK_M, BLOCK_N], [1, 0]
     )
     smem_state = gl.PaddedSharedLayout.with_identity_for(
-        [[_pad_interval(BV), 16]], [K, BV], [1, 0]
+        [[BLOCK_N, 16]], [K, BLOCK_N], [1, 0]
     )
     smem_g = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
     return wmma, op_a, op_b, smem_a_row, smem_a_col, smem_tile, smem_state, smem_g
 
 
-# Per BV: the time of one chunk on a walk (us), and the time of one program-chunk
-# spread over the CUs (us per CU); measured on gfx1250 (256 CUs) at K = V = 128.
-_CHUNK_LATENCY = {128: 1.13, 64: 0.83, 32: 0.71}
-_CHUNK_COST = {128: 2.1, 64: 1.82, 32: 1.39}
-
-
 def launch_config(H, V, total_chunks, longest_chunks, num_cus):
-    """(BV, operand buffers, warps) from host-known shapes alone.
+    """Return (value tile width, buffers, warps) from chunk counts and CU count."""
 
-    A (sequence, head) is one serial walk over its chunks; its V blocks are
-    independent programs that re-read the same w and k tiles. A step takes the
-    longer of its longest walk (narrower blocks shorten the per-chunk chain) and
-    its total work over the CUs (wider blocks re-read less), so the BV with the
-    smaller of the two estimates wins. A third operand buffer keeps the copies
-    further ahead of a walk; at BV 128 only two fit in LDS.
-    """
-
-    def step_estimate(bv):
-        walk = longest_chunks * _CHUNK_LATENCY[bv]
-        work = total_chunks * H * triton.cdiv(V, bv) * _CHUNK_COST[bv] / num_cus
+    def step_estimate(block_n):
+        walk = longest_chunks * _CONFIGS[block_n]["latency"]
+        work = (
+            total_chunks
+            * H
+            * triton.cdiv(V, block_n)
+            * _CONFIGS[block_n]["cost"]
+            / num_cus
+        )
         return max(walk, work)
 
-    bv = min((128, 64, 32), key=step_estimate)
-    return bv, 2 if bv == 128 else 3, 4
+    block_n = min(_CONFIGS, key=step_estimate)
+    return block_n, _CONFIGS[block_n]["buffers"], _NUM_WARPS
 
 
 def chunk_h_gfx1250(
@@ -416,24 +415,23 @@ def chunk_h_gfx1250(
     Hg,
     K,
     V,
-    BT,
-    store_h=True,
-    BV=None,
-    num_warps=None,
-    num_buffers=None,
-    split="M",
-    ckpt_pool=None,
-    ckpt_slot=None,
+    BLOCK_M,
+    ckpt_pool,
+    ckpt_slot,
 ):
-    """``ckpt_slot`` (int32, one entry a chunk of the batch, -1 for none) names
-    the slot of ``ckpt_pool`` that receives the fp32 state entering that chunk:
-    the exact state for a checkpoint at the chunk's first token."""
-    bv, nb, nw = launch_config(H, V, NT_ALL, longest_chunks, _num_cus(k.device.index))
-    BV = BV or bv
-    num_buffers = num_buffers or nb
-    num_warps = num_warps or nw
-    layouts = _layouts(K, BT, BV, num_warps, split)
-    _chunk_h_gfx1250_kernel[(triton.cdiv(V, BV), N * H)](
+    """Write chunk states, residual values, final states and requested checkpoints.
+
+    k/w/u are contiguous bf16 token-major tensors; g holds fp32 log gates.
+    Sequence and state indices select pool slots; ckpt_slot=-1 skips a checkpoint.
+    None disables the gate, initial/final state, residual output or checkpoints.
+    Writes supplied buffers and returns None. Requires K=128, BLOCK_M=64,
+    V divisible by the selected value tile width, and nonempty sequences.
+    """
+    BLOCK_N, num_buffers, num_warps = launch_config(
+        H, V, NT_ALL, longest_chunks, _num_cus(k.device.index)
+    )
+    layouts = _layouts(K, BLOCK_M, BLOCK_N)
+    _chunk_h_gfx1250_kernel[(triton.cdiv(V, BLOCK_N), N * H)](
         k,
         u,
         w,
@@ -456,14 +454,13 @@ def chunk_h_gfx1250(
         Hg=Hg,
         K=K,
         V=V,
-        BT=BT,
-        BV=BV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
         NUM_BUFFERS=num_buffers,
         USE_G=g is not None,
         USE_INITIAL_STATE=h0 is not None,
         STORE_FINAL_STATE=ht is not None,
         SAVE_NEW_VALUE=v_new is not None,
-        STORE_H=store_h,
         IS_VARLEN=cu_seqlens is not None,
         HAS_N=n_ptr is not None,
         USE_STATE_IDX=h0_idx is not None,
