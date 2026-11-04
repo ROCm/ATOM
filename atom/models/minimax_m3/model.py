@@ -663,9 +663,11 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.qkv_proj,
             not self.skip_index_topk and _rope_cache_claims_splitk_partials(self.attn),
         )
-        self.fuse_sparse_pa_output_quant = (
-            _linear_consumes_per_token_fp8(self.o_proj)
-            and envs.ATOM_PA_FLYDSL
+        # Shape and kernel conditions are fixed at construction. Whether o_proj
+        # takes per-token FP8 is only known after online quantization re-quantizes
+        # it at load time, so forward checks that part.
+        self.sparse_pa_output_quant_supported = (
+            envs.ATOM_PA_FLYDSL
             and self.num_kv_heads == 1
             and self.num_heads == 16
             and self.head_dim == 128
@@ -692,7 +694,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        if self.fuse_sparse_pa_output_quant:
+        if self.sparse_pa_output_quant_supported and _linear_consumes_per_token_fp8(
+            self.o_proj
+        ):
             attn_output, attn_scale = self.attn.forward_quantized(
                 q, k, v, positions, qkv=qkv
             )
