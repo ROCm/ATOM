@@ -292,38 +292,23 @@ def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
     sees it and no step allocates."""
     prop = proposer(monkeypatch)
     assert prop.lossless.draft_scratch.nbytes()
-    assert prop.lossless.verify_scratch.nbytes()
 
 
-def test_the_startup_verify_warmup_runs_at_the_serving_widths(monkeypatch):
+def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
     """The ratio verify compiles per store width, draft count, vocab and
-    logits dtype, so the warmup must use the ones serving will."""
-    prop = proposer(monkeypatch)
+    logits dtype, so the warmup must use the ones serving will; its scratch,
+    warmup and step counter are the rejection sampler's, not the drafter's."""
+    from atom.model_ops import rejection_sampler as rs_mod
+
+    sampler = rs_mod.RejectionSampler()
+    sampler.arm_ratio(MAX_BS, T, VOCAB, "cpu")
+    assert sampler._ratio_scratch.nbytes()
     calls = []
-    monkeypatch.setattr(
-        dspark_lossless, "warmup_ratio_verify", lambda *args: calls.append(args)
-    )
-    prop.lossless.warmup_verify(torch.bfloat16)
+    monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: calls.append(a))
+    sampler.warmup_ratio(T, VOCAB, 8, torch.bfloat16)
     ((steps, vocab, width, dtype, scratch),) = calls
-    assert (steps, vocab, width, dtype) == (
-        T,
-        VOCAB,
-        prop.lossless.q_store.ids.shape[1],
-        torch.bfloat16,
-    )
-    assert scratch is prop.lossless.verify_scratch
-
-
-def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
-    """A verify on another logits dtype would JIT every ratio kernel
-    mid-serving, so it is refused instead."""
-    prop = proposer(monkeypatch)
-    monkeypatch.setattr(dspark_lossless, "warmup_ratio_verify", lambda *args: None)
-    prop.lossless.warmup_verify(torch.bfloat16)
-    stage(prop, batch(["a", "b"]))
-    assert prop.lossless.verify_inputs(2, torch.bfloat16, None, None, None) is not None
-    with pytest.raises(RuntimeError, match="warmed up for torch.bfloat16"):
-        prop.lossless.verify_inputs(2, torch.float32, None, None, None)
+    assert (steps, vocab, width, dtype) == (T, VOCAB, 8, torch.bfloat16)
+    assert scratch is sampler._ratio_scratch
 
 
 # ---- staging ----------------------------------------------------------------
@@ -416,19 +401,17 @@ def test_the_v4_mono_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
 # ---- verify policy ----------------------------------------------------------
 
 
-def test_a_filtered_batch_reaches_the_ratio_rule_too(monkeypatch):
+def test_the_verify_reads_the_store_and_each_requests_first_q_row(monkeypatch):
     prop = proposer(monkeypatch)
-    stage(prop, batch(["a", "b"], top_ks=[5, -1], top_ps=[1.0, 0.7]))
-    temps, top_ks, top_ps = torch.ones(2), torch.tensor([5, -1]), 0.7
-    ratio = prop.lossless.verify_inputs(2, torch.bfloat16, temps, top_ks, top_ps)
+    stage(prop, batch(["a", "b"]))
+    stage(prop, batch(["b", "a"]))
+    store, q_row_base = prop.lossless.verify_inputs(2)
     # The sparse store itself; the verify borrows nothing of the draft's.
-    assert ratio.q is prop.lossless.q_store
-    assert (
-        ratio.q_row_base.shape == (2,) and ratio.scratch is prop.lossless.verify_scratch
-    )
-    # The batch's own temperatures and filters, as `Sampler` gets them.
-    assert ratio.temperatures is temps
-    assert ratio.top_ks is top_ks and ratio.top_ps is top_ps
+    assert store is prop.lossless.q_store
+    # The published verify bases, read where the H2D lands them.
+    gpu = prop.metadata_buffers["draft_verify_q_row_base"].gpu
+    assert q_row_base.shape == (2,) and q_row_base.data_ptr() == gpu.data_ptr()
+    assert min(verify(prop)[:2]) >= 0
 
 
 # ---- exclusion with relaxed MTP ----------------------------------------------

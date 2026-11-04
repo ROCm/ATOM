@@ -4,7 +4,13 @@ import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
-from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs, _ratio_sample
+from atom.model_ops.spec_sampling.ratio_verify import (
+    RatioVerifyInputs,
+    _ratio_sample,
+    ratio_verify_scratch,
+    warmup_ratio_verify,
+)
+from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
 from atom.model_ops.verify_kernels import _draft_token, _finish_request
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
@@ -116,6 +122,28 @@ class RejectionSampler(nn.Module):
         # Same, for the probability-ratio path's draws. Advanced on every forward
         # that takes that path, so no two steps replay a stream.
         self._ratio_step = 0
+        # The probability-ratio verify's preallocated scratch (`arm_ratio`), or
+        # None while lossless sampling is not armed.
+        self._ratio_scratch = None
+
+    def arm_ratio(self, max_bs: int, num_spec_steps: int, vocab_size: int, device):
+        """Allocate the ratio verify's scratch for up to ``max_bs`` requests of
+        ``num_spec_steps`` drafts, before the KV cache is sized, so the budget
+        and the profiling run see it and no verify allocates."""
+        self._ratio_scratch = ratio_verify_scratch(
+            max_bs, num_spec_steps, vocab_size, device
+        )
+
+    def warmup_ratio(
+        self, num_spec_steps: int, vocab_size: int, q_width: int, logits_dtype
+    ) -> None:
+        """Compile every ratio verify variant at the widths serving gives it,
+        for ``logits_dtype``, the dtype the target's LM head emitted in the
+        warmup forward (`warmup_ratio_verify`). No warmup or capture forward
+        verifies, so without this the first sampled verify would compile."""
+        warmup_ratio_verify(
+            num_spec_steps, vocab_size, q_width, logits_dtype, self._ratio_scratch
+        )
 
     def forward(
         self,
@@ -126,13 +154,24 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         target_token_ids: torch.Tensor | None = None,
-        # The drafter's probability-ratio inputs; None selects exact match.
-        ratio: RatioVerifyInputs | None = None,
+        # The draft's q store and each request's first q row; None selects
+        # exact match. With it, p is softmax(target_logits / temperatures),
+        # filtered as `Sampler` filters it with top_ks / top_ps.
+        draft_q: tuple[SparseQStore, torch.Tensor] | None = None,
+        temperatures: torch.Tensor | None = None,
+        top_ks: int | torch.Tensor | None = None,
+        top_ps: float | torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
         target_logits = target_logits.contiguous()
+        ratio = None
+        if draft_q is not None:
+            store, q_row_base = draft_q
+            ratio = RatioVerifyInputs(
+                store, q_row_base, temperatures, top_ks, top_ps, self._ratio_scratch
+            )
 
         output_token_ids = rejection_sample(
             metadata.input_ids,

@@ -114,7 +114,7 @@ class _Reached(Exception):
 def test_a_filtered_batch_reaches_one_law_for_every_draw(
     monkeypatch, verified, armed, all_greedy
 ):
-    """The drafter's ratio inputs get the batch's own `top_ks`/`top_ps`; the
+    """The ratio verify gets the drafter's q and the batch's own `top_ks`/`top_ps`; the
     bonus and an unarmed exact-match draw stay `Sampler`'s, one law per
     process. An all-greedy verify asks for neither."""
     bs = 2
@@ -136,8 +136,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     monkeypatch.setattr(
         runner_module, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
-    ratio = object() if armed else None
-    lossless = SimpleNamespace(verify_inputs=mock.Mock(return_value=ratio))
+    draft_q = (object(), object()) if armed else None
+    lossless = SimpleNamespace(verify_inputs=mock.Mock(return_value=draft_q))
     drafter = SimpleNamespace(lossless=lossless)
     runner = SimpleNamespace(
         tokenID_processor=SimpleNamespace(zero_spec_counts=torch.zeros(8)),
@@ -169,12 +169,13 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         return
     if all_greedy:
         lossless.verify_inputs.assert_not_called()
-        assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is None
+        assert runner.rejection_sampler.forward.call_args.kwargs["draft_q"] is None
         assert not runner.sampler.sample_verification_tokens.called
         return
-    asked = lossless.verify_inputs.call_args.args
-    assert asked[3] is top_ks and asked[4] is top_ps
-    assert runner.rejection_sampler.forward.call_args.kwargs["ratio"] is ratio
+    assert lossless.verify_inputs.call_args.args == (bs,)
+    passed = runner.rejection_sampler.forward.call_args.kwargs
+    assert passed["draft_q"] is draft_q
+    assert passed["top_ks"] is top_ks and passed["top_ps"] is top_ps
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
     assert runner.sampler.sample_verification_tokens.called is not armed
 

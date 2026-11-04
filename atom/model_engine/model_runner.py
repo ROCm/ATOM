@@ -890,6 +890,15 @@ class ModelRunner:
         lossless = _draft_lossless(self)
         if lossless is not None:
             lossless.bind_target(self.forward_vars, self.drafter.model)
+            self.rejection_sampler.arm_ratio(
+                config.max_num_seqs,
+                self.drafter.mtp_k,
+                lossless.s_scratch.shape[1],
+                self.device,
+            )
+        # The LM head's logits dtype, as the warmup forward emits it; the ratio
+        # verify is compiled for it.
+        self._logits_dtype = None
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
@@ -942,13 +951,18 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
-        if _draft_lossless(self) is not None:
-            # No warmup or capture forward verifies, so the ratio verify is
-            # compiled here, before the memory profile. Its logits are the LM
-            # head's, which keeps the hidden states' dtype; the verify refuses
-            # logits of any other dtype rather than JIT mid-serving.
-            self.drafter.lossless.warmup_verify(config.torch_dtype)
         self._maybe_warmup()
+        lossless = _draft_lossless(self)
+        if lossless is not None:
+            # For the dtype the warmup forward's LM head emitted, so no serving
+            # verify compiles; a runner that skips the warmup (RapidServe's
+            # decode) has only the model dtype to go by.
+            self.rejection_sampler.warmup_ratio(
+                self.drafter.mtp_k,
+                lossless.s_scratch.shape[1],
+                lossless.q_store.ids.shape[1],
+                self._logits_dtype or config.torch_dtype,
+            )
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
         # DeviceContext intercepting every torch call during serving, including
@@ -3460,15 +3474,13 @@ class ModelRunner:
             )
             # Lossless (`u * q < p`) inputs, asked first: they decide whether the
             # verification sample below runs. All-greedy batches keep exact match.
-            ratio = None
+            draft_q = None
             lossless = _draft_lossless(self)
             if lossless is not None and not all_greedy:
-                ratio = lossless.verify_inputs(
-                    bs, target_logits.dtype, temperatures, top_ks, top_ps
-                )
+                draft_q = lossless.verify_inputs(bs)
             target_token_ids = None
             # Only exact match on a sampled batch reads the target's own draw.
-            if not all_greedy and ratio is None:
+            if not all_greedy and draft_q is None:
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3491,7 +3503,10 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
-                ratio=ratio,
+                draft_q=draft_q,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced
@@ -3702,6 +3717,8 @@ class ModelRunner:
                 batch, get_forward_context().spec_decode_metadata
             )
         logits, hidden_states = self.run_model(input_ids, batch)
+        if logits is not None:
+            self._logits_dtype = logits.dtype
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
 

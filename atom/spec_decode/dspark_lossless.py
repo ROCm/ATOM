@@ -19,11 +19,6 @@ from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
 from atom.model_ops.spec_sampling.dspark_markov_sample import (
     dspark_markov_sample_scratch,
 )
-from atom.model_ops.spec_sampling.ratio_verify import (
-    RatioVerifyInputs,
-    ratio_verify_scratch,
-    warmup_ratio_verify,
-)
 from atom.model_ops.spec_sampling.sparse_q_store import Q_WIDTH, SparseQStore
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
@@ -117,8 +112,9 @@ def _sampling_buffer(rows: int, device, idle: int | None = None) -> CpuGpuBuffer
 
 
 class DSparkLossless:
-    """An armed DSpark drafter's lossless state: the draft's `DraftSampling`,
-    its host `DraftQStaging`, and the verify's scratch."""
+    """An armed DSpark drafter's lossless state: the draft's q store, scratch
+    and `DraftSampling`, and its host `DraftQStaging`. The verify's own state
+    is `RejectionSampler`'s."""
 
     @classmethod
     def arm(cls, drafter) -> "DSparkLossless | None":
@@ -154,7 +150,7 @@ class DSparkLossless:
             logger.info(
                 "Lossless speculative sampling armed: draft q store %d slots x "
                 "[%d, top %d of %d] (%.1f MiB) + %.1f MiB draft scores + %.1f "
-                "MiB draft scratch + %.1f MiB verify scratch",
+                "MiB draft scratch",
                 q_rows // t,
                 t,
                 q_width,
@@ -162,22 +158,17 @@ class DSparkLossless:
                 store.nbytes() / 2**20,
                 lossless.s_scratch.numel() * 4 / 2**20,
                 lossless.draft_scratch.nbytes() / 2**20,
-                lossless.verify_scratch.nbytes() / 2**20,
             )
         return lossless
 
     def __init__(self, drafter):
-        """Allocate the draft's q store, scratch and staged inputs, and the
-        verify's scratch, once, before the KV cache is sized, so the budget
-        and the profiling run see them and no step allocates."""
+        """Allocate the draft's q store, scratch and staged inputs once, before
+        the KV cache is sized, so the budget and the profiling run see them and
+        no step allocates."""
         max_bs = drafter.config.max_num_seqs
         t = drafter.draft_tokens_per_seq
         vocab = int(drafter.model.vocab_size)
         device = drafter.device
-        self.mtp_k = drafter.mtp_k
-        self.verify_scratch = ratio_verify_scratch(max_bs, t, vocab, device)
-        # Set by `warmup_verify`; checked against every verify's logits.
-        self._verify_logits_dtype = None
         q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
         # One row block per live request, not per batch slot: the verify reads
         # it a step later, after the batch may have been reordered.
@@ -253,44 +244,10 @@ class DSparkLossless:
         counts[at["draft_q_row_base"]] = rows.q_row_base
         counts[at["draft_verify_q_row_base"]] = rows.verify_q_row_base
 
-    def verify_inputs(
-        self,
-        bs: int,
-        logits_dtype: torch.dtype,
-        temperatures: torch.Tensor,
-        top_ks: int | torch.Tensor | None,
-        top_ps: float | torch.Tensor | None,
-    ) -> RatioVerifyInputs:
-        """The verify step's `RatioVerifyInputs`, around the batch's own
-        temperatures and `Sampler` filters."""
-        warmed = self._verify_logits_dtype
-        if warmed is not None and logits_dtype != warmed:
-            # The kernels were compiled for another logits dtype; this verify
-            # would JIT them mid-serving while the TP/DP peers wait.
-            raise RuntimeError(
-                f"ratio verify was warmed up for {warmed} "
-                f"logits but the LM head emits {logits_dtype}"
-            )
-        return RatioVerifyInputs(
-            self.q_store,
-            self.verify_q_row_base.gpu[:bs],
-            temperatures,
-            top_ks,
-            top_ps,
-            self.verify_scratch,
-        )
-
-    def warmup_verify(self, logits_dtype: torch.dtype) -> None:
-        """Compile the ratio verify at the widths serving gives it: the store's,
-        the vocab's and ``mtp_k`` drafts (`warmup_ratio_verify`)."""
-        self._verify_logits_dtype = logits_dtype
-        warmup_ratio_verify(
-            self.mtp_k,
-            self.s_scratch.shape[1],
-            self.q_store.ids.shape[1],
-            logits_dtype,
-            self.verify_scratch,
-        )
+    def verify_inputs(self, bs: int) -> tuple[SparseQStore, torch.Tensor]:
+        """What the verify reads of the draft: the q store, and each of the
+        ``bs`` requests' first q row (-1: none)."""
+        return self.q_store, self.verify_q_row_base.gpu[:bs]
 
     def clear_destinations(self) -> None:
         """Point every draft row at no q row, on the host and the device (on
