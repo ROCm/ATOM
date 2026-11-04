@@ -80,9 +80,13 @@ def reference(cache, table, seq, q, S):
     return score, picks, ctx
 
 
-@pytest.mark.parametrize("batch,S", [(1, 8), (5, 8), (17, 8), (6, 1)])
+# `ppb` 16-pages a block: 1 for the MXFP4 KV, 8 for the page-16 SHUFFLE KV that
+# an index-only MXFP4 run keeps (stride 8: its blocks are contiguous)
+@pytest.mark.parametrize(
+    "batch,S,ppb", [(1, 8, 1), (5, 8, 1), (17, 8, 1), (6, 1, 1), (5, 8, 8)]
+)
 @pytest.mark.parametrize("fp8_q", [False, True])
-def test_decode_selection_and_page128_block_table(batch, S, fp8_q):
+def test_decode_selection_and_block_table(batch, S, ppb, fp8_q):
     from atom.model_ops.minimax_m3.index_mxfp4 import (
         build_index_work_map,
         index_work_map_capacity,
@@ -101,22 +105,24 @@ def test_decode_selection_and_page128_block_table(batch, S, fp8_q):
     )
     topk_idx, sbt, sctx = minimax_m3_index_topk_decode(
         q, cache, table, seq, int(seq.max()), TOPK, 0, 1, HEADS, SM_SCALE,
-        emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
-        index_mxfp4=True, pages_per_block=1,
+        emit_sparse_block_table=True, max_query_len=S, block_page_stride=ppb,
+        index_mxfp4=True, pages_per_block=ppb,
         index_score_work_map=wmap, index_score_max_block=max_block,
     )  # fmt: skip
     _, picks, ctx = reference(cache, table, seq, q, S)
-    assert sbt.shape == (batch * S, TOPK) and sctx.shape == (batch * S,)
+    assert sbt.shape == (batch * S, TOPK * ppb) and sctx.shape == (batch * S,)
     for r in range(batch * S):
         got = {int(x) for x in topk_idx[0, r].tolist() if x >= 0}
         assert got == picks[r], f"row {r}"
         assert int(sctx[r]) == ctx[r], f"row {r} ctx"
         n = len(got)
-        want_pages = {int(table[r // S, blk]) for blk in picks[r]}
-        assert {int(x) for x in sbt[r, :n].tolist()} == want_pages
+        row = table[r // S].tolist()
+        want_pages = {row[blk] * ppb + j for blk in picks[r] for j in range(ppb)}
+        assert {int(x) for x in sbt[r, : n * ppb].tolist()} == want_pages
         # the tail block is last: it is the only one that can be partial
         tail = (int(seq[r // S]) - S + r % S) // 128
-        assert int(sbt[r, n - 1]) == int(table[r // S, tail])
+        want_tail = [row[tail] * ppb + j for j in range(ppb)]
+        assert sbt[r, (n - 1) * ppb : n * ppb].tolist() == want_tail
 
 
 def test_prefill_selection_matches_the_decode_definition():

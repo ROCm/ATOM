@@ -25,7 +25,7 @@ pytestmark = pytest.mark.skipif(
 NQ, NKV, D, NIQ, PAGES = 16, 1, 128, 1, 6
 
 
-def make_impl(kv_mxfp4: bool, index_mxfp4: bool):
+def make_impl(kv_mxfp4: bool, index_cache_dtype: str):
     from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 
     dev = "cuda"
@@ -51,7 +51,7 @@ def make_impl(kv_mxfp4: bool, index_mxfp4: bool):
     impl.num_idx_heads, impl.index_q_size, impl.index_head_dim = NIQ, NIQ * D, D
     impl.skip_index_topk = False
     impl.kv_cache_dtype = "fp8"
-    impl.index_cache_dtype = "mxfp4" if index_mxfp4 else "auto"
+    impl.index_cache_dtype = index_cache_dtype
     impl.kv_nvfp4, impl.kv_mxfp4 = False, kv_mxfp4
     impl.index_scale = impl.index_stage = impl.index_stage_slots = None
     impl.kv_stage = impl.kv_stage_slots = None
@@ -60,13 +60,23 @@ def make_impl(kv_mxfp4: bool, index_mxfp4: bool):
     return impl
 
 
-def run(impl, qkv, position, slots, k_cache, v_cache, index_cache):
+def run(
+    impl,
+    qkv,
+    position,
+    slots,
+    k_cache,
+    v_cache,
+    index_cache,
+    k_scale=None,
+    v_scale=None,
+):
     impl.index_cache = index_cache
     ctx = types.SimpleNamespace(
         attn_metadata=types.SimpleNamespace(slot_mapping=slots),
         kv_cache_data={
             "layer_0": types.SimpleNamespace(
-                k_cache=k_cache, v_cache=v_cache, k_scale=None, v_scale=None
+                k_cache=k_cache, v_cache=v_cache, k_scale=k_scale, v_scale=v_scale
             )
         },
     )
@@ -74,34 +84,47 @@ def run(impl, qkv, position, slots, k_cache, v_cache, index_cache):
     return impl.rope_cache(None, None, None, qkv, position, ctx)
 
 
-def test_mxfp4_pages_match_the_bf16_write():
-    T = 37
-    g = torch.Generator(device="cuda").manual_seed(1)
+def inputs(T, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
     width = (NQ + 2 * NKV + NIQ + 1) * D
     qkv = torch.randn(T, width, device="cuda", generator=g, dtype=torch.bfloat16)
     position = torch.arange(T, device="cuda", dtype=torch.int64) + 5
     # tokens land on scattered slots of 3 of the 6 pages; slot -1 is padding
     slots = torch.randperm(PAGES * 128, device="cuda", generator=g)[:T].to(torch.int64)
     slots[4] = -1
+    return qkv, position, slots
 
-    # reference: the same kernel writing bf16 (plain page-128 layout); `ref` only
-    # carries the norm weights and rotary tables
-    ref = make_impl(False, False)
+
+def reference(qkv, position, slots):
+    """The same kernel writing bf16 (plain page-128 layout): rk, rv, ri, q, index q."""
+    T = qkv.shape[0]
+    ref = make_impl(False, "auto")  # only carries the norm weights and rotary tables
     rk = torch.zeros(PAGES, 128, NKV, D, device="cuda", dtype=torch.bfloat16)
     rv = torch.zeros_like(rk)
     ri = torch.zeros(PAGES, 128, D, device="cuda", dtype=torch.bfloat16)
     from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
 
     cs = _minimax_m3_cos_sin_cache(ref.rotary_emb, qkv)
-    q_bf16 = torch.empty(T, NQ * D, device="cuda", dtype=torch.bfloat16)
-    iq_bf16 = torch.empty(T, NIQ * D, device="cuda", dtype=torch.bfloat16)
+    q = torch.empty(T, NQ * D, device="cuda", dtype=torch.bfloat16)
+    iq = torch.empty(T, NIQ * D, device="cuda", dtype=torch.bfloat16)
     aiter.fused_qknorm_idxrqknorm(
         qkv, ref.q_norm.weight, ref.k_norm.weight, cs, position, NQ, NKV, 64, 1e-6,
         ref.index_q_norm.weight, ref.index_k_norm.weight, NIQ, slots, rk, rv, ri,
-        128, q_bf16, iq_bf16, slots, kv_cache_dtype="auto", asm_layout=False,
+        128, q, iq, slots, kv_cache_dtype="auto", asm_layout=False,
     )  # fmt: skip
+    return rk, rv, ri, q, iq
 
-    impl = make_impl(True, True)
+
+def rel(got, want):
+    return ((got - want).norm() / want.norm()).item()
+
+
+def test_mxfp4_pages_match_the_bf16_write():
+    T = 37
+    qkv, position, slots = inputs(T, 1)
+    rk, rv, ri, q_bf16, iq_bf16 = reference(qkv, position, slots)
+
+    impl = make_impl(True, "mxfp4")
     kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
     vp = torch.zeros_like(kp)
     ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
@@ -117,9 +140,6 @@ def test_mxfp4_pages_match_the_bf16_write():
 
     valid = slots >= 0
     page, off = slots[valid] // 128, slots[valid] % 128
-
-    def rel(got, want):
-        return ((got - want).norm() / want.norm()).item()
 
     for pages_u8, want in ((kp, rk), (vp, rv)):
         got = dequantize_pages(pages_u8)[page, 0, off]  # [n, 128]
@@ -141,13 +161,13 @@ def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
     position = torch.arange(T, device="cuda", dtype=torch.int64)
     slots = torch.arange(T, device="cuda", dtype=torch.int64) + 128  # page 1
 
-    full = make_impl(True, True)
+    full = make_impl(True, "mxfp4")
     kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
     vp = torch.zeros_like(kp)
     ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
     q_full = run(full, qkv, position, slots, kp, vp, ip)[0]
 
-    skip = make_impl(True, True)
+    skip = make_impl(True, "mxfp4")
     skip.skip_index_topk = True
     kp2 = torch.zeros_like(kp)
     vp2 = torch.zeros_like(vp)
@@ -168,3 +188,67 @@ def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
     assert skip._topk_cache_key("decode", None, *args) == full._topk_cache_key(
         "decode", full._index_q, *args
     )
+
+
+def test_kv_only_mxfp4_writes_an_fp8_index_cache():
+    T = 37
+    qkv, position, slots = inputs(T, 3)
+    rk, rv, ri, _, iq_bf16 = reference(qkv, position, slots)
+
+    impl = make_impl(True, "fp8")
+    kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
+    vp = torch.zeros_like(kp)
+    ip = torch.zeros(PAGES, 128, D, device="cuda", dtype=aiter.dtypes.fp8)
+    q, _, _, kc, vc, ks, vs = run(impl, qkv, position, slots, kp, vp, ip)
+
+    assert kc is kp and vc is vp and ks is None and vs is None
+    assert q.dtype == torch.float8_e4m3fn  # the MXFP4 KV's main q
+    assert impl._index_q.dtype == torch.bfloat16  # only the MXFP4 index takes fp8 q
+    assert rel(impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()) < 0.02
+    valid = slots >= 0
+    page, off = slots[valid] // 128, slots[valid] % 128
+    for pages_u8, want in ((kp, rk), (vp, rv)):
+        got = dequantize_pages(pages_u8)[page, 0, off]
+        assert rel(got, want[page, off, 0].float()) < 0.15
+    assert rel(ip.float()[page, off], ri[page, off].float()) < 0.1  # the e4m3 cast
+
+
+def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
+    T = 37
+    qkv, position, slots = inputs(T, 4)
+    _, _, ri, _, iq_bf16 = reference(qkv, position, slots)
+
+    def shuffle_cache():
+        # the page-128 SHUFFLE views (x = 16 fp8 elements) and per-token scales
+        k = torch.zeros(
+            PAGES, NKV, D // 16, 128, 16, device="cuda", dtype=aiter.dtypes.fp8
+        )
+        v = torch.zeros(
+            PAGES, NKV, 128 // 16, D, 16, device="cuda", dtype=aiter.dtypes.fp8
+        )
+        scale = torch.zeros(PAGES, NKV, 128, device="cuda", dtype=torch.float32)
+        return k, v, scale, torch.zeros_like(scale)
+
+    runs = {}
+    for name, index_dtype in (("mxfp4", "mxfp4"), ("none", "auto")):
+        impl = make_impl(False, index_dtype)
+        k, v, ksc, vsc = shuffle_cache()
+        index = (
+            torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
+            if index_dtype == "mxfp4"
+            else torch.zeros(PAGES, 128, D, device="cuda", dtype=torch.bfloat16)
+        )
+        q = run(impl, qkv, position, slots, k, v, index, ksc, vsc)[0]
+        runs[name] = (impl, q, k, v, ksc, vsc, index)
+
+    impl, q, k, v, ksc, vsc, index = runs["mxfp4"]
+    _, q0, k0, v0, ksc0, vsc0, _ = runs["none"]
+    assert q.dtype == torch.bfloat16  # no MXFP4 KV: the main q stays as it was
+    for got, want in ((q, q0), (k, k0), (v, v0), (ksc, ksc0), (vsc, vsc0)):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    assert (ksc != 0).any() and (k.view(torch.uint8) != 0).any()
+    assert impl._index_q.dtype == torch.float8_e4m3fn
+    assert rel(impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()) < 0.04
+    valid = slots >= 0
+    page, off = slots[valid] // 128, slots[valid] % 128
+    assert rel(dequantize_pages(index)[page, off], ri[page, off].float()) < 0.15
