@@ -245,9 +245,11 @@ def config_refusal(atom_config) -> str | None:
     # layers and their KV split stay on the production path), and the DSA
     # layers' mono indexer is written for the DCP split -- it serves only
     # under DCP = TP and is off otherwise (``dsa_indexer.bind._refusal``).
+    # The one KV connector served is a Mooncake P/D decode, which queues no
+    # copy kernel of its own (`_served_connectors`).
     checks += (
         common_refusals(atom_config, Dims, SUPPORTED_TP, refuse_decode_cp=False)
-        + resident_grid_refusals(atom_config)
+        + resident_grid_refusals(atom_config, _served_connectors(atom_config))
     ) + [
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted
@@ -333,3 +335,24 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     return first_refusal(checks)
+
+
+def _served_connectors(atom_config) -> tuple[str, ...]:
+    """The KV connectors served beside the kernels: Mooncake, when it is the
+    P/D decode of a deployment without decode CP, whose receives are NIC
+    writes into the pools this rank already holds.
+
+    Mooncake's consumer queues GPU work of its own only for a model that hands
+    it a slot scatter (DeepSeek-V4's compressor staging) or for a DCP landing
+    pool (`mla_landing_configured`); K3 hands it none. A decode running CP is
+    left refused all the same: mono has never served one behind a connector.
+    A producer, any other transport, or an offload tier beside it (`multi`)
+    copies on streams of its own.
+    """
+    kv = getattr(atom_config, "kv_transfer_config", None) or {}
+    if (
+        atom_config.decode_context_parallel_size != 1
+        or kv.get("kv_role") != "kv_consumer"
+    ):
+        return ()
+    return ("mooncake",)
