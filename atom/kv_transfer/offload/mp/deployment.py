@@ -167,6 +167,13 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
                 "server per host: set lmcache.mp.host to a loopback address and "
                 "start a server on every host"
             )
+        if _extra_config(config).get("lmcache.mp.tp_rank_collapse") is True:
+            # One writer and TP readers would need that writer's object on
+            # every host's server; each host stores only its own ranks'.
+            raise NotImplementedError(
+                "lmcache_mp does not collapse TP ranks across hosts; leave "
+                "lmcache.mp.tp_rank_collapse at 'auto' or set it to false"
+            )
         _tp_host_server_urls(config)
 
     _transfer_mode(config)
@@ -234,7 +241,8 @@ def _tp_host_server_urls(config: Any) -> list[str]:
     """
 
     hosts = _tp_host_count(config)
-    configured = _extra_config(config).get("lmcache.mp.tp_host_server_urls")
+    extra = _extra_config(config)
+    configured = extra.get("lmcache.mp.tp_host_server_urls")
     if configured is None:
         raise ValueError(
             f"lmcache_mp: this TP group spans {hosts} hosts; set "
@@ -245,13 +253,32 @@ def _tp_host_server_urls(config: Any) -> list[str]:
         urls = [str(value).strip() for value in configured if str(value).strip()]
     else:
         urls = [value.strip() for value in str(configured).split(",") if value.strip()]
-    urls = [url if "://" in url else f"tcp://{url}" for url in urls]
-    if len(urls) != hosts:
+    port = offcfg._strict_integer(
+        "lmcache.mp.port", extra.get("lmcache.mp.port", 5555), minimum=1
+    )
+    resolved = []
+    for url in urls:
+        url = url if "://" in url else f"tcp://{url}"
+        try:
+            has_port = urlsplit(url).port is not None
+        except ValueError as error:
+            raise ValueError(
+                f"lmcache.mp.tp_host_server_urls has an invalid URL {url!r}"
+            ) from error
+        # Every host's server listens where this host's ranks reach theirs
+        # unless a URL names another port.
+        resolved.append(url if has_port else f"{url}:{port}")
+    if len(resolved) != hosts:
         raise ValueError(
-            f"lmcache.mp.tp_host_server_urls lists {len(urls)} servers for a TP "
-            f"group spanning {hosts} hosts"
+            f"lmcache.mp.tp_host_server_urls lists {len(resolved)} servers for a "
+            f"TP group spanning {hosts} hosts"
         )
-    return urls
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(
+            "lmcache.mp.tp_host_server_urls must name a different server for "
+            f"every host, got {resolved}"
+        )
+    return resolved
 
 
 def _server_is_host_local(config: Any) -> bool:
@@ -288,6 +315,10 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if (getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
         # Under DCP each rank holds only its interleaved share of the latent
         # KV, so no PAGE block is the same on two ranks.
+        return False
+    if _tp_host_count(config) > 1:
+        # One writer's object would have to reach every host's server; each
+        # host's server holds only its own ranks' (`_parallel_strategy`).
         return False
     if _config_has_own_pool_draft(config):
         # A DSpark draft whose backend owns a KV pool appends per-rank-sharded
@@ -419,6 +450,11 @@ def _model_namespace(
     image group) gets a namespace of its own, so a scheduler and workers that
     disagree about images find nothing rather than each other's objects.
 
+    Under DCP a rank's PAGE object holds the tokens the interleave size deals
+    it, which the PAGE namespace (block size, DCP size) does not name; an MP
+    server outlives the engines that fill it, so an engine restarted with
+    another interleave must not read the objects the previous one stored.
+
     A TP group spanning hosts stores each host's ranks as a host-local world
     (`_parallel_strategy`), so local rank 0 of host 0 and of host 1 are
     different shards under the same key fields; `host` keeps them apart.
@@ -432,6 +468,11 @@ def _model_namespace(
         world_size,
     )
     namespace = f"{page_namespace}::lmcache-mp-v{_MP_LAYOUT_VERSION}"
+    if (getattr(config, "decode_context_parallel_size", 1) or 1) > 1:
+        interleave = (
+            getattr(getattr(config, "dcp_config", None), "interleave_size", 1) or 1
+        )
+        namespace += f"::dcp-interleave{int(interleave)}"
     if checkpoint_spec is not None:
         hf = getattr(config, "hf_config", None)
         hf = getattr(hf, "text_config", hf)

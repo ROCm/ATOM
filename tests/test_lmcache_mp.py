@@ -270,14 +270,14 @@ def test_model_namespace_names_the_host_of_a_tp_group_spanning_hosts(monkeypatch
     config = _tp_hosts_config(dcp=8)
 
     assert deployment._model_namespace(config, host=0) == (
-        "page-tp8::lmcache-mp-v3::tp-host0-of2"
+        "page-tp8::lmcache-mp-v3::dcp-interleave1::tp-host0-of2"
     )
     assert deployment._model_namespace(config, host=1).endswith("::tp-host1-of2")
     with pytest.raises(ValueError, match="outside"):
         deployment._model_namespace(config)
-    # A TP group on one host is unchanged.
+    # A TP group on one host is not named by host.
     assert deployment._model_namespace(_config(tp=8, dcp=8)) == (
-        "page-tp8::lmcache-mp-v3"
+        "page-tp8::lmcache-mp-v3::dcp-interleave1"
     )
 
 
@@ -316,6 +316,69 @@ def test_worker_slices_block_ids_by_the_virtual_block_under_dcp():
     assert connector._block_slice(request, 8, 24) == [11, 12]
     with pytest.raises(ValueError, match="must align to block size 8"):
         connector._block_slice(request, 4, 8)
+
+
+def test_tp_host_server_urls_take_the_configured_port_and_must_differ():
+    config = _tp_hosts_config(
+        extra={
+            "lmcache.mp.host": "tcp://127.0.0.1",
+            "lmcache.mp.port": 6000,
+            "lmcache.mp.tp_host_server_urls": ["127.0.0.1", "tcp://10.0.0.2:7000"],
+        }
+    )
+    assert deployment._tp_host_server_urls(config) == [
+        "tcp://127.0.0.1:6000",
+        "tcp://10.0.0.2:7000",
+    ]
+    duplicate = _tp_hosts_config(
+        extra={
+            "lmcache.mp.host": "tcp://127.0.0.1",
+            "lmcache.mp.tp_host_server_urls": "10.0.0.2, tcp://10.0.0.2:5555",
+        }
+    )
+    with pytest.raises(ValueError, match="different server for every host"):
+        deployment._tp_host_server_urls(duplicate)
+
+
+def test_tp_ranks_never_collapse_across_hosts():
+    # MLA without DCP would collapse on one host; across hosts every rank
+    # stores its own copy, and asking for a collapse is refused up front.
+    auto = _tp_hosts_config(kv_lora_rank=512)
+    assert deployment._config_has_fully_replicated_tp_pages(
+        _config(tp=8, kv_lora_rank=512)
+    )
+    assert deployment._tp_replication_factor(auto) == 1
+
+    forced = _tp_hosts_config(
+        kv_lora_rank=512,
+        extra={
+            "lmcache.mp.host": "tcp://127.0.0.1",
+            "lmcache.mp.tp_host_server_urls": _TP_HOST_URLS,
+            "lmcache.mp.tp_rank_collapse": True,
+        },
+    )
+    with pytest.raises(NotImplementedError, match="does not collapse TP ranks"):
+        deployment._validate_mp_config(forced)
+
+
+def test_model_namespace_names_the_dcp_interleave(monkeypatch):
+    monkeypatch.setattr(
+        deployment.offcfg, "build_lmcache_config", lambda _kvc: object()
+    )
+    monkeypatch.setattr(
+        deployment.offcfg,
+        "build_page_namespace",
+        lambda _config, _lmcache_cfg, world: f"page-tp{world}",
+    )
+    token = _config(tp=8, dcp=8)
+    block = _config(tp=8, dcp=8)
+    block.dcp_config = SimpleNamespace(interleave_size=4)
+
+    # A server outlives the engine: one restarted with another interleave
+    # must not read the shares the previous one stored.
+    assert deployment._model_namespace(token).endswith("::dcp-interleave1")
+    assert deployment._model_namespace(block).endswith("::dcp-interleave4")
+    assert deployment._model_namespace(_config(tp=8)) == "page-tp8::lmcache-mp-v3"
 
 
 def test_scheduler_reports_the_tp_hosts_counters(monkeypatch):
