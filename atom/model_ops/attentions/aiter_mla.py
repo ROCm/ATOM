@@ -329,6 +329,17 @@ class AiterMLABackend(AttentionBackend):
         return MLAAttention
 
 
+# What ``set_mla_persistent_worker_buffers`` returns (and builds).
+_MLA_PS_NAMES = (
+    "work_meta_data",
+    "work_info_set",
+    "work_indptr",
+    "reduce_indptr",
+    "reduce_final_map",
+    "reduce_partial_map",
+)
+
+
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     # EagleProposer folds the per-draft-step position/context bump into
     # prepare_mtp_decode's fused kernel when this is set (matches the MHA
@@ -1090,6 +1101,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     ):
         if self.kv_shuffled:
             return {}
+        # whatever this builds or updates supersedes a step's skipped build
+        self._mla_meta_pending = None
         assert num_reject_tokens is None or num_reject_tokens.shape[0] >= bs, (
             f"num_reject_tokens covers {num_reject_tokens.shape[0]} sequences "
             f"but this asks for {bs}; the update kernel loads one per work item "
@@ -2873,6 +2886,52 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and opus_mla.uses_opus_for_batch(bs)
         )
 
+    # ---- opus steps skip aiter's MLA work metadata ------------------------
+    # A step whose target decode is planned for opus_mla skips
+    # set_mla_persistent_worker_buffers: only mla_decode_fwd reads it. The
+    # build is kept pending (_mla_meta_pending) for this step's metadata object
+    # and runs at a call that keeps mla_decode_fwd on these buffers anyway
+    # (_mla_meta_for_call). A graph captured on an opus plan that still
+    # recorded mla_decode_fwd turns the skip off for good (_mla_meta_skip_ok),
+    # since its replays read the buffers with no Python to build them.
+    _mla_meta_pending = None
+    _mla_meta_skip_ok = True
+
+    def _opus_skips_mla_metadata(self) -> bool:
+        """Whether a step whose target decode runs ``opus_mla`` can skip
+        aiter's MLA work metadata: nothing else in the step reads it. An
+        EAGLE / MTP drafter without DCP refreshes the target's metadata in place
+        (``prepare_mtp_decode``'s ``only_update``), so it is built for one; a
+        DSpark drafter plans its own block, and under DCP the MTP drafter
+        rebuilds it."""
+        if not self._mla_meta_skip_ok or self.kv_shuffled:
+            return False
+        drafter = getattr(self.model_runner, "drafter", None)
+        if drafter is None or self.dcp_world_size > 1:
+            return True
+        from atom.spec_decode.eagle_proposer import EagleProposer
+
+        return not isinstance(drafter, EagleProposer)
+
+    def _mla_meta_for_call(self, attn_metadata) -> None:
+        """``mla_decode_fwd`` is about to read ``attn_metadata``'s MLA work
+        metadata. If it is this step's skipped build, build it now; a drafter's
+        own metadata (other buffers) or a rebuilt one is left alone."""
+        var = self.model_runner.forward_vars
+        if getattr(attn_metadata, "work_indptr", None) is not var["work_indptr"]:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            if getattr(attn_metadata, "opus_plan", None) is not None:
+                self._mla_meta_skip_ok = False
+                logger.info(
+                    "opus MLA decode: a graph planned for opus captured "
+                    "mla_decode_fwd; MLA metadata is built every step"
+                )
+            return
+        pending = self._mla_meta_pending
+        if pending is not None and pending[0] is attn_metadata:
+            pending[1]()  # set_mla_persistent_worker_buffers clears it
+
     def _opus_mla_dcp1_heads(self, bs: int, max_q_len: int) -> int:
         """The query heads a DCP1 (no decode context parallelism) MTP decode
         batch of ``bs`` running requests runs ``opus_mla`` with (this rank's
@@ -3130,6 +3189,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
 
         opus_plan = None
+        skip_meta = None
         if is_sparse_mtp:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 running_bs, max_seqlen_q
@@ -3152,12 +3212,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # is a no-op -- but eager no longer implies that, since a DP-unified
             # batch pads off the graph path too.
             meta_bs = scheduled_bs if cp_round_robin else running_bs
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
-            )
             ctx_mla_ps_sparse = None
             # Decided on running_bs (the graph's size); planned over the
-            # scheduled requests, as the cprr metadata above.
+            # scheduled requests, as the cprr metadata below.
             if self._uses_opus_mla(running_bs, cp_round_robin):
                 opus_mla.update_plan(
                     var["kv_indptr"].np,
@@ -3172,6 +3229,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     var["kv_indptr"].np, scheduled_bs, max_seqlen_q, 1, heads
                 )
                 opus_plan = opus_mla.make_marker(running_bs, max_seqlen_q, heads)
+
+            def build_meta(bs=meta_bs, cprr=cp_round_robin):
+                return self.set_mla_persistent_worker_buffers(
+                    bs, max_seqlen_q, is_cp_round_robin=cprr
+                )
+
+            if opus_plan is not None and self._opus_skips_mla_metadata():
+                # every target decode of the step is planned for opus: the
+                # buffers go on the metadata unbuilt (see _mla_meta_for_call)
+                ctx_mla_ps = {n: var[n] for n in _MLA_PS_NAMES}
+                skip_meta = build_meta
+            else:
+                ctx_mla_ps = build_meta()
         ctx.update(ctx_mla_ps)
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
@@ -3181,6 +3251,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         attn_metadata.dtype_q = self.dtype_q
         attn_metadata.opus_plan = opus_plan
+        if opus_plan is not None:
+            attn_metadata.mla_meta_hook = self._mla_meta_for_call
+        self._mla_meta_pending = (
+            None if skip_meta is None else (attn_metadata, skip_meta)
+        )
 
         # Round-robin CP global kv_indptr (only under DCP; None otherwise so the
         # non-DCP / qlen=1 paths keep the plain kernel). Consumed by
@@ -3519,6 +3594,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             elif heads := self._opus_mla_dcp1_heads(bs, max_q_len):
                 opus_plan = opus_mla.capture_marker(bs, max_q_len, heads)
         attn_metadata.opus_plan = opus_plan
+        if opus_plan is not None:
+            attn_metadata.mla_meta_hook = self._mla_meta_for_call
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_metadata, k, v)

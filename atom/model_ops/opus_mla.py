@@ -20,7 +20,10 @@ fp32 reference than ``mla_decode_fwd``'s; its LSE matches as closely.
 Three hooks:
 
 1. ``prepare_decode`` builds the step's plan on the host (:func:`update_plan`),
-   outside the CUDA graph, and marks the metadata (:func:`make_marker`).
+   outside the CUDA graph, and marks the metadata (:func:`make_marker`). Such
+   a step also skips aiter's MLA work metadata (``get_mla_metadata_v1``), which
+   only ``mla_decode_fwd`` reads (``AiterMLAMetadataBuilder._mla_meta_for_call``
+   builds it for a call that keeps ``mla_decode_fwd`` anyway).
 2. ``build_for_cudagraph_capture`` marks every captured batch size that will
    use the kernel (:func:`capture_marker`), with the same test
    (``AiterMLAMetadataBuilder._uses_opus_mla``), so a graph replays the kernel

@@ -2799,6 +2799,10 @@ class MLAAttention(nn.Module):
                 )
                 else mla_decode_fwd
             )
+            hook = getattr(attn_metadata, "mla_meta_hook", None)
+            if hook is not None and decode_fwd is mla_decode_fwd:
+                # a step planned for opus may have skipped the metadata
+                hook(attn_metadata)
             _, final_lse = decode_fwd(
                 q,
                 seg_kv_buffer_4d,

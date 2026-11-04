@@ -338,3 +338,85 @@ def test_dcp1_builder_gate(dcp1, monkeypatch):
     assert not uses(one, 4, False)
     monkeypatch.setenv("ATOM_OPUS_MLA", "0")
     assert heads_of(one, 4, 6) == 0
+
+
+# ---- opus steps skip aiter's MLA work metadata (AiterMLAMetadataBuilder)
+
+
+def _meta_builder(**over):
+    try:
+        from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"aiter MLA backend unavailable: {exc}")
+    cls = AiterMLAMetadataBuilder
+    builds = []
+    var = {"work_indptr": object()}
+    b = SimpleNamespace(
+        model_runner=SimpleNamespace(forward_vars=var),
+        dcp_world_size=1,
+        kv_shuffled=False,
+        _mla_meta_skip_ok=True,
+        _mla_meta_pending=None,
+        builds=builds,
+    )
+    b.__dict__.update(over)
+    b.skips = lambda: cls._opus_skips_mla_metadata(b)
+    b.for_call = lambda md: cls._mla_meta_for_call(b, md)
+    return b, var
+
+
+def test_skip_meta_without_a_drafter(decoder):
+    b, _ = _meta_builder()
+    assert b.skips()
+    b._mla_meta_skip_ok = False
+    assert not b.skips()
+
+
+def test_skip_meta_never_on_a_shuffled_cache(decoder):
+    b, _ = _meta_builder(kv_shuffled=True)
+    assert not b.skips()
+
+
+def test_skip_meta_keeps_an_mtp_drafters_metadata(decoder):
+    try:
+        from atom.spec_decode.eagle_proposer import EagleProposer
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"the MTP drafter needs the aiter stack: {exc}")
+
+    eagle = EagleProposer.__new__(EagleProposer)
+    b, _ = _meta_builder()
+    b.model_runner.drafter = eagle
+    # without DCP it updates the target's metadata in place: built
+    assert not b.skips()
+    # under DCP it rebuilds it
+    b.dcp_world_size = 8
+    assert b.skips()
+    # any other drafter (DSpark plans its own block)
+    b.dcp_world_size = 1
+    b.model_runner.drafter = object()
+    assert b.skips()
+
+
+def test_pending_build_runs_for_its_own_step_only(decoder, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    b, var = _meta_builder()
+    calls = []
+    step = SimpleNamespace(work_indptr=var["work_indptr"], opus_plan=object())
+    other = SimpleNamespace(work_indptr=var["work_indptr"], opus_plan=object())
+    b._mla_meta_pending = (step, lambda: calls.append(1))
+    b.for_call(other)  # a later step's metadata: not this build
+    assert calls == []
+    b.for_call(SimpleNamespace(work_indptr=object()))  # a drafter's buffers
+    assert calls == []
+    b.for_call(step)
+    assert calls == [1]
+
+
+def test_capture_that_keeps_mla_decode_fwd_stops_the_skip(decoder, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    b, var = _meta_builder()
+    b.for_call(SimpleNamespace(work_indptr=var["work_indptr"], opus_plan=None))
+    assert b._mla_meta_skip_ok
+    b.for_call(SimpleNamespace(work_indptr=var["work_indptr"], opus_plan=object()))
+    assert not b._mla_meta_skip_ok
+    assert not b.skips()
