@@ -35,8 +35,8 @@ class _FakeTarget(nn.Module):
         self.layers = nn.ModuleList(
             nn.Identity() if lo <= i < hi else PPMissingLayer() for i in range(n_layers)
         )
-        if with_embed:
-            self.embed_tokens = nn.Identity()
+        # Like the real models: off the first stage the embedding is missing.
+        self.embed_tokens = nn.Identity() if with_embed else PPMissingLayer()
 
 
 _CTX = types.SimpleNamespace(is_draft=False, ubatch_token_offset=0)
@@ -99,7 +99,7 @@ def test_relay_embedding_tap_is_incoming_on_a_later_stage():
     assert relay.own_ids == (6,)
     assert relay.incoming_ids == (-1, 2)
     assert relay.outgoing_ids == (-1, 2, 6)
-    assert not hasattr(target, "embed_tokens")
+    assert not target.embed_tokens._forward_hooks
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
@@ -175,7 +175,6 @@ def test_last_stage_arms_only_its_own_taps():
 
     hidden = 8
     target = _FakeTarget(8, (4, 8), with_embed=False)
-    target.embed_tokens = PPMissingLayer()
     spec = AuxCaptureSpec(
         layer_ids=(-1, 2, 5), hidden_size=hidden, extract=lambda out, mod: out
     )
