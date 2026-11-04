@@ -24,7 +24,6 @@ from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBa
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
-from atom.model_engine.offload_prefetch import OffloadPrefetchState
 
 MIN_LOAD = 32
 
@@ -160,7 +159,6 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
-    s._prefetch = OffloadPrefetchState()
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s._connector_flag = lambda name: getattr(conn, name, False)
@@ -530,7 +528,6 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
-    s._prefetch = OffloadPrefetchState()
     s.kv_connector = conn = _Conn()
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(state_offload=None)
@@ -556,8 +553,6 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
         return 2
 
     s = Scheduler.__new__(Scheduler)
-
-    s._prefetch = OffloadPrefetchState()
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)

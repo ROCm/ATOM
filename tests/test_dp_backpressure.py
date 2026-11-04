@@ -51,6 +51,7 @@ def make_mgr(n_ranks=4, depth=3, fail_ranks=None):
     mgr._seq_load = {}
     mgr._seq_prefilling = set()
     mgr._prefix_spread = False
+    mgr._prefix_router = None
     mgr._lb_lock = Lock()
     mgr._input_send_lock = Lock()
     mgr._bp_depth = depth

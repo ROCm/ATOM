@@ -486,6 +486,13 @@ class OffloadSchedulerMixin(ABC):
     def send_finished(self, req_id) -> None:
         """Offload backends own saves and loads, but no P/D send claims."""
 
+    def lookup_ready(self, seq) -> bool:
+        """No async tier answer to offer; see `ChunkedOffloadSchedulerBase`."""
+        return False
+
+    def cancel_preadmission(self, seq) -> None:
+        self.cancel_pending_load(seq)
+
     def _init_offload_statistics(self) -> None:
         """Initialize layout-independent scheduler counters."""
 

@@ -32,7 +32,6 @@ from atom.kv_transfer.offload.metadata import (
     LoadSpec,
     SaveSpec,
 )
-from atom.model_engine.offload_prefetch import OffloadPrefetchState
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
 
@@ -86,7 +85,6 @@ def _arm_load(scheduler, seq, *, hbm=0, lmcache=8):
 
 def _engine_scheduler(connector):
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler._prefetch = OffloadPrefetchState()
     scheduler.kv_connector = connector
     scheduler.finished_recving_kv_req_ids = []
     scheduler.failed_recving_kv_req_ids = []

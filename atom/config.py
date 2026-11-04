@@ -2151,6 +2151,11 @@ class Config:
     # default must stay in sync with engine_core_mgr.DP_LB_DEFAULT (config.py
     # cannot import it without a cycle: engine_core_mgr imports Config).
     dp_load_balance: str = "least_requests"
+    # Offload prefetch (`atom/model_engine/offload_prefetch.py`): start a
+    # waiting request's tier load before its turn. None: on with prefix-spread
+    # DP routing (ATOM_DP_PREFIX_SPREAD), which moves requests onto ranks that
+    # must load their prefix from the tier.
+    offload_prefetch: bool | None = None
     # MoE expert-parallel layout policy. When True, MoE EP computes ranks in the
     # flattened DP x TP device space (and shared-expert fusion is disabled,
     # because the fused shared expert assumes the per-DP MoE layout). The vLLM
@@ -2428,6 +2433,8 @@ class Config:
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
             raise ValueError("sequence_parallel_size must be at least 1")
+        if self.offload_prefetch is None:
+            self.offload_prefetch = envs.ATOM_DP_PREFIX_SPREAD
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )

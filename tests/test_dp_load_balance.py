@@ -71,6 +71,7 @@ def _make_mgr(
     mgr._seq_load = {}
     mgr._seq_prefilling = set()
     mgr._prefix_spread = False
+    mgr._prefix_router = None
     mgr._lb_lock = Lock()
     return mgr
 
@@ -550,16 +551,11 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 
 
 def _make_spread_mgr(n_ranks=2):
-    from collections import OrderedDict
+    from atom.model_engine.prefix_spread import PrefixSpreadRouter
 
     mgr = _make_mgr(n_ranks)
     mgr._prefix_spread = True
-    mgr._prefix_idle_tokens = 32768
-    mgr._prefix_owner = OrderedDict()
-    mgr._prefix_owner_cap = 1 << 17
-    mgr._prefix_seq_hashes = {}
-    mgr._prefix_pending = {}
-    mgr._prefix_stride_tokens = 4096
+    mgr._prefix_router = PrefixSpreadRouter(32768, mgr._dp_route_counters)
     mgr._dp_route_counters.update(
         prefix_owner_total=0,
         prefix_moved_total=0,
@@ -606,38 +602,56 @@ def test_prefix_spread_ignores_sessions_for_new_prefixes():
     assert mgr._dp_route_counters["prefix_cold_total"] == 4
 
 
-def test_prefix_spread_keeps_prefix_while_its_source_still_prefills():
+def test_busy_source_keeps_followers_unless_the_owner_is_backlogged():
+    """While the prefix's source still prefills, a follower stays to reuse it
+    from HBM -- unless the owner is backlogged and another rank is idle. Then
+    it moves anyway and is charged its full prompt: the tier has nothing yet."""
     mgr = _make_spread_mgr()
-    first = _chain_seq(1, 100_000)
-    (owner,) = _route(mgr, [first])  # still charged: prefill not complete
-    mgr._rank_tokens[owner] += 200_000  # owner busy past the margin
-    (rank,) = _route(mgr, [_chain_seq(2, 110_000)])
-    assert rank == owner
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])  # still prefilling
+    other = 1 - owner
+    mgr._rank_tokens[other] = 40_000  # not idle
+    assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
     assert mgr._dp_route_counters["prefix_source_busy_total"] == 1
-    mgr._mark_seq_prefill_complete(1)  # source done: its KV is in the tier
-    mgr._mark_seq_prefill_complete(2)
-    (rank,) = _route(mgr, [_chain_seq(3, 120_000)])
-    assert rank != owner
+
+    mgr._rank_tokens[other] = 0  # owner backlogged, other idle
+    third = _chain_seq(3, 120_000)
+    assert _route(mgr, [third]) == [other]
+    assert third._dp_est_hit == 0
+    assert mgr._seq_load[3][2] == 120_000
 
 
-def test_prefix_spread_busy_source_survives_a_fully_cached_follower():
-    """A follower whose whole prompt is the prefix is charged 0 tokens but is
-    still prefilling. It becomes the prefix's source; a third request must
-    still see a busy source and stay, not move to a rank the tier cannot feed."""
+def test_a_fully_cached_follower_is_not_the_prefix_source():
+    """A follower whose whole prompt is the prefix is charged 0 tokens and is
+    still prefilling, but it only reuses the prefix: once the real source is
+    done, the next request may move and load the prefix from the tier."""
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 98_304)])
-    mgr._rank_tokens[owner] += 200_000  # owner busy past the margin
+    other = 1 - owner
+    mgr._rank_tokens[other] = 40_000
     follower = _chain_seq(2, 98_304)
     assert _route(mgr, [follower]) == [owner]
-    assert mgr._seq_load[2][2] == 0  # fully cached: no prefill charge
-    (rank,) = _route(mgr, [_chain_seq(3, 98_304)])
-    assert rank == owner
-    assert mgr._dp_route_counters["prefix_source_busy_total"] == 2
-    for seq_id in (1, 2, 3):
-        mgr._mark_seq_prefill_complete(seq_id)
-    assert not mgr._seq_prefilling
-    (rank,) = _route(mgr, [_chain_seq(4, 110_000)])
-    assert rank != owner
+    assert mgr._seq_load[2][2] == 0
+    mgr._mark_seq_prefill_complete(1)  # the source is done; 2 still prefills
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_tokens[owner] = 200_000
+    third = _chain_seq(3, 110_000)
+    assert _route(mgr, [third]) == [other]
+    assert third._dp_est_hit == 98_304
+
+
+def test_move_target_is_chosen_by_queued_prefill_not_combined_load():
+    """The rank with no prefill work is the target even when its decode load
+    makes it look heavier under the combined `least_tokens` score."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._mark_seq_prefill_complete(1)
+    other = 1 - owner
+    mgr._rank_tokens = [0, 0]
+    mgr._rank_reqs = [0, 0]
+    mgr._rank_tokens[owner], mgr._rank_reqs[owner] = 100_000, 10
+    mgr._rank_reqs[other] = 250  # 0 queued prefill, many decodes
+    assert mgr._rank_load(owner) < mgr._rank_load(other)
+    assert _route(mgr, [_chain_seq(2, 110_000)]) == [other]
 
 
 class _SinkSocket:
@@ -712,15 +726,15 @@ def test_prefix_spread_moves_only_to_an_idle_rank():
     assert place(1, 100_000, 10_000) == "other"  # other about to idle
     assert place(2, 50_000, 10_000) == "owner"  # owner has no real backlog
     assert place(3, 500_000, 200_000) == "owner"  # both busy: stay
-    mgr._prefix_idle_tokens = 8192  # the one knob: a smaller idle threshold
+    mgr._prefix_router.idle_tokens = 8192  # the one knob: a smaller idle threshold
     assert place(4, 100_000, 10_000) == "owner"
 
 
 def _dp4_idle_ratio_mgr():
     mgr = _make_spread_mgr(n_ranks=4)
     # rank0 ran the whole 100k prefix, rank2 its first 48k.
-    mgr._prefix_owner_record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1)
-    mgr._prefix_owner_record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2)
+    mgr._prefix_router._record(_chain_seq(1, 100_000).prompt_hash_chain, 0, 1, 0, None)
+    mgr._prefix_router._record(_chain_seq(2, 49_152).prompt_hash_chain, 2, 2, 0, None)
     mgr._rank_tokens = [200_000, 0, 4_096, 8_192]
     mgr._rank_reqs = [0, 0, 0, 0]
     return mgr
@@ -747,7 +761,9 @@ def test_idle_ratio_load_wins_over_a_partial_prefix():
 def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
     mgr = _dp4_idle_ratio_mgr()
     mgr._seq_prefilling.add(2)  # rank2's 48k part is still being prefilled
-    hits, owner, _ = mgr._prefix_rank_hits(_chain_seq(3, 110_000).prompt_hash_chain)
+    hits, owner, _ = mgr._prefix_router._rank_hits(
+        _chain_seq(3, 110_000).prompt_hash_chain, 4, mgr._seq_prefilling
+    )
     assert owner == 0 and 2 not in hits
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
     assert rank == 1  # no partial credit: the lightest idle rank
@@ -781,13 +797,13 @@ def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
     mgr = _make_spread_mgr()
     _route(mgr, [_chain_seq(1, 100_000)])
     mgr._release_seq_load(1)  # aborted / rejected before its first output
-    assert not mgr._prefix_owner
+    assert not mgr._prefix_router.index
     second = _chain_seq(2, 100_000)
     _route(mgr, [second])
     assert second._dp_est_hit == 0  # no fake HBM hit
     mgr._mark_seq_prefill_complete(2)
     mgr._release_seq_load(2)  # finished normally: the record stays
-    assert mgr._prefix_owner
+    assert mgr._prefix_router.index
 
 
 def test_an_aborted_move_leaves_no_hit_on_its_destination():
@@ -810,11 +826,15 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
 
     moved(2)
     mgr._release_seq_load(2)  # aborted before its load
-    hits, _, _ = mgr._prefix_rank_hits(_chain_seq(9, 100_000).prompt_hash_chain)
+    hits, _, _ = mgr._prefix_router._rank_hits(
+        _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
+    )
     assert other not in hits
 
     moved(3)
     mgr._mark_seq_prefill_complete(3)
     mgr._release_seq_load(3)
-    hits, _, _ = mgr._prefix_rank_hits(_chain_seq(9, 100_000).prompt_hash_chain)
+    hits, _, _ = mgr._prefix_router._rank_hits(
+        _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
+    )
     assert hits.get(other) == 98_304
