@@ -3402,6 +3402,11 @@ class Scheduler:
         is_pending = getattr(self.kv_connector, "lookup_is_pending", None)
         if is_pending is not None:
             return bool(is_pending(seq))
+        # Fallback: connectors without lookup_is_pending (P/D, Mooncake)
+        # also lack lookup_pending, so _offload_lookup_pending returns False
+        # without side effects.  If a future connector adds lookup_pending
+        # without lookup_is_pending, this fallback would poll — add the
+        # side-effect-free variant there instead.
         return self._offload_lookup_pending(seq)
 
     def _query_connector_prefill_match(self, seq: Sequence, *, skip: bool) -> bool:
