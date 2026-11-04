@@ -210,7 +210,10 @@ class EngineCore:
             if (
                 config.parallel_config.data_parallel_size == 1
                 and config.pipeline_parallel_size == 1
-                and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                and (
+                    envs.ATOM_PREFILL_DECODE_INTERVAL > 0
+                    or config.prefill_admit_policy == "adaptive"
+                )
             ):
                 self._init_prefill_delayer(config)
 
@@ -262,6 +265,7 @@ class EngineCore:
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
                 exchange_prefill_costs=self.scheduler.cost_balance,
                 cost_gate=envs.ATOM_PREFILL_DELAYER_COST_GATE,
+                admit_policy=config.prefill_admit_policy,
             )
         )
 
@@ -479,7 +483,12 @@ class EngineCore:
             except Exception:
                 logger.exception("KV event publish in engine-step finally failed")
 
-    def _release_multimodal_requests(self, sequences):
+    def _release_request_resources(self, sequences):
+        structured_ids = [
+            seq.id for seq in sequences if getattr(seq, "json_schema", None) is not None
+        ]
+        if structured_ids:
+            self.runner_mgr.call_func("release_structured_requests", structured_ids)
         request_ids = [
             seq.id for seq in sequences if getattr(seq, "cache_seed", -1) != -1
         ]
@@ -497,7 +506,7 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self._release_multimodal_requests(rejected)
+            self._release_request_resources(rejected)
             self.output_queue.put_nowait(rejected)
 
         if result is None:
@@ -535,7 +544,9 @@ class EngineCore:
                 # Arm post-prefill decode protection only after the prefill
                 # forward really completed. A delayer FIRE merely grants
                 # admission and can still result in a decode/empty batch.
-                self.scheduler.prefill_delayer.notify_prefill_executed()
+                self.scheduler.prefill_delayer.notify_prefill_executed(
+                    scheduled_batch.total_tokens_num_prefill
+                )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
         self._poll_kv_transfer_progress()
@@ -566,7 +577,7 @@ class EngineCore:
             pass
 
         if finished_seqs:
-            self._release_multimodal_requests(finished_seqs)
+            self._release_request_resources(finished_seqs)
             self.output_queue.put_nowait(finished_seqs)
 
     def has_pending_kv_work(self) -> bool:

@@ -26,6 +26,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
 | `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `apply_packed_bitmask` | `triton_structured_output.py` | Triton packed-bitmask kernel | JSON grammar masks on selected target logits |
 | `constrain_logits`, `advance_states` | `required_channel.py` | Triton `_constrain_logits_kernel`, `_advance_states_kernel` | `tool_choice="required"` channel mask (Kimi-K3) |
 
 ## AITER integration overview
@@ -278,6 +279,8 @@ The ASM MoE path (`asm_moe` from `aiter.fused_moe_bf16_asm`) is used by FP8 meth
 | `rocm_aiter_topk_softmax` | `aiter.topk_softmax` | Standard top-k (Mixtral) |
 | `rocm_aiter_grouped_topk` | `aiter.grouped_topk` | Grouped top-k (DeepSeek) |
 | `rocm_aiter_biased_grouped_topk` | `aiter.biased_grouped_topk` | Biased grouped top-k (DeepSeek V3) |
+
+`rocm_aiter_topk_softmax` runs `triton_topk_softmax` instead (bit-identical) in launches of up to `triton_topk_softmax_rows` rows: 20 per CU on gfx950, for the shapes it takes. Under an `HSA_CU_MASK` set outside ATOM, export `CU_NUM` (the CUs it leaves) at process start: the cutoff counts AITER's cached `get_cu_num()`, which ignores the mask.
 
 **Shared expert fusion:** When `is_rocm_aiter_fusion_shared_expert_enabled()` returns `True`, the top-k buffers are extended with shared expert IDs appended after routed expert IDs. This allows shared expert computation to be fused into the same MoE kernel call. The metadata is initialized via `init_aiter_topK_meta_data()`. Under DP attention with MoRI EP, fusion is wired up only for MXFP4 / NVFP4 routed experts; FP8 MoE models such as DeepSeek-V3 must run with `ATOM_FUSE_SHARED_EXPERT=0`, or `FusedMoE` raises `NotImplementedError`.
 
@@ -567,6 +570,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `embed_head.py` | `VocabParallelEmbedding`, `ParallelLMHead` |
 | `rotary_embedding.py` | `RotaryEmbedding`, `get_rope` |
 | `topK.py` | `rocm_aiter_topk_softmax`, `rocm_aiter_grouped_topk`, `init_aiter_topK_meta_data` |
+| `triton_topk_softmax.py` | `triton_topk_softmax` -- renormalized softmax top-k, bit-identical to AITER's `topk_softmax` |
 | `sampler.py` | `Sampler` — unified greedy/random sampling |
 | `rejection_sampler.py` | `RejectionSampler` — speculative decoding rejection sampling |
 | `required_channel.py` | `constrain_logits`, `advance_states` — `tool_choice="required"` channel mask (Kimi-K3) |
