@@ -9,6 +9,7 @@ from enum import Enum
 class Capability(str, Enum):
     DEVICE_MAILBOX = "device mailbox"
     STORE_DRAIN = "store drain"
+    DEVICE_ACQUIRE = "device acquire"
     WORKGROUP_BARRIER = "workgroup barrier"
     SYSTEM_EPOCH = "system epoch"
     COHERENT_CPOL_17 = "coherent cpol 0x11"
@@ -38,6 +39,7 @@ GFX1250_MAILBOX = MailboxCapabilities(
     (
         Capability.DEVICE_MAILBOX,
         Capability.STORE_DRAIN,
+        Capability.DEVICE_ACQUIRE,
         Capability.WORKGROUP_BARRIER,
         Capability.SYSTEM_EPOCH,
         Capability.COHERENT_CPOL_17,
@@ -46,6 +48,7 @@ GFX1250_MAILBOX = MailboxCapabilities(
 K1_REQUIRED_CAPABILITIES = (
     Capability.DEVICE_MAILBOX,
     Capability.STORE_DRAIN,
+    Capability.DEVICE_ACQUIRE,
     Capability.WORKGROUP_BARRIER,
     Capability.SYSTEM_EPOCH,
 )

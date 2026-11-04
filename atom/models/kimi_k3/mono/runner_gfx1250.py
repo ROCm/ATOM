@@ -61,11 +61,55 @@ from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner, state_slots
 from atom.models.kimi_k3.mono.weights import bind_k2_expert_scales
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
+from atom.mono.runtime.compile import launcher_resources
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+def _resident_hazards(launcher: object) -> tuple[str, ...]:
+    hazards = []
+    lds_limit = GFX1250.max_workgroup_lds_bytes
+    assert lds_limit is not None
+    for resource in launcher_resources(launcher):
+        if resource["scratch"]:
+            hazards.append(f"{resource['scratch']}B private segment")
+        for kind in ("vgpr_spill", "sgpr_spill"):
+            count = resource[kind]
+            if count:
+                hazards.append(f"{count} {kind.replace('_', ' ')}")
+        if resource["lds"] > lds_limit:
+            hazards.append(f"{resource['lds']}B LDS")
+    return tuple(hazards)
+
+
+def _lean_width(
+    built: Gfx1250WidthBuild,
+    spilled: list[object],
+) -> Gfx1250WidthBuild | None:
+    """Rebuild only spilled resident K1 launchers with one weight group live."""
+
+    replacements: dict[int, Gfx1250K1LocalRunner] = {}
+    for layer, runner in built.k1.items():
+        if (
+            runner.entrypoint.launcher in spilled
+            and runner.spec.gemv_unit > 1
+        ):
+            lean = runner.plan.make_k1_local_runner(
+                replace(runner.spec, gemv_unit=1)
+            )
+            scratch = getattr(runner, "_scratch", None)
+            if scratch is not None:
+                lean.prepare(scratch.device)
+            replacements[layer] = lean
+    if not replacements:
+        return None
+    return Gfx1250WidthBuild(
+        {layer: replacements.get(layer, runner) for layer, runner in built.k1.items()},
+        built.k2,
+    )
 
 
 @dataclass
@@ -90,7 +134,7 @@ class Gfx1250WidthBuild:
         """All local launchers, for compile-time scratch validation."""
         pairs: list[tuple[object, KernelAbi]] = []
         for k1 in self.k1.values():
-            pairs.extend((stage.launcher, stage.abi) for stage in k1.entrypoint.stages)
+            pairs.append((k1.entrypoint.launcher, k1.entrypoint.abi))
         for k2 in self.k2.values():
             pairs.extend(
                 (
@@ -120,6 +164,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             Gfx1250WidthBuild.kernels,
             group,
             "Kimi-K3 gfx1250 packed mono",
+            lean=_lean_width,
+            hazards=_resident_hazards,
         )
         self._served_widths: set[tuple[int, int]] = set()
         logger.info(
@@ -170,11 +216,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         self.plans = plans
 
     def _allocate(self) -> None:
-        # K1's non-debug build still carries these ABI slots.  One stable dummy
-        # of the right dtype is enough because no debug store is emitted.
-        self._x_debug = torch.empty(1, dtype=torch.bfloat16, device=self.device)
-        self._projection_debug = torch.empty_like(self._x_debug)
-        self._timeline = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
 
     def close(self) -> None:
@@ -220,7 +261,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 cache_key = (weight.blocks, spec)
                 local = k1_cache.get(cache_key)
                 if local is None:
-                    local = self._plan(rows, weight.blocks).make_k1_local_runner(spec)
+                    local = self._plan(rows, weight.blocks).make_k1_local_runner(
+                        spec
+                    ).prepare(self.device)
                     k1_cache[cache_key] = local
                 k1_by_layer[layer.layer_id] = local
 
@@ -377,10 +420,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             st_stride=slots.stride(0),
             num_acc=accepted,
             core_out=core,
-            x_dbg=self._x_debug,
-            proj_dbg=self._projection_debug,
-            layer=plan.layer_id,
-            tl=self._timeline,
         )
         return local(runtime, stream=torch.cuda.current_stream())
 

@@ -11,6 +11,7 @@ from atom.models.kimi_k3.mono.kernels.attention.protocol import (
     STATE_CHUNKS,
     K1Protocol,
     ResidencyAssumption,
+    ResidentGenerationState,
     StepResetState,
 )
 
@@ -43,11 +44,11 @@ def test_every_cta_role_and_task_has_unique_complete_ownership(kda0):
     assert slices == list(range(ATTENTION_CTAS))
 
     gates = [
-        assignment.gate_token
+        token
         for assignment in assignments
-        if assignment.gate_token is not None
+        for token in assignment.gate_tokens
     ]
-    assert gates == list(range(protocol.tokens))
+    assert sorted(gates) == list(range(protocol.tokens))
 
     projection = [
         task for assignment in assignments for task in assignment.projection_tasks
@@ -74,6 +75,20 @@ def test_each_head_chunk_group_runs_on_distinct_ctas():
                 for chunk in range(STATE_CHUNKS)
             ]
             assert len({owner[task] for task in tasks}) == STATE_CHUNKS
+
+
+def test_plain_decode_uses_one_local_task_per_request_head():
+    protocol = _protocol(tokens=16, qlen=1)
+    tasks = [
+        task
+        for assignment in protocol.assignments
+        for task in assignment.head_tasks
+    ]
+    assert protocol.uses_head_tasks
+    assert sorted(tasks) == list(range(protocol.head_task_count))
+    assert not any(
+        assignment.kda_tasks for assignment in protocol.assignments
+    )
 
 
 @pytest.mark.parametrize(
@@ -132,17 +147,20 @@ def test_every_wait_has_a_unique_reachable_producer():
     assert all(count == 1 for count in producer_counts.values())
 
 
-def test_reset_chunk_ownership_is_complete_and_nonoverlapping():
-    protocol = _protocol()
-    for region, pairs in protocol.mailbox_pairs.items():
-        owners = protocol.reset_chunk_owners(region)
-        expected_chunks = (pairs * 8 + 15) // 16
-        assert len(owners) == expected_chunks
-        assert len(owners) == len(set(owners))
-        assert all(
-            0 <= block < protocol.blocks and 0 <= thread < protocol.threads
-            for block, thread in owners
-        )
+@pytest.mark.parametrize("tokens", [1, 16, 32, 48])
+def test_every_cta_uses_one_compatible_generation_barrier(tokens):
+    protocol = _protocol(tokens=tokens, qlen=1)
+    assert protocol.barrier_sequence == ("generation",)
+    assert len(protocol.cta_barrier_sequences) == protocol.blocks
+    assert set(protocol.cta_barrier_sequences) == {("generation",)}
+
+
+def test_generation_rendezvous_is_unique_without_mailbox_reset():
+    state = ResidentGenerationState(blocks=256)
+    assert [state.rendezvous(256) for _ in range(3)] == [1, 2, 3]
+    assert state.arrivals == 0
+    with pytest.raises(ValueError, match="needs 256 arrivals"):
+        state.rendezvous(255)
 
 
 def test_epoch_reset_and_peer_fence_gate_publication():
@@ -177,3 +195,17 @@ def test_epoch_reset_and_peer_fence_gate_publication():
 def test_protocol_refuses_incomplete_projection_grid():
     with pytest.raises(ValueError, match="at least 253 CTAs"):
         _protocol(blocks=252)
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 17, 32, 33, 48])
+def test_tile_ready_mailboxes_have_unique_producers(tokens):
+    protocol = _protocol(tokens=tokens, qlen=1)
+    assert protocol.mailbox_pairs["xrdy"] == ATTENTION_CTAS * protocol.token_tiles
+    actions = [action for queue in protocol.action_queues() for action in queue]
+    produced = [
+        resource
+        for action in actions
+        for resource in action.publishes
+        if resource.startswith("xrdy:")
+    ]
+    assert len(produced) == len(set(produced)) == len(protocol.all_xrdy)

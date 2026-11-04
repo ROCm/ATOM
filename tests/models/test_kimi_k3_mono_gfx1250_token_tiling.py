@@ -121,16 +121,18 @@ def test_attention_and_protocol_cover_all_rows(tokens):
         sources=7,
     )
     gates = [
-        assignment.gate_token
+        token
         for assignment in protocol.assignments
-        if assignment.gate_token is not None
+        for token in assignment.gate_tokens
     ]
-    assert gates == list(range(tokens))
+    assert sorted(gates) == list(range(tokens))
     tasks = [
-        task for assignment in protocol.assignments for task in assignment.kda_tasks
+        task
+        for assignment in protocol.assignments
+        for task in assignment.head_tasks
     ]
-    assert len(tasks) == len(set(tasks)) == protocol.kda_task_count
-    assert sorted(tasks) == list(range(protocol.kda_task_count))
+    assert len(tasks) == len(set(tasks)) == protocol.head_task_count
+    assert sorted(tasks) == list(range(protocol.head_task_count))
 
 
 @pytest.mark.parametrize("tokens", BOUNDARIES)

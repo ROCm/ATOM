@@ -43,6 +43,8 @@ def test_device_source_uses_gfx12_store_counter_and_evidenced_scopes():
     assert "comm_ops.fence_system_release()" in source
     assert "comm_ops.fence_system_acquire()" in source
     assert "comm_ops.atomic_add_system(address, value)" in source
+    assert "ordering=fx.AtomicOrdering.Acquire" in source
+    assert 'syncscope="agent"' in source
     publish = source.index("def mailbox_publish_device")
     drain = source.index("wait_vector_stores()", publish)
     barrier = source.index("workgroup_barrier()", drain)

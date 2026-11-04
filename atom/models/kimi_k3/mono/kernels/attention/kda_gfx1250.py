@@ -22,6 +22,7 @@ from atom.models.kimi_k3.mono.kernels.attention.layout import (
     ROWS,
     KdaMatrixContract,
 )
+from atom.models.kimi_k3.mono.kernels.attention.protocol import ATTENTION_CTAS
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
     ACCUMULATOR_ELEMENTS,
     _fragment,
@@ -37,24 +38,52 @@ from atom.mono.device.ops import (
     butterfly,
     hw_exp2,
     hw_rsq,
+    ld_i32,
     mma_bf16,
     rsrc,
     traced,
+    uniform,
     wave_max,
 )
 from atom.mono.plan.architecture import GFX1250
 
 LOG2E = 1.0 / math.log(2.0)
 HEADS = 12
+HEAD_DIM = GATE_K
 STATE_CHUNKS = 8
+VALUE_CHUNK = 16
+NPROJ = 6288
 SEAM_COLUMNS = 128
 SEAM_COLUMN_GROUPS = 32
 SEAM_SLICE_GROUPS = 8
 SEAM_SLICES_PER_GROUP = 7
+PROJ = HEADS * HEAD_DIM
+G2_0 = 3 * PROJ
+BETA_0 = G2_0 + PROJ
+FA_0 = BETA_0 + HEADS
+
+assert SEAM_SLICE_GROUPS * SEAM_SLICES_PER_GROUP == ATTENTION_CTAS
 
 
 def zero_accumulator():
     return fx.Vector.filled(ACCUMULATOR_ELEMENTS, 0.0, fx.Float32)
+
+
+def _scratch_region(c, name):
+    return c["scratch"] + fx.Int64(c[f"{name}_offset"])
+
+
+def _load_bf(pointer, index):
+    return fx.Float32(
+        fx.BFloat16(
+            bo.buffer_load(
+                rsrc(pointer),
+                index,
+                vec_width=1,
+                dtype=T.bf16,
+            )
+        )
+    )
 
 
 def gemv_loads(c, row_group, groups):
@@ -212,16 +241,25 @@ def state_loads(c, k, head, chunk):
     base = (
         args["rstate"] + fx.Int64(fx.max(k["slot0"], 0)) * fx.Int64(args["rs_seq"]) * 4
     )
-    k["state_rows"] = [
-        wave + c["matrix_waves"] * round_index for round_index in range(2)
-    ]
-    k["head_offs"] = [
-        ((head * GATE_K + chunk * ROWS + state_row) * GATE_K + lane * 4)
-        for state_row in k["state_rows"]
-    ]
     k["states"] = [
-        fx.Vector(bo.buffer_load(rsrc(base), offset, vec_width=4, dtype=T.f32))
-        for offset in k["head_offs"]
+        fx.Vector(
+            bo.buffer_load(
+                rsrc(base),
+                (
+                    (
+                        head * GATE_K
+                        + chunk * ROWS
+                        + wave
+                        + c["matrix_waves"] * round_index
+                    )
+                    * GATE_K
+                    + lane * 4
+                ),
+                vec_width=4,
+                dtype=T.f32,
+            )
+        )
+        for round_index in range(2)
     ]
 
 
@@ -262,6 +300,360 @@ def qk_normalize(c):
                 )
 
 
+@traced
+def kda_conv_inputs(c, request, head, chunk):
+    """Land projection, f_a, and beta before holding convolution metadata."""
+
+    L, tid = c["L"], c["tid"]
+    n_fa = L * GATE_K
+    fa_rounds = (n_fa + c["matrix_threads"] - 1) // c["matrix_threads"]
+    for iteration in range_constexpr(fa_rounds):
+        raw_index = tid + c["matrix_threads"] * iteration
+        index = (
+            raw_index
+            if const_expr(n_fa % c["matrix_threads"] == 0)
+            else fx.min(raw_index, n_fa - 1)
+        )
+        value = mailbox_poll_device(
+            _scratch_region(c, "proj"),
+            (request * L + index // GATE_K) * NPROJ
+            + FA_0
+            + index % GATE_K,
+            c["tag"],
+        )
+        if const_expr(n_fa % c["matrix_threads"] == 0):
+            fx.ptr_store(
+                _f32_of(value),
+                c["fa"] + index,
+            )
+        else:
+            if raw_index < n_fa:
+                fx.ptr_store(_f32_of(value), c["fa"] + index)
+    if tid < L:
+        beta = _f32_of(
+            mailbox_poll_device(
+                _scratch_region(c, "proj"),
+                (request * L + tid) * NPROJ + BETA_0 + head,
+                c["tag"],
+            )
+        )
+        fx.ptr_store(
+            fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(-beta * LOG2E)),
+            c["beta"] + tid,
+        )
+
+    if tid < 3 * VALUE_CHUNK:
+        part = tid // VALUE_CHUNK
+        channel = (
+            part * PROJ
+            + head * HEAD_DIM
+            + chunk * VALUE_CHUNK
+            + tid % VALUE_CHUNK
+        )
+        for token in range_constexpr(L):
+            fx.ptr_store(
+                _f32_of(
+                    mailbox_poll_device(
+                        _scratch_region(c, "proj"),
+                        (request * L + token) * NPROJ + channel,
+                        c["tag"],
+                    )
+                ),
+                c["qkl"] + tid * L + token,
+            )
+    gpu.barrier()
+
+
+@traced
+def kda_conv_compute(c, k, request, head, chunk):
+    """Consume landed projection with the owned channel's conv metadata."""
+
+    L, tid = c["L"], c["tid"]
+    if (tid < 3 * VALUE_CHUNK) & (k["slot_c"] >= 0):
+        state = rsrc(k["cs"])
+        for token in range_constexpr(c["SL"]):
+            if const_expr(token < c["SL"] - L):
+                    value = k["old"][token]
+            else:
+                value = fx.ptr_load(
+                    c["qkl"] + tid * L + token - (c["SL"] - L)
+                )
+            bo.buffer_store(
+                fx.Float32(value).to(fx.BFloat16),
+                state,
+                k["co"] + token * c["args"]["cs_tok"],
+            )
+    if tid < 3 * VALUE_CHUNK:
+        for token in range_constexpr(L):
+            value = fx.Float32(0.0)
+            for tap in range_constexpr(4):
+                sequence_index = token + tap
+                if const_expr(sequence_index < 3):
+                    sequence_value = k["win"][sequence_index]
+                else:
+                    sequence_value = fx.ptr_load(
+                        c["qkl"] + tid * L + sequence_index - 3
+                    )
+                value = value + k["cw"][tap] * sequence_value
+            output = _bf16_round(
+                value
+                * (
+                    fx.Float32(1.0)
+                    / (fx.Float32(1.0) + hw_exp2(-value * LOG2E))
+                )
+            )
+            if k["part"] < 2:
+                mailbox_store_device(
+                    _scratch_region(c, "qk"),
+                    ((request * HEADS + head) * L + token) * 2 * HEAD_DIM
+                    + k["part"] * HEAD_DIM
+                    + chunk * VALUE_CHUNK
+                    + tid % VALUE_CHUNK,
+                    output,
+                    c["tag"],
+                )
+            if k["part"] == 2:
+                fx.ptr_store(
+                    output,
+                    c["vloc"] + token * VALUE_CHUNK + tid % VALUE_CHUNK,
+                )
+    gpu.barrier()
+
+
+@traced
+def kda_head_norm(c, request, head):
+    """Finish a whole plain-decode head from CTA-local partial norms."""
+
+    L, tid = c["L"], c["tid"]
+    if tid < L * HEAD_DIM:
+        token = tid // HEAD_DIM
+        row = tid % HEAD_DIM
+        square_sum = fx.Float32(0.0)
+        for chunk in range_constexpr(STATE_CHUNKS):
+            square_sum = square_sum + fx.ptr_load(
+                c["head_onrm"] + token * STATE_CHUNKS + chunk
+            )
+        gate = _f32_of(
+            mailbox_poll_device(
+                _scratch_region(c, "proj"),
+                (request * L + token) * NPROJ
+                + G2_0
+                + head * HEAD_DIM
+                + row,
+                c["tag"],
+            )
+        )
+        inverse = hw_rsq(
+            square_sum * fx.Float32(1.0 / HEAD_DIM)
+            + fx.Float32(c["onorm_eps"])
+        )
+        weight = fx.Float32(
+            bo.buffer_load(
+                rsrc(c["args"]["on_w"]),
+                row,
+                vec_width=1,
+                dtype=T.f32,
+            )
+        )
+        output = (
+            fx.ptr_load(c["ol"] + token * HEAD_DIM + row)
+            * inverse
+            * weight
+            / (fx.Float32(1.0) + hw_exp2(-gate * LOG2E))
+        )
+        bo.buffer_store(
+            output.to(fx.BFloat16),
+            rsrc(c["args"]["core_out"]),
+            (request * L + token) * PROJ + head * HEAD_DIM + row,
+        )
+    gpu.barrier()
+
+
+@traced
+def kda_head(c, request, head):
+    """One plain-decode request/head without cross-CTA QK/ONRM handoffs."""
+
+    L, tid = c["L"], c["tid"]
+    args = c["args"]
+    acc_idx = uniform(ld_i32(args["num_acc"], request)) - 1
+    slot_c = uniform(ld_i32(args["st_idx"], request * args["st_stride"]))
+    slot0 = uniform(
+        ld_i32(
+            args["st_idx"],
+            request * args["st_stride"] + acc_idx,
+        )
+    )
+    if tid < L:
+        fx.ptr_store(
+            ld_i32(args["st_idx"], request * args["st_stride"] + tid),
+            c["slots"] + tid,
+        )
+
+    n_fa = L * HEAD_DIM
+    fa_rounds = (n_fa + c["matrix_threads"] - 1) // c["matrix_threads"]
+    for iteration in range_constexpr(fa_rounds):
+        raw = tid + c["matrix_threads"] * iteration
+        index = fx.min(raw, n_fa - 1)
+        value = mailbox_poll_device(
+            _scratch_region(c, "proj"),
+            (request * L + index // HEAD_DIM) * NPROJ
+            + FA_0
+            + index % HEAD_DIM,
+            c["tag"],
+        )
+        if raw < n_fa:
+            fx.ptr_store(_f32_of(value), c["fa"] + index)
+    if tid < L:
+        beta = _f32_of(
+            mailbox_poll_device(
+                _scratch_region(c, "proj"),
+                (request * L + tid) * NPROJ + BETA_0 + head,
+                c["tag"],
+            )
+        )
+        fx.ptr_store(
+            fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(-beta * LOG2E)),
+            c["beta"] + tid,
+        )
+
+    channels = 3 * HEAD_DIM
+    for round_index in range_constexpr(
+        (channels + c["matrix_threads"] - 1) // c["matrix_threads"]
+    ):
+        raw = tid + c["matrix_threads"] * round_index
+        local_channel = fx.min(raw, channels - 1)
+        part = local_channel // HEAD_DIM
+        column = local_channel % HEAD_DIM
+        channel = part * PROJ + head * HEAD_DIM + column
+        state = (
+            args["conv_st"]
+            + fx.Int64(fx.max(slot_c, 0)) * fx.Int64(args["cs_seq"]) * 2
+        )
+        state_offset = channel * args["cs_dim"]
+        weights = fx.Vector(
+            bo.buffer_load(
+                rsrc(args["conv_w"]),
+                channel * 4,
+                vec_width=4,
+                dtype=T.f32,
+            )
+        )
+        window = [
+            _load_bf(
+                state,
+                state_offset + (acc_idx + tap) * args["cs_tok"],
+            )
+            for tap in range(3)
+        ]
+        new_values = [
+            _f32_of(
+                mailbox_poll_device(
+                    _scratch_region(c, "proj"),
+                    (request * L + token) * NPROJ + channel,
+                    c["tag"],
+                )
+            )
+            for token in range(L)
+        ]
+        if (raw < channels) & (slot_c >= 0):
+            resource = rsrc(state)
+            for token in range_constexpr(c["SL"]):
+                value = (
+                    _load_bf(
+                        state,
+                        state_offset
+                        + (acc_idx + 1 + token) * args["cs_tok"],
+                    )
+                    if token < c["SL"] - L
+                    else new_values[token - (c["SL"] - L)]
+                )
+                bo.buffer_store(
+                    value.to(fx.BFloat16),
+                    resource,
+                    state_offset + token * args["cs_tok"],
+                )
+        sequence = window + new_values
+        for token in range_constexpr(L):
+            value = fx.Float32(0.0)
+            for tap in range_constexpr(4):
+                value = value + weights[tap] * sequence[token + tap]
+            output = _bf16_round(
+                value
+                / (fx.Float32(1.0) + hw_exp2(-value * LOG2E))
+            )
+            if raw < channels:
+                if part < 2:
+                    fx.ptr_store(
+                        output,
+                        c["qkl"]
+                        + (2 * token + part) * HEAD_DIM
+                        + column,
+                    )
+                if part == 2:
+                    fx.ptr_store(
+                        output,
+                        c["vloc"] + token * HEAD_DIM + column,
+                    )
+    gpu.barrier()
+
+    metadata = {}
+    metadata["fb"], metadata["dtb"] = gate_loads(c, head)
+    metadata["aa"] = hw_exp2(
+        fx.Float32(
+            bo.buffer_load(
+                rsrc(args["a_log"]),
+                head,
+                vec_width=1,
+                dtype=T.f32,
+            )
+        )
+        * LOG2E
+    )
+    gate_compute(c, metadata)
+    gpu.barrier()
+    qk_normalize(c)
+    gpu.barrier()
+
+    metadata["slot0"] = slot0
+    vloc = c["vloc"]
+    output = c["ol"]
+    c["head_onrm"] = c["head_onrm_lds"]
+    for chunk in range_constexpr(STATE_CHUNKS):
+        c["vloc"] = vloc + chunk * VALUE_CHUNK
+        c["ol"] = output + chunk * VALUE_CHUNK
+        state_loads(c, metadata, head, chunk)
+        kda_recur(c, metadata, request, head, chunk)
+    c["ol"] = output
+    kda_head_norm(c, request, head)
+    c["vloc"], c["ol"] = vloc, output
+
+
+@traced
+def kda_gates(c, k, request, head):
+    """Poll complete Q/K rows, then run the wave32 gate and norm backend."""
+
+    L, tid = c["L"], c["tid"]
+    elements = L * 2 * HEAD_DIM
+    indices = [
+        tid + c["matrix_threads"] * iteration
+        for iteration in range_constexpr(
+            (elements + c["matrix_threads"] - 1) // c["matrix_threads"]
+        )
+    ]
+    for iteration in range_constexpr(len(indices)):
+        value = mailbox_poll_device(
+            _scratch_region(c, "qk"),
+            (request * HEADS + head) * L * 2 * HEAD_DIM + indices[iteration],
+            c["tag"],
+        )
+        fx.ptr_store(_f32_of(value), c["qkl"] + indices[iteration])
+    gpu.barrier()
+    gate_compute(c, k)
+    gpu.barrier()
+    qk_normalize(c)
+    gpu.barrier()
+
+
 def _bf16_round(value):
     return fx.Float32(fx.Float32(value).to(fx.BFloat16))
 
@@ -274,13 +666,17 @@ def kda_recur(c, k, req, head, chunk):
     args = c["args"]
     live = k["slot0"] >= 0
     for row_index in range_constexpr(2):
-        state_row = k["state_rows"][row_index]
+        state_row = c["wave"] + c["matrix_waves"] * row_index
+        head_offset = (
+            (head * GATE_K + chunk * ROWS + state_row) * GATE_K + lane * 4
+        )
         state = [
             live.select(k["states"][row_index][element], fx.Float32(0.0))
             for element in range(4)
         ]
         column = lane * 4
-        for token in range_constexpr(L):
+        token = fx.Int32(0)
+        while token < L:
             q = [
                 fx.ptr_load(c["qkl"] + (2 * token) * GATE_K + column + element)
                 for element in range(4)
@@ -320,7 +716,7 @@ def kda_recur(c, k, req, head, chunk):
                 )
             )
             output = live.select(output, fx.Float32(0.0))
-            slot = k["slots"][token]
+            slot = fx.ptr_load(c["slots"] + token)
             if (slot >= 0) & live:
                 destination = rsrc(
                     args["rstate"] + fx.Int64(slot) * fx.Int64(args["rs_seq"]) * 4
@@ -328,21 +724,101 @@ def kda_recur(c, k, req, head, chunk):
                 bo.buffer_store(
                     fx.Vector.from_elements(state, fx.Float32),
                     destination,
-                    k["head_offs"][row_index],
+                    head_offset,
                 )
             if lane == 0:
                 fx.ptr_store(output, c["ol"] + token * ROWS + state_row)
+            token = token + fx.Int32(1)
     gpu.barrier()
     if tid < L:
         square_sum = fx.Float32(0.0)
         for element in range_constexpr(ROWS):
             value = fx.ptr_load(c["ol"] + tid * ROWS + element)
             square_sum = square_sum + value * value
-        c["put"](
-            c["onrm"],
-            ((req * HEADS + head) * L + tid) * STATE_CHUNKS + chunk,
-            square_sum,
+        if const_expr(c.get("head_onrm") is not None):
+            fx.ptr_store(
+                square_sum,
+                c["head_onrm"] + tid * STATE_CHUNKS + chunk,
+            )
+        else:
+            mailbox_store_device(
+                _scratch_region(c, "onrm"),
+                ((req * HEADS + head) * L + tid) * STATE_CHUNKS + chunk,
+                square_sum,
+                c["tag"],
+            )
+    gpu.barrier()
+
+
+@traced
+def _kda_norm_row(c, request, head, chunk, token, element):
+    L = c["L"]
+    row = chunk * VALUE_CHUNK + element
+    square_sum = fx.Float32(0.0)
+    for other in range_constexpr(STATE_CHUNKS):
+        square_sum = square_sum + _f32_of(
+            mailbox_poll_device(
+                _scratch_region(c, "onrm"),
+                ((request * HEADS + head) * L + token) * STATE_CHUNKS + other,
+                c["tag"],
+            )
         )
+    gate = _f32_of(
+        mailbox_poll_device(
+            _scratch_region(c, "proj"),
+            (request * L + token) * NPROJ + G2_0 + head * HEAD_DIM + row,
+            c["tag"],
+        )
+    )
+    inverse = hw_rsq(
+        square_sum * fx.Float32(1.0 / HEAD_DIM)
+        + fx.Float32(c["onorm_eps"])
+    )
+    weight = fx.Float32(
+        bo.buffer_load(
+            rsrc(c["args"]["on_w"]),
+            row,
+            vec_width=1,
+            dtype=T.f32,
+        )
+    )
+    output = (
+        fx.ptr_load(c["ol"] + token * VALUE_CHUNK + element)
+        * inverse
+        * weight
+        * (fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(-gate * LOG2E)))
+    )
+    bo.buffer_store(
+        output.to(fx.BFloat16),
+        rsrc(c["args"]["core_out"]),
+        (request * L + token) * PROJ + head * HEAD_DIM + row,
+    )
+
+
+@traced
+def kda_norm(c, request, head, chunk):
+    """Finish one wave32 chunk from tagged partial norms and output gates."""
+
+    L, tid = c["L"], c["tid"]
+    if const_expr(L == 16):
+        _kda_norm_row(
+            c,
+            request,
+            head,
+            chunk,
+            tid // VALUE_CHUNK,
+            tid % VALUE_CHUNK,
+        )
+    else:
+        if tid < L * VALUE_CHUNK:
+            _kda_norm_row(
+                c,
+                request,
+                head,
+                chunk,
+                tid // VALUE_CHUNK,
+                tid % VALUE_CHUNK,
+            )
     gpu.barrier()
 
 
@@ -362,6 +838,15 @@ def wait_vector_stores():
     """Drain gfx12 stores before publishing a mailbox tag."""
 
     rocdl.s_wait_storecnt(0)
+
+
+def device_fence_acquire():
+    """Order bulk device-scope payload loads after a ready-tag observation."""
+
+    fx.memory_fence(
+        ordering=fx.AtomicOrdering.Acquire,
+        syncscope="agent",
+    )
 
 
 def mailbox_store_device(pointer, index, payload, tag):
@@ -485,7 +970,16 @@ def emit_role_lds_types(spec):
         {"red", "tls"},
         {"vals"},
         {"xl"},
-        {"fa", "qkl", "decay", "vloc", "ol", "beta"},
+        {
+            "fa",
+            "qkl",
+            "decay",
+            "vloc",
+            "ol",
+            "beta",
+            "slots",
+            "onrm",
+        },
     ):
         raise ValueError("unexpected gfx1250 K1 LDS type specification")
 
@@ -505,6 +999,8 @@ def emit_role_lds_types(spec):
         vloc: fx.Array[fx.Float32, recurrence["vloc"].elements, 16]
         ol: fx.Array[fx.Float32, recurrence["ol"].elements, 16]
         beta: fx.Array[fx.Float32, recurrence["beta"].elements, 16]
+        slots: fx.Array[fx.Int32, recurrence["slots"].elements, 16]
+        onrm: fx.Array[fx.Float32, recurrence["onrm"].elements, 16]
 
     @fx.union
     class RoleLds:
@@ -544,37 +1040,39 @@ def _bf4_words(values):
 
 
 @traced
-def attention_gate(c, token):
-    """Wave32 softmax over at most 32 AttnRes sources."""
+def _attention_gate(c, token, token0, total_tokens, resident):
+    """Wave32 softmax over one tile's at most 32 AttnRes sources."""
 
-    s, sources, tid, lane, wave, red = (
-        c["S"],
+    sources, tid, lane, wave, red = (
         c["NS"],
         c["tid"],
         c["lane"],
         c["wave"],
         c["red"],
     )
+    global_token = token0 + token
     pairs = sources * 2
     if tid < SEAM_SLICE_GROUPS * pairs:
         group = tid // pairs
         pair = tid % pairs
-        values = c["poll"](
-            [
+        values = []
+        for slice_index in range_constexpr(SEAM_SLICES_PER_GROUP):
+            index = (
                 (
-                    c["part"],
-                    (
-                        ((group * SEAM_SLICES_PER_GROUP + slice_index) * s + token)
-                        * sources
-                    )
-                    * 2
-                    + pair,
-                    1,
+                    (group * SEAM_SLICES_PER_GROUP + slice_index)
+                    * total_tokens
+                    + global_token
                 )
-                for slice_index in range(SEAM_SLICES_PER_GROUP)
-            ]
-        )
-        fx.ptr_store(_sum_polled(values), red + group * pairs + pair)
+                * sources
+                * 2
+                + pair
+            )
+            if const_expr(resident):
+                word = mailbox_poll_device(c["part"], index, c["tag"])
+            else:
+                word = c["poll"]([(c["part"], index, 1)])[0][0]
+            values.append(word.bitcast(fx.Float32))
+        fx.ptr_store(sum(values), red + group * pairs + pair)
     gpu.barrier()
     if wave == 0:
         source = fx.min(lane, sources - 1)
@@ -596,15 +1094,33 @@ def attention_gate(c, token):
             architecture=GFX1250,
         )
         if lane < sources:
-            c["put"](c["wgt"], token * (sources + 1) + lane, exponential)
+            index = global_token * (sources + 1) + lane
+            if const_expr(resident):
+                mailbox_store_device(c["wgt"], index, exponential, c["tag"])
+            else:
+                c["put"](c["wgt"], index, exponential)
         if lane == 0:
-            c["put"](c["wgt"], token * (sources + 1) + sources, denominator)
+            index = global_token * (sources + 1) + sources
+            if const_expr(resident):
+                mailbox_store_device(c["wgt"], index, denominator, c["tag"])
+            else:
+                c["put"](c["wgt"], index, denominator)
     gpu.barrier()
 
 
 @traced
-def attention_mix(c, task):
-    """Mix values with one or more token rows serially owned by each wave32."""
+def attention_gate(c, token):
+    _attention_gate(c, token, 0, c["S"], False)
+
+
+@traced
+def attention_gate_tile(c, token):
+    _attention_gate(c, token, c["token0"], c["total_S"], True)
+
+
+@traced
+def _attention_mix(c, task, token0, total_tokens, tile, resident):
+    """Mix one tile's values with token-global mailbox and output indices."""
 
     s, sources, tid, lane, wave, waves, red = (
         c["S"],
@@ -622,7 +1138,13 @@ def attention_mix(c, task):
     for iteration in range_constexpr((weight_count + threads - 1) // threads):
         item = tid + threads * iteration
         if item < weight_count:
-            value = c["poll"]([(c["wgt"], item, 1)])[0][0]
+            local_token = item // (sources + 1)
+            pair = item % (sources + 1)
+            index = (token0 + local_token) * (sources + 1) + pair
+            if const_expr(resident):
+                value = mailbox_poll_device(c["wgt"], index, c["tag"])
+            else:
+                value = c["poll"]([(c["wgt"], index, 1)])[0][0]
             fx.ptr_store(_f32_of(value), red + item)
     gpu.barrier()
 
@@ -655,7 +1177,11 @@ def attention_mix(c, task):
         )
         square_sum = attention_reduce32(square_sum)
         if live & (lane == 0):
-            c["put"](c["msq"], task * s + token, square_sum)
+            index = task * total_tokens + token0 + token
+            if const_expr(resident):
+                mailbox_store_device(c["msq"], index, square_sum, c["tag"])
+            else:
+                c["put"](c["msq"], index, square_sum)
         if const_expr(c["mix_lds_handoff"]):
             for element in range_constexpr(4):
                 fx.ptr_store(
@@ -674,18 +1200,21 @@ def attention_mix(c, task):
         if item < group_work:
             group = item // s
             token = item % s
-            values = c["poll"](
-                [
-                    (
-                        c["msq"],
-                        (group * SEAM_SLICES_PER_GROUP + slice_index) * s + token,
-                        1,
-                    )
-                    for slice_index in range(SEAM_SLICES_PER_GROUP)
-                ]
-            )
+            values = []
+            for slice_index in range_constexpr(SEAM_SLICES_PER_GROUP):
+                index = (
+                    (group * SEAM_SLICES_PER_GROUP + slice_index)
+                    * total_tokens
+                    + token0
+                    + token
+                )
+                if const_expr(resident):
+                    word = mailbox_poll_device(c["msq"], index, c["tag"])
+                else:
+                    word = c["poll"]([(c["msq"], index, 1)])[0][0]
+                values.append(word.bitcast(fx.Float32))
             fx.ptr_store(
-                _sum_polled(values),
+                sum(values),
                 red + 128 + group * s + token,
             )
     gpu.barrier()
@@ -718,15 +1247,29 @@ def attention_mix(c, task):
             ]
         )
         if live:
-            at = (token * HIDDEN + column0 + lane * 4) // 2
+            at = ((token0 + token) * HIDDEN + column0 + lane * 4) // 2
             bo.buffer_store(output, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
             if const_expr(c["debug"]):
                 bo.buffer_store(output, rsrc(args["x_dbg"]), at)
     wait_vector_stores()
     workgroup_barrier()
     if tid == 0:
-        c["put"](c["xrdy"], task, fx.Int32(1))
+        index = tile * ATTENTION_CTAS + task
+        if const_expr(resident):
+            mailbox_store_device(c["xrdy"], index, fx.Int32(1), c["tag"])
+        else:
+            c["put"](c["xrdy"], index, fx.Int32(1))
     gpu.barrier()
+
+
+@traced
+def attention_mix(c, task):
+    _attention_mix(c, task, 0, c["S"], 0, False)
+
+
+@traced
+def attention_mix_tile(c, task):
+    _attention_mix(c, task, c["token0"], c["total_S"], c["tile"], True)
 
 
 @dataclass(frozen=True)
@@ -781,8 +1324,28 @@ class StageBackend:
         qk_normalize(c)
 
     @staticmethod
+    def kda_conv_inputs(c, request, head, chunk):
+        kda_conv_inputs(c, request, head, chunk)
+
+    @staticmethod
+    def kda_conv_compute(c, k, request, head, chunk):
+        kda_conv_compute(c, k, request, head, chunk)
+
+    @staticmethod
+    def kda_head(c, request, head):
+        kda_head(c, request, head)
+
+    @staticmethod
+    def kda_gates(c, k, request, head):
+        kda_gates(c, k, request, head)
+
+    @staticmethod
     def kda_recur(c, k, req, head, chunk):
         kda_recur(c, k, req, head, chunk)
+
+    @staticmethod
+    def kda_norm(c, request, head, chunk):
+        kda_norm(c, request, head, chunk)
 
     @staticmethod
     def attention_reduce32(value):
@@ -793,8 +1356,16 @@ class StageBackend:
         attention_gate(c, token)
 
     @staticmethod
+    def attention_gate_tile(c, token):
+        attention_gate_tile(c, token)
+
+    @staticmethod
     def attention_mix(c, task):
         attention_mix(c, task)
+
+    @staticmethod
+    def attention_mix_tile(c, task):
+        attention_mix_tile(c, task)
 
     @staticmethod
     def workgroup_barrier():
@@ -803,6 +1374,10 @@ class StageBackend:
     @staticmethod
     def wait_vector_stores():
         wait_vector_stores()
+
+    @staticmethod
+    def device_fence_acquire():
+        device_fence_acquire()
 
     @staticmethod
     def mailbox_store_device(pointer, index, payload, tag):

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx1250 Kimi K1 declarations and rank-local staged builder.
+"""gfx1250 Kimi K1 declarations and rank-local resident builder.
 
 The declaration binds compile-time wave32 geometry, K1 compute, mailbox
 operations, and an exact LDS type specification without importing FlyDSL.
@@ -39,8 +39,9 @@ HEAD_DIM = 128
 VALUE_CHUNK = 16
 HEADS = 12
 STATE_CHUNKS = HEAD_DIM // VALUE_CHUNK
+ATTENTION_REDUCTION_GROUPS = 8
 LDS_PAD = 8
-# The local staged pipeline is intentionally independent of gfx950's
+# The local resident pipeline is intentionally independent of gfx950's
 # persistent-kernel transport arguments (ReplaySSM and peer-memory buffers).
 K1_ABI_NAMES = (
     "prefix",
@@ -67,11 +68,7 @@ K1_ABI_NAMES = (
     "st_stride",
     "num_acc",
     "core_out",
-    "x_dbg",
-    "proj_dbg",
     "scratch",
-    "layer",
-    "tl",
 )
 
 
@@ -197,15 +194,23 @@ COMPUTE_BINDINGS = (
     ("kda_gate_compute", "gate_compute"),
     ("kda_state_loads", "state_loads"),
     ("kda_qk_normalize", "qk_normalize"),
+    ("kda_conv_inputs", "kda_conv_inputs"),
+    ("kda_conv_compute", "kda_conv_compute"),
+    ("kda_head", "kda_head"),
+    ("kda_gates", "kda_gates"),
     ("kda_recur", "kda_recur"),
+    ("kda_norm", "kda_norm"),
     ("attention_reduce32", "attention_reduce32"),
     ("attention_gate", "attention_gate"),
+    ("attention_gate_tile", "attention_gate_tile"),
     ("attention_mix", "attention_mix"),
+    ("attention_mix_tile", "attention_mix_tile"),
 )
 
 DEVICE_PROTOCOL_BINDINGS = (
     ("workgroup_barrier", "workgroup_barrier"),
     ("wait_vector_stores", "wait_vector_stores"),
+    ("device_fence_acquire", "device_fence_acquire"),
     ("mailbox_store_device", "mailbox_store_device"),
     ("mailbox_load_device", "mailbox_load_device"),
     ("mailbox_poll_device", "mailbox_poll_device"),
@@ -237,6 +242,7 @@ class K1KernelDeclaration:
     nblocks: int
     token_tiles: tuple[TokenTile, ...]
     xrow: int
+    gemv_unit: int
     lds: K1RoleLdsPlan
     backend_module: str
     protocol: K1Protocol
@@ -266,6 +272,7 @@ class K1KernelDeclaration:
             ("WAVE_SIZE", GFX1250.wave_size),
             ("TOKEN_TILES", len(self.token_tiles)),
             ("XROW", self.xrow),
+            ("GEMV_UNIT", self.gemv_unit),
             (
                 "RED_ELEMENTS",
                 self.lds.smem_fields[0].bytes // 4,
@@ -337,12 +344,15 @@ class K1LocalBuildSpec:
     timeline: bool = False
     kda0: int = 0
     xp: int = 0
+    gemv_unit: int = 2
 
     def validate(self, plan: Gfx1250KimiBuildPlan) -> None:
         if not 1 <= self.qlen <= 16 or plan.tokens % self.qlen:
             raise ValueError("local K1 qlen must be in [1, 16] and divide tokens")
         if type(self.delta) is not bool:
             raise TypeError("local K1 delta must be bool")
+        if self.debug:
+            raise ValueError("resident gfx1250 K1 does not expose debug taps")
         if self.state_len < self.qlen + 3:
             raise ValueError(
                 "local K1 state_len must cover qlen plus the three-entry "
@@ -364,30 +374,29 @@ class K1LocalBuildSpec:
         if not 0 <= self.kda0 < plan.blocks:
             raise ValueError("local K1 kda0 must name a block in the grid")
         if self.xp != 0:
-            raise ValueError("local K1 staged pipeline does not admit timing xp")
+            raise ValueError("local K1 resident kernel does not admit timing xp")
+        if self.gemv_unit not in (1, 2):
+            raise ValueError("local K1 gemv_unit must be 1 or 2")
         if self.timeline:
             raise ValueError(
-                "local K1 staged pipeline has no cross-launch timeline contract"
+                "local K1 resident kernel does not expose timeline taps"
             )
 
     @property
     def stage_order(self) -> tuple[str, ...]:
-        return (
-            "attn_slice",
-            "attn_gate",
-            "attn_mix",
-            "projection",
-            "conv",
-            "recur",
-            "norm",
-        )
+        return ("resident",)
 
     @property
     def launch_count(self) -> int:
         return len(self.stage_order)
 
 
-def role_lds_plan(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1RoleLdsPlan:
+def role_lds_plan(
+    plan: Gfx1250KimiBuildPlan,
+    *,
+    qlen: int,
+    gemv_unit: int = 2,
+) -> K1RoleLdsPlan:
     """Construct K1's exact Smem + role-union LDS byte layout."""
 
     if plan.nblocks is None:
@@ -398,8 +407,15 @@ def role_lds_plan(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1RoleLdsPlan:
         )
     if plan.waves != 8:
         raise ValueError(f"gfx1250 K1 skeleton requires 8 waves, got {plan.waves}")
+    if gemv_unit not in (1, 2):
+        raise ValueError("gfx1250 K1 gemv_unit must be 1 or 2")
 
     sources = plan.nblocks + 1
+    if 2 * ATTENTION_REDUCTION_GROUPS * sources > plan.threads:
+        raise ValueError(
+            f"gfx1250 K1 attention supports at most {plan.threads // 16} "
+            f"sources, got {sources}"
+        )
     tile_rows = plan.token_tiling.lds_rows
     plan.attention_seam_lds_bytes(sources)
     red_elements = plan.kda_accumulator_lds_elements
@@ -410,13 +426,19 @@ def role_lds_plan(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1RoleLdsPlan:
     smem_bytes = _field_struct_bytes(smem_fields)
 
     contract = plan.kda_matrix_contract()
-    slabs = contract.slab_plan(
-        tile_rows,
-        lds_capacity_bytes=plan.lds_bytes,
-        fixed_lds_bytes=smem_bytes,
+    groups = contract.projection_groups
+    slabs = tuple(
+        (first, min(gemv_unit, groups - first))
+        for first in range(0, groups, gemv_unit)
     )
     widest_groups = max(groups for _, groups in slabs)
     xrow = widest_groups * contract.group_columns + LDS_PAD
+    projection_bytes = tile_rows * xrow * 2
+    if smem_bytes + projection_bytes > plan.lds_bytes:
+        raise ValueError(
+            f"gfx1250 K1 projection needs {smem_bytes + projection_bytes} LDS bytes, "
+            f"candidate has {plan.lds_bytes}"
+        )
 
     attention = RoleLdsVariant(
         "attention",
@@ -426,15 +448,18 @@ def role_lds_plan(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1RoleLdsPlan:
         "projection",
         _fields(("xl", tile_rows * xrow * 2)),
     )
+    state_width = HEAD_DIM if qlen == 1 else VALUE_CHUNK
     recurrence = RoleLdsVariant(
         "recurrence",
         _fields(
             ("fa", qlen * HEAD_DIM * 4),
             ("qkl", qlen * 2 * HEAD_DIM * 4),
             ("decay", qlen * HEAD_DIM * 4),
-            ("vloc", qlen * VALUE_CHUNK * 4),
-            ("ol", qlen * VALUE_CHUNK * 4),
+            ("vloc", qlen * state_width * 4),
+            ("ol", qlen * state_width * 4),
             ("beta", 16 * 4),
+            ("slots", 16 * 4),
+            ("onrm", qlen * STATE_CHUNKS * 4),
         ),
     )
     variants = attention, projection, recurrence
@@ -461,6 +486,8 @@ def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:
         "vloc": "f32",
         "ol": "f32",
         "beta": "f32",
+        "slots": "i32",
+        "onrm": "f32",
     }
 
     def convert(fields: tuple[LdsField, ...]) -> tuple[LdsTypeField, ...]:
@@ -503,13 +530,21 @@ def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:
     return spec
 
 
-def declare(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1KernelDeclaration:
+def declare(
+    plan: Gfx1250KimiBuildPlan,
+    *,
+    qlen: int,
+    gemv_unit: int = 2,
+) -> K1KernelDeclaration:
     """Create the gfx1250 K1 declaration up to kernel-body emission."""
 
-    lds = role_lds_plan(plan, qlen=qlen)
+    lds = role_lds_plan(plan, qlen=qlen, gemv_unit=gemv_unit)
     GFX1250_MAILBOX.require(*K1_REQUIRED_CAPABILITIES)
     assert plan.nblocks is not None
-    name = f"k3_mono_kda_pre_gfx1250_s{plan.tokens}_l{qlen}" f"_nb{plan.nblocks}"
+    name = (
+        f"k3_mono_kda_pre_gfx1250_s{plan.tokens}_l{qlen}"
+        f"_nb{plan.nblocks}_u{gemv_unit}"
+    )
     return K1KernelDeclaration(
         name=name,
         threads=plan.threads,
@@ -520,6 +555,7 @@ def declare(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1KernelDeclaration:
         nblocks=plan.nblocks,
         token_tiles=plan.token_tiling.tiles,
         xrow=lds.xrow,
+        gemv_unit=gemv_unit,
         lds=lds,
         backend_module=("atom.models.kimi_k3.mono.kernels.attention.kda_gfx1250"),
         protocol=K1Protocol(
@@ -532,7 +568,12 @@ def declare(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1KernelDeclaration:
     )
 
 
-def declare_local(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1KernelDeclaration:
+def declare_local(
+    plan: Gfx1250KimiBuildPlan,
+    *,
+    qlen: int,
+    gemv_unit: int = 2,
+) -> K1KernelDeclaration:
     """Declare K1 for the external-collective path.
 
     K1's handoffs are between CTAs of this rank through ``scratch``.  It does
@@ -540,29 +581,22 @@ def declare_local(plan: Gfx1250KimiBuildPlan, *, qlen: int) -> K1KernelDeclarati
     fully fused K2 transport and is removed from this local declaration.
     """
 
-    return replace(declare(plan, qlen=qlen), unsupported_device_protocol=())
+    return replace(
+        declare(plan, qlen=qlen, gemv_unit=gemv_unit),
+        unsupported_device_protocol=(),
+    )
 
 
 def local_scratch_layout(
     declaration: K1KernelDeclaration,
 ) -> dict[str, tuple[int, int]]:
-    """Lay out local pairs and plain tensors shared by staged K1 paths."""
+    """Lay out resident K1's tagged pairs, generation, and x handoff."""
 
     layout = pair_layout(declaration.protocol.mailbox_pairs.items())
     end = max(offset + size for offset, size in layout.values())
     layout["sync"] = (_align(end), 8)
     end = layout["sync"][0] + layout["sync"][1]
     layout["x"] = (_align(end), declaration.tokens * HIDDEN * 2)
-    end = layout["x"][0] + layout["x"][1]
-    layout["vals"] = (
-        _align(end),
-        declaration.tokens * (declaration.nblocks + 1) * HIDDEN * 4,
-    )
-    end = layout["vals"][0] + layout["vals"][1]
-    state_stage_bytes = declaration.tokens * HEADS * HEAD_DIM * 4
-    layout["vloc"] = (_align(end), state_stage_bytes)
-    end = layout["vloc"][0] + layout["vloc"][1]
-    layout["ol"] = (_align(end), state_stage_bytes)
     return layout
 
 
@@ -574,7 +608,15 @@ def build_local(
     """Emit the complete rank-local K1 pipeline."""
 
     spec.validate(plan)
-    declaration = declare_local(plan, qlen=spec.qlen)
+    declaration = declare_local(
+        plan,
+        qlen=spec.qlen,
+        gemv_unit=spec.gemv_unit,
+    )
+    declaration = replace(
+        declaration,
+        protocol=replace(declaration.protocol, kda0=spec.kda0),
+    )
     progress = declaration.protocol.prove_progress(
         ResidencyAssumption(all_declared_ctas_resident=True)
     )
@@ -582,22 +624,22 @@ def build_local(
     dependency_refusal = ()
     try:
         kernels = import_module(
-            "atom.models.kimi_k3.mono.kernels.attention." "kda_local_kernels_gfx1250"
+            "atom.models.kimi_k3.mono.kernels.attention." "kda_resident_gfx1250"
         )
     except ModuleNotFoundError as error:
         if (error.name or "").split(".", 1)[0] not in {"aiter", "flydsl"}:
             raise
         dependency_refusal = (
-            f"projection entry point not emitted because {error.name} is unavailable",
+            f"resident K1 not emitted because {error.name} is unavailable",
         )
     except RuntimeError as error:
         if "No gfx arch found" not in str(error):
             raise
         dependency_refusal = (
-            "local K1 entry points not emitted because no gfx target is visible",
+            "resident K1 not emitted because no gfx target is visible",
         )
     else:
-        kernel = kernels.build_local_pipeline(plan, declaration, spec)
+        kernel = kernels.build_resident_k1(plan, declaration, spec)
 
     if kernel is not None:
         return K1BuildResult(
@@ -615,7 +657,7 @@ def build_local(
         + (
             (
                 "focused target compile/correctness is required before "
-                "the complete staged local callable can be returned"
+                "the complete resident local callable can be returned"
             ),
         ),
     )

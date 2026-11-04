@@ -71,17 +71,13 @@ def _runtime():
         cs_tok=1,
         a_log=f32(1),
         dt_bias=f32(1),
-        on_w=bf16(1),
+        on_w=f32(1),
         rstate=f32(1),
         rs_seq=1,
         st_idx=i32(1),
         st_stride=1,
         num_acc=i32(1),
         core_out=bf16(1),
-        x_dbg=bf16(1),
-        proj_dbg=bf16(1),
-        layer=2,
-        tl=torch.zeros(1, dtype=torch.int64),
     )
 
 
@@ -96,19 +92,23 @@ def test_product_runner_packs_exact_local_abi_and_owns_scratch():
     kernel = SimpleNamespace(
         complete=True,
         launcher=launch,
-        launch_count=6,
+        launch_count=1,
     )
     result = SimpleNamespace(
         runnable=True,
         kernel=kernel,
         declaration=declaration,
+        launch_count=1,
     )
-    runner = Gfx1250K1LocalRunner(plan, _spec(), result)
+    runner = Gfx1250K1LocalRunner(plan, _spec(), result).prepare(
+        torch.device("cpu")
+    )
     runtime = _runtime()
 
+    assert runner._scratch is not None
     assert runner(runtime) is runtime.core_out
     assert runner(runtime, stream=7) is runtime.core_out
-    assert runner.launch_count == 6
+    assert runner.launch_count == 1
     assert len(observed) == 2
     assert all(len(arguments) == len(builder.K1_ABI_NAMES) for arguments, _ in observed)
     scratch_index = builder.K1_ABI_NAMES.index("scratch")
@@ -128,12 +128,13 @@ def test_product_runner_rejects_dtype_drift():
     kernel = SimpleNamespace(
         complete=True,
         launcher=lambda *_args, **_kwargs: None,
-        launch_count=6,
+        launch_count=1,
     )
     result = SimpleNamespace(
         runnable=True,
         kernel=kernel,
         declaration=declaration,
+        launch_count=1,
     )
     runtime = replace(
         _runtime(),
@@ -142,3 +143,23 @@ def test_product_runner_rejects_dtype_drift():
 
     with pytest.raises(ValueError, match="delta must be bfloat16"):
         Gfx1250K1LocalRunner(plan, _spec(), result)(runtime)
+
+
+def test_block_write_requires_the_new_residual_row():
+    plan = _plan()
+    spec = replace(_spec(), write_idx=1)
+    declaration = builder.declare_local(plan, qlen=1)
+    kernel = SimpleNamespace(
+        complete=True,
+        launcher=lambda *_args, **_kwargs: None,
+        launch_count=1,
+    )
+    result = SimpleNamespace(
+        runnable=True,
+        kernel=kernel,
+        declaration=declaration,
+        launch_count=1,
+    )
+
+    with pytest.raises(ValueError, match="at least 2 residual rows"):
+        Gfx1250K1LocalRunner(plan, spec, result)(_runtime())

@@ -48,10 +48,6 @@ class K1LocalRuntime:
     st_stride: int
     num_acc: torch.Tensor
     core_out: torch.Tensor
-    x_dbg: torch.Tensor
-    proj_dbg: torch.Tensor
-    layer: int
-    tl: torch.Tensor
 
     def __post_init__(self) -> None:
         names = tuple(field.name for field in fields(self))
@@ -74,6 +70,8 @@ class Gfx1250K1LocalRunner:
             raise ValueError("local K1 runner requires a complete build result")
         if build_result.declaration.tokens != plan.tokens:
             raise ValueError("local K1 build rows disagree with plan")
+        if build_result.launch_count != 1 or build_result.kernel.launch_count != 1:
+            raise ValueError("gfx1250 resident K1 must contain exactly one launch")
         self.plan = plan
         self.spec = spec
         self.build_result = build_result
@@ -115,6 +113,13 @@ class Gfx1250K1LocalRunner:
             or runtime.blocks.shape[2] != HIDDEN
         ):
             raise ValueError("blocks must have shape [rows, blocks, 7168]")
+        needed_blocks = self.build_result.declaration.nblocks
+        if self.spec.write_idx >= 0:
+            needed_blocks = max(needed_blocks, self.spec.write_idx + 1)
+        if runtime.blocks.shape[1] < needed_blocks:
+            raise ValueError(
+                f"blocks must expose at least {needed_blocks} residual rows"
+            )
         if runtime.prefix.dtype != torch.bfloat16:
             raise ValueError("local K1 activations must be bfloat16")
         for name in (
@@ -126,21 +131,16 @@ class Gfx1250K1LocalRunner:
             "w_in",
             "w_fb",
             "conv_st",
-            "on_w",
             "core_out",
-            "x_dbg",
-            "proj_dbg",
         ):
             if getattr(runtime, name).dtype != torch.bfloat16:
                 raise ValueError(f"local K1 {name} must be bfloat16")
-        for name in ("conv_w", "a_log", "dt_bias", "rstate"):
+        for name in ("conv_w", "a_log", "dt_bias", "on_w", "rstate"):
             if getattr(runtime, name).dtype != torch.float32:
                 raise ValueError(f"local K1 {name} must be float32")
         for name in ("st_idx", "num_acc"):
             if getattr(runtime, name).dtype != torch.int32:
                 raise ValueError(f"local K1 {name} must be int32")
-        if runtime.tl.dtype != torch.int64:
-            raise ValueError("local K1 timeline storage must be int64")
         if runtime.blk_sm < HIDDEN or runtime.blk_sr < HIDDEN:
             raise ValueError("local K1 block strides must span one hidden row")
         if (
@@ -154,8 +154,6 @@ class Gfx1250K1LocalRunner:
             <= 0
         ):
             raise ValueError("local K1 runtime strides must be positive")
-        if runtime.layer < 0:
-            raise ValueError("local K1 layer tag must be nonnegative")
         return device
 
     def _scratch_for(self, device: torch.device) -> torch.Tensor:
@@ -165,6 +163,12 @@ class Gfx1250K1LocalRunner:
         elif self._scratch.device != device:
             raise ValueError("local K1 runner cannot change devices")
         return self._scratch
+
+    def prepare(self, device: torch.device) -> Gfx1250K1LocalRunner:
+        """Allocate stable scratch before warmup/capture enters ``__call__``."""
+
+        self._scratch_for(device)
+        return self
 
     def abi_values(self, runtime: K1LocalRuntime) -> dict[str, int]:
         device = self._validate(runtime)

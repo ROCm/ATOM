@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from atom.models.kimi_k3.mono.kernels.token_tiling import (
     GFX1250_MAX_TOKENS,
+    WMMA_TOKEN_ROWS,
 )
 
 ATTENTION_CTAS = 56
@@ -44,9 +45,10 @@ class ResidencyAssumption:
 class CtaAssignment:
     block: int
     attention_slice: int | None
-    gate_token: int | None
+    gate_tokens: tuple[int, ...]
     projection_tasks: tuple[int, ...]
     kda_tasks: tuple[int, ...]
+    head_tasks: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,40 @@ class StepResetState:
         return 0
 
 
+@dataclass
+class ResidentGenerationState:
+    """CPU model of K1's opening all-CTA generation rendezvous."""
+
+    blocks: int
+    generation: int = 0
+    arrivals: int = 0
+
+    def arrive(self) -> int | None:
+        if self.blocks <= 0:
+            raise ValueError("blocks must be positive")
+        if self.arrivals >= self.blocks:
+            raise RuntimeError("generation rendezvous already complete")
+        self.arrivals += 1
+        if self.arrivals != self.blocks:
+            return None
+        self.arrivals = 0
+        self.generation += 1
+        return self.generation
+
+    def rendezvous(self, arrivals: int) -> int:
+        if arrivals != self.blocks:
+            raise ValueError(
+                f"generation rendezvous needs {self.blocks} arrivals, got {arrivals}"
+            )
+        result = None
+        for _ in range(arrivals):
+            completed = self.arrive()
+            if completed is not None:
+                result = completed
+        assert result is not None
+        return result
+
+
 @dataclass(frozen=True)
 class K1Protocol:
     """CTA roles, mailbox ownership, and progress graph for one K1 launch."""
@@ -162,14 +198,45 @@ class K1Protocol:
         return self.tokens // self.qlen
 
     @property
+    def token_tiles(self) -> int:
+        return -(-self.tokens // WMMA_TOKEN_ROWS)
+
+    @property
+    def barrier_sequence(self) -> tuple[str, ...]:
+        """Every CTA executes this same resident-grid barrier sequence."""
+
+        return ("generation",)
+
+    @property
+    def cta_barrier_sequences(self) -> tuple[tuple[str, ...], ...]:
+        return tuple(self.barrier_sequence for _ in range(self.blocks))
+
+    @property
     def kda_task_count(self) -> int:
         return self.requests * HEADS * STATE_CHUNKS
+
+    @property
+    def uses_head_tasks(self) -> bool:
+        return self.qlen == 1
+
+    @property
+    def head_task_count(self) -> int:
+        return self.requests * HEADS
 
     def first_task(self, block: int) -> int:
         return (block - self.kda0 % self.blocks + self.blocks) % self.blocks
 
     def kda_tasks(self, block: int) -> tuple[int, ...]:
+        if self.uses_head_tasks:
+            return ()
         return tuple(range(self.first_task(block), self.kda_task_count, self.blocks))
+
+    def head_tasks(self, block: int) -> tuple[int, ...]:
+        if not self.uses_head_tasks:
+            return ()
+        return tuple(
+            range(self.first_task(block), self.head_task_count, self.blocks)
+        )
 
     def projection_tasks(self, block: int) -> tuple[int, ...]:
         if block < ATTENTION_CTAS:
@@ -187,9 +254,14 @@ class K1Protocol:
         return CtaAssignment(
             block=block,
             attention_slice=block if block < ATTENTION_CTAS else None,
-            gate_token=block if block < self.tokens else None,
+            gate_tokens=(
+                tuple(range(block, self.tokens, WMMA_TOKEN_ROWS))
+                if block < WMMA_TOKEN_ROWS
+                else ()
+            ),
             projection_tasks=self.projection_tasks(block),
             kda_tasks=self.kda_tasks(block),
+            head_tasks=self.head_tasks(block),
         )
 
     @property
@@ -197,20 +269,20 @@ class K1Protocol:
         return tuple(self.assignment(block) for block in range(self.blocks))
 
     @staticmethod
-    def _part(slice_id: int) -> str:
-        return f"part:{slice_id}"
+    def _part(tile: int, slice_id: int) -> str:
+        return f"part:{tile}:{slice_id}"
 
     @staticmethod
     def _weight(token: int) -> str:
         return f"wgt:{token}"
 
     @staticmethod
-    def _msq(slice_id: int) -> str:
-        return f"msq:{slice_id}"
+    def _msq(tile: int, slice_id: int) -> str:
+        return f"msq:{tile}:{slice_id}"
 
     @staticmethod
-    def _xrdy(slice_id: int) -> str:
-        return f"xrdy:{slice_id}"
+    def _xrdy(tile: int, slice_id: int) -> str:
+        return f"xrdy:{tile}:{slice_id}"
 
     @staticmethod
     def _projection(task: int) -> str:
@@ -226,7 +298,16 @@ class K1Protocol:
 
     @property
     def all_parts(self) -> frozenset[str]:
-        return frozenset(self._part(slice_id) for slice_id in range(ATTENTION_CTAS))
+        return frozenset(
+            self._part(tile, slice_id)
+            for tile in range(self.token_tiles)
+            for slice_id in range(ATTENTION_CTAS)
+        )
+
+    def tile_parts(self, tile: int) -> frozenset[str]:
+        return frozenset(
+            self._part(tile, slice_id) for slice_id in range(ATTENTION_CTAS)
+        )
 
     @property
     def all_weights(self) -> frozenset[str]:
@@ -234,11 +315,24 @@ class K1Protocol:
 
     @property
     def all_msq(self) -> frozenset[str]:
-        return frozenset(self._msq(slice_id) for slice_id in range(ATTENTION_CTAS))
+        return frozenset(
+            self._msq(tile, slice_id)
+            for tile in range(self.token_tiles)
+            for slice_id in range(ATTENTION_CTAS)
+        )
+
+    def tile_msq(self, tile: int) -> frozenset[str]:
+        return frozenset(
+            self._msq(tile, slice_id) for slice_id in range(ATTENTION_CTAS)
+        )
 
     @property
     def all_xrdy(self) -> frozenset[str]:
-        return frozenset(self._xrdy(slice_id) for slice_id in range(ATTENTION_CTAS))
+        return frozenset(
+            self._xrdy(tile, slice_id)
+            for tile in range(self.token_tiles)
+            for slice_id in range(ATTENTION_CTAS)
+        )
 
     @property
     def all_projection(self) -> frozenset[str]:
@@ -258,35 +352,42 @@ class K1Protocol:
             actions = []
             if assignment.attention_slice is not None:
                 slice_id = assignment.attention_slice
-                actions.append(
-                    ProtocolAction(
-                        f"slice:{slice_id}",
-                        publishes=frozenset({self._part(slice_id)}),
-                    )
-                )
-                if assignment.gate_token is not None:
-                    token = assignment.gate_token
+                for tile in range(self.token_tiles):
+                    first_token = tile * WMMA_TOKEN_ROWS
+                    rows = min(WMMA_TOKEN_ROWS, self.tokens - first_token)
                     actions.append(
                         ProtocolAction(
-                            f"gate:{token}",
-                            waits=self.all_parts,
-                            publishes=frozenset({self._weight(token)}),
+                            f"slice:{tile}:{slice_id}",
+                            publishes=frozenset({self._part(tile, slice_id)}),
                         )
                     )
-                actions.append(
-                    ProtocolAction(
-                        f"mix-partial:{slice_id}",
-                        waits=self.all_weights,
-                        publishes=frozenset({self._msq(slice_id)}),
+                    if assignment.block < rows:
+                        token = first_token + assignment.block
+                        actions.append(
+                            ProtocolAction(
+                                f"gate:{token}",
+                                waits=self.tile_parts(tile),
+                                publishes=frozenset({self._weight(token)}),
+                            )
+                        )
+                    tile_weights = frozenset(
+                        self._weight(token)
+                        for token in range(first_token, first_token + rows)
                     )
-                )
-                actions.append(
-                    ProtocolAction(
-                        f"mix-finish:{slice_id}",
-                        waits=self.all_msq,
-                        publishes=frozenset({self._xrdy(slice_id)}),
+                    actions.append(
+                        ProtocolAction(
+                            f"mix-partial:{tile}:{slice_id}",
+                            waits=tile_weights,
+                            publishes=frozenset({self._msq(tile, slice_id)}),
+                        )
                     )
-                )
+                    actions.append(
+                        ProtocolAction(
+                            f"mix-finish:{tile}:{slice_id}",
+                            waits=self.tile_msq(tile),
+                            publishes=frozenset({self._xrdy(tile, slice_id)}),
+                        )
+                    )
             projection = assignment.projection_tasks
             if projection:
                 actions.append(
@@ -298,41 +399,54 @@ class K1Protocol:
                         ),
                     )
                 )
-            for task in assignment.kda_tasks:
-                request, head, chunk = self._task_coordinates(task)
-                actions.append(
-                    ProtocolAction(
-                        f"conv:{task}",
-                        waits=self.all_projection,
-                        publishes=frozenset({self._qk(request, head, chunk)}),
+            if self.uses_head_tasks:
+                for task in assignment.head_tasks:
+                    actions.append(
+                        ProtocolAction(
+                            f"head:{task}",
+                            waits=self.all_projection,
+                        )
                     )
-                )
-                actions.append(
-                    ProtocolAction(
-                        f"gates:{task}",
-                        waits=self.all_projection
-                        | frozenset(
-                            self._qk(request, head, other)
-                            for other in range(STATE_CHUNKS)
-                        ),
+            else:
+                for task in assignment.kda_tasks:
+                    request, head, chunk = self._task_coordinates(task)
+                    actions.append(
+                        ProtocolAction(
+                            f"conv:{task}",
+                            waits=self.all_projection,
+                            publishes=frozenset(
+                                {self._qk(request, head, chunk)}
+                            ),
+                        )
                     )
-                )
-                actions.append(
-                    ProtocolAction(
-                        f"recur:{task}",
-                        publishes=frozenset({self._onrm(request, head, chunk)}),
+                    actions.append(
+                        ProtocolAction(
+                            f"gates:{task}",
+                            waits=self.all_projection
+                            | frozenset(
+                                self._qk(request, head, other)
+                                for other in range(STATE_CHUNKS)
+                            ),
+                        )
                     )
-                )
-                actions.append(
-                    ProtocolAction(
-                        f"norm:{task}",
-                        waits=self.all_projection
-                        | frozenset(
-                            self._onrm(request, head, other)
-                            for other in range(STATE_CHUNKS)
-                        ),
+                    actions.append(
+                        ProtocolAction(
+                            f"recur:{task}",
+                            publishes=frozenset(
+                                {self._onrm(request, head, chunk)}
+                            ),
+                        )
                     )
-                )
+                    actions.append(
+                        ProtocolAction(
+                            f"norm:{task}",
+                            waits=self.all_projection
+                            | frozenset(
+                                self._onrm(request, head, other)
+                                for other in range(STATE_CHUNKS)
+                            ),
+                        )
+                    )
             queues.append(tuple(actions))
         return tuple(queues)
 
@@ -381,22 +495,8 @@ class K1Protocol:
             "part": ATTENTION_CTAS * self.tokens * self.sources * 2,
             "wgt": self.tokens * (self.sources + 1),
             "msq": ATTENTION_CTAS * self.tokens,
-            "xrdy": ATTENTION_CTAS,
+            "xrdy": ATTENTION_CTAS * self.token_tiles,
             "proj": self.tokens * NPROJ,
             "qk": self.tokens * HEADS * 2 * HEAD_DIM,
             "onrm": self.tokens * HEADS * STATE_CHUNKS,
         }
-
-    def reset_chunk_owners(self, region: str) -> tuple[tuple[int, int], ...]:
-        """``(CTA, thread)`` owner of each aligned 16-byte reset chunk."""
-
-        try:
-            pairs = self.mailbox_pairs[region]
-        except KeyError as error:
-            raise ValueError(f"unknown mailbox region {region!r}") from error
-        chunks = (pairs * 8 + 15) // 16
-        lanes = self.blocks * self.threads
-        return tuple(
-            ((chunk % lanes) // self.threads, (chunk % lanes) % self.threads)
-            for chunk in range(chunks)
-        )

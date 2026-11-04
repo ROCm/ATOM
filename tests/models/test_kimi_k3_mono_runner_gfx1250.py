@@ -11,10 +11,14 @@ from aiter.jit.utils import chip_info
 
 import atom.models.kimi_k3.mono.runner_gfx1250 as runner_module
 from atom.models.kimi_k3.mono.dispatch import MonoDecodeModel
+from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
+    K1LocalBuildSpec,
+)
 from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
 from atom.models.kimi_k3.mono.runner_gfx1250 import (
     Gfx1250WidthBuild,
     K3Gfx1250MonoDecodeRunner,
+    _lean_width,
 )
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
@@ -35,20 +39,18 @@ def _entry(launcher, *names):
 
 
 def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
-    launchers = [_Launcher() for _ in range(10)]
+    launchers = [_Launcher() for _ in range(5)]
     k1 = SimpleNamespace(
         entrypoint=SimpleNamespace(
-            stages=tuple(
-                _entry(launcher, f"k1_arg_{index}")
-                for index, launcher in enumerate(launchers[:6])
-            )
+            launcher=launchers[0],
+            abi=KernelAbi(("k1_arg",)),
         )
     )
     k2 = SimpleNamespace(
-        oproj=_entry(launchers[6], "oproj"),
-        front=_entry(launchers[7], "front"),
-        finish=_entry(launchers[8], "finish"),
-        finalize=_entry(launchers[9], "finalize"),
+        oproj=_entry(launchers[1], "oproj"),
+        front=_entry(launchers[2], "front"),
+        finish=_entry(launchers[3], "finish"),
+        finalize=_entry(launchers[4], "finalize"),
     )
     build = Gfx1250WidthBuild(
         k1={1: k1, 2: k1},
@@ -59,6 +61,62 @@ def test_width_build_enumerates_each_local_launcher_once_and_compile_only():
     assert len(kernels) == len(launchers)
     compile_kernels(kernels)
     assert all(launcher.calls == [((0,), "1")] for launcher in launchers)
+
+
+def test_width_build_replaces_only_spilled_k1_with_lean_gemv():
+    spilled = _Launcher()
+    untouched = _Launcher()
+    rebuilt = object()
+    observed = []
+    spec = K1LocalBuildSpec(
+        qlen=1,
+        delta=True,
+        state_len=4,
+        eps=1e-5,
+        out_eps=1e-5,
+        onorm_eps=1e-5,
+        lower_bound=-5.0,
+        write_idx=-1,
+    )
+    plan = SimpleNamespace(
+        make_k1_local_runner=lambda lean: observed.append(lean) or rebuilt
+    )
+    old = SimpleNamespace(
+        entrypoint=SimpleNamespace(launcher=spilled),
+        spec=spec,
+        plan=plan,
+    )
+    other = SimpleNamespace(
+        entrypoint=SimpleNamespace(launcher=untouched),
+        spec=spec,
+        plan=plan,
+    )
+    built = Gfx1250WidthBuild({1: old, 2: other}, {})
+
+    lean = _lean_width(built, [spilled])
+    assert lean is not None
+    assert lean.k1 == {1: rebuilt, 2: other}
+    assert len(observed) == 1 and observed[0].gemv_unit == 1
+    assert _lean_width(built, [object()]) is None
+
+
+def test_resident_resource_hazards_include_explicit_spills(monkeypatch):
+    monkeypatch.setattr(
+        runner_module,
+        "launcher_resources",
+        lambda _launcher: [
+            {
+                "scratch": 0,
+                "vgpr_spill": 2,
+                "sgpr_spill": 3,
+                "lds": 1024,
+            }
+        ],
+    )
+    assert runner_module._resident_hazards(object()) == (
+        "2 vgpr spill",
+        "3 sgpr spill",
+    )
 
 
 def test_runner_admits_only_supported_rows_and_query_lengths():
