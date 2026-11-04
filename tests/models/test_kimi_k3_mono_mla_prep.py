@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""``ATOM_MONO_MLA_PREP=1``: an MLA layer's attention seam as the tail of the
-preceding layer's K2 (``kernels.stages.mla_prep``, P0), host side.
+"""``ATOM_MONO_MLA_PREP``: an MLA layer's attention seam (and, sub-modes 2 / 3,
+its q_a / kv_a, q_b, absorb, rope and KV-cache write) as the tail of the
+preceding layer's K2 (``kernels.stages.mla_prep``), host side.
 
 GPU-free: the flags, the bind-time refusals, which K2 builds carry the stage,
-and that a folded layer takes the stage's outputs while replaying the
-production seam's allocations. Whether the stage is right needs a GPU
+that a folded layer takes the stage's outputs while replaying the production
+seam's allocations, and sub-mode 3's buffers, arguments and decode entry. Whether the stage is right needs a GPU
 (``ATOM_MONO_MLA_PREP_CHECK``).
 """
 
@@ -74,13 +75,13 @@ def test_prep_key_only_on_the_preceding_layer_and_inside_the_width(
     assert r._prep_key(3, 1) == {}
 
 
-def test_sub_mode_3_is_refused(runner_module, monkeypatch):
+def test_an_unknown_sub_mode_is_refused(runner_module, monkeypatch):
     from atom.mono.runtime.consensus import MonoUnsupported
 
     r = _runner(runner_module)
     r.plans = []
-    monkeypatch.setenv("ATOM_MONO_MLA_PREP", "3")
-    with pytest.raises(MonoUnsupported, match="sub-modes 1"):
+    monkeypatch.setenv("ATOM_MONO_MLA_PREP", "4")
+    with pytest.raises(MonoUnsupported, match="sub-modes are 1"):
         r._bind_mla_prep()
     monkeypatch.setenv("ATOM_MONO_MLA_PREP", "0")
     r._bind_mla_prep()
@@ -146,3 +147,188 @@ def test_bind_refuses_before_reading_the_seam():
         weights.bind_mla_prep(layer, 3, Dims(8), 1)
     with pytest.raises(MonoUnsupported, match="sub-modes"):
         weights.bind_mla_prep(layer, 3, Dims(8), 4)
+
+
+def test_prep_key_carries_each_sub_mode_s_constants(runner_module):
+    prep = _prep()
+    prep.mode = 3
+    prep.qa_eps, prep.kva_eps = 1e-6, 2e-6
+    prep.rope_neox = False
+    prep.cos = torch.zeros(4096, 32)
+    r = _runner(runner_module, prep)
+    key = r._prep_key(2, 4)
+    assert key["mla_prep"] == 3
+    assert (key["qa_eps"], key["kva_eps"]) == (1e-6, 2e-6)
+    assert (key["rope_neox"], key["rope_maxpos"]) == (False, 4096)
+
+
+FP8 = torch.float8_e4m3fn
+
+
+def _prep3(q_heads=16):
+    prep = _prep()
+    prep.mode, prep.q_heads = 3, q_heads
+    for name in ("w_qb", "w_qb_s", "w_k", "w_k_s", "cos", "sin"):
+        setattr(prep, name, torch.zeros(4))
+    prep.k_scale, prep.q_scale = torch.ones(1), torch.ones(1)
+    return prep
+
+
+def _runner3(runner_module, prep, rows=ROWS, max_rows=8):
+    r = _runner(runner_module, prep)
+    r.max_rows, r.device = max_rows, "cpu"
+    r.inner = SimpleNamespace(config=SimpleNamespace(hidden_size=HIDDEN))
+    r._alloc_prep_buffers()
+    r._positions = torch.arange(rows, dtype=torch.int64) + 100
+    return r
+
+
+def test_sub_mode_3_buffers(runner_module):
+    """q_out at the decode's head stride, zeroed (the padded heads stay 0);
+    a dummy run's slots all negative."""
+    from atom.models.kimi_k3.mono.kernels.stages import mla_prep as k2pr
+
+    r = _runner3(runner_module, _prep3(q_heads=16))
+    b = r._prep_bufs
+    assert b["qb"].shape == (8, k2pr.QB) and b["qb"].dtype == torch.bfloat16
+    assert b["q_out"].shape == (8, 16, k2pr.ENTRY) and b["q_out"].dtype == FP8
+    assert not b["q_out"].float().any()
+    assert r._neg_slots.shape == (8,) and (r._neg_slots == -1).all()
+
+
+def test_sub_mode_3_needs_one_q_out_head_stride(runner_module):
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    r = _runner(runner_module, _prep3(q_heads=16))
+    r.mla_prep[7] = _prep3(q_heads=12)
+    r.max_rows, r.device = 8, "cpu"
+    r.inner = SimpleNamespace(config=SimpleNamespace(hidden_size=HIDDEN))
+    with pytest.raises(MonoUnsupported, match="q_out heads"):
+        r._alloc_prep_buffers()
+
+
+def _fc(slots, dtype_q=FP8, cache=None, dummy=False):
+    if cache is None:
+        # 4 blocks of 4 slots: the stages address slot * 576 B
+        cache = torch.zeros(4, 4, 1, 576, dtype=FP8)
+    return SimpleNamespace(
+        attn_metadata=SimpleNamespace(dtype_q=dtype_q, slot_mapping=slots),
+        kv_cache_data={"layer_3": SimpleNamespace(k_cache=cache)},
+        context=SimpleNamespace(is_dummy_run=dummy),
+    )
+
+
+def test_sub_mode_3_args(runner_module, monkeypatch):
+    from atom.models.kimi_k3.mono.kernels.stages import mla_prep as k2pr
+
+    prep = _prep3()
+    r = _runner3(runner_module, prep)
+    # a slot mapping longer than the step (the tokens' own are read)
+    slots = torch.tensor([5, -1, 9, 2, 7, 7], dtype=torch.int64)
+    fc = _fc(slots)
+    monkeypatch.setattr(runner_module, "get_forward_context", lambda: fc)
+    out = {}
+    args = r._prep_args3(3, prep, ROWS, out)
+    cache = fc.kv_cache_data["layer_3"].k_cache
+    assert args["kvc"] == cache.data_ptr() and args["kvc_sr"] == k2pr.ENTRY
+    assert args["slots"] == slots.data_ptr()
+    assert args["pos"] == r._positions.data_ptr()
+    assert args["qout"] == r._prep_bufs["q_out"].data_ptr()
+    assert args["qout_sr"] == 16 * k2pr.ENTRY
+    assert args["k_sc"] == prep.k_scale.data_ptr()
+    assert out["slots"].tolist() == [5, -1, 9, 2]
+    assert out["kvrows"].shape == (16, k2pr.ENTRY)
+    assert out["kv3"].shape == (4, 4, k2pr.ENTRY)
+    assert out["attn"]["q_out"].shape == (ROWS, 16, k2pr.ENTRY)
+    assert out["qb"].shape == (ROWS, k2pr.QB)
+    # the ABI's mode-3 arguments, every one
+    mode3 = k2pr.ARGS[k2pr.ARGS.index("w_qb") :]
+    assert set(args) == set(mode3)
+
+    # a dummy run writes no KV-cache row
+    monkeypatch.setattr(
+        runner_module, "get_forward_context", lambda: _fc(slots, dummy=True)
+    )
+    out = {}
+    args = r._prep_args3(3, prep, ROWS, out)
+    assert args["slots"] == r._neg_slots.data_ptr()
+    assert out["slots"].tolist() == [-1] * ROWS
+
+
+@pytest.mark.parametrize(
+    "fc, why",
+    [
+        (lambda s: _fc(s, dtype_q=torch.bfloat16), "q_out dtype"),
+        (
+            lambda s: _fc(s, cache=torch.zeros(4, 4, 1, 576, dtype=torch.bfloat16)),
+            "KV cache",
+        ),
+        (
+            lambda s: _fc(s, cache=torch.zeros(4, 1, 2, 576, dtype=FP8)[:, :, :1]),
+            "KV cache",
+        ),
+        (lambda s: _fc(s[:2]), "slot mapping"),
+        (lambda s: _fc(s.to(torch.int32)), "slot mapping"),
+    ],
+)
+def test_sub_mode_3_refusals(runner_module, monkeypatch, fc, why):
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    prep = _prep3()
+    r = _runner3(runner_module, prep)
+    slots = torch.arange(ROWS, dtype=torch.int64)
+    ctx = fc(slots)
+    monkeypatch.setattr(runner_module, "get_forward_context", lambda: ctx)
+    with pytest.raises(MonoUnsupported, match=why):
+        r._prep_args3(3, prep, ROWS, {})
+
+
+def test_forward_prepped_from_q_out():
+    """Sub-mode 3: the decode starts from the stage's q_out (no q_proj, absorb
+    or rope); the latent is returned as is, else g_proj gates it."""
+    try:
+        from atom.models.kimi_k3.model import KimiFullAttention
+    except (ImportError, RuntimeError) as e:  # the GPU stack, absent or no GPU
+        pytest.skip(f"atom.models.kimi_k3.model does not import here: {e!r}")
+
+    q_out = torch.zeros(ROWS, 16, 576, dtype=FP8)
+    lat = torch.ones(ROWS, 12, 512)
+    calls = []
+
+    def prebuilt(q, latent_out=False):
+        calls.append((q, latent_out))
+        return lat
+
+    def no(*a, **k):
+        pytest.fail("the production attention ran")
+
+    sa = SimpleNamespace(
+        attn=SimpleNamespace(
+            impl=SimpleNamespace(forward_decode_prebuilt=prebuilt, forward_impl=no)
+        ),
+        g_proj=no,
+    )
+    got = KimiFullAttention.forward_prepped(
+        sa, None, None, None, q_out=q_out, latent_out=True
+    )
+    assert got is lat and calls == [(q_out, True)]
+
+
+def test_forward_decode_prebuilt_dummy_run_shapes(monkeypatch):
+    try:
+        from atom.model_ops import attention_mla as am
+    except (ImportError, RuntimeError) as e:  # the GPU stack, absent or no GPU
+        pytest.skip(f"attention_mla does not import here: {e!r}")
+
+    ctx = SimpleNamespace(context=SimpleNamespace(is_dummy_run=True))
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(hidden_size=64), torch_dtype=torch.bfloat16
+    )
+    monkeypatch.setattr(am, "get_forward_context", lambda: ctx)
+    monkeypatch.setattr(am, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(am, "_mla_output_width", lambda impl, hidden: 96)
+    impl = SimpleNamespace(num_heads=12, kv_lora_rank=512)
+    q_out = torch.zeros(ROWS, 16, 576, dtype=FP8)
+    run = am.MLAAttention.forward_decode_prebuilt
+    assert run(impl, q_out).shape == (ROWS, 96)
+    assert run(impl, q_out, latent_out=True).shape == (ROWS, 12, 512)
