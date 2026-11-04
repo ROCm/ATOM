@@ -36,6 +36,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.mono.plan.architecture import GFX950, Architecture, MatrixIsa
 from atom.mono.plan.execution import THREADS, WAVES
 
 # gfx95x cache policy bits (LLVM CPol): SC0 = 1, SC1 = 16. SC1 alone is device
@@ -176,13 +177,13 @@ def div_rn(x, d, r):
     return fx.Float32(fmath.fma(fx.Float32(fmath.fma(-q, d, x)), r, q))
 
 
-def xshfl(v, off):
+def xshfl(v, off, architecture: Architecture = GFX950):
     """Value of lane ``lane ^ off``: offsets 32 / 16 via v_permlane*_swap, in-row
     offsets via DPP (VALU latency, not LDS). Powers of two only: any other
     offset would take the lane ^ 1 path."""
-    assert off in (1, 2, 4, 8, 16, 32), off
+    assert off in architecture.reduction_offsets, (architecture.gfx, off)
     if off >= 16:
-        return v.shuffle_xor(off, 64)
+        return v.shuffle_xor(off, architecture.wave_size)
     is_f = isinstance(v, fx.Float32)
     x = v.bitcast(fx.Int32) if is_f else fx.Int32(v)
     if off == 8:
@@ -198,10 +199,10 @@ def xshfl(v, off):
     return y.bitcast(fx.Float32) if is_f else y
 
 
-def xred(v, off, op):
+def xred(v, off, op, architecture: Architecture = GFX950):
     """op(v, lane ^ off) for a symmetric op; 32 / 16 take both halves of one swap."""
-    if off < 16:
-        return op(v, xshfl(v, off))
+    if off < 16 or not architecture.native_permlane_exchange:
+        return op(v, xshfl(v, off, architecture))
     is_f = isinstance(v, fx.Float32)
     x = v.bitcast(fx.Int32) if is_f else fx.Int32(v)
     a, b = permlane_swap(off, x, x)
@@ -214,13 +215,13 @@ def _add(a, b):
     return a + b
 
 
-def butterfly(v, offsets, op=_add):
+def butterfly(v, offsets, op=_add, architecture: Architecture = GFX950):
     """Butterfly reduction over the given xor offsets, in the given order.
 
     The order is the numerical contract: the aiter per-head norm reduces 32
     lanes with offsets 16, 8, 4, 2, 1, and matching it keeps rstd bit-exact."""
     for off in offsets:
-        v = xred(v, off, op)
+        v = xred(v, off, op, architecture)
     return v
 
 
@@ -291,8 +292,8 @@ def lane_all_gather(v, n, offsets, lane):
     return vs
 
 
-def wave_sum(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1))
+def wave_sum(v, architecture: Architecture = GFX950):
+    return butterfly(v, architecture.reduction_offsets, architecture=architecture)
 
 
 def traced(fn):
@@ -301,8 +302,10 @@ def traced(fn):
     return ASTRewriter.transform(fn)
 
 
-def wave_max(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)
+def wave_max(v, architecture: Architecture = GFX950):
+    return butterfly(
+        v, architecture.reduction_offsets, fx.max, architecture=architecture
+    )
 
 
 @traced
@@ -455,8 +458,29 @@ def rows_to_lds(tid, src, rows, row_words, dst, dst_row):
     )  # fmt: skip
 
 
+def mma_bf16(a, b, c, architecture: Architecture):
+    """One architecture-native BF16 16x16x32 matrix operation."""
+    if architecture.bf16_mma.isa is MatrixIsa.MFMA:
+        acc_type = T.vec(architecture.bf16_mma.accumulator_elements_per_lane, T.f32)
+        return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(acc_type, [a, b, c]))
+    if architecture.bf16_mma.isa is MatrixIsa.WMMA:
+        acc_type = fx.Vector.make_type(
+            architecture.bf16_mma.accumulator_elements_per_lane, fx.Float32
+        )
+        result = rocdl.wmma_f32_16x16x32_bf16(
+            acc_type,
+            as_ir_value(a),
+            as_ir_value(b),
+            as_ir_value(c),
+            reuseA=False,
+            reuseB=False,
+        ).result
+        return fx.Vector(result)
+    raise AssertionError(architecture.bf16_mma.isa)
+
+
 def mfma_bf16(a, b, c):
-    return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+    return mma_bf16(a, b, c, GFX950)
 
 
 def row_sum(red, r, t, waves=None):
