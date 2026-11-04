@@ -23,8 +23,10 @@ applied to the previous stage's own output. References:
   (``_fuse_rmsnorm_quant``): q8 / qs / kv bit for bit;
 * P4: AITER's triton FP8 BMM (the absorb) and aiter's
   ``fused_qk_rope_concat_and_cache_mla``: q_out's rope part bit for bit, its
-  nope part within the BMM's summation order (one FP8 step); padded tokens
-  (negative slot) keep their q_out rows;
+  nope part within the BMM's summation order: one FP8 step, or, near 0 where
+  E4M3's steps are finest, 2^-14 of the dot's sum |a w| (``ABSORB_ACC_TOL``);
+  each side's distance to the exact dot is reported. Padded tokens (negative
+  slot) keep their q_out rows;
 * P5 (P2's kv CTAs in sub-mode 3): the same rope / cache kernel's FP8 KV rows,
   bit for bit; a negative slot writes nothing.
 
@@ -435,7 +437,8 @@ def _check_p3(d, s):
 
 def _rope_ref(d, neox, kvc):
     """The production absorb + rope + KV-cache write on ``d``'s qb / kvn /
-    k_rope: (q_out [s, 16, 576], ``kvc`` written in place)."""
+    k_rope: (q_out [s, 16, 576], the BMM's bf16 output [s, 12, 512]), ``kvc``
+    written in place."""
     from atom.model_ops.attention_mla import (
         _aiter_triton_fp8_bmm,
         fused_qk_rope_concat_and_cache_mla,
@@ -456,7 +459,36 @@ def _rope_ref(d, neox, kvc):
         compute_all_q_rope=False,
     )  # fmt: skip
     torch.cuda.synchronize()
-    return q_ref
+    return q_ref, ql
+
+
+def _absorb_exact(d):
+    """The absorb with the triton BMM's A prequant (per (token, head) 128-group:
+    ``a_scale = max(amax, 1e-10) * f32(1 / 448)``, ``clamp(a * (1 / a_scale))``
+    RNE E4M3) and its epilogue (``bf16((dot * a_scale) * b_scale)``), the dot
+    exact (float64 of the FP8 products), then the rope kernel's
+    ``bf16 * inv_q``: (q_out's nope part pre-quant [s, 12, 512] f32, the dot's
+    unrounded value in q_out units, sum |a w| in q_out units)."""
+    s = d["qb"].size(0)
+    f32 = torch.float32
+    a = d["qb"].view(s, pr.HEADS, pr.QH)[..., : pr.QK_NOPE].float()
+    m = a.abs().amax(-1, keepdim=True).clamp_min(1e-10)
+    asc = m * torch.tensor(1.0 / pr.FP8_MAX, dtype=f32, device=a.device)
+    a8 = (a * (torch.ones_like(asc) / asc)).clamp(-pr.FP8_MAX, pr.FP8_MAX).to(FP8)
+    w = d["w_k"].double()
+    acc = torch.einsum("shk,hnk->shn", a8.double(), w)
+    mag = torch.einsum("shk,hnk->shn", a8.double().abs(), w.abs())
+    bsc = d["w_k_s"].reshape(()).to(f32)
+    inv_q = torch.ones((), dtype=f32, device=a.device) / d["q_sc"].reshape(())
+    ql = ((acc.to(f32) * asc) * bsc).to(torch.bfloat16)
+    unit = asc.double() * bsc.double() * inv_q.double()
+    return ql.float() * inv_q, acc * unit, mag * unit
+
+
+def _e4m3_step(v):
+    """E4M3's step at |v| (subnormal below 2^-6: 2^-9)."""
+    e = torch.floor(torch.log2(v.abs().clamp_min(2.0**-6)))
+    return torch.exp2(e - 3)
 
 
 def _check_p5(d, s, neox, kvc0):
@@ -470,18 +502,85 @@ def _check_p5(d, s, neox, kvc0):
     assert n == 0
 
 
+# The absorb's accumulation bound (q_out's nope part): 2^-12 of the dot's
+# sum |a w|, in q_out units, past one E4M3 step. The FlyDSL absorb (four bf16
+# MFMAs over K = 128) and the triton BMM (one FP8 MFMA, K = 128 inside the
+# instruction) quantize A alike and sum the same exact FP8 products, but not
+# in the same adders: two fp32 chains would agree to ~2^-24 of sum |a w| (no
+# q_out step moves), while the ~0.08% one-step differences seen at every s
+# match an adder keeping ~14 bits under the largest product. That error is
+# absolute: a fraction of an E4M3 step except near 0, where E4M3's steps
+# shrink to 2^-9 (subnormals), many binades under the row's scale. The
+# standalone P4 test's N(0, 1) qb puts q_out at a std of ~85, so its few
+# |q_out| < 2^-5 values move several steps for a dot difference of ~2^-17 of
+# sum |a w| (s = 16: one value, 3 steps). The bound leaves 2^5 of headroom
+# over that; a real defect (a wrong row, head, column or scale, an unready
+# input) is off by ~sum |a w| / sqrt(K), 2^8 times the bound.
+ABSORB_ACC_TOL = 2.0**-12
+
+
+def _p4_bound(gf, rf, mag):
+    return _e4m3_step(torch.maximum(gf.abs(), rf.abs())) + ABSORB_ACC_TOL * mag
+
+
+def _p4_report(rows, d, got, ref, exact, xr, xe, xd, mag, bad, steps, k=8):
+    """The worst nope elements (by steps, then |diff| over the bound): position,
+    the kernel's / triton's / the exact dot's E4M3 and the pre-quant values (the
+    kernel's own is not observable)."""
+    gf, rf = got.float(), ref.float()
+    diff = (gf - rf).abs()
+    tol = _p4_bound(gf, rf, mag)
+    key = steps.double() * 1e6 + diff.double() / tol.double()
+    idx = torch.topk(key.flatten(), min(k, key.numel())).indices
+    lines = []
+    for i in idx.tolist():
+        r, h, n = (
+            i // (pr.HEADS * pr.KVL),
+            (i // pr.KVL) % pr.HEADS,
+            i % pr.KVL,
+        )
+        t = int(rows[r])
+        lines.append(
+            f"  token {t} (slot {int(d['slots'][t])}) head {h} col {n}: "
+            f"{int(steps[r, h, n])} step, got {gf[r, h, n].item():.6g} "
+            f"ref {rf[r, h, n].item():.6g} exact "
+            f"{exact[r, h, n].float().item():.6g} | pre-quant: ref "
+            f"{xr[r, h, n].item():.8g} (bf16 ql * inv_q), exact {xe[r, h, n].item():.8g}"
+            f" (unrounded {xd[r, h, n].item():.8g}), sum|aw| {mag[r, h, n].item():.6g}"
+            f", |diff| {diff[r, h, n].item():.4g} vs bound {tol[r, h, n].item():.4g}"
+            f"{' BAD' if bool(bad[r, h, n]) else ''}"
+        )
+    return "\n".join(lines)
+
+
 def _check_p4(d, s, neox):
-    q_ref = _rope_ref(d, neox, d["kvc"].clone())
+    q_ref, ql = _rope_ref(d, neox, d["kvc"].clone())
     live = d["slots"] >= 0
+    rows = live.nonzero().flatten()
     got, ref = d["qout"][live][:, : pr.HEADS], q_ref[live][:, : pr.HEADS]
     rope = _ndiff(got[..., pr.KVL :], ref[..., pr.KVL :])
-    steps = _fp8_steps(got[..., : pr.KVL], ref[..., : pr.KVL])
+    got, ref = got[..., : pr.KVL], ref[..., : pr.KVL]
+    steps = _fp8_steps(got, ref)
+    xe, xd, mag = (v[live] for v in _absorb_exact(d))
+    inv_q = torch.ones((), device="cuda") / d["q_sc"].reshape(())
+    xr = ql[live].float() * inv_q
+    exact = xe.clamp(-pr.FP8_MAX, pr.FP8_MAX).to(FP8)
+    se, sr = _fp8_steps(got, exact), _fp8_steps(ref, exact)
+    gf, rf = got.float(), ref.float()
+    bad = ~((gf - rf).abs() <= _p4_bound(gf, rf, mag))  # NaN: bad
     print(
         f"s={s}: P4 q_out rope {rope} (must be 0), nope {int((steps > 0).sum())} / "
-        f"{steps.numel()} differ (max {int(steps.max())} step, absorb order)"
+        f"{steps.numel()} differ (max {int(steps.max())} step, absorb order; "
+        f"{int((steps > 1).sum())} > 1 step, {int(bad.sum())} over the bound); "
+        f"vs the exact dot: kernel {int((se > 0).sum())} (max {int(se.max())}), "
+        f"triton {int((sr > 0).sum())} (max {int(sr.max())})"
     )
+    if int(steps.max()) > 1 or bool(bad.any()):
+        print(_p4_report(rows, d, got, ref, exact, xr, xe, xd, mag, bad, steps))
     assert rope == 0
-    assert int(steps.max()) <= 1
+    assert not bool(bad.any()), "P4 nope over the absorb bound:\n" + _p4_report(
+        rows, d, got, ref, exact, xr, xe, xd, mag, bad, steps
+    )
     assert int((steps > 0).sum()) <= max(16, steps.numel() // 50)
     # padded rows and the head padding: not written
     assert _ndiff(d["qout"][~live], torch.zeros_like(d["qout"][~live])) == 0
