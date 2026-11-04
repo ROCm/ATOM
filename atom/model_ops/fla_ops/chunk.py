@@ -53,38 +53,59 @@ def chunk_gated_delta_rule_fwd(
 
     assert gating is None or (is_amd and T >= 64)
     if is_amd and T >= 64:
-        # HIP fast path: 2 kernels for the 4 steps below.
-        # chunk_local_cumsum + chunk_scaled_dot_kkt → fused_cumsum_kkt
-        # solve_tril + recompute_w_u_fwd → fused_inverse_recompute (the chunk's
-        # inverse in 16 x 16 blocks, then w / u)
-        g, A, beta_hm, scale_hm = fused_cumsum_kkt(
-            g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens, plan=plan, gating=gating
-        )
         if (
             envs.ATOM_GDN_GLUON_INVERSE
             and cu_seqlens is not None
             and k.shape[0] == 1
+            and gating is not None
+            and k.shape[2:] == (16, 128)
+            and v.shape[0] == 1
+            and v.shape[2:] == (32, 128)
+            and k.dtype == v.dtype == torch.bfloat16
+            and gating[0].dtype == gating[1].dtype == torch.bfloat16
             and _use_gfx1250_kernel(k.device.index)
         ):
-            # the same w / u from the Gluon kernel for gfx1250
-            from .fused_inverse_recompute_gfx1250 import (
-                fused_inverse_recompute_gfx1250,
-            )
+            from .fused_kkt_inverse_gfx1250 import fused_kkt_inverse_gfx1250
 
-            w, u = fused_inverse_recompute_gfx1250(
-                k, v, A, beta_hm, scale_hm, cu_seqlens, plan
+            g, w, u, beta_hm, scale_hm = fused_kkt_inverse_gfx1250(
+                k, v, cu_seqlens, plan, gating
             )
+            A = None
         else:
-            w, u = fused_inverse_recompute(
+            # Separate KKT and inverse kernels cover the remaining HIP inputs.
+            g, A, beta_hm, scale_hm = fused_cumsum_kkt(
+                g,
                 k,
-                v,
-                A,
-                beta_hm,
-                scale_hm,
+                beta,
                 chunk_size=64,
                 cu_seqlens=cu_seqlens,
                 plan=plan,
+                gating=gating,
             )
+            if (
+                envs.ATOM_GDN_GLUON_INVERSE
+                and cu_seqlens is not None
+                and k.shape[0] == 1
+                and _use_gfx1250_kernel(k.device.index)
+            ):
+                from .fused_inverse_recompute_gfx1250 import (
+                    fused_inverse_recompute_gfx1250,
+                )
+
+                w, u = fused_inverse_recompute_gfx1250(
+                    k, v, A, beta_hm, scale_hm, cu_seqlens, plan
+                )
+            else:
+                w, u = fused_inverse_recompute(
+                    k,
+                    v,
+                    A,
+                    beta_hm,
+                    scale_hm,
+                    chunk_size=64,
+                    cu_seqlens=cu_seqlens,
+                    plan=plan,
+                )
     else:
         g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
         # obtain WY representation. u is actually the new v.
