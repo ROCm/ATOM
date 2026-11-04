@@ -103,6 +103,19 @@ def _prefill_score_config(
     return SCORE_BLOCK_SIZE_Q, None, None, None, 1, False, False
 
 
+def _decode_score_num_warps(batch: int, max_block: int) -> int:
+    """Use the measured two-wave long-context scorer on gfx1250.
+
+    With at least four requests, the decode grid already exposes enough CTAs.
+    Two wave32s per CTA double residency and keep long index-K streams in
+    flight; shorter contexts and tiny batches retain Triton's four-wave
+    default, where launch latency or the smaller grid dominates.
+    """
+    if get_gfx() == "gfx1250" and batch >= 4 and max_block > 512:
+        return 2
+    return 4
+
+
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
 # floors the blocks a chunk walks -- the query tile is loaded once outside the
 # block loop, so at one block per chunk that fixed cost is the whole cost.
@@ -1487,6 +1500,7 @@ def minimax_m3_index_topk_decode(
         NUM_IDX_HEADS=num_idx_heads,
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        num_warps=_decode_score_num_warps(batch, max_block),
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
 
