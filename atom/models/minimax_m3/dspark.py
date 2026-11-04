@@ -71,9 +71,11 @@ from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
     triton_fused_norm_rope_cache,
 )
 from atom.models.dspark_draft import (
+    AllocationCap,
     DSparkConfidenceHead,
     DSparkDraftModel,
     DSparkMarkovHead,
+    KVCacheBinding,
     linear_out,
 )
 from atom.models.minimax_m3.model import MiniMaxM3MLP
@@ -168,26 +170,6 @@ def _window_rows(
     out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
     start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
     torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
-
-
-class KVCacheBinding(nn.Module):
-    """What the draft KV pool binds one layer's cache onto, and nothing else.
-
-    ``DraftKvBuilder`` recognizes a non-MLA attention module by these
-    attributes and sets ``k_cache`` / ``v_cache`` (5-D SHUFFLE), the fp8
-    per-token scales and ``max_model_len`` on it; the layer then reads and
-    writes the cache itself.
-    """
-
-    base_attention = None
-    use_mla = False
-
-    def __init__(self, layer_num: int) -> None:
-        super().__init__()
-        self.layer_num = layer_num
-        self.max_model_len = 0
-        self.k_cache = self.v_cache = torch.tensor([])
-        self.k_scale = self.v_scale = None
 
 
 class M3DSparkAttention(nn.Module):
@@ -502,19 +484,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     def first_attention_layer_num(self) -> int:
         return self.layers[0].self_attn.kv.layer_num
 
-    # ---- weight-loading hooks ---------------------------------------------
-
-    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
-        target_vocab = target_base.model.embed_tokens.num_embeddings
-        if target_vocab != self.vocab_size:
-            raise ValueError(
-                f"DSpark draft vocab {self.vocab_size} != target vocab "
-                f"{target_vocab}. The draft shares the target's embedding and LM "
-                "head, so the two must agree."
-            )
-        self.embed_tokens = target_base.model.embed_tokens
-        self.lm_head = target_base.lm_head
-
     # ---- drafting entry points (called by the proposer) --------------------
 
     def project_context(self, aux_concat: torch.Tensor) -> torch.Tensor:
@@ -535,11 +504,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         """The first call is the warmup, ahead of any capture: these addresses
         are the ones every recording bakes in."""
         max_bs = self.max_num_seqs
-        self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
-        self._alloc_host = torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
-        # Recorded after each copy out of `_alloc_host`; a fresh event has
-        # nothing to wait for.
-        self._alloc_copied = torch.cuda.Event()
+        self._alloc_cap = AllocationCap(max_bs, device)
         # One row of slack past the last request: `_window_rows` reads every
         # row as a P-wide window of this buffer.
         self._bt16_flat = torch.zeros(
@@ -589,22 +554,9 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         if self._bt16 is None or self._bt16.shape[1] != P:
             self._alloc_block_rows(P, T, block_tables.device)
 
-        # Allocated tokens per request. At least one page: the warmup batch and
-        # the pad tail address page 0 by convention. The host can run a step
-        # ahead of the device, so the previous step's copy must have read the
-        # pinned buffer before it is rewritten.
-        self._alloc_copied.synchronize()
-        pages = self._alloc_host.numpy()[:running_bs]
-        n = min(len(allocated_pages), scheduled_bs)
-        pages[:n] = allocated_pages[:n]
-        pages[n:] = 1
-        pages.clip(min=1, out=pages)
-        alloc = self._alloc[:running_bs]
-        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
-        self._alloc_copied.record()
-        alloc.mul_(self.block_size)
-
-        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        alloc = self._alloc_cap.apply(
+            allocated_pages, scheduled_bs, block_positions, slots, self.block_size
+        )
         # The rows' own lengths; `ctx_lens` is left as the proposer built it.
         ctx_eff = self._ctx_eff[:running_bs]
         torch.minimum(ctx_lens, alloc, out=ctx_eff)

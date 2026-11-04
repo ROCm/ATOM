@@ -10,7 +10,7 @@ import torch
 from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
-from atom.config import Config
+from atom.config import K3_DFLASH_ARCH, Config
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
     pcp_allgather_rerange,
@@ -138,6 +138,11 @@ support_draft_model_arch_dict = {
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
     "DSparkMiniMaxDraftModel": "atom.models.minimax_m3.dspark.MiniMaxM3DSpark",
+    # SpecForge's DFlash draft for the same target. The checkpoint's own arch
+    # string is `DSparkDraftModel` -- stamped on every DFlash draft regardless
+    # of target, and colliding with the base class in atom/models/dspark_draft.py
+    # -- so `SpeculativeConfig.hf_config_override` renames it to this.
+    K3_DFLASH_ARCH: "atom.models.kimi_k3_dflash.KimiK3DFlash",
 }
 
 
@@ -180,6 +185,7 @@ class Drafter(abc.ABC):
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
+        self._aux_extract: Callable | None = None
 
         self.metadata_buffers = self._allocate_metadata_buffers(
             self.config.max_num_seqs, self.mtp_k, self.device
@@ -378,6 +384,8 @@ class Drafter(abc.ABC):
         spec = self._aux_capture_spec(target_model)
         if spec is None:
             return
+        # a mono step bypasses the hooks and calls this itself (`AuxTaps.extract`)
+        self._aux_extract = spec.extract
         self._aux_buffers = [
             torch.zeros(
                 self.max_num_tokens,

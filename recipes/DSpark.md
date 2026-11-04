@@ -8,15 +8,16 @@ block. A per-request **confidence head** predicts how many drafted tokens are
 worth verifying, so each request can verify a different length and the freed
 batch capacity lifts throughput.
 
-ATOM supports two DSpark flavors, which differ only in **where the draft lives**:
+ATOM supports these DSpark drafts:
 
-| Target | Draft | How it's loaded |
-|---|---|---|
-| **DeepSeek-V4-Pro** | in-checkpoint (`mtp.*` namespace) | auto-detected via the `dspark_block_size` config field — no `--draft-model` |
-| **Kimi-K3** | separate checkpoint | passed explicitly with `--draft-model` |
+| Target | Draft | How it's loaded | Draft KV | DCP |
+|---|---|---|---|---|
+| **DeepSeek-V4-Pro** | in-checkpoint (`mtp.*` namespace) | auto-detected via the `dspark_block_size` config field — no `--draft-model` | target's pool | — |
+| **Kimi-K3** | [Inferact/Kimi-K3-DSpark](https://huggingface.co/Inferact/Kimi-K3-DSpark) (MLA) | `--draft-model` | extra rows in the target's MLA pool | sharded with the target |
+| **Kimi-K3** | [RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) (SpecForge DFlash, GQA) | `--draft-model` | its own pool, `--kv_cache_dtype` | not sharded: every rank holds the whole context |
 
 Everything downstream of loading — the parallel block draft, confidence-scheduled
-ragged verify, and `--dspark-config` knobs — is shared between the two.
+ragged verify, and `--dspark-config` knobs — is shared between them.
 
 ## Preparing environment
 
@@ -77,6 +78,40 @@ Notes for Kimi-K3:
 - `--draft-model` accepts a local path or an HF repo id (downloaded on startup).
 - The confidence-scheduled ragged verify (`--dspark-config`) also applies here;
   omit it to run the plain batch-uniform verify.
+
+### Kimi-K3 with the RadixArk DFlash draft (TP8 + DCP8 + FP8 KV Cache)
+
+[RadixArk/Kimi-K3-DSpark](https://huggingface.co/RadixArk/Kimi-K3-DSpark) is a
+5-layer Qwen3-style GQA draft (SpecForge DFlash) that reads an aggregate of the
+target's hidden states. ATOM loads it as `K3DFlashModel` and refuses it on any
+target other than Kimi-K3.
+
+```bash
+python -m atom.entrypoints.openai_server \
+  --model moonshotai/Kimi-K3 \
+  --draft-model RadixArk/Kimi-K3-DSpark \
+  --tensor-parallel-size 8 \
+  --decode-context-parallel-size 8 \
+  --kv_cache_dtype fp8 \
+  --block-size 128 \
+  --method dspark \
+  --num-speculative-tokens 5 \
+  --trust-remote-code \
+  --server-port 7777
+```
+
+Notes:
+- The draft has 2 KV heads at TP8 and, as in SGLang, is not split across the
+  DCP group: each rank caches the draft KV for every context token. With DCP8
+  the draft's entry is `block_size * 8` tokens: 1,310,720 B of a 3,080,192 B
+  paged block at fp8, i.e. 43% of the block including the draft, or 74% on top
+  of the target's own 1,769,472 B of MLA rows. The MLA draft above adds
+  368,640 B (17% of its 2,138,112 B block), so with the same memory this draft
+  leaves about 31% fewer KV blocks (1 - 2,138,112 / 3,080,192 = 30.6%).
+- The draft KV is fp8 when `--kv_cache_dtype fp8`, at a per-tensor scale of 1.0
+  (the checkpoint ships no KV scales). SGLang serves this checkpoint with
+  `--speculative-draft-kv-cache-dtype fp8_e4m3` and supports only per-tensor
+  fp8 KV scales as well.
 
 ### `--dspark-config` knobs
 

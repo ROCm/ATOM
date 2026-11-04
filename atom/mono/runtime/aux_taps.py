@@ -10,6 +10,7 @@ drafts from whatever the last non-mono step left behind. Every mono model that
 runs under a drafter has to write these buffers itself -- V4.1 from its
 kernels, K3 from its runner's per-layer seam."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -29,10 +30,16 @@ class AuxTaps:
     A ``-1`` entry taps the embedding rather than a decoder layer. That module
     IS still called on a mono step, so its hook fires and ``write`` simply
     never matches it.
+
+    ``extract`` is the drafter's own ``(layer_output, layer) -> tap`` function,
+    the one its hooks run (``AuxCaptureSpec.extract``); ``None`` where the
+    drafter armed none, and a model that has no layer return to hand it reads
+    only the buffers.
     """
 
     layer_ids: tuple[int, ...]
     buffers: tuple[torch.Tensor, ...]
+    extract: Callable | None = None
 
     def write(self, layer_id: int, tap: torch.Tensor | None) -> None:
         """Record ``tap`` as layer ``layer_id``'s aux hidden state, if it is
@@ -66,4 +73,4 @@ def bind_aux_taps(drafter, hidden_size: int) -> AuxTaps:
             raise MonoUnsupported(f"aux buffer {tuple(buf.shape)} {buf.stride()}")
         if buf.dtype != torch.bfloat16:
             raise MonoUnsupported(f"aux buffer {buf.dtype}")
-    return AuxTaps(layer_ids, buffers)
+    return AuxTaps(layer_ids, buffers, getattr(drafter, "_aux_extract", None))

@@ -39,6 +39,30 @@ def linear_out(output):
     return output[0] if isinstance(output, tuple) else output
 
 
+def draft_rope_scaling(config) -> "tuple[float, dict | None]":
+    """The rope theta and YaRN scaling dict of a standalone draft's own config.
+
+    A draft is trained with its own rope, not the target's, and the context
+    rows it writes are rotated with it, so both must be read from the draft
+    config. The scaling dict is ``None`` for a plain rope. Only the parsing is
+    shared: the rope type, neox style and any attention-scale correction are
+    the caller's, because they differ between drafts and a wrong one loads
+    clean.
+    """
+    rope_params = dict(getattr(config, "rope_parameters", None) or {})
+    rope_theta = rope_params.get("rope_theta") or getattr(config, "rope_theta", 10000.0)
+    use_yarn = rope_params.get("rope_type") in ("yarn", "deepseek_yarn") or (
+        rope_params.get("factor", 1.0) not in (1.0, None)
+    )
+    if not use_yarn:
+        return rope_theta, None
+    rope_scaling = dict(rope_params)
+    rope_scaling.setdefault(
+        "original_max_position_embeddings", config.max_position_embeddings
+    )
+    return rope_theta, rope_scaling
+
+
 class DSparkMarkovHead(nn.Module):
     """Low-rank first-order Markov transition bias over the draft logits.
 
@@ -177,6 +201,74 @@ class DSparkConfidenceHead(nn.Module):
         return aiter.sigmoid(logit).view(x.shape[:-1])
 
 
+class KVCacheBinding(nn.Module):
+    """What a draft KV pool binds one layer's cache onto, and nothing else.
+
+    ``DraftKvBuilder`` recognizes a non-MLA attention module by these
+    attributes and sets ``k_cache`` / ``v_cache`` (in the layout that draft's
+    pool binds), the scales and ``max_model_len`` on it; the layer then reads
+    and writes the cache itself.
+    """
+
+    base_attention = None
+    use_mla = False
+
+    def __init__(self, layer_num: int) -> None:
+        super().__init__()
+        self.layer_num = layer_num
+        self.max_model_len = 0
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = None
+
+
+class AllocationCap:
+    """Each request's allocation, in tokens, for a paged block draft.
+
+    The block writes up to T positions past the anchor, which can run past the
+    pages the scheduler allocated; a table column that was never allocated
+    reads as block 0, another request's entry. ``apply`` drops those positions'
+    writes (slot -1) and returns the allocation so the caller can cap what the
+    block reads. Buffers are sized at ``max_bs`` and only sliced, so a captured
+    block replays against each step's numbers.
+    """
+
+    def __init__(self, max_bs: int, device) -> None:
+        self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._alloc_host = torch.zeros(
+            max_bs, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        # Recorded after each copy out of `_alloc_host`; a fresh event has
+        # nothing to wait for.
+        self._alloc_copied = torch.cuda.Event()
+
+    def apply(
+        self,
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+        block_positions: torch.Tensor,  # [running_bs, T]
+        slots: torch.Tensor,  # [running_bs, T] the block's KV write slots
+        unit: int,  # tokens one allocated page id spans
+    ) -> torch.Tensor:
+        """Mask ``slots`` past each row's allocation; return it in tokens."""
+        running_bs = block_positions.shape[0]
+        # The host can run a step ahead of the device: the previous copy must
+        # have read the pinned buffer before it is rewritten.
+        self._alloc_copied.synchronize()
+        pages = self._alloc_host.numpy()[:running_bs]
+        n = min(len(allocated_pages), scheduled_bs)
+        pages[:n] = allocated_pages[:n]
+        # Pad rows and the warmup batch address page 0 by convention and read
+        # one page.
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
+        alloc = self._alloc[:running_bs]
+        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
+        self._alloc_copied.record()
+        alloc.mul_(unit)
+        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        return alloc
+
+
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
@@ -185,6 +277,12 @@ class DSparkDraftModel(nn.Module):
     # the proposer plans. A draft that attends its block another way (MiniMax-
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
+    # Whether the draft's KV is split across the target's DCP group. A draft
+    # outside it stores every position a target block id covers.
+    in_dcp_group = True
+    # Whether the draft's own pool is entry-granular, FLASH-layout and read at
+    # one per-tensor scale, rather than the generic SHUFFLE pool.
+    owns_flash_pool = False
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
@@ -301,3 +399,44 @@ class DSparkDraftModel(nn.Module):
         argument whose shape says how many requests there are.
         """
         raise NotImplementedError
+
+    def _sample_block(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """Markov-biased left-to-right sampling over the already-computed block.
+
+            logits_k <- U_k + B(x_{k-1}, .);  x_k <- argmax(logits_k)
+
+        Only this loop is sequential, and it is T tiny rank-256 matmuls rather
+        than T backbone passes -- which is the entire point of DSpark.
+        """
+        bs, T, _ = base_logits.shape
+        out_ids = anchor_ids.new_empty(bs, T + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(T):
+            # Greedy: temperature/sampling is applied by the target's verify.
+            # The column is the op's destination, so no id is written twice.
+            self.markov_head.sample_next(
+                out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+            )
+        return out_ids[:, 1:]
+
+    def share_with_target(self, target_base: nn.Module, loaded: set) -> None:
+        """Bind the embedding and LM head to the target's loaded instances.
+
+        ``target_base`` is the target ``*ForCausalLM`` (ModelRunner unwraps a
+        multimodal ``language_model`` wrapper first), whose embedding lives on
+        ``.model``. The vocabularies must agree or the shared LM head would
+        silently score the wrong rows.
+        """
+        target_vocab = int(target_base.model.embed_tokens.num_embeddings)
+        if target_vocab != self.vocab_size:
+            raise ValueError(
+                f"{type(self).__name__} draft vocab {self.vocab_size} != target "
+                f"vocab {target_vocab}. The draft shares the target's embedding "
+                "and LM head, so the two must agree."
+            )
+        self.embed_tokens = target_base.model.embed_tokens
+        self.lm_head = target_base.lm_head
