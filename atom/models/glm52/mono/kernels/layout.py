@@ -322,12 +322,9 @@ def dcp_softmax_weights(maxima, sums):
     return [value / denominator if denominator else 0.0 for value in scaled]
 
 
-def dcp_summary_index(source, sample, tile, item, samples, n_uv):
-    return ((source * samples + sample) * n_uv + tile) * DCP_SUMMARY_PAIRS + item
-
-
-def dcp_uv_owner(tile, output_heads, rank):
-    return tile // (V_DIM // UV_TILE) // output_heads == rank
+def dcp_summary_index(source, sample, head, item, samples, output_heads):
+    """Pair ``item`` of ``source``'s partial latent of (sample, owned head)."""
+    return ((source * samples + sample) * output_heads + head) * DCP_SUMMARY_PAIRS + item
 
 
 def dcp_local_uv_tile(tile, output_heads):
@@ -440,7 +437,7 @@ def layout(
 
     part = npes * samples * HIDDEN * pair_bytes
     region = 2 * part
-    dcp_part = dcp_size * samples * (heads * V_DIM // UV_TILE) * DCP_SUMMARY_PAIRS * pair_bytes if dcp_size > 1 else 0
+    dcp_part = dcp_size * samples * output_heads * DCP_SUMMARY_PAIRS * pair_bytes if dcp_size > 1 else 0
     symmetric = {
         "attn": 0,
         "ffn": region,
@@ -487,8 +484,12 @@ def stage_tasks(
     indexer_cp: bool = False,
     npes: int = 1,
     split_head_merge: bool = False,
+    dcp_size: int = 1,
 ):
     """Return ``(stage name, task count)`` pairs in execution order.
+
+    Under DCP, ``uvl`` builds each (sample, head) partial latent once and sends
+    it to the head's owner; ``uv`` then covers only the owned heads.
 
     ``split_head_merge`` folds the two head groups of an (sample, key-chunk)
     cell into one task, halving ``split``. It must be given the same value the
@@ -530,7 +531,11 @@ def stage_tasks(
             * (1 if split_head_merge else heads // WAVES)
             * (sparse_attention_topk // sparse_keys_per_task(samples, heads)),
         ),
-        ("uv", samples * (heads * V_DIM // UV_TILE)),
+    ]
+    if dcp_size > 1:
+        tasks += [("uvl", samples * heads)]
+    tasks += [
+        ("uv", samples * (heads // dcp_size * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),
         (

@@ -287,6 +287,7 @@ class Glm5MonoKernel:
             npes=npes,
             inter=W.config.inter,
             split_head_merge=W.heads // MONO_WAVES > 1,
+            dcp_size=dcp_size,
         )
         n_tasks = sum(n for _, n in self.stages)
         # debug: every task's s_memrealtime stamps, [task][TL_COLS] in

@@ -148,3 +148,50 @@ def test_a_dcp_indptr_the_kernel_cannot_read_is_refused(bufs):
 
     with pytest.raises(MonoUnsupported, match="DCP sparse indptr"):
         shared_dcp_indptr([_layer_with(b) for b in bufs], 8)
+
+
+# ------------------------------------------------------ uvl / uv under DCP
+@pytest.mark.parametrize("samples", [1, 4, 8, 12])
+def test_dcp_rebuilds_each_head_once_and_runs_only_owned_uv_tiles(samples):
+    from atom.models.glm52.mono.kernels.layout import stage_tasks
+
+    def table(heads, dcp):
+        return stage_tasks(
+            samples, heads, 2048, npes=4, inter=512, split_head_merge=True, dcp_size=dcp
+        )
+
+    names = [n for n, _ in table(64, 4)]
+    tasks = dict(table(64, 4))
+    assert names.index("split") < names.index("uvl") == names.index("uv") - 1
+    assert tasks["uvl"] == samples * 64
+    # 16 owned heads x 4 tiles: the same uv table as the 16-head DCP1 build
+    assert tasks["uv"] == dict(table(16, 1))["uv"] == samples * 64
+    assert "uvl" not in dict(table(16, 1))
+
+
+@pytest.mark.parametrize("samples", [1, 8])
+def test_dcp_summaries_tile_the_peer_buffer(samples):
+    from atom.models.glm52.mono.kernels.layout import (
+        DCP_SUMMARY_PAIRS,
+        dcp_summary_index,
+        layout,
+    )
+
+    dcp, heads, owned = 4, 64, 16
+    _, sym = layout(
+        samples, heads, 4, 2048, inter=512, output_heads=owned, dcp_size=dcp
+    )
+    # every rank's partial of every (sample, head) lands in its owner's
+    # buffer at a distinct pair, and nothing else does
+    seen = {
+        dcp_summary_index(src, s, head % owned, item, samples, owned)
+        for src in range(dcp)
+        for s in range(samples)
+        for head in range(heads)
+        if head // owned == 0
+        for item in range(DCP_SUMMARY_PAIRS)
+    }
+    n = dcp * samples * owned * DCP_SUMMARY_PAIRS
+    assert seen == set(range(n))
+    assert sym["_dcp_part_stride"] == n * 8
+    assert sym["_bytes"] - sym["dcp"] == 2 * n * 8
