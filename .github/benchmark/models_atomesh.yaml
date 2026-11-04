@@ -1701,6 +1701,7 @@ models:
           runner:
             <<: *m31_pp_review20_runner
             time_limit: "02:00:00"
+            exclude_nodes: [pit2-p03-g53]
           prefill: {}
           decode:
             workers: 1

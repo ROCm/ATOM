@@ -255,6 +255,7 @@ exports = {
     "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-atom"),
     "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-spur"),
     "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else runner.get("slurm_qos", ""),
+    "SLURM_EXCLUDE_NODES": csv_value(runner.get("exclude_nodes", [])),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
     "SLURM_TIME_LIMIT": runner.get("time_limit", "06:00:00"),
@@ -318,6 +319,7 @@ echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
+echo "exclude_nodes=${SLURM_EXCLUDE_NODES}"
 echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS:-default}"
@@ -416,6 +418,9 @@ EOF
   if [[ -n "${nodes}" ]]; then
     printf '#SBATCH -w %s\n' "${nodes}" >> "${SUBMIT_SCRIPT}"
   fi
+  if [[ -n "${SLURM_EXCLUDE_NODES}" ]]; then
+    printf '#SBATCH --exclude=%s\n' "${SLURM_EXCLUDE_NODES}" >> "${SUBMIT_SCRIPT}"
+  fi
   cat >> "${SUBMIT_SCRIPT}" <<EOF
 #SBATCH --output=${SLURM_OUTPUT}
 #SBATCH --error=${SLURM_ERROR}
@@ -453,6 +458,9 @@ else
   fi
   if [[ -n "${SLURM_QOS}" ]]; then
     SBATCH_CMD+=(--qos "${SLURM_QOS}")
+  fi
+  if [[ -n "${SLURM_EXCLUDE_NODES}" ]]; then
+    SBATCH_CMD+=(--exclude "${SLURM_EXCLUDE_NODES}")
   fi
   SBATCH_CMD+=(
     --nodes "${NUM_NODES}"
