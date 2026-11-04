@@ -2860,7 +2860,7 @@ class Config:
                     self.index_cache_dtype = "fp8" if get_gfx() == "gfx942" else "fp4"
                 else:
                     self.index_cache_dtype = "fp8"
-            elif is_deepseek_v41:
+            elif self.hf_config.model_type == "deepseek_v41_text":
                 # CSA2 reads its index plane with the paged scorer and has no
                 # other, so the plane's format does not follow the main pool's.
                 # Only the default: an explicit value is carried through to the
