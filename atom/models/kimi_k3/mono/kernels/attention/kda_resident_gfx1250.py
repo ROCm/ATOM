@@ -94,9 +94,7 @@ def _require_contract(
     if declaration.threads != 256 or declaration.waves != 8:
         raise ValueError("resident K1 requires 256 threads/eight wave32 waves")
     if declaration.blocks != GFX1250_BLOCKS:
-        raise ValueError(
-            f"resident K1 requires {GFX1250_BLOCKS} all-resident CTAs"
-        )
+        raise ValueError(f"resident K1 requires {GFX1250_BLOCKS} all-resident CTAs")
     if declaration.gemv_unit != spec.gemv_unit:
         raise ValueError("resident K1 GEMV unit drifted from its declaration")
 
@@ -118,14 +116,10 @@ def _opening_generation(sync, ticket, blocks):
                 generation,
             )
         else:
-            generation = gfx_backend.epoch_load_system_acquire(
-                sync + fx.Int64(4)
-            )
+            generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
             while generation == previous:
                 rocdl.s_sleep(1)
-                generation = gfx_backend.epoch_load_system_acquire(
-                    sync + fx.Int64(4)
-                )
+                generation = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
         fx.ptr_store(generation, ticket)
     gpu.barrier()
     generation = fx.ptr_load(ticket)
@@ -244,9 +238,7 @@ def build_resident_k1(
         )
         metadata["cs"] = (
             args["conv_st"]
-            + fx.Int64(fx.max(metadata["slot_c"], 0))
-            * fx.Int64(args["cs_seq"])
-            * 2
+            + fx.Int64(fx.max(metadata["slot_c"], 0)) * fx.Int64(args["cs_seq"]) * 2
         )
         metadata["co"] = metadata["chan"] * args["cs_dim"]
         metadata["cw"] = fx.Vector(
@@ -260,16 +252,14 @@ def build_resident_k1(
         metadata["win"] = [
             base.ld_bf(
                 metadata["cs"],
-                metadata["co"]
-                + (metadata["acc_idx"] + index) * args["cs_tok"],
+                metadata["co"] + (metadata["acc_idx"] + index) * args["cs_tok"],
             )
             for index in range(3)
         ]
         metadata["old"] = [
             base.ld_bf(
                 metadata["cs"],
-                metadata["co"]
-                + (metadata["acc_idx"] + 1 + index) * args["cs_tok"],
+                metadata["co"] + (metadata["acc_idx"] + 1 + index) * args["cs_tok"],
             )
             for index in range(spec.state_len - qlen)
         ]
@@ -369,18 +359,14 @@ def build_resident_k1(
                 rows = tile_rows[tile]
                 work_items = rows * sources * (SEAM_COLUMNS // 4)
                 for iteration in range_constexpr(
-                    (work_items + declaration.threads - 1)
-                    // declaration.threads
+                    (work_items + declaration.threads - 1) // declaration.threads
                 ):
                     work = tid + declaration.threads * iteration
                     live = work < work_items
                     item = fx.min(work, work_items - 1)
                     local_token = item // (sources * (SEAM_COLUMNS // 4))
                     source = (item // (SEAM_COLUMNS // 4)) % sources
-                    column = (
-                        bid * SEAM_COLUMNS
-                        + (item % (SEAM_COLUMNS // 4)) * 4
-                    )
+                    column = bid * SEAM_COLUMNS + (item % (SEAM_COLUMNS // 4)) * 4
                     global_token = token0 + local_token
                     is_prefix = source == declaration.nblocks
                     block_values = base.ld_bf4(
@@ -417,8 +403,7 @@ def build_resident_k1(
                             fx.Vector.from_elements(selected, fx.Float32),
                             attention.vals.ptr
                             + (
-                                (local_token * sources + source)
-                                * SEAM_COLUMNS
+                                (local_token * sources + source) * SEAM_COLUMNS
                                 + column % SEAM_COLUMNS
                             ),
                         )
@@ -426,20 +411,13 @@ def build_resident_k1(
                     query = base.ld_bf4(ares_qk, column)
                     square_sum = sum(value * value for value in selected)
                     dot = sum(
-                        selected[element]
-                        * (norm_weight[element] * query[element])
+                        selected[element] * (norm_weight[element] * query[element])
                         for element in range(4)
                     )
                     square_sum = compute["attention_reduce32"](square_sum)
                     dot = compute["attention_reduce32"](dot)
                     if live & (lane == 0):
-                        index = (
-                            (
-                                (bid * s + global_token) * sources
-                                + source
-                            )
-                            * 2
-                        )
+                        index = ((bid * s + global_token) * sources + source) * 2
                         gfx_backend.mailbox_store_device(
                             part,
                             index,
@@ -456,25 +434,17 @@ def build_resident_k1(
                 if const_expr(spec.delta or spec.write_idx >= 0):
                     copy_items = rows * (SEAM_COLUMNS // 4)
                     for iteration in range_constexpr(
-                        (copy_items + declaration.threads - 1)
-                        // declaration.threads
+                        (copy_items + declaration.threads - 1) // declaration.threads
                     ):
                         work = tid + declaration.threads * iteration
                         if work < copy_items:
                             local_token = work // (SEAM_COLUMNS // 4)
-                            local_column = (
-                                work % (SEAM_COLUMNS // 4)
-                            ) * 4
+                            local_column = (work % (SEAM_COLUMNS // 4)) * 4
                             global_token = token0 + local_token
                             column = bid * SEAM_COLUMNS + local_column
                             at = (
-                                (
-                                    local_token * sources
-                                    + declaration.nblocks
-                                )
-                                * SEAM_COLUMNS
-                                + local_column
-                            )
+                                local_token * sources + declaration.nblocks
+                            ) * SEAM_COLUMNS + local_column
                             value = [
                                 fx.ptr_load(attention.vals.ptr + at + element)
                                 for element in range(4)
@@ -553,12 +523,8 @@ def build_resident_k1(
                 device["device_fence_acquire"]()
                 gpu.barrier()
             first_task = (bid - ATTENTION_CTAS) * PROJECTION_ROWS_PER_CTA
-            accumulators0 = [
-                compute["kda_zero"]() for _ in range(len(tile_starts))
-            ]
-            accumulators1 = [
-                compute["kda_zero"]() for _ in range(len(tile_starts))
-            ]
+            accumulators0 = [compute["kda_zero"]() for _ in range(len(tile_starts))]
+            accumulators1 = [compute["kda_zero"]() for _ in range(len(tile_starts))]
             projection_context = {
                 "S": ROWS,
                 "lane": lane,
@@ -612,9 +578,7 @@ def build_resident_k1(
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
                     accumulators = (
-                        accumulators0
-                        if const_expr(task_offset == 0)
-                        else accumulators1
+                        accumulators0 if const_expr(task_offset == 0) else accumulators1
                     )
                     for tile in range_constexpr(len(tile_starts)):
                         compute["kda_gemv_store"](
@@ -641,14 +605,10 @@ def build_resident_k1(
                                     )
                                 ).to(fx.BFloat16)
                                 value = fx.Float32(value)
-                                global_token = (
-                                    tile_starts[tile] + local_token
-                                )
+                                global_token = tile_starts[tile] + local_token
                                 gfx_backend.mailbox_store_device(
                                     projected,
-                                    global_token * NPROJ
-                                    + task * ROWS
-                                    + row,
+                                    global_token * NPROJ + task * ROWS + row,
                                     value,
                                     generation,
                                 )
