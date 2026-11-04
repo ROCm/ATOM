@@ -106,6 +106,13 @@ def _has_q(q_base):
 
 
 @triton.jit
+def _sanitize_q(q):
+    """A stored q as both verify kernels read it: anything that is not a
+    probability (NaN, inf, negative, above 1) counts as 0."""
+    return tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+
+
+@triton.jit
 def _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx):
     """``(row, q_base, has_q)`` of one request: the draft row it rejected at
     (-1 if none, or greedy), its q row base, and whether that rejection has a
@@ -229,10 +236,11 @@ def _ratio_accept_kernel(
                     )
                 u = tl.rand(accept_seed, row)
                 # x was drawn from q, so q(x) must be a positive probability;
-                # anything else is not the row x came from. `u * q < p` rather
-                # than `u < p / q`: no division, so a denormal q cannot become
-                # an infinite ratio.
-                accept = (q > 0.0) & (q <= 1.0) & (u * q < p)
+                # a q of 0 (`_sanitize_q`) is not the row x came from. `u * q <
+                # p` rather than `u < p / q`: no division, so a denormal q
+                # cannot become an infinite ratio.
+                q = _sanitize_q(q)
+                accept = (q > 0.0) & (u * q < p)
             if accept:
                 tl.store(out_row + pos, tl.cast(x, tl.int32))
             else:
@@ -361,9 +369,8 @@ def _ratio_residual_race_kernel(
                 # Stored ids are distinct, so each lane takes at most one.
                 hit = inside[:, None] & (ids[:, None] == offs[None, :])
                 q += tl.sum(tl.where(hit, probs[:, None], 0.0), axis=0)
-        # Anything that is not a probability (NaN, inf, negative) counts as 0,
-        # so the residual falls back toward p rather than inheriting garbage.
-        q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+        # So the residual falls back toward p rather than inheriting garbage.
+        q = _sanitize_q(q)
         residual = tl.maximum(p - q, 0.0)
         key = race_key(
             residual, residual_seed, row.to(tl.int64) * vocab_size, offs, vmask
