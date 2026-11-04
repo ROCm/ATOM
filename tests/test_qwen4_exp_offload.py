@@ -407,12 +407,12 @@ _MP = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
         {"kv_connector": "multi", "connectors": [_MP, _IN_PROCESS]},
     ],
 )
-def test_qwen38_refuses_in_process_offload_of_quantized_caches(
+def test_qwen38_runs_in_process_offload_of_quantized_caches(
     kv_transfer_config, kv_cache_dtype, index_cache_dtype
 ):
-    """The in-process codec has no field for the QSA scale planes."""
-    with pytest.raises(ValueError, match="lmcache_offload.*#2655"):
-        _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
+    """The in-process codec carries the QSA scale planes (`k_scale`, `v_scale`,
+    `extra_planes`)."""
+    _check(kv_transfer_config, kv_cache_dtype, index_cache_dtype)
 
 
 @pytest.mark.parametrize(
@@ -529,6 +529,71 @@ def test_a_bf16_target_gives_the_mtp_draft_layer_its_own_rows():
         assert caches[4] is None  # no rope positions without image input
         assert set(scales.values()) == {None}
         assert tensor.k_scale is None and tensor.v_scale is None
+
+
+# `DenseKVByteCodec` reads these in this order; a reorder misreads every stored
+# chunk, so a new plane goes last.
+_STORED_ORDER = (
+    "k",
+    "v",
+    "k_scale",
+    "v_scale",
+    "index_raw",
+    "index_compressed",
+    "rope_positions",
+    "index_compressed_scale",
+)
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype, index_cache_dtype, draft_space",
+    [
+        ("fp8", "bf16", "qsa_draft"),
+        ("fp8", "fp8", "qsa_draft"),
+        ("fp8", "fp4", "qsa_draft"),
+        ("fp8", "fp8", "qsa"),  # ATOM_QSA_DRAFT_KV_BF16=0
+    ],
+)
+def test_every_quantized_qsa_layer_hands_the_codec_the_rows_it_binds(
+    kv_cache_dtype, index_cache_dtype, draft_space
+):
+    """The in-process codec moves exactly what a layer registers: every field
+    of its row space, its own row, in the stored order."""
+    builder, cls = _builder()
+    del builder._qsa_fields  # the real declaration, not `_builder`'s stand-in
+    config = builder.model_runner.config
+    config.kv_cache_dtype, config.index_cache_dtype = kv_cache_dtype, index_cache_dtype
+    config.hf_config.head_dim, config.hf_config.indexer_head_dim = 8, 32
+    builder.model_runner._get_num_kv_heads = lambda: 2
+    builder.block_size = 4
+    builder.cache_rope_positions = True
+    builder.device = torch.device("cpu")
+    builder.kv_pools = {}
+    targets, draft = [_QSALayer(0), _QSALayer(1)], _QSALayer(2, draft_space)
+    rows = {"qsa": {layer: i for i, layer in enumerate(targets)}}
+    rows.setdefault(draft_space, {})[draft] = len(rows.get(draft_space, ()))
+    builder._pool_rows = rows
+    cls.allocate_kv_cache_tensors(builder, blocks=2, buf=None)
+    arena = builder.qsa_arena
+    names = {field.name for field in arena.fields}
+    for layer in (*targets, draft):
+        sfx = "_draft" if layer.qsa_row_space == "qsa_draft" else ""
+        row = builder.pool_rows[layer.qsa_row_space][layer]
+        tensor = cls.build_kv_cache_tensor(builder, layer)
+        handed = [
+            t.data_ptr()
+            for t in (tensor.k_cache, tensor.v_cache, tensor.k_scale, tensor.v_scale)
+            + tensor.extra_planes
+            if t is not None
+        ]
+        assert handed == [
+            arena.view(name + sfx)[row].data_ptr()
+            for name in _STORED_ORDER
+            if name + sfx in names
+        ]
+        caches, scales = layer.bound
+        bound = (*caches, *scales.values())
+        assert {t.data_ptr() for t in bound if t is not None} == set(handed)
 
 
 def test_qsa_regions_are_built_once_per_allocation(monkeypatch):

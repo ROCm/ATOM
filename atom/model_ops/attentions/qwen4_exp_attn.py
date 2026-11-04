@@ -75,8 +75,8 @@ QSA_ROWS = "qsa"
 QSA_DRAFT_ROWS = "qsa_draft"
 
 
-# The QSA field rules. The arena, the layers binding its rows, the PAGE
-# namespace and `_check_kv_transfer` all read these.
+# The QSA field rules. The arena, the layers binding its rows and the PAGE
+# namespace all read these.
 
 
 def qsa_caches_quantized(config) -> bool:
@@ -138,17 +138,6 @@ def _check_kv_transfer(config) -> None:
                 f"kv_connector={name!r} does not read the QSA/GDN/PLE PAGE "
                 "checkpoint image."
             )
-    if "lmcache_offload" in leaves and qsa_caches_quantized(config):
-        # The in-process codec copies what `build_kv_cache_tensor` hands it:
-        # no scale planes, so a CPU hit restores rows under stale scales.
-        raise ValueError(
-            "Qwen3.8 lmcache_offload does not carry the scale planes of a "
-            "quantized QSA cache yet (kv_cache_dtype="
-            f"{getattr(config, 'kv_cache_dtype', None)!r}, index_cache_dtype="
-            f"{getattr(config, 'index_cache_dtype', None)!r}). Use "
-            "--kv-cache-dtype bf16 --index-cache-dtype bf16, or lmcache_mp, "
-            "which stores every QSA field; ROCm/ATOM#2655 lifts this."
-        )
 
 
 class _PlePlane(NamedTuple):
@@ -645,28 +634,38 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             name += sfx
             return arena.view(name)[row] if name in names else None
 
-        key, value = optional("k"), optional("v")
+        key, value, k_scale, v_scale, raw, compressed, rope, compressed_scale = map(
+            optional,
+            (
+                "k",
+                "v",
+                "k_scale",
+                "v_scale",
+                "index_raw",
+                "index_compressed",
+                "rope_positions",
+                "index_compressed_scale",
+            ),
+        )
         module.bind_caches(
             key,
             value,
-            optional("index_raw"),
-            optional("index_compressed"),
-            optional("rope_positions"),
-            k_scale_cache=optional("k_scale"),
-            v_scale_cache=optional("v_scale"),
-            compressed_key_scale=optional("index_compressed_scale"),
+            raw,
+            compressed,
+            rope,
+            k_scale_cache=k_scale,
+            v_scale_cache=v_scale,
+            compressed_key_scale=compressed_scale,
         )
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
-            k_scale=None,
-            v_scale=None,
+            k_scale=k_scale,
+            v_scale=v_scale,
             extra_planes=tuple(
                 plane
-                for plane in map(
-                    optional, ("index_raw", "index_compressed", "rope_positions")
-                )
+                for plane in (raw, compressed, rope, compressed_scale)
                 if plane is not None
             ),
         )
