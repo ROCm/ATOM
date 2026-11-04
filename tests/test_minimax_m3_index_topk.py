@@ -567,6 +567,32 @@ class TestSelectWithAiter:
         assert served != transposed and len(calls) == int(not transposed)
 
 
+def test_a_padded_replay_bounds_the_captured_batch_head_major(monkeypatch):
+    """TP2 (2 index heads), 3 of 8 captured rows scheduled: the selector reads head 1
+    at offset 8 * S, so the bounds are built from the 8 padded lengths."""
+    from atom.model_ops.minimax_m3 import sparse_attn
+
+    calls = []
+    monkeypatch.setattr(
+        sparse_attn,
+        "build_n_valid_column_per_row",
+        lambda starts, prefix, **kw: calls.append((starts, prefix, kw)),
+    )
+    seq = torch.tensor([300, 1000, 5000], dtype=torch.int32)
+    padded = torch.zeros(8, dtype=torch.int32)
+    padded[:3] = seq
+    kw = {"block_table": None, "slot_mapping": None, "max_seq_len": 1}
+    kw |= {"num_idx_heads": 2, "max_query_len": 1}
+    sparse_attn.make_sparse_decode_metadata(
+        seq_lens=seq, index_score_seq_lens=padded, **kw
+    )
+    sparse_attn.make_sparse_decode_metadata(seq_lens=seq, **kw)
+    (starts, prefix, padded_kw), (_, _, plain_kw) = calls
+    assert starts is padded and prefix is padded
+    assert (padded_kw["batch"], padded_kw["total_q"]) == (8, 8)
+    assert (plain_kw["batch"], plain_kw["total_q"]) == (3, 3)
+
+
 @gpu
 def test_the_two_selectors_agree_where_the_dispatch_switches():
     """Above the width threshold both paths must return the same selection.

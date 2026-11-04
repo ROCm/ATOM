@@ -419,3 +419,40 @@ def test_a_padded_replay_builds_the_map_and_scores_of_the_captured_batch():
     assert torch.equal(md.index_score_work_map, want)
     assert tuple(md.index_score_out.shape) == (HEADS, running * S, bound)
     assert bool((md.index_score_out == float("-inf")).all())
+
+
+def test_a_padded_replay_publishes_the_selector_bounds_of_the_captured_batch():
+    """The selector reads `heads * running_bs * S` bounds head-major, from offsets
+    baked at capture: TP2 (2 index heads) scheduled 3 of 8 rows must lay head 1 out
+    at 8, not at 3."""
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+    heads, scheduled, running, bound = 2, 3, 8, 1024
+    seq = torch.tensor([300, 1000, 5000], dtype=torch.int32, device="cuda")
+    padded = torch.zeros(running, dtype=torch.int32, device="cuda")
+    padded[:scheduled] = seq
+    md = make_sparse_decode_metadata(
+        seq_lens=seq,
+        block_table=torch.zeros((scheduled, bound), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(scheduled, dtype=torch.int64, device="cuda"),
+        max_seq_len=bound * 128,
+        num_idx_heads=heads,
+        max_query_len=1,
+        index_score_seq_lens=padded,
+    )
+    got = md.n_valid_column_per_row.view(heads, running).cpu()
+    want = torch.tensor([3, 8, 40, 0, 0, 0, 0, 0], dtype=torch.int32)
+    assert torch.equal(got, want.expand(heads, running))
+    # unpadded: the scheduled batch's own bounds, as before
+    md = make_sparse_decode_metadata(
+        seq_lens=seq,
+        block_table=torch.zeros((scheduled, bound), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(scheduled, dtype=torch.int64, device="cuda"),
+        max_seq_len=bound * 128,
+        num_idx_heads=heads,
+        max_query_len=1,
+    )
+    assert torch.equal(
+        md.n_valid_column_per_row.view(heads, scheduled).cpu(),
+        want[:scheduled].expand(heads, scheduled),
+    )

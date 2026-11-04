@@ -181,17 +181,18 @@ def make_sparse_decode_metadata(
     map is built into it here, once, with ``index_score_max_block`` as its bound.
     ``index_score_buf`` is the scorer's persistent score storage: its view for this
     step's rows is refilled with -inf here, once.
-    ``index_score_seq_lens`` is the lengths of every row the scorer runs, where a
-    padded graph replay runs more rows than ``seq_lens`` holds (pad rows are 0): the
-    map's encoding and grid and the score view's strides are those of the captured
-    batch, not the scheduled one. Default ``seq_lens``."""
+    ``index_score_seq_lens`` is the lengths of every row the scorer and selector run,
+    where a padded graph replay runs more rows than ``seq_lens`` holds (pad rows are
+    0): the map's encoding and grid, the score view's strides and the head offsets of
+    ``n_valid_column_per_row`` are those of the captured batch, not the scheduled
+    one. Default ``seq_lens``."""
     decode = MiniMaxM3SparseDecodeMetadata(
         seq_lens=seq_lens, block_table=block_table, max_query_len=max_query_len
     )
-    batch = seq_lens.shape[0]
-    work_map = None
     if index_score_seq_lens is None:
         index_score_seq_lens = seq_lens
+    batch = index_score_seq_lens.shape[0]
+    work_map = None
     if index_score_work_map_out is not None:
         from atom.model_ops.minimax_m3.index_mxfp4 import build_index_work_map
 
@@ -208,7 +209,7 @@ def make_sparse_decode_metadata(
 
         score_out = fresh_index_score(
             index_score_buf,
-            index_score_seq_lens.shape[0] * max_query_len,
+            batch * max_query_len,
             num_idx_heads,
             index_score_max_block,
             max_query_len,
@@ -223,8 +224,8 @@ def make_sparse_decode_metadata(
         # Dense rows: `max_query_len` per request, so both index arrays collapse
         # to seq_lens and each request's tail token ends at its full length.
         n_valid_column_per_row=build_n_valid_column_per_row(
-            seq_lens,
-            seq_lens,
+            index_score_seq_lens,
+            index_score_seq_lens,
             batch=batch,
             total_q=batch * max_query_len,
             num_idx_heads=num_idx_heads,
