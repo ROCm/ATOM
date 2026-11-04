@@ -242,20 +242,17 @@ class Sampler(nn.Module):
         else:
             return self._native_sample(probs, top_ks, top_ps, temperatures)
 
-    def _to_tensor_scalar(self, x: float | torch.Tensor | None, rows: int):
+    def _to_tensor_scalar(self, x: float | torch.Tensor | None):
         """Adapt filters to AITER's tensor/scalar arguments.
 
         The runner supplies uniform filters as CPU scalars, avoiding a device
         readback. Singleton tensors remain supported for existing callers.
-        With the flag set, a one-row batch's own per-row filter (the runner's
-        while lossless sampling is armed, `prepare_sample`) stays a tensor
-        rather than be read back.
         """
         if x is None:
             return (None, 0)
         if not isinstance(x, torch.Tensor):
             return (None, x)
-        if x.numel() == 1 and not (self.keep_top_k_ties and rows == 1):
+        if x.numel() == 1:
             return (None, x.item())
         return (x, 0)
 
@@ -296,8 +293,8 @@ class Sampler(nn.Module):
             k_tensor = self._per_row_k(top_ks, probs.shape[0], probs.device)
             k_scalar = 0
         else:
-            k_tensor, k_scalar = self._to_tensor_scalar(top_ks, probs.shape[0])
-        p_tensor, p_scalar = self._to_tensor_scalar(top_ps, probs.shape[0])
+            k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
+        p_tensor, p_scalar = self._to_tensor_scalar(top_ps)
 
         if has_topk and has_topp:
             # Joint k+p path

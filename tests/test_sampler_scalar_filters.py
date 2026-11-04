@@ -53,43 +53,6 @@ def test_kept_ties_take_a_per_row_k_without_readback(monkeypatch, rows, k_rows):
     assert seen["k_scalar"] == 0 and seen["p_scalar"] == 0.9
 
 
-@pytest.mark.parametrize("keep_ties", [False, True])
-def test_a_one_row_batchs_own_filters_are_read_back_only_with_the_flag_off(
-    monkeypatch, keep_ties
-):
-    """Armed, the runner hands even a one-row batch its per-row filters
-    (`prepare_sample`); with the flag set they stay tensors, no readback."""
-    from types import SimpleNamespace
-
-    seen = {}
-
-    def renorm(probs, k_tensor, k_scalar):
-        seen["k"] = (k_tensor, k_scalar)
-        return probs
-
-    def top_p(probs, indices, p_tensor, p_scalar, **_):
-        seen["p"] = (p_tensor, p_scalar)
-        return torch.zeros(probs.shape[0], 1, dtype=torch.int64)
-
-    monkeypatch.setattr(
-        sampler,
-        "aiter_ops",
-        SimpleNamespace(top_k_renorm_probs=renorm, top_p_sampling_from_probs=top_p),
-    )
-    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
-    instance = sampler.Sampler()
-    instance.keep_top_k_ties = keep_ties
-    probs = torch.full((1, 8), 1 / 8)
-    k, p = torch.tensor([4], dtype=torch.int32), torch.tensor([0.9])
-    reads = []
-    with monkeypatch.context() as patch:
-        patch.setattr(torch.Tensor, "item", lambda t: reads.append(t) or 4)
-        instance._aiter_sample(probs, k, None, True, False, probs[:, 0])
-        instance._aiter_sample(probs, None, p, False, True, probs[:, 0])
-    assert (seen["k"][0] is k, seen["p"][0] is p) == (keep_ties, keep_ties)
-    assert len(reads) == (0 if keep_ties else 2)
-
-
 def test_kept_ties_expand_a_scalar_k_per_row(monkeypatch):
     """Where the flag is set but nothing armed, the runner hands a uniform k
     as a scalar; `Sampler` expands it per row, without a readback."""
