@@ -16527,6 +16527,19 @@ models:
           env:
             common:
               ATOMESH_M31_MORIIO_READ_MODE: "true"
+        # Submission smoke: the c64 READ recipe above (same vLLM SHA, image, topology, nvfp4 + DSpark argv) at c8
+        # for 900 s. Not a performance comparison point.
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c8-read-smoke
+          concurrency: [8]
+          benchmark:
+            kind: aiperf_agentic
+            benchmark_duration: 900
+            wait_server_timeout: 7200
+            wait_router_timeout: 600
+          env:
+            common:
+              ATOMESH_M31_MORIIO_READ_MODE: "true"
         - <<: *m31_moriio_1p2d_case
           name: m31-flash-vllm-moriio-rdma-1p2d-c96
           concurrency: [96]
