@@ -19,7 +19,6 @@ import pytest
 from atom.models.kimi_k3.mono import config as k3_config
 from atom.models.kimi_k3.mono.config import (
     ATTN_RES_BLOCK,
-    BLOCKS,
     CONV_WIDTH,
     EXPERTS,
     HEAD_DIM,
@@ -33,6 +32,7 @@ from atom.models.kimi_k3.mono.config import (
     TOPK,
     config_refusal,
 )
+from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime import deployment
 
 
@@ -91,7 +91,7 @@ def servable(monkeypatch):
     `config_refusal` is reporting on the checkpoint and nothing else."""
     monkeypatch.setattr(deployment, "is_vllm", lambda: False)
     monkeypatch.setattr(deployment, "is_sglang", lambda: False)
-    monkeypatch.setattr(k3_config, "_cu_count", lambda: BLOCKS)
+    monkeypatch.setattr(deployment, "_cu_count", lambda: BLOCKS)
     monkeypatch.setattr(k3_config.envs, "ATOM_MONO_ENABLE", True)
     monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", "fp32")
     monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", False)
@@ -101,6 +101,40 @@ def test_the_shipped_k3_router_is_served(servable):
     # sigmoid + renormalize -- so the two refusals below are latent today, and
     # this is the assertion that keeps them latent.
     assert config_refusal(_atom_config()) is None
+
+
+def test_a_deployment_without_a_drafter_is_served_as_plain_decode(
+    servable, monkeypatch
+):
+    # ReplaySSM only matters to a verify step's slot table; left at its
+    # default it must not turn a drafter-less deployment away
+    monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", None)
+    atom_config = _atom_config()
+    atom_config.speculative_config = None
+    assert config_refusal(atom_config) is None
+
+
+def test_a_replayssm_deployment_is_served(servable, monkeypatch):
+    # K1 rebuilds a request's state from its checkpoint and records
+    # (``KdaPreBuild.replay_cap``) rather than reading per-token snapshots
+    monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", True)
+    assert config_refusal(_atom_config()) is None
+
+
+def test_decode_context_parallelism_is_served(servable):
+    # the kernels run no attention: the MLA layers keep the KV split
+    atom_config = _atom_config()
+    atom_config.decode_context_parallel_size = 8
+    assert config_refusal(atom_config) is None
+
+
+def test_other_mono_models_still_refuse_decode_context_parallelism(servable):
+    from atom.models.kimi_k3.mono.config import SUPPORTED_TP, Dims
+
+    atom_config = _atom_config()
+    atom_config.decode_context_parallel_size = 8
+    checks = deployment.common_refusals(atom_config, Dims, SUPPORTED_TP)
+    assert deployment.first_refusal(checks) == "decode CP"
 
 
 @pytest.mark.parametrize(
@@ -119,13 +153,13 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
 @pytest.mark.parametrize(
     ("draft_tokens", "refused"),
     [
-        (7, False),  # 8 rows: one request
-        (15, False),  # 16 rows: one request, the widest the buffers hold
-        (16, True),  # 17 rows
+        (7, False),  # 8 tokens a request
+        (15, False),  # 16 tokens a request: the widest query K1 tiles for
+        (16, True),  # 17 tokens a request
     ],
 )
-def test_the_row_cap_bounds_the_speculative_width(servable, draft_tokens, refused):
-    assert k3_config.MAX_ROWS == 16
+def test_the_query_cap_bounds_the_speculative_width(servable, draft_tokens, refused):
+    assert k3_config.MAX_QLEN == 16
     atom_config = _atom_config()
     atom_config.speculative_config = SimpleNamespace(
         method="dspark", num_speculative_tokens=draft_tokens

@@ -168,6 +168,9 @@ For a large L1 and a high-concurrency DP-attention deployment, add:
 - `--l1-read-ttl-seconds` above the longest admission wait (for example 900).
   A lookup's read locks expire after this TTL; under a long queue its chunks
   can be evicted before the retrieve, which then fails into a full recompute.
+  Set `lmcache.mp.read_ttl_seconds` in `kv_connector_extra_config` to the same
+  value: with `OFFLOAD_MP_LOOKUP_THREAD`, ATOM releases and re-asks an answer
+  left unconsumed for 0.4 x that TTL, before its locks can expire.
 - `--eviction-trigger-watermark 0.98`; the default 0.8 evicts a fifth of a
   pool that is far from full.
 - Leave `--max-gpu-workers` at its default. Per-thread lazy initialisation

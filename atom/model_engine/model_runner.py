@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -26,6 +27,7 @@ from aiter.dist.parallel_state import (
 from aiter.dist.utils import get_distributed_init_method
 from torch.profiler import record_function
 
+from atom import structured_output
 from atom.config import Config, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
@@ -98,6 +100,7 @@ from atom.utils import (
     resolve_obj_by_qualname,
     worker_process_name,
 )
+from atom.utils.distributed.utils import raise_timeout_if_dp_spans_nodes
 from atom.utils.forward_context import (
     Context,
     ForwardMode,
@@ -731,6 +734,9 @@ def _profile_runner_stage(method):
 class ModelRunner:
     def __init__(self, rank: int, config: Config):
         self.config = config
+        self.structured_output = None
+        self.structured_compile_executor = None
+        self.structured_compilations = OrderedDict()
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1055,6 +1061,7 @@ class ModelRunner:
         world_size = dp_size * pp_size * stage_span
         dp_rank = config.parallel_config.data_parallel_rank
         global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+        raise_timeout_if_dp_spans_nodes(config.parallel_config)
         if (
             config.parallel_config._managed_distributed_store
             and not torch.distributed.is_initialized()
@@ -1139,6 +1146,8 @@ class ModelRunner:
             return
         self.still_running = False
         self.vision_embeddings.clear()
+        if self.structured_compile_executor is not None:
+            self.structured_compile_executor.shutdown(wait=True, cancel_futures=True)
         # 0. Join any offload connector's copy threads. Its ThreadPoolExecutors
         #    are non-daemon, so leaving them running wedges interpreter shutdown
         #    or races an in-flight copy against atexit. Must run BEFORE the KV
@@ -3308,6 +3317,29 @@ class ModelRunner:
         )
         return device_channel, base
 
+    def release_structured_requests(self, request_ids):
+        if self.structured_output is not None:
+            self.structured_output.release(request_ids)
+
+    def prepare_structured_output(
+        self,
+        schema,
+        tool_format,
+        reasoning_end,
+        fingerprint,
+        vocab_size,
+        request_ids=(),
+    ):
+        return structured_output.prepare_worker_grammar(
+            self,
+            schema,
+            tool_format,
+            reasoning_end,
+            fingerprint,
+            vocab_size,
+            request_ids,
+        )
+
     @_profile_runner_stage
     def postprocess(
         self,
@@ -3325,10 +3357,28 @@ class ModelRunner:
         bs = batch.total_seqs_num
         # AsyncIOProcManager returns forward outputs only from worker 0.
         # Probabilities never feed sampling or the next draft; other workers
-        # need the agreed token IDs, not duplicated probability computation,
-        # broadcasts, D2H copies, or Python output records.
+        # need agreed token IDs, not duplicate scoring, transfers or records.
         need_logprobs = any(batch.return_logprobs) and self.rank == 0
         logprob_snapshot = None
+        structured = getattr(self, "structured_output", None)
+        structured_requests = getattr(batch, "structured_requests", None)
+        if structured_requests and structured is None:
+            raise ValueError("Structured output must be prepared before enqueue")
+        if structured_requests and logits.shape[-1] != structured.vocab_size:
+            raise ValueError(
+                "Target logits do not match the prepared structured vocabulary"
+            )
+        structured_prefixes = {}
+        if structured_requests:
+            if need_logprobs:
+                from atom.model_engine.token_logprobs import capture_token_logits
+
+                # Snapshot requested rows before either grammar or channel
+                # masking, including raw top candidates and token ranks.
+                logprob_snapshot = capture_token_logits(
+                    logits, batch, spec_decode_metadata
+                )
+            structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3339,9 +3389,11 @@ class ModelRunner:
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
             logits = logits[:bs]
-            # Preserve requested raw rows, including top candidates, before
-            # a required-channel mask changes the sampling distribution.
-            if need_logprobs and batch.required_channel is not None:
+            if (
+                need_logprobs
+                and batch.required_channel is not None
+                and logprob_snapshot is None
+            ):
                 from atom.model_engine.token_logprobs import capture_token_logits
 
                 logprob_snapshot = capture_token_logits(logits, batch)
@@ -3427,6 +3479,9 @@ class ModelRunner:
         channel_states = None
         if channel is not None and self.tokenID_processor.is_deferred_out:
             channel_states = advance_states(*channel, sampled_tokens)
+
+        if structured_prefixes:
+            structured.commit(sampled_tokens, batch, structured_prefixes)
 
         sampled_logprobs = None
         if need_logprobs:
@@ -3524,7 +3579,20 @@ class ModelRunner:
             num_bonus=prev_bonus_num,
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
+            structured_errors=(
+                dict(structured.errors) if structured is not None else None
+            ),
         )
+
+    def _kv_after_forward(self) -> None:
+        """Let the KV connector act behind this step's enqueued KV writes.
+
+        lmcache_mp submits same-step saves here, fenced after the forward.
+        """
+        connector = get_kvconnector()
+        callback = getattr(connector, "after_forward", None)
+        if callable(callback):
+            callback()
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
         """Publish completed chunk snapshots and the legacy final-ready event."""
@@ -3579,6 +3647,12 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
+        if getattr(batch, "structured_requests", None):
+            # Snapshot draft ids before target forward, so their D2H can overlap
+            # it. This runs after device-side deferred input assembly.
+            self.structured_output.prepare(
+                batch, get_forward_context().spec_decode_metadata
+            )
         logits, hidden_states = self.run_model(input_ids, batch)
         self._settle_target_pcp_split()
         drafter = getattr(self, "drafter", None)
@@ -3607,6 +3681,8 @@ class ModelRunner:
                 hidden_states,
                 batch.next_token_ids,
             )
+        # Every KV write of this forward is enqueued; sampling is not needed.
+        self._kv_after_forward()
         if pp_non_last or self._is_pure_middle_chunk(batch):
             # This return skips `postprocess`, hence propose() and the DP
             # collectives it carries. Run it for those and drop the ids.

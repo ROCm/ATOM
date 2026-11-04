@@ -94,6 +94,7 @@ from atom.mono.device.ops import (
     hw_rsq,
     kernel_symbol,
     launcher,
+    ld_f32,
     ld_i32,
     row_sum,
     rsrc,
@@ -235,10 +236,6 @@ def fma(a, b, c):
 def sigmoid(z):
     """Triton's ``tl.sigmoid``: 1 / (1 + exp2(-z log2(e)))."""
     return fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(z * fx.Float32(-LOG2E)))
-
-
-def ld_f32(ptr, i):
-    return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.f32))
 
 
 def ld_bf(ptr, i):

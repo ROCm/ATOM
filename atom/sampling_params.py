@@ -148,6 +148,12 @@ class SamplingParams:
     # defines one (Kimi-K3 only); None leaves the output unconstrained.
     required_channel: RequiredChannel | None = None
     top_logprobs: int = 0
+    json_schema: str | None = None
+    structured_tool_format: str | None = None
+    # Generated reasoning tokens are unconstrained until this marker closes.
+    structured_reasoning_end: str = ""
+    # Frontend default may shrink after tokenization; explicit client caps may not.
+    max_tokens_is_default: bool = False
 
     def __post_init__(self):
         if type(self.top_logprobs) is not int or not 0 <= self.top_logprobs <= 20:

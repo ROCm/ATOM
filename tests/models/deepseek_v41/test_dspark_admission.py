@@ -159,12 +159,12 @@ def test_dpa_media_rejected_before_tokenization_and_sequence_creation(
             LLMEngine.add_request(
                 engine,
                 ["image prompt"],
-                SimpleNamespace(n=2),
+                SimpleNamespace(n=2, json_schema=None),
                 multimodal_data_list=[{"image": 1}],
             )
         else:
             getattr(processor, entry)(
                 "image prompt",
-                SimpleNamespace(n=1 if entry == "preprocess" else 2),
+                SimpleNamespace(n=1 if entry == "preprocess" else 2, json_schema=None),
                 multimodal_data={"image": 1},
             )
