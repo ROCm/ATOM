@@ -28,7 +28,7 @@ from aiter.dist.parallel_state import (
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
-from atom.distributed.token_transport import custom_gather_ok
+from atom.distributed.custom_gather import custom_gather_ok
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E

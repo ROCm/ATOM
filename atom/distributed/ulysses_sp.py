@@ -12,10 +12,8 @@ rank dimension and runs with ``-tp 1 -sp W``.
 import torch
 
 from atom.config import get_current_atom_config_or_none
-from atom.distributed.token_transport import (
-    ALLGATHER_MAX_PAYLOAD_BYTES,
-    custom_gather_ok,
-)
+from atom.distributed.custom_gather import custom_gather_ok
+from atom.distributed.token_transport import ALLGATHER_MAX_PAYLOAD_BYTES
 
 # AITER is imported where used: `forward_context` imports this module on CPU.
 

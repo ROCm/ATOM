@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 
 from atom.config import get_current_atom_config
-from atom.distributed.token_transport import custom_gather_ok
+from atom.distributed.custom_gather import custom_gather_ok
 from atom.plugin.prepare import is_plugin_mode
 
 

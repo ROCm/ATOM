@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Head transport for Ulysses SP, and the custom all-gather admission it
-shares with other row gathers.
+"""Head transport for Ulysses SP.
 
 Every choice below depends only on the payload shape and the group, which are
 the same on every rank, so all ranks pick the same collective.
@@ -9,6 +8,7 @@ the same on every rank, so all ranks pick the same collective.
 
 import torch
 
+from atom.distributed.custom_gather import custom_gather_ok, usable_ca_comm
 from atom.utils import envs
 
 # Below this, sending W times the bytes through the registered-buffer
@@ -21,25 +21,6 @@ ALLGATHER_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
 # exchange (FP8 with a gathered amax, the four-rank exchange kernel); decode
 # stays below it on the all-gather.
 HEAD_EXCHANGE_MIN_LOCAL_ROWS = 2048
-
-
-def _ca_comm(group):
-    ca = getattr(getattr(group, "device_communicator", None), "ca_comm", None)
-    return None if ca is None or ca.disabled else ca
-
-
-def custom_gather_ok(
-    payload: torch.Tensor, group, max_bytes: int | None = None
-) -> bool:
-    """Whether AITER's registered-buffer all-gather takes ``payload``, and, with
-    ``max_bytes``, whether the payload is small enough to prefer it. Reads only
-    the env, the group and the payload's shape, so every rank agrees."""
-    if max_bytes is not None and payload.numel() * payload.element_size() > max_bytes:
-        return False
-    if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
-        return False
-    ca = _ca_comm(group)
-    return ca is not None and bool(ca.should_custom_ag(payload))
 
 
 def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
@@ -104,7 +85,7 @@ def head_exchange_comm(group):
         return None
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return _ca_comm(group) if get_gfx_runtime() == "gfx950" else None
+    return usable_ca_comm(group) if get_gfx_runtime() == "gfx950" else None
 
 
 def head_exchange_view(ca, x: torch.Tensor, rows: int, dtype=None):
