@@ -104,6 +104,100 @@ def test_staged_metadata_refreshes_reordered_ragged_and_empty_batches(device):
             )
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_final_request_bucket_refreshes_serving_tail_and_preserves_capture(
+    monkeypatch, device
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    from atom.model_ops.attentions.deepseek_v41.backend import DECODER_ROWS
+
+    monkeypatch.setenv("ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET", "1")
+    monkeypatch.setenv("ATOM_DECODER_GRAPH_SIZES", "1,2,4,8,12,16")
+    geo = V41PoolGeometry(2, ((0, 2),), 32, 128, 512, 32)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.geometry, builder.device, builder.block_size = geo, device, 32
+    builder.max_bs, builder.max_num_batched_tokens = 32, 4096
+    builder._decoder_replays, builder.engram = True, None
+    builder.config = SimpleNamespace(image_token_id=None)
+    builder.cache = PagedAttentionCache(geo, 32, 8, device, max_tokens=4096)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=metadata_buffers(32, 4096, 16, device, geo)
+    )
+    builder.model_runner.forward_vars.update(
+        builder._step_buffer_copies(DECODER_ROWS, builder._step_buffer_names())
+        | builder._decoder_layout_buffers()
+    )
+    builder.prepare_model_inputs = lambda *args: None
+    batch = SimpleNamespace(
+        is_dummy_run=False,
+        req_ids=(10, 20, 30),
+        num_scheduled_tokens=(300, 200, 128),
+        context_lens=(300, 200, 128),
+        state_slots_committed=(3, 5, 1),
+        block_tables=(tuple(range(10)), tuple(range(10, 17)), tuple(range(20, 24))),
+        total_seqs_num=3,
+        total_tokens_num=628,
+        total_tokens_num_prefill=628,
+        is_final_chunk=(True, False, True),
+        replaying={},
+        state_maintenance_ops=SimpleNamespace(
+            relocations=(), checkpoint_stores=(), checkpoint_restores=()
+        ),
+    )
+    before = builder.cache.backing.clone()
+    pointers = {
+        name: value.gpu.data_ptr()
+        for name, value in builder.model_runner.forward_vars.items()
+    }
+    for final_count, local_finals, expected_requests in (
+        (9, (True, False, True), 12),
+        (2, (True, False, True), 2),
+        (2, (False, False, False), 2),
+        (9, (True, False, True), 12),
+    ):
+        batch.is_final_chunk = local_finals
+        mode = SimpleNamespace(
+            scheduled_bs=3,
+            running_bs=32,
+            sync=SimpleNamespace(
+                any_rank_has_prefill=True,
+                tbo_collective_active=False,
+                max_final_requests_across_dp=final_count,
+            ),
+        )
+        builder.publish_cu_seqlens_q(batch, mode)
+        metadata, _ = builder.build(batch, 32, 1024, 1, forward_mode=mode)
+        plan = metadata.step.decoder
+        assert metadata.step.slots.numel() == 32
+        assert plan.last.numel() == expected_requests
+        assert plan.tail.width == expected_requests * 128
+        assert plan.filled == (256 if any(local_finals) else 0)
+        if any(local_finals):
+            assert plan.last_rows.tolist() == [299, 627]
+            assert plan.tail.slots[:2].tolist() == [3, 1]
+            assert plan.tail_rows[:256].tolist() == (
+                list(range(172, 300)) + list(range(500, 628))
+            )
+        else:
+            assert plan.tail.requests == ()
+            assert torch.all(plan.tail.batch_ids == -1)
+            assert torch.all(plan.tail.slots == 0)
+        assert builder._decoder_running_bs is None
+        assert {
+            name: value.gpu.data_ptr()
+            for name, value in builder.model_runner.forward_vars.items()
+        } == pointers
+        torch.testing.assert_close(builder.cache.backing, before, rtol=0, atol=0)
+
+    # Capture bypasses serving build() and keeps the explicitly declared
+    # bucket after serving used another count at these same addresses.
+    metadata, _ = builder.build_for_req_graph_capture(8, finishing=False)
+    assert metadata.step.decoder.last.numel() == 8
+    assert metadata.step.decoder.tail.width == 1024
+    torch.testing.assert_close(builder.cache.backing, before, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("engram", [False, True])
 def test_engram_rows_are_staged_for_the_width_not_for_the_tokens(engram):
     """The forward runs wider than the batch, and Engram feeds every row.

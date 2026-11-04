@@ -12,6 +12,7 @@ from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.models.deepseek_v41.bounded_replay import (
     carry_selections,
     decoder_replay_unsupported,
+    decoder_request_bucket,
     decoder_runs,
     decoder_stages,
     late_layer_start,
@@ -533,6 +534,81 @@ def _dp_forward(sizes, prefill, *, final=1, tbo=False, is_prefill=True, capture=
 
 def _tables(stages):
     return tuple(None if s is None else s.tokens_across_dp for s in stages)
+
+
+@pytest.mark.parametrize(
+    "final,running_bs,capacity,sizes,expected",
+    [
+        (2, 32, 16384, "1,2,4,8,12,16", 2),
+        (9, 32, 16384, "1,2,4,8,12,16", 12),
+        (17, 32, 16384, "1,2,4,8,12,16", 17),
+        (3, 32, 16384, "16,2,8,4", 4),
+        (3, 3, 16384, "1,2,4,8", 3),
+        (3, 32, 256, "1,2,4,8", 3),
+        (2, 32, 16384, "", 2),
+        (0, 32, 16384, "1,2,4,8", 1),
+    ],
+)
+def test_decoder_bucket_uses_the_group_final_count(
+    monkeypatch, final, running_bs, capacity, sizes, expected
+):
+    monkeypatch.setenv("ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET", "1")
+    monkeypatch.setenv("ATOM_DECODER_GRAPH_SIZES", sizes)
+    forward = _dp_forward([512, 512], (True, True), final=final)
+    mode = forward.context.forward_mode
+    assert decoder_request_bucket(running_bs, mode, 128, capacity) == expected
+
+
+@pytest.mark.parametrize("case", ["disabled", "capture", "tbo", "decode"])
+def test_decoder_bucket_preserves_declared_or_full_forward_shapes(monkeypatch, case):
+    monkeypatch.setenv(
+        "ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET", "0" if case == "disabled" else "1"
+    )
+    forward = _dp_forward(
+        [512, 512],
+        (False, False) if case == "decode" else (True, True),
+        final=2,
+        tbo=case == "tbo",
+        capture=case == "capture",
+    )
+    assert decoder_request_bucket(32, forward.context.forward_mode, 128, 16384) == 32
+
+
+@pytest.mark.parametrize("final,expected", [(0, 1), (2, 2), (9, 12)])
+def test_prefill_and_decode_peers_derive_identical_smaller_stage_tables(
+    monkeypatch, final, expected
+):
+    monkeypatch.setenv("ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET", "1")
+    monkeypatch.setenv("ATOM_DECODER_GRAPH_SIZES", "1,2,4,8,12,16")
+    prefill = _dp_forward([512, 40], (True, False), final=final)
+    decode = _dp_forward([512, 40], (True, False), final=final, is_prefill=False)
+    rank1 = SimpleNamespace(data_parallel_size=2, data_parallel_rank=1)
+    stages = []
+    for forward, parallel, replaying in (
+        (prefill, PARALLEL, True),
+        (decode, rank1, False),
+    ):
+        requests = decoder_request_bucket(32, forward.context.forward_mode, 128, 16384)
+        stages.append(
+            decoder_stages(forward, parallel, requests * 128, requests, replaying)
+        )
+    assert (
+        _tables(stages[0])
+        == _tables(stages[1])
+        == (
+            (expected * 128, 40),
+            (expected, 40),
+        )
+    )
+    assert stages[0][0].local_tokens == expected * 128
+    assert stages[1][0].local_tokens == stages[1][1].local_tokens == 40
+
+
+def test_invalid_group_final_count_is_rejected(monkeypatch):
+    monkeypatch.setenv("ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET", "1")
+    forward = _dp_forward([512, 512], (True, True), final=3)
+    with pytest.raises(ValueError, match="finishing count"):
+        decoder_request_bucket(2, forward.context.forward_mode, 128, 16384)
 
 
 def test_a_replaying_rank_beside_a_decoding_peer_runs_the_tail():

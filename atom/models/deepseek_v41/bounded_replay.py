@@ -23,14 +23,17 @@ global KV and the encoder's window rows stay as the cache has them, and the
 rows from where the forward resumed read those rows, exact; only what the rows
 feed the decoder is new.
 
-The tail is a request bucket. Its rows are laid out for the step's
-``running_bs`` requests, ``W`` each (``tail_width``): the finishing requests'
+The tail is a request bucket. Its rows are laid out for the decoder's
+requests, ``W`` each (``tail_width``): the finishing requests'
 first, then zero-length padding requests and rows no request owns
-(``lay_out_tail``). One shape per ``running_bs`` is what lets the decoder
-record as a request graph (`decoder_graph.DecoderGraph`).
+(``lay_out_tail``). By default this is the outer ``running_bs``. Opt-in
+final-request bucketing rounds the DP-wide maximum finishing count onto
+``ATOM_DECODER_GRAPH_SIZES``, independently of the target and draft batch.
+One shape per decoder bucket lets it record as a request graph
+(`decoder_graph.DecoderGraph`).
 
 DP attention. The decoder's MoE collectives are sized by every rank's rows,
-which the tail changes. ``running_bs`` is the group's, so every prefilling
+which the tail changes. The decoder bucket is the group's, so every prefilling
 rank runs the same tail width and request count, and a rank still decoding
 its own rows; each derives that table from the step's DP sync
 (``decoder_stages``). While any rank runs the decoder, a rank finishing no
@@ -57,6 +60,7 @@ import torch
 
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
+from atom.utils import envs
 from atom.utils.forward_context import DPStage
 
 
@@ -129,6 +133,31 @@ def tail_width(requests: int, window: int, capacity: int) -> int:
     the ``capacity`` its buffers hold -- which every finishing request's rows
     fit in, since they are rows of the forward."""
     return min(requests * window, capacity)
+
+
+def decoder_request_bucket(running_bs: int, mode, window: int, capacity: int) -> int:
+    """The decoder's request count, agreed independently of the draft batch.
+
+    Serving ranks use the same maximum finishing count from the existing DP
+    sync, including a decoding peer that only needs the decoder's stage sizes.
+    Captures keep their declared bucket, as do TBO steps that compute every row.
+    At least one padding request lets a rank with no final prompt join a peer.
+    A count beyond the recorded ladder runs eagerly at its exact size.
+    """
+    if not envs.ATOM_DSV41_DECODER_FINAL_REQUEST_BUCKET or mode is None:
+        return running_bs
+    sync = mode.sync
+    if sync.tbo_collective_active or not sync.any_rank_has_prefill:
+        return running_bs
+    requests = max(1, sync.max_final_requests_across_dp)
+    if requests > running_bs:
+        raise ValueError("Decoder finishing count exceeds the agreed request batch")
+    sizes = sorted(
+        n
+        for n in envs.ATOM_DECODER_GRAPH_SIZES
+        if requests <= n <= running_bs and n * window <= capacity
+    )
+    return sizes[0] if sizes else requests
 
 
 @dataclass(frozen=True)
@@ -261,7 +290,7 @@ def decoder_stages(forward, parallel_config, width: int, requests: int, replayin
     ``(None, None)`` where every MoE layer runs the step's own rows.
 
     A prefilling rank replays and runs ``width`` and ``requests`` rows -- the
-    same on every one, since the group's ``running_bs`` fixes both
+    same on every one, since the group's decoder request bucket fixes both
     (`tail_width`) -- and a rank still decoding runs its own rows. Every rank
     of a step with no prefill or a TBO-split one runs its own rows, and so does
     a warmup's (``replaying`` False on a prefill: no rank replays). A capture
