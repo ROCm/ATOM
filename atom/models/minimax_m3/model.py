@@ -708,8 +708,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         # SP runs on TP 1 (Config); the fused FP32-norm quant takes OCP FP8 only.
-        # Plain TP, -tp 1 included, keeps the BF16-rounded quantization that mono
-        # matches, so its FP8 activations differ from SP's bit for bit.
+        # Plain TP keeps main's BF16-rounded quantization (TP4 mono matches it),
+        # and so does -tp 1, whose FP8 activations differ from SP's bit for bit.
         self._quantize_fp32_norm = sp_is_enabled() and dtypes.fp8 == torch.float8_e4m3fn
 
     def forward(
