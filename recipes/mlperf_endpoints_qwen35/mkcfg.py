@@ -74,6 +74,10 @@ if os.environ.get("CLIENT_MAX_IDLE"):
     cfg["settings"].setdefault("client", {})["max_idle_time"] = float(os.environ["CLIENT_MAX_IDLE"])
 if os.environ.get("METRICS_TOKENIZER_WORKERS"):
     cfg["settings"]["metrics_tokenizer_workers"] = int(os.environ["METRICS_TOKENIZER_WORKERS"])
+# METRICS_ISL=0: no input-length metric. The end-of-run drain then skips the chat-template render of every prompt
+# (~40 ms each on one thread: ~1.5 h at c1536); tps, TPOT and OSL do not use it.
+if os.environ.get("METRICS_ISL") == "0":
+    cfg["settings"]["metrics_isl"] = False
 cfg["endpoint_config"]["endpoints"] = ["http://localhost:8000"]
 cfg["report_dir"] = report_dir
 
