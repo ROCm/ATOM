@@ -19,6 +19,7 @@ from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_update,
 )
 from atom.utils import envs
+from atom.utils.call_observe import observe
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -64,6 +65,7 @@ def fused_gdn_gating_kernel(
     )
 
 
+@observe
 def fused_gdn_gating(
     A_log: torch.Tensor,
     a: torch.Tensor,

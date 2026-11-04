@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.call_observe import observe
+
 from .op import exp
 
 
@@ -524,6 +526,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         return o, final_state
 
 
+@observe
 def fused_recurrent_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.utils.call_observe import observe
+
 # from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 PAD_SLOT_ID = -1
@@ -596,6 +598,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
+@observe
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1210,6 +1213,7 @@ def _causal_conv1d_update_kernel(
         tl.store(v_ptrs, acc, mask=mask_token & is_v_block)
 
 
+@observe
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,

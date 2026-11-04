@@ -770,6 +770,15 @@ class ModelRunner:
                 )
             self.profiler_dir = os.path.join(config.torch_profiler_dir, rank_name)
             os.makedirs(self.profiler_dir, exist_ok=True)
+        if envs.ATOM_OP_RECORD_DIR is not None:
+            from atom.utils import op_record
+
+            rank_name = self.rank_name
+            if config.pipeline_parallel_size > 1:
+                rank_name = (
+                    f"pp{config.parallel_config.pipeline_parallel_rank}_{rank_name}"
+                )
+            op_record.install(self, os.path.join(envs.ATOM_OP_RECORD_DIR, rank_name))
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)

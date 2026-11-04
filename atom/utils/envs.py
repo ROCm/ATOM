@@ -760,6 +760,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "0") == "1"
     ),
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
+    # Record every aiter op call's signature and count, graph replays
+    # included, one directory per rank (atom/utils/op_record.py).
+    "ATOM_OP_RECORD_DIR": lambda: os.getenv("ATOM_OP_RECORD_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
     # stop scanning it.  On by default; set 0 to keep the old behaviour.

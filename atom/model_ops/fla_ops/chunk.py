@@ -12,6 +12,8 @@ import torch
 import triton
 from einops import rearrange
 
+from atom.utils.call_observe import observe
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -203,6 +205,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         return o, final_state
 
 
+@observe
 @torch.compiler.disable
 def chunk_gated_delta_rule(
     q: torch.Tensor,
