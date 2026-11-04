@@ -143,7 +143,9 @@ def _drafter_double(online):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
             draft_model_hf_config=SimpleNamespace(
-                torch_dtype=torch.bfloat16, quantization_config=None
+                model_type="kimi_k3_dspark",
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
             ),
             model=DRAFT_PATH,
         ),
@@ -160,7 +162,7 @@ def test_standalone_draft_does_not_inherit_the_target_static_scheme():
     """A bf16 draft beside an MXFP4 target is built unquantized, from its own
     config, with compilation off and the target config untouched."""
     drafter = _drafter_double(None)
-    cfg = Drafter._standalone_draft_config(drafter)
+    cfg = Drafter._standalone_draft_config(drafter, object)
     assert cfg.hf_config is drafter.speculative_config.draft_model_hf_config
     assert cfg.quant_config.global_spec.quant_type == QuantType.No
     assert not cfg.quant_config.online_quant
@@ -172,7 +174,7 @@ def test_standalone_draft_gets_the_runs_online_override():
     """The online override is the run's (Config.online_quant_config), not a
     copy kept on the target's quant config."""
     online = {"global_quant_config": "ptpc_fp8"}
-    cfg = Drafter._standalone_draft_config(_drafter_double(online))
+    cfg = Drafter._standalone_draft_config(_drafter_double(online), object)
     assert cfg.quant_config.online_quant
     assert cfg.quant_config.online_quant_config_raw == online
 
@@ -187,8 +189,22 @@ def test_standalone_draft_quant_config_probes_the_draft_checkpoint(monkeypatch):
         "unquantized_layer_keys",
         lambda model: seen.append(model) or frozenset(),
     )
-    Drafter._standalone_draft_config(_drafter_double(None))
+    Drafter._standalone_draft_config(_drafter_double(None), object)
     assert seen == [DRAFT_PATH]
+
+
+def test_standalone_draft_quant_config_is_remapped_to_the_draft_modules():
+    """Exclude names in HF form are rewritten onto the draft class's packed
+    modules, as ModelRunner does for the target."""
+    draft_class = SimpleNamespace(
+        packed_modules_mapping={"gate_proj": ("gate_up_proj", 0)}
+    )
+    online = {
+        "global_quant_config": "ptpc_fp8",
+        "exclude_layer": ["model.layers.0.mlp.gate_proj"],
+    }
+    cfg = Drafter._standalone_draft_config(_drafter_double(online), draft_class)
+    assert cfg.quant_config.online_exclude_layers == ["model.layers.0.mlp.gate_up_proj"]
 
 
 class _ForeignQuantType:

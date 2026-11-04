@@ -44,6 +44,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    append_linear_rows,
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     uses_mxfp4_n32k4_scale,
@@ -1048,36 +1049,6 @@ def kda_attention_with_output(
     return self._forward_impl(hidden_states, hidden_states_scale)
 
 
-def _fused_per_token_scale(mods) -> torch.Tensor | None:
-    """The scale of KDA's fused in-proj, from the projections it concatenates.
-
-    They must share one scheme: bf16 (returns None) or per_Token FP8, whose
-    per-row scales concatenate in the weights' order. Compared by value: in a
-    plugin process QuantType members from different aiter imports differ.
-    """
-    quant_values = {m.quant_type.value for m in mods}
-    if len(quant_values) != 1:
-        raise NotImplementedError(
-            "KDA in-proj fusion needs one scheme across the projections it "
-            f"concatenates; got {sorted({m.quant_type.name for m in mods})}."
-        )
-    value = quant_values.pop()
-    if value == QuantType.No.value:
-        return None
-    if value != QuantType.per_Token.value:
-        raise NotImplementedError(
-            "KDA in-proj fusion supports unquantized (bf16) or per-output-channel "
-            f"FP8 (per_Token) attention weights; got {mods[0].quant_type.name}."
-        )
-    scales = [getattr(m, "weight_scale", None) for m in mods]
-    if not all(
-        p is not None and p.data.shape[0] == m.weight.shape[0]
-        for p, m in zip(scales, mods)
-    ):
-        raise ValueError("per_Token weight scales must be one row per output channel")
-    return torch.cat([p.data for p in scales])
-
-
 class KimiKDAAttention(nn.Module):
     @property
     def mamba_type(self) -> str:
@@ -1134,9 +1105,8 @@ class KimiKDAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
         )
-        # Keep beta separate so the fused in-proj output width remains the
-        # tile-aligned 4 * local_proj_size. Beta is widened to fp32 in _run_kda.
-        # quant_config: a statically FP8 checkpoint's b_proj has a per-row scale.
+        # Beta: appended to in_proj in process_weights_after_loading (one fused
+        # GEMM); widened to fp32 in _run_kda.
         self.b_proj = ColumnParallelLinear(
             self.hidden_size,
             self.num_heads,
@@ -1263,7 +1233,7 @@ class KimiKDAAttention(nn.Module):
         dominate on the launch-bound decode path.
 
         Supports bf16 or per-output-channel FP8 (``per_Token``) attention
-        weights; any other scheme is rejected (see ``_fused_per_token_scale``).
+        weights; any other scheme is rejected (see ``append_linear_rows``).
         """
         if getattr(self, "_in_proj_fused", False):
             return
@@ -1271,26 +1241,11 @@ class KimiKDAAttention(nn.Module):
         # in_proj already holds the fused [q | k | v | g] (4 * local_proj_size);
         # b_proj and f_a_proj are appended as the two tails.
         tails = (self.b_proj, self.f_a_proj)
-        # Before in_proj's weight grows: each scale is checked against its own
-        # module's rows.
-        fused_scale = _fused_per_token_scale((self.in_proj, *tails))
-        fused = torch.cat(
-            [self.in_proj.weight.data, *[m.weight.data for m in tails]], dim=0
-        ).contiguous()
-        # Grow in_proj's weight in place so the existing module (and its
-        # tgemm path) produces the wide fused output directly; its own post-load
-        # hook runs after this one and pads/preshuffles the fused shape if FP8.
-        self.in_proj.weight = nn.Parameter(fused, requires_grad=False)
-        if fused_scale is not None:
-            self.in_proj.weight_scale = nn.Parameter(fused_scale, requires_grad=False)
-        # Release the tails' storage (weight and, if FP8, its scale now live in
-        # in_proj). Their post-load hooks are no-ops because LinearBase returns
-        # early on an empty weight.
-        for m in tails:
-            m.weight.data = m.weight.data.new_empty(0)
-            scale = getattr(m, "weight_scale", None)
-            if scale is not None:
-                scale.data = scale.data.new_empty(0)
+        # Grows in_proj's weight (and FP8 scale) in place so the existing module
+        # (and its tgemm path) produces the wide fused output directly; its own
+        # post-load hook runs after this one and pads/preshuffles the fused
+        # shape if FP8.
+        append_linear_rows(self.in_proj, tails)
 
         # Pre-concatenate the static q/k/v causal-conv weights once here instead
         # of rebuilding the [3*local_proj_size, K] tensor on every forward.
@@ -1326,8 +1281,8 @@ class KimiKDAAttention(nn.Module):
             # in-kernel with use_beta_sigmoid_in_kernel, and triton's sigmoid
             # follows the input dtype -- a bf16 beta yields a bf16 write
             # strength, which erodes the delta-rule state update across the 71
-            # KDA layers (measured gsm8k regression). b_proj stays bf16; only
-            # this reduction is widened.
+            # KDA layers (measured gsm8k regression). Beta is a slice of the
+            # fused in_proj output; only its dtype into the kernel is widened.
             beta=beta.float(),
             A_log=self.A_log,
             dt_bias=self.dt_bias,

@@ -657,6 +657,54 @@ def weight_is_stored_preshuffled(
     return False
 
 
+def append_linear_rows(dst: nn.Module, tails) -> None:
+    """Append the output rows of ``tails`` to ``dst``'s weight, so one GEMM on
+    ``dst`` produces ``[dst | *tails]``. Call before ``dst``'s post-load hook,
+    which then preshuffles/pads the grown shape.
+
+    The modules must share one scheme: bf16, or per_Token FP8, whose per-row
+    scales concatenate in the weights' order. Compared by value: in a plugin
+    process QuantType members from different aiter imports differ. The tails
+    are left as empty shells; their post-load hooks return early on an empty
+    weight.
+    """
+    mods = (dst, *tails)
+    quant_values = {m.quant_type.value for m in mods}
+    if len(quant_values) != 1:
+        raise NotImplementedError(
+            "Appending linear rows needs one scheme across the modules; got "
+            f"{sorted({m.quant_type.name for m in mods})}."
+        )
+    value = quant_values.pop()
+    if value not in (QuantType.No.value, QuantType.per_Token.value):
+        raise NotImplementedError(
+            "Appending linear rows supports unquantized (bf16) or "
+            f"per-output-channel FP8 (per_Token) weights; got {dst.quant_type.name}."
+        )
+    if value == QuantType.per_Token.value:
+        # Before dst's weight grows: each scale is checked against its own rows.
+        scales = [getattr(m, "weight_scale", None) for m in mods]
+        if not all(
+            p is not None and p.data.shape[0] == m.weight.shape[0]
+            for p, m in zip(scales, mods)
+        ):
+            raise ValueError(
+                "per_Token weight scales must be one row per output channel"
+            )
+        dst.weight_scale = nn.Parameter(
+            torch.cat([p.data for p in scales]), requires_grad=False
+        )
+    dst.weight = nn.Parameter(
+        torch.cat([m.weight.data for m in mods], dim=0).contiguous(),
+        requires_grad=False,
+    )
+    for m in tails:
+        m.weight.data = m.weight.data.new_empty(0)
+        scale = getattr(m, "weight_scale", None)
+        if scale is not None:
+            scale.data = scale.data.new_empty(0)
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,

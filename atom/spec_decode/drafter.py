@@ -19,6 +19,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
+from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
 from atom.utils.forward_context import (
     DPMetadata,
@@ -316,27 +317,55 @@ class Drafter(abc.ABC):
         effect here so the value is available when buffers are sized.
         """
 
-    def _standalone_draft_config(self) -> Config:
+    def _standalone_draft_config(self, model_class) -> Config:
         """The target config with the draft's own hf_config and quant spec.
 
         A standalone draft (eagle3, or DSpark with --draft-model) loads its own
         checkpoint, so its static quant scheme comes from that checkpoint; the
-        run's --online_quant_config still applies to it. Shallow copy: the
-        config can hold non-picklable cuda.Stream objects, and only the fields
-        set here change. Compilation is off for the draft.
+        run's --online_quant_config still applies to it. Its layer names are
+        remapped onto ``model_class``'s packed modules, as the target's are in
+        ModelRunner. Shallow copy: the config can hold non-picklable cuda.Stream
+        objects, and only the fields set here change. Compilation is off for
+        the draft.
         """
         cfg = copy.copy(self.config)
         cfg.hf_config = self.speculative_config.draft_model_hf_config
         cfg.compilation_config = copy.copy(self.config.compilation_config)
         cfg.compilation_config.level = CompilationLevel.NO_COMPILATION
-        # A quantized standalone draft is not supported yet: it would also need
-        # its model's packed-module remap (remap_layer_name), not applied here.
         cfg.quant_config = QuantizationConfig(
             cfg.hf_config,
             self.config.online_quant_config,
             model=self.speculative_config.model,
         )
+        cfg.quant_config.remap_layer_name(
+            cfg.hf_config,
+            packed_modules_mapping=getattr(model_class, "packed_modules_mapping", {}),
+            quant_exclude_name_mapping=getattr(
+                model_class, "quant_exclude_name_mapping", {}
+            ),
+        )
         return cfg
+
+    def _build_standalone_draft(self, model_class) -> nn.Module:
+        """Build a draft that loads its own checkpoint (eagle3, DSpark with
+        --draft-model) from ``_standalone_draft_config``."""
+        # Draft attention layer_num continues from the target's layer count so
+        # it maps to the correct kv_cache_data entry.
+        model = model_class(
+            self._standalone_draft_config(model_class),
+            layer_offset=self.config.hf_config.num_hidden_layers,
+        )
+        # Whether this draft needs a KV pool of its own is answered by the
+        # backend its own config resolves to. A draft whose rows are the
+        # target's latent (K2.6 EAGLE 3.1) binds into the target's pool and
+        # gets None; ModelRunner keys its draft-pool allocation off the presence
+        # of this attribute, so None simply never sets it.
+        builder = draft_kv_builder(
+            self.runner, self.speculative_config.draft_model_hf_config
+        )
+        if builder is not None:
+            self.runner.draft_kv_builder = builder
+        return model
 
     def _build_draft_model(self, model_class) -> nn.Module:
         """Construct the draft ``nn.Module``. Default builds a plain draft from

@@ -15,7 +15,6 @@ from atom.distributed.pcp_utils import (
 from atom.model_ops.attentions.backends import PAD_SLOT_ID
 from atom.model_ops.embed_head import empty_token_ids
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
@@ -199,27 +198,11 @@ class EagleProposer(Drafter):
         return fwd_out, self.model.compute_draft_ids(fwd_out, out=ids)
 
     def _build_draft_model(self, model_class) -> nn.Module:
-        draft_model_hf_config = self.speculative_config.draft_model_hf_config
         if self.speculative_config.method == "eagle3":
-            # Eagle3 draft has its own architecture, so build it from the
-            # draft hf_config (torch.compile off: Dynamo trips on the separate
-            # KV cache binding).
-            draft_atom_config = self._standalone_draft_config()
-            # Draft attention layer_num must continue from the target model's
-            # layer count so it maps to the correct kv_cache_data entry.
-            model = model_class(
-                draft_atom_config,
-                layer_offset=self.config.hf_config.num_hidden_layers,
-            )
-            # Whether this draft needs a KV pool of its own is a property of
-            # the draft's config, answered by the backend that config resolves
-            # to. A draft whose rows are the target's latent (K2.6 EAGLE 3.1)
-            # binds into the target's pool and gets None here; model_runner
-            # accounts for its +1 layer via num_nextn_predict_layers.
-            builder = draft_kv_builder(self.runner, draft_model_hf_config)
-            if builder is not None:
-                self.runner.draft_kv_builder = builder
-            return model
+            # Eagle3 draft has its own architecture, built from the draft
+            # hf_config (torch.compile off: Dynamo trips on the separate KV
+            # cache binding).
+            return self._build_standalone_draft(model_class)
 
         return model_class(self.config)
 

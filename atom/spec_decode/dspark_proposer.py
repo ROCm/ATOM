@@ -378,23 +378,7 @@ class DSparkProposer(Drafter):
 
         # Standalone draft: build from the DRAFT's own hf_config, as
         # EagleProposer does for eagle3.
-        draft_hf = self.speculative_config.draft_model_hf_config
-        draft_atom_config = self._standalone_draft_config()
-        model = model_class(
-            draft_atom_config,
-            layer_offset=self.config.hf_config.num_hidden_layers,
-        )
-        from atom.spec_decode.draft_kv import draft_kv_builder
-
-        # Whether this draft needs a pool of its own is answered by the backend
-        # its own config resolves to -- a draft whose rows are the target's
-        # latent binds into the target's pool and answers None. ModelRunner
-        # keys its draft-pool allocation and per-module binding off the
-        # presence of this attribute, so None simply never sets it.
-        builder = draft_kv_builder(self.runner, draft_hf)
-        if builder is not None:
-            self.runner.draft_kv_builder = builder
-        return model
+        return self._build_standalone_draft(model_class)
 
     @property
     def draft_tokens_per_seq(self) -> int:
