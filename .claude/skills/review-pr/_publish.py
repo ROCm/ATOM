@@ -424,6 +424,14 @@ def _line_starting(card, prefix):
     return ""
 
 
+# The inline index exactly as build_review writes it, so the degraded retry can remove it.
+# If build_review's wording changes and this stops matching, the test below fails rather
+# than the index silently surviving into a review that has no anchors.
+INDEX_BLOCK = re.compile(
+    r"\n*\*\*\d+ finding\(s\) posted inline, on the lines they are about:\*\*\n(?:.*\n?)*?(?=\n\n|\Z)"
+)
+
+
 def build_review(pr, card, diff_text, flagged, sha):
     """-> the exact body of POST /pulls/{pr}/reviews.
 
@@ -548,6 +556,13 @@ def do_post(pr):
             # silently sheds half its findings reads exactly like a review that only had
             # the other half -- the failure this project keeps finding in its own parts.
             payload = dict(payload)
+            # Drop the inline index first. It says "N finding(s) posted inline, on the lines
+            # they are about" -- true of the attempt GitHub just refused, false of the one
+            # being sent, where comments[] is empty. Left in, the degraded review claims N
+            # findings sit on lines that carry nothing and then prints the same N again
+            # below: the reader is told to look somewhere there is nothing, which is the
+            # inverse of the silence this fallback exists to prevent.
+            payload["body"] = INDEX_BLOCK.sub("", payload["body"]).rstrip()
             payload["body"] = (
                 payload["body"]
                 + "\n\n_The findings below could not be attached to their lines — GitHub "
