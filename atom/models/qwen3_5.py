@@ -44,8 +44,6 @@ from atom.models.utils import (
     maybe_prefix,
 )
 from atom.plugin.prepare import is_plugin_mode
-from atom.quant_spec import QuantType
-from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 

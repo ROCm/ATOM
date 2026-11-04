@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from atom.quant_spec import LayerQuantConfig, QuantType
+from atom.quant_spec import QuantType
 from atom.utils import envs
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {
