@@ -153,21 +153,21 @@ def test_logprob_detokenization_preserves_punctuation_spaces():
 @pytest.mark.parametrize("traced", [False, True])
 @pytest.mark.parametrize("starts_open", [False, True])
 def test_schema_literal_answer_preserves_json_and_logprob_source(traced, starts_open):
-    from atom.entrypoints.openai.logprobs import SourceText
+    from atom.entrypoints.openai.logprobs import LogprobText
     from atom.entrypoints.openai.reasoning import ReasoningChannel
 
     answer = '{"text":"<think>literal</think>"}'
     prefix = "reason</think>" if starts_open else ""
     text = prefix + answer
     owner = object()
-    source = SourceText([(text, 0, len(text))], owner) if traced else text
+    source = LogprobText([(text, 0, len(text))], owner) if traced else text
     reasoning, content = ReasoningChannel(
         starts_open=starts_open, literal_answer=True
     ).split(source)
     assert reasoning == ("reason" if starts_open else None)
     assert content == answer
     if traced:
-        assert isinstance(content, SourceText)
+        assert isinstance(content, LogprobText)
         assert content.owner is owner
         assert content.source_ranges == [(len(prefix), len(text))]
 

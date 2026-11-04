@@ -334,9 +334,9 @@ class ReasoningChannel:
 
     def split(self, text: str) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``."""
-        from .logprobs import SourceText, join_text
+        from .logprobs import LogprobText, join_text
 
-        if isinstance(text, SourceText) or self.literal_answer:
+        if isinstance(text, LogprobText) or self.literal_answer:
             reader = self.stream()
             segments = reader.process(text) + reader.flush()
             return (

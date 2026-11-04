@@ -3,7 +3,7 @@
 
 """Request-owned logprob processing for visible text.
 
-TokenBytes maps tokenizer IDs to original bytes. SourceText preserves those
+TokenBytes maps tokenizer IDs to original bytes. LogprobText preserves those
 positions through parsing. LogprobsProcessor decodes deltas and claims records
 from its bounded spool; LogprobCollector connects it to coalesced engine output.
 Chat wire-format assembly lives in serving_chat.py.
@@ -16,8 +16,8 @@ from contextlib import ExitStack
 from tempfile import SpooledTemporaryFile
 
 
-class SourceText(str):
-    """Parsed text retaining original byte spans, including UTF-8 replacements."""
+class LogprobText(str):
+    """Decoded text retaining byte spans for token-logprob attribution after parsing."""
 
     def __new__(cls, parts, owner):
         parts = tuple(p for p in parts if p[0])
@@ -35,7 +35,7 @@ class SourceText(str):
             return str.__getitem__(self, key)
         start, end, step = key.indices(len(self))
         if step != 1:
-            raise ValueError("Source text requires contiguous slices")
+            raise ValueError("Logprob text requires contiguous slices")
         parts, at = [], 0
         for text, lo, hi in self.parts:
             left, right = max(0, start - at), min(len(text), end - at)
@@ -50,7 +50,7 @@ class SourceText(str):
                     first, last = lo, hi
                 parts.append((text[left:right], first, last))
             at += len(text)
-        return SourceText(parts, self.owner)
+        return LogprobText(parts, self.owner)
 
     def __add__(self, other):
         return join_text((self, other))
@@ -63,17 +63,17 @@ def join_text(parts):
     parts = list(parts)
     if not parts or type(parts[0]) is str and all(type(p) is str for p in parts):
         return "".join(parts)
-    traced = next((p for p in parts if isinstance(p, SourceText)), None)
+    traced = next((p for p in parts if isinstance(p, LogprobText)), None)
     if traced is None:
         return "".join(parts)
     spans = []
     for part in parts:
         if not part:
             continue
-        if not isinstance(part, SourceText) or part.owner is not traced.owner:
+        if not isinstance(part, LogprobText) or part.owner is not traced.owner:
             raise ValueError("Parser lost source-byte provenance")
         spans.extend(part.parts)
-    return SourceText(spans, traced.owner)
+    return LogprobText(spans, traced.owner)
 
 
 class _LogprobStore:
@@ -220,7 +220,7 @@ class LogprobsProcessor:
             else:
                 parts.append((decoded, start, start + len(data)))
                 break
-        sourced = SourceText(parts, self)
+        sourced = LogprobText(parts, self)
         if sourced != text:
             raise RuntimeError("Token-byte decoder lost source alignment")
         return sourced
@@ -228,7 +228,7 @@ class LogprobsProcessor:
     def take(self, text):
         if not text:
             return []
-        if not isinstance(text, SourceText) or text.owner is not self:
+        if not isinstance(text, LogprobText) or text.owner is not self:
             raise RuntimeError("Visible text has no token-byte source spans")
         result = []
         for start, end in text.source_ranges:
@@ -253,7 +253,7 @@ class LogprobsProcessor:
             for text, start, end in value.parts
         )
         for start, end, field, text in spans:
-            values[field].extend(self.take(SourceText([(text, start, end)], self)))
+            values[field].extend(self.take(LogprobText([(text, start, end)], self)))
         return values
 
     def close(self):

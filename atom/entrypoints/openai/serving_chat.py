@@ -283,13 +283,13 @@ def create_chat_chunk(
         ],
     }
     if with_logprobs and delta:
-        from .logprobs import SourceText
+        from .logprobs import LogprobText
 
         fields = {
             field: text
             for field, text in delta.items()
             if field in ("content", "reasoning_content")
-            and isinstance(text, SourceText)
+            and isinstance(text, LogprobText)
             and text
         }
         probabilities = (
@@ -298,7 +298,7 @@ def create_chat_chunk(
         if probabilities:
             chunk["choices"][0]["logprobs"] = probabilities
         chunk["choices"][0]["delta"] = {
-            field: str(text) if isinstance(text, SourceText) else text
+            field: str(text) if isinstance(text, LogprobText) else text
             for field, text in delta.items()
         }
     if usage is not None or include_usage:
