@@ -56,7 +56,7 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.model_ops.spec_sampling.softmax_tiles import argmax_lowest_id
+from atom.model_ops.tile_argmax import argmax_lowest_id
 
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline

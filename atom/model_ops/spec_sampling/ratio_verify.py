@@ -28,9 +28,10 @@ from atom.model_ops.spec_sampling.ratio_target_p import (
 )
 from atom.model_ops.spec_sampling.sampling_filter import _FILTER_COUNT_MAX_K
 from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch
-from atom.model_ops.spec_sampling.softmax_tiles import argmax_lowest_id, race_key
+from atom.model_ops.spec_sampling.softmax_tiles import race_key
 from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
-from atom.model_ops.spec_sampling.verify_kernels import _draft_token, _finish_request
+from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.verify_kernels import _draft_token, _finish_request
 
 # Philox via `tl.rand` on a per-step SPMD counter, so every TP rank draws alike.
 # The key's high word names the purpose (0: the draft's noise), so no two
@@ -372,7 +373,9 @@ def _ratio_residual_race_kernel(
                 e = start + tl.arange(0, BLOCK_Q)
                 inside = e < last
                 ids = tl.load(row_ids + e, mask=inside, other=-1)
-                probs = tl.load(q_probs_ptr + q_row * q_width + e, mask=inside, other=0.0)
+                probs = tl.load(
+                    q_probs_ptr + q_row * q_width + e, mask=inside, other=0.0
+                )
                 # Stored ids are distinct, so each lane takes at most one.
                 hit = inside[:, None] & (ids[:, None] == offs[None, :])
                 q += tl.sum(tl.where(hit, probs[:, None], 0.0), axis=0)

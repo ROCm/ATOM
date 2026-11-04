@@ -37,7 +37,8 @@ from torch import nn
 from atom.utils import envs
 
 if TYPE_CHECKING:
-    from atom.model_ops.spec_sampling import SamplingScratch, SparseQStore
+    from atom.model_ops.spec_sampling.sampling_scratch import SamplingScratch
+    from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
 
 
 @dataclass(frozen=True)

@@ -26,7 +26,8 @@ import triton.language as tl
 
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.sampling_scratch import Region
-from atom.model_ops.spec_sampling.softmax_tiles import argmax_lowest_id, race_key
+from atom.model_ops.spec_sampling.softmax_tiles import race_key
+from atom.model_ops.tile_argmax import argmax_lowest_id
 
 # Stages 3 and 5 tile V identically (the cut hands each tile a slot range).
 # 256 bins at 4096 / 4 warps measured fastest for the histogram on gfx950.

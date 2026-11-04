@@ -64,13 +64,10 @@ from atom.model_ops.spec_sampling.sampling_filter_descent import (
     _ratio_filter_pass_kernel,
 )
 from atom.model_ops.spec_sampling.sampling_scratch import SamplingScratch
-from atom.model_ops.spec_sampling.softmax_tiles import (
-    argmax_lowest_id,
-    race_key,
-    softmax_combine_kernel,
-)
+from atom.model_ops.spec_sampling.softmax_tiles import race_key, softmax_combine_kernel
 from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
-from atom.model_ops.spec_sampling.verify_kernels import _draft_token, _finish_request
+from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.verify_kernels import _draft_token, _finish_request
 
 DEV = "cuda"
 ANCHOR = 0

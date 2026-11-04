@@ -4,12 +4,8 @@ import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
-from atom.model_ops.spec_sampling import (
-    RatioVerifyInputs,
-    _draft_token,
-    _finish_request,
-    _ratio_sample,
-)
+from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs, _ratio_sample
+from atom.model_ops.verify_kernels import _draft_token, _finish_request
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
 

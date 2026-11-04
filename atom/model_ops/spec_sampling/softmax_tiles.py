@@ -6,12 +6,14 @@ ratio verify builds p this way; the sampled draft takes only the max
 (``WITH_INV_Z=False``), as its q is normalized over the stored entries.
 `race_key` and `argmax_lowest_id` (lowest id on a tie) are the one exponential
 race every draw goes through, so the draws cannot drift apart bit by bit;
-`argmax_lowest_id` is also the draft's greedy argmax and the verify's
-per-tile raw argmax.
+`argmax_lowest_id` (`tile_argmax`, outside this package: the default greedy
+op uses it too) is also the verify's per-tile raw argmax.
 """
 
 import triton
 import triton.language as tl
+
+from atom.model_ops.tile_argmax import argmax_lowest_id
 
 
 @triton.jit
@@ -46,24 +48,6 @@ def race_key(mass, seed, noise_base, ids, mask):
     racing the same row, draws the same uniform for an id.
     """
     return tl.where(mask, mass / -tl.log(tl.rand(seed, noise_base + ids)), -1.0)
-
-
-@triton.jit
-def argmax_lowest_id(key, ids, mask, sentinel):
-    """``(max, lowest id holding it)`` of a ``[BLOCK]`` or ``[ROWS, BLOCK]``
-    tile along its last axis, over the lanes ``mask`` keeps.
-
-    The tie rule ``torch.argmax`` and ``topk_select(..., tie="low")`` make. A
-    tile no lane of which equals its max (masked out throughout, or all NaN,
-    since NaN equals nothing) answers ``sentinel``; callers pick one past
-    every real id and map it back into range themselves.
-    """
-    best = tl.max(key, axis=-1)
-    if len(key.shape) == 1:
-        hit = key == best
-    else:
-        hit = key == best[:, None]
-    return best, tl.min(tl.where(hit & mask, ids, sentinel), axis=-1)
 
 
 # The ratio verify launches this eagerly at whatever batch arrives, so the row

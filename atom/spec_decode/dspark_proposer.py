@@ -7,7 +7,7 @@ from torch import nn
 from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
-from atom.model_ops.spec_sampling import RatioVerifyInputs
+from atom.model_ops.spec_sampling.ratio_verify import RatioVerifyInputs
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_lossless import DSparkLossless

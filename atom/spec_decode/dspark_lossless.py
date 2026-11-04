@@ -17,16 +17,15 @@ from atom.distributed.pcp_utils import get_pcp_world_size
 from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.dspark_markov_argmax import markov_weights_unsupported
 from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
-from atom.model_ops.spec_sampling import (
-    Q_WIDTH,
-    RatioVerifyInputs,
-    SparseQStore,
-    ratio_verify_scratch,
-    warmup_ratio_verify,
-)
 from atom.model_ops.spec_sampling.dspark_markov_sample import (
     dspark_markov_sample_scratch,
 )
+from atom.model_ops.spec_sampling.ratio_verify import (
+    RatioVerifyInputs,
+    ratio_verify_scratch,
+    warmup_ratio_verify,
+)
+from atom.model_ops.spec_sampling.sparse_q_store import Q_WIDTH, SparseQStore
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
 from atom.spec_decode.draft_q_staging import DraftQStaging

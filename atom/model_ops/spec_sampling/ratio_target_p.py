@@ -32,10 +32,10 @@ from atom.model_ops.spec_sampling.sampling_filter_count import count_floor
 from atom.model_ops.spec_sampling.sampling_filter_descent import descend_floor
 from atom.model_ops.spec_sampling.sampling_scratch import Region
 from atom.model_ops.spec_sampling.softmax_tiles import (
-    argmax_lowest_id,
     softmax_combine_kernel,
     tile_max_sumexp,
 )
+from atom.model_ops.tile_argmax import argmax_lowest_id
 
 # Vocab tile every ratio kernel walks in.
 _RATIO_BLOCK_V = 4096
