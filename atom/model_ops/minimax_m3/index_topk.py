@@ -632,6 +632,19 @@ def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, de
     chunk z is the same pages for every query tile that reaches it.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
+    # M3's served single-request long-prefill window. Twenty-four blocks per
+    # program balances query reuse against grid width better than the nearest
+    # power-of-two sizes on gfx1250: q=4536 score 44.86 (16) / 39.69 (8) ->
+    # 37.01 us, while complete exact top-k improves 59.15 -> 50.76 us. The
+    # #341 q=2517/ctx=105K shape and q=2048/3072/4096 buckets improve too.
+    if (
+        get_gfx() == "gfx1250"
+        and batch * heads == 1
+        and q_tiles >= 16
+        and 400 <= max_block <= 1024
+    ):
+        return 24
+
     want = _compute_units(index) * SCORE_CHUNK_CTAS_PER_CU
     chunks = max(1, want // max(1, q_tiles * batch * heads))
     chunks = min(1 << (chunks.bit_length() - 1), max(1, max_block))
