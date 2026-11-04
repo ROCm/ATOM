@@ -625,6 +625,17 @@ class TestCostGate:
         assert d._decode_tick_us == pytest.approx(10_000)
 
 
+def test_mixed_execution_preserves_adaptive_tokens_without_protecting_decode():
+    d = make_delayer()
+    d.notify_prefill_executed(123, decoded=True)
+    assert d._adapt_last_tokens == 123
+    assert d._prefill_executed_since_last_decision
+    assert not d._prefill_only_since_last_decision
+    d.notify_prefill_executed(7, decoded=False)
+    assert d._adapt_last_tokens == 130
+    assert d._prefill_only_since_last_decision
+
+
 class TestFillAgainstThePrefillBudget:
     def test_fill_is_measured_against_what_a_step_can_admit(self):
         """Under mixed batching a step admits at most `prefill_budget` (the
