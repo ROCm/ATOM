@@ -408,6 +408,13 @@ jobs:
             bash -lc '
               set -euo pipefail
               [ -f "$MODEL_DIR/config.json" ]
+              # An interrupted download can leave config.json and some shards
+              # but no index or tokenizer; only a completion marker proves the
+              # download finished, otherwise let the next step resume it.
+              if [ ! -f "$MODEL_DIR/.download-complete" ] && [ ! -f "$MODEL_DIR/.atom_download_complete" ]; then
+                echo "No download completion marker under $MODEL_DIR"
+                exit 1
+              fi
               python3 - <<'"'"'PY'"'"'
           import json
           import os
