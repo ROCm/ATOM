@@ -301,21 +301,16 @@ RESTORE
   and so on that host. A non-loopback server address under multi-node DP is
   rejected.
 - A TP group spanning hosts (`--tensor-parallel-size-local`) also runs one
-  server per host, with `lmcache.mp.host` at a loopback address. Each host's
-  ranks form its server's world: worker ID = rank within the host, and the
-  model namespace names the host. The engine's scheduler asks every host's
-  server, listed in `lmcache.mp.tp_host_server_urls` in host order as the
-  engine's host reaches them (the first may stay loopback), so the other hosts'
-  servers must listen on a reachable address (`--host 0.0.0.0`). A prefix loads
-  only when every host reports the same hit; otherwise every host's read locks
-  are released and the request recomputes.
+  server per host; see [MP across hosts](#mp-across-hosts-a-tp-group-spanning-hosts).
 - DCP: a block-table entry is a virtual block of `block_size * dcp` global
   tokens, of which each rank's physical block holds its interleaved share. The
   PAGE groups are registered with `tokens_per_block = block_size * dcp`, which
   LMCache moves as one compressed block per entry, so the chunk size must be a
-  multiple of it (Kimi-K3 TP8 + DCP8 at block 16: chunk 128). The DCP interleave
-  size must divide the block size. No PAGE block is the same on two ranks under
-  DCP, so TP ranks never collapse.
+  multiple of it (Kimi-K3 TP8 + DCP8 at block 16: a multiple of 128). The DCP
+  interleave size must divide the block size, and the model namespace names it:
+  a server outlives the engines that fill it, and an engine restarted with
+  another interleave must not read the shares the previous one stored. No PAGE
+  block is the same on two ranks under DCP, so TP ranks never collapse.
 - PP, PCP, and engine-driven transfers are rejected.
 - PAGE tensors are registered as zero-copy `uint8` views, preserving FP8/BF16
   bit patterns and avoiding numerical dtype conversion in ROCm pointer paths.
@@ -333,6 +328,77 @@ RESTORE
   the exact READY state image.
 - LMCache may still allocate internal GPU transfer buffers. Direct aliases
   remove an additional ATOM SLOT image, not every transport copy.
+
+### MP across hosts: a TP group spanning hosts
+
+With `--tensor-parallel-size-local`, one TP group runs on several hosts (for
+example Kimi-K3 `-tp 8` on two 4-GPU MI455X trays). A server moves KV through
+GPU IPC, so it can serve only its own host's ranks:
+
+- Every host runs its own server, and every rank reaches its host's server at
+  the loopback `lmcache.mp.host`. A host's ranks form that server's world
+  (worker ID = rank within the host), and the model namespace names the host,
+  so two hosts' rank-0 shards never share a key, not even in a shared L2.
+- The engine's scheduler, on the host of TP rank 0, asks every host's server:
+  `lmcache.mp.tp_host_server_urls` lists them in host order, as that host
+  reaches them (the first may stay loopback; a URL without a port takes
+  `lmcache.mp.port`). Every other host's server must therefore listen on an
+  address the engine's host reaches as well as on loopback: `--host 0.0.0.0`.
+- A prefix loads only as far as every host holds it. Hosts store in lockstep
+  and normally agree, but each server evicts on its own. When the hits differ,
+  each longer host releases its read locks and is asked again for the prompt
+  cut at the shortest hit -- its STATE image lock must sit at that endpoint,
+  not at its own -- and the answers are combined again. A host is re-asked only
+  once its release has replied, since a server does not order the two. At a
+  shortest hit of 0, or after three rounds, every host's locks are released and
+  the request recomputes. `OFFLOAD_PROFILE=1` reports this per minute as
+  `tp_hosts_answered`, `tp_hosts_disagreed`, `tp_hosts_reasks`,
+  `tp_hosts_abandoned` and `tp_hosts_dropped_chunks`.
+- TP ranks never collapse across hosts: `auto` stores on every rank, and
+  `"lmcache.mp.tp_rank_collapse": true` is refused.
+- The other hosts' workers run on the engine's `Config`, but read `LMCACHE_*`
+  and `OFFLOAD_*` from their own environment: set them the same on every host.
+  `LMCACHE_CHUNK_SIZE` enters the model namespace; each host's workers log the
+  namespace they register under, and the engine logs the one it looks each host
+  up under. A host whose two lines differ never hits.
+- Run the lookup driver (`OFFLOAD_MP_LOOKUP_THREAD=1`): it takes the cross-host
+  round trips, and a disagreement's release and re-ask, off the scheduler
+  thread.
+
+Kimi-K3 TP8 + DCP8 on two 4-GPU trays (`<tray0>` and `<tray1>` are the
+addresses the trays reach each other at). On both trays, start a server, then
+ATOM with the same environment:
+
+```bash
+lmcache server --host 0.0.0.0 --port 5555 \
+  --chunk-size 1024 --null-block-id -1 \
+  --separate-object-groups --supported-transfer-mode lmcache_driven \
+  --max-gpu-workers 4 \
+  --l1-size-gb <GiB of this tray's DRAM> --l1-use-lazy --eviction-policy LRU
+
+export LMCACHE_CHUNK_SIZE=1024
+export OFFLOAD_MP_LOOKUP_THREAD=1
+KV_TRANSFER_CONFIG='{"kv_connector": "lmcache_mp", "kv_role": "offload",
+  "kv_connector_extra_config": {
+    "lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": 5555,
+    "lmcache.mp.tp_host_server_urls": ["tcp://127.0.0.1", "tcp://<tray1>"]}}'
+
+# <tray0>: TP ranks 0-3, the engine and the API server.
+# <tray1>: the same command plus --tensor-parallel-rank 4 (TP ranks 4-7).
+python -m atom.entrypoints.openai_server --model <Kimi-K3> \
+  -tp 8 --tensor-parallel-size-local 4 --decode-context-parallel-size 8 \
+  --data-parallel-master-ip <tray0> --data-parallel-base-port 29700 \
+  --kv_cache_dtype fp8 --enable_prefix_caching \
+  --state-checkpoint-interval-tokens -1 \
+  --kv-transfer-config "$KV_TRANSFER_CONFIG"
+```
+
+The chunk size must be a multiple of `block_size * dcp` (128 at ATOM's default
+block size 16). `--max-gpu-workers 4` lets the tray's four ranks' stores and
+retrieves run on up to four server threads; LMCache's default is one.
+Everything else in that launch -- RCCL between the trays, the model's own
+options -- is what the TP group needs without LMCache; see
+`atom/model_engine/tp_multinode.py`.
 
 ### MP validation
 
