@@ -146,10 +146,11 @@ class _Buf:
         pass
 
 
+@pytest.mark.parametrize("max_bs", [16, 15])
 @pytest.mark.parametrize("tbo_decode", [False, True])
 @pytest.mark.parametrize("mxfp4", [False, True])
 def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
-    mod, monkeypatch, mxfp4, tbo_decode
+    mod, monkeypatch, mxfp4, tbo_decode, max_bs
 ):
     from atom.model_ops.minimax_m3 import index_mxfp4
 
@@ -162,6 +163,8 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
     monkeypatch.setattr(mod, "CpuGpuBuffer", _Buf)
     monkeypatch.setattr(index_mxfp4, "index_work_map_capacity", capacity)
     b = builder(mod, mxfp4=mxfp4, tbo_decode=tbo_decode)
+    b.max_bs = max_bs
+    half = (max_bs + 1) // 2  # the larger ubatch of a split of up to max_bs requests
     max_qlen = 8  # a speculative config: the TBO sparse decode still runs one token
     # the work plan sizes are not under test
     b._allocate_ubatch_buffers(max_qlen, *([1, torch.int32] * 6))
@@ -180,8 +183,10 @@ def test_the_ubatch_buffers_are_for_a_decode_tbo_at_one_token_a_request(
         sbuf = var[f"ub{i}_sparse_attention_index_score_buf"]
         assert wmap.shape == (100, 2) and wmap.dtype == torch.int32
         assert sbuf.dtype == torch.float32
-        assert sbuf.numel() == HEADS * MAX_BS * BOUND  # q == 1, not max_qlen
-    assert capacity_args == [(MAX_BS, BOUND, 1, HEADS)] * 2
+        assert sbuf.numel() == HEADS * half * BOUND  # q == 1, not max_qlen
+    assert capacity_args == [(half, BOUND, 1, HEADS)] * 2
+    # the other per-ubatch buffers stay at max_bs
+    assert var["ub0_context_lens"].gpu.numel() == max_bs
     assert (
         var["ub0_sparse_attention_index_score_buf"].data_ptr()
         != var["ub1_sparse_attention_index_score_buf"].data_ptr()

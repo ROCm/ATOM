@@ -337,7 +337,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # index head at a 1M model length, so 128 MiB at TP4's one head and 512
             # x 8 rows, 1 GiB at 8 heads). Allocated before the KV budget is sized, so
             # the budget counts it as overhead and the cache shrinks by it. decode TBO
-            # adds one pair a ubatch (`_allocate_ubatch_buffers`), one row a request.
+            # adds one pair a ubatch (`_allocate_ubatch_buffers`), the larger half of
+            # `max_bs` rows each.
             self.model_runner.forward_vars["sparse_attention_index_score_buf"] = (
                 index_score_buffer(
                     self.max_bs * max_qlen,
@@ -477,16 +478,24 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                     # reason; only a decode TBO runs them (`enable_tbo` alone is
                     # the prefill split). A ubatch is one token a request (the
                     # sparse TBO decode raises above that), so q == 1 here
-                    # whatever `max_seqlen_qo` is.
+                    # whatever `max_seqlen_qo` is. A ubatch is at most the larger
+                    # half of a split batch of up to `max_bs` requests.
                     from atom.model_ops.minimax_m3.index_mxfp4 import (
                         index_score_buffer,
                         index_work_map_capacity,
                     )
 
+                    half_bs = max(
+                        end - start
+                        for start, end in decode_ubatch_request_ranges(
+                            self.max_bs, self._NUM_TBO_UBATCHES
+                        )
+                    )
+
                     var[f"{p}sparse_attention_index_score_work_map"] = torch.empty(
                         (
                             index_work_map_capacity(
-                                ub_max_bs,
+                                half_bs,
                                 self._index_score_max_block,
                                 1,
                                 self._num_idx_heads,
@@ -496,7 +505,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                         **i32_kwargs,
                     )
                     var[f"{p}sparse_attention_index_score_buf"] = index_score_buffer(
-                        ub_max_bs,
+                        half_bs,
                         self._num_idx_heads,
                         self._index_score_max_block,
                         self.device,
