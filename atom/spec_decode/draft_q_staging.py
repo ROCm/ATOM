@@ -46,20 +46,13 @@ class DraftQStaging:
         self._staged = None
         self._consumed = None
 
-    def stage(
-        self, batch, bs: int, *, drafts_verifiable: bool, verifies: bool, step: int
-    ):
+    def stage(self, batch, bs: int, *, drafts_verifiable: bool, step: int):
         """Stage one step and return ``{buffer: rows to publish or None}``.
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
         may read. False for a dummy forward and an align-only middle chunk:
         those claim no slot and write no q, so their ids (warmup's 0..n-1, the
         DP dummy's -1) never enter the slot map.
-
-        ``verifies``: this forward's verify reads q: it scores drafts
-        (`ModelRunner._verifies_drafts`) and the batch is not all greedy. The
-        only gate on the lookup. False for a prefill, align-only, dummy or
-        all-greedy forward: no lookup is made, so none is counted.
 
         ``step``: the forward this staging is for (`ModelRunner.forward_step`),
         which `consume` checks.
@@ -72,10 +65,8 @@ class DraftQStaging:
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may hand a slot to a new request,
         # and a request's verify must still read the slot its drafts came from.
-        if verifies:
-            self.slots.verify_bases(req_ids, self._verify)
-        else:
-            self._verify[:bs] = -1
+        # Written every step; one whose verify reads no q ignores them.
+        self.slots.verify_bases(req_ids, self._verify)
         # Every row the block runs must name a destination, the pad rows up to
         # `running_bs` included, and a pad row left holding a larger previous
         # batch's base would write its q into a live request's slot. So clear

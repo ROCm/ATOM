@@ -106,9 +106,7 @@ def stage(prop, b, *, verifiable=True):
     """One forward's staging, as `ModelRunner.forward` would number it."""
     g = group(prop)
     prop.runner.forward_step += 1
-    prop.stage_draft_sampling_host(
-        b, len(b.req_ids), g, drafts_verifiable=verifiable, verifies=verifiable
-    )
+    prop.stage_draft_sampling_host(b, len(b.req_ids), g, drafts_verifiable=verifiable)
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 
@@ -192,9 +190,7 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert prop.lossless_verify_inputs(2, torch.bfloat16, None, None, None) is None
     # Staging is a no-op rather than an error.
-    prop.stage_draft_sampling_host(
-        batch(["a"]), 1, None, drafts_verifiable=True, verifies=True
-    )
+    prop.stage_draft_sampling_host(batch(["a"]), 1, None, drafts_verifiable=True)
 
 
 def test_a_block_narrower_than_the_verify_keeps_the_greedy_pair(monkeypatch, caplog):

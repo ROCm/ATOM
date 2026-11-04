@@ -58,13 +58,12 @@ def batch(
     )
 
 
-def stage(st, b, *, verifiable=True, verifies=True, step=None):
+def stage(st, b, *, verifiable=True, step=None):
     """One forward's staging; each call is a new forward unless told."""
     return st.stage(
         b,
         len(b.req_ids),
         drafts_verifiable=verifiable,
-        verifies=verifies,
         step=next(FORWARDS) if step is None else step,
     )
 
@@ -85,7 +84,7 @@ def test_a_dummy_forward_claims_nothing_and_verifies_nothing():
     """Warmup and DP dummies carry ids 0..n-1 and -1; none may enter the map,
     or a real request 0 would later verify against a dummy's q."""
     st, a = staging()
-    stage(st, batch([0, 1, -1], dummy=True), verifiable=False, verifies=False)
+    stage(st, batch([0, 1, -1], dummy=True), verifiable=False)
     assert a.q_row_base[:3].tolist() == [-1, -1, -1]
     assert a.verify_q_row_base[:3].tolist() == [-1, -1, -1]
     assert len(st.slots) == 0
@@ -97,7 +96,7 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
     st, a = staging()
     stage(st, batch(["d"]))
     d = a.q_row_base[0]
-    rows = stage(st, batch(["m1", "m2"]), verifiable=False, verifies=False)
+    rows = stage(st, batch(["m1", "m2"]), verifiable=False)
     assert a.q_row_base[:2].tolist() == [-1, -1]
     assert rows["q_row_base"] == 2
     assert "m1" not in st.slots and "m2" not in st.slots
@@ -105,47 +104,20 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots():
     assert a.verify_q_row_base[0] == d
 
 
-def test_only_a_step_that_verifies_looks_q_up_or_counts():
-    """A prefill-only or align-only step reads no q, so it looks nothing up:
-    a request re-prefilled in chunks after its slot expired neither counts
-    as a lost q nor as a verify, and its first verify reads the slot its
-    final chunk claimed."""
+def test_a_request_re_prefilled_after_its_slot_expired_reads_its_new_slot():
+    """Re-prefilled in chunks after its slot expired, a request finds no q
+    until its final chunk claims a slot, and its first verify reads that
+    slot."""
     st, a = staging(slots=1)
     stage(st, batch(["a"]))
     stage(st, batch(["b"]))  # a expires
-    stage(st, batch(["a"]), verifiable=False, verifies=False)  # middle chunk
+    stage(st, batch(["a"]), verifiable=False)  # middle chunk
     assert a.verify_q_row_base[0] == -1
-    stage(st, batch(["a"], final_chunk=[True]), verifies=False)
+    stage(st, batch(["a"], final_chunk=[True]))
     assert a.verify_q_row_base[0] == -1
-    assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
     claimed = a.q_row_base[0]
     stage(st, batch(["a"]))
     assert a.verify_q_row_base[0] == claimed
-    assert (st.slots.verifies, st.slots.live_expiries) == (1, 0)
-
-
-def test_an_all_greedy_verify_looks_nothing_up_and_publishes_the_same_rows():
-    """The runner passes ``verifies`` False for an all-greedy batch, whose
-    exact-match verify reads no q. Its members never claimed, so a lookup
-    would only have found -1 for each and counted nothing."""
-    st, a = staging()
-    stage(st, batch(["s", "g", "h"], [1.0, 0.0, 0.0]))
-    greedy = batch(["g", "h"], [0.0, 0.0])
-    a.verify_q_row_base[:] = 7
-    stage(st, greedy)
-    looked_up = a.verify_q_row_base.copy()
-    assert looked_up[:2].tolist() == [-1, -1]
-    assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
-
-    def no_lookup(*args):
-        raise AssertionError("an all-greedy verify looked q up")
-
-    st.slots.verify_bases = no_lookup
-    a.verify_q_row_base[:] = 7
-    rows = stage(st, greedy, verifies=False)
-    np.testing.assert_array_equal(a.verify_q_row_base, looked_up)
-    assert rows["verify_q_row_base"] == 2
-    assert (st.slots.verifies, st.slots.live_expiries) == (0, 0)
 
 
 def test_a_mid_prompt_member_expired_by_its_own_batch_loses_nothing():
@@ -158,16 +130,14 @@ def test_a_mid_prompt_member_expired_by_its_own_batch_loses_nothing():
     stage(
         st,
         batch(["m", "c"], final_chunk=[False, True]),
-        verifies=False,
     )
-    assert "m" not in st.slots and st.slots.evictions == 1
+    assert "m" not in st.slots
     assert a.q_row_base[0] == -1
-    stage(st, batch(["m"], final_chunk=[True]), verifies=False)
+    stage(st, batch(["m"], final_chunk=[True]))
     claimed = a.q_row_base[0]
     assert claimed >= 0
     stage(st, batch(["m"]))
     assert a.verify_q_row_base[0] == claimed
-    assert (st.slots.verifies, st.slots.live_expiries) == (1, 0)
 
 
 def test_a_greedy_request_claims_no_slot_and_writes_no_q():
@@ -243,7 +213,7 @@ def test_a_staging_from_another_forward_is_refused():
     st, _ = staging()
     stage(st, batch(["a"]), step=1)
     st.consume(1)
-    stage(st, batch(["m"]), verifiable=False, verifies=False, step=2)
+    stage(st, batch(["m"]), verifiable=False, step=2)
     with pytest.raises(RuntimeError, match="fresh stage_draft_sampling_host"):
         st.consume(3)
 

@@ -88,7 +88,7 @@ class DSparkProposer(Drafter):
         return True
 
     def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, drafts_verifiable: bool, verifies: bool
+        self, batch, bs: int, group, *, drafts_verifiable: bool
     ) -> None:
         """`DSparkLossless.stage`, from `ModelRunner.prepare_sample`, so every
         member rides that function's `sampling` H2D."""
@@ -99,7 +99,6 @@ class DSparkProposer(Drafter):
             bs,
             group,
             drafts_verifiable=drafts_verifiable,
-            verifies=verifies,
             step=self.runner.forward_step,
         )
 

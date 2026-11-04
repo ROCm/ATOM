@@ -229,7 +229,7 @@ class DSparkLossless:
         )
         self._verify_q_row_base = buffers["verify_q_row_base"].gpu
         self.staging = DraftQStaging(
-            DraftQSlots(q_slots, t, log=drafter.runner.rank == 0),
+            DraftQSlots(q_slots, t),
             greedy_threshold=SAMPLER_EPS,
             **{name: buf.np for name, buf in buffers.items()},
         )
@@ -260,7 +260,6 @@ class DSparkLossless:
         group,
         *,
         drafts_verifiable: bool,
-        verifies: bool,
         step: int,
     ) -> None:
         """Stage this step's draft inputs and both q row bases into the host
@@ -270,7 +269,6 @@ class DSparkLossless:
             batch,
             bs,
             drafts_verifiable=drafts_verifiable,
-            verifies=verifies,
             step=step,
         )
         for spec in _LOSSLESS_INPUTS:
