@@ -25,3 +25,22 @@ def argmax_lowest_id(key, ids, mask, sentinel):
     else:
         hit = key == best[:, None]
     return best, tl.min(tl.where(hit & mask, ids, sentinel), axis=-1)
+
+
+@triton.jit
+def argmax_of_tiles(part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_TILE):
+    """One row's ``(max, lowest id)`` from its tiles' pairs, stored
+    ``[num_tiles, num_rows]``, picking among tiles that tie as
+    `argmax_lowest_id` does within one. A row no tile of which holds its max
+    (all NaN) answers id 0, as ``torch.argmax`` would not, but in range, so no
+    consumer can index past the vocab."""
+    offs_tile = tl.arange(0, BLOCK_TILE)
+    tile_mask = offs_tile < num_tiles
+    vals = tl.load(
+        part_val_ptr + offs_tile * num_rows + row, mask=tile_mask, other=float("-inf")
+    )
+    idxs = tl.load(
+        part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=2147483647
+    )
+    best, winner = argmax_lowest_id(vals, idxs, tile_mask, 2147483647)
+    return best, tl.where(winner == 2147483647, 0, winner)

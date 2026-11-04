@@ -20,6 +20,7 @@ from typing import NamedTuple
 
 import torch
 import triton
+import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.dspark_markov_argmax import (
@@ -27,7 +28,8 @@ from atom.model_ops.dspark_markov_argmax import (
     _BLOCK_V,
     _MAX_BLOCK_ROW,
     _MIN_BLOCK_ROW,
-    _markov_stage1,
+    _markov_logits_tile,
+    _publish_tile_argmax,
     check_markov_inputs,
     markov_weights_unsupported,
 )
@@ -39,6 +41,102 @@ from atom.model_ops.spec_sampling.sparse_q_select import (
     q_select_scratch,
     select_and_draw_q,
 )
+
+
+@triton.jit
+def _markov_sample_stage1(
+    base_ptr,
+    prev_ids_ptr,
+    w1_ptr,
+    w2_ptr,
+    embed_out_ptr,
+    part_val_ptr,
+    part_idx_ptr,
+    temperatures_ptr,
+    q_row_base_ptr,
+    s_ptr,
+    part_smax_ptr,
+    num_rows,
+    vocab_size,
+    rank,
+    stride_base_row,
+    stride_prev,
+    stride_w1_vocab,
+    stride_embed_row,
+    stride_w2_vocab,
+    stride_s_row,
+    min_temperature,
+    BLOCK_ROW: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """One (V tile, row tile): the greedy op's stage 1 (bias GEMV, base
+    logits, the tile's (max, lowest id) of the logits), then scale by 1/T,
+    write the scores ``s`` of rows with a q destination into their scratch
+    row, and publish the tile's max of ``s``. The (max, id) is taken before
+    the division: a near-zero temperature can round distinct logits onto one
+    value. The whole vocab, from id 0."""
+    tile = tl.program_id(0)
+    offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
+    offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    row_mask = offs_row < num_rows
+    v_mask = offs_v < vocab_size
+    vals = _markov_logits_tile(
+        base_ptr,
+        prev_ids_ptr,
+        w1_ptr,
+        w2_ptr,
+        embed_out_ptr,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        rank,
+        stride_base_row,
+        stride_prev,
+        stride_w1_vocab,
+        stride_embed_row,
+        stride_w2_vocab,
+        0,
+        BLOCK_ROW,
+        BLOCK_V,
+        BLOCK_K,
+    )
+    _publish_tile_argmax(
+        vals,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        num_rows,
+        vocab_size,
+        0,
+        part_val_ptr,
+        part_idx_ptr,
+    )
+    # Clamped here too, so a pad row's stale or zero temperature never divides
+    # by zero. A greedy row's scores are only scratch: finalize publishes the
+    # exact delta on its argmax instead.
+    temperature = tl.maximum(
+        tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0),
+        min_temperature,
+    )
+    scaled = vals / temperature[:, None]
+    # Only a row with a destination is read back; the rest draft the argmax.
+    q_base = tl.load(q_row_base_ptr + offs_row, mask=row_mask, other=-1)
+    tl.store(
+        s_ptr + offs_row[:, None].to(tl.int64) * stride_s_row + offs_v[None, :],
+        scaled,
+        mask=(row_mask & (q_base >= 0))[:, None] & v_mask[None, :],
+    )
+    # Masked lanes are already -inf.
+    tl.store(
+        part_smax_ptr + tile * num_rows + offs_row,
+        tl.max(scaled, axis=1),
+        mask=row_mask,
+    )
 
 
 def _dspark_markov_sample_fake(
@@ -235,7 +333,7 @@ def dspark_markov_sample(
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
     work = carve(scratch, _sample_scratch(num_rows, vocab_size))
 
-    _markov_stage1[(gemv_tiles, row_tiles)](
+    _markov_sample_stage1[(gemv_tiles, row_tiles)](
         base_logits,
         prev_ids,
         markov_w1,
@@ -256,12 +354,10 @@ def dspark_markov_sample(
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
         stride_s_row=s_scratch.stride(0),
-        vocab_offset=0,
         min_temperature=SAMPLER_EPS,
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,
-        SAMPLED=True,
         num_warps=8 if block_row >= 32 else 4,
         num_stages=2,
     )

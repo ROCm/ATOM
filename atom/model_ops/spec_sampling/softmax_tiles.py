@@ -13,7 +13,7 @@ op uses it too) is also the verify's per-tile raw argmax.
 import triton
 import triton.language as tl
 
-from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.tile_argmax import argmax_of_tiles
 
 
 @triton.jit
@@ -98,17 +98,7 @@ def softmax_combine_kernel(
         # Answer 0 instead, so every probability of that row is 0.
         tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
     if WITH_ARGMAX:
-        vals = tl.load(
-            part_amax_val_ptr + offs_tile * num_rows + row,
-            mask=tile_mask,
-            other=float("-inf"),
+        _, winner = argmax_of_tiles(
+            part_amax_val_ptr, part_amax_idx_ptr, row, num_rows, num_tiles, BLOCK_TILE
         )
-        idxs = tl.load(
-            part_amax_idx_ptr + offs_tile * num_rows + row,
-            mask=tile_mask,
-            other=2147483647,
-        )
-        _, winner = argmax_lowest_id(vals, idxs, tile_mask, 2147483647)
-        # An all-NaN row matches nothing; answer id 0, as `torch.argmax` would
-        # not, but in range, so no consumer can index past the vocab.
-        tl.store(row_argmax_ptr + row, tl.where(winner == 2147483647, 0, winner))
+        tl.store(row_argmax_ptr + row, winner)

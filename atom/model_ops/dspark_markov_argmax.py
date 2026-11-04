@@ -56,7 +56,7 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.model_ops.tile_argmax import argmax_lowest_id
+from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
 
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
@@ -107,7 +107,8 @@ def _markov_logits_tile(
     """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
     padded vocab lanes; tile 0 also publishes ``W1[prev]`` to ``embed_out``.
 
-    The GEMV both stage-1 kernels run; each keeps only its own tail. ``base``
+    The GEMV both stage-1 kernels run (this op's and `dspark_markov_sample`'s);
+    each keeps only its own tail. ``base``
     holds the tile's columns from 0, W2 is read from vocab id ``vocab_offset``
     on (a TP rank's shard of the LM head; 0 for the whole vocab). The vocab
     and row offsets are int64: `[max_bs, T, V]` logits and a whole W2 pass
@@ -159,6 +160,34 @@ def _markov_logits_tile(
 
 
 @triton.jit
+def _publish_tile_argmax(
+    vals,
+    tile,
+    offs_row,
+    offs_v,
+    row_mask,
+    v_mask,
+    num_rows,
+    vocab_size,
+    vocab_offset,
+    part_val_ptr,
+    part_idx_ptr,
+):
+    """Publish one (V tile, row tile)'s (max, lowest id) of ``vals``, the ids
+    global (``vocab_offset`` on), for stage 2 to combine."""
+    # `v_mask` also covers the all--inf row: without it a padded lane, which
+    # is -inf too, could win the id.
+    tile_max, tile_idx = argmax_lowest_id(
+        vals, offs_v[None, :], v_mask[None, :], vocab_size
+    )
+    # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
+    # recognizes before adding the offset back in.
+    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
+    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
+    tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
+
+
+@triton.jit
 def _markov_stage1(
     base_ptr,
     prev_ids_ptr,
@@ -167,10 +196,6 @@ def _markov_stage1(
     embed_out_ptr,
     part_val_ptr,
     part_idx_ptr,
-    temperatures_ptr,
-    q_row_base_ptr,
-    s_ptr,
-    part_smax_ptr,
     num_rows,
     vocab_size,
     rank,
@@ -179,25 +204,17 @@ def _markov_stage1(
     stride_w1_vocab,
     stride_embed_row,
     stride_w2_vocab,
-    stride_s_row,
     vocab_offset,
-    min_temperature,
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    SAMPLED: tl.constexpr,
 ):
-    """One (V tile, row tile) of both Markov ops: bias GEMV, add base logits,
-    publish the tile's (max, lowest id) of the logits.
+    """One (V tile, row tile): bias GEMV, add base logits, publish the tile's
+    (max, lowest id) of the logits.
 
     ``base_ptr`` holds ``vocab_size`` columns starting at vocab id
     ``vocab_offset`` (a TP rank's shard of the LM head; 0 for the whole
     vocab), so W2 is read from that row on and the ids published are global.
-
-    ``SAMPLED`` (`dspark_markov_sample`) also scales by 1/T, writes the scores
-    ``s`` of rows with a q destination into their scratch row, and publishes
-    the tile's max of ``s``. The (max, id) is taken before the division: a
-    near-zero temperature can round distinct logits onto one value.
     """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
@@ -226,39 +243,19 @@ def _markov_stage1(
         BLOCK_V,
         BLOCK_K,
     )
-    # `v_mask` also covers the all--inf row: without it a padded lane, which
-    # is -inf too, could win the id.
-    tile_max, tile_idx = argmax_lowest_id(
-        vals, offs_v[None, :], v_mask[None, :], vocab_size
+    _publish_tile_argmax(
+        vals,
+        tile,
+        offs_row,
+        offs_v,
+        row_mask,
+        v_mask,
+        num_rows,
+        vocab_size,
+        vocab_offset,
+        part_val_ptr,
+        part_idx_ptr,
     )
-    # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
-    # recognizes before adding the offset back in.
-    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
-
-    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
-    tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
-    if SAMPLED:
-        # Clamped here too, so a pad row's stale or zero temperature never
-        # divides by zero. A greedy row's scores are only scratch: finalize
-        # publishes the exact delta on its argmax instead.
-        temperature = tl.maximum(
-            tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0),
-            min_temperature,
-        )
-        scaled = vals / temperature[:, None]
-        # Only a row with a destination is read back; the rest draft the argmax.
-        q_base = tl.load(q_row_base_ptr + offs_row, mask=row_mask, other=-1)
-        tl.store(
-            s_ptr + offs_row[:, None].to(tl.int64) * stride_s_row + offs_v[None, :],
-            scaled,
-            mask=(row_mask & (q_base >= 0))[:, None] & v_mask[None, :],
-        )
-        # Masked lanes are already -inf.
-        tl.store(
-            part_smax_ptr + tile * num_rows + offs_row,
-            tl.max(scaled, axis=1),
-            mask=row_mask,
-        )
 
 
 @triton.jit
@@ -280,31 +277,18 @@ def _dspark_markov_argmax_stage2(
     the id to ``out_ptr``: the TP form, whose ranks then compare their bests.
     """
     row = tl.program_id(0)
-    offs_tile = tl.arange(0, BLOCK_TILE)
-    tile_mask = offs_tile < num_tiles
-    vals = tl.load(
-        part_val_ptr + offs_tile * num_rows + row,
-        mask=tile_mask,
-        other=float("-inf"),
+    # NaN never equals itself, so an all-NaN row answers id 0: what
+    # `torch.argmax` does, so a caller gathering `W1[x]` cannot read past the
+    # table. Packed, the NaN goes out with it, which `torch.argmax` across
+    # ranks then treats as the max, as it would the whole row's.
+    best, winner = argmax_of_tiles(
+        part_val_ptr, part_idx_ptr, row, num_rows, num_tiles, BLOCK_TILE
     )
-    idxs = tl.load(
-        part_idx_ptr + offs_tile * num_rows + row, mask=tile_mask, other=vocab_size
-    )
-    # Ids are global, so the sentinel is anything past every tile's id.
-    best, winner = argmax_lowest_id(vals, idxs, tile_mask, 2147483647)
     if PACKED:
-        # An all-NaN row keeps the sentinel; publish id 0 with the NaN, which
-        # `torch.argmax` across ranks then treats as the max, as it would the
-        # whole row's.
-        winner = tl.where(winner == 2147483647, 0, winner)
         # ids < 2**24 are exact in fp32 (V4.1's vocab is 129280).
         tl.store(packed_ptr + row * 2, best)
         tl.store(packed_ptr + row * 2 + 1, winner.to(tl.float32))
         return
-    # NaN never equals itself, so no lane passes its `== max` test and every
-    # candidate keeps the out-of-range sentinel. Answer 0, as `torch.argmax`
-    # does, so a caller gathering `W1[x]` cannot read past the table.
-    winner = tl.where(winner == 2147483647, 0, winner)
     # Strided and in the destination's own dtype: the caller's `[B, T + 1]`
     # block is int32, and the copy this replaces was narrowing as well as
     # moving -- doing one and not the other would just relocate the cast.
@@ -571,10 +555,6 @@ def _launch(
         markov_embed,
         part_val,
         part_idx,
-        None,
-        None,
-        None,
-        None,
         num_rows,
         vocab_size,
         rank,
@@ -583,13 +563,10 @@ def _launch(
         stride_w1_vocab=markov_w1.stride(0),
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
-        stride_s_row=0,
         vocab_offset=vocab_offset,
-        min_temperature=1.0,
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,
-        SAMPLED=False,
         num_warps=8 if block_row >= 32 else 4,
         num_stages=2,
     )
