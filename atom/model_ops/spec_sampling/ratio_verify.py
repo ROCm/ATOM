@@ -44,6 +44,8 @@ from atom.model_ops.verify_kernels import _draft_token, _finish_request
 _RATIO_ACCEPT_KEY = 1 << 32
 _RATIO_RESIDUAL_KEY = 2 << 32
 
+# Stored q entries one accept lookup counts per vector load.
+_RATIO_ACCEPT_BLOCK_Q = 1024
 # Stored q entries the residual race places per step, from the span its V
 # tile's binary searches found: each is compared against every lane of the
 # tile, so the step stays narrow.
@@ -123,10 +125,16 @@ def _rejecting_row_of(residual_row_ptr, q_row_base_ptr, req_idx):
 
 
 @triton.jit
-def _stored_q(q_ids_ptr, q_probs_ptr, q_row, n, x, SEARCH_STEPS: tl.constexpr):
+def _stored_q(q_ids_ptr, q_probs_ptr, q_row, n, x, BLOCK_Q: tl.constexpr):
     """x's q in one stored row: its probability among the first ``n``
-    (ascending) entries, 0 when it is not one of them."""
-    at = _count_below(q_ids_ptr + q_row, n, x, SEARCH_STEPS)
+    (ascending) entries, 0 when it is not one of them. x's place is the count
+    of ids below it, ``BLOCK_Q`` at a time: one vector load for a row of
+    K <= 1024, rather than a chain of dependent probes."""
+    at = n * 0
+    for start in range(0, n, BLOCK_Q):
+        offs = start + tl.arange(0, BLOCK_Q)
+        ids = tl.load(q_ids_ptr + q_row + offs, mask=offs < n, other=2147483647)
+        at += tl.sum((ids < x).to(tl.int32), axis=0)
     held = (at < n) & (tl.load(q_ids_ptr + q_row + at, mask=at < n, other=-1) == x)
     return tl.load(q_probs_ptr + q_row + at, mask=held, other=0.0)
 
@@ -157,7 +165,7 @@ def _ratio_accept_kernel(
     greedy_temperature,
     accept_seed,
     BLOCK_T: tl.constexpr,
-    SEARCH_STEPS: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
     FILTER: tl.constexpr,
 ):
     """One request: walk its drafts until the first rejection.
@@ -232,7 +240,7 @@ def _ratio_accept_kernel(
                         (q_base + pos).to(tl.int64) * q_width,
                         tl.sum(tl.where(at_pos, stored_n, 0), axis=0),
                         x,
-                        SEARCH_STEPS,
+                        BLOCK_Q,
                     )
                 u = tl.rand(accept_seed, row)
                 # x was drawn from q, so q(x) must be a positive probability;
@@ -544,7 +552,7 @@ def _ratio_sample(
         SAMPLER_EPS,
         _RATIO_ACCEPT_KEY | ratio_step,
         BLOCK_T=triton.next_power_of_2(max(num_spec_steps, 1)),
-        SEARCH_STEPS=q_width.bit_length(),
+        BLOCK_Q=min(triton.next_power_of_2(q_width), _RATIO_ACCEPT_BLOCK_Q),
         FILTER=filtered,
         num_warps=1,
     )

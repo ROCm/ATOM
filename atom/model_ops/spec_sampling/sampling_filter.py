@@ -63,9 +63,10 @@ _BATCH_COUNTS = ["num_tokens", "batch_size"]
 def _count_below(values_ptr, n, x, steps):
     """How many of the ``n`` ascending ``values`` are below ``x``: the index of
     the first at least ``x`` (``n`` if none). A binary search of ``steps``
-    probes, enough for ``n < 2**steps``. The one search every verify kernel
-    shares: a draft row's request in ``cu_num_draft_tokens``, and an id's
-    place in a stored q row (`SparseQStore`: its ids ascend)."""
+    probes, enough for ``n < 2**steps``. The verify kernels' search: a draft
+    row's request in ``cu_num_draft_tokens``, and a V tile's span of a stored
+    q row (`SparseQStore`: its ids ascend). The accept's lookup of one id
+    counts in one vector load instead (`ratio_verify._stored_q`)."""
     lo = n * 0
     hi = n
     for _ in range(steps):
