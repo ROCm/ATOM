@@ -11,6 +11,7 @@ from atom.entrypoints.openai.logprobs import (
     LogprobCollector,
     LogprobsProcessor,
     TokenBytes,
+    claim_logprobs,
 )
 from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
@@ -105,6 +106,7 @@ def test_coalescing_keeps_probabilities_and_choice_identity():
                 delta={"content": chunk["text"]},
                 index=1,
                 with_logprobs=True,
+                logprob_values=claim_logprobs([{"content": chunk["text"]}])[0],
             )
             yield "data: [DONE]\n\n"
 
@@ -145,9 +147,7 @@ def test_non_bytelevel_tokenizer_is_explicitly_rejected():
 def test_chat_route_transports_actual_records(
     server, monkeypatch, stream, top_k, with_tools
 ):
-    from atom.entrypoints.openai import logprobs
-
-    monkeypatch.setattr(logprobs, "TokenBytes", lambda tokenizer: codec())
+    monkeypatch.setattr(api_server, "TokenBytes", lambda tokenizer: codec())
     server.chunks = [
         {
             "text": "hello",
@@ -252,8 +252,6 @@ def test_rapidserve_logprobs_rejected_before_generation(server, stream, enabled)
 
 
 def test_service_codec_is_lazy_reused_and_replaced_with_tokenizer(server, monkeypatch):
-    from atom.entrypoints.openai import logprobs
-
     created = []
     monkeypatch.setattr(
         api_server.tokenizer,
@@ -268,7 +266,7 @@ def test_service_codec_is_lazy_reused_and_replaced_with_tokenizer(server, monkey
         created.append(result)
         return result
 
-    monkeypatch.setattr(logprobs, "TokenBytes", make_codec)
+    monkeypatch.setattr(api_server, "TokenBytes", make_codec)
     monkeypatch.setattr(api_server.app.state, "logprob_codec", None, raising=False)
 
     async def generate(prompt, params, *args, **kwargs):
