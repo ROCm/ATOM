@@ -214,7 +214,8 @@ def _bench(rank, iters=64, replays=20):
 
     group = get_tp_group().cpu_group
     weights = 32  # 32 x 4 MiB of o_proj weight a rank: past the caches
-    cases = [(r, None) for r in (16, 64)] + [(r, r // 5) for r in (65, 80, 320)]
+    cases = [(r, None) for r in (16, 64, 80, 320)]
+    cases += [(r, r // 5) for r in (65, 80, 320)]
     results = []
     for rows, sel in cases:
         t = _Inputs(rank, rows, weights)
