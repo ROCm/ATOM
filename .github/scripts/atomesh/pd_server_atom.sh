@@ -2784,7 +2784,8 @@ run_benchmark_and_eval() {
       --decode "http://${decode_ips[0]}:${DECODE_PORT}/metrics"
       --output "${RUNTIME_LOG_DIR}/issue382-metrics.jsonl.gz"
     )
-    python3 tools/issue382/sample_metrics.py "${metrics_args[@]}" --check
+    python3 tools/issue382/sample_metrics.py "${metrics_args[@]}" --check \
+      --decode-kv-transfer-config "${ATOMESH_DECODE_ENV_DECODE_KV_TRANSFER_CONFIG:-}"
     start_logged_process issue382_metrics_pid "${RUNTIME_LOG_DIR}/issue382-metrics.log" \
       python3 tools/issue382/sample_metrics.py "${metrics_args[@]}"
   fi

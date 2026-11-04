@@ -5,11 +5,24 @@ import concurrent.futures
 import gzip
 import http.client
 import json
+import re
 import signal
 import threading
 import time
 import urllib.request
 from pathlib import Path
+
+
+def admission_enabled(decode_kv_transfer_config):
+    """Whether D's kv_transfer_config turns pd_admission on.
+
+    The cell's config still holds the launcher's ${ROLE_IP} / ${HANDSHAKE_PORT}
+    placeholders, which are not JSON until filled.
+    """
+    if not decode_kv_transfer_config:
+        return False
+    config = json.loads(re.sub(r"\$\{\w+\}", "0", decode_kv_transfer_config))
+    return (config.get("pd_admission") or {}).get("enabled") is True
 
 
 def fetch(endpoint):
@@ -30,6 +43,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=5)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--decode-kv-transfer-config",
+        default="",
+        help="D's kv_transfer_config; --check requires admission series only if it enables pd_admission",
+    )
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error("interval must be positive")
@@ -44,6 +62,9 @@ def main():
             for result in results:
                 if "error" in result:
                     raise RuntimeError(result)
+            if not admission_enabled(args.decode_kv_transfer_config):
+                print("[issue382] P/D metrics reachable; D admission is off")
+                return
             for metric in (
                 "atom:pd_admission_pending_requests",
                 "atom:pd_admission_pending_kv_bytes",
