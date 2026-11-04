@@ -169,3 +169,19 @@ class SamplingParams:
             raise ValueError("top_p must be in range (0.0, 1.0]")
         if self.n < 1:
             raise ValueError("n must be >= 1")
+
+    def validate_logprob_options(
+        self, config, *, kv_transfer=None, multimodal=False, synthetic=False
+    ):
+        """Execution admission shared by HTTP and direct engine callers."""
+        if not self.logprobs:
+            return
+        if getattr(config, "enable_rapidserve", False):
+            raise ValueError("logprobs is unavailable with RapidServe")
+        if kv_transfer or getattr(config, "kv_transfer_config", None):
+            raise ValueError("logprobs is unavailable with P/D transfer")
+        if multimodal:
+            raise ValueError("Chat logprobs currently supports text input only")
+        spec = getattr(config, "speculative_config", None)
+        if synthetic or getattr(spec, "synthetic_acceptance_rates", None) is not None:
+            raise ValueError("logprobs is unavailable with synthetic forced acceptance")

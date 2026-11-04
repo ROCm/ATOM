@@ -578,6 +578,8 @@ def _build_sampling_params(
     n: int = 1,
     required_channel: RequiredChannel | None = None,
     max_tokens_is_default: bool = False,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> SamplingParams:
     from .model_capabilities import deployment_metadata
 
@@ -601,6 +603,8 @@ def _build_sampling_params(
         ignore_eos=ignore_eos,
         n=n,
         required_channel=required_channel,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
     )
 
 
@@ -774,7 +778,7 @@ def _build_stream_chunk(request_output: RequestOutput, request_id: str) -> dict:
         "started_at": started_at,
         "num_cached_tokens": getattr(request_output, "num_cached_tokens", 0),
     }
-    if getattr(request_output, "logprobs", None) is not None:
+    if request_output.logprobs is not None:
         chunk_data["logprobs"] = request_output.logprobs
     if getattr(request_output, "kv_transfer_params_output", None):
         chunk_data["kv_transfer_params"] = request_output.kv_transfer_params_output
@@ -897,7 +901,7 @@ async def generate_async(
             token_queue.put_nowait,
             {
                 "token_ids": request_output.output_tokens,
-                "logprobs": getattr(request_output, "logprobs", None),
+                "logprobs": request_output.logprobs,
                 "finished": request_output.finished,
                 "finish_reason": request_output.finish_reason,
                 "ts": now,
@@ -955,13 +959,7 @@ async def generate_async(
                     engine.core_mgr.abort_request(seq.id)
             engine.io_processor.requests.pop(seq.id, None)
 
-    text = (
-        tokenizer.decode(
-            all_token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )
-        if sampling_params.logprobs
-        else delivered_text(all_token_ids)
-    )
+    text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
     num_tokens_input = (
         seq.num_prompt_tokens
         if seq is not None
@@ -1150,7 +1148,7 @@ async def generate_async_fanout(
                     idx,
                     {
                         "token_ids": request_output.output_tokens,
-                        "logprobs": getattr(request_output, "logprobs", None),
+                        "logprobs": request_output.logprobs,
                         "finished": request_output.finished,
                         "finish_reason": request_output.finish_reason,
                         "ts": now,
@@ -1234,13 +1232,7 @@ async def generate_async_fanout(
         outputs.append(
             {
                 "text": (
-                    tokenizer.decode(
-                        per_tokens[i],
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    if sampling_params.logprobs
-                    else delivered_text(per_tokens[i])
+                    "" if sampling_params.logprobs else delivered_text(per_tokens[i])
                 ),
                 "token_ids": per_tokens[i],
                 "logprobs": per_logprobs[i] if per_logprobs is not None else None,
@@ -1876,28 +1868,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         validate_chat_request(request)
         messages = request.get_messages()
         logprob_codec = None
-        if request.logprobs:
-            from .logprobs import TokenBytes
-
-            if getattr(engine.config, "enable_rapidserve", False):
-                raise ValueError("logprobs is unavailable with RapidServe")
-            spec = getattr(engine.config, "speculative_config", None)
-            if (
-                synthetic_token_text is not None
-                or getattr(spec, "synthetic_acceptance_rates", None) is not None
-            ):
-                raise ValueError(
-                    "logprobs is unavailable with synthetic forced acceptance"
-                )
-            if request.kv_transfer_params or _has_multimodal_content(messages):
-                raise ValueError(
-                    "Chat logprobs currently supports text without P/D transfer"
-                )
-            logprob_codec = getattr(app.state, "logprob_codec", None)
-            if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
-                logprob_codec = TokenBytes(tokenizer)
-                app.state.logprob_codec = logprob_codec
-
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
             merged_kwargs.update(request.chat_template_kwargs)
@@ -1936,13 +1906,27 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             top_k=request.top_k,
             top_p=request.top_p,
             n=effective_n,
+            logprobs=bool(request.logprobs),
+            top_logprobs=request.top_logprobs or 0,
             required_channel=channel_for_request(
                 required_tool_channel, request.tool_choice, request_tools(request)
             ),
         )
 
-        sampling_params.logprobs = bool(request.logprobs)
-        sampling_params.top_logprobs = request.top_logprobs or 0
+        if request.logprobs:
+            sampling_params.validate_logprob_options(
+                _get_engine_config(),
+                kv_transfer=request.kv_transfer_params,
+                multimodal=_has_multimodal_content(messages),
+                synthetic=synthetic_token_text is not None,
+            )
+            from .logprobs import TokenBytes
+
+            logprob_codec = getattr(app.state, "logprob_codec", None)
+            if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
+                logprob_codec = TokenBytes(tokenizer)
+                app.state.logprob_codec = logprob_codec
+
         schema = schema_from_format(request.response_format)
 
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2086,10 +2070,6 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         (request.stream_options or {}).get("include_usage")
                     ),
                 )
-            if logprob_codec is not None:
-                from .serving_chat import stream_logprobs
-
-                gen = stream_logprobs(gen, stream_collector.trackers)
             if schema is not None:
 
                 gen = validate_chat_stream(gen, schema)
@@ -2123,6 +2103,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=request.top_logprobs or 0,
             )
         elif is_multimodal:
             final_output = await _run_nonstream_with_disconnect(
@@ -2148,6 +2130,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=request.top_logprobs or 0,
             )
         elif effective_n > 1:
             outputs = await _race_disconnect(
@@ -2172,6 +2156,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=request.top_logprobs or 0,
             )
         else:
             final_output = await _run_nonstream_with_disconnect(
@@ -2197,19 +2183,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_choice=request.tool_choice,
                 reasoning=_reasoning,
                 tool_parser_cls=tool_call_parser_cls,
-            )
-        if logprob_codec is not None:
-            from .serving_chat import response_logprobs
-
-            resp = response_logprobs(
-                resp,
-                outputs if effective_n > 1 else [final_output],
-                logprob_codec,
-                request.top_logprobs or 0,
-                reasoning=_reasoning,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                tool_parser_cls=tool_call_parser_cls,
+                logprob_codec=logprob_codec,
+                top_logprobs=request.top_logprobs or 0,
             )
         if schema is not None:
 

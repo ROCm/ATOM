@@ -1,8 +1,7 @@
 # Chat token logprobs
 
-This change connects target-model token probabilities to the Python Chat
-Completions endpoint for ordinary and speculative decoding, including DSpark.
-It is separate from the frontend compatibility work in #2844.
+The Python Chat Completions endpoint returns target-model token probabilities
+for ordinary and speculative decoding, including DSpark.
 
 ```json
 {
@@ -82,11 +81,12 @@ Padded positions within requesting sequences are safely masked at delivery;
 avoiding their computation is a later optimization opportunity.
 
 Only selected probabilities and candidate IDs/scores are copied to the host,
-not full vocabularies. Streaming probability records remain in the request-owned
-spool until close; reading a visible source span marks intersecting records as claimed.
-The spool bounds its RAM buffer and spills to disk. This is not a zero-overhead
-claim; throughput, tail latency, temporary device memory, and CPU/SSE costs need
-on/off comparisons at representative loads.
+not full vocabularies. Records live in request-local memory, with no temporary
+files or per-record disk I/O. Resolved records are retired after parsing and
+serialization. Unresolved tool regions retain their records until classified;
+there is no constant-memory guarantee for an arbitrarily long unfinished region.
+This is not a zero-overhead claim: throughput, tail latency, temporary device
+memory and CPU/SSE cost require on/off comparisons at representative loads.
 
 This follows the approach of [vLLM's logprob rank reduction](https://github.com/vllm-project/vllm/blob/0e5b2ba118cfb3763a3640942e02dd8d93e8ed6c/vllm/v1/sample/ops/logprobs.py)
 for comparisons and reductions, and its
@@ -94,7 +94,7 @@ for comparisons and reductions, and its
 ATOM retains its existing strictly-greater rank/tie semantics and raw-target
 probability definition. This is not a claim of equivalent vLLM throughput.
 
-## Review follow-up: alignment and bounded transfer
+## Text attribution and delivery
 
 Logprob-enabled requests explicitly disable tokenizer whitespace cleanup. Parsing
 keeps the original byte ranges through reasoning and tool regions, so visible
@@ -110,23 +110,28 @@ chunks coalesce. They do not construct the ordinary incremental detokenizer.
 The service lazily owns one TokenBytes object for its current tokenizer; no
 process-global LRU cache retains previous tokenizers.
 
-Unclassified tool-like regions may become visible text at end of stream. Their
-fixed-width probability records are kept in a request-owned spool with a 64 KiB
-in-memory limit, spilling to a temporary file beyond that limit. The file is
-closed on completion or cancellation. This bounds retained probability RAM but
-adds file I/O for long enabled requests; it is not a zero-overhead feature.
+When the tool parser holds earlier text, enabled streams hold later deltas until
+that region can be classified. Attribution then follows source-byte order, so a
+token shared by content and reasoning is assigned consistently in JSON and SSE.
+This can delay enabled SSE deltas for unfinished tool-like text. Special added
+tokens are skipped just as in normal tokenizer decoding. A padded-vocabulary
+candidate with no tokenizer entry has empty text and bytes, retaining its score.
+
+A missing or misaligned engine payload terminates only its request. Streaming
+errors include a choice index; other choices continue and the stream ends with
+`[DONE]`. Internal attribution failures are server errors, not invalid-input errors.
 
 Mixed batches compact probability payloads to requesting sequences before CPU
 transfer and Python conversion. Deferred delivery uses the previous batch's
 request IDs and logprob mask, preserving token/probability alignment. Ordinary
-requests do not create source trackers or probability spools.
+requests do not create source trackers or probability stores.
 
 ## Code organization
 
 `atom/entrypoints/openai/logprobs.py` owns byte decoding, source positions,
 request-local probability storage and processing. `LogprobsProcessor` converts
 coalesced engine deltas into traced text and assigns each token once to visible
-fields. Its private spool keeps unresolved parser regions bounded in RAM.
+fields. Unresolved spans remain in request-local memory until classified.
 
 `atom/entrypoints/openai/serving_chat.py` owns JSON/SSE response assembly and
 stream cleanup. Both response modes use the same source-order attribution.

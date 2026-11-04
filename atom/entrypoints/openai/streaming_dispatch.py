@@ -116,7 +116,6 @@ class IncrementalStreamDetokenizer:
     # in state -- only in whether they pay for the decode.
     last_delta: str = ""
     # None preserves the tokenizer's configured policy for ordinary requests.
-    clean_up_tokenization_spaces: bool | None = None
 
     def update(self, token_ids: list[int], finished: bool) -> str:
         """The text this stream has not been given yet, from its next tokens.
@@ -157,11 +156,6 @@ class IncrementalStreamDetokenizer:
         at sixty-four, on DeepSeek-V4-Pro.
         """
         self.tokens.extend(token_ids)
-        decode_kwargs = (
-            {}
-            if self.clean_up_tokenization_spaces is None
-            else {"clean_up_tokenization_spaces": self.clean_up_tokenization_spaces}
-        )
         reuse = _DELTA_REUSE
         if reuse.enabled and not reuse.should_audit():
             prefix_text = self.last_delta
@@ -169,7 +163,6 @@ class IncrementalStreamDetokenizer:
             prefix_text = self.tokenizer.decode(
                 self.tokens[self.prefix_offset : self.read_offset],
                 skip_special_tokens=True,
-                **decode_kwargs,
             )
             if reuse.enabled:
                 if prefix_text:
@@ -179,7 +172,6 @@ class IncrementalStreamDetokenizer:
         new_text = self.tokenizer.decode(
             self.tokens[self.prefix_offset :],
             skip_special_tokens=True,
-            **decode_kwargs,
         )
 
         if len(new_text) > len(prefix_text) and not new_text.endswith("\ufffd"):
@@ -604,6 +596,10 @@ class StreamBatchDispatcher:
         tag: int | None = None,
     ) -> None:
         """Buffer a raw chunk until the current engine step is flushed."""
+        if state.detokenizer is None and not isinstance(
+            collector, StreamOutputCollector
+        ):
+            raise ValueError("Raw streams require StreamOutputCollector")
         buf = getattr(self._thread_local, "buf", None)
         if buf is None:
             buf = self._thread_local.buf = []
@@ -627,8 +623,6 @@ class StreamBatchDispatcher:
             else:
                 # Queue consumers cannot decode on read and still receive a
                 # prepared chunk, as before.
-                if item.state.detokenizer is None:
-                    raise ValueError("Raw streams require StreamOutputCollector")
                 item.chunk["text"] = item.state.detokenizer.update(
                     item.chunk.get("token_ids") or [],
                     bool(item.chunk.get("finished")),

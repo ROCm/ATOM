@@ -239,6 +239,11 @@ class ReasoningFilter:
             else self._scanner_for(self.state)
         )
 
+    @property
+    def held_text(self) -> str:
+        """Unresolved marker prefix that may still become visible text."""
+        return self._scanner.held if self._scanner is not None else ""
+
     def _scanner_for(self, state: int) -> MarkerScanner | None:
         """What this state has to watch for. ``None`` when that is nothing,
         which is the common case for the inline-`<think>` dialect after the

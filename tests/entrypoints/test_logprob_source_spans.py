@@ -7,12 +7,28 @@ import pytest
 
 from atom.entrypoints.openai.logprobs import LogprobsProcessor
 from atom.entrypoints.openai.reasoning import NO_REASONING
-from atom.entrypoints.openai.serving_chat import create_chat_chunk, response_logprobs
+from atom.entrypoints.openai.serving_chat import _build_chat_choice, create_chat_chunk
 from atom.entrypoints.openai.sse import iter_sse_data
-from atom.entrypoints.openai.streaming_dispatch import IncrementalStreamDetokenizer
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
 from atom.entrypoints.openai.tool_parser.deepseekv41_tool_parser import DsmlV41Parser
 from atom.model_engine.token_logprobs import TokenLogprob
+
+
+def response_logprobs(response, outputs, codec, top_k, **kwargs):
+    response.choices = [
+        _build_chat_choice(
+            "",
+            "stop",
+            index=i,
+            logprob_codec=codec,
+            token_ids=output["token_ids"],
+            token_logprobs=output["logprobs"],
+            top_logprobs=top_k,
+            **kwargs,
+        )
+        for i, output in enumerate(outputs)
+    ]
+    return response
 
 
 class Codec:
@@ -106,16 +122,16 @@ def test_stream_hidden_repeated_text_uses_visible_occurrence(size):
     tracker.close()
 
 
-def test_long_undecided_tool_records_spill_without_an_in_memory_index():
+def test_claiming_later_text_keeps_buffered_earlier_records():
     tracker = LogprobsProcessor(Codec(), 20)
-    record = TokenLogprob(-1.0, 1, tuple((97, -float(i + 1)) for i in range(20)))
-    for _ in range(3000):
-        last = tracker.feed([97], [record])
-    assert tracker.store.file._rolled
-    assert not hasattr(tracker, "spans") and not hasattr(tracker, "raw")
-    assert tracker.take(last)[0]["logprob"] == -1.0
+    record = TokenLogprob(-1.0, 1, ((97, -1.0),))
+    first = tracker.feed([97], [record])
+    last = tracker.feed([98], [record])
+    assert tracker.take(last)[0]["token"] == "b"
+    assert tracker.take(first)[0]["token"] == "a"
+    assert tracker.take(first) == []
     tracker.close()
-    assert tracker.store.file.closed
+    assert tracker.store.records == []
 
 
 def test_truncated_multibyte_source_keeps_original_bytes():
@@ -133,21 +149,9 @@ def test_truncated_multibyte_source_keeps_original_bytes():
 
 
 def test_logprob_detokenization_preserves_punctuation_spaces():
-    calls = []
-
-    class Tokenizer:
-        def decode(
-            self, ids, skip_special_tokens=True, clean_up_tokenization_spaces=True
-        ):
-            calls.append(clean_up_tokenization_spaces)
-            text = "".join(map(chr, ids))
-            return text.replace(" .", ".") if clean_up_tokenization_spaces else text
-
-    decoder = IncrementalStreamDetokenizer(
-        Tokenizer(), clean_up_tokenization_spaces=False
-    )
-    assert decoder.update(list(map(ord, "Hello .")), True) == "Hello ."
-    assert calls and not any(calls)
+    text = "Hello ."
+    tracker = LogprobsProcessor(Codec())
+    assert tracker.feed(list(map(ord, text)), records(text), finished=True) == text
 
 
 @pytest.mark.parametrize("traced", [False, True])
@@ -289,3 +293,202 @@ def test_raw_logprob_dispatch_coalesces_without_ordinary_decode(tag):
             tracker.close()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("fanout", [False, True])
+def test_buffered_older_content_owns_shared_token(fanout):
+    import asyncio
+
+    from atom.entrypoints.openai.logprobs import LogprobCollector
+    from atom.entrypoints.openai.serving_chat import (
+        stream_chat_response,
+        stream_chat_response_fanout,
+    )
+    from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
+
+    text = "<calls>literal<think>reason</think>end"
+    codec = SimpleNamespace(
+        special=set(),
+        raw=lambda _: text.encode(),
+        candidate=lambda t, p: {
+            "token": text,
+            "bytes": list(text.encode()),
+            "logprob": p,
+        },
+    )
+    expected = _build_chat_choice(
+        "",
+        "stop",
+        tools=TOOLS,
+        tool_parser_cls=DsmlV41Parser,
+        logprob_codec=codec,
+        token_ids=[0],
+        token_logprobs=[TokenLogprob(-0.25, 1)],
+    )
+
+    async def run():
+        source = StreamOutputCollector()
+        chunk = {
+            "token_ids": [0],
+            "logprobs": [TokenLogprob(-0.25, 1)],
+            "finished": False,
+        }
+        source.put_nowait((0, chunk) if fanout else chunk)
+        final = {"token_ids": [], "finished": True, "finish_reason": "stop"}
+        source.put_nowait((0, final) if fanout else final)
+        collector = LogprobCollector(source, codec, 0)
+        kwargs = {
+            "request_id": "req",
+            "model": "model",
+            "num_prompt_tokens": 1,
+            "cleanup_stream": lambda *a, **kw: None,
+            "cleanup_request": lambda *a: None,
+            "tools": TOOLS,
+            "tool_parser_cls": DsmlV41Parser,
+        }
+        gen = (
+            stream_chat_response_fanout(
+                shared_collector=collector, seq_ids=[1], **kwargs
+            )
+            if fanout
+            else stream_chat_response(stream_collector=collector, seq_id=1, **kwargs)
+        )
+        frames = [frame async for frame in gen]
+        assert collector.trackers[0].store.records == []
+        actual = {"content": [], "reasoning_content": []}
+        for frame in frames:
+            for data in iter_sse_data(frame):
+                if data == "[DONE]":
+                    continue
+                for choice in json.loads(data).get("choices", []):
+                    for field, rows in (choice.get("logprobs") or {}).items():
+                        actual[field].extend(rows)
+        assert actual == expected["logprobs"]
+        assert len(actual["content"]) == 1
+        assert not actual["reasoning_content"]
+
+    asyncio.run(run())
+
+
+def test_bad_logprobs_terminate_only_the_failing_fanout_choice():
+    import asyncio
+
+    from atom.entrypoints.openai.logprobs import LogprobCollector
+    from atom.entrypoints.openai.serving_chat import stream_chat_response_fanout
+    from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
+
+    async def run():
+        source = StreamOutputCollector()
+        source.put_nowait((0, {"token_ids": [97], "logprobs": [], "finished": True}))
+        source.put_nowait(
+            (
+                1,
+                {
+                    "token_ids": [98],
+                    "logprobs": [TokenLogprob(-1, 1)],
+                    "finished": True,
+                    "finish_reason": "stop",
+                },
+            )
+        )
+        collector = LogprobCollector(source, Codec(), 0, 2)
+        cleaned = []
+        gen = stream_chat_response_fanout(
+            "req",
+            "model",
+            collector,
+            [11, 12],
+            1,
+            lambda seq, **kw: cleaned.append((seq, kw)),
+            lambda _: None,
+        )
+        frames = [frame async for frame in gen]
+        payloads = [
+            json.loads(data)
+            for frame in frames
+            for data in iter_sse_data(frame)
+            if data != "[DONE]"
+        ]
+        assert any(p.get("error", {}).get("index") == 0 for p in payloads)
+        assert any(
+            c["index"] == 1 and c["delta"].get("content") == "b"
+            for p in payloads
+            for c in p.get("choices", [])
+        )
+        assert frames[-1].endswith("data: [DONE]\n\n")
+        assert (11, {"aborted": True}) in cleaned
+
+    asyncio.run(run())
+
+
+def test_added_special_tokens_and_padded_vocab_candidates():
+    from atom.entrypoints.openai.logprobs import TokenBytes
+
+    tokenizer = SimpleNamespace(
+        backend_tokenizer=SimpleNamespace(
+            decoder=SimpleNamespace(__getstate__=lambda: b'{"type":"ByteLevel"}')
+        ),
+        all_special_ids=[7],
+        added_tokens_decoder={8: SimpleNamespace(special=True)},
+        convert_ids_to_tokens=lambda i: {0: "hello", 7: "eos", 8: "pad"}.get(i),
+    )
+    codec = TokenBytes(tokenizer)
+    tracker = LogprobsProcessor(codec, 1)
+    text = tracker.feed(
+        [8, 0, 7], [TokenLogprob(-1, 1, ((99, -2),))] * 3, finished=True
+    )
+    assert text == "hello"
+    assert tracker.take(text)[0]["top_logprobs"] == [
+        {"token": "", "bytes": [], "logprob": -2.0}
+    ]
+
+
+def test_bad_raw_registration_preserves_other_buffered_chunks():
+    import asyncio
+
+    from atom.entrypoints.openai.streaming_dispatch import (
+        StreamBatchDispatcher,
+        StreamOutputCollector,
+    )
+
+    async def run():
+        dispatcher = StreamBatchDispatcher(SimpleNamespace())
+        source = StreamOutputCollector()
+        loop = asyncio.get_running_loop()
+        dispatcher.enqueue(
+            loop=loop,
+            collector=source,
+            state=dispatcher.new_state(decode=False),
+            chunk={"token_ids": [97]},
+        )
+        with pytest.raises(ValueError, match="Raw streams"):
+            dispatcher.enqueue(
+                loop=loop,
+                collector=asyncio.Queue(),
+                state=dispatcher.new_state(decode=False),
+                chunk={},
+            )
+        dispatcher.flush()
+        await asyncio.sleep(0)
+        assert (await source.get())["token_ids"] == [97]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "option,value,kwargs",
+    [
+        ("enable_rapidserve", True, {}),
+        ("kv_transfer_config", object(), {}),
+        ("speculative_config", SimpleNamespace(synthetic_acceptance_rates=[]), {}),
+        ("unused", None, {"kv_transfer": {"id": 1}}),
+        ("unused", None, {"multimodal": True}),
+    ],
+)
+def test_logprob_execution_admission_is_shared(option, value, kwargs):
+    from atom.sampling_params import SamplingParams
+
+    config = SimpleNamespace(**{option: value})
+    with pytest.raises(ValueError, match="logprobs"):
+        SamplingParams(logprobs=True).validate_logprob_options(config, **kwargs)
+    SamplingParams(logprobs=False).validate_logprob_options(config, **kwargs)

@@ -141,6 +141,7 @@ Key entry points:
 | Environment variables | `docs/environment_variables.md` |
 | Compilation & CUDAGraph | `docs/compilation_cudagraph_guide.md` |
 | Model support | `docs/model_support_guide.md` |
+| Chat token logprobs | `docs/chat_logprobs.md` |
 | Structured output | `docs/structured_output_capabilities.md` |
 | Model ops (AITER kernels) | `docs/model_ops_guide.md` |
 | Scheduling & KV cache | `docs/scheduling_kv_cache_guide.md` |

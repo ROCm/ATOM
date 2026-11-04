@@ -12,7 +12,6 @@ from atom.entrypoints.openai.logprobs import (
     LogprobsProcessor,
     TokenBytes,
 )
-from atom.entrypoints.openai.serving_chat import stream_logprobs
 from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.model_engine.token_logprobs import TokenLogprob
@@ -94,7 +93,7 @@ def test_coalescing_keeps_probabilities_and_choice_identity():
         wrapper = LogprobCollector(source, codec(), 2, n=2)
         index, chunk = await wrapper.get()
         assert index == 1 and len(chunk["logprobs"]) == 2
-        assert wrapper.trackers[0].store.count == 0
+        assert wrapper.trackers[0].store.records == []
 
         async def frames():
             from atom.entrypoints.openai.serving_chat import create_chat_chunk
@@ -108,7 +107,7 @@ def test_coalescing_keeps_probabilities_and_choice_identity():
             )
             yield "data: [DONE]\n\n"
 
-        result = [x async for x in stream_logprobs(frames(), wrapper.trackers)]
+        result = [x async for x in frames()]
         value = json.loads(next(iter_sse_data(result[0])))
         rows = value["choices"][0]["logprobs"]["content"]
         assert len(rows) == 2
@@ -131,7 +130,7 @@ def test_stream_tracker_preserves_partial_tokens_and_closes_store():
         assert len(tracker.take(text[:4])) == 1
         assert tracker.take(text[4:]) == []
     tracker.close()
-    assert tracker.store.file.closed
+    assert tracker.store.records == []
 
 
 def test_non_bytelevel_tokenizer_is_explicitly_rejected():

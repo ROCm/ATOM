@@ -599,7 +599,7 @@ class ScheduledBatchOutput:
         self.num_bonus = self._copy_array_view(num_bonus)
         self.is_deferred_out = is_deferred_out
         self.is_prev_prefill = is_prev_prefill
-        self.logprobs = logprobs  # Optional[dict[int, float]]
+        self.logprobs = logprobs
         # DSpark Phase 2: {req_id: ell_r} from this step's propose() — the
         # scheduler-chosen verify length per request. Rides back to the
         # (main-process) scheduler so the NEXT step can size each request's
@@ -4202,7 +4202,7 @@ class Scheduler:
         prev_token_ids = fwd_output.token_ids
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
-        token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
+        token_logprobs = fwd_output.logprobs
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -4320,6 +4320,31 @@ class Scheduler:
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
+
+            # Check before mutating tokens. A malformed payload must terminate
+            # only its request, never escape into the engine's main loop.
+            if seq.return_logprobs and (
+                getattr(seq, "_injected_t0", None) is not None
+                or len(token_logprob or ()) != num_new_token
+            ):
+                logger.error("Missing or misaligned logprobs for request %s", seq.id)
+                self._mark_finished(
+                    seq, "logprob_error", seq.num_tokens - seq.num_placeholder_tokens
+                )
+                finished_seqs.append(seq)
+                if stream_output_queue is not None:
+                    stream_outputs.append(
+                        (
+                            seq.id,
+                            RequestOutput(
+                                request_id=seq.id,
+                                output_tokens=[],
+                                finished=True,
+                                finish_reason="logprob_error",
+                            ),
+                        )
+                    )
+                continue
 
             # In-place overwrite only when placeholders already exist.
             if is_deferred_out or (
@@ -4495,21 +4520,10 @@ class Scheduler:
                 # in stop_at_idx / num_new_token, so offset the cut by it.
                 keep = stop_at_idx + 1 + (1 if injected_t0 is not None else 0)
                 new_tokens = new_tokens[:keep]
-                if seq.return_logprobs:
-                    # LLMEngine.postprocess returns the complete logprobs
-                    # array rather than slicing it through num_tokens, so keep
-                    # it aligned explicitly with the cropped completion.
-                    del seq.logprobs[num_tokens - seq.num_prompt_tokens :]
 
             committed_logprobs = None
             if seq.return_logprobs:
-                if injected_t0 is not None:
-                    raise RuntimeError(
-                        "logprobs with injected P/D tokens is unsupported"
-                    )
                 committed_logprobs = (token_logprob or [])[: len(new_tokens)]
-                if len(committed_logprobs) != len(new_tokens):
-                    raise RuntimeError("Token/logprob output length mismatch")
                 seq.logprobs.extend(item.logprob for item in committed_logprobs)
 
             # Record TTFT from the finalized retained length, after rejected

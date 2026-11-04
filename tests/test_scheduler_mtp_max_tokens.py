@@ -168,3 +168,41 @@ class TestMTPMaxTokens:
         assert finished[0].num_completion_tokens == 2
         emitted = stream_queue.put_nowait.call_args.args[0][0][1]
         assert emitted.output_tokens == [10, 11]
+
+
+@pytest.mark.parametrize("injected", [False, True])
+def test_bad_logprobs_do_not_terminate_sibling_requests(seq_factory, injected):
+    sched = Scheduler(MockConfig(num_kvcache_blocks=64))
+    bad = seq_factory(
+        [1, 2, 3], sampling_params=SamplingParams(max_tokens=8, logprobs=True)
+    )
+    good = seq_factory(
+        [1, 2, 4], sampling_params=SamplingParams(max_tokens=8, logprobs=True)
+    )
+    sched.add(bad)
+    sched.add(good)
+    sched.schedule()
+    if injected:
+        bad._injected_t0 = 99
+    queue = mock.Mock()
+    finished = sched.postprocess(
+        list(sched.running),
+        ScheduledBatchOutput(
+            req_ids=[bad.id, good.id],
+            token_ids=[(10,), (11,)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            logprobs={
+                bad.id: [TokenLogprob(-1, 1)] if injected else [],
+                good.id: [TokenLogprob(-0.5, 1)],
+            },
+        ),
+        stream_output_queue=queue,
+    )
+    assert bad in finished and good not in finished
+    assert bad.leave_reason == "logprob_error"
+    assert list(good.logprobs) == [-0.5]
+    outputs = dict(queue.put_nowait.call_args.args[0])
+    assert outputs[bad.id].finish_reason == "logprob_error"
+    assert outputs[good.id].output_tokens == [11]

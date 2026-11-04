@@ -344,6 +344,11 @@ class ToolCallStreamParser:
         """The format this stream is being read as, or None."""
         return self.parser_cls.NAME if self.parser_cls is not None else None
 
+    @property
+    def has_pending_text(self) -> bool:
+        """Whether an earlier input span can still become visible content."""
+        return self._region is not None or bool(self._scanner and self._scanner.held)
+
     # -- public ------------------------------------------------------------
     def process(self, text: str) -> list:
         """Consume one chunk; return the events it completed."""

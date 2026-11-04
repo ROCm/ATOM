@@ -5,15 +5,18 @@
 
 TokenBytes maps tokenizer IDs to original bytes. LogprobText preserves those
 positions through parsing. LogprobsProcessor decodes deltas and claims records
-from its bounded spool; LogprobCollector connects it to coalesced engine output.
+from request-local records; LogprobCollector connects it to coalesced engine output.
 Chat wire-format assembly lives in serving_chat.py.
 """
 
 import codecs
 import json
-import struct
-from contextlib import ExitStack
-from tempfile import SpooledTemporaryFile
+import logging
+from bisect import bisect_right
+
+
+class LogprobError(RuntimeError):
+    """An internal decoding/attribution failure, never a client validation error."""
 
 
 class LogprobText(str):
@@ -71,61 +74,54 @@ def join_text(parts):
         if not part:
             continue
         if not isinstance(part, LogprobText) or part.owner is not traced.owner:
-            raise ValueError("Parser lost source-byte provenance")
+            raise LogprobError("Parser lost source-byte provenance")
         spans.extend(part.parts)
     return LogprobText(spans, traced.owner)
 
 
 class _LogprobStore:
-    """Fixed-width records spill after 64 KiB; ownership needs no Python index."""
-
-    MEMORY_LIMIT = 64 * 1024
+    """Request-local records; retain unclaimed spans while parsers buffer text."""
 
     def __init__(self, top_k):
-        self.layout = struct.Struct("<QQqdi" + "qd" * top_k + "?")
         self.top_k = top_k
-        self._files = ExitStack()
-        self.file = self._files.enter_context(
-            SpooledTemporaryFile(  # noqa: SIM115 - owned by the request ExitStack
-                max_size=self.MEMORY_LIMIT, mode="w+b"
-            )
-        )
-        self.count = 0
+        self.records = []
+        self.ends = []
+        self.cursor = 0
 
     def append(self, start, end, token, record):
-        top = list(record.top[: self.top_k])
-        top += [(-1, 0.0)] * (self.top_k - len(top))
-        values = [start, end, token, record.logprob, record.rank]
-        values.extend(value for pair in top for value in pair)
-        self.file.seek(self.count * self.layout.size)
-        self.file.write(self.layout.pack(*values, False))
-        self.count += 1
-
-    def read(self, index):
-        self.file.seek(index * self.layout.size)
-        return self.layout.unpack(self.file.read(self.layout.size))
+        top = record.top[: self.top_k]
+        values = (start, end, token, record.logprob, record.rank)
+        self.records.append(values + tuple(value for pair in top for value in pair))
+        self.ends.append(end)
 
     def within(self, start, end):
-        left, right = 0, self.count
-        while left < right:
-            middle = (left + right) // 2
-            if self.read(middle)[1] <= start:
-                left = middle + 1
-            else:
-                right = middle
-        for index in range(left, self.count):
-            record = self.read(index)
+        first = bisect_right(self.ends, start, lo=self.cursor)
+        for index in range(first, len(self.records)):
+            record = self.records[index]
+            if record is None:
+                continue
             if record[0] >= end:
                 break
-            if not record[-1]:
-                # Store ownership in the spool, not an ever-growing Python set.
-                # A partially visible token still contributes its probability.
-                self.file.seek((index + 1) * self.layout.size - 1)
-                self.file.write(b"\x01")
-                yield record[:-1]
+            self.records[index] = None
+            yield record
+        while self.cursor < len(self.records) and self.records[self.cursor] is None:
+            self.cursor += 1
+        if self.cursor >= 1024:
+            del self.records[: self.cursor]
+            del self.ends[: self.cursor]
+            self.cursor = 0
+
+    def discard_before(self, offset):
+        count = bisect_right(self.ends, offset)
+        if count:
+            del self.records[:count]
+            del self.ends[:count]
+            self.cursor = max(0, self.cursor - count)
 
     def close(self):
-        self._files.close()
+        self.records.clear()
+        self.ends.clear()
+        self.cursor = 0
 
 
 class TokenBytes:
@@ -136,7 +132,13 @@ class TokenBytes:
         if state.get("type") != "ByteLevel":
             raise ValueError("Chat logprobs currently requires a ByteLevel tokenizer")
         self.tokenizer = tokenizer
-        self.special = frozenset(tokenizer.all_special_ids)
+        self.special = frozenset(tokenizer.all_special_ids) | {
+            token_id
+            for token_id, token in getattr(
+                tokenizer, "added_tokens_decoder", {}
+            ).items()
+            if token.special
+        }
         # Inverse of the reversible GPT-2/ByteLevel byte alphabet.
         bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
         cs = list(bs)
@@ -153,6 +155,10 @@ class TokenBytes:
         if token_id in self.cache:
             return self.cache[token_id]
         token = self.tokenizer.convert_ids_to_tokens(int(token_id))
+        # Model vocabularies may be padded beyond the tokenizer vocabulary.
+        # Such a candidate has no text bytes; its probability remains valid.
+        if token is None:
+            return b""
         try:
             raw = bytes(self.byte_decoder[c] for c in token)
         except KeyError:
@@ -181,7 +187,7 @@ class LogprobsProcessor:
 
     def feed(self, token_ids, records, *, finished=False):
         if token_ids and (records is None or len(token_ids) != len(records)):
-            raise RuntimeError("Missing or misaligned engine token logprobs")
+            raise LogprobError("Missing or misaligned engine token logprobs")
         pending = self.decoder.getstate()[0]
         start = self.source_end - len(pending)
         pieces = []
@@ -222,14 +228,14 @@ class LogprobsProcessor:
                 break
         sourced = LogprobText(parts, self)
         if sourced != text:
-            raise RuntimeError("Token-byte decoder lost source alignment")
+            raise LogprobError("Token-byte decoder lost source alignment")
         return sourced
 
     def take(self, text):
         if not text:
             return []
         if not isinstance(text, LogprobText) or text.owner is not self:
-            raise RuntimeError("Visible text has no token-byte source spans")
+            raise LogprobError("Visible text has no token-byte source spans")
         result = []
         for start, end in text.source_ranges:
             for record in self.store.within(start, end):
@@ -256,6 +262,17 @@ class LogprobsProcessor:
             values[field].extend(self.take(LogprobText([(text, start, end)], self)))
         return values
 
+    def discard_resolved(self, held_text):
+        # Called only after the tool parser and pending SSE deltas are drained.
+        # Keep the UTF-8 prefix and reasoning marker prefix, including any token
+        # straddling their boundaries. Everything older has been classified.
+        offset = self.source_end - len(self.decoder.getstate()[0])
+        if held_text:
+            if not isinstance(held_text, LogprobText):
+                raise LogprobError("Buffered text has no token-byte source spans")
+            offset = min(offset, min(start for start, _ in held_text.source_ranges))
+        self.store.discard_before(offset)
+
     def close(self):
         self.store.close()
 
@@ -270,9 +287,24 @@ class LogprobCollector:
     async def get(self):
         payload = await self.source.get()
         index, chunk = payload if isinstance(payload, tuple) else (0, payload)
-        chunk["text"] = self.trackers[index].feed(
-            chunk.get("token_ids", []),
-            chunk.get("logprobs"),
-            finished=bool(chunk.get("finished")),
-        )
+        try:
+            if chunk.get("finish_reason") == "logprob_error":
+                raise LogprobError(
+                    "Engine returned missing or misaligned token logprobs"
+                )
+            chunk["text"] = self.trackers[index].feed(
+                chunk.get("token_ids", []),
+                chunk.get("logprobs"),
+                finished=bool(chunk.get("finished")),
+            )
+        except LogprobError as exc:
+            logging.getLogger("atom").exception(
+                "Logprob decoding failed for choice %s", index
+            )
+            chunk.update(
+                text="",
+                finished=True,
+                finish_reason="logprob_error",
+                logprob_error=str(exc),
+            )
         return payload

@@ -62,6 +62,7 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.token_logprobs import TokenLogprob
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -259,11 +260,7 @@ class tokenIDProcessor:
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             cpu_logprobs = (
-                (
-                    tuple(t.to("cpu", non_blocking=True) for t in gpu_logprobs)
-                    if isinstance(gpu_logprobs, tuple)
-                    else gpu_logprobs.to("cpu", non_blocking=True)
-                )
+                tuple(t.to("cpu", non_blocking=True) for t in gpu_logprobs)
                 if gpu_logprobs is not None
                 else None
             )
@@ -283,7 +280,7 @@ class tokenIDProcessor:
         cpu_tensor_handle.pop(0)
         return cpu_tensor
 
-    def recv_logprobs(self) -> list[float] | None:
+    def recv_logprobs(self) -> tuple[list, ...] | None:
         """Pop and return the earliest logprobs from the async copy queue.
         Must be called after recv_async_output, which waits for the copy that
         fills this tensor (the same copy_done covers both).
@@ -292,11 +289,7 @@ class tokenIDProcessor:
             return None
         logprob_tensor = self.logprobs_cpu.pop(0)
         if logprob_tensor is not None:
-            return (
-                tuple(t.tolist() for t in logprob_tensor)
-                if isinstance(logprob_tensor, tuple)
-                else logprob_tensor.tolist()
-            )
+            return tuple(t.tolist() for t in logprob_tensor)
         return None
 
     def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
@@ -323,7 +316,7 @@ class tokenIDProcessor:
     def clean(self):
         self._wait_for_pending_copies()
         self.token_ids_cpu: list[tuple] = []
-        self.logprobs_cpu: list[torch.Tensor | None] = []
+        self.logprobs_cpu: list[tuple[torch.Tensor, ...] | None] = []
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
@@ -375,7 +368,7 @@ class tokenIDProcessor:
         sync_event: torch.cuda.Event,
         sampled_logprobs: tuple[torch.Tensor, ...] | None = None,
         channel_states: torch.Tensor | None = None,
-    ) -> tuple[dict[int, tuple[int, ...]], dict[int, float] | None]:
+    ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
         if not self.is_deferred_out:
             token_ids = sampled_token_ids.tolist()
             req_ids = batch.req_ids
