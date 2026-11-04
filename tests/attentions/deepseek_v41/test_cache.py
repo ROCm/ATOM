@@ -832,24 +832,22 @@ def test_candidate_blocks_are_bound_once_a_forward(small_config, monkeypatch):
     assert len(builds) == 2
 
 
-@pytest.mark.parametrize(
-    "arch,backend,layout",
-    [
-        ("gfx950", "opus", "mfma"),
-        ("gfx950", "flydsl", "preshuffle"),
-        ("gfx1250", "opus", "natural"),
-    ],
-)
-def test_fp4_cache_layout_selection_and_page_geometry(
-    monkeypatch, arch, backend, layout
-):
-    from atom.model_ops.attentions.deepseek_v41 import cache as cache_module
+@pytest.mark.parametrize("layout", ["mfma", "preshuffle", "natural"])
+def test_fp4_cache_layout_selection_and_page_geometry(monkeypatch, layout):
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 
-    monkeypatch.setattr(cache_module, "get_gfx", lambda: arch)
-    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", backend)
+    # Allocation follows the declared geometry, not a later environment read.
+    monkeypatch.setenv("ATOM_V4_UNIFIED_MQA", "flydsl")
     geo = V41PoolGeometry(
-        2, ((0, 2), (1, 1)), 128, 128, 512, 128, index_block_rows=8, index_fp4=True
+        2,
+        ((0, 2), (1, 1)),
+        128,
+        128,
+        512,
+        128,
+        index_block_rows=8,
+        index_fp4=True,
+        index_layout=layout,
     )
     cache = PagedAttentionCache(geo, 3, 1, "cpu")
     assert {units.layout for units in cache.index_units.values()} == {layout}

@@ -3,7 +3,6 @@
 
 import numpy as np
 import torch
-from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.attentions.deepseek_v41.packed_rows import (
     gather_prefix_rows,
@@ -23,7 +22,6 @@ from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_plane import (
     FP4_MFMA,
     IndexUnits,
-    fp4_index_layout_for_arch,
 )
 from atom.model_ops.deepseek_v41.index_write import (
     write_index_rows,
@@ -37,7 +35,7 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_scatter_rows_reference,
     swa_write,
 )
-from atom.utils import CpuGpuBuffer, envs, upload_numpy
+from atom.utils import CpuGpuBuffer, upload_numpy
 
 from .indices import (
     build_indices,
@@ -81,11 +79,7 @@ class PagedAttentionCache:
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
-        index_layout = (
-            fp4_index_layout_for_arch(get_gfx(), backend=envs.ATOM_V4_UNIFIED_MQA)
-            if geometry.index_fp4
-            else "fp8"
-        )
+        index_layout = geometry.index_layout
         if index_layout == FP4_MFMA and (
             geometry.index_dim != 128
             or any(geometry.rows_per_page(ratio) % 64 for _, ratio in geometry.owners)

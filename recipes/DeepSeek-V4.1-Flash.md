@@ -107,7 +107,9 @@ What differs from gfx950:
   H32 OPUS MQA API, including full-layer and candidate tables and packed logits.
   Requires AITER [#7128](https://github.com/ROCm/aiter/pull/7128) and
   [#6952](https://github.com/ROCm/aiter/pull/6952). gfx1250 correctness, model E2E
-  and performance remain unvalidated. gfx950 keeps the FlyDSL FP4 scorer.
+  and performance remain unvalidated. On gfx950, FP4 defaults to the OPUS
+  scorer with MFMA cache layout; set `ATOM_V4_UNIFIED_MQA=flydsl` before
+  startup to use the FlyDSL scorer and its page-8 layout.
 - **`--level 0`.** A first `--level 3` start can stall while ranks compile and
   autotune at different times.
 

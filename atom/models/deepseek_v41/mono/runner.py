@@ -25,12 +25,11 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
-from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA, fp4_index_layout_for_arch
+from atom.model_ops.deepseek_v41.index_plane import FP4_MFMA
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
 from atom.models.deepseek_v41.config import AttentionMode
@@ -156,9 +155,7 @@ class V41MonoDecodeRunner:
         self.index_bound_max = ip.cdiv(max_model_len, ip.CHUNK) * ip.CHUNK
         self.index_fp4 = index_fp4
         self.index_layout = (
-            fp4_index_layout_for_arch(get_gfx(), backend=envs.ATOM_V4_UNIFIED_MQA)
-            if index_fp4
-            else "fp8"
+            get_current_atom_config().index_cache_layout if index_fp4 else "fp8"
         )
         self._bind_agreed(lambda: self._bind(model, drafter))
 

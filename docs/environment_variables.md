@@ -13,6 +13,12 @@ The standard `OTEL_SERVICE_NAME` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
 variables configure service identity and delivery. See [tracing setup and
 limitations](observability/README.md).
 
+## DeepSeek FP4 index scoring
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_V4_UNIFIED_MQA** | str | `opus` | DeepSeek-V4/V4.1 FP4 index scorer on gfx950 (MI355): `opus` uses AITER OPUS MQA with MFMA cache layout; `flydsl` uses FlyDSL with its preshuffled cache layout. On gfx1250 the FP4 path uses OPUS with natural cache layout; this switch does not select FlyDSL there. V4.1 gfx1250 hardware validation is pending. Set before process startup/cache allocation and restart to change it; existing cache bytes cannot be reused across physical layouts. Has no effect on FP8 index scoring. |
+
 ## Metadata H2D
 
 | Variable | Type | Default | Description |

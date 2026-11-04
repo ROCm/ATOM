@@ -2076,6 +2076,9 @@ class Config:
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
     index_cache_dtype: str | None = None
+    # V4.1 FP4 physical layout, resolved before config is sent to scheduler
+    # and workers. Their PAGE namespace must describe the same stored bytes.
+    index_cache_layout: str | None = field(default=None, init=False)
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
@@ -2782,12 +2785,31 @@ class Config:
 
             validate_runtime_config(self)
 
+        self._resolve_index_cache_layout()
+
         if is_deepseek_v4:
             from atom.model_ops.attentions.deepseek_v4_replay import (
                 state_replay_tokens,
             )
 
             self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_index_cache_layout(self) -> None:
+        if (
+            self.hf_config.model_type == "deepseek_v41_text"
+            and self.index_cache_dtype == "fp4"
+        ):
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            from atom.model_ops.deepseek_v41.index_plane import (
+                fp4_index_layout_for_arch,
+            )
+
+            self.index_cache_layout = fp4_index_layout_for_arch(
+                get_gfx_runtime(), backend=envs.ATOM_V4_UNIFIED_MQA
+            )
+        else:
+            self.index_cache_layout = None
 
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.

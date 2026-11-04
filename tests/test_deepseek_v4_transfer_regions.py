@@ -131,6 +131,7 @@ def _stub_v4_runtime_imports():
     aiter_jit_utils.__path__ = []
     chip_info = types.ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = lambda: "gfx950"
+    chip_info.get_gfx_runtime = lambda: "gfx950"
     # Replaced, not reused: other test modules leave their own, narrower
     # parallel_state stub in sys.modules.
     aiter_dist = types.ModuleType("aiter.dist")

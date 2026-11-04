@@ -52,7 +52,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from atom.distributed.pcp_utils import (
     get_pcp_rank,
@@ -560,7 +560,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(get_gfx(), backend=envs.ATOM_V4_UNIFIED_MQA)
+            fp4_indexer_layout_for_arch(
+                get_gfx_runtime(), backend=envs.ATOM_V4_UNIFIED_MQA
+            )
             if self._indexer_fp4
             else "fp8"
         )
