@@ -5382,10 +5382,9 @@ class FusedMoE(torch.nn.Module):
         all-reduces. Only rows no gather moved are counted
         (`pass_scheduled_tokens_gpu`)."""
         context = get_forward_context().context
-        # SP ranks hold token shards in every pass, captured and dummy ones too.
-        sp = sp_is_enabled()
-        pcp = self.moe_parallel_config.pcp_merge and (sp or not context.is_dummy_run)
-        split = pcp and (sp or context.pcp_split)
+        pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
+        # SP marks its dummy and captured passes split too.
+        split = self.moe_parallel_config.pcp_merge and context.pcp_split
         if split:
             rows = pack_routed_rows(
                 self.quant_method.routed_rows_wire,

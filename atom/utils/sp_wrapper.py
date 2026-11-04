@@ -29,8 +29,11 @@ class SPModelWrapper(nn.Module):
         local_ids = input_ids.as_strided(
             (rows.stop - rows.start,), (1,), input_ids.storage_offset() + rows.start
         )
+        context = get_forward_context().context
+        # Dummy and captured passes run on a range too; FusedMoE gathers on this.
+        context.pcp_split = True
         hidden_states = self.model(local_ids, positions)
-        if get_forward_context().context.is_prefill:
+        if context.is_prefill:
             return hidden_states
         return sp_gather_tokens(hidden_states, num_tokens)
 

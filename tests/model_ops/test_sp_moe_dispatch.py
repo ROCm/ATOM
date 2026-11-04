@@ -45,12 +45,11 @@ def test_sp_gathers_every_pass_once_and_scatters_it_back(monkeypatch, sp_modules
     gatherv = Mock(side_effect=lambda ts, sizes, g: [t.repeat(world, 1) for t in ts])
     scatter = Mock(side_effect=lambda value: value[:rows])
     reassign = Mock()
-    # A dummy pass that ordinary PCP would neither split nor reduce.
-    context = SimpleNamespace(is_dummy_run=True, pcp_split=False)
+    # A dummy pass, which SPModelWrapper marks split like any other.
+    context = SimpleNamespace(is_dummy_run=True, pcp_split=True)
     monkeypatch.setattr(
         moe, "get_forward_context", lambda: SimpleNamespace(context=context)
     )
-    monkeypatch.setattr(moe, "sp_is_enabled", lambda: True)
     monkeypatch.setattr(moe, "get_pcp_group", lambda: group)
     monkeypatch.setattr(moe, "all_gatherv", gatherv)
     monkeypatch.setattr(moe, "reassign_gathered_shared_ids", reassign)
