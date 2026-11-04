@@ -218,6 +218,7 @@ class ReasoningFilter:
         self,
         starts_thinking: bool = False,
         dialect: ReasoningDialect | None = None,
+        literal_answer: bool = False,
     ) -> None:
         self.starts_thinking = starts_thinking
         self.dialect = dialect
@@ -227,12 +228,16 @@ class ReasoningFilter:
         self._open_markers = frozenset(
             (speaking.output_open_marker,) if speaking.output_open_marker else ()
         )
-        self.state = 1 if starts_thinking else 0
+        self.state = 1 if starts_thinking else (2 if literal_answer else 0)
         # Nothing has been released yet, so an end marker arriving now sits at
         # offset 0 -- which is the only place it means "I did not think this
         # turn". See `_split_inline_tag`, whose answer this has to match.
         self._at_offset_zero = not starts_thinking
-        self._scanner = self._scanner_for(self.state)
+        self._scanner = (
+            None
+            if literal_answer and not starts_thinking
+            else self._scanner_for(self.state)
+        )
 
     def _scanner_for(self, state: int) -> MarkerScanner | None:
         """What this state has to watch for. ``None`` when that is nothing,
@@ -325,14 +330,25 @@ class ReasoningChannel:
 
     dialect: ReasoningDialect | None = None
     starts_open: bool = False
+    literal_answer: bool = False
 
     def split(self, text: str) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``."""
+        if self.literal_answer:
+            reader = self.stream()
+            events = [*reader.process(text), *reader.flush()]
+            reasoning = "".join(v for k, v in events if k == "reasoning_content")
+            content = "".join(v for k, v in events if k == "content")
+            return reasoning or None, content
         return separate_reasoning(text, self.starts_open, self.dialect)
 
     def stream(self) -> ReasoningFilter:
         """A filter over the same output arriving in chunks."""
-        return ReasoningFilter(starts_thinking=self.starts_open, dialect=self.dialect)
+        return ReasoningFilter(
+            starts_thinking=self.starts_open,
+            dialect=self.dialect,
+            literal_answer=self.literal_answer,
+        )
 
 
 # For a caller with no model behind it -- tests, and the completions endpoint,

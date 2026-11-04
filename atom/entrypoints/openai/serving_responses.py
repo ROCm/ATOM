@@ -168,7 +168,7 @@ def _normalize_input_items(items: list, all_tools: list) -> list:
                     "id": item.get("id") or call_id,
                     "call_id": call_id,
                     "name": name,
-                    "arguments": json.dumps({"input": input_text}),
+                    "arguments": json.dumps({"input": input_text}, ensure_ascii=False),
                 }
             )
         elif item_type == "custom_tool_call_output":
@@ -318,7 +318,7 @@ def _value_as_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     try:
-        return json.dumps(value)
+        return json.dumps(value, ensure_ascii=False)
     except (TypeError, ValueError):
         return str(value)
 
