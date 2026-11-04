@@ -225,7 +225,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def share_with_target(self, target_base, loaded=None):
         self.embed, self.head = target_base.embed, target_base.head
 
-    def target_aux_capture_spec(self, layer_ids, hidden_size, _target_model=None):
+    def target_aux_capture_spec(self, layer_ids, hidden_size, _target_layers=None):
         from atom.spec_decode.drafter import AuxCaptureSpec
 
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an

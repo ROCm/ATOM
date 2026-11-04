@@ -44,7 +44,6 @@ from torch import nn
 
 from atom.config import QuantizationConfig
 from atom.model_ops.attentions.dflash_draft_attn import DFlashDraftUnifiedAttention
-from atom.model_ops.kimi_k3 import apply_attn_res
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
@@ -61,8 +60,7 @@ from atom.models.dspark_draft import (
 )
 from atom.models.qwen3 import Qwen3MLP
 from atom.spec_decode.draft_kv import DraftKvPoolSpec
-from atom.spec_decode.drafter import AuxCaptureSpec, _resolve_decoder_layers
-from atom.spec_decode.dspark_proposer import DSparkProposer
+from atom.spec_decode.drafter import AuxCaptureSpec
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -470,110 +468,57 @@ class KimiK3DFlash(DSparkDraftModel):
 
     # -- the target feature this draft was trained on ----------------------
 
-    def target_aux_capture_spec(self, layer_ids, hidden_size, target_model):
+    def target_aux_capture_spec(self, layer_ids, hidden_size, target_layers):
         """Tap the target's AGGREGATE stream, not its running prefix.
 
         Kimi-K3 does not carry a plain pre-norm residual stream. It carries a
         BANK of per-``attn_res_block_size`` snapshots plus a RUNNING PREFIX,
         recombined at each attn-residual site by a softmax mixture over the
         bank plus the prefix (`AttnRes`). ATOM's generic aux tap reconstructs
-        the prefix alone (`KimiDecoderLayer.aux_hidden_state` sums the layer's
-        deferred addends into it) and discards the bank.
+        the prefix alone (`KimiDecoderLayer.aux_hidden_state`) and discards the
+        bank.
 
-        This checkpoint was trained on the mixture, so that is the feature it
-        has to see. It is a per-draft contract: the MLA draft (`KimiK3DSpark`)
-        wants the raw prefix, and gets it by not implementing this method.
-
-        The mixture is ATOM's own `apply_attn_res`, scored by the NEXT target
-        layer's `self_attention_attn_res.score_weight` and called with
-        ``out_norm_weight=None`` so it comes back un-normed. The target model
-        is not touched; the reconstruction lives in this draft.
+        This checkpoint was trained on the mixture the NEXT target layer forms,
+        so that is the feature it has to see; the target layer reconstructs it
+        (`KimiDecoderLayer.aggregate_hidden_state`). It is a per-draft
+        contract: the MLA draft (`KimiK3DSpark`) wants the raw prefix, and gets
+        it by not implementing this method.
         """
-        base_extract = DSparkProposer._extract_layer_hidden
-        layers = _resolve_decoder_layers(target_model)
-
-        # lid -> (num_valid_blocks, the AttnRes that scores the mixture).
-        # Keyed by the layer's OWN `layer_idx`, which is what the extract can
-        # read back off the module it is handed: a module int attribute, which
-        # Dynamo constant-folds inside the target's traced region, where an
-        # `id()`-keyed lookup would graph-break.
-        taps: dict[int, tuple[int, nn.Module]] = {}
+        # lid -> the layer that scores lid's aggregate. Keyed by the layer's OWN
+        # `layer_idx`, which is what the extract can read back off the module it
+        # is handed: a module int attribute, which Dynamo constant-folds inside
+        # the target's traced region, where an `id()`-keyed lookup would
+        # graph-break.
+        taps: dict[int, nn.Module] = {}
         for lid in layer_ids:
             if lid == -1:
                 continue  # the embedding tap: no mixture below the first layer
             # Anything else that cannot form the aggregate would leave this tap
             # on the prefix, a feature the checkpoint was not trained on.
-            if not 0 <= lid < len(layers) - 1:
+            if not 0 <= lid < len(target_layers) - 1:
                 raise ValueError(
                     f"DFlash aggregate tap on target layer {lid}: needs a "
-                    f"successor layer in a {len(layers)}-layer stack"
+                    f"successor layer in a {len(target_layers)}-layer stack"
                 )
-            if getattr(layers[lid], "layer_idx", lid) != lid:
+            if getattr(target_layers[lid], "layer_idx", lid) != lid:
                 raise ValueError(
                     f"DFlash aggregate tap on target layer {lid}: the stack's "
-                    f"layer {lid} has layer_idx {layers[lid].layer_idx}"
+                    f"layer {lid} has layer_idx {target_layers[lid].layer_idx}"
                 )
-            res = getattr(layers[lid + 1], "self_attention_attn_res", None)
-            if res is None or not getattr(res, "enabled", False):
-                raise ValueError(
-                    f"DFlash aggregate tap on target layer {lid}: target layer "
-                    f"{lid + 1} has no enabled attn-residual"
-                )
-            block_size = getattr(res, "block_size", None)
-            if not block_size:
-                raise ValueError(
-                    f"DFlash aggregate tap on target layer {lid}: target layer "
-                    f"{lid + 1}'s attn-residual has no block size"
-                )
-            # Folded here, once after load, never inside the traced and
-            # captured target forward the extract runs in.
-            if res.score_weight is None:
-                res.process_weights_after_loading()
-            if res.score_weight is None:
-                raise RuntimeError(
-                    f"DFlash aggregate tap: target layer {lid + 1}'s "
-                    "attn-residual has no score weight"
-                )
-            # Ceiling division: the bank holds one snapshot per closed block
-            # below this layer.
-            taps[lid] = (-(-(lid + 1) // block_size), res)
+            target_layers[lid].check_aggregate_source(target_layers[lid + 1])
+            taps[lid] = target_layers[lid + 1]
 
-        if not taps:
-            # Only the embedding tap: the prefix IS the whole stream there.
-            return AuxCaptureSpec(layer_ids, hidden_size, base_extract)
-
-        logger.info("DFlash aggregate tap armed on target layers %s", sorted(taps))
+        if taps:
+            logger.info("DFlash aggregate tap armed on target layers %s", sorted(taps))
 
         def extract(output, block):
-            prefix = base_extract(output, block)
-            tap = taps.get(getattr(block, "layer_idx", -1))
-            if prefix is None or tap is None:
-                return prefix
-            nvb, res = tap
-            # `KimiDecoderLayer.forward` returns (prefix_sum, *pendings, bank).
-            bank = output[-1] if isinstance(output, tuple) else None
-            if bank is None or bank.shape[1] < nvb:
-                # A layout change in the target's return would otherwise drop
-                # the draft back to the prefix feature with no error.
-                raise RuntimeError(
-                    f"DFlash aggregate tap on target layer {block.layer_idx}: "
-                    f"expected a bank of >= {nvb} blocks, got "
-                    f"{None if bank is None else tuple(bank.shape)}"
-                )
-            # `out_norm_weight=None` -> the mix comes back un-normed. The base
-            # hook then copies it in place into the same fixed capture buffer it
-            # would have filled with `prefix` -- same buffer, same shape, so
-            # cudagraph capture is unaffected.
-            mixed, _ = apply_attn_res(
-                prefix,
-                bank[:, :nvb, :],
-                res.score_weight,
-                res.eps,
-                None,
-                None,
-                res.out_eps,
-            )
-            return mixed
+            next_layer = taps.get(getattr(block, "layer_idx", -1))
+            if next_layer is None:
+                return block.aux_hidden_state(output)
+            # The base hook copies the mix in place into the same fixed capture
+            # buffer the prefix would have filled, so cudagraph capture is
+            # unaffected.
+            return block.aggregate_hidden_state(output, next_layer)
 
         return AuxCaptureSpec(layer_ids, hidden_size, extract)
 

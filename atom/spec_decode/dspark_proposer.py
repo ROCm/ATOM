@@ -9,7 +9,7 @@ from torch.profiler import record_function
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_kv import block_page_idx, entry_slots
-from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
+from atom.spec_decode.drafter import AuxCaptureSpec, Drafter, _resolve_decoder_layers
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
@@ -560,7 +560,11 @@ class DSparkProposer(Drafter):
         # layer's return (Kimi-K3's aggregate is scored by the next layer).
         own = getattr(self.model, "target_aux_capture_spec", None)
         if own is not None:
-            return own(layer_ids, self.config.hf_config.hidden_size, target_model)
+            return own(
+                layer_ids,
+                self.config.hf_config.hidden_size,
+                _resolve_decoder_layers(target_model),
+            )
         return AuxCaptureSpec(
             layer_ids=layer_ids,
             hidden_size=self.config.hf_config.hidden_size,

@@ -655,11 +655,11 @@ def test_dcp_sharding_is_read_from_the_pool_spec(module, cls_name, sharded):
 def _fake_attn_res_kernel(monkeypatch, calls):
     """Stand in for `apply_attn_res`, whose kernel needs a GPU.
 
-    Patched on `kimi_k3_dflash`, which imports it at module level; the module
-    itself needs aiter, so these tests skip on the CPU-only CI job and run
-    where aiter is installed. The stand-in records the ARGUMENTS the draft
-    marshals and returns a sentinel, so a test can check the extract hands back
-    the kernel's result rather than the prefix.
+    Patched on `atom.model_ops.kimi_k3`, which `KimiDecoderLayer` imports it
+    from at call time; that package needs aiter, so these tests skip on the
+    CPU-only CI job and run where aiter is installed. The stand-in records the
+    ARGUMENTS the layer marshals and returns a sentinel, so a test can check the
+    extract hands back the kernel's result rather than the prefix.
     """
     import torch
 
@@ -682,58 +682,49 @@ def _fake_attn_res_kernel(monkeypatch, calls):
                 "bank": block_residual,
                 "score_weight": score_weight,
                 "eps": eps,
+                "add_hidden": add_hidden,
                 "out_norm_weight": out_norm_weight,
+                "out_eps": out_eps,
+                "add_hidden2": add_hidden2,
                 "quant_dtype": quant_dtype,
             }
         )
         return result, None
 
-    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    monkeypatch.setattr(dflash, "apply_attn_res", apply_attn_res)
+    ops = _gpu_stack_import("atom.model_ops.kimi_k3")
+    monkeypatch.setattr(ops, "apply_attn_res", apply_attn_res)
     return calls
 
 
-def _k3_aux_hidden_state(output):
-    """`KimiDecoderLayer.aux_hidden_state`, transcribed.
-
-    The real one lives on a `@support_torch_compile` model whose import pulls in
-    aiter; its contract -- (prefix_sum, *pendings, block_residual), pendings
-    summed back into the prefix -- is all the extract under test depends on.
-    """
-    prefix_sum, *pendings, _bank = output
-    if prefix_sum is None:
-        return None
-    for pending in pendings:
-        if pending is not None:
-            prefix_sum = prefix_sum + pending
-    return prefix_sum
-
-
 def _k3_target_stub(hidden=16, n_layers=16, block_size=4, enabled=True):
-    """A Kimi-K3 target, down to what aux capture reads off it.
+    """A Kimi-K3 target's layer stack, down to what aux capture reads off it.
 
-    `_resolve_decoder_layers` wants `.layers`; the extract wants each layer's
-    `layer_idx` and `aux_hidden_state`, and the NEXT layer's
-    `self_attention_attn_res` (that is the whole reason the hook needs the
-    target model and not just the tapped block).
+    Each layer carries `KimiDecoderLayer`'s own `aux_hidden_state`,
+    `check_aggregate_source` and `aggregate_hidden_state`, bound to a namespace
+    holding the attributes they read: building the real layer would want a
+    checkpoint, a TP group and a GPU.
     """
     import torch
 
+    layer_cls = _gpu_stack_import("atom.models.kimi_k3.model").KimiDecoderLayer
     torch.manual_seed(0)
-    layers = [
-        types.SimpleNamespace(
+    layers = []
+    for i in range(n_layers):
+        layer = types.SimpleNamespace(
             layer_idx=i,
-            aux_hidden_state=_k3_aux_hidden_state,
+            aux_hidden_state=layer_cls.aux_hidden_state,
             self_attention_attn_res=types.SimpleNamespace(
                 enabled=enabled,
                 block_size=block_size,
+                layer_idx=i,
                 eps=1e-6,
                 out_eps=1e-5,
                 score_weight=torch.randn(hidden) * 0.1,
             ),
         )
-        for i in range(n_layers)
-    ]
+        for name in ("check_aggregate_source", "aggregate_hidden_state"):
+            setattr(layer, name, types.MethodType(getattr(layer_cls, name), layer))
+        layers.append(layer)
     return types.SimpleNamespace(layers=layers)
 
 
@@ -741,17 +732,14 @@ def _dflash_spec(target, layer_ids, hidden=16):
     """Resolve `KimiK3DFlash`'s capture spec without building the draft.
 
     Called unbound on purpose: the method reads nothing off `self` (its inputs
-    are the tap ids, the target's hidden size, and the target model), and
+    are the tap ids, the target's hidden size, and the target's layers), and
     constructing the real draft would want a loaded checkpoint, a TP group and
     a GPU.
     """
     dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    return dflash.KimiK3DFlash.target_aux_capture_spec(None, layer_ids, hidden, target)
-
-
-def _generic_extract():
-    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
-    return proposer.DSparkProposer._extract_layer_hidden
+    return dflash.KimiK3DFlash.target_aux_capture_spec(
+        None, layer_ids, hidden, target.layers
+    )
 
 
 def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
@@ -762,7 +750,7 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     the feature itself.
     """
     torch = pytest.importorskip("torch")
-    generic = _generic_extract()
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
 
     hidden, block_size = 16, 4
     target = _k3_target_stub(hidden=hidden, n_layers=16, block_size=block_size)
@@ -774,22 +762,17 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     assert spec.layer_ids == (6, 11)
     assert spec.hidden_size == hidden
     assert spec.capture == "output"  # an OUTPUT tap; V4.1's is an input tap
-    assert spec.extract is not generic
+    assert spec.extract is not proposer.DSparkProposer._extract_layer_hidden
 
     calls = _fake_attn_res_kernel(monkeypatch, [])
     rows = 5
     prefix = torch.randn(rows, hidden)
     pending = torch.randn(rows, hidden)
+    pending2 = torch.randn(rows, hidden)
     bank = torch.randn(rows, 6, hidden)
     block = target.layers[6]
 
-    out = spec.extract((prefix, pending, bank), block)
-
-    # The prefix half is still the generic reconstruction: the layer's deferred
-    # addends folded back in. The aggregate is a mixture OF that, not a
-    # replacement for it.
-    reconstructed = generic((prefix, pending, bank), block)
-    assert torch.allclose(reconstructed, prefix + pending)
+    out = spec.extract((prefix, pending, pending2, bank), block)
 
     # nvb is a CEILING, matching SGLang's `prev_valid_blocks`: layer 6 sits
     # above ceil(7 / 4) = 2 closed blocks (a floor would say 1), so only 2 of
@@ -798,12 +781,17 @@ def test_dflash_owns_a_capture_spec_that_feeds_the_aggregate(monkeypatch):
     call = calls[0]
     assert call["bank"].shape == (rows, 2, hidden)
     assert torch.equal(call["bank"], bank[:, :2, :])
-    assert torch.equal(call["prefix"], reconstructed)
+    # The layer's deferred addends go to the kernel as the target's next layer
+    # passes them, folded on-load rather than summed into the prefix first.
+    assert call["prefix"] is prefix
+    assert call["add_hidden"] is pending
+    assert call["add_hidden2"] is pending2
     # Scored by the NEXT layer's attn-residual weights -- the one thing only the
     # target model can supply.
     res = target.layers[7].self_attention_attn_res
     assert call["score_weight"] is res.score_weight
     assert call["eps"] == res.eps
+    assert call["out_eps"] == res.out_eps
     # Un-normed and unquantized: SGLang's aggregate is the bare mixture.
     assert call["out_norm_weight"] is None
     assert call["quant_dtype"] is None
@@ -826,16 +814,17 @@ def test_dflash_aggregate_leaves_untapped_layers_on_the_prefix(monkeypatch):
 
     calls = _fake_attn_res_kernel(monkeypatch, [])
     prefix = torch.randn(3, hidden)
+    pending = torch.randn(3, hidden)
     bank = torch.randn(3, 6, hidden)
 
-    out = spec.extract((prefix, None, bank), target.layers[5])
-    assert torch.equal(out, prefix)
+    out = spec.extract((prefix, pending, None, bank), target.layers[5])
+    assert torch.equal(out, prefix + pending)
     assert calls == []
 
     # Fewer closed blocks than the tap implies is a target layout change, not
     # a reason to drop silently back to the prefix feature.
     with pytest.raises(RuntimeError, match="expected a bank"):
-        spec.extract((prefix, None, bank[:, :1, :]), target.layers[6])
+        spec.extract((prefix, pending, None, bank[:, :1, :]), target.layers[6])
     assert calls == []
 
 
@@ -865,13 +854,20 @@ def test_dflash_refuses_a_tap_that_cannot_form_the_aggregate():
         _dflash_spec(target, (6,))
 
 
-def test_dflash_embedding_tap_keeps_the_prefix():
-    """`-1` taps the embedding, below every mixture: the prefix is the stream."""
-    pytest.importorskip("torch")
-    generic = _generic_extract()
-    assert _dflash_spec(_k3_target_stub(), (-1,)).extract is generic
-    spec = _dflash_spec(_k3_target_stub(), (-1, 6))
-    assert spec.extract is not generic
+def test_dflash_embedding_tap_keeps_the_prefix(monkeypatch):
+    """`-1` taps the embedding, below every mixture: the prefix is the stream.
+
+    The embedding hook takes its output verbatim, so with no layer tapped the
+    extract only ever sees an untapped layer, and keeps the prefix there.
+    """
+    torch = pytest.importorskip("torch")
+    target = _k3_target_stub()
+    spec = _dflash_spec(target, (-1,))
+    calls = _fake_attn_res_kernel(monkeypatch, [])
+    prefix = torch.randn(3, 16)
+    out = spec.extract((prefix, None, None, torch.randn(3, 6, 16)), target.layers[6])
+    assert torch.equal(out, prefix)
+    assert calls == []
 
 
 def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
@@ -907,7 +903,7 @@ def test_dsv41_dspark_still_owns_its_input_tap():
     """(c) The signature widening must not disturb the other implementor.
 
     V4.1 reads its feature off the tapped block's own input and needs nothing
-    from the target model; it takes the new argument and ignores it. Pinned
+    from the target's layer stack; it takes the argument and ignores it. Pinned
     because the call site passes it POSITIONALLY to every implementor -- there
     is no `inspect.signature` sniffing that could quietly skip it.
     """
@@ -915,7 +911,8 @@ def test_dsv41_dspark_still_owns_its_input_tap():
     model = v41.DeepseekV41DSpark.__new__(v41.DeepseekV41DSpark)
     model.config = types.SimpleNamespace(engram_layer_ids=[1, 2, 3])
 
-    spec = model.target_aux_capture_spec((37, 38, 39), 7168, _k3_target_stub())
+    layers = _k3_target_stub().layers
+    spec = model.target_aux_capture_spec((37, 38, 39), 7168, layers)
     assert spec.layer_ids == (37, 38, 39)
     assert spec.hidden_size == 7168
     assert spec.capture == "input"
@@ -924,11 +921,11 @@ def test_dsv41_dspark_still_owns_its_input_tap():
     # The Engram guard still fires, i.e. the extra argument did not shift the
     # ones it reads.
     with pytest.raises(ValueError, match="Engram"):
-        model.target_aux_capture_spec((1, 37), 7168, _k3_target_stub())
+        model.target_aux_capture_spec((1, 37), 7168, layers)
 
 
-def test_dspark_proposer_hands_the_target_model_to_the_draft():
-    """The call site passes the target model through, positionally.
+def test_dspark_proposer_hands_the_target_layers_to_the_draft():
+    """The call site passes the target's layer stack through, positionally.
 
     This is the plumbing the K3 aggregate needs: without it the draft cannot
     reach layer `lid + 1`'s scoring weights, and the feature silently degrades
@@ -939,9 +936,9 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 
     seen = {}
 
-    def own(layer_ids, hidden_size, target_model):
+    def own(layer_ids, hidden_size, target_layers):
         seen.update(
-            layer_ids=layer_ids, hidden_size=hidden_size, target_model=target_model
+            layer_ids=layer_ids, hidden_size=hidden_size, target_layers=target_layers
         )
         return AuxCaptureSpec(layer_ids, hidden_size, lambda output, block: None)
 
@@ -956,7 +953,9 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
     target = _k3_target_stub()
 
     proposer._aux_capture_spec(target)
-    assert seen == {"layer_ids": (7, 11), "hidden_size": 16, "target_model": target}
+    assert seen["layer_ids"] == (7, 11)
+    assert seen["hidden_size"] == 16
+    assert seen["target_layers"] is target.layers
 
 
 # --------------------------------------------------------------------------- #
