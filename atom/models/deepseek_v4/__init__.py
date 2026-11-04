@@ -119,6 +119,10 @@ from atom.model_ops.v4_kernels import (
     swa_write,
     update_compressor_states,
 )
+from atom.models.dsv41_fused_shared_expert import (
+    fused_scale_kwargs,
+    shared_expert_fused_act_enabled,
+)
 from atom.utils import envs, mark_spliting_op
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
@@ -2717,13 +2721,6 @@ class DeepseekV4Attention(nn.Module):
         )
 
 
-# `fused_clamp_act_mul` scale layout per w2 kind: a native MX w2 (V4.1, 32x32
-# weights) reads a row-major 1x32 E8M0 x_scale, a blockscale w2 an FP32 1x128
-# one, transposed.
-_FUSED_SCALE_NATIVE_MX = {"quant_block_size": 32, "scale_dtype_fmt": "ue8m0"}
-_FUSED_SCALE_BLOCKSCALE = {"transpose_scale": True}
-
-
 class Expert(nn.Module):
     """Single MoE expert: SwiGLU FFN (w1, w2, w3). Computation in float32 for stability.
 
@@ -2766,11 +2763,8 @@ class Expert(nn.Module):
         # of quantizing itself. The kernel needs this rank's intermediate
         # width to be a multiple of 128 (V4.1-Flash's 2304: whole or at TP2,
         # not 576 at TP4 or 288 at TP8); other widths keep the unfused path.
-        inter_per_rank = self.w2.input_size
-        self.use_fused_clamp_act_mul = (
-            envs.ATOM_V4_USE_TRITON_FUSION
-            and inter_per_rank >= 128
-            and inter_per_rank % 128 == 0
+        self.use_fused_clamp_act_mul = shared_expert_fused_act_enabled(
+            self.w2.input_size
         )
 
     def forward(
@@ -2793,7 +2787,7 @@ class Expert(nn.Module):
                 activation="silu",
                 weights=weights,
                 dtype_quant=dtypes.fp8,
-                **(_FUSED_SCALE_NATIVE_MX if native_mx else _FUSED_SCALE_BLOCKSCALE),
+                **fused_scale_kwargs(self.w2.native_a8_group_rows),
             )
             if native_mx:
                 x_scale = x_scale.view(torch.float8_e8m0fnu)
