@@ -156,6 +156,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._lookup_client = _LookupClient(hit=0)
     sched._load_specs = {}
     sched._reqs_need_recv = {}
+    sched._preadmit_floors = {}
     sched._load_save_floors = {}
     sched._hit_save_floors = {}
     sched._save_tracker = {}
@@ -5867,6 +5868,7 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s._do_save = True
     s._do_load = False
     s._reqs_need_recv = {}
+    s._preadmit_floors = {}
     s._lookup_in_step = []
     s._save_tracker = {}
     s._save_inflight = {}

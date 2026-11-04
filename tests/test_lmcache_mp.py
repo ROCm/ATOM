@@ -2098,13 +2098,13 @@ def test_incremental_tokens_round_trip_through_the_worker_shell():
         (512, -1, 512),
         (1000, -1, 1000),
     ]
-    assert all(t == list(range(len(t))) for t, _, _ in received)
+    assert all(list(t) == list(range(len(t))) for t, _, _ in received)
 
     # Session end drops it; the id is reused by another prompt.
     sched._drop_shipped_tokens(7)
     other = SimpleNamespace(id=7, token_ids=list(range(5000, 5600)), block_table=[0])
     _send(sched, shell, sched._build_save_request(other, 0, 600, None, [0], False))
-    assert received[-1][0] == list(range(5000, 5600))
+    assert list(received[-1][0]) == list(range(5000, 5600))
 
 
 def test_incremental_tokens_desync_raises():

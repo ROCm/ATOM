@@ -69,7 +69,6 @@ def _make_mgr(
     mgr._rank_reqs = [0] * n_ranks
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
-    mgr._seq_prefilling = set()
     mgr._prefix_spread = False
     mgr._prefix_router = None
     mgr._lb_lock = Lock()
@@ -560,16 +559,13 @@ def _make_spread_mgr(n_ranks=2):
 
     mgr = _make_mgr(n_ranks, strategy="prefix_spread")
     mgr._prefix_spread = True
-    mgr._prefix_router = PrefixSpreadRouter(32768, mgr._dp_route_counters)
-    mgr._dp_route_counters.update(
-        prefix_owner_total=0,
-        prefix_moved_total=0,
-        prefix_moved_tokens=0,
-        prefix_cold_total=0,
-        prefix_source_busy_total=0,
-        prefix_moved_partial_total=0,
-    )
+    mgr._prefix_router = PrefixSpreadRouter(32768)
     return mgr
+
+
+def _est(mgr, seq):
+    """The prefix `seq` was credited (its prompt minus its prefill charge)."""
+    return seq.num_prompt_tokens - mgr._seq_load[seq.id][2]
 
 
 def _chain_seq(seq_id, tokens, first_block=0, session=None):
@@ -593,7 +589,7 @@ def test_prefix_spread_keeps_prefix_owner_without_a_backlog():
     mgr._rank_tokens[owner] = 30_000  # busier, but no backlog (<= 2 x idle)
     second = _chain_seq(2, 110_000, session="s")
     assert _route(mgr, [second]) == [owner]
-    assert mgr._dp_route_counters["prefix_owner_total"] == 1
+    assert mgr._prefix_router.counters["prefix_owner_total"] == 1
     # Only the uncached extension is charged as prefill debt.
     assert mgr._seq_load[2][2] == 110_000 - 98_304
 
@@ -604,7 +600,7 @@ def test_prefix_spread_ignores_sessions_for_new_prefixes():
         _chain_seq(i, 50_000, first_block=10_000 * i, session="same") for i in range(4)
     ]
     assert sorted(_route(mgr, seqs)) == [0, 0, 1, 1]
-    assert mgr._dp_route_counters["prefix_cold_total"] == 4
+    assert mgr._prefix_router.counters["prefix_cold_total"] == 4
 
 
 def test_busy_source_keeps_followers_unless_the_owner_is_backlogged():
@@ -616,12 +612,12 @@ def test_busy_source_keeps_followers_unless_the_owner_is_backlogged():
     other = 1 - owner
     mgr._rank_tokens[other] = 40_000  # not idle
     assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
-    assert mgr._dp_route_counters["prefix_source_busy_total"] == 1
+    assert mgr._prefix_router.counters["prefix_source_busy_total"] == 1
 
     mgr._rank_tokens[other] = 0  # owner backlogged, other idle
     third = _chain_seq(3, 120_000)
     assert _route(mgr, [third]) == [other]
-    assert third._dp_est_hit == 0
+    assert _est(mgr, third) == 0
     assert mgr._seq_load[3][2] == 120_000
 
 
@@ -641,7 +637,7 @@ def test_a_fully_cached_follower_is_not_the_prefix_source():
     mgr._rank_tokens[owner] = 200_000
     third = _chain_seq(3, 110_000)
     assert _route(mgr, [third]) == [other]
-    assert third._dp_est_hit == 98_304
+    assert _est(mgr, third) == 98_304
 
 
 def test_move_target_is_chosen_by_queued_prefill_not_combined_load():
@@ -678,7 +674,7 @@ def test_prefix_spread_tracks_load_through_dispatch():
     moved = _chain_seq(2, 110_000)
     mgr._dispatch_to_dp_ranks([moved])
     assert mgr._seq_load[2][0] != owner
-    assert mgr._dp_route_counters["prefix_moved_total"] == 1
+    assert mgr._prefix_router.counters["prefix_moved_total"] == 1
 
 
 def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded(
@@ -748,9 +744,9 @@ def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
     seq = _chain_seq(3, 110_000)
     (rank,) = _route(mgr, [seq])
     assert rank == 2  # 4k above the lightest, holds 48k of the prefix
-    assert seq._dp_est_hit == 98_304  # 48k local + 48k loaded from the tier
-    assert mgr._dp_route_counters["prefix_moved_partial_total"] == 1
-    assert mgr._dp_route_counters["prefix_moved_tokens"] == 98_304 - 49_152
+    assert _est(mgr, seq) == 98_304  # 48k local + 48k loaded from the tier
+    assert mgr._prefix_router.counters["prefix_moved_partial_total"] == 1
+    assert mgr._prefix_router.counters["prefix_moved_tokens"] == 98_304 - 49_152
 
 
 def test_idle_ratio_load_wins_over_a_partial_prefix():
@@ -762,9 +758,9 @@ def test_idle_ratio_load_wins_over_a_partial_prefix():
 
 def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
     mgr = _dp4_idle_ratio_mgr()
-    mgr._seq_prefilling.add(2)  # rank2's 48k part is still being prefilled
+    mgr._prefix_router._prefilling.add(2)  # rank2's 48k part is still being prefilled
     hits, owner, _ = mgr._prefix_router._rank_hits(
-        _chain_seq(3, 110_000).prompt_hash_chain, 4, mgr._seq_prefilling
+        _chain_seq(3, 110_000).prompt_hash_chain, 4
     )
     assert owner == 0 and 2 not in hits
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
@@ -792,7 +788,7 @@ def test_followers_sharing_a_prefix_do_not_convoy_onto_one_rank():
 
     ranks = _route(mgr, [follower(i) for i in range(32)])
     assert set(ranks) == {0, 1}
-    assert mgr._dp_route_counters["prefix_source_busy_total"] == 0
+    assert mgr._prefix_router.counters["prefix_source_busy_total"] == 0
 
 
 def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
@@ -802,7 +798,7 @@ def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
     assert not mgr._prefix_router.index
     second = _chain_seq(2, 100_000)
     _route(mgr, [second])
-    assert second._dp_est_hit == 0  # no fake HBM hit
+    assert _est(mgr, second) == 0  # no fake HBM hit
     mgr._mark_seq_prefill_complete(2)
     mgr._release_seq_load(2)  # finished normally: the record stays
     assert mgr._prefix_router.index
@@ -829,7 +825,7 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
     moved(2)
     mgr._release_seq_load(2)  # aborted before its load
     hits, _, _ = mgr._prefix_router._rank_hits(
-        _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
+        _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
     assert other not in hits
 
@@ -837,7 +833,7 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
     mgr._mark_seq_prefill_complete(3)
     mgr._release_seq_load(3)
     hits, _, _ = mgr._prefix_router._rank_hits(
-        _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
+        _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
     assert hits.get(other) == 98_304
 
@@ -853,32 +849,30 @@ def test_a_producer_abort_hands_the_prefix_to_a_waiting_follower():
     assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]  # follower
     mgr._release_seq_load(1)  # producer aborted
     _, src_owner, source = mgr._prefix_router._rank_hits(
-        _chain_seq(9, 100_000).prompt_hash_chain, 2, mgr._seq_prefilling
+        _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
-    assert src_owner == owner and source == 2 and 2 in mgr._seq_prefilling
+    assert src_owner == owner and source == 2 and 2 in mgr._prefix_router._prefilling
     # 2 now computes the whole prompt: it is charged it.
     assert mgr._seq_load[2][2] == 110_000
     mgr._rank_tokens = [0, 0]
     mgr._rank_tokens[owner] = 200_000
     third = _chain_seq(3, 120_000)
     assert _route(mgr, [third]) == [other]
-    assert third._dp_est_hit == 0  # no tier credit: still being computed
+    assert _est(mgr, third) == 0  # no tier credit: still being computed
 
 
 def test_without_an_offload_tier_a_moved_request_is_charged_its_full_prompt():
     from atom.model_engine.prefix_spread import PrefixSpreadRouter
 
     mgr = _make_spread_mgr()
-    mgr._prefix_router = PrefixSpreadRouter(
-        32768, mgr._dp_route_counters, tier_loads=False
-    )
+    mgr._prefix_router = PrefixSpreadRouter(32768, tier_loads=False)
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
     mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
     mgr._rank_tokens[owner] = 200_000
     moved = _chain_seq(2, 110_000)
     assert _route(mgr, [moved]) == [1 - owner]
-    assert moved._dp_est_hit == 0
+    assert _est(mgr, moved) == 0
     assert mgr._seq_load[2][2] == 110_000
 
 
@@ -903,12 +897,11 @@ def test_offload_tier_loads_reads_the_kv_transfer_config():
     assert _offload_tier_loads(cfg({"kv_connector": "multi", "connectors": [pd, tier]}))
 
 
-def test_a_loadable_move_tells_the_destination_what_it_expects():
-    mgr = _make_spread_mgr()
-    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
-    mgr._mark_seq_prefill_complete(1)
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_tokens[owner] = 200_000
-    moved = _chain_seq(2, 110_000)
-    _route(mgr, [moved])
-    assert moved._dp_tier_expect == 98_304
+def test_offload_prefetch_default_is_off_under_multi():
+    from atom.config import default_offload_prefetch
+
+    mp = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
+    assert default_offload_prefetch("prefix_spread", mp)
+    assert not default_offload_prefetch("least_tokens", mp)
+    multi = {"kv_connector": "multi", "connectors": [mp]}
+    assert not default_offload_prefetch("prefix_spread", multi)

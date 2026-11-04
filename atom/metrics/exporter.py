@@ -154,28 +154,6 @@ class _AtomMetricsCollector:
             metric.add_metric([], float(value))
             yield metric
 
-        for name, documentation, value in (
-            (
-                "atom:dp_prefix_moved_checked",
-                (
-                    "Prefix-spread moves whose prefix the destination expected "
-                    "to load from the offload tier."
-                ),
-                snapshot.get("prefix_moved_checked", 0),
-            ),
-            (
-                "atom:dp_prefix_moved_tier_miss",
-                (
-                    "Of those, moves whose prefix the tier held less of than "
-                    "expected (a save not landed yet, or evicted)."
-                ),
-                snapshot.get("prefix_moved_tier_miss", 0),
-            ),
-        ):
-            metric = CounterMetricFamily(name, documentation)
-            metric.add_metric([], float(value))
-            yield metric
-
         dp_router = snapshot.get("dp_router", {})
         for name, documentation, value in (
             (

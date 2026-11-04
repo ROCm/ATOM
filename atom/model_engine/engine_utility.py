@@ -823,12 +823,6 @@ class EngineUtilityHandler:
                     getattr(self.scheduler, "total_generation_tokens", 0)
                 ),
                 "preemptions": int(getattr(self.scheduler, "total_preemptions", 0)),
-                "prefix_moved_checked": int(
-                    getattr(self.scheduler, "total_prefix_moved_checked", 0)
-                ),
-                "prefix_moved_tier_miss": int(
-                    getattr(self.scheduler, "total_prefix_moved_tier_miss", 0)
-                ),
                 "mtp": mtp,
                 "cache": cache,
                 "offload": offload,
