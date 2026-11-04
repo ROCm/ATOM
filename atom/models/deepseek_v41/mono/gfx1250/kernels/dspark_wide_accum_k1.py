@@ -27,6 +27,9 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import CM_NT_G
 # The gate's CTAs from 232: those hold no wq_b task (wq_b runs on CTAs 40..231); from
 # attn_pre's 160 they were the second slice round's, and from 80 each also ran a wq_b unit.
 GATE0 = 232
+# The index query projection's CTAs from 232 too: from IW_TASKS each of them also ran a
+# wq_b unit before it; from 232 the wq_b/iq overlap is the 32 CTAs the counts force.
+IQ0 = 232
 from flydsl.expr.typing import T
 
 THREADS = 256

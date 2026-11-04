@@ -52,6 +52,11 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds) -> bool:
 class MonoDecodeModel(nn.Module):
     """The target model, with its ``TARGET_WIDTHS`` decode steps on mono."""
 
+    # Verify postprocess: every TP rank seeds its draws from the step number
+    # and samples the all-gathered (rank-identical) logits itself, so rank 0's
+    # ids need no broadcast (``ModelRunner.postprocess``).
+    rank_synced_verify = True
+
     def __init__(self, model, drafter, max_model_len):
         super().__init__()
         self.model = model

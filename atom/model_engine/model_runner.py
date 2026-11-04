@@ -148,6 +148,10 @@ def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
     return is_deferred_out or has_drafter
 
 
+# The rank-synced verify draws' seed base (``rank_synced_verify``).
+_VERIFY_SEED = 0x5EED0000
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -906,6 +910,7 @@ class ModelRunner:
         self._init_forward_vars_ring()
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
+        self._verify_step = 0
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
@@ -3259,6 +3264,7 @@ class ModelRunner:
 
             target_logits = torch.index_select(logits, 0, target_logits_indices)
             target_token_ids = None
+            rank_synced = getattr(self.model, "rank_synced_verify", False)
             if not all_greedy and target_logits_indices.numel():
                 # One sampler pass over every logit row: each row is an
                 # independent draw from its own request's temperature/top-k/
@@ -3288,6 +3294,11 @@ class ModelRunner:
                         return values
                     return values[row_request]
 
+                if rank_synced:
+                    # The same Philox stream on every rank: each rank's draws
+                    # are rank 0's, without an id broadcast below.
+                    torch.cuda.manual_seed(_VERIFY_SEED + self._verify_step)
+                    self._verify_step += 1
                 all_token_ids = self.sampler(
                     logits=logits,
                     temperatures=temperatures[row_request],
@@ -3320,7 +3331,9 @@ class ModelRunner:
             # rejection kernel is a deterministic function of these ids and the
             # rank-identical draft ids, so sampled_tokens then agree across TP
             # ranks without a second broadcast.
-            if (
+            if rank_synced and target_token_ids is not None:
+                ids_synced_with_draws = True
+            elif (
                 target_token_ids is not None
                 and target_token_ids.numel()
                 and get_tp_group().world_size > 1
