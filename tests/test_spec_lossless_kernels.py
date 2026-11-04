@@ -176,8 +176,10 @@ def assert_store_row_is_q(store, row, s_row, out_id, width, top_k=None, top_p=No
     ids, probs, xslot = stored(store, row)
     n = ids.numel()
     assert 1 <= n <= width
-    # Distinct, ascending, in range.
-    assert (ids[1:] > ids[:-1]).all() and ids[0] >= 0 and ids[-1] < s_row.numel()
+    # Strictly ascending, as the `SparseQStore` contract says (the residual
+    # race binary-searches each row), and in range.
+    assert (ids[1:] > ids[:-1]).all(), "stored ids are not strictly ascending"
+    assert ids[0] >= 0 and ids[-1] < s_row.numel()
     assert ids[xslot].item() == out_id, "xslot does not name the emitted id"
     assert (probs > 0).all()
     assert abs(probs.double().sum().item() - 1.0) < 1e-5
@@ -360,6 +362,29 @@ def test_the_store_holds_exactly_the_top_of_q_at_any_width(width):
             reach = int(((s[r].max() - s[r]) <= 19.0).sum())
             limit = width if top_k[r] == 0 else min(width, int(top_k[r]))
             assert store.meta[r, 0].item() == min(limit, reach)
+
+
+@pytest.mark.parametrize("width", [7, 1024, 20000])
+def test_every_stored_row_is_strictly_ascending(width):
+    """The `SparseQStore` contract the residual race's binary search relies
+    on, over every row the writer touches: tied levels, a cut inside a level,
+    and filters, at widths below, at and past the reach."""
+    rows, vocab, rank = 32, 20000, 32
+    torch.manual_seed(5)
+    base = torch.randint(0, 9, (rows, vocab), device=DEV).float().to(torch.bfloat16)
+    base[::2] = torch.randn(rows // 2, vocab, device=DEV).to(torch.bfloat16)
+    prev = torch.zeros(rows, dtype=torch.int64, device=DEV)
+    w = torch.zeros(vocab, rank, dtype=torch.bfloat16, device=DEV)
+    temps, greedy, seed = draft_args(rows, temperature=0.8, step=4)
+    top_k = torch.tensor([0, 5, 300, 0] * (rows // 4), dtype=torch.int32, device=DEV)
+    top_p = torch.tensor([1.0, 1.0, 0.9, 0.6] * (rows // 4), device=DEV)
+    store = empty_store(rows, width)
+    row_base = torch.arange(rows, dtype=torch.int32, device=DEV)
+    sample(base, prev, w, w, store, row_base, 0, temps, greedy, seed, top_k, top_p)
+    for r in range(rows):
+        ids, _, _ = stored(store, r)
+        assert ids.numel() >= 1, r
+        assert (ids[1:] > ids[:-1]).all(), f"row {r} is not strictly ascending"
 
 
 def test_a_draft_top_k_of_one_stores_and_drafts_the_lowest_id_max():

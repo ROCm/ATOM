@@ -4,7 +4,9 @@ A drafter that samples its tokens keeps, for each draft row, the top of the
 distribution q it drew from, and the verify (`ratio_verify`) tests the
 row's token against that q. The store (`SparseQStore`), per draft row
 R = q_row_base[b] + position:
-  ids   [R, :n]  distinct vocab ids;
+  ids   [R, :n]  vocab ids, strictly ascending (so distinct): the verify
+                 binary-searches them, and a row out of order would lose
+                 entries there and with them the target law;
   probs [R, :n]  their q, > 0 and summing to 1 in one fixed-order reduction;
   meta  [R]      (n, xslot): how many are stored, and the slot of the token
                  the draft emitted. Slots >= n are never read.
