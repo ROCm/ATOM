@@ -45,7 +45,7 @@ from atom.models.utils import (
 )
 from atom.plugin.prepare import is_plugin_mode
 from atom.quant_spec import QuantType
-from atom.utils import envs as _envs
+from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.region_graph import token_graph
 
@@ -91,13 +91,27 @@ def _linear_attention_prefixes(atom_config, layers_prefix: str) -> list[str]:
 
 
 def gdn_in_proj_is_merged(atom_config, layers_prefix: str = "model.layers") -> bool:
-    """True when the GDN input projection is one `in_proj_qkvzba` layer."""
+    """True when the GDN input projection is one `in_proj_qkvzba` layer.
+
+    BF16 checkpoints merge unconditionally, as they always have. A quantized
+    checkpoint merges only when, in every GDN layer, `in_proj_qkvz`,
+    `in_proj_ba` and the merged `in_proj_qkvzba` name all carry the same
+    per-token spec: per-token activation scales are one value per row and
+    per-channel weight scales one per column, so concatenating along the output
+    dimension just concatenates the scales. A block-scale checkpoint must not
+    merge -- `in_proj_ba` contributes 32 columns per rank, which is not a whole
+    number of 128-column scale blocks.
+
+    `layers_prefix` is the decoder stack's module prefix as the layers are
+    built (`model.layers`, or `language_model.model.layers` under a multimodal
+    wrapper): exact-name quantization excludes only match the full name.
+    """
     quant_config = atom_config.quant_config
     if quant_config is None:
         return False
     if quant_config.global_quant_config.quant_dtype == torch.bfloat16:
         return True
-    if not _envs.ATOM_QWEN35_GDN_MERGE_QKVZBA:
+    if not envs.ATOM_QWEN35_GDN_MERGE_QKVZBA:
         return False
     prefixes = _linear_attention_prefixes(atom_config, layers_prefix)
     if not prefixes:
