@@ -16475,6 +16475,8 @@ models:
         ATOMESH_M31_AGENTX_VERSION: 1.0.12
         # Split over the 4 prefill TP ranks; the nodes have ~3.17 TB RAM and no cgroup limit.
         ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
+        # Remove this cell's containers left by a cancelled job and require free GPUs before start.
+        ATOMESH_PRE_CLEAN_GPU: "1"
         # rocprofiler-register deadlocks MoRIIO WRITE under load (local 1P1D C64 hangs in warmup without it).
         ROCPROFILER_REGISTER_ENABLED: "0"
         # Wait out a full send queue instead of failing the transfer (50 ms killed P at C64).
