@@ -1334,9 +1334,12 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         Consumes the packed ``qkv`` tensor laid out as
         ``[q | k | v | index_q | index_k]``. Writes:
-          * normed+roped main K/V          -> SHUFFLE K/V cache (asm_layout=True)
-          * normed+roped index_k           -> page-128 index_cache
-          * fp8 per-token dequant scales   -> k_scale / v_scale (when fp8)
+          * normed+roped main K/V          -> the K/V cache: SHUFFLE (asm_layout=True),
+                                              or one MXFP4 page per (page, kv head)
+                                              under ``kv_mxfp4``
+          * normed+roped index_k           -> index_cache (page-128, or MXFP4 pages)
+          * fp8 per-token dequant scales   -> k_scale / v_scale (fp8 SHUFFLE only;
+                                              MXFP4 pages carry their own e8m0 scales)
         and outputs the normed+roped main ``q`` (returned in the parent 7-tuple)
         and index ``q`` (stashed on ``self._index_q`` for dispatch_backend).
 
@@ -1355,8 +1358,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # The M3 paged kernels index this storage as page-16 SHUFFLE: each
         # logical 128-block is 8 contiguous physical 16-pages. 128 == 8*16, so the
         # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
-        # We re-view here (at attention time) instead of at bind time so the binder
-        # has no M3-specific KV/scale code.
+        # We re-view here (at attention time) instead of at bind time. Under
+        # `kv_mxfp4` the pool's pages are [N, nkv, 8704] uint8 (data + e8m0 scales,
+        # no scale planes) and are used as they are.
         from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
 
         layer = kv_cache_data[f"layer_{self.layer_num}"]
@@ -1375,6 +1379,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # M3 sparse attention is fixed to head_dim == 128 and the AITER fused
         # path; there is no model-local Triton fallback here.
         self.use_triton_attn = False
+        # The layout of the non-MXFP4 cache; under `kv_mxfp4` the pages are read
+        # through `sparse_pa_mxfp4` instead.
         self._cache_format = "SHUFFLE"
 
         sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
@@ -1533,7 +1539,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
 
         Prefill and decode both: select per-(token/request) top-k index blocks
         (fusing the page-16 sparse block-table emit), then run the selected
-        paged-attention backend over the SHUFFLE cache. fp8 vs bf16 follows the
+        paged-attention backend over the cache (SHUFFLE, or the MXFP4 pages through
+        ``sparse_pa_mxfp4``). fp8 vs bf16 follows the
         cache dtype inside the runners. Consumes ``self._index_q`` from rope_cache.
         """
         if fwd_ctx.context.is_prefill:

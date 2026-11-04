@@ -10,13 +10,16 @@ handed, and the combinations that must fail at startup and not in a forward.
 
 import sys
 import types
+from unittest import mock
 
 import pytest
 import torch
 
-from atom.config import _check_m3_mxfp4, _resolve_fp4_caches
+from atom import config as config_module
+from atom.config import _resolve_fp4_caches
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
+from atom.models.minimax_m3.config import validate_runtime_config
 
 M3 = ["MiniMaxM3SparseForConditionalGeneration"]
 
@@ -95,20 +98,27 @@ def chip_info(monkeypatch):
 
 
 def check(**kw):
-    args = {
-        "is_m3": True,
+    a = {
         "index_cache_dtype": "fp4",
         "kv_mxfp4": True,
         "block_size": 128,
         "plugin_mode": False,
         "sparse_local_block": 1,
+        **kw,
     }
-    _check_m3_mxfp4(**{**args, **kw})
+    config = types.SimpleNamespace(
+        kv_mxfp4=a["kv_mxfp4"],
+        index_cache_dtype=a["index_cache_dtype"],
+        kv_cache_block_size=a["block_size"],
+        hf_config=types.SimpleNamespace(
+            sparse_attention_config={"sparse_local_block": a["sparse_local_block"]}
+        ),
+    )
+    with mock.patch.object(config_module, "is_plugin_mode", lambda: a["plugin_mode"]):
+        validate_runtime_config(config)
 
 
 def test_refusals_name_what_is_wrong():
-    with pytest.raises(ValueError, match="MiniMax-M3 only"):
-        check(is_m3=False)
     with pytest.raises(ValueError, match="bridges"):
         check(plugin_mode=True)
     with pytest.raises(ValueError, match="128 tokens"):
@@ -133,9 +143,7 @@ def test_the_mxfp4_kv_needs_the_tail_block_selected():
 
 def test_the_baselines_are_never_refused():
     # Neither MXFP4 switch on: nothing to check, whatever else is set.
-    check(is_m3=False, index_cache_dtype="fp8", kv_mxfp4=False)
-    # another model's fp4 index is its own layout, not MiniMax-M3's
-    check(is_m3=False, kv_mxfp4=False, block_size=64)
+    check(index_cache_dtype="fp8", kv_mxfp4=False, block_size=16, plugin_mode=True)
 
 
 @pytest.mark.parametrize(

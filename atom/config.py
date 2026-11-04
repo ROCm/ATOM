@@ -1946,43 +1946,6 @@ def _resolve_fp4_caches(
     return kv_cache_dtype, kv_mxfp4
 
 
-def _check_m3_mxfp4(
-    is_m3: bool,
-    index_cache_dtype,
-    kv_mxfp4: bool,
-    block_size: int,
-    plugin_mode: bool,
-    sparse_local_block: int,
-) -> None:
-    """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
-    than in the first forward (``--kv-cache-dtype fp4``, which
-    ``_resolve_fp4_caches`` maps to ``kv_mxfp4``, and ``--index-cache-dtype fp4``,
-    MiniMax-M3's own layout: other models' ``fp4`` index is not checked here)."""
-    if not (kv_mxfp4 or (is_m3 and index_cache_dtype == "fp4")):
-        return
-    if not is_m3:
-        raise ValueError("MXFP4 KV / index caches are MiniMax-M3 only")
-    if plugin_mode:
-        raise ValueError(
-            "MXFP4 KV / index caches do not run under the vLLM/SGLang bridges"
-        )
-    if block_size != 128:
-        raise ValueError(f"MXFP4 pages are 128 tokens; --block-size is {block_size}")
-    if kv_mxfp4 and sparse_local_block < 1:
-        # The decode plan is refreshed once a step, which holds only while every
-        # layer's rows have the same lengths -- i.e. the tail is always picked.
-        raise ValueError(
-            "--kv-cache-dtype fp4 needs sparse_local_block >= 1, "
-            f"got {sparse_local_block}"
-        )
-    # The live GPU, not `get_gfx()`, which follows GPU_ARCHS (a build setting).
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    arch = get_gfx_runtime()
-    if arch != "gfx950":
-        raise ValueError(f"MXFP4 KV / index caches need gfx950, got {arch}")
-
-
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -2869,14 +2832,12 @@ class Config:
             else:
                 self.index_cache_dtype = self.kv_cache_dtype
 
-        _check_m3_mxfp4(
-            is_m3,
-            self.index_cache_dtype,
-            self.kv_mxfp4,
-            self.kv_cache_block_size,
-            is_plugin_mode(),
-            sparse_cfg.get("sparse_local_block", 0),
-        )
+        if self.kv_mxfp4 and not is_m3:
+            raise ValueError("MXFP4 KV / index caches are MiniMax-M3 only")
+        if is_m3:
+            from atom.models.minimax_m3.config import validate_runtime_config
+
+            validate_runtime_config(self)
 
         if is_deepseek_v41:
             # CSA2's index plane is paged by the same scorer GLM's is, so a

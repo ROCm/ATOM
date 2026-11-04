@@ -287,6 +287,12 @@ def test_an_m3_export_named_only_by_model_type_gets_the_m3_mapping(monkeypatch):
     )
 
 
+def test_a_kv_mxfp4_flag_on_another_model_is_refused(monkeypatch):
+    # not reachable from the CLI (only M3 derives it), but the field is settable
+    with pytest.raises(ValueError, match="MiniMax-M3 only"):
+        _make_config(monkeypatch, kv_cache_dtype="fp8", kv_mxfp4=True)
+
+
 def test_v4_keeps_its_fp4_indexer_and_refuses_a_fp4_kv(monkeypatch):
     config, _ = _make_config(monkeypatch, index_cache_dtype="fp4")
     assert (config.kv_mxfp4, config.index_cache_dtype) == (False, "fp4")
