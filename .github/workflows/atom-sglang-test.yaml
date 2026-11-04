@@ -35,6 +35,7 @@ jobs:
     name: Check Heavy CI Gate
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
@@ -48,6 +49,7 @@ jobs:
         id: gate
         env:
           CI_GATE_LABELS: ci:full,ci:sglang
+          CI_GATE_DUPLICATE_SUCCESS_JOB_PATTERN: '^Accuracy \('
           CI_GATE_PATHS_IGNORE: |
             **/*.md
             docs/**
