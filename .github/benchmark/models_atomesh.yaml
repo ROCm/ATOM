@@ -16518,6 +16518,13 @@ models:
           env:
             common:
               ROCPROFILER_REGISTER_ENABLED: "1"
+        # c64 in MoRIIO READ mode (D pulls), as InferenceX's working Kimi-K3 1P2D RDMA recipe runs it.
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c64-read
+          concurrency: [64]
+          env:
+            common:
+              ATOMESH_M31_MORIIO_READ_MODE: "true"
         - <<: *m31_moriio_1p2d_case
           name: m31-flash-vllm-moriio-rdma-1p2d-c96
           concurrency: [96]

@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# MiniMax-M3.1-Flash vLLM 1P1D/1P2D over MoRIIOConnector (WRITE) cross-node RDMA, sourced by
+# MiniMax-M3.1-Flash vLLM 1P1D/1P2D over MoRIIOConnector (WRITE, or READ with
+# ATOMESH_M31_MORIIO_READ_MODE=true) cross-node RDMA, sourced by
 # pd_server_vllm.sh when ATOMESH_M31_MORIIO=1. Server env/argv follow the local
 # test_scripts/pd/launch_pd_main.sh CONC --offload; only PYTHONPATH, hosts, MoRIIO ports, the rdma
 # backend, the offload size and the per-D max-num-seqs are adapted to the two-node layout. Workers
@@ -95,7 +96,7 @@ m31_overlay || exit $?
 # m31_moriio ROLE HTTP_PORT HANDSHAKE_PORT NOTIFY_PORT: TP rank r listens on handshake/notify base+r.
 # One QP per transfer overflows its 16384-WR send queue on a ~230K-token prompt at C64 (SQ full).
 m31_moriio() {
-  echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"$1\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${NODE0_ADDR}\",\"proxy_ping_port\":${VLLM_DISCOVERY_PORT},\"http_port\":$2,\"handshake_port\":$3,\"notify_port\":$4,\"backend\":\"rdma\",\"num_workers\":4,\"qp_per_transfer\":4,\"read_mode\":false}}"
+  echo "{\"kv_connector\":\"MoRIIOConnector\",\"kv_role\":\"$1\",\"kv_connector_extra_config\":{\"proxy_ip\":\"${NODE0_ADDR}\",\"proxy_ping_port\":${VLLM_DISCOVERY_PORT},\"http_port\":$2,\"handshake_port\":$3,\"notify_port\":$4,\"backend\":\"rdma\",\"num_workers\":4,\"qp_per_transfer\":4,\"read_mode\":${ATOMESH_M31_MORIIO_READ_MODE:-false}}}"
 }
 
 start_vllm_server() {
