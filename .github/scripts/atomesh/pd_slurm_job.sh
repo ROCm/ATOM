@@ -162,7 +162,9 @@ pre_cleanup_local() {
   while IFS=$'\t' read -r id name status; do
     [[ -n "${id}" ]] || continue
     owner_job=""
-    if [[ "${name}" =~ ^atomesh-.+-([0-9]+)-[0-9]+(-benchmark|-eval)?$ ]]; then
+    # Any role suffix (-benchmark, -eval, -router, ...): an unmatched name is
+    # kept forever and can hold ports such as the router's 8000.
+    if [[ "${name}" =~ ^atomesh-.+-([0-9]+)-[0-9]+(-[a-z]+)?$ ]]; then
       owner_job="${BASH_REMATCH[1]}"
     fi
     if [[ "${owner_job}" == "${JOB_ID}" ]]; then

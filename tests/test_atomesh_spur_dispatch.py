@@ -104,6 +104,8 @@ class SpurDispatchTest(unittest.TestCase):
             rank = os.environ["SPUR_TASK_OFFSET"]
             with (Path(os.environ["TEST_ROOT"]) / ("docker-" + rank + ".jsonl")).open("a") as stream:
                 stream.write(json.dumps(sys.argv[1:]) + "\\n")
+            if sys.argv[1] == "ps" and os.environ.get("FAKE_DOCKER_PS"):
+                print(os.environ["FAKE_DOCKER_PS"])
             if sys.argv[1:3] == ["image", "inspect"] and os.environ.get("FAKE_IMAGE_ID"):
                 print(os.environ["FAKE_IMAGE_ID"])
             if sys.argv[1] == "run" and "--entrypoint" in sys.argv and "test-image" in sys.argv:
@@ -429,6 +431,39 @@ class SpurDispatchTest(unittest.TestCase):
         for run in workers:
             self.assertIn(f"{cache}:/opt/atomesh/flydsl-aot", run)
             self.assertIn("ATOMESH_FLYDSL_AOT_DIR=/opt/atomesh/flydsl-aot", run)
+
+    def test_pre_cleanup_stops_finished_jobs_containers_with_any_suffix(self):
+        self.write_tool(
+            "squeue",
+            """
+            import os
+            import sys
+
+            job = sys.argv[sys.argv.index("-j") + 1]
+            if job in os.environ.get("ACTIVE_JOBS", "").split(","):
+                print(job)
+            """,
+        )
+        containers = [
+            ("own", "atomesh-test-cell-42-0-benchmark"),
+            ("done-router", "atomesh-m31-1p2d-c128-vllm-7-0-router"),
+            ("done-eval", "atomesh-m31-1p2d-c128-vllm-7-1-eval"),
+            ("done-worker", "atomesh-m31-1p2d-c128-vllm-7-1"),
+            ("busy-router", "atomesh-other-cell-8-0-router"),
+            ("unrelated", "someone_dev_g35"),
+        ]
+        result = self.run_job(
+            "--spur-worker",
+            FAKE_DOCKER_PS="\n".join(f"{id}\t{name}\tUp" for id, name in containers),
+            ACTIVE_JOBS="8",
+        )
+        stops = [call for call in self.docker_calls(0) if call[0] == "stop"]
+        self.assertEqual(
+            stops,
+            [["stop", "-t", "0", "own", "done-router", "done-eval", "done-worker"]],
+        )
+        self.assertIn("keep busy-router atomesh-other-cell-8-0-router", result.stdout)
+        self.assertIn("keep unrelated someone_dev_g35", result.stdout)
 
     def test_missing_node_interface_fails_before_container_start(self):
         result = self.run_job(
