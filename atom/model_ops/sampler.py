@@ -64,7 +64,7 @@ def get_per_token_exponential(vocab_size: int, device) -> torch.Tensor:
 
 class Sampler(nn.Module):
 
-    def __init__(self, max_rows: int = 0):
+    def __init__(self):
         super().__init__()
         self.eps = SAMPLER_EPS
         # Keep a tie group at the top-k cut whole, as every aiter path but one
@@ -74,13 +74,6 @@ class Sampler(nn.Module):
         # draw does, armed or not. The native fallback keeps exactly k; on
         # such builds the ratio verify does not arm.
         self.keep_top_k_ties = envs.ATOM_SPEC_LOSSLESS_SAMPLING
-        # Where a scalar or one-element k is expanded to one per row for that
-        # (`_per_row_k`), for up to ``max_rows`` rows, so no draw allocates.
-        self._tie_k = (
-            torch.empty(max_rows, dtype=torch.int32)
-            if self.keep_top_k_ties and max_rows
-            else None
-        )
 
     def sample_verification_tokens(
         self,
@@ -249,42 +242,40 @@ class Sampler(nn.Module):
         else:
             return self._native_sample(probs, top_ks, top_ps, temperatures)
 
-    def _to_tensor_scalar(self, x: float | torch.Tensor | None):
+    def _to_tensor_scalar(self, x: float | torch.Tensor | None, rows: int):
         """Adapt filters to AITER's tensor/scalar arguments.
 
         The runner supplies uniform filters as CPU scalars, avoiding a device
         readback. Singleton tensors remain supported for existing callers.
+        With the flag set, a one-row batch's own per-row filter (the runner's
+        while lossless sampling is armed, `prepare_sample`) stays a tensor
+        rather than be read back.
         """
         if x is None:
             return (None, 0)
         if not isinstance(x, torch.Tensor):
             return (None, x)
-        if x.numel() == 1:
+        if x.numel() == 1 and not (self.keep_top_k_ties and rows == 1):
             return (None, x.item())
         return (x, 0)
 
     def _per_row_k(
         self, top_ks: int | torch.Tensor, rows: int, device: torch.device
     ) -> torch.Tensor:
-        """``top_ks`` as one int32 k per row, without a readback: a full
-        per-row k as is, a scalar or one-element k expanded into `_tie_k`."""
+        """``top_ks`` as one int32 k per row, without a readback. Armed, the
+        runner hands every row's already (`prepare_sample`), passed through
+        as is. A scalar or one-element k is expanded: it reaches here only
+        where the flag is set but lossless sampling did not arm (no drafter,
+        or one it refused), where nothing else holds a per-row copy."""
         if (
             isinstance(top_ks, torch.Tensor)
             and top_ks.shape == (rows,)
             and top_ks.dtype == torch.int32
         ):
             return top_ks
-        tie_k = self._tie_k
-        if tie_k is None or tie_k.numel() < rows or tie_k.device != device:
-            # Only a sampler built without room for these rows (a direct
-            # caller's) allocates; the runner's never does.
-            tie_k = self._tie_k = torch.empty(rows, dtype=torch.int32, device=device)
-        k = tie_k[:rows]
         if isinstance(top_ks, torch.Tensor):
-            k.copy_(top_ks.expand(rows))
-        else:
-            k.fill_(top_ks)
-        return k
+            return top_ks.to(torch.int32).expand(rows).contiguous()
+        return torch.full((rows,), top_ks, dtype=torch.int32, device=device)
 
     def _aiter_sample(
         self,
@@ -305,8 +296,8 @@ class Sampler(nn.Module):
             k_tensor = self._per_row_k(top_ks, probs.shape[0], probs.device)
             k_scalar = 0
         else:
-            k_tensor, k_scalar = self._to_tensor_scalar(top_ks)
-        p_tensor, p_scalar = self._to_tensor_scalar(top_ps)
+            k_tensor, k_scalar = self._to_tensor_scalar(top_ks, probs.shape[0])
+        p_tensor, p_scalar = self._to_tensor_scalar(top_ps, probs.shape[0])
 
         if has_topk and has_topp:
             # Joint k+p path

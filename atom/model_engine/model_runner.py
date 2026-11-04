@@ -821,10 +821,7 @@ class ModelRunner:
             use_spec,
             self.num_spec_tokens,
         )
-        # Every row one forward samples: a verify's drafts and bonus rows.
-        self.sampler = Sampler(
-            max_rows=self.config.max_num_seqs * (self.num_spec_tokens + 1)
-        )
+        self.sampler = Sampler()
         # Each `RequiredChannel` a batch has carried, as the kernels read it.
         self._device_channels: dict[RequiredChannel, DeviceChannel] = {}
         self.arange_np = np.arange(
@@ -2735,6 +2732,12 @@ class ModelRunner:
             if top_p_count is None:
                 self.forward_vars["top_ps"].np[:bs] = batch.top_ps
                 top_p_count = bs
+            # On the device per row now, so hand those on rather than a
+            # scalar `Sampler` would expand again.
+            if needs_topk:
+                top_ks = self.forward_vars["top_ks"].gpu[:bs]
+            if needs_topp:
+                top_ps = self.forward_vars["top_ps"].gpu[:bs]
 
         # Read back by `postprocess` through `_constrain_required_channel`.
         channel_count = None

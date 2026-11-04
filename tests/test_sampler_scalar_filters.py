@@ -53,37 +53,66 @@ def test_kept_ties_take_a_per_row_k_without_readback(monkeypatch, rows, k_rows):
     assert seen["k_scalar"] == 0 and seen["p_scalar"] == 0.9
 
 
-def test_kept_ties_expand_a_scalar_k_into_the_samplers_own_buffer(monkeypatch):
-    """The runner hands a uniform k as a scalar; `Sampler` expands it per row
-    into the buffer it allocated up front, so no draw allocates."""
+@pytest.mark.parametrize("keep_ties", [False, True])
+def test_a_one_row_batchs_own_filters_are_read_back_only_with_the_flag_off(
+    monkeypatch, keep_ties
+):
+    """Armed, the runner hands even a one-row batch its per-row filters
+    (`prepare_sample`); with the flag set they stay tensors, no readback."""
+    from types import SimpleNamespace
+
+    seen = {}
+
+    def renorm(probs, k_tensor, k_scalar):
+        seen["k"] = (k_tensor, k_scalar)
+        return probs
+
+    def top_p(probs, indices, p_tensor, p_scalar, **_):
+        seen["p"] = (p_tensor, p_scalar)
+        return torch.zeros(probs.shape[0], 1, dtype=torch.int64)
+
+    monkeypatch.setattr(
+        sampler,
+        "aiter_ops",
+        SimpleNamespace(top_k_renorm_probs=renorm, top_p_sampling_from_probs=top_p),
+    )
+    monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
+    instance = sampler.Sampler()
+    instance.keep_top_k_ties = keep_ties
+    probs = torch.full((1, 8), 1 / 8)
+    k, p = torch.tensor([4], dtype=torch.int32), torch.tensor([0.9])
+    reads = []
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", lambda t: reads.append(t) or 4)
+        instance._aiter_sample(probs, k, None, True, False, probs[:, 0])
+        instance._aiter_sample(probs, None, p, False, True, probs[:, 0])
+    assert (seen["k"][0] is k, seen["p"][0] is p) == (keep_ties, keep_ties)
+    assert len(reads) == (0 if keep_ties else 2)
+
+
+def test_kept_ties_expand_a_scalar_k_per_row(monkeypatch):
+    """Where the flag is set but nothing armed, the runner hands a uniform k
+    as a scalar; `Sampler` expands it per row, without a readback."""
     from types import SimpleNamespace
 
     seen = []
 
     def joint(probs, indices, k_tensor, k_scalar, p_tensor, p_scalar, **_):
-        seen.append((k_tensor.data_ptr(), k_tensor.tolist(), k_scalar))
+        seen.append((k_tensor.tolist(), k_scalar))
         return torch.zeros(probs.shape[0], 1, dtype=torch.int64)
 
     monkeypatch.setattr(
         sampler, "aiter_ops", SimpleNamespace(top_k_top_p_sampling_from_probs=joint)
     )
     monkeypatch.setattr(sampler, "_apply_greedy_tokens", lambda p, t, tokens: tokens)
-    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
-    instance = sampler.Sampler(max_rows=8)
-    buffer = instance._tie_k.data_ptr()
+    instance = sampler.Sampler()
+    instance.keep_top_k_ties = True
     draws = [(torch.full((rows, 16), 1 / 16), k) for rows, k in ((8, 4), (3, 6))]
     with monkeypatch.context() as patch:
         patch.setattr(torch.Tensor, "item", lambda *_: pytest.fail("filter readback"))
-        for alloc in ("empty", "full", "tensor"):
-            patch.setattr(torch, alloc, lambda *_, **__: pytest.fail("k allocated"))
         for probs, k in draws:
             instance._aiter_sample(probs, k, 0.9, True, True, probs[:, 0])
-    assert seen == [(buffer, [4] * 8, 0), (buffer, [6] * 3, 0)]
-
-
-def test_a_sampler_that_drops_ties_keeps_no_k_buffer(monkeypatch):
-    monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0")
-    assert sampler.Sampler(max_rows=8)._tie_k is None
+    assert seen == [([4] * 8, 0), ([6] * 3, 0)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

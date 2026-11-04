@@ -228,8 +228,9 @@ def test_a_uniform_k_reaches_the_sampler_as_a_scalar(ks, ps):
 )
 def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     """The draft samples within each row's own filters, read from the target's
-    buffers, so they are published whatever `Sampler` is handed: off and
-    uniform filters included. `Sampler` still gets its scalars."""
+    buffers, so they are published whatever the batch holds: off and uniform
+    filters included. `Sampler` and the verify get those same device rows,
+    not a scalar to expand again."""
     bs = len(ks)
     buffers = {
         name: SimpleNamespace(np=np.zeros(4, dtype), gpu=torch.zeros(4))
@@ -263,10 +264,16 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
     np.testing.assert_array_equal(buffers["top_ps"].np[:bs], np.float32(ps))
     assert group.counts[group.indices["top_ks"]] == bs
     assert group.counts[group.indices["top_ps"]] == bs
-    if len(set(ks)) == 1 and ks[0] != -1:
-        assert top_ks == ks[0]
-    if len(set(ps)) == 1 and ps[0] < 1.0:
-        assert top_ps == np.float32(ps[0])
+    if any(k != -1 for k in ks):
+        assert top_ks.data_ptr() == buffers["top_ks"].gpu.data_ptr()
+        assert top_ks.shape == (bs,)
+    else:
+        assert top_ks is None
+    if any(p < 1.0 for p in ps):
+        assert top_ps.data_ptr() == buffers["top_ps"].gpu.data_ptr()
+        assert top_ps.shape == (bs,)
+    else:
+        assert top_ps is None
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 64])
