@@ -885,32 +885,7 @@ class ModelRunner:
         torch.set_default_device(self.device)
         self.async_execute_stream = torch.cuda.Stream(self.device)
         self.allocate_forward_vars()
-        # A lossless DSpark draft reads the target's temperatures and filters
-        # rather than a copy of its own; bound before any warmup or capture.
-        lossless = _draft_lossless(self)
-        if lossless is not None:
-            lossless.bind_target(self.forward_vars, self.drafter.model)
-            # The bonus draws keep top-k ties as the verify's p_f does.
-            self.sampler.keep_ties(self.forward_vars["top_ks"].gpu)
-        elif envs.ATOM_SPEC_LOSSLESS_SAMPLING and not getattr(
-            getattr(self, "drafter", None), "is_block_drafter", False
-        ):
-            # A DSpark drafter says why it did not arm (`DSparkLossless.arm`).
-            logger.warning(
-                "ATOM_SPEC_LOSSLESS_SAMPLING is set but only a DSpark drafter "
-                "arms it; this engine (%s) samples and verifies as without it.",
-                type(getattr(self, "drafter", None)).__name__,
-            )
-            # Its logits are the LM head's, which keeps the hidden states'
-            # dtype; the verify refuses logits of any other dtype rather than
-            # JIT mid-serving.
-            self.rejection_sampler.arm_ratio(
-                config.max_num_seqs,
-                self.drafter.mtp_k,
-                int(self.drafter.model.vocab_size),
-                config.torch_dtype,
-                self.device,
-            )
+        self._arm_lossless(config)
         self.attn_metadata_builder = self.attn_backend.get_builder_cls()(
             model_runner=self
         )
@@ -1631,6 +1606,34 @@ class ModelRunner:
             self._h2d_groups.append(groups)
         self.h2d_owner = self._h2d_owners[self._fv_idx]
         self.h2d_groups = self._h2d_groups[self._fv_idx]
+
+    def _arm_lossless(self, config) -> None:
+        """Wire an armed lossless DSpark draft to this runner, before any warmup
+        or capture: the draft reads the target's own temperatures and filters
+        (`DSparkLossless.bind_target`), the bonus draws keep top-k ties as the
+        verify's p_f does, and the ratio verify is armed (scratch and compile).
+        Its logits are the LM head's, which keeps the hidden states' dtype; the
+        verify refuses logits of any other dtype rather than JIT mid-serving."""
+        lossless = _draft_lossless(self)
+        if lossless is not None:
+            lossless.bind_target(self.forward_vars, self.drafter.model)
+            self.sampler.keep_ties(self.forward_vars["top_ks"].gpu)
+            self.rejection_sampler.arm_ratio(
+                config.max_num_seqs,
+                self.drafter.mtp_k,
+                int(self.drafter.model.vocab_size),
+                config.torch_dtype,
+                self.device,
+            )
+        elif envs.ATOM_SPEC_LOSSLESS_SAMPLING and not getattr(
+            getattr(self, "drafter", None), "is_block_drafter", False
+        ):
+            # A DSpark drafter says why it did not arm (`DSparkLossless.arm`).
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is set but only a DSpark drafter "
+                "arms it; this engine (%s) samples and verifies as without it.",
+                type(getattr(self, "drafter", None)).__name__,
+            )
 
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
