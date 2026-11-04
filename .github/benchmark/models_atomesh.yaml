@@ -16477,7 +16477,8 @@ models:
         ATOMESH_M31_P_CPU_OFFLOAD_BYTES: "1349000000000"
         # rocprofiler-register deadlocks MoRIIO WRITE under load (local 1P1D C64 hangs in warmup without it).
         ROCPROFILER_REGISTER_ENABLED: "0"
-        MORI_IO_SQ_BACKOFF_TIMEOUT_US: "50000"
+        # Wait out a full send queue instead of failing the transfer (50 ms killed P at C64).
+        MORI_IO_SQ_BACKOFF_TIMEOUT_US: "1000000"
         MORI_IO_QP_MAX_SEND_WR: "16384"
         MORI_IO_QP_MAX_CQE: "32768"
         MORI_IO_QP_MAX_SGE: "2"
