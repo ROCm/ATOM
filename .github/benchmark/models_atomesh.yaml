@@ -16511,6 +16511,13 @@ models:
         - <<: *m31_moriio_1p2d_case
           name: m31-flash-vllm-moriio-rdma-1p2d-c64
           concurrency: [64]
+        # c64 with rocprofiler-register back on (its default): does RDMA need it off too?
+        - <<: *m31_moriio_1p2d_case
+          name: m31-flash-vllm-moriio-rdma-1p2d-c64-rpon
+          concurrency: [64]
+          env:
+            common:
+              ROCPROFILER_REGISTER_ENABLED: "1"
         - <<: *m31_moriio_1p2d_case
           name: m31-flash-vllm-moriio-rdma-1p2d-c96
           concurrency: [96]
