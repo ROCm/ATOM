@@ -1753,10 +1753,12 @@ class KimiDecoderLayer(nn.Module):
         """Reconstruct this layer's post-layer hidden state from ``forward``'s
         return, for a drafter tapping it as an aux hidden state.
 
-        Every DSpark draft is trained on the HF reference's
-        ``output.hidden_states[layer_idx + 1]`` -- the plain residual stream
-        after this layer, which the reference forms as
-        ``prefix_sum = prefix_sum + hidden_states`` before returning. forward()
+        This is the HF reference's ``output.hidden_states[layer_idx + 1]`` --
+        the plain residual stream after this layer, which the reference forms as
+        ``prefix_sum = prefix_sum + hidden_states`` before returning. It is
+        what a draft trained on that stream reads (the MLA DSpark draft); a
+        draft trained on the attn-residual mixture over the bank (the DFlash
+        draft) reads a different feature and must not be fed this one. forward()
         deliberately does not: it hands the FFN output back unapplied so the
         NEXT layer's attn_res kernel can fold it into its on-load, and an MoE
         layer defers its routed and shared outputs separately so that same fold
@@ -1765,8 +1767,7 @@ class KimiDecoderLayer(nn.Module):
 
         This lives on the layer rather than in the drafter because it is a
         property of THIS layer's return protocol -- it has to change in lockstep
-        with forward(), and any drafter trained against a Kimi-K3 target needs
-        the same reconstruction.
+        with forward().
         """
         prefix_sum, *pendings, _block_residual = output
         if prefix_sum is None:

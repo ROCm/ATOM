@@ -931,7 +931,7 @@ class DSparkProposer(Drafter):
             # positions p with p % dcp_world_size == r, packed densely into its
             # page. Rows this rank does not own go to -1 (dropped).
             virtual_block = block_size * self.dcp_world_size
-            page_idx, in_table = self._block_page_idx(
+            page_idx, in_table = block_page_idx(
                 block_positions, virtual_block, block_tables
             )
             local_off = torch.div(
@@ -1097,8 +1097,6 @@ class DSparkProposer(Drafter):
                 block + self.dcp_world_size - 1 - self.dcp_rank
             ) // self.dcp_world_size
         return min(max(block, 1), self._draft_entry_tokens)
-
-    _block_page_idx = staticmethod(block_page_idx)
 
     def _propose_with_draft(
         self,

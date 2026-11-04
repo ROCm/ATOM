@@ -277,10 +277,10 @@ class MhaKvPool:
         """One layer's `(k, v)`, aliasing the pool, in SHUFFLE.
 
         The fused writer produces it and `cp_mha_gather_cache_kernel` reads it
-        in place, and declaring V the other way round sends `_gather_prefix_and_concat_kv` down its
-        densifying branch. K's tokens are one head-major span where V's are
-        already split by the pack -- which fp8 hides, `x == block_size`
-        collapsing V's outer half to one.
+        in place, and declaring V the other way round sends
+        `_gather_prefix_and_concat_kv` down its densifying branch. K's tokens
+        are one head-major span where V's are already split by the pack -- which
+        fp8 hides, `x == block_size` collapsing V's outer half to one.
         """
         x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
         return (

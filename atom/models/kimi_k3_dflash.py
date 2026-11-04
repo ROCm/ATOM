@@ -36,11 +36,15 @@ per-token scale planes.
 import logging
 from typing import ClassVar
 
+import aiter
 import torch
 from aiter.rotary_embedding import get_rope
+from aiter.tuned_gemm import tgemm
 from torch import nn
 
 from atom.config import QuantizationConfig
+from atom.model_ops.attentions.dflash_draft_attn import DFlashDraftUnifiedAttention
+from atom.model_ops.kimi_k3 import apply_attn_res
 from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
 from atom.model_ops.linear import (
     QKVParallelLinear,
@@ -56,6 +60,9 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.qwen3 import Qwen3MLP
+from atom.spec_decode.drafter import AuxCaptureSpec, _resolve_decoder_layers
+from atom.spec_decode.dspark_proposer import DSparkProposer
+from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
@@ -139,8 +146,6 @@ class KimiK3DFlashAttention(nn.Module):
         Not the paged `Attention` op, which is causal on every arm and would
         mask silently.
         """
-        from atom.utils.forward_context import get_forward_context
-
         fwd_ctx = get_forward_context()
         attn_metadata = fwd_ctx.attn_metadata
 
@@ -159,16 +164,14 @@ class KimiK3DFlashAttention(nn.Module):
 
         # The write goes FIRST: the read takes the block's own T rows out of
         # the pool with the prefix, and the next block's prefix is these rows.
-        self._write_block_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
-        o = self._attend_non_causal(q, k, v, attn_metadata, k_cache, v_cache)
+        self._write_kv(k, v, attn_metadata.slot_mapping[:n], k_cache, v_cache)
+        o = self._attend_non_causal(q, attn_metadata, k_cache, v_cache)
         return linear_out(self.o_proj(o))
 
-    def _write_block_kv(self, k, v, slot_mapping, k_cache, v_cache) -> None:
+    def _write_kv(self, k, v, slot_mapping, k_cache, v_cache) -> None:
         """Scatter K/V into this layer's rows of the pool: the block's own rows
         on the block pass, the context rows on `write_context_kv`.
         """
-        import aiter
-
         if k_cache.dtype.itemsize == 1:
             # The pool's scale is 1.0 (`DraftKvBuilder`), and a plain cast turns
             # an out-of-range value into NaN, which a context row -- written
@@ -188,7 +191,7 @@ class KimiK3DFlashAttention(nn.Module):
             self.kv.v_scale,
         )
 
-    def _attend_non_causal(self, q, k, v, attn_metadata, k_cache, v_cache):
+    def _attend_non_causal(self, q, attn_metadata, k_cache, v_cache):
         """The block's one non-causal read: aiter `unified_attention`, folded.
 
         Keys are `[0, context_lens[b])` of the pool, the T block rows included;
@@ -231,18 +234,13 @@ class KimiK3DFlashAttention(nn.Module):
         merged weight is the shards' rows laid end to end, so the row slice is a
         contiguous view of exactly the k and v shards.
         """
-        from aiter.tuned_gemm import tgemm
-
         kv = tgemm.mm(ctx_hidden, self.qkv_proj.weight[self.q_size :], None)
         k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
         # v is not normed, matching the reference.
         k = self.k_norm(k)
         # Absolute positions, so a cached row stays valid on every later step.
         k = self.rotary_emb(positions, k)
-        k_cache, v_cache = self._caches()
-        if k_cache is None:
-            return
-        self._write_block_kv(k, v, slot_mapping, k_cache, v_cache)
+        self._write_kv(k, v, slot_mapping, self.kv.k_cache, self.kv.v_cache)
 
 
 class KimiK3DFlashDecoderLayer(nn.Module):
@@ -297,8 +295,6 @@ class KimiK3DFlashDecoderLayer(nn.Module):
         The reference feeds `hidden_norm(fc(aux))` straight into k_proj/v_proj;
         only the noise stream goes through the layer's input norm.
         """
-        from atom.utils.forward_context import get_forward_context
-
         fwd_ctx = get_forward_context()
         attn_metadata = fwd_ctx.attn_metadata
         # Not `attn_metadata.slot_mapping`: under DCP the target's is -1 for
@@ -320,9 +316,8 @@ class KimiK3DFlashDecoderLayer(nn.Module):
 def _draft_rope_kwargs(config) -> dict:
     """`get_rope` arguments from the DRAFT's own config, never the target's.
 
-    This checkpoint is YaRN x16 from 65536 at theta 10000, neox-style; Kimi-K3
-    is x32 from 32768 at theta 50000. Inheriting the target's loads clean and
-    only costs acceptance length.
+    The two ropes differ, and the target's loads clean, so nothing would catch
+    the draft inheriting it.
     """
     rope_theta, rope_scaling = draft_rope_scaling(config)
     return {
@@ -418,11 +413,7 @@ class KimiK3DFlash(DSparkDraftModel):
         self.hidden_norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
         # One block read for every layer, built before any capture.
-        from atom.model_ops.attentions.dspark_draft_attn import (
-            DSparkDraftUnifiedAttention,
-        )
-
-        block_attn = DSparkDraftUnifiedAttention(
+        block_attn = DFlashDraftUnifiedAttention(
             torch.get_default_device(),
             max_bs=int(atom_config.max_num_seqs),
             max_model_len=int(atom_config.max_model_len),
@@ -508,11 +499,6 @@ class KimiK3DFlash(DSparkDraftModel):
         ``out_norm_weight=None`` so it comes back un-normed. The target model
         is not touched; the reconstruction lives in this draft.
         """
-        # Local: `drafter` imports the model loader, so a module-level import
-        # here would close a cycle. Both are resolved once, at arm time.
-        from atom.spec_decode.drafter import AuxCaptureSpec, _resolve_decoder_layers
-        from atom.spec_decode.dspark_proposer import DSparkProposer
-
         base_extract = DSparkProposer._extract_layer_hidden
         layers = _resolve_decoder_layers(target_model)
 
@@ -523,40 +509,47 @@ class KimiK3DFlash(DSparkDraftModel):
         # `id()`-keyed lookup would graph-break.
         taps: dict[int, tuple[int, nn.Module]] = {}
         for lid in layer_ids:
-            if lid < 0 or lid + 1 >= len(layers):
-                continue  # the embedding tap, and the last layer (no successor)
+            if lid == -1:
+                continue  # the embedding tap: no mixture below the first layer
+            # Anything else that cannot form the aggregate would leave this tap
+            # on the prefix, a feature the checkpoint was not trained on.
+            if not 0 <= lid < len(layers) - 1:
+                raise ValueError(
+                    f"DFlash aggregate tap on target layer {lid}: needs a "
+                    f"successor layer in a {len(layers)}-layer stack"
+                )
             if getattr(layers[lid], "layer_idx", lid) != lid:
-                continue  # not a stack we can index; take the prefix
+                raise ValueError(
+                    f"DFlash aggregate tap on target layer {lid}: the stack's "
+                    f"layer {lid} has layer_idx {layers[lid].layer_idx}"
+                )
             res = getattr(layers[lid + 1], "self_attention_attn_res", None)
             if res is None or not getattr(res, "enabled", False):
-                continue
+                raise ValueError(
+                    f"DFlash aggregate tap on target layer {lid}: target layer "
+                    f"{lid + 1} has no enabled attn-residual"
+                )
             block_size = getattr(res, "block_size", None)
             if not block_size:
-                continue
+                raise ValueError(
+                    f"DFlash aggregate tap on target layer {lid}: target layer "
+                    f"{lid + 1}'s attn-residual has no block size"
+                )
+            # Folded here, once after load, never inside the traced and
+            # captured target forward the extract runs in.
+            if res.score_weight is None:
+                res.process_weights_after_loading()
+            if res.score_weight is None:
+                raise RuntimeError(
+                    f"DFlash aggregate tap: target layer {lid + 1}'s "
+                    "attn-residual has no score weight"
+                )
             # Ceiling division: the bank holds one snapshot per closed block
             # below this layer.
-            nvb = -(-(lid + 1) // block_size)
-            if nvb > 0:
-                # Folded here, once after load, never inside the traced and
-                # captured target forward the extract runs in.
-                if res.score_weight is None:
-                    res.process_weights_after_loading()
-                if res.score_weight is None:
-                    raise RuntimeError(
-                        f"DFlash aggregate tap: target layer {lid + 1}'s "
-                        "attn-residual has no score weight"
-                    )
-                taps[lid] = (nvb, res)
+            taps[lid] = (-(-(lid + 1) // block_size), res)
 
         if not taps:
-            # A target without attention residuals (or a stack we could not
-            # index) has no aggregate to form; the prefix IS the whole stream.
-            logger.warning(
-                "DFlash draft found no Kimi-K3 attn-residual sites above its "
-                "taps %s; feeding the plain residual stream, which is NOT the "
-                "feature this checkpoint was trained on.",
-                layer_ids,
-            )
+            # Only the embedding tap: the prefix IS the whole stream there.
             return AuxCaptureSpec(layer_ids, hidden_size, base_extract)
 
         logger.info("DFlash aggregate tap armed on target layers %s", sorted(taps))
@@ -577,8 +570,6 @@ class KimiK3DFlash(DSparkDraftModel):
                     f"expected a bank of >= {nvb} blocks, got "
                     f"{None if bank is None else tuple(bank.shape)}"
                 )
-            from atom.model_ops.kimi_k3 import apply_attn_res
-
             # `out_norm_weight=None` -> the mix comes back un-normed. The base
             # hook then copies it in place into the same fixed capture buffer it
             # would have filled with `prefix` -- same buffer, same shape, so

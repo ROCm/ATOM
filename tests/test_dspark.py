@@ -2239,12 +2239,12 @@ def test_a_block_position_past_the_block_table_is_dropped_not_clamped():
     offset, so the block would scatter its KV into whatever request owns that
     page. These rows want the pad tail's `-1`.
     """
-    from atom.spec_decode.dspark_proposer import DSparkProposer
+    from atom.spec_decode.draft_kv import block_page_idx
 
     block_tables = torch.zeros(1, 4, dtype=torch.int32)
     # Columns 0..3 exist; positions 254..258 straddle the end at block_size=64.
     positions = torch.tensor([[254, 255, 256, 257, 258]])
-    page_idx, in_table = DSparkProposer._block_page_idx(positions, 64, block_tables)
+    page_idx, in_table = block_page_idx(positions, 64, block_tables)
 
     assert page_idx.max().item() <= 3, "the gather index must stay in bounds"
     assert in_table.tolist() == [[True, True, False, False, False]]

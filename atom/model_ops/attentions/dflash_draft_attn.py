@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Page-table read for the GQA DFlash/DSpark draft block.
+"""Page-table read for the GQA DFlash draft block.
 
 The block pass writes its own T rows into the draft pool first
-(`KimiK3DFlashAttention._write_block_kv`), so request ``b``'s pool rows are
+(`KimiK3DFlashAttention._write_kv`), so request ``b``'s pool rows are
 keys ``[0, kv_lens[b])``, ``kv_lens = context_lens = anchor + 1 + T``, and every
 block row attends all of them. Key ``t`` sits at slot
 ``block_tables[b, t // E] * E + t % E``, where ``E`` is the pool's entry span
@@ -11,7 +11,7 @@ block row attends all of them. Key ``t`` sits at slot
 read takes exactly that, so the proposer builds no ``kv_indptr``/``kv_indices``
 stream for it.
 
-`DSparkDraftUnifiedAttention` is aiter's ``unified_attention`` -- the kernel
+`DFlashDraftUnifiedAttention` is aiter's ``unified_attention`` -- the kernel
 `PagedAttentionImpl.paged_attention_unified` already decodes through -- on the
 FOLDED query ``[bs, HKV * T * G, D]`` with ``max_seqlen_q = 1``. That kernel
 asserts ``causal``, and with one query row per sequence the causal mask admits
@@ -23,18 +23,16 @@ by one program. The block rows come back out of the pool with the prefix, so
 over an fp8 pool they are read quantized.
 
 Where aiter's Gluon kernel serves this read (gfx950), the query is cast to an
-fp8 pool's dtype too, because Gluon needs q and KV in one dtype: about 1.6x
-faster than the Triton path at bs 32 / 128k context. The cast costs precision
-only down to what this checkpoint was validated at (SGLang's verify kernel
-casts q to the pool dtype for the prefix dot), and it is clamped to the fp8
-range first, since a plain cast turns an out-of-range value into NaN. On
-gfx1250 the 3D Gluon path needs ``shuffled_kv_cache``, which this FLASH-layout
-pool is not, so q stays bf16 there, as everywhere else.
+fp8 pool's dtype too, because Gluon needs q and KV in one dtype. The cast is
+clamped to the fp8 range first, since a plain cast turns an out-of-range value
+into NaN. On gfx1250 the 3D Gluon path needs ``shuffled_kv_cache``, which this
+FLASH-layout pool is not, so q stays bf16 there, as everywhere else.
 """
 
 from __future__ import annotations
 
 import torch
+from aiter.ops.triton.attention import unified_attention as ua
 
 
 def fold_block_queries(
@@ -72,13 +70,10 @@ def unfold_block_output(
     return o
 
 
-class DSparkDraftUnifiedAttention:
+class DFlashDraftUnifiedAttention:
     """aiter ``unified_attention`` (3D split-KV) on the folded draft block."""
 
     def __init__(self, device, max_bs: int, max_model_len: int):
-        from aiter.ops.triton.attention import unified_attention as ua
-
-        self.device = device
         self._ua = ua.unified_attention
         # What aiter picks its kernel and split config from. A heuristic, not a
         # bound: tiles come from each request's own `seqused_k`, which may run

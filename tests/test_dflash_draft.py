@@ -603,20 +603,15 @@ def test_dflash_pool_entry_is_dcp_blocks(dcp):
 
 
 def _fake_attn_res_kernel(monkeypatch, calls):
-    """Stand in for `atom.model_ops.kimi_k3`, which needs aiter and a GPU.
+    """Stand in for `apply_attn_res`, whose kernel needs a GPU.
 
-    The draft imports `apply_attn_res` inside the extract, so swapping the
-    module in `sys.modules` is enough to keep the kernel out of these tests;
-    they still import `kimi_k3_dflash`, which needs aiter, so they skip on the
-    CPU-only CI job and run where aiter is installed. The stand-in records the
-    ARGUMENTS the draft marshals and returns a sentinel, so a test can check the
-    extract hands back the kernel's result rather than the prefix.
+    Patched on `kimi_k3_dflash`, which imports it at module level; the module
+    itself needs aiter, so these tests skip on the CPU-only CI job and run
+    where aiter is installed. The stand-in records the ARGUMENTS the draft
+    marshals and returns a sentinel, so a test can check the extract hands back
+    the kernel's result rather than the prefix.
     """
-    import sys
-
     import torch
-
-    module = types.ModuleType("atom.model_ops.kimi_k3")
 
     def apply_attn_res(
         prefix_sum,
@@ -643,8 +638,8 @@ def _fake_attn_res_kernel(monkeypatch, calls):
         )
         return result, None
 
-    module.apply_attn_res = apply_attn_res
-    monkeypatch.setitem(sys.modules, "atom.model_ops.kimi_k3", module)
+    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
+    monkeypatch.setattr(dflash, "apply_attn_res", apply_attn_res)
     return calls
 
 
@@ -806,17 +801,27 @@ def test_dflash_aggregate_folds_the_score_weight_when_armed():
     assert res.score_weight is folded
 
 
-def test_dflash_falls_back_when_the_target_has_no_attn_residuals():
-    """No attn-residual sites -> the prefix IS the whole stream.
+def test_dflash_refuses_a_tap_that_cannot_form_the_aggregate():
+    """A tap without a mixture would feed the prefix, which this checkpoint was
+    not trained on, so arming refuses it rather than fall back per tap."""
+    pytest.importorskip("torch")
+    with pytest.raises(ValueError, match="no enabled attn-residual"):
+        _dflash_spec(_k3_target_stub(enabled=False), (7, 11))
+    with pytest.raises(ValueError, match="successor layer"):
+        _dflash_spec(_k3_target_stub(n_layers=16), (6, 15))
+    target = _k3_target_stub()
+    target.layers[6].layer_idx = 5
+    with pytest.raises(ValueError, match="layer_idx 5"):
+        _dflash_spec(target, (6,))
 
-    Guards the shape of the degradation: the draft must not try to mix against
-    a bank that does not exist, and must not raise either -- the generic
-    extractor is a correct answer for a target with no mixture.
-    """
+
+def test_dflash_embedding_tap_keeps_the_prefix():
+    """`-1` taps the embedding, below every mixture: the prefix is the stream."""
+    pytest.importorskip("torch")
     generic = _generic_extract()
-    target = _k3_target_stub(enabled=False)
-    spec = _dflash_spec(target, (7, 11))
-    assert spec.extract is generic
+    assert _dflash_spec(_k3_target_stub(), (-1,)).extract is generic
+    spec = _dflash_spec(_k3_target_stub(), (-1, 6))
+    assert spec.extract is not generic
 
 
 def test_k3_dspark_mla_draft_resolves_to_the_generic_extractor():
@@ -1071,7 +1076,7 @@ def test_dflash_context_write_refuses_a_missing_draft_slot_map(monkeypatch):
 
     meta = fc.AttentionMetaData(slot_mapping=torch.zeros(4, dtype=torch.int64))
     monkeypatch.setattr(
-        fc, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=meta)
+        m, "get_forward_context", lambda: types.SimpleNamespace(attn_metadata=meta)
     )
     with pytest.raises(RuntimeError, match="draft slot mapping"):
         m.KimiK3DFlashDecoderLayer.write_context_kv(
@@ -1080,20 +1085,18 @@ def test_dflash_context_write_refuses_a_missing_draft_slot_map(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# the block read (model_ops/attentions/dspark_draft_attn.py)
+# the block read (model_ops/attentions/dflash_draft_attn.py)
 #
 # `unified_attention` asserts causal; the read gets a non-causal block out of it
 # by folding each request's T rows into its head axis and decoding ONE row per
-# request. The fold is pure tensor reshaping and runs anywhere; the kernel check
-# below needs a GPU.
+# request. The fold is pure tensor reshaping, but its module imports aiter's
+# kernel, so these skip where aiter is absent; the kernel check needs a GPU.
 # --------------------------------------------------------------------------- #
 
 
 def _fold_mod():
     pytest.importorskip("torch")
-    from atom.model_ops.attentions import dspark_draft_attn
-
-    return dspark_draft_attn
+    return _gpu_stack_import("atom.model_ops.attentions.dflash_draft_attn")
 
 
 @pytest.mark.parametrize("bs,T,hkv,g", [(1, 7, 2, 4), (3, 7, 2, 4), (2, 4, 1, 8)])
@@ -1222,7 +1225,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
         k_pool, v_pool = k_pool.to(dtypes.fp8), v_pool.to(dtypes.fp8)
     scale = d**-0.5
 
-    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=8, max_model_len=W * E)
+    read = dda.DFlashDraftUnifiedAttention(dev, max_bs=8, max_model_len=W * E)
     one = torch.ones(1, dtype=torch.float32, device=dev)
     # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
     # takes the same q. Taken BEFORE the call, which clamps q in place.
@@ -1294,7 +1297,6 @@ def test_non_mla_block_drafts_skip_the_csr_and_the_mla_plan(
         _blk_ctx_lens=torch.zeros(running_bs, **i32),
         _draft_entry_tokens=vblock,
         _draft_is_dcp_sharded=False,
-        _block_page_idx=proposer.DSparkProposer._block_page_idx,
         _paged_pad_ctx_len=1 + T,
         _blk_cu_seqlens_q=torch.zeros(running_bs + 1, **i32),
         _blk_kv_indptr=torch.zeros(running_bs + 1, **i32),
@@ -1415,7 +1417,7 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
     dda = _fold_mod()
     dev = torch.device("cuda")
     bs, T, hkv, g, d, E = 2, 7, 2, 4, 64, 1024
-    read = dda.DSparkDraftUnifiedAttention(dev, max_bs=4, max_model_len=E)
+    read = dda.DFlashDraftUnifiedAttention(dev, max_bs=4, max_model_len=E)
     if not read.q_to_pool_dtype:
         pytest.skip("q is only cast to fp8 where aiter's Gluon path serves the read")
     k_pool = torch.randn(3, E, hkv, d, device=dev).to(dtypes.fp8)

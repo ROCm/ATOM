@@ -112,6 +112,13 @@ Notes:
   (the checkpoint ships no KV scales). SGLang serves this checkpoint with
   `--speculative-draft-kv-cache-dtype fp8_e4m3` and supports only per-tensor
   fp8 KV scales as well.
+- On gfx950 over an fp8 pool, the draft's block read casts q to the pool's fp8
+  dtype so aiter's Gluon `unified_attention` kernel serves it, about 1.6x
+  faster than the Triton path at bs 32 / 128k context. SGLang's verify kernel
+  casts q to the pool dtype for the prefix dot as well.
+- The draft ropes from its own config: YaRN x16 from 65536 at theta 10000,
+  neox-style, where Kimi-K3 is x32 from 32768 at theta 50000. Inheriting the
+  target's rope loads clean and only costs acceptance length.
 
 ### `--dspark-config` knobs
 
