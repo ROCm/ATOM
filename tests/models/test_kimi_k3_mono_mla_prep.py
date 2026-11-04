@@ -74,13 +74,13 @@ def test_prep_key_only_on_the_preceding_layer_and_inside_the_width(
     assert r._prep_key(3, 1) == {}
 
 
-def test_only_sub_mode_1_is_bound(runner_module, monkeypatch):
+def test_sub_mode_3_is_refused(runner_module, monkeypatch):
     from atom.mono.runtime.consensus import MonoUnsupported
 
     r = _runner(runner_module)
     r.plans = []
-    monkeypatch.setenv("ATOM_MONO_MLA_PREP", "2")
-    with pytest.raises(MonoUnsupported, match="sub-mode 1"):
+    monkeypatch.setenv("ATOM_MONO_MLA_PREP", "3")
+    with pytest.raises(MonoUnsupported, match="sub-modes 1"):
         r._bind_mla_prep()
     monkeypatch.setenv("ATOM_MONO_MLA_PREP", "0")
     r._bind_mla_prep()
@@ -107,7 +107,11 @@ def test_a_folded_layer_takes_the_stage_outputs(runner_module):
     prefix = torch.ones(ROWS, HIDDEN)
     blocks = torch.zeros(ROWS, 4, HIDDEN)
     add = torch.full((ROWS, HIDDEN), 2.0)
-    got, normed, new_prefix, mirror = r._prepped_seam(plan, prefix, blocks, add, None)
+    pend["attn"] = None
+    got, normed, new_prefix, mirror, attn = r._prepped_seam(
+        plan, prefix, blocks, add, None
+    )
+    assert attn is None
     assert got is layer and new_prefix is pend["pref"]
     assert normed[0] is pend["x8"] and normed[1] is pend["xs"]
     y, y_scale = mirror
@@ -128,7 +132,7 @@ def test_an_unfolded_layer_runs_its_seam(runner_module):
     r._seam = seam
     plan = SimpleNamespace(layer_id=3)
     out = r._prepped_seam(plan, None, None, None, None)
-    assert out == ("layer", "normed", "prefix", None) and calls["seam"]
+    assert out == ("layer", "normed", "prefix", None, None) and calls["seam"]
 
 
 def test_bind_refuses_before_reading_the_seam():
