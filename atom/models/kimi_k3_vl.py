@@ -487,6 +487,51 @@ class KimiK3VisionTower(nn.Module):
         return tpool_patch_merge(hidden_states, grid_thws, self.merge_kernel_size)
 
 
+# One full-size image (``in_patch_limit``) already passes the tower at once;
+# a video's grids are encoded in passes of at most this many patches.
+VISION_PATCHES_PER_PASS = 65536
+
+
+def encode_media_in_passes(
+    vision_tower: nn.Module,
+    mm_projector: nn.Module,
+    pixel_values: torch.Tensor,
+    grid_thws: torch.Tensor,
+    max_patches: int = VISION_PATCHES_PER_PASS,
+) -> torch.Tensor:
+    """Vision embeddings for ``grid_thws``, bounding activation memory per pass.
+
+    Every tower op is per grid (position embedding, 2D RoPE, varlen attention
+    bounded by ``cu_seqlens``, temporal pooling) or per token, so encoding whole
+    grids in consecutive groups returns the same rows in the same order. A long
+    video encoded at once (about 490k patches for 40 s at 640x480) runs the
+    tower out of HBM and takes every model runner down with it.
+    """
+    sizes = [int(t) * int(h) * int(w) for t, h, w in grid_thws.tolist()]
+    if sum(sizes) != pixel_values.shape[0]:
+        raise ValueError(
+            f"pixel_values has {pixel_values.shape[0]} patches but the grids "
+            f"describe {sum(sizes)}"
+        )
+    if sum(sizes) <= max_patches:
+        return mm_projector(vision_tower(pixel_values, grid_thws))
+    outputs = []
+    first = start = patches = 0
+    for index, size in enumerate(sizes + [None]):
+        if size is None or (patches and patches + size > max_patches):
+            outputs.append(
+                mm_projector(
+                    vision_tower(
+                        pixel_values[start : start + patches], grid_thws[first:index]
+                    )
+                )
+            )
+            first, start, patches = index, start + patches, 0
+        if size is not None:
+            patches += size
+    return torch.cat(outputs, dim=0)
+
+
 class KimiK3PatchMergerProjector(nn.Module):
     """PatchMergerMLPV2: projects merged vision patches into the text width."""
 

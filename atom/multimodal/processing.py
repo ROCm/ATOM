@@ -100,21 +100,40 @@ def prepare_multimodal_inputs(
     Chat callers supply a conversation with image markers, in the same order as
     multi_modal_data['image']. Qwen-style processors also accept a rendered text
     prompt, with one image placeholder per item and no chat template applied.
-    Video/audio are rejected before any media is loaded.
+    Video is accepted when the model's builder declares ``supports_video``
+    (chat conversations only); audio is rejected before any media is loaded.
     """
     media_items = normalize_multimodal_data(multi_modal_data)
     if not media_items:
         raise ValueError("Multimodal request did not contain any media")
-    unsupported = media_items.keys() - {"image"}
-    if unsupported:
-        raise ValueError(
-            f"Native multimodal inference does not support {', '.join(sorted(unsupported))} "
-            "inputs yet; supported modalities: image"
-        )
     builder = get_multimodal_input_builder(
         atom_config, is_text_prompt=isinstance(prompt, str)
     )
-    media = load_multimodal_data(media_items, media_loader or MediaLoader())
+    supported = {"image"}
+    if getattr(builder, "supports_video", False) and not isinstance(prompt, str):
+        supported.add("video")
+    unsupported = media_items.keys() - supported
+    if unsupported:
+        raise ValueError(
+            f"Native multimodal inference does not support {', '.join(sorted(unsupported))} "
+            f"inputs yet; supported modalities: {', '.join(sorted(supported))}"
+        )
+    loader = media_loader or MediaLoader()
+    if "video" in media_items:
+        # The builder samples and decodes video with its model's own policy;
+        # hand it the encoded bytes, never a full-rate decode.
+        videos = [_encoded_video(item, loader) for item in media_items["video"]]
+        images = [loader.load_image(item) for item in media_items.get("image", [])]
+        return builder(
+            atom_config,
+            processor,
+            _bind_media_to_messages(prompt, images, videos),
+            images,
+            dict(chat_template_kwargs or {}),
+            tools=tools,
+            videos=videos,
+        )
+    media = load_multimodal_data(media_items, loader)
     images = media["image"]
     if not isinstance(prompt, str):
         prompt = _bind_images_to_messages(prompt, images)
@@ -126,3 +145,50 @@ def prepare_multimodal_inputs(
         dict(chat_template_kwargs or {}),
         tools=tools,
     )
+
+
+def _encoded_video(item: Any, loader: MediaLoader) -> Any:
+    from atom.multimodal import EncodedMedia, VideoData
+
+    if isinstance(item, VideoData):
+        return item
+    if isinstance(item, EncodedMedia):
+        return item.data
+    if isinstance(item, bytes):
+        return item
+    return loader.connector.read(item)
+
+
+def _bind_media_to_messages(
+    conversation: list[dict[str, Any]], images: list, videos: list
+) -> list[dict[str, Any]]:
+    """Bind image and video markers to their items, in encounter order."""
+    items = {"image": list(images), "video": list(videos)}
+    used = {"image": 0, "video": 0}
+    messages = []
+    for message in conversation:
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                kind = part["type"]
+                if kind in items:
+                    if used[kind] >= len(items[kind]):
+                        raise ValueError(
+                            f"Conversation has more {kind} markers than {kind}s"
+                        )
+                    part = {**part, kind: items[kind][used[kind]]}
+                    used[kind] += 1
+                elif kind != "text":
+                    raise ValueError(
+                        "Expected a normalized conversation with image/video/text parts"
+                    )
+                parts.append(dict(part))
+            content = parts
+        messages.append({**message, "content": "" if content is None else content})
+    for kind, values in items.items():
+        if used[kind] != len(values):
+            raise ValueError(
+                f"Conversation has {used[kind]} {kind} markers but {len(values)} {kind}s"
+            )
+    return messages

@@ -2092,7 +2092,11 @@ class KimiK3ForConditionalGeneration(KimiK3ForCausalLM):
                 "Kimi-K3 image embeddings were requested on a pipeline rank "
                 "that holds no vision tower; they belong on the first rank."
             )
-        return self.mm_projector(self.vision_tower(pixel_values, grid_thw))
+        from atom.models.kimi_k3_vl import encode_media_in_passes
+
+        return encode_media_in_passes(
+            self.vision_tower, self.mm_projector, pixel_values, grid_thw
+        )
 
     def merge_multimodal_embeddings(
         self,
