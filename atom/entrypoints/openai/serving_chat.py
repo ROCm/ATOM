@@ -17,12 +17,12 @@ from .protocol import (
     TOOL_CHOICE_VALUES,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ended_by_stop,
     openai_stop_reason_with_calls,
 )
 from .reasoning import (
     NO_REASONING,
     ReasoningChannel,
-    ended_by_stop,
 )
 from .reasoning_controls import (
     CHAT_REASONING_RULES,

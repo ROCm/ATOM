@@ -8,10 +8,10 @@ from typing import ClassVar
 
 import pytest
 
+from atom.entrypoints.openai.protocol import ended_by_stop
 from atom.entrypoints.openai.reasoning import (
     ReasoningChannel,
     ReasoningFilter,
-    ended_by_stop,
     prompt_starts_in_reasoning,
 )
 from atom.entrypoints.openai.reasoning_dialects import resolve_dialect
@@ -362,6 +362,7 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         "reason, stopped",
         [
             ("eos", True),
+            ("stop", True),
             ("stop_sequence", True),
             ("stop_163586", True),
             ("max_tokens", False),
@@ -427,6 +428,26 @@ class TestTheChannelEndsAtWhicheverCloserComesFirst:
         answer, calls = parse_tool_calls(content, None, KimiK3Parser)
         assert (reasoning, answer) == (self.REPLY, self.REPLY)
         assert [c.function["name"] for c in calls] == ["get_weather"]
+
+    @pytest.mark.parametrize("before", ["", "Sure. "], ids=["leading", "after-text"])
+    def test_with_thinking_off_reasoning_markers_in_an_argument_are_its_text(
+        self, before
+    ):
+        """Once the tools channel opens, no think channel follows it, so a
+        think marker inside the call is the argument's own text."""
+        value = "<|open|>think<|sep|>payload<|close|>think<|sep|>"
+        call = (
+            '<|open|>tools<|sep|><|open|>call tool="write_file"<|sep|>'
+            f'<|open|>argument key="text"<|sep|>{value}<|close|>argument'
+            "<|close|>call<|close|>tools<|sep|>"
+        )
+        reasoning, content = self.K3_CLOSED.split(before + call, stopped=True)
+        assert (reasoning, content) == (None, before + call)
+        answer, calls = parse_tool_calls(content, None, KimiK3Parser)
+        assert answer == before
+        assert [(c.function["name"], c.function["arguments"]) for c in calls] == [
+            ("write_file", '{"text": "' + value + '"}')
+        ]
 
     def test_with_thinking_off_a_leading_call_keeps_its_opener(self):
         """Only the think exit at offset 0 means "declined to think"; the

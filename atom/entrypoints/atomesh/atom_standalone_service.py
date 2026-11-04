@@ -35,13 +35,13 @@ from atom.entrypoints.openai.protocol import (
     STREAM_DONE_MESSAGE,
     TEXT_COMPLETION_OBJECT,
     CompletionRequest,
+    ended_by_stop,
     openai_stop_reason,
     openai_stop_reason_with_calls,
 )
 from atom.entrypoints.openai.reasoning import (
     NO_REASONING,
     ReasoningChannel,
-    ended_by_stop,
     prompt_starts_in_reasoning,
     template_opens_reasoning_implicitly,
     thinking_switched_off,

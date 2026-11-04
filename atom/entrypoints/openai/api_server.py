@@ -94,11 +94,11 @@ from .protocol import (
     CompletionRequest,
     ModelCard,
     ModelList,
+    ended_by_stop,
     validate_max_tokens,
 )
 from .reasoning import (
     ReasoningChannel,
-    ended_by_stop,
     prompt_starts_in_reasoning,
     prompt_tokens_start_in_reasoning,
     template_opens_reasoning_implicitly,

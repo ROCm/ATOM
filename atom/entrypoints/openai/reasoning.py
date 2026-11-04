@@ -37,14 +37,6 @@ VALID_TEMPLATE_EFFORTS = frozenset().union(*(d.template_efforts for d in DIALECT
 _REPLAY_PIECE = 4096
 
 
-def ended_by_stop(finish_reason: str | None) -> bool:
-    """Did the model end its output itself -- EOS, a stop token or a stop
-    sequence -- rather than being cut off (`max_tokens`, abort)?"""
-    return finish_reason is not None and (
-        finish_reason == "eos" or finish_reason.startswith("stop")
-    )
-
-
 def template_opens_reasoning_implicitly(template_source: str) -> bool:
     """Does this model begin inside the reasoning channel with no marker at all?
 
@@ -216,12 +208,11 @@ class ReasoningFilter:
         channel has closed."""
         watched = set(self._framing)
         if state == 0:
-            # The think exit too, though the channel is not open: at offset 0
-            # it means the model declined to think, further in it is the
-            # model's own words, and watching is what tells them apart. Only
-            # that one: another end marker (K3's tools opener) is a channel
-            # switch, not a declined think, and passes as text.
-            watched |= self._open_markers | {self._think_end}
+            # End markers too, though the channel is not open. The think exit
+            # at offset 0 means the model declined to think, and further in it
+            # is the model's own words; another one (K3's tools opener) means
+            # the answer's channels have begun, wherever it falls.
+            watched |= self._open_markers | self._end_markers
         elif state == 1:
             watched |= self._end_markers | self._answer_end_markers
         return MarkerScanner(tuple(sorted(watched))) if watched else None
@@ -263,8 +254,15 @@ class ReasoningFilter:
                 # K3 deployment whose template refused the tools probe handed
                 # its channel tokens to the client on both delivery paths.
                 continue
-            if self.state == 0 and scan.hit == self._think_end:
-                if self._at_offset_zero:
+            if self.state == 0 and scan.hit in self._end_markers:
+                if scan.hit != self._think_end:
+                    # A channel that only follows the answer's start (K3's
+                    # tools): no think channel comes after it, so a think
+                    # marker inside the call is the call's text. Forwarded,
+                    # so the tool parser sees its opener.
+                    out.append((self._field, scan.hit))
+                    text = self._enter(2)
+                elif self._at_offset_zero:
                     text = self._enter(2)  # declined to think; the rest is the answer
                 else:
                     out.append((self._field, scan.hit))  # the model's own words
@@ -322,7 +320,7 @@ class ReasoningFilter:
     def flush(self, *, stopped: bool) -> list:
         """End of stream: whatever is held never became a marker.
 
-        ``stopped`` is :func:`ended_by_stop` of the finish reason. An output
+        ``stopped`` is :func:`~.protocol.ended_by_stop` of the finish reason. An output
         cut off at `max_tokens` right after a quoted answer closer looks like a
         finished reply, and only the finish reason tells the two apart.
         """
