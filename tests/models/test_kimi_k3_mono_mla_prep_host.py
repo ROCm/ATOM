@@ -3,10 +3,10 @@
 """The MLA fold host check (``_kimi_k3_mono_prep_host_check.py``), run in a
 subprocess because it patches ``torch.empty`` & co: the real runner over 93
 layers with CPU stand-in kernels, flag off against ``ATOM_MONO_MLA_POST`` and
-``ATOM_MONO_MLA_PREP`` 1 / 2, bit for bit on every drafter-visible buffer, on
+``ATOM_MONO_MLA_PREP`` 1 / 2 / 3, bit for bit on every drafter-visible buffer, on
 "every buffer a launch is handed is still allocated", and on the step's pool
 allocations (the CUDA-graph pool layout). Slow (minutes): it runs the stack
-nine times.
+a dozen times.
 """
 
 import os

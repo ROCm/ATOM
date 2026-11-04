@@ -5,7 +5,7 @@
 The REAL ``K3MonoDecodeRunner.forward`` (``_layer``, ``_k2``, ``_pre_o_core``,
 ``_post_core``, ``_prep_args``, ``_prepped_seam``, ``_seam_mirror``,
 ``_write_aux``) over the full 93-layer Kimi-K3 stack: ``ATOM_MONO_MLA_POST``
-off / on against ``ATOM_MONO_MLA_PREP`` 0 / 1, and PREP 1 over an
+off / on against ``ATOM_MONO_MLA_PREP`` 0 / 1 / 2 / 3, and 1 / 3 over an
 ``ATOM_MONO_MLA_PREP_LAYERS`` subset (gaps between folded layers, 92
 unfolded); three decode steps, one of them past the folds' 16-row width (the
 unfused path).
@@ -25,9 +25,10 @@ at every step:
   layer's KV cache, every layer's K2 output -- against flag-off, and POST on
   against POST off;
 * every buffer a K2 launch is handed is still allocated when it is launched;
-* PREP=1: the step's explicit pool allocations and releases (``torch.empty`` /
+* the step's explicit pool allocations and releases (``torch.empty`` /
   ``empty_like`` / ``zeros`` / ``new_empty`` / a copying ``contiguous``), in
-  order and size, identical to flag-off.
+  order and size: identical to flag-off for PREP 1; for PREP 2 / 3 identical
+  outside the production attention internals the stages replace.
 
 It cannot say whether the kernels are right: that needs a GPU.
 """
@@ -63,6 +64,7 @@ QKV_A, QH, ENTRY = QL + KVL + ROPE, QK_NOPE + ROPE, KVL + ROPE
 QB = HEADS * QH
 MAXPOS = 4096
 NSLOTS = 512
+PAGE = 4
 
 fails = []
 
@@ -359,7 +361,7 @@ class MlaModule:
         self.lid = lid
 
     def _kv(self):
-        return FC.kv_cache_data[f"layer_{self.lid}"].k_cache
+        return FC.kv_cache_data[f"layer_{self.lid}"].k_cache.view(NSLOTS, 1, ENTRY)
 
     def _q_kv(self, x, xs):
         qkv0, q80, qs0, kvn0 = qa_ref(x, xs, MW)
@@ -408,10 +410,21 @@ class MlaModule:
         return o, x, xs
 
     def forward_prepped(
-        self, positions, x, xs, q, q_scale, kv, k_rope, latent_out=False
+        self,
+        positions,
+        x,
+        xs,
+        q=None,
+        q_scale=None,
+        kv=None,
+        k_rope=None,
+        q_out=None,
+        latent_out=False,
     ):
         TR.tag = "attn"
-        o = self._decode(self._rope_cache(q, q_scale, kv, k_rope, positions))
+        if q_out is None:
+            q_out = self._rope_cache(q, q_scale, kv, k_rope, positions)
+        o = self._decode(q_out)
         out = o if latent_out else self._core(o, x, xs)
         TR.tag = ""
         return out
@@ -468,13 +481,21 @@ class K2Launch:
             at(a["pref"], (s, H), BF).copy_(pref)
             at(a["x8"], (s, H), FP8).copy_(x8)
             at(a["xs"], (s, 1), torch.float32).copy_(xs)
-            assert key.mla_prep in (1, 2) and m in MLA
+            assert key.mla_prep in (1, 2, 3) and m in MLA
             if key.mla_prep >= 2:
                 qkv, q8, qs, kvn = qa_ref(x8, xs, MW)
                 at(a["qkv"], (s, QKV_A), BF).copy_(qkv)
                 at(a["q8"], (s, QL), FP8).copy_(q8)
                 at(a["qs"], (s, 1), torch.float32).copy_(qs)
                 at(a["kvn"], (s, KVL), BF).copy_(kvn)
+            if key.mla_prep >= 3:
+                pos = at(a["pos"], (s,), torch.int64)
+                q_out, kv = qb_ref(q8, qs, kvn, qkv[:, QL + KVL :], pos, MW)
+                at(a["qout"], (s, HEADS, ENTRY), FP8).copy_(q_out)
+                # one row a slot, whatever the cache's block size
+                assert a["kvc_sr"] == ENTRY, f"kvc_sr {a['kvc_sr']}"
+                kvc = at(a["kvc"], (NSLOTS, 1, ENTRY), FP8)
+                kv_write(kvc, at(a["slots"], (s,), torch.int64), kv)
 
 
 def k1_stub(self, build, plan, prefix, delta, blocks, metadata, taps=None, tag=0):
@@ -605,7 +626,8 @@ def run(mode, post, rows_steps, only=None):
             ]
         )
     r.widths = {}
-    kv = {m: torch.zeros(NSLOTS, 1, ENTRY, dtype=FP8) for m in MLA}
+    # paged as production's (blocks of PAGE slots)
+    kv = {m: torch.zeros(NSLOTS // PAGE, PAGE, 1, ENTRY, dtype=FP8) for m in MLA}
     for t in kv.values():
         reg(t)
     FC.kv_cache_data = {f"layer_{m}": NS(k_cache=t) for m, t in kv.items()}
@@ -695,7 +717,12 @@ for post in POSTS:
         base = ref
     else:
         compare("post 1 vs post 0, mode 0", base, ref)
-    for mode, only in [(1, None), (1, ONLY), (2, None)]:
+    matrix = [(1, None), (1, ONLY), (2, None), (3, None)] + (
+        [(3, ONLY)] if post else []
+    )
+    # ``MODES=3``: only those PREP sub-modes (a quicker rerun)
+    want = {int(m) for m in os.environ.get("MODES", "1,2,3").split(",")}
+    for mode, only in [(m, o) for m, o in matrix if m in want]:
         got, ev = run(mode, post, STEPS, only)
         tag = f"post {int(post)} mode {mode}" + (" layers subset" if only else "")
         check(
