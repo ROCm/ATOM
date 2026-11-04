@@ -14,9 +14,7 @@ import torch
 pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
 
 from atom.model_ops.attentions.deepseek_v4_attn import (
-    MixedViewUnslicedField,
     _mixed_carrier,
-    _MixedDecodeView,
 )
 
 _V4_ATTN = (
@@ -25,34 +23,18 @@ _V4_ATTN = (
 )
 
 
-def _batch(n_p=2, n_d=3, block_rows=None):
-    n = n_p + n_d
-    tables = [[10 + i] for i in range(n)]
-    return SimpleNamespace(
-        total_seqs_num=n,
-        total_seqs_num_decode=n_d,
-        total_tokens_num_prefill=8 * n_p,
-        total_tokens_num_decode=n_d,
-        num_spec_step=0,
-        is_dummy_run=False,
-        context_lens=list(range(n)),
-        block_tables=tables if block_rows is None else tables[:block_rows],
-        swa_block_tables=None,
-        state_slots_committed=list(range(n)),
-        state_fork_srcs=None,
-    )
+from test_mixed_decode_view import make_batch
+
+from atom.utils.forward_context import AttnState
 
 
-def test_view_slices_the_decode_rows():
-    view = _MixedDecodeView(_batch(), 2)
-    assert view.block_tables == [[12], [13], [14]]
-
-
-def test_view_refuses_block_tables_that_are_not_one_per_row():
-    """A row with an empty table (filtered out of `block_tables`) would shift
-    every decode row onto its neighbour's pages if sliced by position."""
-    with pytest.raises(MixedViewUnslicedField, match="block_tables has 4 entries"):
-        _MixedDecodeView(_batch(block_rows=4), 2)
+def _batch(n_p=2, n_d=3):
+    batch = make_batch()
+    batch.num_scheduled_tokens[2:] = 1
+    batch.total_tokens_num_decode = 3
+    batch.total_tokens_num = 19
+    batch.scheduled_tokens = batch.scheduled_tokens[:19]
+    return batch
 
 
 def _meta(cu, slots, max_q):
@@ -63,6 +45,8 @@ def _meta(cu, slots, max_q):
         max_seqlen_k=max_q,
         has_cached=False,
         total_kv=0,
+        state=AttnState.PREFILL_PREFIX if max_q > 1 else AttnState.DECODE,
+        swa_dest_rows=None,
     )
 
 
@@ -123,7 +107,8 @@ def test_prepare_mixed_calls_both_halves_with_their_real_signatures(monkeypatch)
     cu = np.arange(n_d + 1, dtype=np.int32)  # one decode token per row
     builder = builder_cls.__new__(builder_cls)
     builder.model_runner = SimpleNamespace(
-        forward_vars={"cu_seqlens_q": SimpleNamespace(np=cu)}
+        forward_vars={"cu_seqlens_q": SimpleNamespace(np=cu)},
+        tokenID_processor=SimpleNamespace(num_rejected=None),
     )
     monkeypatch.setattr(
         builder_cls,
@@ -156,13 +141,16 @@ def test_mixed_prefill_banks_exist_before_the_first_mixed_step():
     """The banks are built up front, one per `forward_vars` ring slot, and a
     lookup never builds one: allocating on the first mixed step would take
     memory the KV cache was already sized against."""
-    from atom.model_ops.attentions.backends import CommonAttentionBuilder
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
 
-    get_bank = CommonAttentionBuilder._get_mixed_prefill_bank
-    build_banks = CommonAttentionBuilder.build_mixed_prefill_banks
+    get_bank = DeepseekV4AttentionMetadataBuilder._get_mixed_prefill_bank
+    build_banks = DeepseekV4AttentionMetadataBuilder.build_mixed_prefill_banks
     ring = [{"mtp_k": 0}, {"mtp_k": 1}]
     builder = SimpleNamespace(
-        model_runner=SimpleNamespace(_fv_ring=ring, _fv_idx=1, h2d_groups=None)
+        mixed_prefill_groups=DeepseekV4AttentionMetadataBuilder.mixed_prefill_groups,
+        model_runner=SimpleNamespace(_fv_ring=ring, _fv_idx=1, h2d_groups=None),
     )
     with pytest.raises(RuntimeError, match="build_mixed_prefill_banks"):
         get_bank(builder)
@@ -263,3 +251,32 @@ def test_prefill_bank_clones_only_its_writers_and_preserves_live_bindings(
         bank["positions"].cpu.fill_(i + 1)
     if slots == 2:
         assert builder._mixed_prefill_banks[0][0]["positions"].cpu.tolist() == [1] * 4
+
+
+def test_mixed_fused_swa_mask_preserves_prefill_history():
+    prefill = _meta([0, 5], [7], 5)
+    decode = _meta([0, 2, 3], [4, 5], 1)
+    decode.batch_id_per_q_token = torch.tensor([0, 0, 1], dtype=torch.int32)
+    decode.swa_dest_rows = {
+        1: torch.tensor([31, 32, 77]),
+        4: torch.tensor([15, 16, 22]),
+    }
+    merged = _mixed_carrier(prefill, decode, 1, 2, 5, 3, 3)
+    assert merged.batch_id_per_q_token.tolist() == [-1] * 5 + [0, 0, 1]
+    assert merged.swa_dest_rows[1].tolist() == [0] * 5 + [31, 32, 77]
+    assert merged.swa_dest_rows[4].tolist() == [0] * 5 + [15, 16, 22]
+
+
+def test_qkn_token_slice_keeps_every_output_plane():
+    from atom.model_ops.v4_kernels.qk_norm_rope_maybe_quant import QKNormRopeOut
+
+    fields = {
+        name: torch.arange(8).view(4, 2) for name in QKNormRopeOut.__dataclass_fields__
+    }
+    result = QKNormRopeOut(**fields).slice_tokens(slice(2, 4))
+    for name, value in fields.items():
+        assert getattr(result, name).tolist() == [[4, 5], [6, 7]]
+        assert (
+            getattr(result, name).untyped_storage().data_ptr()
+            == value.untyped_storage().data_ptr()
+        )

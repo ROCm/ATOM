@@ -3349,6 +3349,11 @@ class Config:
                 "decode context parallel",
                 "mixed batching requires decode context parallel size 1",
             ),
+            (
+                self.eplb_enable,
+                "EPLB",
+                "its prefill load window cannot exclude decode tokens in a mixed step",
+            ),
         ]
         blocked = [(what, why) for cond, what, why in refusals if cond]
         if blocked:
@@ -3358,27 +3363,21 @@ class Config:
                 + ". Drop the flag, or the feature it conflicts with."
             )
 
-        # Decode-first reserves `spec_width + 1` tokens per in-flight decode
-        # before prefill spends anything. A full decode set can then reserve
-        # the whole step and leave prefill nothing -- mixed batches stop
-        # forming and new requests wait on decodes finishing. Not refused: a
-        # decode set rarely sits at `max_num_seqs`, and the operator may want
-        # decode-first at that extreme. Skipped when the width is left to the
-        # checkpoint (`num_speculative_tokens` unset): it is not known yet.
+        # The scheduler keeps at least 1/8 of the token budget for prefill.
+        # A full speculative decode set may therefore span several steps.
         if spec is not None and spec.num_speculative_tokens:
             full_reserve = self.max_num_seqs * (spec.num_speculative_tokens + 1)
             if full_reserve >= self.max_num_batched_tokens:
                 logger.warning(
                     "--enable-mixed-prefill-decode with %d speculative tokens: a "
-                    "full decode set (max_num_seqs=%d) reserves %d tokens, which "
-                    "is all of --max-num-batched-tokens=%d, leaving prefill no "
-                    "budget at that load. Raise --max-num-batched-tokens above "
-                    "%d to keep prefill admitting.",
+                    "full decode set (max_num_seqs=%d) needs %d tokens with "
+                    "--max-num-batched-tokens=%d. The scheduler reserves at "
+                    "least 1/8 of that budget for prefill, so some decodes "
+                    "may wait for a later step when prefill is present.",
                     spec.num_speculative_tokens,
                     self.max_num_seqs,
                     full_reserve,
                     self.max_num_batched_tokens,
-                    full_reserve,
                 )
 
     def compute_hash(self) -> str:

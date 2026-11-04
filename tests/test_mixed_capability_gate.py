@@ -136,7 +136,9 @@ class _FakeConfig:
         chunked_prefill=True,
         pcp=1,
         dcp=1,
+        eplb=False,
     ):
+        self.eplb_enable = eplb
         self.enable_mixed_prefill_decode = enabled
         self.hf_config = hf if hf is not None else _v4_hf()
         self.speculative_config = spec
@@ -204,7 +206,9 @@ def test_validator_warns_when_a_full_decode_set_eats_the_step(caplog):
     )
     with caplog.at_level("WARNING", logger="atom"):
         cfg._validate_mixed_prefill_decode()
-    assert "leaving prefill no budget" in caplog.text
+    assert "at least 1/8" in caplog.text
+    assert "some decodes may wait" in caplog.text
+    assert "leaving prefill no budget" not in caplog.text
 
 
 def test_validator_is_quiet_when_prefill_keeps_budget(caplog):
@@ -340,3 +344,10 @@ def test_v4_refuses_every_tr_hybrid_mode(mode, refused):
             cfg._validate_mixed_prefill_decode()
     else:
         cfg._validate_mixed_prefill_decode()
+
+
+def test_mixed_rejects_eplb_until_loads_can_exclude_decode_rows():
+    _bind()
+    with pytest.raises(ValueError, match="EPLB"):
+        _FakeConfig(eplb=True)._validate_mixed_prefill_decode()
+    _FakeConfig(enabled=False, eplb=True)._validate_mixed_prefill_decode()

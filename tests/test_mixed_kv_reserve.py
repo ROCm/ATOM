@@ -1,45 +1,59 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Mixed startup profiling uses actual token/query/sequence limits."""
 
-"""Mixed prefill+decode holds 5% of the device back from the KV cache."""
-
+import math
 from types import SimpleNamespace
 
 import pytest
 
-# `model_runner` imports aiter at module scope; same convention as
-# test_mixed_spec_decode.py.
-pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
-
-from atom.model_engine.model_runner import (
-    MIXED_KV_RESERVE_FRACTION,
-    ModelRunner,
-    RapidServeModelRunner,
-)
-
-_GiB = 1 << 30
-_TOTAL = 288 * _GiB
+from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.mixed_profile import _batch, mixed_profile_shapes
 
 
-def _runner(mixed):
-    return SimpleNamespace(config=SimpleNamespace(enable_mixed_prefill_decode=mixed))
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.parametrize("budget", [2048, 8192, 32768])
+@pytest.mark.parametrize("max_seqs", [2, 256, 1024])
+@pytest.mark.parametrize("max_len", [8192, 1048576])
+def test_profiles_are_schedulable_and_cover_decode_heavy_shapes(
+    width, budget, max_seqs, max_len
+):
+    shapes = mixed_profile_shapes(budget, max_seqs, width, max_len)
+    assert shapes
+    for prefill, decodes, q in shapes:
+        assert prefill > 0 and decodes > 0 and q == width
+        assert prefill + decodes * q <= budget
+        assert math.ceil(prefill / max_len) + decodes <= max_seqs
+    assert shapes[0][1] == 1
+    assert shapes[-1][1] == min(max_seqs - 1, (budget - max(1, budget // 8)) // width)
 
 
-def test_mixed_reserves_five_percent():
-    reserve = ModelRunner._kv_budget_extra_reserve(_runner(True), _TOTAL)
-    assert MIXED_KV_RESERVE_FRACTION == 0.05
-    assert reserve == int(_TOTAL * 0.05)  # 14.4 GiB, CI's validated 0.9 -> 0.85
+def test_impossible_mixed_shape_is_not_profiled():
+    assert mixed_profile_shapes(8, 10, 8, 100) == []
+    assert mixed_profile_shapes(2048, 1, 8, 4096) == []
 
 
-def test_no_mixed_reserves_nothing():
-    assert ModelRunner._kv_budget_extra_reserve(_runner(False), _TOTAL) == 0
-
-
-def test_disagg_adds_its_reserve_to_the_mixed_one():
-    """The override composes with the base reserve instead of replacing it."""
-    runner = RapidServeModelRunner.__new__(RapidServeModelRunner)
-    runner.config = SimpleNamespace(enable_mixed_prefill_decode=True)
-    disagg = 4 * int(_TOTAL * 0.02)
-    assert runner._kv_budget_extra_reserve(_TOTAL) == int(_TOTAL * 0.05) + disagg
-    runner.config.enable_mixed_prefill_decode = False
-    assert runner._kv_budget_extra_reserve(_TOTAL) == disagg
+@pytest.mark.parametrize("width", [1, 8])
+@pytest.mark.parametrize("long_context", [False, True])
+def test_profile_addresses_include_full_draft_lookahead(width, long_context):
+    runner = SimpleNamespace(
+        config=SimpleNamespace(max_model_len=257, max_num_seqs=8),
+        block_size=64,
+        drafter=SimpleNamespace(mtp_k=7),
+        pool_plan=SimpleNamespace(entries_per_req={STATE_SLOT_CLASS: 2}),
+    )
+    for prefill, decodes, q in mixed_profile_shapes(400, 8, width, 251):
+        batch, pages = _batch(runner, prefill, decodes, q, long_context=long_context)
+        assert batch.num_spec_step == 7
+        assert batch.total_tokens_num <= 400
+        assert batch.total_seqs_num <= 8
+        # The allocated table has room for the draft's lookahead and fits the
+        # configured max-context metadata even when verification uses q=1.
+        private_pages = []
+        for table in batch.block_tables:
+            assert len(table) <= math.ceil(257 / runner.block_size)
+            private_pages.extend(p for p in table if p)
+        assert len(set(private_pages)) == len(private_pages)
+        assert pages == max(private_pages) + 1
+        assert all(
+            len(draft) == 7 for draft in batch.scheduled_spec_decode_tokens[-decodes:]
+        )

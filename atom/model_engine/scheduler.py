@@ -462,6 +462,9 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
+        self.block_table_rows = [
+            i for i, seq in enumerate(seqs.values()) if seq.block_table
+        ]
         self.last_block_num_tokens = [
             _seq.last_block_num_tokens for _seq in seqs.values()
         ]
@@ -556,6 +559,157 @@ class ScheduledBatch:
         # logger.info(f"{self.context_lens=}")
         # logger.info(f"{[len(blk)*16 for blk in self.block_tables]=}")
         # logger.info(f"{self.block_tables=}")
+
+    # Field axes belong to the batch that creates them. New fields must name
+    # their axis here before a segment can use them; never infer it from length.
+    _ROW_FIELDS = frozenset(
+        (
+            "req_ids",
+            "num_scheduled_tokens",
+            "temperatures",
+            "return_logprobs",
+            "num_rejected",
+            "num_bonus",
+            "top_ks",
+            "top_ps",
+            "needs_independent_noise",
+            "required_channel_states",
+            "is_first_decode_without_local_prefill",
+            "num_cached_tokens",
+            "is_final_chunk",
+            "next_token_ids",
+            "context_lens",
+            "scheduled_spec_decode_tokens",
+            "last_block_num_tokens",
+            "external_request_ids",
+        )
+    )
+    _STATE_FIELDS = frozenset(
+        (
+            "state_slots",
+            "state_slots_committed",
+            "state_fork_srcs",
+            "state_save_all",
+        )
+    )
+    _REQUEST_MAPS = frozenset(
+        (
+            "mrope_positions_by_req",
+            "mrope_position_deltas",
+            "multimodal_data",
+            "remote_kv_seq_blocks",
+        )
+    )
+    _SHARED_FIELDS = frozenset(
+        (
+            "required_channel",
+            "is_dummy_run",
+            "num_spec_step",
+            "cu_stream_fraction",
+        )
+    )
+    _SEGMENT_FIELDS = frozenset(
+        (
+            "scheduled_tokens",
+            "block_tables",
+            "block_table_rows",
+            "state_rows",
+            "replaying",
+            "total_tokens_num",
+            "total_tokens_num_prefill",
+            "total_tokens_num_decode",
+            "total_seqs_num",
+            "total_seqs_num_prefill",
+            "total_seqs_num_decode",
+            "is_mixed",
+            "connector_meta_output",
+            "state_maintenance_ops",
+            "finished_recving_kv_req_ids",
+            "remote_kv_block_ids",
+            "pp_completion_ack",
+            "prefill_gpu_requests",
+            "detailed_sqsq",
+            "detailed_sqsk",
+            "detailed_sk",
+        )
+    )
+
+    def slice_rows(self, start: int, stop: int) -> ScheduledBatch:
+        """An attention sub-batch; step-level transfers/metrics stay on the parent."""
+        if not 0 <= start <= stop <= self.total_seqs_num:
+            raise ValueError(f"invalid batch row slice [{start}:{stop}]")
+        known = (
+            self._ROW_FIELDS
+            | self._STATE_FIELDS
+            | self._REQUEST_MAPS
+            | self._SHARED_FIELDS
+            | self._SEGMENT_FIELDS
+        )
+        unknown = self.__dict__.keys() - known
+        if unknown:
+            raise ValueError(
+                f"ScheduledBatch fields need a slice policy: {sorted(unknown)}"
+            )
+        result = object.__new__(ScheduledBatch)
+        for name in self._ROW_FIELDS:
+            if name not in self.__dict__:
+                continue
+            value = getattr(self, name)
+            if value is not None and len(value) != self.total_seqs_num:
+                raise ValueError(f"{name} is not aligned with batch rows")
+            setattr(result, name, None if value is None else value[start:stop])
+        for name in self._SHARED_FIELDS:
+            setattr(result, name, getattr(self, name))
+        ids = set(result.req_ids)
+        for name in self._REQUEST_MAPS:
+            setattr(
+                result, name, {k: v for k, v in getattr(self, name).items() if k in ids}
+            )
+        for rows_name, fields in (
+            ("state_rows", self._STATE_FIELDS),
+            ("block_table_rows", ("block_tables",)),
+        ):
+            rows = getattr(self, rows_name)
+            indices = [i for i, row in enumerate(rows) if start <= row < stop]
+            setattr(result, rows_name, [rows[i] - start for i in indices])
+            for name in fields:
+                values = getattr(self, name)
+                if len(values) != len(rows):
+                    raise ValueError(f"{name} is not aligned with {rows_name}")
+                setattr(result, name, [values[i] for i in indices])
+        token_start = int(self.num_scheduled_tokens[:start].sum())
+        token_stop = int(self.num_scheduled_tokens[:stop].sum())
+        result.scheduled_tokens = self.scheduled_tokens[token_start:token_stop]
+        result.replaying = {
+            i - start: v for i, v in self.replaying.items() if start <= i < stop
+        }
+        result.total_seqs_num = stop - start
+        result.total_seqs_num_prefill = max(
+            0, min(stop, self.total_seqs_num_prefill) - start
+        )
+        result.total_seqs_num_decode = (
+            result.total_seqs_num - result.total_seqs_num_prefill
+        )
+        result.total_tokens_num = token_stop - token_start
+        result.total_tokens_num_prefill = int(
+            result.num_scheduled_tokens[: result.total_seqs_num_prefill].sum()
+        )
+        result.total_tokens_num_decode = (
+            result.total_tokens_num - result.total_tokens_num_prefill
+        )
+        result.is_mixed = (
+            result.total_seqs_num_prefill > 0 and result.total_seqs_num_decode > 0
+        )
+        result.connector_meta_output = None
+        result.state_maintenance_ops = StateMaintenanceOps()
+        result.finished_recving_kv_req_ids = []
+        result.remote_kv_block_ids = sorted(
+            {b for blocks in result.remote_kv_seq_blocks.values() for b in blocks}
+        )
+        result.pp_completion_ack = False
+        result.prefill_gpu_requests = []
+        result.detailed_sqsq = result.detailed_sqsk = result.detailed_sk = None
+        return result
 
     def produces_output(self) -> bool:
         """True if this batch yields a token the head must consume.
@@ -3012,7 +3166,7 @@ class Scheduler:
 
         # Prefill rows occupy `[:num_seqs_prefill]`: Phase 1/2 put them in
         # `scheduled_seqs` first and decode scheduling appended after them,
-        # which is the same layout `_MixedDecodeView` slices at `[n_p_seqs:]`.
+        # which ScheduledBatch.slice_rows preserves for attention segments.
         prefill_seqs = list(scheduled_seqs.values())[:num_seqs_prefill]
 
         is_final_chunk: list[bool] | None = None
@@ -3396,7 +3550,30 @@ class Scheduler:
         decision and the admission itself, which run in the same pass with no
         pool change in between.
         """
-        probe = AdmissionProbe()
+        # A token reservation alone cannot protect decode: a newly admitted
+        # prompt could consume its last KV pages before the decode phase runs.
+        # Reserve the existing decodes' append demand in the admission probe;
+        # no pages are allocated and a declined prompt stays in waiting.
+        reserved = 0
+        if self.enable_mixed_prefill_decode:
+            width = self.decode_spec_width + 1
+            seats = min(
+                self.max_num_seqs,
+                (self.max_num_batched_tokens - self._prefill_budget()) // width,
+            )
+            for running in self.running:
+                if (
+                    running.is_partial_prefill
+                    or running.id in self._pp_inflight_token_block
+                ):
+                    continue
+                if seats == 0:
+                    break
+                reserved += self.block_manager.append_blocks_needed(
+                    running, width, self.draft_lookahead
+                )
+                seats -= 1
+        probe = AdmissionProbe(reserved_decode_blocks=reserved)
         probe.num_cached_blocks = self.block_manager.can_allocate(
             seq, record=False, probe=probe
         )
