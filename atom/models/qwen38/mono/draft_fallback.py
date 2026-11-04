@@ -112,7 +112,9 @@ def attention(module, positions, mixed):
     cache, including its +1); anything else ATOM's module."""
     fc = get_forward_context()
     meta = fc.attn_metadata.qsa_metadata
-    if meta is None or fc.context.is_prefill:
+    # Text-only pools may omit the three-axis RoPE position cache.
+    # The fused index path requires it; ATOM's native QSA handles its absence.
+    if meta is None or fc.context.is_prefill or module.rope_position_cache is None:
         return module(positions, mixed)
     requests = meta.block_tables.shape[0]
     rows = mixed.shape[0]
