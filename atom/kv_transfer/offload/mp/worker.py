@@ -52,8 +52,16 @@ from atom.kv_transfer.offload.mp.transfer import (
     _transfer_operation_id,
     _UnprovableSubmission,
 )
+from atom.kv_transfer.offload.mp.transfer_thread import (
+    _ProducerFences,
+    _TransferThread,
+)
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+# How long worker teardown waits for queued transfer submissions.
+_TRANSFER_DRAIN_TIMEOUT_S = 60.0
 
 
 class LMCacheMPConnector(KVConnectorBase):
@@ -94,6 +102,15 @@ class LMCacheMPConnector(KVConnectorBase):
         self._transfer_deadline_s = _transfer_deadline_s(config)
         self._immediate_load_failures: set[LoadCompletionId] = set()
         self._lock = threading.Lock()
+        # With OFFLOAD_MP_TRANSFER_THREAD: the submitting thread and the
+        # reused producer fences it needs (see `transfer_thread`).
+        self._transfer: _TransferThread | None = None
+        self._fences: _ProducerFences | None = None
+        # Same-step saves of the current step, held until their forward is
+        # enqueued (`after_forward`) -- and, inline, until it has finished.
+        self._after_forward_saves: list[LMCacheReqMeta] = []
+        self._after_forward_ran = False
+        self._late_flush_logged = False
 
     def register_kv_caches(
         self,
@@ -170,6 +187,7 @@ class LMCacheMPConnector(KVConnectorBase):
             raise
         self._adapter = adapter
         self.chunk_size = chunk_size
+        self._start_transfer_thread(rank)
         logger.info(
             "LMCache MP registered rank=%d tensors=%d groups=%d "
             "bytes_per_block=%d chunk=%d tp_replication=%d writer=%s "
@@ -196,6 +214,11 @@ class LMCacheMPConnector(KVConnectorBase):
         `AtomMPWorkerAdapter.shutdown` drains in-flight operations, stops the
         heartbeat and unregisters.
         """
+        transfer, self._transfer = self._transfer, None
+        if transfer is not None:
+            # Queued submissions go out first: shutdown drains only what the
+            # adapter already holds.
+            transfer.close(_TRANSFER_DRAIN_TIMEOUT_S)
         adapter, self._adapter = self._adapter, None
         if adapter is None:
             return
@@ -211,21 +234,123 @@ class LMCacheMPConnector(KVConnectorBase):
         if self._adapter is None or self.chunk_size is None:
             raise RuntimeError("lmcache_mp KV caches are not registered")
 
-        requests = [
-            req
-            for req in metadata.requests
-            if (req.load_spec is not None and self._do_load)
-            or (req.save_spec is not None and self._do_save)
-        ]
-        if not requests:
+        self._settle_transfer_thread()
+        # Saves still held from the previous step: this fence follows its
+        # forward too.
+        self._flush_after_forward()
+        self._after_forward_ran = False
+        event = None
+        for req in metadata.requests:
+            load = req.load_spec is not None and self._do_load
+            save = req.save_spec is not None and self._do_save
+            if save and req.after_forward:
+                self._after_forward_saves.append(req)
+                save = False
+            if not (load or save):
+                continue
+            if event is None:
+                event = self._producer_fence()
+            if load:
+                self._dispatch(self._submit_load, req, event)
+            if save:
+                self._dispatch(self._submit_save, req, event)
+
+    def after_forward(self) -> None:
+        """Fence this step's same-step saves behind its forward.
+
+        Called by the model runner right after the step's forward is enqueued
+        (before sampling). The fence is recorded here, but a save goes out only
+        once that fence has completed: the server waits for a producer event on
+        the cache's one copy stream and stages block ids with a host-blocking
+        copy, so a save that reached it mid-forward would hold every transfer
+        queued behind it -- loads included -- until the forward ended. With the
+        transfer thread the save is submitted as soon as the fence completes;
+        inline, `get_finished` submits it after the forward has returned.
+        """
+        self._after_forward_ran = True
+        transfer = self._transfer
+        if transfer is None or not self._after_forward_saves:
             return
+        saves, self._after_forward_saves = self._after_forward_saves, []
+        event = self._producer_fence()
+        for req in saves:
+            transfer.submit(self._submit_save, req, event, ready=event.query)
+
+    def _flush_after_forward(self) -> None:
+        """Submit held same-step saves; their forward is enqueued or done."""
+        saves, self._after_forward_saves = self._after_forward_saves, []
+        if not saves:
+            return
+        if (
+            self._transfer is not None or not self._after_forward_ran
+        ) and not self._late_flush_logged:
+            self._late_flush_logged = True
+            logger.warning(
+                "LMCache MP: same-step saves were not submitted after their "
+                "forward; submitting them at the next connector call"
+            )
+        event = self._producer_fence()
+        for req in saves:
+            self._dispatch(self._submit_save, req, event)
+
+    # -- submission thread ---------------------------------------------------
+
+    def _start_transfer_thread(self, rank: int) -> None:
+        if not envs.OFFLOAD_MP_TRANSFER_THREAD:
+            return
+        adapter = self._adapter
+        if getattr(adapter, "_producer_events", None) is not None and not (
+            self._adapter_takes_recorded_events()
+        ):
+            # It would record its own pooled event on the submitting thread's
+            # stream, not behind the forward.
+            logger.warning(
+                "LMCache MP adapter %s records producer events at submission; "
+                "transfers stay on the forward thread",
+                type(adapter).__name__,
+            )
+            return
+        self._fences = _ProducerFences()
+        self._transfer = _TransferThread(f"mp-transfer-{rank}")
+        logger.info("LMCache MP transfer thread started rank=%d", rank)
+
+    def _adapter_takes_recorded_events(self) -> bool:
+        return bool(
+            getattr(type(self._adapter), "ACCEPTS_RECORDED_PRODUCER_EVENTS", False)
+        )
+
+    def _submit_kwargs(self) -> dict[str, Any]:
+        """Tell an adapter that can hear it the fence is recorded and reused."""
+        if self._fences is not None and self._adapter_takes_recorded_events():
+            return {"producer_event_recorded": True}
+        return {}
+
+    def _producer_fence(self) -> Any:
+        """An interprocess event recorded at the current stream position."""
+        if self._fences is not None:
+            return self._fences.record()
         event = torch.cuda.Event(interprocess=True)
         event.record(torch.cuda.current_stream())
-        for req in requests:
-            if req.load_spec is not None and self._do_load:
-                self._submit_load(req, event)
-            if req.save_spec is not None and self._do_save:
-                self._submit_save(req, event)
+        return event
+
+    def _dispatch(self, submit: Any, req: LMCacheReqMeta, event: Any) -> None:
+        if self._transfer is None:
+            submit(req, event)
+        else:
+            self._transfer.submit(submit, req, event)
+
+    def _settle_transfer_thread(self) -> None:
+        """Forward-thread housekeeping for the submission thread.
+
+        Drops the events finished submissions referenced (an interprocess
+        event must not be destroyed on that thread) and surfaces a
+        submission that raised.
+        """
+        transfer = self._transfer
+        if transfer is None:
+            return
+        transfer.take_spent()
+        transfer.raise_error()
 
     def _block_slice(self, req: LMCacheReqMeta, start: int, end: int) -> list[int]:
         if start < 0 or end < start:
@@ -302,6 +427,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 request_id,
                 op,
                 event,
+                **self._submit_kwargs(),
             )
         except Exception:
             # The server may have taken the request before the connection
@@ -394,6 +520,7 @@ class LMCacheMPConnector(KVConnectorBase):
                 request_id,
                 op,
                 event,
+                **self._submit_kwargs(),
             )
         except Exception:
             # The server may have received the request before the connection
@@ -413,9 +540,21 @@ class LMCacheMPConnector(KVConnectorBase):
                 end=end,
             )
 
+    def _finished_housekeeping(self) -> None:
+        """Start of `get_finished`, which runs after the step's forward.
+
+        The forward is done, so destroying replaced fences no longer waits on
+        it, and same-step saves held for it can go out.
+        """
+        self._flush_after_forward()
+        self._settle_transfer_thread()
+        if self._fences is not None:
+            self._fences.release_retired()
+
     def get_finished(self) -> KVConnectorOutput:
         if self._adapter is None:
             return KVConnectorOutput()
+        self._finished_housekeeping()
         done_load: set[LoadCompletionId] = set()
         failed_load: set[LoadCompletionId] = set()
         done_save: set[SaveCompletionId] = set()

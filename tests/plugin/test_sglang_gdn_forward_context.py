@@ -1,11 +1,22 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from atom.plugin.sglang.attention_backend import attention_gdn
 from atom.plugin.sglang.attention_backend.attention_gdn import (
     SGLangGDNForwardContext,
 )
+
+
+@pytest.fixture(autouse=True)
+def _cpu_conv1d_metadata(monkeypatch):
+    # The conv1d program map is a Triton kernel; these tests run on CPU tensors.
+    monkeypatch.setattr(
+        attention_gdn,
+        "compute_causal_conv1d_metadata",
+        lambda query_start_loc, num_tokens: (None, None, None),
+    )
 
 
 class _DecodeMode:

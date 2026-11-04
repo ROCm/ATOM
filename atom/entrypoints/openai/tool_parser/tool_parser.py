@@ -33,6 +33,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from atom.sampling_params import RequiredChannel
+
 # A tool name is an identifier, which is what the model was given.
 #
 # `\w` and not `[A-Za-z_]`: OpenAI's own grammar is `^[a-zA-Z0-9_-]{1,64}$`, so
@@ -350,6 +352,17 @@ class ToolCallParser(ABC):
     # Leniency about what to *parse* stays: once identified, a format should
     # read the malforms its own model emits. Only the claim must be single.
     DETECT_MARKERS: ClassVar[tuple[str, ...]] = ()
+
+    @classmethod
+    def required_call_channel(cls, tokenizer) -> RequiredChannel | None:
+        """What a request that must call a tool holds the output to, in this
+        format's token ids; None leaves it unconstrained.
+
+        None for every format but Kimi-K3, whose answer either closes the
+        message or opens the tools channel at one token -- the place a model
+        told it MUST call a tool still sometimes ends instead.
+        """
+        return None
 
     @classmethod
     def opens_region(cls, marker: str) -> bool:

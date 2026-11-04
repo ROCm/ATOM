@@ -63,6 +63,7 @@ from atom.model_ops.fused_moe.modular_kernel import (
 )
 from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
+    use_mori_low_latency,
 )
 from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.routed_rows import (
@@ -642,23 +643,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 ),
             )
 
+        # gfx1250: MegaMoE over mori's cco instead of the gfx942/950-only v1
+        # kernels. Gated by ATOM_MORI_V2, and decided before anything reads
+        # .all2all_manager, which would pin the default (v1) manager.
+        if moe.use_mori_kernels and envs.ATOM_MORI_V2:
+            from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
+                make_mori_v2_prepare_finalize,
+            )
+
+            return make_mori_v2_prepare_finalize(
+                moe,
+                ep_group.device_communicator.get_or_create_all2all_manager("mori_v2"),
+            )
+
         all2all_manager = ep_group.device_communicator.all2all_manager
         assert all2all_manager is not None
 
         # TODO: could allow this now
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
-            from atom.utils import envs as _atom_envs
-
-            # gfx1250: use mori dispatch_combine_v2 (cco/FlyDSL) instead of the
-            # gfx942/950-only v1 kernels. Gated by ATOM_MORI_V2.
-            if _atom_envs.ATOM_MORI_V2:
-                from atom.model_ops.fused_moe.mori_v2_prepare_finalize import (
-                    make_mori_v2_prepare_finalize,
-                )
-
-                return make_mori_v2_prepare_finalize(moe, all2all_manager)
-
             assert quant_config is not None
 
             # One branch decides the whole wire format: the dtype dispatch() will
@@ -686,7 +689,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # dtype above -- MoRI infers dispatch from the tensor, combine from this.
             mori_combine_quant_type = envs.ATOM_MORI_COMBINE_QUANT
             tbo_is_enabled = tbo_enabled()
-            low_latency = moe.moe_parallel_config.low_latency
+            low_latency = use_mori_low_latency(
+                moe.moe_parallel_config.low_latency, all2all_manager.internode
+            )
             if all2all_manager.internode and mori_combine_quant_type != "none":
                 # MoRI registers no blockwise combine kernel for these; without
                 # this it fails later, at kernel lookup.
@@ -791,9 +796,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # told the expert-GEMM recipe that only the layer + this quant method
             # know. Here is also the last point before any cudagraph capture, and
             # it allocates a cco arena and JIT-compiles its kernels.
-            bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
-            if bind_mega is not None:
-                bind_mega(layer, self)
+            if mori_v2:
+                prepare_finalize.bind_mega_transport(layer, self)
+                assert (
+                    prepare_finalize.mega is not None
+                ), "MoriV2ModularKernel has no MegaMoE to run"
 
         comm_fused = getattr(layer, "_comm_fused_moe", None)
         if comm_fused is not None:
@@ -5394,6 +5401,10 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             prefix=f"{self.prefix}.fused_moe",
             x_scale=x_scale,
+            # Pure-TP padded graphs require ROCm/aiter#7294: its FlyDSL,
+            # FlyDSL-v2, and native-MXFP4 stage2 paths reject the sorting
+            # sentinel at the real token count instead of scattering every
+            # padded expert slot into that row.
             scheduled_tokens_gpu=(
                 None if gathered else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),

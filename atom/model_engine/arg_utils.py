@@ -18,6 +18,7 @@ from atom.config import (
 )
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.model_engine.prefill_delayer import PREFILL_ADMIT_POLICIES
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
@@ -144,7 +145,9 @@ class EngineArgs:
     enable_encoder_swa_bounded_replay: bool = True
     enable_chunked_prefill: bool = True
     enable_log_stats: bool = True
+    enable_request_context_metrics: bool = False
     throughput_log_interval: float = 10.0
+    throughput_log_interval_steps: int = 0
     cache_hit_rate_window: int = 1000
     enable_dynamic_chunking: bool = False
     # None defers to ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR, read only once the
@@ -152,6 +155,7 @@ class EngineArgs:
     dynamic_chunking_smooth_factor: float | None = None
     dynamic_chunking_min_chunk_size: int = 4096
     scheduler_delay_factor: float = 0.0
+    prefill_admit_policy: str = "interval"
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
@@ -572,6 +576,14 @@ class EngineArgs:
             "Use --no-enable_chunked_prefill to disable.",
         )
         parser.add_argument(
+            "--enable-request-context-metrics",
+            action="store_true",
+            default=False,
+            help="Enable per-request prefill/decode context metrics (default: disabled). "
+            "Retains request-labelled series after completion; use only for short "
+            "diagnostic captures. Aggregate metrics are unaffected.",
+        )
+        parser.add_argument(
             "--enable-log-stats",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -588,7 +600,24 @@ class EngineArgs:
             type=float,
             default=10.0,
             help="Seconds between engine-status lines (default: 10, matching "
-            "vLLM). Must be > 0. Ignored when --no-enable-log-stats.",
+            "vLLM). Must be > 0. Ignored when --no-enable-log-stats, and "
+            "superseded by --throughput-log-interval-steps when that is set.",
+        )
+        parser.add_argument(
+            "--throughput-log-interval-steps",
+            type=int,
+            default=0,
+            help="Forwards between engine-status lines, replacing the "
+            "--throughput-log-interval clock when > 0 (default: 0, use the "
+            "clock). For offline / MLPerf runs that compare one DP rank's "
+            "lines against another's: wall-clock sampling lands on a "
+            "different step number on each rank, a cumulative forward count "
+            "lands on the same one. The window can then span any amount of "
+            "wall clock, so time with no forward running is kept out of the "
+            "tokens/s divisor. Base and DP engines only -- pipeline parallel "
+            "replaces the busy loop that counts, and RapidServe and P/D are "
+            "not covered yet; all three fall back to the clock with a "
+            "warning. Ignored when --no-enable-log-stats.",
         )
         parser.add_argument(
             "--cache-hit-rate-window",
@@ -656,6 +685,17 @@ class EngineArgs:
             default=0.0,
             help="Apply a delay (of delay factor multiplied by previous"
             "prompt latency) before scheduling next prompt.",
+        )
+        parser.add_argument(
+            "--prefill-admit-policy",
+            choices=list(PREFILL_ADMIT_POLICIES),
+            default="interval",
+            help="When the prefill delayer admits new prefills. 'interval' "
+            "(default) keeps ATOM_PREFILL_DECODE_INTERVAL and the coalescer. "
+            "'adaptive' fires once the held requests' accumulated cost reaches "
+            "the fixed prefill cost times the decode batch, fitted from measured "
+            "step times; on DP=1, PP=1 it enables the delayer as a positive "
+            "interval does.",
         )
         parser.add_argument(
             "--mark-trace",

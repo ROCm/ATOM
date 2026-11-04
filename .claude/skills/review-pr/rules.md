@@ -9,6 +9,32 @@ Every rule must cite a real ATOM PR as evidence. The rules below were carried
 over verbatim from the pre-pipeline SKILL.md and most do not yet carry one --
 that is the work of P1, not a licence to add more without evidence.
 
+## Descent from `references/rule-catalog.md`
+
+This file and the team's `references/rule-catalog.md` share an ancestor, which is
+why the A-G sections and ids `A1-A3`, `B1-B6`, `C1-C3`, `D1-D9`, `E1-E3`, `F1`, `G1`
+mean the same thing in both. The catalog is the human-facing authority; this file is
+what `triage.py expand` injects. Where they differ, they differ on purpose, and the
+two divergences are recorded here so neither reads as drift:
+
+**This file carries 22 rules the catalog does not.** `A4 A5 B7 D10 D11 E4 F2 G2`
+extend existing families; `H` (batch object invariants), `I` (stateful cache
+invariants) and `T` (Triton kernel review) are new families; `N1-N6` are distilled
+from `references/maintainer-lens.md` section 3 -- the maintainer's lens -- so a
+reviewer reading the lens and a bot applying `N1-N6` are applying the same standard.
+`HK1-HK7` are here too, as the Housekeeping table rather than numbered bodies.
+
+**This file does not carry `P1-P5`.** The catalog's performance-evidence family was
+removed here on evidence, not taste: none of the five had an ATOM citation, a
+targeted search for each found no ATOM instance, and they were the only ids in
+`UNREACHABLE_BY_DESIGN` whose section header claimed "always check" -- no evidence
+AND no trigger. The asks themselves did not disappear: `triage.py`'s `perf_claims()`
+and `test_quality()` still surface "no units or baseline named" and "shapes are all
+small" for Step 1b to judge directly. The full reasoning is at the end of this file.
+**If an ATOM instance of any one of them turns up, re-add that one with its citation
+-- not the family uncited.** Re-adding them wholesale from the catalog would undo a
+decision that was made with a search behind it.
+
 ---
 
 ### STEP4 — Full backbone assessment required

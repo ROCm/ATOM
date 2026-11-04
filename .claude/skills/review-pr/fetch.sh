@@ -262,7 +262,39 @@ elif candidates:
         "name the target explicitly rather than letting the tool pick"
     )
 else:
-    blocker = "the PR changes runtime code but ships no test target"
+    # A PR that changes runtime code without shipping a test is the case worth rescuing,
+    # not giving up on: existing tests may already cover the changed module. ATOM's own
+    # scripts/affected_tests.py (from #2871) computes exactly that -- the tests that import
+    # a changed `atom/` module at any depth, with hub modules like envs.py left unexpanded
+    # so one import does not drag in the suite. Using it here means the validator can run
+    # on real coverage instead of reporting "no target" and examining nothing.
+    reached = []
+    try:
+        sys.path.insert(
+            0, str(project_root / ".claude" / "skills" / "review-pr" / "scripts")
+        )
+        import affected_tests as _at
+
+        reached, _hubs = _at.affected_tests(project_root, sorted(paths), 30)
+    except Exception as _e:  # a helper that cannot run must not take triage down with it
+        reached = []
+        print(f"note: affected_tests unavailable ({_e}); target selection falls back", file=sys.stderr)
+    reached = [r for r in reached if is_candidate_target(r)]
+    if len(reached) == 1:
+        target, basis = reached[0], (
+            "no test in this PR, but one existing test imports the changed module "
+            "(scripts/affected_tests.py)"
+        )
+    elif reached:
+        blocker = (
+            f"the PR ships no test, and {len(reached)} existing tests reach the changed "
+            "module; name the target explicitly rather than letting the tool pick"
+        )
+    else:
+        blocker = (
+            "the PR changes runtime code, ships no test target, and no existing test "
+            "imports the changed module"
+        )
 
 # ---- Perf triage. A kernel change can be correct and still be a regression --
 # correctness_repo_tests passing says nothing about latency. So the same runtime surface that

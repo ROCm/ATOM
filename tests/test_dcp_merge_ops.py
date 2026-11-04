@@ -1241,6 +1241,131 @@ def test_mlaattention_init_actually_calls_qrep_enabled_for_layer():
     ], f"qrep_enabled_for_layer's call site changed shape: got {arg_names}"
 
 
+@needs_gpu
+@pytest.mark.parametrize(
+    "world,decode_heads,prefill_heads", [(2, 32, 32), (4, 48, 64), (8, 96, 128)]
+)
+@pytest.mark.parametrize("cache_dtype", ["bf16", "fp8"])
+def test_sparse_prefill_builder_allocates_for_its_consumer(
+    monkeypatch, world, decode_heads, prefill_heads, cache_dtype
+):
+    """12 heads per rank need distinct decode and prefill work buffers."""
+    from aiter import get_mla_metadata_info_v1
+
+    from atom.model_ops.attentions import aiter_mla, backends
+
+    monkeypatch.setenv("ATOM_MLA_PAGE_SIZE", "1")
+    monkeypatch.setenv("ATOM_MLA_KV_SHUFFLED", "0")
+    monkeypatch.setattr(backends, "get_tp_group", lambda: SimpleNamespace(world_size=8))
+    for module in (backends, aiter_mla):
+        monkeypatch.setattr(module, "get_dcp_world_size", lambda: world)
+        monkeypatch.setattr(module, "get_dcp_rank", lambda: 0)
+    monkeypatch.setattr(aiter_mla, "dcp_persistent_supported", lambda: True)
+    cfg = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_attention_heads=96,
+            index_topk=2048,
+            index_n_heads=32,
+            index_head_dim=128,
+        ),
+        max_model_len=16384,
+        max_num_batched_tokens=16,
+        kv_cache_dtype=cache_dtype,
+        index_cache_dtype="fp8",
+        attn_prefill_chunk_size=0,
+        enable_tbo=False,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    runner = SimpleNamespace(
+        config=cfg,
+        block_size=128,
+        device=torch.device("cuda"),
+        max_num_batched_tokens=16,
+        max_bs=4,
+        num_spec_tokens=0,
+        has_mla_indexer=True,
+        forward_vars={},
+    )
+    builder = aiter_mla.AiterMLAMetadataBuilder(runner)
+    assert builder.persistent_num_heads == decode_heads
+    assert builder.sparse_prefill_num_heads == prefill_heads
+    names = (
+        "work_meta_data",
+        "work_indptr",
+        "work_info_set",
+        "reduce_indptr",
+        "reduce_final_map",
+        "reduce_partial_map",
+    )
+    for prefix, rows, heads in (
+        ("", 4, decode_heads),
+        ("sparse_prefill_", 16, prefill_heads),
+    ):
+        info = get_mla_metadata_info_v1(
+            rows,
+            1,
+            heads,
+            builder.dtype_q,
+            builder.dtype_kv,
+            is_sparse=True,
+            fast_mode=True,
+        )
+        for name, (shape, dtype) in zip(names, info, strict=True):
+            tensor = runner.forward_vars[prefix + name]
+            expected_shape = (shape,) if isinstance(shape, int) else tuple(shape)
+            assert tuple(tensor.shape) == expected_shape
+            assert tensor.dtype == dtype
+
+
+@needs_gpu
+@pytest.mark.parametrize("lengths", [(45, 17), (1,), (13, 17, 3)])
+def test_dcp_prefill_key_gather_ignores_padded_request_tables(monkeypatch, lengths):
+    """The local cu-seqlens, not running_bs, bound the native gather's rows."""
+    from aiter import indexer_k_quant_and_cache
+
+    from atom.model_ops.indexer import indexer_forward
+
+    total = sum(lengths)
+    keys = torch.ones(total, 128, dtype=torch.bfloat16, device=DEV)
+    token = torch.arange(total, device=DEV)
+    for digit in range(2):
+        code = ((token >> (4 * digit)) & 15) - 8
+        keys[:, 2 * digit] = code
+        keys[:, 2 * digit + 1] = -code
+    # Distinct nonidentity pages for each real request; padding points at an
+    # unwritten page so reading it cannot reproduce the expected token tags.
+    table = torch.tensor([[3], [2], [1], [0]], dtype=torch.int32, device=DEV)
+    slots = torch.cat(
+        [
+            torch.arange(length, device=DEV) + (3 - request) * 128
+            for request, length in enumerate(lengths)
+        ]
+    )
+    cache = torch.full((4, 128, 132), 0xA5, dtype=torch.uint8, device=DEV)
+    indexer_k_quant_and_cache(keys, cache, slots, 128, "ue8m0", preshuffle=True)
+    # Put readable guards after the logical view. A gather that erroneously
+    # uses four table rows sees a bogus extra request overlapping valid rows.
+    cums = [0] + np.cumsum(lengths).tolist()
+    backing = torch.tensor(
+        cums + [0, total, total, total], dtype=torch.int32, device=DEV
+    )
+    md = SimpleNamespace(
+        dcp_indexer_local_total=total,
+        dcp_indexer_local_cu_seqlens=backing[: len(cums)],
+        dcp_indexer_gather_index=torch.arange(total, device=DEV),
+        block_tables=table,
+    )
+    monkeypatch.setattr(
+        indexer_forward,
+        "get_dcp_group",
+        lambda: SimpleNamespace(all_gather=lambda x, dim: x),
+    )
+    values, scales = indexer_forward._dcp_gather_indexer_k_prefill(
+        cache, md, 128, keys.device
+    )
+    torch.testing.assert_close(values.float() * scales, keys.float(), rtol=0, atol=0)
+
+
 def test_rebuild_sparse_dcp_persistent_metadata_call_sites_use_their_own_width():
     """Pins gathered_num_heads at both call sites, not just the function.
 

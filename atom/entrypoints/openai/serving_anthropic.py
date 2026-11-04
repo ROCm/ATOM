@@ -57,11 +57,21 @@ class AnthropicMessagesRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: Any | None = None
     metadata: dict | None = None
+    output_config: dict | None = None
     thinking: dict | None = None  # {"type":"enabled","budget_tokens":N}
     kv_transfer_params: dict | None = None  # PD handoff metadata, as on chat
 
 
 # ── Format Conversion ──────────────────────────────────────────────────
+
+
+def _block_field(block: dict, key: str) -> Any:
+    """A field the Anthropic spec requires on this block type. A missing one is
+    the client's error (HTTP 400), not a ``KeyError``."""
+    value = block.get(key)
+    if value is None:
+        raise ValueError(f"{block.get('type')} block requires '{key}'")
+    return value
 
 
 def anthropic_to_openai_messages(
@@ -79,7 +89,7 @@ def anthropic_to_openai_messages(
             text_parts = []
             for b in system:
                 if b.get("type") == "text":
-                    text = b["text"]
+                    text = _block_field(b, "text")
                     if text.startswith("x-anthropic-billing-header"):
                         continue
                     text_parts.append(text)
@@ -100,7 +110,7 @@ def anthropic_to_openai_messages(
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "thinking":
                             thinking = block.get("thinking")
                             if isinstance(thinking, str) and thinking:
@@ -108,11 +118,13 @@ def anthropic_to_openai_messages(
                         elif block.get("type") == "tool_use":
                             tool_calls.append(
                                 {
-                                    "id": block["id"],
+                                    "id": _block_field(block, "id"),
                                     "type": "function",
                                     "function": {
-                                        "name": block["name"],
-                                        "arguments": json.dumps(block.get("input", {})),
+                                        "name": block.get("name"),
+                                        "arguments": json.dumps(
+                                            block.get("input", {}), ensure_ascii=False
+                                        ),
                                     },
                                 }
                             )
@@ -132,7 +144,7 @@ def anthropic_to_openai_messages(
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            text_parts.append(_block_field(block, "text"))
                         elif block.get("type") == "tool_result":
                             tool_content = block.get("content", "")
                             if isinstance(tool_content, list):
@@ -144,7 +156,7 @@ def anthropic_to_openai_messages(
                             tool_results.append(
                                 {
                                     "role": "tool",
-                                    "tool_call_id": block["tool_use_id"],
+                                    "tool_call_id": _block_field(block, "tool_use_id"),
                                     "content": str(tool_content),
                                 }
                             )
