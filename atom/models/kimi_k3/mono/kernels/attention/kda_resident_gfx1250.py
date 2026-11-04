@@ -553,49 +553,69 @@ def build_resident_k1(
                 device["device_fence_acquire"]()
                 gpu.barrier()
             first_task = (bid - ATTENTION_CTAS) * PROJECTION_ROWS_PER_CTA
+            accumulators0 = [
+                compute["kda_zero"]() for _ in range(len(tile_starts))
+            ]
+            accumulators1 = [
+                compute["kda_zero"]() for _ in range(len(tile_starts))
+            ]
+            projection_context = {
+                "S": ROWS,
+                "lane": lane,
+                "wave": wave,
+                "matrix_waves": declaration.waves,
+                "gemv_tasks": PROJECTION_TASKS,
+                "fused_rows": FUSED_ROWS,
+                "xrow": declaration.xrow,
+                "xl": projection.xl.ptr,
+                "args": {"w_in": w_in},
+            }
+            for slab in range_constexpr(len(slabs)):
+                first_group = slabs[slab][0]
+                groups = slabs[slab][1]
+                operands0 = compute["kda_gemv_loads"](
+                    projection_context,
+                    first_task,
+                    range(first_group, first_group + groups),
+                )
+                for tile in range_constexpr(len(tile_starts)):
+                    projection_context["S"] = tile_rows[tile]
+                    stage_x_tile(
+                        x,
+                        projection.xl.ptr,
+                        tid,
+                        tile_starts[tile],
+                        tile_rows[tile],
+                        first_group,
+                        groups,
+                    )
+                    accumulators0[tile] = compute["kda_gemv_slab"](
+                        projection_context,
+                        operands0,
+                        groups,
+                        accumulators0[tile],
+                    )
+                    if const_expr(tile == 0):
+                        operands1 = compute["kda_gemv_loads"](
+                            projection_context,
+                            first_task + 1,
+                            range(first_group, first_group + groups),
+                        )
+                    accumulators1[tile] = compute["kda_gemv_slab"](
+                        projection_context,
+                        operands1,
+                        groups,
+                        accumulators1[tile],
+                    )
+                    gpu.barrier()
             for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
-                    accumulators = [
-                        compute["kda_zero"]() for _ in range(len(tile_starts))
-                    ]
-                    projection_context = {
-                        "S": ROWS,
-                        "lane": lane,
-                        "wave": wave,
-                        "matrix_waves": declaration.waves,
-                        "gemv_tasks": PROJECTION_TASKS,
-                        "fused_rows": FUSED_ROWS,
-                        "xrow": declaration.xrow,
-                        "xl": projection.xl.ptr,
-                        "args": {"w_in": w_in},
-                    }
-                    for slab in range_constexpr(len(slabs)):
-                        first_group = slabs[slab][0]
-                        groups = slabs[slab][1]
-                        operands = compute["kda_gemv_loads"](
-                            projection_context,
-                            task,
-                            range(first_group, first_group + groups),
-                        )
-                        for tile in range_constexpr(len(tile_starts)):
-                            projection_context["S"] = tile_rows[tile]
-                            stage_x_tile(
-                                x,
-                                projection.xl.ptr,
-                                tid,
-                                tile_starts[tile],
-                                tile_rows[tile],
-                                first_group,
-                                groups,
-                            )
-                            accumulators[tile] = compute["kda_gemv_slab"](
-                                projection_context,
-                                operands,
-                                groups,
-                                accumulators[tile],
-                            )
-                            gpu.barrier()
+                    accumulators = (
+                        accumulators0
+                        if const_expr(task_offset == 0)
+                        else accumulators1
+                    )
                     for tile in range_constexpr(len(tile_starts)):
                         compute["kda_gemv_store"](
                             accumulators[tile],
