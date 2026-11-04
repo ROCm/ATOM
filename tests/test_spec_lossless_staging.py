@@ -18,6 +18,7 @@ from torch import nn
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
 from atom.model_ops.sampler import Sampler
+from atom.model_ops.spec_sampling import sparse_q_store
 from atom.spec_decode import dspark_lossless, dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
@@ -170,7 +171,7 @@ def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
 @pytest.mark.parametrize("topk, width", [(None, VOCAB), (5, 5), (99999, VOCAB)])
 def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk, width):
     if topk is not None:
-        monkeypatch.setattr(dspark_lossless, "Q_WIDTH", topk)
+        monkeypatch.setattr(sparse_q_store, "Q_WIDTH", topk)
     sampling = proposer(monkeypatch).model.bound
     store = sampling.q_store
     assert store.ids.shape == store.probs.shape == (2 * MAX_BS * T, width)
@@ -301,12 +302,14 @@ def test_the_rejection_sampler_owns_the_verify_scratch_and_warmup(monkeypatch):
     from atom.model_ops import rejection_sampler as rs_mod
 
     sampler = rs_mod.RejectionSampler()
+    monkeypatch.setattr(sparse_q_store, "Q_WIDTH", 8)
     sampler.arm_ratio(MAX_BS, T, VOCAB, "cpu")
     assert sampler._ratio_scratch.nbytes()
     calls = []
     monkeypatch.setattr(rs_mod, "warmup_ratio_verify", lambda *a: calls.append(a))
-    sampler.warmup_ratio(T, VOCAB, 8, torch.bfloat16)
+    sampler.warmup_ratio(torch.bfloat16)
     ((steps, vocab, width, dtype, scratch),) = calls
+    # The store's width, as the drafter sizes it (`store_width`).
     assert (steps, vocab, width, dtype) == (T, VOCAB, 8, torch.bfloat16)
     assert scratch is sampler._ratio_scratch
 

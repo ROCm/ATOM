@@ -25,6 +25,12 @@ import torch
 Q_WIDTH = 1024
 
 
+def store_width(vocab_size: int) -> int:
+    """Entries per stored row for a draft over ``vocab_size`` ids: K, never
+    wider than the vocab. The store and the verify's warmup both size by it."""
+    return min(Q_WIDTH, vocab_size)
+
+
 class SparseQStore(NamedTuple):
     """The persistent draft q, ``rows`` draft rows of up to ``width`` entries;
     see the module notes for the contract."""

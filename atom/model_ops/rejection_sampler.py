@@ -10,7 +10,7 @@ from atom.model_ops.spec_sampling.ratio_verify import (
     ratio_verify_scratch,
     warmup_ratio_verify,
 )
-from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
+from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore, store_width
 from atom.model_ops.verify_kernels import _draft_token, _finish_request
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
@@ -122,28 +122,28 @@ class RejectionSampler(nn.Module):
         # Same, for the probability-ratio path's draws. Advanced on every forward
         # that takes that path, so no two steps replay a stream.
         self._ratio_step = 0
-        # The probability-ratio verify's preallocated scratch (`arm_ratio`), or
-        # None while lossless sampling is not armed.
+        # The probability-ratio verify's preallocated scratch and the widths it
+        # was armed for (`arm_ratio`), or None while lossless sampling is not
+        # armed.
         self._ratio_scratch = None
+        self._ratio_widths = None
 
     def arm_ratio(self, max_bs: int, num_spec_steps: int, vocab_size: int, device):
         """Allocate the ratio verify's scratch for up to ``max_bs`` requests of
-        ``num_spec_steps`` drafts, before the KV cache is sized, so the budget
-        and the profiling run see it and no verify allocates."""
+        ``num_spec_steps`` drafts over ``vocab_size`` ids, before the KV cache
+        is sized, so the budget and the profiling run see it and no verify
+        allocates."""
         self._ratio_scratch = ratio_verify_scratch(
             max_bs, num_spec_steps, vocab_size, device
         )
+        self._ratio_widths = (num_spec_steps, vocab_size, store_width(vocab_size))
 
-    def warmup_ratio(
-        self, num_spec_steps: int, vocab_size: int, q_width: int, logits_dtype
-    ) -> None:
-        """Compile every ratio verify variant at the widths serving gives it,
-        for ``logits_dtype``, the dtype the target's LM head emitted in the
-        warmup forward (`warmup_ratio_verify`). No warmup or capture forward
-        verifies, so without this the first sampled verify would compile."""
-        warmup_ratio_verify(
-            num_spec_steps, vocab_size, q_width, logits_dtype, self._ratio_scratch
-        )
+    def warmup_ratio(self, logits_dtype) -> None:
+        """Compile every ratio verify variant at the widths `arm_ratio` was
+        given and the store's, for ``logits_dtype`` (`warmup_ratio_verify`).
+        No warmup or capture forward verifies, so without this the first
+        sampled verify would compile."""
+        warmup_ratio_verify(*self._ratio_widths, logits_dtype, self._ratio_scratch)
 
     def forward(
         self,

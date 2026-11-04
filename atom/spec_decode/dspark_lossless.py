@@ -19,7 +19,7 @@ from atom.model_ops.sampler import AITER_TOPK_TOPP_AVAILABLE, SAMPLER_EPS
 from atom.model_ops.spec_sampling.dspark_markov_sample import (
     dspark_markov_sample_scratch,
 )
-from atom.model_ops.spec_sampling.sparse_q_store import Q_WIDTH, SparseQStore
+from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore, store_width
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_q_slots import DraftQSlots
 from atom.spec_decode.draft_q_staging import DraftQStaging
@@ -173,7 +173,7 @@ class DSparkLossless:
         q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
         # One row block per live request, not per batch slot: the verify reads
         # it a step later, after the batch may have been reordered.
-        self.q_store = SparseQStore.allocate(q_slots * t, min(Q_WIDTH, vocab), device)
+        self.q_store = SparseQStore.allocate(q_slots * t, store_width(vocab), device)
         # The draft's own: the verify reads q from the store, not from here.
         self.s_scratch = torch.empty(
             (max_bs, vocab), dtype=torch.float32, device=device
@@ -201,8 +201,6 @@ class DSparkLossless:
             verify_q_row_base=self.verify_q_row_base.np,
             greedy_threshold=SAMPLER_EPS,
         )
-        # The draft model's `DraftSampling`, built by `bind_target`.
-        self.sampling = None
 
     def bind_target(self, forward_vars, model) -> None:
         """Build the draft's `DraftSampling` around these buffers and the
@@ -210,7 +208,7 @@ class DSparkLossless:
         which `prepare_sample` publishes every row of while this is armed), and
         bind ``model`` to it. Once, before any warmup or capture, so the
         recorded block reads them."""
-        self.sampling = DraftSampling(
+        sampling = DraftSampling(
             q_store=self.q_store,
             s_scratch=self.s_scratch,
             q_row_base=self.q_row_base.gpu,
@@ -220,7 +218,7 @@ class DSparkLossless:
             top_k=forward_vars["top_ks"].gpu,
             top_p=forward_vars["top_ps"].gpu,
         )
-        model.bind_draft_sampling(self.sampling)
+        model.bind_draft_sampling(sampling)
 
     def stage(
         self,

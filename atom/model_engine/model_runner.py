@@ -896,7 +896,7 @@ class ModelRunner:
             self.rejection_sampler.arm_ratio(
                 config.max_num_seqs,
                 self.drafter.mtp_k,
-                lossless.s_scratch.shape[1],
+                int(self.drafter.model.vocab_size),
                 self.device,
             )
         # The LM head's logits dtype, as the warmup forward emits it; the ratio
@@ -961,10 +961,7 @@ class ModelRunner:
             # verify compiles; a runner that skips the warmup (RapidServe's
             # decode) has only the model dtype to go by.
             self.rejection_sampler.warmup_ratio(
-                self.drafter.mtp_k,
-                lossless.s_scratch.shape[1],
-                lossless.q_store.ids.shape[1],
-                self._logits_dtype or config.torch_dtype,
+                self._logits_dtype or config.torch_dtype
             )
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -3408,7 +3405,6 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        drafter = getattr(self, "drafter", None)
         # Compute logprobs if any sequence requested them
         need_logprobs = any(batch.return_logprobs)
         structured = getattr(self, "structured_output", None)
