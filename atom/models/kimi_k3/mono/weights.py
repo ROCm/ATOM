@@ -12,11 +12,13 @@ Three groups are the exception, and each says why:
 * four small vectors the kernels read as fp32 that the model holds in bf16 (the
   causal-conv weights, ``A_log``, ``dt_bias``, the router's correction bias) --
   together under 100 KB a layer;
-* the latent MoE's down- and up-projections. The model quantizes both to MXFP4
+* the latent MoE's down- and up-projections. An MXFP4 checkpoint quantizes both
   at load while the kernels' latent GEMVs are bf16, so they are dequantized once
   here (``layouts`` undoes AITER's two shuffles first). This is the port's whole
   weight budget: ~58 MB a mono layer, ~4 GB a rank over K3's KDA layers. A
-  deployment that cannot spare it has to turn mono off, not run it degraded.
+  deployment that cannot spare it has to turn mono off, not run it degraded. A
+  bf16 checkpoint has no scale: its down-projection is bound as is, and only the
+  up-projection's rank band is copied (that is the whole cost there).
 * the fused KDA in-projection, which must be unquantized. ATOM's online quant
   turns it into preshuffled per-token FP8 padded to 6400 rows; the kernels read
   bf16. It is refused rather than dequantized, because at 90 MB a layer that
@@ -120,11 +122,14 @@ def _as_f32(param, n: int, name: str) -> torch.Tensor:
 
 def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     """A preshuffled MXFP4 linear as bf16 ``shape``: both AITER shuffles undone
-    (``layouts``), then the E2M1 values scaled by their E8M0 group scale."""
+    (``layouts``), then the E2M1 values scaled by their E8M0 group scale. A bf16
+    checkpoint has no scale and is already what the kernels read."""
     from atom.model_ops.quant_v4 import dequant_fp4_e2m1
 
     w = _param(module, name)
     scale = getattr(module, "weight_scale", None)
+    if scale is None and w.dtype == BF16:
+        return _plain_bf16(module, name, shape)
     rows, cols = shape
     _need(scale is not None, f"{name}: no weight_scale")
     _need(w.element_size() == 1, f"{name} is {w.dtype}, expected packed FP4")
@@ -256,7 +261,8 @@ def bind_kda(layer, layer_id: int, dims: Dims) -> KdaLayer:
         ),
         a_log=_as_f32(attn.A_log, dims.heads, f"{name} A_log"),
         dt_bias=_as_f32(attn.dt_bias, dims.proj, f"{name} dt_bias"),
-        on_w=_vec(attn.o_norm.weight, HEAD_DIM, f"{name} o_norm"),
+        # the model holds o_norm in fp32 (`control_dtype`); bound as is, no copy
+        on_w=_vec(attn.o_norm.weight, HEAD_DIM, f"{name} o_norm", F32),
         onorm_eps=_eps(attn.o_norm, f"{name} o_norm"),
         lower_bound=float(lower),
     )

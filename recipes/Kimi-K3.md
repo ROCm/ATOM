@@ -42,15 +42,15 @@ Prefix caching remains disabled because the KDA recurrent state is maintained pe
 
 ### Mono decode
 
-Two fused kernels replace the KDA layers of a speculative verify step: K1, the
-attention seam through the KDA recurrence, and K2, `o_proj` plus the latent
-MoE. The MLA layers keep the production paged path.
+Two fused kernels replace the KDA layers of a decode step -- a plain decode or a
+speculative verify: K1, the attention seam through the KDA recurrence, and K2,
+`o_proj` plus the latent MoE. The MLA layers keep the production paged
+attention and run K2.
 
 `ATOM_MONO_ENABLE` defaults to `1`, so a qualifying deployment gets mono
-without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
-`ATOM_ENABLE_REPLAYSSM=0`. The launch above supplies TP8 and FP8 KV and takes
-DCP1 and the FULL cudagraph by default; **DSpark and `ATOM_ENABLE_REPLAYSSM`
-it does not**, and without both mono stays off:
+without being asked. It needs TP8 and a FULL cudagraph; the launch above
+supplies both (the FULL cudagraph by default). DSpark, ReplaySSM and decode
+context parallelism are all served:
 
 - FULL cudagraph **is** the CLI default (`EngineArgs.cudagraph_mode: str =
   "FULL"` in `atom/model_engine/arg_utils.py`), so a launch from the CLI arms
@@ -60,13 +60,13 @@ it does not**, and without both mono stays off:
   mono refuses TR_HYBRID, logging `Kimi-K3 mono decode off: TR_HYBRID
   cudagraph`. The examples below still pass the flag explicitly, because it
   costs nothing and makes the requirement visible in the command.
-- **DSpark is not in the launch above.** Mono replaces the KDA layers of a
-  speculative *verify* step, so a server with no drafter has no such step to
-  replace and says `Kimi-K3 mono decode off: no speculative decoding`. The
-  draft model is a separate checkpoint and a local directory, not a repo id.
-- `ATOM_ENABLE_REPLAYSSM` defaults ON whenever spec decode is used, and K1
-  resumes a request from a per-token snapshot slot that ReplaySSM does not
-  keep live.
+- **DSpark is optional.** Without a drafter mono serves the plain decode steps
+  (one row a request); with one it serves the verify steps (8 rows a request at
+  seven draft tokens). The draft model is a separate checkpoint and a local
+  directory, not a repo id.
+- `ATOM_ENABLE_REPLAYSSM` (default ON whenever spec decode is used) is served:
+  K1 rebuilds a request's state from its checkpoint and the committed (k, u, g)
+  records, and writes records instead of per-token states.
 - **Five projections must stay out of the online quant.** The kernels read
   them as plain BF16 (`kimi_k3/mono/weights.py`, five `_plain_bf16` call
   sites): `self_attn.in_proj`, `self_attn.f_b_proj`, `self_attn.o_proj`, and
@@ -81,8 +81,9 @@ it does not**, and without both mono stays off:
   refuses the whole model at the first KDA layer (`mono decode off: layer 1
   in_proj is ...`); decode runs on the production path.
 
+With a drafter:
+
 ```bash
-export ATOM_ENABLE_REPLAYSSM=0
 export DRAFT_MODEL_PATH=/path/to/Kimi-K3-DSpark   # a directory, not a repo id
 ```
 
@@ -94,9 +95,10 @@ Add these to the launch command:
   --num-speculative-tokens 7 \
 ```
 
-Seven draft tokens make one request exactly 8 rows. The buffers hold 16 rows
-(`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), so up to 15 draft tokens are
-accepted for a single request; every number below was measured at 7.
+Seven draft tokens make one request exactly 8 rows. The buffers hold 64 rows
+(`atom/models/kimi_k3/mono/config.py:MAX_ROWS`; past 16, 16-row token groups),
+so `--max-num-seqs 8` keeps every verify step on the kernels; every number
+below was measured at 7.
 
 Add these to the launch's `exclude_layer` list:
 
@@ -108,24 +110,21 @@ The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
 `Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
 it before concluding anything about a run.
 
-**A step is served only if it is at most 16 rows** (batch x query length). bs=1
-with seven speculative tokens is 8 rows and bs=2 at the same width is 16; both
-are served, including the bs=2 CUDA graph. A step past 16 rows declines back to
-the production path -- the server still answers, just without mono. The log
-names a declined row count once per distinct count (`Kimi-K3 mono decode
-declined a step: 24 rows > the 16-row buffers`), so the number of such lines is
-the number of distinct widths turned away, not the number of steps.
+**A step is served only if it is at most 64 rows** (batch x query length, a
+uniform query length). bs=8 with seven speculative tokens is 64 rows, and every
+CUDA-graph capture size inside the cap is served. A step past 64 rows declines
+back to the production path -- the server still answers, just without mono.
+The log names a declined row count once per distinct count (`Kimi-K3 mono
+decode declined a step: 72 rows > the 64-row buffers`), so the number of such
+lines is the number of distinct widths turned away, not the number of steps.
 
-The 16-row cap and K2 on the 24 full-attention (MLA) layers are fixed; there is
+The 64-row cap and K2 on the 24 full-attention (MLA) layers are fixed; there is
 no switch for either. Only `ATOM_MONO_ENABLE=0` turns them off, and it turns
-off mono on the KDA layers with them. What this means for a deployment that
-used to run the 8-row, KDA-only mono:
+off mono on the KDA layers with them. The peer buffer is about 10 MB a rank for
+K2 at 64 rows, plus the DSA indexer's regions past it, zeroed at every step.
+What follows was measured when the cap went from 8 to 16 rows and K2 came to
+the MLA layers:
 
-- bs=2 steps (16 rows) and every CUDA-graph capture size up to 16 rows now run
-  on the kernels instead of the production path. The log line above no longer
-  appears for them.
-- The peer buffer doubles, 4.76 MB to 9.52 MB a rank, and is zeroed at every
-  step.
 - K2 on the MLA layers dequantizes those layers' latent-MoE weights: about
   1.4 GB a rank (24 layers x about 58 MB, computed from the per-layer size in
   `mono/weights.py`; not measured). The runner is built on the first eligible
@@ -227,7 +226,16 @@ The tower is replicated on every TP rank rather than sharded, costing ~0.9 GB bf
 - Kimi-K3's processor takes `messages` plus a separate `medias` list (chat rendering is Python, not Jinja) and returns `grid_thws` rather than `image_grid_thw`;
 - it emits **one** `<|media_pad|>` token per image, leaving the expansion to the model. ATOM expands it to `(h // 2) * (w // 2)` tokens up front so the scheduler, KV blocks and positions all see the real prompt length.
 
-Multimodal prefills are never chunked — the vision embeddings cover the whole prompt — so `--max-num-batched-tokens` is a hard cap on an image prompt's length even with chunked prefill enabled. A 512x512 image is 256 tokens; the default 10240 leaves ample room. Lifting this is a known TODO (see the merge site in `ModelRunner.run_model` and the admission check in `Scheduler.schedule`); it needs the encoder output cached per request and sliced per chunk.
+ATOM also records where each expanded run starts (`embedding_spans`), so an image prompt is chunked like a text one: the first prefill chunk encodes the whole image once into a per-request cache, and every chunk scatters only the rows it covers. `--max-num-batched-tokens` therefore no longer caps an image prompt's length. The processor caps one image at 65,536 patches (`in_patch_limit`) before padding, so a single image can reach ~16.5K tokens (a 4961x7016 A4 scan is 16,524).
+
+Both copies of an image live until its request finishes, through decode and any preemption:
+
+| Copy | Where | Per image token | 4961x7016 A4 scan |
+|---|---|---|---|
+| `pixel_values` (fp32 14x14 patches, 4 per token), kept to re-encode on retry | engine-core host RAM | 9.2 KiB | 148 MiB |
+| encoded embeddings (7168 x bf16), the per-request vision cache | every TP rank's GPU | 14 KiB | 226 MiB |
+
+The vision cache has no size cap and is not part of the KV-cache sizing, so it comes out of the HBM that `--gpu-memory-utilization` leaves free, as does the vision tower's activations while it encodes an image. For scale, the TP8 server with `--gpu-memory-utilization 0.9`, `--max-num-seqs 64`, `--max-num-batched-tokens 8192` and the DSpark draft, serving text, had 23.8-24.9 GiB free per GPU and 1.59M tokens of KV. 64 concurrent A4 scans hold 14.1 GiB of cache; KV filled entirely with image tokens would hold 21.2 GiB. Each 0.01 of `--gpu-memory-utilization` is ~2.9 GiB of that headroom, so for image-heavy traffic keep it at 0.9 or lower, or lower `--max-num-seqs`.
 
 On a **cold AITER JIT cache**, the first image request builds the varlen attention kernel and pays ~35 s of TTFT; once that kernel is cached it drops to ~2 s for the first request of a fresh server and ~0.3 s steady-state. Send one throwaway image before timing anything or starting an eval.
 

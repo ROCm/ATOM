@@ -141,7 +141,7 @@ def test_api_rejects_invalid_numeric_effort(effort):
         ChatCompletionRequest(reasoning_effort=effort)
 
 
-@pytest.mark.parametrize("effort", [True, False, 0, 101, 75.0, "75", "medium", [], {}])
+@pytest.mark.parametrize("effort", [True, False, 0, 101, 75.0, "75", "ultra", [], {}])
 def test_adapter_rejects_invalid_native_or_common_effort(effort):
     adapter = build_message_encoder_adapter("encoding_dsv41", lambda messages, **kw: kw)
     for key in ("thinking_effort", "reasoning_effort"):
@@ -292,7 +292,8 @@ def test_typed_call_matches_reference_and_all_stream_boundaries(encoder):
     )
     expected = parse_reference(reference_text, thinking_mode="thinking")
     reasoning, content = ReasoningChannel(starts_open=True).split(
-        reference_text.removesuffix("<｜end▁of▁sentence｜>")
+        reference_text.removesuffix("<｜end▁of▁sentence｜>"),
+        stopped=True,
     )
     assert reasoning == expected["reasoning_content"]
     text, calls = parse_tool_calls(content, TOOLS, DsmlV41Parser)

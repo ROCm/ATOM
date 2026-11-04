@@ -32,6 +32,7 @@ arithmetically once the group is behind the current chunk. That is what
 raw index keys so pooling can read them back.
 """
 
+import functools
 from types import SimpleNamespace
 
 import aiter
@@ -63,6 +64,27 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+
+# Selection widths the aiter FlyDSL kernel accepts: 4T + 3 for T complete
+# four-token groups (T = 256, 512, 768, 1024), then the 0..3 causal tail.
+_FLYDSL_WIDTHS = (1027, 2051, 3075, 4099)
+
+
+@functools.cache
+def _flydsl_arch_supported() -> bool:
+    # aiter's entry raises on anything but gfx942 instead of falling back.
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx942"
+
+
+@functools.cache
+def _flydsl_attention_op():
+    # Imported on first use so the flag-off path needs no FlyDSL QSA in aiter.
+    # aiter.ops.qsa is aiter's entry for consumers (ROCm/aiter#6576).
+    from aiter.ops.qsa import qsa_sparse_prefill
+
+    return qsa_sparse_prefill
 
 
 def build_qwen4_exp_rope(config, head_size: int):
@@ -458,17 +480,21 @@ class Qwen4ExpAttention(nn.Module):
             qsa = qsa.for_tokens(num_tokens)
             self._store_kv(key, value, qsa.slot_mapping)
             selected = self._select_tokens(hidden_states, positions, qsa)
-            attn_out = self._attend(
-                query,
-                selected,
-                qsa.block_tables,
-                qsa.token_to_req,
-                (
-                    None
-                    if forward_context.context.is_prefill
-                    else qsa.block_tables.shape[0]
-                ),
-            )
+            attn_out = None
+            if forward_context.context.is_prefill:
+                attn_out = self._flydsl_attention(query, key, value, selected, qsa)
+            if attn_out is None:
+                attn_out = self._attend(
+                    query,
+                    selected,
+                    qsa.block_tables,
+                    qsa.token_to_req,
+                    (
+                        None
+                        if forward_context.context.is_prefill
+                        else qsa.block_tables.shape[0]
+                    ),
+                )
 
         if is_per_token_fp8_linear(self.o_proj):
             gated, gated_scale = sigmoid_mul_quant(
@@ -477,6 +503,52 @@ class Qwen4ExpAttention(nn.Module):
             return self.o_proj(gated, x_scale=gated_scale)
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
+
+    def _flydsl_attention(self, query, key, value, selected, qsa):
+        """aiter FlyDSL sparse attention for an eager prefill, or None for the native kernel."""
+        width = next((w for w in _FLYDSL_WIDTHS if w >= selected.shape[1]), None)
+        if (
+            not envs.ATOM_QSA_FLYDSL_ATTN
+            or qsa.host_lens is None
+            or width is None
+            # aiter rejects a padded selection spanning 2**31 bytes or more.
+            or query.shape[0] * width * selected.element_size() >= 2**31
+            # Padding a selection laid out for another budget or ratio moves the
+            # causal tail: the kernel would read it at the wrong column.
+            or self.indexer.compress_ratio != 4
+            or self.indexer.token_topk + 3 not in _FLYDSL_WIDTHS
+            # The prefixed path gathers raw cache rows; the kernel takes BF16 only.
+            or self.k_scale_cache is not None
+            or not _flydsl_arch_supported()
+            or torch.cuda.is_current_stream_capturing()
+            or self.num_kv_heads != 1
+            or self.num_heads not in (12, 6, 3)
+            or self.head_dim != 256
+            or query.dtype != torch.bfloat16
+        ):
+            return None
+        query_lens, seq_lens = qsa.host_lens
+        if sum(query_lens) != query.shape[0]:
+            return None
+        if qsa.context_slots is None:
+            k, v = key.contiguous(), value.contiguous()
+        else:
+            k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+            v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+        # The expansion drops columns no row can reach; the kernel reads them as -1.
+        # It does not validate the layout: a malformed selection gives wrong output.
+        indices = torch.nn.functional.pad(
+            selected, (0, width - selected.shape[1]), value=-1
+        )
+        return _flydsl_attention_op()(
+            query.contiguous(),
+            k,
+            v,
+            indices,
+            query_lens=query_lens,
+            prefix_lens=tuple(s - q for q, s in zip(query_lens, seq_lens)),
+            softmax_scale=self.scaling,
+        )
 
     def _profile_attention(self, query, key, value, hidden_states, positions):
         """Exercise real indexer, cache and sparse workspaces before pool sizing.

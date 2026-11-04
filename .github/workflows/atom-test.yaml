@@ -40,8 +40,10 @@ on:
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved') }}
+  # Approval runs queue behind existing work. Other reviews get their own
+  # group so they cannot replace a pending approval run in GitHub's queue.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
@@ -56,11 +58,13 @@ jobs:
     name: Check Heavy CI Gate
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      pr_check_takeover: ${{ steps.gate.outputs.pr_check_takeover }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -68,6 +72,8 @@ jobs:
       - name: Check approval and label gate
         id: gate
         env:
+          CI_GATE_WORKFLOW: atom-test.yaml
+          CI_GATE_PR_CHECK_JOB: Offline inference smoke test
           CI_GATE_LABELS: ci:full,ci:atom
           CI_GATE_PATHS_IGNORE: |
             **/*.md
@@ -164,8 +170,12 @@ jobs:
           PY
 
   offline-smoke-test:
-    # Ungated on purpose: this runs on every PR, unlike the accuracy matrix
-    # behind `ci-gate`, which only opens on an approval or a ci:* label.
+    needs: [ci-gate]
+    if: ${{ !cancelled() }}
+    # Not behind the approval/label gate: this runs on every PR, unlike the
+    # accuracy matrix, which only opens on an approval or a ci:* label. It
+    # needs `ci-gate` only so an approval run can take over the check from a
+    # pending PR run it replaced; other review runs skip its steps.
     #
     # It guards the path the nightly Docker release smoke-tests after it builds
     # the image -- the offline entrypoint. The accuracy job is not a substitute:
@@ -177,8 +187,9 @@ jobs:
     # Completing is the assertion. The failure it exists to catch is a hang or
     # a crash, not wrong text, so there is no golden file to keep per model --
     # and one small model exercises that code path as well as thirteen do.
-    name: Offline inference smoke test
-    runs-on: linux-atom-mi35x-1
+    # Do not publish a same-named skipped check over a previous smoke failure.
+    name: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'Offline inference smoke test' || 'Offline smoke not requested' }}
+    runs-on: ${{ (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true') && 'linux-atom-mi35x-1' || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       CONTAINER_NAME: atom_smoke_test
@@ -188,22 +199,26 @@ jobs:
       # the offline entrypoint completes, so it keeps the small model and its
       # settings regardless of what the accuracy matrix tracks.
       SMOKE_EXTRA_ARGS: --kv_cache_dtype fp8 --gpu-memory-utilization 0.3
+      SMOKE_REQUESTED: ${{ github.event_name != 'pull_request_review' || needs.ci-gate.outputs.pr_check_takeover == 'true' }}
     steps:
       - name: Kill stale containers
+        if: env.SMOKE_REQUESTED == 'true'
         run: |
           docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
 
       - name: Checkout ATOM repo
+        if: env.SMOKE_REQUESTED == 'true'
         uses: actions/checkout@v6
 
       - name: Docker Login
-        if: ${{ !github.event.pull_request.head.repo.fork }}
+        if: ${{ env.SMOKE_REQUESTED == 'true' && !github.event.pull_request.head.repo.fork }}
         uses: ./.github/actions/docker-auth
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Start CI container
+        if: env.SMOKE_REQUESTED == 'true'
         uses: ./.github/actions/setup-gpu-container
         with:
           container-name: ${{ env.CONTAINER_NAME }}
@@ -213,6 +228,7 @@ jobs:
           network-host: "true"
 
       - name: Download model
+        if: env.SMOKE_REQUESTED == 'true'
         timeout-minutes: 30
         env:
           HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
@@ -230,6 +246,7 @@ jobs:
           fi
 
       - name: Run offline inference
+        if: env.SMOKE_REQUESTED == 'true'
         # An 8B model loads and answers a handful of prompts in a couple of
         # minutes. This bound is the guard: the failure it exists to catch is a
         # hang, and a hang should cost minutes rather than most of an hour.
@@ -252,7 +269,7 @@ jobs:
             || { echo "::error::simple_inference produced no completions"; exit 1; }
 
       - name: Clean Up
-        if: always()
+        if: ${{ always() && env.SMOKE_REQUESTED == 'true' }}
         run: |
           docker ps -aq -f "name=${CONTAINER_NAME}" | xargs -r docker rm -f || true
 

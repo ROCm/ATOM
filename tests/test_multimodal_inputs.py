@@ -264,6 +264,9 @@ def test_kimi_preparation_expands_each_image_and_keeps_interleaving(image_module
     assert token_ids == [9] + [42] * 4 + [7] + [42] * 8 + [8]
     assert model_inputs["image_grid_thw"] is grid
     assert model_inputs["pixel_values"] is pixel_values
+    # One span per expanded run, in image order, so the prefill can chunk.
+    assert model_inputs["embedding_spans"] == ((1, 4), (6, 8))
+    assert isinstance(model_inputs["cache_seed"], int)
     assert [part["type"] for part in seen["messages"][0]["content"]] == [
         "image",
         "text",
