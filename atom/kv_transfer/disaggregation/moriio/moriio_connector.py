@@ -537,7 +537,13 @@ class MoRIIOConnector(KVConnectorBase):
             )
         descs = self.layer_name_to_remote_kv_cache_metadata[engine_id]
         for local, peer in zip(self._regions, remote):
-            if (local.name, local.kind, local.unit, local.reverse, local.chunk_bytes) != (
+            if (
+                local.name,
+                local.kind,
+                local.unit,
+                local.reverse,
+                local.chunk_bytes,
+            ) != (
                 peer.name,
                 peer.kind,
                 peer.unit,
