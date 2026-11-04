@@ -218,16 +218,17 @@ def stage_oproj(c, gi):
 @traced
 def stage_oproj_post(c, gi, task):
     """``stage_oproj`` reading the core this launch's MLA post stage writes:
-    the o_proj weights in flight first, then this CTA's post task (if any),
-    every task's ``mpdone`` pair, then a token group at a time its core rows
-    at device scope and the MFMAs."""
+    this CTA's post task (if any), the o_proj weights in flight across the
+    wait for every task's ``mpdone`` pair, then a token group at a time its
+    core rows at device scope and the MFMAs. (The weights issued before the
+    post task stay live across it: one VGPR spilled from 4 rows.)"""
+    if task >= 0:
+        enter_stage("k2.mlapost")
+        mp.post_task(c, task)
     ops = [
         k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
         for j in range(O_ROUNDS)
     ]
-    if task >= 0:
-        enter_stage("k2.mlapost")
-        mp.post_task(c, task)
     mp.wait_core(c)
     for g in range_constexpr(c["G"]):
         cg = k2a.group_view(c, g)

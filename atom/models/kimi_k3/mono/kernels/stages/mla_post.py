@@ -53,6 +53,7 @@ from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (  # noqa: F40
     HIDDEN,
     KCH,
     LORA,
+    MAX_ROWS,
     PROJ,
     PT,
     ROWS,
