@@ -23,7 +23,6 @@ import enum
 import itertools
 import logging
 import math
-import os
 import struct
 import threading
 import time
@@ -894,13 +893,6 @@ class Scheduler:
         # `_record_prefill_supply` adds the admittable waiting seqs to it.
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
-        self._bench_sched_cpu: bool = os.environ.get("ATOM_BENCH_SCHED_CPU", "") == "1"
-        self._sched_cpu_ns: list[int] = []
-        if self._bench_sched_cpu:
-            import atexit
-
-            atexit.register(self._dump_sched_cpu)
-
         self._num_parked_remote_kv: int = 0
 
         # Under PP the head keeps pp_size batches in flight, so schedule() must
@@ -1183,8 +1175,8 @@ class Scheduler:
                 if bypass_left == 0:
                     break
                 bypass_left -= 1
-            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
-                # Promoted remote-ready seq: admission routes it to first
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS and not self._is_offload_prefill_resume(seq):
+                # P/D remote-ready seq: admission routes it to first
                 # decode (no prefill rows). Count the running slot only.
                 num_running += 1
                 continue
@@ -1350,8 +1342,12 @@ class Scheduler:
         if seq.replay_kv_load and not needs_remote_load:
             if dry is not None:
                 # It parks for the load once allocated, with no rows this
-                # pass. Treat as a parked slot so the scan continues past it.
-                return _WaitingSeqDecision(_Verdict.WAIT)
+                # pass but it claims blocks. Mirror _park_for_remote_load.
+                return _WaitingSeqDecision(
+                    _Verdict.ADMIT,
+                    needs_remote_load=True,
+                    hbm_probe=hbm_probe,
+                )
             if num_running + self._num_parked_remote_kv >= self.max_num_seqs:
                 # A replay that loads its KV first parks for that load like any
                 # remote load (`needs_remote_load` knew only the state-carrying
@@ -2272,35 +2268,9 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
-        if self._bench_sched_cpu:
-            import time as _t
-
-            _t0 = _t.perf_counter_ns()
-            result = self._schedule()
-            self._sched_cpu_ns.append(_t.perf_counter_ns() - _t0)
-        else:
-            result = self._schedule()
+        result = self._schedule()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
-
-    def _dump_sched_cpu(self) -> None:
-        if not self._sched_cpu_ns:
-            return
-        import numpy as np
-
-        us = np.array(self._sched_cpu_ns, dtype=np.float64) / 1e3
-        path = f"/tmp/sched_cpu_us_{os.getpid()}.npy"
-        np.save(path, us)
-        logger.info(
-            "schedule() CPU: %d ticks, p50=%.1f p90=%.1f p99=%.1f mean=%.1f max=%.1f µs -> %s",
-            len(us),
-            np.percentile(us, 50),
-            np.percentile(us, 90),
-            np.percentile(us, 99),
-            np.mean(us),
-            np.max(us),
-            path,
-        )
 
     def _schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
         """Select the next batch of sequences for a forward pass.

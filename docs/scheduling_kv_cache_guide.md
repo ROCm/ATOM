@@ -79,8 +79,8 @@ delayer whether this tick allows prefill. It then selects work in three phases:
    `_decide_waiting_seq`. The local coalescer's fill probe and the DP chunk-cost
    estimate run it as a dry pass (`_dry_admission_pass`) over the same loop
    bounds, asking each fit against the pool the requests admitted before it
-   would leave (`PoolReservation`: their blocks, the hit blocks they claim, the
-   cached blocks their fresh blocks evict, their state slots). A dry pass does
+   would leave (`PoolReservation`: the block ids they hold and a conservative
+   spill flag when the reservation exceeds what a per-id set can track). A dry pass does
    not query the connector, start a checkpoint wait or allocate; it reads the
    request's last connector answer and stops, reporting prefill, where only a
    query could decide.

@@ -1350,8 +1350,6 @@ _ADMISSION_HINTS = frozenset(
         "num_wanted_hit_blocks",
         "checkpoint_demand_pos",
         "checkpoint_end_pos",
-        "checkpoint_demand_declined",
-        "checkpoint_demand_counted",
         "replays_hit",
         "replay_kv_load",
         "block_hashes",
