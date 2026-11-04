@@ -313,12 +313,15 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         # the top level has one list, a token's last: it has no region above it
         to_final = True if level == ip.top_level(kind, bound_max) else final
         got = []
+        # A level-0 list of a row with bound <= k takes all its n keys in
+        # index order (``lds_topk``'s n <= k case): no scores to wait for
+        take_all = bound <= k
         if const_expr(level == 0):
             if const_expr(kind == "sel"):
                 first, count = ip.CHUNKS_PER_SEG * j, ip.seg_chunks(bound, j)
             else:
                 first, count = ip.block_chunks(raw, j)
-            if tid < count:
+            if (tid < count) & (bound > k):
                 c["poll"]([(c["isf"], t * max_chunks + first + tid, 1)])
             gpu.barrier()
         else:
@@ -400,11 +403,26 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         if const_expr(kind == "blk" and not c["tok_par"]):
             c_fin = restore_late(c, pointers=('icout',), words=(), scratch=False)
             fin_rsrc = rsrc(c_fin["args"]["icout"])
-        if const_expr(level == 0 and kind == "sel"):
-            # A level-0 sel list of n <= 2048 keys ranks them 8 a thread (same index order,
-            # same winners and places); the 32-a-thread form scanned 8192 slots every radix pass.
-            if n <= THREADS * SMALL_PER_THREAD:
-                lds_topk(n, k, load, emit, c["sel_lds"], tid, SMALL_PER_THREAD, None)
+        if const_expr(level == 0):
+            if take_all:
+                # place pos holds key pos (j * SEG + pos) below n, -1 from n to k
+                for r in range_constexpr(k // THREADS):
+                    pos = tid + THREADS * r
+                    ident = (pos < n).select(j * ip.SEG + pos, Int32(-1))
+                    if const_expr(kind == "sel"):
+                        fx.ptr_store(ident, win + pos)
+                    elif const_expr(fin_rsrc is not None):
+                        bo.buffer_store(Int32(ident), fin_rsrc, t * ip.TOPK_BLOCKS + pos, cache_modifier=CM_DEV)
+                    else:
+                        _final(c, kind, t, pos, ident, None)
+                gpu.barrier()
+            elif const_expr(kind == "sel"):
+                # A level-0 sel list of n <= 2048 keys ranks them 8 a thread (same index order,
+                # same winners and places); the 32-a-thread form scanned 8192 slots every radix pass.
+                if n <= THREADS * SMALL_PER_THREAD:
+                    lds_topk(n, k, load, emit, c["sel_lds"], tid, SMALL_PER_THREAD, None)
+                else:
+                    lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
             else:
                 lds_topk(n, k, load, emit, c["sel_lds"], tid, PER_THREAD, None)
         else:
@@ -503,10 +521,18 @@ def run_indexer(c, s, bid, bound_max):
         for t in range(n):
             fx.ptr_store(ld_i32(a['ibound'],t0+t),c['late_meta']+mhtjstest_index_row_offset(c,0)+t)
     gpu.barrier()
-    if const_expr(c["index_fp4"]):
-        run_scores4(c, t0, n, bid, max_chunks)
-    else:
-        run_scores(c, t0, n, bid, None if s > 24 else restored_bounds(c,n), max_chunks)
+    # Rows whose columns all fit one selection (bound <= TOPK, so their
+    # blocks <= TOPK_BLOCKS) take every column whatever the scores; a tree list
+    # of such a row emits its identity list without them (``stage_ilist``), and
+    # when every row is one the scores are not computed at all.
+    widest = Int32(0)
+    for t in range_constexpr(n):
+        widest = fx.max(widest, scalar_word(fx.ptr_load(c['late_meta']+mhtjstest_index_row_offset(c,0)+t)))
+    if widest > ip.TOPK:
+        if const_expr(c["index_fp4"]):
+            run_scores4(c, t0, n, bid, max_chunks)
+        else:
+            run_scores(c, t0, n, bid, None if s > 24 else restored_bounds(c,n), max_chunks)
     _run_tree(c, t0, n, bid, "sel", None, bound_max, max_chunks)
     if late_word(c,'iprod') != 0:
         _run_tree(c, t0, n, bid, "blk", None, bound_max, max_chunks)
