@@ -418,11 +418,11 @@ def test_engram_rows_carry_live_tokens_and_dead_flags():
 def test_armed_capture_keeps_the_extract_its_hooks_run(monkeypatch):
     """A mono step bypasses the hooks, so it needs the same function."""
     proposer, target, _ = capture_fixture(monkeypatch)
-    proposer._aux_extract = None
+    proposer.aux_extract = None
 
     def extract(output, block):
         return output.residual.mean(-2).squeeze(0)
 
     proposer._aux_capture_spec = lambda _: AuxCaptureSpec((0,), 8, extract)
     proposer.arm_aux_capture(target)
-    assert proposer._aux_extract is extract
+    assert proposer.aux_extract is extract

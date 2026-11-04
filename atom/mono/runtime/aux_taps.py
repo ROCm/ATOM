@@ -33,8 +33,9 @@ class AuxTaps:
 
     ``extract`` is the drafter's own ``(layer_output, layer) -> tap`` function,
     the one its hooks run (``AuxCaptureSpec.extract``); ``None`` where the
-    drafter armed none, and a model that has no layer return to hand it reads
-    only the buffers.
+    drafter armed none. A model that has no layer return to hand it computes
+    the tap in its kernels instead, and binds with the one extract those
+    kernels reproduce (``bind_aux_taps``).
     """
 
     layer_ids: tuple[int, ...]
@@ -55,7 +56,16 @@ class AuxTaps:
         self.buffers[self.layer_ids.index(layer_id)][: tap.shape[0]].copy_(tap)
 
 
-def bind_aux_taps(drafter, hidden_size: int) -> AuxTaps:
+def bind_aux_taps(
+    drafter, hidden_size: int, kernel_extract: Callable | None = None
+) -> AuxTaps:
+    """The drafter's taps, for a runner whose mono step writes them.
+
+    ``kernel_extract`` is for a runner that never calls ``AuxTaps.extract``
+    and computes the tap in its own kernels: the one extract those kernels
+    reproduce. Any other extract the drafter armed is refused, since its
+    production steps would then feed the draft a different feature than the
+    mono steps do."""
     # the layer ids the drafter armed its hooks from (DSparkProposer._aux_capture_spec)
     draft_config = drafter.speculative_config.draft_model_hf_config
     layer_ids = tuple(
@@ -73,4 +83,10 @@ def bind_aux_taps(drafter, hidden_size: int) -> AuxTaps:
             raise MonoUnsupported(f"aux buffer {tuple(buf.shape)} {buf.stride()}")
         if buf.dtype != torch.bfloat16:
             raise MonoUnsupported(f"aux buffer {buf.dtype}")
-    return AuxTaps(layer_ids, buffers, getattr(drafter, "_aux_extract", None))
+    extract = drafter.aux_extract
+    if kernel_extract is not None and extract not in (None, kernel_extract):
+        raise MonoUnsupported(
+            f"the drafter's aux extract {getattr(extract, '__qualname__', extract)}"
+            " is not the one this model's mono kernels compute"
+        )
+    return AuxTaps(layer_ids, buffers, extract)

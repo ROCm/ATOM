@@ -185,7 +185,9 @@ class Drafter(abc.ABC):
         # Drafter-owned aux capture state (armed by arm_aux_capture).
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
-        self._aux_extract: Callable | None = None
+        # the extract the hooks run; a mono step that writes the taps itself
+        # calls it too (`AuxTaps.extract`)
+        self.aux_extract: Callable | None = None
 
         self.metadata_buffers = self._allocate_metadata_buffers(
             self.config.max_num_seqs, self.mtp_k, self.device
@@ -384,8 +386,7 @@ class Drafter(abc.ABC):
         spec = self._aux_capture_spec(target_model)
         if spec is None:
             return
-        # a mono step bypasses the hooks and calls this itself (`AuxTaps.extract`)
-        self._aux_extract = spec.extract
+        self.aux_extract = spec.extract
         self._aux_buffers = [
             torch.zeros(
                 self.max_num_tokens,

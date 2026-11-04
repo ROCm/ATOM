@@ -573,10 +573,11 @@ def _aux_drafter(**extra):
     import torch
 
     config = SimpleNamespace(dspark_target_layer_ids=(1, 3))
+    fields = {"aux_extract": None, **extra}
     return SimpleNamespace(
         speculative_config=SimpleNamespace(draft_model_hf_config=config),
         _aux_buffers=[torch.zeros(4, 8, dtype=torch.bfloat16) for _ in range(2)],
-        **extra,
+        **fields,
     )
 
 
@@ -586,7 +587,7 @@ def test_bind_aux_taps_carries_the_drafters_extract():
     def extract(output, layer):
         return output[0]
 
-    taps = bind_aux_taps(_aux_drafter(_aux_extract=extract), 8)
+    taps = bind_aux_taps(_aux_drafter(aux_extract=extract), 8)
     assert taps.layer_ids == (1, 3)
     assert taps.extract is extract
 
@@ -596,3 +597,55 @@ def test_bind_aux_taps_without_an_extract_leaves_it_unset():
 
     assert bind_aux_taps(_aux_drafter(), 8).extract is None
     assert AuxTaps((), ()).extract is None
+
+
+def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
+    """A runner that writes the taps from its kernels never calls ``extract``,
+    so a drafter armed with another one would draft from two features."""
+    from atom.mono.runtime.aux_taps import bind_aux_taps
+    from atom.mono.runtime.consensus import MonoUnsupported
+
+    def kernel(output, layer):
+        return output[0]
+
+    def other(output, layer):
+        return output[1]
+
+    with pytest.raises(MonoUnsupported, match="aux extract"):
+        bind_aux_taps(_aux_drafter(aux_extract=other), 8, kernel)
+    assert bind_aux_taps(_aux_drafter(aux_extract=kernel), 8, kernel).extract is kernel
+    assert bind_aux_taps(_aux_drafter(), 8, kernel).extract is None
+    # a runner that calls the extract itself takes any
+    assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other
+
+
+@pytest.mark.parametrize(
+    "runner, kernel_extract",
+    [
+        (
+            "models/deepseek_v41/mono/runner.py",
+            "DeepseekV41DSpark._target_layer_input",
+        ),
+        (
+            "models/minimax_m3/mono/runner.py",
+            "DSparkProposer._extract_layer_hidden",
+        ),
+    ],
+)
+def test_kernel_tap_runners_bind_the_extract_they_compute(runner, kernel_extract):
+    """V4.1 and MiniMax-M3 write the taps from their kernels and never call
+    ``AuxTaps.extract``; each binds with the extract those kernels reproduce,
+    so ``bind_aux_taps`` refuses any other. Read from the source because the
+    runners need the GPU stack to import."""
+    tree = ast.parse((FRAMEWORK.parent / runner).read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "bind_aux_taps"
+    ]
+    assert calls
+    for call in calls:
+        assert len(call.args) == 3
+        assert ast.unparse(call.args[2]) == kernel_extract
