@@ -114,8 +114,14 @@ def prepare_multimodal_inputs(
     builder = get_multimodal_input_builder(
         atom_config, is_text_prompt=isinstance(prompt, str)
     )
-    media = load_multimodal_data(media_items, media_loader or MediaLoader())
-    images = media["image"]
+    loader = media_loader or MediaLoader()
+    if getattr(builder, "keeps_alpha", False):
+        # The builder's processor fills transparent backgrounds itself.
+        images = [
+            loader.load_image(item, keep_alpha=True) for item in media_items["image"]
+        ]
+    else:
+        images = load_multimodal_data(media_items, loader)["image"]
     if not isinstance(prompt, str):
         prompt = _bind_images_to_messages(prompt, images)
     return builder(

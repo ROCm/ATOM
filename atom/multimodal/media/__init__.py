@@ -29,8 +29,8 @@ class MediaLoader:
     def __init__(self, timeout: float = 30):
         self.connector = MediaConnector(timeout)
 
-    def load_image(self, data: ImageItem):
-        return load_image(data, self.connector)
+    def load_image(self, data: ImageItem, *, keep_alpha: bool = False):
+        return load_image(data, self.connector, keep_alpha=keep_alpha)
 
     def load_audio(self, data: AudioItem) -> AudioData:
         if isinstance(data, tuple):

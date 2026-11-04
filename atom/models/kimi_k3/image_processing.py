@@ -95,3 +95,8 @@ def build_kimi_k3_inputs(
     }
     multimodal_data["cache_seed"] = multimodal_cache_seed(multimodal_data)
     return input_ids, multimodal_data
+
+
+# KimiK3Processor fills transparent backgrounds with its configured
+# ``transparent_bg`` setting, so it needs the alpha channel.
+build_kimi_k3_inputs.keeps_alpha = True
