@@ -1952,10 +1952,12 @@ def _check_m3_mxfp4(
             "ATOM_M3_SPARSE_KV_MXFP4 needs sparse_local_block >= 1, "
             f"got {sparse_local_block}"
         )
-    from aiter.jit.utils.chip_info import get_gfx
+    # The live GPU, not `get_gfx()`, which follows GPU_ARCHS (a build setting).
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    if get_gfx() != "gfx950":
-        raise ValueError(f"MXFP4 KV / index caches need gfx950, got {get_gfx()}")
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        raise ValueError(f"MXFP4 KV / index caches need gfx950, got {arch}")
 
 
 def indexer_cp_unsupported_reason(

@@ -336,7 +336,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # with -inf once in `make_sparse_decode_metadata` (fp32: 32 KiB a row and
             # index head at a 1M model length, so 128 MiB at TP4's one head and 512
             # x 8 rows, 1 GiB at 8 heads). Allocated before the KV budget is sized, so
-            # the budget counts it as overhead and the cache shrinks by it.
+            # the budget counts it as overhead and the cache shrinks by it. decode TBO
+            # adds one pair a ubatch (`_allocate_ubatch_buffers`), one row a request.
             self.model_runner.forward_vars["sparse_attention_index_score_buf"] = (
                 index_score_buffer(
                     self.max_bs * max_qlen,
@@ -468,6 +469,38 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 var[f"{p}sparse_attention_n_valid_column_per_row"] = torch.empty(
                     self._num_idx_heads * ub_max_bs * max_seqlen_qo, **i32_kwargs
                 )
+                if (
+                    self._index_score_max_block
+                    and self.model_runner.config.enable_tbo_decode
+                ):
+                    # The MXFP4 scorer's map and scores, per ubatch for the same
+                    # reason; only a decode TBO runs them (`enable_tbo` alone is
+                    # the prefill split). A ubatch is one token a request (the
+                    # sparse TBO decode raises above that), so q == 1 here
+                    # whatever `max_seqlen_qo` is.
+                    from atom.model_ops.minimax_m3.index_mxfp4 import (
+                        index_score_buffer,
+                        index_work_map_capacity,
+                    )
+
+                    var[f"{p}sparse_attention_index_score_work_map"] = torch.empty(
+                        (
+                            index_work_map_capacity(
+                                ub_max_bs,
+                                self._index_score_max_block,
+                                1,
+                                self._num_idx_heads,
+                            ),
+                            2,
+                        ),
+                        **i32_kwargs,
+                    )
+                    var[f"{p}sparse_attention_index_score_buf"] = index_score_buffer(
+                        ub_max_bs,
+                        self._num_idx_heads,
+                        self._index_score_max_block,
+                        self.device,
+                    )
 
             # PA work buffers per ubatch (GPU only)
             var[f"{p}work_meta_data"] = torch.empty(
@@ -819,22 +852,20 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             f"{prefix}sparse_attention_n_valid_column_per_row"
         ]
 
-    def _index_score_work_map_kwargs(self, seq_lens: torch.Tensor) -> dict:
+    def _index_score_work_map_kwargs(self, prefix: str = "") -> dict:
         """The MXFP4 decode scorer's persistent map, score storage and the map's
         bound, for `make_sparse_decode_metadata`; nothing for any other index cache.
-        ``seq_lens`` is every row the scorer runs: a replayed graph's padded batch."""
-        buf = self.model_runner.forward_vars.get(
-            "sparse_attention_index_score_work_map"
-        )
+        `prefix` selects the ubatch's pair (`ub<i>_`): both ubatches' metadata are
+        alive at once on one stream, so a shared pair would be overwritten by the
+        second before the first one's layers ran."""
+        var = self.model_runner.forward_vars
+        buf = var.get(f"{prefix}sparse_attention_index_score_work_map")
         if buf is None:
             return {}
         return {
             "index_score_work_map_out": buf,
             "index_score_max_block": self._index_score_max_block,
-            "index_score_buf": self.model_runner.forward_vars[
-                "sparse_attention_index_score_buf"
-            ],
-            "index_score_seq_lens": seq_lens,
+            "index_score_buf": var[f"{prefix}sparse_attention_index_score_buf"],
         }
 
     def _get_sparse_attention_block_tables(
@@ -1381,6 +1412,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.context_lens
         )
         if self._has_sparse_attention:
+            from atom.model_ops.minimax_m3.index_mxfp4 import index_batch
             from atom.model_ops.minimax_m3.sparse_attn import (
                 make_sparse_decode_metadata,
             )
@@ -1388,10 +1420,15 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Plain decode (q==1) and eagle3 spec-verify (q==num_spec+1) both run
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
+            # Every index cache: the selector's bounds are laid out head-major over
+            # the rows the captured scorer runs, whichever cache scored them.
+            index_bs = index_batch(
+                scheduled_bs, running_bs, running_tokens, max_seqlen_q
+            )
             sparse_block_tables = self._get_sparse_attention_block_tables(
-                attn_metadata.block_tables[:scheduled_bs],
-                attn_metadata.context_lens[:scheduled_bs],
-                scheduled_bs,
+                attn_metadata.block_tables[:index_bs],
+                attn_metadata.context_lens[:index_bs],
+                index_bs,
             )
             # token -> request, -1 on the graph's pad tail: the mono kernels keep
             # a pad row out of every cross-row decision (``row_live``)
@@ -1400,14 +1437,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 pad_to=running_tokens,
             )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
-                seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                seq_lens=attn_metadata.context_lens[:index_bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
                 max_query_len=int(max_seqlen_q),
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_score_work_map_kwargs(attn_metadata.context_lens),
+                **self._index_score_work_map_kwargs(),
             )
         mrope_positions = self._build_mrope_decode_positions(
             batch, context_lens, max_seqlen_q, running_tokens=running_tokens
@@ -1611,6 +1648,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_seq_len=attn.max_seqlen_k,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
+                **self._index_score_work_map_kwargs(p),
             )
         return attn
 
@@ -1661,7 +1699,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=max_q_len,
                 num_idx_heads=self._num_idx_heads,
                 n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(),
-                **self._index_score_work_map_kwargs(seq_lens),
+                **self._index_score_work_map_kwargs(),
             )
 
         positions = var["positions"].copy_to_gpu(scheduled_tokens)

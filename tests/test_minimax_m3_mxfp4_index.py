@@ -26,7 +26,7 @@ TOPK, HEADS, DIM = 16, 1, 128
 SM_SCALE = DIM**-0.5
 
 
-def make_case(batch, S, seed, max_len=128 * 70, fp8_q=False):
+def make_case(batch, S, seed, max_len=128 * 70, fp8_q=False, heads=HEADS):
     g = torch.Generator(device="cuda").manual_seed(seed)
     seq = torch.randint(S + 1, max_len, (batch,), device="cuda", generator=g)
     seq[0] = max_len  # one full-length request
@@ -47,7 +47,7 @@ def make_case(batch, S, seed, max_len=128 * 70, fp8_q=False):
             for _ in range(batch)
         ]
     ).to(torch.int32)
-    q = torch.randn(batch * S, HEADS, DIM, device="cuda", generator=g) * 0.7
+    q = torch.randn(batch * S, heads, DIM, device="cuda", generator=g) * 0.7
     q = q.to(torch.float8_e4m3fn) if fp8_q else q.to(torch.bfloat16)
     return cache, table, seq.to(torch.int32), q
 
@@ -375,7 +375,7 @@ def test_the_decode_metadata_refills_the_score_view_once():
     assert make_sparse_decode_metadata(**kw).index_score_out is None
 
 
-def test_a_padded_replay_builds_the_map_and_scores_of_the_captured_batch():
+def test_a_padded_step_builds_the_map_and_scores_of_the_padded_batch():
     """A graph captured at 8 requests replays 3 scheduled ones: its scorer's grid,
     the map's encoding and the score view's strides are the 8-request batch's, so
     the metadata is built from the 8 lengths, the 5 pad ones 0."""
@@ -387,9 +387,8 @@ def test_a_padded_replay_builds_the_map_and_scores_of_the_captured_batch():
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
     batch, running, S, bound = 3, 8, 8, 64
-    seq = torch.tensor([300, 1000, 5000], dtype=torch.int32, device="cuda")
     padded = torch.zeros(running, dtype=torch.int32, device="cuda")
-    padded[:batch] = seq
+    padded[:batch] = torch.tensor([300, 1000, 5000], dtype=torch.int32)
     sbuf = index_score_buffer(running * S, HEADS, bound, "cuda")
     sbuf.fill_(1.0)
     wmap = torch.empty(
@@ -398,22 +397,21 @@ def test_a_padded_replay_builds_the_map_and_scores_of_the_captured_batch():
         device="cuda",
     )
     md = make_sparse_decode_metadata(
-        seq_lens=seq,
-        block_table=torch.zeros((batch, bound), dtype=torch.int32, device="cuda"),
-        slot_mapping=torch.zeros(batch * S, dtype=torch.int64, device="cuda"),
+        seq_lens=padded,
+        block_table=torch.zeros((running, bound), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(running * S, dtype=torch.int64, device="cuda"),
         max_seq_len=5000,
         num_idx_heads=HEADS,
         max_query_len=S,
         index_score_work_map_out=wmap,
         index_score_max_block=bound,
         index_score_buf=sbuf,
-        index_score_seq_lens=padded,
     )
     want = build_index_work_map(
         padded, max_block=bound, max_query_len=S, num_idx_heads=HEADS
     )
     scheduled = build_index_work_map(
-        seq, max_block=bound, max_query_len=S, num_idx_heads=HEADS
+        padded[:batch], max_block=bound, max_query_len=S, num_idx_heads=HEADS
     )
     assert want.shape[0] > scheduled.shape[0]
     assert torch.equal(md.index_score_work_map, want)
@@ -421,38 +419,171 @@ def test_a_padded_replay_builds_the_map_and_scores_of_the_captured_batch():
     assert bool((md.index_score_out == float("-inf")).all())
 
 
-def test_a_padded_replay_publishes_the_selector_bounds_of_the_captured_batch():
+def test_a_padded_step_publishes_the_selector_bounds_of_the_padded_batch():
     """The selector reads `heads * running_bs * S` bounds head-major, from offsets
     baked at capture: TP2 (2 index heads) scheduled 3 of 8 rows must lay head 1 out
     at 8, not at 3."""
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
     heads, scheduled, running, bound = 2, 3, 8, 1024
-    seq = torch.tensor([300, 1000, 5000], dtype=torch.int32, device="cuda")
     padded = torch.zeros(running, dtype=torch.int32, device="cuda")
-    padded[:scheduled] = seq
+    padded[:scheduled] = torch.tensor([300, 1000, 5000], dtype=torch.int32)
     md = make_sparse_decode_metadata(
-        seq_lens=seq,
-        block_table=torch.zeros((scheduled, bound), dtype=torch.int32, device="cuda"),
-        slot_mapping=torch.zeros(scheduled, dtype=torch.int64, device="cuda"),
+        seq_lens=padded,
+        block_table=torch.zeros((running, bound), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.zeros(running, dtype=torch.int64, device="cuda"),
         max_seq_len=bound * 128,
         num_idx_heads=heads,
         max_query_len=1,
-        index_score_seq_lens=padded,
     )
     got = md.n_valid_column_per_row.view(heads, running).cpu()
     want = torch.tensor([3, 8, 40, 0, 0, 0, 0, 0], dtype=torch.int32)
     assert torch.equal(got, want.expand(heads, running))
-    # unpadded: the scheduled batch's own bounds, as before
-    md = make_sparse_decode_metadata(
+
+
+# What a pad row's block-table entries hold: the builder zero-fills them, so zero
+# is what runs; the poison is a page id no cache has, so a run that passes with it
+# never dereferenced a pad row's table.
+PAD_FILLS = [pytest.param(0, id="zero"), pytest.param(0x7FFFFFFF, id="poison")]
+
+
+def _pad(table, seq, q, S, running, fill):
+    """The scheduled rows of a step, then `running - scheduled` pad rows the way the
+    builder publishes them: length 0, a filled block-table row, zero activations."""
+    n = seq.shape[0]
+    t = torch.full((running, table.shape[1]), fill, dtype=table.dtype, device="cuda")
+    s = torch.zeros(running, dtype=seq.dtype, device="cuda")
+    x = torch.zeros((running * S, *q.shape[1:]), dtype=q.dtype, device="cuda")
+    t[:n], s[:n], x[: n * S] = table, seq, q
+    return t, s, x
+
+
+def _assert_pad_rows_are_empty(got, live, heads):
+    """What the sparse attention is handed for a pad row: nothing. A context of
+    exactly 0 (never negative: decode kernels take 0 <= context) and page id 0,
+    whatever the pad row's block table holds. The emitted rows are token-major,
+    head-minor, so `live` request tokens are `live * heads` rows."""
+    _, sbt, sctx = got
+    assert int(sctx[live * heads :].abs().max()) == 0, "a pad row has a context"
+    assert int(sbt[live * heads :].abs().max()) == 0, "a pad row names a page"
+
+
+def _assert_live_rows_match(got, want, live, heads):
+    assert torch.equal(got[0][:, :live], want[0])
+    assert torch.equal(got[1][: live * heads], want[1])
+    assert torch.equal(got[2][: live * heads], want[2])
+
+
+def _metadata(table, seq, S, wbuf, sbuf, nvalid, heads=HEADS):
+    """What the builder refills each step, outside any graph."""
+    from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+    bound = table.shape[1]
+    return make_sparse_decode_metadata(
         seq_lens=seq,
-        block_table=torch.zeros((scheduled, bound), dtype=torch.int32, device="cuda"),
-        slot_mapping=torch.zeros(scheduled, dtype=torch.int64, device="cuda"),
+        block_table=table,
+        slot_mapping=torch.zeros(seq.shape[0] * S, dtype=torch.int64, device="cuda"),
         max_seq_len=bound * 128,
         num_idx_heads=heads,
-        max_query_len=1,
+        max_query_len=S,
+        n_valid_column_per_row_out=nvalid,
+        index_score_work_map_out=wbuf,
+        index_score_max_block=bound,
+        index_score_buf=sbuf,
     )
-    assert torch.equal(
-        md.n_valid_column_per_row.view(heads, scheduled).cpu(),
-        want[:scheduled].expand(heads, scheduled),
+
+
+def _select(q, cache, table, seq, S, md, heads=HEADS):
+    """The decode selection as the attention layer calls it."""
+    from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+
+    bound = table.shape[1]
+    return minimax_m3_index_topk_decode(
+        q, cache, table, seq, bound * 128, TOPK, 0, 1, heads, SM_SCALE,
+        emit_sparse_block_table=True, max_query_len=S, block_page_stride=1,
+        index_mxfp4=True, pages_per_block=1,
+        n_valid_column_per_row=md.n_valid_column_per_row,
+        index_score_work_map=md.index_score_work_map,
+        index_score_max_block=md.index_score_max_block,
+        index_score_out=md.index_score_out,
+    )  # fmt: skip
+
+
+def _buffers(running, S, bound, heads=HEADS):
+    from atom.model_ops.minimax_m3.index_mxfp4 import (
+        index_score_buffer,
+        index_work_map_capacity,
     )
+
+    wbuf = torch.empty(
+        (index_work_map_capacity(running, bound, S, heads), 2),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    sbuf = index_score_buffer(running * S, heads, bound, "cuda")
+    nvalid = torch.empty(heads * running * S, dtype=torch.int32, device="cuda")
+    return wbuf, sbuf, nvalid
+
+
+@pytest.mark.parametrize("fill", PAD_FILLS)
+@pytest.mark.parametrize("heads", [1, 2])
+@pytest.mark.parametrize("S", [1, 8])
+@pytest.mark.parametrize("scheduled", [0, 1, 3])
+def test_a_padded_eager_step_selects_like_the_scheduled_batch(
+    S, heads, scheduled, fill
+):
+    """An eager step padded for DP runs `running_bs` rows of idx_q: the scorer takes
+    its batch off them, so lengths and block table hold pad rows too, and the rows
+    that are real select what they do unpadded."""
+    running = 8
+    cache, table, seq, q = make_case(max(scheduled, 1), S, seed=70 + S, heads=heads)
+    table, seq, q = table[:scheduled], seq[:scheduled], q[: scheduled * S]
+    bound = table.shape[1]
+    pt, ps, pq = _pad(table, seq, q, S, running, fill)
+    bufs = _buffers(running, S, bound, heads)
+    got = _select(pq, cache, pt, ps, S, _metadata(pt, ps, S, *bufs, heads), heads)
+    if scheduled:
+        bufs = _buffers(scheduled, S, bound, heads)
+        md = _metadata(table, seq, S, *bufs, heads)
+        want = _select(q, cache, table, seq, S, md, heads)
+        _assert_live_rows_match(got, want, scheduled * S, heads)
+    _assert_pad_rows_are_empty(got, scheduled * S, heads)
+
+
+@pytest.mark.parametrize("fill", PAD_FILLS)
+@pytest.mark.parametrize("heads", [1, 2])
+@pytest.mark.parametrize("S", [1, 8])
+def test_a_graph_replays_a_padded_step_like_the_scheduled_batch(S, heads, fill):
+    """Captured at 8 requests, replayed with 3 scheduled and 5 pad rows: the
+    metadata refilled outside the graph is the padded batch's."""
+    running, scheduled = 8, 3
+    cache, table, seq, q = make_case(running, S, seed=80 + S, heads=heads)
+    bound = table.shape[1]
+    wbuf, sbuf, nvalid = _buffers(running, S, bound, heads)
+    static = [x.clone() for x in (table, seq, q)]
+
+    def refill():
+        return _metadata(static[0], static[1], S, wbuf, sbuf, nvalid, heads)
+
+    def run(md):
+        return _select(static[2], cache, static[0], static[1], S, md, heads)
+
+    md = refill()
+    run(md)  # JIT outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = run(md)
+    t, s, x = _pad(
+        table[:scheduled], seq[:scheduled], q[: scheduled * S], S, running, fill
+    )
+    for dst, src in zip(static, (t, s, x)):
+        dst.copy_(src)
+    refill()  # the builder's per-step refill, outside the graph
+    graph.replay()
+    torch.cuda.synchronize()
+    bufs = _buffers(scheduled, S, bound, heads)
+    md = _metadata(table[:scheduled], seq[:scheduled], S, *bufs, heads)
+    want = _select(q[: scheduled * S], cache, table[:scheduled], seq[:scheduled], S, md, heads)  # fmt: skip
+    _assert_live_rows_match(got, want, scheduled * S, heads)
+    _assert_pad_rows_are_empty(got, scheduled * S, heads)

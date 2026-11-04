@@ -567,9 +567,10 @@ class TestSelectWithAiter:
         assert served != transposed and len(calls) == int(not transposed)
 
 
-def test_a_padded_replay_bounds_the_captured_batch_head_major(monkeypatch):
-    """TP2 (2 index heads), 3 of 8 captured rows scheduled: the selector reads head 1
-    at offset 8 * S, so the bounds are built from the 8 padded lengths."""
+def test_a_padded_step_bounds_the_scorer_batch_head_major(monkeypatch):
+    """TP2 (2 index heads), 3 of 8 rows scheduled: the selector reads head 1 at
+    offset 8 * S, so the bounds are built over the 8 padded lengths the builder hands
+    `make_sparse_decode_metadata` (pad rows 0), not over the 3 scheduled ones."""
     from atom.model_ops.minimax_m3 import sparse_attn
 
     calls = []
@@ -578,18 +579,16 @@ def test_a_padded_replay_bounds_the_captured_batch_head_major(monkeypatch):
         "build_n_valid_column_per_row",
         lambda starts, prefix, **kw: calls.append((starts, prefix, kw)),
     )
-    seq = torch.tensor([300, 1000, 5000], dtype=torch.int32)
     padded = torch.zeros(8, dtype=torch.int32)
-    padded[:3] = seq
+    padded[:3] = torch.tensor([300, 1000, 5000], dtype=torch.int32)
     kw = {"block_table": None, "slot_mapping": None, "max_seq_len": 1}
     kw |= {"num_idx_heads": 2, "max_query_len": 1}
-    sparse_attn.make_sparse_decode_metadata(
-        seq_lens=seq, index_score_seq_lens=padded, **kw
-    )
-    sparse_attn.make_sparse_decode_metadata(seq_lens=seq, **kw)
+    sparse_attn.make_sparse_decode_metadata(seq_lens=padded, **kw)
+    sparse_attn.make_sparse_decode_metadata(seq_lens=padded[:3], **kw)
     (starts, prefix, padded_kw), (_, _, plain_kw) = calls
     assert starts is padded and prefix is padded
     assert (padded_kw["batch"], padded_kw["total_q"]) == (8, 8)
+    assert padded_kw["num_idx_heads"] == 2
     assert (plain_kw["batch"], plain_kw["total_q"]) == (3, 3)
 
 
@@ -634,6 +633,102 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     )
     assert torch.equal(ait_ctx, tri_ctx)
     assert torch.equal(ait_bt, tri_bt)
+
+
+def test_the_small_k_selector_is_importable_at_the_installed_aiter():
+    """The flat module is an older aiter's, the `topk` package a newer one's: with
+    either installed the selector must be bound, or the dispatch silently never
+    leaves Triton."""
+    import importlib
+
+    for name in (
+        "aiter.ops.flydsl.topk.topk_per_row_small_k",
+        "aiter.ops.flydsl.topk_per_row_small_k",
+    ):
+        try:
+            mod = importlib.import_module(name)
+        except ImportError:
+            continue
+        assert m.topk_per_row_small_k is not None
+        assert m.topk_per_row_small_k_supported is not None
+        # whichever module served the import, it is the one aiter ships
+        assert m.topk_per_row_small_k.__module__ in (name, mod.__name__)
+        return
+    pytest.skip("this aiter has no small-k selector")
+
+
+@gpu
+@pytest.mark.parametrize("width", [70, m._AITER_MIN_WIDTH_WITH_EMIT + 252])
+@pytest.mark.parametrize("heads", [1, 2])
+@pytest.mark.parametrize("S", [1, 8])
+def test_pad_rows_of_a_padded_step_emit_nothing_and_live_rows_are_unchanged(
+    monkeypatch, S, heads, width
+):
+    """Decode selection + emission over a step padded from 3 to 6 requests (pad rows
+    length 0, a poisoned block table), on both selectors. A pad row has no causal
+    key: it emits context 0 and page 0 and never reads its table; a live row's
+    context is the closed form of what the selection holds. The wide case is the one
+    `_aiter_selector_wins` hands to aiter's selector: it must actually serve it, and
+    agree with Triton."""
+    live_lens = [width * SPARSE_BLOCK_SIZE - 5, 300 + S, 9 * SPARSE_BLOCK_SIZE + S]
+    batch, live = 6, len(live_lens)
+    dev = "cuda"
+    seq = torch.zeros(batch, dtype=torch.int32, device=dev)
+    seq[:live] = torch.tensor(live_lens, dtype=torch.int32)
+    table = torch.full((batch, width), 0x7FFFFFFF, dtype=torch.int32, device=dev)
+    table[:live] = torch.randperm(10_000, device=dev)[: live * width].reshape(live, -1).int()  # fmt: skip
+    total_q = batch * S
+    g = torch.Generator(device=dev).manual_seed(7 * S + heads)
+    score = torch.randn(heads, total_q, width, generator=g, device=dev)
+    nvalid = m.build_n_valid_column_per_row(
+        seq, seq, batch=batch, total_q=total_q, num_idx_heads=heads, decode_max_q=S
+    )
+
+    served = []
+    real = m.topk_per_row_small_k
+    if real is not None:
+        monkeypatch.setattr(
+            m, "topk_per_row_small_k", lambda *a: (served.append(1), real(*a))[1]
+        )
+    monkeypatch.setattr(m, "_AITER_SERVES", {})
+
+    def run(bounds):
+        topk_idx = torch.empty((heads, total_q, TOPK), dtype=torch.int32, device=dev)
+        (sbt, sctx), args = m._alloc_emit(total_q, heads, TOPK, table, True, dev, 1)
+        m._launch_select(
+            score, topk_idx, seq, seq, batch, TOPK, 0, 1, table, (sbt, sctx, *args[2:]),
+            heads, rows_per_req=S, decode_max_q=S,
+            block_size_k=m.DECODE_TOPK_BLOCK_SIZE_K, num_warps=m.DECODE_TOPK_NUM_WARPS,
+            emit=True, block_page_stride=1, n_valid_column_per_row=bounds,
+            pages_per_block=1,
+        )  # fmt: skip
+        return topk_idx, sbt, sctx
+
+    tri_idx, tri_bt, tri_ctx = run(None)
+    assert not served
+    ait_idx, ait_bt, ait_ctx = run(nvalid)
+    if width >= m._AITER_MIN_WIDTH_WITH_EMIT:
+        if real is None:
+            pytest.skip("aiter's small-k selector is not installed")
+        assert served, "the wide row was not served by aiter's selector"
+    rows = heads * total_q
+    assert torch.equal(
+        torch.sort(ait_idx.reshape(rows, TOPK), dim=1).values,
+        torch.sort(tri_idx.reshape(rows, TOPK), dim=1).values,
+    )
+    for bt, ctx in ((tri_bt, tri_ctx), (ait_bt, ait_ctx)):
+        n = live * S * heads
+        # live rows (token-major, head-minor): the closed form of the context
+        for r in range(live * S):
+            b, t = divmod(r, S)
+            causal = live_lens[b] - S + t + 1
+            last = (causal - 1) // SPARSE_BLOCK_SIZE
+            want = (min(TOPK, last + 1) - 1) * SPARSE_BLOCK_SIZE + causal - last * SPARSE_BLOCK_SIZE  # fmt: skip
+            assert ctx[r * heads : (r + 1) * heads].tolist() == [want] * heads
+        # pad rows: nothing, and no poisoned page id got out
+        assert int(ctx[n:].abs().max()) == 0 and int(bt[n:].abs().max()) == 0
+        assert int(bt[:n].max()) < 10_000 * 8 * heads
+    assert torch.equal(ait_ctx, tri_ctx) and torch.equal(ait_bt, tri_bt)
 
 
 @gpu

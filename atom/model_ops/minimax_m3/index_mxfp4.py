@@ -34,6 +34,23 @@ def _flydsl(name):
         ) from e
 
 
+def index_batch(scheduled_bs, running_bs, running_tokens, max_query_len):
+    """Requests the decode scorer and selector run, for every index cache: they take
+    their batch off the rows of ``idx_q``, which a padded step (a graph bucket, or an
+    eager step padded for DP) runs more of than were scheduled -- the pad requests
+    have length 0 and dispatch nothing -- and the selector's bounds are laid out
+    head-major over those rows. ``running_tokens`` rows of ``max_query_len`` tokens
+    are that many requests; anything that is not between the scheduled and the
+    padded batch is a builder bug, refused rather than clamped."""
+    batch, rem = divmod(running_tokens, max_query_len)
+    if rem or not scheduled_bs <= batch <= running_bs:
+        raise ValueError(
+            f"index decode: {running_tokens} rows of {max_query_len} query "
+            f"tokens is not {scheduled_bs}..{running_bs} requests"
+        )
+    return batch
+
+
 def index_work_map_capacity(max_batch, max_block, max_query_len, num_idx_heads):
     """Rows of a persistent work-map buffer serving every batch up to
     ``max_batch`` (the exact grid is not monotonic in the batch)."""

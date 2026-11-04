@@ -89,7 +89,7 @@ def test_only_the_128_page_of_head_dim_128_is_a_pool(kw):
 def chip_info(monkeypatch):
     """The architecture query: CI has no aiter, and a GPU host's answer is its own."""
     mod = types.ModuleType("aiter.jit.utils.chip_info")
-    mod.get_gfx = lambda: "gfx950"
+    mod.get_gfx_runtime = lambda: "gfx950"
     monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", mod)
     return mod
 
@@ -116,7 +116,7 @@ def test_refusals_name_what_is_wrong():
 
 
 def test_only_gfx950_is_served(chip_info):
-    chip_info.get_gfx = lambda: "gfx942"
+    chip_info.get_gfx_runtime = lambda: "gfx942"
     with pytest.raises(ValueError, match="gfx950, got gfx942"):
         check()
 

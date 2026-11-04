@@ -34,10 +34,18 @@ try:
     # It narrows in one pass where Triton folds tl.topk over
     # ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens
     # -- 7us against 36us at a 1M context. `_aiter_selector_wins` says where.
-    from aiter.ops.flydsl.topk_per_row_small_k import (
-        topk_per_row_small_k,
-        topk_per_row_small_k_supported,
-    )
+    # A newer aiter keeps it in the `topk` package; the flat module is an older
+    # aiter's, the same functions.
+    try:
+        from aiter.ops.flydsl.topk.topk_per_row_small_k import (
+            topk_per_row_small_k,
+            topk_per_row_small_k_supported,
+        )
+    except ImportError:
+        from aiter.ops.flydsl.topk_per_row_small_k import (
+            topk_per_row_small_k,
+            topk_per_row_small_k_supported,
+        )
 except ImportError:  # pragma: no cover - aiter is optional at import time
     topk_per_row_small_k = None
     topk_per_row_small_k_supported = None
@@ -178,7 +186,10 @@ def _emit_sparse_block_table_row(
     bt_ctx = tl.where(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
-    tl.store(sctx_ptr, bt_ctx)
+    # A pad row of a padded step (length 0) has no causal key: causal_len <= 0
+    # makes the count above negative, and a context below zero is outside what the
+    # decode kernels take. A live row has causal_len >= 1 and a positive count.
+    tl.store(sctx_ptr, tl.maximum(bt_ctx, 0))
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +959,8 @@ def _topk_index_packed_kernel(
     valid_blocks = (prefix_len + pid_q * sample_interval + block_size) // block_size
     local_start = tl.maximum(0, valid_blocks - local_blocks)
 
-    # valid_blocks >= 1 always, so the first tile is unconditional and the loop
+    # valid_blocks >= 1 for a live row (a pad row's is 0, and selects nothing: its
+    # `topk_idx` is all -1 below), so the first tile is unconditional and the loop
     # covers only the rows long enough to need a second one. Folding it into the
     # loop instead would cost the single-tile rows -- the common case -- one
     # extra cat and topk against an all-padding vector. (The two argument lists
