@@ -620,9 +620,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 mono: the NEXT MLA layer's prep glue as tail stages of the
     # preceding layer's K2 (kernels/stages/mla_prep.py): 1 the attention seam +
     # per-token FP8 quant (P0); 2 also the fused q_a/kv_a projection and its
-    # two RMSNorms (P1 / P2); 3 (also q_b, the absorb BMM, rope and the FP8
-    # KV-cache write) is not ported to this mono yet and is refused. Not
-    # bit-identical (row-reduction / GEMM order). 0 (default) is off.
+    # two RMSNorms (P1 / P2); 3 also q_b, the absorb BMM, rope and the FP8
+    # KV-cache write (P3 .. P5). Not bit-identical (row-reduction / GEMM
+    # order). 0 (default) is off.
     "ATOM_MONO_MLA_PREP": lambda: os.getenv("ATOM_MONO_MLA_PREP", "0"),
     # Debug: with ATOM_MONO_MLA_PREP, run the production prep next to the stages
     # on the same inputs and log what differs (rank 0; synchronizes). Use with

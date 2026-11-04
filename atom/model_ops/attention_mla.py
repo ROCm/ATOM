@@ -3264,10 +3264,11 @@ class MLAAttention(nn.Module):
         if forward_context.context.is_dummy_run:
             atom_config = get_current_atom_config()
             width = _mla_output_width(self, atom_config.hf_config.hidden_size)
+            shape = (q_out.shape[0], width)
+            if latent_out:
+                shape = (q_out.shape[0], self.num_heads, self.kv_lora_rank)
             return torch.empty(
-                (q_out.shape[0], width),
-                dtype=atom_config.torch_dtype,
-                device=q_out.device,
+                shape, dtype=atom_config.torch_dtype, device=q_out.device
             )
         kv_cache = forward_context.kv_cache_data[f"layer_{self.layer_num}"].k_cache
         return self._forward_decode(

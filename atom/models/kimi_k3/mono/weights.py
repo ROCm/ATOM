@@ -738,12 +738,16 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims, mode: int) -> MlaPrep:
             kv_dt.startswith("fp8"),
             f"{name}: kv_cache_dtype {kv_dt}, the stages write FP8",
         )
+        scales = {}
         for sc in ("_k_scale", "_q_scale"):
             t = getattr(impl, sc, None)
             _need(
                 isinstance(t, torch.Tensor) and t.dtype == F32 and t.numel() == 1,
                 f"{name}: {sc} is not an fp32 scalar tensor",
             )
+            # the rope kernel takes them as host scalars; the stages read a
+            # device copy, taken here (they are load-time constants)
+            scales[sc] = t.detach().reshape(1).to(w_k.device).clone()
         heads = (
             impl.padded_num_heads
             if getattr(impl, "_fused_q_head_pad", False)
@@ -757,8 +761,8 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims, mode: int) -> MlaPrep:
             cos=cos,
             sin=sin,
             rope_neox=bool(rot.is_neox_style),
-            k_scale=impl._k_scale,
-            q_scale=impl._q_scale,
+            k_scale=scales["_k_scale"],
+            q_scale=scales["_q_scale"],
             q_heads=int(heads),
         )
     return MlaPrep(**out)
