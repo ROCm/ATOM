@@ -60,6 +60,7 @@ from atom.models.dspark_draft import (
     linear_out,
 )
 from atom.models.qwen3 import Qwen3MLP
+from atom.spec_decode.draft_kv import DraftKvPoolSpec
 from atom.spec_decode.drafter import AuxCaptureSpec, _resolve_decoder_layers
 from atom.spec_decode.dspark_proposer import DSparkProposer
 from atom.utils.forward_context import get_forward_context
@@ -370,8 +371,7 @@ class KimiK3DFlash(DSparkDraftModel):
     """
 
     block_attention_is_mla = False
-    in_dcp_group = False
-    owns_flash_pool = True
+    kv_pool_spec = DraftKvPoolSpec(flash_layout=True, in_dcp_group=False)
 
     packed_modules_mapping: ClassVar[dict[str, tuple]] = {
         "q_proj": ("qkv_proj", "q"),

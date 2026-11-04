@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from functools import partial
 
 import torch
@@ -12,6 +13,38 @@ logger = logging.getLogger("atom")
 # This pool's one row space. Named, not a geometry: `make_kv_pool` already
 # settled the draft's geometry, and there is only ever the one.
 DRAFT_KV_ROWS = "draft_kv"
+
+
+@dataclass(frozen=True)
+class DraftKvPoolSpec:
+    """The pool a draft declares of its own, as the draft class's
+    `kv_pool_spec`; None there is the generic SHUFFLE pool.
+
+    One declaration for both facts because they are one: a draft outside the
+    target's DCP group stores every position a target block id covers, so its
+    entry is `block_size * dcp` tokens, and only the FLASH order reads an entry
+    that wide. The proposer's addressing and the pool's geometry both read it
+    from here, so they cannot disagree.
+    """
+
+    # `MhaKvPool.flash_layout`.
+    flash_layout: bool = False
+    # Whether the draft's KV is split across the target's DCP group.
+    in_dcp_group: bool = True
+
+    def __post_init__(self):
+        if not (self.in_dcp_group or self.flash_layout):
+            raise ValueError(
+                "a draft outside the DCP group addresses entries of "
+                "block_size * dcp tokens, which only a FLASH pool reads"
+            )
+
+    def pool_kwargs(self, dcp: int) -> dict:
+        """What `make_kv_pool` takes beyond the geometry."""
+        return {
+            "blocks_per_entry": 1 if self.in_dcp_group else dcp,
+            "flash_layout": self.flash_layout,
+        }
 
 
 def block_page_idx(
@@ -88,9 +121,8 @@ def draft_kv_builder(model_runner, draft_hf, model):
     Which is why speculative decoding imports no attention anywhere: adding a
     flavor is a flag and a `make_kv_pool` on that backend.
 
-    `model` is the built draft; one that declares `owns_flash_pool` gets the
-    DFlash pool (a draft that is not a `DSparkDraftModel`, e.g. Eagle3, does
-    not declare it).
+    `model` is the built draft; its `kv_pool_spec` (None, or undeclared as on
+    Eagle3, is the generic pool) adds to the pool's kwargs.
     """
     from aiter import dtypes
 
@@ -100,20 +132,13 @@ def draft_kv_builder(model_runner, draft_hf, model):
     if not backend.DRAFT_OWNS_KV_POOL:
         return None
 
-    # The DFlash draft runs outside the target's DCP group, so one target block
-    # id spans `dcp` of its blocks. Its scales are per-tensor because
-    # `reshape_and_cache_flash` and `unified_attention` each take one scale.
-    # It sits beside an MLA target, whose builder pages at ATOM_MLA_PAGE_SIZE
-    # (a kernel page, not a block id), so it takes the SCHEDULER's block, the
-    # unit the target's block tables count in.
-    dflash_pool = getattr(model, "owns_flash_pool", False)
-    dflash_kwargs = (
-        {
-            "blocks_per_entry": model_runner.config.decode_context_parallel_size,
-            "per_tensor_scales": True,
-            "flash_layout": True,
-        }
-        if dflash_pool
+    # A declared pool sits beside an MLA target, whose builder pages at
+    # ATOM_MLA_PAGE_SIZE (a kernel page, not a block id), so it takes the
+    # SCHEDULER's block, the unit the target's block tables count in.
+    spec = getattr(model, "kv_pool_spec", None)
+    spec_kwargs = (
+        spec.pool_kwargs(model_runner.config.decode_context_parallel_size)
+        if spec is not None
         else {}
     )
     make_pool = partial(
@@ -121,12 +146,12 @@ def draft_kv_builder(model_runner, draft_hf, model):
         draft_hf,
         world_size=model_runner.world_size,
         kv_dtype=dtypes.d_dtypes[model_runner.config.kv_cache_dtype],
-        **dflash_kwargs,
+        **spec_kwargs,
     )
     return DraftKvBuilder(
         model_runner,
         make_pool,
-        block_size=model_runner.block_size if dflash_pool else None,
+        block_size=model_runner.block_size if spec is not None else None,
     )
 
 
@@ -277,9 +302,8 @@ class DraftKvBuilder(PoolRowsMixin):
         runner = self.model_runner
         pool = self.kv_pool
         idx = self.pool_rows[DRAFT_KV_ROWS][module]
-        k_cache, v_cache = pool.reader_views(idx)
-        module.max_model_len = runner.config.max_model_len
-        if pool.per_tensor_scales:
+        if pool.flash_layout:
+            k_cache, v_cache = pool.fa_views(idx)
             # One per-tensor scale of 1.0: the pool declares no scale planes,
             # and the only such draft's checkpoint ships no KV scales (all
             # tensors BF16, no `quantization_config`), so 1.0 is the value both
@@ -289,8 +313,11 @@ class DraftKvBuilder(PoolRowsMixin):
                     1, dtype=torch.float32, device=k_cache.device
                 )
             module.k_scale = module.v_scale = self._unit_scale
-        elif runner.config.kv_cache_dtype == "fp8":
-            module.k_scale, module.v_scale = pool.scale_views(idx)
+        else:
+            k_cache, v_cache = pool.kv_views(idx)
+            if runner.config.kv_cache_dtype == "fp8":
+                module.k_scale, module.v_scale = pool.scale_views(idx)
+        module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
         return KVCacheTensor(

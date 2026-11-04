@@ -434,7 +434,7 @@ def _pool(block_size, world_size, kv_dtype=None, blocks_per_entry=1):
         layers=5,
         block_size=block_size,
         blocks_per_entry=blocks_per_entry,
-        per_tensor_scales=True,
+        flash_layout=True,
     )
 
 
@@ -485,10 +485,6 @@ def _normalized_radixark():
     return hf
 
 
-# What `draft_kv_builder` reads off a built draft that owns the DFlash pool.
-_FLASH_DRAFT = types.SimpleNamespace(owns_flash_pool=True)
-
-
 def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
     """A ModelRunner stand-in carrying only what `draft_kv_builder` reads."""
     return types.SimpleNamespace(
@@ -502,10 +498,12 @@ def _stub_runner(tp=8, dcp=1, kv_cache_dtype="fp8"):
     )
 
 
-def _make_kv_pool_kwargs(runner):
-    """Build the DFlash draft's pool through a stub backend.
+def _make_kv_pool_kwargs(runner, model=None):
+    """Build a draft's pool through a stub backend, the DFlash draft's unless
+    `model` names another.
 
-    Returns what `make_kv_pool` was called with. The selector module is
+    Returns what `make_kv_pool` was called with, and the builder under
+    ``"builder"``. The selector module is
     patched, not draft_kv: `draft_kv_builder` imports `attn_family` and
     `get_attn_backend` function-locally.
     """
@@ -530,10 +528,13 @@ def _make_kv_pool_kwargs(runner):
         mock.patch.object(selector, "attn_family", lambda _c: None),
     ):
         builder = dk.draft_kv_builder(
-            runner, _normalized_radixark(), model=_FLASH_DRAFT
+            runner,
+            _normalized_radixark(),
+            model=model or _gpu_stack_import("atom.models.kimi_k3_dflash").KimiK3DFlash,
         )
 
     assert builder is not None
+    seen["builder"] = builder
     builder._make_pool(layers=5, target_block_size=128)
     return seen
 
@@ -556,7 +557,6 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         f"draft pool must take the target's fp8 ({dtypes.d_dtypes['fp8']}), "
         f"got {seen['kv_dtype']}"
     )
-    assert seen["per_tensor_scales"] is True
     assert seen["flash_layout"] is True
 
     # ... and the pool it describes really has no scale region.
@@ -568,7 +568,7 @@ def test_dflash_pool_inherits_the_targets_fp8_and_declares_no_scale_planes():
         block_size=128,
         layers=5,
         kv_dtype=dtypes.d_dtypes["fp8"],
-        per_tensor_scales=True,
+        flash_layout=True,
     )
     assert pool.scale_fields == []
     pool.allocate(4, "cpu")
@@ -583,6 +583,56 @@ def test_dflash_pool_entry_is_dcp_blocks(dcp):
     """
     seen = _make_kv_pool_kwargs(_stub_runner(dcp=dcp))
     assert seen["blocks_per_entry"] == dcp
+
+
+@pytest.mark.parametrize("model", ["eagle3", "minimax"])
+def test_a_draft_without_a_pool_spec_gets_the_generic_pool(model):
+    """Eagle3 declares no `kv_pool_spec` and MiniMax-M3.1 DSpark inherits
+    None: neither adds a pool kwarg, and both keep the target builder's
+    block."""
+    if model == "eagle3":
+        draft = types.SimpleNamespace()
+    else:
+        draft = _gpu_stack_import("atom.models.minimax_m3.dspark").MiniMaxM3DSpark
+        assert draft.kv_pool_spec is None
+    seen = _make_kv_pool_kwargs(_stub_runner(dcp=8), model=draft)
+    builder = seen.pop("builder")
+    assert set(seen) == {"layers", "target_block_size", "world_size", "kv_dtype"}
+    assert builder._block_size is None
+
+
+def test_a_draft_outside_the_dcp_group_needs_the_flash_pool():
+    """Out of the group, an entry is `block_size * dcp` tokens, which only the
+    FLASH order reads; the spec refuses the pair rather than let the
+    proposer's addressing and the pool's geometry part."""
+    dk = _gpu_stack_import("atom.spec_decode.draft_kv")
+    with pytest.raises(ValueError, match="FLASH"):
+        dk.DraftKvPoolSpec(in_dcp_group=False)
+    spec = dk.DraftKvPoolSpec(flash_layout=True, in_dcp_group=False)
+    assert spec.pool_kwargs(8) == {"blocks_per_entry": 8, "flash_layout": True}
+    assert dk.DraftKvPoolSpec().pool_kwargs(8) == {
+        "blocks_per_entry": 1,
+        "flash_layout": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "module,cls_name,sharded",
+    [
+        ("atom.models.kimi_k3_dspark", "KimiK3DSpark", True),
+        ("atom.models.kimi_k3_dflash", "KimiK3DFlash", False),
+        ("atom.models.minimax_m3.dspark", "MiniMaxM3DSpark", True),
+    ],
+)
+def test_dcp_sharding_is_read_from_the_pool_spec(module, cls_name, sharded):
+    """Whether the draft addresses in per-rank terms comes from the same
+    declaration that shapes its pool."""
+    proposer = _gpu_stack_import("atom.spec_decode.dspark_proposer")
+    draft_cls = getattr(_gpu_stack_import(module), cls_name)
+    stub = types.SimpleNamespace(dcp_world_size=8, model=draft_cls)
+    assert proposer.DSparkProposer._draft_is_dcp_sharded.fget(stub) is sharded
+    stub.dcp_world_size = 1
+    assert proposer.DSparkProposer._draft_is_dcp_sharded.fget(stub) is False
 
 
 # --------------------------------------------------------------------------
@@ -946,7 +996,7 @@ def _publish(block_size, dcp, tables, seqlens, positions, running_bs=None):
                 kv_pool=types.SimpleNamespace(entry_tokens=block_size * dcp)
             ),
         ),
-        model=types.SimpleNamespace(owns_flash_pool=True),
+        model=_gpu_stack_import("atom.models.kimi_k3_dflash").KimiK3DFlash,
         _blk_ctx_slots=torch.full((n_tok,), 7, dtype=torch.int64, device=dev),
         _blk_tok_ramp=torch.arange(n_tok, dtype=torch.int32, device=dev),
     )
@@ -1355,7 +1405,7 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
     p.mtp_k = 7
     p.model = types.SimpleNamespace(
         block_attention_is_mla=draft_cls.block_attention_is_mla,
-        owns_flash_pool=draft_cls.owns_flash_pool,
+        kv_pool_spec=draft_cls.kv_pool_spec,
     )
     p._init_draft_block_buffers()
 

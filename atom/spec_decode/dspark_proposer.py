@@ -63,8 +63,9 @@ class DSparkProposer(Drafter):
         )
         # The draft rides the target's block tables. An MLA draft shares the
         # target's pool and so its DCP sharding, addressing in LOCAL (per-rank)
-        # terms; the DFlash draft owns a pool outside the DCP group
-        # (`_draft_is_dcp_sharded`). 1 when -dcp is unset.
+        # terms; a draft whose `kv_pool_spec` puts it outside the DCP group
+        # owns a pool that is not (`_draft_is_dcp_sharded`). 1 when -dcp is
+        # unset.
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
         # None unless the draft owns a pool: `compute_draft_kv` reads these
@@ -248,7 +249,7 @@ class DSparkProposer(Drafter):
             **i32,
         )
 
-        if self.model.owns_flash_pool:
+        if self.model.kv_pool_spec is not None:
             # One slot per token of the target forward, prefill chunks included.
             n_tok = int(self.config.max_num_batched_tokens)
             self._blk_ctx_slots = torch.zeros(n_tok, **i64)
@@ -461,23 +462,24 @@ class DSparkProposer(Drafter):
         """Whether the DRAFT's KV is split across the DCP group, like the target's.
 
         True for the MLA DSpark draft, which binds into the target's latent
-        rows and so addresses in LOCAL per-rank terms. False for a draft outside
-        the DCP group (`in_dcp_group`), whatever `-dcp` says: every rank holds
-        the whole token axis.
+        rows and so addresses in LOCAL per-rank terms. False for a draft whose
+        `kv_pool_spec` puts it outside the DCP group, whatever `-dcp` says:
+        every rank holds the whole token axis.
         """
-        return self.dcp_world_size > 1 and self.model.in_dcp_group
+        spec = self.model.kv_pool_spec
+        return self.dcp_world_size > 1 and (spec is None or spec.in_dcp_group)
 
     @property
     def _draft_entry_tokens(self) -> int:
         """Token span of ONE entry of the draft's pool, i.e. of one block id.
 
         Under DCP one target block id covers `block_size * dcp_world_size`
-        global positions; a draft that owns a pool stores all of them, so its
-        span is the pool's `entry_tokens`. Any other draft addresses in local
-        terms, one `block_size` per id. Not readable from `__init__`: the pool
+        global positions; a draft whose declared pool stores all of them has
+        that pool's `entry_tokens` as its span. Any other draft addresses in
+        local terms, one `block_size` per id. Not readable from `__init__`: the pool
         is built later.
         """
-        if self.model.owns_flash_pool:
+        if self.model.kv_pool_spec is not None:
             return self.runner.draft_kv_builder.kv_pool.entry_tokens
         return self.runner.block_size
 
