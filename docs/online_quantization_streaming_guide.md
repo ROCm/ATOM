@@ -196,8 +196,13 @@ are one example, not expected values for every model:
 
 ```text
 Online-quant streaming: 444/582 eligible modules quantized during load,
-138 fell back to the post-load pass (no memory saving for those).
+138 fell back to the post-load pass (no memory saving for those),
+0 deferred to their parent's post-load.
 ```
+
+Modules a model defers to its parent's post-load hook (for example Kimi-K3's
+KDA `in_proj`, `b_proj` and `f_a_proj`, which are fused before they are
+quantized) are counted separately: they are neither eligible nor fallbacks.
 
 The final loading summary includes:
 
