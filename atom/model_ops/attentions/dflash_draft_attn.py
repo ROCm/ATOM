@@ -22,17 +22,60 @@ the split-KV grid, so a long context is spread over segments instead of walked
 by one program. The block rows come back out of the pool with the prefix, so
 over an fp8 pool they are read quantized.
 
-Where aiter's Gluon kernel serves this read (gfx950), the query is cast to an
-fp8 pool's dtype too, because Gluon needs q and KV in one dtype. The cast is
-clamped to the fp8 range first, since a plain cast turns an out-of-range value
-into NaN. On gfx1250 the 3D Gluon path needs ``shuffled_kv_cache``, which this
-FLASH-layout pool is not, so q stays bf16 there, as everywhere else.
+Over an fp8 pool the query is cast to the pool's dtype only where aiter's own
+gfx950 Gluon gate accepts this read with q in that dtype, because Gluon needs q
+and KV in one dtype; anywhere else the cast would quantize q for nothing. The
+cast is clamped to the fp8 range first, since a plain cast turns an
+out-of-range value into NaN. On gfx1250 the 3D Gluon path needs
+``shuffled_kv_cache``, which this FLASH-layout pool is not, so q stays bf16
+there, as everywhere else.
 """
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from aiter.ops.triton.attention import unified_attention as ua
+
+logger = logging.getLogger("atom")
+
+
+def gluon_takes_pool_dtype_q(
+    head_size: int, head_size_v: int, block_size: int, kv_dtype: torch.dtype
+) -> bool:
+    """Whether aiter's gfx950 Gluon gate accepts this read with q in ``kv_dtype``.
+
+    aiter exposes no public form of the gate, so this calls its private
+    ``_gfx950_gluon_supported`` on a ``_UAParams`` carrying the read's real
+    arguments; the fields the read does not fix are ``None``. A missing gate
+    leaves q uncast and says so; a renamed field raises.
+    """
+    supported = getattr(ua, "_gfx950_gluon_supported", None)
+    params_t = getattr(ua, "_UAParams", None)
+    if supported is None or params_t is None:
+        logger.warning(
+            "aiter unified_attention has no _gfx950_gluon_supported/_UAParams; "
+            "the DFlash draft read keeps q in bf16 over an fp8 pool"
+        )
+        return False
+    fields = dict.fromkeys(params_t._fields)
+    fields.update(
+        softcap=0,
+        causal=True,
+        sliding_window=0,
+        max_seqlen_q=1,
+        all_decode=True,
+        head_size=head_size,
+        head_size_v=head_size_v,
+        block_size=block_size,
+        q_dtype=kv_dtype,
+        kv_cache_dtype=kv_dtype,
+        shuffled_kv_cache=False,
+        use_alibi_slopes=False,
+        use_qq_bias=False,
+    )
+    return bool(supported(params_t(**fields)))
 
 
 def fold_block_queries(
@@ -79,17 +122,22 @@ class DFlashDraftUnifiedAttention:
         # bound: tiles come from each request's own `seqused_k`, which may run
         # T past it for a block anchored at the last position.
         self.max_model_len = max_model_len
-        # Cast q to an fp8 pool's dtype only where that selects the Gluon
-        # kernel: aiter's own gfx950 test plus its kernel having loaded.
-        self.q_to_pool_dtype = (
-            getattr(ua, "DEVICE_ARCH", None) == "gfx950"
-            and getattr(ua, "_unified_attention_kernel_gfx950", None) is not None
-        )
+        # `gluon_takes_pool_dtype_q` per (head_size, head_size_v, block_size,
+        # pool dtype), so a replay does not re-ask aiter.
+        self._q_cast = {}
         # q's descale when it is cast: the cast is a plain one, so 1.0.
         self._q_descale = torch.ones(1, dtype=torch.float32, device=device)
         # One query row per sequence, so `cu_seqlens_q` is a constant ramp,
         # sized for the engine's widest batch so a replay only slices it.
         self._cu_seqlens_q = torch.arange(max_bs + 1, dtype=torch.int32, device=device)
+
+    def casts_q(self, k_cache, v_cache) -> bool:
+        """Whether a read over this pool casts q to the pool's dtype."""
+        key = (k_cache.shape[-1], v_cache.shape[-1], k_cache.shape[1], k_cache.dtype)
+        cast = self._q_cast.get(key)
+        if cast is None:
+            cast = self._q_cast[key] = gluon_takes_pool_dtype_q(*key)
+        return cast
 
     def __call__(
         self,
@@ -105,7 +153,7 @@ class DFlashDraftUnifiedAttention:
         """Returns the block's attention output, ``[bs * T, HQ, D]`` in q's dtype."""
         bs = kv_lens.shape[0]
         hkv = k_cache.shape[2]
-        quantized = self.q_to_pool_dtype and k_cache.dtype.itemsize == 1
+        quantized = k_cache.dtype.itemsize == 1 and self.casts_q(k_cache, v_cache)
         if quantized:
             fp8_max = torch.finfo(k_cache.dtype).max
             q.clamp_(-fp8_max, fp8_max)

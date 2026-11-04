@@ -1343,7 +1343,7 @@ def test_unified_block_read_matches_the_bidirectional_reference(kv_dtype, far_en
     one = torch.ones(1, dtype=torch.float32, device=dev)
     # Where the read casts q to an fp8 pool's dtype (gfx950), the reference
     # takes the same q. Taken BEFORE the call, which clamps q in place.
-    cast = kv_dtype == "fp8" and read.q_to_pool_dtype
+    cast = kv_dtype == "fp8" and read.casts_q(k_pool, v_pool)
     q_ref = q.to(k_pool.dtype).to(q.dtype) if cast else q.clone()
     o = read(q, k_pool, v_pool, block_tables, kv_lens, scale, one, one)
 
@@ -1501,6 +1501,37 @@ def test_dflash_draft_is_refused_on_a_non_k3_target():
     cfg._check_dflash_draft_target(types.SimpleNamespace(architectures=[]), None)
 
 
+def test_fp8_q_cast_asks_aiters_gluon_gate_with_the_reads_arguments(monkeypatch):
+    """The cast follows aiter's own gate, asked about this read: q in the
+    pool's dtype, the pool's head and page sizes, no softcap, all-decode."""
+    torch = pytest.importorskip("torch")
+    dda = _fold_mod()
+    ua = dda.ua
+    seen = []
+
+    def gate(params):
+        seen.append(params)
+        return params.head_size == 64
+
+    monkeypatch.setattr(ua, "_gfx950_gluon_supported", gate)
+    read = dda.DFlashDraftUnifiedAttention("cpu", max_bs=2, max_model_len=1024)
+    fp8 = torch.float8_e4m3fn
+    k = torch.empty(2, 1024, 2, 64, dtype=fp8)
+    assert read.casts_q(k, k) and read.casts_q(k, k)
+    assert len(seen) == 1, "the answer is cached per pool shape and dtype"
+    p = seen[0]
+    assert (p.head_size, p.head_size_v, p.block_size) == (64, 64, 1024)
+    assert p.q_dtype == p.kv_cache_dtype == fp8
+    assert p.softcap == 0 and p.max_seqlen_q == 1 and p.all_decode
+    assert not (p.shuffled_kv_cache or p.use_alibi_slopes or p.use_qq_bias)
+
+    k96 = torch.empty(2, 1024, 2, 96, dtype=fp8)
+    assert not read.casts_q(k96, k96)
+
+    monkeypatch.delattr(ua, "_gfx950_gluon_supported")
+    assert not dda.gluon_takes_pool_dtype_q(64, 64, 1024, fp8)
+
+
 def test_fp8_q_cast_saturates_instead_of_producing_nan():
     """A plain cast to fp8 turns |x| > fp8 max into NaN, and one NaN q row
     poisons that row's softmax against every key; the read clamps first."""
@@ -1514,10 +1545,10 @@ def test_fp8_q_cast_saturates_instead_of_producing_nan():
     dev = torch.device("cuda")
     bs, T, hkv, g, d, E = 2, 7, 2, 4, 64, 1024
     read = dda.DFlashDraftUnifiedAttention(dev, max_bs=4, max_model_len=E)
-    if not read.q_to_pool_dtype:
-        pytest.skip("q is only cast to fp8 where aiter's Gluon path serves the read")
     k_pool = torch.randn(3, E, hkv, d, device=dev).to(dtypes.fp8)
     v_pool = torch.randn_like(k_pool, dtype=torch.float32).to(dtypes.fp8)
+    if not read.casts_q(k_pool, v_pool):
+        pytest.skip("q is only cast to fp8 where aiter's Gluon path serves the read")
     q = torch.randn(bs * T, hkv * g, d, device=dev, dtype=torch.bfloat16)
     q[0, 0, 0] = 1e4  # far past fp8_e4m3's 448
     block_tables = torch.tensor([[1], [2]], dtype=torch.int32, device=dev)
