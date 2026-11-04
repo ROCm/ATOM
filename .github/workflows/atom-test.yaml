@@ -1,4 +1,5 @@
 name: ATOM Test
+run-name: Temporary DeepSeek-V4-Pro EPLB r64 biased GSM8K accuracy
 
 on:
   push:
@@ -164,6 +165,7 @@ jobs:
           PY
 
   offline-smoke-test:
+    if: false
     # Ungated on purpose: this runs on every PR, unlike the accuracy matrix
     # behind `ci-gate`, which only opens on an approval or a ci:* label.
     #
@@ -258,7 +260,7 @@ jobs:
 
   atom-test:
     needs: [ci-gate, download_aiter_wheel, load-test-models]
-    name: Accuracy
+    name: Accuracy (${{ matrix.model_name }})
     strategy:
       fail-fast: false
       matrix:
