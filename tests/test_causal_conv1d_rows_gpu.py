@@ -127,3 +127,70 @@ def test_rows_kernel_matches_fp64(k_heads, v_heads, norm, fork):
         steps = _bf16_steps(got.reshape(ref.shape), ref)
         assert steps.max() <= (2 if norm and i < 2 else 1)
         assert (steps > 0).double().mean() < 1e-3
+
+
+@pytest.mark.parametrize("fork", [False, True])
+def test_persistent_kernel_matches_rows_with_padded_metadata(fork):
+    if (
+        torch.version.hip is None
+        or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250"
+    ):
+        pytest.skip("persistent conv1d requires gfx1250")
+
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.gdn_attn import compute_causal_conv1d_metadata
+    from atom.model_ops.mamba_ops.causal_conv1d_persistent import PERSISTENT_BLOCK_M
+
+    lengths = [1, 2, 3, 7, 8, 9, 31, 32, 33, 4097]
+    tokens, count = sum(lengths), len(lengths)
+    k_dim, v_dim = 2048, 4096
+    dim = 2 * k_dim + v_dim
+    generator = torch.Generator(device="cpu").manual_seed(42 + fork)
+    projection = (
+        torch.randn(tokens, dim + v_dim, generator=generator).to(torch.bfloat16).to(DEV)
+    )
+    weight = torch.randn(dim, 4, generator=generator).to(torch.bfloat16).to(DEV)
+    pool = (
+        torch.randn(2 * count, 3, dim, generator=generator).to(torch.bfloat16).to(DEV)
+    )
+    slots_out = torch.arange(count, dtype=torch.int32, device=DEV)
+    slots_in = slots_out + count if fork else slots_out
+    has_init = torch.arange(count, device=DEV) % 2 == 0
+    cu = (
+        torch.tensor([0] + lengths, dtype=torch.int32, device=DEV)
+        .cumsum(0)
+        .to(torch.int32)
+    )
+    tables, batch, offsets = compute_causal_conv1d_metadata(cu)
+    for table in tables.values():
+        table["programs_max"] = table["tot"] + 3
+    outputs, pools = [], []
+    for use_persistent in (False, True):
+        current_pool = pool.clone()
+        metadata = SimpleNamespace(
+            nums_dict=tables if use_persistent else {8: tables[8]},
+            batch_ptr=batch,
+            token_chunk_offset_ptr=offsets,
+        )
+        assert (PERSISTENT_BLOCK_M in metadata.nums_dict) == use_persistent
+        outputs.append(
+            causal_conv1d_fn(
+                projection[:, :dim].T,
+                weight,
+                None,
+                conv_states=current_pool.transpose(-1, -2),
+                query_start_loc=cu,
+                k_dim_size=k_dim,
+                v_dim_size=v_dim,
+                cache_indices=slots_out,
+                cache_indices_in=slots_in,
+                has_initial_state=has_init,
+                qk_l2norm_head_dim=HEAD,
+                metadata=metadata,
+            )
+        )
+        pools.append(current_pool)
+    assert torch.equal(pools[0], pools[1])
+    for expected, actual in zip(outputs[0], outputs[1]):
+        assert torch.equal(expected, actual)

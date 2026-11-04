@@ -21,6 +21,7 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
+from atom.model_ops.mamba_ops.causal_conv1d_persistent import PERSISTENT_BLOCK_M
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import (
     AttentionMetaData,
@@ -2249,49 +2250,55 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return self._staging(name, cap, dtype)["gpu"]
 
     def _staged_i64(self, name: str, values: np.ndarray):
-        out = self._stage_upload(name, values, self.model_runner.max_bs + 1, torch.int64)
+        out = self._stage_upload(
+            name, values, self.model_runner.max_bs + 1, torch.int64
+        )
         if out is None:
             return torch.as_tensor(values, dtype=torch.int64, device=self.device)
         return out
 
     def _conv1d_metadata(self, query_start_loc, num_prefills: int):
-        """`compute_causal_conv1d_metadata` from the host copy of the query
-        prefix: the per-program (sequence, chunk) tables of the conv1d prefill
-        kernel, uploaded without a sync. The device-tensor version did a D2H
-        for the lengths and two pageable H2Ds, on every prefill step."""
-        BLOCK_M = 8
+        """Return separate row and persistent program tables from host lengths."""
         cu = self.model_runner.forward_vars["cu_seqlens_q"].np[: num_prefills + 1]
         lens = np.diff(cu).astype(np.int64)
-        nums = -(-lens // BLOCK_M)
-        tot = int(nums.sum())
-        cap = self.model_runner.max_num_batched_tokens // BLOCK_M + self.model_runner.max_bs + 1
-        mlist = np.repeat(np.arange(len(nums), dtype=np.int32), nums)
-        offsets = np.arange(tot, dtype=np.int32) - np.repeat(
-            (np.cumsum(nums) - nums).astype(np.int32), nums
-        )
-        programs_max = None
-        width = self._prefill_running_tokens
-        if width is not None and self._gdn_graph_prefill():
-            # a bucket-shaped grid: the tail of the batch table is pad slots,
-            # which the kernel skips, so the table is written to that width
-            programs_max = min(cap, width // BLOCK_M + envs.ATOM_GDN_GRAPH_MAX_SEQS)
-            if tot <= programs_max:
-                mlist = np.concatenate(
-                    (mlist, np.full(programs_max - tot, PAD_SLOT_ID, dtype=np.int32))
-                )
-                offsets = np.concatenate(
-                    (offsets, np.zeros(programs_max - tot, dtype=np.int32))
-                )
-            else:
-                programs_max = None
-        batch_ptr = self._stage_upload("conv1d_batch", mlist, cap, torch.int32)
-        offset_ptr = self._stage_upload("conv1d_offset", offsets, cap, torch.int32)
-        if batch_ptr is None or offset_ptr is None:
-            return compute_causal_conv1d_metadata(query_start_loc)
-        # The launcher's grid reads `tot` (or `programs_max`); with the
-        # pointers set it copies nothing.
-        nums_dict = {
-            BLOCK_M: {
+        nums_dict = {}
+        for BLOCK_M in (8, PERSISTENT_BLOCK_M):
+            nums = -(-lens // BLOCK_M)
+            tot = int(nums.sum())
+            cap = (
+                self.model_runner.max_num_batched_tokens // BLOCK_M
+                + self.model_runner.max_bs
+                + 1
+            )
+            mlist = np.repeat(np.arange(len(nums), dtype=np.int32), nums)
+            offsets = np.arange(tot, dtype=np.int32) - np.repeat(
+                (np.cumsum(nums) - nums).astype(np.int32), nums
+            )
+            programs_max = None
+            width = self._prefill_running_tokens
+            if width is not None and self._gdn_graph_prefill():
+                programs_max = min(cap, width // BLOCK_M + envs.ATOM_GDN_GRAPH_MAX_SEQS)
+                if tot <= programs_max:
+                    mlist = np.concatenate(
+                        (
+                            mlist,
+                            np.full(programs_max - tot, PAD_SLOT_ID, dtype=np.int32),
+                        )
+                    )
+                    offsets = np.concatenate(
+                        (offsets, np.zeros(programs_max - tot, dtype=np.int32))
+                    )
+                else:
+                    programs_max = None
+            batch_ptr = self._stage_upload(
+                f"conv1d_batch_{BLOCK_M}", mlist, cap, torch.int32
+            )
+            offset_ptr = self._stage_upload(
+                f"conv1d_offset_{BLOCK_M}", offsets, cap, torch.int32
+            )
+            if batch_ptr is None or offset_ptr is None:
+                return compute_causal_conv1d_metadata(query_start_loc)
+            nums_dict[BLOCK_M] = {
                 "nums": torch.from_numpy(nums),
                 "tot": tot,
                 "mlist": torch.from_numpy(mlist[:tot]),
@@ -2300,10 +2307,13 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 "batch_ptr": batch_ptr,
                 "token_chunk_offset_ptr": offset_ptr,
             }
-        }
-        if programs_max is not None:
-            nums_dict[BLOCK_M]["programs_max"] = programs_max
-        return nums_dict, batch_ptr, offset_ptr
+            if programs_max is not None:
+                nums_dict[BLOCK_M]["programs_max"] = programs_max
+        return (
+            nums_dict,
+            nums_dict[8]["batch_ptr"],
+            nums_dict[8]["token_chunk_offset_ptr"],
+        )
 
     # Chunk index tables for the GDN prefill kernels (`prepare_chunk_indices`:
     # [(sequence, chunk-in-sequence)] per chunk, for the 16- and 64-token
@@ -2751,46 +2761,35 @@ PAD_SLOT_ID = -1
 
 
 def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
-    # Needed for causal_conv1d
+    """Return program tables and row-kernel pointers from cumulative lengths.
+
+    Tables map each program to a sequence and token chunk, with separate
+    device storage for each chunk size and a tail of skipped padding entries.
+    """
     seqlens = query_start_loc_p.diff().to("cpu")
-    nums_dict = {}  # type: ignore
-    batch_ptr = None
-    token_chunk_offset_ptr = None
-    device = query_start_loc_p.device
-    for BLOCK_M in [8]:  # cover all BLOCK_M values
+    nums_dict = {}
+    for BLOCK_M in (8, PERSISTENT_BLOCK_M):
         nums = -(-seqlens // BLOCK_M)
-        nums_dict[BLOCK_M] = {}
-        nums_dict[BLOCK_M]["nums"] = nums
-        nums_dict[BLOCK_M]["tot"] = nums.sum().item()
+        tot = nums.sum().item()
         mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
-        nums_dict[BLOCK_M]["mlist"] = mlist
-        mlist_len = len(nums_dict[BLOCK_M]["mlist"])
-        nums_dict[BLOCK_M]["mlist_len"] = mlist_len
-        MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
-        offsetlist = []  # type: ignore
-        for idx, num in enumerate(nums):
-            offsetlist.extend(range(num))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
-        nums_dict[BLOCK_M]["offsetlist"] = offsetlist
-
-        if batch_ptr is None:
-            # Update default value after class definition
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-        else:
-            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
-                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(  # type: ignore
-                    PAD_SLOT_ID
-                )
-
-        batch_ptr[0:mlist_len].copy_(mlist)
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist)  # type: ignore
-        nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
-        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
-
-    return nums_dict, batch_ptr, token_chunk_offset_ptr
+        offsetlist = torch.tensor(
+            [offset for num in nums.tolist() for offset in range(num)],
+            dtype=torch.int32,
+        )
+        capacity = max(1024, tot) * 2
+        batch_ptr = torch.full(
+            (capacity,), PAD_SLOT_ID, dtype=torch.int32, device=query_start_loc_p.device
+        )
+        token_chunk_offset_ptr = torch.full_like(batch_ptr, PAD_SLOT_ID)
+        batch_ptr[:tot].copy_(mlist)
+        token_chunk_offset_ptr[:tot].copy_(offsetlist)
+        nums_dict[BLOCK_M] = {
+            "nums": nums,
+            "tot": tot,
+            "mlist": mlist,
+            "mlist_len": tot,
+            "offsetlist": offsetlist,
+            "batch_ptr": batch_ptr,
+            "token_chunk_offset_ptr": token_chunk_offset_ptr,
+        }
+    return nums_dict, nums_dict[8]["batch_ptr"], nums_dict[8]["token_chunk_offset_ptr"]
