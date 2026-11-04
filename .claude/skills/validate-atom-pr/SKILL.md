@@ -70,10 +70,17 @@ repo)`.
 That default is a security decision, not an oversight. ROCm/ATOM is public, anyone can
 open a PR, and validating one means executing its code on a self-hosted box. The trigger
 allowlist bounds this -- a review only starts when one of the 88 logins in
-`authorized.txt` asks for it -- so the exposure is not "any stranger runs code here" but
-"a maintainer triggering a review on a stranger's PR runs that stranger's code". That is
-the same hazard as any CI that builds PR branches on self-hosted runners, and it is
-worth deciding deliberately rather than inheriting.
+`authorized.txt` asks for it -- and a second gate closed the rest: `fetch.sh` also
+requires the **PR author** to be on `authorized.txt` before auto-validation runs, so
+"a maintainer triggering a review on a stranger's PR runs that stranger's code" is no
+longer reachable. An outside contribution degrades to a static-only review with the
+reason recorded in `auto_validation_outcome.txt`, and the per-invocation override below
+degrades the same way -- it cannot be used to run a stranger's code either.
+
+What remains is narrower: code from an allowlisted author, executed on the self-hosted
+box. That is the same hazard as any CI that builds PR branches on self-hosted runners,
+and it is still worth deciding deliberately rather than inheriting -- but it is the
+decision in front of you, not the wider one this paragraph used to describe.
 
 **The capability being off is not the same as the gap being silent.** When triage decides
 a PR needs validation and none ran, `fetch.sh` tells the worker, in these words, to
@@ -98,6 +105,11 @@ default:
 ```bash
 REVIEW_AUTO_VALIDATE=1 bash .claude/skills/review-pr/run_one.sh <PR> ROCm/ATOM
 ```
+
+The flag is necessary, not sufficient: the author gate still applies, so this runs the
+validator only when the PR's author is on `authorized.txt`. On an outside contribution
+it degrades to a static-only review and says so in `auto_validation_outcome.txt` --
+measured on ATOM#2893, where triage required validation and the run refused it by name.
 
 Turning it on repo-wide means deciding the untrusted-code question first -- restricting
 it to PRs from known authors, or running it somewhere disposable. Flip the workflow's

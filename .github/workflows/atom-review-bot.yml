@@ -203,6 +203,16 @@ jobs:
       # over untrusted PR content.
       - name: Render and post the review card (as the bot)
         if: success()
+        # The token mapping is what makes this step post AT ALL. Without it _publish.py
+        # falls back to ~/.git-credentials, which RUNNER-SETUP never provisions on the
+        # runner (gh is authenticated under GH_CONFIG_DIR), so every run would finish the
+        # whole review and then fail to publish -- the PR getting "review job ended as
+        # failure" instead of a card, every time. aiter's workflow this port descends from
+        # carries it here; the port dropped it, and nothing noticed until the bot read its
+        # own workflow. check_prompts.check_publish_has_bot_env now asserts it.
+        env:
+          ATOM_BOT_TOKEN: ${{ secrets.ATOM_BOT_TOKEN }}
+          ATOM_BOT_LOGIN: ${{ vars.ATOM_BOT_LOGIN }}
         run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
 
       - name: Report a failed review to the owner (as the bot)

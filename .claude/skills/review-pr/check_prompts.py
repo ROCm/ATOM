@@ -197,6 +197,36 @@ def check_no_self_trigger():
     return 0
 
 
+def check_publish_has_bot_env():
+    """The publish step must carry the bot token, or it posts nothing and says so late.
+
+    _publish.py falls back to ~/.git-credentials when ATOM_BOT_TOKEN(_FILE) is unset, and
+    the runner has no such file -- gh is authenticated under GH_CONFIG_DIR and the .env is
+    machine facts only. So a publish step without the mapping finishes the entire review
+    and then fails at the last line, and the PR gets a "nothing was posted" notice instead
+    of a card. Every run. The port dropped the mapping aiter's workflow carries on this
+    exact step, five sibling steps kept theirs, and nothing compared them.
+    """
+    miss = _missing(WORKFLOW)
+    if miss:
+        print(f"\u23ed\ufe0f  check_publish_has_bot_env: skipped \u2014 not yet built: "
+              f"{[q.name for q in miss]}")
+        return 0
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    m = re.search(r"\n(      - name: [^\n]*post the review card[^\n]*\n(?:.*?\n)*?)      - name: ", wf)
+    if not m:
+        print("\u274c no publish step found in the workflow to check")
+        return 1
+    step = m.group(1)
+    missing = [v for v in ("ATOM_BOT_TOKEN", "ATOM_BOT_LOGIN") if v not in step]
+    if missing:
+        print(f"\u274c the publish step does not map {missing} -- it would run the whole "
+              "review and then fail to post, every time")
+        return 1
+    print("\u2705 the publish step maps the bot token and login")
+    return 0
+
+
 def check_prompt_artifacts():
     """Every artifact the worker prompt promises is one fetch.sh actually writes.
 
@@ -467,6 +497,7 @@ def main():
     bad += check_owner_fallbacks()
     bad += check_no_self_trigger()
     bad += check_prompt_artifacts()
+    bad += check_publish_has_bot_env()
     bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
     bad += check_publish_needs_post_flag()
