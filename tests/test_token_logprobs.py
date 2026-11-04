@@ -111,9 +111,9 @@ def test_gpu_ragged_probabilities_match_cpu_reference():
         torch.testing.assert_close(result.cpu(), reference, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU compiled scoring")
-def test_compiled_scoring_batch_transitions_and_snapshot():
-    # Exercise one compiled scorer across the shapes a live mixed workload
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU scoring")
+def test_scoring_batch_transitions_and_snapshot():
+    # Exercise the scorer across the shapes a live mixed workload
     # changes between: prefill, zero-draft, ragged decode, and masked snapshots.
     for bs, drafts, k, snapshot in [
         (1, None, 0, False),

@@ -4,7 +4,6 @@
 """Target-model probabilities for committed ordinary/speculative output tokens."""
 
 from dataclasses import dataclass
-from functools import lru_cache
 
 import torch
 
@@ -42,7 +41,7 @@ def capture_token_logits(logits, batch, metadata=None):
 
 
 def _score_rows(logits, rows, ids, k):
-    """Fuse row gathering, normalization and rank; keep scheduling outside.
+    """Compute normalization and rank with native PyTorch operations.
 
     Inputs have one flat token dimension, independent of draft width and
     optional snapshots. Only compact probabilities/candidates leave scoring.
@@ -61,14 +60,6 @@ def _score_rows(logits, rows, ids, k):
             (rows.shape[0], 0), device=logits.device, dtype=torch.int32
         )
     return values, candidates, ranks
-
-
-@lru_cache(maxsize=1)
-def _compiled_scorer():
-    # Lazy: disabled requests and CPU callers neither compile nor warm kernels.
-    # Normal Dynamo fallback preserves correctness if an unusual workload
-    # exceeds the compilation cache; never raise from a fullgraph-only limit.
-    return torch.compile(_score_rows, dynamic=True)
 
 
 def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot=None):
@@ -110,10 +101,9 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot
     if snapshot is not None:
         rows = snapshot[1][rows]
         logits = snapshot[0]
-    # Native topk is faster than the compiled variant on the tested ROCm path.
-    # Compile the no-candidates path, where gather/reductions can fully fuse.
-    score = _compiled_scorer() if logits.is_cuda and k == 0 else _score_rows
-    values, candidates, ranks = score(logits, rows.flatten(), selected_ids.flatten(), k)
+    values, candidates, ranks = _score_rows(
+        logits, rows.flatten(), selected_ids.flatten(), k
+    )
     return values.view(*shape, k + 1), candidates.view(*shape, k), ranks.view(shape)
 
 

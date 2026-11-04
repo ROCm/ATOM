@@ -66,13 +66,10 @@ Existing token-ID synchronization is unchanged. This retains the original TP
 probability synchronization rather than assuming only the output-owning rank
 needs probability data.
 
-For `top_logprobs=0`, a lazily compiled tensor function fuses row gathering,
-normalization and ranking. It takes flat token rows, keeping optional snapshots
-and ragged scheduling outside the compilation boundary. The first enabled call
-can incur compilation latency; performance measurements must warm this path.
-Normal PyTorch compilation fallback remains available for unusual shape mixes.
-CPU execution and top-K requests use native PyTorch operations. Disabled
-requests do not compile or warm the scorer.
+All logprob scoring uses native PyTorch operations on both CPU and GPU,
+including `top_logprobs=0`. The scorer has no `torch.compile` wrapper or
+compilation cache. Optional snapshots and ragged row mapping are resolved
+before scoring; disabled requests do not invoke the scorer.
 
 The implementation avoids explicitly retaining a full log-softmax matrix, but
 the native selected-logit gather/conversion still allocates vocabulary-sized workspace.
@@ -87,7 +84,7 @@ claim; throughput, tail latency, temporary device memory, and CPU/SSE costs need
 on/off comparisons at representative loads.
 
 This follows the approach of [vLLM's logprob rank reduction](https://github.com/vllm-project/vllm/blob/0e5b2ba118cfb3763a3640942e02dd8d93e8ed6c/vllm/v1/sample/ops/logprobs.py)
-to fuse comparisons and reductions, and its
+for comparisons and reductions, and its
 [compact sampled/top-K output](https://github.com/vllm-project/vllm/blob/0e5b2ba118cfb3763a3640942e02dd8d93e8ed6c/vllm/v1/sample/sampler.py).
 ATOM retains its existing strictly-greater rank/tie semantics and raw-target
 probability definition. This is not a claim of equivalent vLLM throughput.
