@@ -2804,8 +2804,9 @@ def build_glm5_monokernel(
         r_idx = _rsrc(indices)
         KPW = SPLIT_KEYS // WAVES
 
-        def split_keys(t, s):
-            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
+        def split_key_range(s):
+            """(index base, nkeys, sparse) of sample s: the one key count both the
+            split producers and the DCP merge's live-split bound read."""
             if const_expr(use_atom_kv_cache):
                 index_base, index_end = row_index_bounds(s)
                 nkeys = index_end - index_base
@@ -2815,6 +2816,16 @@ def build_glm5_monokernel(
                 kv_len = pos0 + s + 1
                 sparse = kv_len > topk
                 nkeys = sparse.select(fx.Int32(topk), kv_len)
+            return index_base, nkeys, sparse
+
+        def live_split_count(s):
+            """Splits of sample s holding keys, at least one (DCP only)."""
+            nkeys = _uniform(split_key_range(s)[1])
+            return fx.max((nkeys + SPLIT_KEYS - 1) // SPLIT_KEYS, fx.Int32(1))
+
+        def split_keys(t, s):
+            """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
+            index_base, nkeys, sparse = split_key_range(s)
             if const_expr(with_indexer):
                 if sparse:
                     if wave == 0:
@@ -2938,149 +2949,164 @@ def build_glm5_monokernel(
                 s = tt // (N_HEAD_GROUPS * N_SPLIT)
                 hg0 = (tt // N_SPLIT) % N_HEAD_GROUPS
             t = tt % N_SPLIT
-            nkeys, sparse = split_keys(t, s)
-            gpu.barrier()
-            gather_old_kv()  # before waiting for q: these rows are from earlier launches
-            if const_expr(True):
-                N_PE_T = PE_DIM // Q_B_TILE
-                hint_wait(
-                    N_UK + H * N_PE_T + 1,
-                    lambda k: (
-                        (k < N_UK).select(
-                            fx.Int64(SC["q_lat"]),
-                            (k < N_UK + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
-                        )
-                        + scratch,
-                        (k < N_UK).select(
-                            (s * H + k // UK_PER_HEAD) * KV_LORA + (k % UK_PER_HEAD) * UK_TILE + UK_TILE - 1,
-                            (k < N_UK + H * N_PE_T).select(
-                                (s * H + (k - N_UK) // N_PE_T) * PE_DIM
-                                + ((k - N_UK) % N_PE_T) * Q_B_TILE
-                                + Q_B_TILE
-                                - 1,
-                                s * PE_DIM + PE_DIM - 1,
+
+            def split_body(nkeys):
+                gpu.barrier()
+                gather_old_kv()  # before waiting for q: these rows are from earlier launches
+                if const_expr(True):
+                    N_PE_T = PE_DIM // Q_B_TILE
+                    hint_wait(
+                        N_UK + H * N_PE_T + 1,
+                        lambda k: (
+                            (k < N_UK).select(
+                                fx.Int64(SC["q_lat"]),
+                                (k < N_UK + H * N_PE_T).select(fx.Int64(SC["q_pe"]), fx.Int64(SC["penew"])),
+                            )
+                            + scratch,
+                            (k < N_UK).select(
+                                (s * H + k // UK_PER_HEAD) * KV_LORA + (k % UK_PER_HEAD) * UK_TILE + UK_TILE - 1,
+                                (k < N_UK + H * N_PE_T).select(
+                                    (s * H + (k - N_UK) // N_PE_T) * PE_DIM
+                                    + ((k - N_UK) % N_PE_T) * Q_B_TILE
+                                    + Q_B_TILE
+                                    - 1,
+                                    s * PE_DIM + PE_DIM - 1,
+                                ),
                             ),
                         ),
-                    ),
-                    mark=("split", tt),
-                )
-            # q -> bf16 Q[h][576] (words h * 288 + d / 2): latent 512 then pe 64.
-            # A task only ever reads its own head group's WAVES rows (``hn`` and
-            # ``h`` are both ``head_group * WAVES + ...``), so stage only those:
-            # with N_HEAD_GROUPS = 2 the old all-H staging polled and stored
-            # twice the q words it used, in every one of the S * 2 * N_SPLIT
-            # tasks. Bit-identical -- the skipped LDS rows are never read.
-            NQ = SPLIT_QH * KV_LORA // 4 // THREADS
-            # pe words: one pass up to 32 heads; 64 heads (DCP4) need two
-            PE_WORDS = SPLIT_QH * PE_DIM // 4
-            NPE = -(-PE_WORDS // THREADS)
-            tpe = fx.min(tid, PE_WORDS - 1)
-            qh0 = hg0 * SPLIT_QH if const_expr(SPLIT_QH != H) else fx.Int32(0)
-            qv = poll(
-                [(mb("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
-                + [(mb("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
-                + [
-                    (mb("q_pe"), ((s * H + qh0) * PE_DIM + fx.min(tid + i * THREADS, PE_WORDS - 1) * 4) // 2, 2)
-                    for i in range(1, NPE)
-                ]
-            )
-            for i in range_constexpr(NQ):
-                w4 = tid + i * THREADS
-                qw = (qh0 + w4 // (KV_LORA // 4)) * QS + (w4 % (KV_LORA // 4)) * 2
-                lds_st(xs, qw, qv[i][0].bitcast(fx.Float32))
-                lds_st(xs, qw + 1, qv[i][1].bitcast(fx.Float32))
-            if tid < SPLIT_QH * PE_DIM // 4:
-                hh = qh0 + tid // (PE_DIM // 4)
-                qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
-                lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
-                lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
-            for i in range_constexpr(1, NPE):
-                pw = tid + i * THREADS
-                if pw < PE_WORDS:
-                    hh = qh0 + pw // (PE_DIM // 4)
-                    qw = hh * QS + KV_LORA // 2 + (pw % (PE_DIM // 4)) * 2
-                    lds_st(xs, qw, qv[NQ + i][0].bitcast(fx.Float32))
-                    lds_st(xs, qw + 1, qv[NQ + i][1].bitcast(fx.Float32))
-            patch_new_kv()
-            if const_expr(True):
-                stamp("split", tt, 2)
-            gpu.barrier()
-            stamp("split", tt, 5)
-            # scores = K Q^T on MFMA.  The 64-key tile maps the eight waves to
-            # (four row groups, two K halves); the batch-8 32-key tile uses two
-            # row groups and four waves per K half.  All waves subsequently own
-            # one attention head for softmax and P@V.
-            for hgi in range_constexpr(SPLIT_GROUPS):
-                head_group = (hg0 + hgi) if const_expr(SPLIT_MERGE) else hg0
-                h = head_group * WAVES + wave
-                if const_expr(hgi):
-                    # the previous group's softmax read ``red``; this one
-                    # overwrites it with its own scores
-                    gpu.barrier()
-                hn = head_group * WAVES + fx.min(lane % 16, WAVES - 1)
-                rgk = wave % (SPLIT_KEYS // 16)
-                c = fx.Vector.filled(4, 0.0, fx.Float32)
-                for st in range_constexpr(QK_DIM // 32 // 2):
-                    kst = ((wave // (SPLIT_KEYS // 16)) % 2) * (QK_DIM // 32 // 2) + st
-                    key = rgk * 16 + lane % 16
-                    kw = (kst < KV_LORA // 32).select(
-                        KT_OFF + key * KS + kst * 16, PT_OFF + key * PS + (kst - KV_LORA // 32) * 16
+                        mark=("split", tt),
                     )
-                    a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                    b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                    c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-                if const_expr(SPLIT_KEYS == 64) or wave < 4:
-                    fx.ptr_store(c, red + (wave * 64 + lane) * 4)
-                gpu.barrier()
-                stamp("split", tt, 6)
-                # split-local softmax: wave h, lane = key j (score = sum of the two K halves)
-                kidx = t * SPLIT_KEYS + lane
-                valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
-                r16 = lane % 16
-                cl = split_score_column(wave, lane)
-                key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
-                half_stride = SPLIT_KEYS // 16
-                raw = lds_ld(red, (key_rg * 64 + cl) * 4 + r16 % 4) + lds_ld(
-                    red, ((key_rg + half_stride) * 64 + cl) * 4 + r16 % 4
+                # q -> bf16 Q[h][576] (words h * 288 + d / 2): latent 512 then pe 64.
+                # A task only ever reads its own head group's WAVES rows (``hn`` and
+                # ``h`` are both ``head_group * WAVES + ...``), so stage only those:
+                # with N_HEAD_GROUPS = 2 the old all-H staging polled and stored
+                # twice the q words it used, in every one of the S * 2 * N_SPLIT
+                # tasks. Bit-identical -- the skipped LDS rows are never read.
+                NQ = SPLIT_QH * KV_LORA // 4 // THREADS
+                # pe words: one pass up to 32 heads; 64 heads (DCP4) need two
+                PE_WORDS = SPLIT_QH * PE_DIM // 4
+                NPE = -(-PE_WORDS // THREADS)
+                tpe = fx.min(tid, PE_WORDS - 1)
+                qh0 = hg0 * SPLIT_QH if const_expr(SPLIT_QH != H) else fx.Int32(0)
+                qv = poll(
+                    [(mb("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
+                    + [(mb("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
+                    + [
+                        (mb("q_pe"), ((s * H + qh0) * PE_DIM + fx.min(tid + i * THREADS, PE_WORDS - 1) * 4) // 2, 2)
+                        for i in range(1, NPE)
+                    ]
                 )
-                sc_v = valid.select(raw * scale, fx.Float32(NEG))
-                m = wave_max(sc_v)
-                p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
-                lsum = wave_sum(p)
-                p_n = _xshfl(p, 1)
-                if (lane < SPLIT_KEYS) & (lane % 2 == 0):
-                    lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+                for i in range_constexpr(NQ):
+                    w4 = tid + i * THREADS
+                    qw = (qh0 + w4 // (KV_LORA // 4)) * QS + (w4 % (KV_LORA // 4)) * 2
+                    lds_st(xs, qw, qv[i][0].bitcast(fx.Float32))
+                    lds_st(xs, qw + 1, qv[i][1].bitcast(fx.Float32))
+                if tid < SPLIT_QH * PE_DIM // 4:
+                    hh = qh0 + tid // (PE_DIM // 4)
+                    qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
+                    lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
+                    lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
+                for i in range_constexpr(1, NPE):
+                    pw = tid + i * THREADS
+                    if pw < PE_WORDS:
+                        hh = qh0 + pw // (PE_DIM // 4)
+                        qw = hh * QS + KV_LORA // 2 + (pw % (PE_DIM // 4)) * 2
+                        lds_st(xs, qw, qv[NQ + i][0].bitcast(fx.Float32))
+                        lds_st(xs, qw + 1, qv[NQ + i][1].bitcast(fx.Float32))
+                patch_new_kv()
+                if const_expr(True):
+                    stamp("split", tt, 2)
                 gpu.barrier()
-                stamp("split", tt, 3)
-                # O = P V on MFMA: heads M, keys K, latent dims N.  Each V word holds
-                # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
-                # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
-                for g in range_constexpr(KV_LORA // 32 // WAVES):
-                    dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
-                    c0 = fx.Vector.filled(4, 0.0, fx.Float32)
-                    c1 = fx.Vector.filled(4, 0.0, fx.Float32)
-                    for js in range_constexpr(SPLIT_KEYS // 32):
-                        a = fx.ptr_load(
-                            pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
-                        ).bitcast(fx.BFloat16)
-                        ws = [
-                            fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
-                            for i in range(8)
-                        ]
-                        w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
-                        w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
-                        b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
-                        b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
-                        c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
-                        c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
-                    if lane < 32:
-                        for e in range_constexpr(4):
-                            hh = split_acc_head(head_group, lane // 16, e)
-                            put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
-                if lane == 0:  # written last: the merge's readiness hint
-                    put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
-                    put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
-                stamp("split", tt, 4)
+                stamp("split", tt, 5)
+                # scores = K Q^T on MFMA.  The 64-key tile maps the eight waves to
+                # (four row groups, two K halves); the batch-8 32-key tile uses two
+                # row groups and four waves per K half.  All waves subsequently own
+                # one attention head for softmax and P@V.
+                for hgi in range_constexpr(SPLIT_GROUPS):
+                    head_group = (hg0 + hgi) if const_expr(SPLIT_MERGE) else hg0
+                    h = head_group * WAVES + wave
+                    if const_expr(hgi):
+                        # the previous group's softmax read ``red``; this one
+                        # overwrites it with its own scores
+                        gpu.barrier()
+                    hn = head_group * WAVES + fx.min(lane % 16, WAVES - 1)
+                    rgk = wave % (SPLIT_KEYS // 16)
+                    c = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for st in range_constexpr(QK_DIM // 32 // 2):
+                        kst = ((wave // (SPLIT_KEYS // 16)) % 2) * (QK_DIM // 32 // 2) + st
+                        key = rgk * 16 + lane % 16
+                        kw = (kst < KV_LORA // 32).select(
+                            KT_OFF + key * KS + kst * 16, PT_OFF + key * PS + (kst - KV_LORA // 32) * 16
+                        )
+                        a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                        b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                        c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+                    if const_expr(SPLIT_KEYS == 64) or wave < 4:
+                        fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+                    gpu.barrier()
+                    stamp("split", tt, 6)
+                    # split-local softmax: wave h, lane = key j (score = sum of the two K halves)
+                    kidx = t * SPLIT_KEYS + lane
+                    valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
+                    r16 = lane % 16
+                    cl = split_score_column(wave, lane)
+                    key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
+                    half_stride = SPLIT_KEYS // 16
+                    raw = lds_ld(red, (key_rg * 64 + cl) * 4 + r16 % 4) + lds_ld(
+                        red, ((key_rg + half_stride) * 64 + cl) * 4 + r16 % 4
+                    )
+                    sc_v = valid.select(raw * scale, fx.Float32(NEG))
+                    m = wave_max(sc_v)
+                    p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
+                    lsum = wave_sum(p)
+                    p_n = _xshfl(p, 1)
+                    if (lane < SPLIT_KEYS) & (lane % 2 == 0):
+                        lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+                    gpu.barrier()
+                    stamp("split", tt, 3)
+                    # O = P V on MFMA: heads M, keys K, latent dims N.  Each V word holds
+                    # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
+                    # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
+                    for g in range_constexpr(KV_LORA // 32 // WAVES):
+                        dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
+                        c0 = fx.Vector.filled(4, 0.0, fx.Float32)
+                        c1 = fx.Vector.filled(4, 0.0, fx.Float32)
+                        for js in range_constexpr(SPLIT_KEYS // 32):
+                            a = fx.ptr_load(
+                                pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
+                            ).bitcast(fx.BFloat16)
+                            ws = [
+                                fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
+                                for i in range(8)
+                            ]
+                            w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
+                            w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
+                            b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
+                            b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
+                            c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
+                            c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
+                        if lane < 32:
+                            for e in range_constexpr(4):
+                                hh = split_acc_head(head_group, lane // 16, e)
+                                put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
+                    if lane == 0:  # written last: the merge's readiness hint
+                        put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
+                        put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
+                    stamp("split", tt, 4)
+
+            if const_expr(D == 1):
+                nkeys, sparse = split_keys(t, s)
+                split_body(nkeys)
+            else:
+                # under DCP a rank holds about topk / D of the keys: a split
+                # past them only publishes the empty-split statistics
+                if t < live_split_count(s):
+                    split_body(split_keys(t, s)[0])
+                else:
+                    if tid < H:
+                        put(mb("sp_m"), (s * N_SPLIT + t) * H + tid, fx.Float32(NEG))
+                        put(mb("sp_l"), (s * N_SPLIT + t) * H + tid, fx.Float32(0.0))
+                    stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
         # 4 row groups x 8 chunks: 2 waves per row group, 4 chunks each
@@ -3115,14 +3141,31 @@ def build_glm5_monokernel(
                     lds_st(misc, N_SPLIT, m_all)
                     lds_st(misc, N_SPLIT + 1, den)
             gpu.barrier()
+            if const_expr(D > 1):
+                # splits past this rank's keys published no partials and weigh
+                # exp(NEG - M) = 0 (or 0 through ``den > 0`` when no split has
+                # a key): read the last live one in their place
+                last = live_split_count(s) - 1
             for dh in range_constexpr(2):
                 dp = dp_lo + dh * (KV_LORA // 4)
-                got = poll(
-                    [
-                        (mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1)
-                        for j in range(SPH)
-                    ]
-                )
+                if const_expr(D == 1):
+                    got = poll(
+                        [
+                            (mb("sp_acc"), ((s * N_SPLIT + hf * SPH + j) * H + head) * (KV_LORA // 2) + dp, 1)
+                            for j in range(SPH)
+                        ]
+                    )
+                else:
+                    got = poll(
+                        [
+                            (
+                                mb("sp_acc"),
+                                ((s * N_SPLIT + fx.min(hf * SPH + j, last)) * H + head) * (KV_LORA // 2) + dp,
+                                1,
+                            )
+                            for j in range(SPH)
+                        ]
+                    )
                 o0 = fx.Float32(0.0)
                 o1 = fx.Float32(0.0)
                 for j in range_constexpr(SPH):
