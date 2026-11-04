@@ -119,23 +119,22 @@ def flat_view(flat, rows, width):
     return flat[: rows * width].view(rows, width)
 
 
-def dcp_qsplit_rows(
-    num_rows: int, rank: int, world_size: int
-) -> tuple[int, int, int, int]:
+def qsplit_rows(num_rows: int, rank: int, world_size: int) -> tuple[int, int, int, int]:
     """This rank's slot in the gathered buffer and the rows it scores into it.
 
     Under DCP every rank already all-gathers the whole index cache, so having
     all ``world_size`` of them score every row recomputes the same top-k that
     many times. Each rank scores ``[row_lo, row_hi)`` instead, against the full
-    key set, and the selections are all-gathered back.
+    key set, and the selections are all-gathered back. (V4's plain-TP split
+    deals its rows round-robin instead: `RowSplit.striped`.)
 
     The stride is uniform -- ``ceil(num_rows / world_size)`` for every rank --
     so a rank-major concatenation of stride-sized buffers lands row ``i`` back
-    at row ``i``, with no index exchange. The price is that the last rank's
-    buffer has a tail of unwritten rows: the gathered payload is
+    at row ``i``, with no index exchange. The price is that the last ranks'
+    buffers can have tails of unscored rows: the gathered payload is
     ``world_size * ceil(num_rows / world_size)`` rows, at most
-    ``world_size - 1`` more than ``num_rows``. That tail sits at gathered
-    indices ``>= num_rows`` and is never read back.
+    ``world_size - 1`` more than ``num_rows``. Those tails sit at gathered
+    indices ``>= num_rows`` and are never read back.
 
     ``slot_lo`` is where this rank's stride sits in the gathered buffer, and it
     is deliberately NOT clamped, while ``row_lo``/``row_hi`` -- the rows to
@@ -155,6 +154,46 @@ def dcp_qsplit_rows(
     row_lo = min(slot_lo, num_rows)
     row_hi = min(slot_lo + rows_per_rank, num_rows)
     return rows_per_rank, slot_lo, row_lo, row_hi
+
+
+def indexer_qsplit_world(
+    tp: int,
+    *,
+    physical_tp: int,
+    enabled: bool,
+    gfx1250_opus: bool,
+    dp_attention: bool,
+    tbo: bool,
+    pcp: int,
+    dcp: int,
+    kv_consumer: bool,
+) -> int:
+    """TP width the DeepSeek-V4 prefill indexer splits its query rows over
+    (`RowSplit` with `group="tp"`); 1 means no split.
+
+    The V4 indexer is replicated across TP, so every rank would score the
+    same rows. The split needs every TP rank to hold the same rows, which DP
+    attention, PCP and DCP each break; a prefill TBO's ubatch rows do not
+    take it yet. Simulated TP (`--fake-eplb` on fewer devices) reports a
+    width the device group does not have. gfx1250 OPUS scores through its own
+    plans. A P/D decode instance (`kv_consumer`) prefills only to recompute,
+    too rarely to pay for the split's startup gather. Within this width a
+    prefill step still splits only from `ATOM_V4_INDEXER_QSPLIT_MIN_LOGITS`
+    index logits (the V4 builder's `_prefill_row_split`).
+    """
+    if (
+        not enabled
+        or tp <= 1
+        or physical_tp != tp
+        or gfx1250_opus
+        or dp_attention
+        or tbo
+        or pcp > 1
+        or dcp > 1
+        or kv_consumer
+    ):
+        return 1
+    return tp
 
 
 class LogitsWorkspace:

@@ -152,6 +152,10 @@ its end marker — not a stall: it is reasoning, and it is delivered as
 region* appears, everything from it onward belongs to the format until it can
 parse the region.
 
+One case is sent twice instead of held: a dialect that declares
+`answer_end_markers` replays a think channel the model used as its reply as
+`content` once that is known (see `ReasoningFilter._close_channel`).
+
 ##### What is held, and for how long
 
 The rule is that a byte is buffered only while its **destination field** is
@@ -344,6 +348,10 @@ chunking) comparisons, the two agreed byte-for-byte on 50% of them; they now
 agree on all of them, and the property that says so is byte-exact rather than
 word-level.
 
+There is one reader: the non-streaming split is the streaming filter run over
+the whole output, once, and the filter is chunk-invariant, so the two delivery
+modes cannot disagree.
+
 The streaming filter also stopped eating the newline after its end marker. It
 only ever saw what happened to be buffered when the marker arrived, so the
 same answer kept those bytes at one chunk size and lost them at another —
@@ -393,6 +401,19 @@ suppressed. `/v1/messages` reads the field too, in Anthropic's
 `{"type": "none"}` spelling; it previously parsed it off the request and used
 it nowhere, so a client that forbade tool calls got `tool_use` blocks and
 `stop_reason: tool_use` anyway.
+
+**`tool_choice: "required"` on Kimi-K3 opens the tools channel.** The chat
+template only tells the model it MUST call a tool, and at T=1 it still closed
+the message after its response on a share of requests, writing the arguments
+as `content`. On a chat request with `tool_choice: "required"` and a non-empty
+`tools`, both chat endpoints now hold K3's output to its tools channel on the
+GPU: it may not end before the channel opens, and once the response channel
+closes (`<|close|>response<|sep|>`) the next tokens are forced to
+`<|open|>tools<|sep|><|open|>call tool="`. The tool name and arguments stay the
+model's. A model that writes `<|open|>tools<|sep|>` itself, by any other way,
+has opened it too: nothing is held back from then on. Every other format, every other `tool_choice`, and `/v1/messages` and
+`/v1/responses` sample as before; see `atom/model_ops/required_channel.py`.
+A required request's own `stop` strings can still end it before a call.
 
 Forwarding it to the chat template is a separate step, and one that used to be
 a 500. The handler passes template controls it cannot know the model reads —
