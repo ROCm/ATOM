@@ -541,7 +541,7 @@ class StreamDeliveryTiming:
 
 @dataclass
 class StreamState:
-    detokenizer: IncrementalStreamDetokenizer
+    detokenizer: IncrementalStreamDetokenizer | None
     timing: StreamDeliveryTiming = field(default_factory=StreamDeliveryTiming)
 
 
@@ -584,12 +584,14 @@ class StreamBatchDispatcher:
         self._observe_inter_token_latency = observe_inter_token_latency
         self._thread_local = threading.local()
 
-    def new_state(self) -> StreamState:
+    def new_state(self, *, decode: bool = True) -> StreamState:
         """Make decoding and delivery timing state for one stream's callback."""
         return StreamState(
             IncrementalStreamDetokenizer(
                 self.tokenizer, synthetic_text=self.synthetic_text
             )
+            if decode
+            else None
         )
 
     def enqueue(
@@ -625,6 +627,8 @@ class StreamBatchDispatcher:
             else:
                 # Queue consumers cannot decode on read and still receive a
                 # prepared chunk, as before.
+                if item.state.detokenizer is None:
+                    raise ValueError("Raw streams require StreamOutputCollector")
                 item.chunk["text"] = item.state.detokenizer.update(
                     item.chunk.get("token_ids") or [],
                     bool(item.chunk.get("finished")),

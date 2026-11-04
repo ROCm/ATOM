@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from atom.entrypoints.openai.chat_logprobs import LogprobTracker, response_logprobs
+from atom.entrypoints.openai.logprobs import LogprobsProcessor
 from atom.entrypoints.openai.reasoning import NO_REASONING
-from atom.entrypoints.openai.serving_chat import create_chat_chunk
+from atom.entrypoints.openai.serving_chat import create_chat_chunk, response_logprobs
 from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.streaming_dispatch import IncrementalStreamDetokenizer
 from atom.entrypoints.openai.tool_parser import ToolCallStreamParser
@@ -73,7 +73,7 @@ def test_nonstream_joins_source_spans_without_search(text, answer, thought):
 @pytest.mark.parametrize("size", [1, 3, 17, 1000])
 def test_stream_hidden_repeated_text_uses_visible_occurrence(size):
     text = "left" + CALL + "right"
-    tracker = LogprobTracker(Codec())
+    tracker = LogprobsProcessor(Codec())
     reader = NO_REASONING.stream()
     parser = ToolCallStreamParser(tools=TOOLS, parser_cls=DsmlV41Parser)
     rows, visible = [], []
@@ -107,7 +107,7 @@ def test_stream_hidden_repeated_text_uses_visible_occurrence(size):
 
 
 def test_long_undecided_tool_records_spill_without_an_in_memory_index():
-    tracker = LogprobTracker(Codec(), 20)
+    tracker = LogprobsProcessor(Codec(), 20)
     record = TokenLogprob(-1.0, 1, tuple((97, -float(i + 1)) for i in range(20)))
     for _ in range(3000):
         last = tracker.feed([97], [record])
@@ -124,7 +124,7 @@ def test_truncated_multibyte_source_keeps_original_bytes():
         raw=lambda _: b"\xe4",
         candidate=lambda t, p: {"bytes": [228], "token": "\ufffd", "logprob": p},
     )
-    tracker = LogprobTracker(codec)
+    tracker = LogprobsProcessor(codec)
     assert tracker.feed([0], [TokenLogprob(-0.25, 1)]) == ""
     source = tracker.feed([], None, finished=True)
     assert source == "\ufffd"
@@ -153,8 +153,8 @@ def test_logprob_detokenization_preserves_punctuation_spaces():
 @pytest.mark.parametrize("traced", [False, True])
 @pytest.mark.parametrize("starts_open", [False, True])
 def test_schema_literal_answer_preserves_json_and_logprob_source(traced, starts_open):
+    from atom.entrypoints.openai.logprobs import SourceText
     from atom.entrypoints.openai.reasoning import ReasoningChannel
-    from atom.entrypoints.openai.source_text import SourceText
 
     answer = '{"text":"<think>literal</think>"}'
     prefix = "reason</think>" if starts_open else ""
@@ -170,3 +170,122 @@ def test_schema_literal_answer_preserves_json_and_logprob_source(traced, starts_
         assert isinstance(content, SourceText)
         assert content.owner is owner
         assert content.source_ranges == [(len(prefix), len(text))]
+
+
+@pytest.mark.parametrize(
+    "pieces",
+    [
+        [b".</", b"think>", b"ok"],
+        [b".</think>ok"],
+        [b"a<think>b</think>c"],
+        [b"left" + CALL.encode() + b"right"],
+    ],
+)
+@pytest.mark.parametrize("size", [1, 100])
+def test_boundary_tokens_owned_once_in_json_and_stream(pieces, size):
+    from atom.entrypoints.openai.reasoning import ReasoningChannel
+
+    class ByteCodec:
+        special = frozenset()
+
+        def raw(self, token):
+            return pieces[token]
+
+        def candidate(self, token, logprob):
+            return {
+                "token": pieces[token].decode(),
+                "bytes": list(pieces[token]),
+                "logprob": logprob,
+            }
+
+    channel = ReasoningChannel(starts_open=pieces[0].startswith(b"."))
+    probabilities = [TokenLogprob(-float(i + 1), 1, ()) for i in range(len(pieces))]
+    response = SimpleNamespace(choices=[{"message": {}}])
+    response_logprobs(
+        response,
+        [{"token_ids": list(range(len(pieces))), "logprobs": probabilities}],
+        ByteCodec(),
+        0,
+        reasoning=channel,
+        tools=TOOLS,
+        tool_parser_cls=DsmlV41Parser,
+    )
+    expected = response.choices[0]["logprobs"]
+    tracker = LogprobsProcessor(ByteCodec())
+    reader = channel.stream()
+    parser = ToolCallStreamParser(tools=TOOLS, parser_cls=DsmlV41Parser)
+    actual = {key: [] for key in expected}
+    visible = {key: "" for key in expected}
+
+    def emit(field, text):
+        visible[field] += str(text)
+        actual[field].extend(tracker.take(text))
+
+    for start in range(0, len(pieces), size):
+        stop = min(start + size, len(pieces))
+        final = stop == len(pieces)
+        text = tracker.feed(
+            list(range(start, stop)), probabilities[start:stop], finished=final
+        )
+        for field, value in reader.process(text) + (reader.flush() if final else []):
+            if field == "content":
+                for kind, part in parser.process(value):
+                    if kind == "content":
+                        emit(field, part)
+            else:
+                emit(field, value)
+        if final:
+            for kind, part in parser.flush():
+                if kind == "content":
+                    emit("content", part)
+    assert actual == expected
+    assert visible == {key: response.choices[0]["message"][key] for key in expected}
+    claimed = [entry["logprob"] for entries in actual.values() for entry in entries]
+    assert len(claimed) == len(set(claimed))
+    assert -1.0 in claimed
+    tracker.close()
+
+
+@pytest.mark.parametrize("tag", [None, 1])
+def test_raw_logprob_dispatch_coalesces_without_ordinary_decode(tag):
+    import asyncio
+
+    from atom.entrypoints.openai.logprobs import LogprobCollector
+    from atom.entrypoints.openai.streaming_dispatch import (
+        StreamBatchDispatcher,
+        StreamOutputCollector,
+    )
+
+    async def run():
+        # No tokenizer methods exist: constructing/using an ordinary decoder fails.
+        dispatcher = StreamBatchDispatcher(object())
+        state = dispatcher.new_state(decode=False)
+        assert state.detokenizer is None
+        source = StreamOutputCollector()
+        wrapper = LogprobCollector(source, Codec(), 0, n=2)
+        loop = asyncio.get_running_loop()
+        for token in (97, 98):
+            dispatcher.enqueue(
+                loop=loop,
+                collector=source,
+                state=state,
+                tag=tag,
+                chunk={
+                    "token_ids": [token],
+                    "logprobs": [TokenLogprob(-1, 1, ())],
+                    "finished": token == 98,
+                },
+            )
+        dispatcher.flush()
+        await asyncio.sleep(0)
+        payload = await wrapper.get()
+        index, chunk = payload if isinstance(payload, tuple) else (0, payload)
+        assert index == (tag or 0)
+        assert chunk["text"] == "ab"
+        assert chunk["token_ids"] == [97, 98]
+        assert chunk["finished"]
+        assert len(wrapper.trackers[index].take(chunk["text"])) == 2
+        for tracker in wrapper.trackers:
+            tracker.close()
+
+    asyncio.run(run())

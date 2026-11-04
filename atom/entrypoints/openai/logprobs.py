@@ -1,14 +1,131 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Keep generated token probabilities aligned with visible Chat byte spans."""
+"""Request-owned logprob processing for visible text.
+
+TokenBytes maps tokenizer IDs to original bytes. SourceText preserves those
+positions through parsing. LogprobsProcessor decodes deltas and claims records
+from its bounded spool; LogprobCollector connects it to coalesced engine output.
+Chat wire-format assembly lives in serving_chat.py.
+"""
 
 import codecs
 import json
-from functools import lru_cache
+import struct
+from contextlib import ExitStack
+from tempfile import SpooledTemporaryFile
 
-from .logprob_store import LogprobStore
-from .source_text import SourceText
+
+class SourceText(str):
+    """Parsed text retaining original byte spans, including UTF-8 replacements."""
+
+    def __new__(cls, parts, owner):
+        parts = tuple(p for p in parts if p[0])
+        obj = super().__new__(cls, "".join(p[0] for p in parts))
+        obj.parts = parts
+        obj.owner = owner
+        return obj
+
+    @property
+    def source_ranges(self):
+        return [(lo, hi) for _, lo, hi in self.parts]
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice):
+            return str.__getitem__(self, key)
+        start, end, step = key.indices(len(self))
+        if step != 1:
+            raise ValueError("Source text requires contiguous slices")
+        parts, at = [], 0
+        for text, lo, hi in self.parts:
+            left, right = max(0, start - at), min(len(text), end - at)
+            if left < right:
+                if hi - lo == len(text.encode("utf-8")):
+                    first = lo + len(text[:left].encode("utf-8"))
+                    last = lo + len(text[:right].encode("utf-8"))
+                else:
+                    # A replacement part is one character mapped to the bytes
+                    # that caused it. Never infer its source length from U+FFFD.
+                    assert len(text) == 1 and left == 0 and right == 1
+                    first, last = lo, hi
+                parts.append((text[left:right], first, last))
+            at += len(text)
+        return SourceText(parts, self.owner)
+
+    def __add__(self, other):
+        return join_text((self, other))
+
+    def __radd__(self, other):
+        return join_text((other, self))
+
+
+def join_text(parts):
+    parts = list(parts)
+    if not parts or type(parts[0]) is str and all(type(p) is str for p in parts):
+        return "".join(parts)
+    traced = next((p for p in parts if isinstance(p, SourceText)), None)
+    if traced is None:
+        return "".join(parts)
+    spans = []
+    for part in parts:
+        if not part:
+            continue
+        if not isinstance(part, SourceText) or part.owner is not traced.owner:
+            raise ValueError("Parser lost source-byte provenance")
+        spans.extend(part.parts)
+    return SourceText(spans, traced.owner)
+
+
+class _LogprobStore:
+    """Fixed-width records spill after 64 KiB; ownership needs no Python index."""
+
+    MEMORY_LIMIT = 64 * 1024
+
+    def __init__(self, top_k):
+        self.layout = struct.Struct("<QQqdi" + "qd" * top_k + "?")
+        self.top_k = top_k
+        self._files = ExitStack()
+        self.file = self._files.enter_context(
+            SpooledTemporaryFile(  # noqa: SIM115 - owned by the request ExitStack
+                max_size=self.MEMORY_LIMIT, mode="w+b"
+            )
+        )
+        self.count = 0
+
+    def append(self, start, end, token, record):
+        top = list(record.top[: self.top_k])
+        top += [(-1, 0.0)] * (self.top_k - len(top))
+        values = [start, end, token, record.logprob, record.rank]
+        values.extend(value for pair in top for value in pair)
+        self.file.seek(self.count * self.layout.size)
+        self.file.write(self.layout.pack(*values, False))
+        self.count += 1
+
+    def read(self, index):
+        self.file.seek(index * self.layout.size)
+        return self.layout.unpack(self.file.read(self.layout.size))
+
+    def within(self, start, end):
+        left, right = 0, self.count
+        while left < right:
+            middle = (left + right) // 2
+            if self.read(middle)[1] <= start:
+                left = middle + 1
+            else:
+                right = middle
+        for index in range(left, self.count):
+            record = self.read(index)
+            if record[0] >= end:
+                break
+            if not record[-1]:
+                # Store ownership in the spool, not an ever-growing Python set.
+                # A partially visible token still contributes its probability.
+                self.file.seek((index + 1) * self.layout.size - 1)
+                self.file.write(b"\x01")
+                yield record[:-1]
+
+    def close(self):
+        self._files.close()
 
 
 class TokenBytes:
@@ -55,15 +172,10 @@ class TokenBytes:
         }
 
 
-@lru_cache(maxsize=4)
-def token_bytes(tokenizer):
-    return TokenBytes(tokenizer)
-
-
-class LogprobTracker:
+class LogprobsProcessor:
     def __init__(self, codec, top_k=0):
         self.codec = codec
-        self.store = LogprobStore(top_k)
+        self.store = _LogprobStore(top_k)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.source_end = 0
 
@@ -131,6 +243,19 @@ class LogprobTracker:
                 result.append(entry)
         return result
 
+    def take_fields(self, fields):
+        """Assign boundary tokens once, in source order for both JSON and SSE."""
+        values = {field: [] for field in fields}
+        spans = sorted(
+            (start, end, field, text)
+            for field, value in fields.items()
+            if value
+            for text, start, end in value.parts
+        )
+        for start, end, field, text in spans:
+            values[field].extend(self.take(SourceText([(text, start, end)], self)))
+        return values
+
     def close(self):
         self.store.close()
 
@@ -140,7 +265,7 @@ class LogprobCollector:
 
     def __init__(self, source, codec, top_k, n=1):
         self.source = source
-        self.trackers = [LogprobTracker(codec, top_k) for _ in range(n)]
+        self.trackers = [LogprobsProcessor(codec, top_k) for _ in range(n)]
 
     async def get(self):
         payload = await self.source.get()
@@ -151,58 +276,3 @@ class LogprobCollector:
             finished=bool(chunk.get("finished")),
         )
         return payload
-
-
-async def stream_logprobs(source, trackers):
-    # create_chat_chunk attaches probabilities before serialization, while source
-    # spans still exist. Never search rendered SSE text or re-encode its frames.
-    try:
-        async for frame in source:
-            yield frame
-    finally:
-        try:
-            await source.aclose()
-        finally:
-            for tracker in trackers:
-                tracker.close()
-
-
-def response_logprobs(
-    response,
-    outputs,
-    codec,
-    top_k,
-    *,
-    reasoning,
-    tools=None,
-    tool_choice=None,
-    tool_parser_cls=None,
-):
-    from .serving_chat import _tool_parser_for_request
-    from .tool_parser import parse_tool_calls
-    from .tool_parser.registry import forbids_tool_calls
-
-    for choice, output in zip(response.choices, outputs):
-        tracker = LogprobTracker(codec, top_k)
-        try:
-            source = tracker.feed(
-                output["token_ids"], output.get("logprobs"), finished=True
-            )
-            thought, answer = reasoning.split(source)
-            content, _ = parse_tool_calls(
-                answer,
-                tools,
-                parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
-                suppress_calls=forbids_tool_calls(tool_choice),
-            )
-            # Consume spans independently; reasoning and content can be interleaved
-            # in source order, then joined into separate non-streaming fields.
-            values = {"content": tracker.take(content)}
-            choice["message"]["content"] = str(content)
-            if thought is not None:
-                choice["message"]["reasoning_content"] = str(thought)
-                values["reasoning_content"] = tracker.take(thought)
-            choice["logprobs"] = values
-        finally:
-            tracker.close()
-    return response

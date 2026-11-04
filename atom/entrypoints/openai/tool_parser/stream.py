@@ -17,8 +17,8 @@ compares them, but no second implementation to compare against.
 
 import logging
 
+from ..logprobs import join_text
 from ..marker_scanner import MarkerScanner
-from ..source_text import join_text
 from .schema import ParamTypes, build_param_types
 from .tool_parser import (
     RegionParse,

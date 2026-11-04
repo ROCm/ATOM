@@ -1364,9 +1364,9 @@ async def setup_streaming_request(
     # The detokenizer lives in this closure, so it is freed when the engine
     # drops the callback on the stream's last chunk -- no registry, no cleanup.
     assert _stream_batch_dispatcher is not None
-    detokenizer = _stream_batch_dispatcher.new_state()
-    if sampling_params.logprobs:
-        detokenizer.detokenizer.clean_up_tokenization_spaces = False
+    detokenizer = _stream_batch_dispatcher.new_state(
+        decode=not sampling_params.logprobs
+    )
 
     def stream_callback(request_output: RequestOutput) -> None:
         _send_stream_chunk_direct(
@@ -1577,9 +1577,9 @@ async def setup_streaming_request_fanout(
 
     def make_callback(idx: int):
         # One detokenizer per sibling, held by the closure that feeds it.
-        detokenizer = _stream_batch_dispatcher.new_state()
-        if sampling_params.logprobs:
-            detokenizer.detokenizer.clean_up_tokenization_spaces = False
+        detokenizer = _stream_batch_dispatcher.new_state(
+            decode=not sampling_params.logprobs
+        )
 
         def _cb(request_output: RequestOutput) -> None:
             _send_stream_chunk_tagged(
@@ -1877,7 +1877,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         messages = request.get_messages()
         logprob_codec = None
         if request.logprobs:
-            from .chat_logprobs import token_bytes
+            from .logprobs import TokenBytes
 
             if getattr(engine.config, "enable_rapidserve", False):
                 raise ValueError("logprobs is unavailable with RapidServe")
@@ -1893,7 +1893,10 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 raise ValueError(
                     "Chat logprobs currently supports text without P/D transfer"
                 )
-            logprob_codec = token_bytes(tokenizer)
+            logprob_codec = getattr(app.state, "logprob_codec", None)
+            if logprob_codec is None or logprob_codec.tokenizer is not tokenizer:
+                logprob_codec = TokenBytes(tokenizer)
+                app.state.logprob_codec = logprob_codec
 
         merged_kwargs = dict(default_chat_template_kwargs)
         if request.chat_template_kwargs:
@@ -2024,7 +2027,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     )
                 )
                 if logprob_codec is not None:
-                    from .chat_logprobs import LogprobCollector
+                    from .logprobs import LogprobCollector
 
                     stream_collector = LogprobCollector(
                         stream_collector,
@@ -2061,7 +2064,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     )
                 )
                 if logprob_codec is not None:
-                    from .chat_logprobs import LogprobCollector
+                    from .logprobs import LogprobCollector
 
                     stream_collector = LogprobCollector(
                         stream_collector, logprob_codec, request.top_logprobs or 0, 1
@@ -2084,7 +2087,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     ),
                 )
             if logprob_codec is not None:
-                from .chat_logprobs import stream_logprobs
+                from .serving_chat import stream_logprobs
 
                 gen = stream_logprobs(gen, stream_collector.trackers)
             if schema is not None:
@@ -2196,7 +2199,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         if logprob_codec is not None:
-            from .chat_logprobs import response_logprobs
+            from .serving_chat import response_logprobs
 
             resp = response_logprobs(
                 resp,

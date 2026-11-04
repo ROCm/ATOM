@@ -7,12 +7,12 @@ from types import SimpleNamespace
 import pytest
 
 from atom.entrypoints.openai import api_server
-from atom.entrypoints.openai.chat_logprobs import (
+from atom.entrypoints.openai.logprobs import (
     LogprobCollector,
-    LogprobTracker,
+    LogprobsProcessor,
     TokenBytes,
-    stream_logprobs,
 )
+from atom.entrypoints.openai.serving_chat import stream_logprobs
 from atom.entrypoints.openai.sse import iter_sse_data
 from atom.entrypoints.openai.streaming_dispatch import StreamOutputCollector
 from atom.model_engine.token_logprobs import TokenLogprob
@@ -50,7 +50,7 @@ def rec(rank=1):
 
 
 def test_bytes_across_chinese_tokens_and_special_eos():
-    tracker = LogprobTracker(codec(), 1)
+    tracker = LogprobsProcessor(codec(), 1)
     text = tracker.feed([2, 3, 4, 7], [rec()] * 4, finished=True)
     rows = tracker.take(text)
     assert len(rows) == 3
@@ -60,7 +60,7 @@ def test_bytes_across_chinese_tokens_and_special_eos():
 
 
 def test_reasoning_delimiter_and_rank_sentinel():
-    tracker = LogprobTracker(codec(), 0)
+    tracker = LogprobsProcessor(codec(), 0)
     text = tracker.feed([0, 5, 6], [rec(), rec(), rec(21)], finished=True)
     assert tracker.take(text[:5])[0]["logprob"] == -0.25
     rows = tracker.take(text[-2:])
@@ -69,7 +69,7 @@ def test_reasoning_delimiter_and_rank_sentinel():
 
 
 def test_truncated_utf8_keeps_original_token_bytes():
-    tracker = LogprobTracker(codec())
+    tracker = LogprobsProcessor(codec())
     text = tracker.feed([2], [rec()], finished=True)
     rows = tracker.take(text)
     assert rows[0]["bytes"] == [0xE4]
@@ -119,17 +119,17 @@ def test_coalescing_keeps_probabilities_and_choice_identity():
 
 
 def test_missing_probability_does_not_succeed_silently():
-    tracker = LogprobTracker(codec())
+    tracker = LogprobsProcessor(codec())
     with pytest.raises(RuntimeError, match="Missing"):
         tracker.feed([0], None)
 
 
 def test_stream_tracker_preserves_partial_tokens_and_closes_store():
-    tracker = LogprobTracker(codec())
+    tracker = LogprobsProcessor(codec())
     for _ in range(100):
         text = tracker.feed([0], [rec()])
-        assert tracker.take(text[:4]) == []
-        assert len(tracker.take(text[4:])) == 1
+        assert len(tracker.take(text[:4])) == 1
+        assert tracker.take(text[4:]) == []
     tracker.close()
     assert tracker.store.file.closed
 
@@ -145,9 +145,9 @@ def test_non_bytelevel_tokenizer_is_explicitly_rejected():
 def test_chat_route_transports_actual_records(
     server, monkeypatch, stream, top_k, with_tools
 ):
-    from atom.entrypoints.openai import chat_logprobs
+    from atom.entrypoints.openai import logprobs
 
-    monkeypatch.setattr(chat_logprobs, "token_bytes", lambda tokenizer: codec())
+    monkeypatch.setattr(logprobs, "TokenBytes", lambda tokenizer: codec())
     server.chunks = [
         {
             "text": "hello",
@@ -249,3 +249,53 @@ def test_rapidserve_logprobs_rejected_before_generation(server, stream, enabled)
     else:
         assert response.status_code == 200, response.text
         assert server.generations
+
+
+def test_service_codec_is_lazy_reused_and_replaced_with_tokenizer(server, monkeypatch):
+    from atom.entrypoints.openai import logprobs
+
+    created = []
+    monkeypatch.setattr(
+        api_server.tokenizer,
+        "convert_ids_to_tokens",
+        codec().tokenizer.convert_ids_to_tokens,
+        raising=False,
+    )
+
+    def make_codec(tokenizer):
+        result = codec()
+        result.tokenizer = tokenizer
+        created.append(result)
+        return result
+
+    monkeypatch.setattr(logprobs, "TokenBytes", make_codec)
+    monkeypatch.setattr(api_server.app.state, "logprob_codec", None, raising=False)
+
+    async def generate(prompt, params, *args, **kwargs):
+        yield {
+            "text": "hello",
+            "token_ids": [0],
+            "logprobs": [rec()],
+            "finish_reason": "eos",
+            "num_tokens_input": 2,
+            "num_tokens_output": 1,
+        }
+
+    monkeypatch.setattr(api_server, "generate_async", generate)
+    request = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    }
+    assert post("/v1/chat/completions", request).status_code == 200
+    assert created == []
+    request["logprobs"] = True
+    for _ in range(2):
+        response = post("/v1/chat/completions", request)
+        assert response.status_code == 200, response.text
+    assert len(created) == 1
+    assert api_server.app.state.logprob_codec is created[0]
+    # Simulate a stale codec after replacing the service tokenizer.
+    created[0].tokenizer = object()
+    assert post("/v1/chat/completions", request).status_code == 200
+    assert len(created) == 2
+    assert api_server.app.state.logprob_codec is created[1]

@@ -283,15 +283,18 @@ def create_chat_chunk(
         ],
     }
     if with_logprobs and delta:
-        from .source_text import SourceText
+        from .logprobs import SourceText
 
-        probabilities = {
-            field: text.owner.take(text)
+        fields = {
+            field: text
             for field, text in delta.items()
             if field in ("content", "reasoning_content")
             and isinstance(text, SourceText)
             and text
         }
+        probabilities = (
+            next(iter(fields.values())).owner.take_fields(fields) if fields else {}
+        )
         if probabilities:
             chunk["choices"][0]["logprobs"] = probabilities
         chunk["choices"][0]["delta"] = {
@@ -303,6 +306,59 @@ def create_chat_chunk(
     if kv_transfer_params is not None:
         chunk["kv_transfer_params"] = kv_transfer_params
     return data_frame(chunk)
+
+
+async def stream_logprobs(source, trackers):
+    # create_chat_chunk attaches probabilities before serialization, while source
+    # spans still exist. Never search rendered SSE text or re-encode its frames.
+    try:
+        async for frame in source:
+            yield frame
+    finally:
+        try:
+            await source.aclose()
+        finally:
+            for tracker in trackers:
+                tracker.close()
+
+
+def response_logprobs(
+    response,
+    outputs,
+    codec,
+    top_k,
+    *,
+    reasoning,
+    tools=None,
+    tool_choice=None,
+    tool_parser_cls=None,
+):
+    from .logprobs import LogprobsProcessor
+
+    for choice, output in zip(response.choices, outputs):
+        tracker = LogprobsProcessor(codec, top_k)
+        try:
+            source = tracker.feed(
+                output["token_ids"], output.get("logprobs"), finished=True
+            )
+            thought, answer = reasoning.split(source)
+            content, _ = parse_tool_calls(
+                answer,
+                tools,
+                parser_cls=_tool_parser_for_request(tool_parser_cls, tools),
+                suppress_calls=forbids_tool_calls(tool_choice),
+            )
+            fields = {"content": content}
+            if thought is not None:
+                fields["reasoning_content"] = thought
+            values = tracker.take_fields(fields)
+            choice["message"]["content"] = str(content)
+            if thought is not None:
+                choice["message"]["reasoning_content"] = str(thought)
+            choice["logprobs"] = values
+        finally:
+            tracker.close()
+    return response
 
 
 def chat_finish_frames(

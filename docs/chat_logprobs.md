@@ -25,7 +25,7 @@ Equal-logit tokens share a rank, so ties at the boundary are retained.
 
 For each committed token, use its **target-model** logit minus the full-vocabulary
 logsumexp at that position. This is the raw model distribution before temperature,
-top-k, and top-p sampling adjustments, consistent with ATOM's existing offline
+top-k, top-p sampling adjustments, and grammar masking, consistent with ATOM's existing offline
 logprob computation. Candidate probabilities use the same normalizer. These are
 token conditional probabilities, not calibrated confidence in answer correctness.
 
@@ -49,6 +49,11 @@ logprob arrays contain committed tokens only, not speculative placeholders.
   No image implementation is added.
 - Forced synthetic acceptance is rejected. It cannot validate target-model
   semantics or token probabilities.
+- JSON Schema with logprobs is supported without speculative decoding. Scores
+  describe the raw pre-grammar distribution; they are not renormalized over the
+  schema-allowed tokens. Schema + speculative decoding + logprobs is rejected
+  before admission. Mixed batches may still contain separate Schema-only and
+  logprob-only requests.
 - This does not add logprob fields to Responses or Anthropic Messages.
 - Full-model teacher-forcing comparisons, broad deployment-topology validation,
   and performance qualification remain required before declaring production
@@ -78,7 +83,7 @@ avoiding their computation is a later optimization opportunity.
 
 Only selected probabilities and candidate IDs/scores are copied to the host,
 not full vocabularies. Streaming probability records remain in the request-owned
-spool until close; reading a source span does not consume or release its records.
+spool until close; reading a visible source span marks intersecting records as claimed.
 The spool bounds its RAM buffer and spills to disk. This is not a zero-overhead
 claim; throughput, tail latency, temporary device memory, and CPU/SSE costs need
 on/off comparisons at representative loads.
@@ -95,7 +100,15 @@ Logprob-enabled requests explicitly disable tokenizer whitespace cleanup. Parsin
 keeps the original byte ranges through reasoning and tool regions, so visible
 text joined across hidden regions retains the correct token probabilities even
 when the same text also occurs inside tool arguments. SSE attaches probabilities
-before serialization; it does not search or reparse serialized text.
+before serialization; it does not search or reparse serialized text. A token
+crossing a hidden marker or channel boundary belongs once to its first visible
+source span. Its token bytes remain intact, so they can include hidden marker
+bytes; probability entries cannot be split into partial tokens.
+
+Logprob streams decode once through their source-aware byte decoder, after raw
+chunks coalesce. They do not construct the ordinary incremental detokenizer.
+The service lazily owns one TokenBytes object for its current tokenizer; no
+process-global LRU cache retains previous tokenizers.
 
 Unclassified tool-like regions may become visible text at end of stream. Their
 fixed-width probability records are kept in a request-owned spool with a 64 KiB
@@ -107,3 +120,19 @@ Mixed batches compact probability payloads to requesting sequences before CPU
 transfer and Python conversion. Deferred delivery uses the previous batch's
 request IDs and logprob mask, preserving token/probability alignment. Ordinary
 requests do not create source trackers or probability spools.
+
+## Code organization
+
+`atom/entrypoints/openai/logprobs.py` owns byte decoding, source positions,
+request-local probability storage and processing. `LogprobsProcessor` converts
+coalesced engine deltas into traced text and assigns each token once to visible
+fields. Its private spool keeps unresolved parser regions bounded in RAM.
+
+`atom/entrypoints/openai/serving_chat.py` owns JSON/SSE response assembly and
+stream cleanup. Both response modes use the same source-order attribution.
+GPU scoring remains in `atom/model_engine/token_logprobs.py`.
+
+This follows vLLM's separation between its logprob processor and Chat serving
+methods, rather than adding separate public modules for each helper. ATOM's
+source-span tracking additionally handles separate visible reasoning/content
+fields and tool-parser buffering; consolidating files does not remove that work.
