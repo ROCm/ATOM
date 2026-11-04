@@ -682,6 +682,12 @@ def bind_mla_prep(layer, layer_id: int, dims: Dims, mode: int) -> MlaPrep:
 
         impl = _mla_impl_checks(sa, name)
         _need(sa.q_lora_rank == MLA_QL, f"{name}: q_lora_rank {sa.q_lora_rank}")
+        # q_c | kv_c | k_rope only: a DSA layer's plane carries its indexer's too
+        split = tuple(getattr(sa, "projection_split_sizes", ()))
+        _need(
+            split == (MLA_QL, MLA_LORA, MLA_QH - MLA_NOPE),
+            f"{name}: fused_qkv_a_proj splits {split}",
+        )
         w_qa, w_qa_s = _fp8_dense(
             sa.fused_qkv_a_proj, f"{name} fused_qkv_a_proj", (MLA_QKV_A, HIDDEN)
         )
