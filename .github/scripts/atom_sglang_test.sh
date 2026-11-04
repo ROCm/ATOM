@@ -181,9 +181,15 @@ served_models = {
 sys.exit(0 if expected_model in served_models else 1)
 PY
       then
-        emit_new_sglang_logs
-        echo "SGLang server is ready for ${MODEL_NAME}."
-        return 0
+        # /v1/models answers before the warmup request finishes; /health stays
+        # 503 until then, and the warmup can spend minutes in JIT kernel builds
+        # that would otherwise eat the eval client's request timeout.
+        if curl -fsS -o /dev/null --max-time 60 "http://127.0.0.1:${SGLANG_PORT}/health" 2>/dev/null; then
+          emit_new_sglang_logs
+          echo "SGLang server is ready for ${MODEL_NAME}."
+          return 0
+        fi
+        echo "SGLang server lists ${MODEL_NAME} but is still warming up."
       fi
     fi
 
