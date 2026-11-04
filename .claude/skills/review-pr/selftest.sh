@@ -367,10 +367,13 @@ _drift_outside_a_repo() {
   # The whole skill tree, at the same depth it sits in the repo, with no .git anywhere --
   # what `git archive HEAD | tar -x` produces. Checks whose inputs are absent skip and
   # still exit 0; what must not happen is the crash that an empty repo-root produced.
+  # Exactly what `git archive HEAD | tar -x` produces: the tracked tree, no .git. That is
+  # what the description tells a reviewer to verify from, so it is what this asserts --
+  # not a bare skill directory, which promises nothing and would test the wrong thing.
   local t; t=$(mktemp -d)
-  mkdir -p "$t/.claude/skills"
-  cp -r "$S" "$t/.claude/skills/review-pr"
+  ( cd "$S/../../.." && git archive HEAD | tar -x -C "$t" ) 2>/dev/null
   rm -rf "$t/.claude/skills/review-pr/reports"
+  cp "$S/check_prompts.py" "$t/.claude/skills/review-pr/check_prompts.py" 2>/dev/null
   ( cd /tmp && python3 "$t/.claude/skills/review-pr/check_prompts.py" >/dev/null 2>&1; echo $? )
   rm -rf "$t"
 }
