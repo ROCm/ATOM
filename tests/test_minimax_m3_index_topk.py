@@ -66,6 +66,24 @@ def test_prefill_score_launch_config(monkeypatch, arch, dtype, want):
         m._prefill_score_launch_config.cache_clear()
 
 
+@pytest.mark.parametrize(
+    "arch,max_block,want",
+    [
+        ("gfx950", 2000, 512),
+        ("gfx1250", 250, 512),
+        ("gfx1250", 500, 512),
+        ("gfx1250", 513, 1024),
+        ("gfx1250", 1508, 1024),
+        ("gfx1250", 1969, 1024),
+        ("gfx1250", 1984, 2048),
+        ("gfx1250", 2000, 2048),
+    ],
+)
+def test_decode_topk_block_size_policy(monkeypatch, arch, max_block, want):
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    assert m._decode_topk_block_size_k(max_block) == want
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
