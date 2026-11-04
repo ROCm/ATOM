@@ -1042,3 +1042,112 @@ def test_engine_unaligned_hbm_hit_replays_without_a_load(monkeypatch):
     assert not seq.replay_kv_load
     assert seq.replay == Replay(12, True, (), 12 - _REPLAY)
     assert list(batch.num_cached_tokens) == [12 - _REPLAY]
+
+
+# -- offload prefetch on the native-state engine ----------------------------
+
+
+class _EarlyDelayer:
+    """A prefill delayer that holds until `allow` is set."""
+
+    is_local = False
+    max_queue_ms = None
+    kv_high_watermark = 0.9
+
+    def __init__(self):
+        self.rank_prefill_costs = []
+        self.allow = False
+
+    def protects_decode(self, running_decode_batch):
+        return False
+
+    def should_allow_prefill(self, **_):
+        from atom.model_engine.prefill_delayer import PrefillDecision
+
+        return PrefillDecision(allow=self.allow, prefillable_ranks=1)
+
+    def notify_prefill_executed(self): ...
+
+
+def _async_adapter(chunks, base=Adapter):
+    """`base` with the async-lookup surface over a fake server answering
+    `chunks` LMCache chunks: what the lookup client needs to answer a lookup
+    without blocking the scheduler."""
+    from test_lmcache_mp_async_lookup import _Adapter as AsyncAdapter
+    from test_lmcache_mp_async_lookup import _Client
+
+    class _Both(base):
+        lmcache_tokens_per_chunk = 8
+
+        def __init__(self, *args):
+            base.__init__(self, *args)
+            fake = AsyncAdapter(_Client(chunks=chunks))
+            self._client = fake._client
+            self._parallel = fake._parallel
+            self._pending_lookups = fake._pending_lookups
+            self._lookup_results = fake._lookup_results
+            self._create_key = fake._create_key
+
+    return _Both
+
+
+def _holding_engine(monkeypatch, adapter, **overrides):
+    monkeypatch.setenv("ATOM_DP_PREFIX_SPREAD", "1")
+    engine, connector, _ = engine_scheduler(monkeypatch, adapter=adapter, **overrides)
+    # A 40-block pool: the default watermark would not fit one prompt.
+    engine._PREFETCH_KV_WATERMARK = 0.95
+    delayer = _EarlyDelayer()
+    engine.set_prefill_delayer(delayer)
+    return engine, connector, delayer
+
+
+def _until_parked(engine, seq, ticks=6):
+    for _ in range(ticks):
+        batch, scheduled = engine.schedule()
+        if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+            return batch, scheduled
+    raise AssertionError(f"never parked: settled={engine._prefetch.settled}")
+
+
+def test_prefetch_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
+    monkeypatch,
+):
+    """PAGE-only + bounded replay (DeepSeek-V4): the KV-only load is submitted on
+    a HOLD tick the lookup answered on; the replayed prefill waits for a FIRE."""
+    adapter = _async_adapter(4, _ReachAdapter)(32)
+    engine, _, delayer = _holding_engine(
+        monkeypatch, adapter, state_replay_tokens=_REPLAY
+    )
+    bm = engine.block_manager
+    first = Sequence(list(range(16)) + [900] * 4, 4, has_per_req_cache=True)
+    assert bm.allocate(first, bm.can_allocate(first))
+    bm.hash_blocks(first, first.num_tokens)
+    bm.deallocate(first)
+    seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    engine.add(seq)
+
+    batch, scheduled = _until_parked(engine, seq)
+
+    assert scheduled == {} and not delayer.allow  # a HOLD tick
+    assert seq.replays_hit and seq.replay_kv_load
+    assert seq.num_cached_tokens == 16
+    assert list(engine.waiting) == [seq]
+    [request] = batch.connector_meta_output.requests  # shipped with this tick
+    assert request.native_state.kv_only and not request.native_state.unit_ids
+    assert request.native_state.boundary_tokens == 32
+    assert seq.id in engine._prefetch.entries
+
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_loading={request.load_operation})
+    )
+    batch, scheduled = engine.schedule()  # loaded, still HOLD: no prefill
+    assert scheduled == {}
+    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+
+    delayer.allow = True
+    batch, scheduled = engine.schedule()
+    assert scheduled[seq.id] is seq
+    assert seq.replay == Replay(32, True, (), 32 - _REPLAY)
+    assert list(batch.num_cached_tokens) == [32 - _REPLAY]
+    assert engine._num_parked_remote_kv == 0
+    assert seq.id not in engine._prefetch.entries

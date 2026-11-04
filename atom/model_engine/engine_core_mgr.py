@@ -316,9 +316,22 @@ class CoreManager:
                 label,
                 " and ".join(overridden),
             )
+            if not (
+                getattr(config, "enable_prefix_caching", False)
+                and envs.ATOM_FRONTEND_PREFIX_HASH
+            ):
+                # No prompt hash chain reaches the router: every request is
+                # cold and goes to the lightest rank.
+                raise ValueError(
+                    "ATOM_DP_PREFIX_SPREAD=1 needs --enable_prefix_caching and "
+                    "ATOM_FRONTEND_PREFIX_HASH=1 (the frontend prompt hash chain)"
+                )
         # Sampled prompt-block hash -> {rank: request that ran it there}.
         self._prefix_owner: OrderedDict[int, dict] = OrderedDict()
-        self._prefix_owner_cap = 1 << 19
+        # 2^17 sampled hashes, 4096 tokens apart: 512M tokens of prefix history.
+        self._prefix_owner_cap = 1 << 17
+        # seq id -> (rank, sampled hashes it recorded as their producer).
+        self._prefix_seq_hashes: dict = {}
         self._prefix_stride_tokens = 4096
         self._dp_route_counters = {
             "prefix_owner_total": 0,
@@ -1153,7 +1166,7 @@ class CoreManager:
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
             and not self._dp_session_affinity_enabled
-            and not getattr(self, "_prefix_spread", False)
+            and not self._prefix_spread
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
@@ -1166,7 +1179,7 @@ class CoreManager:
         track_load = (
             self._dp_lb_strategy != "round_robin"
             or self._dp_session_affinity_enabled
-            or getattr(self, "_prefix_spread", False)
+            or self._prefix_spread
         )
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
@@ -1416,14 +1429,16 @@ class CoreManager:
                 # element-wise, so tokens only decide among request-count ties.
                 score = (self._rank_reqs[r], self._rank_tokens[r])
             else:  # "least_tokens"
-                score = (
-                    self._rank_tokens[r] + self._dp_lb_req_equiv * self._rank_reqs[r]
-                )
+                score = self._rank_load(r)
             if best_score is None or score < best_score:
                 best_score = score
                 best_rank = r
         self._rank_rotation_cursor += 1
         return best_rank
+
+    def _rank_load(self, rank: int) -> int:
+        """The `least_tokens` score: queued prefill plus decode slots."""
+        return self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
 
     def _stable_session_rank(self, session_id: str) -> int:
         """Map a session to a stable rank with rendezvous hashing.
@@ -1460,9 +1475,7 @@ class CoreManager:
         best_load = None
         best_hash = -1
         for rank in range(self._routable_engine_count):
-            load = (
-                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
-            )
+            load = self._rank_load(rank)
             tie_hash = int.from_bytes(
                 hashlib.blake2b(
                     session_key + rank.to_bytes(4, "little"), digest_size=8
@@ -1514,7 +1527,7 @@ class CoreManager:
 
         session_id = getattr(seq, "dp_session_id", None)
         parent_id = getattr(seq, "dp_parent_session_id", None)
-        if getattr(self, "_prefix_spread", False):
+        if self._prefix_spread:
             return self._select_prefix_spread_locked(seq)
         if not self._dp_session_affinity_enabled or not session_id:
             rank = self._select_dp_rank_locked()
@@ -1533,8 +1546,7 @@ class CoreManager:
                 session_id,
                 parent_id,
                 owner,
-                self._rank_tokens[owner]
-                + self._dp_lb_req_equiv * self._rank_reqs[owner],
+                self._rank_load(owner),
                 self._rank_tokens[owner],
                 self._rank_reqs[owner],
             )
@@ -1561,7 +1573,7 @@ class CoreManager:
         n = self._routable_engine_count
         hits: dict[int, int] = {}
         owner, source = None, None
-        busy = getattr(self, "_seq_prefilling", ())
+        busy = self._seq_prefilling
         for i in range((len(hashes) // stride) * stride - 1, -1, -stride):
             holders = self._prefix_owner.get(hashes[i])
             if not holders:
@@ -1580,23 +1592,62 @@ class CoreManager:
                 break
         return hits, owner, source
 
-    def _prefix_owner_record(self, chain, rank: int, seq_id=None) -> None:
+    def _prefix_owner_record(
+        self, chain, rank: int, seq_id, hit: int = 0, hit_source=None
+    ) -> None:
+        """Record that `rank` holds this prompt's sampled prefix.
+
+        Each entry names the request whose prefill puts that part on the rank:
+        `seq_id` for the part it computes; for the part it reuses (the first
+        `hit` tokens, from HBM or loaded from the tier) the request that
+        computed it -- the rank's existing holder, else `hit_source`. So a
+        follower that only reuses a prefix never becomes its busy source, and
+        followers sharing a prefix are not pinned to one rank while each of
+        them prefills only its suffix. What `seq_id` wrote is rolled back if it
+        leaves before its prefill completes (`_forget_prefix_record`).
+        """
         if chain is None:
             return
         hbs = int(chain.hash_block_size)
         stride = max(1, self._prefix_stride_tokens // hbs)
         index = self._prefix_owner
         hashes = chain.hashes
+        written = []
         for i in range(stride - 1, len(hashes), stride):
-            holders = index.get(hashes[i])
+            h = hashes[i]
+            holders = index.get(h)
             if holders is None:
-                holders = index[hashes[i]] = {}
+                holders = index[h] = {}
             else:
-                index.move_to_end(hashes[i])
+                index.move_to_end(h)
+            if (i + 1) * hbs <= hit:
+                producer = holders.pop(rank, hit_source)
+            else:
                 holders.pop(rank, None)
-            holders[rank] = seq_id  # last = most recent
+                producer = seq_id
+            holders[rank] = producer  # last = most recent
+            if producer == seq_id:
+                written.append(h)
+        if written:
+            self._prefix_seq_hashes[seq_id] = (rank, written)
         while len(index) > self._prefix_owner_cap:
             index.popitem(last=False)
+
+    def _forget_prefix_record(self, seq_id) -> None:
+        """Drop the prefix entries `seq_id` wrote: it left (abort, reject, a
+        failed send) before its prefill completed, so the rank does not hold
+        that part."""
+        entry = self._prefix_seq_hashes.pop(seq_id, None)
+        if entry is None:
+            return
+        rank, hashes = entry
+        index = self._prefix_owner
+        for h in hashes:
+            holders = index.get(h)
+            if holders is not None and holders.get(rank) == seq_id:
+                del holders[rank]
+                if not holders:
+                    del index[h]
 
     def _prefix_stays_on_owner(self, owner: int, lightest: int) -> bool:
         """Whether a request stays on the rank holding its prefix.
@@ -1653,11 +1704,7 @@ class CoreManager:
         hits, owner, source = self._prefix_rank_hits(chain)
         hit = hits.get(owner, 0) if owner is not None else 0
 
-        def load(rank: int) -> int:
-            return (
-                self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
-            )
-
+        load = self._rank_load
         # The `least_tokens` score whatever the strategy: prefill debt plus
         # decode slots, ties rotated so equal ranks share new prefixes.
         n = self._routable_engine_count
@@ -1699,7 +1746,9 @@ class CoreManager:
             self._dp_route_counters["prefix_moved_tokens"] += max(0, hit - local)
             if local > 0:
                 self._dp_route_counters["prefix_moved_partial_total"] += 1
-        self._prefix_owner_record(chain, rank, seq.id)
+        self._prefix_owner_record(
+            chain, rank, seq.id, hit=seq._dp_est_hit, hit_source=source
+        )
         return self._record_dp_route_locked(decision, rank)
 
     def get_dp_router_statistics(self) -> dict:
@@ -1724,7 +1773,7 @@ class CoreManager:
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
-        if getattr(self, "_prefix_spread", False):
+        if self._prefix_spread:
             tok_cost = max(0, prompt_tokens - int(getattr(seq, "_dp_est_hit", 0)))
         elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
@@ -1792,6 +1841,13 @@ class CoreManager:
 
     def _release_seq_load_locked(self, seq_id) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
+        if self._prefix_spread:
+            if seq_id in self._seq_prefilling:
+                # Left before its prefill completed: its prefix record is not
+                # real.
+                self._forget_prefix_record(seq_id)
+            else:
+                self._prefix_seq_hashes.pop(seq_id, None)
         self._seq_prefilling.discard(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
@@ -1814,6 +1870,8 @@ class CoreManager:
             return
         with self._lb_lock:
             self._seq_prefilling.discard(seq_id)
+            if self._prefix_spread:
+                self._prefix_seq_hashes.pop(seq_id, None)
             entry = self._seq_load.get(seq_id)
             if entry is None:
                 return
@@ -1850,6 +1908,9 @@ class CoreManager:
             self._rank_tokens = [0] * self._routable_engine_count
             self._seq_load.clear()
             self._seq_prefilling.clear()
+            if self._prefix_spread:
+                self._prefix_owner.clear()
+                self._prefix_seq_hashes.clear()
             pending = getattr(self, "_bp_pending", None)
             if pending:
                 logger.warning(

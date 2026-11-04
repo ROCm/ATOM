@@ -198,6 +198,37 @@ class _AtomMetricsCollector:
                 ),
                 dp_router.get("load_balanced_total", 0),
             ),
+            (
+                "atom:dp_prefix_owner",
+                "Prefix-spread requests kept on the rank holding their prefix.",
+                dp_router.get("prefix_owner_total", 0),
+            ),
+            (
+                "atom:dp_prefix_moved",
+                (
+                    "Prefix-spread requests moved to an idle rank, which loads "
+                    "their prefix from the offload tier."
+                ),
+                dp_router.get("prefix_moved_total", 0),
+            ),
+            (
+                "atom:dp_prefix_moved_tokens",
+                "Prefix tokens the moved prefix-spread requests load from the tier.",
+                dp_router.get("prefix_moved_tokens", 0),
+            ),
+            (
+                "atom:dp_prefix_cold",
+                "Prefix-spread requests with no known prefix (lightest rank).",
+                dp_router.get("prefix_cold_total", 0),
+            ),
+            (
+                "atom:dp_prefix_source_busy",
+                (
+                    "Prefix-spread requests kept on their prefix's rank because "
+                    "the request computing that prefix was still prefilling."
+                ),
+                dp_router.get("prefix_source_busy_total", 0),
+            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))

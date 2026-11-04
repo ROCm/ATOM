@@ -22,8 +22,6 @@ from atom.kv_transfer.offload.chunked_scheduler import (
 )
 from atom.kv_transfer.offload.metadata import (
     LMCacheOffloadMetadata,
-    LMCacheReqMeta,
-    SaveSpec,
 )
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
@@ -58,6 +56,10 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
     ) -> None:
         _validate_mp_config(config)
+        # Incremental token shipping: req id -> (request, tokens the workers
+        # hold), and the ids whose worker copy is to be dropped.
+        self._shipped_tokens: dict[Any, tuple[Any, int]] = {}
+        self._shipped_drops: list[Any] = []
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
         offcfg._strict_integer(
@@ -235,12 +237,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
     # prompts are saved a chunk at a time, so shipping the whole prefix with
     # every save is quadratic in the prompt. Workers keep each request's
     # tokens (`LMCacheMPConnector._resolve_shipped_tokens`); only tokens past
-    # what they already hold travel. ATOM_MP_INCREMENTAL_TOKENS=0 ships whole
-    # prefixes again.
+    # what they already hold travel.
 
     def _ship_tokens(self, seq: Any, end: int) -> tuple[int, list[int]]:
         """(worker-held prefix length, tokens to append) for prefix ``[0, end)``."""
-        shipped = self.__dict__.setdefault("_shipped_tokens", {})
+        shipped = self._shipped_tokens
         entry = shipped.get(seq.id)
         base = 0
         if entry is not None:
@@ -250,50 +251,19 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
                 self._drop_shipped_tokens(seq.id)
         new = max(base, end)
         delta = list(seq.token_ids[base:new]) if new > base else []
-        # The request itself, to tell a reused id from it; dropped when it
-        # finishes (`request_finished`, `_finish_retired_request`).
+        # The request itself, to tell a reused id from it; dropped once no
+        # save can follow (`_end_finished_sessions`).
         shipped[seq.id] = (seq, new)
         return base, delta
 
     def _drop_shipped_tokens(self, req_id: Any) -> None:
-        shipped = self.__dict__.setdefault("_shipped_tokens", {})
+        shipped = self._shipped_tokens
         if shipped.pop(req_id, None) is not None:
-            self.__dict__.setdefault("_shipped_drops", []).append(req_id)
+            self._shipped_drops.append(req_id)
 
-    def _build_save_request(
-        self, seq, saved, aligned, operation, block_ids, is_last_prefill
-    ):
-        if not envs.ATOM_MP_INCREMENTAL_TOKENS:
-            return super()._build_save_request(
-                seq, saved, aligned, operation, block_ids, is_last_prefill
-            )
-        base, delta = self._ship_tokens(seq, aligned)
-        return LMCacheReqMeta(
-            req_id=seq.id,
-            token_ids=delta,
-            block_ids=block_ids,
-            save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
-            is_last_prefill=is_last_prefill,
-            save_operation=operation,
-            token_base=base,
-            token_end=aligned,
-        )
-
-    def _build_load_request(self, seq, load_spec, load_operation, transfer_end):
-        if not envs.ATOM_MP_INCREMENTAL_TOKENS:
-            return super()._build_load_request(
-                seq, load_spec, load_operation, transfer_end
-            )
-        base, delta = self._ship_tokens(seq, transfer_end)
-        return LMCacheReqMeta(
-            req_id=seq.id,
-            token_ids=delta,
-            block_ids=list(seq.block_table),
-            load_spec=load_spec,
-            load_operation=load_operation,
-            token_base=base,
-            token_end=transfer_end,
-        )
+    def _transfer_tokens(self, seq: Any, end: int) -> tuple[list[int], int]:
+        base, delta = self._ship_tokens(seq, end)
+        return delta, base
 
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         try:
@@ -304,7 +274,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             self._step_compute_end = {}
             extended = self.__dict__.get("_step_extended", set())
             self._step_extended = set()
-        drops = self.__dict__.get("_shipped_drops")
+        drops = self._shipped_drops
         if drops:
             # A work field of its own: metadata carrying only drops still
             # reaches the workers, so a finished prefix is not held until the
@@ -430,7 +400,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     def request_finished(self, seq: Any) -> None:
         super().request_finished(seq)
-        self._drop_shipped_tokens(seq.id)
         self._pending_session_ends()[str(seq.id)] = seq
         self._end_finished_sessions()
 
@@ -454,7 +423,7 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             or bool(callable(orphans) and orphans())
             # Worker token-cache drops go out with the next metadata build;
             # an idle engine must still build it.
-            or bool(self.__dict__.get("_shipped_drops"))
+            or bool(self._shipped_drops)
         )
 
     def _pending_session_ends(self) -> dict[str, Any]:
