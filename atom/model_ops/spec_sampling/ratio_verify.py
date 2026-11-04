@@ -15,6 +15,7 @@ Greedy rows take exact match in the same launch, the rule of
 
 from typing import NamedTuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -61,6 +62,9 @@ class RatioVerifyInputs(NamedTuple):
     top_ps: float | torch.Tensor | None
     #: Preallocated device scratch (`ratio_verify_scratch`).
     scratch: SamplingScratch
+    #: A per-request ``top_ks``' values on the host, if known: a batch none of
+    #: whose k is countable then skips the count (`row_filters`).
+    host_top_ks: np.ndarray | None = None
 
 
 class VerifyScratch(NamedTuple):
@@ -531,6 +535,7 @@ def _ratio_sample(
         ratio.top_ks,
         ratio.top_ps,
         target,
+        ratio.host_top_ks,
     )
     _ratio_accept_kernel[(batch_size,)](
         output_token_ids,

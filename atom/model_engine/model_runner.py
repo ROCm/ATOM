@@ -3456,10 +3456,11 @@ class ModelRunner:
             )
             # Lossless (`u * q < p`) inputs, asked first: they decide whether the
             # verification sample below runs. All-greedy batches keep exact match.
-            draft_q = None
+            draft_q = host_top_ks = None
             lossless = _draft_lossless(self)
             if lossless is not None and not all_greedy:
                 draft_q = lossless.verify_inputs(bs)
+                host_top_ks = batch.top_ks
             target_token_ids = None
             # Only exact match on a sampled batch reads the target's own draw.
             if not all_greedy and draft_q is None:
@@ -3489,6 +3490,7 @@ class ModelRunner:
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
+                host_top_ks=host_top_ks,
             )
             # PCP ranks decode redundantly but not bit-identically, so their
             # accept counts can differ: take rank 0's verdict. Ids are synced

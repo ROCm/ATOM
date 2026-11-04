@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -165,6 +166,8 @@ class RejectionSampler(nn.Module):
         temperatures: torch.Tensor | None = None,
         top_ks: int | torch.Tensor | None = None,
         top_ps: float | torch.Tensor | None = None,
+        # A per-request top_ks' values on the host, if known (`row_filters`).
+        host_top_ks: np.ndarray | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -182,7 +185,13 @@ class RejectionSampler(nn.Module):
                 )
             store, q_row_base = draft_q
             ratio = RatioVerifyInputs(
-                store, q_row_base, temperatures, top_ks, top_ps, self._ratio_scratch
+                store,
+                q_row_base,
+                temperatures,
+                top_ks,
+                top_ps,
+                self._ratio_scratch,
+                host_top_ks,
             )
 
         output_token_ids = rejection_sample(

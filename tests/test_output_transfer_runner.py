@@ -119,6 +119,7 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     process. An all-greedy verify asks for neither."""
     bs = 2
     top_ks, top_ps = torch.tensor([5, 0]), 0.9
+    host_top_ks = np.array([5, 0], np.int32)
     spec = (
         SimpleNamespace(
             bonus_logits_indices=torch.tensor([1, 3]),
@@ -155,7 +156,10 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
         runner_module.ModelRunner.postprocess(
             runner,
             SimpleNamespace(
-                total_seqs_num=bs, return_logprobs=[False] * bs, required_channel=None
+                total_seqs_num=bs,
+                return_logprobs=[False] * bs,
+                required_channel=None,
+                top_ks=host_top_ks,
             ),
             torch.zeros(4, 8),
             torch.ones(bs),
@@ -176,6 +180,8 @@ def test_a_filtered_batch_reaches_one_law_for_every_draw(
     passed = runner.rejection_sampler.forward.call_args.kwargs
     assert passed["draft_q"] is draft_q
     assert passed["top_ks"] is top_ks and passed["top_ps"] is top_ps
+    # The host copy of the per-request k, so the verify knows whether to count.
+    assert passed["host_top_ks"] is host_top_ks
     # Unarmed, the exact-match draw is the flag-off law, as the bonus is.
     assert runner.sampler.sample_verification_tokens.called is not armed
 

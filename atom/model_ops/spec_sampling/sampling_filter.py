@@ -14,6 +14,7 @@ apart (about ``exp(-max)`` of mass each), and top-p compares a sum to top_p.
 
 from typing import NamedTuple
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -155,6 +156,7 @@ class RowFilters(NamedTuple):
     #: Bits of a logit's key: 16 for a bf16 logit, 32 otherwise.
     key_bits: int
     #: Can a row be counted (a top-k of at most _FILTER_COUNT_MAX_K alone)?
+    #: Only then does the stats pass keep run maxima and the count launch.
     counts: bool
     #: Can one be descended?
     descends: bool
@@ -167,10 +169,13 @@ def row_filters(
     top_ps: float | torch.Tensor | None,
     batch_size: int,
     logits_dtype: torch.dtype,
+    host_top_ks: np.ndarray | None = None,
 ) -> RowFilters:
     """How a batch filters. ``top_ks``/``top_ps`` are what `Sampler` is
     given: None (no row filters), one value for the batch, or one per
-    request, a top-k of -1 meaning none."""
+    request, a top-k of -1 meaning none. ``host_top_ks`` is a per-request
+    top-k's values on the host, if the caller has them: without them a
+    per-request k is assumed to hold a counted row."""
     k_rows = isinstance(top_ks, torch.Tensor)
     p_rows = isinstance(top_ps, torch.Tensor)
     for name, rows_of in (("top_ks", top_ks), ("top_ps", top_ps)):
@@ -194,12 +199,16 @@ def row_filters(
     if p_scalar is not None and p_scalar >= 1.0:
         p_scalar = None
     k_small = k_scalar is not None and 0 < k_scalar <= _FILTER_COUNT_MAX_K
+    k_small_rows = k_rows and (
+        host_top_ks is None
+        or bool(((host_top_ks > 0) & (host_top_ks <= _FILTER_COUNT_MAX_K)).any())
+    )
     return RowFilters(
         request_filter,
         k_rows,
         p_rows,
         key_bits,
-        counts=(k_rows or k_small) and p_scalar is None,
+        counts=(k_small_rows or k_small) and p_scalar is None,
         descends=not (k_small and not p_rows and p_scalar is None),
         # Only a top-p needs the passes to weigh; counting alone is cheaper.
         weigh=top_ps is not None,
@@ -212,6 +221,14 @@ def _count_run_cells(num_tokens: int, vocab_size: int, stats_block_v: int) -> in
     return num_tokens * triton.cdiv(vocab_size, stats_block_v) * _FILTER_COUNT_GROUPS
 
 
+class CountRuns(NamedTuple):
+    """The counted top-k's run maxima and the ids at each, which the stats
+    pass keeps per tile: ``num_tokens * V / 8`` bytes in all."""
+
+    maxima: torch.Tensor  # [cells] int32, keyed
+    ids: torch.Tensor  # [cells] int32
+
+
 class FilterScratch(NamedTuple):
     """`ratio_target_p.filter_floor`'s work buffers."""
 
@@ -220,30 +237,20 @@ class FilterScratch(NamedTuple):
     filter_i32: torch.Tensor  # [2, rows, _FILTER_I32_WIDTH] int32
     #: A row of last-digit counts per (row, split) of the last count.
     floor_counts: torch.Tensor
+    runs: CountRuns
 
 
-def filter_scratch(num_tokens: int, vocab_size: int) -> FilterScratch:
-    """The regions `ratio_target_p.filter_floor` needs. The counted top-k's
-    run maxima are not among them: they are allocated per verify, only for a
-    batch that can count (`count_runs`)."""
+def filter_scratch(
+    num_tokens: int, vocab_size: int, stats_block_v: int
+) -> FilterScratch:
+    """The regions `ratio_target_p.filter_floor` needs, the run maxima of a
+    stats pass over ``stats_block_v`` tiles included."""
     f32, i32 = torch.float32, torch.int32
+    cells = _count_run_cells(num_tokens, vocab_size, stats_block_v)
     return FilterScratch(
         Region((2, num_tokens, _FILTER_F32_WIDTH), f32),
         Region((triton.cdiv(vocab_size, _FILTER_BLOCK_V), num_tokens), f32),
         Region((2, num_tokens, _FILTER_I32_WIDTH), i32),
         Region((max(num_tokens, _FILTER_FLOOR_PROGRAMS) * _FILTER_LAST_BINS,), i32),
-    )
-
-
-def count_runs(
-    num_tokens: int, vocab_size: int, stats_block_v: int, device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The counted top-k's run maxima and the ids at each, which the stats
-    pass keeps per ``stats_block_v`` tile: ``num_tokens * V / 8`` bytes, so
-    taken only by a batch that has a counted row rather than reserved from
-    the KV budget."""
-    cells = _count_run_cells(num_tokens, vocab_size, stats_block_v)
-    return (
-        torch.empty(cells, dtype=torch.int32, device=device),
-        torch.empty(cells, dtype=torch.int32, device=device),
+        CountRuns(Region((cells,), i32), Region((cells,), i32)),
     )
