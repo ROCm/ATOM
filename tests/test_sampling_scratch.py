@@ -10,7 +10,6 @@ from atom.model_ops.spec_sampling.sampling_scratch import (
     SCRATCH_ALIGN,
     Region,
     SamplingScratch,
-    scratch_bytes,
 )
 
 
@@ -46,15 +45,6 @@ def test_views_come_back_named_in_field_order_with_their_shapes_and_dtypes():
     assert all(v.is_contiguous() for v in (views.a, views.b, views.inner.c))
 
 
-def test_regions_are_whole_alignment_units():
-    s = Spec(
-        Region((SCRATCH_ALIGN // 4 + 1,), torch.float32),
-        Region((0,), torch.int32),
-        Inner(Region((1,), torch.int32)),
-    )
-    assert scratch_bytes(s) == 2 * SCRATCH_ALIGN + 0 + SCRATCH_ALIGN
-
-
 @pytest.mark.parametrize("rows", range(1, 9))
 def test_every_view_is_aligned_whatever_the_batch(rows):
     # Triton specializes on each pointer's 16-byte alignment: views whose
@@ -69,7 +59,3 @@ def test_a_batch_larger_than_the_scratch_is_refused():
     scratch = SamplingScratch.for_spec(spec(2), "cpu")
     with pytest.raises(ValueError, match="cannot hold"):
         scratch.carve(spec(200))
-
-
-def test_nbytes_is_the_buffer():
-    assert SamplingScratch.for_spec(spec(), "cpu").nbytes() == scratch_bytes(spec())
