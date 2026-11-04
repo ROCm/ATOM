@@ -68,7 +68,8 @@ def _topk_softmax_kernel(
     if RENORMALIZE:
         wv = wv * (1.0 / total)
     else:
-        full_denom = tl.sum(tl.exp(x - row_max), axis=0)
+        ex = tl.exp(x - row_max)
+        full_denom = tl.sum(tl.where(nan, 0.0, ex), axis=0)
         wv = wv * (1.0 / full_denom)
     if HAS_NUM_VALID_ROWS:
         pad = row >= tl.load(num_valid_rows_ptr)

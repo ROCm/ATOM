@@ -104,10 +104,11 @@ _INTERPRET_CASES = textwrap.dedent("""
             rw, ri = reference_route(logits, N, K, renorm, shared,
                                      None if valid is None else valid.item())
             tag = (name, dtype, renorm, shared, padded)
-            if name == "neg_inf" and dtype == torch.bfloat16:
+            if name == "neg_inf":
                 # Triton interpreter's tl.max on int64 breaks -inf ties
-                # in a different order than torch.sort(stable=True) when
-                # the input was bfloat16.  GPU tests cover this case.
+                # differently from torch.sort(stable=True).  GPU tests
+                # (test_triton_router_ties_and_padding_rows_match_aiter)
+                # cover this case on real hardware.
                 continue
             assert torch.equal(i, ri), tag
             torch.testing.assert_close(w, rw, atol=1e-6, rtol=1e-5,
