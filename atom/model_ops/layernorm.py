@@ -862,17 +862,15 @@ class GemmaRMSNorm(nn.Module):
             residual_2d = None
             res_out = None
 
-        # An empty grid leaves a launch error for the next kernel to report.
-        if x_2d.shape[0]:
-            fused_qk_rmsnorm_group_quant(
-                q=x_2d,
-                q_weight=self.weight.data,
-                q_epsilon=self.variance_epsilon,
-                q_out_unquantized=out,
-                q_res_out=res_out,
-                q_residual=residual_2d,
-                gemma_norm=True,
-            )
+        fused_qk_rmsnorm_group_quant(
+            q=x_2d,
+            q_weight=self.weight.data,
+            q_epsilon=self.variance_epsilon,
+            q_out_unquantized=out,
+            q_res_out=res_out,
+            q_residual=residual_2d,
+            gemma_norm=True,
+        )
 
         out = out.view(ori_shape)
         if residual is not None:
@@ -1020,13 +1018,6 @@ def gemma_rms_norm_quant(
     from aiter.utility.dtypes import fp8
 
     x = hidden_states
-    # An empty grid leaves a launch error for the next kernel to report.
-    if not x.numel():
-        return (
-            torch.empty(x.shape, dtype=fp8, device=x.device),
-            torch.empty((*x.shape[:-1], 1), dtype=torch.float32, device=x.device),
-            x if residual is None else torch.empty_like(x),
-        )
     if quantize_fp32_norm:
         if not (
             fp8 == torch.float8_e4m3fn

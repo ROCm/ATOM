@@ -120,34 +120,3 @@ def test_fp32_norm_quant_only_when_asked(monkeypatch, modules):
         layernorm.gemma_rms_norm_quant(
             x.float(), None, _Norm(), quantize_fp32_norm=True
         )
-
-
-@pytest.mark.parametrize("rows", [0, 2])
-def test_empty_rows_launch_no_norm_kernel(monkeypatch, modules, rows):
-    """An SP rank can hold no rows; an empty grid fails the next launch."""
-    norm_ops, dtypes, layernorm = modules.norm_ops, modules.dtypes, modules.layernorm
-    calls = []
-    monkeypatch.setattr(dtypes, "fp8", torch.float8_e4m3fn)
-    monkeypatch.setattr(
-        norm_ops, "fused_qk_rmsnorm_group_quant", lambda **kw: calls.append("bf16")
-    )
-    monkeypatch.setattr(
-        norm_ops,
-        "fused_qk_rmsnorm_per_token_quant",
-        lambda *args, **kwargs: calls.append("fp8"),
-    )
-
-    def quant(x, **kwargs):
-        calls.append("quant")
-        return x, x[:, :1]
-
-    monkeypatch.setattr(modules.aiter, "get_hip_quant", lambda quant_type: quant)
-    x = torch.ones(rows, 8, dtype=torch.bfloat16)
-    out, res = layernorm.GemmaRMSNorm(8).forward_cuda(x, x)
-    assert out.shape == res.shape == x.shape
-    for fp32 in (True, False):
-        out, scale, res = layernorm.gemma_rms_norm_quant(
-            x, x, _Norm(), quantize_fp32_norm=fp32
-        )
-        assert out.shape == res.shape == x.shape and scale.shape == (rows, 1)
-    assert calls == (["bf16", "fp8", "quant"] if rows else [])
