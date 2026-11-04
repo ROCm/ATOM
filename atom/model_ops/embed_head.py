@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -25,6 +27,53 @@ from atom.plugin import is_plugin_mode
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
+
+# Rows the argmax epilogue takes: the draft passes' and step 0's.
+_ARGMAX_EPILOGUE_MAX_ROWS = 512
+
+
+def gemm_a16w16_argmax_units(x, w, vocab_start, rank, world):
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+        gemm_a16w16_argmax_units as _units,
+    )
+
+    return _units(x, w, vocab_start, rank, world)
+
+
+_ARGMAX_EXCHANGE_STATE = None
+
+
+def _argmax_exchange_state(tp_size: int):
+    """The (group, inboxes, calls) of aiter's argmax_exchange_pick, made once for
+    every head (one stream, so the calls never overlap); None where it does not
+    run (gfx1250 and 4 TP ranks only)."""
+    global _ARGMAX_EXCHANGE_STATE
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if tp_size != 4 or get_gfx() != "gfx1250":
+        return None
+    if _ARGMAX_EXCHANGE_STATE is None:
+        from aiter.dist.parallel_state import get_tp_group
+        from aiter.ops.triton.comms.all_reduce import all_reduce_init
+        from aiter.ops.triton.comms.fused.argmax_exchange import (
+            argmax_exchange_max_bytes,
+        )
+
+        group = get_tp_group().cpu_group
+        max_bytes = argmax_exchange_max_bytes(_ARGMAX_EPILOGUE_MAX_ROWS)
+        _ARGMAX_EXCHANGE_STATE = (group, *all_reduce_init(group, max_bytes))
+    return _ARGMAX_EXCHANGE_STATE
+
+
+@functools.lru_cache(maxsize=256)
+def _tgemm_is_gluon(m: int, n: int, k: int) -> bool:
+    """Whether tgemm.mm runs the default gfx1250 gluon GEMM at this shape."""
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available
+    from aiter.tuned_gemm import get_GEMM_A16W16_config
+
+    bf16 = str(torch.bfloat16)
+    config = get_GEMM_A16W16_config(m, n, k, False, bf16, bf16)
+    return _is_gluon_available() and config["libtype"] == "triton"
 
 
 @triton.jit
@@ -261,6 +310,13 @@ class ParallelLMHead(VocabParallelEmbedding):
         # The TP1 argmax's row lengths (see compute_argmax_token). Every buffer
         # made stays referenced: a recorded draft pass reads it by address.
         self._argmax_row_lens: list[torch.Tensor] = []
+        # ATOM_LM_HEAD_ARGMAX_EXCHANGE's inboxes: collective, so made here, as
+        # every rank builds the same heads in the same order.
+        self._argmax_exchange = (
+            _argmax_exchange_state(self.tp_size)
+            if envs.ATOM_LM_HEAD_ARGMAX_EXCHANGE
+            else None
+        )
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
@@ -377,6 +433,41 @@ class ParallelLMHead(VocabParallelEmbedding):
             and self._can_use_dp_sharded_argmax(get_forward_context().context)
         ):
             return out.copy_(self._dp_sharded_logits(x, "argmax"))
+        exchange = getattr(self, "_argmax_exchange", None)
+        if (
+            exchange is not None
+            and out.is_contiguous()
+            and self._argmax_epilogue_serves(x)
+        ):
+            # The GEMM's per-tile argmax keys (the logits are never written),
+            # then one kernel: reduce, exchange the packs, pick (aiter).
+            from aiter.ops.triton.comms.fused.argmax_exchange import (
+                argmax_exchange_pick,
+            )
+            from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+                gemm_a16w16_argmax_keys,
+            )
+
+            keys = gemm_a16w16_argmax_keys(x, self.weight)
+            argmax_exchange_pick(keys, self.vocab_start_idx, out.view(-1), *exchange)
+            return out
+        if (
+            envs.ATOM_LM_HEAD_ARGMAX_EPILOGUE
+            and self.tp_size > 1
+            and envs.ATOM_ARGMAX_HEAD_AR_GATHER
+            and out.is_contiguous()
+            and self._argmax_epilogue_serves(x)
+        ):
+            # The pack image from the GEMM's epilogue: the same tiles, so the
+            # same bf16 logits, never written (aiter gemm_a16w16_argmax_units:
+            # the GEMM and a per-row reduce instead of the GEMM and
+            # lm_head_argmax_units); then the same exchange and pick.
+            units = gemm_a16w16_argmax_units(
+                x, self.weight, self.vocab_start_idx, self.tp_rank, self.tp_size
+            )
+            units = tensor_model_parallel_all_reduce(units)
+            lm_head_argmax_pick(units, self.tp_size, out.view(-1))
+            return out
         logits = tgemm.mm(x, self.weight, self.bias)  # [N, vocab/tp]
         if self.tp_size <= 1:
             # `output_idx=out` rather than a returned tensor: a draft pass is
@@ -424,6 +515,22 @@ class ParallelLMHead(VocabParallelEmbedding):
         winner = gathered[:, :, 0].argmax(dim=0)  # [N] winning rank (ties -> lowest)
         token = gathered[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0)  # [N] fp32
         return out.copy_(token)
+
+    def _argmax_epilogue_serves(self, x: torch.Tensor) -> bool:
+        """Whether `gemm_a16w16_argmax_units` gives this head's argmax: the
+        GEMM `tgemm.mm` runs here is the gluon one whose tiles it shares (no
+        tuned row naming another kernel), with no bias, on 2-D bf16 rows."""
+        if (
+            self.bias is not None
+            or x.dim() != 2
+            or x.dtype != torch.bfloat16
+            or self.weight.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or not 1 <= x.shape[0] <= _ARGMAX_EPILOGUE_MAX_ROWS
+            or getattr(self.weight, "is_shuffled", False)
+        ):
+            return False
+        return _tgemm_is_gluon(x.shape[0], self.weight.shape[0], x.shape[1])
 
     # ------------------------------------------------------------------
     # Pure-DP sharded LM head (config ② all-gather / ③ all-to-all).

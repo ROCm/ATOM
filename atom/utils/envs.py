@@ -1245,6 +1245,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the custom all-gather, and pick the winner in one kernel. Three
     # launches instead of six; token-identical.
     "ATOM_ARGMAX_HEAD_AR_GATHER": lambda: _flag_env("ATOM_ARGMAX_HEAD_AR_GATHER", "0"),
+    # With ATOM_ARGMAX_HEAD_AR_GATHER on gfx1250: the per-rank argmax pack image
+    # comes out of the LM-head GEMM's epilogue (aiter gemm_a16w16_argmax_units)
+    # -- the logits are never written and the separate argmax kernel goes. The
+    # same GEMM tiles and bf16 logits, so the same draft ids, ties included.
+    "ATOM_LM_HEAD_ARGMAX_EPILOGUE": lambda: _flag_env(
+        "ATOM_LM_HEAD_ARGMAX_EPILOGUE", "0"
+    ),
+    # TP4 greedy argmax head on gfx1250: the GEMM's per-tile argmax keys (as
+    # ATOM_LM_HEAD_ARGMAX_EPILOGUE), then one aiter kernel that reduces them,
+    # exchanges the (max, token) packs over its own IPC inboxes and picks the
+    # winner (argmax_exchange_pick): two launches for the head instead of four.
+    # Token-identical, ties included. Its inboxes are made with the LM head.
+    "ATOM_LM_HEAD_ARGMAX_EXCHANGE": lambda: _flag_env(
+        "ATOM_LM_HEAD_ARGMAX_EXCHANGE", "0"
+    ),
     # GDN-hybrid MTP: each draft step's context_lens fix-up and kv_indptr rebuild
     # (GDNAttentionMetadataBuilder.prepare_mtp_decode) in one Triton launch
     # instead of up to seven eager ones. Integer math, so the same result.
