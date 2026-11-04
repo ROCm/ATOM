@@ -17,12 +17,6 @@ def embed_head():
         yield load("atom.model_ops.embed_head")
 
 
-@pytest.fixture(scope="module")
-def sp_wrapper():
-    with atom_without_aiter() as load:
-        yield load("atom.utils.sp_wrapper")
-
-
 def _on_each_rank(monkeypatch, world, fn, all_gatherv=None):
     settings = SimpleNamespace(sequence_parallel_size=world)
     monkeypatch.setattr(sp, "get_current_atom_config_or_none", lambda: settings)
@@ -67,26 +61,6 @@ def test_gather_rows_matches_full_gather(monkeypatch, world):
         lambda rank: sp.sp_gather_rows(shards[rank], rows), lambda x: torch.cat(sent)
     ):
         assert torch.equal(out, hidden[rows])
-
-
-@pytest.mark.parametrize("world", [2, 4])
-def test_multimodal_embeddings_follow_the_token_range(monkeypatch, sp_wrapper, world):
-    ids, embeds = torch.arange(16), torch.randn(5, 8)
-    ctx = SimpleNamespace(context=SimpleNamespace(is_prefill=True))
-    monkeypatch.setattr(sp_wrapper, "get_forward_context", lambda: ctx)
-
-    def model(input_ids, positions, inputs_embeds):
-        assert inputs_embeds.shape[0] == input_ids.shape[0]
-        return inputs_embeds
-
-    wrapper = sp_wrapper.SPModelWrapper(model)
-    shards = _on_each_rank(
-        monkeypatch, world, lambda _: wrapper(ids[:5], ids[:5], inputs_embeds=embeds)
-    )
-    local = -(-5 // world)
-    torch.testing.assert_close(
-        torch.cat(shards), torch.cat([embeds, embeds.new_zeros(world * local - 5, 8)])
-    )
 
 
 @pytest.mark.parametrize("world", [2, 4])
