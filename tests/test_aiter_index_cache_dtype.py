@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""MiniMax-M3's ``mxfp4`` index cache: logical dtype fp4x2, physical uint8 page.
+"""MiniMax-M3's ``fp4x2`` index cache: logical dtype fp4x2, physical uint8 page.
 
 The resolver reads aiter's registry (``d_dtypes["fp4x2"]``); the entry's shape follows
 the config string, because where torch has no float4 the registry's fp8 and fp4x2 are
@@ -20,7 +20,7 @@ from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES
 
 
 @pytest.mark.parametrize(
-    "index,key", [("mxfp4", "fp4x2"), ("fp8", "fp8"), ("bf16", "bf16")]
+    "index,key", [("fp4x2", "fp4x2"), ("fp8", "fp8"), ("bf16", "bf16")]
 )
 def test_resolves_through_the_aiter_registry(index, key):
     config = types.SimpleNamespace(index_cache_dtype=index)
@@ -41,8 +41,8 @@ def builder(monkeypatch, index):
     return b
 
 
-def test_mxfp4_is_one_uint8_page_even_when_fp8_is_uint8(monkeypatch):
-    (f,) = builder(monkeypatch, "mxfp4")._index_cache_fields(128)
+def test_fp4x2_is_one_uint8_page_even_when_fp8_is_uint8(monkeypatch):
+    (f,) = builder(monkeypatch, "fp4x2")._index_cache_fields(128)
     assert (f.shape, f.dtype) == ((PAGE_BYTES,), torch.uint8)
 
 

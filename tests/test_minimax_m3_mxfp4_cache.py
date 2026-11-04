@@ -97,7 +97,7 @@ def chip_info(monkeypatch):
 def check(**kw):
     args = {
         "arches": M3,
-        "index_cache_dtype": "mxfp4",
+        "index_cache_dtype": "fp4x2",
         "kv_mxfp4": True,
         "block_size": 128,
         "plugin_mode": False,
@@ -138,9 +138,9 @@ def test_the_baselines_are_never_refused():
     "kv, flag, index, want",
     [
         ("fp4", False, None, ("fp8", True, None)),
-        ("fp4", False, "fp4", ("fp8", True, "mxfp4")),
-        ("bf16", False, "fp4", ("bf16", False, "mxfp4")),
-        ("fp8", True, "mxfp4", ("fp8", True, "mxfp4")),
+        ("fp4", False, "fp4", ("fp8", True, "fp4x2")),
+        ("bf16", False, "fp4", ("bf16", False, "fp4x2")),
+        ("fp8", True, "fp4x2", ("fp8", True, "fp4x2")),
         ("fp8", False, "fp8", ("fp8", False, "fp8")),
         ("bf16", False, None, ("bf16", False, None)),
     ],

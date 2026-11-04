@@ -98,13 +98,18 @@ def kv_storage_formats(config: Any) -> dict[str, str]:
     choices (the MHA kernels' fixed fp8 scale) follow the arch too, so it is
     named as well. The scheduler resolves them as its workers do, with the
     same AITER on the same node, as the dense LMCache scheduler already does.
-    A name AITER does not know (``fp4``) stands as it is.
+    A name AITER does not know (``fp4``) stands as it is, and so does ``fp4x2``,
+    MiniMax-M3's MXFP4 index page: AITER's ``fp4x2`` is whatever the torch build
+    has (float4, or uint8 where it lacks one), which would rename the namespace
+    with the torch version for the same bytes.
     """
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_gfx
 
     def resolve(name: Any) -> str:
-        return str(dtypes.d_dtypes.get(str(name), name))
+        return (
+            str(name) if name == "fp4x2" else str(dtypes.d_dtypes.get(str(name), name))
+        )
 
     kv_cache_dtype = getattr(config, "kv_cache_dtype", "auto")
     index_cache_dtype = getattr(config, "index_cache_dtype", None)

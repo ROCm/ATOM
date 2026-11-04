@@ -124,7 +124,7 @@ def test_mxfp4_pages_match_the_bf16_write():
     qkv, position, slots = inputs(T, 1)
     rk, rv, ri, q_bf16, iq_bf16 = reference(qkv, position, slots)
 
-    impl = make_impl(True, "mxfp4")
+    impl = make_impl(True, "fp4x2")
     kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
     vp = torch.zeros_like(kp)
     ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
@@ -161,13 +161,13 @@ def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
     position = torch.arange(T, device="cuda", dtype=torch.int64)
     slots = torch.arange(T, device="cuda", dtype=torch.int64) + 128  # page 1
 
-    full = make_impl(True, "mxfp4")
+    full = make_impl(True, "fp4x2")
     kp = torch.zeros(PAGES, NKV, PAGE_BYTES, device="cuda", dtype=torch.uint8)
     vp = torch.zeros_like(kp)
     ip = torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
     q_full = run(full, qkv, position, slots, kp, vp, ip)[0]
 
-    skip = make_impl(True, "mxfp4")
+    skip = make_impl(True, "fp4x2")
     skip.skip_index_topk = True
     kp2 = torch.zeros_like(kp)
     vp2 = torch.zeros_like(vp)
@@ -230,12 +230,12 @@ def test_index_only_mxfp4_leaves_the_fp8_shuffle_kv_write_alone():
         return k, v, scale, torch.zeros_like(scale)
 
     runs = {}
-    for name, index_dtype in (("mxfp4", "mxfp4"), ("none", "auto")):
+    for name, index_dtype in (("mxfp4", "fp4x2"), ("none", "auto")):
         impl = make_impl(False, index_dtype)
         k, v, ksc, vsc = shuffle_cache()
         index = (
             torch.zeros(PAGES, PAGE_BYTES, device="cuda", dtype=torch.uint8)
-            if index_dtype == "mxfp4"
+            if index_dtype == "fp4x2"
             else torch.zeros(PAGES, 128, D, device="cuda", dtype=torch.bfloat16)
         )
         q = run(impl, qkv, position, slots, k, v, index, ksc, vsc)[0]
