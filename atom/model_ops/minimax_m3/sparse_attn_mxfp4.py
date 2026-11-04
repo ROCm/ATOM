@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Block-sparse attention over the MXFP4 KV cache (``ATOM_M3_SPARSE_KV_MXFP4=1``).
+"""Block-sparse attention over the MXFP4 KV cache (``--kv-cache-dtype mxfp4``).
 
 A row is a decode query token or a prefill query token: one sparse selection of
 at most ``topk`` 128-token pages, the tail page last, with its exact context

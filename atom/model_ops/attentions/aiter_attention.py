@@ -625,11 +625,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             and not module.use_mla
         ):
             kv_format = ""
-            if _is_indexed_sparse_attention(module):
-                from atom.utils import envs
-
-                if envs.ATOM_M3_SPARSE_KV_MXFP4:
-                    kv_format = "mxfp4"
+            if (
+                _is_indexed_sparse_attention(module)
+                and self.model_runner.config.kv_mxfp4
+            ):
+                kv_format = "mxfp4"
             kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, kv_format))
         return tuple(kinds)
 

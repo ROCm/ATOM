@@ -1920,6 +1920,16 @@ def qrep_for_step(
     return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
 
 
+def _resolve_kv_mxfp4(kv_cache_dtype: str, kv_mxfp4: bool) -> tuple[str, bool]:
+    """``--kv-cache-dtype mxfp4`` as (fp8, True): the layers that are not MXFP4
+    keep an fp8 cache, and everything keyed on the storage dtype reads fp8."""
+    if kv_cache_dtype == "mxfp4":
+        return "fp8", True
+    if kv_mxfp4 and kv_cache_dtype != "fp8":
+        raise ValueError(f"kv_mxfp4 needs kv_cache_dtype fp8, got {kv_cache_dtype!r}")
+    return kv_cache_dtype, kv_mxfp4
+
+
 def _check_m3_mxfp4(
     arches,
     index_cache_dtype,
@@ -1927,14 +1937,11 @@ def _check_m3_mxfp4(
     block_size: int,
     plugin_mode: bool,
     sparse_local_block: int,
-    index_q_fp8: bool = False,
 ) -> None:
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
-    than in the first forward (``ATOM_M3_SPARSE_KV_MXFP4``, ``--index-cache-dtype
+    than in the first forward (``--kv-cache-dtype mxfp4``, ``--index-cache-dtype
     mxfp4``)."""
     index_mxfp4 = index_cache_dtype == "mxfp4"
-    if index_q_fp8 and not index_mxfp4:
-        raise ValueError("ATOM_M3_INDEX_Q_FP8 needs --index-cache-dtype mxfp4")
     if not (kv_mxfp4 or index_mxfp4):
         return
     if not any("MiniMaxM3" in str(a) for a in arches):
@@ -1949,7 +1956,7 @@ def _check_m3_mxfp4(
         # The decode plan is refreshed once a step, which holds only while every
         # layer's rows have the same lengths -- i.e. the tail is always picked.
         raise ValueError(
-            "ATOM_M3_SPARSE_KV_MXFP4 needs sparse_local_block >= 1, "
+            "--kv-cache-dtype mxfp4 needs sparse_local_block >= 1, "
             f"got {sparse_local_block}"
         )
     # The live GPU, not `get_gfx()`, which follows GPU_ARCHS (a build setting).
@@ -2120,6 +2127,9 @@ class Config:
     kv_cache_block_size: int = 16
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "bf16"
+    # Derived from ``--kv-cache-dtype mxfp4``, which leaves the generic
+    # ``kv_cache_dtype`` at "fp8" for the layers that are not MXFP4.
+    kv_mxfp4: bool = False
     index_cache_dtype: str | None = None
     enable_prefix_caching: bool = True
     enable_chunked_prefill: bool = True
@@ -2335,6 +2345,9 @@ class Config:
         )
 
     def __post_init__(self):
+        self.kv_cache_dtype, self.kv_mxfp4 = _resolve_kv_mxfp4(
+            self.kv_cache_dtype, self.kv_mxfp4
+        )
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2785,7 +2798,7 @@ class Config:
                 is_plugin_mode(),
             )
             if indexer_cp_off is None and (
-                self.index_cache_dtype == "mxfp4" or envs.ATOM_M3_SPARSE_KV_MXFP4
+                self.index_cache_dtype == "mxfp4" or self.kv_mxfp4
             ):
                 indexer_cp_off = "the MXFP4 caches are not wired to the CP scorer"
             if indexer_cp_off is not None:
@@ -2841,11 +2854,10 @@ class Config:
         _check_m3_mxfp4(
             arches,
             self.index_cache_dtype,
-            envs.ATOM_M3_SPARSE_KV_MXFP4,
+            self.kv_mxfp4,
             self.kv_cache_block_size,
             is_plugin_mode(),
             m3_sparse_cfg.get("sparse_local_block", 0),
-            envs.ATOM_M3_INDEX_Q_FP8,
         )
 
         if self.hf_config.model_type == "deepseek_v41_text":
@@ -2969,6 +2981,7 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        factors.append(self.kv_mxfp4)
         # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
         # graphs (early + late layers) instead of one; both compile under the
         # `backbone` tag, so the flag must key the artifacts.

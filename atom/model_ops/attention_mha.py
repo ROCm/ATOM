@@ -1313,7 +1313,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # Bound by AiterAttentionMetadataBuilder.build_kv_cache_tensor (Task 6):
         # the page-128 indexer-key cache. None until the runner binds it.
         self.index_cache: torch.Tensor | None = None
-        # ATOM_M3_SPARSE_KV_MXFP4: the bound k/v caches are uint8 [pages, Hkv,
+        # --kv-cache-dtype mxfp4: the bound k/v caches are uint8 [pages, Hkv,
         # 8704] MXFP4 pages (minimax_m3/kv_mxfp4.py), written by the fused kernel
         # directly together with an fp8 main q. `--index-cache-dtype mxfp4` makes
         # index_cache uint8 [pages, 8704] the same way.
@@ -1417,11 +1417,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_index_slot_mapping = slot_mapping
         # e4m3 (cast as is) for the MXFP4 index's fp8-q scorer; the top-k reuse key
         # records it, so a reusing layer finds what a producing layer stored
-        index_q_dtype = (
-            torch.float8_e4m3fn
-            if self.index_mxfp4 and envs.ATOM_M3_INDEX_Q_FP8
-            else qkv.dtype
-        )
+        index_q_dtype = torch.float8_e4m3fn if self.index_mxfp4 else qkv.dtype
 
         if self.skip_index_topk and not self.kv_mxfp4:
             from atom.model_ops.triton_fused_qkv_norm_rope_cache import (

@@ -14,7 +14,7 @@ import types
 import pytest
 import torch
 
-from atom.config import _check_m3_mxfp4
+from atom.config import _check_m3_mxfp4, _resolve_kv_mxfp4
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, page_views
 
@@ -134,7 +134,19 @@ def test_the_baselines_are_never_refused():
     check(index_cache_dtype="fp4", kv_mxfp4=False, block_size=16)
 
 
-def test_an_fp8_index_q_needs_the_mxfp4_index():
-    check(index_q_fp8=True)
-    with pytest.raises(ValueError, match="INDEX_Q_FP8"):
-        check(index_cache_dtype="fp8", index_q_fp8=True)
+@pytest.mark.parametrize(
+    "dtype, flag, want",
+    [
+        ("mxfp4", False, ("fp8", True)),
+        ("fp8", True, ("fp8", True)),
+        ("fp8", False, ("fp8", False)),
+        ("bf16", False, ("bf16", False)),
+    ],
+)
+def test_the_mxfp4_kv_request_leaves_an_fp8_storage_dtype(dtype, flag, want):
+    assert _resolve_kv_mxfp4(dtype, flag) == want
+
+
+def test_a_kv_mxfp4_flag_over_a_bf16_cache_is_refused():
+    with pytest.raises(ValueError, match="kv_cache_dtype fp8"):
+        _resolve_kv_mxfp4("bf16", True)

@@ -379,6 +379,11 @@ def build_page_namespace(
             getattr(config, "speculative_config", None)
         ),
     }
+    # `--kv-cache-dtype mxfp4` leaves `kv_cache_dtype` at fp8, so only this
+    # tells its pages from fp8 ones. Absent otherwise, which keeps every other
+    # server's namespace as it was.
+    if getattr(config, "kv_mxfp4", False) is True:
+        document["kv_mxfp4"] = True
     canonical = json.dumps(
         document,
         sort_keys=True,

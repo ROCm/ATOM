@@ -7,8 +7,8 @@ for prefill) read the cache as the two views of ``kv_mxfp4.page_views`` and writ
 the same ``[heads, rows, max_block]`` fp32 scores the Triton scorers do, so the
 selection and the block-table emit after them are index_topk's own, unchanged.
 
-The query is bf16, or e4m3 as the fused writer emits it with
-``ATOM_M3_INDEX_Q_FP8=1`` (cast as stored, no per-tensor scale).
+The query is e4m3 as the fused writer emits it (cast as stored, no per-tensor
+scale).
 
 The decode scorer wants a per-step work map. It is built once per step in the
 metadata (outside any graph) into a persistent buffer, ``index_score_work_map``;

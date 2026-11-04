@@ -74,11 +74,7 @@ def run(impl, qkv, position, slots, k_cache, v_cache, index_cache):
     return impl.rope_cache(None, None, None, qkv, position, ctx)
 
 
-@pytest.mark.parametrize("index_q_fp8", [False, True])
-def test_mxfp4_pages_match_the_bf16_write(index_q_fp8, monkeypatch):
-    from atom.utils import envs
-
-    monkeypatch.setattr(envs, "ATOM_M3_INDEX_Q_FP8", index_q_fp8)
+def test_mxfp4_pages_match_the_bf16_write():
     T = 37
     g = torch.Generator(device="cuda").manual_seed(1)
     width = (NQ + 2 * NKV + NIQ + 1) * D
@@ -113,15 +109,9 @@ def test_mxfp4_pages_match_the_bf16_write(index_q_fp8, monkeypatch):
 
     assert kc is kp and vc is vp and ks is None and vs is None
     assert q.dtype == torch.float8_e4m3fn and q.shape == (T, NQ, D)
-    if index_q_fp8:
-        assert impl._index_q.dtype == torch.float8_e4m3fn
-        got_iq, want_iq = impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()
-        assert (got_iq - want_iq).norm() / want_iq.norm() < 0.04  # the e4m3 cast
-    else:
-        assert impl._index_q.dtype == torch.bfloat16
-        torch.testing.assert_close(
-            impl._index_q.float(), iq_bf16.view(T, NIQ, D).float(), rtol=0, atol=0
-        )
+    assert impl._index_q.dtype == torch.float8_e4m3fn
+    got_iq, want_iq = impl._index_q.float(), iq_bf16.view(T, NIQ, D).float()
+    assert (got_iq - want_iq).norm() / want_iq.norm() < 0.04  # the e4m3 cast
     qd = q.float().view(T, NQ * D)
     assert (qd - q_bf16.float()).norm() / q_bf16.float().norm() < 0.04  # e4m3 cast
 
@@ -143,11 +133,7 @@ def test_mxfp4_pages_match_the_bf16_write(index_q_fp8, monkeypatch):
     assert (untouched == 0).all()
 
 
-@pytest.mark.parametrize("index_q_fp8", [False, True])
-def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index(index_q_fp8, monkeypatch):
-    from atom.utils import envs
-
-    monkeypatch.setattr(envs, "ATOM_M3_INDEX_Q_FP8", index_q_fp8)
+def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index():
     T = 21
     g = torch.Generator(device="cuda").manual_seed(2)
     width = (NQ + 2 * NKV + NIQ + 1) * D
@@ -178,7 +164,7 @@ def test_a_top_k_reusing_layer_writes_kv_and_skips_the_index(index_q_fp8, monkey
         impl.topk, impl.init_blocks, impl.local_blocks = 16, 1, 1
         impl.indexer_cp_group = None
     args = (bt, bt[:, 0], 1, 512)
-    assert (full._index_q.dtype == torch.float8_e4m3fn) == index_q_fp8
+    assert full._index_q.dtype == torch.float8_e4m3fn
     assert skip._topk_cache_key("decode", None, *args) == full._topk_cache_key(
         "decode", full._index_q, *args
     )
