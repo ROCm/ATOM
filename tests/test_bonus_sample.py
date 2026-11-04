@@ -6,6 +6,11 @@
 Runs on CPU tensors under Triton's interpreter (`triton_interpreter`), so it
 needs Triton but no GPU and no AITER.
 
+A plain `pytest` run reports most tests as skipped: those are marked
+`in_the_interpreter` and run in the `TRITON_INTERPRET=1` child that
+`test_under_the_interpreter` starts, which fails if any of them fails or
+if the child collects nothing.
+
 The reference is float64 `argmax_i softmax(x / max(T, 1e-5))_i / (E_i + eps)` on
 the noise the kernel is given -- the definition of
 `mixed_sample_outer_exponential` -- and, for a greedy row (T at or below the

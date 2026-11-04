@@ -1030,7 +1030,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # server starts. Off by default: sampling rows are not bit-exact with the
     # aiter kernel (above), and the gain shrinks with the verify-row count --
     # on MI355X about -25% at <= 128 rows but none at 256 (~Kimi-K3 DSpark at
-    # concurrency 64) -- so it stays opt-in until that shape gains too.
+    # concurrency 64) -- so it stays opt-in until that shape gains too. A
+    # row-count gate (fused at or below the crossover, aiter above) would remove
+    # the speed reason; aiter's fused_mixed_sample (ROCm/aiter#7416), faster
+    # than the aiter path at 256 rows too, would remove it without one.
     "ATOM_SPEC_BONUS_FUSED": lambda: os.getenv("ATOM_SPEC_BONUS_FUSED", "0") == "1",
     # --- Atomesh ---
     # Build atomesh when installing ATOM from source.
