@@ -3407,7 +3407,7 @@ class TestRoutedExpertPatches:
         np.testing.assert_array_equal(seq.routed_experts[:3], first[:3])
         np.testing.assert_array_equal(seq.routed_experts[3:], nxt)
 
-    def test_postprocess_gap_fills_uncaptured(self, scheduler, seq_factory):
+    def test_postprocess_gap_raises(self, scheduler, seq_factory):
         sp = SamplingParams(ignore_eos=True, max_tokens=100)
         seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
         scheduler.add(seq)
@@ -3417,13 +3417,15 @@ class TestRoutedExpertPatches:
             list(scheduler.running),
             self._output(seq.id, [10], self._patch((seq.id, 0, zeros))),
         )
-        scheduler.postprocess(
-            list(scheduler.running),
-            self._output(
-                seq.id, [11], self._patch((seq.id, 4, np.ones((1, 1, 1), np.int16)))
-            ),
-        )
-        assert seq.routed_experts[:, 0, 0].tolist() == [0, 0, -1, -1, 1]
+        with pytest.raises(RuntimeError, match="were never returned"):
+            scheduler.postprocess(
+                list(scheduler.running),
+                self._output(
+                    seq.id,
+                    [11],
+                    self._patch((seq.id, 4, np.ones((1, 1, 1), np.int16))),
+                ),
+            )
 
     def test_postprocess_applies_each_segment_in_order(self, scheduler, seq_factory):
         """Two requests in one step, plus a prefix segment ahead of a step one."""
@@ -3702,6 +3704,7 @@ class TestRoutedExpertPatches:
         rejected drafts are trimmed, so routes stay `num_tokens - 1` long."""
         spec = TestPreemptStripsExactlyThePlaceholders
         sched = spec()._sched(mtp_k)
+        sched._return_routed_experts = True
         prompt = [5, 6, 7, 8]
         seq = seq_factory(prompt)
         sched.add(seq)

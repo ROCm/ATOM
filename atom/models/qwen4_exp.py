@@ -12,9 +12,12 @@ from aiter.dist.parallel_state import (
 )
 from torch import nn
 
-from atom.config import Config, get_current_atom_config
+from atom.config import Config
 from atom.model_ops.base_attention import LinearAttention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    maybe_capture_routed_experts,
+)
 from atom.model_ops.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -351,7 +354,6 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
 
         It indexes global expert ids into the local weights, hard-codes a
         320-wide intermediate, and reads FP8 weights with per-channel scales.
-        It routes outside `FusedMoE`, so routed-expert capture would miss it.
         """
         if self._single_token_ok is None:
             ex = self.experts
@@ -359,8 +361,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             s2 = getattr(ex, "w2_weight_scale", None)
             n, two_inter = ex.w13_weight.shape[:2]
             self._single_token_ok = (
-                not get_current_atom_config().enable_return_routed_experts
-                and ex.expert_map is None
+                ex.expert_map is None
                 and s13 is not None
                 and s2 is not None
                 and ex.w13_weight.dtype == dtypes.fp8
@@ -411,14 +412,20 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             and ex.routed_scaling_factor == 1.0
             and n == self.n_routed_experts + 1
         ):
-            return moe_decode_single_token(
+            capturing = getattr(ex, "moe_capture_layer_id", None) is not None
+            out = moe_decode_single_token(
                 hidden_states,
                 None,
                 None,
                 *weights,
                 router_logits=logits,
                 top_k=ex.top_k,
+                return_topk_ids=capturing,
             )
+            if capturing:
+                out, topk_ids = out
+                maybe_capture_routed_experts(ex, topk_ids)
+            return out
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=hidden_states,
             router_logits=logits,
@@ -435,6 +442,7 @@ class Qwen4ExpSparseMoeBlock(nn.Module):
             num_fused_shared_experts=ex.num_fused_shared_experts,
             routed_scaling_factor=ex.routed_scaling_factor,
         )
+        maybe_capture_routed_experts(ex, topk_ids)
         return moe_decode_single_token(hidden_states, topk_ids, topk_weights, *weights)
 
 

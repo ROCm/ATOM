@@ -7,7 +7,6 @@ import inspect
 import logging
 import math
 import os
-import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -86,13 +85,14 @@ from atom.model_ops.eplb import (
     with_eplb_forward_monitor,
 )
 from atom.model_ops.fused_moe.routed_experts_capturer import (
+    PendingRoutes,
     RoutedExpertsCapturer,
     batch_prefix_slots,
     capture_bytes_per_kv_block,
-    capture_pad_row_bytes,
-    check_return_routed_experts_config,
+    capture_row_bytes,
     current_slot_mapping,
     fused_moe_modules,
+    merge_routed_patches,
 )
 from atom.model_ops.indexer.schedule import skips_index_topk
 from atom.model_ops.rejection_sampler import RejectionSampler
@@ -103,6 +103,7 @@ from atom.model_ops.required_channel import (
 )
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.models.registry import mono_decode_installers, support_model_arch_dict
+from atom.models.utils import extract_layer_index
 from atom.sampling_params import RequiredChannel
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
@@ -746,6 +747,12 @@ class ModelRunner:
         self.structured_compilations = OrderedDict()
         self._return_routed_experts = bool(config.enable_return_routed_experts)
         self._routed_experts_capturer: RoutedExpertsCapturer | None = None
+        # Pure middle chunks' stored routes, oldest first, until an output
+        # carries them.
+        self._held_routes: list[PendingRoutes] = []
+        # Deferred output: the routes of `tokenID_processor.prev_batch`, which
+        # the next output carries with that batch's tokens.
+        self._deferred_routes: PendingRoutes | None = None
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1202,7 +1209,9 @@ class ModelRunner:
                 del self.drafter
             RoutedExpertsCapturer.reset(owner=self)
             self._routed_experts_capturer = None
-        torch.cuda.empty_cache()
+            self._held_routes = []
+            self._deferred_routes = None
+            torch.cuda.empty_cache()
         return True
 
     def start_profiler(self, trace_name: str | None = None):
@@ -1919,9 +1928,8 @@ class ModelRunner:
 
         geo = self._routed_experts_geometry()
         if geo is not None:
-            available_for_kv = max(
-                0, int(available_for_kv) - capture_pad_row_bytes(*geo)
-            )
+            # The capture buffer's pad row, charged once rather than per block.
+            available_for_kv = max(0, int(available_for_kv) - capture_row_bytes(*geo))
 
         specs = self._sub_pool_specs()
 
@@ -2384,29 +2392,22 @@ class ModelRunner:
                 f"attention metadata; {builder_cls.__name__} does not supply them, "
                 "so routes would never be written"
             )
+        if self.config.enable_dp_attention and builder_cls.supports_token_graph:
+            raise ValueError(
+                "enable_return_routed_experts does not support enable_dp_attention "
+                f"with {builder_cls.__name__}: its prefill token graphs make an "
+                "idle DP rank run a dummy prefill on physical block 0, whose "
+                "captures overwrite the routes a real request reads there"
+            )
         # The exported layer axis is the decoder's, dense layers included, so a
         # consumer indexes it by decoder layer.
         num_layers = int(self.hf_text_config.num_hidden_layers)
         layer_ids: list[int] = []
-        for ordinal, moe in enumerate(moes):
-            prefix = getattr(moe, "prefix", "") or ""
-            match = re.search(r"layers\.(\d+)", prefix)
-            if match:
-                idx = int(match.group(1))
-            elif getattr(moe, "layer_id", None) is not None:
-                idx = int(moe.layer_id)
-            elif len(moes) == num_layers:
-                # Only when every decoder layer is MoE is position its index.
-                idx = ordinal
-            else:
-                raise ValueError(
-                    "enable_return_routed_experts cannot place the FusedMoE "
-                    f"{prefix or ordinal!r} on a decoder layer: its prefix has no "
-                    "'layers.N' and it has no layer_id"
-                )
+        for moe in moes:
+            idx = extract_layer_index(moe.prefix)
             if not 0 <= idx < num_layers:
                 raise ValueError(
-                    f"FusedMoE {prefix!r} resolves to layer {idx}, outside the "
+                    f"FusedMoE {moe.prefix!r} resolves to layer {idx}, outside the "
                     f"model's {num_layers} decoder layers"
                 )
             moe.moe_capture_layer_id = idx
@@ -2443,19 +2444,19 @@ class ModelRunner:
         *,
         stream: torch.cuda.Stream | None = None,
         slot_mapping: torch.Tensor | None = None,
-    ) -> None:
-        """Queue this step's routes; ``_attach_routed_experts`` claims them.
+    ) -> PendingRoutes | None:
+        """Queue this step's routes for an output to carry.
 
         Must run in the same forward as ``prepare_model``: each request's first
         position is read from that forward's ``positions`` mirror.
         """
         if not self._return_routed_experts:
-            return
+            return None
         if getattr(batch, "is_dummy_run", False) or self.rank != 0:
-            return
+            return None
         capturer = self._routed_experts_capturer
         if capturer is None:
-            return
+            return None
         if RoutedExpertsCapturer.get() is not capturer:
             raise RuntimeError(
                 "enable_return_routed_experts: the MoE layers are capturing "
@@ -2463,28 +2464,37 @@ class ModelRunner:
             )
         lens = batch.num_scheduled_tokens
         first = np.cumsum(lens) - lens
-        batch.routed_experts_pending = capturer.store_step(
+        return capturer.store_step(
             slot_mapping,
             batch.req_ids,
             self.forward_vars["positions"].np[first],
             lens,
-            prefix=self._routed_prefix_slots(batch),
+            prefix=batch_prefix_slots(batch, self.block_size),
             stream=stream,
         )
 
-    def _routed_prefix_slots(self, batch: ScheduledBatch):
-        """Slots of cached prefixes the scheduler has no routes for yet."""
-        return batch_prefix_slots(batch, self.block_size)
-
     def _attach_routed_experts(
-        self, batch: ScheduledBatch, output: ScheduledBatchOutput
+        self,
+        own: PendingRoutes | None,
+        output: ScheduledBatchOutput,
+        *,
+        held_first: bool,
+        take_held: bool = True,
     ) -> None:
-        """Hand ``batch``'s stored routes to the scheduler in ``output``, once."""
-        pending = getattr(batch, "routed_experts_pending", None)
-        if pending is None:
-            return
-        batch.routed_experts_pending = None
-        output.routed_experts = pending.patch()
+        """Hand the scheduler ``own`` and the held routes, once.
+
+        Oldest step first, since a request's rows must apply in order:
+        ``held_first`` when ``own``'s step ran after the held middle chunks. An
+        idle DP rank's dummy output may never reach the scheduler, so it passes
+        ``take_held=False`` and leaves them for the next real output.
+        """
+        held = []
+        if take_held:
+            held, self._held_routes = self._held_routes, []
+        ordered = [*held, own] if held_first else [own, *held]
+        patches = [p.patch() for p in ordered if p is not None]
+        if patches:
+            output.routed_experts = merge_routed_patches(patches)
 
     def _maybe_create_tbo_slices(
         self,
@@ -3635,8 +3645,12 @@ class ModelRunner:
 
         self.forward_done_event.record()
         deferred = self.tokenID_processor.is_deferred_out
-        # Capture before prepare_sampled_ids(), which advances self.prev_batch.
+        # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.
         prev_batch = self.tokenID_processor.prev_batch
+        own_routes = None
+        if self._return_routed_experts and deferred:
+            # prev_batch's routes; prepare_sampled_ids() stores this batch's.
+            own_routes, self._deferred_routes = self._deferred_routes, None
         store_routes_after_recv = None
         store_routes = self._return_routed_experts and not getattr(
             batch, "is_dummy_run", False
@@ -3644,12 +3658,13 @@ class ModelRunner:
         if store_routes:
             slots = current_slot_mapping()
             if deferred:
-                store_routes_after_recv = partial(
-                    self._store_routed_experts_step,
-                    batch,
-                    stream=self.tokenID_processor.async_copy_stream,
-                    slot_mapping=slots,
-                )
+
+                def store_routes_after_recv():
+                    self._deferred_routes = self._store_routed_experts_step(
+                        batch,
+                        stream=self.tokenID_processor.async_copy_stream,
+                        slot_mapping=slots,
+                    )
 
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
             batch,
@@ -3660,7 +3675,7 @@ class ModelRunner:
             after_recv=store_routes_after_recv,
         )
         if store_routes and not deferred:
-            self._store_routed_experts_step(batch, slot_mapping=slots)
+            own_routes = self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
@@ -3739,8 +3754,13 @@ class ModelRunner:
                 dict(structured.errors) if structured is not None else None
             ),
         )
-        if self._return_routed_experts and not (deferred and prev_batch is None):
-            self._attach_routed_experts(prev_batch if deferred else batch, output)
+        if self._return_routed_experts:
+            self._attach_routed_experts(
+                own_routes,
+                output,
+                held_first=not deferred,
+                take_held=not getattr(batch, "is_dummy_run", False),
+            )
         return output
 
     def _kv_after_forward(self) -> None:
@@ -3861,9 +3881,11 @@ class ModelRunner:
                     None,  # nothing verified -> segment's last row
                     align_only=True,
                 )
-            self.forward_done_event.record()
-            # No token copy_done on this path; blocking store is fine.
-            self._store_routed_experts_step(batch)
+            held = self._store_routed_experts_step(
+                batch, stream=self.tokenID_processor.async_copy_stream
+            )
+            if held is not None:
+                self._held_routes.append(held)
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
@@ -3875,8 +3897,6 @@ class ModelRunner:
                 num_bonus=None,
                 draft_token_ids=None,
             )
-            if self._return_routed_experts:
-                self._attach_routed_experts(batch, output)
             return output
 
         fwd_output = self.postprocess(
@@ -4852,16 +4872,9 @@ class RapidServeModelRunner(ModelRunner):
         safety_margin = int(total_bytes * 0.02)
         return 4 * safety_margin
 
-    def _refuse_routed_experts_capture(self) -> None:
-        if not self._return_routed_experts:
-            return
-        check_return_routed_experts_config(self.config, rapidserve_runner=True)
-
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
-        # prefill. That also skips `_maybe_init_routed_experts_capturer`, so
-        # capture cannot be served from this process.
-        self._refuse_routed_experts_capture()
+        # prefill.
         if self.config.disagg_is_decode:
             transfer = self.attn_metadata_builder.state_transfer()
             if transfer.copies:
@@ -4877,7 +4890,6 @@ class RapidServeModelRunner(ModelRunner):
 
     def allocate_kv_cache(self, num_kvcache_blocks):
         # Decode in disagg mode: kvcache is imported from prefill, not allocated.
-        self._refuse_routed_experts_capture()
         if self.config.disagg_is_decode:
             logger.info("decode skipping kv cache allocation")
             return True

@@ -59,83 +59,18 @@ class PendingRoutes(NamedTuple):
         )
 
 
-def check_return_routed_experts(
-    dcp_size: int,
-    pcp_size: int,
-    pp_size: int = 1,
-    *,
-    kv_transfer_config: dict | None = None,
-    enable_rapidserve: bool = False,
-    enable_dp_attention: bool = False,
-    plugin_mode: bool = False,
-) -> None:
-    """Refuse topologies that cannot assemble a full [seq_len-1] route tensor."""
-    if plugin_mode:
-        raise ValueError(
-            "enable_return_routed_experts is not supported in plugin mode: "
-            "capture lives in ATOM's ModelRunner, which a host framework does "
-            "not run"
-        )
-    if dcp_size != 1 or pcp_size != 1:
-        raise ValueError(
-            "enable_return_routed_experts requires decode_context_parallel_size "
-            "== 1 and prefill_context_parallel_size == 1"
-        )
-    if pp_size != 1:
-        raise ValueError(
-            "enable_return_routed_experts requires pipeline_parallel_size == 1"
-        )
-    if kv_transfer_config:
-        raise ValueError(
-            "enable_return_routed_experts does not support KV transfer "
-            "(prefill/decode disaggregation or KV offload); routed-expert "
-            "metadata is not moved with KV blocks"
-        )
-    if enable_rapidserve:
-        raise ValueError(
-            "enable_return_routed_experts does not support RapidServe "
-            "prefill/decode disaggregation; decode skips KV allocation and "
-            "never initializes the process-local capture buffer"
-        )
-    if enable_dp_attention:
-        raise ValueError(
-            "enable_return_routed_experts does not support enable_dp_attention: "
-            "select_experts runs after the DP all-gather, so captured top-k ids "
-            "are aligned to the gathered token stream, not this rank's local "
-            "slot_mapping; export would silently return another rank's routes"
-        )
-
-
-def check_return_routed_experts_config(
-    config: Any, *, rapidserve_runner: bool = False
-) -> None:
-    """``check_return_routed_experts`` over an ATOM ``Config``.
-
-    The one place the effective topology is read from a config, for every
-    caller: ``Config`` at construction, the scheduler and the RapidServe
-    runner, which see the config again in their own processes.
-    ``rapidserve_runner`` is the runner's own knowledge that it is one.
-    """
-    if not getattr(config, "enable_return_routed_experts", False):
-        return
-    from atom.plugin import is_plugin_mode
-
-    check_return_routed_experts(
-        getattr(config, "decode_context_parallel_size", 1),
-        getattr(config, "prefill_context_parallel_size", 1),
-        getattr(config, "pipeline_parallel_size", 1),
-        kv_transfer_config=getattr(config, "kv_transfer_config", None),
-        enable_rapidserve=bool(
-            rapidserve_runner
-            or getattr(config, "enable_rapidserve", False)
-            or getattr(config, "disagg_is_decode", False)
-            or "RapidServeModelRunner" in str(getattr(config, "runner_qualname", ""))
-        ),
-        enable_dp_attention=bool(getattr(config, "enable_dp_attention", False)),
-        plugin_mode=bool(
-            getattr(getattr(config, "plugin_config", None), "is_plugin_mode", False)
-            or is_plugin_mode()
-        ),
+def merge_routed_patches(patches: list[RoutedExpertsPatch]) -> RoutedExpertsPatch:
+    """One patch holding ``patches``' segments in order, oldest step first."""
+    if len(patches) == 1:
+        return patches[0]
+    offsets = [patches[0].offsets]
+    for p in patches[1:]:
+        offsets.append(p.offsets[1:] + offsets[-1][-1])
+    return RoutedExpertsPatch(
+        np.concatenate([p.req_ids for p in patches]),
+        np.concatenate([p.starts for p in patches]),
+        np.concatenate(offsets),
+        np.concatenate([p.rows for p in patches]),
     )
 
 
@@ -230,21 +165,6 @@ def capture_bytes_per_kv_block(block_size: int, num_layers: int, top_k: int) -> 
     return int(block_size) * capture_row_bytes(num_layers, top_k)
 
 
-def capture_pad_row_bytes(num_layers: int, top_k: int) -> int:
-    """Sacrificial dummy-slot row charged once, not per KV block."""
-    return capture_row_bytes(num_layers, top_k)
-
-
-def trim_routed_experts(routes: np.ndarray | None, num_tokens: int):
-    """Keep routes for every forwarded token: ``num_tokens - 1`` rows."""
-    if routes is None:
-        return None
-    keep = max(int(num_tokens) - 1, 0)
-    if routes.shape[0] != keep:
-        return routes[:keep]
-    return routes
-
-
 class RoutedExpertsCapturer:
     """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
 
@@ -276,9 +196,7 @@ class RoutedExpertsCapturer:
             dtype=CAPTURE_DTYPE,
             device=device,
         )
-        charged = self.num_slots * capture_row_bytes(
-            self.num_layers, self.top_k
-        ) + capture_pad_row_bytes(self.num_layers, self.top_k)
+        charged = (self.num_slots + 1) * capture_row_bytes(self.num_layers, self.top_k)
         if self.buffer.nbytes != charged:
             raise RuntimeError(
                 f"routed-expert capture buffer is {self.buffer.nbytes} B but the "
@@ -340,22 +258,40 @@ class RoutedExpertsCapturer:
         self,
         layer_id: int,
         topk_ids: torch.Tensor,
-        slot_mapping: torch.Tensor | None = None,
+        top_k: int | None = None,
     ) -> None:
-        """Scatter logical expert ids. Pad slots (``-1``) write the pad row."""
-        if layer_id < 0 or layer_id >= self.num_layers:
+        """Scatter logical expert ids. Pad slots (``-1``) write the pad row.
+
+        Only this layer's first ``top_k`` columns are routes; the rest are
+        fused shared experts.
+        """
+        if not 0 <= layer_id < self.num_layers:
+            raise RuntimeError(
+                f"routed-expert capture: layer {layer_id} is outside the "
+                f"buffer's {self.num_layers} layers"
+            )
+        slots = current_slot_mapping()
+        n = int(topk_ids.shape[0])
+        if int(slots.shape[0]) != n:
+            raise RuntimeError(
+                f"routed-expert capture: layer {layer_id} routed {n} tokens but "
+                f"this forward's slot_mapping has {int(slots.shape[0])} slots"
+            )
+        k = self.top_k if top_k is None else int(top_k)
+        if not 0 < k <= self.top_k or int(topk_ids.shape[-1]) < k:
+            raise RuntimeError(
+                f"routed-expert capture: layer {layer_id} top_k={k} with "
+                f"{int(topk_ids.shape[-1])} top-k columns does not fit the "
+                f"buffer's top_k={self.top_k}"
+            )
+        if n == 0:
             return
-        slots = slot_mapping if slot_mapping is not None else current_slot_mapping()
-        if slots.numel() == 0 or topk_ids.numel() == 0:
-            return
-        n = min(int(slots.shape[0]), int(topk_ids.shape[0]))
-        k = min(int(topk_ids.shape[-1]), self.top_k)
-        ids = topk_ids[:n, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
+        ids = topk_ids[:, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
         if k < self.top_k:
             row = self.buffer.new_full((n, self.top_k), UNCAPTURED)
             row[:, :k] = ids
             ids = row
-        self.buffer[slots.reshape(-1)[:n], layer_id, :] = ids
+        self.buffer[slots.reshape(-1), layer_id, :] = ids
 
     def store_step(
         self,
@@ -385,23 +321,24 @@ class RoutedExpertsCapturer:
             return None
         req_ids = np.asarray(req_ids, dtype=np.int64)
         starts = np.asarray(starts, dtype=np.int64)
-        captured = min(int(slots.shape[0]), total)
-        rows_at = slots.reshape(-1)[:captured]
+        if int(slots.shape[0]) < total:
+            raise RuntimeError(
+                f"routed-expert capture: the step forwarded {total} tokens but "
+                f"its slot_mapping has {int(slots.shape[0])} slots"
+            )
+        # Slots past `total` are graph padding.
+        rows_at = slots.reshape(-1)[:total]
         if prefix is not None:
             p_req, p_starts, p_lens, p_slots = prefix
-            p_at = torch.from_numpy(np.asarray(p_slots)).to(
-                rows_at.device, rows_at.dtype
-            )
+            p_at = torch.from_numpy(np.asarray(p_slots))
+            if rows_at.is_cuda:
+                p_at = p_at.pin_memory()
+            p_at = p_at.to(rows_at.device, rows_at.dtype, non_blocking=True)
             rows_at = torch.cat([p_at, rows_at])
             req_ids = np.concatenate([p_req, req_ids])
             starts = np.concatenate([p_starts, starts])
             lens = np.concatenate([p_lens, lens])
         rows = self.buffer[rows_at].to(dtype=torch.int16)
-        if captured < total:
-            # A metadata builder exposed fewer slots than the step ran.
-            rows = torch.cat(
-                [rows, rows.new_full((total - captured, *rows.shape[1:]), UNCAPTURED)]
-            )
         offsets = np.zeros(len(lens) + 1, dtype=np.int64)
         np.cumsum(lens, out=offsets[1:])
         if stream is not None and self.buffer.is_cuda:
@@ -428,4 +365,4 @@ def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
     layer_id = getattr(layer, "moe_capture_layer_id", None)
     if layer_id is None:
         return
-    capturer.capture(int(layer_id), topk_ids)
+    capturer.capture(int(layer_id), topk_ids, top_k=int(layer.top_k))

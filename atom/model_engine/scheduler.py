@@ -365,9 +365,6 @@ class ScheduledBatch:
         # `(batch index, lo, hi)` cached-prefix route ranges the runner returns
         # with this step; set by `Scheduler._plan_routed_prefixes`.
         self.routed_prefix_ranges = None
-        # Runner-local: this step's `PendingRoutes`, set after the forward and
-        # claimed when the step's output is built. Never sent back.
-        self.routed_experts_pending = None
 
         # Each sequence's window, staged into one array rather than assigned
         # per sequence: a numpy slice-assign costs ~245ns of dispatch whatever
@@ -706,12 +703,6 @@ class Scheduler:
         self._return_routed_experts = bool(
             getattr(config, "enable_return_routed_experts", False)
         )
-        if self._return_routed_experts:
-            from atom.model_ops.fused_moe.routed_experts_capturer import (
-                check_return_routed_experts_config,
-            )
-
-            check_return_routed_experts_config(config)
         pc = getattr(config, "parallel_config", None)
         self.metrics = SchedulerMetrics(
             getattr(pc, "data_parallel_rank", 0)
@@ -4202,7 +4193,9 @@ class Scheduler:
                     seq.multimodal_cache_ready = True
         routed = getattr(fwd_output, "routed_experts", None)
         if routed is not None:
-            seq_map = dict(running_by_id)
+            # Not ``running_by_id``: a dummy prefill's output carries the
+            # previous step's routes with ``batch=None``.
+            seq_map = {seq.id: seq for seq in self.running}
             for seq in seqs:
                 seq_map[seq.id] = seq
             self._apply_routed_experts_patch(seq_map, routed)
@@ -4323,8 +4316,9 @@ class Scheduler:
             # chunks and the first deferred step may have none; waiting for
             # one keeps an aborted request alive without advancing its tokens.
             if seq.status == SequenceStatus.ABORTED:
-                num_tokens = seq.num_tokens - seq.num_placeholder_tokens
-                self._mark_finished(seq, "aborted", num_tokens)
+                self._mark_finished(
+                    seq, "aborted", seq.num_tokens - seq.num_placeholder_tokens
+                )
                 finished_seqs.append(seq)
                 continue
             # Update the running status
@@ -4617,19 +4611,22 @@ class Scheduler:
                 # output. Aborts without sampled output use the same helper.
                 self._mark_finished(seq, leave_reason, num_tokens)
 
-            # Prepare stream output
-            # A terminal event is required even when truncation leaves no
-            # tokens (for example max_tokens <= 0). Async consumers wait for
-            # this finished RequestOutput and would otherwise block forever.
+            # Drop rejected drafts' rows each step: the held count must stay the
+            # live length, or `apply_routed_expert_patch`'s gap check misses a
+            # lost patch under speculative decoding.
             if (
-                leave_reason is None
-                and seq.routed_expert_rows > 0
+                self._return_routed_experts
+                and leave_reason is None
                 and not seq.is_partial_prefill
-                and seq.id not in pp_middle_chunk_ids
             ):
                 keep = max(int(num_tokens) - 1, 0)
                 if keep < seq.routed_expert_rows:
                     seq.truncate_routed_experts(keep)
+
+            # Prepare stream output
+            # A terminal event is required even when truncation leaves no
+            # tokens (for example max_tokens <= 0). Async consumers wait for
+            # this finished RequestOutput and would otherwise block forever.
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):

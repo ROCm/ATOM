@@ -1,28 +1,31 @@
 # SPDX-License-Identifier: MIT
 """Slot-indexed MoE route capture: scatter, gather, CUDA-graph pad slots."""
 
+from contextlib import contextmanager
 from dataclasses import fields
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from atom.config import Config
+from atom.config import Config, check_return_routed_experts
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
 from atom.model_ops.fused_moe import routed_experts_capturer as cap_mod
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     UNCAPTURED,
+    PendingRoutes,
     RoutedExpertsCapturer,
     RoutedExpertsPatch,
     capture_bytes_per_kv_block,
-    capture_pad_row_bytes,
-    check_return_routed_experts,
+    capture_row_bytes,
     maybe_capture_routed_experts,
+    merge_routed_patches,
     prefix_slots,
-    trim_routed_experts,
 )
+from atom.utils import forward_context as fc
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +51,23 @@ def _store_take(capturer, slots, req_ids, starts, lens, **kw):
     return capturer.store_step(slots, req_ids, starts, lens, **kw).patch()
 
 
+@contextmanager
+def _forward(slots):
+    """A forward whose attention metadata carries ``slots``."""
+    fc._forward_context = fc.ForwardContext(
+        attn_metadata=SimpleNamespace(slot_mapping=slots)
+    )
+    try:
+        yield
+    finally:
+        fc.reset_forward_context()
+
+
+def _capture(capturer, layer_id, ids, slots, **kw):
+    with _forward(slots):
+        capturer.capture(layer_id, ids, **kw)
+
+
 def test_config_flag_defaults_off():
     names = {f.name for f in fields(Config)}
     assert "enable_return_routed_experts" in names
@@ -55,29 +75,7 @@ def test_config_flag_defaults_off():
     assert field.default is False
 
 
-def test_dcp_pcp_pp_fail_closed():
-    check_return_routed_experts(1, 1, 1)
-    with pytest.raises(ValueError, match="decode_context_parallel_size"):
-        check_return_routed_experts(2, 1)
-    with pytest.raises(ValueError, match="prefill_context_parallel_size"):
-        check_return_routed_experts(1, 2)
-    with pytest.raises(ValueError, match="pipeline_parallel_size"):
-        check_return_routed_experts(1, 1, 2)
-    with pytest.raises(ValueError, match="KV transfer"):
-        check_return_routed_experts(
-            1, 1, 1, kv_transfer_config={"kv_connector": "moriio"}
-        )
-    with pytest.raises(ValueError, match="RapidServe"):
-        check_return_routed_experts(1, 1, 1, enable_rapidserve=True)
-    with pytest.raises(ValueError, match="enable_dp_attention"):
-        check_return_routed_experts(1, 1, 1, enable_dp_attention=True)
-    check_return_routed_experts(1, 1, 1, kv_transfer_config={})
-    check_return_routed_experts(1, 1, 1, enable_dp_attention=False)
-
-
 def _r3_config(**overrides):
-    from types import SimpleNamespace
-
     base = {
         "enable_return_routed_experts": True,
         "decode_context_parallel_size": 1,
@@ -85,51 +83,51 @@ def _r3_config(**overrides):
         "pipeline_parallel_size": 1,
         "kv_transfer_config": {},
         "enable_rapidserve": False,
-        "disagg_is_decode": False,
-        "runner_qualname": "atom.model_engine.model_runner.ModelRunner",
-        "enable_dp_attention": False,
         "plugin_config": None,
     }
     return SimpleNamespace(**{**base, **overrides})
 
 
-def test_config_check_is_one_resolution_for_every_caller():
-    from types import SimpleNamespace
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"decode_context_parallel_size": 2}, "decode_context_parallel_size"),
+        ({"prefill_context_parallel_size": 2}, "prefill_context_parallel_size"),
+        ({"pipeline_parallel_size": 2}, "pipeline_parallel_size"),
+        ({"kv_transfer_config": {"kv_connector": "moriio"}}, "KV transfer"),
+        ({"enable_rapidserve": True}, "never initializes"),
+        ({"plugin_config": SimpleNamespace(is_plugin_mode=True)}, "plugin mode"),
+    ],
+)
+def test_unsupported_topologies_fail_closed(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        check_return_routed_experts(_r3_config(**overrides))
 
-    from atom.model_ops.fused_moe.routed_experts_capturer import (
-        check_return_routed_experts_config as check,
+
+def test_supported_topologies_pass():
+    check_return_routed_experts(_r3_config())
+    check_return_routed_experts(_r3_config(enable_dp_attention=True))
+    check_return_routed_experts(
+        _r3_config(enable_return_routed_experts=False, pipeline_parallel_size=2)
     )
 
-    check(_r3_config())
-    check(_r3_config(enable_return_routed_experts=False, pipeline_parallel_size=2))
-    for overrides in (
-        {"disagg_is_decode": True},
-        {"runner_qualname": "x.RapidServeModelRunner"},
-        {"enable_rapidserve": True},
-    ):
-        with pytest.raises(ValueError, match="RapidServe"):
-            check(_r3_config(**overrides))
-    with pytest.raises(ValueError, match="RapidServe"):
-        check(_r3_config(), rapidserve_runner=True)
-    with pytest.raises(ValueError, match="plugin mode"):
-        check(_r3_config(plugin_config=SimpleNamespace(is_plugin_mode=True)))
 
+def test_dp_attention_refuses_a_builder_with_prefill_token_graphs(monkeypatch):
+    """Its idle-rank dummy prefill captures into physical block 0's slots."""
+    import atom.model_engine.model_runner as mr
 
-def test_rapidserve_decode_skip_is_rejected():
-    """Decode skips KV alloc / capturer init; RapidServeModelRunner must refuse."""
-    from pathlib import Path
+    class Builder:
+        supplies_token_slots = True
+        supports_token_graph = True
 
-    src = (
-        Path(__file__).resolve().parents[1]
-        / "atom"
-        / "model_engine"
-        / "model_runner.py"
-    ).read_text()
-    rapid = src.split("class RapidServeModelRunner", 1)[1]
-    assert "def _refuse_routed_experts_capture" in rapid
-    assert rapid.count("self._refuse_routed_experts_capture()") >= 2
-    with pytest.raises(ValueError, match="never initializes"):
-        check_return_routed_experts(1, 1, 1, enable_rapidserve=True)
+    monkeypatch.setattr(mr, "fused_moe_modules", lambda model: [object()])
+    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+    runner._return_routed_experts = True
+    runner.model = object()
+    runner.attn_metadata_builder = Builder()
+    runner.config = SimpleNamespace(enable_dp_attention=True)
+    with pytest.raises(ValueError, match="enable_dp_attention with Builder"):
+        runner._routed_experts_geometry()
 
 
 def test_flag_off_leaves_field_absent():
@@ -150,8 +148,8 @@ def test_two_request_batch_order_segments():
     ids = torch.tensor(
         [[10, 11], [12, 13], [20, 21], [22, 23]], dtype=torch.int32, device=device
     )
-    capturer.capture(0, ids, slot_mapping=slots)
-    capturer.capture(1, ids + 100, slot_mapping=slots)
+    _capture(capturer, 0, ids, slots)
+    _capture(capturer, 1, ids + 100, slots)
     patch = _store_take(capturer, slots, [7, 9], [0, 0], [2, 2])
     assert patch.rows.dtype == np.int16
     assert patch.rows.shape == (4, 3, 2)
@@ -164,7 +162,7 @@ def test_two_request_batch_order_segments():
     # Next step decodes A alone at position 2.
     slots2 = torch.tensor([2], device=device)
     ids2 = torch.tensor([[14, 15]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids2, slot_mapping=slots2)
+    _capture(capturer, 0, ids2, slots2)
     patch2 = _store_take(capturer, slots2, [7], [2], [1])
     [(r, s, rows)] = _segments(patch2)
     assert (r, s) == (7, 2)
@@ -181,7 +179,7 @@ def test_patches_rebuild_request_history():
     for start, n in ((0, 3), (3, 1), (4, 1)):
         slots = torch.arange(start, start + n, device=device)
         ids = slots.to(torch.int32).unsqueeze(-1) + 40
-        capturer.capture(0, ids, slot_mapping=slots)
+        _capture(capturer, 0, ids, slots)
         patch = _store_take(capturer, slots, [7], [start], [n])
         for _r, s, rows in _segments(patch):
             seq.apply_routed_expert_patch(s, rows)
@@ -199,7 +197,7 @@ def test_length_contract_prompt_plus_completion_minus_one():
     n_routes = prompt_len + completion_len - 1
     slots = torch.arange(n_routes, device=device)
     ids = torch.arange(n_routes, device=device, dtype=torch.int32).unsqueeze(-1)
-    capturer.capture(0, ids, slot_mapping=slots)
+    _capture(capturer, 0, ids, slots)
     patch = _store_take(capturer, slots, [1], [0], [n_routes])
     assert patch.rows.shape[0] == prompt_len + completion_len - 1
 
@@ -213,7 +211,7 @@ def test_graph_dummy_does_not_clobber_slot_zero():
     capturer.buffer[:, 0, :] = -7
     slots = torch.tensor([0, -1], device=device)
     ids = torch.tensor([[9, 8], [1, 2]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids, slot_mapping=slots)
+    _capture(capturer, 0, ids, slots)
     assert capturer.buffer[0, 0].tolist() == [9, 8]
     assert capturer.buffer[capturer.num_slots, 0].tolist() == [1, 2]
 
@@ -226,7 +224,7 @@ def test_graph_dummy_negative_slots_ignored():
     capturer.buffer[:, 0, :] = -7
     slots = torch.tensor([-1, -1, 3], device=device)
     ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids, slot_mapping=slots)
+    _capture(capturer, 0, ids, slots)
     # Pad rows must not clobber slot 0.
     got0 = capturer.buffer[0, 0].tolist()
     assert got0 == [-7, -7]
@@ -242,14 +240,15 @@ def test_prefix_hit_segment_reads_cached_slots():
     )
     slots = torch.tensor([0, 1, 2], device=device)
     ids = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32, device=device)
-    capturer.capture(0, ids, slot_mapping=slots)
+    _capture(capturer, 0, ids, slots)
     a = _store_take(capturer, slots, [1], [0], [3])
 
     b_slots = torch.tensor([3], device=device)
-    capturer.capture(
+    _capture(
+        capturer,
         0,
         torch.tensor([[5, 6]], dtype=torch.int32, device=device),
-        slot_mapping=b_slots,
+        b_slots,
     )
     prefix = (
         np.array([2]),
@@ -272,22 +271,34 @@ def test_maybe_capture_skips_when_uninitialized():
     assert RoutedExpertsCapturer.get() is None
 
 
-def test_moe_outside_the_target_model_never_captures(monkeypatch):
+def test_moe_hook_writes_its_layer_at_this_forwards_slots():
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=2, top_k=2, device=device
+    )
+    layer = SimpleNamespace(moe_capture_layer_id=1, top_k=2)
+    with _forward(torch.tensor([3], device=device)):
+        maybe_capture_routed_experts(
+            layer, torch.tensor([[5, 6]], dtype=torch.int32, device=device)
+        )
+    assert capturer.buffer[3, 1].tolist() == [5, 6]
+    assert (capturer.buffer[3, 0] == UNCAPTURED).all()
+
+
+def test_moe_outside_the_target_model_never_captures():
     """A drafter's MoE has a `layer_id` but no `moe_capture_layer_id`."""
     device = _device()
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=2, top_k=2, device=device
     )
-    monkeypatch.setattr(
-        cap_mod, "current_slot_mapping", lambda: torch.tensor([0], device=device)
-    )
 
     class _DraftMoE:
         layer_id = 0
 
-    maybe_capture_routed_experts(
-        _DraftMoE(), torch.tensor([[5, 6]], dtype=torch.int32, device=device)
-    )
+    with _forward(torch.tensor([0], device=device)):
+        maybe_capture_routed_experts(
+            _DraftMoE(), torch.tensor([[5, 6]], dtype=torch.int32, device=device)
+        )
     assert (capturer.buffer == UNCAPTURED).all()
 
 
@@ -342,10 +353,11 @@ def test_store_step_drops_graph_pad_tail():
         num_slots=8, num_layers=1, top_k=2, device=device
     )
     slots = torch.tensor([0, -1, -1], device=device)
-    capturer.capture(
+    _capture(
+        capturer,
         0,
         torch.tensor([[9, 8], [1, 2], [3, 4]], dtype=torch.int32, device=device),
-        slot_mapping=slots,
+        slots,
     )
     patch = _store_take(capturer, slots, [1], [0], [1])
     np.testing.assert_array_equal(patch.rows[:, 0, :], [[9, 8]])
@@ -358,25 +370,83 @@ def test_uncaptured_rows_are_minus_one():
         num_slots=8, num_layers=2, top_k=2, device=device
     )
     slots = torch.tensor([0, 1], device=device)
-    capturer.capture(
-        0, torch.tensor([[7, 8], [9, 10]], dtype=torch.int32, device=device), slots
+    _capture(
+        capturer,
+        0,
+        torch.tensor([[7, 8], [9, 10]], dtype=torch.int32, device=device),
+        slots,
     )
     patch = _store_take(capturer, slots, [1], [0], [2])
     np.testing.assert_array_equal(patch.rows[:, 0, :], [[7, 8], [9, 10]])
     assert (patch.rows[:, 1, :] == UNCAPTURED).all()
 
 
-def test_short_slot_mapping_pads_uncaptured():
-    """A metadata builder exposing fewer slots than tokens yields -1 rows."""
+def test_short_slot_mapping_raises_at_store():
+    """A metadata builder exposing fewer slots than tokens is an error, not -1 rows."""
     device = _device()
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=1, device=device
     )
     slots = torch.tensor([2], device=device)
-    capturer.capture(0, torch.tensor([[5]], dtype=torch.int32, device=device), slots)
-    patch = _store_take(capturer, slots, [1, 2], [0, 0], [2, 1])
-    assert patch.rows[:, 0, 0].tolist() == [5, UNCAPTURED, UNCAPTURED]
-    assert patch.offsets.tolist() == [0, 2, 3]
+    _capture(capturer, 0, torch.tensor([[5]], dtype=torch.int32, device=device), slots)
+    with pytest.raises(
+        RuntimeError, match="forwarded 3 tokens but its slot_mapping has 1"
+    ):
+        capturer.store_step(slots, [1, 2], [0, 0], [2, 1])
+
+
+@pytest.mark.parametrize("slot_count", [2, 4])
+def test_capture_raises_when_topk_rows_and_slots_differ(slot_count):
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=2, device="cpu"
+    )
+    with pytest.raises(RuntimeError, match="routed 3 tokens"):
+        _capture(
+            capturer,
+            0,
+            torch.zeros((3, 2), dtype=torch.int32),
+            torch.arange(slot_count),
+        )
+
+
+@pytest.mark.parametrize("layer_id", [-1, 2])
+def test_capture_raises_on_layer_outside_buffer(layer_id):
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=2, top_k=2, device="cpu"
+    )
+    with pytest.raises(RuntimeError, match="outside the buffer's 2 layers"):
+        _capture(
+            capturer,
+            layer_id,
+            torch.zeros((1, 2), dtype=torch.int32),
+            torch.tensor([0]),
+        )
+
+
+def test_capture_raises_when_fewer_columns_than_layer_top_k():
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=4, device="cpu"
+    )
+    with pytest.raises(RuntimeError, match="top_k=4 with 3 top-k columns"):
+        _capture(
+            capturer,
+            0,
+            torch.zeros((1, 3), dtype=torch.int32),
+            torch.tensor([0]),
+            top_k=4,
+        )
+
+
+def test_capture_drops_fused_shared_columns_past_layer_top_k():
+    """A top-2 layer with one fused shared column, in a buffer sized for a top-3
+    layer: the shared id must not land in the third route column."""
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=1, top_k=3, device="cpu"
+    )
+    slots = torch.tensor([1])
+    _capture(capturer, 0, torch.tensor([[4, 7, 99]], dtype=torch.int32), slots, top_k=2)
+    patch = _store_take(capturer, slots, [1], [0], [1])
+    assert patch.rows[0, 0].tolist() == [4, 7, UNCAPTURED]
 
 
 def test_empty_step_stores_nothing():
@@ -394,9 +464,9 @@ def test_stored_steps_are_independent():
     capturer = RoutedExpertsCapturer.init(
         num_slots=8, num_layers=1, top_k=1, device="cpu"
     )
-    capturer.capture(0, torch.tensor([[4]], dtype=torch.int32), torch.tensor([1]))
+    _capture(capturer, 0, torch.tensor([[4]], dtype=torch.int32), torch.tensor([1]))
     a = capturer.store_step(torch.tensor([1]), [1], [0], [1])
-    capturer.capture(0, torch.tensor([[6]], dtype=torch.int32), torch.tensor([2]))
+    _capture(capturer, 0, torch.tensor([[6]], dtype=torch.int32), torch.tensor([2]))
     b = capturer.store_step(torch.tensor([2]), [2], [0], [1])
     assert b.patch().req_ids.tolist() == [2]
     assert a.patch().req_ids.tolist() == [1]
@@ -413,16 +483,16 @@ def test_async_store_snapshots_slots_before_staging_reuse():
         num_slots=8, num_layers=1, top_k=2, device=device
     )
     slots = torch.tensor([1], device=device)
-    capturer.capture(
-        0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slot_mapping=slots
+    _capture(
+        capturer, 0, torch.tensor([[7, 8]], dtype=torch.int32, device=device), slots
     )
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         torch.cuda._sleep(2_000_000_000)
     pending = capturer.store_step(slots, [1], [0], [1], stream=stream)
     slots.fill_(2)
-    capturer.capture(
-        0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slot_mapping=slots
+    _capture(
+        capturer, 0, torch.tensor([[3, 4]], dtype=torch.int32, device=device), slots
     )
     np.testing.assert_array_equal(pending.patch().rows[:, 0, :], [[7, 8]])
 
@@ -461,8 +531,11 @@ def test_reused_slot_keeps_dense_layers_uncaptured():
     slot = torch.tensor([3], device=device)
     for ids in ([[1, 2]], [[5, 6]]):  # request A, then B on the same slot
         for layer in (0, 2):
-            capturer.capture(
-                layer, torch.tensor(ids, dtype=torch.int32, device=device), slot
+            _capture(
+                capturer,
+                layer,
+                torch.tensor(ids, dtype=torch.int32, device=device),
+                slot,
             )
     row = capturer.buffer[3].cpu().tolist()
     assert row == [[5, 6], [UNCAPTURED, UNCAPTURED], [5, 6]]
@@ -524,13 +597,12 @@ def test_capture_buffer_matches_its_budget():
     assert capturer.buffer.dtype == cap_mod.CAPTURE_DTYPE
     assert capturer.buffer.nbytes == num_blocks * capture_bytes_per_kv_block(
         block_size, layers, top_k
-    ) + capture_pad_row_bytes(layers, top_k)
+    ) + capture_row_bytes(layers, top_k)
 
 
 def test_capture_page_bytes_are_budgeted_per_block():
     item = cap_mod.CAPTURE_DTYPE.itemsize
     assert capture_bytes_per_kv_block(16, 58, 8) == 16 * 58 * 8 * item
-    assert capture_pad_row_bytes(58, 8) == 58 * 8 * item
     from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
         PAGED_CLASS,
         page_pool,
@@ -541,19 +613,6 @@ def test_capture_page_bytes_are_budgeted_per_block():
     capture = page_pool(capture_bytes_per_kv_block(16, 2, 2))
     plan = plan_pools([kv, capture], available_bytes=1024 * 10 + 256, max_num_seqs=1)
     assert plan.entry_bytes[PAGED_CLASS] == 1024 + capture_bytes_per_kv_block(16, 2, 2)
-
-
-def test_trim_routed_experts_before_request_output():
-    routes = np.arange(6, dtype=np.int16).reshape(6, 1, 1)
-    trimmed = trim_routed_experts(routes, num_tokens=4)
-    assert trimmed.shape[0] == 3
-    ro = RequestOutput(
-        request_id=0,
-        output_tokens=[1],
-        finished=True,
-        routed_experts=trimmed,
-    )
-    assert ro.routed_experts.shape[0] == 3
 
 
 def test_lazy_wrapper_fused_moe_is_detected(monkeypatch):
@@ -616,11 +675,11 @@ def test_in_place_slot_rewrite_between_forwards():
     staging = torch.tensor([0, 1, -1], device=device)
     ids = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32, device=device)
     for layer in range(3):
-        capturer.capture(layer, ids + 10 * layer, slot_mapping=staging)
+        _capture(capturer, layer, ids + 10 * layer, staging)
     first = _store_take(capturer, staging, [0], [0], [2])
     staging.copy_(torch.tensor([2, 3, -1], device=device))
     for layer in range(3):
-        capturer.capture(layer, ids + 100 + 10 * layer, slot_mapping=staging)
+        _capture(capturer, layer, ids + 100 + 10 * layer, staging)
     second = _store_take(capturer, staging, [0], [2], [2])
     for layer in range(3):
         np.testing.assert_array_equal(
@@ -647,11 +706,12 @@ def test_apply_patch_extends_none_and_appends():
     )
 
 
-def test_apply_patch_gap_fills_uncaptured():
+def test_apply_patch_gap_raises():
     seq = Sequence([1, 2, 3], 3)
     seq.apply_routed_expert_patch(0, np.zeros((2, 1, 1), dtype=np.int16))
-    seq.apply_routed_expert_patch(4, np.full((1, 1, 1), 5, dtype=np.int16))
-    assert seq.routed_experts[:, 0, 0].tolist() == [0, 0, -1, -1, 5]
+    with pytest.raises(RuntimeError, match="positions 2..3 were never returned"):
+        seq.apply_routed_expert_patch(4, np.full((1, 1, 1), 5, dtype=np.int16))
+    assert seq.routed_expert_rows == 2
 
 
 def test_apply_patch_overlap_overwrites_and_keeps_high_water():
@@ -696,18 +756,10 @@ def test_apply_patch_deferred_overlap_keeps_prefix():
     np.testing.assert_array_equal(seq.routed_experts[2:], nxt)
 
 
-def test_apply_patch_after_empty_full_array_grows():
-    seq = Sequence([1, 2, 3], 3)
-    seq.routed_experts = np.zeros((0, 2, 2), dtype=np.int16)
-    rows = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
-    seq.apply_routed_expert_patch(0, rows)
-    np.testing.assert_array_equal(seq.routed_experts, rows)
-
-
-def test_routed_experts_setter_does_not_alias_caller_array():
+def test_apply_patch_does_not_alias_caller_array():
     seq = Sequence([1, 2, 3], 3)
     full = np.arange(12, dtype=np.int16).reshape(3, 2, 2)
-    seq.routed_experts = full
+    seq.apply_routed_expert_patch(0, full)
     seq.apply_routed_expert_patch(2, np.full((1, 2, 2), 99, dtype=np.int16))
     np.testing.assert_array_equal(full[2], [[8, 9], [10, 11]])
     np.testing.assert_array_equal(seq.routed_experts[2], [[99, 99], [99, 99]])
@@ -771,6 +823,91 @@ def test_running_routes_are_still_copies():
     assert seq.routed_experts[0, 0, 0] == 0
 
 
+def _pending(req_id: int, start: int, n: int, fill: int) -> PendingRoutes:
+    rows = torch.full((n, 1, 2), fill, dtype=torch.int16)
+    return PendingRoutes(
+        np.array([req_id]), np.array([start]), np.array([0, n]), rows, None
+    )
+
+
+def test_merge_routed_patches_keeps_segment_order_and_offsets():
+    a = _pending(1, 0, 2, 5).patch()
+    b = RoutedExpertsPatch(
+        np.array([1, 2]),
+        np.array([2, 0]),
+        np.array([0, 3, 4]),
+        np.arange(8, dtype=np.int16).reshape(4, 1, 2),
+    )
+    merged = merge_routed_patches([a, b])
+    np.testing.assert_array_equal(merged.req_ids, [1, 1, 2])
+    np.testing.assert_array_equal(merged.starts, [0, 2, 0])
+    np.testing.assert_array_equal(merged.offsets, [0, 2, 5, 6])
+    np.testing.assert_array_equal(merged.rows[2:], b.rows)
+    assert merge_routed_patches([a]) is a
+
+
+def _runner_with_held(*held: PendingRoutes):
+    from atom.model_engine.model_runner import ModelRunner
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner._held_routes = list(held)
+    return runner, ModelRunner
+
+
+@pytest.mark.parametrize("deferred", [True, False])
+def test_middle_chunk_routes_reach_the_next_output_in_order(deferred):
+    """Chunks 0..2 of one prompt: the middle chunk's routes ride the next output.
+
+    Deferred, that output carries the previous batch's routes (chunk 0, older
+    than the held chunk 1); otherwise its own batch's (chunk 2, newer).
+    """
+    from atom.model_engine.scheduler import Scheduler
+
+    runner, cls = _runner_with_held(_pending(7, 4, 4, 1))
+    own = _pending(7, 0, 4, 0) if deferred else _pending(7, 8, 4, 2)
+    output = SimpleNamespace(routed_experts=None)
+    cls._attach_routed_experts(runner, own, output, held_first=not deferred)
+    assert runner._held_routes == []
+
+    seq = Sequence(list(range(12)), 4)
+    if not deferred:
+        seq.apply_routed_expert_patch(0, np.zeros((4, 1, 2), dtype=np.int16))
+    Scheduler._apply_routed_experts_patch({7: seq}, output.routed_experts)
+    rows = 8 if deferred else 12
+    assert seq.routed_expert_rows == rows
+    np.testing.assert_array_equal(
+        seq.routed_experts[:, 0, 0], np.repeat(np.arange(rows // 4), 4)
+    )
+
+
+def test_held_routes_attach_without_a_batch_of_their_own():
+    runner, cls = _runner_with_held(_pending(3, 0, 2, 9), _pending(3, 2, 2, 8))
+    output = SimpleNamespace(routed_experts=None)
+    cls._attach_routed_experts(runner, None, output, held_first=False)
+    np.testing.assert_array_equal(output.routed_experts.starts, [0, 2])
+    np.testing.assert_array_equal(output.routed_experts.rows[:, 0, 0], [9, 9, 8, 8])
+
+
+def test_dummy_output_leaves_held_routes_for_the_next_real_output():
+    """An idle DP rank's dummy output can be discarded; the held rows must survive it."""
+    runner, cls = _runner_with_held(_pending(8, 0, 2, 4))
+    dummy_out = SimpleNamespace(routed_experts=None)
+    cls._attach_routed_experts(
+        runner, None, dummy_out, held_first=False, take_held=False
+    )
+    assert dummy_out.routed_experts is None
+    real_out = SimpleNamespace(routed_experts=None)
+    cls._attach_routed_experts(runner, None, real_out, held_first=False)
+    np.testing.assert_array_equal(real_out.routed_experts.starts, [0])
+
+
+def test_no_routes_leaves_output_untouched():
+    runner, cls = _runner_with_held()
+    output = SimpleNamespace(routed_experts=None)
+    cls._attach_routed_experts(runner, None, output, held_first=True)
+    assert output.routed_experts is None
+
+
 def test_incremental_decode_payload_smaller_than_full_history():
     import pickle
 
@@ -785,3 +922,62 @@ def test_incremental_decode_payload_smaller_than_full_history():
     full_size = len(pickle.dumps(full))
     patch_size = len(pickle.dumps(patch))
     assert patch_size * 20 < full_size
+
+
+@pytest.mark.parametrize("in_kernel_routing", [True, False])
+@pytest.mark.parametrize("capturing", [True, False])
+def test_qwen4_exp_single_token_moe_captures_its_routes(
+    monkeypatch, capturing, in_kernel_routing
+):
+    """Both batch-1 MoE branches capture the ids their kernel ran: the
+    in-kernel routing's own ids, or `select_experts`'."""
+    import atom.models.qwen4_exp as q4
+
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=2, top_k=2, device="cpu"
+    )
+    kernel_ids = torch.tensor([[3, 1, 4]], dtype=torch.int32)
+    selected_ids = torch.tensor([[2, 0, 4]], dtype=torch.int32)
+    monkeypatch.setattr(
+        q4.FusedMoE,
+        "select_experts",
+        staticmethod(lambda **kw: (torch.ones((1, 3)), selected_ids)),
+    )
+
+    def kernel(x, topk_ids, *a, return_topk_ids=False, **kw):
+        return (x, kernel_ids) if return_topk_ids else x
+
+    monkeypatch.setattr(q4, "moe_decode_single_token", kernel)
+    n = 5
+    experts = SimpleNamespace(
+        w13_weight=torch.zeros((n, 2)),
+        w13_weight_scale=torch.zeros((n, 2)),
+        w2_weight=torch.zeros((n, 2)),
+        w2_weight_scale=torch.zeros((n, 2)),
+        renormalize=True,
+        scoring_func="softmax",
+        use_grouped_topk=False,
+        custom_routing_function=None,
+        e_score_correction_bias=None,
+        routed_scaling_factor=1.0 if in_kernel_routing else 2.0,
+        top_k=2,
+        topk_group=None,
+        num_expert_group=None,
+        shared_expert_scoring_func=None,
+        global_num_experts=n,
+        num_fused_shared_experts=1,
+    )
+    if capturing:
+        experts.moe_capture_layer_id = 1
+    block = q4.Qwen4ExpSparseMoeBlock.__new__(q4.Qwen4ExpSparseMoeBlock)
+    torch.nn.Module.__init__(block)
+    block.experts = experts
+    block.n_routed_experts = n - 1
+    x = torch.zeros((1, 2))
+    with _forward(torch.tensor([6])):
+        assert block._single_token_experts(x, torch.zeros((1, n))) is x
+    if capturing:
+        ran = kernel_ids if in_kernel_routing else selected_ids
+        assert capturer.buffer[6, 1].tolist() == ran[0, :2].tolist()
+    else:
+        assert (capturer.buffer == UNCAPTURED).all()
