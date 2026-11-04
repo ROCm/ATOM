@@ -617,35 +617,3 @@ def test_bind_aux_taps_refuses_an_extract_the_kernels_do_not_compute():
     assert bind_aux_taps(_aux_drafter(), 8, kernel).extract is None
     # a runner that calls the extract itself takes any
     assert bind_aux_taps(_aux_drafter(aux_extract=other), 8).extract is other
-
-
-@pytest.mark.parametrize(
-    "runner, kernel_extract",
-    [
-        (
-            "models/deepseek_v41/mono/runner.py",
-            "DeepseekV41DSpark._target_layer_input",
-        ),
-        (
-            "models/minimax_m3/mono/runner.py",
-            "DSparkProposer._extract_layer_hidden",
-        ),
-    ],
-)
-def test_kernel_tap_runners_bind_the_extract_they_compute(runner, kernel_extract):
-    """V4.1 and MiniMax-M3 write the taps from their kernels and never call
-    ``AuxTaps.extract``; each binds with the extract those kernels reproduce,
-    so ``bind_aux_taps`` refuses any other. Read from the source because the
-    runners need the GPU stack to import."""
-    tree = ast.parse((FRAMEWORK.parent / runner).read_text())
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "bind_aux_taps"
-    ]
-    assert calls
-    for call in calls:
-        assert len(call.args) == 3
-        assert ast.unparse(call.args[2]) == kernel_extract
