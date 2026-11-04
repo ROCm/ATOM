@@ -33,7 +33,14 @@ def _no_disk_cache(monkeypatch):
 P0_REGIONS = {"ppart", "pwgt", "pmsq", "pamx", "pxrdy"}
 
 
-@pytest.mark.parametrize("mode", [1, 2])
+REGIONS_OF = {
+    1: P0_REGIONS,
+    2: P0_REGIONS | {"p1done", "p2done"},
+    3: P0_REGIONS | {"p1done", "p2done", "p3done"},
+}
+
+
+@pytest.mark.parametrize("mode", [1, 2, 3])
 def test_prep_build_adds_only_its_tail(mode):
     base_key = k2.K2Build(tokens=1, nblocks=2)
     key = k2.K2Build(tokens=1, nblocks=2, mla_prep=mode, prep_nblocks=2)
@@ -44,7 +51,7 @@ def test_prep_build_adds_only_its_tail(mode):
     before = [(a.region, a.kind) for a in rec.accesses if a.stage != "k2.mlaprep"]
     assert before == [(a.region, a.kind) for a in base.accesses]
     tail = [a for a in rec.accesses if a.stage == "k2.mlaprep"]
-    regions = set(pr.REGIONS) if mode >= 2 else P0_REGIONS
+    regions = REGIONS_OF[mode]
     assert regions <= set(pr.REGIONS)
     assert {a.region for a in tail} == regions | {"fing"}
     for a in tail:
@@ -60,9 +67,13 @@ def test_prep_build_adds_only_its_tail(mode):
     pxrdy = [a.kind for a in tail if a.region == "pxrdy"]
     assert pxrdy == (["put", "poll"] if mode >= 2 else ["put"])
     if mode >= 2:
-        # P2 waits on P1's pairs; P2DONE is the host's (the launch's end)
+        # P2 waits on P1's pairs; P2DONE is P3's (mode 3), else nobody's
         assert [a.kind for a in tail if a.region == "p1done"] == ["put", "poll"]
-        assert [a.kind for a in tail if a.region == "p2done"] == ["put"]
+        p2 = [a.kind for a in tail if a.region == "p2done"]
+        assert p2 == (["put", "poll"] if mode >= 3 else ["put"])
+    if mode >= 3:
+        # P4 waits on its head's P3 tasks
+        assert [a.kind for a in tail if a.region == "p3done"] == ["put", "poll"]
     # every other region of the tail is put before it is polled
     for r in ("ppart", "pwgt", "pmsq", "pamx"):
         kinds = [a.kind for a in tail if a.region == r]
