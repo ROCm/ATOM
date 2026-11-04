@@ -579,19 +579,6 @@ class KimiK3DFlash(DSparkDraftModel):
 
     # -- DSparkDraftModel contract ----------------------------------------
 
-    def write_context_kv(
-        self,
-        aux_concat: torch.Tensor,
-        positions: torch.Tensor,
-        slot_mapping: torch.Tensor | None = None,
-    ):
-        # Under TR_HYBRID the runner hands over `running_tokens` rows of target
-        # hidden state but only the scheduled rows' `positions`; the padded tail
-        # has no slot to land in, so it is dropped before the projection.
-        super().write_context_kv(
-            aux_concat[: positions.shape[0]], positions, slot_mapping
-        )
-
     @property
     def first_attention_layer_num(self) -> int:
         return self.layers[0].self_attn.kv.layer_num

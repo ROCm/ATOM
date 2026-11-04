@@ -1087,7 +1087,7 @@ def test_the_builder_skips_dummy_runs_and_drafts_without_a_pool():
     assert _publish(stub, [2], 2, _TABLES) is None
 
 
-def _compute_draft_kv(kv_pool_spec, n_tok):
+def _compute_draft_kv(kv_pool_spec, n_tok, n_rows=None):
     """Drive the real `compute_draft_kv`; return what reached the model."""
     import torch
 
@@ -1103,7 +1103,7 @@ def _compute_draft_kv(kv_pool_spec, n_tok):
         model=types.SimpleNamespace(
             kv_pool_spec=kv_pool_spec,
             write_context_kv=lambda aux, pos, slot_mapping: seen.update(
-                rows=aux.shape[0], slots=slot_mapping
+                rows=aux.shape[0], pos=pos.shape[0], slots=slot_mapping
             ),
         ),
     )
@@ -1112,7 +1112,7 @@ def _compute_draft_kv(kv_pool_spec, n_tok):
     proposer.get_forward_context = lambda: fwd
     try:
         proposer.DSparkProposer.compute_draft_kv(
-            stub, torch.arange(n_tok), torch.zeros(n_tok, 4), None
+            stub, torch.arange(n_tok), torch.zeros(n_rows or n_tok, 4), None
         )
     finally:
         proposer.get_forward_context = orig
@@ -1131,6 +1131,19 @@ def test_the_proposer_hands_a_pooled_draft_its_own_slots():
 def test_the_proposer_hands_other_drafts_no_slots():
     """Every other draft writes at the target's slots, so gets None."""
     assert _compute_draft_kv(None, 5)["slots"] is None
+
+
+@pytest.mark.parametrize("pooled", [True, False])
+def test_the_proposer_drops_padded_target_rows(pooled):
+    """Under TR_HYBRID the target runs `running_tokens` hidden rows but only
+    the scheduled rows have positions; only those rows reach any draft."""
+    from atom.spec_decode.draft_kv import DraftKvPoolSpec
+
+    spec = DraftKvPoolSpec(flash_layout=True, in_dcp_group=False) if pooled else None
+    seen = _compute_draft_kv(spec, 9, n_rows=12)
+    assert (seen["rows"], seen["pos"]) == (9, 9)
+    if pooled:
+        assert seen["slots"].numel() == 9
 
 
 def test_the_draft_fans_its_slots_out_to_every_context_layer(monkeypatch):
@@ -1465,27 +1478,6 @@ def test_kv_indices_buffer_is_allocated_only_for_mla_block_plans(
         assert p._blk_kv_indices.numel() == 8 * (4096 + 7)
     else:
         assert p._blk_kv_indices.numel() == 0
-
-
-def test_context_write_drops_padded_target_rows(monkeypatch):
-    """Under TR_HYBRID the runner passes `running_tokens` hidden rows but only
-    the scheduled rows' positions; only those rows may reach the projection."""
-    torch = pytest.importorskip("torch")
-    dflash = _gpu_stack_import("atom.models.kimi_k3_dflash")
-    from atom.models import dspark_draft
-
-    seen = {}
-    monkeypatch.setattr(
-        dspark_draft.DSparkDraftModel,
-        "write_context_kv",
-        lambda self, aux, pos, slots: seen.update(
-            rows=aux.shape[0], pos=pos.shape[0], slots=slots
-        ),
-    )
-    draft = dflash.KimiK3DFlash.__new__(dflash.KimiK3DFlash)
-    slots = torch.arange(9)
-    draft.write_context_kv(torch.zeros(12, 4), torch.arange(9), slots)
-    assert seen == {"rows": 9, "pos": 9, "slots": slots}
 
 
 def test_dflash_draft_is_refused_on_a_non_k3_target():

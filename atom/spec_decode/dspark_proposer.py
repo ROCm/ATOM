@@ -655,14 +655,15 @@ class DSparkProposer(Drafter):
             return
         forward_context = get_forward_context()
         scheduled_bs = forward_context.context.scheduled_bs
-        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)
+        # Under TR_HYBRID the target ran `running_tokens` rows but `positions`
+        # covers only the scheduled ones; the padded tail has nowhere to land.
+        num_rows = positions.shape[0]
+        main_hidden_all = torch.cat(aux_hidden_states, dim=-1)[:num_rows]
         # A draft with a declared pool writes at the slots the target's builder
         # uploaded for it; any other draft at the target's own.
         slot_mapping = None
         if self.model.kv_pool_spec is not None:
-            slot_mapping = self.runner.forward_vars["draft_ctx_slots"].gpu[
-                : positions.shape[0]
-            ]
+            slot_mapping = self.runner.forward_vars["draft_ctx_slots"].gpu[:num_rows]
         with record_function(
             f"draft_kv[bs={scheduled_bs} tok={main_hidden_all.shape[0]}]"
         ):
