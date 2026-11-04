@@ -18,7 +18,6 @@ from atom.kv_transfer.disaggregation.types import (
 )
 from atom.kv_transfer.offload._offload_common import OffloadSchedulerMixin
 from atom.model_engine.engine_stats import EngineStats
-from atom.model_engine.offload_prefetch import OffloadPrefetchState
 from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.scheduler import (
     ScheduledBatch,
@@ -452,7 +451,6 @@ class TestSchedule:
             _counted_as_inflight_load=True,
         )
         sched = Scheduler.__new__(Scheduler)
-        sched._prefetch = OffloadPrefetchState()
         sched._rejected = []
         sched._inflight_prefix_wait = {}
         sched.deferred_free_blocks = {}
@@ -579,8 +577,6 @@ class TestSchedule:
                 events.append(("source_blocks_released", value.id))
 
         sched = Scheduler.__new__(Scheduler)
-
-        sched._prefetch = OffloadPrefetchState()
         sched.waiting = deque()
         sched.running = deque()
         sched._rejected = []
@@ -990,7 +986,6 @@ class TestSchedule:
 
     def test_ready_remote_kv_waiter_is_promoted_ahead_of_fresh_head(self):
         sched = Scheduler.__new__(Scheduler)
-        sched._prefetch = OffloadPrefetchState()
         fresh = SimpleNamespace(id=1, status=SequenceStatus.WAITING)
         ready = SimpleNamespace(id=2, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
         blocked = SimpleNamespace(id=3, status=SequenceStatus.WAITING_FOR_REMOTE_KVS)
@@ -1135,8 +1130,6 @@ class TestSchedule:
                 return seq.id == 2
 
         sched = Scheduler.__new__(Scheduler)
-
-        sched._prefetch = OffloadPrefetchState()
         sched.kv_connector = _Connector()
         sched.waiting = deque()
         sched._partial_prefill_count = 1

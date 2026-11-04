@@ -224,15 +224,10 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         return int(getattr(self._impl, "chunk_size", 0) or 0)
 
     def lookup_ready(self, seq) -> bool:
-        callback = getattr(self._impl, "lookup_ready", None)
-        return bool(callback(seq)) if callable(callback) else False
+        return self._impl.lookup_ready(seq)
 
     def cancel_preadmission(self, seq) -> None:
-        callback = getattr(self._impl, "cancel_preadmission", None)
-        if callable(callback):
-            callback(seq)
-        else:
-            self._impl.cancel_pending_load(seq)
+        self._impl.cancel_preadmission(seq)
 
     def can_detach_lookup(self, seq, num_hbm_tokens: int) -> bool:
         callback = getattr(self._impl, "can_detach_lookup", None)

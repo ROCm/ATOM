@@ -1092,10 +1092,11 @@ def _async_adapter(chunks, base=Adapter):
 
 
 def _holding_engine(monkeypatch, adapter, **overrides):
-    monkeypatch.setenv("ATOM_DP_PREFIX_SPREAD", "1")
-    engine, connector, _ = engine_scheduler(monkeypatch, adapter=adapter, **overrides)
+    engine, connector, _ = engine_scheduler(
+        monkeypatch, adapter=adapter, offload_prefetch=True, **overrides
+    )
     # A 40-block pool: the default watermark would not fit one prompt.
-    engine._PREFETCH_KV_WATERMARK = 0.95
+    engine._prefetch.KV_WATERMARK = 0.95
     delayer = _EarlyDelayer()
     engine.set_prefill_delayer(delayer)
     return engine, connector, delayer

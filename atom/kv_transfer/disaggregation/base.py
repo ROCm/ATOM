@@ -124,6 +124,15 @@ class KVConnectorSchedulerBase(ABC):
         """Whether the scheduler may allocate this request and start prefill."""
         return True
 
+    def lookup_ready(self, seq: Any) -> bool:
+        """Whether `seq`'s tier lookup has answered, so the offload prefetch may
+        admit it without a round trip. No tier, no answer."""
+        return False
+
+    def cancel_preadmission(self, seq: Any) -> None:
+        """Undo an admission the scheduler takes back before any dispatch."""
+        self.cancel_pending_load(seq)
+
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""
         self.send_finished(seq.id)

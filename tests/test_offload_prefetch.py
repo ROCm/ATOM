@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Scheduler._offload_prefetch.
+"""The scheduler's offload prefetch (`OffloadPrefetch`).
 
 A waiting request whose tier lookup answered gets its blocks and its load on any
 tick -- delayer HOLD or FIRE, wherever it waits -- while its prefill still waits
@@ -113,11 +113,15 @@ class _Delayer:
 
 def _make(monkeypatch, seq_factory, n=1, blocks=100, **env):
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
-    monkeypatch.setenv("ATOM_DP_PREFIX_SPREAD", "1")
     for key, value in env.items():
         monkeypatch.setenv(key, str(value))
     sched = Scheduler(
-        MockConfig(max_num_seqs=8, max_num_batched_tokens=64, num_kvcache_blocks=blocks)
+        MockConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=64,
+            num_kvcache_blocks=blocks,
+            offload_prefetch=True,
+        )
     )
     sched.kv_connector = _Connector()
     delayer = _Delayer()
@@ -278,7 +282,7 @@ def test_watermark_stops_prefetch_allocation_and_the_request_waits_for_the_fire(
     monkeypatch, seq_factory
 ):
     sched, delayer, (seq,) = _make(monkeypatch, seq_factory)
-    sched._PREFETCH_KV_WATERMARK = 0.01
+    sched._prefetch.KV_WATERMARK = 0.01
 
     sched.schedule()
 
