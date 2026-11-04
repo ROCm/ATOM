@@ -229,14 +229,6 @@ class _AtomMetricsCollector:
                 ),
                 dp_router.get("prefix_moved_partial_total", 0),
             ),
-            (
-                "atom:dp_prefix_source_busy",
-                (
-                    "Prefix-spread requests kept on their prefix's rank because "
-                    "the request computing that prefix was still prefilling."
-                ),
-                dp_router.get("prefix_source_busy_total", 0),
-            ),
         ):
             metric = CounterMetricFamily(name, documentation)
             metric.add_metric([], float(value))

@@ -594,10 +594,11 @@ def test_deallocate_forgets_the_kv_only_load(monkeypatch):
     assert not seq.replay_kv_load and not seq.replays_hit
 
 
-def test_the_delayer_probes_size_a_finished_load_without_rewalking_its_hit():
-    """A finished tier load still waits for admission to mark it a resume. The
-    delayer's probes must size it as that resume, not re-ask the hit walk,
-    which would rewrite the `replays_hit` flag it was admitted with."""
+def test_a_finished_load_is_sized_as_a_resume_without_rewalking_its_hit():
+    """A finished tier load is resolved into a resume at the top of the tick
+    (`_promote_ready_remote_kv_requests`). The delayer's probes then size it
+    as that resume and do not re-ask the hit walk, which would rewrite the
+    `replays_hit` flag it was admitted with."""
     engine, seq = _engine_with_a_replayed_head(budget=64)
     bm = engine.block_manager
     assert bm.allocate(seq, bm.can_allocate(seq))
@@ -605,24 +606,19 @@ def test_the_delayer_probes_size_a_finished_load_without_rewalking_its_hit():
     engine.waiting.remove(seq)
     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     seq.offload_loaded_tokens = 36
+    seq.offload_load_start_tokens = None
     engine.waiting.append(seq)
     engine.kv_connector = SimpleNamespace(is_offload=True)
+    engine._prefetch = None
     engine.finished_recving_kv_req_ids = [seq.id]
 
-    assert engine._finished_load_tokens(seq) == 36
     walks = []
     real = bm.can_allocate_memoized
     bm.can_allocate_memoized = lambda s: walks.append(s) or real(s)
+    assert not engine._local_prefill_pending_work()[0]  # not resolved yet
+    engine._promote_ready_remote_kv_requests()
+    assert seq.status == SequenceStatus.WAITING and seq.num_cached_tokens == 36
     assert engine._local_prefill_pending_work()[0]
     engine._estimate_prefill_chunk_cost()
     assert not walks
     assert seq.replays_hit
-
-    # A load still in flight is not work yet and is not a resume either.
-    engine.finished_recving_kv_req_ids = []
-    assert engine._finished_load_tokens(seq) is None
-
-    # A failed load recomputes past its local hit; the planned boundary in
-    # `offload_loaded_tokens` is not cached.
-    engine.failed_recving_kv_req_ids = [seq.id]
-    assert engine._finished_load_tokens(seq) == seq.num_cached_tokens

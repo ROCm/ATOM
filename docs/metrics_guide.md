@@ -216,6 +216,11 @@ Summed across DP ranks by `LLMEngine.get_metrics_statistics()`.
 | `atom:dp_affinity_spill` | Counter | Existing sessions moved off their cache owner; strict affinity keeps this at 0. |
 | `atom:dp_affinity_parent_ignored` | Counter | New child sessions placed independently instead of inheriting a parent owner. |
 | `atom:dp_route_explicit` / `atom:dp_route_load_balanced` | Counter | Requests routed by explicit rank / by the load balancer. |
+| `atom:dp_prefix_owner` | Counter | `prefix_spread`: requests kept on the rank holding their prefix. |
+| `atom:dp_prefix_moved` | Counter | `prefix_spread`: requests moved to an idle rank, which loads their prefix from the offload tier. |
+| `atom:dp_prefix_moved_tokens` | Counter, tokens | `prefix_spread`: prefix tokens the moved requests were credited (loaded from the tier on the new rank). |
+| `atom:dp_prefix_moved_partial` | Counter | `prefix_spread`: moves onto a rank already holding part of the prefix. |
+| `atom:dp_prefix_cold` | Counter | `prefix_spread`: requests with no known prefix, placed by `least_tokens`. |
 | `atom:dp_requests_routed` | Counter, requests | Cumulative requests per rank. Label: `rank`. |
 | `atom:dp_inflight_requests` | Gauge, requests | In-flight requests charged to each rank. Label: `rank`. |
 | `atom:dp_queued_prefill_tokens` | Gauge, tokens | Estimated uncached prefill-token debt per rank; sticky follow-up turns charge only positive prompt growth. Label: `rank`. |

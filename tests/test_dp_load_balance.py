@@ -69,7 +69,6 @@ def _make_mgr(
     mgr._rank_reqs = [0] * n_ranks
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
-    mgr._prefix_spread = False
     mgr._prefix_router = None
     mgr._lb_lock = Lock()
     return mgr
@@ -554,13 +553,26 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 # ── Prefix-spread routing ──────────────────────────────────────────────────
 
 
-def _make_spread_mgr(n_ranks=2):
+def _make_spread_mgr(n_ranks=2, tier=None):
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
     from atom.model_engine.prefix_spread import PrefixSpreadRouter
 
+    if tier is None:
+        tier = OffloadTierProfile(loads=True, async_lookup=True, min_load_tokens=8192)
     mgr = _make_mgr(n_ranks, strategy="prefix_spread")
-    mgr._prefix_spread = True
-    mgr._prefix_router = PrefixSpreadRouter(32768)
+    mgr._prefix_router = PrefixSpreadRouter(32768, tier)
+    mgr._dp_route_counters.update(
+        dict.fromkeys(
+            PrefixSpreadRouter.DECISIONS
+            + ("prefix_moved_tokens", "prefix_moved_partial_total"),
+            0,
+        )
+    )
     return mgr
+
+
+def _count(mgr, name):
+    return mgr._dp_route_counters[name]
 
 
 def _est(mgr, seq):
@@ -589,7 +601,7 @@ def test_prefix_spread_keeps_prefix_owner_without_a_backlog():
     mgr._rank_tokens[owner] = 30_000  # busier, but no backlog (<= 2 x idle)
     second = _chain_seq(2, 110_000, session="s")
     assert _route(mgr, [second]) == [owner]
-    assert mgr._prefix_router.counters["prefix_owner_total"] == 1
+    assert _count(mgr, "prefix_owner_total") == 1
     # Only the uncached extension is charged as prefill debt.
     assert mgr._seq_load[2][2] == 110_000 - 98_304
 
@@ -600,7 +612,7 @@ def test_prefix_spread_ignores_sessions_for_new_prefixes():
         _chain_seq(i, 50_000, first_block=10_000 * i, session="same") for i in range(4)
     ]
     assert sorted(_route(mgr, seqs)) == [0, 0, 1, 1]
-    assert mgr._prefix_router.counters["prefix_cold_total"] == 4
+    assert _count(mgr, "prefix_cold_total") == 4
 
 
 def test_busy_source_keeps_followers_unless_the_owner_is_backlogged():
@@ -612,7 +624,6 @@ def test_busy_source_keeps_followers_unless_the_owner_is_backlogged():
     other = 1 - owner
     mgr._rank_tokens[other] = 40_000  # not idle
     assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]
-    assert mgr._prefix_router.counters["prefix_source_busy_total"] == 1
 
     mgr._rank_tokens[other] = 0  # owner backlogged, other idle
     third = _chain_seq(3, 120_000)
@@ -674,15 +685,13 @@ def test_prefix_spread_tracks_load_through_dispatch():
     moved = _chain_seq(2, 110_000)
     mgr._dispatch_to_dp_ranks([moved])
     assert mgr._seq_load[2][0] != owner
-    assert mgr._prefix_router.counters["prefix_moved_total"] == 1
+    assert _count(mgr, "prefix_moved_total") == 1
 
 
-def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded(
-    monkeypatch,
-):
-    """The connector only loads a hit of at least OFFLOAD_MIN_LOAD_TOKENS. A
-    smaller one that moves rank is recomputed there, so it is not credited."""
-    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "8192")
+def test_prefix_spread_charges_full_prompt_when_a_moved_hit_is_not_loaded():
+    """The connector only loads a hit of at least its minimum (8192 here,
+    `OffloadTierProfile.min_load_tokens`). A smaller one that moves rank is
+    recomputed there, so it is not credited."""
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 4_096)])
     mgr._mark_seq_prefill_complete(1)
@@ -745,8 +754,8 @@ def test_idle_ratio_prefers_idle_rank_holding_part_of_the_prefix():
     (rank,) = _route(mgr, [seq])
     assert rank == 2  # 4k above the lightest, holds 48k of the prefix
     assert _est(mgr, seq) == 98_304  # 48k local + 48k loaded from the tier
-    assert mgr._prefix_router.counters["prefix_moved_partial_total"] == 1
-    assert mgr._prefix_router.counters["prefix_moved_tokens"] == 98_304 - 49_152
+    assert _count(mgr, "prefix_moved_partial_total") == 1
+    assert _count(mgr, "prefix_moved_tokens") == 98_304 - 49_152
 
 
 def test_idle_ratio_load_wins_over_a_partial_prefix():
@@ -788,7 +797,6 @@ def test_followers_sharing_a_prefix_do_not_convoy_onto_one_rank():
 
     ranks = _route(mgr, [follower(i) for i in range(32)])
     assert set(ranks) == {0, 1}
-    assert mgr._prefix_router.counters["prefix_source_busy_total"] == 0
 
 
 def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
@@ -838,34 +846,66 @@ def test_an_aborted_move_leaves_no_hit_on_its_destination():
     assert hits.get(other) == 98_304
 
 
-def test_a_producer_abort_hands_the_prefix_to_a_waiting_follower():
+def test_a_producer_abort_drops_the_prefix_it_was_computing():
     """The producer of a prefix aborts while a follower on its rank still
-    relies on it: the follower becomes the (busy) producer, so a later request
-    gets no tier credit for KV nobody has computed."""
+    relies on it: its entries go, so no later request is credited KV nobody
+    computed. Who recomputes it is the scheduler's call; the follower keeps
+    its charge."""
     mgr = _make_spread_mgr()
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])  # producer, prefilling
     other = 1 - owner
     mgr._rank_tokens[other] = 40_000
     assert _route(mgr, [_chain_seq(2, 110_000)]) == [owner]  # follower
+    charged = mgr._seq_load[2][2]
     mgr._release_seq_load(1)  # producer aborted
-    _, src_owner, source = mgr._prefix_router._rank_hits(
+    _, src_owner, _ = mgr._prefix_router._rank_hits(
         _chain_seq(9, 100_000).prompt_hash_chain, 2
     )
-    assert src_owner == owner and source == 2 and 2 in mgr._prefix_router._prefilling
-    # 2 now computes the whole prompt: it is charged it.
-    assert mgr._seq_load[2][2] == 110_000
-    mgr._rank_tokens = [0, 0]
-    mgr._rank_tokens[owner] = 200_000
-    third = _chain_seq(3, 120_000)
-    assert _route(mgr, [third]) == [other]
-    assert _est(mgr, third) == 0  # no tier credit: still being computed
+    assert src_owner is None
+    assert mgr._seq_load[2][2] == charged
+    third = _chain_seq(3, 100_000)
+    _route(mgr, [third])
+    assert _est(mgr, third) == 0
+
+
+def test_an_abort_racing_the_first_stream_keeps_the_prefix():
+    """The client disconnects after the engine finished the prefill but before
+    the output thread saw its first STREAM: the abort (API thread) leaves the
+    router alone, the STREAM confirms the prefix, and the terminal output
+    releases the request with its prefix kept."""
+    mgr = _make_spread_mgr()
+    (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._release_seq_load(1, route=False)  # abort_request
+    assert mgr._prefix_router.prefilling(1)
+    mgr._mark_seq_prefill_complete(1)  # the STREAM, on the output thread
+    mgr._release_seq_load(1)  # the terminal output
+    assert not mgr._prefix_router.prefilling(1)
+    hits, src_owner, _ = mgr._prefix_router._rank_hits(
+        _chain_seq(9, 100_000).prompt_hash_chain, 2
+    )
+    assert src_owner == owner and hits[owner] == 98_304
+    assert mgr._rank_reqs == [0, 0] and mgr._rank_tokens == [0, 0]
+
+
+def test_prefix_spread_records_its_routes_like_every_strategy():
+    """Cold requests go where `least_tokens` puts them (the rotation cursor
+    advances once) and every decision lands in the route counters and the
+    per-rank totals."""
+    mgr = _make_spread_mgr()
+    mgr._rank_tokens = [10, 0]
+    cursor = mgr._rank_rotation_cursor
+    (rank,) = _route(mgr, [_chain_seq(1, 4_096)])
+    assert rank == 1 and mgr._rank_rotation_cursor == cursor + 1
+    assert _count(mgr, "prefix_cold_total") == 1
+    assert _count(mgr, "load_balanced_total") == 0
+    assert mgr._rank_routed_total == [0, 1]
+    assert mgr.get_dp_router_statistics()["prefix_cold_total"] == 1
 
 
 def test_without_an_offload_tier_a_moved_request_is_charged_its_full_prompt():
-    from atom.model_engine.prefix_spread import PrefixSpreadRouter
+    from atom.kv_transfer.disaggregation.factory import OffloadTierProfile
 
-    mgr = _make_spread_mgr()
-    mgr._prefix_router = PrefixSpreadRouter(32768, tier_loads=False)
+    mgr = _make_spread_mgr(tier=OffloadTierProfile())
     (owner,) = _route(mgr, [_chain_seq(1, 100_000)])
     mgr._mark_seq_prefill_complete(1)
     mgr._rank_tokens = [0, 0]
@@ -876,32 +916,25 @@ def test_without_an_offload_tier_a_moved_request_is_charged_its_full_prompt():
     assert mgr._seq_load[2][2] == 110_000
 
 
-def test_offload_tier_loads_reads_the_kv_transfer_config():
+def test_offload_tier_profile_reads_the_kv_transfer_config(monkeypatch):
     from types import SimpleNamespace
 
-    from atom.model_engine.engine_core_mgr import _offload_tier_loads
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    def cfg(kvc):
-        return SimpleNamespace(kv_transfer_config=kvc)
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "4096")
 
-    assert not _offload_tier_loads(cfg({}))
-    assert _offload_tier_loads(
-        cfg({"kv_connector": "lmcache_mp", "kv_role": "offload"})
-    )
-    assert not _offload_tier_loads(
-        cfg({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"})
-    )
-    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
-    assert not _offload_tier_loads(cfg({"kv_connector": "multi", "connectors": [pd]}))
-    tier = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
-    assert _offload_tier_loads(cfg({"kv_connector": "multi", "connectors": [pd, tier]}))
+    def tier(kvc):
+        return KVConnectorFactory.offload_tier(SimpleNamespace(kv_transfer_config=kvc))
 
-
-def test_offload_prefetch_default_is_off_under_multi():
-    from atom.config import default_offload_prefetch
-
+    assert not tier({}).loads
     mp = {"kv_connector": "lmcache_mp", "kv_role": "offload"}
-    assert default_offload_prefetch("prefix_spread", mp)
-    assert not default_offload_prefetch("least_tokens", mp)
-    multi = {"kv_connector": "multi", "connectors": [mp]}
-    assert not default_offload_prefetch("prefix_spread", multi)
+    assert tier(mp).loads and tier(mp).async_lookup
+    assert tier(mp).min_load_tokens == 4096
+    assert not tier({"kv_connector": "lmcache_mp", "kv_role": "kv_producer"}).loads
+    pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+    assert not tier({"kv_connector": "multi", "connectors": [pd]}).loads
+    dense = {"kv_connector": "lmcache_offload", "kv_role": "offload"}
+    assert tier(dense).loads and not tier(dense).async_lookup
+    # `multi` answers no async lookup, whatever it wraps.
+    both = tier({"kv_connector": "multi", "connectors": [pd, mp]})
+    assert both.loads and not both.async_lookup

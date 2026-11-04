@@ -678,8 +678,6 @@ def test_mp_lookup_releases_hit_suffix_outside_retrieve_range(monkeypatch):
     scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
-    scheduler._shipped_tokens = {}
-    scheduler._shipped_drops = []
     scheduler._lookup_client = client
     monkeypatch.setattr(
         ChunkedOffloadSchedulerBase,
@@ -767,8 +765,6 @@ def _full_prompt_hit_scheduler(monkeypatch, chunk_size, hit=8):
     scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
-    scheduler._shipped_tokens = {}
-    scheduler._shipped_drops = []
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -924,8 +920,6 @@ def test_stale_load_failure_does_not_release_current_generation_locks():
     scheduler = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
-    scheduler._shipped_tokens = {}
-    scheduler._shipped_drops = []
     scheduler._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         scheduler,
@@ -2047,73 +2041,3 @@ def test_merge_pages_appends_a_draft_and_takes_the_gcd_replication():
     assert [r.semantic_role for r in target.block_regions] == ["t", "d"]
     assert len(target.block_tensor_views) == 2
     assert target.tp_replication_factor == 1
-
-
-# -- incremental token shipping: scheduler-built metadata through the shell --
-
-
-def _incremental_pair():
-    from atom.kv_transfer.offload.mp.connector import LMCacheMPConnector
-    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
-
-    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
-    sched._shipped_tokens = {}
-    sched._shipped_drops = []
-    shell = LMCacheMPConnector.__new__(LMCacheMPConnector)
-    shell._token_cache = {}
-    received = []
-    shell._impl = SimpleNamespace(
-        start_load_kv=lambda meta: received.extend(
-            (r.token_ids, r.token_base, r.token_end) for r in meta.requests
-        )
-    )
-    return sched, shell, received
-
-
-def _send(sched, shell, *reqs):
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-    meta = LMCacheOffloadMetadata()
-    meta.requests = list(reqs)
-    meta.token_cache_drops, sched._shipped_drops = sched._shipped_drops, []
-    shell.start_load_kv(meta)
-
-
-def test_incremental_tokens_round_trip_through_the_worker_shell():
-    """Initial load, growing saves, a shorter transfer after a longer one, and
-    a request id reused after its drop: the implementation receives exactly
-    the prefix each transfer covers."""
-    sched, shell, received = _incremental_pair()
-    seq = SimpleNamespace(id=7, token_ids=list(range(1000)), block_table=[0])
-    load = sched._build_load_request(seq, LoadSpec(0, 256, can_load=True), None, 256)
-    assert (load.token_base, len(load.token_ids)) == (0, 256)
-    _send(sched, shell, load)
-    for end in (512, 768, 512, 1000):
-        save = sched._build_save_request(seq, 0, end, None, [0], False)
-        _send(sched, shell, save)
-    assert [(len(t), b, e) for t, b, e in received] == [
-        (256, -1, 256),
-        (512, -1, 512),
-        (768, -1, 768),
-        (512, -1, 512),
-        (1000, -1, 1000),
-    ]
-    assert all(list(t) == list(range(len(t))) for t, _, _ in received)
-
-    # Session end drops it; the id is reused by another prompt.
-    sched._drop_shipped_tokens(7)
-    other = SimpleNamespace(id=7, token_ids=list(range(5000, 5600)), block_table=[0])
-    _send(sched, shell, sched._build_save_request(other, 0, 600, None, [0], False))
-    assert list(received[-1][0]) == list(range(5000, 5600))
-
-
-def test_incremental_tokens_desync_raises():
-    from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
-
-    _, shell, _ = _incremental_pair()
-    shell._token_cache[7] = __import__("array").array("q", range(100))
-    req = SimpleNamespace(req_id=7, token_ids=[1, 2], token_base=50, token_end=52)
-    meta = LMCacheOffloadMetadata()
-    meta.requests = [req]
-    with pytest.raises(RuntimeError, match="shipped from 50"):
-        shell.start_load_kv(meta)

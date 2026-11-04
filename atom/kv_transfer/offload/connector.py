@@ -223,11 +223,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         """The tier's transfer granule in tokens; 0 when the impl has none."""
         return int(getattr(self._impl, "chunk_size", 0) or 0)
 
+    @property
+    def supports_async_lookup(self) -> bool:
+        return bool(getattr(self._impl, "supports_async_lookup", False))
+
     def lookup_ready(self, seq) -> bool:
         return self._impl.lookup_ready(seq)
 
-    def lookup_guard(self):
-        return self._impl.lookup_guard()
+    def take_ready_lookup(self, seq) -> bool:
+        return self._impl.take_ready_lookup(seq)
 
     def cancel_preadmission(self, seq) -> None:
         self._impl.cancel_preadmission(seq)

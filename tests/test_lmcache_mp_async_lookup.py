@@ -284,3 +284,26 @@ def test_failed_lookup_has_no_answer():
     assert not client.is_pending("req")
     assert "req" in client.pending_ids()
     assert not client.has_answer("req")
+
+
+def test_take_answer_consumes_only_an_answered_lookup():
+    """`take_answer` checks and consumes under one hold of the lock: nothing is
+    consumed (and the prompt is not copied) before the lookup answers; once it
+    has, the answer is taken exactly as `lookup` would take it."""
+    client = _client(_Adapter(_Client(chunks=2)))
+    copies = []
+
+    def tokens():
+        copies.append(1)
+        return list(range(8))
+
+    client.submit(list(range(8)), "req")
+    assert not client.has_answer("req")
+    assert client.take_answer("req", tokens) is None
+    assert copies == []
+    client.pump()
+    assert client.has_answer("req")
+    assert client.take_answer("req", tokens) == 2 * CHUNK
+    assert copies == [1]
+    assert not client.has_answer("req")
+    assert client.take_answer("req", tokens) is None

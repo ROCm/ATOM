@@ -37,8 +37,6 @@ def _scheduler(monkeypatch, *, chunks=8, lookup_done=False):
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
-    sched._shipped_tokens = {}
-    sched._shipped_drops = []
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -159,6 +157,7 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = None
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s._connector_flag = lambda name: getattr(conn, name, False)
@@ -229,36 +228,6 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
     kinds = [k for k, _ in events]
     assert kinds == ["free", "end"], events
     assert "7" not in sched._pending_session_ends()
-
-
-def test_a_late_save_token_prefix_is_dropped_when_the_session_ends(monkeypatch):
-    """`request_finished` keeps the shipped-token state, so a save emitted
-    after it ships only its new tokens; ending the session drops it, so the
-    workers' token cache cannot keep a finished request's prefix."""
-    sched, _client, adapter = _scheduler(monkeypatch, lookup_done=True)
-    adapter.end_session = lambda rid: None
-    seq = _seq()
-    sched._ship_tokens(seq, 32)
-    sched._save_inflight["7"] = None  # its last save is still in flight
-    sched.request_finished(seq)
-    assert sched._shipped_tokens[7][1] == 32
-    assert sched._ship_tokens(seq, 64)[0] == 32  # the late save: delta only
-    del sched._save_inflight["7"]
-    sched._end_finished_sessions()
-    assert 7 not in sched._shipped_tokens
-    assert sched._shipped_drops == [7]
-
-    # The drop alone keeps an idle engine stepping the connector, and the
-    # next metadata build ships it to the workers even with no transfer.
-    from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
-
-    assert sched.has_pending_work()
-    meta = sched.build_connector_meta()
-    assert not meta.requests
-    assert meta.token_cache_drops == [7]
-    assert connector_metadata_has_work(meta)
-    assert not sched._shipped_drops
-    assert not sched.has_pending_work()
 
 
 # ── review findings (#2547) ──────────────────────────────────────────────
@@ -528,6 +497,7 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = None
     s.kv_connector = conn = _Conn()
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(state_offload=None)
@@ -553,6 +523,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
         return 2
 
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = None
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
@@ -570,33 +541,3 @@ def test_the_detach_is_on_by_default_and_0_turns_it_off(monkeypatch):
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is True
     monkeypatch.setenv("OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "0")
     assert envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT is False
-
-
-def test_dropping_a_finished_requests_tokens_spares_a_reused_id(monkeypatch):
-    sched, _client, _adapter = _scheduler(monkeypatch, lookup_done=True)
-    old, new = _seq(), _seq()  # same id, different requests
-    sched._ship_tokens(old, 32)
-    sched._ship_tokens(new, 32)  # the id is reused: old's copy is dropped
-    sched._shipped_drops.clear()
-    sched._drop_shipped_tokens(7, old)  # old's session ends late
-    assert sched._shipped_tokens[7][0] is new
-    assert not sched._shipped_drops
-
-
-def test_taking_an_admission_back_restores_the_previous_save_floor(monkeypatch):
-    """A preempted request back in `waiting` keeps the floor it had saved to
-    when a prefetch takes its re-admission back; a fresh one loses the tracker
-    the admission created."""
-    sched, _client, _adapter = _scheduler(monkeypatch, lookup_done=True)
-    seq = _seq()
-    sched._save_tracker["7"] = [seq, 48]
-    sched.update_state_after_alloc(seq)
-    sched._save_tracker["7"][1] = 0  # the admission rewrote the floor
-    sched.cancel_preadmission(seq)
-    assert sched._save_tracker["7"] == [seq, 48]
-
-    fresh = _seq(sid=8)
-    sched.update_state_after_alloc(fresh)
-    assert "8" in sched._save_tracker
-    sched.cancel_preadmission(fresh)
-    assert "8" not in sched._save_tracker

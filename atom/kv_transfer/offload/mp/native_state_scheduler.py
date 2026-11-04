@@ -219,18 +219,22 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
     # a replay's to use. The lookup keeps the PAGE KV locked up to it, and
     # `BlockManager._replay_hit` weighs it at admission.
 
-    def _fresh_tier_lookup(self, seq: Any, sid: str) -> int | None:
+    def _before_tier_lookup(self, sid: str) -> None:
         if not self._page_only:
-            return super()._fresh_tier_lookup(seq, sid)
+            return
         # A lookup this request still holds (one whose reach was never weighed,
         # say) goes back first: asking again replaces the server's record of
         # what the earlier one locked.
         self._kv_reach.pop(sid, None)
         if self._lookup_client.hit_tokens(sid) is not None:
             self._lookup_client.clear_lookup_status(sid)
-        reach = super()._fresh_tier_lookup(seq, sid)
-        if reach is None:
-            return None
+
+    def _fresh_tier_lookup(
+        self, seq: Any, sid: str, *, take: bool = False
+    ) -> int | None:
+        reach = super()._fresh_tier_lookup(seq, sid, take=take)
+        if not self._page_only or reach is None:
+            return reach
         self._kv_reach[sid] = (seq, int(reach))
         # Kept on the request past admission, for a later admission that
         # reuses this answer instead of asking again (the save floor).

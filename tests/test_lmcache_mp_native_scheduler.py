@@ -594,10 +594,7 @@ def test_save_admission_returns_lease_when_it_raises(monkeypatch):
     def boom(*_args, **_kwargs):
         raise RuntimeError("request construction failed")
 
-    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
-
     monkeypatch.setattr(ChunkedOffloadSchedulerBase, "_build_save_request", boom)
-    monkeypatch.setattr(LMCacheMPConnectorScheduler, "_build_save_request", boom)
     with pytest.raises(RuntimeError, match="request construction failed"):
         scheduler.build_connector_meta()
     assert scheduler._native_saves == {}
@@ -1096,7 +1093,7 @@ def _holding_engine(monkeypatch, adapter, **overrides):
         monkeypatch, adapter=adapter, offload_prefetch=True, **overrides
     )
     # A 40-block pool: the default watermark would not fit one prompt.
-    engine._prefetch.KV_WATERMARK = 0.95
+    engine._prefetch.max_kv_usage = 0.95
     delayer = _EarlyDelayer()
     engine.set_prefill_delayer(delayer)
     return engine, connector, delayer
@@ -1107,7 +1104,7 @@ def _until_parked(engine, seq, ticks=6):
         batch, scheduled = engine.schedule()
         if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
             return batch, scheduled
-    raise AssertionError(f"never parked: settled={engine._prefetch.settled}")
+    raise AssertionError(f"never parked: skipped={engine._prefetch.skip_until}")
 
 
 def test_prefetch_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
@@ -1143,7 +1140,7 @@ def test_prefetch_page_only_replay_parks_on_a_hold_tick_and_prefills_on_fire(
     )
     batch, scheduled = engine.schedule()  # loaded, still HOLD: no prefill
     assert scheduled == {}
-    assert seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert seq.status == SequenceStatus.WAITING and seq.offload_loaded
 
     delayer.allow = True
     batch, scheduled = engine.schedule()

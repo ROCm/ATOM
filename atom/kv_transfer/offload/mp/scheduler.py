@@ -54,10 +54,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
     ) -> None:
         _validate_mp_config(config)
-        # Incremental token shipping: req id -> (request, tokens the workers
-        # hold), and the ids whose worker copy is to be dropped.
-        self._shipped_tokens: dict[Any, tuple[Any, int]] = {}
-        self._shipped_drops: list[Any] = []
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
         offcfg._strict_integer(
@@ -231,42 +227,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         seq.offload_load_start_tokens = int(seq.num_cached_tokens)
         return operation
 
-    # A save names its LMCache chunks by the request's token prefix. Long
-    # prompts are saved a chunk at a time, so shipping the whole prefix with
-    # every save is quadratic in the prompt. Workers keep each request's
-    # tokens (`LMCacheMPConnector._resolve_shipped_tokens`); only tokens past
-    # what they already hold travel.
-
-    def _ship_tokens(self, seq: Any, end: int) -> tuple[int, list[int]]:
-        """(worker-held prefix length, tokens to append) for prefix ``[0, end)``."""
-        shipped = self._shipped_tokens
-        entry = shipped.get(seq.id)
-        base = 0
-        if entry is not None:
-            if entry[0] is seq:
-                base = entry[1]
-            else:
-                self._drop_shipped_tokens(seq.id)
-        new = max(base, end)
-        delta = list(seq.token_ids[base:new]) if new > base else []
-        # The request itself, to tell a reused id from it; dropped once no
-        # save can follow (`_end_finished_sessions`).
-        shipped[seq.id] = (seq, new)
-        return base, delta
-
-    def _drop_shipped_tokens(self, req_id: Any, seq: Any = None) -> None:
-        """Drop `req_id`'s shipped prefix; with `seq`, only if the entry is
-        that request's (a reused id may already belong to a newer one)."""
-        entry = self._shipped_tokens.get(req_id)
-        if entry is None or (seq is not None and entry[0] is not seq):
-            return
-        del self._shipped_tokens[req_id]
-        self._shipped_drops.append(req_id)
-
-    def _transfer_tokens(self, seq: Any, end: int) -> tuple[list[int], int]:
-        base, delta = self._ship_tokens(seq, end)
-        return delta, base
-
     def build_connector_meta(self) -> LMCacheOffloadMetadata:
         try:
             metadata = super().build_connector_meta()
@@ -276,13 +236,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             self._step_compute_end = {}
             extended = self.__dict__.get("_step_extended", set())
             self._step_extended = set()
-        drops = self._shipped_drops
-        if drops:
-            # A work field of its own: metadata carrying only drops still
-            # reaches the workers, so a finished prefix is not held until the
-            # next transfer.
-            metadata.token_cache_drops = drops
-            self._shipped_drops = []
         for req in metadata.requests:
             if req.save_spec is not None and str(req.req_id) in extended:
                 req.after_forward = True
@@ -423,9 +376,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             super().has_pending_work()
             or bool(self._pending_session_ends())
             or bool(callable(orphans) and orphans())
-            # Worker token-cache drops go out with the next metadata build;
-            # an idle engine must still build it.
-            or bool(self._shipped_drops)
         )
 
     def _pending_session_ends(self) -> dict[str, Any]:
@@ -463,9 +413,6 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
-            # No save can follow now: drop the workers' copy of its shipped
-            # token prefix.
-            self._drop_shipped_tokens(seq.id, seq)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))
             except Exception:

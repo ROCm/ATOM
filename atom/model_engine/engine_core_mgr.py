@@ -21,6 +21,7 @@ import zmq
 import zmq.asyncio
 
 from atom.config import Config
+from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 from atom.model_engine.capabilities import pcp_group_size_of
 from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
@@ -58,28 +59,11 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
     DISCARD_WEIGHT_SYNC_CMD,
 }
 
-
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
 DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
 DP_LB_DEFAULT = "least_requests"
-
-
-def _offload_tier_loads(config) -> bool:
-    """Whether a rank can load a prefix it does not hold from an offload tier:
-    some configured transport (`multi` expanded) is an offload backend whose
-    role loads."""
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
-    for name, sub in KVConnectorFactory.leaf_connectors(config) or ():
-        role = (getattr(sub, "kv_transfer_config", None) or {}).get(
-            "kv_role", "offload"
-        )
-        if KVConnectorFactory.is_offload_backend(name) and role != "kv_producer":
-            return True
-    return False
-
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
 # must derive identical TCP ports without negotiating. Both compute this plan
@@ -326,10 +310,10 @@ class CoreManager:
         }
         # Prefix-spread routing (`atom/model_engine/prefix_spread.py`): keeps a
         # request on the rank holding its prompt's prefix unless that rank has
-        # a prefill backlog and another is about to idle.
-        self._prefix_spread = self._dp_lb_strategy == "prefix_spread"
+        # a prefill backlog and another is about to idle. Set exactly when
+        # dp_load_balance is "prefix_spread".
         self._prefix_router: PrefixSpreadRouter | None = None
-        if self._prefix_spread:
+        if self._dp_lb_strategy == "prefix_spread":
             if self._dp_session_affinity_enabled:
                 # Both place every request by their own rule; a session pin
                 # would undo every move.
@@ -349,7 +333,14 @@ class CoreManager:
                 )
             self._prefix_router = PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS,
-                tier_loads=_offload_tier_loads(config),
+                KVConnectorFactory.offload_tier(config),
+            )
+            self._dp_route_counters.update(
+                dict.fromkeys(
+                    PrefixSpreadRouter.DECISIONS
+                    + ("prefix_moved_tokens", "prefix_moved_partial_total"),
+                    0,
+                )
             )
         self._rank_routed_total = [0] * self.global_engine_count
         # Authoritative local load per rank. Request count is in-flight until
@@ -385,7 +376,15 @@ class CoreManager:
         # after the caller has already seen the error. ``reset_dp_router``
         # clears it.
         self._bp_dispatch_paused = False
-        if self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
+        if self._bp_depth > 0 and self._prefix_router is not None:
+            logger.warning(
+                "%s: ATOM_DP_DISPATCH_DEPTH=%d is ignored under "
+                "dp_load_balance=prefix_spread, which places every request "
+                "itself (offline batches are sent at once)",
+                label,
+                self._bp_depth,
+            )
+        elif self._bp_depth > 0 and self._dp_lb_strategy != "least_requests":
             logger.warning(
                 "%s: ATOM_DP_DISPATCH_DEPTH=%d balances on in-flight request "
                 "count and ignores dp_load_balance=%s",
@@ -1163,14 +1162,14 @@ class CoreManager:
             getattr(self, "_bp_depth", 0) > 0
             and getattr(self, "_bp_offline_batch", False)
             and not self._dp_session_affinity_enabled
-            and not self._prefix_spread
+            and self._prefix_router is None
             and all(h is None for h in hints)
         ):
             self._bp_dispatch_or_refill(new_seqs=seqs, raise_on_error=True)
             return
 
         # round_robin normally skips load bookkeeping. Session affinity still
-        # needs the in-flight counters, even if the fallback strategy is RR.
+        # needs queued-prefill counters even if the fallback strategy is RR.
         track_load = (
             self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
         )
@@ -1431,15 +1430,6 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         return best_rank
 
-    def _lightest_rank_locked(self, key) -> int:
-        """Argmin of `key(rank)` (prefix spread), scanned from a rotating start
-        offset so a run of fully-equal ranks spreads evenly. Caller must hold
-        _lb_lock."""
-        n = self._routable_engine_count
-        offset = self._rank_rotation_cursor % n
-        self._rank_rotation_cursor += 1
-        return min(((offset + i) % n for i in range(n)), key=key)
-
     def _rank_load(self, rank: int) -> int:
         """The `least_tokens` score: queued prefill plus decode slots."""
         return self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
@@ -1531,7 +1521,7 @@ class CoreManager:
 
         session_id = getattr(seq, "dp_session_id", None)
         parent_id = getattr(seq, "dp_parent_session_id", None)
-        if self._prefix_spread:
+        if self._prefix_router is not None:
             return self._select_prefix_spread_locked(seq)
         if not self._dp_session_affinity_enabled or not session_id:
             rank = self._select_dp_rank_locked()
@@ -1559,17 +1549,15 @@ class CoreManager:
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
 
     def _select_prefix_spread_locked(self, seq: Sequence) -> int:
-        """Prefix-spread placement (`PrefixSpreadRouter.select`)."""
-        rank, decision = self._prefix_router.select(
-            seq,
-            self._rank_tokens,
-            self._rank_load,
-            lambda: self._lightest_rank_locked(self._rank_load),
+        """Prefix-spread placement (`PrefixSpreadRouter.select`); a new prefix
+        goes where `least_tokens` would put it."""
+        route = self._prefix_router.select(
+            seq, self._rank_tokens, self._rank_load, self._select_dp_rank_locked
         )
-        # The router counts its own decisions (`PrefixSpreadRouter.counters`).
-        del decision
-        self._rank_routed_total[rank] += 1
-        return rank
+        if route.decision == "prefix_moved_total":
+            self._dp_route_counters["prefix_moved_tokens"] += route.moved_tokens
+            self._dp_route_counters["prefix_moved_partial_total"] += route.partial
+        return self._record_dp_route_locked(route.decision, route.rank)
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
@@ -1585,11 +1573,6 @@ class CoreManager:
                 "inflight_requests_per_rank": list(self._rank_reqs),
                 "queued_prefill_tokens_per_rank": list(self._rank_tokens),
                 "session_count_per_rank": sessions_per_rank,
-                **(
-                    self._prefix_router.counters
-                    if self._prefix_router is not None
-                    else {}
-                ),
             }
 
     def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
@@ -1599,7 +1582,7 @@ class CoreManager:
         tok_cost = prompt_tokens
         session_id = getattr(seq, "dp_session_id", None)
         if self._prefix_router is not None:
-            tok_cost = max(0, prompt_tokens - self._prefix_router.charged(seq.id))
+            tok_cost = max(0, prompt_tokens - self._prefix_router.charge(seq.id))
         elif self._dp_session_affinity_enabled and session_id:
             previous_prompt_tokens = self._dp_session_prompt_tokens.get(session_id)
             if previous_prompt_tokens is not None:
@@ -1654,25 +1637,26 @@ class CoreManager:
         )
         return True
 
-    def _release_seq_load(self, seq_id) -> None:
+    def _release_seq_load(self, seq_id, *, route: bool = True) -> None:
         """Undo a seq's in-flight load when it finishes or is aborted.
 
         Idempotent: a seq is only charged once and released once, so a repeated
         call (e.g. finish followed by abort) is a no-op.
+
+        `route=False` (an abort, on the API thread) leaves the prefix router
+        alone. Its state moves only on the output threads, in order with the
+        STREAM that completes the prefill: an abort racing that STREAM would
+        otherwise see the request still prefilling and drop prefix entries its
+        prefill did produce. The terminal output the abort leads to releases
+        it there.
         """
         with self._lb_lock:
-            self._release_seq_load_locked(seq_id)
+            self._release_seq_load_locked(seq_id, route=route)
 
-    def _release_seq_load_locked(self, seq_id) -> None:
+    def _release_seq_load_locked(self, seq_id, *, route: bool = True) -> None:
         """``_release_seq_load`` for a caller that already holds ``_lb_lock``."""
-        if self._prefix_router is not None:
-            # A request that took over computing a prefix part this one left
-            # unprefilled is now charged its whole prompt.
-            for heir, prompt in self._prefix_router.released(seq_id).items():
-                held = self._seq_load.get(heir)
-                if held is not None and prompt > held[2]:
-                    self._rank_tokens[held[0]] += prompt - held[2]
-                    self._seq_load[heir] = (held[0], held[1], prompt)
+        if route and self._prefix_router is not None:
+            self._prefix_router.release(seq_id)
         entry = self._seq_load.pop(seq_id, None)
         if entry is None:
             return
@@ -1683,16 +1667,15 @@ class CoreManager:
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
         # Every decode token reaches this path. The prefill charge may be zero
-        # at admission, or already released by the first output. Avoid taking
+        # at admission, or already released by the first output (or by an
+        # abort, which leaves the router's state to this thread). Avoid taking
         # the router lock for a no-op; re-read under the lock before changing
         # counters because abort/finish may release the charge concurrently.
-        entry = self._seq_load.get(seq_id)
-        if entry is None:
-            return
-        _, _, tok_cost = entry
         router = self._prefix_router
-        if tok_cost == 0 and (router is None or not router.prefilling(seq_id)):
-            return
+        if router is None or not router.prefilling(seq_id):
+            entry = self._seq_load.get(seq_id)
+            if entry is None or entry[2] == 0:
+                return
         with self._lb_lock:
             if router is not None:
                 router.prefill_complete(seq_id)
@@ -1814,8 +1797,9 @@ class CoreManager:
         # Release DP load bookkeeping now: an aborted seq may never emit a
         # finished STREAM output, so relying on the finish path alone would leak
         # its in-flight count. _release_seq_load is idempotent. A pending seq
-        # was never charged, so this is a no-op for it.
-        self._release_seq_load(req_id)
+        # was never charged, so this is a no-op for it. The prefix router is
+        # released by the terminal output the abort leads to.
+        self._release_seq_load(req_id, route=False)
         if pending_seq is not None:
             if not getattr(pending_seq, "leave_reason", None):
                 pending_seq.leave_reason = "aborted"

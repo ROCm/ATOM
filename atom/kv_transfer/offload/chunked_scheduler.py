@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import time
 
@@ -32,6 +31,9 @@ from atom.model_engine.sequence import SequenceStatus, resumes_offload_prefill
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+# `_ask_tier`'s answer when the lookup raised (None is "did not answer").
+_LOOKUP_FAILED = object()
 
 DENSE_PAGE_SOURCE_SAFE_CHANNEL = "dense.page.source_safe"
 DENSE_PAGE_SOURCE_QUIESCENT_CHANNEL = "dense.page.source_quiescent"
@@ -145,9 +147,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._load_lifecycles: dict[str, object] = {}
         self._active_load_operations: dict[str, tuple[object, LoadOperationId]] = {}
         self._lookup_in_step: list[str] = []
-        # sid -> the save tracker entry an admission overwrote, until this
-        # tick's metadata build (`cancel_preadmission` restores it).
-        self._preadmit_floors: dict[str, tuple | None] = {}
         self._lookup_results: dict[str, tuple[object, int]] = {}
         self._handoff_loads: set[str] = set()
         self._block_manager = None
@@ -450,16 +449,25 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._perf_bump("lookup_deferred")
         return True
 
-    def lookup_ready(self, seq) -> bool:
-        """Whether `seq`'s tier answer can be consumed without a round trip.
+    @property
+    def supports_async_lookup(self) -> bool:
+        """Whether the lookup client hands over an answered async lookup
+        (`take_answer`), so `take_ready_lookup` never waits."""
+        client = self._lookup_client
+        supported = getattr(client, "supports_async", None)
+        return (
+            self._do_load
+            and callable(getattr(client, "take_answer", None))
+            and callable(supported)
+            and bool(supported())
+        )
 
-        True when the answer is already held (`_lookup_results`) or its async
-        lookup has answered and waits to be consumed (`has_answer`; a failed
-        lookup has no answer, so it is not ready). The offload prefetch asks this so that it
-        never blocks the scheduler thread -- and with it every DP rank -- on a
-        synchronous lookup. It does not advance the lookup: call it after
-        `lookup_pending`, or after a lookup driver thread answered.
-        """
+    def lookup_ready(self, seq) -> bool:
+        """Whether `seq`'s tier answer can be consumed without a round trip:
+        already held (`_lookup_results`), or answered by its async lookup and
+        waiting to be consumed (`has_answer`; a failed lookup has no answer).
+        A peek for the offload prefetch, which takes the answer with
+        `take_ready_lookup`. It does not advance the lookup."""
         sid = str(seq.id)
         held = self._lookup_results.get(sid)
         if held is not None:
@@ -467,75 +475,76 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         has_answer = getattr(self._lookup_client, "has_answer", None)
         return callable(has_answer) and bool(has_answer(sid))
 
-    def lookup_guard(self):
-        """The lookup client's lock (the one its driver thread takes), so an
-        answer `lookup_ready` saw is still there when the admission consumes
-        it; a no-op for a client without one."""
-        lock = getattr(self._lookup_client, "_lock", None)
-        return lock if lock is not None else contextlib.nullcontext()
+    def take_ready_lookup(self, seq) -> bool:
+        """Take `seq`'s answered async lookup for its admission, as the
+        admission's own lookup would (`_fresh_tier_lookup`: the pin, the held
+        answer and the memo), if it has answered; never waits. The client
+        checks and consumes in one step (`take_answer`), so a driver thread
+        cannot expire the answer in between. True if the answer is now held,
+        so the admission's `get_num_new_matched_tokens` asks no round trip."""
+        if not self._do_load or not callable(
+            getattr(self._lookup_client, "take_answer", None)
+        ):
+            return False
+        # The admission's own preconditions (`_get_num_new_matched_tokens`).
+        self._begin_load_lifecycle(seq)
+        sid = str(seq.id)
+        held = self._lookup_results.get(sid)
+        if held is not None:
+            return held[0] is seq
+        if self._repeat_load_suppressed(seq, sid) or self._lookup_len(seq) <= 0:
+            return False
+        return self._fresh_tier_lookup(seq, sid, take=True) is not None
 
     def cancel_preadmission(self, seq) -> None:
-        """Forget an admission the scheduler takes back before any dispatch.
-
-        The scheduler's offload prefetch (`OffloadPrefetch`) allocates and
-        notifies this
-        connector like a normal admission, then hands the request back to
-        `waiting` when the outcome is not a load it can park for. Cancel its
-        pending load -- which also gives the lookup's read locks back
-        (`_clear_pending_load`) -- and drop the held answer, so the next
-        admission asks the tier again instead of reusing an answer nothing pins
-        (`_ensure_lookup_pin` trusts a held answer). Also restore the save
-        tracker the admission overwrote: drop it if the admission created it
-        (the re-admission sets its own floor), or put back the previous floor
-        of a request that had already saved (a preempted one back in
-        `waiting`), keeping its saved progress.
-        """
+        """Forget an admission the scheduler refused after notifying this
+        connector (`Admit.REQUEUE`). Cancel its pending load -- which also
+        gives the lookup's read locks back (`_clear_pending_load`) -- and drop
+        the held answer, so the next admission asks the tier again instead of
+        reusing an answer nothing pins (`_ensure_lookup_pin` trusts a held
+        answer)."""
         self.cancel_pending_load(seq)
         sid = str(seq.id)
         held = self._lookup_results.get(sid)
         if held is not None and held[0] is seq:
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
-        if sid not in self._preadmit_floors:
-            return
-        prev = self._preadmit_floors.pop(sid)
-        entry = self._save_tracker.get(sid)
-        if entry is None or entry[0] is not seq:
-            return
-        if prev is None:
-            del self._save_tracker[sid]
-        elif prev[0] is seq:
-            entry[1] = prev[1]
 
-    def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
-        """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
+    def _before_tier_lookup(self, sid: str) -> None:
+        """Run right before this request's lookup is asked or taken; a layout
+        that must give back an earlier lookup first overrides it."""
+
+    def _fresh_tier_lookup(self, seq, sid: str, *, take: bool = False) -> int | None:
+        """Ask the tier, take its pin, and remember the hit. None if it did not answer.
+
+        `take`: only take an async lookup that has already answered
+        (`take_answer`, atomic in the client); None, with nothing done, if it
+        has not.
+        """
 
         num_prompt = seq.num_prompt_tokens
-        token_ids = self._lookup_token_ids(seq)
-        if sid not in self._lookup_in_step:
-            self._lookup_in_step.append(sid)
-        self._lookup_results[sid] = (seq, 0)
-        _t0 = time.perf_counter()
-        try:
-            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
-            _us = int((time.perf_counter() - _t0) * 1e6)
-            self._perf_bump("lookup_n")
-            self._perf_bump("lookup_us", _us)
-            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
-                self._perf_lookup_max_us = _us
-                self._perf_counters["lookup_max_us"] = _us
-            self._perf_bump("lookup_prompt_tokens", num_prompt)
-            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
-            self._perf_bump("lookup_hit_tokens", int(hit or 0))
+        token_ids = None
+        if take:
+
+            def tokens():
+                nonlocal token_ids
+                token_ids = self._lookup_token_ids(seq)
+                return token_ids
+
+            hit = self._lookup_client.take_answer(
+                sid, tokens, before=lambda: self._before_tier_lookup(sid)
+            )
             if hit is None:
-                self._perf_bump("lookup_none")
-        except Exception:
-            # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
-            # a half-run lookup may have taken.
-            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
-            self._lookup_results.pop(sid, None)
-            self._remember_tier_hit(seq, sid, None)
-            return None
+                return None
+            if sid not in self._lookup_in_step:
+                self._lookup_in_step.append(sid)
+            self._perf_bump("lookup_taken")
+        else:
+            self._before_tier_lookup(sid)
+            token_ids = self._lookup_token_ids(seq)
+            hit = self._ask_tier(seq, sid, token_ids)
+            if hit is _LOOKUP_FAILED:
+                return None
         if hit is None:
             self._lookup_results.pop(sid, None)
         else:
@@ -563,6 +572,35 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 hit,
                 _lh,
             )
+        return hit
+
+    def _ask_tier(self, seq, sid: str, token_ids):
+        """The synchronous lookup, with its pin taken; `_LOOKUP_FAILED` if it
+        raised."""
+        if sid not in self._lookup_in_step:
+            self._lookup_in_step.append(sid)
+        self._lookup_results[sid] = (seq, 0)
+        _t0 = time.perf_counter()
+        try:
+            hit = self._lookup_client.lookup(token_ids, lookup_id=sid)
+            _us = int((time.perf_counter() - _t0) * 1e6)
+            self._perf_bump("lookup_n")
+            self._perf_bump("lookup_us", _us)
+            if _us > self.__dict__.get("_perf_lookup_max_us", 0):
+                self._perf_lookup_max_us = _us
+                self._perf_counters["lookup_max_us"] = _us
+            self._perf_bump("lookup_prompt_tokens", seq.num_prompt_tokens)
+            self._perf_bump("lookup_hbm_tokens", int(seq.num_cached_tokens))
+            self._perf_bump("lookup_hit_tokens", int(hit or 0))
+            if hit is None:
+                self._perf_bump("lookup_none")
+        except Exception:
+            # The ID stays in `_lookup_in_step` so the dispatch unpins whatever
+            # a half-run lookup may have taken.
+            logger.exception("LMCache offload lookup failed for seq %s", seq.id)
+            self._lookup_results.pop(sid, None)
+            self._remember_tier_hit(seq, sid, None)
+            return _LOOKUP_FAILED
         return hit
 
     def _answer_from_tier_hit(self, seq, sid: str, hit: int) -> tuple[int, bool]:
@@ -638,10 +676,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         )
         if self._do_save:
             entry = self._save_tracker.get(sid)
-            # What this admission overwrites, for `cancel_preadmission`.
-            self._preadmit_floors[sid] = (
-                None if entry is None or entry[0] is not seq else (seq, entry[1])
-            )
             if entry is None or entry[0] is not seq:
                 self._save_tracker[sid] = [seq, initial_saved]
             else:
@@ -719,16 +753,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         is_last_prefill: bool,
     ) -> LMCacheReqMeta | None:
         """Admit any layout-specific sources before advancing the watermark."""
-        token_ids, token_base = self._transfer_tokens(seq, aligned)
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=token_ids,
+            token_ids=list(seq.token_ids[:aligned]),
             block_ids=block_ids,
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
-            token_base=token_base,
-            token_end=aligned if token_base >= 0 else -1,
         )
 
     def _build_load_request(
@@ -743,22 +774,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         Ships the prompt prefix the transfer covers, from which the worker
         derives the chunk keys. A transport keyed differently overrides this.
         """
-        token_ids, token_base = self._transfer_tokens(seq, transfer_end)
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=token_ids,
+            token_ids=list(seq.token_ids[:transfer_end]),
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
-            token_base=token_base,
-            token_end=transfer_end if token_base >= 0 else -1,
         )
-
-    def _transfer_tokens(self, seq, end: int) -> tuple[list[int], int]:
-        """(token ids to ship, the prefix length the worker already holds)
-        for a transfer covering ``[0, end)``. -1: the whole prefix is shipped
-        and the worker keeps nothing."""
-        return list(seq.token_ids[:end]), -1
 
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""
@@ -995,7 +1017,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             sid for sid in self._lookup_in_step if sid not in dispatched
         ]
         self._reqs_need_recv.clear()
-        self._preadmit_floors.clear()
         self._perf_bump("build_meta_us", int((time.perf_counter() - _perf_t0) * 1e6))
         self._perf_bump("build_meta_n")
         self._perf_maybe_log()
