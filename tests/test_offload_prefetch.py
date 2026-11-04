@@ -199,6 +199,22 @@ def test_loaded_request_passes_a_head_that_cannot_allocate(monkeypatch, seq_fact
     assert list(sched.waiting) == [b, a]
 
 
+def test_loaded_request_passes_a_head_blocked_by_the_parked_slot_cap(
+    monkeypatch, seq_factory
+):
+    """KV fits, but every parked-load slot is held and nothing runs: the
+    finished prefetch must run first to free its slot."""
+    sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
+    sched.kv_connector.not_ready_ids = {a.id}
+    sched.schedule()  # b parks with its prefetch, a waits
+    sched.finished_recving_kv_req_ids.append(b.id)
+    sched._num_parked_remote_kv = sched.max_num_seqs
+
+    sched._promote_ready_remote_kv_requests()
+
+    assert list(sched.waiting) == [b, a]
+
+
 def test_new_token_count_counts_a_finished_load_from_its_resume(setup):
     sched, _, seq = setup
     sched.schedule()  # parks with its prefetch
