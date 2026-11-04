@@ -29,6 +29,7 @@ import zmq
 import zmq.asyncio
 from aiter.dist.shm_broadcast import MessageQueue
 
+from atom.config import local_device_index
 from atom.kv_transfer.disaggregation import KVConnectorOutput, KVOutputAggregator
 from atom.model_engine.block_table_codec import (
     FORWARD_RPC,
@@ -144,26 +145,12 @@ class AsyncIOProc:
         # Auto-detects the GPU's local node by default; gated by
         # ATOM_NUMA_BIND. Must run before any large allocation / native
         # (mooncake) thread spawn so the mask is inherited by child threads and
-        # first-touch lands memory locally. The node-local GPU index must match
-        # ModelRunner._setup_device_and_distributed:
-        # (dp_local_rank*pp_size + pp_rank) * tp_size*pcp_size + rank.
+        # first-touch lands memory locally. The GPU is the one ModelRunner
+        # picks (`local_device_index`).
         # Best-effort: any failure here is logged and skipped rather than
         # taking the worker down, hence the blanket except.
         try:
-            cfg = args[0]
-            # Node-local: this indexes a GPU on THIS machine. The global rank
-            # would run off the end of a later node's device list.
-            pc = cfg.parallel_config
-            dp_local_rank = pc.data_parallel_rank_local
-            if dp_local_rank is None:
-                dp_local_rank = pc.data_parallel_rank
-            pp_size = getattr(cfg, "pipeline_parallel_size", 1) or 1
-            pp_rank = getattr(pc, "pipeline_parallel_rank", 0) or 0
-            stage_span = cfg.tp_world_size * (
-                getattr(cfg, "prefill_context_parallel_size", 1) or 1
-            )
-            gpu = (dp_local_rank * pp_size + pp_rank) * stage_span + rank
-            numa_bind_to_node(gpu, label)
+            numa_bind_to_node(local_device_index(args[0], rank), label)
         except Exception as e:  # noqa: BLE001 - binding is an optimization
             # NUMA binding only affects locality, never correctness, so any
             # failure (missing libnuma, restricted cpuset, odd topology) must

@@ -15,7 +15,7 @@ from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
 )
-from atom.model_engine.engine_core import EngineCore
+from atom.model_engine.engine_core import EngineCore, publish_idle_state_work
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.observability import tracing
 from atom.utils import envs
@@ -294,10 +294,7 @@ class PPEngineCoreProc(EngineCore):
         ):
             return
         if dispatch_new:
-            for name in ("_publish_state_loads", "_publish_state_stores"):
-                publish = getattr(self.scheduler, name, None)
-                if publish is not None:
-                    publish()
+            publish_idle_state_work(self.scheduler)
         self._dispatch_connector_only_batch(
             ScheduledBatch(
                 seqs={},

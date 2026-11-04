@@ -143,8 +143,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
     # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
     # does not serve): pages per producer slot that repacks MLA KV for a DCP
-    # consumer below a page of interleave. The slots are allocated whatever the
-    # decode runs, so this is opt-in; 0 writes each token run in place.
+    # consumer below a page of interleave. The slots are held back from the KV
+    # cache whatever the decode runs, so this is opt-in; 0 writes each token run
+    # in place.
     "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
         "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 0
     ),

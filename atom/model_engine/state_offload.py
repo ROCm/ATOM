@@ -228,6 +228,12 @@ class StateOffloadIndex:
 #: (DSV4) keeps its own in the SLOT sidecar. `qwen` subclasses the K3 tier.
 _STATE_TIER_LAYOUTS = frozenset({"kimi_k3", "qwen"})
 
+#: Of those, the layouts that keep the tier under PP. Only K3's PAGE
+#: checkpoints span the stages (`paged_checkpoints_span_pipeline`); Qwen keeps
+#: fork checkpoints under PP, publishes no layout id, and its worker turns the
+#: tier off.
+_PP_STATE_TIER_LAYOUTS = frozenset({"kimi_k3"})
+
 #: Roles from which the worker will save / load. Mirrors `_do_save` / `_do_load`
 #: in `OffloadWorkerMixin`; the state legs ride those same halves.
 _SAVE_ROLES = frozenset({"offload", "kv_both", "kv_producer"})
@@ -240,7 +246,8 @@ class StateTierCapability:
 
     Derived from configuration, not from the connector's public name. The name
     only says which connector class is constructed; whether that class builds a
-    `StateOffloadTier` depends on the layout it resolves and the role it was
+    `StateOffloadTier` depends on the layout it resolves, the pipeline depth
+    for a layout whose checkpoints do not span stages, and the role it was
     given. The engine used to install a `StateOffloadIndex` for any
     `lmcache_offload`, so any `dense`/`hybrid` run got an index against a
     worker that would never build the tier. That mismatch is what left stores
@@ -330,8 +337,8 @@ def state_tier_capability(config) -> StateTierCapability:
     A capability descriptor rather than a name check, because the two are not
     the same question and the worker refuses on conditions the name cannot see
     (no transfer config, a `multi` composite with no offload sub, an unknown
-    explicit override, a layout that offloads no state, or a `kv_role` that
-    neither saves nor loads). Config alone because this runs in the engine
+    explicit override, a layout that offloads no state, `pp_size > 1` for a
+    layout other than K3's, or a `kv_role` that neither saves nor loads). Config alone because this runs in the engine
     process at
     `BlockManager.__init__`, before any worker connector exists -- so it must
     agree with the worker by construction, which is why the layout comes from
@@ -371,6 +378,13 @@ def state_tier_capability(config) -> StateTierCapability:
         return replace(none, reason=str(exc))
     if layout not in _STATE_TIER_LAYOUTS:
         return replace(none, reason=f"layout {layout!r} offloads no state")
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size > 1 and layout not in _PP_STATE_TIER_LAYOUTS:
+        return replace(
+            none,
+            reason=f"layout {layout!r} keeps no state tier at "
+            f"pipeline_parallel_size={pp_size}",
+        )
 
     role = cfg.get("kv_role", "offload")
     can_store = role in _SAVE_ROLES

@@ -67,6 +67,7 @@ from atom.kv_transfer.disaggregation.mooncake.mla_landing import (
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.pd_producer import (
     MLA_STAGING_SLOT_BYTES,
+    mla_shard_staging_reserve_bytes,
     mla_staging_pool_bytes,
     mla_staging_reserve_bytes,
     mla_staging_slot_count,
@@ -159,7 +160,8 @@ class SlotPool:
     is permanent: every later ``acquire`` raises too, free rows or not, since
     the consumer that reports it cannot run on (see
     ``MooncakeConnector._post_queued_write_requests``). The consumer staging
-    rows, the DSA index staging slots and the MLA staging slots each keep one.
+    rows, the DSA index staging slots and both MLA staging pools' slots each
+    keep one.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -1091,8 +1093,11 @@ class MooncakeConnector(KVConnectorBase):
             mla_landing_table_segments(config) if mla_landing_configured(config) else 0
         )
         # The same staging for the per-request-state path, which the pool above
-        # does not serve (see _build_kv_staging).
+        # does not serve (see _build_kv_staging), within what the KV budget
+        # held back for it.
         self._kv_staging: MLAShardStaging | None = None
+        self._kv_staging_slots = SlotPool()
+        self._kv_staging_reserve = mla_shard_staging_reserve_bytes(config)
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -1270,11 +1275,15 @@ class MooncakeConnector(KVConnectorBase):
 
     @classmethod
     def kv_budget_reserve_bytes(cls, config) -> int:
-        """The MLA staging pool (producer) and landing pool (DCP consumer).
+        """The MLA staging pools (producer) and landing pool (DCP consumer).
 
-        ``register_kv_caches`` allocates both after the KV cache is sized.
+        ``register_kv_caches`` allocates them after the KV cache is sized.
         """
-        return mla_staging_reserve_bytes(config) + mla_landing_reserve_bytes(config)
+        return (
+            mla_staging_reserve_bytes(config)
+            + mla_shard_staging_reserve_bytes(config)
+            + mla_landing_reserve_bytes(config)
+        )
 
     def register_kv_caches(
         self,
@@ -1663,13 +1672,16 @@ class MooncakeConnector(KVConnectorBase):
         `_execute_block_slot_transfer`, so from a producer without DCP its MLA
         rows to a DCP consumer below a page of interleave would otherwise go
         as one descriptor per token run per layer.
+
+        Its slots fit what ``mla_shard_staging_reserve_bytes`` held back from
+        the KV cache; without that reserve it builds nothing.
         """
         chunk_pages = envs.ATOM_PD_MLA_STAGING_CHUNK_PAGES
         if (
             not self.is_producer
             or self.dcp_size > 1
             or not self._has_slot_regions
-            or not chunk_pages
+            or not self._kv_staging_reserve
         ):
             return None
         staging = MLAShardStaging.build(
@@ -1677,10 +1689,22 @@ class MooncakeConnector(KVConnectorBase):
             block_size=self.block_size,
             pool_size=self._num_send_workers,
             chunk_pages=chunk_pages,
+            max_bytes=self._kv_staging_reserve,
             device=torch.device("cuda", self._cuda_device),
             stream_priority=envs.ATOM_PD_MLA_STAGING_STREAM_PRIORITY,
         )
-        if staging is not None:
+        if staging is None:
+            logger.warning(
+                "MLA DCP staging off: no token-contiguous MLA page, or a "
+                "%d-page slot does not fit the %.1f MiB reserve; MLA rows to "
+                "DCP decode ranks go as token runs",
+                chunk_pages,
+                self._kv_staging_reserve / 2**20,
+            )
+        else:
+            # A worker holds at most one slot, so fewer slots than workers
+            # (a row wider than the reserve assumed) only makes it wait.
+            self._kv_staging_slots = SlotPool(staging.pool_size)
             logger.info(
                 "MLA DCP staging: %d slots x %d pages (%.1f MiB) for %d MLA "
                 "regions, stream priority %d",
@@ -1764,9 +1788,11 @@ class MooncakeConnector(KVConnectorBase):
         with self._completed_prefills_lock:
             return self._kv_cache_ready_events.get(req_id)
 
-    def _discard_kv_cache_ready_event(self, req_id: ReqId) -> None:
+    def _drop_completed_prefill(self, transfer_id: TransferId) -> None:
+        """Forget a prefill no write reads again, with its KV ready event."""
         with self._completed_prefills_lock:
-            self._kv_cache_ready_events.pop(req_id, None)
+            self._completed_prefills.pop(transfer_id, None)
+            self._kv_cache_ready_events.pop(transfer_id, None)
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
         """Initiate KV transfers for pending requests.
@@ -2452,9 +2478,7 @@ class MooncakeConnector(KVConnectorBase):
             self._release_count.pop(transfer_id, None)
             self._released_transfers.add(transfer_id)
             self.done_sending.add(transfer_id)
-        with self._completed_prefills_lock:
-            self._completed_prefills.pop(transfer_id, None)
-            self._kv_cache_ready_events.pop(transfer_id, None)
+        self._drop_completed_prefill(transfer_id)
         logger.debug(
             "[PRODUCER] All %d decode ranks released transfer_id=%s; page freed",
             consumer_tp_size,
@@ -2668,9 +2692,7 @@ class MooncakeConnector(KVConnectorBase):
                     if self.pp_rank != 0:
                         # Stage 0 drops its entry on release, which only it
                         # receives; nothing here reads this one again.
-                        with self._completed_prefills_lock:
-                            self._completed_prefills.pop(transfer_id, None)
-                            self._kv_cache_ready_events.pop(transfer_id, None)
+                        self._drop_completed_prefill(transfer_id)
                     # PP-prefill: this stage's write is done, but stage-0 must not
                     # reuse the shared page until ALL stages finish. Freeing is
                     # deferred to _record_release (driven by consumer releases).
@@ -2684,9 +2706,7 @@ class MooncakeConnector(KVConnectorBase):
                 else:
                     with self._completion_lock:
                         self.done_sending.add(transfer_id)
-                    with self._completed_prefills_lock:
-                        self._completed_prefills.pop(transfer_id, None)
-                        self._kv_cache_ready_events.pop(transfer_id, None)
+                    self._drop_completed_prefill(transfer_id)
                     logger.debug(
                         "[PRODUCER] All %d consumers served for transfer_id=%s",
                         consumers_per_rank,
@@ -3625,7 +3645,7 @@ class MooncakeConnector(KVConnectorBase):
         staging = self._kv_staging
         dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
         descriptors = 0
-        slot = staging.acquire()
+        slot = self._kv_staging_slots.acquire()
         try:
             shard = staging.prepare(plan, kv_cache_ready_event, slot)
             for region_idx, dst_base, bpb in regions:
@@ -3664,7 +3684,7 @@ class MooncakeConnector(KVConnectorBase):
                         )
                         return False
         finally:
-            staging.release(slot)
+            self._kv_staging_slots.release(slot)
         logger.debug(
             "[PRODUCER] staged MLA RDMA write: req=%s, regions=%d, pages=%d, "
             "descriptors=%d",
@@ -3718,7 +3738,7 @@ class MooncakeConnector(KVConnectorBase):
             len(self._slot_regions),
             len(consumer_slot_addrs),
             None,
-            getattr(self, "_slot_region_consumer_indices", None),
+            self._slot_region_consumer_indices,
         )
         if any(not 0 <= cidx < len(consumer_slot_addrs) for cidx in slot_cmap):
             raise RuntimeError(
@@ -3729,8 +3749,8 @@ class MooncakeConnector(KVConnectorBase):
         # shard this rank holds, which is only this rank's when q's group is.
         # A backend that publishes no segments keeps whole-unit writes.
         consumer_tp_size = request_data.get("consumer_tp_size")
-        tp_segments = getattr(self, "_slot_region_tp_segments", None)
-        tp_replicated = getattr(self, "_slot_region_tp_replicated", None)
+        tp_segments = self._slot_region_tp_segments
+        tp_replicated = self._slot_region_tp_replicated
         # Any other consumer TP would floor to whole-unit writes and fail
         # below as a model or spec mismatch.
         if (
@@ -3853,9 +3873,7 @@ class MooncakeConnector(KVConnectorBase):
             # Without the ready event the gather could read KV still being
             # written, so such a request keeps the per-token path.
             if kv_cache_ready_event is not None:
-                staging = mla_staging_for(
-                    getattr(self, "_kv_staging", None), sharded_plan
-                )
+                staging = mla_staging_for(self._kv_staging, sharded_plan)
         staged_kv: list[tuple[int, int, int]] = []
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]

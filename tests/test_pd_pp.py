@@ -2005,6 +2005,7 @@ def _pp_stage_connector(mc, nic, *, tp_size=1, tp_rank=0, ssm_segments=True):
         (_CONV_RUN,) * (3 * _CONV_ROWS),
         (_SSM_BPS,) if ssm_segments else None,
     ]
+    connector._slot_region_tp_replicated = None
     connector._gather_slot = None
     connector._rdma_write = nic.write
     return connector

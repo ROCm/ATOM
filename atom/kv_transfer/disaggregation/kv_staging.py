@@ -14,13 +14,13 @@ destination page.
 from __future__ import annotations
 
 import contextlib
-import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
+from atom.kv_transfer.disaggregation.pd_producer import mla_shard_slot_bytes
 from atom.kv_transfer.disaggregation.sharded_transfer import DCPShardPlan
 from atom.kv_transfer.disaggregation.types import (
     MLA_KV_ROLE,
@@ -29,7 +29,6 @@ from atom.kv_transfer.disaggregation.types import (
 )
 
 MLA_STAGING_ROLE = "mla.kv_staging"
-_SLOT_ALIGN = 4096
 
 
 @dataclass(frozen=True)
@@ -64,10 +63,10 @@ def _row_view(view: torch.Tensor, block_size: int) -> torch.Tensor:
 class MLAShardStaging:
     """A pool of staging slots plus the token-row views of the pages they read.
 
-    One slot per send worker, held for one request's push to one consumer
-    rank, so a slot is never shared and a pushed chunk is never overwritten
-    before its RDMA write returns. Each slot has its own stream, so a
-    gather's ``synchronize`` waits for that push only, not every worker's.
+    The caller hands out the slots, each held for one request's push to one
+    consumer rank, so a pushed chunk is never overwritten before its RDMA
+    write returns. Each slot has its own stream, so a gather waits for that
+    push only, not every worker's.
     """
 
     def __init__(
@@ -77,6 +76,7 @@ class MLAShardStaging:
         block_size: int,
         pool_size: int,
         chunk_pages: int,
+        slot_bytes: int,
         device: torch.device,
         stream_priority: int = 0,
     ):
@@ -88,16 +88,10 @@ class MLAShardStaging:
         self.block_size = block_size
         self.chunk_pages = chunk_pages
         self._sources = sources
-        row_bytes = max(
-            rows[0].numel() * rows.element_size() for rows in sources.values()
-        )
-        slot_bytes = chunk_pages * block_size * row_bytes
-        self.slot_bytes = -(-slot_bytes // _SLOT_ALIGN) * _SLOT_ALIGN
+        self.slot_bytes = slot_bytes
         self._pool = torch.empty(
             (pool_size, self.slot_bytes), dtype=torch.uint8, device=device
         )
-        self._free = list(range(pool_size))
-        self._free_cv = threading.Condition()
         self._streams = (
             [
                 torch.cuda.Stream(device=device, priority=stream_priority)
@@ -132,10 +126,15 @@ class MLAShardStaging:
         block_size: int,
         pool_size: int,
         chunk_pages: int,
+        max_bytes: int,
         device: torch.device,
         stream_priority: int = 0,
     ) -> MLAShardStaging | None:
-        """Staging over every token-contiguous MLA page, or None if none is."""
+        """Staging over every token-contiguous MLA page, or None if none is.
+
+        Up to ``pool_size`` slots, as many as fit ``max_bytes``; None if not
+        even one does.
+        """
         sources = {}
         for idx, page in enumerate(pages):
             region, view = page.region, page.view
@@ -150,11 +149,19 @@ class MLAShardStaging:
             sources[idx] = _row_view(view, block_size)
         if not sources:
             return None
+        row_bytes = max(
+            rows[0].numel() * rows.element_size() for rows in sources.values()
+        )
+        slot_bytes = mla_shard_slot_bytes(chunk_pages, block_size * row_bytes)
+        pool_size = min(pool_size, max_bytes // slot_bytes)
+        if pool_size <= 0:
+            return None
         return cls(
             sources,
             block_size=block_size,
             pool_size=pool_size,
             chunk_pages=chunk_pages,
+            slot_bytes=slot_bytes,
             device=device,
             stream_priority=stream_priority,
         )
@@ -174,16 +181,6 @@ class MLAShardStaging:
 
     def stages(self, region_idx: int) -> bool:
         return region_idx in self._sources
-
-    def acquire(self) -> int:
-        with self._free_cv:
-            self._free_cv.wait_for(lambda: bool(self._free))
-            return self._free.pop()
-
-    def release(self, slot: int) -> None:
-        with self._free_cv:
-            self._free.append(slot)
-            self._free_cv.notify()
 
     def _on_stream(self, slot: int):
         if self._streams is None:
@@ -242,16 +239,12 @@ class MLAShardStaging:
         first = start * self.block_size
         last = min(stop * self.block_size, shard.tokens)
         out = self._pool[slot].view(source.dtype)[: (last - first) * source.shape[1]]
-        done = None
         with self._on_stream(slot):
             torch.index_select(
                 source, 0, shard.rows[first:last], out=out.view(last - first, -1)
             )
-            if self._streams is not None:
-                done = torch.cuda.Event()
-                done.record(self._streams[slot])
-        if done is not None:
-            done.synchronize()
+        if self._streams is not None:
+            self._streams[slot].synchronize()
         page_bytes = self.block_size * source.shape[1] * source.element_size()
         return self._pool[slot].data_ptr(), page_bytes
 

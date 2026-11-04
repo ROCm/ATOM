@@ -82,6 +82,17 @@ def test_stages_take_the_largest_unit_count(monkeypatch):
     assert agreed.op_bytes == sum(slot for _, slot in K3_PP8)
 
 
+def test_every_stage_bounds_its_tier_by_the_largest_image(monkeypatch):
+    """Each stage's codec evicts by its own image, so the head's index must
+    count entries by the largest one, or it offers loads a larger stage has
+    already evicted."""
+    largest = max(slot for _, slot in K3_PP8)
+    for stage in range(len(K3_PP8)):
+        own, agreed = _agree(monkeypatch, stage=stage)
+        assert agreed.largest_image_bytes == largest
+        assert own.largest_image_bytes == own.image_bytes
+
+
 def test_every_stage_reaches_the_same_identity(monkeypatch):
     agreed = [_agree(monkeypatch, stage=i)[1] for i in range(len(K3_PP8))]
 

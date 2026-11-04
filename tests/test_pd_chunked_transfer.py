@@ -599,6 +599,9 @@ def test_mutable_slot_is_sent_once_after_final_metadata():
     slot_dst = (ctypes.c_ubyte * 8)()
     c._block_regions = [(c.kv_caches_base_addr[0], 4)]
     c._slot_regions = [(ctypes.addressof(slot_src), 4)]
+    c._slot_region_consumer_indices = None
+    c._slot_region_tp_segments = None
+    c._slot_region_tp_replicated = None
     c._swa_block_regions = []
     c._fp4_index_layout = False
     c._gather_slot = None

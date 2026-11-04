@@ -8,6 +8,8 @@ from conftest import MockConfig
 
 from atom.model_engine import block_manager as bm_module
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
+from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 
 # ── compute_hash ───────────────────────────────────────────────────────────
 
@@ -1022,6 +1024,51 @@ def test_pipeline_parallelism_hosts_the_state_tier(monkeypatch):
     assert bm.state_offload is not None
     assert bm.state_offload.can_store and bm.state_offload.can_load
     assert bm.state_tier_capability.reason == ""
+
+
+def test_under_pipeline_parallelism_the_index_counts_the_largest_stage_image(
+    monkeypatch,
+):
+    """Each stage's codec evicts by its own image, so an index sized by the
+    head's smaller one would offer loads the larger stage already evicted."""
+    monkeypatch.setenv("OFFLOAD_STATE_CPU_SIZE", "1")
+    mib = 1 << 20
+    head = PagedStateCheckpointSpec(mib, 40 * mib, "kda", image_bytes=25 * mib)
+    agreed = head.for_pipeline(
+        "pp2-joint:abc", units=35, op_bytes=60 * mib, largest_image_bytes=35 * mib
+    )
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config=_OFFLOAD_KVC,
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    bm = BlockManager(
+        cfg,
+        state_runtime=StateRuntime(
+            transfer=StateTransfer.copy(agreed.layout_id), checkpoint_spec=agreed
+        ),
+    )
+    # 1 GiB holds 29 of the other stage's 35 MiB images, not 40 of the head's,
+    # less the index's margin of 16.
+    assert bm.state_offload._hash_cap == 29 - 16
+
+
+def test_a_qwen_layout_under_pipeline_parallelism_hosts_no_state_tier(monkeypatch):
+    """Qwen keeps fork checkpoints under PP, so its worker publishes no layout
+    id and turns the tier off. An index here would offer loads no worker can
+    serve and floor checkpoints to an LMCache chunk nothing reads back."""
+    cfg = MockConfig(
+        enable_prefix_caching=True,
+        kv_transfer_config={**_OFFLOAD_KVC, "offload_layout": "qwen"},
+        pool_entries={"state": 4},
+        pool_entries_per_req={"state": 1},
+    )
+    cfg.pipeline_parallel_size = 2
+    bm = BlockManager(cfg)
+    assert bm.state_offload is None
+    assert "pipeline_parallel_size=2" in bm.state_tier_capability.reason
 
 
 def test_a_producer_role_stores_but_never_votes_for_a_load(monkeypatch):

@@ -1680,8 +1680,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         Off under pipeline parallelism and RapidServe. ``get_num_blocks``
         raises when a copying transfer meets either, and answering yes there
         would turn "this model keeps fork-slot checkpoints" into "this model
-        does not start". Kimi's ``_uses_paged_checkpoints`` is the same two
-        switches and no model-type set, because that builder is Kimi-only.
+        does not start". Kimi's ``_uses_paged_checkpoints`` has only the
+        RapidServe switch, since its PAGE checkpoints span pipeline stages,
+        and no model-type set, because that builder is Kimi-only.
         """
 
         config = self.model_runner.config

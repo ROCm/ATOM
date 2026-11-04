@@ -8,6 +8,8 @@ import pytest
 from atom.kv_transfer.disaggregation.pd_producer import (
     disaggregated_kv_role,
     index_staging_pool_size,
+    mla_shard_slot_bytes,
+    mla_shard_staging_reserve_bytes,
     mla_staging_reserve_bytes,
     mla_staging_slot_count,
     mooncake_pd_producer_configured,
@@ -206,6 +208,55 @@ def test_mla_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert mla_staging_reserve_bytes(_mla_producer_config(16, **overrides)) == 0
+
+
+def _k3_producer_config(workers, **overrides):
+    config = {
+        "hf_config": SimpleNamespace(
+            model_type="kimi_linear", kv_lora_rank=512, qk_rope_head_dim=64
+        ),
+        "kv_cache_block_size": 128,
+        "kv_cache_dtype": "fp8",
+    }
+    config.update(overrides)
+    return _mla_producer_config(workers, **config)
+
+
+def test_mla_shard_staging_reserve_covers_the_connector_pool(monkeypatch):
+    monkeypatch.setenv("ATOM_PD_MLA_STAGING_CHUNK_PAGES", "128")
+    # 16 slots of 128 pages, each 128 FP8 rows of 576 bytes: 144 MiB.
+    assert mla_shard_staging_reserve_bytes(_k3_producer_config(16)) == 144 << 20
+    bf16 = _k3_producer_config(4, kv_cache_dtype="bf16")
+    assert mla_shard_staging_reserve_bytes(bf16) == 4 * mla_shard_slot_bytes(
+        128, 128 * 1152
+    )
+    assert mla_shard_slot_bytes(3, 1000) == 4096
+
+
+@pytest.mark.parametrize(
+    "overrides, chunk_pages",
+    [
+        ({}, "0"),
+        # Plain MLA has the other pool; only the hybrid stages here.
+        ({"hf_config": SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)}, "128"),
+        ({"decode_context_parallel_size": 4}, "128"),
+        (
+            {
+                "kv_transfer_config": {
+                    "kv_connector": "mooncake",
+                    "kv_role": "kv_consumer",
+                }
+            },
+            "128",
+        ),
+    ],
+)
+def test_mla_shard_staging_reserve_is_zero_without_a_pool(
+    monkeypatch, overrides, chunk_pages
+):
+    monkeypatch.setenv("ATOM_PD_MLA_STAGING_CHUNK_PAGES", chunk_pages)
+    config = _k3_producer_config(16, **overrides)
+    assert mla_shard_staging_reserve_bytes(config) == 0
 
 
 @pytest.mark.parametrize(

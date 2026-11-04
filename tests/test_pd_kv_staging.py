@@ -41,6 +41,9 @@ _SRC_BLOCKS = 12
 _DST_BLOCKS = 10
 _REGIONS = 2
 
+# Reserve for tests that are not about it.
+_UNCAPPED = 1 << 40
+
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
@@ -102,7 +105,11 @@ def _connector(src, nic, staging):
     connector._fp4_index_layout = False
     connector._swa_block_regions = []
     connector._slot_regions = []
+    connector._slot_region_consumer_indices = None
+    connector._slot_region_tp_segments = None
+    connector._slot_region_tp_replicated = None
     connector._kv_staging = staging
+    connector._kv_staging_slots = mc.SlotPool(staging.pool_size if staging else 0)
     connector._rdma_write = nic.write
     return connector
 
@@ -114,6 +121,7 @@ def _staging(src, chunk_pages):
         block_size=_BLOCK,
         pool_size=2,
         chunk_pages=chunk_pages,
+        max_bytes=_UNCAPPED,
         device=src[0].device,
     )
 
@@ -246,7 +254,12 @@ def test_staging_covers_only_token_contiguous_mla_pages():
         page_region(src[1], semantic_role=MLA_KV_ROLE),
     ]
     staging = MLAShardStaging.build(
-        pages, block_size=_BLOCK, pool_size=1, chunk_pages=2, device=src[0].device
+        pages,
+        block_size=_BLOCK,
+        pool_size=1,
+        chunk_pages=2,
+        max_bytes=_UNCAPPED,
+        device=src[0].device,
     )
     assert [staging.stages(i) for i in range(3)] == [True, False, True]
     assert staging.slot_bytes >= 2 * _BPB
@@ -256,10 +269,30 @@ def test_staging_covers_only_token_contiguous_mla_pages():
             block_size=_BLOCK,
             pool_size=1,
             chunk_pages=2,
+            max_bytes=_UNCAPPED,
             device=src[0].device,
         )
         is None
     )
+
+
+def test_staging_slots_fit_the_reserve():
+    pages = [page_region(t, semantic_role=MLA_KV_ROLE) for t in _producer("cpu")]
+
+    def build(max_bytes):
+        return MLAShardStaging.build(
+            pages,
+            block_size=_BLOCK,
+            pool_size=4,
+            chunk_pages=2,
+            max_bytes=max_bytes,
+            device=torch.device("cpu"),
+        )
+
+    slot = build(_UNCAPPED).slot_bytes
+    assert build(4 * slot).pool_size == 4
+    assert build(4 * slot - 1).pool_size == 3
+    assert build(slot - 1) is None
 
 
 @pytest.mark.parametrize("has_kv_staging", [True, False])

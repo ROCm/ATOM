@@ -105,40 +105,53 @@ def test_pipeline_spec_takes_the_agreed_units_and_op_bytes():
     """A PP stage needing fewer units than its peers still takes all of them,
     and its ops name the summed image the head priced, not its own."""
     own = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-    spec = own.for_pipeline("pp2-joint:abc", units=5, op_bytes=60)
+    spec = own.for_pipeline(
+        "pp2-joint:abc", units=5, op_bytes=60, largest_image_bytes=35
+    )
 
     assert own.units_per_checkpoint == 3
     assert spec.units_per_checkpoint == 5
     assert spec.op_bytes == 60
     assert spec.image_bytes == 25
+    assert spec.largest_image_bytes == 35
     assert spec.layout_id == "pp2-joint:abc"
     assert own.op_bytes == own.image_bytes
+    assert own.largest_image_bytes == own.image_bytes
 
 
 def test_pipeline_fields_ride_the_wire_only_when_set():
     own = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
-    spec = own.for_pipeline("pp2-joint:abc", units=5, op_bytes=60)
+    spec = own.for_pipeline(
+        "pp2-joint:abc", units=5, op_bytes=60, largest_image_bytes=35
+    )
 
     assert "pipeline_units" not in own.to_wire()
     assert spec.to_wire()["pipeline_units"] == 5
     assert spec.to_wire()["pipeline_op_bytes"] == 60
+    assert spec.to_wire()["pipeline_image_bytes"] == 35
     assert PagedStateCheckpointSpec.from_wire(spec.to_wire()) == spec
 
 
 @pytest.mark.parametrize(
-    "units, op_bytes",
+    "units, op_bytes, largest",
     [
         # Fewer units than this stage's own image needs.
-        (2, 60),
+        (2, 60, 35),
         # Less than this stage's own image.
-        (5, 24),
+        (5, 24, 25),
+        # A largest image below this stage's own, or above all stages' sum.
+        (5, 60, 24),
+        (5, 60, 61),
         # Agreed together or not at all.
-        (5, 0),
-        (0, 60),
-        (-1, 60),
+        (5, 0, 35),
+        (0, 60, 35),
+        (5, 60, 0),
+        (-1, 60, 35),
     ],
 )
-def test_pipeline_spec_rejects_an_agreement_this_stage_cannot_hold(units, op_bytes):
+def test_pipeline_spec_rejects_an_agreement_this_stage_cannot_hold(
+    units, op_bytes, largest
+):
     with pytest.raises(ValueError):
         PagedStateCheckpointSpec(
             10,
@@ -147,6 +160,7 @@ def test_pipeline_spec_rejects_an_agreement_this_stage_cannot_hold(units, op_byt
             image_bytes=25,
             pipeline_units=units,
             pipeline_op_bytes=op_bytes,
+            pipeline_image_bytes=largest,
         )
 
 
@@ -154,7 +168,10 @@ def test_pipeline_store_and_restore_ops_name_the_agreed_geometry():
     pool = BlockPool(20)
     spec = PagedStateCheckpointSpec(10, 25, "layout-v1", image_bytes=25)
     store = PageUnitCheckpointStore(
-        pool, spec.for_pipeline("pp2-joint:abc", units=5, op_bytes=60)
+        pool,
+        spec.for_pipeline(
+            "pp2-joint:abc", units=5, op_bytes=60, largest_image_bytes=35
+        ),
     )
 
     op = store.begin_store(101, src_slot=3)

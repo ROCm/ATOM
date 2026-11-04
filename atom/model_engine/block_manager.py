@@ -510,8 +510,10 @@ class BlockManager:
                 # Not `slot_bytes`: under MTP a slot holds more than an image
                 # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
                 # this index a third below the codec, hiding images it holds.
+                # Under PP every stage's codec evicts by its own image, so the
+                # stage with the largest one keeps the fewest entries.
                 max_cpu_entries=(
-                    state_tier_cpu_bytes() // checkpoint_spec.image_bytes
+                    state_tier_cpu_bytes() // checkpoint_spec.largest_image_bytes
                     if checkpoint_spec is not None
                     else None
                 ),
@@ -2423,26 +2425,11 @@ class BlockManager:
             return False
         seq.scheduled_checkpoint_pos = max(seq.scheduled_checkpoint_pos, pos)
         if kept:
-            h = self._prompt_chain_hash(seq, pos // self.hash_block_size)
+            chain = self._chain_to(seq, [], pos // self.hash_block_size)
+            h = chain[-1] if chain else seq.cache_seed
             self.paged_state_checkpoints.checkpoint_when_scheduled(seq, h)
             seq.last_checkpoint_pos = pos
         return True
-
-    def _prompt_chain_hash(self, seq: Sequence, blocks: int) -> int:
-        """Chained hash of the first `blocks` blocks of `seq`'s tokens.
-
-        Blocks still in flight are not hashed yet, so this resumes from the
-        last one that is, or from the seed when none is.
-        """
-        start, h = 0, seq.cache_seed
-        for i in range(min(blocks, len(seq.block_table)) - 1, -1, -1):
-            published = self.kv.block(seq.block_table[i]).hash
-            if published != -1:
-                start, h = i + 1, published
-                break
-        for i in range(start, blocks):
-            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
-        return h
 
     def hash_decode_blocks(
         self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
