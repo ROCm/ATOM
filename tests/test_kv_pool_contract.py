@@ -240,3 +240,5 @@ def test_a_geometry_row_space_names_itself_readably():
 
     assert str(KvGeometry(2, 256)) == "h2d256"
     assert f"mha.{KvGeometry(8, 128)}.k.layer_0" == "mha.h8d128.k.layer_0"
+    # MiniMax-M3's MXFP4 sparse-layer pool is named by its format too
+    assert f"mha.{KvGeometry(8, 128, 'fp4')}.k.layer_0" == "mha.h8d128fp4.k.layer_0"

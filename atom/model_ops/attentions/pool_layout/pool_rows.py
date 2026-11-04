@@ -32,7 +32,7 @@ class KvGeometry(NamedTuple):
 
     num_kv_heads: int
     head_dim: int
-    # "" for the dtype-wide cache; "mxfp4" for MiniMax-M3 sparse layers under
+    # "" for the dtype-wide cache; "fp4" for MiniMax-M3 sparse layers under
     # --kv-cache-dtype fp4 -- a separate pool beside any dense layers' one.
     kv_format: str = ""
 

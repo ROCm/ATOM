@@ -630,7 +630,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 _is_indexed_sparse_attention(module)
                 and self.model_runner.config.kv_mxfp4
             ):
-                kv_format = "mxfp4"
+                kv_format = "fp4"
             kinds.append(KvGeometry(module.num_kv_heads, module.head_dim, kv_format))
         return tuple(kinds)
 
@@ -831,7 +831,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         row = self.pool_rows[geometry][module]
 
         k_cache, v_cache = pool.kv_views(row)
-        if pool.kv_format == "mxfp4":
+        if pool.kv_format == "fp4":
             # [pages, Hkv, 8704] each; no scale planes. The sparse impl takes
             # the (data, scale) views from them (kv_mxfp4.page_views).
             module.impl.kv_mxfp4 = True

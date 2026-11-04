@@ -119,12 +119,12 @@ class MhaKvPool:
                 f"an entry holds at least one block, not {blocks_per_entry}"
             )
         self.block_size = block_size
-        # "mxfp4": MiniMax-M3 sparse layers, per (page, kv head) one 8704 B field
+        # "fp4": MiniMax-M3 sparse layers, per (page, kv head) one 8704 B field
         # holding e2m1 data and e8m0 scales (minimax_m3/kv_mxfp4.py); K and V a
         # field each, no scale planes. "" is the dtype-wide SHUFFLE cache.
         self.kv_format = kv_format
         self.x = shuffle_pack(kv_dtype)
-        if kv_format == "mxfp4":
+        if kv_format == "fp4":
             self.x = 1
         elif head_dim % self.x or block_size % self.x:
             raise ValueError(
@@ -140,7 +140,7 @@ class MhaKvPool:
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
         entry_tokens = block_size * blocks_per_entry
-        if kv_format == "mxfp4":
+        if kv_format == "fp4":
             from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES, PAGE_TOKENS
 
             if block_size != PAGE_TOKENS or head_dim != 128 or blocks_per_entry != 1:
@@ -282,7 +282,7 @@ class MhaKvPool:
         collapsing V's outer half to one.
         """
         x, nh, hd, bs = self.x, self.num_kv_heads, self.head_dim, self.block_size
-        if self.kv_format == "mxfp4":
+        if self.kv_format == "fp4":
             from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES
 
             shape = (-1, nh, PAGE_BYTES)

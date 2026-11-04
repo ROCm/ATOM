@@ -28,7 +28,7 @@ def pool(layers=3, heads=1, **kw):
         num_kv_heads=heads,
         head_dim=128,
         kv_dtype=torch.float8_e4m3fnuz,
-        kv_format="mxfp4",
+        kv_format="fp4",
         **kw,
     )
 
@@ -79,7 +79,7 @@ def test_only_the_128_page_of_head_dim_128_is_a_pool(kw):
         "num_kv_heads": 1,
         "head_dim": 128,
         "kv_dtype": torch.float8_e4m3fnuz,
-        "kv_format": "mxfp4",
+        "kv_format": "fp4",
     }
     with pytest.raises(ValueError):
         MhaKvPool(**{**base, **kw})
