@@ -162,6 +162,8 @@ class RowFilters(NamedTuple):
     descends: bool
     #: Must the descent's passes weigh (the batch has a top-p)?
     weigh: bool
+    #: Does the batch hand over any filter at all (the verify's ``FILTER``)?
+    filtered: bool
 
 
 def row_filters(
@@ -212,6 +214,7 @@ def row_filters(
         descends=not (k_small and not p_rows and p_scalar is None),
         # Only a top-p needs the passes to weigh; counting alone is cheaper.
         weigh=top_ps is not None,
+        filtered=top_ks is not None or top_ps is not None,
     )
 
 

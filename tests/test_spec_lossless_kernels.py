@@ -692,14 +692,22 @@ def verify_batch(drafts, width, logits, temperatures, row_base=None, scratch=Non
 
 
 def verify(
-    q, *, temperatures, q_row_base, ratio_scratch, top_ks=None, top_ps=None, **args
+    q,
+    *,
+    temperatures,
+    q_row_base,
+    ratio_scratch,
+    top_ks=None,
+    top_ps=None,
+    host_top_ks=None,
+    **args,
 ):
     """`rejection_sample` on `verify_batch` arguments: the ratio verify of
     ``q`` under these filters, or exact match where ``q`` is None."""
     ratio = None
     if q is not None:
         ratio = RatioVerifyInputs(
-            q, q_row_base, temperatures, top_ks, top_ps, ratio_scratch
+            q, q_row_base, temperatures, top_ks, top_ps, ratio_scratch, host_top_ks
         )
     return rejection_sample(**args, ratio=ratio)
 
@@ -1102,21 +1110,27 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
         drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
         # Sliced out of the per-row buffers, as `prepare_sample` hands them.
         top_ks = torch.randint(1, 300, (max_bs,), device=DEV, dtype=torch.int32)
+        wide_ks = torch.randint(300, 900, (max_bs,), device=DEV, dtype=torch.int32)
         top_ps = torch.rand(max_bs, device=DEV) * 0.9 + 0.05
-        forms = (
-            (None, None),
-            (20, None),
-            (300, None),
-            (None, 0.8),
-            (top_ks[:batch_n], None),
-            (None, top_ps[:batch_n]),
-            (top_ks[:batch_n], 0.8),
-            (top_ks[:batch_n], top_ps[:batch_n]),
-        )
+        ks, wide = top_ks[:batch_n], wide_ks[:batch_n]
+        host, wide_host = ks.cpu().numpy(), wide.cpu().numpy()
+        # (top_ks, top_ps, host_top_ks), every kind beside every kind.
+        forms = [
+            (k, p, h)
+            for k, h in (
+                (None, None),
+                (20, None),
+                (300, None),
+                (ks, None),
+                (ks, host),
+                (wide, wide_host),
+            )
+            for p in (None, 0.8, top_ps[:batch_n])
+        ]
         store = SparseQStore.allocate(max_bs * width, q_width, DEV)
         for t in store:
             t.zero_()
-        for top_ks_form, top_ps_form in forms:
+        for top_ks_form, top_ps_form, host_form in forms:
             # A step's target rows are gathered out of its whole logits.
             logits = torch.randn(rows + batch_n, vocab, device=DEV).to(dtype)
             args = verify_batch(
@@ -1133,6 +1147,7 @@ def test_the_startup_warmup_compiles_every_variant_a_serving_verify_launches(
                 ratio_step=3,
                 top_ks=top_ks_form,
                 top_ps=top_ps_form,
+                host_top_ks=host_form,
             )
         torch.cuda.synchronize()
         grew = [

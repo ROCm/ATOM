@@ -27,7 +27,11 @@ from atom.model_ops.spec_sampling.ratio_target_p import (
     _ratio_target_p,
     target_p_scratch,
 )
-from atom.model_ops.spec_sampling.sampling_filter import _FILTER_COUNT_MAX_K
+from atom.model_ops.spec_sampling.sampling_filter import (
+    _FILTER_COUNT_MAX_K,
+    RowFilters,
+    row_filters,
+)
 from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch
 from atom.model_ops.spec_sampling.softmax_tiles import race_key
 from atom.model_ops.spec_sampling.sparse_q_store import SparseQStore
@@ -612,6 +616,47 @@ def _ratio_sample(
     )
 
 
+def filter_variant(filters: RowFilters) -> RowFilters:
+    """What the verify kernels specialize on in a batch's filters: all of
+    `row_filters`' answer but the values."""
+    return filters._replace(args=None)
+
+
+def warmup_forms(logits_dtype: torch.dtype, device) -> list[tuple]:
+    """One one-request ``(top_ks, top_ps, host_top_ks)`` per filter variant
+    a verify can launch. Every kind of top-k a caller can hand over (none;
+    one for the batch, counted or descended; one per request, its host values
+    countable, not countable, or not given) beside every kind of top-p (none,
+    one for the batch, at or past 1, one per request), kept where `row_filters` makes a new
+    variant of them, so a form a caller starts handing over is warmed
+    without anyone listing it."""
+
+    def per_row(value, dtype):
+        return torch.full((1,), value, dtype=dtype, device=device)
+
+    counted, descended = _FILTER_COUNT_MAX_K, _FILTER_COUNT_MAX_K + 1
+    top_k_kinds = [
+        (None, None),
+        (counted, None),
+        (descended, None),
+        (per_row(counted, torch.int32), None),
+        (per_row(counted, torch.int32), np.array([counted], np.int32)),
+        (per_row(descended, torch.int32), np.array([descended], np.int32)),
+    ]
+    # A top-p of 1 or more is none to the rows, yet a variant of its own.
+    top_p_kinds = [None, 0.9, 1.0, per_row(0.9, torch.float32)]
+    forms, seen = [], set()
+    for top_ks, host_top_ks in top_k_kinds:
+        for top_ps in top_p_kinds:
+            variant = filter_variant(
+                row_filters(top_ks, top_ps, 1, logits_dtype, host_top_ks)
+            )
+            if variant not in seen:
+                seen.add(variant)
+                forms.append((top_ks, top_ps, host_top_ks))
+    return forms
+
+
 def warmup_ratio_verify(
     num_spec_steps: int,
     vocab_size: int,
@@ -626,7 +671,7 @@ def warmup_ratio_verify(
     Triton cache each variant would otherwise compile inside the first serving
     step that needs it, seconds per rank, with DP peers waiting in the
     collective. So this verifies a one-request dummy batch once per filter
-    form. It matches a serving batch in everything Triton specializes on: the
+    variant (`warmup_forms`). It matches a serving batch in everything Triton specializes on: the
     logits' dtype and width, the index dtypes, ``num_spec_steps``, the store's
     width and ``scratch``'s alignment (batch counts are not specialized on,
     `_BATCH_COUNTS`).
@@ -643,27 +688,8 @@ def warmup_ratio_verify(
     def ints(values, dtype=torch.int32):
         return torch.tensor(values, dtype=dtype, device=device)
 
-    def per_row_p():
-        return torch.full((1,), 0.9, dtype=torch.float32, device=device)
-
-    k_counted = _FILTER_COUNT_MAX_K
-    k_descended = _FILTER_COUNT_MAX_K + 1
-    # The (top_ks, top_ps) forms `ModelRunner.prepare_sample` hands over: none,
-    # a scalar top-k (counted or descended), a scalar top-p, and a per-row k,
-    # p or both. Never a scalar k beside a top-p: `Sampler` keeps top-k ties
-    # with the flag on, so that k arrives per row, beside either kind of p.
-    forms = (
-        (None, None),
-        (k_counted, None),
-        (k_descended, None),
-        (None, 0.9),
-        (ints([k_counted]), None),
-        (None, per_row_p()),
-        (ints([k_counted]), 0.9),
-        (ints([k_counted]), per_row_p()),
-    )
     store = SparseQStore.allocate(num_tokens, q_width, device)
-    for top_ks, top_ps in forms:
+    for top_ks, top_ps, host_top_ks in warmup_forms(logits_dtype, device):
         # The buffers `rejection_sample` hands the verify.
         output_token_ids = torch.empty(
             (1, num_spec_steps + 1), dtype=torch.int32, device=device
@@ -683,6 +709,7 @@ def warmup_ratio_verify(
                 top_ks,
                 top_ps,
                 scratch,
+                host_top_ks,
             ),
             ints([0]),
             ints([num_tokens], torch.int64),
