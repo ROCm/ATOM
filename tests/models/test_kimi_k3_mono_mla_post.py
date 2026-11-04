@@ -233,8 +233,10 @@ def test_bind_refuses_an_mla_without_latent_out():
 
 
 def test_attention_hooks_exist():
-    pytest.importorskip("aiter", reason="attention_mla imports the AITER runtime")
-    from atom.model_ops.attention_mla import MLAAttention
+    try:
+        from atom.model_ops.attention_mla import MLAAttention
+    except ImportError as e:  # the AITER / triton runtime, absent or without a GPU
+        pytest.skip(f"attention_mla does not import here: {e!r}")
 
     for fn in (MLAAttention.forward_impl, MLAAttention._forward_decode):
         assert "latent_out" in inspect.signature(fn).parameters
