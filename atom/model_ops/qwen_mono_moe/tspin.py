@@ -1,6 +1,7 @@
 """Time-bounded spin for the fused MoE kernels: poll until ``pending`` clears; trap (llvm.trap -> the process faults,
 nothing keeps spinning on the GPU) once DEADLINE_TICKS of the 100 MHz steady counter have passed. The clock is read
 every 64 polls only (a clock read on every poll slows the co-resident working waves)."""
+
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter

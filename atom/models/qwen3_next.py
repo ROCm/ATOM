@@ -43,7 +43,6 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.qwen_mono_moe.integration import mono_moe_forward
 from atom.model_ops.moe_tail_norm import (
     CombineTailRequest,
     MoEGatedSum,
@@ -53,6 +52,7 @@ from atom.model_ops.moe_tail_norm import (
     interleave_gate_up,
     silu_gate_up_gemm,
 )
+from atom.model_ops.qwen_mono_moe.integration import mono_moe_forward
 from atom.model_ops.sigmoid_gate import output_gate_mul, shared_expert_gate_add
 from atom.model_ops.topK import (
     is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config,

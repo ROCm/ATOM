@@ -16,7 +16,8 @@ WAVE_CTA = [False]
 
 def pipeline_fence(outstanding=0, use_cluster=False):
     """aiter's READY + REUSE fence (s_wait_tensorcnt, then a workgroup barrier); in WAVE_CTA mode the wave's own: its
-    TDM loads landed (tensorcnt) and its LDS reads of the buffer to reuse returned (dscnt)."""
+    TDM loads landed (tensorcnt) and its LDS reads of the buffer to reuse returned (dscnt).
+    """
     if WAVE_CTA[0]:
         tdm_ops.tensor_wait(outstanding)
         rocdl.s_wait_dscnt(0)
@@ -26,11 +27,14 @@ def pipeline_fence(outstanding=0, use_cluster=False):
 
 def _wg_barrier():
     """The tile's workgroup barrier; in WAVE_CTA mode the wave's own LDS wait (its LDS reads / writes are ordered in
-    program order once s_wait_dscnt drains them; TDM loads are waited by the caller's tensor_wait)."""
+    program order once s_wait_dscnt drains them; TDM loads are waited by the caller's tensor_wait).
+    """
     if WAVE_CTA[0]:
         rocdl.s_wait_dscnt(0)
     else:
         workgroup_barrier()
+
+
 # Per-call trace-time hooks (set by the caller right before each gemm_task call):
 #   expert_fn(blk_m) -> (expert, psum[expert]): the tile's expert without the native in-kernel bisect (9 dependent
 #     global loads); same values. has_work then uses the caller's live row count (schedule_rows).
@@ -50,25 +54,21 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
-from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.rocdl import cluster
-from flydsl.expr.typing import Constexpr, T
-from flydsl.expr.typing import Vector as Vec
-
-from aiter.utility.mx_types import MxDtypeInt as MxDtype
-
-from aiter.ops.flydsl.kernels.buffer_ops import buffer_store, create_buffer_resource_from_addr
+from aiter.ops.flydsl.kernels.buffer_ops import (
+    buffer_store,
+    create_buffer_resource_from_addr,
+)
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
-    pipeline_fence as _pipeline_fence_wg,
     situv2_consts,
     workgroup_barrier,
+)
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    pipeline_fence as _pipeline_fence_wg,
 )
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.tdm_gather_shim import (
@@ -82,11 +82,13 @@ from aiter.ops.flydsl.kernels.quant_utils import (
     emit_cvt_scalef32_pk8_fp4_f32,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import (
-    AITER_FLYDSL_KERNARG_PRELOAD,
-    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
-)
+from aiter.utility.mx_types import MxDtypeInt as MxDtype
+from flydsl._mlir.dialects import llvm as llvm_dialect
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.rocdl import cluster
+from flydsl.expr.typing import Constexpr, T
+from flydsl.expr.typing import Vector as Vec
 
 
 def is_fx_set_register_available():
@@ -361,7 +363,7 @@ def build_gemm_task(
     n_acc = wmma_m_rep * wmma_n_rep
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
-    block = num_waves * WAVE
+    num_waves * WAVE
     SCATTER_GROUP_ROWS = 8
     SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
     scatter_groups = (tile_m + SCATTER_GROUP_ROWS - 1) // SCATTER_GROUP_ROWS
@@ -510,9 +512,13 @@ def build_gemm_task(
     # Compile the static path directly, preserving its launch ABI and the
     # compiler's knowledge of block IDs. Only persistent workers need a helper
     # whose task coordinates are runtime values inside the worker loop.
-    task_decorator = flyc.jit  # fused monolayer: always a device function of the caller's kernel
+    task_decorator = (
+        flyc.jit
+    )  # fused monolayer: always a device function of the caller's kernel
     task_index_type = fx.Int32
-    assert persistent_workers, "build_gemm_task: pass persistent_workers=1 (runtime task ids)"
+    assert (
+        persistent_workers
+    ), "build_gemm_task: pass persistent_workers=1 (runtime task ids)"
 
     @task_decorator
     def gemm_task(
@@ -597,11 +603,19 @@ def build_gemm_task(
         _efn = HOOKS.get("expert_fn")
         _mode = HOOKS.get("mode", "full")
         _late = HOOKS.get("outstanding", 0)
-        _dcb = HOOKS.get("drain_cb")  # called once buffer 0's last k tile is computed (2-buffer post-compute path)
+        _dcb = HOOKS.get(
+            "drain_cb"
+        )  # called once buffer 0's last k tile is computed (2-buffer post-compute path)
         _dx = HOOKS.get("drain_extra", 0)
-        _scb = HOOKS.get("store_cb")  # called right after the output tile's TDM store is issued
+        _scb = HOOKS.get(
+            "store_cb"
+        )  # called right after the output tile's TDM store is issued
         _sx = HOOKS.get("store_extra", 0)
-        has_work = (blk_m < schedule_rows) if _efn is not None else (blk_m < tile_map[n_experts - 1])
+        has_work = (
+            (blk_m < schedule_rows)
+            if _efn is not None
+            else (blk_m < tile_map[n_experts - 1])
+        )
 
         # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
         # result with the padding sentinel so it remains defined outside the
@@ -610,18 +624,20 @@ def build_gemm_task(
         _psum_e = blk_m * 0
         if const_expr(_efn is not None):
             expert, _psum_e = _efn(blk_m)
-        if const_expr(_efn is None):
-          if has_work:
-            lo, hi = blk_m * 0, blk_m * 0 + n_experts
-            for _ in range_constexpr(
-                max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
-            ):
-                mid = (lo + hi) >> 1
-                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-                go_right = tile_map[mid_clamped] <= blk_m
-                lo = go_right.select(mid + 1, lo)
-                hi = go_right.select(hi, mid)
-            expert = lo
+        if const_expr(  # noqa: SIM102 (a compile-time test, then a runtime one)
+            _efn is None
+        ):
+            if has_work:
+                lo, hi = blk_m * 0, blk_m * 0 + n_experts
+                for _ in range_constexpr(
+                    max(1, math.ceil(math.log2(max(2, n_experts))) + 1)
+                ):
+                    mid = (lo + hi) >> 1
+                    mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                    go_right = tile_map[mid_clamped] <= blk_m
+                    lo = go_right.select(mid + 1, lo)
+                    hi = go_right.select(hi, mid)
+                expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = ceildiv(n64, 32)
@@ -640,7 +656,9 @@ def build_gemm_task(
         if const_expr(_efn is not None):
             mn_oob = _psum_e - blk_m
         else:
-            mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+            mn_oob = (
+                tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+            )
 
         b_mcast_mask = None
         full_cluster = None
@@ -996,34 +1014,63 @@ def build_gemm_task(
 
         def gather_emit(j, s, kt):
             """One TDM gather load: the 16 token rows of the A (or row-major A-scale) k tile kt into buffer s."""
-            from flydsl.expr.rocdl.tdm_ops import TDMGatherDescriptor, tensor_load_gather
+            from flydsl.expr.rocdl.tdm_ops import (
+                TDMGatherDescriptor,
+                tensor_load_gather,
+            )
 
             is_a = j is _A_JOB
             elem = 1 if is_a else 4
             row_w = A_ROW_B if is_a else SA_KDW  # elements
             dim0 = (K // 2) if is_a else (K // 128)  # global row length, elements
-            lds_b = (A_LDS_OFF + s * A_LDS_STAGE) if is_a else (SA_LDS_OFF + s * SA_LDS_STAGE)
-            g_i64 = fx.Int64(_ag["a_i64"] if is_a else _ag["sa_i64"]) + fx.Int64(kt) * (row_w * elem)
+            lds_b = (
+                (A_LDS_OFF + s * A_LDS_STAGE)
+                if is_a
+                else (SA_LDS_OFF + s * SA_LDS_STAGE)
+            )
+            g_i64 = fx.Int64(_ag["a_i64"] if is_a else _ag["sa_i64"]) + fx.Int64(kt) * (
+                row_w * elem
+            )
             ei, ea = compute_tdm_pad(A_ROW_B, LDS_PAD_A, 8) if is_a else (0, 0)
             pad_en = 1 if is_a else 0
-            g1_0 = fx.Int32((int(math.log2(elem)) << 16) | (pad_en << 20) | (ei << 22) | (ea << 25))
+            g1_0 = fx.Int32(
+                (int(math.log2(elem)) << 16) | (pad_en << 20) | (ei << 22) | (ea << 25)
+            )
             ntok = fx.Int32(_ag["ntok"])
             g1_1 = fx.Int32((dim0 & 0xFFFF) << 16)
             g1_2 = fx.Int32((dim0 >> 16) & 0xFFFF) | ((ntok & 0xFFFF) << 16)
             g1_3 = ((ntok >> 16) & 0xFFFF) | fx.Int32(row_w << 16)
             g1_4 = fx.Int32(16)
             g1_5 = fx.Int32(dim0)
-            dg1 = fx.Vector.from_elements([g1_0, g1_1, g1_2, g1_3, g1_4, g1_5, fx.Int32(0), fx.Int32(0)], fx.Int32)
+            dg1 = fx.Vector.from_elements(
+                [g1_0, g1_1, g1_2, g1_3, g1_4, g1_5, fx.Int32(0), fx.Int32(0)], fx.Int32
+            )
             g0_s1 = fx.Int32(fx.ptrtoint(base_ptr)) + fx.Int32(lds_b)
             dg0 = fx.Vector.from_elements(
-                [fx.Int32(-2147483647), g0_s1, fx.Int32(g_i64 & 0xFFFFFFFF),
-                 fx.Int32((g_i64 >> 32) & 0xFFFFFFFF) | fx.Int32(-(1 << 31))], fx.Int32)  # 16-bit indices
+                [
+                    fx.Int32(-2147483647),
+                    g0_s1,
+                    fx.Int32(g_i64 & 0xFFFFFFFF),
+                    fx.Int32((g_i64 >> 32) & 0xFFFFFFFF) | fx.Int32(-(1 << 31)),
+                ],
+                fx.Int32,
+            )  # 16-bit indices
             rws = _ag["rows"]
-            pk = [(fx.Int32(rws[2 * w]) & 0xFFFF) | ((fx.Int32(rws[2 * w + 1]) & 0xFFFF) << 16) for w in range(8)]
+            pk = [
+                (fx.Int32(rws[2 * w]) & 0xFFFF)
+                | ((fx.Int32(rws[2 * w + 1]) & 0xFFFF) << 16)
+                for w in range(8)
+            ]
             dg2 = fx.Vector.from_elements(pk[:4], fx.Int32)
             dg3 = fx.Vector.from_elements(pk[4:], fx.Int32)
-            tensor_load_gather(TDMGatherDescriptor(dgroup0=dg0.ir_value(), dgroup1=dg1.ir_value(),
-                                                   dgroup2=dg2.ir_value(), dgroup3=dg3.ir_value()))
+            tensor_load_gather(
+                TDMGatherDescriptor(
+                    dgroup0=dg0.ir_value(),
+                    dgroup1=dg1.ir_value(),
+                    dgroup2=dg2.ir_value(),
+                    dgroup3=dg3.ir_value(),
+                )
+            )
 
         def owns(wv):
             """Runtime predicate: is this wave one of ``wv``?"""
@@ -1540,10 +1587,16 @@ def build_gemm_task(
                     gather_emit(j, s, kt)
                 else:
                     base = base_i32 if j.on_i32 else base_i8
-                    dst = lds_view(base + j.lds_off + s * j.lds_stage, (j.outer, j.inner), (j.lds_row, 1))
+                    dst = lds_view(
+                        base + j.lds_off + s * j.lds_stage,
+                        (j.outer, j.inner),
+                        (j.lds_row, 1),
+                    )
                     fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
 
-        if const_expr(_mode in ("issue_b", "issue_a")):
+        if const_expr(  # noqa: SIM102 (a compile-time test, then a runtime one)
+            _mode in ("issue_b", "issue_a")
+        ):
             if has_work:
                 for _i in range_constexpr(num_buffers):
                     issue_sel(_i, _i, (1, 3) if _mode == "issue_b" else (0, 2))
@@ -1681,7 +1734,8 @@ def build_gemm_task(
                         has_next = next_stage_on and j + 1 < num_buffers
                         pipeline_fence(
                             outstanding=TDM_PER
-                            * max(0, num_buffers - 1 - j - (1 if has_next else 0)) + _late
+                            * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                            + _late
                             + (_dx if (_dcb is not None and j > 0) else 0)
                         )
                         next_stage_buf = (
