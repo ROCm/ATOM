@@ -9,6 +9,7 @@ import torch
 
 from atom.model_ops import base_attention
 from atom.model_ops.minimax_m3 import sparse_attn
+from atom.models.minimax_m3 import model as m3_model
 from atom.models.minimax_m3.model import MiniMaxM3SparseAttention
 
 
@@ -19,8 +20,13 @@ class _QKV:
 
 
 class _OProj:
-    def __init__(self):
+    def __init__(self, per_token_fp8: bool = True):
         self.calls = []
+        # Online quantization sets these after load; the fused path depends on them.
+        self.quant_type = (
+            m3_model.QuantType.per_Token if per_token_fp8 else m3_model.QuantType.No
+        )
+        self.params_dtype = m3_model.dtypes.fp8 if per_token_fp8 else torch.bfloat16
 
     def __call__(self, values, x_scale=None):
         self.calls.append((values, x_scale))
@@ -43,16 +49,16 @@ class _QuantAttention:
         return args[0]
 
 
-def _sparse_layer(*, fused: bool):
+def _sparse_layer(*, fused: bool, o_proj_per_token_fp8: bool = True):
     return SimpleNamespace(
         qkv_proj=_QKV(),
-        o_proj=_OProj(),
+        o_proj=_OProj(o_proj_per_token_fp8),
         attn=_QuantAttention(),
         q_size=4,
         kv_size=2,
         index_q_size=2,
         idx_head_dim=2,
-        fuse_sparse_pa_output_quant=fused,
+        sparse_pa_output_quant_supported=fused,
     )
 
 
@@ -131,3 +137,18 @@ def test_sparse_runner_forces_flydsl_and_preserves_token_scale_layout(monkeypatc
     assert captured["output_scale"].shape == (2, 1)
     assert captured["max_seqlen_q"] == 1
     assert captured["max_context_partition_num"] == 1
+
+
+def test_sparse_model_checks_o_proj_quant_at_forward_time():
+    # At construction o_proj is not yet per-token FP8 (online quantization runs at
+    # load time); the fused path must follow o_proj's state when forward runs.
+    layer = _sparse_layer(fused=True, o_proj_per_token_fp8=False)
+    packed = torch.randn(3, 12)
+    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), packed)
+    assert not layer.attn.quant_calls
+    assert len(layer.attn.plain_calls) == 1
+
+    layer.o_proj.quant_type = m3_model.QuantType.per_Token
+    layer.o_proj.params_dtype = m3_model.dtypes.fp8
+    MiniMaxM3SparseAttention.forward(layer, torch.arange(3), packed)
+    assert len(layer.attn.quant_calls) == 1
