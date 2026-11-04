@@ -5384,7 +5384,7 @@ class FusedMoE(torch.nn.Module):
         context = get_forward_context().context
         pcp = self.moe_parallel_config.pcp_merge and not context.is_dummy_run
         # SP marks its dummy and captured passes split too.
-        split = self.moe_parallel_config.pcp_merge and context.pcp_split
+        split = context.pcp_split and (pcp or sp_is_enabled())
         if split:
             rows = pack_routed_rows(
                 self.quant_method.routed_rows_wire,
