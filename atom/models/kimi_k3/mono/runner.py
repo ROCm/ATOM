@@ -34,8 +34,10 @@ returns it as the single pending and folds any two it was handed into K1's one
 """
 
 import logging
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import torch
 from aiter.dist.parallel_state import (
@@ -154,6 +156,9 @@ class K3MonoDecodeRunner:
     refusal every rank agrees on before anything collective."""
 
     max_rows = MAX_ROWS
+    # ``ATOM_MONO_MLA_POST`` (``_bind_mla_post``): none until bound
+    mla_post: Mapping = MappingProxyType({})
+    _mla_post_pending = None
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -515,7 +520,11 @@ class K3MonoDecodeRunner:
                 )
         else:
             post = keep = None
-            if plan.ffn_only and build.k2_keys[plan.layer_id].mla_post:
+            if (
+                plan.ffn_only
+                and plan.layer_id in self.mla_post
+                and build.k2_keys[plan.layer_id].mla_post
+            ):
                 core, prefix, post, keep = self._post_core(
                     plan, positions, prefix, blocks, add, add2
                 )
@@ -528,7 +537,9 @@ class K3MonoDecodeRunner:
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
-            out = (prefix, self._k2(build, plan, core, prefix, blocks, post), None)
+            k2_args = (build, plan, core, prefix, blocks)
+            ffn = self._k2(*k2_args) if post is None else self._k2(*k2_args, post)
+            out = (prefix, ffn, None)
             # ``keep`` holds what the launch was handed pointers to until now
             del keep
             if self._mla_post_pending is not None:
