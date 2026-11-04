@@ -519,7 +519,12 @@ def test_reset_clears_even_with_charged_in_flight():
 
 
 def test_dp_lb_strategies_constant():
-    assert DP_LB_STRATEGIES == ("round_robin", "least_requests", "least_tokens")
+    assert DP_LB_STRATEGIES == (
+        "round_robin",
+        "least_requests",
+        "least_tokens",
+        "prefix_spread",
+    )
     assert "least_request" not in DP_LB_STRATEGIES  # guards against typos
 
 
@@ -553,7 +558,7 @@ def test_decode_bookkeeping_does_not_wait_for_an_unrelated_router_lock():
 def _make_spread_mgr(n_ranks=2):
     from atom.model_engine.prefix_spread import PrefixSpreadRouter
 
-    mgr = _make_mgr(n_ranks)
+    mgr = _make_mgr(n_ranks, strategy="prefix_spread")
     mgr._prefix_spread = True
     mgr._prefix_router = PrefixSpreadRouter(32768, mgr._dp_route_counters)
     mgr._dp_route_counters.update(
@@ -659,12 +664,9 @@ class _SinkSocket:
         pass
 
 
-def test_prefix_spread_tracks_load_through_dispatch_under_round_robin():
-    """Prefix-spread scores ranks by in-flight load whatever the strategy, so
-    dispatch must charge it even when the fallback strategy is round_robin;
-    otherwise every load reads 0 and a busy owner never spills."""
+def test_prefix_spread_tracks_load_through_dispatch():
+    """Dispatch charges the in-flight load prefix spread scores ranks by."""
     mgr = _make_spread_mgr()
-    mgr._dp_lb_strategy = "round_robin"
     mgr.engine_core_identities = [b"e0", b"e1"]
     mgr.input_sockets = [_SinkSocket(), _SinkSocket()]
     first = _chain_seq(1, 100_000)
@@ -672,7 +674,7 @@ def test_prefix_spread_tracks_load_through_dispatch_under_round_robin():
     (owner,) = [r for r, n in enumerate(mgr._rank_reqs) if n]
     assert mgr._rank_tokens[owner] == 100_000
     mgr._mark_seq_prefill_complete(1)
-    mgr._rank_tokens[owner] = 200_000  # busy past the margin
+    mgr._rank_tokens[owner] = 200_000  # backlogged
     moved = _chain_seq(2, 110_000)
     mgr._dispatch_to_dp_ranks([moved])
     assert mgr._seq_load[2][0] != owner

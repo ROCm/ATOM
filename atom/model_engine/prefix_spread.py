@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Prefix-spread DP routing (`ATOM_DP_PREFIX_SPREAD=1`).
+"""Prefix-spread DP routing (`--dp-load-balance prefix_spread`).
 
 A request stays on the rank holding its prompt's prefix, unless that rank has a
 prefill backlog while another rank is about to run out of prefill work; then it
