@@ -11,8 +11,9 @@ milliseconds. `OffloadPrefetch.run` allocates the blocks and submits the load on
 any tick (HOLD or FIRE), wherever the request waits. Nothing else moves earlier:
 
 - the request keeps its place in `waiting`, and Phase 2 reaches it in arrival
-  order (a finished prefetch is not promoted, a load in flight does not push it
-  to the tail);
+  order (a load in flight does not push it to the tail, and a finished prefetch
+  is promoted only past a head blocked on KV blocks or parked-load slots --
+  `Scheduler._head_blocked_on_resources`);
 - it is not prefillable while its load is in flight, and once loaded it
   prefills only when a FIRE admits it;
 - no collective runs and no step type changes, so DP lockstep holds.
@@ -81,26 +82,6 @@ class OffloadPrefetch:
     def note_gone(self, seq_id: Any) -> None:
         """`seq_id` was scheduled for prefill, aborted or otherwise left."""
         self.entries.pop(seq_id, None)
-
-    def must_pass_head(self) -> bool:
-        """Whether finished prefetches must be let past the head of `waiting`.
-
-        Only when nothing is running (so nothing else will free blocks or
-        slots) and the first request that is not a prefetch is stuck: it
-        cannot allocate, or every parked-load slot is taken (by prefetches
-        that hold their slot until they run). In that state the GPU is idle, so
-        letting the finished prefetches run first costs the head nothing.
-        """
-        s = self.sched
-        if not self.entries or s.running:
-            return False
-        for seq in s.waiting:
-            if seq.id in self.entries or seq.status != SequenceStatus.WAITING:
-                continue
-            if s._num_parked_remote_kv >= s.max_num_seqs:
-                return True
-            return s.block_manager.can_allocate_memoized(seq) < 0
-        return False
 
     # -- the per-tick pass ----------------------------------------------------
 

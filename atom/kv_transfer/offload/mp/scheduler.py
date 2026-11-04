@@ -20,9 +20,7 @@ from atom.kv_transfer.offload._offload_common import validated_kv_role
 from atom.kv_transfer.offload.chunked_scheduler import (
     ChunkedOffloadSchedulerBase,
 )
-from atom.kv_transfer.offload.metadata import (
-    LMCacheOffloadMetadata,
-)
+from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata
 from atom.kv_transfer.offload.mp.deployment import (
     _extra_config,
     _make_scheduler_adapter,
@@ -461,8 +459,8 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
-            # No save can follow now. A late save re-created the worker-held
-            # token prefix after `request_finished` dropped it; drop it again.
+            # No save can follow now: drop the workers' copy of its shipped
+            # token prefix.
             self._drop_shipped_tokens(seq.id)
             try:
                 self._mp_adapter.end_session(_mp_session_id(self._config, seq.id))

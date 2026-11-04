@@ -62,6 +62,10 @@ _WEIGHT_SYNC_OWNED_CMDS = WEIGHT_UPDATE_UTILITY_CMDS | {
 # Valid values for Config.dp_load_balance / --dp-load-balance, and the default.
 # Single source of truth for argparse (choices + default) so the CLI flag and
 # the Config field can never diverge.
+DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
+DP_LB_DEFAULT = "least_requests"
+
+
 def _offload_tier_loads(config) -> bool:
     """Whether a rank can load a prefix it does not hold from an offload tier:
     some configured transport (`multi` expanded) is an offload backend whose
@@ -76,9 +80,6 @@ def _offload_tier_loads(config) -> bool:
             return True
     return False
 
-
-DP_LB_STRATEGIES = ("round_robin", "least_requests", "least_tokens", "prefix_spread")
-DP_LB_DEFAULT = "least_requests"
 
 # Engine sockets for a multi-node run cannot use IPC paths, and the two ends
 # must derive identical TCP ports without negotiating. Both compute this plan
@@ -1650,8 +1651,18 @@ class CoreManager:
         if self._prefix_router is not None:
             if seq_id in self._seq_prefilling:
                 # Left before its prefill completed: its prefix record is not
-                # real.
-                self._prefix_router.left_unprefilled(seq_id)
+                # real. A request that took over computing its part is now
+                # charged its whole prompt.
+                for heir, prompt in self._prefix_router.left_unprefilled(
+                    seq_id
+                ).items():
+                    held = self._seq_load.get(heir)
+                    if held is None or heir not in self._seq_prefilling:
+                        continue
+                    heir_rank, heir_reqs, heir_tokens = held
+                    if prompt > heir_tokens:
+                        self._rank_tokens[heir_rank] += prompt - heir_tokens
+                        self._seq_load[heir] = (heir_rank, heir_reqs, prompt)
             else:
                 self._prefix_router.prefill_complete(seq_id)
         self._seq_prefilling.discard(seq_id)
