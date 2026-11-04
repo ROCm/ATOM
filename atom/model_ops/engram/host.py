@@ -394,10 +394,11 @@ class EngramHost:
         heads is a contiguous row -- and byte -- range. A rank page-locks only
         that range (`host_memory.pin_rows`: copied into page-locked memory by
         default, registered in place with ATOM_ENGRAM_UVA_COPY=0): the full
-        table on every rank is what a TP job cannot afford. Under DP attention
-        every rank does hold the full table; unless ATOM_ENGRAM_UVA_COPY is
-        set it is then registered in place, so the node pins the checkpoint's
-        page cache once instead of one copy per rank.
+        table on every rank is what a TP job cannot afford, unless
+        ATOM_ENGRAM_UVA_FULL_TABLE asks for it. Under DP attention or that
+        switch every rank does hold the full table; unless ATOM_ENGRAM_UVA_COPY
+        is set it is then registered in place, so the node pins the
+        checkpoint's page cache once instead of one copy per rank.
 
         The answer is the GROUP's. An empty shard and a refused page-lock are
         both per-rank outcomes, and the device lookup ends in an all-gather: a
@@ -406,7 +407,8 @@ class EngramHost:
         from aiter.dist.parallel_state import get_tp_group
 
         group = get_tp_group()
-        shards = group.world_size
+        # ATOM_ENGRAM_UVA_FULL_TABLE: one shard, the whole tables, on every rank
+        shards = 1 if envs.ATOM_ENGRAM_UVA_FULL_TABLE else group.world_size
         if shards > num_hash_heads:
             logger.info(
                 "engram: UVA lookup needs at most one shard per hash head "
@@ -417,14 +419,17 @@ class EngramHost:
             return False
         self._tp_group = group if shards > 1 else None
         per = -(-num_hash_heads // shards)
-        self.head_start = group.rank_in_group * per
+        self.head_start = (group.rank_in_group if shards > 1 else 0) * per
         self.local_heads = min(per, max(0, num_hash_heads - self.head_start))
         self.total_heads = num_hash_heads
-        # DP attention: a one-GPU TP group per DP rank, each holding every
-        # head. The tables are then the same on every rank of the node, and
-        # registering the shared checkpoint mapping in place pins them once
-        # where a copy per rank would pin them once per rank.
-        self._shared_tables = shards == 1 and _dp_world_size() > 1
+        # DP attention (a one-GPU TP group per DP rank) or a full-table TP
+        # rank: each holds every head. The tables are then the same on every
+        # rank of the node, and registering the shared checkpoint mapping in
+        # place pins them once where a copy per rank would pin them once per
+        # rank.
+        self._shared_tables = shards == 1 and (
+            _dp_world_size() > 1 or envs.ATOM_ENGRAM_UVA_FULL_TABLE
+        )
         pinned = self._register_shard(prefetcher)
         if shards > 1:
             # Gloo, once, at load. MIN: one refusal is the group's answer.
@@ -445,7 +450,11 @@ class EngramHost:
             self.head_start + self.local_heads,
             num_hash_heads,
             pinned / 1024**3,
-            " (whole tables, shared by the DP ranks)" if self._shared_tables else "",
+            (
+                " (whole tables, registered in place once per node)"
+                if self._shared_tables
+                else ""
+            ),
         )
         return True
 

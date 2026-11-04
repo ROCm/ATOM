@@ -578,9 +578,13 @@ class V41MonoDecodeRunner:
         model.begin_forward(hidden, None)
         # Engram staging's side-stream all-gather spins on CUs until every
         # rank joins it: beside a kernel that needs every CU resident it
-        # deadlocks, so it ends before the first one
+        # deadlocks, so it ends before the first one. A full-table lookup
+        # (ATOM_ENGRAM_UVA_FULL_TABLE) waits on no rank and runs beside them.
         rows_staged = metadata.engram_embeddings
-        if getattr(rows_staged, "stage", None) is not None:
+        staging = getattr(rows_staged, "staging", None)
+        if getattr(rows_staged, "stage", None) is not None and (
+            staging is None or staging.collective is not None
+        ):
             rows_staged.join()
         write_step_meta(
             step,

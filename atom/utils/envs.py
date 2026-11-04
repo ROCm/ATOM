@@ -1229,6 +1229,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENGRAM_CACHE_DIR": lambda: os.getenv(
         "ATOM_ENGRAM_CACHE_DIR", str(Path.home() / ".cache" / "atom" / "engram")
     ),
+    # Every TP rank looks every hash head up itself from the whole tables,
+    # registered in place once per node as under DP attention (the checkpoint
+    # mapping, ~183 GiB for V4.1), instead of its head shard reassembled by a
+    # TP all-gather. The lookup then waits on no other rank: a forward whose
+    # kernels need every CU resident (gfx1250 mono decode) can run beside it
+    # instead of waiting it out before its first layer.
+    "ATOM_ENGRAM_UVA_FULL_TABLE": lambda: os.getenv("ATOM_ENGRAM_UVA_FULL_TABLE", "0")
+    == "1",
     # Overlap hash/UVA lookup and TP reassembly with early layers, using private
     # IPC state where supported. Requires UVA; set 0 to disable.
     "ATOM_ENGRAM_OVERLAP": lambda: os.getenv("ATOM_ENGRAM_OVERLAP", "1") == "1",
