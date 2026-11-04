@@ -162,6 +162,7 @@ class Glm5MonoKernel:
         dcp_size: int = 1,
         native_fp4_mfma: bool = False,
         rope_dtype: str = "fp32",
+        timeline: bool = False,
     ):
         if W.config not in (GLM5_CONFIG, glm5_tp_config(4)):
             raise ValueError(f"unsupported GLM-5 shard configuration: {W.config}")
@@ -288,6 +289,15 @@ class Glm5MonoKernel:
             split_head_merge=W.heads // MONO_WAVES > 1,
         )
         n_tasks = sum(n for _, n in self.stages)
+        # debug: every task's s_memrealtime stamps, [task][TL_COLS] in
+        # ``stages`` order (``build_glm5_monokernel(timeline=True)``)
+        self.timeline = (
+            torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=torch.cuda.current_device())
+            if timeline
+            else None
+        )
+        if timeline and with_indexer:
+            raise ValueError("the timeline build is the external-indexer kernel's")
         if with_indexer:
             index_tensors = dict(t, **self.packed)
             self.index_params = torch.tensor(
@@ -390,6 +400,7 @@ class Glm5MonoKernel:
                 else W.t["w_uv"].shape[0] // W.t["s_uv"].shape[0]
             ),
             indexer_cp=indexer_cp,
+            timeline=timeline,
         )
 
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
@@ -583,7 +594,11 @@ class Glm5MonoKernel:
                 p(self.scratch),
                 self.sym,
                 p(self.peers),
-                (p(self.index_params) if self.with_indexer else 0),
+                (
+                    p(self.index_params)
+                    if self.with_indexer
+                    else (0 if self.timeline is None else p(self.timeline))
+                ),
                 p(self.step),
                 self.rank,
                 layer,

@@ -93,6 +93,7 @@ class _GlmLayerOp:
         runtime,
         launches_per_step: int,
         dcp_size: int = 1,
+        timeline: bool = False,
     ) -> None:
         from atom.models.glm52.mono.kernels.op import Glm5MonoKernel
 
@@ -114,6 +115,7 @@ class _GlmLayerOp:
             runtime=runtime,
             native_fp4_mfma=True,
             dcp_size=dcp_size,
+            timeline=timeline,
             # ``Glm5MonoKernel`` defaults to FP32 RoPE tables and validates the
             # dtype it is handed (``glm/op.py``); the tables ATOM passes to
             # ``forward`` are ``attn.rotary_emb.{cos,sin}_cache``, which are
@@ -321,6 +323,9 @@ class Glm52MonoRunner:
         self._lm = causal_lm
         self._atom_config = atom_config
         self._dcp = atom_config.decode_context_parallel_size
+        # debug: per-task stamps of every layer's kernel (``ATOM_MONO_TIMELINE``)
+        self._tl_prefix = envs.ATOM_MONO_TIMELINE
+        self._tl_steps: dict[int, int] = {}
         spec = atom_config.speculative_config
         self._query_length = 1 if spec is None else spec.num_speculative_tokens + 1
         is_mtp = spec is not None and spec.method == "mtp"
@@ -696,6 +701,7 @@ class Glm52MonoRunner:
                         runtime,
                         launches_per_step=base_launches,
                         dcp_size=self._dcp,
+                        timeline=bool(self._tl_prefix),
                     )
                     if runtime is None:
                         runtime = owned.op
@@ -931,6 +937,8 @@ class Glm52MonoRunner:
                 "the peer-buffer double buffer is no longer alternating."
             )
         self._announce(step_chunk)
+        if self._tl_prefix and not torch.cuda.is_current_stream_capturing():
+            self._save_timeline(step_chunk)
         state = hidden if residual is None else hidden + residual
         from atom.model_ops.layernorm import rmsnorm2d_fwd_
 
@@ -939,6 +947,22 @@ class Glm52MonoRunner:
             model.norm.weight,
             model.norm.eps,
             GLM5_CONFIG.hidden,
+        )
+
+    def _save_timeline(self, width: int) -> None:
+        """Steps 20..24 of a width: every layer's per-task stamps (int64
+        [task][TL_COLS], s_memrealtime at 100 MHz) and the stage list."""
+        seen = self._tl_steps.get(width, 0)
+        self._tl_steps[width] = seen + 1
+        if not 20 <= seen < 25:
+            return
+        ops = {lid: owned.op for (lid, w), owned in self._ops.items() if w == width}
+        torch.save(
+            {
+                "stages": next(iter(ops.values())).stages,
+                "stamps": {lid: op.timeline.cpu() for lid, op in ops.items()},
+            },
+            f"{self._tl_prefix}_r{self.rank}_s{width}_{seen - 20}.pt",
         )
 
     def close(self) -> None:

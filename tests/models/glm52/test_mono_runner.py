@@ -15,6 +15,7 @@ def _bare_runner():
     """A runner with only the fields ``prepare`` reads: no model, no GPU."""
     runner = object.__new__(Glm52MonoRunner)
     runner._dcp = 1
+    runner._tl_prefix = None
     runner._ops = {}
     runner._refused = set()
     runner._query_length = 5
