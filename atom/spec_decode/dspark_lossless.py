@@ -227,7 +227,6 @@ class DSparkLossless:
         group,
         *,
         drafts_verifiable: bool,
-        step: int,
     ) -> None:
         """Stage this step's draft inputs and both q row bases into the host
         buffers and claim their counts in ``group``, the `sampling`
@@ -236,7 +235,6 @@ class DSparkLossless:
             batch,
             bs,
             drafts_verifiable=drafts_verifiable,
-            step=step,
         )
         counts, at = group.counts, group.indices
         counts[at["draft_seed"]] = rows.seed

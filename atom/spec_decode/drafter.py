@@ -363,7 +363,7 @@ class Drafter(abc.ABC):
         flavor's `_propose`. A template, so no flavor can skip the step before
         it."""
         if self.lossless is not None:
-            self.lossless.staging.consume(self.runner.forward_step)
+            self.lossless.staging.consume()
         return self._propose(
             target_token_ids,
             target_positions,

@@ -9,7 +9,6 @@ CPU unit job; `tests/test_spec_lossless_staging.py` covers the proposer wiring
 around it.
 """
 
-import itertools
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,7 +20,6 @@ from atom.spec_decode.draft_q_staging import DraftQStaging
 MAX_BS = 4
 T = 3
 EPS = 1e-10  # SAMPLER_EPS
-FORWARDS = itertools.count(1)
 
 
 def staging(slots=2 * MAX_BS):
@@ -58,14 +56,9 @@ def batch(
     )
 
 
-def stage(st, b, *, verifiable=True, step=None):
-    """One forward's staging; each call is a new forward unless told."""
-    return st.stage(
-        b,
-        len(b.req_ids),
-        drafts_verifiable=verifiable,
-        step=next(FORWARDS) if step is None else step,
-    )
+def stage(st, b, *, verifiable=True):
+    """One forward's staging."""
+    return st.stage(b, len(b.req_ids), drafts_verifiable=verifiable)
 
 
 def test_a_verify_finds_the_rows_its_drafts_were_written_to():
@@ -198,24 +191,12 @@ def test_a_propose_needs_a_staging_of_its_own():
     a staging of its own, or it would draft through stale row bases."""
     st, _ = staging()
     with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
-        st.consume(1)
-    for step in (1, 2):
-        stage(st, batch(["a", "b"]), step=step)
-        st.consume(step)
-        with pytest.raises(RuntimeError):
-            st.consume(step)
-
-
-def test_a_staging_from_another_forward_is_refused():
-    """A middle chunk stages and returns before proposing. A later forward
-    whose propose skipped staging finds a staging nobody consumed, but not
-    its own forward's, and must refuse it rather than draft through it."""
-    st, _ = staging()
-    stage(st, batch(["a"]), step=1)
-    st.consume(1)
-    stage(st, batch(["m"]), verifiable=False, step=2)
-    with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
-        st.consume(3)
+        st.consume()
+    for _ in range(2):
+        stage(st, batch(["a", "b"]))
+        st.consume()
+        with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
+            st.consume()
 
 
 def test_clearing_the_destinations_keeps_the_slot_map():

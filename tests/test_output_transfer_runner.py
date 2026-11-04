@@ -247,7 +247,6 @@ def test_a_lossless_draft_gets_every_rows_filters_published(ks, ps):
         forward_vars=buffers,
         drafter=SimpleNamespace(lossless=SimpleNamespace(stage=mock.Mock())),
         _is_pure_middle_chunk=lambda batch: False,
-        forward_step=0,
     )
     batch = SimpleNamespace(
         total_seqs_num=bs,

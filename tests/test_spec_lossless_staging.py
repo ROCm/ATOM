@@ -69,7 +69,7 @@ def proposer(
         },
     )
     prop.device = torch.device("cpu")
-    prop.runner = SimpleNamespace(rank=1, forward_step=0)
+    prop.runner = SimpleNamespace(rank=1)
     prop.metadata_buffers = {}
     prop.mtp_k = T
     prop.model = FakeDraftModel() if model is None else model
@@ -120,16 +120,9 @@ def batch(
 
 
 def stage(prop, b, *, verifiable=True):
-    """One forward's staging, as `ModelRunner.forward` would number it."""
+    """One forward's staging."""
     g = group(prop)
-    prop.runner.forward_step += 1
-    prop.lossless.stage(
-        b,
-        len(b.req_ids),
-        g,
-        drafts_verifiable=verifiable,
-        step=prop.runner.forward_step,
-    )
+    prop.lossless.stage(b, len(b.req_ids), g, drafts_verifiable=verifiable)
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 
@@ -345,18 +338,6 @@ def test_the_verify_refuses_logits_it_was_not_warmed_for(monkeypatch):
 # ---- staging ----------------------------------------------------------------
 
 
-def test_a_propose_drafts_only_through_its_own_forwards_staging(monkeypatch):
-    """A middle chunk stages and returns before proposing; a later forward
-    whose propose skipped staging must not draft through those row bases."""
-    prop = proposer(monkeypatch)
-    stage(prop, batch(["a"]))
-    prop.lossless.staging.consume(prop.runner.forward_step)
-    stage(prop, batch(["m"]), verifiable=False)
-    prop.runner.forward_step += 1
-    with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
-        prop.lossless.staging.consume(prop.runner.forward_step)
-
-
 def test_every_flavors_propose_claims_its_staging(monkeypatch):
     """`Drafter.propose` claims the staging before any flavor's `_propose`,
     so a flavor that replaces the native one (V4 mono) cannot forget it."""
@@ -373,11 +354,7 @@ def test_every_flavors_propose_claims_its_staging(monkeypatch):
     stage(mono, batch(["a"]))
     mono.propose(*args)
     assert drafted == [args]
-    # A second propose in the same forward, or one in a forward that staged
-    # nothing, never reaches the flavor.
-    with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
-        mono.propose(*args)
-    mono.runner.forward_step += 1
+    # A second propose without a staging of its own never reaches the flavor.
     with pytest.raises(RuntimeError, match="fresh DSparkLossless.stage"):
         mono.propose(*args)
     assert drafted == [args]

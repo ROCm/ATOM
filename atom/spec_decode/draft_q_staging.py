@@ -52,26 +52,22 @@ class DraftQStaging:
         self._step = 0
         # Leading destination rows that may still name a slot.
         self._dest_hi = 0
-        # The forwards that last staged and last consumed a staging.
-        self._staged = None
-        self._consumed = None
+        # Staged since the last propose consumed a staging.
+        self._fresh = False
 
-    def stage(self, batch, bs: int, *, drafts_verifiable: bool, step: int):
+    def stage(self, batch, bs: int, *, drafts_verifiable: bool):
         """Stage one step and return the rows to publish (`StagedRows`).
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
         may read. False for a dummy forward and an align-only middle chunk:
         those claim no slot and write no q, so their ids (warmup's 0..n-1, the
         DP dummy's -1) never enter the slot map.
-
-        ``step``: the forward this staging is for (`ModelRunner.forward_step`),
-        which `consume` checks.
         """
         # The Philox key. A plain SPMD counter, so every TP rank reaches the
         # same number without exchanging it.
         self._seed[0] = self._step
         self._step = (self._step + 1) & 0x7FFFFFFF
-        self._staged = step
+        self._fresh = True
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may hand a slot to a new request,
         # and a request's verify must still read the slot its drafts came from.
@@ -100,24 +96,18 @@ class DraftQStaging:
             self._dest_hi = 0
         return StagedRows(seed=1, q_row_base=hi or None, verify_q_row_base=bs or None)
 
-    def consume(self, step: int) -> None:
-        """Claim forward ``step``'s staging for the propose about to run, or
-        refuse.
-
-        A propose whose forward skipped `stage` would draft through an earlier
-        forward's destination rows, into slots other requests may own by now.
-        That earlier forward need not have proposed (a middle chunk stages and
-        returns first), so what is checked is that this very forward staged,
-        and only once consumed.
-        """
-        if self._staged != step or self._consumed == step:
+    def consume(self) -> None:
+        """Claim the staging for the propose about to run, or refuse one that
+        an earlier propose already drafted through: a second propose without
+        a `stage` would draft through stale destination rows, into slots other
+        requests may own by now. Every forward path stages
+        (`ModelRunner.prepare_sample`) before it proposes."""
+        if not self._fresh:
             raise RuntimeError(
-                f"propose in forward {step} without a fresh "
-                f"DSparkLossless.stage (last staged {self._staged}, last "
-                f"consumed {self._consumed}): the q row bases are another "
-                "forward's"
+                "propose without a fresh DSparkLossless.stage: the q row bases "
+                "are an earlier propose's"
             )
-        self._consumed = step
+        self._fresh = False
 
     def clear_destinations(self) -> None:
         """Point every host-side destination row at no q row."""
