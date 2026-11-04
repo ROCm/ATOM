@@ -97,7 +97,7 @@ def chip_info(monkeypatch):
 def check(**kw):
     args = {
         "arches": M3,
-        "index_cache_dtype": "fp4x2",
+        "index_cache_dtype": "fp4",
         "kv_mxfp4": True,
         "block_size": 128,
         "plugin_mode": False,
@@ -113,6 +113,9 @@ def test_refusals_name_what_is_wrong():
         check(plugin_mode=True)
     with pytest.raises(ValueError, match="128 tokens"):
         check(block_size=16)
+    # the MXFP4 index alone, MiniMax-M3's own layout, is held to the same
+    with pytest.raises(ValueError, match="128 tokens"):
+        check(kv_mxfp4=False, block_size=16)
 
 
 def test_only_gfx950_is_served(chip_info):
@@ -131,39 +134,33 @@ def test_the_mxfp4_kv_needs_the_tail_block_selected():
 def test_the_baselines_are_never_refused():
     # Neither MXFP4 switch on: nothing to check, whatever else is set.
     check(arches=["LlamaForCausalLM"], index_cache_dtype="fp8", kv_mxfp4=False)
-    check(index_cache_dtype="fp4", kv_mxfp4=False, block_size=16)
+    # another model's fp4 index is its own layout, not MiniMax-M3's
+    check(arches=["DeepseekV4ForCausalLM"], kv_mxfp4=False, block_size=64)
 
 
 @pytest.mark.parametrize(
-    "kv, flag, index, want",
+    "kv, flag, want",
     [
-        ("fp4", False, None, ("fp8", True, None)),
-        ("fp4", False, "fp4", ("fp8", True, "fp4x2")),
-        ("bf16", False, "fp4", ("bf16", False, "fp4x2")),
-        ("fp8", True, "fp4x2", ("fp8", True, "fp4x2")),
-        ("fp8", False, "fp8", ("fp8", False, "fp8")),
-        ("bf16", False, None, ("bf16", False, None)),
+        ("fp4", False, ("fp8", True)),
+        ("fp8", True, ("fp8", True)),
+        ("fp8", False, ("fp8", False)),
+        ("bf16", False, ("bf16", False)),
     ],
 )
-def test_m3_fp4_requests_become_the_internal_mxfp4_ones(kv, flag, index, want):
-    assert _resolve_fp4_caches(kv, flag, index, is_m3=True, is_v41=False) == want
+def test_m3_fp4_kv_becomes_the_internal_mxfp4_one(kv, flag, want):
+    assert _resolve_fp4_caches(kv, flag, is_m3=True, is_v41=False) == want
 
 
-def test_other_models_keep_fp4_index_and_refuse_a_fp4_kv():
-    assert _resolve_fp4_caches("fp8", False, "fp4", is_m3=False, is_v41=False) == (
+def test_other_models_keep_their_kv_and_refuse_a_fp4_one():
+    assert _resolve_fp4_caches("fp8", False, is_m3=False, is_v41=False) == (
         "fp8",
         False,
-        "fp4",
     )
-    assert _resolve_fp4_caches("fp4", False, "fp4", is_m3=False, is_v41=True) == (
-        "fp4",
-        False,
-        "fp4",
-    )
+    assert _resolve_fp4_caches("fp4", False, is_m3=False, is_v41=True) == ("fp4", False)
     with pytest.raises(ValueError, match="MiniMax-M3 only"):
-        _resolve_fp4_caches("fp4", False, None, is_m3=False, is_v41=False)
+        _resolve_fp4_caches("fp4", False, is_m3=False, is_v41=False)
 
 
 def test_a_kv_mxfp4_flag_over_a_bf16_cache_is_refused():
     with pytest.raises(ValueError, match="kv_cache_dtype fp8"):
-        _resolve_fp4_caches("bf16", True, None, is_m3=True, is_v41=False)
+        _resolve_fp4_caches("bf16", True, is_m3=True, is_v41=False)

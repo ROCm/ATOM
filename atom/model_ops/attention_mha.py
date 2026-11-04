@@ -1396,11 +1396,11 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         fused_v_scale = v_scale if is_fp8 else None
         fused_index_cache_dtype = (
             self.index_cache_dtype
-            if self.index_cache_dtype in ("fp8", "fp4x2")
+            if self.index_cache_dtype in ("fp8", "fp4")
             and not self.skip_index_topk  # no index branch
             else "auto"
         )
-        if fused_index_cache_dtype == "fp4x2":  # the AITER writer's name for it
+        if fused_index_cache_dtype == "fp4":  # the AITER writer's name for it
             fused_index_cache_dtype = "mxfp4"
 
         if self.kv_mxfp4:
@@ -1412,7 +1412,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # e4m3 (cast as is) for the MXFP4 index's fp8-q scorer; the top-k reuse key
         # records it, so a reusing layer finds what a producing layer stored
         index_q_dtype = (
-            torch.float8_e4m3fn if self.index_cache_dtype == "fp4x2" else qkv.dtype
+            torch.float8_e4m3fn if self.index_cache_dtype == "fp4" else qkv.dtype
         )
 
         if self.skip_index_topk and not self.kv_mxfp4:
@@ -1635,7 +1635,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         kw = {}
         if self.kv_mxfp4:
             kw.update(pages_per_block=1, block_page_stride=1)
-        if self.index_cache_dtype == "fp4x2":
+        if self.index_cache_dtype == "fp4":
             kw["index_mxfp4"] = True
             if decode:
                 kw["index_score_work_map"] = sparse_metadata.index_score_work_map

@@ -222,13 +222,13 @@ def _m3(monkeypatch, **overrides):
         # KV-only: the index default follows the fp8 storage dtype.
         ("fp4", None, ("fp8", True, "fp8")),
         # index-only: KV stays as asked.
-        ("bf16", "fp4", ("bf16", False, "fp4x2")),
-        ("fp4", "fp4", ("fp8", True, "fp4x2")),
+        ("bf16", "fp4", ("bf16", False, "fp4")),
+        ("fp4", "fp4", ("fp8", True, "fp4")),
         ("fp4", "fp8", ("fp8", True, "fp8")),
         ("fp8", None, ("fp8", False, "fp8")),
     ],
 )
-def test_m3_public_fp4_is_the_internal_fp4x2(monkeypatch, kv, index, want):
+def test_m3_public_fp4_keeps_the_index_and_maps_the_kv(monkeypatch, kv, index, want):
     config = _m3(monkeypatch, kv_cache_dtype=kv, index_cache_dtype=index)
 
     assert (

@@ -368,11 +368,7 @@ class _FakeAiterDtypes:
 
     @property
     def d_dtypes(self):
-        return {
-            "fp8": _AITER_FP8[self._state.gfx],
-            "bf16": torch.bfloat16,
-            "fp4x2": getattr(torch, "float4_e2m1fn_x2", torch.uint8),
-        }
+        return {"fp8": _AITER_FP8[self._state.gfx], "bf16": torch.bfloat16}
 
 
 @pytest.fixture(autouse=True)
@@ -821,10 +817,6 @@ def test_namespace_fingerprints_the_formats_the_gpu_stores(aiter_arch):
     assert keys.kv_storage_formats(_config(index_cache_dtype="fp4"))["index_cache"] == (
         "fp4"
     )
-    # MiniMax-M3's MXFP4 index page: named, not the torch build's fp4x2 dtype
-    assert keys.kv_storage_formats(_config(index_cache_dtype="fp4x2"))[
-        "index_cache"
-    ] == ("fp4x2")
     bf16_mi355 = keys.store_namespace(_config(kv_cache_dtype="bf16"), CHUNK)
     aiter_arch.gfx = "gfx942"
     # "fp8" is e4m3fnuz here: one byte either way, so only the namespace

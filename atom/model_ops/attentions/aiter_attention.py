@@ -44,10 +44,10 @@ class _IndexCacheSpec(NamedTuple):
 
     rows: int
     dim: int
-    # fp4x2 is `--index-cache-dtype fp4`: one 8704 B uint8 page of data and scales
-    # a block (minimax_m3/kv_mxfp4), 68 B a token. The dtype is only its label,
-    # and is uint8 for fp8 too where torch lacks float4, so the branches below key
-    # on the config string.
+    # `--index-cache-dtype fp4`: one 8704 B uint8 page of data and scales a block
+    # (minimax_m3/kv_mxfp4), 68 B a token. The dtype is only aiter's fp4x2 name
+    # for it, and is uint8 for fp8 too where torch lacks float4, so the branches
+    # below key on the config string.
     dtype: torch.dtype
 
     def __str__(self) -> str:
@@ -79,10 +79,12 @@ def _resolve_index_cache_dtype(config) -> torch.dtype:
     index_cache_dtype = getattr(config, "index_cache_dtype", None)
     if index_cache_dtype is None:
         index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
-    if index_cache_dtype in ("bf16", "fp8", "fp4x2"):
+    if index_cache_dtype in ("bf16", "fp8"):
         return dtypes.d_dtypes[index_cache_dtype]
+    if index_cache_dtype == "fp4":  # aiter's name for it
+        return dtypes.d_dtypes["fp4x2"]
     raise ValueError(
-        "index_cache_dtype must be 'bf16', 'fp8' or 'fp4x2', "
+        "index_cache_dtype must be 'bf16', 'fp8' or 'fp4', "
         f"got {index_cache_dtype!r}"
     )
 
@@ -307,7 +309,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         self._index_score_max_block = 0
         if (
             self._has_sparse_attention
-            and getattr(self.model_runner.config, "index_cache_dtype", None) == "fp4x2"
+            and getattr(self.model_runner.config, "index_cache_dtype", None) == "fp4"
         ):
             from atom.model_ops.minimax_m3.index_mxfp4 import (
                 index_score_buffer,
@@ -711,7 +713,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         spec = self._index_cache_spec()
         if spec is None:
             return ()
-        if self.model_runner.config.index_cache_dtype == "fp4x2":
+        if self.model_runner.config.index_cache_dtype == "fp4":
             from atom.model_ops.minimax_m3.kv_mxfp4 import HEAD_DIM, PAGE_BYTES
 
             if spec.dim != HEAD_DIM or entry_tokens != self.block_size:
@@ -799,7 +801,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             pool = next(p for p in self.kv_pools.values() if p.extra_fields)
             spec = self._index_cache_spec()
             row = self.pool_rows[INDEX_ROWS][module]
-            if runner.config.index_cache_dtype == "fp4x2":
+            if runner.config.index_cache_dtype == "fp4":
                 from atom.model_ops.minimax_m3.kv_mxfp4 import PAGE_BYTES
 
                 module.impl.index_cache = pool.field_view(

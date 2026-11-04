@@ -1923,29 +1923,25 @@ def qrep_for_step(
 def _resolve_fp4_caches(
     kv_cache_dtype: str,
     kv_mxfp4: bool,
-    index_cache_dtype: str | None,
     *,
     is_m3: bool,
     is_v41: bool,
-) -> tuple[str, bool, str | None]:
-    """The public ``fp4`` cache values as this model's internal formats.
+) -> tuple[str, bool]:
+    """The public ``fp4`` KV cache value as this model's internal format.
 
-    ``fp4`` names a different layout per model (DeepSeek-V4 / GLM index pages
-    are not MiniMax-M3's), so only MiniMax-M3 maps it: KV ``fp4`` -> (fp8, True)
-    -- the layers that are not MXFP4 keep an fp8 cache, and everything keyed on
-    the storage dtype reads fp8 -- and index ``fp4`` -> ``fp4x2``. Other models
-    keep their ``fp4`` index; a KV ``fp4`` is DeepSeek-V4.1's own, else refused.
+    Only MiniMax-M3 maps it: KV ``fp4`` -> (fp8, True) -- the layers that are
+    not MXFP4 keep an fp8 cache, and everything keyed on the storage dtype reads
+    fp8. A KV ``fp4`` is DeepSeek-V4.1's own, else refused. The index ``fp4`` is
+    left as it is: its layout is per model, told apart by the architecture.
     """
     if kv_mxfp4 and kv_cache_dtype != "fp8":
         raise ValueError(f"kv_mxfp4 needs kv_cache_dtype fp8, got {kv_cache_dtype!r}")
     if is_m3:
         if kv_cache_dtype == "fp4":
             kv_cache_dtype, kv_mxfp4 = "fp8", True
-        if index_cache_dtype == "fp4":
-            index_cache_dtype = "fp4x2"
     elif kv_cache_dtype == "fp4" and not is_v41:
         raise ValueError("--kv-cache-dtype fp4 is supported by MiniMax-M3 only")
-    return kv_cache_dtype, kv_mxfp4, index_cache_dtype
+    return kv_cache_dtype, kv_mxfp4
 
 
 def _check_m3_mxfp4(
@@ -1957,12 +1953,13 @@ def _check_m3_mxfp4(
     sparse_local_block: int,
 ) -> None:
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
-    than in the first forward (``--kv-cache-dtype fp4``, ``--index-cache-dtype
-    fp4``, which ``_resolve_fp4_caches`` maps to ``kv_mxfp4`` / ``"fp4x2"``)."""
-    index_mxfp4 = index_cache_dtype == "fp4x2"
-    if not (kv_mxfp4 or index_mxfp4):
+    than in the first forward (``--kv-cache-dtype fp4``, which
+    ``_resolve_fp4_caches`` maps to ``kv_mxfp4``, and ``--index-cache-dtype fp4``,
+    MiniMax-M3's own layout: other models' ``fp4`` index is not checked here)."""
+    is_m3 = any("MiniMaxM3" in str(a) for a in arches)
+    if not (kv_mxfp4 or (is_m3 and index_cache_dtype == "fp4")):
         return
-    if not any("MiniMaxM3" in str(a) for a in arches):
+    if not is_m3:
         raise ValueError("MXFP4 KV / index caches are MiniMax-M3 only")
     if plugin_mode:
         raise ValueError(
@@ -2739,14 +2736,11 @@ class Config:
         )
         is_deepseek_v41 = self.hf_config.model_type == "deepseek_v41_text"
         # Before the CP fallback and the index default, which read these.
-        self.kv_cache_dtype, self.kv_mxfp4, self.index_cache_dtype = (
-            _resolve_fp4_caches(
-                self.kv_cache_dtype,
-                self.kv_mxfp4,
-                self.index_cache_dtype,
-                is_m3=any("MiniMaxM3" in str(a) for a in arches),
-                is_v41=is_deepseek_v41,
-            )
+        self.kv_cache_dtype, self.kv_mxfp4 = _resolve_fp4_caches(
+            self.kv_cache_dtype,
+            self.kv_mxfp4,
+            is_m3=any("MiniMaxM3" in str(a) for a in arches),
+            is_v41=is_deepseek_v41,
         )
         if is_deepseek_v4:
             v4_block_size = 256
@@ -2825,7 +2819,7 @@ class Config:
                 is_plugin_mode(),
             )
             if indexer_cp_off is None and (
-                self.index_cache_dtype == "fp4x2" or self.kv_mxfp4
+                self.index_cache_dtype == "fp4" or self.kv_mxfp4
             ):
                 indexer_cp_off = "the MXFP4 caches are not wired to the CP scorer"
             if indexer_cp_off is not None:
