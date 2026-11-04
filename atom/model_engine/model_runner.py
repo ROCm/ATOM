@@ -4018,8 +4018,8 @@ class ModelRunner:
            fit in free GPU memory (adapts to GPU size / config, no hardcoded
            cap). DP amplifies the retained per-token footprint (MoE all_gather
            ~dp_size x tokens); scale the slope by dp**0.6 to match
-           _estimate_cudagraph_overhead. Free is min-reduced across the DP, TP
-           and PCP groups so all ranks skip the same set.
+           _estimate_cudagraph_overhead. Free is min-reduced across the DP and
+           PCP groups so all ranks skip the same set.
         """
         dp_size = self.config.parallel_config.data_parallel_size
         if dp_size > 1 and hasattr(self, "drafter"):
@@ -4042,7 +4042,7 @@ class ModelRunner:
         if dp_size > 1:
             slope *= float(dp_size) ** 0.6
         free = torch.cuda.mem_get_info()[0]
-        for group in (get_dp_group(), get_tp_group(), get_pcp_group()):
+        for group in (get_dp_group(), get_pcp_group()):
             if group.world_size > 1:
                 free = group_min(free, group.cpu_group)
         need = slope * running_tokens * 1.25 + (4 << 30)
@@ -4308,8 +4308,10 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:running_tokens]
                     )
-                    model_ids = input_ids[:running_tokens]
-                    outputs[:running_tokens] = self.model(model_ids, model_positions)
+                    model_output = self.model(
+                        input_ids[:running_tokens], model_positions
+                    )
+                    outputs[:running_tokens] = model_output
                     if logits_in_graph:
                         self.model.compute_logits(outputs[:running_tokens])
 
@@ -4319,7 +4321,7 @@ class ModelRunner:
                         # its rows replays, whatever its requests.
                         fc = get_forward_context()
                         fc.tr_graph = "record"
-                        self.model(model_ids, model_positions)
+                        self.model(input_ids[:running_tokens], model_positions)
                         fc.tr_graph = None
                         if prof is not None:
                             # Drain before closing the window so this bs's
@@ -4338,10 +4340,8 @@ class ModelRunner:
                     ):
                         # The drafter's aux capture hook runs inside the
                         # forward and writes its own buffers (in-graph).
-                        def full_forward(
-                            n=running_tokens, ids=model_ids, pos=model_positions
-                        ):
-                            outputs[:n] = self.model(ids, pos)
+                        def full_forward(n=running_tokens, pos=model_positions):
+                            outputs[:n] = self.model(input_ids[:n], pos)
                             if logits_in_graph:
                                 return self.model.compute_logits(outputs[:n])
                             return None

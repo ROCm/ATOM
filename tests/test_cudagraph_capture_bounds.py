@@ -97,12 +97,10 @@ def test_split_rows_graph_ladder_covers_every_schedulable_batch(
     assert len({-(-r // sp) for r in ladder}) == len(ladder)
 
 
-def test_memory_guard_skips_a_bucket_any_tp_or_pcp_rank_cannot_fit(
-    monkeypatch, model_runner
-):
+def test_memory_guard_skips_a_bucket_any_pcp_rank_cannot_fit(monkeypatch, model_runner):
     # A rank with ample free memory must still skip the bucket a peer skips,
     # or the peers' captured collectives pair mismatched buckets.
-    groups = {"get_dp_group": 1, "get_tp_group": 1, "get_pcp_group": 4}
+    groups = {"get_dp_group": 1, "get_pcp_group": 4}
     for name, size in groups.items():
         group = SimpleNamespace(world_size=size, cpu_group=name)
         monkeypatch.setattr(model_runner, name, lambda group=group: group)
