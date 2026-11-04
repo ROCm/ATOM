@@ -178,11 +178,19 @@ def check_no_self_trigger():
               f"{[p.name for p in miss]}")
         return 0
     wf = WORKFLOW.read_text(encoding="utf-8")
-    if not re.search(r"github\.event\.comment\.user\.login != 'rocm-atom-bot'", wf):
+    # Assert the property, not one spelling of it: EVERY account this bot has spoken as
+    # must be excluded. Pinning a single login is what made swapping the account unsafe --
+    # the guard would still name the old one, the token would belong to the new one, and
+    # each card the bot posted would start a run that posts a card.
+    import _identity
+
+    unguarded = [who for who in _identity.KNOWN if who not in wf]
+    if unguarded or "vars.ATOM_BOT_LOGIN" not in wf:
         print("\u274c the gate does not exclude the bot's own comments; every notice it posts "
-              "will start a run that competes with real requests")
+              "will start a run that competes with real requests"
+              + (f" (missing: {unguarded})" if unguarded else " (no vars.ATOM_BOT_LOGIN)"))
         return 1
-    print("\u2705 the gate excludes the bot's own comments")
+    print("\u2705 the gate excludes every identity this bot has spoken as")
     return 0
 
 

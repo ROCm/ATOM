@@ -1,4 +1,4 @@
-"""Publish gate (phase-2): post a collected report to the PR, as rocm-atom-bot, under the rules.
+"""Publish gate (phase-2): post a collected report to the PR, as the bot (see _identity), under the rules.
 
 The card goes up as a PR *review* (`event: "COMMENT"`, never APPROVE/REQUEST_CHANGES -- this
 bot is advisory and does not gate merges), with the findings that can be anchored attached to
@@ -29,10 +29,10 @@ Rules (after run_one, given 7 green gates):
   - otherwise (✅ / ⚠️ / notes only) → POST: post card.md as a PR review
   - already posted (same head SHA, by marker) → SKIP: do not repost
   - PR already merged/closed         → SKIP: a post-merge follow-up should not go as a PR review
-Publishing identity = the owner of ATOM_BOT_TOKEN(_FILE) (rocm-atom-bot). Dry-run by default; --post actually posts.
+Publishing identity = the owner of ATOM_BOT_TOKEN(_FILE), named by ATOM_BOT_LOGIN. Dry-run by default; --post actually posts.
 
 A marker line is embedded at the end of the review summary for followup/dedup:
-  <!-- rocm-atom-bot review pr=<pr> head=<sha> -->
+  <!-- <bot-login> review pr=<pr> head=<sha> -->
 """
 
 import argparse
@@ -43,13 +43,15 @@ import re
 import subprocess
 import sys
 
+import _identity
+
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check_citations  # noqa: E402  -- the one authority on whether a citation resolves
 
 REPORTS = HERE / "reports"
 REPO = os.environ.get("GITHUB_REPOSITORY", "ROCm/ATOM")  # neither a secret nor machine-specific
-BOT = "rocm-atom-bot"  # the bot's fixed identity, not configuration
+BOT = _identity.login()  # see _identity: the account is configuration, not a constant
 
 
 def _token():
@@ -466,7 +468,7 @@ def build_review(pr, card, diff_text, flagged, sha):
     ind = _line_starting(card, "_Independent refutation:")
     if ind:
         parts.append(ind)
-    parts.append(f"<!-- rocm-atom-bot review pr={pr} head={sha} -->")
+    parts.append(f"<!-- {BOT} review pr={pr} head={sha} -->")
     return {
         "event": "COMMENT",
         "commit_id": sha,
@@ -487,15 +489,19 @@ def review_payload(pr):
 
 
 def already_posted(pr, sha):
-    """Whether rocm-atom-bot already posted for this head (by marker).
+    """Whether this bot already posted for this head (by marker).
 
     Both endpoints: the marker used to ride in an issue comment and now rides in a review
     summary, so a dedup check that only reads one of them would repost over the old runs.
+    Every identity this bot has spoken as counts -- a review that was posted does not
+    become un-posted because the account changed (see _identity).
     """
-    marker = f"rocm-atom-bot review pr={pr} head={sha}"
+    marks = _identity.markers(pr, sha)
     for ep in (f"issues/{pr}/comments?per_page=100", f"pulls/{pr}/reviews?per_page=100"):
         cs = _api(ep)
-        if isinstance(cs, list) and any(marker in (c.get("body") or "") for c in cs):
+        if isinstance(cs, list) and any(
+            any(m in (c.get("body") or "") for m in marks) for c in cs
+        ):
             return True
     return False
 
@@ -590,7 +596,7 @@ def main(argv):
             (posted if ok else failed).append(pr)
             if ok and severity((REPORTS / f"PR-{pr}" / "card.md").read_text(encoding="utf-8")) == "high":
                 # extra signal in the checks UI; the card itself is already posted as a comment
-                print(f"::warning title=rocm-atom-bot HIGH RISK::PR #{pr} — review flags HIGH RISK (advisory, not a merge gate)")
+                print(f"::warning title={BOT} HIGH RISK::PR #{pr} — review flags HIGH RISK (advisory, not a merge gate)")
         else:
             print(f"  #{pr}: {action} — {reason}")
         if a.payload and (REPORTS / f"PR-{pr}" / "card.md").is_file():

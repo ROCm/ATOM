@@ -282,14 +282,30 @@ Expected output: `ROCm/ATOM` (or `zufayu/ATOM` while registered against the fork
 
 ## 4. Bot identity
 
-`rocm-atom-bot` was registered on 2026-10-29 (`public_repo` scope, `pull` on the repo — enough
-to comment on a public repo, though **not yet exercised against `ROCm/ATOM`**; an org or repo interaction limit would reject every comment it posts).
-Set the repo secret `ATOM_BOT_TOKEN` to that account's PAT. The workflow binds it as a step env var at five
-places (gate's queue step, the watchdog job, review's claim step, review's notify step, and the
-report job) — including steps that run inside the review job. The one step that is never given
-it is `run_one.sh`'s own "Review (headless GLM)" step: that step carries no `ATOM_BOT_TOKEN` env,
-and `run_one.sh` never reads or exports that name itself, so the headless review agent that runs
-over untrusted PR content has no path to the token even though other steps in the same job do.
+The account is **configuration**, not a constant: `ATOM_BOT_LOGIN` (a repo *variable*)
+names the owner of `ATOM_BOT_TOKEN`, and defaults to `aiter-bot`.
+
+It was a hard-coded literal until `rocm-atom-bot` was suspended by GitHub seven days
+after it was created — `users/rocm-atom-bot` returns 404 to anyone else, while its own
+token still authenticates, and its rate limit sits at the anonymous tier (60 core calls,
+GraphQL disabled). An identity a third party can take away from you is configuration
+whether or not you modelled it that way.
+
+**Set the variable whenever you change the secret.** The login decides two things that
+fail quietly when it is wrong:
+
+- the self-trigger guard. The bot's own cards arrive as `issue_comment` events and a
+  card's body contains the trigger phrase, so a guard naming the wrong account means
+  every card starts a run that posts a card. The workflow therefore excludes *every*
+  login in `_identity.KNOWN` as well as `vars.ATOM_BOT_LOGIN`, and `check_prompts.py`
+  asserts that each one appears — adding an identity to `KNOWN` without adding it to the
+  workflow turns the drift check red.
+- the dedup marker, `<!-- <login> review pr=<n> head=<sha> -->`. A marker left by any
+  former identity still counts, or the first run after a switch re-reviews every open PR.
+
+Appeal a suspension rather than minting a new account: `rocm-atom-bot` was 7 days old
+when it was suspended, and a fresh account doing automated review is the same profile.
+The two accounts that work here are 47 days and 12 years old.
 
 ## 5. Keep it running across reboots *and* container restarts (host only)
 

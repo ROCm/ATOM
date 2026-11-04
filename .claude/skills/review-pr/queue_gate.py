@@ -26,6 +26,7 @@ to the hardcoded owner below.
 import datetime
 import math
 import os
+import _identity
 import sys
 import time
 
@@ -109,7 +110,7 @@ def _hours(minutes):
 def message(verdict, ahead, eta, owner):
     if verdict == "no-runner":
         return (
-            "⚠️ **rocm-atom-bot** — %d review(s) have been waiting %s and none has "
+            "⚠️ **" + _identity.login() + "** — %d review(s) have been waiting %s and none has "
             "started, so the self-hosted runner is not picking up work. It is either down or "
             "wedged; both need the same thing, a look at the box.\n\n"
             "This request was **not queued**, because a job queued behind a stopped runner is "
@@ -119,13 +120,13 @@ def message(verdict, ahead, eta, owner):
             % (ahead, _hours(eta), owner))
     if verdict == "too-deep":
         return (
-            "**rocm-atom-bot** — the box reviews one PR at a time and is **%d deep** right now "
+            "**" + _identity.login() + "** — the box reviews one PR at a time and is **%d deep** right now "
             "(roughly %s of work ahead).\n\n"
             "This request was **not queued**: a job that waits more than 24 h is cancelled "
             "silently, so saying no now is better than losing it later.\n\n"
             "Re-comment `atom-bot review` once the queue is shorter."
             % (ahead, _hours(eta)))
-    return ("**rocm-atom-bot** — queued behind %d review(s); expect to start in about %s. "
+    return ("**" + _identity.login() + "** — queued behind %d review(s); expect to start in about %s. "
             "The box reviews one PR at a time." % (ahead, _hours(eta)))
 
 

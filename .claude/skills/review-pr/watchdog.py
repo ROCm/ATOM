@@ -23,6 +23,7 @@ is now the only map) -- so this always falls back to the hardcoded owner below.
 import json
 import math
 import os
+import _identity
 import sys
 import time
 import urllib.error
@@ -100,7 +101,7 @@ class GitHub:
             page += 1
 
     def comment(self, repo, pr, body):
-        # Post as rocm-atom-bot, like every other message this workflow sends.
+        # Post as the bot, like every other message this workflow sends.
         return self._post("/repos/%s/issues/%s/comments" % (repo, pr),
                           {"body": body}, self._bot_token)
 
@@ -132,7 +133,7 @@ def failed(msg):
 
 def stuck_body(mins, owner):
     return (
-        "⚠️ **rocm-atom-bot** — no self-hosted runner claimed this review in "
+        "⚠️ **" + _identity.login() + "** — no self-hosted runner claimed this review in "
         "%s min, so it has not started. Nothing is wrong with this PR.\n\n"
         "A queued job never fails on its own, so this notice is the only signal: the runner "
         "process is probably not running on the box — see "

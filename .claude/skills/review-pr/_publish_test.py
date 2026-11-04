@@ -205,6 +205,7 @@ def test_a_refused_post_exits_non_zero(report, monkeypatch, capsys):
     and if main() still returns 0, the step stays green while every card is lost.
     """
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
+
     # Only the review POST is refused. Stubbing every call would make the gate skip on
     # PR metadata instead, and a test that never reaches the code it names proves nothing.
     def _refuse_reviews(path, method="GET", body=None):
@@ -218,6 +219,26 @@ def test_a_refused_post_exits_non_zero(report, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "failed to post" in out
     assert "not accessible" in out  # the API's own words reach the operator
+
+
+def test_a_marker_from_a_former_identity_still_counts(monkeypatch):
+    """A review that was posted does not become un-posted because the account changed.
+
+    The bot's account was suspended by GitHub seven days after it was created, so the
+    identity had to move. Dedup keys on a marker carrying the login: if only the current
+    one counts, the first run after a switch re-reviews every open PR and posts a second
+    card under the new name.
+    """
+    import _identity
+
+    old = _identity.KNOWN[1]  # an identity this bot used to speak as
+    assert old != _publish.BOT
+    monkeypatch.setattr(
+        _publish,
+        "_api",
+        lambda *a, **k: [{"body": f"<!-- {old} review pr=9999 head=abc -->"}],
+    )
+    assert _publish.already_posted("9999", "abc") is True
 
 
 def test_a_crashed_checker_is_not_a_clean_verdict(report, monkeypatch):
@@ -254,7 +275,7 @@ def test_summary_carries_the_verdict_and_validation_lines(report, monkeypatch):
     body = _publish.review_payload("9999")["body"]
     assert "Review: ⚠️ NEEDS WORK" in body
     assert "Validation (advisory): nothing ran here." in body
-    assert "rocm-atom-bot review pr=9999 head=deadbeef" in body
+    assert f"{_publish.BOT} review pr=9999 head=deadbeef" in body
 
 
 def test_card_md_is_not_rewritten(report, monkeypatch):

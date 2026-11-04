@@ -14,6 +14,8 @@ import os
 import sys
 import urllib.request
 
+import _identity
+
 # class -> (login, what is wrong). Hardcoded, not read from a file: aiter keeps the same
 # map inline in its own _notify.py, and a second file that only this module reads buys
 # nothing over a literal while adding a way for the two to drift. Changing who gets paged
@@ -65,7 +67,7 @@ def main():
     owner = owner_for(cls)
     domain = OWNERS[cls][1]
     body = (
-        f"⚠️ **rocm-atom-bot** — this review could not complete: a problem with **{domain}**, "
+        f"⚠️ **{_identity.login()}** — this review could not complete: a problem with **{domain}**, "
         f"not with this PR.\n\n> {msg}\n\n@{owner} — please take a look."
     )
     if cls == "glm":

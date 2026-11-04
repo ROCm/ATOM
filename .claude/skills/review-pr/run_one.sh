@@ -102,7 +102,7 @@ say() { echo "[run_one #$PR] $*"; }
 fail() {  # <class> <exit-code> <message...>
   local cls="$1" code="$2"; shift 2
   say "$*"
-  echo "::error title=rocm-atom-bot::[$cls] $*"
+  echo "::error title=${ATOM_BOT_LOGIN:-aiter-bot}::[$cls] $*"
   printf '%s\t%s\n' "$cls" "$*" > "$STATUS"
   exit "$code"
 }

@@ -26,6 +26,7 @@ always falls back to the hardcoded owner below.
 """
 
 import os
+import _identity
 import sys
 
 from watchdog import GitHub      # sibling; sys.path[0] is this script's directory
@@ -36,7 +37,7 @@ def body(result, owner, run_url):
     # a review that ran fine and then failed to publish its card, and for a notice that could not
     # be posted -- naming one of them as the cause would send the reader to the wrong place.
     return (
-        "\u26a0\ufe0f **rocm-atom-bot** \u2014 the review job ended as `%s` and nothing was posted "
+        "\u26a0\ufe0f **" + _identity.login() + "** \u2014 the review job ended as `%s` and nothing was posted "
         "for this PR: no review card, and no failure report either.\n\n"
         "Everything that reports a failure runs inside that job, so a job that stops existing, "
         "or one whose posting step is what failed, cannot report itself. The run log says which "
