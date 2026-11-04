@@ -331,6 +331,31 @@ def test_probe_looks_past_prefetches_still_loading(monkeypatch, seq_factory):
     assert sched._can_admit_head_prefill()
 
 
+def test_lookup_is_checked_and_consumed_under_the_lookup_guard(setup):
+    """The answer `lookup_ready` saw must still be there when the admission
+    consumes it: both run inside the connector's lookup guard."""
+    sched, _, _seq = setup
+    events = []
+    conn = sched.kv_connector
+
+    class _Guard:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *exc):
+            events.append("exit")
+
+    conn.lookup_guard = lambda: _Guard()
+    ready, match = conn.lookup_ready, conn.get_num_new_matched_tokens
+    conn.lookup_ready = lambda s: events.append("ready") or ready(s)
+    conn.get_num_new_matched_tokens = lambda s: events.append("match") or match(s)
+
+    sched.schedule()
+
+    i = events.index("enter")
+    assert events[i : i + 4] == ["enter", "ready", "match", "exit"]
+
+
 # -- lookup driver thread -------------------------------------------------------
 
 

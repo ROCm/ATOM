@@ -138,7 +138,16 @@ class OffloadPrefetch:
                 ):
                     self.settled.add(seq.id)
                     continue  # no load possible: it prefills when a FIRE admits it
-            needs_remote_load = s._query_connector_prefill_match(seq, skip=False)
+            # Never block the scheduler thread -- and every DP rank with it -- on
+            # a synchronous lookup: only an answered async lookup qualifies,
+            # checked and consumed under the lookup client's lock so a driver
+            # thread cannot expire the answer in between. Asked without
+            # `lookup_pending`, which would start the request's lookup deferral
+            # clock long before Phase 2 reaches it.
+            with s.kv_connector.lookup_guard():
+                if not s.kv_connector.lookup_ready(seq):
+                    continue
+                needs_remote_load = s._query_connector_prefill_match(seq, skip=False)
             # One HBM walk, after the tier answer: `can_allocate` reads that
             # answer under a bounded replay, so only then re-probe (as Phase 2).
             if hbm_probe is None or (
@@ -194,11 +203,7 @@ class OffloadPrefetch:
         admission_ready = getattr(s.kv_connector, "admission_ready", None)
         if callable(admission_ready) and not admission_ready(seq):
             return False
-        # Never block the scheduler thread -- and every DP rank with it -- on a
-        # synchronous lookup: only an answered async lookup qualifies. Asked
-        # without `lookup_pending`, which would start the request's lookup
-        # deferral clock long before Phase 2 reaches it; `prefetch_lookups`
-        # (or the lookup driver thread) advances the lookup.
+        # Cheap pre-filter; `run` checks again under the lookup guard.
         return bool(s.kv_connector.lookup_ready(seq))
 
     def _admit(self, seq, hbm_probe, needs_remote_load: bool) -> bool:
