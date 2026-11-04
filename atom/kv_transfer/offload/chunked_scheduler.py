@@ -472,7 +472,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         pending load -- which also gives the lookup's read locks back
         (`_clear_pending_load`) -- and drop the held answer, so the next
         admission asks the tier again instead of reusing an answer nothing pins
-        (`_ensure_lookup_pin` trusts a held answer).
+        (`_ensure_lookup_pin` trusts a held answer). Also drop the save floor
+        that admission wrote: the re-admission sets its own, and keeping the
+        first one (`max`) would skip re-saving chunks the tier evicted since.
         """
         self.cancel_pending_load(seq)
         sid = str(seq.id)
@@ -480,6 +482,9 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         if held is not None and held[0] is seq:
             del self._lookup_results[sid]
         self._forget_tier_hit(sid)
+        entry = self._save_tracker.get(sid)
+        if entry is not None and entry[0] is seq:
+            del self._save_tracker[sid]
 
     def _fresh_tier_lookup(self, seq, sid: str) -> int | None:
         """Ask the tier, take its pin, and remember the hit. None if it did not answer."""
@@ -689,13 +694,16 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         is_last_prefill: bool,
     ) -> LMCacheReqMeta | None:
         """Admit any layout-specific sources before advancing the watermark."""
+        token_ids, token_base = self._transfer_tokens(seq, aligned)
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:aligned]),
+            token_ids=token_ids,
             block_ids=block_ids,
             save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
             is_last_prefill=is_last_prefill,
             save_operation=operation,
+            token_base=token_base,
+            token_end=aligned if token_base >= 0 else -1,
         )
 
     def _build_load_request(
@@ -710,13 +718,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         Ships the prompt prefix the transfer covers, from which the worker
         derives the chunk keys. A transport keyed differently overrides this.
         """
+        token_ids, token_base = self._transfer_tokens(seq, transfer_end)
         return LMCacheReqMeta(
             req_id=seq.id,
-            token_ids=list(seq.token_ids[:transfer_end]),
+            token_ids=token_ids,
             block_ids=list(seq.block_table),
             load_spec=load_spec,
             load_operation=load_operation,
+            token_base=token_base,
+            token_end=transfer_end if token_base >= 0 else -1,
         )
+
+    def _transfer_tokens(self, seq, end: int) -> tuple[list[int], int]:
+        """(token ids to ship, the prefix length the worker already holds)
+        for a transfer covering ``[0, end)``. -1: the whole prefix is shipped
+        and the worker keeps nothing."""
+        return list(seq.token_ids[:end]), -1
 
     def _late_save_frontier(self, seq, saved: int, available: int) -> int:
         """Return the largest layout-valid boundary for a late-acquired source."""

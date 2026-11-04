@@ -204,6 +204,8 @@ def test_scheduler_offers_only_waiting_requests_to_the_driver():
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._shipped_tokens = {}
+    sched._shipped_drops = []
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -474,6 +476,8 @@ def _same_step_scheduler():
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._shipped_tokens = {}
+    sched._shipped_drops = []
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client

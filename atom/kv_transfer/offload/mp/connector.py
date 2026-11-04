@@ -91,6 +91,8 @@ class LMCacheMPConnector(KVConnectorBase):
         validated_kv_role(getattr(config, "kv_transfer_config", {}) or {})
         self._config = config
         self._impl: KVConnectorBase | None = None
+        # req id -> the token prefix incremental shipping has delivered.
+        self._token_cache: dict[Any, array.array] = {}
 
     def _require_impl(self) -> KVConnectorBase:
         if self._impl is None:
@@ -147,7 +149,7 @@ class LMCacheMPConnector(KVConnectorBase):
 
     def _resolve_shipped_tokens(self, metadata: Any) -> None:
         """Rebuild each request's token prefix from incremental shipping."""
-        cache = self.__dict__.setdefault("_token_cache", {})
+        cache = self._token_cache
         for req_id in getattr(metadata, "token_cache_drops", None) or ():
             cache.pop(req_id, None)
         for req in getattr(metadata, "requests", None) or ():
@@ -157,17 +159,21 @@ class LMCacheMPConnector(KVConnectorBase):
             tokens = cache.get(req.req_id)
             if tokens is None:
                 tokens = cache[req.req_id] = array.array("q")
-            if len(tokens) > base:
-                # The scheduler restarted this request's shipping (a late save
-                # after a drop that has not reached us yet). A request's
-                # tokens are a fixed prompt, so its prefix is unchanged.
-                del tokens[base:]
+            # The scheduler restarts a request's shipping at 0 only together
+            # with a drop for it in the same metadata (handled above), so any
+            # other length is a desync: chunk keys from it would name the
+            # wrong KV.
             if len(tokens) != base:
                 raise RuntimeError(
                     f"LMCache MP token cache for {req.req_id!r} holds "
                     f"{len(tokens)} tokens, the scheduler shipped from {base}"
                 )
             tokens.extend(req.token_ids)
+            if len(tokens) < req.token_end:
+                raise RuntimeError(
+                    f"LMCache MP token cache for {req.req_id!r} holds "
+                    f"{len(tokens)} tokens, the transfer needs {req.token_end}"
+                )
             req.token_ids = tokens[: req.token_end].tolist()
             req.token_base = -1
 

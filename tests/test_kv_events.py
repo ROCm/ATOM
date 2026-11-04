@@ -41,6 +41,7 @@ from atom.distributed.kv_events import (
     offset_endpoint,
 )
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.offload_prefetch import OffloadPrefetchState
 from atom.model_engine.scheduler import Scheduler
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -437,6 +438,7 @@ class TestSchedulerRemoteStore:
             record_remote_store=lambda **kw: calls.append(kw),
         )
         sched = Scheduler.__new__(Scheduler)
+        sched._prefetch = OffloadPrefetchState()
         sched.block_manager = bm
         sched.kv_connector = SimpleNamespace(is_offload=False)
         sched.finished_recving_kv_req_ids = []

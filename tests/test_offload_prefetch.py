@@ -113,6 +113,7 @@ class _Delayer:
 
 def _make(monkeypatch, seq_factory, n=1, blocks=100, **env):
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
+    monkeypatch.setenv("ATOM_DP_PREFIX_SPREAD", "1")
     for key, value in env.items():
         monkeypatch.setenv(key, str(value))
     sched = Scheduler(
@@ -150,7 +151,7 @@ def test_hold_tick_parks_a_request_and_ships_its_load(setup):
     # The load leaves with this HOLD tick's (empty) batch.
     assert batch.connector_meta_output is META
     assert seq in sched.waiting
-    assert sched._prefetch.submitted == 1
+    assert seq.id in sched._prefetch.entries
 
 
 def test_request_behind_the_head_is_loaded_and_the_order_is_unchanged(
@@ -181,19 +182,29 @@ def test_loaded_request_is_not_promoted_ahead_of_earlier_arrivals(
     # would have moved up; an prefetched one keeps its place
 
 
-def test_loaded_request_passes_a_head_refused_kv_blocks(monkeypatch, seq_factory):
-    """A head that cannot allocate must not wait forever on an prefetched
-    request behind it that holds blocks and could run and release them."""
+def test_loaded_request_passes_a_head_that_cannot_allocate(monkeypatch, seq_factory):
+    """Nothing running and a head that cannot allocate: a finished prefetch
+    behind it holds blocks and must run to release them. Otherwise it keeps
+    its place."""
     sched, _, (a, b) = _make(monkeypatch, seq_factory, n=2)
     sched.kv_connector.not_ready_ids = {a.id}
     sched.schedule()  # b parks with its prefetch, a waits
     sched.finished_recving_kv_req_ids.append(b.id)
-    # The last admission pass found the head refused KV blocks.
-    sched._admission_head_blocked = True
 
     sched._promote_ready_remote_kv_requests()
+    assert list(sched.waiting) == [a, b]  # a can allocate: order kept
 
+    monkeypatch.setattr(sched.block_manager, "can_allocate_memoized", lambda s: -1)
+    sched._promote_ready_remote_kv_requests()
     assert list(sched.waiting) == [b, a]
+
+
+def test_new_token_count_counts_a_finished_load_from_its_resume(setup):
+    sched, _, seq = setup
+    sched.schedule()  # parks with its prefetch
+    sched.finished_recving_kv_req_ids.append(seq.id)
+    seq.offload_loaded_tokens = 12
+    assert sched._waiting_new_token_count() == len(seq) - 12
 
 
 def test_finished_disagg_consumer_load_is_not_prefill_work(setup):
@@ -257,7 +268,7 @@ def test_watermark_stops_prefetch_allocation_and_the_request_waits_for_the_fire(
 
     assert seq.status == SequenceStatus.WAITING
     assert len(seq.block_table) == 0
-    assert sched._prefetch.skips["watermark"] == 1
+    assert seq.id in sched._prefetch.retry_at
     # Back to the old path: the FIRE's admission parks it as before.
     delayer.allow = True
     sched.schedule()
@@ -313,6 +324,8 @@ def test_lookup_ready_in_lookup_thread_mode(fake_lmcache_modules):  # noqa: F811
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._shipped_tokens = {}
+    sched._shipped_drops = []
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client

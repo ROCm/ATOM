@@ -70,6 +70,7 @@ def _make_mgr(
     mgr._rank_tokens = [0] * n_ranks
     mgr._seq_load = {}
     mgr._seq_prefilling = set()
+    mgr._prefix_spread = False
     mgr._lb_lock = Lock()
     return mgr
 
@@ -555,7 +556,8 @@ def _make_spread_mgr(n_ranks=2):
     mgr._prefix_spread = True
     mgr._prefix_idle_tokens = 32768
     mgr._prefix_owner = OrderedDict()
-    mgr._prefix_owner_cap = 1 << 19
+    mgr._prefix_owner_cap = 1 << 17
+    mgr._prefix_seq_hashes = {}
     mgr._prefix_stride_tokens = 4096
     mgr._dp_route_counters.update(
         prefix_owner_total=0,
@@ -748,3 +750,40 @@ def test_partial_holder_still_prefilling_is_not_an_hbm_hit():
     assert owner == 0 and 2 not in hits
     (rank,) = _route(mgr, [_chain_seq(3, 110_000)])
     assert rank == 1  # no partial credit: the lightest idle rank
+
+
+def test_followers_sharing_a_prefix_do_not_convoy_onto_one_rank():
+    """Followers that only reuse a prefix the tier holds are not its busy
+    source: the idle rule spreads them instead of pinning them all."""
+    import array
+
+    from atom.model_engine.prefix_hash import ShippedChain
+
+    mgr = _make_spread_mgr()
+    _route(mgr, [_chain_seq(1, 65_536)])
+    mgr._mark_seq_prefill_complete(1)
+
+    def follower(i):
+        seq = _FakeSeq(100 + i, num_prompt_tokens=65_536 + 8_192)
+        blocks = array.array(
+            "Q", list(range(512)) + [10**6 + 64 * i + j for j in range(64)]
+        )
+        seq.prompt_hash_chain = ShippedChain(128, 0, 65_536 + 8_192, 0, blocks)
+        return seq
+
+    ranks = _route(mgr, [follower(i) for i in range(32)])
+    assert set(ranks) == {0, 1}
+    assert mgr._dp_route_counters["prefix_source_busy_total"] == 0
+
+
+def test_a_prefix_record_is_rolled_back_when_its_request_leaves_unprefilled():
+    mgr = _make_spread_mgr()
+    _route(mgr, [_chain_seq(1, 100_000)])
+    mgr._release_seq_load(1)  # aborted / rejected before its first output
+    assert not mgr._prefix_owner
+    second = _chain_seq(2, 100_000)
+    _route(mgr, [second])
+    assert second._dp_est_hit == 0  # no fake HBM hit
+    mgr._mark_seq_prefill_complete(2)
+    mgr._release_seq_load(2)  # finished normally: the record stays
+    assert mgr._prefix_owner

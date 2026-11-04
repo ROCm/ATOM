@@ -233,7 +233,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `Scheduler._offload_prefetch`). New prefixes go to the lightest rank
     # (`least_tokens` score).
     "ATOM_DP_PREFIX_SPREAD": lambda: os.getenv("ATOM_DP_PREFIX_SPREAD", "0") == "1",
-    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _int_env("ATOM_DP_PREFIX_IDLE_TOKENS", 32768),
+    # Must be positive; the default is two 16k prefill chunks.
+    "ATOM_DP_PREFIX_IDLE_TOKENS": lambda: _optional_int_env(
+        "ATOM_DP_PREFIX_IDLE_TOKENS", min_value=1
+    )
+    or 32768,
     # Place a new agent session on the lightest DP rank, then keep every later
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
@@ -1241,11 +1245,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
     "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
-    # `lmcache_mp`: ship only the tokens a worker does not yet hold with each
-    # transfer instead of the whole prefix. "0" ships whole prefixes.
-    "ATOM_MP_INCREMENTAL_TOKENS": lambda: (
-        os.getenv("ATOM_MP_INCREMENTAL_TOKENS", "1") == "1"
-    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

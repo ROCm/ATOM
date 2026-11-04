@@ -24,6 +24,7 @@ from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBa
 from atom.kv_transfer.offload.metadata import LoadSpec
 from atom.kv_transfer.offload.mp import lookup as mp_lookup
 from atom.kv_transfer.offload.mp import scheduler as mp_scheduler
+from atom.model_engine.offload_prefetch import OffloadPrefetchState
 
 MIN_LOAD = 32
 
@@ -37,6 +38,8 @@ def _scheduler(monkeypatch, *, chunks=8, lookup_done=False):
     sched = mp_scheduler.LMCacheMPConnectorScheduler.__new__(
         mp_scheduler.LMCacheMPConnectorScheduler
     )
+    sched._shipped_tokens = {}
+    sched._shipped_drops = []
     sched._mp_adapter = adapter
     ChunkedOffloadSchedulerBase.__init__(
         sched, _config(), chunk_size=CHUNK, lookup_client=client
@@ -157,6 +160,7 @@ def _gate(monkeypatch, *, conn, state_offload=None, hit_blocks=10):
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = OffloadPrefetchState()
     s.kv_connector = conn
     s._local_prefill_coalescing = False
     s._connector_flag = lambda name: getattr(conn, name, False)
@@ -230,21 +234,18 @@ def test_session_outlives_an_unanswered_fire_and_forget_lookup(monkeypatch):
 
 
 def test_a_late_save_token_prefix_is_dropped_when_the_session_ends(monkeypatch):
-    """A save emitted after `request_finished` re-creates the shipped-token
-    state the finish already dropped; ending the session drops it again, so
-    the workers' token cache cannot keep a finished request's prefix."""
+    """`request_finished` keeps the shipped-token state, so a save emitted
+    after it ships only its new tokens; ending the session drops it, so the
+    workers' token cache cannot keep a finished request's prefix."""
     sched, _client, adapter = _scheduler(monkeypatch, lookup_done=True)
     adapter.end_session = lambda rid: None
     seq = _seq()
     sched._ship_tokens(seq, 32)
+    sched._save_inflight["7"] = None  # its last save is still in flight
     sched.request_finished(seq)
-    assert 7 not in sched._shipped_tokens
-    assert sched._shipped_drops == [7]
-    sched._shipped_drops = []
-
-    sched._ship_tokens(seq, 64)  # the late save
-    assert 7 in sched._shipped_tokens
-    sched._pending_session_ends()["7"] = seq
+    assert sched._shipped_tokens[7][1] == 32
+    assert sched._ship_tokens(seq, 64)[0] == 32  # the late save: delta only
+    del sched._save_inflight["7"]
     sched._end_finished_sessions()
     assert 7 not in sched._shipped_tokens
     assert sched._shipped_drops == [7]
@@ -258,7 +259,7 @@ def test_a_late_save_token_prefix_is_dropped_when_the_session_ends(monkeypatch):
     assert not meta.requests
     assert meta.token_cache_drops == [7]
     assert connector_metadata_has_work(meta)
-    assert not sched.__dict__.get("_shipped_drops")
+    assert not sched._shipped_drops
     assert not sched.has_pending_work()
 
 
@@ -529,6 +530,7 @@ def test_a_declined_detach_turns_the_request_back_to_the_ordinary_path(monkeypat
 
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     s = Scheduler.__new__(Scheduler)
+    s._prefetch = OffloadPrefetchState()
     s.kv_connector = conn = _Conn()
     s._connector_flag = lambda name: getattr(conn, name, False)
     s.block_manager = SimpleNamespace(state_offload=None)
@@ -554,6 +556,8 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
         return 2
 
     s = Scheduler.__new__(Scheduler)
+
+    s._prefetch = OffloadPrefetchState()
     s.kv_connector = _Conn()
     s._local_prefill_coalescing = False
     s.block_manager = SimpleNamespace(hash_block_size=4, can_allocate=can_allocate)
