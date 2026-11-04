@@ -4252,6 +4252,12 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = _make_mxfp4_moe_method(
                 online_quant_config, self.moe_config
             )
+            # A model that pads its natively quantized experts to `pad_align`
+            # can ask the same of experts quantized here (`online_quant_pad_align`,
+            # set by the model): the fresh method otherwise pads to its default.
+            online_pad_align = getattr(self, "online_quant_pad_align", None)
+            if online_pad_align is not None:
+                self.quant_method.pad_align = online_pad_align
         else:
             raise ValueError(
                 f"Unsupported online quant_dtype for MoE: {online_quant_dtype}"

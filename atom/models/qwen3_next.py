@@ -356,6 +356,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 else None
             ),
         )
+        # The same padding for experts quantized online at load: the MTP layer's
+        # experts are unquantized in the checkpoint and become MXFP4 there.
+        # ATOM_QWEN_MONO_MOE's kernel needs 128 (TP4) either way.
+        if (
+            envs.ATOM_QWEN_MOE_PAD_ALIGN_128
+            and (config.moe_intermediate_size // self.tp_size) % 128 == 0
+        ):
+            self.experts.online_quant_pad_align = 128
 
     def combine_tail_forward(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
