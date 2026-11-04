@@ -387,6 +387,12 @@ class tokenIDProcessor:
     def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         return self.spec_status_queue.receive() or (None, None)
 
+    def take_deferred_spec_status(self) -> None:
+        """The previous step's status a pure prefill left for its postprocess
+        (`prepare_input_ids`)."""
+        if self.__dict__.pop("_spec_status_deferred", False):
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+
     def _wait_for_pending_copies(self) -> None:
         """Wait for every queued D2H before its entry (and source) is dropped."""
         for _, copy_done, _ in getattr(self, "token_ids_cpu", ()):
@@ -582,7 +588,14 @@ class tokenIDProcessor:
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
         if batch.produces_output():
-            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
+            if locs is None and envs.ATOM_EARLY_PREFILL_SCHEDULE:
+                # ATOM_EARLY_PREFILL_SCHEDULE: a pure prefill reads no carried
+                # status before its launch (`locs` is None), only its
+                # postprocess does. Taking it there lets the prefill launch
+                # behind the previous verify instead of waiting for it.
+                self._spec_status_deferred = True
+            else:
+                self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
         if locs is not None:
             # Map the previous step's rejected/bonus counts onto this batch's
             # order (prev_idx -> curr_idx) for the carried-over sequences.
@@ -3965,6 +3978,7 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
+        self.tokenID_processor.take_deferred_spec_status()
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -5000,6 +5014,7 @@ class RapidServeModelRunner(ModelRunner):
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
         # postprocess (sampling + async CPU copy) always runs on default stream.
+        self.tokenID_processor.take_deferred_spec_status()
         fwd_output = self.postprocess(
             batch,
             logits,

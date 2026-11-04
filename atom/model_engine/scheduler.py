@@ -1968,7 +1968,12 @@ class Scheduler:
         as long as it fires, and nothing would fail — the log would just go
         quiet, which is indistinguishable from an idle engine.
         """
-        result = self._schedule()
+        early = self.__dict__.pop("_early_tick", None)
+        if early is not None:
+            # `try_schedule_prefill_early` already ran this tick's prefill half.
+            result = self._finish_early_tick(early)
+        else:
+            result = self._schedule()
         self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
         return result
 
@@ -1978,6 +1983,65 @@ class Scheduler:
         Tries prefill first; if no new prefills are ready, falls back to
         decoding already-running sequences.
         """
+        gen = self._schedule_gen()
+        try:
+            next(gen)
+        except StopIteration as done:
+            return done.value
+        return self._finish_early_tick(gen)
+
+    @staticmethod
+    def _finish_early_tick(early):
+        """The rest of a tick that `try_schedule_prefill_early` began: its
+        result if the prefill half already returned one, else the decode half
+        of the suspended pass."""
+        if isinstance(early, tuple):
+            return early[0]
+        try:
+            next(early)
+        except StopIteration as done:
+            return done.value
+        raise AssertionError("_schedule_gen yields once")
+
+    def try_schedule_prefill_early(
+        self,
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]] | None:
+        """ATOM_EARLY_PREFILL_SCHEDULE: run the NEXT tick's prefill half now,
+        while the previous (decode) forward is still in flight, before its
+        postprocess. Returns the prefill batch if the tick admits one, so the
+        engine can dispatch it at once. Otherwise the tick stays open: its
+        decode half runs in the next `schedule()`, after the postprocess, so a
+        decode batch never sees running state from before it.
+
+        The caller must only use this after a pure decode batch and with no
+        partial prefill in flight: then the postprocess in between touches no
+        sequence this half schedules (its deferred tokens are the decode
+        batch's; new admissions have no output index yet)."""
+        assert "_early_tick" not in self.__dict__
+        if type(self)._schedule is not Scheduler._schedule:
+            return None
+        gen = self._schedule_gen()
+        try:
+            next(gen)
+        except StopIteration as done:
+            result = done.value
+            if (
+                result is not None
+                and result[0] is not None
+                and result[0].total_seqs_num_prefill > 0
+            ):
+                self._record_throughput(num_prompt_tokens=_prompt_tokens_of(result))
+                return result
+            # The tick ended without a prefill and without reaching decode (an
+            # idle rank, a dummy prefill): hand its result to the next call.
+            self._early_tick = (result,)
+            return None
+        self._early_tick = gen
+        return None
+
+    def _schedule_gen(self):
+        """`_schedule`'s pass as a generator: it yields once, between the
+        prefill half (returns a prefill batch, or None) and the decode half."""
         self._schedule_tick += 1
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
@@ -2706,6 +2770,9 @@ class Scheduler:
             # keeps its peers company on a dummy prefill rather than decode, so
             # every rank's forward replays its token graph (`ForwardMode.decide`).
             return None
+
+        # The prefill half is done and found nothing to prefill.
+        yield None
 
         # --- Decode scheduling ---
         num_seqs_decode = 0
