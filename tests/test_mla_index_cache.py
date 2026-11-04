@@ -310,6 +310,26 @@ def test_a_hybrid_stage_still_finds_its_shared_draft(monkeypatch):
     assert local_layer_ids == (3, 5, 6)
 
 
+def test_a_dense_dspark_draft_has_kv_rows_and_no_index_slices(monkeypatch):
+    """Kimi-K3-DSpark on K3.1: five dense MLA layers of its own (no indexer),
+    sharing the target's pool. Its rows are its `num_hidden_layers`, not an MTP
+    predict count, and it owns no index-key slice: the layout is the target's
+    alone. Counting one draft layer with a slice failed K3.1 + DSpark at
+    startup ("5 MLA modules ... declares 1 layers")."""
+    builder, runner = _builder(("full",) * 6, total_local_layers=11, draft_layers=5)
+    runner.config.speculative_config = SimpleNamespace(
+        draft_model_hf_config=SimpleNamespace(num_hidden_layers=5),
+        use_dspark_with_draft=lambda: True,
+    )
+    _mock_pp(monkeypatch, rank=0, world_size=1)
+
+    local_layer_ids, global_layer_ids = builder._index_cache_layout()
+
+    assert builder._local_draft_rows() == builder._global_num_draft_layers() == 5
+    assert builder._global_num_draft_index_layers() == 0
+    assert global_layer_ids == local_layer_ids == (0, 1, 2, 3, 4, 5)
+
+
 def test_a_draft_cannot_appear_on_a_stage_that_is_not_the_last(monkeypatch):
     """`ModelRunner` builds the drafter under `pp_group().is_last_rank`, so an
     earlier stage owning draft rows means something else already went wrong --
