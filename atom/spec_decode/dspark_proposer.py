@@ -9,6 +9,10 @@ from torch.profiler import record_function
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_kv import block_page_idx, draft_ctx_slots, entry_slots
+from atom.spec_decode.draft_kv_kernels import (
+    block_addressing_one_launch,
+    draft_ctx_slots_one_launch,
+)
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
@@ -697,10 +701,16 @@ class DSparkProposer(Drafter):
         # The padded batch: `cu_seqlens_q` is filled out to it, non-decreasing.
         rows = max(int(ctx.running_bs), int(ctx.scheduled_bs), 1)
         block_tables = var["block_tables"].gpu[:rows]
+        cu_ends = var["cu_seqlens_q"].gpu[1 : rows + 1]
+        if out.is_cuda:
+            draft_ctx_slots_one_launch(
+                out, positions, cu_ends, block_tables, self._draft_entry_tokens
+            )
+            return
         draft_ctx_slots(
             out,
             positions[:n],
-            var["cu_seqlens_q"].gpu[1 : rows + 1],
+            cu_ends,
             block_tables,
             self._blk_tok_ramp[:n],
             self._draft_entry_tokens,
@@ -884,14 +894,18 @@ class DSparkProposer(Drafter):
         # own metadata (causal defaults True), so this never leaks back.
         attn_metadata.causal = False
 
+        bound = self._bound_draft_k_cache(forward_context) is not None
+        # The unsharded addressing below, positions included, is one launch.
+        fused = bound and anchor_positions.is_cuda and not self._draft_is_dcp_sharded
         # Filled for the PADDED batch: the backbone runs the pad rows too, so
         # they need positions to embed and rotate.
         block_positions = self._blk_positions[:running_bs]
-        torch.add(
-            anchor_positions.view(running_bs, 1),
-            self._blk_offsets.view(1, T),
-            out=block_positions,
-        )
+        if not fused:
+            torch.add(
+                anchor_positions.view(running_bs, 1),
+                self._blk_offsets.view(1, T),
+                out=block_positions,
+            )
 
         # q_out dtype for the draft's MLA decode, ahead of the dummy return
         # below because that pass needs it just as much: MLA allocates q_out
@@ -906,7 +920,7 @@ class DSparkProposer(Drafter):
                 self._blk_dtype_q = dtype_q
         attn_metadata.dtype_q = dtype_q
 
-        if self._bound_draft_k_cache(forward_context) is None:
+        if not bound:
             # warmup_model() runs before allocate_kv_cache(), so there is no
             # paged state to describe. The block forward still runs on that
             # pass -- it doubles as memory profiling, and omitting the draft
@@ -923,9 +937,21 @@ class DSparkProposer(Drafter):
         slots = self._blk_slots[: running_bs * T].view(running_bs, T)  # stable
         # Each request's KV spans [0, anchor] (context) ++ the T block rows.
         ctx_lens = self._blk_ctx_lens[:running_bs]  # stable
-        global_lens = anchor_positions + (1 + T)
+        global_lens = None if fused else anchor_positions + (1 + T)
         entry_tokens = self._draft_entry_tokens
-        if self._draft_is_dcp_sharded:
+        if fused:
+            # The unsharded branch below, the clamp and the pad tail.
+            block_addressing_one_launch(
+                block_positions,
+                slots,
+                ctx_lens,
+                anchor_positions,
+                block_tables,
+                scheduled_bs,
+                self._paged_pad_ctx_len,
+                entry_tokens,
+            )
+        elif self._draft_is_dcp_sharded:
             # DCP shards KV token-wise round-robin: one block table entry covers
             # block_size*dcp_world_size GLOBAL tokens, and rank r holds the
             # positions p with p % dcp_world_size == r, packed densely into its
@@ -966,9 +992,10 @@ class DSparkProposer(Drafter):
 
         # The CSR generator skips entries past the block table's width, so
         # `kv_indptr` must not promise more than the table holds.
-        ctx_lens.clamp_(max=block_tables.shape[1] * entry_tokens)
+        if not fused:
+            ctx_lens.clamp_(max=block_tables.shape[1] * entry_tokens)
 
-        if running_bs > scheduled_bs:
+        if running_bs > scheduled_bs and not fused:
             # See the docstring for why this tail reads a page rather than
             # nothing. `_blk_last_page_lens` needs no tail of its own: it is
             # all ones already, which is what one page holding one token means.
