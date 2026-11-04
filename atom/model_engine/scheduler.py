@@ -51,6 +51,7 @@ from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.offload_prefetch import Admit, OffloadPrefetch
 from atom.model_engine.prefill_delayer import PrefillDecision
+from atom.model_engine.prefix_spread import PrefixSpreadRouter
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Replay,
@@ -3354,9 +3355,10 @@ class Scheduler:
         expect = seq.__dict__.pop("_dp_tier_expect", 0)
         if expect:
             # The router moved this request expecting its prefix from the tier
-            # (HBM plus tier hit); one sampling stride of slack.
+            # (HBM plus tier hit); one router sampling stride of slack.
             self.total_prefix_moved_checked += 1
-            if int(ext_tokens) + int(seq.num_cached_tokens) + 4096 < expect:
+            slack = PrefixSpreadRouter.STRIDE_TOKENS
+            if int(ext_tokens) + int(seq.num_cached_tokens) + slack < expect:
                 self.total_prefix_moved_tier_miss += 1
         # Keep the lookup's answer, not just the park flag: `can_allocate` runs
         # next and a hybrid's two legs have to be aimed at one boundary, for
