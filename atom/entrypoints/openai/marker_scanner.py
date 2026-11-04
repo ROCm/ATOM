@@ -143,7 +143,7 @@ def _plan(markers: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...], d
 def _pattern_for(ordered: tuple[str, ...]) -> re.Pattern:
     """One alternation of the markers, longest first.
 
-    A search finds the leftmost position where any marker completes, and at
+    A search finds the leftmost position where any marker starts, and at
     that position tries the alternatives in order, so the longest one wins:
     the same answer as a `find` per marker, in one C call per hit.
     """

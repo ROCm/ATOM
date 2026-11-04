@@ -319,7 +319,7 @@ class ReasoningFilter:
             for i in range(0, len(reply), _REPLAY_PIECE)
         ]
 
-    def flush(self, *, stopped: bool = True) -> list:
+    def flush(self, *, stopped: bool) -> list:
         """End of stream: whatever is held never became a marker.
 
         ``stopped`` is :func:`ended_by_stop` of the finish reason. An output
@@ -333,7 +333,7 @@ class ReasoningFilter:
             out.extend(self._close_channel(None, stopped=stopped))
         return out
 
-    def read_whole_events(self, text: str, *, stopped: bool = True) -> list:
+    def read_whole_events(self, text: str, *, stopped: bool) -> list:
         """A complete output's events, flushed: the whole output in one feed,
         which `MarkerScanner` reads in time linear in its length."""
         return self.process(text) + self.flush(stopped=stopped)
@@ -360,12 +360,13 @@ class ReasoningChannel:
     starts_open: bool = False
     literal_answer: bool = False
 
-    def split(self, text: str, *, stopped: bool = True) -> tuple[str | None, str]:
+    def split(self, text: str, *, stopped: bool) -> tuple[str | None, str]:
         """A complete output as ``(reasoning, content)``: the stream's own
         events, so the two delivery modes cannot differ. Each half is
         byte-for-byte what the model wrote minus the markers the dialect
-        declares; ``reasoning`` is ``None`` when there is none. ``stopped`` is
-        as for :meth:`ReasoningFilter.flush`."""
+        declares, except that a replayed channel is in both; ``reasoning`` is
+        ``None`` when there is none. ``stopped`` is as for
+        :meth:`ReasoningFilter.flush`."""
         events = self.stream().read_whole_events(text, stopped=stopped)
         reasoning = "".join(v for k, v in events if k == "reasoning_content")
         content = "".join(v for k, v in events if k == "content")

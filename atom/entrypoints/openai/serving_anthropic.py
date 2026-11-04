@@ -210,7 +210,7 @@ def read_whole_blocks(
     tools: list | None = None,
     *,
     suppress_calls: bool = False,
-    stopped: bool = True,
+    stopped: bool,
 ) -> list:
     """One complete output as ordered events, reasoning included.
 

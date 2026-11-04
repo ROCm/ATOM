@@ -2608,8 +2608,9 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
         # streaming branch above asks.
         # Both stages over the whole output, once, in the order the branch
         # above streams them: reasoning filter, then the tool parser on the
-        # content segments it yields. Calling `.split()` here instead flattened the two into
-        # `(reasoning, content)` and lost the interleaving at that line.
+        # content segments it yields. Calling `.split()` here instead
+        # flattened the two into `(reasoning, content)` and lost the
+        # interleaving at that line.
         events = read_whole_blocks(
             reasoning_channel(
                 prompt_starts_in_reasoning(prompt),

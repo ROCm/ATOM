@@ -188,7 +188,7 @@ def drive(
         last = i == len(chunks) - 1
         segments = rf.process(chunk)
         if last:
-            segments.extend(rf.flush())
+            segments.extend(rf.flush(stopped=True))
         for field, seg in segments:
             if field == "reasoning_content":
                 take(field, seg)
@@ -745,8 +745,8 @@ def reasoning_shapes(dialect) -> list[str]:
             out.add(a + answer_m + b + end_m + c)  # and the channel then closes
             out.add(a + answer_m + end_m + c)  # or closes right after it
             out.add(a + answer_m + "\n" + c)  # whitespace after the closer
-    # Outputs longer than a 4 KiB piece, each with its marker across
-    # 4095/4096, where a reader that chunked a whole output would cut it.
+    # Outputs over 4096 characters, each with its marker across 4095/4096:
+    # long enough to cross any page-sized boundary a reader might cut at.
     for head, marker in [("", end_m), (open_m, end_m)] + [
         ("", m) for m in dialect.answer_end_markers
     ]:
@@ -767,7 +767,7 @@ def split_reasoning_streaming(text: str, chunk: int, channel: ReasoningChannel):
     segs = []
     for i in range(0, len(text), chunk):
         segs += f.process(text[i : i + chunk])
-    segs += f.flush()
+    segs += f.flush(stopped=True)
     return (
         "".join(t for k, t in segs if k == "reasoning_content"),
         "".join(t for k, t in segs if k == "content"),
@@ -781,7 +781,7 @@ def every_way(dialect, text, chunks=(1, 3, 10_000)) -> list:
     agreeing on the wrong answer -- comparing them to each other says nothing.
     """
     channel = ReasoningChannel(dialect=dialect, starts_open=False)
-    out = [channel.split(text)]
+    out = [channel.split(text, stopped=True)]
     for chunk in chunks:
         reasoning, content = split_reasoning_streaming(text, chunk, channel)
         out.append((reasoning or None, content))
@@ -865,8 +865,8 @@ class TestTheReasoningReadIsChunkInvariant:
     That class holds the *tool parser* to stream/non-stream agreement. Both
     reasoning delivery modes are one reader -- the split is the filter run
     over the whole output -- so what is left to hold is that the filter
-    answers the same however the output is chunked: the split's own bounded
-    pieces against 1-, 3- and 11-character chunks. What the answer *is* is
+    answers the same however the output is chunked: the whole output in one
+    feed against 1-, 3- and 11-character chunks. What the answer *is* is
     pinned elsewhere (`TestWhatTheReaderDoesWithAChannelThePromptDidNotOpen`
     here, the K3 shapes in `test_reasoning.py`).
 
@@ -888,7 +888,7 @@ class TestTheReasoningReadIsChunkInvariant:
         channel = ReasoningChannel(dialect=dialect, starts_open=starts_thinking)
         out = []
         for text in reasoning_shapes(dialect):
-            non = channel.split(text)[field]
+            non = channel.split(text, stopped=True)[field]
             for chunk in self.CHUNKS:
                 got = split_reasoning_streaming(text, chunk, channel)[field]
                 if (non or "") != got:
@@ -930,9 +930,11 @@ class TestTheReasoningReadIsChunkInvariant:
         rule was written for one stage later, and the one measured here
         before the strips came out.
         """
-        assert ReasoningChannel(starts_open=False).split(text)[1] == expected
+        assert (
+            ReasoningChannel(starts_open=False).split(text, stopped=True)[1] == expected
+        )
         f = ReasoningFilter(starts_thinking=False)
-        segs = f.process(text) + f.flush()
+        segs = f.process(text) + f.flush(stopped=True)
         assert "".join(t for k, t in segs if k == "content") == expected
 
     @staticmethod
