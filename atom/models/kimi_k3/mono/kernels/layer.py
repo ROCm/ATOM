@@ -110,7 +110,8 @@ class K2Build:
     mla_post: bool = False
     # ``ATOM_MONO_MLA_PREP``: the NEXT (MLA) layer's prep as this launch's tail
     # stages (``stages.mla_prep``; 1: its attention seam, P0; 2: also the q_a /
-    # kv_a GEMV and RMSNorms, P1 / P2), on a seam of
+    # kv_a GEMV and RMSNorms, P1 / P2; 3: also q_b, the absorb, rope and the
+    # FP8 KV-cache write, P3 .. P5), on a seam of
     # ``prep_nblocks`` blocks; in the symbol only when set
     mla_prep: int = 0
     prep_nblocks: int = 0
@@ -118,6 +119,9 @@ class K2Build:
     prep_out_eps: float = 1e-6
     qa_eps: float = 1e-6  # mode 2: q_a_layernorm
     kva_eps: float = 1e-6  # mode 2: kv_a_layernorm
+    # mode 3: the MLA layer's rotary module (neox style; cos / sin rows)
+    rope_neox: bool = True
+    rope_maxpos: int = 1
 
 
 ABI = KernelAbi(
@@ -480,6 +484,9 @@ def _body(
             c["prep_slabs"] = post_slabs
             c["qa_eps"] = key.qa_eps
             c["kva_eps"] = key.kva_eps
+            c["prep_mode"] = key.mla_prep
+            c["rope_neox"] = key.rope_neox
+            c["rope_maxpos"] = key.rope_maxpos
     on, tls = key.timeline, lds.tls.ptr
     stamp_begin(on, tls, tid, TL_POINTS)
     # ---- o_proj on every CTA (``o_slot``)
@@ -569,6 +576,12 @@ def _body(
                 pr.p1_task(c, bid - pr.P1_CTA0)
             if bid < 2 * s:
                 pr.p2_norm(c, bid)
+        if const_expr(key.mla_prep >= 3):
+            # P3 on the lnorm CTAs and P1's (after it), P4 past them
+            if (bid >= pr.P3_CTA0) & (bid < pr.P3_CTA0 + pr.P3_TASKS):
+                pr.p3_task(c, bid - pr.P3_CTA0)
+            if bid >= pr.P4_CTA0:
+                pr.p4_task(c, bid - pr.P4_CTA0)
     stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
@@ -611,7 +624,7 @@ def build(key: K2Build):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     if key.mla_prep:
-        assert key.mla_prep in (1, 2), f"MLA prep mode {key.mla_prep}: P0 / P1-P2"
+        assert key.mla_prep in (1, 2, 3), f"MLA prep mode {key.mla_prep}"
         # P2 on P0's first 2 S CTAs
         assert 2 * s <= NA
         assert s <= pr.MAX_ROWS, f"MLA prep: {s} rows past {pr.MAX_ROWS}"
@@ -623,6 +636,9 @@ def build(key: K2Build):
         # the post stage stages x in whatever LDS is left past the fixed parts
         budget = (LDS_LIMIT - lds_bytes(Smem) - lds_bytes(RouteLds) - 256) // 16 * 16
         post_slabs = tuple(mp.slabs(s, budget))
+        if key.mla_prep >= 3:
+            # P3 stages all of q8 (K 1536) at once
+            assert mp.lds_words(s, budget) * 4 >= s * (pr.QB_K + mp.XPAD)
 
         @fx.struct
         class PostLds:
@@ -1053,6 +1069,21 @@ def _build_prep(key, name, keyed, bk):
         kvn: Int64,
         qa_nw: Int64,
         kva_nw: Int64,
+        w_qb: Int64,
+        w_qb_s: Int64,
+        w_k: Int64,
+        w_k_s: Int64,
+        qb: Int64,
+        qout: Int64,
+        qout_sr: Int32,
+        kvc: Int64,
+        kvc_sr: Int32,
+        slots: Int64,
+        pos: Int64,
+        cosc: Int64,
+        sinc: Int64,
+        k_sc: Int64,
+        q_sc: Int64,
     ):
         _ = keyed
         post = {
@@ -1113,6 +1144,21 @@ def _build_prep(key, name, keyed, bk):
                 "kvn": kvn,
                 "qa_nw": qa_nw,
                 "kva_nw": kva_nw,
+                "w_qb": w_qb,
+                "w_qb_s": w_qb_s,
+                "w_k": w_k,
+                "w_k_s": w_k_s,
+                "qb": qb,
+                "qout": qout,
+                "qout_sr": qout_sr,
+                "kvc": kvc,
+                "kvc_sr": kvc_sr,
+                "slots": slots,
+                "pos": pos,
+                "cosc": cosc,
+                "sinc": sinc,
+                "k_sc": k_sc,
+                "q_sc": q_sc,
             },
         )
 
@@ -1170,6 +1216,21 @@ def _build_prep(key, name, keyed, bk):
         kvn: Int64,
         qa_nw: Int64,
         kva_nw: Int64,
+        w_qb: Int64,
+        w_qb_s: Int64,
+        w_k: Int64,
+        w_k_s: Int64,
+        qb: Int64,
+        qout: Int64,
+        qout_sr: Int32,
+        kvc: Int64,
+        kvc_sr: Int32,
+        slots: Int64,
+        pos: Int64,
+        cosc: Int64,
+        sinc: Int64,
+        k_sc: Int64,
+        q_sc: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1226,6 +1287,21 @@ def _build_prep(key, name, keyed, bk):
             kvn,
             qa_nw,
             kva_nw,
+            w_qb,
+            w_qb_s,
+            w_k,
+            w_k_s,
+            qb,
+            qout,
+            qout_sr,
+            kvc,
+            kvc_sr,
+            slots,
+            pos,
+            cosc,
+            sinc,
+            k_sc,
+            q_sc,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI_PREP.check(k2, launch)

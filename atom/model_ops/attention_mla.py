@@ -3253,6 +3253,31 @@ class MLAAttention(nn.Module):
 
         return output
 
+    def forward_decode_prebuilt(
+        self, q_out: torch.Tensor, latent_out: bool = False
+    ) -> torch.Tensor:
+        """K3 mono decode, ``ATOM_MONO_MLA_PREP=3``: ``forward_impl``'s plain DCP-1
+        decode branch from the ``q_out`` the preceding K2 launch wrote, together
+        with this step's KV-cache rows (the work of ``q_proj``, the absorb BMM and
+        ``fused_qk_rope_concat_and_cache_mla``)."""
+        forward_context: ForwardContext = get_forward_context()
+        if forward_context.context.is_dummy_run:
+            atom_config = get_current_atom_config()
+            width = _mla_output_width(self, atom_config.hf_config.hidden_size)
+            return torch.empty(
+                (q_out.shape[0], width),
+                dtype=atom_config.torch_dtype,
+                device=q_out.device,
+            )
+        kv_cache = forward_context.kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        return self._forward_decode(
+            q_out,
+            kv_cache,
+            forward_context.attn_metadata,
+            q_prepadded=self._fused_q_head_pad,
+            latent_out=latent_out,
+        )
+
     def forward(
         self,
         query: torch.Tensor,  # query in unified attn
