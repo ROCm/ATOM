@@ -64,8 +64,11 @@ Disabled requests retain the original sampling path. In mixed batches, only
 requesting sequences have their vocabulary rows scored. Enabled requests add
 FP32 normalization, chosen-token ranking, optional top-K, and result serialization.
 Every participating rank computes these results. With deferred output and TP > 1,
-the complete compact payload is broadcast from TP rank 0 before asynchronous
-output transfer: chosen/top probabilities, candidate IDs and ranks stay aligned.
+the complete compact payload uses one broadcast from TP rank 0 and one asynchronous
+device-to-host copy: chosen/top probabilities, candidate IDs and ranks stay aligned.
+Integer fields are packed by reinterpreting their int32 bits, without a lossy
+conversion to floating-point numbers. The completed CPU buffer is unpacked using
+its own top-K width and the corresponding deferred batch's request IDs and mask.
 Existing token-ID synchronization is unchanged. This retains the original TP
 probability synchronization rather than assuming only the output-owning rank
 needs probability data.
@@ -73,7 +76,11 @@ needs probability data.
 All logprob scoring uses native PyTorch operations on both CPU and GPU,
 including `top_logprobs=0`. The scorer has no `torch.compile` wrapper or
 compilation cache. Optional snapshots and ragged row mapping are resolved
-before scoring; disabled requests do not invoke the scorer.
+before scoring; disabled requests do not invoke the scorer. Snapshot capture and
+scoring share one GPU row plan. Requested sequence indices use the runner's
+existing staged H2D publication; disabled batches do not publish that optional
+buffer. Ragged draft counts already on the host determine allocation sizes;
+building the plan does not read GPU metadata back to the CPU.
 
 The implementation avoids explicitly retaining a full log-softmax matrix, but
 the native selected-logit gather/conversion still allocates vocabulary-sized workspace.
@@ -93,6 +100,26 @@ for comparisons and reductions, and its
 [compact sampled/top-K output](https://github.com/vllm-project/vllm/blob/0e5b2ba118cfb3763a3640942e02dd8d93e8ed6c/vllm/v1/sample/sampler.py).
 ATOM retains its existing strictly-greater rank/tie semantics and raw-target
 probability definition. This is not a claim of equivalent vLLM throughput.
+
+## Short-run performance comparison
+
+V4.1 Flash, TP2, DSpark with five draft tokens and CUDA graphs, streaming at
+concurrency 8, temperature 0, fixed 68-token output. Each mode used two rotated
+15-second issue windows; throughput is total output tokens divided by total
+request span. These are short-run results, not long-run qualification.
+
+| Mode | Before packed transport (tok/s) | Packed transport confirmation (tok/s) |
+| --- | ---: | ---: |
+| Disabled | 2642 | 2679 |
+| Enabled, top-K 0 | 2310 | 2607 |
+| Enabled, top-K 20 | 2245 | 2570 |
+
+The confirmation run measured approximately 2.7% / 4.1% lower throughput for
+top-K 0 / 20 than disabled. All outputs had the same text hash and no request
+errors. The initial packed-transport run included a slower disabled window
+(2343 tok/s; its second window was 2654 tok/s), so an additional identical
+confirmation block was collected; the original samples were retained.
+This comparison is against the preceding PR implementation, not main.
 
 ## Text attribution and delivery
 

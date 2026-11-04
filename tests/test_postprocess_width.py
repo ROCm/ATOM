@@ -121,8 +121,7 @@ def test_a_step_that_padded_nothing_is_unaffected(monkeypatch):
     assert seen["logits_rows"] == bs
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-def test_the_logprob_gather_reads_the_cut_logits(monkeypatch, rank):
+def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     """`log_probs.gather` indexes with the sampled ids, which are per-request.
 
     Left on the padded logits it is `[running_bs, V]` gathered by `[scheduled_bs,
@@ -144,7 +143,6 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch, rank):
     batch.return_logprobs = [True] * scheduled_bs
     captured = {}
     runner = _runner(seen)
-    runner.rank = rank
     runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_: (
         captured.update(logprobs=lp) or ({}, {})
     )
@@ -160,7 +158,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch, rank):
     )
 
     assert seen["logits_rows"] == seen["temperature_rows"] == scheduled_bs
-    values, candidates, ranks = captured["logprobs"]
+    values, candidates, ranks = _payload_tensors(captured["logprobs"])
     assert values.shape == (scheduled_bs, 1, 1)
     assert candidates.shape == (scheduled_bs, 1, 0)
     assert ranks.shape == (scheduled_bs, 1)
@@ -186,7 +184,10 @@ def test_deferred_tp_broadcasts_complete_probability_payload(
 
     def broadcast(tensor, src):
         # Distinct received values prove output uses the broadcast result.
-        received = tensor + 10 if tensor.ndim >= 2 else tensor
+        received = tensor.clone()
+        if tensor.ndim >= 2:
+            received[..., 0] += 10
+            received[..., -1:].view(torch.int32).add_(100)
         broadcasts.append((tensor, received, src))
         return received
 
@@ -223,14 +224,16 @@ def test_deferred_tp_broadcasts_complete_probability_payload(
         assert captured["payload"] is not None
         assert not probability_calls
     else:
-        assert len(probability_calls) == (3 if top_k else 2)
+        assert len(probability_calls) == 1
         payload = captured["payload"]
         for tensor, received, source in probability_calls:
             assert source == 0
-            assert any(received is item for item in payload)
-        assert payload[0].shape == (1, 1, top_k + 1)
-        assert payload[1].shape == (1, 1, top_k)
-        assert payload[2].shape == (1, 1)
+            assert received is payload
+        values, candidates, ranks = _payload_tensors(payload)
+        assert values.shape == (1, 1, top_k + 1)
+        assert candidates.shape == (1, 1, top_k)
+        assert ranks.shape == (1, 1)
+        assert ranks.item() == 101
 
 
 @pytest.mark.parametrize(
@@ -291,7 +294,7 @@ def test_a_masked_row_still_reports_the_models_logprob(
         hidden_states=None,
     )
 
-    values, candidates, ranks = captured["logprobs"]
+    values, candidates, ranks = _payload_tensors(captured["logprobs"])
     torch.testing.assert_close(values[:, 0, 0], expected)
     expected_top, expected_ids = torch.topk(torch.log_softmax(logits, dim=-1), 3)
     torch.testing.assert_close(values[:, 0, 1:], expected_top)
@@ -322,3 +325,12 @@ def test_prefill_really_does_run_wider_than_it_scheduled():
     )
 
     assert (mode.scheduled_bs, mode.running_bs) == (3, 4)
+
+
+def _payload_tensors(payload):
+    k = (payload.shape[-1] - 2) // 2
+    return (
+        payload[..., : k + 1],
+        payload[..., k + 1 : 2 * k + 1].view(torch.int32),
+        payload[..., -1].view(torch.int32),
+    )

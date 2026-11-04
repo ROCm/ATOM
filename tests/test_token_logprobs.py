@@ -7,8 +7,10 @@ import pytest
 import torch
 
 from atom.model_engine.token_logprobs import (
+    _logprob_rows,
     capture_token_logits,
     gather_token_logprobs,
+    pack_token_logprobs,
     unpack_token_logprobs,
 )
 
@@ -39,6 +41,7 @@ def test_ragged_acceptance_correction_and_bonus_rows(accepted):
     # Request 0: target rows 0,1,2 + bonus row 3. Request 1: row 4 + bonus 5.
     logits = torch.arange(6 * 7, dtype=torch.float64).reshape(6, 7).sin().float()
     metadata = SimpleNamespace(
+        num_draft_tokens_np=np.array([3, 1]),
         cu_num_draft_tokens=torch.tensor([3, 4]),
         target_logits_indices=torch.tensor([0, 1, 2, 4]),
         bonus_logits_indices=torch.tensor([3, 5]),
@@ -48,7 +51,7 @@ def test_ragged_acceptance_correction_and_bonus_rows(accepted):
     batch = SimpleNamespace(return_logprobs=[True, True], top_logprobs=[2, 2])
     payload = gather_token_logprobs(logits, ids, batch, metadata)
     tokens = {12: tuple(ids[0, : accepted + 1].tolist()), 7: (5, 6)}
-    records = unpack_token_logprobs(tuple(t.tolist() for t in payload), [12, 7], tokens)
+    records = unpack_token_logprobs(pack_token_logprobs(*payload), [12, 7], tokens)
     reference = logits.double().log_softmax(-1)
     for i, token in enumerate(tokens[12]):
         assert records[12][i].logprob == pytest.approx(
@@ -69,7 +72,7 @@ def test_mixed_requests_do_not_score_disabled_rows():
     assert values.shape == (1, 1, 3)
     assert ranks[0, 0] == 2
     records = unpack_token_logprobs(
-        (values.tolist(), _candidates.tolist(), ranks.tolist()),
+        pack_token_logprobs(values, _candidates, ranks),
         [12, 7],
         {12: (1,), 7: (2,)},
         [False, True],
@@ -79,6 +82,7 @@ def test_mixed_requests_do_not_score_disabled_rows():
 
 def test_zero_draft_step_uses_bonus_row():
     metadata = SimpleNamespace(
+        num_draft_tokens_np=np.array([0]),
         cu_num_draft_tokens=torch.tensor([0]),
         target_logits_indices=torch.tensor([], dtype=torch.int64),
         bonus_logits_indices=torch.tensor([0]),
@@ -100,6 +104,7 @@ def test_gpu_ragged_probabilities_match_cpu_reference():
 
     def metadata(device):
         return SimpleNamespace(
+            num_draft_tokens_np=np.array([3, 1]),
             cu_num_draft_tokens=torch.tensor([3, 4], device=device),
             target_logits_indices=torch.tensor([0, 1, 2, 4], device=device),
             bonus_logits_indices=torch.tensor([3, 5], device=device),
@@ -183,3 +188,78 @@ def test_scoring_batch_transitions_and_snapshot():
                     atol=2e-5,
                     rtol=1e-5,
                 )
+
+
+@pytest.mark.parametrize("k", [0, 1, 20])
+def test_packed_payload_preserves_float_and_int32_bits(k):
+    values = torch.randn(2, 3, k + 1)
+    candidates = torch.full((2, 3, k), 2**24 + 17, dtype=torch.int32)
+    ranks = torch.full((2, 3), 2**30 + 3, dtype=torch.int32)
+    packed = pack_token_logprobs(values, candidates, ranks)
+    assert packed.is_contiguous() and packed.dtype == torch.float32
+    result = unpack_token_logprobs(packed, [4, 9], {4: (1, 2, 3), 9: (4,)})
+    assert len(result[4]) == 3 and len(result[9]) == 1
+    assert result[4][1].logprob == values[0, 1, 0].item()
+    assert result[4][1].rank == 2**30 + 3
+    assert result[4][1].top == tuple((2**24 + 17, v) for v in values[0, 1, 1:].tolist())
+
+
+@pytest.mark.parametrize("counts", [[0, 0, 0], [0, 3, 1], [5, 0, 2]])
+@pytest.mark.parametrize(
+    "mask", [[True, True, True], [True, False, True], [False, True, False]]
+)
+def test_one_row_plan_preserves_compact_snapshot_and_padding(counts, mask):
+    widths = np.array(counts) + 1
+    starts = np.concatenate(([0], np.cumsum(widths)[:-1]))
+    metadata = SimpleNamespace(
+        num_draft_tokens_np=np.array(counts),
+        cu_num_draft_tokens=torch.tensor(np.cumsum(counts)),
+        target_logits_indices=torch.tensor(
+            [int(starts[i] + j) for i, n in enumerate(counts) for j in range(n)],
+            dtype=torch.long,
+        ),
+        bonus_logits_indices=torch.tensor(starts + counts),
+    )
+    batch = SimpleNamespace(return_logprobs=mask, top_logprobs=[3] * 3)
+    logits = torch.randn(int(sum(widths)), 11)
+    ids = torch.full((3, 6), 2)
+    plan = _logprob_rows(batch, metadata, logits.device, 6)
+    snapshot = capture_token_logits(logits, batch, metadata, rows=plan)
+    assert snapshot.shape[0] == sum(widths[i] for i in range(3) if mask[i])
+    original = logits.clone()
+    logits.fill_(-100)
+    values, _, _ = gather_token_logprobs(
+        logits, ids, batch, metadata, snapshot=snapshot, rows=plan
+    )
+    for compact, req in enumerate(i for i in range(3) if mask[i]):
+        for pos in range(6):
+            row = starts[req] + min(pos, counts[req])
+            expected = original[row].double().log_softmax(-1)[2]
+            assert values[compact, pos, 0].item() == pytest.approx(
+                expected.item(), abs=1e-6
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU row planning")
+def test_staged_row_plan_needs_no_pageable_h2d_or_readback(monkeypatch):
+    batch = SimpleNamespace(
+        return_logprobs=[False, True],
+        logprob_request_indices=torch.tensor([1], device="cuda"),
+    )
+    metadata = SimpleNamespace(
+        num_draft_tokens_np=np.array([0, 2]),
+        cu_num_draft_tokens=torch.tensor([0, 2], device="cuda"),
+        target_logits_indices=torch.tensor([1, 2], device="cuda"),
+        bonus_logits_indices=torch.tensor([0, 3], device="cuda"),
+    )
+    with monkeypatch.context() as patch:
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("row plan performed a host/device conversion")
+
+        patch.setattr(torch, "tensor", forbidden)
+        for method in ("cpu", "tolist", "item"):
+            patch.setattr(torch.Tensor, method, forbidden)
+        plan = _logprob_rows(batch, metadata, torch.device("cuda"), 4)
+    assert plan.model_rows.tolist() == [1, 2, 3]
+    assert plan.sample_rows.tolist() == [[0, 1, 2, 2]]

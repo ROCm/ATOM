@@ -403,7 +403,7 @@ def test_prepare_model_publishes_sampling_and_query_prefix_before_token_consumer
             unpublished = {
                 b.name for b in group.members if b._epoch != runner.h2d_owner.epoch
             }
-            expected = set()
+            expected = {"logprob_request_indices"}
             if phase != "deferred":
                 expected.add("decode_src")
             if not with_channel:
@@ -611,3 +611,31 @@ def test_producer_reentry_preserves_sources_and_first_consumer(
     ):
         assert torch.equal(member.source, before), member.name
         assert torch.equal(output, reference), member.name
+
+
+@pytest.mark.parametrize("transport", ["direct", "packed"])
+def test_logprob_request_indices_share_sampling_publication(monkeypatch, transport):
+    runner = runner_with_buffers(monkeypatch, transport)
+    for mask in ([True, False, True], [False, False, False], [False, True, False]):
+        runner._advance_forward_vars()
+        runner._gate_staging_reuse()
+        batch = SimpleNamespace(
+            total_seqs_num=3,
+            temperatures=np.ones(3),
+            top_ks=np.full(3, -1),
+            top_ps=np.ones(3),
+            required_channel=None,
+            return_logprobs=mask,
+        )
+        runner.prepare_sample(batch)
+        expected = [i for i, enabled in enumerate(mask) if enabled]
+        group = runner.h2d_groups["sampling"]
+        assert group.counts[group.indices["logprob_request_indices"]] == (
+            len(expected) or None
+        )
+        if expected:
+            assert batch.logprob_request_indices.tolist() == expected
+        else:
+            assert batch.logprob_request_indices is None
+        runner._mark_staging_h2d_enqueued()
+        runner._record_forward_vars_event()

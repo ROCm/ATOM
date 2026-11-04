@@ -260,12 +260,12 @@ class LogprobsProcessor:
         # A replayed Kimi answer has the same source as its earlier reasoning.
         # Preserve the first delivery's ownership when both spans are identical.
         spans = sorted(
-            (start, end, 0 if field == "reasoning_content" else 1, field, text)
+            (start, 0 if field == "reasoning_content" else 1, end, field, text)
             for field, value in fields.items()
             if value
             for text, start, end in value.parts
         )
-        for start, end, _, field, text in spans:
+        for start, _, end, field, text in spans:
             values[field].extend(self.take(LogprobText([(text, start, end)], self)))
         return values
 

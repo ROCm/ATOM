@@ -354,8 +354,8 @@ def _logprob_frames(pending, make_chunk, request_id, model, index=0):
                 raise LogprobError("Visible text has no token-byte source spans")
             values[i][field] = []
             for value, start, end in text.parts:
-                spans.append((start, end, i, field, value, text.owner))
-    for start, end, i, field, value, owner in sorted(spans):
+                spans.append((start, i, end, field, value, text.owner))
+    for start, i, end, field, value, owner in sorted(spans):
         values[i][field].extend(owner.take(LogprobText([(value, start, end)], owner)))
     frames = [
         make_chunk(

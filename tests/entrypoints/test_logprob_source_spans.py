@@ -498,9 +498,10 @@ def test_logprob_execution_admission_is_shared(option, value, kwargs):
     SamplingParams(logprobs=False).validate_logprob_options(config, **kwargs)
 
 
-@pytest.mark.parametrize("size", [1, 1000])
+@pytest.mark.parametrize("size", [1, 1000, 8192])
+@pytest.mark.parametrize("answer", ["Paris.", "a" * 4100])
 @pytest.mark.parametrize("finish_reason", ["stop", "max_tokens"])
-def test_kimi_replayed_answer_keeps_json_sse_probabilities(size, finish_reason):
+def test_kimi_replayed_answer_keeps_json_sse_probabilities(size, answer, finish_reason):
     import asyncio
 
     from atom.entrypoints.openai.logprobs import LogprobCollector
@@ -510,7 +511,7 @@ def test_kimi_replayed_answer_keeps_json_sse_probabilities(size, finish_reason):
 
     dialect, _ = resolve_dialect("", "<|open|>think<|sep|>")
     reasoning = ReasoningChannel(dialect=dialect, starts_open=True)
-    text = "Paris.<|close|>response<|sep|>"
+    text = answer + "<|close|>response<|sep|>"
     probabilities = records(text)
     expected = _build_chat_choice(
         "",
@@ -566,6 +567,8 @@ def test_kimi_replayed_answer_keeps_json_sse_probabilities(size, finish_reason):
                         )
         assert texts["content"] == expected["message"]["content"]
         assert actual == expected["logprobs"]
+        assert len(actual["reasoning_content"]) == len(answer)
+        assert not actual["content"]
 
     asyncio.run(run())
 

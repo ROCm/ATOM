@@ -62,7 +62,14 @@ from atom.model_engine.sequence import (
     new_block_table,
 )
 from atom.model_engine.state_runtime import StateRuntime
-from atom.model_engine.token_logprobs import TokenLogprob
+from atom.model_engine.token_logprobs import (
+    TokenLogprob,
+    _logprob_rows,
+    capture_token_logits,
+    gather_token_logprobs,
+    pack_token_logprobs,
+    unpack_token_logprobs,
+)
 from atom.model_loader.loader import load_model
 from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
@@ -253,14 +260,14 @@ class tokenIDProcessor:
         cpu_tensor_handle,
         data_ready: torch.cuda.Event,
         copy_done: torch.cuda.Event | None = None,
-        gpu_logprobs: tuple[torch.Tensor, ...] | None = None,
+        gpu_logprobs: torch.Tensor | None = None,
     ):
         copy_done = copy_done or torch.cuda.Event()
         with torch.cuda.stream(self.async_copy_stream):
             data_ready.wait(stream=self.async_copy_stream)
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             cpu_logprobs = (
-                tuple(t.to("cpu", non_blocking=True) for t in gpu_logprobs)
+                gpu_logprobs.to("cpu", non_blocking=True)
                 if gpu_logprobs is not None
                 else None
             )
@@ -280,17 +287,14 @@ class tokenIDProcessor:
         cpu_tensor_handle.pop(0)
         return cpu_tensor
 
-    def recv_logprobs(self) -> tuple[list, ...] | None:
+    def recv_logprobs(self) -> torch.Tensor | None:
         """Pop and return the earliest logprobs from the async copy queue.
         Must be called after recv_async_output, which waits for the copy that
         fills this tensor (the same copy_done covers both).
         """
         if not self.logprobs_cpu:
             return None
-        logprob_tensor = self.logprobs_cpu.pop(0)
-        if logprob_tensor is not None:
-            return tuple(t.tolist() for t in logprob_tensor)
-        return None
+        return self.logprobs_cpu.pop(0)
 
     def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
         # The next replay of this draft output follows a whole target forward.
@@ -316,7 +320,7 @@ class tokenIDProcessor:
     def clean(self):
         self._wait_for_pending_copies()
         self.token_ids_cpu: list[tuple] = []
-        self.logprobs_cpu: list[tuple[torch.Tensor, ...] | None] = []
+        self.logprobs_cpu: list[torch.Tensor | None] = []
 
         self.prev_batch: ScheduledBatch | None = None
         self.prev_token_ids: torch.Tensor | None = None
@@ -366,7 +370,7 @@ class tokenIDProcessor:
         batch: ScheduledBatch,
         sampled_token_ids: torch.Tensor,
         sync_event: torch.cuda.Event,
-        sampled_logprobs: tuple[torch.Tensor, ...] | None = None,
+        sampled_logprobs: torch.Tensor | None = None,
         channel_states: torch.Tensor | None = None,
     ) -> tuple[dict[int, tuple[int, ...]], dict[int, list[TokenLogprob]] | None]:
         if not self.is_deferred_out:
@@ -378,12 +382,8 @@ class tokenIDProcessor:
                 processed = [(tid,) for tid in token_ids]
             ret = dict(zip(req_ids, processed))
             ret[-1] = 0  # is_deferred_out flag
-            from atom.model_engine.token_logprobs import unpack_token_logprobs
-
             payload = (
-                tuple(t.tolist() for t in sampled_logprobs)
-                if sampled_logprobs is not None
-                else None
+                sampled_logprobs.to("cpu") if sampled_logprobs is not None else None
             )
             logprobs_map = unpack_token_logprobs(
                 payload, req_ids, ret, batch.return_logprobs
@@ -412,8 +412,6 @@ class tokenIDProcessor:
                 processed = [(tid,) for tid in token_ids_list]
             token_id_dict = dict(zip(self.prev_req_ids, processed))
             if logprobs is not None:
-                from atom.model_engine.token_logprobs import unpack_token_logprobs
-
                 logprobs_map = unpack_token_logprobs(
                     logprobs,
                     self.prev_req_ids,
@@ -1458,6 +1456,9 @@ class ModelRunner:
             ),
             "top_ps": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **f32_kwargs
+            ),
+            "logprob_request_indices": CpuGpuBuffer(
+                self.max_bs, publication_group="sampling", **i64_kwargs
             ),
             "required_channel_states": CpuGpuBuffer(
                 self.max_bs, publication_group="sampling", **i32_kwargs
@@ -2708,6 +2709,18 @@ class ModelRunner:
                 top_ps = top_p_buffer.gpu[:bs]
                 top_p_count = bs
 
+        requested = [
+            i
+            for i, enabled in enumerate(getattr(batch, "return_logprobs", ()))
+            if enabled
+        ]
+        logprob_count = len(requested) or None
+        batch.logprob_request_indices = None
+        if requested:
+            buffer = self.forward_vars["logprob_request_indices"]
+            buffer.np[: len(requested)] = requested
+            batch.logprob_request_indices = buffer.gpu[: len(requested)]
+
         # Read back by `postprocess` through `_constrain_required_channel`.
         channel_count = None
         if batch.required_channel is not None:
@@ -2726,6 +2739,7 @@ class ModelRunner:
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
         counts[group.indices["required_channel_states"]] = channel_count
+        counts[group.indices["logprob_request_indices"]] = logprob_count
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -3351,6 +3365,16 @@ class ModelRunner:
         # Keep probability payloads available on every participating rank.
         need_logprobs = any(batch.return_logprobs)
         logprob_snapshot = None
+        logprob_rows = None
+        if need_logprobs:
+            width = (
+                1
+                if spec_decode_metadata is None
+                else spec_decode_metadata.num_spec_steps + 1
+            )
+            logprob_rows = _logprob_rows(
+                batch, spec_decode_metadata, logits.device, width
+            )
         structured = getattr(self, "structured_output", None)
         structured_requests = getattr(batch, "structured_requests", None)
         if structured_requests and structured is None:
@@ -3362,12 +3386,10 @@ class ModelRunner:
         structured_prefixes = {}
         if structured_requests:
             if need_logprobs:
-                from atom.model_engine.token_logprobs import capture_token_logits
-
                 # Snapshot requested rows before either grammar or channel
                 # masking, including raw top candidates and token ranks.
                 logprob_snapshot = capture_token_logits(
-                    logits, batch, spec_decode_metadata
+                    logits, batch, spec_decode_metadata, rows=logprob_rows
                 )
             structured_prefixes = structured.apply(logits, batch, spec_decode_metadata)
         if spec_decode_metadata is None:
@@ -3385,9 +3407,9 @@ class ModelRunner:
                 and batch.required_channel is not None
                 and logprob_snapshot is None
             ):
-                from atom.model_engine.token_logprobs import capture_token_logits
-
-                logprob_snapshot = capture_token_logits(logits, batch)
+                logprob_snapshot = capture_token_logits(
+                    logits, batch, rows=logprob_rows
+                )
             channel = self._constrain_required_channel(batch, logits)
             sampled_tokens = self.sampler(
                 logits,
@@ -3476,27 +3498,18 @@ class ModelRunner:
 
         sampled_logprobs = None
         if need_logprobs:
-            from atom.model_engine.token_logprobs import gather_token_logprobs
-
             sampled_logprobs = gather_token_logprobs(
                 logits,
                 sampled_tokens,
                 batch,
                 spec_decode_metadata,
                 snapshot=logprob_snapshot,
+                rows=logprob_rows,
             )
+            sampled_logprobs = pack_token_logprobs(*sampled_logprobs)
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
-                # Preserve deferred TP synchronization for the complete payload:
-                # chosen/top probabilities, candidate IDs, and ranks must agree.
-                # top_logprobs=0 has an empty candidate tensor on every rank.
-                sampled_logprobs = tuple(
-                    (
-                        get_tp_group().broadcast(tensor, src=0)
-                        if tensor.numel()
-                        else tensor
-                    )
-                    for tensor in sampled_logprobs
-                )
+                # One bit-preserving broadcast for scores, candidate IDs and ranks.
+                sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
         self.forward_done_event.record()
         # Capture before prepare_sampled_ids(), which advances self.prev_batch to current batch.

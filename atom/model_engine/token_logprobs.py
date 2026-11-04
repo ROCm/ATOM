@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 
@@ -15,29 +16,62 @@ class TokenLogprob:
     top: tuple[tuple[int, float], ...] = ()
 
 
-def capture_token_logits(logits, batch, metadata=None):
-    """Preserve requested target rows before in-place grammar masking.
+@dataclass
+class LogprobRows:
+    requests: torch.Tensor
+    model_rows: torch.Tensor
+    sample_rows: torch.Tensor
 
-    Ordinary requests never call this. The snapshot contains only rows for
-    logprob requests, including their speculative bonus row, not the full batch.
+
+def _logprob_rows(batch, metadata, device, width):
+    """One compact model-row plan for snapshots and sampled-token scoring.
+
+    All indices stay on the device. Host draft counts supply only the allocation
+    size; they are the existing scheduling metadata, never a GPU readback.
     """
     requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
+    chosen = getattr(batch, "logprob_request_indices", None)
+    if chosen is None:
+        # Direct scorer/CPU callers do not run the runner's H2D preparation.
+        chosen = torch.tensor(requested, device=device, dtype=torch.long)
     if metadata is None:
-        rows = torch.tensor(requested, device=logits.device, dtype=torch.long)
-    else:
-        counts = metadata.num_draft_tokens_np.tolist()
-        offsets = [0]
-        for count in counts:
-            offsets.append(offsets[-1] + count)
-        parts = [
-            metadata.target_logits_indices[offsets[i] : offsets[i + 1]]
-            for i in requested
-        ]
-        parts.append(metadata.bonus_logits_indices[requested])
-        rows = torch.cat(parts).long()
-    row_map = torch.zeros(logits.shape[0], device=logits.device, dtype=torch.long)
-    row_map[rows] = torch.arange(len(rows), device=logits.device)
-    return logits.index_select(0, rows), row_map
+        return LogprobRows(
+            chosen, chosen, torch.arange(len(requested), device=device)[:, None]
+        )
+    cu = metadata.cu_num_draft_tokens.long()
+    starts = torch.cat((cu.new_zeros(1), cu[:-1]))
+    lengths = (cu - starts)[chosen]
+    ends = (lengths + 1).cumsum(0)
+    compact_starts = torch.cat((ends.new_zeros(1), ends[:-1]))
+    count = len(requested) + sum(
+        int(metadata.num_draft_tokens_np[i]) for i in requested
+    )
+    slots = torch.arange(count, device=device)
+    owners = torch.searchsorted(ends, slots, right=True)
+    positions = slots - compact_starts[owners]
+    target = torch.cat((metadata.target_logits_indices.long(), cu.new_zeros(1)))
+    flat = starts[chosen[owners]] + positions
+    model_rows = torch.where(
+        positions < lengths[owners],
+        target[flat.clamp(max=target.numel() - 1)],
+        metadata.bonus_logits_indices.long()[chosen[owners]],
+    )
+    sample_rows = compact_starts[:, None] + torch.minimum(
+        torch.arange(width, device=device)[None, :], lengths[:, None]
+    )
+    return LogprobRows(chosen, model_rows, sample_rows)
+
+
+def capture_token_logits(logits, batch, metadata=None, *, rows=None):
+    """Snapshot only requested, real target/bonus rows before grammar masking."""
+    if rows is None:
+        width = (
+            1
+            if metadata is None
+            else int(max(metadata.num_draft_tokens_np, default=0)) + 1
+        )
+        rows = _logprob_rows(batch, metadata, logits.device, width)
+    return logits.index_select(0, rows.model_rows)
 
 
 def _score_rows(logits, rows, ids, k):
@@ -62,7 +96,9 @@ def _score_rows(logits, rows, ids, k):
     return values, candidates, ranks
 
 
-def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot=None):
+def gather_token_logprobs(
+    logits, sampled_ids, batch, metadata=None, *, snapshot=None, rows=None
+):
     """Return (values, candidate IDs, ranks) for requesting sequences only.
 
     Values slot 0 holds the sampled token; remaining slots hold top candidates.
@@ -75,55 +111,59 @@ def gather_token_logprobs(logits, sampled_ids, batch, metadata=None, *, snapshot
     requested = [i for i, enabled in enumerate(batch.return_logprobs) if enabled]
     width = sampled_ids.shape[1] if sampled_ids.ndim == 2 else 1
     ids = sampled_ids.reshape(len(batch.return_logprobs), width)
-    device = logits.device
-    chosen = torch.tensor(requested, device=device, dtype=torch.long)
+    if rows is None:
+        rows = _logprob_rows(batch, metadata, logits.device, width)
     counts = getattr(batch, "top_logprobs", [0] * len(batch.return_logprobs))
     k = min(max((counts[i] for i in requested), default=0), logits.shape[-1])
     shape = (len(requested), width)
-    if metadata is None:
-        rows = chosen[:, None]
+    selected_ids = ids[rows.requests].clamp(min=0).long()
+    if snapshot is None:
+        score_rows = rows.model_rows[rows.sample_rows]
     else:
-        cu = metadata.cu_num_draft_tokens.long()
-        starts = torch.cat((cu.new_zeros(1), cu[:-1]))
-        lengths = cu - starts
-        pos = torch.arange(width, device=device)[None, :]
-        flat = starts[chosen, None] + pos
-        # Append a safe row for zero-draft steps and padded positions.
-        target_rows = torch.cat(
-            (metadata.target_logits_indices.long(), cu.new_zeros(1))
-        )
-        rows = torch.where(
-            pos < lengths[chosen, None],
-            target_rows[flat.clamp(max=target_rows.numel() - 1)],
-            metadata.bonus_logits_indices.long()[chosen, None],
-        )
-    selected_ids = ids[chosen].clamp(min=0).long()
-    if snapshot is not None:
-        rows = snapshot[1][rows]
-        logits = snapshot[0]
+        score_rows = rows.sample_rows
+        logits = snapshot
     values, candidates, ranks = _score_rows(
-        logits, rows.flatten(), selected_ids.flatten(), k
+        logits, score_rows.flatten(), selected_ids.flatten(), k
     )
     return values.view(*shape, k + 1), candidates.view(*shape, k), ranks.view(shape)
 
 
+def pack_token_logprobs(values, candidates, ranks):
+    """One FP32 transport buffer; integer fields retain their int32 bit patterns."""
+    return torch.cat(
+        (values, candidates.view(torch.float32), ranks[..., None].view(torch.float32)),
+        dim=-1,
+    )
+
+
 def unpack_token_logprobs(payload, req_ids, token_ids, requested=None):
-    """Decode the matching CPU batch, never the next scheduled batch."""
+    """Read the completed CPU buffer using its own batch identity and top-K width."""
     if payload is None:
         return None
-    values, candidates, ranks = payload
+    if payload.device.type != "cpu":
+        raise ValueError("Logprob payload must complete D2H before unpacking")
+    k = (payload.shape[-1] - 2) // 2
+    # A structured NumPy view converts mixed floats/ints in one tolist call.
+    # No numeric cast of IDs: ranks and candidates remain bit-exact, even for
+    # int32 values outside FP32's exact integer range.
+    dtype = np.dtype(
+        [(f"value{i}", np.float32) for i in range(k + 1)]
+        + [(f"id{i}", np.int32) for i in range(k)]
+        + [("rank", np.int32)]
+    )
+    records = payload.numpy().view(dtype).reshape(payload.shape[:2]).tolist()
     if requested is not None:
         req_ids = [rid for rid, enabled in zip(req_ids, requested) if enabled]
-    if len(values) != len(req_ids):
+    if len(records) != len(req_ids):
         raise ValueError("Token/logprob batch identity mismatch")
     return {
         req_id: [
-            TokenLogprob(float(v[0]), int(rank), tuple(zip(c, v[1:])))
-            for v, c, rank in zip(
-                values[i][: len(token_ids[req_id])],
-                candidates[i][: len(token_ids[req_id])],
-                ranks[i][: len(token_ids[req_id])],
+            TokenLogprob(
+                record[0],
+                record[-1],
+                tuple(zip(record[k + 1 : 2 * k + 1], record[1 : k + 1])),
             )
+            for record in records[i][: len(token_ids[req_id])]
         ]
         for i, req_id in enumerate(req_ids)
     }
