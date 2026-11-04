@@ -5,6 +5,7 @@
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -399,3 +400,93 @@ def test_a_shape_that_does_not_build_stops_startup(monkeypatch):
     with pytest.raises(RuntimeError, match="ATOM_MONO_ENABLE=0"):
         kernels.build(1, 4, 4096)
     assert not kernels.serves(1, 4, 4096)
+
+
+@pytest.fixture
+def draft_attention_fallback():
+    # Dispatch checks run on CPU but import the actual GPU implementation.
+    # CPU CI lacks these libraries; keep its other Mono plan tests running.
+    pytest.importorskip("triton")
+    pytest.importorskip("flydsl")
+    pytest.importorskip("aiter")
+    from atom.models.qwen38.mono import draft_fallback
+
+    return draft_fallback
+
+
+def _draft_attention_context(requests, *, prefill=False):
+    meta = SimpleNamespace(block_tables=SimpleNamespace(shape=(requests, 4096)))
+    return SimpleNamespace(
+        attn_metadata=SimpleNamespace(qsa_metadata=meta),
+        context=SimpleNamespace(is_prefill=prefill, is_draft=True),
+    )
+
+
+def _draft_attention_module(rope_cache):
+    module = Mock()
+    module.rope_position_cache = rope_cache
+    module.compressed_key_scale = None
+    module.k_scale_cache = None
+    module.indexer.compress_ratio = 4
+    module.indexer.index_head_dim = 128
+    module.qkv_proj.side_effect = RuntimeError("entered fused QSA")
+    return module
+
+
+@pytest.mark.parametrize("requests", [1, 6])
+@pytest.mark.parametrize("query_length", [1, 4])
+def test_draft_attention_text_pool_uses_native_before_fused_preparation(
+    draft_attention_fallback, monkeypatch, requests, query_length
+):
+    # Six requests reproduce the serving failure outside the <=4-request
+    # draft Mono program. Both q1 and q4 fallback layouts must remain usable.
+    module = _draft_attention_module(None)
+    positions = object()
+    mixed = SimpleNamespace(shape=(requests * query_length, 2560))
+    monkeypatch.setattr(
+        draft_attention_fallback,
+        "get_forward_context",
+        lambda: _draft_attention_context(requests),
+    )
+    result = draft_attention_fallback.attention(module, positions, mixed)
+    assert result is module.return_value
+    module.assert_called_once_with(positions, mixed)
+    module.qkv_proj.assert_not_called()
+
+
+@pytest.mark.parametrize("query_length", [1, 4])
+def test_draft_attention_position_cache_keeps_fused_fallback(
+    draft_attention_fallback, monkeypatch, query_length
+):
+    module = _draft_attention_module(object())
+    mixed = SimpleNamespace(shape=(6 * query_length, 2560))
+    monkeypatch.setattr(
+        draft_attention_fallback,
+        "get_forward_context",
+        lambda: _draft_attention_context(6),
+    )
+    with pytest.raises(RuntimeError, match="entered fused QSA"):
+        draft_attention_fallback.attention(module, object(), mixed)
+    module.qkv_proj.assert_called_once_with(mixed)
+    module.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "prefill,has_metadata,rows", [(True, True, 6), (False, False, 6), (False, True, 7)]
+)
+def test_draft_attention_existing_native_dispatch(
+    draft_attention_fallback, monkeypatch, prefill, has_metadata, rows
+):
+    module = _draft_attention_module(object())
+    positions = object()
+    mixed = SimpleNamespace(shape=(rows, 2560))
+    context = _draft_attention_context(6, prefill=prefill)
+    if not has_metadata:
+        context.attn_metadata.qsa_metadata = None
+    monkeypatch.setattr(
+        draft_attention_fallback, "get_forward_context", lambda: context
+    )
+    result = draft_attention_fallback.attention(module, positions, mixed)
+    assert result is module.return_value
+    module.assert_called_once_with(positions, mixed)
+    module.qkv_proj.assert_not_called()
