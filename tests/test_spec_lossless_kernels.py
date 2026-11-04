@@ -1529,7 +1529,7 @@ def test_the_sparse_store_verifies_bit_for_bit_as_its_dense_q():
     args = verify_batch(drafts, width, logits, temps)
     args["q_row_base"][7::11] = -1
     q = draft_q(q_rows, drafts)
-    n, xslot = q.store.meta.unbind(1)
+    n, xslot = q.meta.unbind(1)
     # Slots that name another stored id: the walk must find x's true q.
     xslot[1::9] = (xslot[1::9] + 1) % n[1::9]
     for step in (0, 1, 2):
