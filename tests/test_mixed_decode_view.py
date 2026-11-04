@@ -87,3 +87,13 @@ def test_prefill_and_empty_slices():
     assert prefill.total_seqs_num_decode == 0
     empty = batch.slice_rows(5, 5)
     assert empty.total_tokens_num == empty.total_seqs_num == 0
+
+
+def test_structured_request_row_keys_are_filtered_and_rebased():
+    batch = make_batch()
+    captures = {0: object(), 2: object(), 4: object()}
+    batch.structured_requests = captures
+    child = batch.slice_rows(2, 5)
+    assert child.structured_requests == {0: captures[2], 2: captures[4]}
+    assert batch.structured_requests is captures
+    assert batch.slice_rows(5, 5).structured_requests == {}

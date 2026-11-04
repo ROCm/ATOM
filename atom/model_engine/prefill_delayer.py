@@ -1022,7 +1022,9 @@ class PrefillDelayer:
         self._stat_adapt_hold_ticks += 1
         return self._hold(g_pending)
 
-    def notify_prefill_executed(self, tokens: int = 0, *, decoded: bool = False) -> None:
+    def notify_prefill_executed(
+        self, tokens: int = 0, *, decoded: bool = False
+    ) -> None:
         """Report a completed local prefill forward.
 
         The next lockstep decision folds both flags into the existing SUM

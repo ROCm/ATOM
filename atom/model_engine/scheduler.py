@@ -610,6 +610,7 @@ class ScheduledBatch:
             "block_table_rows",
             "state_rows",
             "replaying",
+            "structured_requests",
             "total_tokens_num",
             "total_tokens_num_prefill",
             "total_tokens_num_decode",
@@ -677,6 +678,11 @@ class ScheduledBatch:
         result.scheduled_tokens = self.scheduled_tokens[token_start:token_stop]
         result.replaying = {
             i - start: v for i, v in self.replaying.items() if start <= i < stop
+        }
+        result.structured_requests = {
+            i - start: v
+            for i, v in self.structured_requests.items()
+            if start <= i < stop
         }
         result.total_seqs_num = stop - start
         result.total_seqs_num_prefill = max(
@@ -3154,11 +3160,19 @@ class Scheduler:
         next_token_ids: list[int] | None = None
         if num_seqs_prefill > 0:
             self.prev_prompt = True
-            logger.info(
-                f"Scheduled {'mixed' if num_seqs_decode > 0 else 'prefill'} batch: "
-                f"{num_seqs_prefill} prefill + {num_seqs_decode} decode, "
-                f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens"
-            )
+            if num_seqs_decode:
+                logger.info(
+                    f"Scheduled mixed batch: {num_seqs_prefill} prefill + "
+                    f"{num_seqs_decode} decode, "
+                    f"{total_tokens_num_prefill}+{total_tokens_num_decode} tokens"
+                )
+            else:
+                logger.info(
+                    f"Scheduled prefill batch: {num_seqs_prefill} reqs, "
+                    f"{total_tokens_num_prefill} new tokens "
+                    f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
+                    f"req_ids: {tuple(scheduled_seqs.keys())}"
+                )
             # Before connector metadata and the batch snapshot: plan_midstep
             # reserves checkpoints consumed by both.
             is_final_chunk, next_token_ids = self._settle_prefill_chunks(
