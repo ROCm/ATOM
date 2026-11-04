@@ -76,3 +76,27 @@ def lds_words(s: int, budget: int) -> int:
     per-task av tile (16 x 16 words)."""
     w = max(g1 - g0 for g0, g1 in slabs(s, budget)) * GROUP_COLS
     return max(s * (w + XPAD) // 4, ROWS * ROWS)
+
+
+def w8_dword(row0, lane, ldk, kcol):
+    """The dword where lane ``lane``'s 8 fp8 of weight rows ``row0`` .. + 16
+    (``row0`` a multiple of 16) start, at K column ``kcol`` (a multiple of 32) +
+    its lane group's 8: AITER's (16, 16) preshuffle of a ``[N, ldk]`` E4M3
+    plane. The next q step (32 columns on) is 128 dwords further. Plain
+    integer arithmetic: the kernel calls it on traced values."""
+    g = lane // ROWS
+    byte = (
+        ((row0 // ROWS * (ldk // 32) + kcol // 32) * 2 + g // 2) * 256
+        + lane % ROWS * 16
+        + g % 2 * 8
+    )
+    return byte // 4
+
+
+def shuffle16(w):
+    """A ``[N, K]`` (N % 16 == 0, K % 32 == 0) byte plane in AITER's (16, 16)
+    preshuffle, as ``w8_dword`` reads it: a torch-only reference."""
+    n, k = w.shape
+    return (
+        w.reshape(n // 16, 16, k // 32, 2, 2, 8).permute(0, 2, 3, 1, 4, 5).reshape(n, k)
+    )

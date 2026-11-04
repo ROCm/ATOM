@@ -222,14 +222,17 @@ def stage_oproj_post(c, gi, task):
     wait for every task's ``mpdone`` pair, then a token group at a time its
     core rows at device scope and the MFMAs. (The weights issued before the
     post task stay live across it: one VGPR spilled from 4 rows.)"""
+    # one stage on every CTA: a task publishes its pair before the CTA waits
+    # on all of them (an exchange, as an all-reduce's push and poll)
+    enter_stage("k2.mlapost")
     if task >= 0:
-        enter_stage("k2.mlapost")
         mp.post_task(c, task)
     ops = [
         k2a.o_loads(c, k2a.o_task_or(gi, gi + BLOCKS * j), paired=True)
         for j in range(O_ROUNDS)
     ]
     mp.wait_core(c)
+    enter_stage("k2.o")
     for g in range_constexpr(c["G"]):
         cg = k2a.group_view(c, g)
         mp.load_core_dev(cg, 0, cg["S"], k2a.OK, gemv.LDS_PAD)

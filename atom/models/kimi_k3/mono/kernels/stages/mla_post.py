@@ -65,6 +65,7 @@ from atom.models.kimi_k3.mono.kernels.stages.mla_post_plan import (  # noqa: F40
     slabs,
     task_cta,
     task_rows,
+    w8_dword,
 )
 from atom.mono.device import gemv
 from atom.mono.device.ops import (
@@ -119,20 +120,6 @@ def task_of(bid):
 def token_tiles(s):
     """``[(t0, n)]``: the 16-token tiles of ``s`` rows, one at s <= 16."""
     return [(t0, min(ROWS, s - t0)) for t0 in range(0, s, ROWS)]
-
-
-def w8_dword(row0, lane, ldk, kcol):
-    """The dword where lane ``lane``'s 8 fp8 of weight rows ``row0`` .. + 16
-    (``row0`` a multiple of 16) start, at K column ``kcol`` (a multiple of 32) +
-    its lane group's 8: AITER's (16, 16) preshuffle of a ``[N, ldk]`` E4M3
-    plane. The next q step (32 columns on) is 128 dwords further."""
-    g = lane // ROWS
-    byte = (
-        ((row0 // ROWS * (ldk // 32) + kcol // 32) * 2 + g // 2) * 256
-        + lane % ROWS * 16
-        + g % 2 * 8
-    )
-    return byte // 4
 
 
 def w8_operand(op):
