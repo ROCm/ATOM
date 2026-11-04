@@ -1926,11 +1926,14 @@ def _check_m3_mxfp4(
     kv_mxfp4: bool,
     block_size: int,
     plugin_mode: bool,
+    index_q_fp8: bool = False,
 ) -> None:
     """Refuse MiniMax-M3's MXFP4 caches where they cannot run, at startup rather
     than in the first forward (``ATOM_M3_SPARSE_KV_MXFP4``, ``--index-cache-dtype
     mxfp4``)."""
     index_mxfp4 = index_cache_dtype == "mxfp4"
+    if index_q_fp8 and not index_mxfp4:
+        raise ValueError("ATOM_M3_INDEX_Q_FP8 needs --index-cache-dtype mxfp4")
     if not (kv_mxfp4 or index_mxfp4):
         return
     if not any("MiniMaxM3" in str(a) for a in arches):
@@ -2823,6 +2826,7 @@ class Config:
             envs.ATOM_M3_SPARSE_KV_MXFP4,
             self.kv_cache_block_size,
             is_plugin_mode(),
+            envs.ATOM_M3_INDEX_Q_FP8,
         )
 
         if self.hf_config.model_type == "deepseek_v41_text":

@@ -1457,26 +1457,24 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             )
             return q, k, v, k_cache, v_cache, k_scale, v_scale
 
-        # MXFP4 KV: the kernel hands back the main q as e4m3 (cast as is, no
-        # per-tensor scale) and writes no bf16 copy of it.
-        q_fp8 = None
-        if self.kv_mxfp4:
-            q_fp8 = torch.empty(
-                (num_tokens, self.num_heads * self.head_dim),
-                dtype=torch.float8_e4m3fn,
-                device=qkv.device,
-            )
-            q_out = None
-        else:
-            q_out = torch.empty(
-                (num_tokens, self.num_heads * self.head_dim),
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
+        # MXFP4 KV: an e4m3 q_out makes the kernel write the main q as e4m3 (cast
+        # as is, scale 1.0) and no bf16 copy of it, nor write it back into qkv.
+        q_out = torch.empty(
+            (num_tokens, self.num_heads * self.head_dim),
+            dtype=torch.float8_e4m3fn if self.kv_mxfp4 else qkv.dtype,
+            device=qkv.device,
+        )
         index_q = None
         if not self.skip_index_topk:
+            # e4m3 (cast as is) for the MXFP4 index's fp8-q scorer
             index_q = torch.empty(
-                (num_tokens, self.index_q_size), dtype=qkv.dtype, device=qkv.device
+                (num_tokens, self.index_q_size),
+                dtype=(
+                    torch.float8_e4m3fn
+                    if self.index_mxfp4 and envs.ATOM_M3_INDEX_Q_FP8
+                    else qkv.dtype
+                ),
+                device=qkv.device,
             )
         aiter.fused_qknorm_idxrqknorm(
             qkv,
@@ -1505,10 +1503,9 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             v_scale=fused_v_scale,
             asm_layout=not self.kv_mxfp4,
             skip_index_branch=self.skip_index_topk,
-            q_fp8_out=q_fp8,
         )
 
-        q = (q_fp8 if self.kv_mxfp4 else q_out).view(-1, self.num_heads, self.head_dim)
+        q = q_out.view(-1, self.num_heads, self.head_dim)
         self._out_dtype = qkv.dtype
         if index_q is None:
             # top-k-reusing layer: no indexer query, as the Triton branch above
@@ -1622,6 +1619,40 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
 
+    def _sparse_pa_mxfp4(self, q, k_cache, v_cache, sparse_bt, sparse_ctx, plan_owner):
+        from atom.model_ops.minimax_m3.sparse_attn_mxfp4 import sparse_pa_mxfp4
+
+        if self.local_blocks < 1:
+            # The plan is refreshed once a step, which holds only while every
+            # layer's rows have the same lengths -- i.e. the tail is always picked.
+            raise NotImplementedError("the MXFP4 KV path needs sparse_local_block >= 1")
+        return sparse_pa_mxfp4(
+            q,
+            k_cache,
+            v_cache,
+            sparse_bt,
+            sparse_ctx,
+            self.num_kv_heads,
+            self.scale,
+            self._out_dtype,
+            plan_owner,
+        )
+
+    def _mxfp4_select_kwargs(self, sparse_metadata, decode: bool) -> dict:
+        """What the selection needs to know about the MXFP4 caches: a block table
+        of one page-128 page a block for the MXFP4 KV, the MXFP4 scorer (and, on
+        decode, the step's work map) for the MXFP4 index."""
+        kw = {}
+        if self.kv_mxfp4:
+            kw.update(pages_per_block=1, block_page_stride=1)
+        if self.index_mxfp4:
+            kw["index_mxfp4"] = True
+            if decode:
+                kw["index_score_work_map"] = sparse_metadata.index_score_work_map
+                kw["index_score_max_block"] = sparse_metadata.index_score_max_block
+                kw["index_score_out"] = sparse_metadata.index_score_out
+        return kw
+
     @mark_trace(prefix="sparse_attention_prefill", torch_compile=False)
     def _sparse_prefill(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -1675,34 +1706,41 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                 self.scale,
                 emit_sparse_block_table=True,
                 n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                **self._mxfp4_select_kwargs(sparse_metadata, decode=False),
             )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn_prefill_asm(
-            q,
-            k_cache,
-            v_cache,
-            topk_idx,
-            block_tables,
-            None,  # query_req_id -> sync-free on-device fallback
-            None,  # query_abs_pos -> sync-free on-device fallback
-            prefill_md.qo_indptr,  # qo_indptr -> arange(total_q+1)
-            self.num_kv_heads,
-            self.scale,
-            output,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            cu_seqlens_q=cu_seqlens_q,
-            prefix_lens=prefix_lens,
-            sparse_bt=sparse_bt,
-            sparse_ctx=sparse_ctx,
-            plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
-            plan_cache_owner=prefill_md,
-        )
+        if self.kv_mxfp4:
+            # plan-free: a prefill chunk's row count is new almost every forward
+            output = self._sparse_pa_mxfp4(
+                q, k_cache, v_cache, sparse_bt, sparse_ctx, None
+            )
+        else:
+            output = torch.empty_like(q)
+            minimax_m3_sparse_attn_prefill_asm(
+                q,
+                k_cache,
+                v_cache,
+                topk_idx,
+                block_tables,
+                None,  # query_req_id -> sync-free on-device fallback
+                None,  # query_abs_pos -> sync-free on-device fallback
+                prefill_md.qo_indptr,  # qo_indptr -> arange(total_q+1)
+                self.num_kv_heads,
+                self.scale,
+                output,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                cu_seqlens_q=cu_seqlens_q,
+                prefix_lens=prefix_lens,
+                sparse_bt=sparse_bt,
+                sparse_ctx=sparse_ctx,
+                plan_step_owner=prefill_md if self.local_blocks >= 1 else None,
+                plan_cache_owner=prefill_md,
+            )
         output = output.view(*q.shape)
         self._index_q = None
         self._index_q_cache_key_info = None
@@ -1821,30 +1859,36 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
                     emit_sparse_block_table=True,
                     max_query_len=max_query_len,
                     n_valid_column_per_row=sparse_metadata.n_valid_column_per_row,
+                    **self._mxfp4_select_kwargs(sparse_metadata, decode=True),
                 )
             self._store_cached_topk(
                 sparse_metadata, topk_key, (topk_idx, sparse_bt, sparse_ctx)
             )
         else:
             topk_idx, sparse_bt, sparse_ctx = cached_topk
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn_decode_asm(
-            q,
-            k_cache,
-            v_cache,
-            topk_idx,
-            decode_md.block_table,
-            decode_md.seq_lens,
-            self.num_kv_heads,
-            self.scale,
-            output,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            sparse_bt=sparse_bt,
-            sparse_ctx=sparse_ctx,
-            # Once per step only when the tail block is forced (see sparse_attn).
-            plan_step_owner=decode_md if self.local_blocks >= 1 else None,
-        )
+        if self.kv_mxfp4:
+            output = self._sparse_pa_mxfp4(
+                q, k_cache, v_cache, sparse_bt, sparse_ctx, sparse_metadata
+            )
+        else:
+            output = torch.empty_like(q)
+            minimax_m3_sparse_attn_decode_asm(
+                q,
+                k_cache,
+                v_cache,
+                topk_idx,
+                decode_md.block_table,
+                decode_md.seq_lens,
+                self.num_kv_heads,
+                self.scale,
+                output,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                sparse_bt=sparse_bt,
+                sparse_ctx=sparse_ctx,
+                # Once per step only when the tail block is forced (see sparse_attn).
+                plan_step_owner=decode_md if self.local_blocks >= 1 else None,
+            )
         self._index_q = None
         self._index_q_cache_key_info = None
         output = output.view(*q.shape)

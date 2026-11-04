@@ -3,7 +3,7 @@
 
 The pool lays one (page, kv head) of K, of V and of the index key out as one
 8704 B field -- [128 x 64 B e2m1][128 x 4 B e8m0] -- which is what the aiter
-writer produces and `pa_decode_mxfp4` / `score_flydsl_fp4` read. Pinned here:
+writer produces and `pa_decode` (MXFP4 K/V) / `score_flydsl_fp4` read. Pinned here:
 the bytes per token the capacity arithmetic rests on, the views the kernels are
 handed, and the combinations that must fail at startup and not in a forward.
 """
@@ -106,3 +106,9 @@ def test_the_baselines_are_never_refused():
     # Neither MXFP4 switch on: nothing to check, whatever else is set.
     check(arches=["LlamaForCausalLM"], index_cache_dtype="fp8", kv_mxfp4=False)
     check(index_cache_dtype="fp4", kv_mxfp4=False, block_size=16)
+
+
+def test_an_fp8_index_q_needs_the_mxfp4_index():
+    check(index_q_fp8=True)
+    with pytest.raises(ValueError, match="INDEX_Q_FP8"):
+        check(index_cache_dtype="fp8", index_q_fp8=True)
