@@ -290,3 +290,18 @@ def test_vision_pass_rejects_patch_count_mismatch(vision_passes):
         vision_passes.encode_media_in_passes(
             None, None, torch.zeros(5, 3), torch.tensor([[1, 2, 2]])
         )
+
+
+def test_video_time_embedding_follows_the_embedding_device_and_dtype(vision_passes):
+    # Review on #2990: time_weight is a from_numpy buffer, so it stays on the CPU
+    # (fp32) while the tower is built on the GPU; only t > 1 grids (video) read
+    # it, and the first video request failed with a device mismatch. The meta
+    # device stands in for the accelerator here.
+    embed = vision_passes.KimiK3InterpPosEmb(4, 4, 4, 8)
+    embed.weight = torch.nn.Parameter(
+        torch.empty(4, 4, 8, device="meta", dtype=torch.bfloat16)
+    )
+    x = torch.empty(2 * 16, 8, device="meta", dtype=torch.bfloat16)
+    out = embed(x, torch.tensor([[2, 4, 4]]))
+    assert out.device.type == "meta" and out.dtype == torch.bfloat16
+    assert embed.time_weight.device.type == "cpu"

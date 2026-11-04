@@ -124,8 +124,8 @@ def _format_k3_timestamp(seconds: float, mode: str) -> str:
 def _k3_video_chunks(video, cfg: dict) -> list[tuple[str, "np.ndarray", int]]:
     """Sample a video and split it into MoonViT temporal chunks.
 
-    Mirrors the Kimi-K3 reference video contract (as implemented in sglang
-    PR #35325): sample at most ``sample_fps``, cap each frame's patches so the
+    Follows the video settings in the Kimi-K3 processor config (the same
+    contract as the open sglang PR #35325): sample at most ``sample_fps``, cap each frame's patches so the
     whole clip stays within ``in_patch_limit_video``, group
     ``temporal_merge_kernel_size`` frames per grid (the tower mean-pools them),
     and label each grid with the timestamp of its first frame. Returns
