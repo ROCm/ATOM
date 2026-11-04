@@ -40,6 +40,18 @@ jobs:
           python3 .claude/skills/review-pr/triage.py mapping > /tmp/mapping.md
           diff /tmp/mapping.md .claude/skills/review-pr/MAPPING.md
 
+      - name: Lint the skill for real errors
+        run: |
+          pip3 install --quiet ruff==0.16.0
+          # --isolated on purpose: pyproject exempts the vendored review-pr files from ALL
+          # rules so they stay byte-comparable with upstream aiter, and that exemption was
+          # hiding five genuine F-class defects in them (a dead import left by a refactor,
+          # four f-strings with no placeholders). Keeping vendored files unformatted is a
+          # reason not to restyle them, never a reason to stop looking for real errors.
+          # F and E9 only: actual mistakes, nothing about style.
+          ruff check --isolated --no-cache --select F,E9 .claude/skills/review-pr/ \
+            .claude/skills/validate-atom-pr/
+
       - name: SKILL.md stays inside its 500-line budget
         run: |
           n=$(wc -l < .claude/skills/review-pr/SKILL.md)

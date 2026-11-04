@@ -12,7 +12,6 @@ SKILL.md is always at <repo>/.claude/skills/review-pr/SKILL.md.
 
 import pathlib
 import re
-import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -326,11 +325,11 @@ def check_publish_needs_post_flag():
               f"accident")
         return 1
     if granted:
-        print(f"✅ atom-review-bot.yml grants write, and _publish.py is invoked with "
-              f"--post to match it")
+        print("✅ atom-review-bot.yml grants write, and _publish.py is invoked with "
+              "--post to match it")
         return 0
-    print(f"✅ atom-review-bot.yml grants no issues/pull-requests write anywhere; "
-          f"_publish.py's missing --post is its only closure, as documented")
+    print("✅ atom-review-bot.yml grants no issues/pull-requests write anywhere; "
+          "_publish.py's missing --post is its only closure, as documented")
     return 0
 
 
