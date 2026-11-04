@@ -3,7 +3,7 @@
 
 """Sampled DSpark Markov step (`dspark_markov_sample`, the lossless draft).
 
-The greedy op's bias GEMV (`_markov_logits_tile`), then ``x_k`` drawn from the
+The greedy op's stage-1 GEMV (`dspark_markov_stage1`), then ``x_k`` drawn from the
 top K of ``softmax(logits_k / T)``, stored as q (`sparse_q_store`). q is 0 off
 the stored set, so truncation costs acceptance, never exactness (`Q_WIDTH`).
 Six launches per position: GEMV + 1/T into the fp32 ``s`` scratch with tile
@@ -24,14 +24,15 @@ import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.model_ops.dspark_markov_argmax import (
-    _BLOCK_K,
-    _BLOCK_V,
-    _MAX_BLOCK_ROW,
-    _MIN_BLOCK_ROW,
-    _markov_logits_tile,
-    _publish_tile_argmax,
     check_markov_inputs,
     markov_weights_unsupported,
+)
+from atom.model_ops.dspark_markov_stage1 import (
+    BLOCK_K,
+    BLOCK_V,
+    markov_launch_geometry,
+    markov_logits_tile,
+    publish_tile_argmax,
 )
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.spec_sampling.sampling_scratch import Region, SamplingScratch, carve
@@ -81,7 +82,7 @@ def _markov_sample_stage1(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    vals = _markov_logits_tile(
+    vals = markov_logits_tile(
         base_ptr,
         prev_ids_ptr,
         w1_ptr,
@@ -103,7 +104,7 @@ def _markov_sample_stage1(
         BLOCK_V,
         BLOCK_K,
     )
-    _publish_tile_argmax(
+    publish_tile_argmax(
         vals,
         tile,
         offs_row,
@@ -179,7 +180,7 @@ class SampleScratch(NamedTuple):
 
 def _sample_scratch(num_rows: int, vocab_size: int) -> SampleScratch:
     """The regions one `dspark_markov_sample` call of ``num_rows`` needs."""
-    gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
+    gemv_tiles = triton.cdiv(vocab_size, BLOCK_V)
     f32, i32 = torch.float32, torch.int32
     return SampleScratch(
         Region((gemv_tiles, num_rows), f32),
@@ -323,17 +324,13 @@ def dspark_markov_sample(
     markov_embed = torch.empty(num_rows, rank, dtype=markov_w1.dtype, device=device)
     if num_rows == 0:
         return markov_embed
-    block_row = min(
-        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
-    )
-    row_tiles = triton.cdiv(num_rows, block_row)
-
     # Stage 1's GEMV keeps the greedy op's narrow V tile (its accumulator is the
     # MFMA one); the q stages tile wide, because they only stream.
-    gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
+    geometry = markov_launch_geometry(num_rows, vocab_size)
+    gemv_tiles = geometry.v_tiles
     work = carve(scratch, _sample_scratch(num_rows, vocab_size))
 
-    _markov_sample_stage1[(gemv_tiles, row_tiles)](
+    _markov_sample_stage1[(gemv_tiles, geometry.row_tiles)](
         base_logits,
         prev_ids,
         markov_w1,
@@ -355,10 +352,10 @@ def dspark_markov_sample(
         stride_w2_vocab=markov_w2.stride(0),
         stride_s_row=s_scratch.stride(0),
         min_temperature=SAMPLER_EPS,
-        BLOCK_ROW=block_row,
-        BLOCK_V=_BLOCK_V,
-        BLOCK_K=_BLOCK_K,
-        num_warps=8 if block_row >= 32 else 4,
+        BLOCK_ROW=geometry.block_row,
+        BLOCK_V=BLOCK_V,
+        BLOCK_K=BLOCK_K,
+        num_warps=geometry.num_warps,
         num_stages=2,
     )
     softmax_combine_kernel[(num_rows,)](

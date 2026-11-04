@@ -600,6 +600,7 @@ ATOM uses fused kernels to reduce memory traffic by combining multiple operation
 | `tile_argmax.py` | `argmax_lowest_id` — the lowest-id tile argmax the greedy DSpark draft and the lossless sampling kernels share |
 | `spec_sampling/ratio_verify.py` | `RatioVerifyInputs`, `ratio_verify_scratch`, `warmup_ratio_verify` — the probability-ratio accept rule: accept and a residual race that reads each rejecting row's `q` from the store |
 | `spec_sampling/ratio_target_p.py` | `_ratio_target_p`, `filter_floor` — the ratio verify's target p: per-row softmax statistics and raw argmax, then the filter floor |
+| `dspark_markov_stage1.py` | `markov_logits_tile`, `publish_tile_argmax`, `markov_launch_geometry` — stage 1 of both DSpark Markov ops: the bias GEMV tile, its (max, lowest id), and the launch both ops use |
 | `dspark_markov_argmax.py` | `dspark_markov_argmax` / `dspark_markov_argmax_tp` — the default greedy DSpark draft (full-vocab and vocab-sharded head) |
 | `spec_sampling/dspark_markov_sample.py` | `dspark_markov_sample` — the lossless DSpark draft: samples each block position and stores its top-K `q` for the ratio verify |
 | `spec_sampling/sparse_q_select.py` | `select_and_draw_q` — the lossless DSpark draft's top-K `q` select by level, its store, and the draw from exactly the stored entries |

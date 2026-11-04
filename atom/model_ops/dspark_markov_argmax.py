@@ -17,8 +17,8 @@ This op keeps ``W2`` bf16, adds the base logits in the GEMM epilogue and
 reduces to ids in registers, so per block position the only large read is
 ``W2`` itself, exactly once.
 
-The sampled lossless draft shares the GEMV (`_markov_logits_tile`); it is
-`dspark_markov_sample.dspark_markov_sample`.
+The sampled lossless draft shares the stage-1 GEMV and its launch
+(`dspark_markov_stage1`); it is `dspark_markov_sample.dspark_markov_sample`.
 
 Numerics. The reference does the GEMV as an fp32 matmul over an fp32 copy of
 bf16 data. Here ``tl.dot`` takes the bf16 operands directly into MFMA with an
@@ -56,135 +56,22 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
-from atom.model_ops.tile_argmax import argmax_lowest_id, argmax_of_tiles
+from atom.model_ops.dspark_markov_stage1 import (
+    BLOCK_K,
+    BLOCK_V,
+    markov_launch_geometry,
+    markov_logits_tile,
+    publish_tile_argmax,
+)
+from atom.model_ops.tile_argmax import argmax_of_tiles
 
-# Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
-# [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
-# stage stages [BLOCK_ROW, BLOCK_K] + [BLOCK_K, BLOCK_V] bf16 = 24KB of the 64KB
-# LDS. Left as-is once these shapes measured 145us/step of savings at B=1 and
-# 235us at B=64 on Kimi-K3; a sweep is the obvious next thing if that matters.
-_BLOCK_V = 128
-_BLOCK_K = 64
-# MFMA needs M >= 16, so a batch smaller than that runs padded-and-masked
-# rather than falling off the kernel. Capped at 64 because the accumulator is
-# [BLOCK_ROW, BLOCK_V] fp32 and lives in registers: batches past the cap take
-# more row tiles rather than a wider accumulator, which would spill (native
-# ATOM defaults max_num_seqs to 512, so this is reachable, not theoretical).
-_MIN_BLOCK_ROW = 16
-_MAX_BLOCK_ROW = 64
-# The GEMV addresses base, W1 and W2 in int64 (`_markov_logits_tile`), but the
+# The GEMV addresses base, W1 and W2 in int64 (`markov_logits_tile`), but the
 # id and output offsets are still formed in int32 before sign-extending into
 # the pointer, so a tensor whose largest element offset does not fit is
 # handed to torch instead of silently wrapping.
 _MAX_INT32 = 2**31 - 1
 # An id block is one of these two; both ends of this op index with it.
 _ID_DTYPES = (torch.int32, torch.int64)
-
-
-@triton.jit
-def _markov_logits_tile(
-    base_ptr,
-    prev_ids_ptr,
-    w1_ptr,
-    w2_ptr,
-    embed_out_ptr,
-    tile,
-    offs_row,
-    offs_v,
-    row_mask,
-    v_mask,
-    rank,
-    stride_base_row,
-    stride_prev,
-    stride_w1_vocab,
-    stride_embed_row,
-    stride_w2_vocab,
-    vocab_offset,
-    BLOCK_ROW: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """``base + W1[prev] @ W2^T`` on one (row tile, V tile), fp32, -inf on
-    padded vocab lanes; tile 0 also publishes ``W1[prev]`` to ``embed_out``.
-
-    The GEMV both stage-1 kernels run (this op's and `dspark_markov_sample`'s);
-    each keeps only its own tail. ``base``
-    holds the tile's columns from 0, W2 is read from vocab id ``vocab_offset``
-    on (a TP rank's shard of the LM head; 0 for the whole vocab). The vocab
-    and row offsets are int64: `[max_bs, T, V]` logits and a whole W2 pass
-    2**31 elements at serving sizes.
-    """
-    # Strided: the caller's ids are one column of its `[B, T + 1]` block, so
-    # assuming unit stride here reads another position's tokens.
-    prev = tl.load(prev_ids_ptr + offs_row * stride_prev, mask=row_mask, other=0)
-
-    acc = tl.zeros((BLOCK_ROW, BLOCK_V), dtype=tl.float32)
-    for k in range(tl.cdiv(rank, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < rank
-        # W1[x_{k-1}] rows, [BLOCK_ROW, BLOCK_K], gathered here rather than
-        # handed in: every tile program reads these same values anyway, so
-        # the gather rides along in L2 and costs no launch of its own.
-        embed = tl.load(
-            w1_ptr + prev[:, None].to(tl.int64) * stride_w1_vocab + offs_k[None, :],
-            mask=row_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        # One tile publishes the row for the confidence head; the rest hold
-        # the same values and would only write them again.
-        if tile == 0:
-            tl.store(
-                embed_out_ptr + offs_row[:, None] * stride_embed_row + offs_k[None, :],
-                embed,
-                mask=row_mask[:, None] & k_mask[None, :],
-            )
-        # W2^T tile, [BLOCK_K, BLOCK_V]. W2 is stored [V, r] so the rank axis
-        # is the contiguous one: each vocab column is one 2*BLOCK_K-byte run.
-        w2 = tl.load(
-            w2_ptr
-            + (vocab_offset + offs_v[None, :]).to(tl.int64) * stride_w2_vocab
-            + offs_k[:, None],
-            mask=v_mask[None, :] & k_mask[:, None],
-            other=0.0,
-        )
-        # Zeros from the rank mask contribute exact 0.0 terms, so padding the
-        # K tile does not perturb the sum.
-        acc = tl.dot(embed, w2, acc)
-
-    base = tl.load(
-        base_ptr + offs_row[:, None].to(tl.int64) * stride_base_row + offs_v[None, :],
-        mask=row_mask[:, None] & v_mask[None, :],
-        other=0.0,
-    )
-    return tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
-
-
-@triton.jit
-def _publish_tile_argmax(
-    vals,
-    tile,
-    offs_row,
-    offs_v,
-    row_mask,
-    v_mask,
-    num_rows,
-    vocab_size,
-    vocab_offset,
-    part_val_ptr,
-    part_idx_ptr,
-):
-    """Publish one (V tile, row tile)'s (max, lowest id) of ``vals``, the ids
-    global (``vocab_offset`` on), for stage 2 to combine."""
-    # `v_mask` also covers the all--inf row: without it a padded lane, which
-    # is -inf too, could win the id.
-    tile_max, tile_idx = argmax_lowest_id(
-        vals, offs_v[None, :], v_mask[None, :], vocab_size
-    )
-    # Global id; a padded lane's sentinel stays `vocab_size`, which stage 2
-    # recognizes before adding the offset back in.
-    tile_idx = tl.where(tile_idx < vocab_size, tile_idx + vocab_offset, vocab_size)
-    tl.store(part_val_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
-    tl.store(part_idx_ptr + tile * num_rows + offs_row, tile_idx, mask=row_mask)
 
 
 @triton.jit
@@ -221,7 +108,7 @@ def _markov_stage1(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     row_mask = offs_row < num_rows
     v_mask = offs_v < vocab_size
-    vals = _markov_logits_tile(
+    vals = markov_logits_tile(
         base_ptr,
         prev_ids_ptr,
         w1_ptr,
@@ -243,7 +130,7 @@ def _markov_stage1(
         BLOCK_V,
         BLOCK_K,
     )
-    _publish_tile_argmax(
+    publish_tile_argmax(
         vals,
         tile,
         offs_row,
@@ -532,10 +419,8 @@ def _launch(
         if embed_out is None
         else embed_out
     )
-    num_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    block_row = min(
-        _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
-    )
+    geometry = markov_launch_geometry(num_rows, vocab_size)
+    num_tiles = geometry.v_tiles
     # Fresh per call rather than a persistent buffer: under CUDA-graph capture
     # these come from the graph's private pool and are freed back into it each
     # block position, so the pool holds one pair of them and replay reuses the
@@ -547,7 +432,7 @@ def _launch(
     part_idx = torch.empty(
         (num_tiles, num_rows), dtype=torch.int32, device=base_logits.device
     )
-    _markov_stage1[(num_tiles, triton.cdiv(num_rows, block_row))](
+    _markov_stage1[(num_tiles, geometry.row_tiles)](
         base_logits,
         prev_ids,
         markov_w1,
@@ -564,10 +449,10 @@ def _launch(
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
         vocab_offset=vocab_offset,
-        BLOCK_ROW=block_row,
-        BLOCK_V=_BLOCK_V,
-        BLOCK_K=_BLOCK_K,
-        num_warps=8 if block_row >= 32 else 4,
+        BLOCK_ROW=geometry.block_row,
+        BLOCK_V=BLOCK_V,
+        BLOCK_K=BLOCK_K,
+        num_warps=geometry.num_warps,
         num_stages=2,
     )
     _dspark_markov_argmax_stage2[(num_rows,)](
