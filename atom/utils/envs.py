@@ -1273,6 +1273,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM": lambda: _flag_env(
         "ATOM_MTP_FUSED_EMBED_PRE_FC_NORM", "0"
     ),
+    # Qwen3.5 MTP: the pre-fc norms and the fc in one aiter kernel
+    # (fused_rmsnorm_gemm_a16w16) on a pass of up to 32 rows. norm_e(embed) is
+    # a table normed once at load by the norm kernel itself (+1 GB a rank, the
+    # size of the replicated embedding), gathered by id; norm_h(hidden) runs in
+    # the GEMM's prologue with the norm kernel's rstd. Bitwise the same as the
+    # norm kernel + fc GEMM. Needs ATOM_QWEN35_MTP_REPLICATED_EMBED (or TP 1)
+    # and the replicated bf16 fc (ATOM_MTP_REPLICATED_FC or TP 1); a wider pass
+    # keeps the unfused path.
+    "ATOM_MTP_FUSED_FC_NORM": lambda: _flag_env("ATOM_MTP_FUSED_FC_NORM", "0"),
     # GDN-hybrid MTP (Qwen3.5 / Next): EagleProposer's eager glue between its
     # draft passes fused -- step 0's staging in one launch on a uniform verify
     # batch, and each later pass's metadata advance + input staging + draft id
