@@ -3,8 +3,10 @@
 
 An owner retains its one/two N16 routed contributions in LDS, computes the
 shared expert before routed waits, and combines/publishes its own columns.
-Wave ownership follows the branch contract; native two-bank operands remain. B/SB survive all M16 tiles of that expert;
-MID/SA are read directly into native register operands after that tile's UGF.
+Each wave takes two experts a round. B/SB survive all M16 tiles of that
+expert; MID/SA are read into native register operands after its UGF, every K
+step at once. Rounds are pipelined: the next round's weights (one-task owners,
+second bank) and UGF loads are in flight while a round computes.
 There is no global DCON handoff, column counter, or foreign finish owner.
 """
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_down import *
@@ -12,40 +14,57 @@ from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_suppo
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_support import ready
 from atom.models.deepseek_v41.mono.gfx1250.kernels.dspark_mhtjstest_native_support import retire_reads
 from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import publish_plain as publish
+from atom.models.deepseek_v41.mono.gfx1250.kernels.reference_sync import CM_SYS_GFX1250
 from atom.mono.device.sync import _noted, _spin, preg
 from atom.mono.device.ops import bf2_f32, bf16_pair, rsrc
 
 
+# A wave's weight arena: two banks of (owned tasks x expert slots) == 4 B/SB
+# regions. One-task owners alternate banks so the next round's weights stream
+# in while this round computes; two-task owners fill all 4 regions per round.
+REGIONS = 4
+SLOTS = 2  # experts a wave takes per round
+
+
 def weight_words(inter):
-    return WAVES * 2 * (inter // 128) * (256 + 16)
+    return WAVES * REGIONS * (inter // 128) * (256 + 16)
+
+
+def _arena(c):
+    return c['column_weights'] + c['wave'] * (REGIONS * (c['d'].inter // 128) * (256 + 16))
+
+
+def _region(tasks, bank, j, slot):
+    return bank * (len(tasks) * SLOTS) + j * SLOTS + slot
 
 
 @traced
-def issue_expert(c, tasks, expert, slot, slots):
-    """Each wave's complete K weights/scales, issued once per expert."""
+def issue_round(c, tasks, experts, bank):
+    """Each wave's complete K weights/scales of a round's experts."""
     d, steps = c['d'], c['d'].inter // 128
-    base = c['column_weights'] + c['wave'] * (2 * steps * (256 + 16))
-    for j in range_constexpr(len(tasks)):
-        task = tasks[j]
-        offset = fx.Int64(expert) * HIDDEN * d.inter // 8 + fx.Int64(task) * d.inter * 2
-        pointer = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
-                             c['args']['w2'] + offset * 4)
-        src = tensor(pointer, (steps, 256), (256, 1))
-        atom = fx.rocdl.make_tdm_atom(src, [steps, 256], strides=[256, None],
-                                    num_warps=1, cache_modifier=CM_NT)
-        fx.copy(atom, src, tensor(base + (j * slots + slot) * steps * 256,
-                                 (steps, 256), (256, 1)))
-        # Native n32k4 is [K128][N16 half][16 scale dwords]. Select one
-        # half with a strided source, then pack only that N16's scales in LDS.
-        offset = ((fx.Int64(expert) * HIDDEN // 32 + fx.Int64(task // 2))
-                  * (d.down_scale_cols * 8) + (task % 2) * 16)
-        pointer = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
-                             c['args']['w2_s'] + offset * 4)
-        src = tensor(pointer, (steps, 16), (32, 1))
-        atom = fx.rocdl.make_tdm_atom(src, [steps, 16], strides=[32, None],
-                                    num_warps=1, cache_modifier=CM_NT)
-        fx.copy(atom, src, tensor(base + 2 * steps * 256 + (j * slots + slot) * steps * 16,
-                                 (steps, 16), (16, 1)))
+    base = _arena(c)
+    for i in range_constexpr(SLOTS):
+        for j in range_constexpr(len(tasks)):
+            region = _region(tasks, bank, j, i)
+            task = tasks[j]
+            offset = fx.Int64(experts[i]) * HIDDEN * d.inter // 8 + fx.Int64(task) * d.inter * 2
+            pointer = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
+                                 c['args']['w2'] + offset * 4)
+            src = tensor(pointer, (steps, 256), (256, 1))
+            atom = fx.rocdl.make_tdm_atom(src, [steps, 256], strides=[256, None],
+                                        num_warps=1, cache_modifier=CM_NT)
+            fx.copy(atom, src, tensor(base + region * steps * 256, (steps, 256), (256, 1)))
+            # Native n32k4 is [K128][N16 half][16 scale dwords]. Select one
+            # half with a strided source, then pack only that N16's scales in LDS.
+            offset = ((fx.Int64(experts[i]) * HIDDEN // 32 + fx.Int64(task // 2))
+                      * (d.down_scale_cols * 8) + (task % 2) * 16)
+            pointer = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16),
+                                 c['args']['w2_s'] + offset * 4)
+            src = tensor(pointer, (steps, 16), (32, 1))
+            atom = fx.rocdl.make_tdm_atom(src, [steps, 16], strides=[32, None],
+                                        num_warps=1, cache_modifier=CM_NT)
+            fx.copy(atom, src, tensor(base + REGIONS * steps * 256 + region * steps * 16,
+                                     (steps, 16), (16, 1)))
 
 
 def operands(n):
@@ -80,56 +99,98 @@ def load_tile_scales(c, first, count):
     return packed
 
 
+def flag_loader(c, ucs):
+    """The round's UGF loads and stale-tag test, split so the loads can be in
+    flight while the previous round computes (same loads as ``Mailbox.poll``)."""
+    mb = c['poll'].__self__
+    specs = [(c['ugf'], f, 1) for f in down_ug_flags(c, ucs)]
+    # System scope, not the scratch space's device scope: with the next
+    # round's UGF read early and its weights in flight, device-scope polls were
+    # seen to keep returning a stale tag (request runs stalled); system-scope
+    # loads always observe the producer's publish.
+    cms = [CM_SYS_GFX1250 for a, _, _ in specs]
+    bases = [_noted(a, 'poll') for a, _, _ in specs]
+    tag = mb.tag
+    nw = sum(2 * n for _, _, n in specs)
+
+    def load_all():
+        words = []
+        for b, cm, (_, i, n) in zip(bases, cms, specs):
+            w = fx.Vector(bo.buffer_load(rsrc(b), fx.Int32(i) * 2, vec_width=2 * n,
+                                         dtype=T.i32, cache_modifier=cm))
+            words += [w[e] for e in range(2 * n)]
+        return fx.Vector.from_elements(words, fx.Int32)
+
+    def pending(v):
+        bad = v[1] != tag
+        for e in range_constexpr(3, nw, 2):
+            bad = bad | (v[e] != tag)
+        return bad
+    return load_all, pending
+
+
 @traced
-def load_operands(c, tasks, first, count, step, out, slot, slots, scale_code):
+def load_x(c, first, count, step, out):
     lane, d = c['lane'], c['d']
     row = first + fx.min(lane % 16, count - 1)
     chunks = [fx.Vector(bo.buffer_load(rsrc(c['mid'].value),
                   row * d.mid_words + step * 32 + lane // 16 * 4 + h * 8,
                   vec_width=4, dtype=T.i32, cache_modifier=CM_DEV)) for h in range(4)]
-    out['x'].store(fx.Vector.from_elements(
+    out.store(fx.Vector.from_elements(
         [chunks[h][q] for h in range(4) for q in range(4)], fx.Int32))
-    out['sx'].store(fx.Vector.from_elements([scale_code], fx.Int32))
-    steps = d.inter // 128
-    base = c['column_weights'] + c['wave'] * (2 * steps * (256 + 16))
+
+
+@traced
+def load_weights(c, tasks, step, out, bank, slot):
+    lane, steps = c['lane'], c['d'].inter // 128
+    base = _arena(c)
     at = lane // 16 * 64 + lane % 16 * 4
     scales = []
     for j in range_constexpr(len(tasks)):
-        halves = [fx.Vector(fx.ptr_load(base + (j * slots + slot) * steps * 256 + step * 256
+        region = _region(tasks, bank, j, slot)
+        halves = [fx.Vector(fx.ptr_load(base + region * steps * 256 + step * 256
                      + at + h * 128, result_type=fx.Vector.make_type(4, fx.Int32)))
                   for h in range(2)]
         out['w'][j].store(halves[0].shuffle(halves[1], list(range(8))))
-        scales.append(fx.ptr_load(base + 2 * steps * 256 + (j * slots + slot) * steps * 16
+        scales.append(fx.ptr_load(base + REGIONS * steps * 256 + region * steps * 16
                                   + step * 16 + lane % 16))
     out['sw'].store(fx.Vector.from_elements(scales, fx.Int32))
 
 
+def preload(c, first, count):
+    """A tile's scale codes and every K step's MID, issued together (after its UGF)."""
+    steps = c['d'].inter // 128
+    codes = load_tile_scales(c, first, count)
+    xs = [fx.make_rmem_tensor(16, fx.Int32) for _ in range(steps)]
+    for step in range_constexpr(steps):
+        load_x(c, first, count, step, xs[step])
+    return codes, xs
+
+
 @traced
-def matrix_tile(c, tasks, first, count, slot, slots):
-    """Original two interleaved K chains and current/next register operands."""
+def compute_tile(c, tasks, first, count, bank, slot, codes, xs):
+    """Original two interleaved K chains; route weight, BF16 contribution."""
+    steps = c['d'].inter // 128
     atom = fx.make_mma_atom(fx.rocdl.WMMAScale(16, 16, 128,
         fx.Float4E2M1FN, fx.Float8E4M3FN, fx.Float32))
     acc = [[fx.make_rmem_tensor(8, fx.Float32) for _ in range(2)] for _ in tasks]
     for pair in acc:
         for a in pair:
             a.store(fx.full(8, 0., fx.Float32))
-    scale_codes = load_tile_scales(c, first, count)
+    code = codes.load()
     cur, nxt = operands(len(tasks)), operands(len(tasks))
-    load_operands(c, tasks, first, count, fx.Int32(0), cur, slot, slots, scale_codes.load()[0])
-    for step in range_constexpr(c['d'].inter // 128 - 1):
-        load_operands(c, tasks, first, count, step + 1, nxt, slot, slots, scale_codes.load()[step + 1])
-        sx, sw = cur['sx'].load()[0], cur['sw'].load()
+    load_weights(c, tasks, 0, cur, bank, slot)
+    for step in range_constexpr(steps):
+        if const_expr(step + 1 < steps):
+            load_weights(c, tasks, step + 1, nxt, bank, slot)
+        sw = cur['sw'].load()
         for j in range_constexpr(len(tasks)):
-            fx.gemm(atom, acc[j][step % 2], cur['w'][j], cur['x'], acc[j][step % 2],
-                    scale_a=sw[j], scale_b=sx)
-        for name in ('x', 'sx', 'sw'):
-            cur[name].store(nxt[name].load())
-        for j in range_constexpr(len(tasks)):
-            cur['w'][j].store(nxt['w'][j].load())
-    sx, sw = cur['sx'].load()[0], cur['sw'].load()
-    for j in range_constexpr(len(tasks)):
-        fx.gemm(atom, acc[j][(c['d'].inter // 128 - 1) % 2], cur['w'][j], cur['x'], acc[j][(c['d'].inter // 128 - 1) % 2],
-                scale_a=sw[j], scale_b=sx)
+            fx.gemm(atom, acc[j][step % 2], cur['w'][j], xs[step], acc[j][step % 2],
+                    scale_a=sw[j], scale_b=code[step])
+        if const_expr(step + 1 < steps):
+            cur['sw'].store(nxt['sw'].load())
+            for j in range_constexpr(len(tasks)):
+                cur['w'][j].store(nxt['w'][j].load())
     lane, rs = c['lane'], c['rs']
     row = lane % 16
     pick = rs.pick_at(c['tab'], first + fx.min(row, count - 1))
@@ -144,31 +205,71 @@ def matrix_tile(c, tasks, first, count, slot, slots):
 
 
 @traced
-def routed_columns(c, tasks):
-    # gfx950 stage_down: task count times expert slots is always two.
-    tab = c['tab']
-    nu = c['rs'].n_union(tab, c['S'])
-    slots = 2 // len(tasks)
-    for rnd in range(0, (nu + WAVES * slots - 1) // (WAVES * slots)):
-        us = [c['wave'] + WAVES * (slots * rnd + i) for i in range(slots)]
-        ucs = [fx.min(u, nu - 1) for u in us]
-        # Retire old operands once before either bank can be overwritten.
+def extra_tile(c, tasks, first, count, bank, slot):
+    codes, xs = preload(c, first, count)
+    compute_tile(c, tasks, first, count, bank, slot, codes, xs)
+
+
+def _units(c, r):
+    return [c['wave'] + WAVES * (SLOTS * r + i) for i in range(SLOTS)]
+
+
+def _experts(c, nu, r):
+    return [local_expert(c, c['rs'].union_expert(c['tab'], c['S'], fx.min(u, nu - 1)))
+            for u in _units(c, r)]
+
+
+def _clamped(nu, units):
+    return [fx.min(u, nu - 1) for u in units]
+
+
+@traced
+def routed_round(c, tasks, nu, nr, rnd):
+    """One round: its UGF was confirmed by the previous round (or the first
+    poll). MID is read only after that. The next round's weights (one-task
+    owners) and UGF loads are issued before this round's matrices; its UGF is
+    then confirmed, spinning only on a stale tag. A last round re-issues
+    itself (clamped) into the idle bank; ``routed_columns`` drains it."""
+    banks = 2 if len(tasks) == 1 else 1
+    bank = rnd % 2 if banks == 2 else 0
+    us = _units(c, rnd)
+    ucs = _clamped(nu, us)
+    if const_expr(banks == 1):
         retire_reads()
-        for i in range_constexpr(slots):
-            if us[i] < nu:
-                e = local_expert(c, c['rs'].union_expert(tab, c['S'], us[i]))
-                issue_expert(c, tasks, e, i, slots)
-        # Complete all current-round slot/tile/part producers before MID.
-        # Fold gfx950's wave64 flags across both logical halves of wave32.
-        c['poll']([(c['ugf'], f, 1) for f in down_ug_flags(c, ucs)])
-        ready(0)
-        for i in range_constexpr(slots):
-            if us[i] < nu:
-                first = c['rs'].slot_first(tab, us[i])
-                count = c['rs'].slot_first(tab, us[i] + 1) - first
-                for offset in range(0, count, 16):
-                    matrix_tile(c, tasks, first + offset,
-                                fx.min(fx.Int32(16), count - offset), i, slots)
+        issue_round(c, tasks, _experts(c, nu, rnd), 0)
+    firsts = [c['rs'].slot_first(c['tab'], u) for u in ucs]
+    counts = [c['rs'].slot_first(c['tab'], u + 1) - f for u, f in zip(ucs, firsts)]
+    pre = [preload(c, firsts[i], fx.min(fx.Int32(16), counts[i])) for i in range(SLOTS)]
+    nxt = fx.min(rnd + 1, nr - 1)
+    if const_expr(banks == 2):
+        retire_reads()
+        issue_round(c, tasks, _experts(c, nu, nxt), 1 - bank)
+    load_all, pending = flag_loader(c, _clamped(nu, _units(c, nxt)))
+    early = load_all()
+    ready(2 * len(tasks) * SLOTS if banks == 2 else 0)
+    for i in range_constexpr(SLOTS):
+        if us[i] < nu:
+            compute_tile(c, tasks, firsts[i], fx.min(fx.Int32(16), counts[i]), bank, i,
+                         pre[i][0], pre[i][1])
+            for offset in range(16, counts[i], 16):
+                extra_tile(c, tasks, firsts[i] + offset,
+                           fx.min(fx.Int32(16), counts[i] - offset), bank, i)
+    if pending(early):
+        _spin(load_all, pending)
+
+
+@traced
+def routed_columns(c, tasks):
+    nu = c['rs'].n_union(c['tab'], c['S'])
+    nr = (nu + WAVES * SLOTS - 1) // (WAVES * SLOTS)
+    retire_reads()
+    if const_expr(len(tasks) == 1):
+        issue_round(c, tasks, _experts(c, nu, fx.Int32(0)), 0)
+    # Fold gfx950's wave64 flags across both logical halves of wave32.
+    c['poll']([(c['ugf'], f, 1) for f in down_ug_flags(c, _clamped(nu, _units(c, fx.Int32(0))))])
+    for rnd in range(0, nr):
+        routed_round(c, tasks, nu, nr, rnd)
+    ready(0)
 
 
 @traced
