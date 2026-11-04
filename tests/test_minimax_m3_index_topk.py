@@ -82,6 +82,28 @@ def test_decode_score_num_warps(monkeypatch, arch, batch, max_block, want):
     assert m._decode_score_num_warps(batch, max_block) == want
 
 
+@pytest.mark.parametrize(
+    "arch,batch,max_block,max_q,want",
+    [
+        ("gfx950", 128, 2000, 4, False),
+        ("gfx1250", 0, 2000, 4, False),
+        ("gfx1250", 7, 1500, 1, False),
+        ("gfx1250", 8, 1500, 1, True),
+        ("gfx1250", 4, 999, 4, False),
+        ("gfx1250", 4, 1000, 4, True),
+        ("gfx1250", 15, 500, 4, False),
+        ("gfx1250", 16, 500, 4, True),
+        ("gfx1250", 32, 499, 4, False),
+        ("gfx1250", 6, 2000, 2, True),
+    ],
+)
+def test_transposed_decode_score_policy(
+    monkeypatch, arch, batch, max_block, max_q, want
+):
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    assert m._use_transposed_decode_score(batch, max_block, max_q) is want
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
