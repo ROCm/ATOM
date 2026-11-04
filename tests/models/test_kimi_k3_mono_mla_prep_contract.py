@@ -24,8 +24,10 @@ from atom.mono.runtime.compile import trace
 
 @pytest.fixture(autouse=True)
 def _no_disk_cache(monkeypatch):
-    # a build served from FlyDSL's disk cache is not traced
+    # a build served from FlyDSL's disk cache, or one this process already
+    # built (``layer._BUILDS``), is not traced
     monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    monkeypatch.setattr(k2, "_BUILDS", {})
 
 
 def test_prep_build_adds_only_its_tail():
