@@ -607,8 +607,8 @@ def descend_floor(
     passes = (key_bits - _FILTER_LAST_BITS) // _FILTER_DIGIT_BITS
     weigh = filters.weigh
     # Unweighted bf16: the key's top byte is one 8-bit count (the floor
-    # kernel's) and a pick, instead of two 4-bit passes, so V is read once
-    # less. A weighing batch keeps the passes, which carry the mass down.
+    # kernel's) and a pick. A weighing batch keeps the passes, which carry
+    # the mass down.
     top_byte = key_bits == 2 * _FILTER_LAST_BITS and not weigh
     block_v = _FILTER_WEIGH_BLOCK_V if weigh else _FILTER_BLOCK_V
     for filter_pass in range(0 if top_byte else passes):

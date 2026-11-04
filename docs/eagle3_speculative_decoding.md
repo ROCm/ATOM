@@ -188,7 +188,7 @@ draft sized to K2.6, which is not yet publicly available.
   of `draft_kv_builder`. MLA drafts piggyback the target pool and so
   have no draft builder, but they still need the layer-index offset.
 - **Do not modify `@support_torch_compile`-decorated model files** for
-  EAGLE-related changes — instrument at call sites (`EagleProposer.propose`,
+  EAGLE-related changes — instrument at call sites (`EagleProposer._propose`,
   `ModelRunner.run_model`) instead. See the project `CLAUDE.md`.
 
 ## References

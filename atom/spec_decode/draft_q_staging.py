@@ -24,14 +24,14 @@ class StagedRows(NamedTuple):
 class DraftQStaging:
     """The host half of a lossless draft step: what to stage, row by row.
 
-    Writes, into numpy views of the proposer's pinned staging buffers, the
+    Writes, into numpy views of `DSparkLossless`'s pinned staging buffers, the
     inputs the captured draft head and the ratio verify read beyond the
     target's own (temperatures and filters, which the draft reads from the
     runner): the Philox step, each row's q destination and each request's
     verify q row. `stage` returns how many leading rows of each buffer to
-    publish (`StagedRows`); the proposer turns those into its publication
-    counts. Free of torch and aiter, so the policy is testable on
-    any host.
+    publish (`StagedRows`); `DSparkLossless.stage` turns those into the
+    runner's publication counts. Free of torch and aiter, so the policy is
+    testable on any host.
     """
 
     def __init__(

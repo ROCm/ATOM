@@ -2320,7 +2320,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ):
         """Per-draft-step V4 region metadata rebuild for 1-token-per-seq shape.
 
-        Called by EagleProposer.propose at mid-step iters. Eagle has already
+        Called by EagleProposer._propose at mid-step iters. Eagle has already
         updated GPU state before this call:
           - ``attn_metadata.context_lens`` (GPU view of
             ``var["context_lens"].gpu``): rolled-back by ``prepare_decode``

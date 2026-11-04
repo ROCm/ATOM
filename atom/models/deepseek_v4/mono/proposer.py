@@ -49,7 +49,7 @@ class MonoDSparkProposer(DSparkProposer):
             context.scheduled_tokens = context.running_tokens = (
                 bs * self.draft_tokens_per_seq
             )
-            # The draft pass's count, as `Drafter.warmup_draft_graphs` points
+            # The draft pass's count, as `Drafter._warmup_draft_graphs` points
             # it: not the target's, which would run past these rows.
             context.scheduled_tokens_gpu = self.runner.forward_vars["batch_info"].gpu[
                 2:3

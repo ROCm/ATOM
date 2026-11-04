@@ -30,7 +30,6 @@ from atom.model_ops.spec_sampling.softmax_tiles import race_key
 from atom.model_ops.tile_argmax import argmax_lowest_id
 
 # Stages 3 and 5 tile V identically (the cut hands each tile a slot range).
-# 256 bins at 4096 / 4 warps measured fastest for the histogram on gfx950.
 _Q_BLOCK_V = 4096
 _Q_BINS = 256
 # Level = 1 + floor(gap * 8) for a gap in (0, 19] nats: at most 153, so

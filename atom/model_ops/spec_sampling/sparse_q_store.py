@@ -20,9 +20,8 @@ import torch
 # from exactly the stored entries, renormalized, so any K is exact; a smaller
 # one only gives up q's tail mass, i.e. some acceptance. A drafter clamps it to
 # the vocab size, which stores everything drawable: the full-q baseline for
-# acceptance-length studies, at ~200-400 us per draft position on MI355X
-# (vs ~5-20 us at 1024), since one program per row normalizes and draws from
-# the stored entries.
+# acceptance-length studies, not for throughput, since one program per row
+# normalizes and draws from the stored entries.
 Q_WIDTH = 1024
 
 
