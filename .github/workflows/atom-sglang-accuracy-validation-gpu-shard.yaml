@@ -408,13 +408,6 @@ jobs:
             bash -lc '
               set -euo pipefail
               [ -f "$MODEL_DIR/config.json" ]
-              # An interrupted download can leave config.json and some shards
-              # but no index or tokenizer; only a completion marker proves the
-              # download finished, otherwise let the next step resume it.
-              if [ ! -f "$MODEL_DIR/.download-complete" ] && [ ! -f "$MODEL_DIR/.atom_download_complete" ]; then
-                echo "No download completion marker under $MODEL_DIR"
-                exit 1
-              fi
               python3 - <<'"'"'PY'"'"'
           import json
           import os
@@ -422,19 +415,34 @@ jobs:
           from pathlib import Path
 
           model_dir = Path(os.environ["MODEL_DIR"])
+          has_marker = any(
+              (model_dir / name).exists()
+              for name in (".download-complete", ".atom_download_complete")
+          )
           index_path = model_dir / "model.safetensors.index.json"
-          if not index_path.exists():
-              sys.exit(0)
+          if index_path.exists():
+              weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+              expected = {Path(path).name for path in weight_map.values()}
+              present = {path.name for path in model_dir.glob("*.safetensors")}
+              missing = sorted(expected - present)
+              if missing:
+                  shown = ", ".join(missing[:10])
+                  suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
+                  print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
+                  sys.exit(1)
 
-          weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-          expected = {Path(path).name for path in weight_map.values()}
-          present = {path.name for path in model_dir.glob("*.safetensors")}
-          missing = sorted(expected - present)
-          if missing:
-              shown = ", ".join(missing[:10])
-              suffix = "" if len(missing) <= 10 else f" ... and {len(missing) - 10} more"
-              print(f"Missing safetensors shards under {model_dir}: {shown}{suffix}")
-              sys.exit(1)
+          # An interrupted download can leave config.json and some shards but no
+          # index or tokenizer. Without a completion marker, require both so such
+          # a directory falls through to the resumable download; hand-copied
+          # models that are complete but unmarked (e.g. MI308 local roots) pass.
+          if not has_marker:
+              if not index_path.exists() and not (model_dir / "model.safetensors").exists():
+                  print(f"No download completion marker or safetensors index under {model_dir}")
+                  sys.exit(1)
+              tokenizer_files = ("tokenizer.json", "tokenizer.model", "tiktoken.model", "tokenizer_config.json")
+              if not any((model_dir / name).exists() for name in tokenizer_files):
+                  print(f"No download completion marker or tokenizer files under {model_dir}")
+                  sys.exit(1)
           PY
             '; then
             echo "Resolved local model path: ${model_dir}"
