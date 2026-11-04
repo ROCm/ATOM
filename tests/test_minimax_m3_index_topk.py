@@ -114,22 +114,6 @@ def test_prefill_score_policy(arch, is_fp8, q_len, max_block, batch, heads, want
     assert m._prefill_score_config(arch, is_fp8, q_len, max_block, batch, heads) == want
 
 
-@pytest.mark.parametrize(
-    "arch,batch,max_block,want",
-    [
-        ("gfx950", 128, 2000, 4),
-        ("gfx1250", 1, 2000, 4),
-        ("gfx1250", 2, 2000, 4),
-        ("gfx1250", 4, 512, 4),
-        ("gfx1250", 4, 513, 2),
-        ("gfx1250", 128, 2000, 2),
-    ],
-)
-def test_decode_score_num_warps(monkeypatch, arch, batch, max_block, want):
-    monkeypatch.setattr(m, "get_gfx", lambda: arch)
-    assert m._decode_score_num_warps(batch, max_block) == want
-
-
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
@@ -997,6 +981,96 @@ def test_decode_chunk_policy_scores_selection_and_replay(
             graph.replay()
             reference = run(_previous_decode_score_chunks)
             assert all(torch.equal(x, y) for x, y in zip(replayed, reference))
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@gpu
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("batch,pages,max_q", [(8, 1500, 1), (4, 1000, 4)])
+def test_transposed_decode_score_matches_baseline_and_replay(
+    monkeypatch, cache_dtype, batch, pages, max_q
+):
+    import triton
+
+    if m.get_gfx_runtime() != "gfx1250":
+        pytest.skip("gfx1250 transposed decode scorer")
+    heads, device = 1, "cuda"
+    context = pages * SPARSE_BLOCK_SIZE - 3
+    q = torch.randn(batch * max_q, heads, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    cache = torch.randn(
+        pages, SPARSE_BLOCK_SIZE, HEAD_DIM, device=device, dtype=torch.bfloat16
+    ).to(cache_dtype)
+    table = torch.stack(
+        [torch.randperm(pages, device=device, dtype=torch.int32) for _ in range(batch)]
+    )
+    lengths = torch.tensor(
+        [context - i * 7 for i in range(batch)], device=device, dtype=torch.int32
+    )
+    chunks = m._native_decode_score_chunks(batch, pages)
+
+    def score(kernel, warps):
+        out = torch.empty((heads, batch * max_q, pages), device=device)
+        kernel[(batch, chunks)](
+            q,
+            cache,
+            out,
+            table,
+            lengths,
+            HEAD_DIM,
+            HEAD_DIM**-0.5,
+            triton.cdiv(pages, chunks),
+            *q.stride(),
+            *cache.stride(),
+            *out.stride(),
+            table.stride(0),
+            NUM_IDX_HEADS=heads,
+            MAX_Q=max_q,
+            BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+            num_warps=warps,
+            num_stages=m.DECODE_SCORE_NUM_STAGES,
+        )
+        return out
+
+    baseline = score(m._decode_index_score_tiled_kernel, 4)
+    optimized = score(m._decode_index_score_transposed_kernel, 2)
+    assert torch.equal(baseline, optimized)
+
+    def run(transposed):
+        with monkeypatch.context() as patch:
+            patch.setattr(m, "use_transposed_decode_score", lambda *args: transposed)
+            patch.setattr(
+                m, "decode_score_num_warps", lambda *args: 2 if transposed else 4
+            )
+            return m.minimax_m3_index_topk_decode(
+                q,
+                cache,
+                table,
+                lengths,
+                context,
+                TOPK,
+                INIT,
+                LOCAL,
+                heads,
+                HEAD_DIM**-0.5,
+                emit_sparse_block_table=True,
+                max_query_len=max_q,
+            )
+
+    expected, actual = run(False), run(True)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            replayed = run(True)
+        q.neg_()
+        lengths.sub_(1)
+        graph.replay()
+        expected = run(False)
+        assert all(torch.equal(a, b) for a, b in zip(replayed, expected))
     torch.cuda.current_stream().wait_stream(stream)
 
 

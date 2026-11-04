@@ -28,6 +28,11 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
+from .decode_score_policy import (
+    decode_score_num_warps,
+    use_transposed_decode_score,
+)
+
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
     # direction as the Triton one below, same selection on every shape tried.
@@ -101,19 +106,6 @@ def _prefill_score_config(
     if heads == 4 and 4096 <= max_query_len <= 8192 and 400 <= max_block <= 1024:
         return 256, 40, 2, 1, 4, False, True
     return SCORE_BLOCK_SIZE_Q, None, None, None, 1, False, False
-
-
-def _decode_score_num_warps(batch: int, max_block: int) -> int:
-    """Use the measured two-wave long-context scorer on gfx1250.
-
-    With at least four requests, the decode grid already exposes enough CTAs.
-    Two wave32s per CTA double residency and keep long index-K streams in
-    flight; shorter contexts and tiny batches retain Triton's four-wave
-    default, where launch latency or the smaller grid dominates.
-    """
-    if get_gfx() == "gfx1250" and batch >= 4 and max_block > 512:
-        return 2
-    return 4
 
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
@@ -1255,6 +1247,97 @@ def _decode_index_score_tiled_kernel(
         )
 
 
+# Wide-grid gfx1250 variant. It is separate so launch-limited fallback shapes
+# retain the exact original compiled kernel.
+@triton.heuristics(
+    {
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+        "BLOCK_SIZE_N": lambda args: max(
+            16, triton.next_power_of_2(args["NUM_IDX_HEADS"] * args["MAX_Q"])
+        ),
+    }
+)
+@triton.jit
+def _decode_index_score_transposed_kernel(
+    q_ptr,
+    ik_cache_ptr,
+    score_ptr,
+    block_table_ptr,
+    seq_lens,
+    head_dim,
+    sm_scale,
+    chunk_blocks,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_ik_blk,
+    stride_ik_pos,
+    stride_ik_d,
+    stride_s_h,
+    stride_s_b,
+    stride_s_k,
+    stride_bt_b,
+    NUM_IDX_HEADS: tl.constexpr,
+    MAX_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_chunk = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens + pid_b)
+    num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    chunk_start = pid_chunk * chunk_blocks
+    chunk_end = tl.minimum(chunk_start + chunk_blocks, num_blocks)
+    if chunk_start >= chunk_end:
+        return
+
+    off_n = tl.arange(0, BLOCK_SIZE_N)
+    tok = off_n // NUM_IDX_HEADS
+    head = off_n - tok * NUM_IDX_HEADS
+    n_valid = off_n < NUM_IDX_HEADS * MAX_Q
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    d_mask = off_d < head_dim
+    off_k = tl.arange(0, BLOCK_SIZE_K)
+    row = pid_b * MAX_Q + tok
+
+    # Exchange the two non-reduction axes so converted BF16 K is WMMA's N
+    # operand. The D reduction order and FP32 accumulation stay unchanged.
+    q = tl.load(
+        q_ptr
+        + row[:, None] * stride_q_n
+        + head[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=n_valid[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    causal_len = seq_len - MAX_Q + tok + 1
+    bt_row = block_table_ptr + pid_b * stride_bt_b
+    sm_scale_log2e = sm_scale * 1.4426950409
+
+    for blk in tl.range(chunk_start, chunk_end):
+        page = tl.load(bt_row + blk).to(tl.int64)
+        k = tl.load(
+            ik_cache_ptr
+            + page * stride_ik_blk
+            + off_k[None, :] * stride_ik_pos
+            + off_d[:, None] * stride_ik_d,
+            mask=d_mask[:, None],
+            other=0.0,
+            cache_modifier=".cv",
+        )
+        qk = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32) * sm_scale_log2e
+        pos = blk * BLOCK_SIZE_K + off_k
+        qk = tl.where(pos[None, :] < causal_len[:, None], qk, float("-inf"))
+        score = tl.max(qk, axis=1)
+        tl.store(
+            score_ptr + head * stride_s_h + row * stride_s_b + blk * stride_s_k,
+            score,
+            mask=n_valid,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
@@ -1478,7 +1561,13 @@ def minimax_m3_index_topk_decode(
         device=idx_q.device,
     )
     num_score_chunks = _native_decode_score_chunks(batch, max_block)
-    _decode_index_score_tiled_kernel[(batch, num_score_chunks)](
+    arch = get_gfx_runtime()
+    score_kernel = (
+        _decode_index_score_transposed_kernel
+        if use_transposed_decode_score(arch, batch, max_block, max_query_len)
+        else _decode_index_score_tiled_kernel
+    )
+    score_kernel[(batch, num_score_chunks)](
         idx_q,
         index_kv_cache,
         score,
@@ -1500,7 +1589,7 @@ def minimax_m3_index_topk_decode(
         NUM_IDX_HEADS=num_idx_heads,
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_warps=_decode_score_num_warps(batch, max_block),
+        num_warps=decode_score_num_warps(arch, batch, max_block, max_query_len),
         num_stages=DECODE_SCORE_NUM_STAGES,
     )
 
