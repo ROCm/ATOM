@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
+import torch
 
-from atom.spec_decode.calibration import validate_calibration
+from atom.spec_decode.calibration import calibration_identity, validate_calibration
 
 
 def profile():
@@ -42,3 +44,43 @@ def test_incompatible_or_invalid_profile_is_rejected(field, value):
     data[field] = value
     with pytest.raises(ValueError):
         validate_calibration(data, identity, width=5, max_batch=4)
+
+
+def identity_of(tmp_path, monkeypatch, **kw):
+    for name in ("config.json", "model.safetensors.index.json"):
+        (tmp_path / name).write_text("{}")
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "gpu")
+    config = SimpleNamespace(
+        model=str(tmp_path),
+        hf_config=SimpleNamespace(model_type="m"),
+        tensor_parallel_size=4,
+        kv_cache_dtype="fp8",
+        index_cache_dtype="fp8",
+        enforce_eager=False,
+    )
+    for key, value in kw.items():
+        setattr(config, key, value)
+    return calibration_identity(config, 0)
+
+
+def test_mxfp4_kv_does_not_share_an_fp8_identity(tmp_path, monkeypatch):
+    # kv_cache_dtype reads "fp8" under MXFP4 KV, as does the index default
+    fp8 = identity_of(tmp_path, monkeypatch)
+    kv_mx = identity_of(tmp_path, monkeypatch, kv_mxfp4=True)
+    assert fp8 != kv_mx
+    both = identity_of(tmp_path, monkeypatch, kv_mxfp4=True, index_cache_dtype="fp4")
+    index_only = identity_of(tmp_path, monkeypatch, index_cache_dtype="fp4")
+    assert both != index_only
+
+    data = {**profile(), "identity": fp8}
+    with pytest.raises(ValueError):
+        validate_calibration(data, kv_mx, width=5, max_batch=4)
+
+
+def test_an_identity_without_mxfp4_kv_is_unchanged(tmp_path, monkeypatch):
+    # profiles calibrated before the key existed keep matching, whether the
+    # config says kv_mxfp4=False or has no such attribute
+    plain = identity_of(tmp_path, monkeypatch)
+    assert "kv_mxfp4" not in plain
+    assert identity_of(tmp_path, monkeypatch, kv_mxfp4=False) == plain
+    validate_calibration({**profile(), "identity": plain}, plain, width=5, max_batch=4)
