@@ -70,6 +70,7 @@ class EngineCapabilities:
     data_parallel_size: int
     pipeline_parallel_size: int
     prefill_context_parallel_size: int
+    sequence_parallel_size: int
     workers_per_engine: int
     kv_cache_dtype: str
     # Only what every rank reports. See the module docstring.
@@ -103,6 +104,7 @@ class EngineCapabilities:
         parallel = getattr(config, "parallel_config", None)
         tp_world_size = int(getattr(config, "tp_world_size", len(workers)))
         pcp_size = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
+        sp_size = int(getattr(config, "sequence_parallel_size", 1) or 1)
         return cls(
             protocol_version=versions.pop(),
             tp_world_size=tp_world_size,
@@ -111,7 +113,9 @@ class EngineCapabilities:
                 getattr(config, "pipeline_parallel_size", 1) or 1
             ),
             prefill_context_parallel_size=pcp_size,
-            workers_per_engine=tp_world_size * pcp_size,
+            sequence_parallel_size=sp_size,
+            # Ulysses SP runs over the PCP group's ranks.
+            workers_per_engine=tp_world_size * max(pcp_size, sp_size),
             kv_cache_dtype=str(getattr(config, "kv_cache_dtype", "auto")),
             methods=methods,
             features=features,

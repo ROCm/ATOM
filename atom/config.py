@@ -2070,7 +2070,7 @@ class Config:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     # Ulysses shards tokens and exchanges them for heads around attention.
-    # Its workers use the PCP rank dimension.
+    # Its workers form AITER's PCP process group; see `pcp_group_size`.
     sequence_parallel_size: int = 1
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
@@ -2237,6 +2237,11 @@ class Config:
         return visible if 0 < visible < tp else tp
 
     @property
+    def pcp_group_size(self) -> int:
+        """Ranks in AITER's PCP process group, which Ulysses SP runs over too."""
+        return max(self.prefill_context_parallel_size, self.sequence_parallel_size)
+
+    @property
     def capture_sizes(self) -> list[int]:
         """The declared CUDAGraph capture ladder, in batch sizes.
 
@@ -2319,7 +2324,7 @@ class Config:
         )
 
     def _init_sequence_parallel(self) -> None:
-        """Validate Ulysses SP and assign its workers to the PCP dimension."""
+        """Validate Ulysses SP, which runs over AITER's PCP process group."""
         sp = self.sequence_parallel_size
         if self.parallel_config.data_parallel_size != 1 or self.enable_dp_attention:
             raise ValueError(
@@ -2336,7 +2341,6 @@ class Config:
             raise ValueError("Ulysses SP is not validated with pipeline parallelism.")
         if self.enable_expert_parallel:
             raise ValueError("Ulysses SP is not validated with expert parallelism.")
-        # SP takes over this field below; a user-set one would be striped PCP.
         if self.prefill_context_parallel_size != 1:
             raise ValueError(
                 "--sequence-parallel-size and --prefill-context-parallel-size "
@@ -2363,6 +2367,11 @@ class Config:
                 "they address KV by TP rank, while each SP rank holds 1/SP of "
                 "the KV heads."
             )
+        if self.enable_rapidserve:
+            raise ValueError(
+                "Ulysses SP does not support --enable-rapidserve: it hands KV "
+                "over by TP rank only."
+            )
         # Local import: atom.utils pulls in atom.config at module scope.
         from atom.utils import get_hf_text_config
         from atom.utils.selector import Family, attn_family
@@ -2382,7 +2391,6 @@ class Config:
                 "query heads evenly."
             )
         sp_head_shards(getattr(hf_text, "num_key_value_heads", None) or heads, sp)
-        self.prefill_context_parallel_size = sp
 
     def __post_init__(self):
         if self.sequence_parallel_size < 1:
@@ -2581,11 +2589,6 @@ class Config:
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
-        if self.enable_rapidserve and self.prefill_context_parallel_size > 1:
-            raise ValueError(
-                "--enable-rapidserve hands KV over by TP rank only; it does not "
-                "support -pcp or -sp."
-            )
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

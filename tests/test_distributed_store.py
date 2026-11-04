@@ -191,6 +191,7 @@ def _model_runner_worker(pc, layout, global_rank):
         tp_world_size=tp,
         pipeline_parallel_size=pp,
         prefill_context_parallel_size=pcp,
+        pcp_group_size=pcp,
         decode_context_parallel_size=dcp,
         master_addr="127.0.0.1",
         port=0,

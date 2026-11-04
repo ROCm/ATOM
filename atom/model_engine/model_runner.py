@@ -37,7 +37,6 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rerange,
     pcp_pad_len,
     pcp_round_robin_split,
-    pcp_stripe_count,
 )
 from atom.distributed.pp_comm import (
     async_send_intermediate_tensors,
@@ -1057,7 +1056,7 @@ class ModelRunner:
             # Reject before any collective can wait for nonexistent ranks.
             reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
-        stage_span = config.tp_world_size * config.prefill_context_parallel_size
+        stage_span = config.tp_world_size * config.pcp_group_size
         engine_index = dp_rank_local * pp_size + pp_rank
         local_device_rank = engine_index * stage_span + rank
         num_gpus = torch.cuda.device_count()
@@ -1118,7 +1117,7 @@ class ModelRunner:
                 distributed_init_method=distributed_init_method,
                 backend="nccl",
                 data_parallel_size=dp_size,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                prefill_context_model_parallel_size=config.pcp_group_size,
             )
         else:
             # The group spans the devices that exist; apply_simulated_tp then
@@ -1134,7 +1133,7 @@ class ModelRunner:
                 local_rank=local_device_rank,
                 data_parallel_size=config.parallel_config.data_parallel_size,
                 data_parallel_rank=config.parallel_config.data_parallel_rank,
-                prefill_context_model_parallel_size=config.prefill_context_parallel_size,
+                prefill_context_model_parallel_size=config.pcp_group_size,
                 decode_context_parallel_size=getattr(
                     config, "decode_context_parallel_size", 1
                 ),
@@ -1395,7 +1394,7 @@ class ModelRunner:
         max_tokens = self.config.max_num_batched_tokens
         if not self.config.enable_dp_attention:
             max_tokens //= get_dp_group().world_size
-        pcp_size = pcp_stripe_count()
+        pcp_size = self.config.prefill_context_parallel_size
         if pcp_size > 1:
             max_tokens = max(1, max_tokens // pcp_size)
         return max_tokens
@@ -2419,7 +2418,7 @@ class ModelRunner:
         # (never split a sequence's tokens), so each ubatch = "non-TBO PCP on a
         # request subset". Requires num_reqs >= 2 (request-boundary split needs
         # two non-empty groups); bs=1 falls back to non-TBO.
-        pcp_size = pcp_stripe_count()
+        pcp_size = self.config.prefill_context_parallel_size
         # Read by build_ubatch / run_model / prepare_prefill to route the
         # per-group path; reset every step so a stale value cannot route one.
         self._pcp_tbo_balanced_active = False
@@ -2646,7 +2645,7 @@ class ModelRunner:
             scheduled_tokens_gpu=self.forward_vars["batch_info"].gpu[1:2],
         )
 
-        pcp_size = pcp_stripe_count()
+        pcp_size = self.config.prefill_context_parallel_size
         _pcp_tbo_balanced = (
             is_prefill
             and pcp_size > 1
@@ -3107,7 +3106,7 @@ class ModelRunner:
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
-        _pcp_size = pcp_stripe_count()
+        _pcp_size = self.config.prefill_context_parallel_size
         _pcp_bal_groups = getattr(self, "_pcp_bal_groups", None)
         _pcp_tbo_balanced = (
             _pcp_size > 1

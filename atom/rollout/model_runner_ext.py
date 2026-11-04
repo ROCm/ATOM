@@ -141,7 +141,10 @@ class RLHFModelRunner(
             device_map = os.environ.get(self.DP_DEVICE_MAP_ENV)
             if device_map is None:
                 return super()._setup_device_and_distributed(rank, config)
-        if config.prefill_context_parallel_size > 1:
+        if (
+            config.prefill_context_parallel_size > 1
+            or config.sequence_parallel_size > 1
+        ):
             # These worlds have no PCP group: attention would shard heads by TP
             # alone while the KV pool is sized for TP x SP.
             raise ValueError(

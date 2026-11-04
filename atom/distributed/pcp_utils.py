@@ -24,8 +24,6 @@ from aiter.dist.parallel_state import (
     get_prefill_context_model_parallel_world_size,
 )
 
-from atom.distributed.ulysses_sp import sp_is_enabled
-
 
 class PcpBalGroup(NamedTuple):
     """One request group for PCP+TBO request-boundary split prefill.
@@ -57,15 +55,8 @@ def get_pcp_rank() -> int:
     return get_prefill_context_model_parallel_rank()
 
 
-def pcp_stripes_tokens() -> bool:
-    """Whether prefill tokens are striped over the PCP group. SP shares the
-    group with contiguous token shards."""
-    return get_pcp_world_size() > 1 and not sp_is_enabled()
-
-
-def pcp_stripe_count() -> int:
-    """Ranks the runner stripes a prefill's tokens over, round-robin."""
-    return get_pcp_world_size() if pcp_stripes_tokens() else 1
+def pcp_is_enabled() -> bool:
+    return get_pcp_world_size() > 1
 
 
 def pcp_pad_len(

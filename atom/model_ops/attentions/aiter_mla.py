@@ -28,11 +28,11 @@ from atom.distributed.dcp_utils import (
 from atom.distributed.pcp_utils import (
     get_pcp_rank,
     get_pcp_world_size,
+    pcp_is_enabled,
     pcp_owned_rows_by_request,
     pcp_pad_dense,
     pcp_pad_len,
     pcp_round_robin_query_indices,
-    pcp_stripes_tokens,
 )
 from atom.kv_transfer.disaggregation.index_staging import (
     gather_dcp_preshuffled_index_pages,
@@ -2102,7 +2102,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # model's round-robin token split (ForCausalLM._pcp_active() also
             # skips dummy/warmup). Per-sequence + KV-write fields (slot_mapping,
             # block_tables, cu_seqlens_q/k) stay FULL — every rank keeps full KV.
-            pcp_split = pcp_stripes_tokens() and not batch.is_dummy_run
+            pcp_split = pcp_is_enabled() and not batch.is_dummy_run
             if pcp_split:
                 self._apply_pcp_reindex(attn_metadata, scheduled_tokens, sparse_counts)
             self._publish_prefill_index_rows(

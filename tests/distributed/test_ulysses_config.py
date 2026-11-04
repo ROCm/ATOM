@@ -21,7 +21,9 @@ def test_gqa_kv_heads_can_replicate_to_query_owners(world):
         hf_config=SimpleNamespace(num_attention_heads=32, num_key_value_heads=4),
     )
     Config._init_sequence_parallel(config)
-    assert config.prefill_context_parallel_size == world
+    # SP keeps -pcp's value and widens only the process group it runs over.
+    assert config.prefill_context_parallel_size == 1
+    assert Config.pcp_group_size.fget(config) == world
 
 
 @pytest.mark.parametrize(
@@ -81,7 +83,7 @@ def test_dp_isolated_rlhf_workers_refuse_sp(monkeypatch):
 
     monkeypatch.setenv(RLHFModelRunner.DP_DEVICE_MAP_ENV, "0,1,2,3")
     config = atom_config_double(
-        prefill_context_parallel_size=4,
+        sequence_parallel_size=4,
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     runner = object.__new__(RLHFModelRunner)

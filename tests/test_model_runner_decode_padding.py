@@ -57,7 +57,6 @@ def test_runner_model_height_and_sampling_rows(
     monkeypatch.setattr(ulysses_sp, "get_current_atom_config_or_none", lambda: sp)
     group = SimpleNamespace(rank_in_group=sp_rank)
     monkeypatch.setattr(modules.parallel_state, "get_pcp_group", lambda: group)
-    monkeypatch.setattr(runner_module, "pcp_stripe_count", lambda: 1)
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
     runner.sp_mega_moe = Mock()
