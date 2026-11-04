@@ -53,6 +53,7 @@ from atom.models.kimi_k3.mono.config import (
 )
 from atom.models.kimi_k3.mono.kernels import layer as k2
 from atom.models.kimi_k3.mono.kernels.attention import kda as k1
+from atom.models.kimi_k3.mono.kernels.stages import mla_post_plan
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
 from atom.models.kimi_k3.mono.plan import (
     _width,
@@ -61,7 +62,7 @@ from atom.models.kimi_k3.mono.plan import (
     width_key,
     width_refusal,
 )
-from atom.models.kimi_k3.mono.weights import bind_model
+from atom.models.kimi_k3.mono.weights import bind_mla_post, bind_model
 from atom.mono.dsa_indexer import kernel as kix
 from atom.mono.dsa_indexer.runner import IndexerRunner
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
@@ -111,7 +112,7 @@ class WidthBuild:
         ix = [] if self.indexer is None else [(self.indexer, kix.ABI)]
         return (
             [(f, k1.ABI) for f in self.k1_launchers.values()]
-            + [(f, k2.ABI) for f in self.k2_launchers.values()]
+            + [(f, k2.abi_for(key)) for key, f in self.k2_launchers.items()]
             + ix
         )
 
@@ -218,6 +219,8 @@ class K3MonoDecodeRunner:
         except MonoUnsupported as why:
             logger.info("mono DSA indexer off: %s", why)
             self.ix = None
+        # before ``_allocate``: an ``mla_post`` K2 key adds scratch (its pairs)
+        self._bind_mla_post()
         self._allocate()
 
     def _state_len(self) -> int:
@@ -408,6 +411,9 @@ class K3MonoDecodeRunner:
         return keys
 
     def _k2_keys(self, rows: int) -> dict[int, k2.K2Build]:
+        # the MLA post stage up to its width bound; wider steps run those
+        # layers' attention tail unfused (``_pre_o_core``)
+        post = self.mla_post if rows <= mla_post_plan.MAX_ROWS else {}
         return {
             p.layer_id: k2.K2Build(
                 tokens=rows,
@@ -417,6 +423,7 @@ class K3MonoDecodeRunner:
                 out_eps=p.moe.seam.out_eps,
                 ln_eps=p.moe.ln_eps,
                 diag=self.debug,
+                mla_post=p.layer_id in post,
             )
             for p in self.plans
             if p.moe is not None
@@ -507,7 +514,12 @@ class K3MonoDecodeRunner:
                     f"an {rows}-row step"
                 )
         else:
-            if plan.ffn_only:
+            post = keep = None
+            if plan.ffn_only and build.k2_keys[plan.layer_id].mla_post:
+                core, prefix, post, keep = self._post_core(
+                    plan, positions, prefix, blocks, add, add2
+                )
+            elif plan.ffn_only:
                 core, prefix = self._pre_o_core(
                     plan, positions, prefix, blocks, add, add2
                 )
@@ -516,7 +528,12 @@ class K3MonoDecodeRunner:
                 core = self._k1(build, plan, prefix, delta, blocks, metadata)
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
-            out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+            out = (prefix, self._k2(build, plan, core, prefix, blocks, post), None)
+            # ``keep`` holds what the launch was handed pointers to until now
+            del keep
+            if self._mla_post_pending is not None:
+                pending, self._mla_post_pending = self._mla_post_pending, None
+                self._mla_post_compare(*pending)
         self._write_aux(plan.layer_id, out)
         return out
 
@@ -545,6 +562,112 @@ class K3MonoDecodeRunner:
                 f"{core.dtype} stride {core.stride()} for an {rows}-row step"
             )
         return core, prefix
+
+    def _bind_mla_post(self) -> None:
+        """``ATOM_MONO_MLA_POST=1``: the full-attention layers whose v-up, g_proj
+        and output gate run as the first stage of their own K2 launch
+        (``kernels.stages.mla_post``) -- 4 launches fewer a layer, no new launch
+        and no grid barrier. Off by default; then ``mla_post`` is empty and every
+        key, launch and argument is as before. A layer the stage cannot serve
+        exactly (a DSA layer's sparse MLA, a tail outside the FP8 recipe) keeps
+        its unfused tail (``_pre_o_core``), as ``bind_model`` keeps a layer it
+        refuses on the production path. The refusals are static properties of
+        the model, the same on every rank; the stage is rank-local besides, so
+        its K2 talks to its peers exactly as the unfused build does."""
+        self.mla_post: dict = {}
+        self.mla_post_check = envs.ATOM_MONO_MLA_POST_CHECK
+        self._mla_post_pending = None
+        if not envs.ATOM_MONO_MLA_POST:
+            return
+        for p in self.plans:
+            if not p.ffn_only:
+                continue
+            layer = self.inner.layers[p.layer_id]
+            try:
+                self.mla_post[p.layer_id] = bind_mla_post(layer, p.layer_id, self.dims)
+            except MonoUnsupported as why:
+                logger.info(
+                    "Kimi-K3 mono: layer %d keeps its unfused MLA tail (%s)",
+                    p.layer_id,
+                    why,
+                )
+        if self.rank == 0:
+            logger.info(
+                "Kimi-K3 mono: ATOM_MONO_MLA_POST: v-up / g_proj / gate in K2 on "
+                "%d MLA layers",
+                len(self.mla_post),
+            )
+
+    def _post_core(self, plan, positions, prefix, blocks, add, add2):
+        """``_pre_o_core`` with the attention stopped at the MLA decode's latent
+        output: K2's post stage makes ``core`` from it and g_proj's FP8 input.
+        Returns the buffer the stage writes, the seam's prefix and the stage's
+        kernel arguments, and the tensors those arguments point into: they must
+        stay allocated until the launch (a caching allocator hands a released
+        block to the next allocation, under graph capture across graphs)."""
+        post = self.mla_post[plan.layer_id]
+        layer, normed, prefix, _, _ = self._seam(plan, prefix, blocks, add, add2)
+        olat, x, xs = layer.self_attn.forward_latent(positions, normed)
+        rows = prefix.size(0)
+        heads, lora = post.w_v.shape[0], post.w_v.shape[2]
+        if (
+            olat.dim() != 3
+            or tuple(olat.shape) != (rows, heads, lora)
+            or olat.dtype != torch.bfloat16
+            or olat.stride(1) != lora
+            or olat.stride(2) != 1
+            or x.dtype != post.w_g.dtype
+            or tuple(x.shape) != (rows, post.w_g.shape[1])
+            or not x.is_contiguous()
+            or xs is None
+            or xs.dtype != torch.float32
+            or xs.numel() != rows
+            or not xs.is_contiguous()
+            or not prefix.is_contiguous()
+        ):
+            raise MonoUnsupported(
+                f"layer {plan.layer_id}: MLA post inputs latent "
+                f"{tuple(olat.shape)} {olat.dtype} {olat.stride()}, x "
+                f"{tuple(x.shape)} {x.dtype}, scale "
+                f"{None if xs is None else (tuple(xs.shape), xs.dtype)} for a "
+                f"{rows}-row step"
+            )
+        core = prefix.new_empty(rows, self.dims.proj)
+        p = torch.Tensor.data_ptr
+        args = {
+            "olat": p(olat), "olat_sr": olat.stride(0), "w_v": p(post.w_v),
+            "w_v_s": p(post.w_v_s), "xg": p(x), "xg_s": p(xs),
+            "w_g": p(post.w_g), "w_g_s": p(post.w_g_s),
+        }  # fmt: skip
+        if self.mla_post_check and not torch.cuda.is_current_stream_capturing():
+            self._mla_post_pending = (plan.layer_id, layer, olat, x, xs, core)
+        return core, prefix, args, (olat, x, xs)
+
+    def _mla_post_compare(self, layer_id, layer, olat, x, xs, core) -> None:
+        """``ATOM_MONO_MLA_POST_CHECK=1`` (eager GPU validation): the production
+        tail -- ``_v_up_proj``, g_proj, ``attn * sigmoid(gate)`` -- on the same
+        inputs, against the core the K2 post stage wrote; rank 0 logs the bf16
+        ulp statistics. Synchronizes."""
+        sa = layer.self_attn
+        av = sa.attn.impl._v_up_proj(olat).reshape(olat.size(0), -1)
+        gate = sa.g_proj(x, xs)
+        ref = av * torch.sigmoid(gate)
+        a = core.view(torch.int16).int()
+        b = ref.view(torch.int16).int()
+        a = torch.where(a < 0, -(a & 0x7FFF), a)
+        b = torch.where(b < 0, -(b & 0x7FFF), b)
+        d = (a - b).abs()
+        if self.rank == 0:
+            logger.info(
+                "MLA post check layer %d: %d / %d bf16 values differ, max %d ulp, "
+                "max |diff| %.3e (max |ref| %.3e)",
+                layer_id,
+                int((d > 0).sum()),
+                d.numel(),
+                int(d.max()),
+                float((core.float() - ref.float()).abs().max()),
+                float(ref.float().abs().max()),
+            )
 
     def _seam(self, plan, prefix, blocks, add, add2):
         """The layer's attention-side AttnRes seam, on the blocks behind it."""
@@ -675,12 +798,14 @@ class K3MonoDecodeRunner:
             self._replay_tables[layer_id] = (table, ptrs)
         return table.data_ptr()
 
-    def _k2(self, build, plan, core, prefix, blocks) -> torch.Tensor:
+    def _k2(self, build, plan, core, prefix, blocks, post=None) -> torch.Tensor:
+        """``post`` (an ``mla_post`` build): the post stage's arguments, ``core``
+        then being the buffer the stage writes and o_proj reads."""
         w = plan.moe
         key = build.k2_keys[plan.layer_id]
         out = torch.empty_like(prefix)
         p = torch.Tensor.data_ptr
-        args = k2.ABI.pack({
+        args = k2.abi_for(key).pack({
             "core": p(core), "w_o": p(w.w_o), "prefix": p(prefix),
             "blocks": p(blocks), "blk_sm": blocks.stride(0),
             "blk_sr": blocks.stride(1), "ares_nw": p(w.seam.nw),
@@ -699,6 +824,7 @@ class K3MonoDecodeRunner:
             # a block-write layer's MLP seam restarts its prefix
             "reset": int(plan.moe.write_idx >= 0),
             "diag": self._diag_ptr(), "tl": 0,
+            **(post or {}),
         })  # fmt: skip
         _run_compiled(build.k2_launchers[key], *args, torch.cuda.current_stream())
         return out
