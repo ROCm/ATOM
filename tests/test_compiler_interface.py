@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import operator
+
 import pytest
 import torch
 
 from atom.utils import compilation_counter
-from atom.utils.compiler_inferface import (
-    InductorStandaloneAdaptor,
-    _save_standalone_compiled_graph,
-)
+from atom.utils.backends import split_graph
+from atom.utils.compiler_inferface import _save_standalone_compiled_graph
 
 
 def test_non_saveable_torch_213_artifact_is_skipped():
@@ -71,83 +71,33 @@ def test_saveable_artifact_returns_cache_handle(monkeypatch):
     assert compilation_counter.num_compiled_artifacts_saved == 1
 
 
-@pytest.mark.parametrize("aot", [False, True])
-def test_load_flattens_tuple_inputs_only_for_cache_artifacts(monkeypatch, aot):
-    """A cache-backed artifact takes the leaves; an AOT one keeps its own call
-    convention and takes the (activation, scale) tuple as given."""
-    standalone = pytest.importorskip("torch._inductor.standalone_compile")
-    calls = []
+def test_split_graph_keeps_a_split_ops_getitems_in_its_piece():
+    """A tuple from a split op is unpacked inside the split op's piece, so no
+    compiled piece takes the tuple as one input (a reloaded standalone artifact
+    cannot unpack it)."""
 
-    class CacheArtifact:
-        def __call__(self, *args):
-            calls.append(args)
-            return (args[-1],)
+    def pair_op(x):
+        return x + 1, x * 2
 
-    class AOTArtifact(CacheArtifact):
-        pass
+    pair_op.spliting_op = True
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    pair = graph.call_function(pair_op, (graph.call_function(torch.relu, (x,)),))
+    first = graph.call_function(operator.getitem, (pair, 0))
+    second = graph.call_function(operator.getitem, (pair, 1))
+    graph.output(graph.call_function(torch.add, (first, second)))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-    artifact = AOTArtifact() if aot else CacheArtifact()
-    monkeypatch.setattr(standalone, "AOTCompiledArtifact", AOTArtifact, raising=False)
-    monkeypatch.setattr(
-        torch._inductor.CompiledArtifact, "load", lambda **kwargs: artifact
-    )
-
-    class TupleInput(torch.nn.Module):
-        def forward(self, pair, n):
-            return (pair[0] * pair[1] + n,)
-
-    pair = (torch.ones(2), torch.ones(2))
-    loaded = InductorStandaloneAdaptor().load(
-        ("g", "/unused"), torch.fx.symbolic_trace(TupleInput()), [pair, 3], 0
-    )
-    loaded(pair, 3)
-    assert calls == [(pair, 3) if aot else (*pair, 3)]
-
-
-def test_standalone_cpu_artifact_roundtrip_with_tuple_input(tmp_path, monkeypatch):
-    """Reload retains tuple-input flattening and input-mutation argument order.
-
-    The mutation is intentional: wrong flat argument indices after reloading
-    used to pass a scalar to increment_version in the last piecewise graph.
-    This compiles a real CPU kernel, saves it, and uses ATOM's real loader.
-    """
-    standalone = pytest.importorskip("torch._inductor.standalone_compile")
-
-    class Nested(torch.nn.Module):
-        def forward(self, pair, n, residual):
-            torch.ops.aten.add_.Tensor(
-                residual,
-                torch.ops.aten.add.Tensor(
-                    torch.ops.aten.mul.Tensor(pair[0], pair[1]), n
-                ),
+    split_gm, items = split_graph(gm, [])
+    compiled_inputs = []
+    for item in items:
+        if not item.is_splitting_graph:
+            item.graph.register_forward_pre_hook(
+                lambda _, args: compiled_inputs.extend(args)
             )
-            return residual
-
-    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
-    graph = torch.fx.symbolic_trace(Nested())
-
-    def inputs():
-        x = torch.arange(8, dtype=torch.float32, device="cpu")
-        scale = torch.full((8,), 2.0, device="cpu")
-        residual = torch.ones(8, device="cpu")
-        return (x, scale), 3, residual
-
-    example_inputs = inputs()
-    with torch._functorch.config.patch(enable_autograd_cache=True):
-        fresh = standalone.standalone_compile(
-            graph,
-            example_inputs,
-            dynamic_shapes="from_example_inputs",
-            options={"config_patches": {"compile_threads": 1, "fx_graph_cache": True}},
-        )
-    if isinstance(fresh, getattr(standalone, "AOTCompiledArtifact", ())):
-        pytest.skip("Torch selected the AOT standalone artifact format")
-    path = str(tmp_path / "artifact")
-    handle = _save_standalone_compiled_graph(fresh, path, "roundtrip")
-    assert handle is not None, "The CPU probe must produce a serializable artifact"
-    loaded = InductorStandaloneAdaptor().load(handle, graph, list(example_inputs), 0)
-    expected = torch.arange(8, dtype=torch.float32) * 2 + 4
-    fresh_args, loaded_args = inputs(), inputs()
-    torch.testing.assert_close(fresh(*fresh_args), expected, rtol=0, atol=0)
-    torch.testing.assert_close(loaded(*loaded_args), expected, rtol=0, atol=0)
-    torch.testing.assert_close(loaded_args[-1], fresh_args[-1], rtol=0, atol=0)
+    x = torch.randn(4)
+    torch.testing.assert_close(split_gm(x), gm(x), rtol=0, atol=0)
+    assert [item.is_splitting_graph for item in items] == [False, True, False]
+    assert compiled_inputs and all(
+        isinstance(arg, torch.Tensor) for arg in compiled_inputs
+    )
