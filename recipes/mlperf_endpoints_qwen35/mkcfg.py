@@ -26,7 +26,7 @@ perf = next(d for d in cfg["datasets"] if d.get("type") == "performance")
 perf["path"] = dataset
 # ACC_INLINE=1 keeps the example's inline accuracy (agentic_inference_inline, scored from events.jsonl
 # when the run finalizes), which an official submission requires on every point; SWE-bench stays out.
-if os.environ.get("ACC_INLINE", "0") != "1":
+if os.environ.get("ACC_INLINE", "1") != "1":
     perf.pop("accuracy_config", None)
 ai = perf["agentic_inference"]
 # trajectories: at least the dataset's 613, and TRAJ_X (default 4) per concurrency slot. The client
@@ -51,13 +51,15 @@ ai["num_trajectories_to_issue"] = n_traj
 ai["turn_timeout_s"] = float(os.environ.get("TURN_TIMEOUT", "14400"))
 ai["enable_salt"] = True
 ai["inject_tool_delay"] = True
-# STOP_FIRST=0 / CAP_MIN=600: every trajectory to its end, the compliant 10-hour cap
-ai["stop_issuing_on_first_user_complete"] = os.environ.get("STOP_FIRST", "1") == "1"
+# Defaults are the submission settings (README "Official Submission Rules"): STOP_FIRST=0 (every started
+# trajectory to its end), CAP_MIN=600 (the 10-hour cap), ACC_INLINE=1 (inline accuracy). STOP_FIRST=1 is not
+# valid for a submission.
+ai["stop_issuing_on_first_user_complete"] = os.environ.get("STOP_FIRST", "0") == "1"
 cfg["datasets"] = [perf]
 
 cfg["settings"]["load_pattern"]["target_concurrency"] = int(conc)
 cfg["settings"].setdefault("runtime", {})["max_issue_duration_ms"] = int(
-    float(os.environ.get("CAP_MIN", "30")) * 60 * 1000
+    float(os.environ.get("CAP_MIN", "600")) * 60 * 1000
 )
 # Client capacity, YAML-only (rules 2.1.1: the reference client is unmodified; runtime behavior is set here).
 # CLIENT_WORKERS: HTTP worker processes (default auto). METRICS_TOKENIZER_WORKERS: the metrics aggregator's
