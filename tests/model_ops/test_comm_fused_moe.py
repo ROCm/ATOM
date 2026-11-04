@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from aiter_stubs import ActivationType, GateMode, QuantType, atom_under_stubs
+from aiter_stub import ActivationType, GateMode, QuantType
 from conftest import atom_config_double
 
 
@@ -74,18 +74,6 @@ class _State:
         self.shape_keys = []
         self.runner_calls = []
         self.missing_shape = False
-
-
-@pytest.fixture(scope="module")
-def atom_modules():
-    with atom_under_stubs() as load:
-        yield SimpleNamespace(
-            moe=load("atom.model_ops.moe"),
-            comm=load("atom.model_ops.fused_moe.comm_fused_moe"),
-            deepseek_v4=load("atom.models.deepseek_v4"),
-            host=load("aiter.ops.flydsl.comm_fused_moe_host"),
-            runtime=load("aiter.ops.comm_fused_moe_runtime"),
-        )
 
 
 @pytest.fixture

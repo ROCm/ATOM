@@ -7,16 +7,9 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from test_comm_fused_moe import atom_modules  # noqa: F401
-from test_sp_moe_dispatch import sp_modules as _sp_modules
 
 from atom.model_ops.fused_moe import sp_mega_moe as fusion
 from atom.model_ops.fused_moe.sp_mega_moe import SPMegaMoE, local_token_tile
-
-
-@pytest.fixture
-def sp_modules(request):
-    return _sp_modules.__wrapped__(request)
 
 
 def _layer(moe):

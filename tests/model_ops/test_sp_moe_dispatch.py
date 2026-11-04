@@ -1,23 +1,10 @@
 # SPDX-License-Identifier: MIT
 """CPU coverage for SP MoE routing and transport selection."""
 
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import pytest
 import torch
-from test_comm_fused_moe import atom_modules  # noqa: F401
-
-
-@pytest.fixture
-def sp_modules(request):
-    # Preserve the external types used by an already imported MoE module.
-    # Replacing AITER then would create a second, incompatible QuantType enum.
-    moe = sys.modules.get("atom.model_ops.moe")
-    if moe is None:
-        moe = request.getfixturevalue("atom_modules").moe
-    return SimpleNamespace(moe=moe)
 
 
 def test_sp_gathers_every_pass_once_and_scatters_it_back(monkeypatch, sp_modules):

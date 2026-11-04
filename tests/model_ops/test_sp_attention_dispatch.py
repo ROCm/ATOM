@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from aiter_stubs import atom_without_aiter
+from aiter_stub import atom_without_aiter
 
 from atom import config
 

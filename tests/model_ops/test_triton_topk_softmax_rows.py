@@ -2,12 +2,12 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Which layers take `triton_topk_softmax` and up to how many rows, on the
-GPU-less CI (through `tests/aiter_stubs.py`)."""
+GPU-less CI (through `tests/aiter_stub.py`)."""
 
 from types import SimpleNamespace
 
 import pytest
-from aiter_stubs import atom_under_stubs
+from aiter_stub import atom_under_stubs
 
 
 @pytest.fixture(scope="module")
