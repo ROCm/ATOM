@@ -440,3 +440,79 @@ def test_kimi_rendered_prompt_reports_required_conversation_before_loading():
             "prompt",
             {"image": "unused.png"},
         )
+
+
+IMG = 248056  # Qwen3.5 <|image_pad|>
+
+
+def qwen3_5_config(model_type="qwen3_5_moe"):
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
+        multimodal_config=SimpleNamespace(
+            model_type=model_type,
+            image_token_id=IMG,
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+        ),
+    )
+
+
+def prepare_qwen3_5(image_module, input_ids, image_grid_thw, model_type="qwen3_5_moe"):
+    hf_output = {
+        "input_ids": np.array([input_ids]),
+        "pixel_values": np.ones((sum(t * h * w for t, h, w in image_grid_thw), 3)),
+        "image_grid_thw": np.array(image_grid_thw),
+    }
+
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return "<|image_pad|>" * len(image_grid_thw) + " prompt"
+
+        def __call__(self, **kwargs):
+            return hf_output
+
+    images = [image_module.new("RGB", (2, 2)) for _ in image_grid_thw]
+    conversation = chat(*({"type": "image"} for _ in images))
+    return prepare_multimodal_inputs(
+        qwen3_5_config(model_type), Processor(), conversation, {"image": images}
+    )
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+def test_qwen3_5_image_prompts_carry_one_span_per_image(image_module, model_type):
+    # Two images: a 4x4 grid (4 tokens after the 2x2 merge) and a 2x4 grid
+    # (2 tokens), the second directly after the first with no separator.
+    input_ids = [1, 2, IMG, IMG, IMG, IMG, IMG, IMG, 3]
+    token_ids, data = prepare_qwen3_5(
+        image_module, input_ids, [[1, 4, 4], [1, 2, 4]], model_type
+    )
+    assert token_ids == input_ids
+    assert data["embedding_spans"] == ((2, 4), (6, 2))
+    assert isinstance(data["cache_seed"], int)
+
+
+def test_qwen3_5_cache_seed_tells_images_apart(image_module):
+    _, first = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]])
+    _, same = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]])
+    _, other_grid = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 2, 8]])
+    assert first["cache_seed"] == same["cache_seed"]
+    assert first["cache_seed"] != other_grid["cache_seed"]
+
+
+@pytest.mark.parametrize(
+    "input_ids",
+    [
+        [1, IMG, IMG, IMG, 2],  # one token short of the grid's 4
+        [1, IMG, IMG, 2, IMG, IMG],  # the run is split
+        [1, IMG, IMG, IMG, IMG, IMG],  # one image token too many
+    ],
+)
+def test_qwen3_5_image_tokens_that_disagree_with_the_grid_are_rejected(
+    image_module, input_ids
+):
+    with pytest.raises(ValueError, match="image tokens"):
+        prepare_qwen3_5(image_module, input_ids, [[1, 4, 4]])
+
+
+def test_other_qwen_model_types_keep_the_whole_image_merge(image_module):
+    _, data = prepare_qwen3_5(image_module, [IMG] * 4, [[1, 4, 4]], "qwen4_exp")
+    assert "embedding_spans" not in data and "cache_seed" not in data

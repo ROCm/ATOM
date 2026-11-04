@@ -257,3 +257,103 @@ def test_kimi_k3_image_prompt_longer_than_the_token_budget_is_chunked():
             batch=batch,
         )
     assert chunks == [6, 6, 6]
+
+
+def qwen3_5_payload(token_ids, image_grid_thw, seed=21):
+    from atom.models.qwen3_5_vl import qwen3_5_image_spans
+
+    spans = qwen3_5_image_spans(token_ids, image_grid_thw, 42, 2)
+    rows = sum(count for _, count in spans)
+    return {
+        "cache_seed": seed,
+        "embedding_spans": spans,
+        "pixel_values": torch.arange(2 * rows).view(rows, 2).float(),
+        "image_grid_thw": torch.tensor(image_grid_thw),
+    }
+
+
+# 3 text tokens, one 1x4x8 image (8 tokens after the 2x2 merge), 5 text tokens.
+QWEN3_5_IDS = [7, 8, 9] + [42] * 8 + [5, 6, 7, 8, 9]
+
+
+@pytest.mark.parametrize("cached", [0, 3, 5, 10, 11, 13])
+def test_qwen3_5_prefix_hit_scatters_only_the_image_rows_left_in_the_forward(cached):
+    # ROCm/ATOM#2865: the whole-image merge scattered all 8 image rows into the
+    # forward even when a prefix hit had already covered some (cached=5, 10) or
+    # all (cached=11, 13) of them, and crashed on the shape mismatch.
+    model = VisionModel()
+    data = qwen3_5_payload(QWEN3_5_IDS, [[1, 4, 8]])
+    full_ids = torch.tensor(QWEN3_5_IDS)
+    expected = model.embed_input_ids(full_ids)
+    expected[3:11] = data["pixel_values"] + 100
+
+    length = len(QWEN3_5_IDS) - cached
+    batch = SimpleNamespace(
+        req_ids=[4],
+        num_scheduled_tokens=[length],
+        context_lens=[len(QWEN3_5_IDS)],
+        multimodal_data={4: data},
+    )
+    actual = embed_multimodal_batch(
+        model, VisionEmbeddingCache(), full_ids[cached:], batch, "cpu", torch.float32
+    )
+    torch.testing.assert_close(actual, expected[cached:], rtol=0, atol=0)
+
+
+def test_qwen3_5_image_prompt_is_chunked_and_resumes_after_a_prefix_hit():
+    from atom.models.qwen3_5_vl import build_qwen_vl_inputs
+
+    def processor(**kwargs):
+        return {
+            "input_ids": torch.tensor([QWEN3_5_IDS]),
+            "pixel_values": torch.ones(32, 3),
+            "image_grid_thw": torch.tensor([[1, 4, 8]]),
+        }
+
+    atom_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(
+            model_type="qwen3_5",
+            image_token_id=42,
+            vision_config=SimpleNamespace(spatial_merge_size=2),
+        )
+    )
+    token_ids, data = build_qwen_vl_inputs(
+        atom_config, processor, "<|image_pad|> prompt", [object()], {}
+    )
+    assert data["embedding_spans"] == ((3, 8),)
+
+    scheduler = Scheduler(
+        MockConfig(
+            max_num_batched_tokens=6,
+            max_model_len=128,
+            num_kvcache_blocks=100,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+        )
+    )
+
+    def prefill(seq):
+        """Schedule `seq` to the end of its prompt; return each chunk's size."""
+        assert scheduler._unschedulable_reason(seq) is None
+        assert not scheduler._requires_atomic_prefill(seq)
+        scheduler.add(seq)
+        chunks = []
+        while seq.num_cached_tokens < len(token_ids):
+            batch, _ = scheduler.schedule()
+            assert batch.multimodal_data[seq.id]["embedding_spans"] == ((3, 8),)
+            chunks.append(batch.total_tokens_num_prefill)
+            scheduler.postprocess(
+                list(scheduler.running),
+                ScheduledBatchOutput([], [], None, None, None),
+                batch=batch,
+            )
+        return chunks
+
+    params = SamplingParams(temperature=0, max_tokens=2)
+    # The 16-token prompt no longer has to fit one forward.
+    assert prefill(Sequence(token_ids, 4, params, multimodal_data=data)) == [6, 6, 4]
+    # The same image again hits the 12 published tokens, past the image's end
+    # at 11: the forward holds 4 text tokens and none of the image (the
+    # `[0, 2048]` crash in ROCm/ATOM#2865).
+    again = Sequence(token_ids, 4, params, multimodal_data=dict(data))
+    assert prefill(again) == [4]
