@@ -109,7 +109,7 @@ def test_semi_autoregressive_bias_changes_argmax():
 
 
 def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch):
-    """`DSparkMarkovHead.sample_block_q`, the one sampled loop every flavor
+    """`DSparkMarkovHead.sample_block`, the one sampled loop every flavor
     shares: position k draws from x_{k-1} into its own column, at store
     position k, with the noise counter strided by the buffers' max batch."""
     max_bs, bs, steps, V = 4, 3, 3, 10
@@ -136,11 +136,11 @@ def test_the_sampled_block_chains_positions_through_the_shared_head(monkeypatch)
     monkeypatch.setattr(dspark_markov_sample_mod, "dspark_markov_sample", sample)
     base_logits = torch.randn(bs, steps, V)
     anchors = torch.tensor([0, 3, 5])
-    drafts = head.sample_block_q(base_logits, anchors, sampling)
+    drafts = head.sample_block(base_logits, anchors, sampling)
     assert torch.equal(drafts, anchors[:, None] + torch.arange(1, steps + 1))
     assert calls == [(bs, k, k * max_bs * V) for k in range(steps)]
     with pytest.raises(AssertionError, match="score scratch"):
-        head.sample_block_q(torch.randn(bs, steps, V + 1), anchors, sampling)
+        head.sample_block(torch.randn(bs, steps, V + 1), anchors, sampling)
 
 
 def _real_hf_config_override():

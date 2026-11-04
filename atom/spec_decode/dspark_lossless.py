@@ -231,7 +231,7 @@ class DSparkLossless:
             top_k=forward_vars["top_ks"].gpu,
             top_p=forward_vars["top_ps"].gpu,
         )
-        model.bind_draft_sampling(sampling)
+        model.draft_sampling = sampling
 
     def stage(
         self,

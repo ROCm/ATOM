@@ -42,10 +42,7 @@ class FakeDraftModel:
         self.markov_head = SimpleNamespace(
             markov_w1=nn.Embedding(VOCAB, 8), markov_w2=nn.Embedding(VOCAB, 8)
         )
-        self.bound = None
-
-    def bind_draft_sampling(self, sampling):
-        self.bound = sampling
+        self.draft_sampling = None
 
 
 def proposer(
@@ -150,7 +147,7 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
     prop = proposer(monkeypatch)
     for name in LOSSLESS:
         assert prop.metadata_buffers[name].publication_group == "sampling", name
-    sampling = prop.model.bound
+    sampling = prop.model.draft_sampling
     assert sampling.q_row_base is prop.metadata_buffers["draft_q_row_base"].gpu
     # Unpublished rows are harmless from the start: no destination.
     assert dest(prop) == [-1] * MAX_BS and verify(prop) == [-1] * MAX_BS
@@ -161,10 +158,10 @@ def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
     filters are the runner's `forward_vars` buffers themselves. Arming only
     allocates; the model is bound once, complete."""
     prop = proposer(monkeypatch, bind=False)
-    assert prop.model.bound is None
+    assert prop.model.draft_sampling is None
     forward_vars = target_vars()
     prop.lossless.bind_target(forward_vars, prop.model)
-    sampling = prop.model.bound
+    sampling = prop.model.draft_sampling
     assert sampling.temperatures is forward_vars["temperatures"].gpu
     assert sampling.top_k is forward_vars["top_ks"].gpu
     assert sampling.top_p is forward_vars["top_ps"].gpu
@@ -174,7 +171,7 @@ def test_the_draft_reads_the_targets_own_temperatures_and_filters(monkeypatch):
 def test_the_q_store_is_k_wide_and_never_wider_than_the_vocab(monkeypatch, topk, width):
     if topk is not None:
         monkeypatch.setattr(sparse_q_store, "Q_WIDTH", topk)
-    sampling = proposer(monkeypatch).model.bound
+    sampling = proposer(monkeypatch).model.draft_sampling
     store = sampling.q_store
     assert store.ids.shape == store.probs.shape == (2 * MAX_BS * T, width)
     assert store.meta.shape == (2 * MAX_BS * T, 2)
@@ -246,7 +243,7 @@ def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
         lambda w1, w2: "markov weights are torch.float32/torch.float32",
     )
     prop.lossless = dspark_lossless.DSparkLossless.arm(prop)
-    assert prop.lossless is None and prop.model.bound is None
+    assert prop.lossless is None and prop.model.draft_sampling is None
 
 
 def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
@@ -256,7 +253,7 @@ def test_a_sampler_without_aiters_filters_keeps_the_greedy_pair(monkeypatch):
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1")
     monkeypatch.setattr(dspark_lossless, "AITER_TOPK_TOPP_AVAILABLE", False)
     prop.lossless = dspark_lossless.DSparkLossless.arm(prop)
-    assert prop.lossless is None and prop.model.bound is None
+    assert prop.lossless is None and prop.model.draft_sampling is None
 
 
 @pytest.mark.parametrize(

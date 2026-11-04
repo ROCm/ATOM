@@ -172,44 +172,51 @@ class DSparkMarkovHead(nn.Module):
         out.copy_((base_logits + bias).argmax(dim=-1))
         return markov_embed
 
-    def sample_block_q(
+    def sample_block(
         self,
         base_logits: torch.Tensor,  # [B, T, V]
         anchor_ids: torch.Tensor,  # [B]
-        sampling: "DraftSampling",
+        sampling: "DraftSampling | None",
     ) -> torch.Tensor:
-        """The sampled block, left to right, through ``dspark_markov_sample``:
+        """The block, left to right, each position from ``x_{k-1}`` into its
+        own column of one ``[B, T + 1]`` block whose first column is the
+        anchor; returns the drafts ``[B, T]``:
 
             logits_k <- U_k + B(x_{k-1}, .)
-            q_k      <- top of softmax(logits_k / T) -- stored at q_store[base + k]
-            x_k      <- q_k                          -- drawn, not argmaxed
+            x_k      <- argmax(logits_k)                      (``sampling`` None)
+            x_k      <- drawn from the top of softmax(logits_k / T),
+                        that q stored at q_store[base + k]     (lossless)
 
-        Each row writes its q straight into the persistent row block its
-        request owns, ``sampling.q_row_base`` naming the block; the accept
-        kernel reads it back from there a step later. Returns the drafts
-        ``[B, T]``. One loop for every flavor that drafts losslessly, so the
-        noise counters cannot differ between them.
-
-        A separate entry point from ``sample_next`` rather than a flag on it:
-        this one publishes the q the other exists not to materialize.
+        One loop for both and for every flavor, so the column convention and
+        the noise counters cannot drift apart. Lossless, each row writes its q
+        straight into the row block its request owns (``sampling.q_row_base``),
+        which the accept kernel reads a step later. ``sampling`` is the
+        model's binding, fixed before capture, so one side is recorded.
         """
-        # Imported here for the reason `sample_next` gives.
-        from atom.model_ops.spec_sampling.dspark_markov_sample import (
-            dspark_markov_sample,
-        )
-
         bs, num_draft, vocab = base_logits.shape
-        assert sampling.s_scratch.shape[1] == vocab, (
-            f"the score scratch is {sampling.s_scratch.shape[1]} wide but the "
-            f"block scores {vocab} ids"
-        )
-        # The noise counter stride is the buffer's max batch, not this step's,
-        # so the uniform a (position, row, id) draws does not move with the
-        # batch, and no two positions of one block share a counter.
-        position_stride = sampling.q_row_base.shape[0] * vocab
+        if sampling is not None:
+            # Imported here for the reason `sample_next` gives.
+            from atom.model_ops.spec_sampling.dspark_markov_sample import (
+                dspark_markov_sample,
+            )
+
+            assert sampling.s_scratch.shape[1] == vocab, (
+                f"the score scratch is {sampling.s_scratch.shape[1]} wide but "
+                f"the block scores {vocab} ids"
+            )
+            # The noise counter stride is the buffer's max batch, not this
+            # step's, so the uniform a (position, row, id) draws does not move
+            # with the batch, and no two positions of one block share one.
+            position_stride = sampling.q_row_base.shape[0] * vocab
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
         for k in range(num_draft):
+            if sampling is None:
+                # Greedy: temperature/sampling is applied by the target's
+                # verify. The column is the op's destination, so no id is
+                # written twice.
+                self.sample_next(out_ids[:, k], base_logits[:, k], out_ids[:, k + 1])
+                continue
             dspark_markov_sample(
                 base_logits[:, k],
                 out_ids[:, k],
@@ -293,27 +300,17 @@ class DSparkDraftModel(nn.Module):
     # M3.1's per-row MHA decode) builds what it reads in `prepare_paged_block`.
     block_attention_is_mla = True
 
-    #: Does this flavor's block sampler branch on ``draft_sampling`` and draw
-    #: from, and publish, a real q (``DSparkMarkovHead.sample_block_q``)? A
-    #: class flag, not a probe: every flavor's head has ``sample_block_q``.
+    #: Does this flavor's block sampler hand ``draft_sampling`` to
+    #: ``DSparkMarkovHead.sample_block``, so it draws from, and publishes, a
+    #: real q? A class flag, not a probe: every flavor's head has the method.
     #: ``DSparkProposer`` binds sampling buffers only where it is set.
     supports_lossless_draft = False
 
-    #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
-    #: None keeps the greedy block sampler. A class default, so a flavor that
-    #: does not support lossless drafts reads None.
+    #: The buffers the block sampler draws into, set once lossless speculative
+    #: sampling arms (`DSparkLossless.bind_target`), before any warmup or
+    #: capture; None keeps the greedy block sampler. The branch is python, so
+    #: a captured graph holds whichever side was set at capture.
     draft_sampling: "DraftSampling | None" = None
-
-    def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
-        """Hand this model the buffers its block sampler draws into.
-
-        Called once the draft's sampling inputs exist (`DSparkLossless.bind_target`),
-        before any warmup or capture, so the sampled branch is the one that gets
-        JITed and recorded.
-        Switching it per step would not work: the branch is python, and a
-        captured graph holds whichever side was taken at capture.
-        """
-        self.draft_sampling = sampling
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""
