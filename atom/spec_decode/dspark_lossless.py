@@ -148,6 +148,14 @@ class DSparkLossless:
                 "by construction and the probability-ratio rule is exact, so "
                 "there is no defensible way to apply both. Turn one off."
             )
+        if drafter.speculative_config.synthetic_acceptance_rates is not None:
+            # The synthetic accept pattern replaces every verify, so the q the
+            # sampled draft stores would never be read.
+            raise ValueError(
+                "ATOM_SPEC_LOSSLESS_SAMPLING and synthetic_acceptance_rates are "
+                "mutually exclusive: synthetic acceptance replaces the verify, "
+                "so the probability-ratio rule would never run. Turn one off."
+            )
         lossless = cls(drafter)
         if drafter.runner.rank == 0:
             store = lossless.q_store

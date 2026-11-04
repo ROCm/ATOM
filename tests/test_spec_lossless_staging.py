@@ -49,7 +49,15 @@ class FakeDraftModel:
 
 
 def proposer(
-    monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, bind=True, **config
+    monkeypatch,
+    *,
+    lossless=True,
+    pp=1,
+    pcp=1,
+    model=None,
+    bind=True,
+    synthetic=None,
+    **config,
 ):
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1" if lossless else "0")
     monkeypatch.setattr(dspark_lossless, "get_pcp_world_size", lambda: pcp)
@@ -68,6 +76,7 @@ def proposer(
             **config,
         },
     )
+    prop.speculative_config = SimpleNamespace(synthetic_acceptance_rates=synthetic)
     prop.device = torch.device("cpu")
     prop.runner = SimpleNamespace(rank=1)
     prop.metadata_buffers = {}
@@ -443,6 +452,19 @@ def test_dspark_refuses_relaxed_mtp_where_lossless_sampling_arms(
     else:
         prop = proposer(monkeypatch, lossless=bool(lossless))
         assert (prop.lossless is not None) is bool(lossless)
+
+
+@pytest.mark.parametrize("lossless", [True, False])
+def test_dspark_refuses_synthetic_acceptance_where_lossless_sampling_arms(
+    monkeypatch, lossless
+):
+    """Synthetic acceptance replaces the verify, so the sampled draft's q
+    would be stored and never read."""
+    if lossless:
+        with pytest.raises(ValueError, match="synthetic_acceptance_rates"):
+            proposer(monkeypatch, synthetic=[0.5])
+    else:
+        assert proposer(monkeypatch, lossless=False, synthetic=[0.5]).lossless is None
 
 
 def test_a_plain_drafter_starts_with_both_flags_set(monkeypatch):
