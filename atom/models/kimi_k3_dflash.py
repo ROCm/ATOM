@@ -134,7 +134,7 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.model_ops.layernorm import DualRMSNorm, RMSNorm
+from atom.model_ops.layernorm import DualRMSNorm, RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -471,7 +471,14 @@ class KimiK3DFlashAttention(nn.Module):
         # Only k is normed -- v is not, matching the reference. Row-wise RMSNorm
         # makes norming this half separately identical to norming the concat,
         # which is what lets the context live in the pool at all.
-        k = self.k_norm(k)
+        if kv.is_contiguous():
+            # `k_norm(k)` would first copy the strided k dense to view it as
+            # head rows; norming every head row of `kv` is the same per-row
+            # kernel without the copy, and only k's rows are kept.
+            k = rmsnorm2d_fwd_(kv, self.k_norm.weight, self.k_norm.eps, self.head_dim)
+            k = k[:, : self.kv_size]
+        else:
+            k = self.k_norm(k)
         # Rope at the token's ABSOLUTE position, before the write: that is what
         # makes a cached row valid on every later step without being rewritten.
         k = self.rotary_emb(positions, k)
