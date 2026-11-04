@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -583,6 +584,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         -- the experts run on none past it, the prefilled shared column
         included (aiter's `num_local_tokens`)."""
         raise NotImplementedError
+
+    def supports_out(self, layer: torch.nn.Module) -> bool:
+        """Whether ``apply(..., output=)`` writes the final rows in place."""
+        return False
 
     def select_experts(
         self, layer: torch.nn.Module, x: torch.Tensor, router_logits: torch.Tensor
@@ -2102,6 +2107,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         topk_physical = eplb_map_and_record_fused(layer, topk_ids, gathered)
         return layer.to_dispatch_space(topk_weights, topk_physical)
 
+    def supports_out(self, layer: torch.nn.Module) -> bool:
+        """The TP FlyDSL path can write GEMM2/gather-reduce into caller storage."""
+        parallel = self.moe.moe_parallel_config
+        return (
+            self.fused_experts is None
+            and self.is_gfx1250
+            and self.is_guinterleave
+            # Compare the primitive enum payload: Dynamo cannot constant-fold
+            # QuantType object equality when this method is reached through an
+            # nn.Module attribute, and splits the model at the first MoE layer.
+            and self.quant_type.value == QuantType.per_1x32.value
+            and os.environ.get("AITER_DISABLE_GROUPED_A8W4", "0") != "1"
+            and not self.use_triton
+            and not self.use_triton_ep
+            and not parallel.use_ep
+            and parallel.dp_size == 1
+            and parallel.dp_logical_ratio == 1
+            and not parallel.pcp_merge
+            and not layer.reduce_results
+        )
+
     @mark_trace
     def apply(
         self,
@@ -2116,7 +2142,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         prefix: str = "",
         x_scale: torch.Tensor | None = None,
         scheduled_tokens_gpu: torch.Tensor | None = None,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if output is not None and not self.supports_out(layer):
+            raise ValueError("MXFP4 MoE backend cannot honor output= for this layout")
         # ATOM_USE_TRITON_MOE_DECODE splits the two kernels by phase: the weights
         # sit in the FlyDSL layout, so prefill falls through to the FlyDSL tail
         # below and only decode takes the Triton block (over a view of the very
@@ -2446,6 +2475,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 bias1=layer.w13_bias,
                 bias2=layer.w2_bias,
                 num_local_tokens=scheduled_tokens_gpu,
+                output=output,
                 **moe_extra_args,
             )
         return self.fused_experts(
@@ -3442,6 +3472,40 @@ direct_register_custom_op(
     op_func=moe_forward,
     mutates_args=["hidden_states"],
     fake_impl=moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def moe_forward_into_output(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Run MoE into caller storage without returning an aliased custom-op output."""
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    result = self.forward_impl(hidden_states, router_logits, output=output)
+    # ``supports_out`` is a performance promise, not a correctness gamble.
+    # Preserve the caller-owned result if a future backend declines its out=.
+    if result.data_ptr() != output.data_ptr():
+        output.copy_(result)
+
+
+def moe_forward_into_output_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="moe_forward_into_output",
+    op_func=moe_forward_into_output,
+    mutates_args=["hidden_states", "output"],
+    fake_impl=moe_forward_into_output_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -5302,7 +5366,15 @@ class FusedMoE(torch.nn.Module):
 
         return topk_weights, topk_ids
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def supports_out(self) -> bool:
+        return self.quant_method is not None and self.quant_method.supports_out(self)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ):
         if self.balance_router_logits is not None:
             # Match the dtype of the logits being replaced. The table is built
             # once at the default dtype, but aiter's `biased_grouped_topk`
@@ -5315,6 +5387,13 @@ class FusedMoE(torch.nn.Module):
             router_logits = self.balance_router_logits[: hidden_states.shape[0]].to(
                 router_logits.dtype
             )
+        if out is not None:
+            if not self.supports_out():
+                raise ValueError(f"{self.layer_name} cannot honor MoE out=")
+            torch.ops.aiter.moe_forward_into_output(
+                hidden_states, router_logits, out, self.layer_name
+            )
+            return out
         return torch.ops.aiter.moe_forward(
             hidden_states, router_logits, self.layer_name
         )
@@ -5355,6 +5434,7 @@ class FusedMoE(torch.nn.Module):
         topk_ids: torch.Tensor,
         x_scale: torch.Tensor | None = None,
         gathered: bool = False,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The experts on the routed rows (`x_scale`: they are in the method's
         `routed_rows_wire` already), still on logical experts: placed on the
@@ -5393,6 +5473,11 @@ class FusedMoE(torch.nn.Module):
         topk_weights, topk_ids = self.quant_method.place_experts(
             self, topk_weights, topk_ids, gathered
         )
+        apply_kwargs = {}
+        if output is not None:
+            if not self.quant_method.supports_out(self):
+                raise ValueError(f"{self.layer_name} cannot honor MoE output=")
+            apply_kwargs["output"] = output
         output = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -5409,6 +5494,7 @@ class FusedMoE(torch.nn.Module):
                 if gathered or not self.use_ep
                 else pass_scheduled_tokens_gpu(topk_ids.shape[0])
             ),
+            **apply_kwargs,
         )
         if split:
             if tbo:
@@ -5421,7 +5507,10 @@ class FusedMoE(torch.nn.Module):
         return output
 
     def forward_impl_graph(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor | None = None,
     ):
         # There are three mode
         # 1. Pure DP mode: only DP is used
@@ -5477,7 +5566,12 @@ class FusedMoE(torch.nn.Module):
                 tbo_switch_to_compute_sync()
 
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, x_scale, use_dp_gather_scatter
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            x_scale,
+            use_dp_gather_scatter,
+            output=output,
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -5506,11 +5600,16 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ):
         assert self.quant_method is not None
 
         if get_dp_group().world_size > 1:
-            return self.forward_impl_graph(hidden_states, router_logits)
+            return self.forward_impl_graph(hidden_states, router_logits, output=output)
 
         # Simulated DP with no peers to gather from: the absent ranks' token
         # shards are stood in for locally, same as after the gather in
@@ -5529,7 +5628,11 @@ class FusedMoE(torch.nn.Module):
         # The stand-in copies make the rows the logical group's, as a gather
         # would.
         final_hidden_states = self._run_experts(
-            hidden_states, topk_weights, topk_ids, gathered=dp_repeat > 1
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            gathered=dp_repeat > 1,
+            output=output,
         )
 
         if dp_repeat > 1:
