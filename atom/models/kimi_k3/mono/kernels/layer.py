@@ -109,12 +109,15 @@ class K2Build:
     # set, so the default build's symbol is unchanged
     mla_post: bool = False
     # ``ATOM_MONO_MLA_PREP``: the NEXT (MLA) layer's prep as this launch's tail
-    # stages (``stages.mla_prep``; 1: its attention seam, P0), on a seam of
+    # stages (``stages.mla_prep``; 1: its attention seam, P0; 2: also the q_a /
+    # kv_a GEMV and RMSNorms, P1 / P2), on a seam of
     # ``prep_nblocks`` blocks; in the symbol only when set
     mla_prep: int = 0
     prep_nblocks: int = 0
     prep_eps: float = 1e-6
     prep_out_eps: float = 1e-6
+    qa_eps: float = 1e-6  # mode 2: q_a_layernorm
+    kva_eps: float = 1e-6  # mode 2: kv_a_layernorm
 
 
 ABI = KernelAbi(
@@ -471,6 +474,12 @@ def _body(
     if const_expr(key.mla_prep):
         for region in pr.REGIONS:
             c[region] = sreg(scratch, lay[region][0], region)
+        if const_expr(key.mla_prep >= 2):
+            # P1 stages x8 where the post stage stages g_proj's x
+            c["prep_xl"] = st.post.peek().xq.ptr
+            c["prep_slabs"] = post_slabs
+            c["qa_eps"] = key.qa_eps
+            c["kva_eps"] = key.kva_eps
     on, tls = key.timeline, lds.tls.ptr
     stamp_begin(on, tls, tid, TL_POINTS)
     # ---- o_proj on every CTA (``o_slot``)
@@ -553,6 +562,13 @@ def _body(
         cp = pr.prep_context(c, key.prep_nblocks + 1, key.prep_eps, key.prep_out_eps)
         if bid < NA:
             pr.p0_seam(cp, bid)
+        if const_expr(key.mla_prep >= 2):
+            # P1 past the lnorm CTAs, after their own work; P2 on P0's first
+            # 2 S CTAs, after it (it waits on P1, P1 on P0)
+            if (bid >= pr.P1_CTA0) & (bid < pr.P1_CTA0 + pr.P1_TASKS):
+                pr.p1_task(c, bid - pr.P1_CTA0)
+            if bid < 2 * s:
+                pr.p2_norm(c, bid)
     stamp_flush(on, tls, tl, tid, bid, TL_POINTS)
 
 
@@ -595,12 +611,14 @@ def build(key: K2Build):
         tls: fx.Array[fx.Int64, TL_POINTS, 16]
 
     if key.mla_prep:
-        assert key.mla_prep == 1, f"MLA prep mode {key.mla_prep}: only P0 (1)"
+        assert key.mla_prep in (1, 2), f"MLA prep mode {key.mla_prep}: P0 / P1-P2"
+        # P2 on P0's first 2 S CTAs
+        assert 2 * s <= NA
         assert s <= pr.MAX_ROWS, f"MLA prep: {s} rows past {pr.MAX_ROWS}"
         # P0 stages layer M's sources in this build's ``vals``
         assert 1 <= key.prep_nblocks < ns, (key.prep_nblocks, ns)
         assert pr.red_fits(s, key.prep_nblocks + 1)
-    if key.mla_post:
+    if key.mla_post or key.mla_prep >= 2:
         assert s <= mp.MAX_ROWS, f"MLA post: {s} rows past {mp.MAX_ROWS}"
         # the post stage stages x in whatever LDS is left past the fixed parts
         budget = (LDS_LIMIT - lds_bytes(Smem) - lds_bytes(RouteLds) - 256) // 16 * 16
@@ -1027,6 +1045,14 @@ def _build_prep(key, name, keyed, bk):
         p_nw: Int64,
         p_qk: Int64,
         p_onw: Int64,
+        w_qa: Int64,
+        w_qa_s: Int64,
+        qkv: Int64,
+        q8: Int64,
+        qs: Int64,
+        kvn: Int64,
+        qa_nw: Int64,
+        kva_nw: Int64,
     ):
         _ = keyed
         post = {
@@ -1079,6 +1105,14 @@ def _build_prep(key, name, keyed, bk):
                 "p_nw": p_nw,
                 "p_qk": p_qk,
                 "p_onw": p_onw,
+                "w_qa": w_qa,
+                "w_qa_s": w_qa_s,
+                "qkv": qkv,
+                "q8": q8,
+                "qs": qs,
+                "kvn": kvn,
+                "qa_nw": qa_nw,
+                "kva_nw": kva_nw,
             },
         )
 
@@ -1128,6 +1162,14 @@ def _build_prep(key, name, keyed, bk):
         p_nw: Int64,
         p_qk: Int64,
         p_onw: Int64,
+        w_qa: Int64,
+        w_qa_s: Int64,
+        qkv: Int64,
+        q8: Int64,
+        qs: Int64,
+        kvn: Int64,
+        qa_nw: Int64,
+        kva_nw: Int64,
         stream: fx.Stream = _STREAM,
     ):
         _ = keyed
@@ -1176,6 +1218,14 @@ def _build_prep(key, name, keyed, bk):
             p_nw,
             p_qk,
             p_onw,
+            w_qa,
+            w_qa_s,
+            qkv,
+            q8,
+            qs,
+            kvn,
+            qa_nw,
+            kva_nw,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
     ABI_PREP.check(k2, launch)
