@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # MiniMax-M3.1-Flash vLLM 1P1D/1P2D over MoRIIOConnector (WRITE, or READ with
-# ATOMESH_M31_MORIIO_READ_MODE=true) cross-node RDMA, sourced by
+# ATOMESH_M31_MORIIO_READ_MODE=true) RDMA, cross-node or within one node (single_node), sourced by
 # pd_server_vllm.sh when ATOMESH_M31_MORIIO=1. Server env/argv follow the local
 # test_scripts/pd/launch_pd_main.sh CONC --offload; only PYTHONPATH, hosts, MoRIIO ports, the rdma
 # backend, the offload size and the per-D max-num-seqs are adapted to the two-node layout. Workers
@@ -115,6 +115,8 @@ start_vllm_server() {
     # decode_single_node: worker idx serves DECODE_PORT+idx on the GPUs pd_server_atom.sh exported, so
     # each D on the node needs its own handshake/notify bases (4 TP ranks each).
     gpus="${HIP_VISIBLE_DEVICES}" idx=$((server_port - DECODE_PORT))
+    # single_node: prefill holds GPUs 0-3 of this node.
+    [[ "${SINGLE_NODE_PD}" == "1" ]] && gpus=4,5,6,7
     xfer="$(m31_moriio kv_consumer "${server_port}" $((M31_HANDSHAKE_PORT + 100 * (idx + 1))) $((M31_NOTIFY_PORT + 100 * (idx + 1))))"
     # Every concurrency can land on one D under consistent_hash: FULL graphs for 1..CONC requests x 8 tokens.
     role_args=(--max-num-seqs "${m31_conc}" --port "${server_port}" --gpu-memory-utilization 0.85
