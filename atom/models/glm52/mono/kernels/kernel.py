@@ -2971,11 +2971,18 @@ def build_glm5_monokernel(
             # twice the q words it used, in every one of the S * 2 * N_SPLIT
             # tasks. Bit-identical -- the skipped LDS rows are never read.
             NQ = SPLIT_QH * KV_LORA // 4 // THREADS
-            tpe = fx.min(tid, SPLIT_QH * PE_DIM // 4 - 1)
+            # pe words: one pass up to 32 heads; 64 heads (DCP4) need two
+            PE_WORDS = SPLIT_QH * PE_DIM // 4
+            NPE = -(-PE_WORDS // THREADS)
+            tpe = fx.min(tid, PE_WORDS - 1)
             qh0 = hg0 * SPLIT_QH if const_expr(SPLIT_QH != H) else fx.Int32(0)
             qv = poll(
                 [(mb("q_lat"), ((s * H + qh0) * KV_LORA + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ)]
                 + [(mb("q_pe"), ((s * H + qh0) * PE_DIM + tpe * 4) // 2, 2)]
+                + [
+                    (mb("q_pe"), ((s * H + qh0) * PE_DIM + fx.min(tid + i * THREADS, PE_WORDS - 1) * 4) // 2, 2)
+                    for i in range(1, NPE)
+                ]
             )
             for i in range_constexpr(NQ):
                 w4 = tid + i * THREADS
@@ -2987,6 +2994,13 @@ def build_glm5_monokernel(
                 qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
                 lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
                 lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
+            for i in range_constexpr(1, NPE):
+                pw = tid + i * THREADS
+                if pw < PE_WORDS:
+                    hh = qh0 + pw // (PE_DIM // 4)
+                    qw = hh * QS + KV_LORA // 2 + (pw % (PE_DIM // 4)) * 2
+                    lds_st(xs, qw, qv[NQ + i][0].bitcast(fx.Float32))
+                    lds_st(xs, qw + 1, qv[NQ + i][1].bitcast(fx.Float32))
             patch_new_kv()
             if const_expr(True):
                 stamp("split", tt, 2)
